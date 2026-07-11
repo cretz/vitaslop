@@ -1,64 +1,67 @@
-//! Vita-agnostic ARMv7-A + Thumb-2 + NEON + VFP to WASM transpiler.
+//! Vita-agnostic ARMv7-A + Thumb-2 (later NEON/VFP) to WASM transpiler.
 //!
-//! Input is a code image, a set of entry-point addresses, and
-//! relocation/provenance facts ([`Program`]). Output is raw WASM plus the
-//! guest-address-to-export dispatch map ([`Artifact`]). Nothing Vita-specific
-//! belongs in this crate.
+//! Input is a code image, entry-point addresses, and import/relocation facts
+//! ([`Program`]). Output is a WASM module plus the guest-function-to-export map
+//! ([`Artifact`]). Nothing Vita-specific belongs here.
 //!
-//! The pipeline is decode (yaxpeax) -> a small IR ([`Stmt`]/[`Value`]) that we
-//! optimize over (e.g. const-folding `adr`) -> emit (wasm-encoder). Today only
-//! a handful of instructions are lifted; the IR seam is what lets that grow
-//! into a real optimizing transpiler rather than a 1:1 emitter.
+//! Pipeline: decode + discover ([`lower`]) -> per-function CFG IR ([`ir`]) ->
+//! wasm emission ([`emit`]). Each guest function becomes one wasm function whose
+//! body is a dispatch loop over its basic blocks; see [`emit`] and [`abi`] for
+//! the control-flow and state model, and the crate README for the rationale.
 
 pub mod abi;
+mod emit;
+mod ir;
+mod lower;
 
-use wasm_encoder::{
-    CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, ImportSection, Instruction, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
-};
-use yaxpeax_arch::{Decoder, U8Reader};
-use yaxpeax_arm::armv7::{InstDecoder, Opcode, Operand};
+use std::collections::BTreeMap;
 
-/// Function index of the imported `svc` trap. Imports come first, so it is 0.
-const SVC_FUNC: u32 = 0;
+pub use ir::ConditionCode;
+use lower::Imports;
 
-/// A code image to transpile: the ARM blob, where it loads, which addresses to
-/// start decoding from, and how guest imports wire to host functions.
+/// A code image to transpile: the ARM/Thumb blob, where it loads, which
+/// addresses to start decoding from, how guest imports wire to host functions,
+/// and the guest memory size.
 pub struct Program<'a> {
-    /// The ARM code/data image.
+    /// The ARM/Thumb code/data image.
     pub code: &'a [u8],
-    /// Guest address the image loads at.
+    /// Guest address the image loads at (and the linear-memory rebase origin).
     pub base: u32,
-    /// Entry points to transpile (each becomes a block).
+    /// True to decode in Thumb-2 mode, false for ARM. Whole-program for now;
+    /// per-function `blx` mode switches come later.
+    pub thumb: bool,
+    /// Entry points to discover (each becomes a function, transitively pulling
+    /// in its direct callees).
     pub entries: &'a [u32],
-    /// Extern (imported-function) wiring. Unused until NID imports land.
+    /// Extern (imported-function) wiring: each maps a guest stub address to a
+    /// dense host-import index.
     pub externs: &'a [Extern],
     /// Syscall numbers (guest r7) that do not return, so a `svc` with a
-    /// statically-known one of them ends a block. Supplied by the host so the
-    /// transpiler stays free of any particular syscall convention.
+    /// statically-known one of them ends decoding (before trailing data).
     pub noreturn_svc: &'a [u32],
+    /// Total guest memory to provision, in bytes from `base`. The host keeps all
+    /// guest allocations (image, stack, heap) within `[base, base + mem_bytes)`.
+    pub mem_bytes: u32,
 }
 
-/// A guest address that dispatches to a host import (the Vita NID mechanism,
-/// later). Present so the public shape is stable; not consumed yet.
+/// A guest address that dispatches to a host import (the Vita NID mechanism): a
+/// `bl`/`blx` to `addr` becomes a host call with dense index `import`.
 pub struct Extern {
     pub addr: u32,
     pub import: u32,
 }
 
-/// The transpiler output: the WASM blob plus the dispatch map the runtime needs
-/// to call guest addresses.
+/// The transpiler output: the WASM blob plus the map the runtime needs to enter
+/// guest code by address.
 pub struct Artifact {
     /// The emitted WASM module bytes.
     pub wasm: Vec<u8>,
-    /// One entry per transpiled block: guest address and its WASM export name.
-    pub blocks: Vec<Block>,
+    /// One entry per transpiled function: its guest address and wasm export name.
+    pub funcs: Vec<FuncExport>,
 }
 
-/// A transpiled block: the guest address it starts at and the WASM function
-/// exported for it.
-pub struct Block {
+/// A transpiled function: the guest address it starts at and its wasm export.
+pub struct FuncExport {
     pub addr: u32,
     pub export: String,
 }
@@ -69,391 +72,57 @@ pub enum Error {
     /// The decoder could not decode the bytes at `addr`.
     Decode { addr: u32 },
     /// A decoded instruction is not lifted yet.
-    Unsupported { addr: u32, opcode: Opcode },
+    Unsupported {
+        addr: u32,
+        opcode: yaxpeax_arm::armv7::Opcode,
+    },
     /// An operand had an unexpected shape for its opcode.
     Operand { addr: u32 },
 }
 
-/// A computed value in the IR. Only what the current instruction set needs;
-/// grows toward a full SSA value graph.
-enum Value {
-    Const(u32),
-    Reg(u8),
-    Add(Box<Value>, Box<Value>),
-}
-
-/// One lowered effect of a guest instruction.
-enum Stmt {
-    /// `r[reg] = value`
-    SetReg { reg: u8, value: Value },
-}
-
-/// What ends a segment.
-enum Boundary {
-    /// A host `svc`. Promoted registers are flushed to their globals, the trap
-    /// runs, then (unless it was EXIT) the next segment reloads and continues.
-    Svc(u32),
-    /// The block ran off the end of the image: nothing more to run.
-    FellThrough,
-}
-
-/// A boundary-free run within a block: its statements, the registers worth
-/// caching in locals for just this run, and the boundary that ends it. Register
-/// caching lives at this granularity because every boundary spills the locals to
-/// their globals (the host observes and can change registers there), so a local
-/// only earns its keep within a single segment.
-struct Segment {
-    stmts: Vec<Stmt>,
-    /// Registers promoted to a local for this segment, ascending.
-    promoted: Vec<u8>,
-    boundary: Boundary,
-}
-
-/// A decoded/lifted block: its entry address and its segments. The block is the
-/// wasm function (and owns the local slots); segments are the caching spans.
-struct Lowered {
-    addr: u32,
-    segments: Vec<Segment>,
-}
-
 /// Transpile `program` into a WASM module and its dispatch map.
 pub fn transpile(program: &Program) -> Result<Artifact, Error> {
-    let decoder = InstDecoder::default();
-    let mut lowered = Vec::new();
-    for &entry in program.entries {
-        lowered.push(lift_block(
+    let import_map: BTreeMap<u32, u32> =
+        program.externs.iter().map(|e| (e.addr, e.import)).collect();
+    let imports = Imports::new(&import_map);
+
+    // Discover the transitive direct-call closure from the entries.
+    let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
+    let mut work: Vec<u32> = program.entries.to_vec();
+    while let Some(addr) = work.pop() {
+        if funcs.contains_key(&addr) {
+            continue;
+        }
+        let found = lower::discover(
             program.code,
             program.base,
-            entry,
-            &decoder,
+            addr,
+            program.thumb,
+            &imports,
             program.noreturn_svc,
-        )?);
+        )?;
+        work.extend(found.callees);
+        funcs.insert(addr, found.func);
     }
-    let wasm = emit(&lowered, program.base, program.code.len());
-    let blocks = lowered
+
+    // Assign wasm function indices (imports occupy the low indices) in ascending
+    // address order, and build the address -> index map for call lowering.
+    let ordered: Vec<ir::Func> = funcs.into_values().collect();
+    let func_index: BTreeMap<u32, u32> = ordered
         .iter()
-        .map(|b| Block {
-            addr: b.addr,
-            export: abi::block_export(b.addr),
+        .enumerate()
+        .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
+        .collect();
+
+    let wasm = emit::emit_module(&ordered, &func_index, program.base, program.mem_bytes);
+    let funcs = ordered
+        .iter()
+        .map(|f| FuncExport {
+            addr: f.addr,
+            export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, blocks })
-}
-
-/// Decode and lift a single straight-line block, starting at `entry`. Stops at
-/// a noreturn `svc` (exit) or when it runs off the end of the image.
-fn lift_block(
-    code: &[u8],
-    base: u32,
-    entry: u32,
-    decoder: &InstDecoder,
-    noreturn_svc: &[u32],
-) -> Result<Lowered, Error> {
-    let mut segments = Vec::new();
-    let mut stmts = Vec::new();
-    // Per-segment access tally (reset at each boundary by `close_segment`). We
-    // decide promotion per segment because every boundary spills the locals to
-    // their globals anyway, so only density *between* boundaries earns a local.
-    let mut seg_uses = [0u32; abi::REG_COUNT];
-    // Known-constant register values, tracked across the whole block. Lets us
-    // recognize a noreturn `svc` (r7 = an exit syscall) and end the block there,
-    // rather than decoding whatever data follows it.
-    let mut regvals = [None; abi::REG_COUNT];
-    let mut addr = entry;
-    loop {
-        let off = addr.wrapping_sub(base) as usize;
-        if off + 4 > code.len() {
-            // Ran past the image: close the trailing segment and stop.
-            segments.push(close_segment(
-                &mut stmts,
-                &mut seg_uses,
-                Boundary::FellThrough,
-            ));
-            break;
-        }
-        let mut reader = U8Reader::new(&code[off..]);
-        let inst = decoder
-            .decode(&mut reader)
-            .map_err(|_| Error::Decode { addr })?;
-        match inst.opcode {
-            // adr rd, label  ->  rd = pc + imm (pc = addr + 8). Const-folded.
-            Opcode::ADR => {
-                let rd = reg(inst.operands[0], addr)?;
-                let imm = imm32(inst.operands[2], addr)?;
-                let value = addr.wrapping_add(8).wrapping_add(imm);
-                seg_uses[rd as usize] += 1;
-                regvals[rd as usize] = Some(value);
-                stmts.push(Stmt::SetReg {
-                    reg: rd,
-                    value: Value::Const(value),
-                });
-            }
-            // mov rd, #imm
-            Opcode::MOV if matches!(inst.operands[1], Operand::Imm32(_)) => {
-                let rd = reg(inst.operands[0], addr)?;
-                let imm = imm32(inst.operands[1], addr)?;
-                seg_uses[rd as usize] += 1;
-                regvals[rd as usize] = Some(imm);
-                stmts.push(Stmt::SetReg {
-                    reg: rd,
-                    value: Value::Const(imm),
-                });
-            }
-            // add{s} rd, rn, rm  ->  rd = rn + rm (flags not modeled yet).
-            Opcode::ADD => {
-                let rd = reg(inst.operands[0], addr)?;
-                let rn = reg(inst.operands[1], addr)?;
-                let rm = reg(inst.operands[2], addr)?;
-                seg_uses[rn as usize] += 1;
-                seg_uses[rm as usize] += 1;
-                seg_uses[rd as usize] += 1;
-                regvals[rd as usize] = None;
-                stmts.push(Stmt::SetReg {
-                    reg: rd,
-                    value: Value::Add(Box::new(Value::Reg(rn)), Box::new(Value::Reg(rm))),
-                });
-            }
-            // svc #imm: a host call, and a segment boundary.
-            Opcode::SVC => {
-                let imm = imm32(inst.operands[0], addr)?;
-                segments.push(close_segment(&mut stmts, &mut seg_uses, Boundary::Svc(imm)));
-                // A syscall whose number (r7) is statically a noreturn one ends
-                // the block; otherwise execution continues into the next segment.
-                if regvals[7].is_some_and(|nr| noreturn_svc.contains(&nr)) {
-                    break;
-                }
-            }
-            opcode => return Err(Error::Unsupported { addr, opcode }),
-        }
-        addr = addr.wrapping_add(4); // ARM fixed instruction width
-    }
-    Ok(Lowered {
-        addr: entry,
-        segments,
-    })
-}
-
-/// Close a segment: take its statements, decide which registers were hot enough
-/// within it to cache in a local (accessed past the threshold, since each spills
-/// at the boundary regardless), reset the tally, and pair them with the boundary
-/// that ends the segment.
-fn close_segment(
-    stmts: &mut Vec<Stmt>,
-    seg_uses: &mut [u32; abi::REG_COUNT],
-    boundary: Boundary,
-) -> Segment {
-    let promoted = (0..abi::REG_COUNT)
-        .filter(|&r| seg_uses[r] > abi::LOCAL_PROMOTION_THRESHOLD)
-        .map(|r| r as u8)
-        .collect();
-    seg_uses.fill(0);
-    Segment {
-        stmts: std::mem::take(stmts),
-        promoted,
-        boundary,
-    }
-}
-
-fn reg(op: Operand, addr: u32) -> Result<u8, Error> {
-    match op {
-        Operand::Reg(r) => Ok(r.number()),
-        _ => Err(Error::Operand { addr }),
-    }
-}
-
-fn imm32(op: Operand, addr: u32) -> Result<u32, Error> {
-    match op {
-        Operand::Imm32(v) => Ok(v),
-        Operand::Imm12(v) => Ok(v as u32),
-        _ => Err(Error::Operand { addr }),
-    }
-}
-
-/// Emit the WASM module for the lowered blocks (see [`abi`] for the layout).
-fn emit(blocks: &[Lowered], base: u32, code_len: usize) -> Vec<u8> {
-    // Types: svc import `(i32) -> ()`, block `() -> i32`.
-    let mut types = TypeSection::new();
-    types.ty().function([ValType::I32], []);
-    types.ty().function([], [ValType::I32]);
-    let svc_type = 0;
-    let block_type = 1;
-
-    let mut imports = ImportSection::new();
-    imports.import(
-        abi::SVC_MODULE,
-        abi::SVC_NAME,
-        EntityType::Function(svc_type),
-    );
-
-    let mut funcs = FunctionSection::new();
-    for _ in blocks {
-        funcs.function(block_type);
-    }
-
-    // Enough linear-memory pages to cover the guest image at its load base.
-    let end = base as u64 + code_len as u64;
-    let pages = end.div_ceil(abi::PAGE_SIZE as u64).max(1);
-    let mut mems = MemorySection::new();
-    mems.memory(MemoryType {
-        minimum: pages,
-        maximum: None,
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
-
-    // The register file: 16 mutable i32 globals, r0..r15, exported by name.
-    let mut globals = GlobalSection::new();
-    for _ in 0..abi::REG_COUNT {
-        globals.global(
-            GlobalType {
-                val_type: ValType::I32,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::i32_const(0),
-        );
-    }
-
-    let mut exports = ExportSection::new();
-    exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
-    for i in 0..abi::REG_COUNT {
-        exports.export(&abi::reg_export(i), ExportKind::Global, abi::reg_global(i));
-    }
-
-    let mut code = CodeSection::new();
-    for (i, block) in blocks.iter().enumerate() {
-        // Imported funcs occupy the low indices; block funcs follow.
-        let func_index = SVC_FUNC + 1 + i as u32;
-        exports.export(&abi::block_export(block.addr), ExportKind::Func, func_index);
-        code.function(&emit_block(block));
-    }
-
-    let mut module = Module::new();
-    module
-        .section(&types)
-        .section(&imports)
-        .section(&funcs)
-        .section(&mems)
-        .section(&globals)
-        .section(&exports)
-        .section(&code);
-    module.finish()
-}
-
-/// Per-segment register caching: which of this segment's registers live in a
-/// wasm local, and the block-wide local slot each uses.
-struct RegCache<'a> {
-    /// `local_of[r]` is the local slot for register `r` if it is cached in this
-    /// segment, else `None` (accessed through its global).
-    local_of: [Option<u32>; abi::REG_COUNT],
-    /// This segment's promoted registers, ascending.
-    promoted: &'a [u8],
-}
-
-impl RegCache<'_> {
-    /// Push the current value of register `r`.
-    fn get(&self, f: &mut Function, r: u8) {
-        match self.local_of[r as usize] {
-            Some(l) => f.instruction(&Instruction::LocalGet(l)),
-            None => f.instruction(&Instruction::GlobalGet(abi::reg_global(r as usize))),
-        };
-    }
-
-    /// Store the top of stack into register `r`.
-    fn set(&self, f: &mut Function, r: u8) {
-        match self.local_of[r as usize] {
-            Some(l) => f.instruction(&Instruction::LocalSet(l)),
-            None => f.instruction(&Instruction::GlobalSet(abi::reg_global(r as usize))),
-        };
-    }
-
-    /// Load this segment's promoted registers from their globals into locals.
-    fn load(&self, f: &mut Function) {
-        for &r in self.promoted {
-            f.instruction(&Instruction::GlobalGet(abi::reg_global(r as usize)));
-            f.instruction(&Instruction::LocalSet(self.local_of[r as usize].unwrap()));
-        }
-    }
-
-    /// Flush this segment's promoted registers back to their globals at the
-    /// boundary, so the host and the next segment see current registers.
-    fn flush(&self, f: &mut Function) {
-        for &r in self.promoted {
-            f.instruction(&Instruction::LocalGet(self.local_of[r as usize].unwrap()));
-            f.instruction(&Instruction::GlobalSet(abi::reg_global(r as usize)));
-        }
-    }
-}
-
-fn emit_block(block: &Lowered) -> Function {
-    // A wasm local is declared once per function, so give each register promoted
-    // in *any* segment a block-wide slot; a segment that does not promote it just
-    // leaves the slot untouched. Slots are keyed by register, so a register
-    // promoted in several segments reuses the same slot (reloaded each time).
-    let mut slot_of = [None; abi::REG_COUNT];
-    let mut slots = 0u32;
-    for seg in &block.segments {
-        for &r in &seg.promoted {
-            if slot_of[r as usize].is_none() {
-                slot_of[r as usize] = Some(slots);
-                slots += 1;
-            }
-        }
-    }
-    let locals = if slots == 0 {
-        Vec::new()
-    } else {
-        vec![(slots, ValType::I32)]
-    };
-    let mut f = Function::new(locals);
-
-    for seg in &block.segments {
-        // Cache only this segment's promoted registers (into their block-wide
-        // slots); everything else goes straight through the globals.
-        let mut local_of = [None; abi::REG_COUNT];
-        for &r in &seg.promoted {
-            local_of[r as usize] = slot_of[r as usize];
-        }
-        let cache = RegCache {
-            local_of,
-            promoted: &seg.promoted,
-        };
-
-        cache.load(&mut f);
-        for stmt in &seg.stmts {
-            match stmt {
-                Stmt::SetReg { reg, value } => {
-                    emit_value(&mut f, &cache, value);
-                    cache.set(&mut f, *reg);
-                }
-            }
-        }
-        cache.flush(&mut f);
-
-        if let Boundary::Svc(imm) = seg.boundary {
-            f.instruction(&Instruction::I32Const(imm as i32));
-            f.instruction(&Instruction::Call(SVC_FUNC));
-        }
-    }
-
-    f.instruction(&Instruction::I32Const(abi::HALT));
-    f.instruction(&Instruction::End);
-    f
-}
-
-fn emit_value(f: &mut Function, cache: &RegCache, value: &Value) {
-    match value {
-        Value::Const(v) => {
-            f.instruction(&Instruction::I32Const(*v as i32));
-        }
-        Value::Reg(src) => cache.get(f, *src),
-        Value::Add(a, b) => {
-            emit_value(f, cache, a);
-            emit_value(f, cache, b);
-            f.instruction(&Instruction::I32Add);
-        }
-    }
+    Ok(Artifact { wasm, funcs })
 }
 
 #[cfg(test)]
@@ -461,7 +130,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transpiles_hello() {
+    fn transpiles_arm_hello() {
+        // adr r0,msg / mov r1,#13 / svc #0 / svc #1  (base 0x10000, ARM).
         let code: [u8; 16] = [
             0x08, 0x00, 0x8f, 0xe2, // adr r0, msg
             0x0d, 0x10, 0xa0, 0xe3, // mov r1, #13
@@ -471,14 +141,64 @@ mod tests {
         let artifact = transpile(&Program {
             code: &code,
             base: 0x10000,
+            thumb: false,
             entries: &[0x10000],
             externs: &[],
             noreturn_svc: &[],
+            mem_bytes: 0x20000,
         })
         .expect("transpile");
         assert!(!artifact.wasm.is_empty());
-        assert_eq!(artifact.blocks.len(), 1);
-        assert_eq!(artifact.blocks[0].addr, 0x10000);
-        assert_eq!(artifact.blocks[0].export, "b_10000");
+        assert_eq!(artifact.funcs.len(), 1);
+        assert_eq!(artifact.funcs[0].addr, 0x10000);
+        assert_eq!(artifact.funcs[0].export, "f_10000");
+        // The module must validate.
+        wasmparser::validate(&artifact.wasm).expect("valid wasm");
+    }
+
+    #[test]
+    fn transpiles_cube_memset() {
+        // The cube's Thumb memset at 0x81000948 (cbz, subs, strb[!], cmp, bne,
+        // bx lr): a 4-block loop that stresses the dispatch machinery.
+        let code: [u8; 18] = [
+            0x32, 0xb1, 0x01, 0x3a, 0x43, 0x1e, 0x02, 0x44, 0x03, 0xf8, 0x01, 0x1f, 0x93, 0x42,
+            0xfb, 0xd1, 0x70, 0x47,
+        ];
+        let base = 0x8100_0948;
+        let artifact = transpile(&Program {
+            code: &code,
+            base,
+            thumb: true,
+            entries: &[base],
+            externs: &[],
+            noreturn_svc: &[],
+            mem_bytes: 0x1_0000,
+        })
+        .expect("transpile memset");
+        if let Err(e) = wasmparser::validate(&artifact.wasm) {
+            dump_last_func(&artifact.wasm);
+            panic!("invalid memset module: {e}");
+        }
+    }
+
+    /// Print the operators of the last function body with a running control depth.
+    fn dump_last_func(wasm: &[u8]) {
+        use wasmparser::{Parser, Payload};
+        let mut depth = 0i32;
+        for payload in Parser::new(0).parse_all(wasm) {
+            if let Ok(Payload::CodeSectionEntry(body)) = payload {
+                let mut reader = body.get_operators_reader().unwrap();
+                while let Ok(op) = reader.read() {
+                    use wasmparser::Operator::*;
+                    let before = depth;
+                    match op {
+                        Block { .. } | Loop { .. } | If { .. } => depth += 1,
+                        End => depth -= 1,
+                        _ => {}
+                    }
+                    eprintln!("depth {before}->{depth}: {op:?}");
+                }
+            }
+        }
     }
 }

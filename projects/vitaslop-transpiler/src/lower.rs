@@ -1,0 +1,881 @@
+//! Decode + lower: turn a code image into per-function IR ([`ir::Func`]).
+//!
+//! Discovery is reachability-driven, not a linear sweep: starting from a
+//! function entry we follow only real control-flow edges (fall-through, taken/
+//! not-taken branches), so inline literal pools and the padding after an
+//! unconditional branch are never mistaken for instructions - nothing branches
+//! into them. Direct `bl`/`blx` targets are recorded as separate functions to
+//! discover; they are never pulled into the caller's body. Thumb `IT` state is
+//! tracked along fall-through edges so predicated instructions (which yaxpeax
+//! decodes as unconditional) get their real condition.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use yaxpeax_arch::{Decoder, U8Reader};
+use yaxpeax_arm::armv7::{ConditionCode, InstDecoder, Instruction, Opcode, Operand, Reg};
+
+use crate::Error;
+use crate::ir::{Block, BinOp, Func, MemSize, Stmt, Term, Value};
+
+/// A resolved import: the guest stub address a `bl`/`blx` targets maps to a
+/// dense host-import index.
+pub struct Imports<'a> {
+    map: &'a BTreeMap<u32, u32>,
+}
+
+impl<'a> Imports<'a> {
+    pub fn new(map: &'a BTreeMap<u32, u32>) -> Self {
+        Imports { map }
+    }
+    fn get(&self, addr: u32) -> Option<u32> {
+        self.map.get(&addr).copied()
+    }
+}
+
+/// Result of discovering one function: its IR and the guest addresses of the
+/// direct callees found in it (to be discovered as their own functions).
+pub struct Discovered {
+    pub func: Func,
+    pub callees: Vec<u32>,
+}
+
+/// Decode one instruction at guest `addr`, returning it and its byte length.
+fn decode_at(
+    decoder: &InstDecoder,
+    code: &[u8],
+    base: u32,
+    addr: u32,
+    thumb: bool,
+) -> Result<(Instruction, u32), Error> {
+    let off = addr.wrapping_sub(base) as usize;
+    let end = off.checked_add(if thumb { 2 } else { 4 });
+    if end.is_none_or(|e| e > code.len()) {
+        return Err(Error::Decode { addr });
+    }
+    let mut reader = U8Reader::new(&code[off..]);
+    let inst = decoder
+        .decode(&mut reader)
+        .map_err(|_| Error::Decode { addr })?;
+    let len = if !thumb || inst.wide { 4 } else { 2 };
+    Ok((inst, len))
+}
+
+/// The control-flow shape of a decoded instruction, used to find successors.
+enum Flow {
+    /// Continue to `addr + len` only.
+    Seq,
+    /// A call: continue to `addr + len` (the callee returns). `guest` is the
+    /// callee address if it is translated code, else it is a host import.
+    Call { guest: Option<u32> },
+    /// Unconditional branch: successor is `target` only.
+    Jump(u32),
+    /// Conditional/zero branch: successors are `target` and `addr + len`.
+    Fork(u32),
+    /// Returns to caller; no successors.
+    Return,
+    /// Stops without returning; no successors.
+    Halt,
+}
+
+/// The pc-relative target of a branch instruction, if it has one. yaxpeax's
+/// Thumb offset is measured from the instruction address in halfwords, so the
+/// target is `addr + 2*off`. `blx` switches to ARM and word-aligns the pc
+/// (`Align(PC,4)`), so from a non-word-aligned address its target is rounded
+/// down to the next word - otherwise it lands 2 bytes past the real callee/stub.
+fn branch_target(inst: &Instruction, addr: u32, thumb: bool) -> Option<u32> {
+    for op in &inst.operands {
+        match op {
+            Operand::BranchThumbOffset(off) => {
+                let t = addr.wrapping_add((2 * off) as u32);
+                return Some(if inst.opcode == Opcode::BLX { t & !3 } else { t });
+            }
+            Operand::BranchOffset(off) => {
+                let pc = if thumb { addr.wrapping_add(4) } else { addr.wrapping_add(8) };
+                return Some(pc.wrapping_add((4 * off) as u32));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True if this ldm/pop register list writes the pc (bit 15) - i.e. it returns.
+fn writes_pc(inst: &Instruction) -> bool {
+    inst.operands.iter().any(|op| match op {
+        Operand::RegList(mask) => mask & (1 << 15) != 0,
+        _ => false,
+    })
+}
+
+/// Classify an instruction's control flow.
+fn flow(
+    inst: &Instruction,
+    addr: u32,
+    len: u32,
+    thumb: bool,
+    imports: &Imports,
+    r7: Option<u32>,
+    noreturn_svc: &[u32],
+) -> Flow {
+    match inst.opcode {
+        Opcode::B => match branch_target(inst, addr, thumb) {
+            // `b .` (branch to self) is an idle spin: treat as Halt so we do not
+            // emit an infinite wasm loop the host cannot leave.
+            Some(t) if t == addr => Flow::Halt,
+            Some(t) if inst.condition == ConditionCode::AL => Flow::Jump(t),
+            Some(t) => Flow::Fork(t),
+            None => Flow::Halt,
+        },
+        Opcode::CBZ | Opcode::CBNZ => match branch_target(inst, addr, thumb) {
+            Some(t) => Flow::Fork(t),
+            None => Flow::Halt,
+        },
+        Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb) {
+            Some(t) if imports.get(t).is_some() => Flow::Call { guest: None },
+            Some(t) => Flow::Call { guest: Some(t) },
+            // Indirect bl/blx (register target) not yet supported.
+            None => Flow::Halt,
+        },
+        Opcode::BX => match inst.operands[0] {
+            Operand::Reg(r) if r.number() == 14 => Flow::Return,
+            _ => Flow::Halt, // indirect bx (not lr) unsupported yet
+        },
+        Opcode::POP | Opcode::LDM(..) if writes_pc(inst) => Flow::Return,
+        Opcode::SVC => {
+            if r7.is_some_and(|n| noreturn_svc.contains(&n)) {
+                Flow::Halt
+            } else {
+                Flow::Seq
+            }
+        }
+        _ => {
+            // A write to pc via mov/ldr etc. would be an indirect jump; not yet
+            // handled. Everything else falls through.
+            let _ = len;
+            Flow::Seq
+        }
+    }
+}
+
+/// Track a constant in r7 across a straight run, so a noreturn `svc` (r7 = an
+/// exit syscall) can end decoding before the data that follows it. Only `mov r7,
+/// #imm` is tracked; any other write clears it.
+fn track_r7(inst: &Instruction, r7: Option<u32>) -> Option<u32> {
+    let writes = |n: u8| matches!(inst.operands[0], Operand::Reg(r) if r.number() == n);
+    match inst.opcode {
+        Opcode::MOV if writes(7) => match inst.operands[1] {
+            Operand::Imm32(v) => Some(v),
+            Operand::Imm12(v) => Some(v as u32),
+            _ => None,
+        },
+        _ if writes(7) => None,
+        _ => r7,
+    }
+}
+
+/// ITSTATE advance (ARM ARM `ITAdvance`): shift the low 5 bits left, keeping the
+/// top 3 condition bits. Returns the next ITSTATE (0 = out of an IT block).
+fn it_advance(itstate: u8) -> u8 {
+    if itstate & 0b111 == 0 {
+        0
+    } else {
+        (itstate & 0b1110_0000) | ((itstate << 1) & 0b0001_1111)
+    }
+}
+
+/// The condition an instruction runs under, given the current ITSTATE.
+fn it_condition(itstate: u8) -> ConditionCode {
+    cond_from_u8((itstate >> 4) & 0xF)
+}
+
+/// Map a 4-bit ARM condition field to yaxpeax's `ConditionCode` (same order).
+fn cond_from_u8(c: u8) -> ConditionCode {
+    use ConditionCode::*;
+    [EQ, NE, HS, LO, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE, AL, AL][c as usize & 0xF]
+}
+
+/// Discover and lower the function at `entry`.
+pub fn discover(
+    code: &[u8],
+    base: u32,
+    entry: u32,
+    thumb: bool,
+    imports: &Imports,
+    noreturn_svc: &[u32],
+) -> Result<Discovered, Error> {
+    let decoder = InstDecoder::default().with_thumb_mode(thumb);
+
+    // Pass 1: reachability. Decode every reachable instruction, recording its
+    // decoded form + length + applied (IT) condition, and collect leaders,
+    // callees, and the terminating instructions.
+    // Per address: the decoded instruction, its length, the applied condition,
+    // and whether it sits inside an IT block (where flag-setting is suppressed).
+    let mut decoded: BTreeMap<u32, (Instruction, u32, ConditionCode, bool)> = BTreeMap::new();
+    let mut leaders: BTreeSet<u32> = BTreeSet::new();
+    let mut callees: BTreeSet<u32> = BTreeSet::new();
+    // Worklist carries IT state and the tracked r7 constant along fall-through.
+    let mut work: Vec<(u32, u8, Option<u32>)> = vec![(entry, 0, None)];
+    leaders.insert(entry);
+
+    // A guest address is decodable only if it lies within the code image.
+    let in_bounds = |addr: u32| {
+        let off = addr.wrapping_sub(base) as usize;
+        off < code.len()
+    };
+
+    while let Some((addr, itstate, r7)) = work.pop() {
+        if !in_bounds(addr) {
+            continue;
+        }
+        if decoded.contains_key(&addr) {
+            continue;
+        }
+        let (inst, len) = decode_at(&decoder, code, base, addr, thumb)?;
+
+        // Applied condition: an explicit branch condition wins; otherwise the IT
+        // condition if we are in a block; otherwise unconditional.
+        let applied = if inst.condition != ConditionCode::AL {
+            inst.condition
+        } else if itstate != 0 && inst.opcode != Opcode::IT {
+            it_condition(itstate)
+        } else {
+            ConditionCode::AL
+        };
+        let in_it = itstate != 0 && inst.opcode != Opcode::IT;
+        decoded.insert(addr, (inst.clone(), len, applied, in_it));
+
+        // Next IT state for the fall-through successor.
+        let next_it = if inst.opcode == Opcode::IT {
+            it_state_from(&inst)
+        } else if itstate != 0 {
+            it_advance(itstate)
+        } else {
+            0
+        };
+        let next_r7 = track_r7(&inst, r7);
+        let next = addr.wrapping_add(len);
+
+        match flow(&inst, addr, len, thumb, imports, r7, noreturn_svc) {
+            Flow::Seq => work.push((next, next_it, next_r7)),
+            Flow::Call { guest } => {
+                if let Some(t) = guest {
+                    callees.insert(t);
+                }
+                work.push((next, next_it, next_r7));
+            }
+            Flow::Jump(t) => {
+                leaders.insert(t);
+                work.push((t, 0, None));
+            }
+            Flow::Fork(t) => {
+                leaders.insert(t);
+                leaders.insert(next);
+                work.push((t, 0, None));
+                work.push((next, next_it, next_r7));
+            }
+            Flow::Return | Flow::Halt => {}
+        }
+    }
+
+    // Pass 2: build blocks. Each leader starts a block that runs until a
+    // terminating instruction or the address just before the next leader.
+    let mut blocks = Vec::new();
+    for &addr in &leaders {
+        // A leader can be out of bounds (a branch target past the image); such a
+        // block is unreachable in practice - skip it.
+        if !decoded.contains_key(&addr) {
+            continue;
+        }
+        let mut cursor = addr;
+        let mut stmts = Vec::new();
+        let term = loop {
+            let Some((inst, len, applied, in_it)) = decoded.get(&cursor) else {
+                // Fell through to code that was never decoded (off image or
+                // unreachable): stop the function here.
+                break Term::Halt;
+            };
+            let (mut effects, term) =
+                lower_insn(inst, cursor, *len, *applied, *in_it, thumb, imports)?;
+            stmts.append(&mut effects);
+            cursor = cursor.wrapping_add(*len);
+            if let Some(t) = term {
+                break t;
+            }
+            // A block also ends when the next instruction begins another block.
+            if leaders.contains(&cursor) && decoded.contains_key(&cursor) {
+                break Term::Fallthrough;
+            }
+        };
+        blocks.push(Block { addr, stmts, term });
+    }
+    blocks.sort_by_key(|b| b.addr);
+
+    Ok(Discovered {
+        func: Func { addr: entry, thumb, blocks },
+        callees: callees.into_iter().collect(),
+    })
+}
+
+/// Build the initial ITSTATE byte from an `IT` instruction's `firstcond`/`mask`.
+fn it_state_from(inst: &Instruction) -> u8 {
+    let firstcond = match inst.operands[0] {
+        Operand::Imm32(v) => v as u8,
+        _ => 0,
+    };
+    let mask = match inst.operands[1] {
+        Operand::Imm32(v) => v as u8,
+        _ => 0,
+    };
+    ((firstcond & 0xF) << 4) | (mask & 0xF)
+}
+
+// --- instruction lowering -------------------------------------------------
+
+fn regnum(op: &Operand) -> Option<u8> {
+    match op {
+        Operand::Reg(r) => Some(r.number()),
+        Operand::RegWBack(r, _) => Some(r.number()),
+        _ => None,
+    }
+}
+
+fn imm(op: &Operand) -> Option<u32> {
+    match op {
+        Operand::Imm32(v) | Operand::Imm(v) => Some(*v),
+        Operand::Imm12(v) => Some(*v as u32),
+        _ => None,
+    }
+}
+
+/// A data-processing operand: a register read or an immediate.
+fn operand_value(op: &Operand) -> Option<Value> {
+    match op {
+        Operand::Reg(r) => Some(Value::Reg(r.number())),
+        Operand::Imm32(v) | Operand::Imm(v) => Some(Value::Imm(*v)),
+        Operand::Imm12(v) => Some(Value::Imm(*v as u32)),
+        _ => None,
+    }
+}
+
+/// Decode a data-processing instruction's `(rd, rn, op2)`. Handles the 3-operand
+/// form `op rd, rn, op2` and the 2-operand form `op rd, op2` (where rd is rn).
+fn dataproc(inst: &Instruction) -> Option<(u8, Value, Value)> {
+    let rd = regnum(&inst.operands[0])?;
+    if matches!(inst.operands[2], Operand::Nothing) {
+        let op2 = operand_value(&inst.operands[1])?;
+        Some((rd, Value::Reg(rd), op2))
+    } else {
+        let rn = operand_value(&inst.operands[1])?;
+        let op2 = operand_value(&inst.operands[2])?;
+        Some((rd, rn, op2))
+    }
+}
+
+fn bin(op: BinOp, a: Value, b: Value) -> Value {
+    Value::Bin(op, Box::new(a), Box::new(b))
+}
+
+/// Lower a memory addressing operand into the effective address, plus any
+/// base-register writeback statements (ordered relative to the access: pre-index
+/// writeback happens before the access uses the base, post-index after).
+struct Addr {
+    /// Statements to run *before* the memory access (pre-index writeback).
+    pre: Vec<Stmt>,
+    /// The effective address expression.
+    addr: Value,
+    /// Statements to run *after* the memory access (post-index writeback).
+    post: Vec<Stmt>,
+}
+
+fn lower_addr(op: &Operand) -> Option<Addr> {
+    let signed_off = |off: u16, add: bool| -> Value {
+        let v = off as u32;
+        Value::Imm(if add { v } else { v.wrapping_neg() })
+    };
+    match op {
+        Operand::RegDeref(base) => Some(Addr {
+            pre: vec![],
+            addr: Value::Reg(base.number()),
+            post: vec![],
+        }),
+        Operand::RegDerefPreindexOffset(base, off, add, wback) => {
+            let b = base.number();
+            let ea = bin(BinOp::Add, Value::Reg(b), signed_off(*off, *add));
+            if *wback {
+                // Writeback sets base = ea; the access then uses the new base.
+                Some(Addr {
+                    pre: vec![Stmt::SetReg(b, ea)],
+                    addr: Value::Reg(b),
+                    post: vec![],
+                })
+            } else {
+                Some(Addr { pre: vec![], addr: ea, post: vec![] })
+            }
+        }
+        Operand::RegDerefPostindexOffset(base, off, add, _wback) => {
+            // Post-index: access uses the old base, then base += offset.
+            let b = base.number();
+            Some(Addr {
+                pre: vec![],
+                addr: Value::Reg(b),
+                post: vec![Stmt::SetReg(
+                    b,
+                    bin(BinOp::Add, Value::Reg(b), signed_off(*off, *add)),
+                )],
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Lower one instruction into its statements and, if it terminates the block,
+/// the terminator. `cond` is the applied (possibly IT) condition; when it is not
+/// `AL` the data effects are wrapped in a `Guard`.
+fn lower_insn(
+    inst: &Instruction,
+    addr: u32,
+    len: u32,
+    cond: ConditionCode,
+    in_it: bool,
+    thumb: bool,
+    imports: &Imports,
+) -> Result<(Vec<Stmt>, Option<Term>), Error> {
+    use Opcode::*;
+    let err = || Error::Operand { addr };
+    let ops = &inst.operands;
+
+    // Control-flow terminators first (these are never predicated in our corpus
+    // except conditional branches, which carry their own condition).
+    match inst.opcode {
+        B => {
+            let target = branch_target(inst, addr, thumb).ok_or_else(err)?;
+            if target == addr {
+                return Ok((vec![], Some(Term::Halt)));
+            }
+            if cond == ConditionCode::AL {
+                return Ok((vec![], Some(Term::Jump(target))));
+            }
+            return Ok((vec![], Some(Term::Branch { cond, taken: target })));
+        }
+        CBZ | CBNZ => {
+            let reg = regnum(&ops[0]).ok_or_else(err)?;
+            let target = branch_target(inst, addr, thumb).ok_or_else(err)?;
+            return Ok((
+                vec![],
+                Some(Term::BranchZero {
+                    reg,
+                    nonzero: inst.opcode == CBNZ,
+                    taken: target,
+                }),
+            ));
+        }
+        BX => {
+            return match ops[0] {
+                Operand::Reg(r) if r.number() == 14 => Ok((vec![], Some(Term::Return))),
+                _ => Err(err()),
+            };
+        }
+        BL | BLX => {
+            let target = branch_target(inst, addr, thumb).ok_or_else(err)?;
+            let ret = addr.wrapping_add(len);
+            let stmt = match imports.get(target) {
+                Some(index) => Stmt::Import(index),
+                None => Stmt::Call { target },
+            };
+            // bl/blx set lr = return address (Thumb bit set in Thumb state).
+            let lr = if thumb { ret | 1 } else { ret };
+            return Ok((vec![Stmt::SetReg(14, Value::Imm(lr)), stmt], None));
+        }
+        POP | LDM(..) if writes_pc(inst) => {
+            let mut stmts = lower_ldm(inst, addr)?;
+            // The popped pc becomes the return; we do not write r15.
+            let _ = &mut stmts;
+            return Ok((stmts, Some(Term::Return)));
+        }
+        SVC => {
+            let n = imm(&ops[0]).unwrap_or(0);
+            return Ok((vec![Stmt::Svc(n)], None));
+        }
+        _ => {}
+    }
+
+    // Non-control effects. Build the effect list, then wrap in a Guard if
+    // predicated.
+    let effects = lower_effects(inst, addr, in_it)?;
+    if cond == ConditionCode::AL || effects.is_empty() {
+        Ok((effects, None))
+    } else {
+        Ok((vec![Stmt::Guard(cond, effects)], None))
+    }
+}
+
+/// Lower the (non-control) data/memory effects of an instruction. Inside an IT
+/// block the S bit is suppressed for data-processing ops (ARM: only cmp/cmn/tst,
+/// which set flags unconditionally, still do).
+fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>, Error> {
+    use Opcode::*;
+    let err = || Error::Operand { addr };
+    let ops = &inst.operands;
+    let sets_flags = inst.s && !in_it;
+
+    let mut out = Vec::new();
+    match inst.opcode {
+        NOP | IT | HINT => {}
+
+        ADR => {
+            // adr rd, label => rd = pc-relative constant. pc is addr+8 in ARM,
+            // (addr+4) word-aligned in Thumb. Const-folded.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let disp = ops.iter().find_map(imm).ok_or_else(err)?;
+            let pc = if inst.thumb {
+                addr.wrapping_add(4) & !3
+            } else {
+                addr.wrapping_add(8)
+            };
+            out.push(Stmt::SetReg(rd, Value::Imm(pc.wrapping_add(disp))));
+        }
+
+        MOV => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let src = operand_value(&ops[1]).ok_or_else(err)?;
+            // Flags before the write: the value expression reads original regs.
+            if sets_flags {
+                out.push(Stmt::FlagsLogic { value: src.clone(), carry: None });
+            }
+            out.push(Stmt::SetReg(rd, src));
+        }
+        MOVT => {
+            // movt rd, #imm16: set the top halfword, keep the low halfword.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let hi = imm(&ops[1]).ok_or_else(err)?;
+            let value = bin(
+                BinOp::Or,
+                bin(BinOp::And, Value::Reg(rd), Value::Imm(0x0000_FFFF)),
+                Value::Imm(hi << 16),
+            );
+            out.push(Stmt::SetReg(rd, value));
+        }
+        MVN => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let src = operand_value(&ops[1]).ok_or_else(err)?;
+            let value = Value::Not(Box::new(src));
+            if sets_flags {
+                out.push(Stmt::FlagsLogic { value: value.clone(), carry: None });
+            }
+            out.push(Stmt::SetReg(rd, value));
+        }
+
+        ADD => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            if sets_flags {
+                out.push(Stmt::FlagsAdd { a: rn.clone(), b: op2.clone(), cin: 0 });
+            }
+            out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, op2)));
+        }
+        SUB => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            if sets_flags {
+                out.push(Stmt::FlagsAdd {
+                    a: rn.clone(),
+                    b: Value::Not(Box::new(op2.clone())),
+                    cin: 1,
+                });
+            }
+            out.push(Stmt::SetReg(rd, bin(BinOp::Sub, rn, op2)));
+        }
+        RSB => {
+            // rsb rd, rn, op2 => rd = op2 - rn.
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            if sets_flags {
+                out.push(Stmt::FlagsAdd {
+                    a: op2.clone(),
+                    b: Value::Not(Box::new(rn.clone())),
+                    cin: 1,
+                });
+            }
+            out.push(Stmt::SetReg(rd, bin(BinOp::Sub, op2, rn)));
+        }
+        CMP => {
+            let a = operand_value(&ops[0]).ok_or_else(err)?;
+            let b = operand_value(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::FlagsAdd { a, b: Value::Not(Box::new(b)), cin: 1 });
+        }
+        CMN => {
+            let a = operand_value(&ops[0]).ok_or_else(err)?;
+            let b = operand_value(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::FlagsAdd { a, b, cin: 0 });
+        }
+
+        AND | BIC | ORR | EOR | TST => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let op2 = if inst.opcode == BIC {
+                Value::Not(Box::new(op2))
+            } else {
+                op2
+            };
+            let binop = match inst.opcode {
+                ORR => BinOp::Or,
+                EOR => BinOp::Xor,
+                _ => BinOp::And, // AND, BIC, TST
+            };
+            let result = bin(binop, rn, op2);
+            if inst.opcode == TST {
+                out.push(Stmt::FlagsLogic { value: result, carry: None });
+            } else {
+                if sets_flags {
+                    out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
+                }
+                out.push(Stmt::SetReg(rd, result));
+            }
+        }
+
+        LSL | LSR | ASR => {
+            let (rd, rn, sh) = dataproc(inst).ok_or_else(err)?;
+            let binop = match inst.opcode {
+                LSL => BinOp::Shl,
+                LSR => BinOp::Lsr,
+                _ => BinOp::Asr,
+            };
+            let result = bin(binop, rn.clone(), sh.clone());
+            if sets_flags {
+                let carry = shift_carry(inst.opcode, &rn, &sh);
+                out.push(Stmt::FlagsLogic { value: result.clone(), carry });
+            }
+            out.push(Stmt::SetReg(rd, result));
+        }
+
+        MUL => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let result = bin(BinOp::Mul, rn, op2);
+            if sets_flags {
+                out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
+            }
+            out.push(Stmt::SetReg(rd, result));
+        }
+
+        BFC => {
+            // bfc rd, #lsb, #width: clear `width` bits starting at `lsb`.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let lsb = imm(&ops[1]).ok_or_else(err)?;
+            let width = imm(&ops[2]).ok_or_else(err)?;
+            let mask = if width >= 32 {
+                0
+            } else {
+                !(((1u32 << width) - 1) << lsb)
+            };
+            out.push(Stmt::SetReg(rd, bin(BinOp::And, Value::Reg(rd), Value::Imm(mask))));
+        }
+
+        LDR | LDRB | LDRH | LDRSB | LDRSH => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let a = lower_addr(&ops[1]).ok_or_else(err)?;
+            let (size, signed) = load_kind(inst.opcode);
+            out.extend(a.pre);
+            out.push(Stmt::SetReg(
+                rt,
+                Value::Load { addr: Box::new(a.addr), size, signed },
+            ));
+            out.extend(a.post);
+        }
+        STR | STRB | STRH => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let a = lower_addr(&ops[1]).ok_or_else(err)?;
+            let size = store_size(inst.opcode);
+            out.extend(a.pre);
+            out.push(Stmt::Store { addr: a.addr, data: Value::Reg(rt), size });
+            out.extend(a.post);
+        }
+        LDRD => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let rt2 = regnum(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2]).ok_or_else(err)?;
+            out.extend(a.pre);
+            out.push(Stmt::SetReg(
+                rt,
+                Value::Load { addr: Box::new(a.addr.clone()), size: MemSize::Word, signed: false },
+            ));
+            out.push(Stmt::SetReg(
+                rt2,
+                Value::Load {
+                    addr: Box::new(bin(BinOp::Add, a.addr, Value::Imm(4))),
+                    size: MemSize::Word,
+                    signed: false,
+                },
+            ));
+            out.extend(a.post);
+        }
+        STRD => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let rt2 = regnum(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2]).ok_or_else(err)?;
+            out.extend(a.pre);
+            out.push(Stmt::Store {
+                addr: a.addr.clone(),
+                data: Value::Reg(rt),
+                size: MemSize::Word,
+            });
+            out.push(Stmt::Store {
+                addr: bin(BinOp::Add, a.addr, Value::Imm(4)),
+                data: Value::Reg(rt2),
+                size: MemSize::Word,
+            });
+            out.extend(a.post);
+        }
+
+        PUSH => out.extend(lower_push(inst, addr)?),
+        POP | LDM(..) => out.extend(lower_ldm(inst, addr)?),
+        STM(..) => out.extend(lower_stm(inst, addr)?),
+
+        _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+    }
+    Ok(out)
+}
+
+fn load_kind(op: Opcode) -> (MemSize, bool) {
+    match op {
+        Opcode::LDRB => (MemSize::Byte, false),
+        Opcode::LDRSB => (MemSize::Byte, true),
+        Opcode::LDRH => (MemSize::Half, false),
+        Opcode::LDRSH => (MemSize::Half, true),
+        _ => (MemSize::Word, false),
+    }
+}
+
+fn store_size(op: Opcode) -> MemSize {
+    match op {
+        Opcode::STRB => MemSize::Byte,
+        Opcode::STRH => MemSize::Half,
+        _ => MemSize::Word,
+    }
+}
+
+/// The shifter carry-out for a flag-setting immediate shift.
+fn shift_carry(op: Opcode, rn: &Value, sh: &Value) -> Option<Value> {
+    // Only the immediate-shift form has a statically simple carry; register
+    // shifts are left to a later, exact model. Return None (C unchanged) if the
+    // amount is not a constant.
+    let n = match sh {
+        Value::Imm(v) => *v & 0xFF,
+        _ => return None,
+    };
+    match op {
+        Opcode::LSL if n == 0 => None,
+        Opcode::LSL => Some(bin(BinOp::And, bin(BinOp::Lsr, rn.clone(), Value::Imm(32 - n)), Value::Imm(1))),
+        Opcode::LSR => {
+            let n = if n == 0 { 32 } else { n };
+            Some(bin(BinOp::And, bin(BinOp::Lsr, rn.clone(), Value::Imm(n - 1)), Value::Imm(1)))
+        }
+        Opcode::ASR => {
+            let n = if n == 0 { 32 } else { n };
+            Some(bin(BinOp::And, bin(BinOp::Asr, rn.clone(), Value::Imm(n - 1)), Value::Imm(1)))
+        }
+        _ => None,
+    }
+}
+
+/// The registers named by an ldm/stm/push/pop register list, ascending.
+fn reglist(inst: &Instruction) -> Vec<u8> {
+    for op in &inst.operands {
+        if let Operand::RegList(mask) = op {
+            return (0..16u8).filter(|i| mask & (1 << i) != 0).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// `push {list}`: sp -= 4*n; store each register at ascending addresses.
+fn lower_push(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
+    let regs = reglist(inst);
+    let n = regs.len() as u32;
+    let mut out = vec![Stmt::SetReg(
+        13,
+        bin(BinOp::Sub, Value::Reg(13), Value::Imm(4 * n)),
+    )];
+    for (i, r) in regs.iter().enumerate() {
+        out.push(Stmt::Store {
+            addr: bin(BinOp::Add, Value::Reg(13), Value::Imm(4 * i as u32)),
+            data: Value::Reg(*r),
+            size: MemSize::Word,
+        });
+    }
+    Ok(out)
+}
+
+/// `pop {list}` / `ldmia rn(!), {list}`: load each register ascending, then
+/// writeback. When the list has pc, the pc slot is consumed (sp advances) but
+/// not written - the caller turns that into a return.
+fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
+    let regs = reglist(inst);
+    let base = ldm_base(inst);
+    let wback = ldm_wback(inst);
+    let mut out = Vec::new();
+    for (i, r) in regs.iter().enumerate() {
+        if *r == 15 {
+            continue; // pc -> return, handled by terminator
+        }
+        out.push(Stmt::SetReg(
+            *r,
+            Value::Load {
+                addr: Box::new(bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * i as u32))),
+                size: MemSize::Word,
+                signed: false,
+            },
+        ));
+    }
+    if wback {
+        out.push(Stmt::SetReg(
+            base,
+            bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * regs.len() as u32)),
+        ));
+    }
+    Ok(out)
+}
+
+/// `stmia rn(!), {list}`: store each register ascending, then writeback.
+fn lower_stm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
+    let regs = reglist(inst);
+    let base = ldm_base(inst);
+    let wback = ldm_wback(inst);
+    let mut out = Vec::new();
+    for (i, r) in regs.iter().enumerate() {
+        out.push(Stmt::Store {
+            addr: bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * i as u32)),
+            data: Value::Reg(*r),
+            size: MemSize::Word,
+        });
+    }
+    if wback {
+        out.push(Stmt::SetReg(
+            base,
+            bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * regs.len() as u32)),
+        ));
+    }
+    Ok(out)
+}
+
+/// The base register of an ldm/stm; `pop`/`push` are implicitly sp (r13).
+fn ldm_base(inst: &Instruction) -> u8 {
+    match inst.opcode {
+        Opcode::POP | Opcode::PUSH => 13,
+        _ => inst
+            .operands
+            .iter()
+            .find_map(|o| match o {
+                Operand::RegWBack(r, _) => Some(r.number()),
+                _ => None,
+            })
+            .unwrap_or(13),
+    }
+}
+
+/// Whether an ldm/stm writes back its base; `pop`/`push` always do (sp).
+fn ldm_wback(inst: &Instruction) -> bool {
+    match inst.opcode {
+        Opcode::POP | Opcode::PUSH => true,
+        _ => inst.operands.iter().any(|o| matches!(o, Operand::RegWBack(_, true))),
+    }
+}
+
+/// Unused import guard for `Reg` (kept for future indirect-branch handling).
+#[allow(dead_code)]
+fn _reg_marker(_: Reg) {}

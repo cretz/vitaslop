@@ -12,3 +12,6 @@ vitaslop-runtime = { path = "../vitaslop-runtime" }
 # Native wasm engine. Only ever built for native hosts, so no cfg gating and no
 # effect on the browser blob (which uses the browser's own WebAssembly).
 wasmtime = "46"
+# Precise validation errors on the emitted module (wasmtime only says which
+# function failed to compile, not why).
+wasmparser = "0.253"

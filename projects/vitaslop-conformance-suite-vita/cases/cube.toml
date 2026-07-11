@@ -1,12 +1,21 @@
 category = "vita"
-description = "placeholder: minimal GXM spinning cube, blob-free (not runnable yet)"
+description = "minimal GXM spinning cube, blob-free - the graphics north star"
 
-# The graphics north star: a minimal GXM cube authored from vita-headers with
-# precompiled/fixed-function shaders (blob-free, no libshacccg), plus a
-# controller/touch reader. Its "output" is a rendered frame, so its assertion
-# is a framebuffer hash/screenshot golden - which needs the GXM stack, the
-# display path, and a headless renderer first. The runner skips `vita` cases
-# until then.
+# The cube now exists as a real Vita executable: see ../cube-src/ (cube.c +
+# build.sh -> cube.velf). It is authored clean-room from MIT vita-headers,
+# built -nostdlib, and carries 38 NID imports across SceGxm/SceDisplayUser/
+# SceCtrl/SceSysmem.
 #
-# TODO: define the framebuffer-hash assertion format once the display path
-# exists (a `[out]` frame-hash sidecar, not register/output state).
+# Bring-up is work-backwards over this artifact (see working-area/agent-notes):
+#   M1 artifact (done): cube.velf builds and inspects.
+#   M2 loader: parse the velf + resolve NID imports (vitaslop-loader).
+#   M3 execute-to-first-GXM-call: grow the transpiler (CFG, branches, VFP) until
+#      cube CPU code runs _start -> init -> first sceGxm* call into a host stub.
+#   M4 capture: record the GXM command stream as the blob-free "it works" golden.
+#   M5 render: software/wgpu rasterize; only here do the shader-blob / precompiled
+#      .gxp questions bite. The shaders in cube.c are placeholders until then.
+#
+# The runner skips `vita` cases until the loader + execute path exist.
+#
+# TODO: define the M4 assertion format (a GXM-call-trace golden, not register or
+# framebuffer state) once the execute path reaches the first draw.

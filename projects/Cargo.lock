@@ -1231,6 +1231,7 @@ name = "vitaslop-conformance-harness"
 version = "0.0.0"
 dependencies = [
  "vitaslop-conformance-suite-arm",
+ "vitaslop-loader",
  "vitaslop-native",
 ]
 
@@ -1264,6 +1265,7 @@ version = "0.0.0"
 dependencies = [
  "vitaslop-runtime",
  "vitaslop-transpiler",
+ "wasmparser 0.253.0",
  "wasmtime",
 ]
 
@@ -1285,6 +1287,7 @@ name = "vitaslop-transpiler"
 version = "0.0.0"
 dependencies = [
  "wasm-encoder 0.253.0",
+ "wasmparser 0.253.0",
  "yaxpeax-arch",
  "yaxpeax-arm",
 ]
@@ -1405,8 +1408,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19db11f87d2486580e1e8b6f494c54df7e0566b87d0b599db843c24019667339"
 dependencies = [
  "bitflags",
+ "hashbrown 0.17.1",
  "indexmap",
  "semver",
+ "serde",
 ]
 
 [[package]]
@@ -1783,7 +1788,6 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
-source = "git+https://github.com/cretz/yaxpeax-arm?rev=95f46784bd1a5795254cc93a5aa09c0a3c4e124e#95f46784bd1a5795254cc93a5aa09c0a3c4e124e"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",

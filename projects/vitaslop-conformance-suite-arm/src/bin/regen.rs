@@ -211,6 +211,12 @@ fn header(mode: &str) -> String {
     format!(".syntax unified\n.arch armv7-a\n{m}\n.text\n")
 }
 
+/// In Thumb mode `_start` must be a thumb_func so the ELF entry has bit 0 set and
+/// qemu enters in Thumb state (otherwise it decodes Thumb bytes as ARM -> SIGILL).
+fn thumb_func(mode: &str) -> &'static str {
+    if mode == "thumb" { ".thumb_func\n" } else { "" }
+}
+
 /// Seed r0..r12 and r14 to their seed value (0 if unseeded), so an unseeded
 /// register is a deterministic 0 rather than qemu's startup garbage.
 fn seed_all(seeds: &BTreeMap<u8, u32>) -> String {
@@ -245,7 +251,7 @@ fn assemble_bin(asm: &str, mode: &str) -> Result<Vec<u8>, String> {
 /// Seed, run the instructions, then dump r0..r12/cpsr/r14 via a write syscall.
 fn harness_regs(asm: &str, mode: &str, seeds: &BTreeMap<u8, u32>) -> String {
     format!(
-        "{}.global _start\n_start:\n{}{}\n\
+        "{}.global _start\n{}_start:\n{}{}\n\
          push {{r0-r12}}\n\
          mrs r0, cpsr\n\
          push {{r0}}\n\
@@ -259,6 +265,7 @@ fn harness_regs(asm: &str, mode: &str, seeds: &BTreeMap<u8, u32>) -> String {
          mov r7, #1\n\
          svc #0\n",
         header(mode),
+        thumb_func(mode),
         seed_all(seeds),
         asm.trim()
     )
@@ -267,8 +274,9 @@ fn harness_regs(asm: &str, mode: &str, seeds: &BTreeMap<u8, u32>) -> String {
 /// Seed (listed only), then run a self-exiting program; qemu captures its stdout.
 fn harness_output(asm: &str, mode: &str, seeds: &BTreeMap<u8, u32>) -> String {
     format!(
-        "{}.global _start\n_start:\n{}{}\n",
+        "{}.global _start\n{}_start:\n{}{}\n",
         header(mode),
+        thumb_func(mode),
         seed_listed(seeds),
         asm.trim()
     )

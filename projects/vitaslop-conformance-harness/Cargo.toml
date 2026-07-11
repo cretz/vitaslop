@@ -13,3 +13,4 @@ publish.workspace = true
 [dev-dependencies]
 vitaslop-native = { path = "../vitaslop-native" }
 vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
+vitaslop-loader = { path = "../vitaslop-loader" }

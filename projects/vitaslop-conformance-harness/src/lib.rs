@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 mod tests {
-    use vitaslop_conformance_suite_arm::{self as suite, Expected};
-    use vitaslop_native::{HostAbi, SvcOutcome, run_arm};
+    use vitaslop_conformance_suite_arm::{self as suite, Expected, Mode};
+    use vitaslop_native::{HostAbi, SvcOutcome, abi, run};
 
     /// Address every arm case's image loads at (see the suite README).
     const BASE: u32 = 0x10000;
@@ -22,10 +22,19 @@ mod tests {
 
     /// The corpus's host convention: Linux `write` to the output sink, `exit`
     /// halts. `write`'s fd (r0) is ignored - all writes are captured output.
-    fn linux_svc(nr: u32, _r0: u32, r1: u32, r2: u32, mem: &[u8], out: &mut Vec<u8>) -> SvcOutcome {
+    /// Guest pointers are rebased to linear-memory offsets by subtracting `base`.
+    fn linux_svc(
+        _selector: u32,
+        regs: &mut [u32; abi::REG_COUNT],
+        mem: &mut [u8],
+        base: u32,
+        out: &mut Vec<u8>,
+    ) -> SvcOutcome {
+        let (nr, r1, r2) = (regs[7], regs[1], regs[2]);
         match nr {
             SYS_WRITE => {
-                let (ptr, len) = (r1 as usize, r2 as usize);
+                let ptr = r1.wrapping_sub(base) as usize;
+                let len = r2 as usize;
                 if let Some(bytes) = ptr.checked_add(len).and_then(|end| mem.get(ptr..end)) {
                     out.extend_from_slice(bytes);
                 }
@@ -40,11 +49,12 @@ mod tests {
         HostAbi {
             noreturn_svc: &[SYS_EXIT, SYS_EXIT_GROUP],
             svc: linux_svc,
+            ..Default::default()
         }
     }
 
-    /// Transpile, run, and diff every case against its golden. Flags are not
-    /// modeled yet (no CPSR), so `regs` cases check registers only.
+    /// Transpile, run, and diff every case against its golden - registers,
+    /// flags, and output.
     #[test]
     fn run_cases() {
         let cases = suite::load_cases().expect("load arm corpus");
@@ -57,14 +67,15 @@ mod tests {
                 .iter()
                 .map(|(&i, &v)| (i as usize, v))
                 .collect();
-            let result = run_arm(&case.bin, BASE, BASE, &in_regs, &abi)
+            let thumb = case.mode == Mode::Thumb;
+            let result = run(&case.bin, BASE, BASE, thumb, &[], &in_regs, &abi)
                 .unwrap_or_else(|e| panic!("{}: run failed: {e:?}", case.name));
 
             match &case.expected {
                 Expected::Output(want) => {
                     assert_eq!(result.output, *want, "{}: output mismatch", case.name);
                 }
-                Expected::Regs { regs, flags: _ } => {
+                Expected::Regs { regs, flags } => {
                     // Captured registers are r0..r12 and r14; one not listed in
                     // the golden is expected to be zero.
                     for r in (0u8..=12).chain(std::iter::once(14)) {
@@ -75,6 +86,14 @@ mod tests {
                             case.name
                         );
                     }
+                    let got = &result.flags;
+                    assert_eq!(
+                        (got.n, got.z, got.c, got.v),
+                        (flags.n, flags.z, flags.c, flags.v),
+                        "{}: NZCV mismatch (got {:?})",
+                        case.name,
+                        (got.n, got.z, got.c, got.v),
+                    );
                 }
             }
         }
