@@ -1,0 +1,10 @@
+category = "vita"
+description = "placeholder: C hello world via real sceClibPrintf NID import (not runnable yet)"
+
+# North-star target, one rung up from arm/hello: a C program built with
+# gcc-arm-none-eabi that calls sceClibPrintf through Vita's real module-import
+# (NID) mechanism, not the arm-level svc trap. Making this run needs the loader
+# (import resolution) and runtime host modules. The runner skips `vita` cases
+# until then. When runnable, it asserts the captured printf output.
+[out]
+output = "Hello, world\n"

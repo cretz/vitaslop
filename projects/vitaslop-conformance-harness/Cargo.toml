@@ -1,0 +1,15 @@
+[package]
+name = "vitaslop-conformance-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The only crate that runs the generic conformance corpora against vitaslop's
+# engine. The corpora and their tomls are engine-agnostic (see each suite's
+# README); this crate supplies vitaslop and the corpus's host ABI. Everything is
+# a dev-dependency because the crate is purely a test runner.
+[dev-dependencies]
+vitaslop-native = { path = "../vitaslop-native" }
+vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }

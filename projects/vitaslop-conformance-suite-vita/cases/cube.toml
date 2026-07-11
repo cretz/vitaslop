@@ -1,0 +1,12 @@
+category = "vita"
+description = "placeholder: minimal GXM spinning cube, blob-free (not runnable yet)"
+
+# The graphics north star: a minimal GXM cube authored from vita-headers with
+# precompiled/fixed-function shaders (blob-free, no libshacccg), plus a
+# controller/touch reader. Its "output" is a rendered frame, so its assertion
+# is a framebuffer hash/screenshot golden - which needs the GXM stack, the
+# display path, and a headless renderer first. The runner skips `vita` cases
+# until then.
+#
+# TODO: define the framebuffer-hash assertion format once the display path
+# exists (a `[out]` frame-hash sidecar, not register/output state).

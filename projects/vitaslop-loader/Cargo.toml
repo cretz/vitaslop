@@ -1,0 +1,10 @@
+[package]
+name = "vitaslop-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }

@@ -8,7 +8,18 @@ A client-side, in-browser PlayStation Vita emulator.
 
 ## License
 
-MIT. This project is developed clean-room from permissive and neutral sources
-only (vitasdk headers, psdevwiki/henkaku documentation, the ARM Architecture
-Reference Manual, and independent reverse engineering). We do **not** read or
-derive from copyleft (GPL/LGPL) emulator sources.
+MIT (see [LICENSE](LICENSE)). The project is developed clean-room: no copyleft
+(GPL/LGPL) code. It is built only from these permissive or neutral references:
+
+- [vita-headers](https://github.com/vitasdk/vita-headers) (MIT) - the `sce*` API
+  surface and NID database.
+- [vita-toolchain](https://github.com/vitasdk/vita-toolchain) (MIT) - the
+  SELF/ELF and VELF executable-format tools.
+- [dynarmic](https://github.com/yuzu-mirror/dynarmic) (0BSD) - a permissive
+  ARMv7 + Thumb-2 + NEON + VFP recompiler, used as decode and semantics reference.
+- [psdevwiki](https://www.psdevwiki.com/vita/) and
+  [henkaku wiki](https://wiki.henkaku.xyz/) - hardware and reverse-engineering
+  documentation.
+- The ARM Architecture Reference Manual.
+
+Independent reverse engineering fills the rest.

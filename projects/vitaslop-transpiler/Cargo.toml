@@ -1,0 +1,16 @@
+[package]
+name = "vitaslop-transpiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# ARMv7/Thumb2 decode front-end, from our consolidation fork. The sibling
+# NEON/VFP decoder (later) plugs in alongside for encodings yaxpeax returns
+# Incomplete on. Pinned to an exact rev for reproducible builds.
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "95f46784bd1a5795254cc93a5aa09c0a3c4e124e", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arch = { version = "0.3.1", default-features = false }
+# WASM backend.
+wasm-encoder = "0.253"

@@ -1,0 +1,14 @@
+[package]
+name = "vitaslop-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
+vitaslop-runtime = { path = "../vitaslop-runtime" }
+# Native wasm engine. Only ever built for native hosts, so no cfg gating and no
+# effect on the browser blob (which uses the browser's own WebAssembly).
+wasmtime = "46"
