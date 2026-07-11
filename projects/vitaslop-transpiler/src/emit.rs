@@ -47,6 +47,9 @@ const L_T0: u32 = 1;
 const L_T1: u32 = 2;
 const L_T2: u32 = 3;
 const L_I32_COUNT: u32 = 4;
+/// i64 scratch, used to split/merge a double register across its two aliased
+/// single-register halves. Index follows the i32 locals.
+const L_D64: u32 = L_I32_COUNT;
 
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the exported linear
@@ -82,13 +85,25 @@ pub fn emit_module(
         page_size_log2: None,
     });
 
-    // 16 register globals + 4 flag globals, all mutable i32.
+    // Globals, in ABI order: 16 registers + 4 integer flags (i32), then the VFP
+    // register file - 32 single-precision S registers (raw-bit i32) and 16 upper
+    // double registers D16..D31 (i64) - then 4 FP condition flags (i32).
     let mut globals = GlobalSection::new();
+    let i32_global =
+        GlobalType { val_type: ValType::I32, mutable: true, shared: false };
+    let i64_global =
+        GlobalType { val_type: ValType::I64, mutable: true, shared: false };
     for _ in 0..abi::GLOBAL_COUNT {
-        globals.global(
-            GlobalType { val_type: ValType::I32, mutable: true, shared: false },
-            &ConstExpr::i32_const(0),
-        );
+        globals.global(i32_global, &ConstExpr::i32_const(0));
+    }
+    for _ in 0..abi::VFP_S_COUNT {
+        globals.global(i32_global, &ConstExpr::i32_const(0));
+    }
+    for _ in 0..abi::VFP_D_HI_COUNT {
+        globals.global(i64_global, &ConstExpr::i64_const(0));
+    }
+    for _ in 0..abi::FP_FLAG_COUNT {
+        globals.global(i32_global, &ConstExpr::i32_const(0));
     }
 
     let mut exports = ExportSection::new();
@@ -98,6 +113,17 @@ pub fn emit_module(
     }
     for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
         exports.export(abi::flag_export(f), ExportKind::Global, abi::flag_global(f));
+    }
+    // Export the VFP register file so the host can seed/read FP state (tests,
+    // GXM capture). S0..S31, D16..D31, and the FP flags.
+    for n in 0..abi::VFP_S_COUNT as u8 {
+        exports.export(&abi::vfp_s_export(n), ExportKind::Global, abi::vfp_s_global(n));
+    }
+    for n in abi::VFP_D_HI_FIRST as u8..(abi::VFP_D_HI_FIRST + abi::VFP_D_HI_COUNT) as u8 {
+        exports.export(&abi::vfp_dhi_export(n), ExportKind::Global, abi::vfp_dhi_global(n));
+    }
+    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
+        exports.export(abi::fp_flag_export(f), ExportKind::Global, abi::fp_flag_global(f));
     }
 
     let mut code = CodeSection::new();
@@ -121,8 +147,9 @@ pub fn emit_module(
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
 fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Function {
-    // Locals: $bb + three i32 scratch temps (used by flag computation).
-    let mut f = Function::new([(L_I32_COUNT, ValType::I32)]);
+    // Locals: $bb + three i32 scratch temps (flag computation), then one i64
+    // scratch (double-register split/merge).
+    let mut f = Function::new([(L_I32_COUNT, ValType::I32), (1, ValType::I64)]);
 
     let n = func.blocks.len() as u32;
 
@@ -318,6 +345,211 @@ fn emit_stmt(
                 emit_stmt(f, s, func_index, base);
             }
             f.instruction(&W::End);
+        }
+        Stmt::Vfp(op) => emit_vfp(f, op),
+        Stmt::VfpMem { reg, addr, load } => emit_vfp_mem(f, *reg, addr, *load, base),
+    }
+}
+
+// --- VFP / floating-point emission ---------------------------------------
+
+/// Push S`n` interpreted as an f32.
+fn get_s_f32(f: &mut Function, n: u8) {
+    f.instruction(&W::GlobalGet(abi::vfp_s_global(n)));
+    f.instruction(&W::F32ReinterpretI32);
+}
+
+/// Store the f32 on the stack into S`n` (as raw bits).
+fn set_s_f32(f: &mut Function, n: u8) {
+    f.instruction(&W::I32ReinterpretF32);
+    f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
+}
+
+/// Push the raw 64 bits of D`n` as an i64 (merging its two S halves when n < 16).
+fn get_d_bits(f: &mut Function, n: u8) {
+    if (n as usize) < abi::VFP_D_HI_FIRST {
+        let lo = 2 * n;
+        let hi = 2 * n + 1;
+        f.instruction(&W::GlobalGet(abi::vfp_s_global(hi)));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Const(32));
+        f.instruction(&W::I64Shl);
+        f.instruction(&W::GlobalGet(abi::vfp_s_global(lo)));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Or);
+    } else {
+        f.instruction(&W::GlobalGet(abi::vfp_dhi_global(n)));
+    }
+}
+
+/// Store the raw i64 on the stack into D`n` (splitting into its two S halves when
+/// n < 16). Uses the i64 scratch local.
+fn set_d_bits(f: &mut Function, n: u8) {
+    if (n as usize) < abi::VFP_D_HI_FIRST {
+        let lo = 2 * n;
+        let hi = 2 * n + 1;
+        f.instruction(&W::LocalSet(L_D64));
+        f.instruction(&W::LocalGet(L_D64));
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::GlobalSet(abi::vfp_s_global(lo)));
+        f.instruction(&W::LocalGet(L_D64));
+        f.instruction(&W::I64Const(32));
+        f.instruction(&W::I64ShrU);
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::GlobalSet(abi::vfp_s_global(hi)));
+    } else {
+        f.instruction(&W::GlobalSet(abi::vfp_dhi_global(n)));
+    }
+}
+
+fn fbinop(op: crate::ir::FBinOp) -> W<'static> {
+    use crate::ir::FBinOp::*;
+    match op {
+        Add => W::F32Add,
+        Sub => W::F32Sub,
+        Mul => W::F32Mul,
+        Div => W::F32Div,
+    }
+}
+
+fn emit_vfp(f: &mut Function, op: &crate::ir::VfpOp) {
+    use crate::ir::VfpOp::*;
+    match op {
+        Bin32 { op, rd, rn, rm } => {
+            get_s_f32(f, *rn);
+            get_s_f32(f, *rm);
+            f.instruction(&fbinop(*op));
+            set_s_f32(f, *rd);
+        }
+        MulAcc32 { rd, rn, rm, sub } => {
+            // rd = rd +/- (rn * rm), non-fused.
+            get_s_f32(f, *rd);
+            get_s_f32(f, *rn);
+            get_s_f32(f, *rm);
+            f.instruction(&W::F32Mul);
+            f.instruction(if *sub { &W::F32Sub } else { &W::F32Add });
+            set_s_f32(f, *rd);
+        }
+        Neg32 { rd, rm } => {
+            get_s_f32(f, *rm);
+            f.instruction(&W::F32Neg);
+            set_s_f32(f, *rd);
+        }
+        Abs32 { rd, rm } => {
+            get_s_f32(f, *rm);
+            f.instruction(&W::F32Abs);
+            set_s_f32(f, *rd);
+        }
+        Sqrt32 { rd, rm } => {
+            get_s_f32(f, *rm);
+            f.instruction(&W::F32Sqrt);
+            set_s_f32(f, *rd);
+        }
+        Mov32 { rd, rm } => {
+            // Raw bit copy (no float interpretation).
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*rm)));
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*rd)));
+        }
+        SetImmS { s, bits } => {
+            f.instruction(&W::I32Const(*bits as i32));
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*s)));
+        }
+        SetImmD { d, lo, hi } => {
+            if (*d as usize) < abi::VFP_D_HI_FIRST {
+                // Aliased low double: write the two S halves directly.
+                f.instruction(&W::I32Const(*lo as i32));
+                f.instruction(&W::GlobalSet(abi::vfp_s_global(2 * d)));
+                f.instruction(&W::I32Const(*hi as i32));
+                f.instruction(&W::GlobalSet(abi::vfp_s_global(2 * d + 1)));
+            } else {
+                let bits = ((*hi as u64) << 32) | (*lo as u64);
+                f.instruction(&W::I64Const(bits as i64));
+                f.instruction(&W::GlobalSet(abi::vfp_dhi_global(*d)));
+            }
+        }
+        Cmp32 { rn, rm } => emit_vfp_cmp(f, *rn, *rm),
+        MrsNzcv => {
+            // Copy FP flags -> integer NZCV.
+            for flag in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
+                f.instruction(&W::GlobalGet(abi::fp_flag_global(flag)));
+                f.instruction(&W::GlobalSet(abi::flag_global(flag)));
+            }
+        }
+        CvtToInt { rd, rm, signed } => {
+            // Round toward zero, saturating (matches ARM vcvt.{s,u}32.f32).
+            get_s_f32(f, *rm);
+            f.instruction(if *signed { &W::I32TruncSatF32S } else { &W::I32TruncSatF32U });
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*rd)));
+        }
+        CvtFromInt { rd, rm, signed } => {
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*rm)));
+            f.instruction(if *signed { &W::F32ConvertI32S } else { &W::F32ConvertI32U });
+            set_s_f32(f, *rd);
+        }
+    }
+}
+
+/// Set the FP condition flags (FPSCR N,Z,C,V) from comparing S`rn` against S`rm`
+/// (or +0.0 when `rm` is `None`). N=less, Z=equal, C=not-less, V=unordered.
+fn emit_vfp_cmp(f: &mut Function, rn: u8, rm: Option<u8>) {
+    let push_b = |f: &mut Function| match rm {
+        Some(m) => get_s_f32(f, m),
+        None => {
+            f.instruction(&W::F32Const(0.0f32.into()));
+        }
+    };
+    // N = (a < b)
+    get_s_f32(f, rn);
+    push_b(f);
+    f.instruction(&W::F32Lt);
+    f.instruction(&W::GlobalSet(abi::fp_flag_global(abi::Flag::N)));
+    // Z = (a == b)
+    get_s_f32(f, rn);
+    push_b(f);
+    f.instruction(&W::F32Eq);
+    f.instruction(&W::GlobalSet(abi::fp_flag_global(abi::Flag::Z)));
+    // C = !(a < b)
+    get_s_f32(f, rn);
+    push_b(f);
+    f.instruction(&W::F32Lt);
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::GlobalSet(abi::fp_flag_global(abi::Flag::C)));
+    // V = unordered = (a != a) | (b != b)
+    get_s_f32(f, rn);
+    get_s_f32(f, rn);
+    f.instruction(&W::F32Ne);
+    push_b(f);
+    push_b(f);
+    f.instruction(&W::F32Ne);
+    f.instruction(&W::I32Or);
+    f.instruction(&W::GlobalSet(abi::fp_flag_global(abi::Flag::V)));
+}
+
+/// One VFP register <-> memory transfer. S = 4-byte raw i32; D = 8-byte raw i64.
+fn emit_vfp_mem(f: &mut Function, reg: crate::ir::VfpReg, addr: &Value, load: bool, base: u32) {
+    use crate::ir::VfpReg::*;
+    match reg {
+        S(n) => {
+            if load {
+                emit_addr(f, addr, base);
+                f.instruction(&W::I32Load(mem_arg()));
+                f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
+            } else {
+                emit_addr(f, addr, base);
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(n)));
+                f.instruction(&W::I32Store(mem_arg()));
+            }
+        }
+        D(n) => {
+            if load {
+                emit_addr(f, addr, base);
+                f.instruction(&W::I64Load(mem_arg()));
+                set_d_bits(f, n);
+            } else {
+                emit_addr(f, addr, base);
+                get_d_bits(f, n);
+                f.instruction(&W::I64Store(mem_arg()));
+            }
         }
     }
 }

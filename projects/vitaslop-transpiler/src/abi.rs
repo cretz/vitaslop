@@ -76,8 +76,75 @@ pub const fn flag_global(f: Flag) -> u32 {
     REG_COUNT as u32 + f as u32
 }
 
-/// Total number of exported globals (registers + flags).
-pub const GLOBAL_COUNT: u32 = REG_COUNT as u32 + FLAG_COUNT as u32;
+// --- VFP / floating-point state ------------------------------------------
+//
+// The VFP register file (Cortex-A9 = VFPv3-D32 + NEON) is modeled to respect
+// S/D/Q aliasing exactly. The 32 single-precision registers S0..S31 are the low
+// 32-bit halves of the doubles D0..D15, so they are stored as 32 **raw-bit i32
+// globals** (`s0..s31`): reading S`n` as an f32 is an `f32.reinterpret_i32`, and
+// D`n` (n < 16) is the concatenation of `s[2n]` (low) and `s[2n+1]` (high). The
+// upper doubles D16..D31 have no single-precision alias, so they are stored as 16
+// **i64 globals** (`d16..d31`). This keeps VFP state out of guest memory (same
+// reasoning as the GP registers) while a `vpush {d8-d11}` still saves whatever the
+// aliased `s16..s23` currently hold.
+//
+// Floating-point compare results (FPSCR N,Z,C,V) live in four more i32 globals;
+// `vmrs APSR_nzcv, fpscr` copies them into the integer condition flags.
+
+/// Number of single-precision VFP registers (S0..S31), stored as raw-bit i32.
+pub const VFP_S_COUNT: usize = 32;
+/// First upper double register with no single-precision alias (D16).
+pub const VFP_D_HI_FIRST: usize = 16;
+/// Number of upper double registers (D16..D31), stored as i64.
+pub const VFP_D_HI_COUNT: usize = 16;
+/// Number of floating-point condition-flag globals (FPSCR N,Z,C,V).
+pub const FP_FLAG_COUNT: usize = 4;
+
+/// Base global index of the register + integer-flag block (r0..r15, nf..vf).
+const CORE_GLOBALS: u32 = REG_COUNT as u32 + FLAG_COUNT as u32;
+
+/// WASM global index of single-precision register S`n` (raw bits, i32).
+pub const fn vfp_s_global(n: u8) -> u32 {
+    CORE_GLOBALS + n as u32
+}
+
+/// WASM global index of an upper double register D`n` (16 <= n < 32; i64).
+pub const fn vfp_dhi_global(n: u8) -> u32 {
+    CORE_GLOBALS + VFP_S_COUNT as u32 + (n as u32 - VFP_D_HI_FIRST as u32)
+}
+
+/// WASM global index of floating-point condition flag `f` (FPSCR N,Z,C,V; i32).
+pub const fn fp_flag_global(f: Flag) -> u32 {
+    CORE_GLOBALS + VFP_S_COUNT as u32 + VFP_D_HI_COUNT as u32 + f as u32
+}
+
+/// Total number of registers + integer flags (the i32-only core block, exported
+/// under their `r*`/`nf`.. names and seeded/read by the host).
+pub const GLOBAL_COUNT: u32 = CORE_GLOBALS;
+
+/// Total number of globals including the VFP register file and FP flags.
+pub const TOTAL_GLOBAL_COUNT: u32 =
+    CORE_GLOBALS + VFP_S_COUNT as u32 + VFP_D_HI_COUNT as u32 + FP_FLAG_COUNT as u32;
+
+/// Export name of single-precision register S`n`.
+pub fn vfp_s_export(n: u8) -> String {
+    format!("s{n}")
+}
+
+/// Export name of upper double register D`n`.
+pub fn vfp_dhi_export(n: u8) -> String {
+    format!("d{n}")
+}
+
+/// Export name of floating-point condition flag `f`.
+pub fn fp_flag_export(f: Flag) -> &'static str {
+    match f {
+        Flag::N => "fpn",
+        Flag::Z => "fpz",
+        Flag::C => "fpc",
+        Flag::V => "fpv",
+    }
+}
 
 /// Export name of the global holding ARM register `i`.
 pub fn reg_export(i: usize) -> String {

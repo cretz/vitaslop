@@ -174,6 +174,23 @@ impl Vm {
         self.global(&abi::reg_export(i)).get(&mut self.store).i32().unwrap() as u32
     }
 
+    /// Set single-precision VFP register S`n` from an f32.
+    pub fn set_s(&mut self, n: u8, v: f32) {
+        self.global(&abi::vfp_s_export(n))
+            .set(&mut self.store, Val::I32(v.to_bits() as i32))
+            .unwrap();
+    }
+
+    /// Read single-precision VFP register S`n` as an f32.
+    pub fn get_s(&mut self, n: u8) -> f32 {
+        f32::from_bits(self.global(&abi::vfp_s_export(n)).get(&mut self.store).i32().unwrap() as u32)
+    }
+
+    /// Read the raw 32 bits of VFP register S`n`.
+    pub fn get_s_bits(&mut self, n: u8) -> u32 {
+        self.global(&abi::vfp_s_export(n)).get(&mut self.store).i32().unwrap() as u32
+    }
+
     /// Read the N,Z,C,V flags.
     pub fn flags(&mut self) -> Flags {
         let mut f = |flag| {

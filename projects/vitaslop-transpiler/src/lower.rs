@@ -12,10 +12,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use yaxpeax_arch::{Decoder, U8Reader};
-use yaxpeax_arm::armv7::{ConditionCode, InstDecoder, Instruction, Opcode, Operand, Reg};
+use yaxpeax_arm::armv7::{
+    ConditionCode, InstDecoder, Instruction, Opcode, Operand, Reg, RegShift, RegShiftStyle,
+    SIMDSizeCode, ShiftStyle, VfpType,
+};
 
 use crate::Error;
-use crate::ir::{Block, BinOp, Func, MemSize, Stmt, Term, Value};
+use crate::ir::{Block, BinOp, FBinOp, Func, MemSize, Stmt, Term, Value, VfpOp, VfpReg};
 
 /// A resolved import: the guest stub address a `bl`/`blx` targets maps to a
 /// dense host-import index.
@@ -347,13 +350,72 @@ fn imm(op: &Operand) -> Option<u32> {
     }
 }
 
-/// A data-processing operand: a register read or an immediate.
+/// A data-processing operand: a register read, an immediate, or a shifted
+/// register (the Thumb-2 wide `add.w`/`mov.w`/... forms carry an explicit shift,
+/// often `lsl #0`).
 fn operand_value(op: &Operand) -> Option<Value> {
     match op {
         Operand::Reg(r) => Some(Value::Reg(r.number())),
         Operand::Imm32(v) | Operand::Imm(v) => Some(Value::Imm(*v)),
         Operand::Imm12(v) => Some(Value::Imm(*v as u32)),
+        Operand::RegShift(rs) => shift_operand(rs),
         _ => None,
+    }
+}
+
+/// Lower a shifted-register operand into its value. Immediate shifts fold to a
+/// single wasm shift (with the ARM `#0` conventions: LSL #0 is the bare register,
+/// LSR/ASR #0 mean shift by 32, ROR #0 is RRX). Register-controlled shifts mask
+/// the amount to a byte; amounts >= 32 are left to wasm's mod-32 shift for now
+/// (exact wide-shift semantics are a later refinement). `RRX` (needs the carry
+/// flag) is not modeled yet.
+fn shift_operand(rs: &RegShift) -> Option<Value> {
+    match rs.into_shift() {
+        RegShiftStyle::RegImm(s) => {
+            let base = Value::Reg(s.shiftee().number());
+            let n = s.imm() as u32;
+            Some(match s.stype() {
+                ShiftStyle::LSL => {
+                    if n == 0 {
+                        base
+                    } else {
+                        bin(BinOp::Shl, base, Value::Imm(n))
+                    }
+                }
+                ShiftStyle::LSR => {
+                    if n == 0 {
+                        Value::Imm(0) // LSR #32
+                    } else {
+                        bin(BinOp::Lsr, base, Value::Imm(n))
+                    }
+                }
+                ShiftStyle::ASR => {
+                    // ASR #0 means ASR #32: fill with the sign bit.
+                    bin(BinOp::Asr, base, Value::Imm(if n == 0 { 31 } else { n }))
+                }
+                ShiftStyle::ROR => {
+                    if n == 0 {
+                        return None; // RRX (rotate through carry) not modeled yet
+                    }
+                    bin(
+                        BinOp::Or,
+                        bin(BinOp::Lsr, base.clone(), Value::Imm(n)),
+                        bin(BinOp::Shl, base, Value::Imm(32 - n)),
+                    )
+                }
+            })
+        }
+        RegShiftStyle::RegReg(s) => {
+            let base = Value::Reg(s.shiftee().number());
+            let amt = bin(BinOp::And, Value::Reg(s.shifter().number()), Value::Imm(0xff));
+            let op = match s.stype() {
+                ShiftStyle::LSL => BinOp::Shl,
+                ShiftStyle::LSR => BinOp::Lsr,
+                ShiftStyle::ASR => BinOp::Asr,
+                ShiftStyle::ROR => return None,
+            };
+            Some(bin(op, base, amt))
+        }
     }
 }
 
@@ -424,7 +486,34 @@ fn lower_addr(op: &Operand) -> Option<Addr> {
                 )],
             })
         }
+        // Register offset (optionally shifted): `[Rn, Rm{, shift}]{!}`.
+        Operand::RegDerefPreindexReg(base, index, add, wback) => {
+            reg_offset_addr(base.number(), Value::Reg(index.number()), *add, *wback, false)
+        }
+        Operand::RegDerefPreindexRegShift(base, rs, add, wback) => {
+            reg_offset_addr(base.number(), shift_operand(rs)?, *add, *wback, false)
+        }
+        Operand::RegDerefPostindexReg(base, index, add, _wback) => {
+            reg_offset_addr(base.number(), Value::Reg(index.number()), *add, true, true)
+        }
+        Operand::RegDerefPostindexRegShift(base, rs, add, _wback) => {
+            reg_offset_addr(base.number(), shift_operand(rs)?, *add, true, true)
+        }
         _ => None,
+    }
+}
+
+/// Build an [`Addr`] for a register-offset addressing mode: effective address is
+/// `base +/- offset`. `post` selects post-index (access at the old base, then
+/// writeback); otherwise it is pre-index with optional writeback.
+fn reg_offset_addr(base: u8, offset: Value, add: bool, wback: bool, post: bool) -> Option<Addr> {
+    let ea = bin(if add { BinOp::Add } else { BinOp::Sub }, Value::Reg(base), offset);
+    if post {
+        Some(Addr { pre: vec![], addr: Value::Reg(base), post: vec![Stmt::SetReg(base, ea)] })
+    } else if wback {
+        Some(Addr { pre: vec![Stmt::SetReg(base, ea)], addr: Value::Reg(base), post: vec![] })
+    } else {
+        Some(Addr { pre: vec![], addr: ea, post: vec![] })
     }
 }
 
@@ -726,6 +815,133 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         POP | LDM(..) => out.extend(lower_ldm(inst, addr)?),
         STM(..) => out.extend(lower_stm(inst, addr)?),
 
+        // --- VFP / floating-point ---------------------------------------
+        VADD | VSUB | VMUL | VDIV => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rn = s_num(&ops[1]).ok_or_else(err)?;
+            let rm = s_num(&ops[2]).ok_or_else(err)?;
+            let op = match inst.opcode {
+                VADD => FBinOp::Add,
+                VSUB => FBinOp::Sub,
+                VMUL => FBinOp::Mul,
+                _ => FBinOp::Div,
+            };
+            out.push(Stmt::Vfp(VfpOp::Bin32 { op, rd, rn, rm }));
+        }
+        VMLA | VMLS => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rn = s_num(&ops[1]).ok_or_else(err)?;
+            let rm = s_num(&ops[2]).ok_or_else(err)?;
+            out.push(Stmt::Vfp(VfpOp::MulAcc32 { rd, rn, rm, sub: inst.opcode == VMLS }));
+        }
+        VNEG => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rm = s_num(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::Vfp(VfpOp::Neg32 { rd, rm }));
+        }
+        VABS => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rm = s_num(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::Vfp(VfpOp::Abs32 { rd, rm }));
+        }
+        VSQRT => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rm = s_num(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::Vfp(VfpOp::Sqrt32 { rd, rm }));
+        }
+        VMOV => {
+            match (&ops[0], &ops[1]) {
+                // Immediate move. A single-precision destination is the VFP
+                // `vmov.f32 sd, #imm` (one 32-bit Imm); a D/Q destination is either
+                // a VFP `vmov.f64` or a NEON `vmov.iN` modified-immediate, both a
+                // 64-bit constant per D register (Imm low, Imm high).
+                (Operand::SIMDReg(dst), Operand::Imm(lo)) => {
+                    if dst.size == SIMDSizeCode::S {
+                        out.push(Stmt::Vfp(VfpOp::SetImmS { s: dst.num, bits: *lo }));
+                    } else {
+                        let hi = match ops[2] {
+                            Operand::Imm(h) => h,
+                            _ => 0,
+                        };
+                        for d in simd_imm_dregs(dst) {
+                            out.push(Stmt::Vfp(VfpOp::SetImmD { d, lo: *lo, hi }));
+                        }
+                    }
+                }
+                // Register move between two single-precision regs (raw bit copy).
+                // The core<->fp transfer forms are not used by the cube.
+                _ => {
+                    let rd = s_num(&ops[0]).ok_or_else(err)?;
+                    let rm = s_num(&ops[1]).ok_or_else(err)?;
+                    out.push(Stmt::Vfp(VfpOp::Mov32 { rd, rm }));
+                }
+            }
+        }
+        VCMP(_) => {
+            let rn = s_num(&ops[0]).ok_or_else(err)?;
+            // Second operand is either a register or `#0.0` (Imm(0)).
+            let rm = match &ops[1] {
+                Operand::SIMDReg(r) if r.size == SIMDSizeCode::S => Some(r.num),
+                Operand::Imm(0) => None,
+                _ => return Err(err()),
+            };
+            out.push(Stmt::Vfp(VfpOp::Cmp32 { rn, rm }));
+        }
+        VMRS => {
+            // `vmrs APSR_nzcv, fpscr` (Rt == 15): move FP flags into NZCV. Other
+            // destinations (a real core register) are not used by the cube.
+            match regnum(&ops[0]) {
+                Some(15) => out.push(Stmt::Vfp(VfpOp::MrsNzcv)),
+                _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+            }
+        }
+        VCVT { to, from, .. } => {
+            let rd = s_num(&ops[0]).ok_or_else(err)?;
+            let rm = s_num(&ops[1]).ok_or_else(err)?;
+            match (to, from) {
+                (VfpType::S32, VfpType::F32) => {
+                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: true }));
+                }
+                (VfpType::U32, VfpType::F32) => {
+                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: false }));
+                }
+                (VfpType::F32, VfpType::S32) => {
+                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: true }));
+                }
+                (VfpType::F32, VfpType::U32) => {
+                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: false }));
+                }
+                _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+            }
+        }
+        VLDR | VSTR => {
+            let (size, num) = simd(&ops[0]).ok_or_else(err)?;
+            let a = vfp_single_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
+            let reg = vfp_reg(size, num).ok_or_else(err)?;
+            out.push(Stmt::VfpMem { reg, addr: a, load: inst.opcode == VLDR });
+        }
+        VLDM(inc) | VSTM(inc) => {
+            let base = ldm_base(inst);
+            let wback = ldm_wback(inst);
+            let (size, num, count) = simd_list(inst).ok_or_else(err)?;
+            let load = matches!(inst.opcode, VLDM(_));
+            out.extend(vfp_multi(size, num, count, base, !inc, wback, None, load)?);
+        }
+        VPUSH => {
+            let (size, num, count) = simd_list(inst).ok_or_else(err)?;
+            out.extend(vfp_multi(size, num, count, 13, true, true, None, false)?);
+        }
+        VPOP => {
+            let (size, num, count) = simd_list(inst).ok_or_else(err)?;
+            out.extend(vfp_multi(size, num, count, 13, false, true, None, true)?);
+        }
+        VLDN(1, _) | VSTN(1, _) => {
+            let (size, num, count) = simd_list(inst).ok_or_else(err)?;
+            let (base, wback, post) = simd_deref(inst).ok_or_else(err)?;
+            let load = matches!(inst.opcode, VLDN(..));
+            out.extend(vfp_multi(size, num, count, base, false, wback, post, load)?);
+        }
+
         _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
     }
     Ok(out)
@@ -874,6 +1090,147 @@ fn ldm_wback(inst: &Instruction) -> bool {
         Opcode::POP | Opcode::PUSH => true,
         _ => inst.operands.iter().any(|o| matches!(o, Operand::RegWBack(_, true))),
     }
+}
+
+// --- VFP operand helpers --------------------------------------------------
+
+/// A SIMD register operand as `(width, number)`.
+fn simd(op: &Operand) -> Option<(SIMDSizeCode, u8)> {
+    match op {
+        Operand::SIMDReg(r) => Some((r.size, r.num)),
+        _ => None,
+    }
+}
+
+/// A single-precision (`S`) register operand's number.
+fn s_num(op: &Operand) -> Option<u8> {
+    match op {
+        Operand::SIMDReg(r) if r.size == SIMDSizeCode::S => Some(r.num),
+        _ => None,
+    }
+}
+
+/// The constituent double-register numbers of a VFP register targeted by a NEON
+/// modified-immediate: a `Q` register is two consecutive `D`s; a `D` is itself.
+fn simd_imm_dregs(r: &yaxpeax_arm::armv7::SIMDReg) -> Vec<u8> {
+    match r.size {
+        SIMDSizeCode::Q => vec![r.num * 2, r.num * 2 + 1],
+        _ => vec![r.num],
+    }
+}
+
+/// Build the IR register reference for a `(width, number)` VFP register.
+fn vfp_reg(size: SIMDSizeCode, num: u8) -> Option<VfpReg> {
+    match size {
+        SIMDSizeCode::S => Some(VfpReg::S(num)),
+        SIMDSizeCode::D => Some(VfpReg::D(num)),
+        SIMDSizeCode::Q => None,
+    }
+}
+
+/// Bytes occupied by one register of the given width in a memory transfer.
+fn reg_bytes(size: SIMDSizeCode) -> u32 {
+    match size {
+        SIMDSizeCode::S => 4,
+        SIMDSizeCode::D => 8,
+        SIMDSizeCode::Q => 16,
+    }
+}
+
+/// The `{first, ...}` register list of a vldm/vstm/vpush/vpop/vld1/vst1 as
+/// `(width, first number, count)`.
+fn simd_list(inst: &Instruction) -> Option<(SIMDSizeCode, u8, u8)> {
+    inst.operands.iter().find_map(|op| match op {
+        Operand::SIMDRegList(r, count) => Some((r.size, r.num, *count)),
+        _ => None,
+    })
+}
+
+/// The `[Rn]{!}` / `[Rn], Rm` addressing of a vld1/vst1 as
+/// `(base, writeback, post-index register)`.
+fn simd_deref(inst: &Instruction) -> Option<(u8, bool, Option<u8>)> {
+    inst.operands.iter().find_map(|op| match op {
+        Operand::SIMDDeref { base, wback, post, .. } => {
+            Some((base.number(), *wback, post.map(|r| r.number())))
+        }
+        _ => None,
+    })
+}
+
+/// The effective address of a single-register vldr/vstr. Handles the pc-relative
+/// literal form by constant-folding (pc = `Align(addr+4,4)` in Thumb, `addr+8` in
+/// ARM), matching how `adr` and integer literal loads resolve the pc.
+fn vfp_single_addr(op: &Operand, iaddr: u32, thumb: bool) -> Option<Value> {
+    let pc_const = |disp: u32| {
+        let pc = if thumb { iaddr.wrapping_add(4) & !3 } else { iaddr.wrapping_add(8) };
+        Value::Imm(pc.wrapping_add(disp))
+    };
+    match op {
+        Operand::RegDeref(base) => {
+            if base.number() == 15 {
+                Some(pc_const(0))
+            } else {
+                Some(Value::Reg(base.number()))
+            }
+        }
+        Operand::RegDerefPreindexOffset(base, off, add, _wback) => {
+            let disp = if *add { *off as u32 } else { (*off as u32).wrapping_neg() };
+            if base.number() == 15 {
+                Some(pc_const(disp))
+            } else {
+                Some(bin(BinOp::Add, Value::Reg(base.number()), Value::Imm(disp)))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Lower a multi-register VFP memory transfer (vldm/vstm/vpush/vpop/vld1/vst1):
+/// `count` consecutive registers starting at `num`, each `reg_bytes` wide, at
+/// ascending addresses from `base` (decrement-before when `db`), with optional
+/// base writeback. `post` (a register added to the base afterward) overrides the
+/// fixed writeback delta when present.
+#[allow(clippy::too_many_arguments)]
+fn vfp_multi(
+    size: SIMDSizeCode,
+    num: u8,
+    count: u8,
+    base: u8,
+    db: bool,
+    wback: bool,
+    post: Option<u8>,
+    load: bool,
+) -> Result<Vec<Stmt>, Error> {
+    let bytes = reg_bytes(size);
+    let total = count as u32 * bytes;
+    // Start address: decrement-before subtracts the whole transfer up front.
+    let start = if db {
+        bin(BinOp::Sub, Value::Reg(base), Value::Imm(total))
+    } else {
+        Value::Reg(base)
+    };
+    let mut out = Vec::new();
+    for i in 0..count {
+        let addr = if i == 0 {
+            start.clone()
+        } else {
+            bin(BinOp::Add, start.clone(), Value::Imm(i as u32 * bytes))
+        };
+        let reg = vfp_reg(size, num + i).ok_or(Error::Operand { addr: 0 })?;
+        out.push(Stmt::VfpMem { reg, addr, load });
+    }
+    // Writeback runs after all transfers, so every transfer sees the old base.
+    if let Some(rm) = post {
+        out.push(Stmt::SetReg(base, bin(BinOp::Add, Value::Reg(base), Value::Reg(rm))));
+    } else if wback {
+        let newbase = if db {
+            bin(BinOp::Sub, Value::Reg(base), Value::Imm(total))
+        } else {
+            bin(BinOp::Add, Value::Reg(base), Value::Imm(total))
+        };
+        out.push(Stmt::SetReg(base, newbase));
+    }
+    Ok(out)
 }
 
 /// Unused import guard for `Reg` (kept for future indirect-branch handling).
