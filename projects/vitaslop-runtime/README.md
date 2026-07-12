@@ -92,6 +92,19 @@ point here.
   - Audio: output deliberately blocks to pace to the audio clock. We keep that block.
   - Async IO: async calls return immediately, synchronous reads block. Match each.
 
+## Capture and software raster
+
+- **Capture** records the GXM command stream (surfaces, per-draw vertex/index/
+  uniform snapshots taken from guest memory at draw time) without emulating a GPU
+  or drawing a pixel. This is the blob-free "it works" signal.
+- **Software raster** is the CPU reference renderer over that capture: transform
+  each vertex by the captured MVP, perspective-divide, depth-test, interpolate
+  per-vertex color. A fixed-function equivalent of the placeholder shaders, so no
+  Sony shader blob is needed. A wgpu backend over the same capture comes later and
+  uses this as its oracle.
+- Status: implemented. The cube runs end to end and rasterizes to a spinning 3D
+  cube (see the conformance harness cube_run and cube_render tests).
+
 ## Determinism seam: the World trait
 
 - One small trait is the single choke point for external-world inputs: monotonic
