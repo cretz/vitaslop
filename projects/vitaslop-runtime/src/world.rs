@@ -117,34 +117,41 @@ pub enum WorldEvent {
 /// world at all.
 pub struct Record<W: World> {
     inner: W,
-    pub events: Vec<WorldEvent>,
+    events: std::rc::Rc<std::cell::RefCell<Vec<WorldEvent>>>,
 }
 
 impl<W: World> Record<W> {
     pub fn new(inner: W) -> Self {
-        Record { inner, events: Vec::new() }
+        Record { inner, events: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())) }
+    }
+
+    /// A shared handle to the recorded log. Clone it before boxing the recorder as
+    /// the run's world, then read the events back after the run (the recorder
+    /// itself is owned by the run).
+    pub fn events(&self) -> std::rc::Rc<std::cell::RefCell<Vec<WorldEvent>>> {
+        self.events.clone()
     }
 }
 
 impl<W: World> World for Record<W> {
     fn monotonic_us(&mut self) -> u64 {
         let v = self.inner.monotonic_us();
-        self.events.push(WorldEvent::Monotonic(v));
+        self.events.borrow_mut().push(WorldEvent::Monotonic(v));
         v
     }
     fn wall_us(&mut self) -> u64 {
         let v = self.inner.wall_us();
-        self.events.push(WorldEvent::Wall(v));
+        self.events.borrow_mut().push(WorldEvent::Wall(v));
         v
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
         let frame = self.inner.poll_ctrl(port);
-        self.events.push(WorldEvent::Ctrl { port, frame });
+        self.events.borrow_mut().push(WorldEvent::Ctrl { port, frame });
         frame
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
         self.inner.fill_random(buf);
-        self.events.push(WorldEvent::Random(buf.to_vec()));
+        self.events.borrow_mut().push(WorldEvent::Random(buf.to_vec()));
     }
 }
 
