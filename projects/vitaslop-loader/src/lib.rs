@@ -13,6 +13,14 @@
 //!
 //! Parsing is pure, bounds-checked byte reading with no dependencies, so it
 //! builds for wasm as cleanly as native.
+//!
+//! Real titles ship as a SELF/fSELF (`eboot.bin`), which wraps this velf in an
+//! SCE container. [`load`] auto-detects the `"SCE\0"` magic and unwraps it (see
+//! [`self_`]) before parsing the velf inside.
+
+#[path = "self.rs"]
+pub mod self_;
+pub mod inflate;
 
 /// `e_type` of a velf: a relocatable SCE executable.
 const ET_SCE_RELEXEC: u16 = 0xFE04;
@@ -68,6 +76,11 @@ pub enum Error {
     OutOfBounds(&'static str),
     /// The module-info segment index encoded in `e_entry` has no segment.
     BadModuleInfo,
+    /// A SELF segment is encrypted (a real retail title); we do not decrypt.
+    EncryptedSelf,
+    /// A SELF segment is zlib-compressed (`vita-make-fself -c`); the loader is
+    /// dependency-free, so inflate is not built in yet.
+    CompressedSelf,
 }
 
 impl Module {
@@ -96,6 +109,10 @@ pub struct ProgramInputs {
     /// Total guest memory to provision (image + stack + heap), in bytes from
     /// `base`. Chosen by the caller; defaults to [`DEFAULT_MEM_BYTES`].
     pub mem_bytes: u32,
+    /// Emit a module that imports a shared linear memory instead of defining one,
+    /// so several instances can share the guest address space (the preemptive
+    /// multi-thread scheduler). Off by default; single-instance hosts leave it so.
+    pub import_memory: bool,
 }
 
 /// Default guest memory for a loaded module (image + stack + host allocations).
@@ -114,6 +131,10 @@ impl ProgramInputs {
             // address), not `svc`, so there is no noreturn-syscall set here.
             noreturn_svc: &[],
             mem_bytes: self.mem_bytes,
+            // Vita modules take function addresses (thread entries, GXM
+            // callbacks) that the direct-call closure alone would miss.
+            discover_code_pointers: true,
+            import_memory: self.import_memory,
         }
     }
 }
@@ -137,13 +158,33 @@ impl Module {
                 import: i as u32,
             })
             .collect();
+        // The image the host loads into guest memory spans every loadable segment,
+        // not just the executable one: a Vita module's initialized data (`.data`)
+        // and zero-filled `.bss` live in a second RW segment above the code, and a
+        // program that reads a static initializer (or any global) needs those bytes
+        // present. Each segment is placed at `vaddr - base`; the gaps and each
+        // segment's `.bss` tail are left zero. The transpiler decodes only the code
+        // reachable from the entry, so the trailing data bytes are never mis-decoded.
+        let base = exec.vaddr;
+        let end = self
+            .segments
+            .iter()
+            .map(|s| s.vaddr.wrapping_add(s.mem_size))
+            .max()
+            .unwrap_or(base);
+        let mut code = vec![0u8; end.wrapping_sub(base) as usize];
+        for seg in &self.segments {
+            let off = seg.vaddr.wrapping_sub(base) as usize;
+            code[off..off + seg.data.len()].copy_from_slice(&seg.data);
+        }
         ProgramInputs {
-            code: exec.data.clone(),
-            base: exec.vaddr,
+            code,
+            base,
             entries: vec![self.entry & !1],
             externs,
             thumb_entry: self.entry & 1 != 0,
             mem_bytes: DEFAULT_MEM_BYTES,
+            import_memory: false,
         }
     }
 }
@@ -169,6 +210,16 @@ impl<'a> Reader<'a> {
             .ok_or(Error::OutOfBounds("u32"))?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+
+    fn u64(&self, at: usize) -> Result<u64, Error> {
+        let b = self
+            .bytes
+            .get(at..at + 8)
+            .ok_or(Error::OutOfBounds("u64"))?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
 }
 
 /// A loadable segment plus where it sits in the file, so we can map a guest
@@ -181,8 +232,17 @@ struct LoadSeg {
     flags: u32,
 }
 
-/// Parse a velf image into a [`Module`].
+/// Parse a Vita executable into a [`Module`].
+///
+/// Accepts either a bare velf or a SELF/fSELF container (`eboot.bin`): a SELF is
+/// unwrapped to its inner velf first, then parsed. The returned [`Module`] owns
+/// its segment bytes, so the unwrapped buffer does not need to outlive the call.
 pub fn load(bytes: &[u8]) -> Result<Module, Error> {
+    if self_::is_self(bytes) {
+        let inner = self_::unwrap_self(bytes)?;
+        return load(&inner);
+    }
+
     let r = Reader { bytes };
 
     // ELF32 little-endian header check: magic + EI_CLASS=1 + EI_DATA=1.
@@ -368,6 +428,14 @@ mod tests {
     const CUBE: &[u8] = include_bytes!(
         "../../vitaslop-conformance-suite-vita/cube-src/cube.velf"
     );
+    // The same cube wrapped as an fSELF eboot.bin: uncompressed (loadable) and
+    // zlib-compressed (exercises the clean CompressedSelf error).
+    const CUBE_EBOOT: &[u8] = include_bytes!(
+        "../../vitaslop-conformance-suite-vita/cube-src/cube.eboot.bin"
+    );
+    const CUBE_EBOOT_C: &[u8] = include_bytes!(
+        "../../vitaslop-conformance-suite-vita/cube-src/cube.eboot_c.bin"
+    );
 
     #[test]
     fn loads_cube_header() {
@@ -424,9 +492,17 @@ mod tests {
         let m = load(CUBE).expect("load cube.velf");
         let inputs = m.program_inputs();
 
-        // Code image is the executable segment, based at 0x81000000.
+        // The memory image spans every loadable segment (each placed at vaddr - base),
+        // based at 0x81000000; the executable segment sits at the front.
         assert_eq!(inputs.base, 0x8100_0000);
-        assert_eq!(inputs.code.len(), m.segments[0].data.len());
+        let expected_len = m
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.mem_size - inputs.base)
+            .max()
+            .unwrap() as usize;
+        assert_eq!(inputs.code.len(), expected_len);
+        assert_eq!(&inputs.code[..m.segments[0].data.len()], &m.segments[0].data[..]);
 
         // The Vita entry is Thumb (odd address); the entry point clears bit 0.
         assert!(inputs.thumb_entry);
@@ -443,5 +519,85 @@ mod tests {
         let prog = inputs.program();
         assert_eq!(prog.base, 0x8100_0000);
         assert_eq!(prog.entries.len(), 1);
+    }
+
+    #[test]
+    fn detects_self_magic() {
+        assert!(self_::is_self(CUBE_EBOOT));
+        assert!(!self_::is_self(CUBE));
+    }
+
+    #[test]
+    fn loads_cube_from_fself() {
+        // Unwrapping the fSELF must yield the same module the bare velf does.
+        // vita-make-fself patches module_nid (sha256 of the input), so that one
+        // field legitimately differs; everything the pipeline consumes matches.
+        let m = load(CUBE_EBOOT).expect("load cube.eboot.bin");
+        let velf = load(CUBE).expect("load cube.velf");
+
+        assert_eq!(m.name, velf.name);
+        assert_eq!(m.base, velf.base);
+        assert_eq!(m.entry, velf.entry);
+        assert_eq!(m.segments.len(), velf.segments.len());
+        // Segment bytes are identical except for module_nid: vita-make-fself
+        // computes it (sha256 of the velf) and patches the 4-byte field, while
+        // the bare velf still carries its 0 placeholder. So the fSELF module
+        // carries the real NID and the segment data differs by exactly those
+        // 4 bytes and nothing else.
+        assert_ne!(m.module_nid, velf.module_nid);
+        assert_eq!(velf.module_nid, 0);
+        let mut diff_bytes = 0usize;
+        for (a, b) in m.segments.iter().zip(&velf.segments) {
+            assert_eq!(a.vaddr, b.vaddr);
+            assert_eq!(a.mem_size, b.mem_size);
+            assert_eq!(a.executable, b.executable);
+            assert_eq!(a.writable, b.writable);
+            assert_eq!(a.data.len(), b.data.len());
+            diff_bytes += a.data.iter().zip(&b.data).filter(|(x, y)| x != y).count();
+        }
+        assert_eq!(diff_bytes, 4, "only the module_nid word may differ");
+        assert_eq!(m.imports.len(), velf.imports.len());
+        for (a, b) in m.imports.iter().zip(&velf.imports) {
+            assert_eq!(a.library_nid, b.library_nid);
+            assert_eq!(a.func_nid, b.func_nid);
+            assert_eq!(a.stub_addr, b.stub_addr);
+        }
+    }
+
+    #[test]
+    fn unwrapped_fself_transpiles_identically() {
+        // The unwrapped image lowers to the same transpiler inputs as the velf,
+        // so the whole downstream pipeline is unaffected by the container.
+        let m = load(CUBE_EBOOT).expect("load cube.eboot.bin");
+        let inputs = m.program_inputs();
+        assert_eq!(inputs.base, 0x8100_0000);
+        assert!(inputs.thumb_entry);
+        assert_eq!(inputs.entries, vec![0x8100_095c]);
+        assert_eq!(inputs.externs.len(), 38);
+    }
+
+    #[test]
+    fn loads_cube_from_compressed_fself() {
+        // A zlib-compressed eboot (vita-make-fself -c) inflates to the identical
+        // module the uncompressed eboot yields - proving the built-in inflate.
+        let c = load(CUBE_EBOOT_C).expect("load compressed cube.eboot_c.bin");
+        let u = load(CUBE_EBOOT).expect("load cube.eboot.bin");
+
+        assert_eq!(c.name, u.name);
+        assert_eq!(c.base, u.base);
+        assert_eq!(c.entry, u.entry);
+        assert_eq!(c.module_nid, u.module_nid);
+        assert_eq!(c.segments.len(), u.segments.len());
+        for (a, b) in c.segments.iter().zip(&u.segments) {
+            assert_eq!(a.vaddr, b.vaddr);
+            assert_eq!(a.mem_size, b.mem_size);
+            assert_eq!(a.data, b.data);
+        }
+        assert_eq!(c.imports.len(), u.imports.len());
+        for (a, b) in c.imports.iter().zip(&u.imports) {
+            assert_eq!(a.library_nid, b.library_nid);
+            assert_eq!(a.func_nid, b.func_nid);
+            assert_eq!(a.stub_addr, b.stub_addr);
+        }
     }
 }

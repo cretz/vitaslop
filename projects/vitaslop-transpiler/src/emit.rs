@@ -46,10 +46,19 @@ const L_BB: u32 = 0;
 const L_T0: u32 = 1;
 const L_T1: u32 = 2;
 const L_T2: u32 = 3;
-const L_I32_COUNT: u32 = 4;
+/// Fourth i32 scratch: the carry-in of add/sub-family flag computation (an
+/// immediate, or the C flag for adc/sbc).
+const L_T3: u32 = 4;
+const L_I32_COUNT: u32 = 5;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
+/// Two `v128` scratch locals, used by NEON emission to hold a quad register for
+/// read-modify-write (writing one D lane of an upper-bank quad) and to stage the
+/// two operands of the ops that read each twice (`vabd`/`vabdl`). Follow the i64
+/// scratch.
+const L_V128A: u32 = L_D64 + 1;
+const L_V128B: u32 = L_D64 + 2;
 
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the exported linear
@@ -59,6 +68,7 @@ pub fn emit_module(
     func_index: &BTreeMap<u32, u32>,
     base: u32,
     mem_bytes: u32,
+    import_memory: bool,
 ) -> Vec<u8> {
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
@@ -66,41 +76,66 @@ pub fn emit_module(
     types.ty().function([], []); // guest function: () -> ()
     let func_ty = 1;
 
+    let pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1);
+    // Preemptive multithreading (the native `ThreadedScheduler`) runs each guest
+    // thread as its own instance so their register globals stay independent, but
+    // they must share one address space. wasm gives us exactly one tool for that:
+    // a `shared` linear memory imported into every instance. When `import_memory`
+    // is set the module imports `env.memory` (shared, fixed size) instead of
+    // defining its own; single-instance hosts leave it off and get the original
+    // self-contained module unchanged. The memory index is 0 either way (it is the
+    // only memory), so every load/store and the `memory` export are identical.
     let mut imports = ImportSection::new();
     imports.import(abi::IMPORT_MODULE, abi::SVC_NAME, wasm_encoder::EntityType::Function(host_ty));
     imports.import(abi::IMPORT_MODULE, abi::IMPORT_NAME, wasm_encoder::EntityType::Function(host_ty));
+    if import_memory {
+        // A shared memory must declare a maximum; the guest never grows memory, so
+        // pin max == min at the provisioned size.
+        imports.import(
+            abi::IMPORT_MODULE,
+            abi::MEMORY_EXPORT,
+            wasm_encoder::EntityType::Memory(MemoryType {
+                minimum: pages,
+                maximum: Some(pages),
+                memory64: false,
+                shared: true,
+                page_size_log2: None,
+            }),
+        );
+    }
 
     let mut function_section = FunctionSection::new();
     for _ in funcs {
         function_section.function(func_ty);
     }
 
-    let pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1);
     let mut mems = MemorySection::new();
-    mems.memory(MemoryType {
-        minimum: pages,
-        maximum: None,
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
+    if !import_memory {
+        mems.memory(MemoryType {
+            minimum: pages,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+    }
 
-    // Globals, in ABI order: 16 registers + 4 integer flags (i32), then the VFP
-    // register file - 32 single-precision S registers (raw-bit i32) and 16 upper
-    // double registers D16..D31 (i64) - then 4 FP condition flags (i32).
+    // Globals, in ABI order: 16 registers + 4 integer flags (i32), then the VFP/NEON
+    // register file - 32 single-precision S registers (raw-bit i32) and 8 upper
+    // quad registers Q8..Q15 (v128) - then 4 FP condition flags (i32).
     let mut globals = GlobalSection::new();
     let i32_global =
         GlobalType { val_type: ValType::I32, mutable: true, shared: false };
-    let i64_global =
-        GlobalType { val_type: ValType::I64, mutable: true, shared: false };
+    let v128_global =
+        GlobalType { val_type: ValType::V128, mutable: true, shared: false };
     for _ in 0..abi::GLOBAL_COUNT {
         globals.global(i32_global, &ConstExpr::i32_const(0));
     }
     for _ in 0..abi::VFP_S_COUNT {
         globals.global(i32_global, &ConstExpr::i32_const(0));
     }
-    for _ in 0..abi::VFP_D_HI_COUNT {
-        globals.global(i64_global, &ConstExpr::i64_const(0));
+    for _ in 0..abi::VFP_Q_HI_COUNT {
+        globals.global(v128_global, &ConstExpr::v128_const(0));
     }
     for _ in 0..abi::FP_FLAG_COUNT {
         globals.global(i32_global, &ConstExpr::i32_const(0));
@@ -114,13 +149,15 @@ pub fn emit_module(
     for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
         exports.export(abi::flag_export(f), ExportKind::Global, abi::flag_global(f));
     }
-    // Export the VFP register file so the host can seed/read FP state (tests,
-    // GXM capture). S0..S31, D16..D31, and the FP flags.
+    // Export the VFP/NEON register file so the host can seed/read FP state (tests,
+    // GXM capture). S0..S31 (i32), Q8..Q15 (v128), and the FP flags. The host only
+    // marshals the low-bank S registers; the v128 quads are exported for
+    // completeness (JS cannot read them, but native hosts and tools can).
     for n in 0..abi::VFP_S_COUNT as u8 {
         exports.export(&abi::vfp_s_export(n), ExportKind::Global, abi::vfp_s_global(n));
     }
-    for n in abi::VFP_D_HI_FIRST as u8..(abi::VFP_D_HI_FIRST + abi::VFP_D_HI_COUNT) as u8 {
-        exports.export(&abi::vfp_dhi_export(n), ExportKind::Global, abi::vfp_dhi_global(n));
+    for q in abi::VFP_Q_HI_FIRST as u8..(abi::VFP_Q_HI_FIRST + abi::VFP_Q_HI_COUNT) as u8 {
+        exports.export(&abi::vfp_qhi_export(q), ExportKind::Global, abi::vfp_qhi_global(q));
     }
     for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
         exports.export(abi::fp_flag_export(f), ExportKind::Global, abi::fp_flag_global(f));
@@ -147,9 +184,13 @@ pub fn emit_module(
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
 fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Function {
-    // Locals: $bb + three i32 scratch temps (flag computation), then one i64
-    // scratch (double-register split/merge).
-    let mut f = Function::new([(L_I32_COUNT, ValType::I32), (1, ValType::I64)]);
+    // Locals: $bb + i32 scratch temps (flag computation), then one i64 scratch
+    // (double-register split/merge) and one v128 scratch (NEON quad staging).
+    let mut f = Function::new([
+        (L_I32_COUNT, ValType::I32),
+        (1, ValType::I64),
+        (2, ValType::V128),
+    ]);
 
     let n = func.blocks.len() as u32;
 
@@ -309,7 +350,7 @@ fn emit_stmt(
             emit_value(f, data, base);
             f.instruction(&store_op(*size));
         }
-        Stmt::FlagsAdd { a, b, cin } => emit_flags_add(f, a, b, *cin, base),
+        Stmt::FlagsAdd { a, b, cin } => emit_flags_add(f, a, b, cin, base),
         Stmt::FlagsLogic { value, carry } => {
             emit_value(f, value, base);
             f.instruction(&W::LocalTee(L_T0));
@@ -334,6 +375,32 @@ fn emit_stmt(
             f.instruction(&W::I32Const(*index as i32));
             f.instruction(&W::Call(IMPORT_FUNC));
         }
+        Stmt::MulLong { rdlo, rdhi, rn, rm, signed } => {
+            // Extend both operands to i64 (sign- or zero-extend), multiply, and
+            // split the 64-bit product into its low and high 32-bit halves. The
+            // full product is computed before either register is written, so an
+            // operand that aliases a destination reads its old value first.
+            let extend = |f: &mut Function| {
+                if *signed {
+                    f.instruction(&W::I64ExtendI32S);
+                } else {
+                    f.instruction(&W::I64ExtendI32U);
+                }
+            };
+            emit_value(f, rn, base);
+            extend(f);
+            emit_value(f, rm, base);
+            extend(f);
+            f.instruction(&W::I64Mul);
+            f.instruction(&W::LocalTee(L_D64)); // full product, kept for the high half
+            f.instruction(&W::I32WrapI64); // low 32 bits
+            f.instruction(&W::GlobalSet(abi::reg_global(*rdlo as usize)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64Const(32));
+            f.instruction(&W::I64ShrU);
+            f.instruction(&W::I32WrapI64); // high 32 bits
+            f.instruction(&W::GlobalSet(abi::reg_global(*rdhi as usize)));
+        }
         Stmt::Call { target } => {
             let idx = *func_index.get(target).expect("callee index");
             f.instruction(&W::Call(idx));
@@ -348,6 +415,7 @@ fn emit_stmt(
         }
         Stmt::Vfp(op) => emit_vfp(f, op),
         Stmt::VfpMem { reg, addr, load } => emit_vfp_mem(f, *reg, addr, *load, base),
+        Stmt::Neon(op) => emit_neon(f, op),
     }
 }
 
@@ -365,7 +433,8 @@ fn set_s_f32(f: &mut Function, n: u8) {
     f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
 }
 
-/// Push the raw 64 bits of D`n` as an i64 (merging its two S halves when n < 16).
+/// Push the raw 64 bits of D`n` as an i64. Low bank (n < 16): merge the two S
+/// halves. Upper bank (n >= 16): extract `i64x2` lane `n & 1` of the quad `q(n/2)`.
 fn get_d_bits(f: &mut Function, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
         let lo = 2 * n;
@@ -378,12 +447,14 @@ fn get_d_bits(f: &mut Function, n: u8) {
         f.instruction(&W::I64ExtendI32U);
         f.instruction(&W::I64Or);
     } else {
-        f.instruction(&W::GlobalGet(abi::vfp_dhi_global(n)));
+        f.instruction(&W::GlobalGet(abi::vfp_qhi_global(n / 2)));
+        f.instruction(&W::I64x2ExtractLane(n & 1));
     }
 }
 
-/// Store the raw i64 on the stack into D`n` (splitting into its two S halves when
-/// n < 16). Uses the i64 scratch local.
+/// Store the raw i64 on the stack into D`n`. Low bank (n < 16): split into the two
+/// S halves. Upper bank (n >= 16): replace `i64x2` lane `n & 1` of quad `q(n/2)`,
+/// leaving the sibling D untouched. Uses the i64 scratch local.
 fn set_d_bits(f: &mut Function, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
         let lo = 2 * n;
@@ -398,7 +469,13 @@ fn set_d_bits(f: &mut Function, n: u8) {
         f.instruction(&W::I32WrapI64);
         f.instruction(&W::GlobalSet(abi::vfp_s_global(hi)));
     } else {
-        f.instruction(&W::GlobalSet(abi::vfp_dhi_global(n)));
+        // Read-modify-write the quad so the sibling D lane survives.
+        let q = abi::vfp_qhi_global(n / 2);
+        f.instruction(&W::LocalSet(L_D64));
+        f.instruction(&W::GlobalGet(q));
+        f.instruction(&W::LocalGet(L_D64));
+        f.instruction(&W::I64x2ReplaceLane(n & 1));
+        f.instruction(&W::GlobalSet(q));
     }
 }
 
@@ -450,6 +527,14 @@ fn emit_vfp(f: &mut Function, op: &crate::ir::VfpOp) {
             f.instruction(&W::GlobalGet(abi::vfp_s_global(*rm)));
             f.instruction(&W::GlobalSet(abi::vfp_s_global(*rd)));
         }
+        ScalarToCore { rt, s } => {
+            f.instruction(&W::GlobalGet(abi::vfp_s_global(*s)));
+            f.instruction(&W::GlobalSet(abi::reg_global(*rt as usize)));
+        }
+        CoreToScalar { s, rt } => {
+            f.instruction(&W::GlobalGet(abi::reg_global(*rt as usize)));
+            f.instruction(&W::GlobalSet(abi::vfp_s_global(*s)));
+        }
         SetImmS { s, bits } => {
             f.instruction(&W::I32Const(*bits as i32));
             f.instruction(&W::GlobalSet(abi::vfp_s_global(*s)));
@@ -462,9 +547,10 @@ fn emit_vfp(f: &mut Function, op: &crate::ir::VfpOp) {
                 f.instruction(&W::I32Const(*hi as i32));
                 f.instruction(&W::GlobalSet(abi::vfp_s_global(2 * d + 1)));
             } else {
+                // Upper-bank double: an i64 lane of the quad (set_d_bits does the RMW).
                 let bits = ((*hi as u64) << 32) | (*lo as u64);
                 f.instruction(&W::I64Const(bits as i64));
-                f.instruction(&W::GlobalSet(abi::vfp_dhi_global(*d)));
+                set_d_bits(f, *d);
             }
         }
         Cmp32 { rn, rm } => emit_vfp_cmp(f, *rn, *rm),
@@ -554,17 +640,383 @@ fn emit_vfp_mem(f: &mut Function, reg: crate::ir::VfpReg, addr: &Value, load: bo
     }
 }
 
-/// N,Z,C,V for `a + b + cin`. Uses i64 for an always-correct unsigned carry.
-fn emit_flags_add(f: &mut Function, a: &Value, b: &Value, cin: u32, base: u32) {
+// --- NEON data-processing emission ----------------------------------------
+//
+// Every NEON operand is materialized as a wasm `v128`; a `D` register uses the low
+// 64 bits. The register banks are handled by `neon_get`/`neon_set` (see the model
+// in `abi`): the upper bank Q8..Q15 are `v128` globals accessed directly, the low
+// bank is assembled from / scattered to the `s` globals. The widening family maps
+// onto the wasm `extend_low` / `extmul_low` / `extadd_pairwise` primitives, which
+// widen the low 64 bits of a `v128` - exactly the NEON long/wide semantics.
+
+/// Push NEON register `reg` as a `v128` (a `D` lands in the low 64 bits).
+fn neon_get(f: &mut Function, reg: crate::ir::NeonReg) {
+    use crate::ir::NeonReg::*;
+    match reg {
+        Q(k) => {
+            if (k as usize) >= abi::VFP_Q_HI_FIRST {
+                f.instruction(&W::GlobalGet(abi::vfp_qhi_global(k)));
+            } else {
+                // Low bank: assemble the quad from its four aliased S registers.
+                let s = 4 * k;
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(s)));
+                f.instruction(&W::I32x4Splat);
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 1)));
+                f.instruction(&W::I32x4ReplaceLane(1));
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 2)));
+                f.instruction(&W::I32x4ReplaceLane(2));
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 3)));
+                f.instruction(&W::I32x4ReplaceLane(3));
+            }
+        }
+        D(n) => {
+            get_d_bits(f, n);
+            f.instruction(&W::I64x2Splat);
+        }
+    }
+}
+
+/// Store the `v128` on the stack into NEON register `reg`. A `Q` writes all 128
+/// bits; a `D` writes only the low 64 (leaving the sibling half of an upper-bank
+/// quad intact). Uses the `L_V128A` scratch to fan a low-bank quad out to its S
+/// halves (safe: any staged operands are already consumed by this point).
+fn neon_set(f: &mut Function, reg: crate::ir::NeonReg) {
+    use crate::ir::NeonReg::*;
+    match reg {
+        Q(k) => {
+            if (k as usize) >= abi::VFP_Q_HI_FIRST {
+                f.instruction(&W::GlobalSet(abi::vfp_qhi_global(k)));
+            } else {
+                let s = 4 * k;
+                f.instruction(&W::LocalSet(L_V128A));
+                for lane in 0..4u8 {
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::I32x4ExtractLane(lane));
+                    f.instruction(&W::GlobalSet(abi::vfp_s_global(s + lane)));
+                }
+            }
+        }
+        D(n) => {
+            f.instruction(&W::I64x2ExtractLane(0));
+            set_d_bits(f, n);
+        }
+    }
+}
+
+/// Lanewise `i{bits}x{n}.add`.
+fn simd_add(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Add,
+        16 => W::I16x8Add,
+        32 => W::I32x4Add,
+        64 => W::I64x2Add,
+        _ => unreachable!("neon add width {bits}"),
+    }
+}
+
+/// Lanewise `i{bits}x{n}.sub`.
+fn simd_sub(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Sub,
+        16 => W::I16x8Sub,
+        32 => W::I32x4Sub,
+        64 => W::I64x2Sub,
+        _ => unreachable!("neon sub width {bits}"),
+    }
+}
+
+/// Lanewise `i{bits}x{n}.mul` (undefined for 8-bit: wasm has no `i8x16.mul`).
+fn simd_mul(bits: u8) -> W<'static> {
+    match bits {
+        16 => W::I16x8Mul,
+        32 => W::I32x4Mul,
+        64 => W::I64x2Mul,
+        _ => unreachable!("neon mul width {bits}"),
+    }
+}
+
+/// Lanewise signed/unsigned min.
+fn simd_min(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I8x16MinS,
+        (8, false) => W::I8x16MinU,
+        (16, true) => W::I16x8MinS,
+        (16, false) => W::I16x8MinU,
+        (32, true) => W::I32x4MinS,
+        (32, false) => W::I32x4MinU,
+        _ => unreachable!("neon min width {bits}"),
+    }
+}
+
+/// Lanewise signed/unsigned max.
+fn simd_max(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I8x16MaxS,
+        (8, false) => W::I8x16MaxU,
+        (16, true) => W::I16x8MaxS,
+        (16, false) => W::I16x8MaxU,
+        (32, true) => W::I32x4MaxS,
+        (32, false) => W::I32x4MaxU,
+        _ => unreachable!("neon max width {bits}"),
+    }
+}
+
+/// Lanewise integer abs / neg.
+fn simd_abs(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Abs,
+        16 => W::I16x8Abs,
+        32 => W::I32x4Abs,
+        64 => W::I64x2Abs,
+        _ => unreachable!("neon abs width {bits}"),
+    }
+}
+fn simd_neg(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Neg,
+        16 => W::I16x8Neg,
+        32 => W::I32x4Neg,
+        64 => W::I64x2Neg,
+        _ => unreachable!("neon neg width {bits}"),
+    }
+}
+
+/// Widen the low half of a `v128` from `bits`-wide elements to `2*bits` (signed or
+/// unsigned zero/sign extension).
+fn simd_extend_low(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I16x8ExtendLowI8x16S,
+        (8, false) => W::I16x8ExtendLowI8x16U,
+        (16, true) => W::I32x4ExtendLowI16x8S,
+        (16, false) => W::I32x4ExtendLowI16x8U,
+        (32, true) => W::I64x2ExtendLowI32x4S,
+        (32, false) => W::I64x2ExtendLowI32x4U,
+        _ => unreachable!("neon extend width {bits}"),
+    }
+}
+
+/// Widen-and-multiply the low halves of two `v128`s (`bits` -> `2*bits`).
+fn simd_extmul_low(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I16x8ExtMulLowI8x16S,
+        (8, false) => W::I16x8ExtMulLowI8x16U,
+        (16, true) => W::I32x4ExtMulLowI16x8S,
+        (16, false) => W::I32x4ExtMulLowI16x8U,
+        (32, true) => W::I64x2ExtMulLowI32x4S,
+        (32, false) => W::I64x2ExtMulLowI32x4U,
+        _ => unreachable!("neon extmul width {bits}"),
+    }
+}
+
+/// Pairwise-add adjacent `bits`-wide elements, widening to `2*bits` (8->16 or
+/// 16->32 only; wasm has no 32->64 form).
+fn simd_extadd_pairwise(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I16x8ExtAddPairwiseI8x16S,
+        (8, false) => W::I16x8ExtAddPairwiseI8x16U,
+        (16, true) => W::I32x4ExtAddPairwiseI16x8S,
+        (16, false) => W::I32x4ExtAddPairwiseI16x8U,
+        _ => unreachable!("neon extadd-pairwise width {bits}"),
+    }
+}
+
+fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt) {
+    use crate::ir::NeonStmt::*;
+    match op {
+        Bin { op: bop, ty, dst, a, b } => {
+            use crate::ir::NeonBin::*;
+            match bop {
+                Add | Sub | Mul => {
+                    neon_get(f, *a);
+                    neon_get(f, *b);
+                    f.instruction(&match bop {
+                        Add => simd_add(ty.bits),
+                        Sub => simd_sub(ty.bits),
+                        _ => simd_mul(ty.bits),
+                    });
+                    neon_set(f, *dst);
+                }
+                Max | Min => {
+                    neon_get(f, *a);
+                    neon_get(f, *b);
+                    f.instruction(&if matches!(bop, Max) {
+                        simd_max(ty.bits, ty.signed)
+                    } else {
+                        simd_min(ty.bits, ty.signed)
+                    });
+                    neon_set(f, *dst);
+                }
+                Abd => {
+                    // |a - b| = max(a, b) - min(a, b), avoiding the overflow of a
+                    // straight sub-then-abs. Both operands are read twice.
+                    neon_get(f, *a);
+                    f.instruction(&W::LocalSet(L_V128A));
+                    neon_get(f, *b);
+                    f.instruction(&W::LocalSet(L_V128B));
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::LocalGet(L_V128B));
+                    f.instruction(&simd_max(ty.bits, ty.signed));
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::LocalGet(L_V128B));
+                    f.instruction(&simd_min(ty.bits, ty.signed));
+                    f.instruction(&simd_sub(ty.bits));
+                    neon_set(f, *dst);
+                }
+            }
+        }
+        MulAcc { ty, dst, a, b, sub } => {
+            neon_get(f, *dst);
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&simd_mul(ty.bits));
+            f.instruction(&if *sub { simd_sub(ty.bits) } else { simd_add(ty.bits) });
+            neon_set(f, *dst);
+        }
+        PairAdd { ty, dst, a, b } => {
+            // No wasm horizontal add: gather the even and odd source elements of the
+            // (a : b) concatenation with two shuffles, then add. `a` is source bytes
+            // 0..16, `b` is 16..32.
+            let ebytes = (ty.bits / 8) as usize;
+            let cnt = 8 / ebytes; // elements per D register
+            let mut xmask = [0u8; 16];
+            let mut ymask = [0u8; 16];
+            for k in 0..cnt {
+                let (src_base, within) =
+                    if k < cnt / 2 { (0usize, k) } else { (16usize, k - cnt / 2) };
+                let even = src_base + (2 * within) * ebytes;
+                let odd = src_base + (2 * within + 1) * ebytes;
+                for j in 0..ebytes {
+                    xmask[k * ebytes + j] = (even + j) as u8;
+                    ymask[k * ebytes + j] = (odd + j) as u8;
+                }
+            }
+            neon_get(f, *a);
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *b);
+            f.instruction(&W::LocalSet(L_V128B));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(xmask));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(ymask));
+            f.instruction(&simd_add(ty.bits));
+            neon_set(f, *dst);
+        }
+        Widen { ty, dst, a } => {
+            neon_get(f, *a);
+            f.instruction(&simd_extend_low(ty.bits, ty.signed));
+            neon_set(f, *dst);
+        }
+        WideAddSub { sub, wide, ty, dst, a, b } => {
+            // Wide form: `a` is already a Q of 2*bits elements; long form: widen `a`.
+            neon_get(f, *a);
+            if !wide {
+                f.instruction(&simd_extend_low(ty.bits, ty.signed));
+            }
+            neon_get(f, *b);
+            f.instruction(&simd_extend_low(ty.bits, ty.signed));
+            f.instruction(&if *sub { simd_sub(ty.bits * 2) } else { simd_add(ty.bits * 2) });
+            neon_set(f, *dst);
+        }
+        WideMul { acc, sub, ty, dst, a, b } => {
+            if *acc {
+                neon_get(f, *dst);
+            }
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&simd_extmul_low(ty.bits, ty.signed));
+            if *acc {
+                f.instruction(&if *sub { simd_sub(ty.bits * 2) } else { simd_add(ty.bits * 2) });
+            }
+            neon_set(f, *dst);
+        }
+        WideAbd { acc, ty, dst, a, b } => {
+            let w = ty.bits * 2;
+            neon_get(f, *a);
+            f.instruction(&simd_extend_low(ty.bits, ty.signed));
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *b);
+            f.instruction(&simd_extend_low(ty.bits, ty.signed));
+            f.instruction(&W::LocalSet(L_V128B));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&simd_max(w, ty.signed));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&simd_min(w, ty.signed));
+            f.instruction(&simd_sub(w));
+            if *acc {
+                f.instruction(&W::LocalSet(L_V128A));
+                neon_get(f, *dst);
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&simd_add(w));
+            }
+            neon_set(f, *dst);
+        }
+        PairLong { acc, ty, dst, a } => {
+            neon_get(f, *a);
+            f.instruction(&simd_extadd_pairwise(ty.bits, ty.signed));
+            if *acc {
+                f.instruction(&W::LocalSet(L_V128A));
+                neon_get(f, *dst);
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&simd_add(ty.bits * 2));
+            }
+            neon_set(f, *dst);
+        }
+        Unary { neg, ty, dst, a } => {
+            neon_get(f, *a);
+            f.instruction(&if ty.float {
+                if *neg { W::F32x4Neg } else { W::F32x4Abs }
+            } else if *neg {
+                simd_neg(ty.bits)
+            } else {
+                simd_abs(ty.bits)
+            });
+            neon_set(f, *dst);
+        }
+        MovImm { ty, dst, imm } => {
+            let mut bytes = [0u8; 16];
+            match ty.bits {
+                8 => bytes = [*imm as u8; 16],
+                16 => {
+                    let h = (*imm as u16).to_le_bytes();
+                    for i in 0..8 {
+                        bytes[2 * i] = h[0];
+                        bytes[2 * i + 1] = h[1];
+                    }
+                }
+                32 => {
+                    let w = imm.to_le_bytes();
+                    for i in 0..4 {
+                        bytes[4 * i..4 * i + 4].copy_from_slice(&w);
+                    }
+                }
+                _ => unreachable!("neon vmov.i width {}", ty.bits),
+            }
+            f.instruction(&W::V128Const(i128::from_le_bytes(bytes)));
+            neon_set(f, *dst);
+        }
+    }
+}
+
+/// N,Z,C,V for `a + b + cin`. `cin` is a runtime value (0 or 1) - an immediate for
+/// add/sub/cmp, the C flag for adc/sbc. Uses i64 for an always-correct unsigned
+/// carry. `cin` is emitted once into a local, since a flag read must not be
+/// duplicated if it ever had a cost.
+fn emit_flags_add(f: &mut Function, a: &Value, b: &Value, cin: &Value, base: u32) {
     emit_value(f, a, base);
     f.instruction(&W::LocalSet(L_T0)); // a
     emit_value(f, b, base);
     f.instruction(&W::LocalSet(L_T1)); // b
+    emit_value(f, cin, base);
+    f.instruction(&W::LocalSet(L_T3)); // cin
     // res = a + b + cin
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::LocalGet(L_T1));
     f.instruction(&W::I32Add);
-    f.instruction(&W::I32Const(cin as i32));
+    f.instruction(&W::LocalGet(L_T3));
     f.instruction(&W::I32Add);
     f.instruction(&W::LocalSet(L_T2)); // res
     // Z = res == 0
@@ -582,7 +1034,8 @@ fn emit_flags_add(f: &mut Function, a: &Value, b: &Value, cin: u32, base: u32) {
     f.instruction(&W::LocalGet(L_T1));
     f.instruction(&W::I64ExtendI32U);
     f.instruction(&W::I64Add);
-    f.instruction(&W::I64Const(cin as i64));
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::I64ExtendI32U);
     f.instruction(&W::I64Add);
     f.instruction(&W::I64Const(32));
     f.instruction(&W::I64ShrU);
@@ -622,6 +1075,14 @@ fn emit_value(f: &mut Function, v: &Value, base: u32) {
             emit_value(f, a, base);
             f.instruction(&W::I32Const(-1));
             f.instruction(&W::I32Xor);
+        }
+        Value::Flag(flag) => {
+            // Flag globals hold 0 or 1, so a plain read is the flag's value.
+            f.instruction(&W::GlobalGet(abi::flag_global(*flag)));
+        }
+        Value::Clz(a) => {
+            emit_value(f, a, base);
+            f.instruction(&W::I32Clz);
         }
         Value::Bin(op, a, b) => {
             emit_value(f, a, base);

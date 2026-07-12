@@ -11,6 +11,15 @@ pub mod lib {
     pub const SCE_DISPLAY_USER: u32 = 0x4FAA_CD11;
     pub const SCE_CTRL: u32 = 0xD197_E3C7;
     pub const SCE_SYSMEM: u32 = 0x37FE_725A;
+    /// SceLibKernel: the user-facing libc/clib and process/thread wrappers
+    /// (sceClib*, sceKernelExitProcess, sceKernelCreateThread, ...).
+    pub const SCE_LIB_KERNEL: u32 = 0xCAE9_ACE6;
+    /// SceThreadmgr: the thread-manager primitives (sceKernelDelayThread, ...).
+    pub const SCE_THREADMGR: u32 = 0x859A_24B1;
+    /// SceIofilemgr: the file IO library (sceIoRead/Write/Close/Lseek32). Note the
+    /// user-facing sceIoOpen/Lseek/Getstat/Mkdir/Remove live under SceLibKernel;
+    /// dispatch is by func NID, so the split is only cosmetic.
+    pub const SCE_IO_FILEMGR: u32 = 0xF2FF_276E;
 }
 
 /// SceGxm function NIDs.
@@ -67,10 +76,90 @@ pub mod sysmem {
     pub const GET_MEM_BLOCK_BASE: u32 = 0xB8EF_5818;
 }
 
+/// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
+/// process/thread wrappers. NIDs are facts from the MIT vita-headers database.
+pub mod libkernel {
+    // clib print family.
+    pub const CLIB_PRINTF: u32 = 0xFA26_BC62;
+    pub const CLIB_VPRINTF: u32 = 0x5EA3_B6CE;
+    pub const CLIB_SNPRINTF: u32 = 0x8CBA_03D5;
+    pub const CLIB_VSNPRINTF: u32 = 0xFA6B_E467;
+    // clib memory/string family (pure, everything uses them).
+    pub const CLIB_MEMCPY: u32 = 0x14E9_DBD7;
+    pub const CLIB_MEMMOVE: u32 = 0x7367_53C8;
+    pub const CLIB_MEMSET: u32 = 0x6329_80D7;
+    pub const CLIB_MEMCMP: u32 = 0x9CC2_BFDF;
+    pub const CLIB_STRNLEN: u32 = 0xAC59_5E68;
+    pub const CLIB_STRNCPY: u32 = 0xC458_D60A;
+    pub const CLIB_STRNCMP: u32 = 0x660D_1F6D;
+    pub const CLIB_STRCMP: u32 = 0xA2FB_4D9D;
+    // process control.
+    pub const EXIT_PROCESS: u32 = 0x7595_D9AA;
+    // thread wrappers (user-facing; the ThreadMgr primitives back them).
+    pub const CREATE_THREAD: u32 = 0xC5C1_1EE7;
+    pub const START_THREAD: u32 = 0xF08D_E149;
+    pub const WAIT_THREAD_END: u32 = 0xDDB3_95A9;
+    pub const GET_THREAD_ID: u32 = 0x0FB9_72F9;
+}
+
+/// SceThreadmgr function NIDs: thread-manager primitives not wrapped in
+/// SceLibKernel.
+pub mod threadmgr {
+    pub const DELAY_THREAD: u32 = 0x4B67_5D05;
+    pub const EXIT_DELETE_THREAD: u32 = 0x1D17_DECF;
+    pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
+}
+
+/// File IO (SceIoFilemgr). Function NIDs span SceIofilemgr (read/write/close/
+/// lseek32) and SceLibKernel (open/lseek/getstat/mkdir/remove); grouped by concept
+/// here since dispatch is by func NID.
+pub mod iofilemgr {
+    pub const IO_OPEN: u32 = 0x6C60_AC61;
+    pub const IO_CLOSE: u32 = 0xC70B_8886;
+    pub const IO_READ: u32 = 0xFDB3_2293;
+    pub const IO_WRITE: u32 = 0x34EF_D876;
+    pub const IO_LSEEK: u32 = 0x99BA_173E;
+    pub const IO_LSEEK32: u32 = 0x4925_2B9B;
+    pub const IO_GETSTAT: u32 = 0xBCA5_B623;
+    pub const IO_MKDIR: u32 = 0x9670_D39F;
+    pub const IO_REMOVE: u32 = 0xE20E_D0F3;
+}
+
+/// Synchronization primitives (mutex, semaphore, event flag) and system time.
+/// Function NIDs span SceLibKernel (the create/lock/wait wrappers) and
+/// SceThreadmgr (unlock/signal/set/clear/delete); dispatch is by func NID, so
+/// they are grouped by concept here rather than by module.
+pub mod sync {
+    pub const CREATE_MUTEX: u32 = 0xED53_334A;
+    pub const LOCK_MUTEX: u32 = 0x1D8D_7945;
+    pub const TRY_LOCK_MUTEX: u32 = 0x72FC_1F54;
+    pub const UNLOCK_MUTEX: u32 = 0x1A37_2EC8;
+    pub const DELETE_MUTEX: u32 = 0xCB78_710D;
+    pub const CREATE_SEMA: u32 = 0x1BD6_7366;
+    pub const WAIT_SEMA: u32 = 0x0C7B_834B;
+    pub const SIGNAL_SEMA: u32 = 0xE6B7_61D1;
+    pub const DELETE_SEMA: u32 = 0xDB32_948A;
+    pub const CREATE_EVENT_FLAG: u32 = 0x8516_D040;
+    pub const SET_EVENT_FLAG: u32 = 0xEC94_DFF7;
+    pub const WAIT_EVENT_FLAG: u32 = 0x83C0_E2AF;
+    pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
+    pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
+    pub const GET_SYSTEM_TIME_WIDE: u32 = 0xF4EE_4FA9;
+    // Condition variables (SceLibKernel create/wait + SceThreadmgr signal/delete).
+    pub const CREATE_COND: u32 = 0x5057_2FDA;
+    pub const WAIT_COND: u32 = 0xC88D_44AD;
+    pub const SIGNAL_COND: u32 = 0x6ED2_E2DC;
+    pub const SIGNAL_COND_ALL: u32 = 0xC2E7_AC22;
+    pub const DELETE_COND: u32 = 0x879E_6EBD;
+}
+
 /// A human-readable name for a `(library_nid, func_nid)` pair, for logging and
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
-    use {ctrl as c, display as d, gxm as g, sysmem as s};
+    use {
+        ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk, sync as sy,
+        sysmem as s, threadmgr as tm,
+    };
     match func_nid {
         g::INITIALIZE => "sceGxmInitialize",
         g::TERMINATE => "sceGxmTerminate",
@@ -110,6 +199,55 @@ pub fn name(func_nid: u32) -> &'static str {
         c::PEEK_BUFFER_POSITIVE => "sceCtrlPeekBufferPositive",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
+        lk::CLIB_PRINTF => "sceClibPrintf",
+        lk::CLIB_VPRINTF => "sceClibVprintf",
+        lk::CLIB_SNPRINTF => "sceClibSnprintf",
+        lk::CLIB_VSNPRINTF => "sceClibVsnprintf",
+        lk::CLIB_MEMCPY => "sceClibMemcpy",
+        lk::CLIB_MEMMOVE => "sceClibMemmove",
+        lk::CLIB_MEMSET => "sceClibMemset",
+        lk::CLIB_MEMCMP => "sceClibMemcmp",
+        lk::CLIB_STRNLEN => "sceClibStrnlen",
+        lk::CLIB_STRNCPY => "sceClibStrncpy",
+        lk::CLIB_STRNCMP => "sceClibStrncmp",
+        lk::CLIB_STRCMP => "sceClibStrcmp",
+        lk::EXIT_PROCESS => "sceKernelExitProcess",
+        lk::CREATE_THREAD => "sceKernelCreateThread",
+        lk::START_THREAD => "sceKernelStartThread",
+        lk::WAIT_THREAD_END => "sceKernelWaitThreadEnd",
+        lk::GET_THREAD_ID => "sceKernelGetThreadId",
+        io::IO_OPEN => "sceIoOpen",
+        io::IO_CLOSE => "sceIoClose",
+        io::IO_READ => "sceIoRead",
+        io::IO_WRITE => "sceIoWrite",
+        io::IO_LSEEK => "sceIoLseek",
+        io::IO_LSEEK32 => "sceIoLseek32",
+        io::IO_GETSTAT => "sceIoGetstat",
+        io::IO_MKDIR => "sceIoMkdir",
+        io::IO_REMOVE => "sceIoRemove",
+        tm::DELAY_THREAD => "sceKernelDelayThread",
+        tm::EXIT_DELETE_THREAD => "sceKernelExitDeleteThread",
+        tm::EXIT_THREAD => "sceKernelExitThread",
+        sy::CREATE_MUTEX => "sceKernelCreateMutex",
+        sy::LOCK_MUTEX => "sceKernelLockMutex",
+        sy::TRY_LOCK_MUTEX => "sceKernelTryLockMutex",
+        sy::UNLOCK_MUTEX => "sceKernelUnlockMutex",
+        sy::DELETE_MUTEX => "sceKernelDeleteMutex",
+        sy::CREATE_SEMA => "sceKernelCreateSema",
+        sy::WAIT_SEMA => "sceKernelWaitSema",
+        sy::SIGNAL_SEMA => "sceKernelSignalSema",
+        sy::DELETE_SEMA => "sceKernelDeleteSema",
+        sy::CREATE_EVENT_FLAG => "sceKernelCreateEventFlag",
+        sy::SET_EVENT_FLAG => "sceKernelSetEventFlag",
+        sy::WAIT_EVENT_FLAG => "sceKernelWaitEventFlag",
+        sy::CLEAR_EVENT_FLAG => "sceKernelClearEventFlag",
+        sy::DELETE_EVENT_FLAG => "sceKernelDeleteEventFlag",
+        sy::GET_SYSTEM_TIME_WIDE => "sceKernelGetSystemTimeWide",
+        sy::CREATE_COND => "sceKernelCreateCond",
+        sy::WAIT_COND => "sceKernelWaitCond",
+        sy::SIGNAL_COND => "sceKernelSignalCond",
+        sy::SIGNAL_COND_ALL => "sceKernelSignalCondAll",
+        sy::DELETE_COND => "sceKernelDeleteCond",
         _ => "<unknown>",
     }
 }

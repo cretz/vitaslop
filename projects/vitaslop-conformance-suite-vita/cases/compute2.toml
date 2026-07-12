@@ -1,0 +1,18 @@
+category = "vita"
+description = "integer compute 2: byte reverse, sign/zero extend, mla, bitfield - RUNNABLE"
+
+# Source: ../compute2-src/compute2.c (clean-room, -nostdlib, volatile inputs). A
+# second CPU-core probe for the bit/byte-manipulation instructions ordinary C
+# emits: REV/REV16, SXTB/UXTB/SXTH, MLA, UBFX. Surfaced them as transpiler gaps;
+# now lifted and qemu-certified (arm suite thumb_rev/rev16/sxtb/uxtb/sxth/mla/ubfx,
+# plus sbfx). Executable form: tests/vita_compute2.rs.
+[out]
+output = """
+rev: 0x44332211
+rev16: 0xcdab
+sxtb: -101
+uxtb: 155
+sxth: -101
+mla: 142
+ubfx: 43
+"""

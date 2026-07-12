@@ -41,6 +41,58 @@ point here.
   vita-headers NID database once the hand-written pattern is proven. Generate the
   glue, never behavior. No monolithic trait of thousands of methods.
 
+## Host module surface (`vita/`)
+
+One file per Sce* module, each exposing `try_dispatch`. Beyond the cube's GXM /
+sysmem / display / ctrl handlers, `libkernel` and `threadmgr` cover a plain C
+program:
+
+- **Variadic calls** (`sceClibPrintf`, `sceClibSnprintf`): the fixed-signature
+  `#[hostcall]` macro cannot express these, so they are hand-written and drive the
+  shared C formatter (`vita/cfmt`). The formatter walks the variadic tail per
+  AAPCS: variadic args are always marshaled as for the base standard (no VFP), so
+  every argument is in the core registers then on the stack, and a `double`/`long
+  long` takes an 8-byte-aligned (even word-index) slot. `cfmt` models this as a
+  word cursor over `GuestCtx::arg`. Verified against real arm-vita-eabi-gcc output
+  (the hello corpus), so the double-in-core-registers promotion is proven, not
+  assumed. Formatter output (debug console) accumulates in `Capture::stdout`.
+- **Pure clib** (memcpy/memset/memcmp/strnlen/strncpy/strcmp/strncmp): ordinary
+  `#[hostcall]` handlers over `GuestCtx` memory. Note `#[hostcall]` inlines the
+  body into a `()` wrapper, so handlers must be expression-bodied - an early
+  `return` would escape the wrapper, not the handler.
+- **Process control**: `sceKernelExitProcess` returns `SvcOutcome::Halt`, the
+  clean run-ending signal (replacing the cube's halt-on-terminate hack).
+- **File IO** (`vita/iofilemgr`): `sceIoOpen/Read/Write/Lseek/Lseek32/Close/
+  Getstat/Mkdir/Remove` over a host virtual filesystem (a path->bytes map in
+  `VitaState`). Read files are preloaded by the harness (`VitaState::add_file`);
+  write opens create/truncate entries. **fd 1/2 are the captured console** -
+  `sceIoWrite(1, ..)` is the sink newlib's stdout resolves to, so it lands in
+  `Capture::stdout` alongside `sceClibPrintf`. `sceIoLseek` is hand-written (its
+  64-bit `SceOff` offset takes the r2:r3 pair and returns in r0:r1, past the
+  macro's 32-bit value model). Deterministic and host-only - no real filesystem
+  is touched.
+
+## Guest re-entry (thread entry, callbacks)
+
+Some host calls must run *guest* code: a thread's entry, a GXM ring callback. The
+engine-agnostic runtime cannot itself re-enter the wasm engine, so it records the
+intent and the engine host performs the call:
+
+- `sceKernelCreateThread` allocates the thread its own stack and records
+  `{entry, stack_top}`; `sceKernelStartThread` raises a `Reentry` (via
+  `VitaState::start_thread`).
+- After each dispatch the engine host drains `ImportDispatch::take_reentry`. The
+  native `Vm` **saves the whole register file**, seeds r0/r1/sp for the entry,
+  calls the transpiled `f_<entry>` to completion, captures its r0, then **restores
+  the register file** - so the re-entry is transparent to the interrupted thread.
+  The result flows back through `set_thread_exit`, and `sceKernelWaitThreadEnd`
+  reads it. Bring-up model: one thread of control, workers run synchronously at
+  start (a valid cooperative serialization); preemptive multi-thread scheduling
+  over fibers is future work (see Concurrency model).
+- The thread entry is *address-taken* (a function pointer, never directly called),
+  so the transpiler must discover it as a **code pointer**, not via the direct-
+  call closure - see the transpiler README.
+
 ## Handles vs heap (kept distinct)
 
 - **Heap** = the single shared linear guest arena. Hot path. Native wasm
@@ -103,6 +155,17 @@ point here.
   (only the main thread exists so far), and the browser mechanism (JSPI or
   Asyncify - the browser guest is its own WebAssembly instance and cannot suspend
   mid-call the way a wasmtime fiber can).
+- **Sync primitives** (`vita/sync`, dual-mode): mutex, semaphore, event flag, and
+  condition variable. Single-thread bring-up: uncontended success (a wait floors
+  the count / assumes the bits set), correct for one thread of control plus
+  synchronous workers. Preemptive: a wait that cannot proceed returns
+  `SvcOutcome::Block` and is woken by a sibling's signal/unlock. A **condition
+  variable** is the subtle one - its wait releases the associated mutex (handing
+  it to any mutex waiter) and parks; a signal transfers each woken waiter to the
+  mutex (taken now if free, else queued behind the owner), so it re-acquires the
+  mutex before running. A cond has no memory, so a lost signal is a real hazard
+  (the signal must come from a thread that runs after the waiter parks) - see
+  `cond-src/cond.c` / `tests/vita_cond.rs`.
 - **Locks, not spinlocks**: our primitives use shared-memory atomics with
   wait/notify. We never busy-spin the host.
 - **Determinism by construction**: scheduling order and allocation addresses are

@@ -272,16 +272,18 @@ const FLAG_ORDER: [abi::Flag; abi::FLAG_COUNT] =
 /// Write back regs already done by the caller; turn a host outcome into the
 /// closure's return, throwing the halt sentinel to unwind the guest call.
 fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> Result<(), JsValue> {
+    use vitaslop_runtime::SvcOutcome;
     match outcome {
-        vitaslop_runtime::SvcOutcome::Halt => {
+        // A worker ending is the process ending on this single-worker path.
+        SvcOutcome::Halt | SvcOutcome::ThreadExit => {
             *halted.borrow_mut() = true;
             Err(halt_sentinel())
         }
-        vitaslop_runtime::SvcOutcome::Continue => Ok(()),
         // This run-to-completion path has no scheduler to yield to, so a blocking
-        // hint just keeps running (identical to the native sync Vm). The browser's
-        // cooperative-scheduler path will handle Yield distinctly.
-        vitaslop_runtime::SvcOutcome::Yield => Ok(()),
+        // hint (Yield at a flip, or a would-block wait) just keeps running,
+        // identical to the native sync Vm. The browser's cooperative-scheduler path
+        // will handle these distinctly.
+        SvcOutcome::Continue | SvcOutcome::Yield | SvcOutcome::Block => Ok(()),
     }
 }
 

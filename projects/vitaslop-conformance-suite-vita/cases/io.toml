@@ -1,0 +1,21 @@
+category = "vita"
+description = "SceIoFilemgr file IO over the host virtual filesystem - RUNNABLE"
+
+# Source: ../io-src/io.c (clean-room, -nostdlib). Drives the file-IO host module
+# end to end: sceIoWrite to fd 1 (the newlib-stdout sink), sceIoOpen/Read/Getstat
+# on a preloaded read-only asset (app0:/asset.bin = bytes 1..=10), and
+# create/write then reopen/lseek/read-back on a guest-produced file, plus a
+# missing-file open that fails. Every result is printed through sceClibPrintf, so
+# the golden is a deterministic transcript. Executable form: tests/vita_io.rs
+# (the harness preloads the asset before the run). Built -fno-tree-vectorize so
+# the byte-sum loop is not auto-vectorized into (not-yet-lifted) NEON.
+[out]
+output = """
+hello io
+open asset: ok=1
+read: n=10 sum=55
+getstat: ret=0 size=10
+open write: ok=1
+seek: pos=4 tail=[slop]
+missing: failed=1
+"""

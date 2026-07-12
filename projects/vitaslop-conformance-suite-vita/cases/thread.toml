@@ -1,0 +1,19 @@
+category = "vita"
+description = "create/start/wait threading over real Vita NID imports - RUNNABLE"
+
+# Source: ../thread-src/thread.c (clean-room, -nostdlib). main creates a thread,
+# starts it with an argument (14), and collects its return value (14*3 = 42)
+# through sceKernelWaitThreadEnd. Proves two hard mechanisms:
+#   - code-pointer discovery: `worker` is address-taken (passed to
+#     sceKernelCreateThread), never directly called, so the transpiler finds it
+#     via the movw/movt materialization, not the direct-call closure; and
+#   - guest re-entry: the host runs the worker's own guest code (its printf line
+#     appears) synchronously at start, transparently to the main thread.
+# Executable form: tests/vita_thread.rs.
+[out]
+output = """
+main: creating thread
+main: thid ok=1
+worker: got 14
+main: worker returned 42
+"""

@@ -39,6 +39,10 @@ impl Engine for WebEngine {
             externs: &[],
             noreturn_svc: NORETURN_SVC,
             mem_bytes: MEM_BYTES,
+            // The ARM corpus is tightly controlled and takes no function
+            // addresses; keep discovery off so output matches the native runner.
+            discover_code_pointers: false,
+            import_memory: false,
         })
         .map_err(|e| format!("transpile: {e:?}"))?;
 

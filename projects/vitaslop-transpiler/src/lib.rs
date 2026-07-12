@@ -42,6 +42,19 @@ pub struct Program<'a> {
     /// Total guest memory to provision, in bytes from `base`. The host keeps all
     /// guest allocations (image, stack, heap) within `[base, base + mem_bytes)`.
     pub mem_bytes: u32,
+    /// Also discover address-taken code pointers (functions materialized via
+    /// `movw`/`movt` but never directly called - e.g. a thread entry passed to
+    /// sceKernelCreateThread). Such candidates are transpiled tentatively: one
+    /// that fails to decode is skipped, so a mis-identified constant can never
+    /// break the build. Vita modules set this; the tightly controlled ARM
+    /// conformance corpus leaves it off so its output stays exactly as before.
+    pub discover_code_pointers: bool,
+    /// Import a shared linear memory (`env.memory`) instead of defining one, so
+    /// several instances of this module can share one guest address space while
+    /// keeping independent register globals. Only the preemptive multi-thread
+    /// scheduler (`vitaslop_native::ThreadedScheduler`) needs this; every single-
+    /// instance host leaves it off and gets the original self-contained module.
+    pub import_memory: bool,
 }
 
 /// A guest address that dispatches to a host import (the Vita NID mechanism): a
@@ -86,22 +99,34 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         program.externs.iter().map(|e| (e.addr, e.import)).collect();
     let imports = Imports::new(&import_map);
 
-    // Discover the transitive direct-call closure from the entries.
+    // Discover the transitive closure from the entries: direct callees are hard
+    // (a decode failure is a real bug and propagates), while address-taken code
+    // pointers are tentative (a mis-identified constant that fails to decode is
+    // silently skipped, never breaking the build).
     let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
-    let mut work: Vec<u32> = program.entries.to_vec();
-    while let Some(addr) = work.pop() {
+    // (address, tentative).
+    let mut work: Vec<(u32, bool)> = program.entries.iter().map(|&a| (a, false)).collect();
+    while let Some((addr, tentative)) = work.pop() {
         if funcs.contains_key(&addr) {
             continue;
         }
-        let found = lower::discover(
+        let found = match lower::discover(
             program.code,
             program.base,
             addr,
             program.thumb,
             &imports,
             program.noreturn_svc,
-        )?;
-        work.extend(found.callees);
+            program.discover_code_pointers,
+        ) {
+            Ok(found) => found,
+            // A tentative code pointer that does not decode was not a function;
+            // drop it. A hard callee failure is a genuine error.
+            Err(_) if tentative => continue,
+            Err(e) => return Err(e),
+        };
+        work.extend(found.callees.into_iter().map(|a| (a, false)));
+        work.extend(found.code_pointers.into_iter().map(|a| (a, true)));
         funcs.insert(addr, found.func);
     }
 
@@ -114,7 +139,8 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let wasm = emit::emit_module(&ordered, &func_index, program.base, program.mem_bytes);
+    let wasm =
+        emit::emit_module(&ordered, &func_index, program.base, program.mem_bytes, program.import_memory);
     let funcs = ordered
         .iter()
         .map(|f| FuncExport {
@@ -146,6 +172,8 @@ mod tests {
             externs: &[],
             noreturn_svc: &[],
             mem_bytes: 0x20000,
+            discover_code_pointers: false,
+            import_memory: false,
         })
         .expect("transpile");
         assert!(!artifact.wasm.is_empty());
@@ -173,6 +201,8 @@ mod tests {
             externs: &[],
             noreturn_svc: &[],
             mem_bytes: 0x1_0000,
+            discover_code_pointers: false,
+            import_memory: false,
         })
         .expect("transpile memset");
         if let Err(e) = wasmparser::validate(&artifact.wasm) {
@@ -200,5 +230,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn import_memory_mode_imports_shared_memory_and_validates() {
+        // Same tiny ARM program, once self-contained and once importing a shared
+        // memory: both must validate, and only the shared build declares the
+        // `env.memory` import (shared, with a maximum).
+        let code: [u8; 8] = [
+            0x0d, 0x10, 0xa0, 0xe3, // mov r1, #13
+            0x00, 0x00, 0x00, 0xef, // svc #0
+        ];
+        let mk = |import_memory| {
+            transpile(&Program {
+                code: &code,
+                base: 0x10000,
+                thumb: false,
+                entries: &[0x10000],
+                externs: &[],
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory,
+            })
+            .expect("transpile")
+            .wasm
+        };
+
+        let plain = mk(false);
+        let shared = mk(true);
+        wasmparser::validate(&plain).expect("plain module valid");
+        wasmparser::validate(&shared).expect("shared-memory module valid");
+
+        // Walk imports: the shared build must import a shared memory named
+        // `env.memory`; the plain build must not import any memory.
+        let has_shared_mem_import = |wasm: &[u8]| {
+            use wasmparser::{Parser, Payload, TypeRef};
+            for payload in Parser::new(0).parse_all(wasm) {
+                if let Ok(Payload::ImportSection(reader)) = payload {
+                    for imp in reader.into_imports() {
+                        let imp = imp.unwrap();
+                        if let TypeRef::Memory(mt) = imp.ty {
+                            assert_eq!(imp.module, "env");
+                            assert_eq!(imp.name, "memory");
+                            assert!(mt.shared, "imported memory must be shared");
+                            assert!(mt.maximum.is_some(), "shared memory needs a maximum");
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        assert!(has_shared_mem_import(&shared), "shared build imports env.memory");
+        assert!(!has_shared_mem_import(&plain), "plain build imports no memory");
     }
 }

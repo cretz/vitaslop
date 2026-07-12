@@ -178,6 +178,10 @@ impl Scheduler {
             externs,
             noreturn_svc: &[],
             mem_bytes,
+            // Vita modules take function addresses (thread entries, callbacks).
+            discover_code_pointers: true,
+            // The single-worker scheduler is one instance with its own memory.
+            import_memory: false,
         })?;
         wasmparser::validate(&artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
@@ -344,7 +348,11 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                         set_vfp_caller(&mut caller, i, v);
                     }
                     match outcome {
-                        SvcOutcome::Halt => {
+                        // This single-worker scheduler runs one thread of control,
+                        // so a worker ending (`ThreadExit`) is the process ending,
+                        // same as `Halt`. Preemptive multithreading lives in the
+                        // `ThreadedScheduler`.
+                        SvcOutcome::Halt | SvcOutcome::ThreadExit => {
                             caller.data_mut().halted = true;
                             return Err(wasmtime::Error::msg("guest halted"));
                         }
@@ -361,7 +369,10 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                             }
                             YieldNow(false).await;
                         }
-                        SvcOutcome::Continue => {}
+                        // A single-worker run has no other thread to switch to, so
+                        // its uncontended waits never block; if one did, treat it as
+                        // Continue rather than deadlock.
+                        SvcOutcome::Continue | SvcOutcome::Block => {}
                     }
                     Ok(())
                 })

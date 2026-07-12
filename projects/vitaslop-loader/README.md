@@ -8,12 +8,31 @@ Parses a Vita executable into a Module the transpiler can consume: base address,
 entry point, segments, and resolved NID imports. Pure bounds-checked byte
 reading, no dependencies, wasm-clean.
 
-## Input format: velf (ET_SCE_RELEXEC)
+## Input formats: velf and SELF/fSELF
 
+- `load` accepts either a bare velf or a SELF/fSELF container (`eboot.bin`, the
+  form a shipped title actually is). It sniffs the `"SCE\0"` magic and unwraps
+  the container to the inner velf first, then parses that.
 - A velf is an ELF with the Sony relocatable-executable type plus NID import
-  tables. No crypto is involved (SELF/fself encryption is skipped).
-- Struct layouts are taken from the MIT vita-toolchain source, not reverse
-  engineered from binaries.
+  tables. No crypto or relocation is involved.
+- Struct layouts (velf and SELF) are taken from the MIT vita-toolchain source
+  (`sce-elf-defs.h`, `self.h`, `vita-make-fself.c`), not reverse engineered.
+
+### SELF/fSELF unwrap (`self.rs`)
+
+- A SELF is a small SCE header + a copy of the program headers + a per-segment
+  `segment_info` table + control info, then the segment payloads. We rebuild the
+  inner ELF from the segment table (handles both the verbatim uncompressed
+  layout and, in principle, scattered segments).
+- **Unencrypted fSELF is loadable, compressed or not** - both `vita-make-fself`
+  homebrew forms. Compressed segments are inflated by the loader's own
+  dependency-free zlib/DEFLATE (`inflate.rs`), so no zlib crate and still
+  wasm-clean. Encrypted segments (retail titles) return `EncryptedSelf`; a
+  segment that fails to inflate returns `CompressedSelf`. Retail decryption is
+  out of scope (no keys, license posture).
+- `vita-make-fself` patches `module_nid` (sha256 of the velf) into the copy, so
+  an unwrapped fSELF carries the real NID where the bare velf had a 0
+  placeholder - the one field that differs from the input velf.
 
 ## What it extracts, and the pitfalls
 
@@ -38,8 +57,12 @@ reading, no dependencies, wasm-clean.
 ## State and TODO
 
 - Validated against the committed conformance cube: import count, entry, and
-  segments match.
+  segments match. The same cube wrapped as an fSELF (`cube.eboot.bin`) unwraps to
+  the identical module (modulo `module_nid`) and runs the whole north-star path
+  end to end (`conformance-harness/tests/cube_eboot.rs`).
 - Relocations are not yet applied. Fine while the main module pins its fixed load
   address; needed for a non-fixed base.
-- Vita path (SELF/ELF plus real NID resolution) comes later; today the focus is
-  the velf the conformance artifact ships.
+- The built-in inflate (`inflate.rs`) is validated by round-trip tests against
+  real zlib output (stored/fixed/dynamic Huffman) and end to end by
+  `cube.eboot_c.bin`.
+- Encrypted retail SELF is intentionally out of scope (no keys, license posture).

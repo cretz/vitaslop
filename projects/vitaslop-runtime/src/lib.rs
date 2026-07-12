@@ -24,8 +24,8 @@ pub mod vita;
 pub mod world;
 
 pub use host::{
-    GuestCtx, GuestMemory, ImportDispatch, Ptr, SliceMemory, SvcDispatch, VitaEnv, VitaState,
-    VFP_ARG_COUNT,
+    GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory, SvcDispatch, VitaEnv,
+    VitaState, VFP_ARG_COUNT,
 };
 pub use world::{CtrlFrame, DeterministicWorld, Record, Replay, World, WorldEvent};
 
@@ -61,6 +61,22 @@ pub enum SvcOutcome {
     /// completion conformance and capture paths) treats this exactly like
     /// `Continue`, so the outcome is a safe hint, never a requirement.
     Yield,
-    /// The program asked to exit; unwind and stop the run.
+    /// The program asked to exit the whole process; unwind and stop the run.
     Halt,
+    /// The calling thread must wait on an unavailable primitive (an empty
+    /// semaphore, a held mutex, an unset event flag). The preemptive scheduler
+    /// ([`vitaslop_native::ThreadedScheduler`]) parks this thread and runs another;
+    /// the thread resumes - and its wait call returns - once another thread makes
+    /// the primitive available (see [`ImportDispatch::take_wakes`]). A single-
+    /// worker host never produces this (its uncontended waits succeed at once), and
+    /// if one somehow received it, it treats it as [`Continue`](Self::Continue).
+    ///
+    /// [`vitaslop_native::ThreadedScheduler`]: https://docs.rs/vitaslop-native
+    Block,
+    /// The calling thread has ended (a worker returned, or called
+    /// `sceKernelExitThread`), but the process keeps running. The preemptive
+    /// scheduler finishes just this thread's fiber, keeping its siblings alive; the
+    /// exit code is the guest's r0. A single-worker host has only the one thread,
+    /// so it treats this exactly like [`Halt`](Self::Halt).
+    ThreadExit,
 }

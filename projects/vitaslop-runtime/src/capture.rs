@@ -93,6 +93,13 @@ pub struct Capture {
     pub call_count: u64,
     /// Ordered trace of every serviced call's function NID, for debugging.
     pub trace: Vec<u32>,
+    /// Bytes the guest wrote to the debug console (sceClibPrintf and friends), in
+    /// order. This is the blob-free "it printed" signal for the hello corpus: the
+    /// Vita has no framebuffer console for these, so the host is the sink. Also fed
+    /// by sceIoWrite to fd 1 (the path newlib's stdout takes).
+    pub stdout: Vec<u8>,
+    /// Bytes written to fd 2 (stderr) via sceIoWrite.
+    pub stderr: Vec<u8>,
 }
 
 impl Capture {

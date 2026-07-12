@@ -13,12 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv7::{
-    ConditionCode, InstDecoder, Instruction, Opcode, Operand, Reg, RegShift, RegShiftStyle,
-    SIMDSizeCode, ShiftStyle, VfpType,
+    ConditionCode, InstDecoder, Instruction, NeonOp, Opcode, Operand, Reg, RegShift, RegShiftStyle,
+    SIMDDataType, SIMDSizeCode, ShiftStyle, VfpType,
 };
 
 use crate::Error;
-use crate::ir::{Block, BinOp, FBinOp, Func, MemSize, Stmt, Term, Value, VfpOp, VfpReg};
+use crate::ir::{
+    Block, BinOp, FBinOp, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType, Stmt, Term, Value,
+    VfpOp, VfpReg,
+};
 
 /// A resolved import: the guest stub address a `bl`/`blx` targets maps to a
 /// dense host-import index.
@@ -35,12 +38,21 @@ impl<'a> Imports<'a> {
     }
 }
 
-/// Result of discovering one function: its IR and the guest addresses of the
-/// direct callees found in it (to be discovered as their own functions).
+/// Result of discovering one function: its IR, the guest addresses of the direct
+/// callees found in it, and any code pointers it materializes (address-taken
+/// functions - e.g. a thread entry passed to sceKernelCreateThread - which the
+/// direct-call closure alone would never reach).
 pub struct Discovered {
     pub func: Func,
     pub callees: Vec<u32>,
+    pub code_pointers: Vec<u32>,
 }
+
+/// Per-register tracked immediate constants along a straight run, so a `movt`
+/// completing a `movw` can be recognized as a full 32-bit value. Index is the
+/// register number; `None` means "not a known constant here". `[7]` doubles as
+/// the r7 tracking a noreturn `svc` needs.
+type RegConsts = [Option<u32>; 16];
 
 /// Decode one instruction at guest `addr`, returning it and its byte length.
 fn decode_at(
@@ -160,20 +172,57 @@ fn flow(
     }
 }
 
-/// Track a constant in r7 across a straight run, so a noreturn `svc` (r7 = an
-/// exit syscall) can end decoding before the data that follows it. Only `mov r7,
-/// #imm` is tracked; any other write clears it.
-fn track_r7(inst: &Instruction, r7: Option<u32>) -> Option<u32> {
-    let writes = |n: u8| matches!(inst.operands[0], Operand::Reg(r) if r.number() == n);
+/// Track per-register immediate constants across a straight run and return the
+/// updated state. Two jobs, one pass:
+///   - r7 tracking a noreturn `svc` (r7 = an exit syscall) can end decoding
+///     before the data that follows it (formerly `track_r7`), and
+///   - `movw`/`movt` materialization of a full 32-bit value, so an address-taken
+///     code pointer can be recognized. When `discover_pointers` is set and a
+///     completed value has bit 0 set (a Thumb function pointer, as opposed to a
+///     data pointer, which is even) and lands inside the code image, it is
+///     recorded in `code_pointers`.
+///
+/// Conservative: any register written by an instruction we do not model as a
+/// constant is cleared. Register `n` is deemed written when it is the first
+/// operand (matching the old r7 rule, so r7's noreturn behavior is unchanged).
+fn track_regs(
+    inst: &Instruction,
+    mut regs: RegConsts,
+    in_code: &impl Fn(u32) -> bool,
+    discover_pointers: bool,
+    code_pointers: &mut BTreeSet<u32>,
+) -> RegConsts {
+    let dst = inst.operands.first().and_then(regnum);
     match inst.opcode {
-        Opcode::MOV if writes(7) => match inst.operands[1] {
-            Operand::Imm32(v) => Some(v),
-            Operand::Imm12(v) => Some(v as u32),
-            _ => None,
-        },
-        _ if writes(7) => None,
-        _ => r7,
+        // movw / mov rd, #imm: rd becomes the immediate (or unknown if not one).
+        // A register source (`mov rd, rn`) yields None, clearing rd.
+        Opcode::MOV => {
+            if let Some(rd) = dst {
+                regs[rd as usize] = inst.operands.get(1).and_then(imm);
+            }
+        }
+        // movt rd, #hi: set the top halfword. If rd held a low halfword, this
+        // completes a 32-bit value - the moment an address-taken pointer appears.
+        Opcode::MOVT => {
+            if let (Some(rd), Some(hi)) = (dst, inst.operands.get(1).and_then(imm)) {
+                let rd = rd as usize;
+                regs[rd] = regs[rd].map(|lo| {
+                    let v = (lo & 0x0000_FFFF) | (hi << 16);
+                    if discover_pointers && v & 1 == 1 && in_code(v & !1) {
+                        code_pointers.insert(v & !1);
+                    }
+                    v
+                });
+            }
+        }
+        // Anything else that writes a register clears its tracked constant.
+        _ => {
+            if let Some(rd) = dst {
+                regs[rd as usize] = None;
+            }
+        }
     }
+    regs
 }
 
 /// ITSTATE advance (ARM ARM `ITAdvance`): shift the low 5 bits left, keeping the
@@ -205,6 +254,7 @@ pub fn discover(
     thumb: bool,
     imports: &Imports,
     noreturn_svc: &[u32],
+    discover_pointers: bool,
 ) -> Result<Discovered, Error> {
     let decoder = InstDecoder::default().with_thumb_mode(thumb);
 
@@ -216,8 +266,15 @@ pub fn discover(
     let mut decoded: BTreeMap<u32, (Instruction, u32, ConditionCode, bool)> = BTreeMap::new();
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     let mut callees: BTreeSet<u32> = BTreeSet::new();
-    // Worklist carries IT state and the tracked r7 constant along fall-through.
-    let mut work: Vec<(u32, u8, Option<u32>)> = vec![(entry, 0, None)];
+    // Address-taken code pointers materialized in this function (thread entries,
+    // callbacks). Collected via `movw`/`movt` tracking; processed as tentative
+    // entries by the caller.
+    let mut code_pointers: BTreeSet<u32> = BTreeSet::new();
+    // Worklist carries IT state and the tracked register constants along fall-
+    // through (a fresh, all-unknown set at every branch target, which may have
+    // multiple predecessors).
+    let init: RegConsts = [None; 16];
+    let mut work: Vec<(u32, u8, RegConsts)> = vec![(entry, 0, init)];
     leaders.insert(entry);
 
     // A guest address is decodable only if it lies within the code image.
@@ -226,7 +283,7 @@ pub fn discover(
         off < code.len()
     };
 
-    while let Some((addr, itstate, r7)) = work.pop() {
+    while let Some((addr, itstate, regs)) = work.pop() {
         if !in_bounds(addr) {
             continue;
         }
@@ -255,26 +312,26 @@ pub fn discover(
         } else {
             0
         };
-        let next_r7 = track_r7(&inst, r7);
+        let next_regs = track_regs(&inst, regs, &in_bounds, discover_pointers, &mut code_pointers);
         let next = addr.wrapping_add(len);
 
-        match flow(&inst, addr, len, thumb, imports, r7, noreturn_svc) {
-            Flow::Seq => work.push((next, next_it, next_r7)),
+        match flow(&inst, addr, len, thumb, imports, regs[7], noreturn_svc) {
+            Flow::Seq => work.push((next, next_it, next_regs)),
             Flow::Call { guest } => {
                 if let Some(t) = guest {
                     callees.insert(t);
                 }
-                work.push((next, next_it, next_r7));
+                work.push((next, next_it, next_regs));
             }
             Flow::Jump(t) => {
                 leaders.insert(t);
-                work.push((t, 0, None));
+                work.push((t, 0, init));
             }
             Flow::Fork(t) => {
                 leaders.insert(t);
                 leaders.insert(next);
-                work.push((t, 0, None));
-                work.push((next, next_it, next_r7));
+                work.push((t, 0, init));
+                work.push((next, next_it, next_regs));
             }
             Flow::Return | Flow::Halt => {}
         }
@@ -316,6 +373,7 @@ pub fn discover(
     Ok(Discovered {
         func: Func { addr: entry, thumb, blocks },
         callees: callees.into_iter().collect(),
+        code_pointers: code_pointers.into_iter().collect(),
     })
 }
 
@@ -435,6 +493,17 @@ fn dataproc(inst: &Instruction) -> Option<(u8, Value, Value)> {
 
 fn bin(op: BinOp, a: Value, b: Value) -> Value {
     Value::Bin(op, Box::new(a), Box::new(b))
+}
+
+/// The value tree for a full 32-bit byte reverse (ARM `rev`): move each byte to
+/// the mirrored position. `x` is read four times (a pure register read, so this
+/// is free).
+fn byte_reverse(x: Value) -> Value {
+    let b0 = bin(BinOp::And, bin(BinOp::Lsr, x.clone(), Value::Imm(24)), Value::Imm(0x0000_00FF));
+    let b1 = bin(BinOp::And, bin(BinOp::Lsr, x.clone(), Value::Imm(8)), Value::Imm(0x0000_FF00));
+    let b2 = bin(BinOp::And, bin(BinOp::Shl, x.clone(), Value::Imm(8)), Value::Imm(0x00FF_0000));
+    let b3 = bin(BinOp::And, bin(BinOp::Shl, x, Value::Imm(24)), Value::Imm(0xFF00_0000));
+    bin(BinOp::Or, bin(BinOp::Or, b0, b1), bin(BinOp::Or, b2, b3))
 }
 
 /// Lower a memory addressing operand into the effective address, plus any
@@ -677,7 +746,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         ADD => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
             if sets_flags {
-                out.push(Stmt::FlagsAdd { a: rn.clone(), b: op2.clone(), cin: 0 });
+                out.push(Stmt::FlagsAdd { a: rn.clone(), b: op2.clone(), cin: Value::Imm(0) });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, op2)));
         }
@@ -687,10 +756,38 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 out.push(Stmt::FlagsAdd {
                     a: rn.clone(),
                     b: Value::Not(Box::new(op2.clone())),
-                    cin: 1,
+                    cin: Value::Imm(1),
                 });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, rn, op2)));
+        }
+        // adc rd, rn, op2 => rd = rn + op2 + C. The carry-in is the runtime C flag.
+        ADC => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            if sets_flags {
+                out.push(Stmt::FlagsAdd {
+                    a: rn.clone(),
+                    b: op2.clone(),
+                    cin: Value::Flag(crate::abi::Flag::C),
+                });
+            }
+            let sum = bin(BinOp::Add, bin(BinOp::Add, rn, op2), Value::Flag(crate::abi::Flag::C));
+            out.push(Stmt::SetReg(rd, sum));
+        }
+        // sbc rd, rn, op2 => rd = rn - op2 - NOT(C) = rn + ~op2 + C.
+        SBC => {
+            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let not_op2 = Value::Not(Box::new(op2));
+            if sets_flags {
+                out.push(Stmt::FlagsAdd {
+                    a: rn.clone(),
+                    b: not_op2.clone(),
+                    cin: Value::Flag(crate::abi::Flag::C),
+                });
+            }
+            let diff =
+                bin(BinOp::Add, bin(BinOp::Add, rn, not_op2), Value::Flag(crate::abi::Flag::C));
+            out.push(Stmt::SetReg(rd, diff));
         }
         RSB => {
             // rsb rd, rn, op2 => rd = op2 - rn.
@@ -699,7 +796,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 out.push(Stmt::FlagsAdd {
                     a: op2.clone(),
                     b: Value::Not(Box::new(rn.clone())),
-                    cin: 1,
+                    cin: Value::Imm(1),
                 });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, op2, rn)));
@@ -707,12 +804,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         CMP => {
             let a = operand_value(&ops[0]).ok_or_else(err)?;
             let b = operand_value(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::FlagsAdd { a, b: Value::Not(Box::new(b)), cin: 1 });
+            out.push(Stmt::FlagsAdd { a, b: Value::Not(Box::new(b)), cin: Value::Imm(1) });
         }
         CMN => {
             let a = operand_value(&ops[0]).ok_or_else(err)?;
             let b = operand_value(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::FlagsAdd { a, b, cin: 0 });
+            out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0) });
         }
 
         AND | BIC | ORR | EOR | TST => {
@@ -759,6 +856,83 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             if sets_flags {
                 out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
             }
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // umull/smull rdlo, rdhi, rn, rm: {rdhi:rdlo} = rn * rm (64-bit). The S
+        // form (flag-setting) is not emitted by the compilers we target; ignore
+        // flags here (the widening product's N/Z would need the 64-bit value).
+        UMULL | SMULL => {
+            let rdlo = regnum(&ops[0]).ok_or_else(err)?;
+            let rdhi = regnum(&ops[1]).ok_or_else(err)?;
+            let rn = operand_value(&ops[2]).ok_or_else(err)?;
+            let rm = operand_value(&ops[3]).ok_or_else(err)?;
+            out.push(Stmt::MulLong { rdlo, rdhi, rn, rm, signed: inst.opcode == SMULL });
+        }
+        // clz rd, rm.
+        CLZ => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::SetReg(rd, Value::Clz(Box::new(rm))));
+        }
+        // mla rd, rn, rm, ra => rd = rn*rm + ra; mls => rd = ra - rn*rm.
+        MLA | MLS => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[2]).ok_or_else(err)?;
+            let ra = operand_value(&ops[3]).ok_or_else(err)?;
+            let prod = bin(BinOp::Mul, rn, rm);
+            let result = if inst.opcode == MLS {
+                bin(BinOp::Sub, ra, prod)
+            } else {
+                bin(BinOp::Add, prod, ra)
+            };
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // rev rd, rm: reverse all four bytes.
+        REV => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::SetReg(rd, byte_reverse(rm)));
+        }
+        // rev16 rd, rm: reverse the bytes within each halfword.
+        REV16 => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            // ((rm >> 8) & 0x00FF00FF) | ((rm << 8) & 0xFF00FF00)
+            let hi = bin(BinOp::And, bin(BinOp::Lsr, rm.clone(), Value::Imm(8)), Value::Imm(0x00FF_00FF));
+            let lo = bin(BinOp::And, bin(BinOp::Shl, rm, Value::Imm(8)), Value::Imm(0xFF00_FF00));
+            out.push(Stmt::SetReg(rd, bin(BinOp::Or, hi, lo)));
+        }
+        // Sign/zero extend a byte or halfword (the plain form, no pre-rotate).
+        SXTB | UXTB | SXTH | UXTH => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let result = match inst.opcode {
+                UXTB => bin(BinOp::And, rm, Value::Imm(0xFF)),
+                UXTH => bin(BinOp::And, rm, Value::Imm(0xFFFF)),
+                // Sign-extend by shifting the field to the top then arithmetic-
+                // shifting back down.
+                SXTB => bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(24)), Value::Imm(24)),
+                _ => bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(16)), Value::Imm(16)),
+            };
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // Bitfield extract: ubfx rd, rn, #lsb, #width (zero-extended); sbfx
+        // (sign-extended).
+        UBFX | SBFX => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let lsb = imm(&ops[2]).ok_or_else(err)?;
+            let width = imm(&ops[3]).ok_or_else(err)?;
+            let result = if inst.opcode == UBFX {
+                let mask = if width >= 32 { !0 } else { (1u32 << width) - 1 };
+                bin(BinOp::And, bin(BinOp::Lsr, rn, Value::Imm(lsb)), Value::Imm(mask))
+            } else {
+                // Shift the field to the top (bit 31 = msb of field), then
+                // arithmetic-shift down by 32-width to sign-extend.
+                let top = 32u32.saturating_sub(lsb + width);
+                bin(BinOp::Asr, bin(BinOp::Shl, rn, Value::Imm(top)), Value::Imm(32 - width))
+            };
             out.push(Stmt::SetReg(rd, result));
         }
 
@@ -888,8 +1062,16 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                         }
                     }
                 }
+                // Core <- scalar: `vmov Rt, Sn` (e.g. extracting a reduced NEON/VFP
+                // lane into a GP register).
+                (Operand::Reg(rt), Operand::SIMDReg(s)) if s.size == SIMDSizeCode::S => {
+                    out.push(Stmt::Vfp(VfpOp::ScalarToCore { rt: rt.number(), s: s.num }));
+                }
+                // Scalar <- core: `vmov Sn, Rt`.
+                (Operand::SIMDReg(s), Operand::Reg(rt)) if s.size == SIMDSizeCode::S => {
+                    out.push(Stmt::Vfp(VfpOp::CoreToScalar { s: s.num, rt: rt.number() }));
+                }
                 // Register move between two single-precision regs (raw bit copy).
-                // The core<->fp transfer forms are not used by the cube.
                 _ => {
                     let rd = s_num(&ops[0]).ok_or_else(err)?;
                     let rm = s_num(&ops[1]).ok_or_else(err)?;
@@ -960,6 +1142,9 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let (base, wback, post) = simd_deref(inst).ok_or_else(err)?;
             let load = matches!(inst.opcode, VLDN(..));
             out.extend(vfp_multi(size, num, count, base, false, wback, post, load)?);
+        }
+        Neon { op, dt } => {
+            out.push(Stmt::Neon(lower_neon(op, dt, ops).ok_or_else(err)?));
         }
 
         _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
@@ -1175,6 +1360,98 @@ fn simd_deref(inst: &Instruction) -> Option<(u8, bool, Option<u8>)> {
         }
         _ => None,
     })
+}
+
+// --- NEON data-processing lowering ----------------------------------------
+
+/// The IR register reference for a NEON `Q`/`D` register operand (an `S` operand is
+/// not a NEON data-processing operand and yields `None`).
+fn neon_reg(op: &Operand) -> Option<NeonReg> {
+    match op {
+        Operand::SIMDReg(r) => match r.size {
+            SIMDSizeCode::Q => Some(NeonReg::Q(r.num)),
+            SIMDSizeCode::D => Some(NeonReg::D(r.num)),
+            SIMDSizeCode::S => None,
+        },
+        _ => None,
+    }
+}
+
+/// The element data type of a NEON operation (size, signedness, float-ness).
+fn neon_type(dt: SIMDDataType) -> NeonType {
+    match dt {
+        SIMDDataType::Signed(b) => NeonType { bits: b, signed: true, float: false },
+        SIMDDataType::Unsigned(b) => NeonType { bits: b, signed: false, float: false },
+        SIMDDataType::Int(b) => NeonType { bits: b, signed: false, float: false },
+        SIMDDataType::Float(b) => NeonType { bits: b, signed: false, float: true },
+        SIMDDataType::Any(b) => NeonType { bits: b, signed: false, float: false },
+        SIMDDataType::Poly(b) => NeonType { bits: b, signed: false, float: false },
+    }
+}
+
+/// Lower a decoded NEON data-processing instruction to a [`NeonStmt`]. Returns
+/// `None` (surfaced as an `Unsupported` error) for operand shapes the emitter
+/// cannot map. The operand order matches the ARM encoding: `[dst, a, b]` (or
+/// `[dst, a]` / `[dst, #imm]`).
+fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt> {
+    let ty = neon_type(dt);
+    let r = |i: usize| neon_reg(&ops[i]);
+    use NeonOp::*;
+    let st = match op {
+        VADD => NeonStmt::Bin { op: NeonBin::Add, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VSUB => NeonStmt::Bin { op: NeonBin::Sub, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMUL => NeonStmt::Bin { op: NeonBin::Mul, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMAX => NeonStmt::Bin { op: NeonBin::Max, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMIN => NeonStmt::Bin { op: NeonBin::Min, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VABD => NeonStmt::Bin { op: NeonBin::Abd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMLA => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: false },
+        VMLS => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: true },
+        VPADD => NeonStmt::PairAdd { ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMOVL => NeonStmt::Widen { ty, dst: r(0)?, a: r(1)? },
+        VADDL => NeonStmt::WideAddSub { sub: false, wide: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VADDW => NeonStmt::WideAddSub { sub: false, wide: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VSUBL => NeonStmt::WideAddSub { sub: true, wide: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VSUBW => NeonStmt::WideAddSub { sub: true, wide: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMULL => NeonStmt::WideMul { acc: false, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMLAL => NeonStmt::WideMul { acc: true, sub: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMLSL => NeonStmt::WideMul { acc: true, sub: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VABDL => NeonStmt::WideAbd { acc: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VABAL => NeonStmt::WideAbd { acc: true, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VPADDL => NeonStmt::PairLong { acc: false, ty, dst: r(0)?, a: r(1)? },
+        VPADAL => NeonStmt::PairLong { acc: true, ty, dst: r(0)?, a: r(1)? },
+        VABS => NeonStmt::Unary { neg: false, ty, dst: r(0)?, a: r(1)? },
+        VNEG => NeonStmt::Unary { neg: true, ty, dst: r(0)?, a: r(1)? },
+        VMOVI => {
+            let imm = match ops[1] {
+                Operand::Imm(v) => v,
+                _ => return None,
+            };
+            NeonStmt::MovImm { ty, dst: r(0)?, imm }
+        }
+    };
+    neon_emittable(&st).then_some(st)
+}
+
+/// Whether the emitter has a wasm-SIMD sequence for this NEON statement. A few width
+/// combinations have no direct wasm primitive (no `i8x16.mul`, no 64-bit lanewise
+/// min/max, no 32->64 pairwise widen); those are reported as `Unsupported` at lift
+/// rather than reached at emit. gcc's auto-vectorizer does not emit them.
+fn neon_emittable(s: &NeonStmt) -> bool {
+    match s {
+        NeonStmt::Bin { op, ty, .. } => match op {
+            // wasm has no `i8x16.mul`.
+            NeonBin::Mul => ty.bits != 8,
+            // wasm has no 64-bit lanewise min/max (`abd` uses them).
+            NeonBin::Max | NeonBin::Min | NeonBin::Abd => ty.bits != 64,
+            NeonBin::Add | NeonBin::Sub => true,
+        },
+        NeonStmt::MulAcc { ty, .. } => ty.bits != 8,
+        // `extadd_pairwise` widens only 8->16 and 16->32.
+        NeonStmt::PairLong { ty, .. } => ty.bits == 8 || ty.bits == 16,
+        // the widened `|a-b|` needs 16/32-bit min/max, so the source is 8/16-bit.
+        NeonStmt::WideAbd { ty, .. } => ty.bits == 8 || ty.bits == 16,
+        _ => true,
+    }
 }
 
 /// The effective address of a single-register vldr/vstr. Handles the pc-relative

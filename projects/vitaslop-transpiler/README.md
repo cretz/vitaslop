@@ -28,6 +28,17 @@ whole-program analysis on the load path.
   and not-taken branches), so inline literal pools and post-branch padding are
   never decoded as instructions - nothing branches into them.
 - A call target is recorded as a separate function to discover, never inlined.
+- **Code pointers (address-taken functions)** are also discovered when
+  `discover_code_pointers` is set (Vita modules). A function passed as a value -
+  a thread entry to sceKernelCreateThread, a GXM callback - is never directly
+  called, so the direct-call closure alone would miss it. Discovery tracks
+  per-register `movw`/`movt` constant materialization; when a completed value has
+  bit 0 set (a Thumb function pointer - data pointers are even) and lands in the
+  code image, its address is a candidate entry. Candidates are transpiled
+  *tentatively*: one that fails to decode was a mis-identified constant and is
+  silently skipped, so this can never break the build. The tightly controlled ARM
+  conformance corpus leaves the flag off (and materializes no such pointers
+  anyway, so its output is unchanged).
 
 ## Control flow: guest edges onto wasm
 
@@ -95,6 +106,27 @@ handled, which covers compiled C.
   svc/NID args and returns, and for reentry. Exported globals let the JIT keep
   optimizing within a call-free span while the host caches the global handles once
   after instantiation to avoid per-access name lookup.
+
+### VFP / NEON register file (two banks)
+
+- **Low bank S0..S31 / D0..D15 / Q0..Q7** are 32 raw-bit **i32** globals `s0..s31`;
+  D and Q reads assemble a `v128` from them. i32 (not a wider type) because the
+  host marshals VFP call args/returns through these and the JS WebAssembly API
+  cannot read `v128` globals.
+- **Upper bank D16..D31 / Q8..Q15** are 8 **`v128`** globals `q8..q15` (one per quad;
+  D`n` is `i64x2` lane `n & 1` of `q(n/2)`). The host never marshals these, so
+  storing them as `v128` lets NEON data-processing - which gcc's auto-vectorizer
+  parks in Q8..Q15 - map straight onto wasm 128-bit SIMD with no per-op
+  gather/scatter.
+- **NEON data-processing** lifts to wasm SIMD: the widening family (`vmovl`,
+  `vaddl`/`vaddw`, `vmull`/`vmlal`, `vabdl`/`vabal`, `vpaddl`/`vpadal`) uses the
+  `extend_low` / `extmul_low` / `extadd_pairwise` primitives (which widen a v128's
+  low 64 bits - exactly the NEON long/wide semantics); `vabd`/`vabdl` use
+  `max - min` (no overflow); `vpadd` uses two shuffles + add. The decode side is
+  certified against capstone over the whole A32/Thumb NEON data-processing space;
+  the lift is proven numerically end-to-end (conformance `vita_neon`, gcc-O2
+  auto-vectorized reductions). Ops with no direct wasm primitive (`i8x16.mul`,
+  64-bit lanewise min/max, 32->64 pairwise widen) are reported `Unsupported`.
 
 ### Reentry (why the host needs write access)
 

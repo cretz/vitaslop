@@ -1,0 +1,17 @@
+category = "vita"
+description = "integer compute: 64-bit multiply, clz, wide add/sub, shifts - RUNNABLE"
+
+# Source: ../compute-src/compute.c (clean-room, -nostdlib). A CPU-core probe with
+# volatile inputs (so nothing constant-folds) that drives real runtime UMULL,
+# SMULL, CLZ, 64-bit add/sub (adc/sbc), and shifts/rotate, printing each result.
+# Its job is demand-driven transpiler growth: it surfaced UMULL/SMULL/CLZ as gaps,
+# which were then lifted and certified against qemu (arm suite thumb_umull/smull/
+# clz). Executable form: tests/vita_compute.rs.
+[out]
+output = """
+umull: 18446744065119617025
+smull: -3000000
+clz: 31 15 0
+wide: sum=8589934593 dif=8589934588
+shift: shl=591751040 shr=19088743 ror8=0x78123456
+"""

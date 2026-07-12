@@ -120,6 +120,10 @@ fn expand(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     }
 
+    // A value return writes through `__ctx` (ret/ret_f32/ret_f64), so a handler
+    // that only returns a value - no ctx or value args - still needs the context
+    // bound with its real name.
+    let uses_ctx = uses_ctx || matches!(func.sig.output, ReturnType::Type(..));
     let ctx_param = if uses_ctx { format_ident!("__ctx") } else { format_ident!("_ctx") };
     let st_param = if uses_st { format_ident!("__st") } else { format_ident!("_st") };
 

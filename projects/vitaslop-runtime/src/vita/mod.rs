@@ -3,10 +3,15 @@
 //! returns `Some(outcome)` if it handles the function NID. The top-level
 //! `dispatch` tries them in turn and records anything unhandled.
 
+pub mod cfmt;
 pub mod ctrl;
 pub mod display;
 pub mod gxm;
+pub mod iofilemgr;
+pub mod libkernel;
+pub mod sync;
 pub mod sysmem;
+pub mod threadmgr;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::{nid, SvcOutcome};
@@ -31,6 +36,18 @@ pub fn dispatch(
         return outcome;
     }
     if let Some(outcome) = ctrl::try_dispatch(func_nid, ctx, st) {
+        return outcome;
+    }
+    if let Some(outcome) = libkernel::try_dispatch(func_nid, ctx, st) {
+        return outcome;
+    }
+    if let Some(outcome) = threadmgr::try_dispatch(func_nid, ctx, st) {
+        return outcome;
+    }
+    if let Some(outcome) = sync::try_dispatch(func_nid, ctx, st) {
+        return outcome;
+    }
+    if let Some(outcome) = iofilemgr::try_dispatch(func_nid, ctx, st) {
         return outcome;
     }
     st.capture.note_unimplemented(library_nid, func_nid, nid::name(func_nid));

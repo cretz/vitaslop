@@ -1,10 +1,29 @@
 category = "vita"
-description = "placeholder: C hello world via real sceClibPrintf NID import (not runnable yet)"
+description = "C hello world via real Vita NID imports (sceClibPrintf + exit) - RUNNABLE"
 
-# North-star target, one rung up from arm/hello: a C program built with
-# gcc-arm-none-eabi that calls sceClibPrintf through Vita's real module-import
-# (NID) mechanism, not the arm-level svc trap. Making this run needs the loader
-# (import resolution) and runtime host modules. The runner skips `vita` cases
-# until then. When runnable, it asserts the captured printf output.
+# One rung up from arm/hello: a C program built with arm-vita-eabi-gcc that
+# reaches the host through the Vita's real module-import (NID) mechanism, not the
+# arm-level svc trap. The source is ../hello-src/hello.c (clean-room from MIT
+# vita-headers, built -nostdlib -> hello.velf), and it is deliberately printf-
+# heavy so the host's variadic argument walk and C formatter are both stressed.
+#
+# RUNNABLE now: loader (SceLibKernel import resolution) + the sceClibPrintf /
+# sceKernelExitProcess host handlers exist. The executable form of this case is
+# the harness integration test `tests/vita_hello.rs`, which loads hello.velf,
+# transpiles+runs it, and asserts the captured debug-console output below byte
+# for byte. (Unlike the arm corpus there is no offline register oracle for a NID
+# program, so the vita corpus runs as hand-written end-to-end tests.)
+#
+# The golden is standard C printf output for every conversion hello.c uses:
+# signed/unsigned/hex/octal integers, char/string/percent, width/zero/left/plus
+# flags, a pointer, six stack-spilled ints, and three doubles (the variadic float
+# promotion path - passed in core registers and on the stack, never the VFP file).
 [out]
-output = "Hello, world\n"
+output = """
+Hello, world
+int=-42 uint=42 hex=beef HEX=BEEF oct=100
+char=! str=vitaslop pct=%
+width=[   42] zero=[00042] left=[42   ] plus=[+42]
+ptr=0x81000000 six=1,2,3,4,5,6
+float=1.500000 half=0.250000 neg=-3.500000
+"""

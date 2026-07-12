@@ -1,0 +1,12 @@
+category = "vita"
+description = "Preemptive condition variables (wait releases mutex, signal hands it back) - RUNNABLE"
+
+# Source: ../cond-src/cond.c (clean-room, -nostdlib). A waiter thread locks a
+# mutex and blocks in sceKernelWaitCond (releasing the mutex); a separate
+# signaller thread prints "B", locks the mutex, and signals, handing the mutex
+# back to the woken waiter, which prints "A"; main (joining both) then prints "M".
+# Run on the preemptive ThreadedScheduler, the order is "BAM"; a synchronous
+# run-to-completion could not block the wait and would give "ABM". Executable
+# form: tests/vita_cond.rs. Needs -lSceKernelThreadMgr_stub for the cond/mutex.
+[out]
+output = "BAM"

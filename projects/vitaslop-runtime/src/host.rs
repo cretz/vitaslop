@@ -97,7 +97,7 @@ pub struct GuestCtx<'a> {
 }
 
 impl<'a> GuestCtx<'a> {
-    fn new(
+    pub(crate) fn new(
         regs: &'a mut [u32; REG_COUNT],
         vfp: &'a mut [u32; VFP_ARG_COUNT],
         mem: &'a mut dyn GuestMemory,
@@ -240,6 +240,217 @@ pub struct MemBlock {
     pub size: u32,
 }
 
+/// A guest thread the program created: its SceUID, entry address (Thumb bit
+/// cleared, so it names the transpiled `f_<addr>` export), its own stack top, and
+/// its return value once it has run.
+struct ThreadRec {
+    uid: i32,
+    entry: u32,
+    stack_top: u32,
+    exit_code: Option<u32>,
+}
+
+/// A recursive mutex's state (preemptive mode only; the single-thread model needs
+/// none). `owner` is the holding thread's id (None if free), `count` the recursion
+/// depth, `waiters` the threads parked in `sceKernelLockMutex` in FIFO order.
+struct MutexRec {
+    uid: i32,
+    owner: Option<i32>,
+    count: i32,
+    waiters: Vec<i32>,
+}
+
+/// A condition variable's state (preemptive mode only). `mutex` is the associated
+/// mutex it releases on wait and re-acquires on wake; `waiters` are the threads
+/// parked in `sceKernelWaitCond` in FIFO order. A condition variable has no
+/// memory: a signal with no waiter is lost.
+struct CondRec {
+    uid: i32,
+    mutex: i32,
+    waiters: Vec<i32>,
+}
+
+/// A thread parked in `sceKernelWaitSema`: which semaphore, which thread, and how
+/// many signals it still needs. It is released (and the count consumed) when a
+/// signal makes `need` available.
+struct SemaWaiter {
+    uid: i32,
+    thid: i32,
+    need: i32,
+}
+
+/// A request to synchronously run guest code (a thread entry) that a host call
+/// raised. The engine-agnostic runtime cannot itself re-enter the wasm engine, so
+/// it records this intent and the engine host ([`vitaslop_native::Vm`]) executes
+/// it - seeding r0/r1 and sp, calling the guest function, and reporting the
+/// result back through [`ImportDispatch::set_thread_exit`]. The register file is
+/// saved and restored around the call so the re-entry is transparent to the
+/// interrupted thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reentry {
+    /// Guest function to run (Thumb bit cleared; names the `f_<addr>` export).
+    pub entry: u32,
+    /// r0 for the entry: the argument-block length (`SceSize args`).
+    pub arg_len: u32,
+    /// r1 for the entry: the argument-block pointer (`void *argp`).
+    pub arg_ptr: u32,
+    /// sp for the entry: the top of the thread's own stack.
+    pub stack_top: u32,
+    /// The thread whose exit code the result becomes.
+    pub thid: i32,
+}
+
+/// One open file descriptor: which path it refers to, the read/write cursor, and
+/// the access mode decoded from the open flags.
+struct OpenFile {
+    path: String,
+    cursor: usize,
+    readable: bool,
+    writable: bool,
+}
+
+/// A minimal virtual filesystem backing SceIoFilemgr: a path -> bytes map plus a
+/// table of open descriptors. Read files are preloaded by the harness (e.g. a
+/// game's data files); write opens create or truncate entries here. The console
+/// streams (fd 1/2) are handled directly in the IO handlers and are not tracked
+/// here. Deterministic and host-only, so a run touches no real filesystem.
+#[derive(Default)]
+pub struct FileTable {
+    files: std::collections::HashMap<String, Vec<u8>>,
+    open: std::collections::HashMap<i32, OpenFile>,
+    next_fd: i32,
+}
+
+// Vita open flags (SCE_O_*), from the MIT vita-headers.
+const SCE_O_RDONLY: u32 = 0x0001;
+const SCE_O_WRONLY: u32 = 0x0002;
+const SCE_O_RDWR: u32 = 0x0003;
+const SCE_O_APPEND: u32 = 0x0100;
+const SCE_O_CREAT: u32 = 0x0200;
+const SCE_O_TRUNC: u32 = 0x0400;
+
+// Seek origins.
+const SCE_SEEK_SET: i32 = 0;
+const SCE_SEEK_CUR: i32 = 1;
+const SCE_SEEK_END: i32 = 2;
+
+/// A generic "no such file/dir" errno, as SCE returns negative on IO failure.
+/// The guest only ever tests fd < 0, so the exact value only needs to be
+/// negative; this is the real `SCE_ERROR_ERRNO_ENOENT`.
+const SCE_ERROR_ERRNO_ENOENT: i32 = 0x8001_0002u32 as i32;
+/// Bad file descriptor.
+const SCE_ERROR_ERRNO_EBADF: i32 = 0x8001_0009u32 as i32;
+
+/// Reserved descriptors: 0 stdin, 1 stdout, 2 stderr. Real fds start at 3.
+const FIRST_FD: i32 = 3;
+pub const FD_STDOUT: i32 = 1;
+pub const FD_STDERR: i32 = 2;
+
+impl FileTable {
+    fn new() -> Self {
+        FileTable { next_fd: FIRST_FD, ..Default::default() }
+    }
+
+    /// Open `path` per the SCE_O_* `flags`; returns a new fd or a negative errno.
+    fn open(&mut self, path: &str, flags: u32) -> i32 {
+        let readable = flags & SCE_O_RDWR == SCE_O_RDONLY || flags & SCE_O_RDWR == SCE_O_RDWR;
+        let writable = flags & SCE_O_WRONLY != 0;
+        let exists = self.files.contains_key(path);
+
+        if !exists {
+            if flags & SCE_O_CREAT != 0 {
+                self.files.insert(path.to_string(), Vec::new());
+            } else {
+                return SCE_ERROR_ERRNO_ENOENT;
+            }
+        } else if flags & SCE_O_TRUNC != 0 {
+            self.files.insert(path.to_string(), Vec::new());
+        }
+
+        // Append seeks to end; every other open starts at the beginning.
+        let cursor = if flags & SCE_O_APPEND != 0 {
+            self.files.get(path).map(|d| d.len()).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.open.insert(fd, OpenFile { path: path.to_string(), cursor, readable, writable });
+        fd
+    }
+
+    /// Read up to `len` bytes from `fd` at its cursor; advances it. Returns the
+    /// bytes, or None on a bad/unreadable descriptor.
+    fn read(&mut self, fd: i32, len: usize) -> Option<Vec<u8>> {
+        let of = self.open.get_mut(&fd)?;
+        if !of.readable {
+            return None;
+        }
+        let data = self.files.get(&of.path)?;
+        let start = of.cursor.min(data.len());
+        let end = (start + len).min(data.len());
+        let out = data[start..end].to_vec();
+        of.cursor = end;
+        Some(out)
+    }
+
+    /// Write `bytes` to `fd` at its cursor (extending the file); advances it.
+    /// Returns the count written, or None on a bad/unwritable descriptor.
+    fn write(&mut self, fd: i32, bytes: &[u8]) -> Option<usize> {
+        let of = self.open.get_mut(&fd)?;
+        if !of.writable {
+            return None;
+        }
+        let data = self.files.entry(of.path.clone()).or_default();
+        if of.cursor > data.len() {
+            data.resize(of.cursor, 0);
+        }
+        let end = of.cursor + bytes.len();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[of.cursor..end].copy_from_slice(bytes);
+        of.cursor = end;
+        Some(bytes.len())
+    }
+
+    /// Seek `fd` to `offset` from `whence`; returns the new absolute position or a
+    /// negative errno.
+    fn lseek(&mut self, fd: i32, offset: i64, whence: i32) -> i64 {
+        let Some(of) = self.open.get_mut(&fd) else {
+            return SCE_ERROR_ERRNO_EBADF as i64;
+        };
+        let size = self.files.get(&of.path).map(|d| d.len()).unwrap_or(0) as i64;
+        let base = match whence {
+            SCE_SEEK_SET => 0,
+            SCE_SEEK_CUR => of.cursor as i64,
+            SCE_SEEK_END => size,
+            _ => return SCE_ERROR_ERRNO_EBADF as i64,
+        };
+        let pos = base + offset;
+        if pos < 0 {
+            return SCE_ERROR_ERRNO_EBADF as i64;
+        }
+        of.cursor = pos as usize;
+        pos
+    }
+
+    /// Close `fd`; returns 0 or a negative errno.
+    fn close(&mut self, fd: i32) -> i32 {
+        if self.open.remove(&fd).is_some() {
+            0
+        } else {
+            SCE_ERROR_ERRNO_EBADF
+        }
+    }
+
+    /// The size of `path` if it exists (for sceIoGetstat).
+    fn size_of(&self, path: &str) -> Option<u64> {
+        self.files.get(path).map(|d| d.len() as u64)
+    }
+}
+
 /// Per-draw vertex program layout captured at create time, keyed by the vertex
 /// program handle so a later Draw knows how to snapshot the vertex buffer.
 struct VertexProgramInfo {
@@ -268,6 +479,33 @@ pub struct VitaState {
     bound_vertex_program: u32,
     bound_stream0: u32,
     pending_uniforms: Vec<f32>,
+    // Threads the program created, and any pending synchronous thread run raised
+    // by sceKernelStartThread (drained by the engine host after the call).
+    threads: Vec<ThreadRec>,
+    pending_reentry: Option<Reentry>,
+    // Synchronization objects. Bring-up model: one thread of control (workers run
+    // synchronously to completion), so nothing ever actually blocks; a semaphore's
+    // count and an event flag's bit pattern are still tracked so their observable
+    // state is faithful for single-thread use (guarding data, wait-then-read).
+    semaphores: Vec<(i32, i32)>,
+    event_flags: Vec<(i32, u32)>,
+    // Preemptive-mode state (unused in the single-thread model). When `preemptive`
+    // is set, blocking primitives actually park the calling thread (`current`) and
+    // are woken by another thread's signal/unlock/thread-end; the scheduler drains
+    // `pending_spawns` (threads to start as their own fibers) and `pending_wakes`
+    // (parked threads made runnable) after each host call. See the runtime README
+    // concurrency model and `vitaslop_native::ThreadedScheduler`.
+    preemptive: bool,
+    current: i32,
+    mutexes: Vec<MutexRec>,
+    conds: Vec<CondRec>,
+    sema_waiters: Vec<SemaWaiter>,
+    /// (waiter thread id, target thread id) for threads parked in a join.
+    join_waiters: Vec<(i32, i32)>,
+    pending_spawns: Vec<Reentry>,
+    pending_wakes: Vec<i32>,
+    // Virtual filesystem backing SceIoFilemgr (open/read/write/lseek/close).
+    fs: FileTable,
     pub capture: Capture,
     // `Send` so a `VitaEnv` can be the data of a wasmtime async Store (the
     // cooperative scheduler runs the guest on a fiber, which wasmtime may resume
@@ -299,10 +537,426 @@ impl VitaState {
             bound_vertex_program: 0,
             bound_stream0: 0,
             pending_uniforms: Vec::new(),
+            threads: Vec::new(),
+            pending_reentry: None,
+            semaphores: Vec::new(),
+            event_flags: Vec::new(),
+            preemptive: false,
+            current: 0,
+            mutexes: Vec::new(),
+            conds: Vec::new(),
+            sema_waiters: Vec::new(),
+            join_waiters: Vec::new(),
+            pending_spawns: Vec::new(),
+            pending_wakes: Vec::new(),
+            fs: FileTable::new(),
             capture: Capture::new(),
             world,
             halt_on_terminate: false,
         }
+    }
+
+    // --- SceIoFilemgr virtual filesystem ---
+
+    /// Preload a read-only file into the virtual filesystem before a run (e.g. a
+    /// title's data file). The guest can then `sceIoOpen`/`sceIoRead` it.
+    pub fn add_file(&mut self, path: &str, bytes: Vec<u8>) {
+        self.fs.files.insert(path.to_string(), bytes);
+    }
+
+    /// Read back a file's current bytes (a write target after the run, for tests).
+    pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
+        self.fs.files.get(path).map(|v| v.as_slice())
+    }
+
+    /// sceIoOpen: returns a new fd or a negative errno.
+    pub fn io_open(&mut self, path: &str, flags: u32) -> i32 {
+        self.fs.open(path, flags)
+    }
+
+    /// sceIoRead: read up to `len` bytes; None on a bad/unreadable fd.
+    pub fn io_read(&mut self, fd: i32, len: usize) -> Option<Vec<u8>> {
+        self.fs.read(fd, len)
+    }
+
+    /// sceIoWrite: fd 1/2 go to the captured console; other fds to the vfs.
+    /// Returns the byte count written (always the full length for the console).
+    pub fn io_write(&mut self, fd: i32, bytes: &[u8]) -> Option<usize> {
+        match fd {
+            FD_STDOUT => {
+                self.capture.stdout.extend_from_slice(bytes);
+                Some(bytes.len())
+            }
+            FD_STDERR => {
+                self.capture.stderr.extend_from_slice(bytes);
+                Some(bytes.len())
+            }
+            _ => self.fs.write(fd, bytes),
+        }
+    }
+
+    /// sceIoLseek/sceIoLseek32: new absolute position or a negative errno.
+    pub fn io_lseek(&mut self, fd: i32, offset: i64, whence: i32) -> i64 {
+        self.fs.lseek(fd, offset, whence)
+    }
+
+    /// sceIoClose: 0 or a negative errno.
+    pub fn io_close(&mut self, fd: i32) -> i32 {
+        self.fs.close(fd)
+    }
+
+    /// File size for sceIoGetstat, or None if the path does not exist.
+    pub fn io_size(&self, path: &str) -> Option<u64> {
+        self.fs.size_of(path)
+    }
+
+    /// Enable preemptive multithreading: blocking primitives now actually park the
+    /// calling thread instead of succeeding uncontended. Set once, before the run,
+    /// by the [`ThreadedScheduler`](vitaslop_native::ThreadedScheduler); the single-
+    /// worker hosts leave it off and keep the run-to-completion behavior.
+    /// (Scheduler: `vitaslop_native::ThreadedScheduler`.)
+    pub fn set_preemptive(&mut self, on: bool) {
+        self.preemptive = on;
+    }
+
+    /// True when running under the preemptive scheduler.
+    pub fn is_preemptive(&self) -> bool {
+        self.preemptive
+    }
+
+    /// The id of the thread currently executing a host call (preemptive mode). Set
+    /// by the scheduler before each dispatch via `ImportDispatch::set_current_thread`.
+    pub fn current_thread(&self) -> i32 {
+        self.current
+    }
+
+    /// Record which thread is running (scheduler hook).
+    pub fn set_current(&mut self, thid: i32) {
+        self.current = thid;
+    }
+
+    /// Take the threads a host call asked to start (scheduler hook).
+    pub fn take_spawns(&mut self) -> Vec<Reentry> {
+        std::mem::take(&mut self.pending_spawns)
+    }
+
+    /// Take the parked threads a host call just made runnable (scheduler hook).
+    pub fn take_wakes(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.pending_wakes)
+    }
+
+    /// Create a thread: allocate its own stack and record it, returning its
+    /// SceUID. The entry's Thumb bit is cleared so it names the transpiled export.
+    pub fn create_thread(&mut self, entry: u32, stack_size: u32) -> i32 {
+        let size = stack_size.max(0x1000);
+        let stack = self.galloc(size, 16);
+        // The stack grows down from an 8-byte-aligned top (AAPCS at a public call).
+        let stack_top = stack.wrapping_add(size) & !0xF;
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        self.threads.push(ThreadRec { uid, entry: entry & !1, stack_top, exit_code: None });
+        uid
+    }
+
+    /// Start a thread. In the single-thread model this raises a *synchronous*
+    /// re-entry (the engine host runs the entry to completion before the guest sees
+    /// anything past the start call). Under the preemptive scheduler it instead
+    /// queues a *spawn*: the entry becomes its own concurrent fiber, and the
+    /// starting thread keeps running.
+    pub fn start_thread(&mut self, thid: i32, arg_len: u32, arg_ptr: u32) {
+        if let Some(t) = self.threads.iter().find(|t| t.uid == thid) {
+            let req = Reentry { entry: t.entry, arg_len, arg_ptr, stack_top: t.stack_top, thid };
+            if self.preemptive {
+                self.pending_spawns.push(req);
+            } else {
+                self.pending_reentry = Some(req);
+            }
+        }
+    }
+
+    /// The exit code of a finished thread, if it has run.
+    pub fn thread_exit_code(&self, thid: i32) -> Option<u32> {
+        self.threads.iter().find(|t| t.uid == thid).and_then(|t| t.exit_code)
+    }
+
+    /// Whether the thread with id `thid` has finished.
+    pub fn thread_finished(&self, thid: i32) -> bool {
+        self.threads.iter().any(|t| t.uid == thid && t.exit_code.is_some())
+    }
+
+    /// Take the pending thread-run request, if any (drained by the engine host).
+    pub fn take_reentry(&mut self) -> Option<Reentry> {
+        self.pending_reentry.take()
+    }
+
+    /// Record a finished thread's return value (set by the engine host after the
+    /// thread ends). In preemptive mode this also wakes any thread parked joining
+    /// it (`sceKernelWaitThreadEnd`).
+    pub fn set_thread_exit(&mut self, thid: i32, code: u32) {
+        if let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) {
+            t.exit_code = Some(code);
+        }
+        if self.preemptive {
+            let mut i = 0;
+            while i < self.join_waiters.len() {
+                if self.join_waiters[i].1 == thid {
+                    let (waiter, _) = self.join_waiters.remove(i);
+                    self.pending_wakes.push(waiter);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Park the current thread joining `target`, unless it has already finished.
+    /// Returns true if `target` is already done (the caller continues) or false if
+    /// the caller was parked (return [`SvcOutcome::Block`]).
+    pub fn join_block(&mut self, target: i32) -> bool {
+        if self.thread_finished(target) {
+            true
+        } else {
+            self.join_waiters.push((self.current, target));
+            false
+        }
+    }
+
+    /// Try to take `need` from semaphore `uid` without blocking. Returns true if
+    /// the count was available (and consumed), false otherwise.
+    pub fn sema_try_acquire(&mut self, uid: i32, need: i32) -> bool {
+        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
+            if *c >= need {
+                *c -= need;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Park the current thread waiting for `need` signals on semaphore `uid`.
+    pub fn sema_block(&mut self, uid: i32, need: i32) {
+        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need });
+    }
+
+    /// Signal semaphore `uid` by `n`, then release every parked waiter the new
+    /// count can satisfy (in FIFO order), consuming the count for each. Preemptive
+    /// counterpart of [`sema_signal`](Self::sema_signal).
+    pub fn sema_signal_wake(&mut self, uid: i32, n: i32) {
+        self.sema_signal(uid, n);
+        loop {
+            let count = self
+                .semaphores
+                .iter()
+                .find(|(u, _)| *u == uid)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            // The first waiter on this semaphore whose need the count can meet.
+            let next = self
+                .sema_waiters
+                .iter()
+                .position(|w| w.uid == uid && w.need <= count);
+            let Some(idx) = next else { break };
+            let w = self.sema_waiters.remove(idx);
+            self.sema_signal(uid, -w.need); // consume the count for the woken waiter
+            self.pending_wakes.push(w.thid);
+        }
+    }
+
+    /// Create a recursive mutex, recording its state (preemptive ownership
+    /// tracking), and return its SceUID.
+    pub fn create_mutex(&mut self) -> i32 {
+        let uid = self.new_uid();
+        self.mutexes.push(MutexRec { uid, owner: None, count: 0, waiters: Vec::new() });
+        uid
+    }
+
+    /// Lock mutex `uid` for the current thread. Returns true if acquired (free, or
+    /// already held by this thread - recursive), false if the caller was parked
+    /// behind the current owner (return [`SvcOutcome::Block`]).
+    pub fn mutex_lock(&mut self, uid: i32) -> bool {
+        let cur = self.current;
+        if let Some(m) = self.mutexes.iter_mut().find(|m| m.uid == uid) {
+            match m.owner {
+                None => {
+                    m.owner = Some(cur);
+                    m.count = 1;
+                    true
+                }
+                Some(o) if o == cur => {
+                    m.count += 1;
+                    true
+                }
+                Some(_) => {
+                    m.waiters.push(cur);
+                    false
+                }
+            }
+        } else {
+            // Unknown mutex: treat as uncontended success.
+            true
+        }
+    }
+
+    /// Whether locking mutex `uid` right now would contend (another thread owns
+    /// it). Used by `sceKernelTryLockMutex`, which fails rather than blocks.
+    pub fn mutex_contended(&self, uid: i32) -> bool {
+        let cur = self.current;
+        self.mutexes
+            .iter()
+            .find(|m| m.uid == uid)
+            .map(|m| matches!(m.owner, Some(o) if o != cur))
+            .unwrap_or(false)
+    }
+
+    /// Unlock mutex `uid`. When the recursion count reaches zero, hand ownership to
+    /// the next parked waiter (FIFO) and wake it.
+    pub fn mutex_unlock(&mut self, uid: i32) {
+        let mut wake = None;
+        if let Some(m) = self.mutexes.iter_mut().find(|m| m.uid == uid) {
+            if m.count > 0 {
+                m.count -= 1;
+            }
+            if m.count == 0 {
+                if m.waiters.is_empty() {
+                    m.owner = None;
+                } else {
+                    let next = m.waiters.remove(0);
+                    m.owner = Some(next);
+                    m.count = 1;
+                    wake = Some(next);
+                }
+            }
+        }
+        if let Some(next) = wake {
+            self.pending_wakes.push(next);
+        }
+    }
+
+    /// Acquire mutex `uid` on behalf of thread `thid` (not the current thread).
+    /// Used when a condition-variable signal transfers a waiter to its mutex: if
+    /// the mutex is free the thread takes it and is woken now; otherwise it joins
+    /// the mutex wait queue and is woken when the owner unlocks. An unknown mutex
+    /// just wakes the thread.
+    fn mutex_acquire_for(&mut self, uid: i32, thid: i32) {
+        let mut wake = true;
+        if let Some(m) = self.mutexes.iter_mut().find(|m| m.uid == uid) {
+            match m.owner {
+                None => {
+                    m.owner = Some(thid);
+                    m.count = 1;
+                }
+                Some(o) if o == thid => m.count += 1,
+                Some(_) => {
+                    m.waiters.push(thid);
+                    wake = false; // woken later, when the owner unlocks
+                }
+            }
+        }
+        if wake {
+            self.pending_wakes.push(thid);
+        }
+    }
+
+    // --- condition variables (preemptive mode) ---
+
+    /// Create a condition variable bound to mutex `mutex_uid`.
+    pub fn create_cond(&mut self, mutex_uid: i32) -> i32 {
+        let uid = self.new_uid();
+        self.conds.push(CondRec { uid, mutex: mutex_uid, waiters: Vec::new() });
+        uid
+    }
+
+    /// `sceKernelWaitCond`: release the associated mutex (handing it to any waiter)
+    /// and park the current thread on the condition variable. The caller returns
+    /// [`SvcOutcome::Block`]; on wake it has re-acquired the mutex (see
+    /// [`cond_signal`](Self::cond_signal)) and the wait returns 0.
+    pub fn cond_wait(&mut self, uid: i32) {
+        let Some(mutex) = self.conds.iter().find(|c| c.uid == uid).map(|c| c.mutex) else {
+            return;
+        };
+        self.mutex_unlock(mutex);
+        let cur = self.current;
+        if let Some(c) = self.conds.iter_mut().find(|c| c.uid == uid) {
+            c.waiters.push(cur);
+        }
+    }
+
+    /// `sceKernelSignalCond`/`SignalCondAll`: wake one (or all) parked waiter. Each
+    /// woken thread must re-acquire the condition's mutex before it runs, so it is
+    /// handed to the mutex (taken now if free, else queued behind the owner).
+    pub fn cond_signal(&mut self, uid: i32, all: bool) {
+        let (mutex, woken) = {
+            let Some(c) = self.conds.iter_mut().find(|c| c.uid == uid) else {
+                return;
+            };
+            let woken: Vec<i32> = if all {
+                std::mem::take(&mut c.waiters)
+            } else if c.waiters.is_empty() {
+                Vec::new()
+            } else {
+                vec![c.waiters.remove(0)]
+            };
+            (c.mutex, woken)
+        };
+        for thid in woken {
+            self.mutex_acquire_for(mutex, thid);
+        }
+    }
+
+    /// Mint a fresh SceUID (for a mutex, semaphore, event flag, ...).
+    pub fn new_uid(&mut self) -> i32 {
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        uid
+    }
+
+    /// Create a semaphore with an initial count, returning its SceUID.
+    pub fn create_sema(&mut self, init: i32) -> i32 {
+        let uid = self.new_uid();
+        self.semaphores.push((uid, init));
+        uid
+    }
+
+    /// Wait on a semaphore: take `n` from its count (never blocks in the single-
+    /// thread model; the count floors at 0).
+    pub fn sema_wait(&mut self, uid: i32, n: i32) {
+        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
+            *c = (*c - n).max(0);
+        }
+    }
+
+    /// Signal a semaphore: add `n` to its count.
+    pub fn sema_signal(&mut self, uid: i32, n: i32) {
+        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
+            *c += n;
+        }
+    }
+
+    /// Create an event flag with an initial bit pattern, returning its SceUID.
+    pub fn create_event_flag(&mut self, init: u32) -> i32 {
+        let uid = self.new_uid();
+        self.event_flags.push((uid, init));
+        uid
+    }
+
+    /// Set (OR in) bits on an event flag.
+    pub fn event_set(&mut self, uid: i32, bits: u32) {
+        if let Some((_, p)) = self.event_flags.iter_mut().find(|(u, _)| *u == uid) {
+            *p |= bits;
+        }
+    }
+
+    /// Clear an event flag's bits: keep only the bits also set in `bits` (the
+    /// sceKernelClearEventFlag semantics, `pattern &= bits`).
+    pub fn event_clear(&mut self, uid: i32, bits: u32) {
+        if let Some((_, p)) = self.event_flags.iter_mut().find(|(u, _)| *u == uid) {
+            *p &= bits;
+        }
+    }
+
+    /// The current bit pattern of an event flag.
+    pub fn event_pattern(&self, uid: i32) -> u32 {
+        self.event_flags.iter().find(|(u, _)| *u == uid).map(|(_, p)| *p).unwrap_or(0)
     }
 
     /// Allocate `size` bytes of real guest memory aligned to `align`, returning
@@ -438,6 +1092,11 @@ impl VitaState {
     pub fn present(&mut self, buffer_addr: u32) {
         self.capture.presents.push(buffer_addr);
     }
+
+    /// Append bytes the guest printed to the debug console (sceClibPrintf).
+    pub fn write_stdout(&mut self, bytes: &[u8]) {
+        self.capture.stdout.extend_from_slice(bytes);
+    }
 }
 
 /// The Vita host environment: the NID import table plus per-run state. Implements
@@ -508,6 +1167,49 @@ pub trait ImportDispatch {
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome;
+
+    /// Take a synchronous guest re-entry the last dispatch raised (a thread
+    /// start), if any. The engine host calls this after each dispatch and runs
+    /// the returned entry, then reports the result via [`set_thread_exit`]. A host
+    /// with no engine to re-enter (default) never has one.
+    ///
+    /// [`set_thread_exit`]: ImportDispatch::set_thread_exit
+    fn take_reentry(&mut self) -> Option<Reentry> {
+        None
+    }
+
+    /// Record a re-entered thread's return value.
+    fn set_thread_exit(&mut self, _thid: i32, _code: u32) {}
+
+    // --- preemptive scheduler hooks (default no-ops) -----------------------
+    //
+    // The single-worker `Vm`/`Scheduler` never call these; only the preemptive
+    // `ThreadedScheduler` does. They let a shared host and the scheduler agree on
+    // which thread is running, which new threads to spawn as their own fibers, and
+    // which parked threads a signal just made runnable - the state the scheduler
+    // cannot see (it lives in the host's sync objects) and the host cannot act on
+    // (only the scheduler owns the fibers).
+
+    /// Tell the host which guest thread is about to run a host call, so a blocking
+    /// primitive knows whom to park and a wake knows whom to release. The scheduler
+    /// sets this before each dispatch.
+    fn set_current_thread(&mut self, _thid: i32) {}
+
+    /// Take the threads the last dispatch asked to *start* (each becomes its own
+    /// fiber sharing the guest address space), if any. The preemptive counterpart
+    /// of [`take_reentry`](Self::take_reentry): instead of running the entry
+    /// synchronously to completion, the scheduler creates a concurrent thread.
+    fn take_spawns(&mut self) -> Vec<Reentry> {
+        Vec::new()
+    }
+
+    /// Take the parked threads the last dispatch just made runnable (a signal, an
+    /// unlock, an event-flag set that satisfied a waiter). The scheduler drains
+    /// this after each dispatch and moves those threads back onto the run queue;
+    /// each resumes inside its blocking call, which then returns success.
+    fn take_wakes(&mut self) -> Vec<i32> {
+        Vec::new()
+    }
 }
 
 impl ImportDispatch for VitaEnv {
@@ -529,6 +1231,26 @@ impl ImportDispatch for VitaEnv {
         let mut ctx = GuestCtx::new(regs, vfp, mem, base);
         vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
     }
+
+    fn take_reentry(&mut self) -> Option<Reentry> {
+        self.state.take_reentry()
+    }
+
+    fn set_thread_exit(&mut self, thid: i32, code: u32) {
+        self.state.set_thread_exit(thid, code);
+    }
+
+    fn set_current_thread(&mut self, thid: i32) {
+        self.state.set_current(thid);
+    }
+
+    fn take_spawns(&mut self) -> Vec<Reentry> {
+        self.state.take_spawns()
+    }
+
+    fn take_wakes(&mut self) -> Vec<i32> {
+        self.state.take_wakes()
+    }
 }
 
 /// A shared handle to a `VitaEnv`: attach one clone as the engine's import
@@ -544,6 +1266,26 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         base: u32,
     ) -> SvcOutcome {
         self.borrow_mut().dispatch(index, regs, vfp, mem, base)
+    }
+
+    fn take_reentry(&mut self) -> Option<Reentry> {
+        self.borrow_mut().take_reentry()
+    }
+
+    fn set_thread_exit(&mut self, thid: i32, code: u32) {
+        self.borrow_mut().set_thread_exit(thid, code);
+    }
+
+    fn set_current_thread(&mut self, thid: i32) {
+        self.borrow_mut().set_current_thread(thid);
+    }
+
+    fn take_spawns(&mut self) -> Vec<Reentry> {
+        self.borrow_mut().take_spawns()
+    }
+
+    fn take_wakes(&mut self) -> Vec<i32> {
+        self.borrow_mut().take_wakes()
     }
 }
 
@@ -638,5 +1380,251 @@ mod hostcall_tests {
             sum_out(&mut ctx, &mut st);
         }
         assert_eq!(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]), 42);
+    }
+}
+
+#[cfg(test)]
+mod preemptive_tests {
+    //! The preemptive block/wake bookkeeping in `VitaState`, exercised directly
+    //! (no wasm engine): a parked thread and its release for each primitive. The
+    //! engine-level proof that these outcomes drive real fibers lives in
+    //! `vitaslop-native/tests/threaded_scheduler.rs`.
+    use super::*;
+    use crate::world::DeterministicWorld;
+
+    fn state() -> VitaState {
+        let mut st = VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()));
+        st.set_preemptive(true);
+        st
+    }
+
+    #[test]
+    fn semaphore_parks_then_a_signal_wakes_and_consumes() {
+        let mut st = state();
+        let sem = st.create_sema(0);
+        // Thread 1 wants 1 but the count is 0: it cannot acquire and parks.
+        st.set_current(1);
+        assert!(!st.sema_try_acquire(sem, 1));
+        st.sema_block(sem, 1);
+        assert!(st.take_wakes().is_empty());
+        // Thread 2 signals: thread 1 is released and the token is consumed for it.
+        st.set_current(2);
+        st.sema_signal_wake(sem, 1);
+        assert_eq!(st.take_wakes(), vec![1]);
+        // The count was consumed by the wake, so a fresh acquire would block again.
+        assert!(!st.sema_try_acquire(sem, 1));
+    }
+
+    #[test]
+    fn mutex_hands_ownership_to_the_next_waiter_on_unlock() {
+        let mut st = state();
+        let m = st.create_mutex();
+        // Thread 1 acquires; thread 2 contends and parks.
+        st.set_current(1);
+        assert!(st.mutex_lock(m));
+        st.set_current(2);
+        assert!(st.mutex_contended(m));
+        assert!(!st.mutex_lock(m));
+        assert!(st.take_wakes().is_empty());
+        // Thread 1 unlocks: ownership passes to thread 2, which is woken.
+        st.set_current(1);
+        st.mutex_unlock(m);
+        assert_eq!(st.take_wakes(), vec![2]);
+        // Thread 2 now owns it, so thread 3 would contend.
+        st.set_current(3);
+        assert!(st.mutex_contended(m));
+    }
+
+    #[test]
+    fn mutex_is_recursive_for_the_owner() {
+        let mut st = state();
+        let m = st.create_mutex();
+        st.set_current(1);
+        assert!(st.mutex_lock(m)); // count 1
+        assert!(st.mutex_lock(m)); // count 2 (recursive, same owner)
+        st.mutex_unlock(m); // count 1, still owned
+        st.set_current(2);
+        assert!(st.mutex_contended(m), "still held after one of two unlocks");
+        st.set_current(1);
+        st.mutex_unlock(m); // count 0, released
+        st.set_current(2);
+        assert!(!st.mutex_contended(m), "free after the matching unlock");
+    }
+
+    #[test]
+    fn cond_wait_releases_the_mutex_and_signal_hands_it_back() {
+        let mut st = state();
+        let m = st.create_mutex();
+        let cv = st.create_cond(m);
+
+        // Thread 1 holds the mutex, then waits on the condition: the wait releases
+        // the mutex (so another thread can take it) and parks thread 1.
+        st.set_current(1);
+        assert!(st.mutex_lock(m));
+        st.cond_wait(cv);
+        assert!(st.take_wakes().is_empty(), "waiter is parked, not runnable");
+        st.set_current(2);
+        assert!(!st.mutex_contended(m), "mutex was released by the wait");
+
+        // Thread 2 takes the mutex, then signals: the waiter cannot run yet (thread
+        // 2 still owns the mutex), so it is queued behind the owner, not woken.
+        assert!(st.mutex_lock(m));
+        st.cond_signal(cv, false);
+        assert!(st.take_wakes().is_empty(), "waiter must re-acquire the mutex first");
+
+        // Thread 2 unlocks: ownership passes to the waiter, which is finally woken.
+        st.mutex_unlock(m);
+        assert_eq!(st.take_wakes(), vec![1]);
+        // Thread 1 now owns the mutex again (the wait re-acquired it).
+        st.set_current(3);
+        assert!(st.mutex_contended(m));
+    }
+
+    #[test]
+    fn cond_signal_with_free_mutex_wakes_immediately() {
+        let mut st = state();
+        let m = st.create_mutex();
+        let cv = st.create_cond(m);
+        st.set_current(1);
+        assert!(st.mutex_lock(m));
+        st.cond_wait(cv); // releases m, parks thread 1
+        // The signaller does not hold the mutex, so the woken waiter takes it now.
+        st.set_current(2);
+        st.cond_signal(cv, false);
+        assert_eq!(st.take_wakes(), vec![1]);
+        st.set_current(3);
+        assert!(st.mutex_contended(m), "waiter re-acquired the free mutex");
+    }
+
+    #[test]
+    fn cond_signal_all_wakes_every_waiter() {
+        let mut st = state();
+        let m = st.create_mutex();
+        let cv = st.create_cond(m);
+        // Two threads wait (neither holds the mutex at wait's end - a plain park).
+        for t in [1, 2] {
+            st.set_current(t);
+            st.mutex_lock(m);
+            st.cond_wait(cv);
+            st.mutex_unlock(m); // no-op: wait already released it
+        }
+        st.set_current(3);
+        st.cond_signal(cv, true);
+        // All waiters are released from the condition, but the mutex serializes
+        // them: only the first can hold it and wake now; the second queues behind
+        // it and is woken when the first unlocks.
+        assert_eq!(st.take_wakes(), vec![1]);
+        st.set_current(1);
+        st.mutex_unlock(m);
+        assert_eq!(st.take_wakes(), vec![2]);
+    }
+
+    #[test]
+    fn join_parks_until_the_target_thread_exits() {
+        let mut st = state();
+        let worker = st.create_thread(0x2000, 0x1000);
+        // Main (thread 0) joins the not-yet-finished worker and parks.
+        st.set_current(0);
+        assert!(!st.join_block(worker));
+        assert!(st.take_wakes().is_empty());
+        // The worker ends: the joiner is woken and the exit code is recorded.
+        st.set_thread_exit(worker, 7);
+        assert_eq!(st.take_wakes(), vec![0]);
+        assert_eq!(st.thread_exit_code(worker), Some(7));
+        // A join after the fact does not park.
+        assert!(st.join_block(worker));
+    }
+
+    #[test]
+    fn start_thread_queues_a_spawn_not_a_synchronous_reentry() {
+        let mut st = state();
+        let worker = st.create_thread(0x2000, 0x1000);
+        st.start_thread(worker, 4, 0x1234);
+        assert!(st.take_reentry().is_none(), "preemptive start does not re-enter synchronously");
+        let spawns = st.take_spawns();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].thid, worker);
+        assert_eq!(spawns[0].entry, 0x2000);
+        assert_eq!(spawns[0].arg_len, 4);
+        assert_eq!(spawns[0].arg_ptr, 0x1234);
+    }
+}
+
+#[cfg(test)]
+mod filesystem_tests {
+    //! The SceIoFilemgr virtual filesystem in `VitaState`, exercised directly via
+    //! the public io_* methods. The end-to-end proof on a real velf is
+    //! `vitaslop-conformance-harness/tests/vita_io.rs`; these cover the paths that
+    //! artifact does not (SEEK_CUR/END, append, truncate, bad fd, stderr).
+    use super::*;
+    use crate::world::DeterministicWorld;
+
+    fn state() -> VitaState {
+        VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
+    }
+
+    #[test]
+    fn write_then_read_back_via_the_vfs() {
+        let mut st = state();
+        let fd = st.io_open("ux0:/a", SCE_O_WRONLY | SCE_O_CREAT);
+        assert!(fd >= 3);
+        assert_eq!(st.io_write(fd, b"abcdef"), Some(6));
+        assert_eq!(st.io_close(fd), 0);
+        assert_eq!(st.io_size("ux0:/a"), Some(6));
+
+        let r = st.io_open("ux0:/a", SCE_O_RDONLY);
+        assert_eq!(st.io_lseek(r, 2, SCE_SEEK_SET), 2);
+        assert_eq!(st.io_read(r, 100).as_deref(), Some(&b"cdef"[..]));
+        // At EOF a further read is empty, not an error.
+        assert_eq!(st.io_read(r, 100).as_deref(), Some(&b""[..]));
+        st.io_close(r);
+    }
+
+    #[test]
+    fn seek_cur_end_and_negative_is_error() {
+        let mut st = state();
+        st.add_file("app0:/f", b"0123456789".to_vec());
+        let fd = st.io_open("app0:/f", SCE_O_RDONLY);
+        assert_eq!(st.io_lseek(fd, 3, SCE_SEEK_SET), 3);
+        assert_eq!(st.io_lseek(fd, 2, SCE_SEEK_CUR), 5);
+        assert_eq!(st.io_lseek(fd, -1, SCE_SEEK_END), 9);
+        assert_eq!(st.io_read(fd, 4).as_deref(), Some(&b"9"[..]));
+        // Seeking before the start is a negative errno, leaving the cursor put.
+        assert!(st.io_lseek(fd, -100, SCE_SEEK_SET) < 0);
+    }
+
+    #[test]
+    fn append_seeks_to_end_and_truncate_clears() {
+        let mut st = state();
+        st.add_file("ux0:/log", b"head".to_vec());
+        let a = st.io_open("ux0:/log", SCE_O_WRONLY | SCE_O_APPEND);
+        assert_eq!(st.io_write(a, b"-tail"), Some(5));
+        st.io_close(a);
+        assert_eq!(st.file_bytes("ux0:/log"), Some(&b"head-tail"[..]));
+
+        // Opening with TRUNC discards the old contents.
+        let t = st.io_open("ux0:/log", SCE_O_WRONLY | SCE_O_TRUNC);
+        assert_eq!(st.io_write(t, b"new"), Some(3));
+        st.io_close(t);
+        assert_eq!(st.file_bytes("ux0:/log"), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn missing_file_and_bad_fd_are_errors() {
+        let mut st = state();
+        assert!(st.io_open("app0:/nope", SCE_O_RDONLY) < 0);
+        assert!(st.io_read(999, 4).is_none());
+        assert!(st.io_write(999, b"x").is_none());
+        assert!(st.io_lseek(999, 0, SCE_SEEK_SET) < 0);
+        assert!(st.io_close(999) < 0);
+    }
+
+    #[test]
+    fn fd_one_and_two_route_to_captured_console() {
+        let mut st = state();
+        assert_eq!(st.io_write(FD_STDOUT, b"out"), Some(3));
+        assert_eq!(st.io_write(FD_STDERR, b"err"), Some(3));
+        assert_eq!(st.capture.stdout, b"out");
+        assert_eq!(st.capture.stderr, b"err");
     }
 }

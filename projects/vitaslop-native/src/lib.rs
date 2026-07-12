@@ -16,6 +16,9 @@ pub use vitaslop_runtime::{
 pub mod sched;
 pub use sched::{FrameStop, Scheduler};
 
+pub mod threaded;
+pub use threaded::{RunReport, ThreadSpawn, ThreadedScheduler};
+
 pub mod wgpu_render;
 pub use wgpu_render::WgpuRenderer;
 pub use vitaslop_transpiler::abi;
@@ -79,6 +82,9 @@ struct Host {
     base: u32,
     import_fn: SvcHandler,
     import_env: Option<Box<dyn ImportDispatch>>,
+    /// The instantiated module, so a host call can re-enter guest code (run a
+    /// thread entry). Set once, right after instantiation.
+    instance: Option<Instance>,
 }
 
 /// Errors running a program end to end.
@@ -142,6 +148,12 @@ impl Vm {
             externs,
             noreturn_svc: host_abi.noreturn_svc,
             mem_bytes,
+            // Vita modules take function addresses (thread entries, GXM
+            // callbacks); discover them. Safe for the ARM corpus too - those
+            // cases materialize no code pointers, so the closure is unchanged.
+            discover_code_pointers: true,
+            // The single-instance `Vm` defines its own memory.
+            import_memory: false,
         })?;
 
         // Validate first for a precise error (wasmtime only names the function).
@@ -158,6 +170,7 @@ impl Vm {
                 base,
                 import_fn: host_abi.import,
                 import_env: None,
+                instance: None,
             },
         );
 
@@ -165,6 +178,8 @@ impl Vm {
         bind_host(&mut linker, abi::SVC_NAME, host_abi.svc)?;
         bind_import(&mut linker)?;
         let instance = linker.instantiate(&mut store, &module)?;
+        // Record the instance so an import handler can re-enter guest code.
+        store.data_mut().instance = Some(instance);
 
         let mut vm = Vm { store, instance, base };
         vm.write_mem(base, code)?;
@@ -359,10 +374,64 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
                 caller.data_mut().halted = true;
                 return Err(HaltUnwind.into());
             }
+            // Drain any synchronous guest re-entries the call raised (a thread
+            // start). Each runs the thread entry to completion on its own stack,
+            // transparently to the interrupted thread: the whole register file is
+            // saved and restored around the call, so only the entry's return value
+            // (captured before the restore) and its side effects persist.
+            run_reentries(&mut caller);
             Ok(())
         },
     )?;
     Ok(())
+}
+
+/// Run every pending guest re-entry the last import call raised.
+fn run_reentries(caller: &mut Caller<'_, Host>) {
+    while let Some(re) = caller.data_mut().import_env.as_mut().and_then(|e| e.take_reentry()) {
+        // Save the full register context of the interrupted thread.
+        let saved_regs: [u32; abi::REG_COUNT] =
+            std::array::from_fn(|i| read_reg(caller, i));
+        let saved_vfp: [u32; vitaslop_runtime::VFP_ARG_COUNT] =
+            std::array::from_fn(|i| read_vfp(caller, i));
+        // The worker ending itself (a normal return, or an exit-thread halt) must
+        // not end the interrupted thread, so shield its halt flag too.
+        let saved_halted = caller.data().halted;
+
+        // Seed the entry's arguments (r0 = arg length, r1 = arg pointer) and its
+        // own stack, then run it to completion.
+        write_reg(caller, 0, re.arg_len);
+        write_reg(caller, 1, re.arg_ptr);
+        write_reg(caller, abi::SP, re.stack_top);
+        let export = abi::func_export(re.entry);
+        let worker_ret = if let Some(instance) = caller.data().instance {
+            match instance.get_typed_func::<(), ()>(&mut *caller, &export) {
+                Ok(func) => {
+                    // A clean return or a guest halt inside the worker both end
+                    // the entry; either way its r0 is the return value.
+                    let _ = func.call(&mut *caller, ());
+                    read_reg(caller, 0)
+                }
+                // The entry was never transpiled (should not happen: thread
+                // entries are discovered as code pointers). Report 0.
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+
+        // Restore the interrupted thread's context and record the result.
+        for (i, &v) in saved_regs.iter().enumerate() {
+            write_reg(caller, i, v);
+        }
+        for (i, &v) in saved_vfp.iter().enumerate() {
+            write_vfp(caller, i, v);
+        }
+        caller.data_mut().halted = saved_halted;
+        if let Some(env) = caller.data_mut().import_env.as_mut() {
+            env.set_thread_exit(re.thid, worker_ret);
+        }
+    }
 }
 
 fn read_reg(caller: &mut Caller<'_, Host>, i: usize) -> u32 {
