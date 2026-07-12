@@ -14,6 +14,7 @@ use vitaslop_transpiler::abi;
 pub mod capture;
 pub mod host;
 pub mod nid;
+pub mod render;
 pub mod vita;
 pub mod world;
 

@@ -9,8 +9,8 @@
 //! `WebAssembly`. [`run`]/[`run_arm`] are thin conformance-oriented wrappers.
 
 pub use vitaslop_runtime::{
-    nid, CtrlFrame, DeterministicWorld, Flags, ImportDispatch, Record, Replay, RunResult,
-    SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
+    capture, nid, render, CtrlFrame, DeterministicWorld, Flags, ImportDispatch, Record, Replay,
+    RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
 };
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
