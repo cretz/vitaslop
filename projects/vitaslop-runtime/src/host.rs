@@ -10,6 +10,30 @@ use crate::capture::Capture;
 use crate::world::{DeterministicWorld, World};
 use crate::{vita, SvcOutcome};
 
+/// The number of VFP single-precision registers (s0..s15) that carry floating-
+/// point arguments and the float return under AAPCS-VFP (the Vita is hardfloat).
+/// The host reads these from the guest at a NID trap alongside the core registers
+/// so [`GuestCtx`] can marshal float args and returns.
+pub const VFP_ARG_COUNT: usize = 16;
+
+/// A guest address crossing the host-call boundary (an in- or out-parameter). A
+/// newtype so `#[hostcall]` classifies it as integer class (core register / stack)
+/// while keeping the intent - "this is a pointer" - visible in the signature. The
+/// handler dereferences it through [`GuestCtx`] (`read_u32`, `write_bytes`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ptr(pub u32);
+
+impl Ptr {
+    /// The raw guest address.
+    pub fn addr(self) -> u32 {
+        self.0
+    }
+    /// True for a null guest pointer.
+    pub fn is_null(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Random-access to the guest's linear memory during a host call, rebased so
 /// guest address `A` is byte `A - base`. The abstraction exists because the two
 /// engines reach guest memory differently: on native wasmtime the runtime and
@@ -59,16 +83,27 @@ impl GuestMemory for SliceMemory<'_> {
 /// and a sequential AAPCS argument cursor.
 pub struct GuestCtx<'a> {
     pub regs: &'a mut [u32; REG_COUNT],
+    /// Raw bits of the VFP single-precision registers s0..s15 (the float argument
+    /// and return file). d`n` is (s[2n], s[2n+1]).
+    pub vfp: &'a mut [u32; VFP_ARG_COUNT],
     pub mem: &'a mut dyn GuestMemory,
     pub base: u32,
-    /// Next positional argument to read (0-based). Args 0..3 are r0..r3, args >=4
+    /// Next core (integer/pointer) argument slot: args 0..3 are r0..r3, args >=4
     /// are on the stack at sp + (n-4)*4.
-    next_arg: usize,
+    next_core: usize,
+    /// Next VFP single-register slot for a float argument (AAPCS-VFP keeps a
+    /// separate counter from the core one; doubles align to an even slot).
+    next_vfp: usize,
 }
 
 impl<'a> GuestCtx<'a> {
-    fn new(regs: &'a mut [u32; REG_COUNT], mem: &'a mut dyn GuestMemory, base: u32) -> Self {
-        GuestCtx { regs, mem, base, next_arg: 0 }
+    fn new(
+        regs: &'a mut [u32; REG_COUNT],
+        vfp: &'a mut [u32; VFP_ARG_COUNT],
+        mem: &'a mut dyn GuestMemory,
+        base: u32,
+    ) -> Self {
+        GuestCtx { regs, vfp, mem, base, next_core: 0, next_vfp: 0 }
     }
 
     /// Read positional integer/pointer argument `n` (AAPCS: r0..r3 then stack).
@@ -81,11 +116,44 @@ impl<'a> GuestCtx<'a> {
         }
     }
 
-    /// Read the next positional argument and advance the cursor.
+    /// Read the next core integer/pointer argument and advance the core cursor.
     pub fn next_u32(&mut self) -> u32 {
-        let v = self.arg(self.next_arg);
-        self.next_arg += 1;
+        let v = self.arg(self.next_core);
+        self.next_core += 1;
         v
+    }
+
+    /// Read the next float argument (a single VFP register) and advance the VFP
+    /// cursor. Used by `#[hostcall]` for `f32` parameters.
+    pub fn next_f32(&mut self) -> f32 {
+        let i = self.next_vfp;
+        self.next_vfp += 1;
+        let bits = self.vfp.get(i).copied().unwrap_or(0);
+        f32::from_bits(bits)
+    }
+
+    /// Read the next double argument (an even-aligned VFP register pair) and
+    /// advance the VFP cursor past it. Used by `#[hostcall]` for `f64` parameters.
+    pub fn next_f64(&mut self) -> f64 {
+        // Doubles occupy an even-aligned single-register pair (d`k` = s[2k],
+        // s[2k+1]); align up to the next even slot, no back-fill.
+        let i = (self.next_vfp + 1) & !1;
+        self.next_vfp = i + 2;
+        let lo = self.vfp.get(i).copied().unwrap_or(0) as u64;
+        let hi = self.vfp.get(i + 1).copied().unwrap_or(0) as u64;
+        f64::from_bits(lo | (hi << 32))
+    }
+
+    /// Set the call's float return value in s0.
+    pub fn ret_f32(&mut self, v: f32) {
+        self.vfp[0] = v.to_bits();
+    }
+
+    /// Set the call's double return value in d0 (s0 low, s1 high).
+    pub fn ret_f64(&mut self, v: f64) {
+        let bits = v.to_bits();
+        self.vfp[0] = bits as u32;
+        self.vfp[1] = (bits >> 32) as u32;
     }
 
     /// The offset into guest memory for guest address `addr`, or None if outside
@@ -436,6 +504,7 @@ pub trait ImportDispatch {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
+        vfp: &mut [u32; VFP_ARG_COUNT],
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome;
@@ -446,6 +515,7 @@ impl ImportDispatch for VitaEnv {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
+        vfp: &mut [u32; VFP_ARG_COUNT],
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
@@ -456,7 +526,7 @@ impl ImportDispatch for VitaEnv {
             .copied()
             .unwrap_or((0, 0));
         self.state.capture.trace.push(func_nid);
-        let mut ctx = GuestCtx::new(regs, mem, base);
+        let mut ctx = GuestCtx::new(regs, vfp, mem, base);
         vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
     }
 }
@@ -469,9 +539,104 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
+        vfp: &mut [u32; VFP_ARG_COUNT],
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
-        self.borrow_mut().dispatch(index, regs, mem, base)
+        self.borrow_mut().dispatch(index, regs, vfp, mem, base)
+    }
+}
+
+#[cfg(test)]
+mod hostcall_tests {
+    //! Verify the `#[hostcall]` marshalling directly (the cube exercises only
+    //! integer/pointer handlers, so these cover the hardfloat classification and
+    //! the float returns end to end against a hand-built `GuestCtx`).
+    use super::*;
+    use crate::hostcall;
+    use crate::world::DeterministicWorld;
+
+    fn dummy_state() -> VitaState {
+        VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
+    }
+
+    // Mixed integer and float args with a float return: `a` and `b` come from the
+    // core registers (r0, r1), `x` and `y` from the VFP file (s0 and d1), and the
+    // f32 result goes to s0.
+    #[hostcall]
+    fn mix(st: &mut VitaState, a: u32, x: f32, b: i32, y: f64) -> f32 {
+        a as f32 + x + b as f32 + y as f32 + st.base as f32
+    }
+
+    // A pure float handler: double the d0 argument back into d0.
+    #[hostcall]
+    fn dbl(v: f64) -> f64 {
+        v * 2.0
+    }
+
+    // A pointer out-param handler: write the sum of two ints through the pointer.
+    #[hostcall]
+    fn sum_out(ctx: &mut GuestCtx, a: u32, b: u32, out: Ptr) -> i32 {
+        ctx.write_u32(out.addr(), a.wrapping_add(b));
+        0
+    }
+
+    #[test]
+    fn classifies_int_and_float_args_and_returns_float() {
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 64];
+        regs[0] = 5; // a
+        regs[1] = (-3i32) as u32; // b
+        vfp[0] = 2.5f32.to_bits(); // x -> s0
+        let y = 1.5f64.to_bits(); // y -> d1 (s2 low, s3 high)
+        vfp[2] = y as u32;
+        vfp[3] = (y >> 32) as u32;
+
+        let mut st = dummy_state();
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            mix(&mut ctx, &mut st);
+        }
+        // 5 + 2.5 + (-3) + 1.5 + 0 = 6.0, in s0.
+        assert_eq!(f32::from_bits(vfp[0]), 6.0);
+    }
+
+    #[test]
+    fn marshals_double_arg_and_return() {
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 8];
+        let v = 3.0f64.to_bits(); // d0 = s0 (low), s1 (high)
+        vfp[0] = v as u32;
+        vfp[1] = (v >> 32) as u32;
+
+        let mut st = dummy_state();
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            dbl(&mut ctx, &mut st);
+        }
+        let out = (vfp[0] as u64) | ((vfp[1] as u64) << 32);
+        assert_eq!(f64::from_bits(out), 6.0);
+    }
+
+    #[test]
+    fn writes_through_pointer_out_param() {
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 64];
+        regs[0] = 7; // a
+        regs[1] = 35; // b
+        regs[2] = 16; // out pointer (guest addr, base 0 -> offset 16)
+
+        let mut st = dummy_state();
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            sum_out(&mut ctx, &mut st);
+        }
+        assert_eq!(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]), 42);
     }
 }

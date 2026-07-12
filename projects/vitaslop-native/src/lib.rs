@@ -325,6 +325,13 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
             for (i, r) in regs.iter_mut().enumerate() {
                 *r = read_reg(&mut caller, i);
             }
+            // The Vita is hardfloat, so the NID path also carries the VFP argument
+            // registers (s0..s15). Read them alongside the core registers so a
+            // handler can marshal float args and returns.
+            let mut vfp = [0u32; vitaslop_runtime::VFP_ARG_COUNT];
+            for (i, s) in vfp.iter_mut().enumerate() {
+                *s = read_vfp(&mut caller, i);
+            }
             let mem = caller
                 .get_export(abi::MEMORY_EXPORT)
                 .and_then(|e| e.into_memory())
@@ -337,13 +344,16 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
                     // the rebased slice backs `GuestMemory` directly (zero-copy).
                     Some(env) => {
                         let mut mem = vitaslop_runtime::SliceMemory(bytes);
-                        env.dispatch(selector as u32, &mut regs, &mut mem, base)
+                        env.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, base)
                     }
                     None => (host.import_fn)(selector as u32, &mut regs, bytes, base, &mut host.output),
                 }
             };
             for (i, &v) in regs.iter().enumerate() {
                 write_reg(&mut caller, i, v);
+            }
+            for (i, &v) in vfp.iter().enumerate() {
+                write_vfp(&mut caller, i, v);
             }
             if let SvcOutcome::Halt = outcome {
                 caller.data_mut().halted = true;
@@ -372,6 +382,25 @@ fn write_reg(caller: &mut Caller<'_, Host>, i: usize, v: u32) {
         .expect("module exports registers")
         .set(&mut *caller, Val::I32(v as i32))
         .expect("register global is mutable i32");
+}
+
+fn read_vfp(caller: &mut Caller<'_, Host>, i: usize) -> u32 {
+    caller
+        .get_export(&abi::vfp_s_export(i as u8))
+        .and_then(|e| e.into_global())
+        .expect("module exports vfp registers")
+        .get(&mut *caller)
+        .i32()
+        .expect("vfp global is i32") as u32
+}
+
+fn write_vfp(caller: &mut Caller<'_, Host>, i: usize, v: u32) {
+    caller
+        .get_export(&abi::vfp_s_export(i as u8))
+        .and_then(|e| e.into_global())
+        .expect("module exports vfp registers")
+        .set(&mut *caller, Val::I32(v as i32))
+        .expect("vfp global is mutable i32");
 }
 
 /// Transpile an ARM code image, run it from `entry`, and return the final

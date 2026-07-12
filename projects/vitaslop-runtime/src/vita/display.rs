@@ -3,6 +3,7 @@
 //! presented framebuffer address.
 
 use crate::host::{GuestCtx, VitaState};
+use crate::hostcall;
 use crate::nid::display as nid;
 use crate::SvcOutcome;
 
@@ -17,11 +18,11 @@ pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Op
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)
 /// SceDisplayFrameBuf: { SceSize size; void *base; uint32 pitch; uint32 fmt;
 ///                       uint32 width; uint32 height; } (0x18 bytes).
-fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let param = ctx.arg(0);
-    let base = ctx.read_u32(param + 4);
+#[hostcall]
+fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, _sync: i32) -> i32 {
+    let base = ctx.read_u32(param.addr() + 4);
     if base != 0 {
         st.present(base);
     }
-    ctx.ret(0);
+    0
 }

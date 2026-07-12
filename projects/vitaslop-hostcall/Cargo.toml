@@ -1,0 +1,18 @@
+[package]
+name = "vitaslop-hostcall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The #[hostcall] attribute macro: generates AAPCS-VFP argument marshalling and
+# return writing around a typed Vita host handler, so behavior stays hand-written
+# and only the register/memory shuffle is generated. See src/lib.rs.
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

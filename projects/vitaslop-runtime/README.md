@@ -14,18 +14,26 @@ point here.
 
 - Guest calls a NID import stub, which the transpiler turned into an import trap
   carrying a dense index. The runtime maps that index to a handler and dispatches.
-- **Typed handlers**: each host function is written as a normal typed Rust
-  function. A hostcall attribute generates the marshalling glue, so behavior stays
-  hand-written and only the boring register/memory shuffling is generated.
-- **Arg marshalling**: reads AAPCS args and writes the return. The Vita is
-  hardfloat (VFP), so each arg is classified int-class vs float-class and pulled
-  from the right register file, with stack spill for the rest.
+- **Typed handlers (realized)**: each host function is written as a normal typed
+  Rust function tagged `#[hostcall]` (the `vitaslop-hostcall` proc-macro); it
+  generates the marshalling glue, so behavior stays hand-written and only the
+  register/memory shuffling is generated. A handler declares `&mut VitaState`
+  and/or `&mut GuestCtx` params plus its value args; the macro emits the
+  `(ctx, st)` wrapper the dispatch table calls. The `vita/` handlers use it.
+- **Arg marshalling (realized)**: reads AAPCS args and writes the return. The Vita
+  is hardfloat (VFP), so each arg is classified int-class vs float-class by its
+  Rust type and pulled from the right register file - integer/pointer from the core
+  registers (r0..r3 then stack), `f32`/`f64` from the VFP registers (s0.. / d0..).
+  The VFP argument registers (s0..s15) are read at the NID trap alongside the core
+  registers; a float return goes to s0/d0. Verified in `host.rs`'s hostcall tests.
 - **Type taxonomy across the boundary** (both directions):
-  - Scalars: direct in registers.
-  - Guest pointers: a guest address wrapper, used for in-params and out-params
-    (out-params are pervasive in GXM create-calls).
+  - Scalars: `u32`/`i32`/`bool` in core registers, `f32`/`f64` in VFP. Direct.
+  - Guest pointers: the `Ptr` wrapper (integer class), used for in-params and
+    out-params (out-params are pervasive in GXM create-calls); the handler takes
+    `&mut GuestCtx` to dereference it.
   - Structs: repr-C mirrors read/written field by field from guest memory, with
     layout asserts. These are cold control-plane calls, so safety over raw casts.
+    (Not yet needed by the cube; the `Ptr` + `GuestCtx` path covers it for now.)
   - Guest callbacks: a guest code address the host can re-enter (GXM ring-buffer
     callbacks). Re-entrancy uses the same register-seed-then-call mechanism as
     thread entry.

@@ -2742,6 +2742,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vitaslop-hostcall"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "vitaslop-loader"
 version = "0.0.0"
 dependencies = [
@@ -2772,6 +2781,7 @@ dependencies = [
 name = "vitaslop-runtime"
 version = "0.0.0"
 dependencies = [
+ "vitaslop-hostcall",
  "vitaslop-loader",
  "vitaslop-platform",
  "vitaslop-transpiler",

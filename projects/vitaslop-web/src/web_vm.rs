@@ -63,6 +63,9 @@ impl GuestMemory for JsGuestMemory {
 struct GuestExports {
     memory: WebAssembly::Memory,
     regs: [WebAssembly::Global; abi::REG_COUNT],
+    /// VFP single-precision argument registers s0..s15 (raw bits), the float arg
+    /// and return file for the hardfloat NID path.
+    vfp: [WebAssembly::Global; vitaslop_runtime::VFP_ARG_COUNT],
     flags: [WebAssembly::Global; abi::FLAG_COUNT],
 }
 
@@ -79,6 +82,18 @@ impl GuestExports {
         for (i, g) in self.regs.iter().enumerate() {
             // ToInt32 in the setter wraps a u32-valued f64 to the right bits.
             g.set_value(&JsValue::from_f64(regs[i] as f64));
+        }
+    }
+    fn read_vfp(&self) -> [u32; vitaslop_runtime::VFP_ARG_COUNT] {
+        let mut vfp = [0u32; vitaslop_runtime::VFP_ARG_COUNT];
+        for (i, g) in self.vfp.iter().enumerate() {
+            vfp[i] = g.value().as_f64().unwrap_or(0.0) as i64 as u32;
+        }
+        vfp
+    }
+    fn write_vfp(&self, vfp: &[u32; vitaslop_runtime::VFP_ARG_COUNT]) {
+        for (i, g) in self.vfp.iter().enumerate() {
+            g.set_value(&JsValue::from_f64(vfp[i] as f64));
         }
     }
     fn read_flags(&self) -> Flags {
@@ -164,14 +179,16 @@ impl WebVm {
                 let cell = exports.borrow();
                 let ex = cell.as_ref().expect("exports set before first call");
                 let mut regs = ex.read_regs();
+                let mut vfp = ex.read_vfp();
                 let outcome = match import.as_mut() {
                     Some(h) => {
                         let mut mem = ex.memory_view();
-                        h.dispatch(index as u32, &mut regs, &mut mem, base)
+                        h.dispatch(index as u32, &mut regs, &mut vfp, &mut mem, base)
                     }
                     None => vitaslop_runtime::SvcOutcome::Continue,
                 };
                 ex.write_regs(&regs);
+                ex.write_vfp(&vfp);
                 finish(&halted, outcome)
             }) as Box<dyn FnMut(i32) -> Result<(), JsValue>>)
         };
@@ -190,10 +207,13 @@ impl WebVm {
         let memory = Reflect::get(&exports_obj, &JsValue::from_str(abi::MEMORY_EXPORT))?
             .dyn_into::<WebAssembly::Memory>()?;
         let regs = read_globals::<{ abi::REG_COUNT }>(&exports_obj, |i| abi::reg_export(i))?;
+        let vfp = read_globals::<{ vitaslop_runtime::VFP_ARG_COUNT }>(&exports_obj, |i| {
+            abi::vfp_s_export(i as u8)
+        })?;
         let flags = read_globals::<{ abi::FLAG_COUNT }>(&exports_obj, |i| {
             abi::flag_export(FLAG_ORDER[i]).to_string()
         })?;
-        *exports.borrow_mut() = Some(GuestExports { memory: memory.clone(), regs, flags });
+        *exports.borrow_mut() = Some(GuestExports { memory: memory.clone(), regs, vfp, flags });
 
         // Seed the guest image at rebased offset 0 and set sp to the top of the
         // provisioned region (matches native Vm::new).

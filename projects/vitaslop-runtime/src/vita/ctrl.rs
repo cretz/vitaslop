@@ -3,6 +3,7 @@
 //! record or replay wrapper can capture.
 
 use crate::host::{GuestCtx, VitaState};
+use crate::hostcall;
 use crate::nid::ctrl as nid;
 use crate::SvcOutcome;
 
@@ -20,11 +21,8 @@ pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Op
 }
 
 /// int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count)
-fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let port = ctx.arg(0);
-    let data = ctx.arg(1);
-    let count = ctx.arg(2).max(1);
-
+#[hostcall]
+fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
     let frame = st.world.poll_ctrl(port);
     let ts = st.world.monotonic_us();
 
@@ -40,9 +38,8 @@ fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState) {
     buf[13] = frame.ly;
     buf[14] = frame.rx;
     buf[15] = frame.ry;
-    let _ = count;
-    ctx.write_bytes(data, &buf);
+    ctx.write_bytes(data.addr(), &buf);
 
     // Return the number of buffers filled.
-    ctx.ret(1);
+    1
 }

@@ -11,6 +11,11 @@
 
 use vitaslop_transpiler::abi;
 
+// So `#[hostcall]`'s generated `::vitaslop_runtime::...` paths resolve inside this
+// crate itself (the handlers in `vita/` that use the macro live here), not only in
+// downstream crates.
+extern crate self as vitaslop_runtime;
+
 pub mod capture;
 pub mod host;
 pub mod nid;
@@ -19,9 +24,14 @@ pub mod vita;
 pub mod world;
 
 pub use host::{
-    GuestCtx, GuestMemory, ImportDispatch, SliceMemory, SvcDispatch, VitaEnv, VitaState,
+    GuestCtx, GuestMemory, ImportDispatch, Ptr, SliceMemory, SvcDispatch, VitaEnv, VitaState,
+    VFP_ARG_COUNT,
 };
 pub use world::{CtrlFrame, DeterministicWorld, Record, Replay, World, WorldEvent};
+
+/// Write a Vita host handler as a typed function; the macro generates the AAPCS-
+/// VFP argument marshalling and return write. See [`vitaslop_hostcall`].
+pub use vitaslop_hostcall::hostcall;
 
 /// The N,Z,C,V condition flags read back after a run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

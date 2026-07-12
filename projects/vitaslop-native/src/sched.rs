@@ -323,6 +323,10 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                     for (i, r) in regs.iter_mut().enumerate() {
                         *r = get_reg(&mut caller, i);
                     }
+                    let mut vfp = [0u32; vitaslop_runtime::VFP_ARG_COUNT];
+                    for (i, s) in vfp.iter_mut().enumerate() {
+                        *s = get_vfp(&mut caller, i);
+                    }
                     let mem = caller
                         .get_export(abi::MEMORY_EXPORT)
                         .and_then(|e| e.into_memory())
@@ -331,10 +335,13 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                         let (bytes, host) = mem.data_and_store_mut(&mut caller);
                         let base = host.base;
                         let mut gm = SliceMemory(bytes);
-                        host.env.dispatch(selector as u32, &mut regs, &mut gm, base)
+                        host.env.dispatch(selector as u32, &mut regs, &mut vfp, &mut gm, base)
                     };
                     for (i, &v) in regs.iter().enumerate() {
                         set_reg_caller(&mut caller, i, v);
+                    }
+                    for (i, &v) in vfp.iter().enumerate() {
+                        set_vfp_caller(&mut caller, i, v);
                     }
                     match outcome {
                         SvcOutcome::Halt => {
@@ -399,6 +406,27 @@ fn set_reg_caller<T>(caller: &mut Caller<'_, T>, i: usize, v: u32) {
         .expect("module exports registers")
         .set(&mut *caller, Val::I32(v as i32))
         .expect("register global is mutable i32");
+}
+
+/// Read VFP single-precision register s`i` (raw bits) through a `Caller`.
+fn get_vfp<T>(caller: &mut Caller<'_, T>, i: usize) -> u32 {
+    caller
+        .get_export(&abi::vfp_s_export(i as u8))
+        .and_then(|e| e.into_global())
+        .expect("module exports vfp registers")
+        .get(&mut *caller)
+        .i32()
+        .expect("vfp global is i32") as u32
+}
+
+/// Write VFP single-precision register s`i` (raw bits) through a `Caller`.
+fn set_vfp_caller<T>(caller: &mut Caller<'_, T>, i: usize, v: u32) {
+    caller
+        .get_export(&abi::vfp_s_export(i as u8))
+        .and_then(|e| e.into_global())
+        .expect("module exports vfp registers")
+        .set(&mut *caller, Val::I32(v as i32))
+        .expect("vfp global is mutable i32");
 }
 
 /// Write guest register `i` through the owned store (during setup).
