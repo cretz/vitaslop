@@ -9,6 +9,33 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[dependencies]
+# Browser-only crate: everything is gated to wasm32 (see the crate-level cfg in
+# lib.rs), so the deps live under the wasm32 target. A native `cargo build
+# --workspace` then sees an empty crate with no deps to build, while
+# `cargo build --target wasm32-unknown-unknown -p vitaslop-web` pulls the stack.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
-vitaslop-platform = { path = "../vitaslop-platform" }
+vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
+vitaslop-loader = { path = "../vitaslop-loader" }
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
+# The engine-agnostic conformance runner + the embedded ARM corpus, so the browser
+# runs the exact same suite as the native test through WebVm (proves engine parity).
+vitaslop-conformance-harness = { path = "../vitaslop-conformance-harness" }
+vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
+# Pinned to match the installed `wasm-bindgen` CLI: the CLI and crate must be the
+# exact same version (the CLI reads a schema the macro embeds). Bump both together
+# (cargo install -f wasm-bindgen-cli, then set this to its --version).
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+# Serialize the conformance summary the browser returns to the page/Playwright.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same wgpu as native, WebGPU backend on the canvas. The shared cube pipeline in
+# vitaslop-platform is fed the surface's format.
+wgpu = { workspace = true, features = ["webgpu"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["Window", "Performance", "HtmlCanvasElement", "console"]

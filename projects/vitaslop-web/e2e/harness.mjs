@@ -1,0 +1,67 @@
+// Shared plumbing for the vitaslop-web browser tests: a static file server for
+// the built bundle and a Chrome launcher with WebGPU enabled. Used by both the
+// cube render test (run.mjs) and the conformance runner (conformance.mjs).
+
+import { chromium } from "playwright";
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { extname, join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export const here = dirname(fileURLToPath(import.meta.url));
+export const webDir = join(here, "..", "web");
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".json": "application/json",
+  ".css": "text/css; charset=utf-8",
+};
+
+/// Fail early with a clear message if the wasm bundle has not been built.
+export function requireBundle() {
+  if (!existsSync(join(webDir, "pkg", "vitaslop_web.js"))) {
+    console.error("Bundle missing: run ../build.ps1 first (expected web/pkg/vitaslop_web.js).");
+    process.exit(2);
+  }
+}
+
+/// Serve `root` on an ephemeral localhost port. Returns the http.Server.
+export function startServer(root) {
+  const server = createServer(async (req, res) => {
+    try {
+      const urlPath = decodeURIComponent(req.url.split("?")[0]);
+      const rel = urlPath === "/" ? "/index.html" : urlPath;
+      const file = join(root, rel);
+      if (!file.startsWith(root)) {
+        res.writeHead(403).end("forbidden");
+        return;
+      }
+      const body = await readFile(file);
+      res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream" });
+      res.end(body);
+    } catch {
+      res.writeHead(404).end("not found");
+    }
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+/// Launch Chrome with WebGPU enabled (and a software fallback so a GPU-less box
+/// still runs). Uses the installed Chrome channel by default - Playwright's cached
+/// Chromium can lag the pkg version, and we want to test real Chrome anyway.
+export function launchChrome() {
+  return chromium.launch({
+    channel: process.env.PWCHANNEL || "chrome",
+    headless: process.env.HEADED ? false : true,
+    args: [
+      "--enable-unsafe-webgpu",
+      "--enable-features=Vulkan",
+      "--enable-unsafe-swiftshader",
+      "--use-angle=default",
+    ],
+  });
+}

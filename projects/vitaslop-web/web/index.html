@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>vitaslop - cube in the browser</title>
+    <style>
+      body {
+        margin: 0;
+        background: #101018;
+        color: #d8d8e0;
+        font: 14px/1.5 system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 24px;
+      }
+      canvas {
+        width: 960px;
+        max-width: 100%;
+        aspect-ratio: 960 / 544;
+        border: 1px solid #2a2a3a;
+        image-rendering: pixelated;
+      }
+      #status {
+        font-family: ui-monospace, monospace;
+        text-align: center;
+        min-height: 2.5em;
+      }
+      a {
+        color: #7fb0ff;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>vitaslop</h1>
+    <p>
+      A clean-room Vita GXM cube: loaded, transpiled from ARM/Thumb/VFP to wasm,
+      run on the browser's own WebAssembly engine, its GXM stream captured and
+      drawn with WebGPU. No emulated GPU shader blob, no server.
+    </p>
+    <canvas id="screen" width="960" height="544"></canvas>
+    <div id="status">Loading...</div>
+    <script type="module">
+      import init, { run } from "./pkg/vitaslop_web.js";
+
+      const status = document.getElementById("status");
+      const canvas = document.getElementById("screen");
+
+      async function main() {
+        if (!("gpu" in navigator)) {
+          status.textContent =
+            "This browser has no WebGPU (navigator.gpu). Try a recent Chrome/Edge, or Safari/Firefox with WebGPU enabled.";
+          return;
+        }
+        try {
+          status.textContent = "Initializing wasm...";
+          await init();
+          status.textContent = "Running the cube on browser wasm...";
+          const msg = await run(canvas);
+          status.textContent = msg;
+        } catch (e) {
+          status.textContent = "Error: " + (e && e.message ? e.message : e);
+          throw e;
+        }
+      }
+      main();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>vitaslop - conformance in the browser</title>
+    <style>
+      body {
+        margin: 0;
+        background: #101018;
+        color: #d8d8e0;
+        font: 14px/1.5 system-ui, sans-serif;
+        padding: 24px;
+        max-width: 760px;
+        margin: 0 auto;
+      }
+      h1 { font-size: 1.4rem; }
+      #summary { font-family: ui-monospace, monospace; font-size: 1.05rem; margin: 12px 0; }
+      table { border-collapse: collapse; width: 100%; font-family: ui-monospace, monospace; }
+      td, th { text-align: left; padding: 4px 10px; border-bottom: 1px solid #2a2a3a; }
+      .pass { color: #6bd08a; }
+      .fail { color: #ff6b6b; }
+      .detail { color: #ff9b9b; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>vitaslop conformance - browser engine</h1>
+    <p>
+      The same ARM/Thumb corpus the native (wasmtime) test runs, executed here on
+      Chrome's own WebAssembly engine through <code>WebVm</code>. Each case is
+      transpiled and run in-browser, then diffed against its qemu-derived golden.
+    </p>
+    <div id="summary">Running corpus...</div>
+    <table id="results"></table>
+    <script type="module">
+      import init, { run_conformance } from "./pkg/vitaslop_web.js";
+
+      const summary = document.getElementById("summary");
+      const results = document.getElementById("results");
+
+      async function main() {
+        try {
+          await init();
+          const json = run_conformance();
+          const data = JSON.parse(json);
+          window.__CONFORMANCE__ = data;
+
+          const allPass = data.passed === data.total;
+          summary.textContent = `${data.passed} / ${data.total} cases passed`;
+          summary.className = allPass ? "pass" : "fail";
+
+          results.innerHTML =
+            "<tr><th>case</th><th>result</th><th>detail</th></tr>" +
+            data.cases
+              .map(
+                (c) =>
+                  `<tr><td>${c.name}</td>` +
+                  `<td class="${c.pass ? "pass" : "fail"}">${c.pass ? "PASS" : "FAIL"}</td>` +
+                  `<td class="detail">${c.detail ? c.detail : ""}</td></tr>`
+              )
+              .join("");
+        } catch (e) {
+          summary.className = "fail";
+          summary.textContent = "Error: " + (e && e.message ? e.message : e);
+          window.__CONFORMANCE__ = { error: String(e) };
+          throw e;
+        }
+      }
+      main();
+    </script>
+  </body>
+</html>
