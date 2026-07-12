@@ -15,3 +15,7 @@ wasmtime = "46"
 # Precise validation errors on the emitted module (wasmtime only says which
 # function failed to compile, not why).
 wasmparser = "0.253"
+# GPU backend for rendering the captured GXM stream. Native backends here; the
+# browser path mirrors this over WebGPU in the web crate, sharing the WGSL.
+wgpu = "22"
+pollster = "0.3"

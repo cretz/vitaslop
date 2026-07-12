@@ -12,6 +12,9 @@ pub use vitaslop_runtime::{
     capture, nid, render, CtrlFrame, DeterministicWorld, Flags, ImportDispatch, Record, Replay,
     RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
 };
+
+pub mod wgpu_render;
+pub use wgpu_render::WgpuRenderer;
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Engine, Instance, Linker, Module, Store, Val};
