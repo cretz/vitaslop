@@ -1233,6 +1233,7 @@ dependencies = [
  "vitaslop-conformance-suite-arm",
  "vitaslop-loader",
  "vitaslop-native",
+ "vitaslop-transpiler",
 ]
 
 [[package]]

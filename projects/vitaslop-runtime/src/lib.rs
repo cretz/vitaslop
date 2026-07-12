@@ -11,6 +11,15 @@
 
 use vitaslop_transpiler::abi;
 
+pub mod capture;
+pub mod host;
+pub mod nid;
+pub mod vita;
+pub mod world;
+
+pub use host::{GuestCtx, ImportDispatch, VitaEnv, VitaState};
+pub use world::{CtrlFrame, DeterministicWorld, Record, Replay, World, WorldEvent};
+
 /// The N,Z,C,V condition flags read back after a run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Flags {

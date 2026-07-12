@@ -449,19 +449,39 @@ struct Addr {
     post: Vec<Stmt>,
 }
 
-fn lower_addr(op: &Operand) -> Option<Addr> {
+fn lower_addr(op: &Operand, iaddr: u32, thumb: bool) -> Option<Addr> {
     let signed_off = |off: u16, add: bool| -> Value {
         let v = off as u32;
         Value::Imm(if add { v } else { v.wrapping_neg() })
     };
+    // The pc-relative literal form `[pc, #off]`: the base register r15 is not
+    // maintained per-instruction (pc is a wasm global the transpiler does not
+    // update on every step), so fold it to the constant pc the ISA defines -
+    // `Align(addr+4, 4)` in Thumb, `addr+8` in ARM. Matches `adr` and vldr/vstr.
+    let base_value = |b: u8| -> Value {
+        if b == 15 {
+            let pc = if thumb { iaddr.wrapping_add(4) & !3 } else { iaddr.wrapping_add(8) };
+            Value::Imm(pc)
+        } else {
+            Value::Reg(b)
+        }
+    };
     match op {
         Operand::RegDeref(base) => Some(Addr {
             pre: vec![],
-            addr: Value::Reg(base.number()),
+            addr: base_value(base.number()),
             post: vec![],
         }),
         Operand::RegDerefPreindexOffset(base, off, add, wback) => {
             let b = base.number();
+            // Const-fold a pc base so the literal address is correct.
+            if b == 15 {
+                return Some(Addr {
+                    pre: vec![],
+                    addr: bin(BinOp::Add, base_value(b), signed_off(*off, *add)),
+                    post: vec![],
+                });
+            }
             let ea = bin(BinOp::Add, Value::Reg(b), signed_off(*off, *add));
             if *wback {
                 // Writeback sets base = ea; the access then uses the new base.
@@ -757,7 +777,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
         LDR | LDRB | LDRH | LDRSB | LDRSH => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
-            let a = lower_addr(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
             let (size, signed) = load_kind(inst.opcode);
             out.extend(a.pre);
             out.push(Stmt::SetReg(
@@ -768,7 +788,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         STR | STRB | STRH => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
-            let a = lower_addr(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
             let size = store_size(inst.opcode);
             out.extend(a.pre);
             out.push(Stmt::Store { addr: a.addr, data: Value::Reg(rt), size });
@@ -777,7 +797,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         LDRD => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
             let rt2 = regnum(&ops[1]).ok_or_else(err)?;
-            let a = lower_addr(&ops[2]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
             out.push(Stmt::SetReg(
                 rt,
@@ -796,7 +816,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         STRD => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
             let rt2 = regnum(&ops[1]).ok_or_else(err)?;
-            let a = lower_addr(&ops[2]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
             out.push(Stmt::Store {
                 addr: a.addr.clone(),

@@ -12,5 +12,6 @@ publish.workspace = true
 # a dev-dependency because the crate is purely a test runner.
 [dev-dependencies]
 vitaslop-native = { path = "../vitaslop-native" }
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
 vitaslop-loader = { path = "../vitaslop-loader" }

@@ -8,7 +8,10 @@
 //! by address, read state back. The browser host will mirror this shape over
 //! `WebAssembly`. [`run`]/[`run_arm`] are thin conformance-oriented wrappers.
 
-pub use vitaslop_runtime::{Flags, RunResult, SvcOutcome};
+pub use vitaslop_runtime::{
+    nid, CtrlFrame, DeterministicWorld, Flags, ImportDispatch, Record, Replay, RunResult,
+    SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
+};
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Engine, Instance, Linker, Module, Store, Val};
@@ -60,11 +63,16 @@ impl Default for HostAbi<'_> {
 /// from `base`.
 pub const DEFAULT_MEM_BYTES: u32 = 64 * 1024 * 1024;
 
-/// Host state threaded through a run: captured output and the exit flag.
+/// Host state threaded through a run: captured output, the exit flag, and an
+/// optional stateful Vita import environment. When `import_env` is set, the
+/// `env.import` trap routes to it (the Vita NID path); otherwise it falls back to
+/// the fn-pointer handler in `HostAbi` (the ARM/Linux conformance path).
 struct Host {
     output: Vec<u8>,
     halted: bool,
     base: u32,
+    import_fn: SvcHandler,
+    import_env: Option<Box<dyn ImportDispatch>>,
 }
 
 /// Errors running a program end to end.
@@ -136,17 +144,38 @@ impl Vm {
 
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &artifact.wasm)?;
-        let mut store = Store::new(&engine, Host { output: Vec::new(), halted: false, base });
+        let mut store = Store::new(
+            &engine,
+            Host {
+                output: Vec::new(),
+                halted: false,
+                base,
+                import_fn: host_abi.import,
+                import_env: None,
+            },
+        );
 
         let mut linker = Linker::new(&engine);
         bind_host(&mut linker, abi::SVC_NAME, host_abi.svc)?;
-        bind_host(&mut linker, abi::IMPORT_NAME, host_abi.import)?;
+        bind_import(&mut linker)?;
         let instance = linker.instantiate(&mut store, &module)?;
 
         let mut vm = Vm { store, instance, base };
         vm.write_mem(base, code)?;
         vm.set_reg(abi::SP, base.wrapping_add(mem_bytes));
         Ok(vm)
+    }
+
+    /// Attach a stateful Vita import environment. Once set, the `env.import` trap
+    /// routes NID calls to it instead of the fn-pointer handler. Set before the
+    /// first `call`.
+    pub fn set_import_env(&mut self, env: Box<dyn ImportDispatch>) {
+        self.store.data_mut().import_env = Some(env);
+    }
+
+    /// Reclaim the import environment after a run (to read its captured state).
+    pub fn take_import_env(&mut self) -> Option<Box<dyn ImportDispatch>> {
+        self.store.data_mut().import_env.take()
     }
 
     /// Write `bytes` at guest address `addr`.
@@ -221,7 +250,11 @@ impl Vm {
                 if self.store.data().halted {
                     Ok(())
                 } else {
-                    Err(RunError::Wasm(e.to_string()))
+                    let detail = match e.downcast_ref::<wasmtime::Trap>() {
+                        Some(t) => format!("{t:?}: {e}"),
+                        None => e.to_string(),
+                    };
+                    Err(RunError::Wasm(detail))
                 }
             }
         }
@@ -262,6 +295,42 @@ fn bind_host(
                 handler(selector as u32, &mut regs, bytes, host.base, &mut host.output)
             };
             // Write back any registers the handler set (e.g. the r0 return value).
+            for (i, &v) in regs.iter().enumerate() {
+                write_reg(&mut caller, i, v);
+            }
+            if let SvcOutcome::Halt = outcome {
+                caller.data_mut().halted = true;
+                return Err(HaltUnwind.into());
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// Bind the `env.import` NID trap. Routes to the stateful import environment if
+/// one is attached, else to the fn-pointer fallback in `Host`.
+fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
+    linker.func_wrap(
+        abi::IMPORT_MODULE,
+        abi::IMPORT_NAME,
+        move |mut caller: Caller<'_, Host>, selector: i32| -> Result<(), wasmtime::Error> {
+            let mut regs = [0u32; abi::REG_COUNT];
+            for (i, r) in regs.iter_mut().enumerate() {
+                *r = read_reg(&mut caller, i);
+            }
+            let mem = caller
+                .get_export(abi::MEMORY_EXPORT)
+                .and_then(|e| e.into_memory())
+                .expect("module exports memory");
+            let outcome = {
+                let (bytes, host) = mem.data_and_store_mut(&mut caller);
+                let base = host.base;
+                match host.import_env.as_mut() {
+                    Some(env) => env.dispatch(selector as u32, &mut regs, bytes, base),
+                    None => (host.import_fn)(selector as u32, &mut regs, bytes, base, &mut host.output),
+                }
+            };
             for (i, &v) in regs.iter().enumerate() {
                 write_reg(&mut caller, i, v);
             }
