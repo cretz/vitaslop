@@ -13,6 +13,9 @@ pub use vitaslop_runtime::{
     Replay, RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
 };
 
+pub mod sched;
+pub use sched::{FrameStop, Scheduler};
+
 pub mod wgpu_render;
 pub use wgpu_render::WgpuRenderer;
 pub use vitaslop_transpiler::abi;

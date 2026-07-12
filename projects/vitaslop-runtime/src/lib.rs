@@ -44,6 +44,13 @@ pub struct RunResult {
 pub enum SvcOutcome {
     /// Keep running.
     Continue,
+    /// The call was serviced, but the guest hit a blocking primitive and should
+    /// now suspend here, yielding to the cooperative scheduler. The classic case
+    /// is the per-frame display flip: the frame is complete and on hardware the
+    /// thread would wait for the flip. A host with no scheduler (the run-to-
+    /// completion conformance and capture paths) treats this exactly like
+    /// `Continue`, so the outcome is a safe hint, never a requirement.
+    Yield,
     /// The program asked to exit; unwind and stop the run.
     Halt,
 }

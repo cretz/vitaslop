@@ -83,6 +83,18 @@ point here.
   threads on a core. A quantum (fixed retired-instruction count) preempts even
   without a blocking call, so guest busy-waits cannot deadlock the worker. The
   fixed quantum keeps this deterministic in single-worker mode.
+- **Realized (native, single guest thread)**: a blocking host call returns
+  `SvcOutcome::Yield` (a hint; run-to-completion hosts treat it as Continue). The
+  native scheduler (`vitaslop-native::Scheduler`) runs the guest on a wasmtime
+  async fiber: `Yield` suspends the fiber, and wasmtime fuel
+  (`fuel_async_yield_interval`) supplies the quantum. The host steps the guest one
+  frame per call (`run_frame`), injecting input between frames - this is what
+  drives the live desktop window. Proven bit-identical to the sync run-to-
+  completion path, and preemption is transparent (see the harness
+  `cube_scheduler` tests). Still future: multiple guest threads / a real run queue
+  (only the main thread exists so far), and the browser mechanism (JSPI or
+  Asyncify - the browser guest is its own WebAssembly instance and cannot suspend
+  mid-call the way a wasmtime fiber can).
 - **Locks, not spinlocks**: our primitives use shared-memory atomics with
   wait/notify. We never busy-spin the host.
 - **Determinism by construction**: scheduling order and allocation addresses are

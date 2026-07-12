@@ -45,7 +45,13 @@ pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Op
         nid::SET_UNIFORM_DATA_F => set_uniform_data_f(ctx, st),
         nid::SET_VERTEX_STREAM => set_vertex_stream(ctx, st),
         nid::DRAW => draw(ctx, st),
-        nid::DISPLAY_QUEUE_ADD_ENTRY => display_queue_add_entry(ctx, st),
+        nid::DISPLAY_QUEUE_ADD_ENTRY => {
+            // The frame is complete and queued to flip. On hardware the calling
+            // thread waits here for the flip (double-buffer backpressure), so this
+            // is the guest's per-frame yield point for the cooperative scheduler.
+            display_queue_add_entry(ctx, st);
+            return Some(SvcOutcome::Yield);
+        }
         _ => return None,
     }
     Some(SvcOutcome::Continue)

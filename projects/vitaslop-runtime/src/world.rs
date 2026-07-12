@@ -117,18 +117,20 @@ pub enum WorldEvent {
 /// world at all.
 pub struct Record<W: World> {
     inner: W,
-    events: std::rc::Rc<std::cell::RefCell<Vec<WorldEvent>>>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<WorldEvent>>>,
 }
 
 impl<W: World> Record<W> {
     pub fn new(inner: W) -> Self {
-        Record { inner, events: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())) }
+        Record { inner, events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
     }
 
     /// A shared handle to the recorded log. Clone it before boxing the recorder as
     /// the run's world, then read the events back after the run (the recorder
-    /// itself is owned by the run).
-    pub fn events(&self) -> std::rc::Rc<std::cell::RefCell<Vec<WorldEvent>>> {
+    /// itself is owned by the run). `Arc<Mutex>` rather than `Rc<RefCell>` so a
+    /// recorder can back a `Send` world (the async scheduler needs `World: Send`);
+    /// there is still only one thread, so the lock never contends.
+    pub fn events(&self) -> std::sync::Arc<std::sync::Mutex<Vec<WorldEvent>>> {
         self.events.clone()
     }
 }
@@ -136,22 +138,22 @@ impl<W: World> Record<W> {
 impl<W: World> World for Record<W> {
     fn monotonic_us(&mut self) -> u64 {
         let v = self.inner.monotonic_us();
-        self.events.borrow_mut().push(WorldEvent::Monotonic(v));
+        self.events.lock().unwrap().push(WorldEvent::Monotonic(v));
         v
     }
     fn wall_us(&mut self) -> u64 {
         let v = self.inner.wall_us();
-        self.events.borrow_mut().push(WorldEvent::Wall(v));
+        self.events.lock().unwrap().push(WorldEvent::Wall(v));
         v
     }
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
         let frame = self.inner.poll_ctrl(port);
-        self.events.borrow_mut().push(WorldEvent::Ctrl { port, frame });
+        self.events.lock().unwrap().push(WorldEvent::Ctrl { port, frame });
         frame
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
         self.inner.fill_random(buf);
-        self.events.borrow_mut().push(WorldEvent::Random(buf.to_vec()));
+        self.events.lock().unwrap().push(WorldEvent::Random(buf.to_vec()));
     }
 }
 

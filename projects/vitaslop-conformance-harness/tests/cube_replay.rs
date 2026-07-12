@@ -48,7 +48,7 @@ impl World for Script {
 }
 
 /// Run the cube with `world`, returning the captured scenes and presents.
-fn run(world: Box<dyn World>) -> (Vec<Scene>, Vec<u32>) {
+fn run(world: Box<dyn World + Send>) -> (Vec<Scene>, Vec<u32>) {
     let m = loader::load(CUBE).expect("load");
     let inputs = m.program_inputs();
     let imports: Vec<(u32, u32)> =
@@ -78,7 +78,7 @@ fn record_then_replay_is_identical() {
     let recorder = Record::new(Script { polls: 0 });
     let log = recorder.events();
     let (scenes_rec, presents_rec) = run(Box::new(recorder));
-    let events: Vec<WorldEvent> = log.borrow().clone();
+    let events: Vec<WorldEvent> = log.lock().unwrap().clone();
 
     assert!(!events.is_empty(), "nothing was recorded");
     assert!(!scenes_rec.is_empty(), "recorded run drew nothing");

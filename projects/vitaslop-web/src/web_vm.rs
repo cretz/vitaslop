@@ -258,6 +258,10 @@ fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> 
             Err(halt_sentinel())
         }
         vitaslop_runtime::SvcOutcome::Continue => Ok(()),
+        // This run-to-completion path has no scheduler to yield to, so a blocking
+        // hint just keeps running (identical to the native sync Vm). The browser's
+        // cooperative-scheduler path will handle Yield distinctly.
+        vitaslop_runtime::SvcOutcome::Yield => Ok(()),
     }
 }
 

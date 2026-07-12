@@ -201,7 +201,10 @@ pub struct VitaState {
     bound_stream0: u32,
     pending_uniforms: Vec<f32>,
     pub capture: Capture,
-    pub world: Box<dyn World>,
+    // `Send` so a `VitaEnv` can be the data of a wasmtime async Store (the
+    // cooperative scheduler runs the guest on a fiber, which wasmtime may resume
+    // on any thread). Everything stays single-threaded in practice.
+    pub world: Box<dyn World + Send>,
     /// Bring-up aid: halt the run when the guest calls sceGxmTerminate. The cube
     /// entry is `_start`, which spins forever after `main` returns (there is no OS
     /// to exit to yet), so terminate is the clean stopping point after teardown.
@@ -212,7 +215,7 @@ impl VitaState {
     /// New state for a run over `[base, base + mem_bytes)`. Allocations start
     /// above the image (at base + 1 MiB) and grow up, well below the stack that
     /// starts at the top of the region.
-    pub fn new(base: u32, mem_bytes: u32, world: Box<dyn World>) -> Self {
+    pub fn new(base: u32, mem_bytes: u32, world: Box<dyn World + Send>) -> Self {
         VitaState {
             base,
             mem_bytes,
@@ -381,7 +384,12 @@ pub struct VitaEnv {
 impl VitaEnv {
     /// Build an environment for a module whose imports are `(library_nid,
     /// func_nid)` in dense index order, over guest memory `[base, base+mem_bytes)`.
-    pub fn new(imports: Vec<(u32, u32)>, base: u32, mem_bytes: u32, world: Box<dyn World>) -> Self {
+    pub fn new(
+        imports: Vec<(u32, u32)>,
+        base: u32,
+        mem_bytes: u32,
+        world: Box<dyn World + Send>,
+    ) -> Self {
         VitaEnv { imports, state: VitaState::new(base, mem_bytes, world) }
     }
 
