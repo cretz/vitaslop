@@ -53,6 +53,32 @@ pub struct Scene {
     pub draws: Vec<Draw>,
 }
 
+impl Scene {
+    /// Reduce the scene's draws to the neutral [`DrawBatch`](vitaslop_platform::gpu::DrawBatch)
+    /// list the shared cube pipeline consumes. Keeps only draws the fixed-function
+    /// cube shader can render (triangle lists with a 16-byte interleaved vertex
+    /// and a full 4x4 MVP), so both the native and browser GPU paths select the
+    /// same draws from one place. The software rasterizer stays independent.
+    pub fn draw_batches(&self) -> Vec<vitaslop_platform::gpu::DrawBatch> {
+        self.draws
+            .iter()
+            .filter(|d| d.primitive == 0 && d.uniforms.len() >= 16 && d.vertex_stride == 16)
+            .map(|d| {
+                let mut mvp = [0f32; 16];
+                mvp.copy_from_slice(&d.uniforms[..16]);
+                vitaslop_platform::gpu::DrawBatch {
+                    mvp,
+                    vertices: d.vertices.clone(),
+                    indices: d.indices.clone(),
+                    index_count: d.index_count,
+                    // GXM index format: 0 is U16, anything else U32.
+                    index_u32: d.index_format != 0,
+                }
+            })
+            .collect()
+    }
+}
+
 /// The whole recorded stream across a run.
 #[derive(Default)]
 pub struct Capture {

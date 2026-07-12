@@ -76,6 +76,13 @@ pub struct Case {
     pub expected: Expected,
 }
 
+/// The case tomls, embedded at compile time. Lets the corpus run where there is
+/// no filesystem - notably the browser (wasm) conformance runner - from the exact
+/// same committed files the native path reads. `include_dir` tracks the directory
+/// so edits (e.g. after `regen`) trigger a rebuild.
+static EMBEDDED_CASES: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/cases");
+
 /// Load and fully parse every case under [`cases_dir`], sorted by name. Errors
 /// if a case is missing its generated half (run `regen` first).
 pub fn load_cases() -> Result<Vec<Case>, String> {
@@ -89,15 +96,34 @@ pub fn load_cases() -> Result<Vec<Case>, String> {
     paths.iter().map(|p| load_case(p)).collect()
 }
 
+/// Parse every embedded case, sorted by name. The filesystem-free twin of
+/// [`load_cases`], for hosts (the browser) that cannot read [`cases_dir`].
+pub fn embedded_cases() -> Result<Vec<Case>, String> {
+    let mut cases: Vec<Case> = EMBEDDED_CASES
+        .files()
+        .filter(|f| f.path().extension().is_some_and(|x| x == "toml"))
+        .map(|f| {
+            let name = f.path().file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let text = f.contents_utf8().ok_or_else(|| format!("{name}: case is not UTF-8"))?;
+            parse_case(name, text)
+        })
+        .collect::<Result<_, _>>()?;
+    cases.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(cases)
+}
+
 /// Parse a single case file.
 pub fn load_case(path: &Path) -> Result<Case, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let raw: Raw = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    parse_case(name, &text)
+}
+
+/// Parse a case from its `name` (file stem) and toml `text`. The
+/// filesystem-independent core of [`load_case`].
+pub fn parse_case(name: &str, text: &str) -> Result<Case, String> {
+    let raw: Raw = toml::from_str(text).map_err(|e| format!("{name}: {e}"))?;
+    let name = name.to_string();
 
     let mode = match raw.mode.as_deref() {
         None | Some("arm") => Mode::Arm,

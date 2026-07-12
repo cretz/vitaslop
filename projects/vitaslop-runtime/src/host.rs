@@ -10,12 +10,56 @@ use crate::capture::Capture;
 use crate::world::{DeterministicWorld, World};
 use crate::{vita, SvcOutcome};
 
+/// Random-access to the guest's linear memory during a host call, rebased so
+/// guest address `A` is byte `A - base`. The abstraction exists because the two
+/// engines reach guest memory differently: on native wasmtime the runtime and
+/// guest share one address space, so a plain `&mut [u8]` slice works and is
+/// zero-copy; in the browser the guest runs as its own `WebAssembly` instance
+/// with a linear memory the runtime's (wasm-bindgen) module cannot borrow as a
+/// Rust slice, so its impl copies through the guest `ArrayBuffer`. Host calls
+/// happen only at kernel/GXM boundaries (tens per frame), never in the hot CPU
+/// loop, so the per-access indirection here costs nothing on the fast path.
+///
+/// Callers (via [`GuestCtx`]) validate `off` against [`len`](GuestMemory::len)
+/// and clamp before calling, so implementors may assume `off` and
+/// `off + buf.len()` are in range.
+pub trait GuestMemory {
+    /// The size of the provisioned guest region, in bytes from `base`.
+    fn len(&self) -> usize;
+    /// True when no guest memory is provisioned.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Read `buf.len()` bytes starting at rebased offset `off` into `buf`.
+    fn read(&self, off: usize, buf: &mut [u8]);
+    /// Write `bytes` at rebased offset `off`.
+    fn write(&mut self, off: usize, bytes: &[u8]);
+}
+
+/// The native/zero-copy backing: guest memory the runtime can borrow directly
+/// (wasmtime linear memory, or any in-process buffer). A `Sized` newtype so it
+/// can coerce to `&mut dyn GuestMemory` (an unsized `[u8]` cannot back a trait
+/// object). Wrap the engine's rebased slice: `SliceMemory(bytes)`.
+pub struct SliceMemory<'a>(pub &'a mut [u8]);
+
+impl GuestMemory for SliceMemory<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        buf.copy_from_slice(&self.0[off..off + buf.len()]);
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        self.0[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
 /// A borrowed view of guest state for the duration of one host call: the
 /// register file, guest memory (rebased so guest address `A` is byte `A - base`),
 /// and a sequential AAPCS argument cursor.
 pub struct GuestCtx<'a> {
     pub regs: &'a mut [u32; REG_COUNT],
-    pub mem: &'a mut [u8],
+    pub mem: &'a mut dyn GuestMemory,
     pub base: u32,
     /// Next positional argument to read (0-based). Args 0..3 are r0..r3, args >=4
     /// are on the stack at sp + (n-4)*4.
@@ -23,7 +67,7 @@ pub struct GuestCtx<'a> {
 }
 
 impl<'a> GuestCtx<'a> {
-    fn new(regs: &'a mut [u32; REG_COUNT], mem: &'a mut [u8], base: u32) -> Self {
+    fn new(regs: &'a mut [u32; REG_COUNT], mem: &'a mut dyn GuestMemory, base: u32) -> Self {
         GuestCtx { regs, mem, base, next_arg: 0 }
     }
 
@@ -59,7 +103,9 @@ impl<'a> GuestCtx<'a> {
     pub fn read_u32(&self, addr: u32) -> u32 {
         match self.offset(addr) {
             Some(o) if o + 4 <= self.mem.len() => {
-                u32::from_le_bytes([self.mem[o], self.mem[o + 1], self.mem[o + 2], self.mem[o + 3]])
+                let mut b = [0u8; 4];
+                self.mem.read(o, &mut b);
+                u32::from_le_bytes(b)
             }
             _ => 0,
         }
@@ -69,7 +115,7 @@ impl<'a> GuestCtx<'a> {
     pub fn write_u32(&mut self, addr: u32, v: u32) {
         if let Some(o) = self.offset(addr) {
             if o + 4 <= self.mem.len() {
-                self.mem[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                self.mem.write(o, &v.to_le_bytes());
             }
         }
     }
@@ -79,7 +125,9 @@ impl<'a> GuestCtx<'a> {
         match self.offset(addr) {
             Some(o) => {
                 let end = (o + len).min(self.mem.len());
-                self.mem[o..end].to_vec()
+                let mut buf = vec![0u8; end - o];
+                self.mem.read(o, &mut buf);
+                buf
             }
             None => Vec::new(),
         }
@@ -89,7 +137,7 @@ impl<'a> GuestCtx<'a> {
     pub fn write_bytes(&mut self, addr: u32, bytes: &[u8]) {
         if let Some(o) = self.offset(addr) {
             let end = (o + bytes.len()).min(self.mem.len());
-            self.mem[o..end].copy_from_slice(&bytes[..end - o]);
+            self.mem.write(o, &bytes[..end - o]);
         }
     }
 
@@ -343,6 +391,35 @@ impl VitaEnv {
     }
 }
 
+/// The seam an engine host implements to deliver an ARM `svc` trap to a host
+/// convention (e.g. the Linux-EABI the ARM conformance corpus uses). The parallel
+/// of [`ImportDispatch`] for the `env.svc` import instead of `env.import`. The
+/// host passes the `svc` immediate, the register file, and rebased guest memory;
+/// any register the handler changes is written back.
+pub trait SvcDispatch {
+    fn svc(
+        &mut self,
+        imm: u32,
+        regs: &mut [u32; REG_COUNT],
+        mem: &mut dyn GuestMemory,
+        base: u32,
+    ) -> SvcOutcome;
+}
+
+/// Drive a `svc` handler behind a shared handle, so a caller can keep a clone to
+/// read accumulated state (e.g. captured output) back after the run.
+impl<T: SvcDispatch> SvcDispatch for std::rc::Rc<std::cell::RefCell<T>> {
+    fn svc(
+        &mut self,
+        imm: u32,
+        regs: &mut [u32; REG_COUNT],
+        mem: &mut dyn GuestMemory,
+        base: u32,
+    ) -> SvcOutcome {
+        self.borrow_mut().svc(imm, regs, mem, base)
+    }
+}
+
 /// The seam an engine host implements to deliver a NID import trap to the Vita
 /// host. Engine-agnostic: the host passes the raw register file and rebased guest
 /// memory, and any register the handler changes is written back.
@@ -351,7 +428,7 @@ pub trait ImportDispatch {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
-        mem: &mut [u8],
+        mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome;
 }
@@ -361,7 +438,7 @@ impl ImportDispatch for VitaEnv {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
-        mem: &mut [u8],
+        mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
         self.state.capture.call_count += 1;
@@ -384,7 +461,7 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         &mut self,
         index: u32,
         regs: &mut [u32; REG_COUNT],
-        mem: &mut [u8],
+        mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
         self.borrow_mut().dispatch(index, regs, mem, base)

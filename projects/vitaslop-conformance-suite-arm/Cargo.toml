@@ -24,3 +24,6 @@ path = "src/bin/regen.rs"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 base64 = "0.22"
+# Embeds the case tomls at compile time so the corpus can run with no filesystem
+# (the browser conformance runner). Tracks the dir for rebuilds.
+include_dir = "0.7"

@@ -6,4 +6,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Pulls in wgpu and the shared cube render pipeline. Off by default so
+# vitaslop-runtime (the engine-agnostic browser blob) can depend on this crate
+# for the neutral seam types without dragging in a GPU stack. The frontends
+# (vitaslop-native, vitaslop-web) enable it.
+gpu = ["dep:wgpu"]
+
 [dependencies]
+wgpu = { workspace = true, optional = true }

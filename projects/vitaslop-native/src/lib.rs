@@ -9,8 +9,8 @@
 //! `WebAssembly`. [`run`]/[`run_arm`] are thin conformance-oriented wrappers.
 
 pub use vitaslop_runtime::{
-    capture, nid, render, CtrlFrame, DeterministicWorld, Flags, ImportDispatch, Record, Replay,
-    RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
+    capture, nid, render, CtrlFrame, DeterministicWorld, Flags, GuestMemory, ImportDispatch, Record,
+    Replay, RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
 };
 
 pub mod wgpu_render;
@@ -330,7 +330,12 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
                 let (bytes, host) = mem.data_and_store_mut(&mut caller);
                 let base = host.base;
                 match host.import_env.as_mut() {
-                    Some(env) => env.dispatch(selector as u32, &mut regs, bytes, base),
+                    // Native wasmtime shares one address space with the guest, so
+                    // the rebased slice backs `GuestMemory` directly (zero-copy).
+                    Some(env) => {
+                        let mut mem = vitaslop_runtime::SliceMemory(bytes);
+                        env.dispatch(selector as u32, &mut regs, &mut mem, base)
+                    }
                     None => (host.import_fn)(selector as u32, &mut regs, bytes, base, &mut host.output),
                 }
             };

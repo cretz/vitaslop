@@ -21,6 +21,11 @@ publish = false
 
 [workspace.dependencies]
 tracing = "0.1"
+# GPU backend. wgpu spans native (Vulkan/Metal/DX) and the browser (WebGPU) from
+# one API, so the cube pipeline is authored once (in vitaslop-platform) and used
+# by both the native headless renderer and the browser canvas.
+wgpu = "30"
+pollster = "1"
 
 # Browser wasm blob. Runtime perf first (opt-level 3 from release), size second.
 [profile.wasm-release]

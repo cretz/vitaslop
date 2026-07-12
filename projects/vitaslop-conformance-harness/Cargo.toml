@@ -6,12 +6,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The only crate that runs the generic conformance corpora against vitaslop's
-# engine. The corpora and their tomls are engine-agnostic (see each suite's
-# README); this crate supplies vitaslop and the corpus's host ABI. Everything is
-# a dev-dependency because the crate is purely a test runner.
+# Runs the generic conformance corpora against vitaslop's engine. The corpora and
+# their tomls are engine-agnostic (see each suite's README); this crate supplies
+# the corpus's host ABI and the engine-agnostic run/compare loop ([`Engine`],
+# `run_all`), used by BOTH the native (wasmtime) test here and the browser
+# (WebAssembly) runner in vitaslop-web. The lib deps are therefore wasm-safe (no
+# wasmtime); the native engine used by the tests is a dev-dependency only.
+[dependencies]
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
+vitaslop-runtime = { path = "../vitaslop-runtime" }
+vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
+
 [dev-dependencies]
 vitaslop-native = { path = "../vitaslop-native" }
-vitaslop-transpiler = { path = "../vitaslop-transpiler" }
-vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
 vitaslop-loader = { path = "../vitaslop-loader" }

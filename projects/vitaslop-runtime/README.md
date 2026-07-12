@@ -55,6 +55,18 @@ point here.
 - Guest addresses are rebased (see the transpiler README). The CPU worker is the
   sole writer; service workers only read at defined sync points, so sharing does
   not introduce races.
+- **Host-call memory seam (realized): `GuestMemory`.** The abstraction above is
+  live for host calls. `ImportDispatch`/`GuestCtx` reach guest memory through the
+  `GuestMemory` trait, not a raw `&mut [u8]`. Native wasmtime shares one address
+  space with the guest, so its impl (`SliceMemory`) is a zero-copy slice. In the
+  browser the guest runs as its **own** `WebAssembly` instance with its own linear
+  memory that this (wasm-bindgen) module cannot borrow as a Rust slice, so the
+  impl copies through a `Uint8Array` over the guest `ArrayBuffer` (in
+  `vitaslop-web::web_vm`). This is cheap because host calls happen only at
+  kernel/GXM boundaries, never in the hot loop. NOTE this is the two-separate-
+  memories model, not yet the single-shared-SharedArrayBuffer vision above:
+  unifying them (so GPU/audio service workers read one buffer) is future work tied
+  to the cooperative scheduler.
 - Leak discipline: guest-internal alloc/free stays inside the one arena (no
   per-object host allocation). Host bookkeeping that can leak - handle tables, the
   capture stream, the World log - is bounded and tied to guest destroy-calls.

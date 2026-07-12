@@ -18,7 +18,9 @@ pub mod render;
 pub mod vita;
 pub mod world;
 
-pub use host::{GuestCtx, ImportDispatch, VitaEnv, VitaState};
+pub use host::{
+    GuestCtx, GuestMemory, ImportDispatch, SliceMemory, SvcDispatch, VitaEnv, VitaState,
+};
 pub use world::{CtrlFrame, DeterministicWorld, Record, Replay, World, WorldEvent};
 
 /// The N,Z,C,V condition flags read back after a run.

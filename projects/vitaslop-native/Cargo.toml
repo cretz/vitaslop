@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }
+# The shared cube render pipeline (shader, layout, per-draw encoding). The `gpu`
+# feature pulls in wgpu here; the browser path enables the same feature.
+vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
 # Native wasm engine. Only ever built for native hosts, so no cfg gating and no
 # effect on the browser blob (which uses the browser's own WebAssembly).
 wasmtime = "46"
@@ -16,6 +19,6 @@ wasmtime = "46"
 # function failed to compile, not why).
 wasmparser = "0.253"
 # GPU backend for rendering the captured GXM stream. Native backends here; the
-# browser path mirrors this over WebGPU in the web crate, sharing the WGSL.
-wgpu = "22"
-pollster = "0.3"
+# browser path mirrors this over WebGPU in the web crate, sharing the pipeline.
+wgpu = { workspace = true }
+pollster = { workspace = true }
