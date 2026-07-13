@@ -93,10 +93,45 @@ pub enum Error {
     Operand { addr: u32 },
 }
 
+/// The linker inserts Thumb->ARM interworking veneers so Thumb code (e.g. newlib,
+/// linked without -nostdlib) can `bl` an ARM import stub. Each veneer has a fixed
+/// five-word shape:
+///   bx   pc          ; 0x4778     Thumb -> ARM, pc word-aligned to veneer+4
+///   b.n  .-2         ; 0xe7fd     never executed (bx pc reads pc = veneer+4)
+///   ldr  ip, [pc]    ; 0xe59fc000 ip = the offset word below
+///   add  pc, ip, pc  ; 0xe08cf00f pc(here)+8 + ip  ->  stub = veneer+16+off
+///   .word off
+/// Resolve each veneer to its stub and, when the stub is a known import, return
+/// `(veneer_addr, import_index)`. Aliasing the veneer's entry to that import lets
+/// a `bl veneer` lower straight to the import call - no ARM lifting and no
+/// computed-branch support needed. Artifacts with no veneers (our -nostdlib ones,
+/// which `blx` the stub directly) yield nothing here, so this is purely additive.
+fn scan_veneers(code: &[u8], base: u32, imports: &BTreeMap<u32, u32>) -> Vec<(u32, u32)> {
+    let rd16 = |o: usize| u16::from_le_bytes([code[o], code[o + 1]]);
+    let rd32 = |o: usize| u32::from_le_bytes([code[o], code[o + 1], code[o + 2], code[o + 3]]);
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 16 <= code.len() {
+        if rd16(o) == 0x4778 && rd32(o + 4) == 0xe59f_c000 && rd32(o + 8) == 0xe08c_f00f {
+            let veneer = base.wrapping_add(o as u32);
+            let stub = veneer.wrapping_add(16).wrapping_add(rd32(o + 12));
+            if let Some(&idx) = imports.get(&stub) {
+                out.push((veneer, idx));
+            }
+        }
+        o += 2;
+    }
+    out
+}
+
 /// Transpile `program` into a WASM module and its dispatch map.
 pub fn transpile(program: &Program) -> Result<Artifact, Error> {
-    let import_map: BTreeMap<u32, u32> =
+    let mut import_map: BTreeMap<u32, u32> =
         program.externs.iter().map(|e| (e.addr, e.import)).collect();
+    // Alias Thumb->ARM interworking veneers to the imports they trampoline to.
+    for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
+        import_map.insert(veneer, idx);
+    }
     let imports = Imports::new(&import_map);
 
     // Discover the transitive closure from the entries: direct callees are hard
@@ -182,6 +217,50 @@ mod tests {
         assert_eq!(artifact.funcs[0].export, "f_10000");
         // The module must validate.
         wasmparser::validate(&artifact.wasm).expect("valid wasm");
+    }
+
+    #[test]
+    fn transpiles_indirect_call() {
+        // Thumb: `blx r0` (indirect call through a function pointer) then `bx lr`.
+        // Exercises the indirect-call lowering + the module dispatcher emission.
+        let code: [u8; 4] = [
+            0x80, 0x47, // blx r0
+            0x70, 0x47, // bx lr
+        ];
+        let artifact = transpile(&Program {
+            code: &code,
+            base: 0x10000,
+            thumb: true,
+            entries: &[0x10000],
+            externs: &[],
+            noreturn_svc: &[],
+            mem_bytes: 0x20000,
+            discover_code_pointers: false,
+            import_memory: false,
+        })
+        .expect("transpile indirect");
+        // One guest function plus the emitted dispatcher must produce valid wasm.
+        assert_eq!(artifact.funcs.len(), 1);
+        wasmparser::validate(&artifact.wasm).expect("valid wasm with dispatcher");
+    }
+
+    #[test]
+    fn scan_veneers_resolves_interworking_stub() {
+        // A Thumb->ARM interworking veneer trampolining to a stub 0x10 past it.
+        // Layout at base: bx pc / b.n .-2 / ldr ip,[pc] / add pc,ip,pc / .word off.
+        let mut code = vec![0u8; 0x40];
+        let put16 = |c: &mut [u8], o: usize, v: u16| c[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |c: &mut [u8], o: usize, v: u32| c[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put16(&mut code, 0x00, 0x4778); // bx pc
+        put16(&mut code, 0x02, 0xe7fd); // b.n .-2
+        put32(&mut code, 0x04, 0xe59f_c000); // ldr ip, [pc]
+        put32(&mut code, 0x08, 0xe08c_f00f); // add pc, ip, pc
+        put32(&mut code, 0x0c, 0x0000_0010); // .word 0x10 -> stub = base+16+16 = base+0x20
+        let base = 0x8100_0000;
+        let mut imports = BTreeMap::new();
+        imports.insert(base + 0x20, 7u32); // the stub at base+0x20 -> import 7
+        let found = scan_veneers(&code, base, &imports);
+        assert_eq!(found, vec![(base, 7)]);
     }
 
     #[test]

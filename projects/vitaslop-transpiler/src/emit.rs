@@ -108,6 +108,10 @@ pub fn emit_module(
     for _ in funcs {
         function_section.function(func_ty);
     }
+    // The indirect-call dispatcher (the last defined function): `(i32) -> ()`,
+    // the same shape as the host imports (type 0). It maps a runtime guest
+    // function-pointer to the matching translated function - see `emit_dispatch`.
+    function_section.function(host_ty);
 
     let mut mems = MemorySection::new();
     if !import_memory {
@@ -169,6 +173,7 @@ pub fn emit_module(
         exports.export(&abi::func_export(func.addr), ExportKind::Func, idx);
         code.function(&emit_func(func, func_index, base));
     }
+    code.function(&emit_dispatch(func_index));
 
     let mut module = Module::new();
     module
@@ -180,6 +185,34 @@ pub fn emit_module(
         .section(&exports)
         .section(&code);
     module.finish()
+}
+
+/// Emit the indirect-call dispatcher: `(addr: i32) -> ()`. It masks the Thumb
+/// bit off the runtime function-pointer and, for each translated function,
+/// compares the address and directly calls the match. Every guest function is
+/// `() -> ()` (state lives in globals), so a direct `call` after the match is all
+/// that is needed - no wasm table or `call_indirect`. An unresolved target hits
+/// `unreachable` (a real bug: an indirect callee we never discovered). The chain
+/// is linear in the function count; a binary search is a later optimization.
+fn emit_dispatch(func_index: &BTreeMap<u32, u32>) -> Function {
+    let mut f = Function::new([]);
+    // addr &= ~1  (clear the Thumb bit; function addresses are even).
+    f.instruction(&W::LocalGet(0));
+    f.instruction(&W::I32Const(!1));
+    f.instruction(&W::I32And);
+    f.instruction(&W::LocalSet(0));
+    for (&addr, &idx) in func_index {
+        f.instruction(&W::LocalGet(0));
+        f.instruction(&W::I32Const(addr as i32));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::Call(idx));
+        f.instruction(&W::Return);
+        f.instruction(&W::End);
+    }
+    f.instruction(&W::Unreachable);
+    f.instruction(&W::End);
+    f
 }
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
@@ -404,6 +437,14 @@ fn emit_stmt(
         Stmt::Call { target } => {
             let idx = *func_index.get(target).expect("callee index");
             f.instruction(&W::Call(idx));
+        }
+        Stmt::CallIndirect { addr } => {
+            // Push the runtime target address and call the module dispatcher,
+            // which maps it to the matching translated function. The dispatcher is
+            // the last defined function: IMPORT_FUNCS + one index per guest func.
+            let dispatch = IMPORT_FUNCS + func_index.len() as u32;
+            emit_value(f, addr, base);
+            f.instruction(&W::Call(dispatch));
         }
         Stmt::Guard(cond, body) => {
             emit_cond(f, *cond);

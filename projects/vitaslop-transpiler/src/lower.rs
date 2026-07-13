@@ -137,6 +137,13 @@ fn flow(
             // `b .` (branch to self) is an idle spin: treat as Halt so we do not
             // emit an infinite wasm loop the host cannot leave.
             Some(t) if t == addr => Flow::Halt,
+            // An unconditional branch to an import stub/veneer is a tail call
+            // (`return memset(...)`): it transfers out of the function, so it has
+            // no in-function successor and adds no callee - lowering runs the
+            // import then returns.
+            Some(t) if inst.condition == ConditionCode::AL && imports.get(t).is_some() => {
+                Flow::Return
+            }
             Some(t) if inst.condition == ConditionCode::AL => Flow::Jump(t),
             Some(t) => Flow::Fork(t),
             None => Flow::Halt,
@@ -148,12 +155,18 @@ fn flow(
         Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb) {
             Some(t) if imports.get(t).is_some() => Flow::Call { guest: None },
             Some(t) => Flow::Call { guest: Some(t) },
-            // Indirect bl/blx (register target) not yet supported.
+            // A register-target `blx rN` is an indirect call through a function
+            // pointer: it returns here, so continue to the fall-through, but the
+            // target is not a statically-known callee (the dispatcher resolves it
+            // at runtime).
+            None if matches!(inst.operands[0], Operand::Reg(_)) => Flow::Call { guest: None },
             None => Flow::Halt,
         },
         Opcode::BX => match inst.operands[0] {
-            Operand::Reg(r) if r.number() == 14 => Flow::Return,
-            _ => Flow::Halt, // indirect bx (not lr) unsupported yet
+            // `bx lr` returns; `bx rN` is an indirect tail call (dispatch to the
+            // target, then return). Either way there is no in-function successor.
+            Operand::Reg(_) => Flow::Return,
+            _ => Flow::Halt,
         },
         Opcode::POP | Opcode::LDM(..) if writes_pc(inst) => Flow::Return,
         Opcode::SVC => {
@@ -631,6 +644,11 @@ fn lower_insn(
                 return Ok((vec![], Some(Term::Halt)));
             }
             if cond == ConditionCode::AL {
+                // Tail call to an import stub/veneer: run the import, then return
+                // to our caller (lr already holds the caller's return address).
+                if let Some(index) = imports.get(target) {
+                    return Ok((vec![Stmt::Import(index)], Some(Term::Return)));
+                }
                 return Ok((vec![], Some(Term::Jump(target))));
             }
             return Ok((vec![], Some(Term::Branch { cond, taken: target })));
@@ -650,18 +668,32 @@ fn lower_insn(
         BX => {
             return match ops[0] {
                 Operand::Reg(r) if r.number() == 14 => Ok((vec![], Some(Term::Return))),
+                // `bx rN` tail-calls through a function pointer: dispatch to the
+                // runtime target, then return to our caller (lr is unchanged, so
+                // the callee's own return unwinds past us correctly).
+                Operand::Reg(r) => Ok((
+                    vec![Stmt::CallIndirect { addr: Value::Reg(r.number()) }],
+                    Some(Term::Return),
+                )),
                 _ => Err(err()),
             };
         }
         BL | BLX => {
-            let target = branch_target(inst, addr, thumb).ok_or_else(err)?;
             let ret = addr.wrapping_add(len);
-            let stmt = match imports.get(target) {
-                Some(index) => Stmt::Import(index),
-                None => Stmt::Call { target },
-            };
             // bl/blx set lr = return address (Thumb bit set in Thumb state).
             let lr = if thumb { ret | 1 } else { ret };
+            let stmt = match branch_target(inst, addr, thumb) {
+                Some(target) => match imports.get(target) {
+                    Some(index) => Stmt::Import(index),
+                    None => Stmt::Call { target },
+                },
+                // Register-target `blx rN`: indirect call through a function
+                // pointer, resolved at runtime by the dispatcher.
+                None => match ops[0] {
+                    Operand::Reg(r) => Stmt::CallIndirect { addr: Value::Reg(r.number()) },
+                    _ => return Err(err()),
+                },
+            };
             return Ok((vec![Stmt::SetReg(14, Value::Imm(lr)), stmt], None));
         }
         POP | LDM(..) if writes_pc(inst) => {

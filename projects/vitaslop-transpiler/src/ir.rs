@@ -211,6 +211,12 @@ pub enum Stmt {
     /// A direct guest call (`bl`/`blx` to translated code): call the callee's
     /// wasm function, which returns here. `lr` is set by a preceding `SetReg`.
     Call { target: u32 },
+    /// An indirect guest call (`blx rN` through a function pointer - init_array
+    /// constructors, qsort comparators, C++ vtables): `addr` is the runtime target
+    /// (Thumb bit set). Emission routes it through the module's dispatcher, which
+    /// maps the address to the matching translated function. `lr` is set by a
+    /// preceding `SetReg`.
+    CallIndirect { addr: Value },
     /// Execute the inner statements only if `cond` holds (ARM predication / an
     /// `IT` block body).
     Guard(ConditionCode, Vec<Stmt>),

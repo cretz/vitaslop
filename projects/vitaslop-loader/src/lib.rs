@@ -63,6 +63,13 @@ pub struct Module {
     pub segments: Vec<Segment>,
     /// Function imports, in import-table order.
     pub imports: Vec<Import>,
+    /// Static constructor/destructor function pointers, read from the
+    /// `.preinit_array`/`.init_array`/`.fini_array` sections (when the module
+    /// keeps section headers). These are reachable only through an indirect call
+    /// (`__libc_init_array` walks the table and `blx`es each), so they seed
+    /// transpiler discovery that the direct-call closure alone would miss. Empty
+    /// for `-nostdlib` modules and for anything with its section headers stripped.
+    pub init_pointers: Vec<u32>,
 }
 
 /// Why loading failed.
@@ -177,10 +184,23 @@ impl Module {
             let off = seg.vaddr.wrapping_sub(base) as usize;
             code[off..off + seg.data.len()].copy_from_slice(&seg.data);
         }
+        // Entries: the module entry plus every static constructor/destructor the
+        // init/fini arrays reference (each masked to its even function address).
+        // These are reached only via indirect call, so without them the closure
+        // walk would never translate the constructors and the indirect-call
+        // dispatcher could not resolve them.
+        let in_image = |a: u32| a.wrapping_sub(base) < end.wrapping_sub(base);
+        let mut entries = vec![self.entry & !1];
+        for &p in &self.init_pointers {
+            let a = p & !1;
+            if in_image(a) && !entries.contains(&a) {
+                entries.push(a);
+            }
+        }
         ProgramInputs {
             code,
             base,
-            entries: vec![self.entry & !1],
+            entries,
             externs,
             thumb_entry: self.entry & 1 != 0,
             mem_bytes: DEFAULT_MEM_BYTES,
@@ -394,6 +414,8 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         });
     }
 
+    let init_pointers = read_init_pointers(&r, bytes).unwrap_or_default();
+
     Ok(Module {
         name,
         module_nid,
@@ -401,7 +423,47 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         entry,
         segments,
         imports,
+        init_pointers,
     })
+}
+
+/// Read the constructor/destructor pointer tables (`.preinit_array`,
+/// `.init_array`, `.fini_array`) from the ELF section headers, if present. The
+/// entries are absolute Thumb function pointers (bit 0 set); we return them
+/// verbatim (masking is the transpiler's job). Any structural problem (stripped
+/// section headers, a table off the end of the file) yields `None`, so a module
+/// without these sections simply contributes no seeds.
+fn read_init_pointers(r: &Reader, bytes: &[u8]) -> Option<Vec<u32>> {
+    let e_shoff = r.u32(0x20).ok()? as usize;
+    let e_shentsize = r.u16(0x2e).ok()? as usize;
+    let e_shnum = r.u16(0x30).ok()? as usize;
+    let e_shstrndx = r.u16(0x32).ok()? as usize;
+    if e_shoff == 0 || e_shnum == 0 || e_shstrndx >= e_shnum {
+        return None;
+    }
+    // The section-header string table gives each section's name.
+    let strtab_off = r.u32(e_shoff + e_shstrndx * e_shentsize + 0x10).ok()? as usize;
+
+    let mut out = Vec::new();
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        let name_off = strtab_off + r.u32(sh).ok()? as usize;
+        let rest = bytes.get(name_off..)?;
+        let name = &rest[..rest.iter().position(|&b| b == 0)?];
+        if !matches!(name, b".preinit_array" | b".init_array" | b".fini_array") {
+            continue;
+        }
+        let sh_offset = r.u32(sh + 0x10).ok()? as usize;
+        let sh_size = r.u32(sh + 0x14).ok()? as usize;
+        for w in (0..sh_size).step_by(4) {
+            let p = r.u32(sh_offset + w).ok()?;
+            // 0 and ~0 are the empty-array sentinels some linkers emit.
+            if p != 0 && p != u32::MAX {
+                out.push(p);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Read a u16 at a guest vaddr (via the u32 reader, masking).
