@@ -50,12 +50,67 @@ pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Op
         // Join can block under the preemptive scheduler, so it returns the outcome.
         nid::WAIT_THREAD_END => return Some(wait_thread_end(ctx, st)),
         nid::GET_THREAD_ID => get_thread_id(ctx, st),
+        nid::GET_THREAD_EXIT_STATUS => get_thread_exit_status(ctx, st),
+        // Thread-local storage: a per-thread pointer slot keyed by an integer.
+        nid::GET_TLS_ADDR => get_tls_addr(ctx, st),
+        // 64-bit process runtime in microseconds (r0 low, r1 high).
+        nid::GET_PROCESS_TIME_WIDE => return Some(get_process_time_wide(ctx, st)),
         // Process control: unwind the run. r0 (the exit code) is left as the
         // guest set it; the host treats any exit as a clean stop.
-        nid::EXIT_PROCESS => return Some(SvcOutcome::Halt),
+        nid::EXIT_PROCESS => {
+            trace_exit(ctx, st);
+            return Some(SvcOutcome::Halt);
+        }
         _ => return None,
     }
     Some(SvcOutcome::Continue)
+}
+
+/// Diagnostic (env-gated by `VITASLOP_TRACE_EXIT`): when the guest calls
+/// `sceKernelExitProcess`, dump the exit code, the immediate caller (LR), and a
+/// window of the stack top. Return addresses saved on the stack (even words that
+/// point into the code image) reveal the call chain that decided to quit, so the
+/// deciding function can be disassembled. Zero cost when the env var is unset.
+fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
+    if std::env::var("VITASLOP_TRACE_EXIT").is_err() {
+        return;
+    }
+    // The last serviced calls, tagged by thread, so the exiting (main) thread's final
+    // decisions are legible apart from any worker's interleaved calls.
+    let trace = &st.capture.trace;
+    let thids = &st.capture.trace_thid;
+    // Optionally write the WHOLE thread-tagged trace to a file (VITASLOP_TRACE_FILE) so
+    // the pre-exit decision region can be examined, not just the exit-machinery tail.
+    if let Ok(path) = std::env::var("VITASLOP_TRACE_FILE") {
+        let mut out = String::new();
+        for i in 0..trace.len() {
+            let thid = thids.get(i).copied().unwrap_or(0);
+            out.push_str(&format!("{i} t{thid:#x} {}\n", crate::nid::name(trace[i])));
+        }
+        let _ = std::fs::write(&path, out);
+    }
+    let start = trace.len().saturating_sub(30);
+    eprintln!("[exit] last {} calls (idx thid name):", trace.len() - start);
+    for i in start..trace.len() {
+        let thid = thids.get(i).copied().unwrap_or(0);
+        eprintln!("[exit]   {i} t{thid:#x} {}", crate::nid::name(trace[i]));
+    }
+    let r0 = ctx.regs[0];
+    let lr = ctx.regs[14];
+    let sp = ctx.regs[13];
+    eprintln!("[exit] code={r0:#x} (r0={} signed) lr={lr:#010x} sp={sp:#010x}", r0 as i32);
+    eprintln!("[exit] r0..r12: {:08x?}", &ctx.regs[0..13]);
+    // Print stack words; flag any that fall inside the loaded code image (a plausible
+    // return address, Thumb or ARM) so the manual backtrace is quick. The image spans
+    // [base, base + ~5 MiB); use a generous 8 MiB window to stay title-agnostic.
+    let base = ctx.base;
+    let code_end = base.wrapping_add(0x0080_0000);
+    for i in 0..48u32 {
+        let a = sp.wrapping_add(i * 4);
+        let v = ctx.read_u32(a);
+        let tag = if v >= base && v < code_end { "  <- code?" } else { "" };
+        eprintln!("[exit]   sp+{:<3} {a:#010x}: {v:#010x}{tag}", i * 4);
+    }
 }
 
 /// SceUID sceKernelCreateThread(const char *name, SceKernelThreadEntry entry,
@@ -77,11 +132,23 @@ fn create_thread(
 }
 
 /// int sceKernelStartThread(SceUID thid, SceSize arglen, void *argp)
-/// Raises a synchronous run of the thread entry; the run happens after this call
-/// returns, so from the guest's view the thread has run by the next observation.
+/// Under the preemptive scheduler the worker runs later, not synchronously, so the
+/// argument block must be *snapshotted now*: the kernel copies `arglen` bytes from
+/// `argp` to the new thread before it runs, and callers rely on that - `argp` is
+/// almost always a stack temporary in the caller's frame that is reused (overwritten)
+/// long before the worker reads it. Copy it into a stable heap buffer and hand the
+/// worker that copy; without this the worker reads garbage for its argument.
 #[hostcall]
-fn start_thread(st: &mut VitaState, thid: i32, arglen: u32, argp: Ptr) -> i32 {
-    st.start_thread(thid, arglen, argp.addr());
+fn start_thread(ctx: &mut GuestCtx, st: &mut VitaState, thid: i32, arglen: u32, argp: Ptr) -> i32 {
+    let arg_ptr = if arglen > 0 && argp.addr() != 0 {
+        let bytes = ctx.read_bytes(argp.addr(), arglen as usize);
+        let buf = st.galloc(arglen, 8);
+        ctx.write_bytes(buf, &bytes);
+        buf
+    } else {
+        argp.addr()
+    };
+    st.start_thread(thid, arglen, arg_ptr);
     0
 }
 
@@ -99,8 +166,10 @@ fn wait_thread_end(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let thid = ctx.arg(0) as i32;
     let stat = ctx.arg(1);
     ctx.ret(0);
-    if st.is_preemptive() && !st.join_block(thid) {
-        // Parked; the target is still running. `join_block` recorded the waiter.
+    if st.is_preemptive() && !st.join_block(thid, stat) {
+        // Parked; the target is still running. `join_block` recorded the waiter and
+        // its `stat` pointer, so the exit code is delivered when the target ends (the
+        // handler cannot re-run at wake time - see `VitaState::take_stat_writes`).
         return SvcOutcome::Block;
     }
     // Either single-thread (worker already ran) or the target was already finished.
@@ -121,6 +190,39 @@ fn get_thread_id(st: &mut VitaState) -> i32 {
     } else {
         MAIN_THREAD_ID
     }
+}
+
+/// int sceKernelGetThreadExitStatus(SceUID thid, int *pExitStatus)
+/// Writes the thread's exit code and succeeds; a never-finished or unknown thread
+/// reports 0. (Single-thread: workers already ran to completion by the time this is
+/// asked.)
+#[hostcall]
+fn get_thread_exit_status(ctx: &mut GuestCtx, st: &mut VitaState, thid: i32, out: Ptr) -> i32 {
+    let code = st.thread_exit_code(thid).unwrap_or(0);
+    if !out.is_null() {
+        ctx.write_u32(out.addr(), code);
+    }
+    0
+}
+
+/// SceUInt64 sceKernelGetProcessTimeWide(void)
+/// The 64-bit process-runtime clock in microseconds. Returned in r0 (low)/r1 (high),
+/// so it is hand-written rather than `#[hostcall]`. Uses the virtual monotonic clock.
+fn get_process_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    // The virtual monotonic clock the scheduler advances (jumping over idle waits),
+    // so a timed wait loop reads real elapsed time instead of a frozen value.
+    let t = st.now_us();
+    ctx.regs[0] = t as u32;
+    ctx.regs[1] = (t >> 32) as u32;
+    SvcOutcome::Continue
+}
+
+/// void *sceKernelGetTLSAddr(int key)
+/// Returns this thread's storage slot for `key`, a stable zero-initialized pointer
+/// slot (see [`VitaState::tls_addr`]).
+#[hostcall]
+fn get_tls_addr(st: &mut VitaState, key: u32) -> u32 {
+    st.tls_addr(key)
 }
 
 /// int sceClibPrintf(const char *fmt, ...)

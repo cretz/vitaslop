@@ -130,6 +130,7 @@ pub struct WebVm {
     // this Vm holds them alive for as long as it lives.
     _svc: Closure<dyn FnMut(i32) -> Result<(), JsValue>>,
     _import: Closure<dyn FnMut(i32) -> Result<(), JsValue>>,
+    _dispatch_miss: Closure<dyn FnMut(i32, i32) -> Result<(), JsValue>>,
 }
 
 impl WebVm {
@@ -193,9 +194,20 @@ impl WebVm {
             }) as Box<dyn FnMut(i32) -> Result<(), JsValue>>)
         };
 
+        // env.dispatch_miss: an indirect call that resolves to no translated function
+        // throws with the faulting (target, caller) addresses, turning an opaque
+        // `unreachable` trap into a debuggable message.
+        let dispatch_miss_closure = Closure::wrap(Box::new(move |target: i32, caller: i32| -> Result<(), JsValue> {
+            Err(JsValue::from_str(&format!(
+                "indirect dispatch to unknown target {:#010x} from f_{:x}",
+                target as u32, caller as u32
+            )))
+        }) as Box<dyn FnMut(i32, i32) -> Result<(), JsValue>>);
+
         let env_obj = Object::new();
         Reflect::set(&env_obj, &JsValue::from_str(abi::SVC_NAME), svc_closure.as_ref())?;
         Reflect::set(&env_obj, &JsValue::from_str(abi::IMPORT_NAME), import_closure.as_ref())?;
+        Reflect::set(&env_obj, &JsValue::from_str(abi::DISPATCH_MISS_NAME), dispatch_miss_closure.as_ref())?;
         let imports = Object::new();
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env_obj)?;
 
@@ -225,7 +237,14 @@ impl WebVm {
             ex.regs[abi::SP].set_value(&JsValue::from_f64(base.wrapping_add(mem_bytes) as f64));
         }
 
-        Ok(WebVm { instance, exports, halted, _svc: svc_closure, _import: import_closure })
+        Ok(WebVm {
+            instance,
+            exports,
+            halted,
+            _svc: svc_closure,
+            _import: import_closure,
+            _dispatch_miss: dispatch_miss_closure,
+        })
     }
 
     /// Call the guest function exported at `addr`, running until it returns or a

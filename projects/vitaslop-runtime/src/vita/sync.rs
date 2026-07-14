@@ -229,7 +229,7 @@ fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
 /// than `#[hostcall]` (whose value returns are 32-bit). Time is the virtual
 /// monotonic clock, so it never goes backward.
 fn get_system_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let t = st.world.monotonic_us();
+    let t = st.now_us();
     ctx.regs[0] = t as u32;
     ctx.regs[1] = (t >> 32) as u32;
 }

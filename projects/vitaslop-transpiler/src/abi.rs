@@ -188,6 +188,11 @@ pub const SVC_NAME: &str = "svc";
 pub const SVC_MODULE: &str = IMPORT_MODULE;
 /// Import name of the Vita NID host trap: `(i32 index) -> ()`.
 pub const IMPORT_NAME: &str = "import";
+/// Import name of the indirect-dispatch miss reporter: `(i32 target, i32 caller) ->
+/// ()`. The dispatcher calls it when a runtime function-pointer resolves to no
+/// translated function; the host records the addresses and traps, turning an
+/// otherwise opaque `unreachable` into a debuggable "unknown target from caller".
+pub const DISPATCH_MISS_NAME: &str = "dispatch_miss";
 
 /// WASM page size in bytes.
 pub const PAGE_SIZE: u32 = 65536;

@@ -36,7 +36,9 @@ impl Engine for WebEngine {
             base: BASE,
             thumb,
             entries: &[BASE],
+            arm_entries: &[],
             externs: &[],
+            redirects: &[],
             noreturn_svc: NORETURN_SVC,
             mem_bytes: MEM_BYTES,
             // The ARM corpus is tightly controlled and takes no function

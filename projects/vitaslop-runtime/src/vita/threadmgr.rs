@@ -22,8 +22,19 @@ pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Op
         } else {
             SvcOutcome::Halt
         }),
+        nid::GET_PROCESS_ID => {
+            get_process_id(ctx, st);
+            Some(SvcOutcome::Continue)
+        }
         _ => None,
     }
+}
+
+/// SceUID sceKernelGetProcessId(void)
+/// A single process, so a fixed nonzero id is faithful and stable.
+#[hostcall]
+fn get_process_id(_st: &mut VitaState) -> i32 {
+    0x1000
 }
 
 /// int sceKernelDelayThread(SceUInt delay)

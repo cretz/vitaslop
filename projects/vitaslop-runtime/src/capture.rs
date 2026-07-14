@@ -27,6 +27,27 @@ pub struct ColorSurface {
     pub data_addr: u32,
 }
 
+/// A texture bound to a fragment sampler unit at draw time. Decoded from the
+/// guest's 16-byte `SceGxmTexture` control words (format, dimensions, memory
+/// layout, data address) with a snapshot of the referenced pixel bytes, so a
+/// renderer can sample it without touching guest memory later. Fields are the
+/// raw GXM enum parts: `base_format` is the high byte of `SceGxmTextureBaseFormat`
+/// (e.g. `0x0c` for U8U8U8U8), `swizzle` is the format's low 24 bits, and
+/// `tex_type` is the 3-bit `SceGxmTextureType` selector (`0b011` = LINEAR).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundTexture {
+    pub unit: u32,
+    pub base_format: u32,
+    pub swizzle: u32,
+    pub tex_type: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row of the snapshotted `pixels` (== the source stride).
+    pub stride: u32,
+    pub data_addr: u32,
+    pub pixels: Vec<u8>,
+}
+
 /// A single draw call with everything needed to reproduce it, snapshotted from
 /// guest memory at draw time (so later guest writes cannot perturb it).
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +64,9 @@ pub struct Draw {
     /// The vertex default uniform buffer contents the guest wrote for this draw
     /// (column-major 4x4 MVP for the cube), if any.
     pub uniforms: Vec<f32>,
+    /// Fragment textures bound at draw time (one per active sampler unit),
+    /// snapshotted from guest memory. Empty for an untextured (vertex-color) draw.
+    pub textures: Vec<BoundTexture>,
 }
 
 /// One scene (BeginScene to EndScene): its render target color buffer and the
@@ -93,6 +117,10 @@ pub struct Capture {
     pub call_count: u64,
     /// Ordered trace of every serviced call's function NID, for debugging.
     pub trace: Vec<u32>,
+    /// The guest thread id that made each serviced call, parallel to [`trace`](Self::trace)
+    /// (0 outside the preemptive scheduler). Lets a trace be split by thread - e.g. to
+    /// see what the main thread did versus a worker.
+    pub trace_thid: Vec<i32>,
     /// Bytes the guest wrote to the debug console (sceClibPrintf and friends), in
     /// order. This is the blob-free "it printed" signal for the hello corpus: the
     /// Vita has no framebuffer console for these, so the host is the sink. Also fed
@@ -100,6 +128,11 @@ pub struct Capture {
     pub stdout: Vec<u8>,
     /// Bytes written to fd 2 (stderr) via sceIoWrite.
     pub stderr: Vec<u8>,
+    /// Diagnostic sample of the first few `sceKernelWaitLwCond` calls:
+    /// `(cond work addr, timeout pointer, timeout value or 0)`. Lets the probe tell
+    /// a producer/consumer wait (no timeout) from a timed delay loop (finite
+    /// timeout) without a full trace. Capped so it costs nothing after warm-up.
+    pub lwcond_wait_samples: Vec<(u32, u32, u32)>,
 }
 
 impl Capture {

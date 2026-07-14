@@ -18,6 +18,8 @@ extern crate self as vitaslop_runtime;
 
 pub mod capture;
 pub mod host;
+pub mod ingest;
+pub mod link;
 pub mod nid;
 pub mod render;
 pub mod vita;

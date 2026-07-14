@@ -175,7 +175,9 @@ impl Scheduler {
             base,
             thumb,
             entries,
+            arm_entries: &[],
             externs,
+            redirects: &[],
             noreturn_svc: &[],
             mem_bytes,
             // Vita modules take function addresses (thread entries, callbacks).
@@ -214,6 +216,7 @@ impl Scheduler {
         let mut linker = Linker::new(&engine);
         bind_svc(&mut linker)?;
         bind_import(&mut linker)?;
+        bind_dispatch_miss(&mut linker)?;
         // No start section in the guest module, so instantiation completes without
         // suspending; drive it to completion synchronously.
         let instance = pollster::block_on(linker.instantiate_async(&mut store, &module))?;
@@ -307,6 +310,27 @@ fn bind_svc(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
             abi::SVC_NAME,
             |_caller: Caller<'_, SchedState>, (_selector,): (i32,)| {
                 Box::new(async { Ok(()) })
+            },
+        )
+        .map_err(|e| RunError::Wasm(e.to_string()))?;
+    Ok(())
+}
+
+/// Bind `env.dispatch_miss`: an indirect call resolving to no translated function
+/// unwinds the fiber with the faulting `(target, caller)` addresses, so an unmapped
+/// target is a clear report rather than an opaque `unreachable` trap.
+fn bind_dispatch_miss(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
+    linker
+        .func_wrap_async(
+            abi::IMPORT_MODULE,
+            abi::DISPATCH_MISS_NAME,
+            |_caller: Caller<'_, SchedState>, (target, caller): (i32, i32)| {
+                Box::new(async move {
+                    Err::<(), wasmtime::Error>(wasmtime::Error::msg(format!(
+                        "indirect dispatch to unknown target {:#010x} from f_{:x}",
+                        target as u32, caller as u32
+                    )))
+                })
             },
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;

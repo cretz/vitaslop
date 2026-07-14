@@ -14,3 +14,23 @@ vitaslop-platform = { path = "../vitaslop-platform" }
 # Vita host handlers in vita/. A proc-macro crate, so it is host-side only and
 # adds nothing to the guest wasm.
 vitaslop-hostcall = { path = "../vitaslop-hostcall" }
+
+# ROM ingestion (the `ingest` module): decrypting a retail app container down to
+# the plaintext velf the loader parses. Pure-Rust RustCrypto primitives, all
+# wasm-safe so the browser decrypts in OPFS exactly as native does on disk.
+# AES-128 (ECB/CBC/CTR) block cipher; the mode wrappers; AES-CMAC and HMAC for
+# key derivation and page verification; SHA-1/SHA-256 for the digest steps.
+aes = "0.8"
+cbc = "0.1"
+ctr = "0.9"
+cmac = "0.7"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+# Raw DEFLATE for the SELF segment decompression and the container zip. Permissive
+# (MIT/Apache), pure Rust, wasm-clean - unlike a zlib-crate C dependency.
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+# Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.
+wasmparser = "0.253"

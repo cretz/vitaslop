@@ -27,15 +27,28 @@ pub struct Program<'a> {
     pub code: &'a [u8],
     /// Guest address the image loads at (and the linear-memory rebase origin).
     pub base: u32,
-    /// True to decode in Thumb-2 mode, false for ARM. Whole-program for now;
-    /// per-function `blx` mode switches come later.
+    /// Default decode mode for [`entries`](Self::entries) and their transitively
+    /// discovered callees: true for Thumb-2, false for ARM. A title is overwhelmingly
+    /// one mode (Vita user code is Thumb); the few functions in the other mode are
+    /// listed in [`arm_entries`](Self::arm_entries).
     pub thumb: bool,
-    /// Entry points to discover (each becomes a function, transitively pulling
-    /// in its direct callees).
+    /// Entry points to discover in the default [`thumb`](Self::thumb) mode (each
+    /// becomes a function, transitively pulling in its direct callees).
     pub entries: &'a [u32],
+    /// Entry points to discover in ARM mode regardless of [`thumb`](Self::thumb) -
+    /// even code pointers a Thumb title reaches through a `blx` into an ARM stub.
+    /// Discovered tentatively (a bad guess that fails to decode is dropped), like
+    /// address-taken code pointers.
+    pub arm_entries: &'a [u32],
     /// Extern (imported-function) wiring: each maps a guest stub address to a
     /// dense host-import index.
     pub externs: &'a [Extern],
+    /// Inter-module redirects: each maps an import-stub address to the guest
+    /// address of the function that satisfies it in another module of the same
+    /// link. A `bl`/`b` to such a stub becomes a direct guest call to the target
+    /// (no host trap), so a call across module boundaries is as cheap as one
+    /// within a module. Empty for a single-module link.
+    pub redirects: &'a [Redirect],
     /// Syscall numbers (guest r7) that do not return, so a `svc` with a
     /// statically-known one of them ends decoding (before trailing data).
     pub noreturn_svc: &'a [u32],
@@ -64,6 +77,14 @@ pub struct Extern {
     pub import: u32,
 }
 
+/// An inter-module redirect: a `bl`/`b` to import stub `addr` is retargeted to
+/// the guest function at `target` (an export of another module in the same link),
+/// lowering to a direct guest call instead of a host import trap.
+pub struct Redirect {
+    pub addr: u32,
+    pub target: u32,
+}
+
 /// The transpiler output: the WASM blob plus the map the runtime needs to enter
 /// guest code by address.
 pub struct Artifact {
@@ -71,6 +92,11 @@ pub struct Artifact {
     pub wasm: Vec<u8>,
     /// One entry per transpiled function: its guest address and wasm export name.
     pub funcs: Vec<FuncExport>,
+    /// Total linear-memory pages the module declares (the guest region plus the
+    /// appended indirect-dispatch address table). A host that imports a shared memory
+    /// must create it with exactly this many pages; a host that lets the module define
+    /// its own memory can ignore this. See [`emit::EmitOutput`].
+    pub mem_pages: u32,
 }
 
 /// A transpiled function: the guest address it starts at and its wasm export.
@@ -125,6 +151,35 @@ fn scan_veneers(code: &[u8], base: u32, imports: &BTreeMap<u32, u32>) -> Vec<(u3
 }
 
 /// Transpile `program` into a WASM module and its dispatch map.
+/// One pending discovery target: its address, whether it is `tentative` (a guessed
+/// code pointer that is dropped on a decode failure rather than erroring), and which
+/// `thumb`/ARM mode to decode it in.
+struct WorkItem {
+    addr: u32,
+    tentative: bool,
+    thumb: bool,
+}
+
+impl WorkItem {
+    /// A hard target (a decode failure is a real error), decoded in `thumb` mode.
+    fn hard(addr: u32, thumb: bool) -> WorkItem {
+        WorkItem { addr, tentative: false, thumb }
+    }
+    /// A tentative target (dropped on a decode failure), decoded in `thumb` mode.
+    fn tentative(addr: u32, thumb: bool) -> WorkItem {
+        WorkItem { addr, tentative: true, thumb }
+    }
+}
+
+/// The initial discovery worklist: hard entries in the program's default mode, plus
+/// tentative ARM entries (even code pointers reached through a `blx` into ARM code).
+fn seed_worklist(program: &Program) -> Vec<WorkItem> {
+    let mut work: Vec<WorkItem> =
+        program.entries.iter().map(|&a| WorkItem::hard(a, program.thumb)).collect();
+    work.extend(program.arm_entries.iter().map(|&a| WorkItem::tentative(a, false)));
+    work
+}
+
 pub fn transpile(program: &Program) -> Result<Artifact, Error> {
     let mut import_map: BTreeMap<u32, u32> =
         program.externs.iter().map(|e| (e.addr, e.import)).collect();
@@ -132,16 +187,17 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
     for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
         import_map.insert(veneer, idx);
     }
-    let imports = Imports::new(&import_map);
+    let redirect_map: BTreeMap<u32, u32> =
+        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let imports = Imports::new(&import_map, &redirect_map);
 
     // Discover the transitive closure from the entries: direct callees are hard
     // (a decode failure is a real bug and propagates), while address-taken code
     // pointers are tentative (a mis-identified constant that fails to decode is
     // silently skipped, never breaking the build).
     let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
-    // (address, tentative).
-    let mut work: Vec<(u32, bool)> = program.entries.iter().map(|&a| (a, false)).collect();
-    while let Some((addr, tentative)) = work.pop() {
+    let mut work = seed_worklist(program);
+    while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
         if funcs.contains_key(&addr) {
             continue;
         }
@@ -149,7 +205,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             program.code,
             program.base,
             addr,
-            program.thumb,
+            thumb,
             &imports,
             program.noreturn_svc,
             program.discover_code_pointers,
@@ -160,8 +216,18 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             Err(_) if tentative => continue,
             Err(e) => return Err(e),
         };
-        work.extend(found.callees.into_iter().map(|a| (a, false)));
-        work.extend(found.code_pointers.into_iter().map(|a| (a, true)));
+        // A tentative guess that decoded into a malformed function (a branch to a
+        // non-block - common when ARM-decoding data or a Thumb address) was never a
+        // real function; drop it so it never reaches emission.
+        if tentative && !found.func.well_formed() {
+            continue;
+        }
+        // Direct callees inherit this function's mode and its tentativeness (a
+        // callee reached only from a guess is itself a guess); discovered code
+        // pointers are tentative Thumb (materialized with the Thumb bit set).
+        let callee: fn(u32, bool) -> WorkItem = if tentative { WorkItem::tentative } else { WorkItem::hard };
+        work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+        work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
         funcs.insert(addr, found.func);
     }
 
@@ -174,7 +240,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let wasm =
+    let emit::EmitOutput { wasm, mem_pages } =
         emit::emit_module(&ordered, &func_index, program.base, program.mem_bytes, program.import_memory);
     let funcs = ordered
         .iter()
@@ -183,7 +249,158 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, funcs })
+    Ok(Artifact { wasm, funcs, mem_pages })
+}
+
+/// The output of a lenient whole-program build ([`transpile_lenient`]): the module
+/// plus the addresses that were emitted as trapping stubs.
+pub struct LenientArtifact {
+    pub artifact: Artifact,
+    /// Guest addresses of functions that could not be lowered and became trapping
+    /// stubs. Empty means a fully-translated program. Any of these reached at
+    /// runtime faults (a real, visible signal that the code is on the hot path).
+    pub stubbed: Vec<u32>,
+    /// The wasm function indices of the stubs (parallel to [`stubbed`](Self::stubbed)),
+    /// so a runtime `unreachable` trap backtrace ("wasm function N") can be told
+    /// apart from a genuine miscompile - a stub is expected, anything else is a bug.
+    pub stub_wasm_indices: Vec<u32>,
+}
+
+/// Transpile like [`transpile`], but never abort: a function that fails to lower
+/// becomes a trapping stub instead of an error, so the whole program still emits a
+/// valid, runnable module. This is what lets a real title boot while a handful of
+/// exotic instructions remain unlifted - the boot path proceeds, and any stub it
+/// actually calls faults loudly instead of silently mistranslating. Discovery from
+/// a stubbed function's body stops (its callees are unknown), which is correct: we
+/// could not decode past the unlifted instruction anyway.
+pub fn transpile_lenient(program: &Program) -> LenientArtifact {
+    let mut import_map: BTreeMap<u32, u32> =
+        program.externs.iter().map(|e| (e.addr, e.import)).collect();
+    for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
+        import_map.insert(veneer, idx);
+    }
+    let redirect_map: BTreeMap<u32, u32> =
+        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let imports = Imports::new(&import_map, &redirect_map);
+
+    let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
+    let mut stubbed = Vec::new();
+    let mut work = seed_worklist(program);
+    while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
+        if funcs.contains_key(&addr) {
+            continue;
+        }
+        match lower::discover(
+            program.code,
+            program.base,
+            addr,
+            thumb,
+            &imports,
+            program.noreturn_svc,
+            program.discover_code_pointers,
+        ) {
+            // A tentative guess that decoded into a malformed function (a branch to
+            // a non-block) was never real; drop it before it can be emitted.
+            Ok(found) if tentative && !found.func.well_formed() => {}
+            Ok(found) => {
+                let callee: fn(u32, bool) -> WorkItem =
+                    if tentative { WorkItem::tentative } else { WorkItem::hard };
+                work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+                work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+                funcs.insert(addr, found.func);
+            }
+            // A tentative code pointer that does not decode was never a function.
+            Err(_) if tentative => {}
+            // A hard callee we cannot lower becomes a trapping stub, so the rest of
+            // the program still builds and runs.
+            Err(_) => {
+                stubbed.push(addr);
+                funcs.insert(addr, ir::Func::new_stub(addr));
+            }
+        }
+    }
+
+    let ordered: Vec<ir::Func> = funcs.into_values().collect();
+    let func_index: BTreeMap<u32, u32> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
+        .collect();
+    let emit::EmitOutput { wasm, mem_pages } = emit::emit_module(
+        &ordered,
+        &func_index,
+        program.base,
+        program.mem_bytes,
+        program.import_memory,
+    );
+    let funcs = ordered
+        .iter()
+        .map(|f| FuncExport { addr: f.addr, export: abi::func_export(f.addr) })
+        .collect();
+    stubbed.sort_unstable();
+    let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
+    LenientArtifact { artifact: Artifact { wasm, funcs, mem_pages }, stubbed, stub_wasm_indices }
+}
+
+/// A single function the report could not translate: the discovery root it was
+/// reached from, and the error (whose `addr` pinpoints the offending instruction).
+pub struct ReportFailure {
+    pub root: u32,
+    pub error: Error,
+}
+
+/// The result of a resilient, diagnostic-only discovery pass: how many functions
+/// translated cleanly and the ones that failed.
+pub struct Report {
+    /// Guest addresses of functions that discovered and lowered without error.
+    pub ok: Vec<u32>,
+    /// Functions that failed to translate (skipped rather than aborting).
+    pub failures: Vec<ReportFailure>,
+}
+
+/// Diagnostic: attempt to discover and lower every reachable function, but on a
+/// failure record it and continue instead of aborting at the first one. Unlike
+/// [`transpile`] this never emits a module and never returns `Err` - it is purely
+/// for sizing what CPU work remains (which instructions block which functions),
+/// so bring-up can see the whole gap at once rather than one instruction per run.
+pub fn transpile_report(program: &Program) -> Report {
+    let import_map: BTreeMap<u32, u32> =
+        program.externs.iter().map(|e| (e.addr, e.import)).collect();
+    let redirect_map: BTreeMap<u32, u32> =
+        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let imports = Imports::new(&import_map, &redirect_map);
+
+    let mut done: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut ok = Vec::new();
+    let mut failures = Vec::new();
+    let mut work = seed_worklist(program);
+    while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
+        if !done.insert(addr) {
+            continue;
+        }
+        match lower::discover(
+            program.code,
+            program.base,
+            addr,
+            thumb,
+            &imports,
+            program.noreturn_svc,
+            program.discover_code_pointers,
+        ) {
+            Ok(found) if tentative && !found.func.well_formed() => {}
+            Ok(found) => {
+                let callee: fn(u32, bool) -> WorkItem =
+                    if tentative { WorkItem::tentative } else { WorkItem::hard };
+                work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+                work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+                ok.push(addr);
+            }
+            // A tentative code pointer that does not decode was never a function.
+            Err(_) if tentative => {}
+            Err(error) => failures.push(ReportFailure { root: addr, error }),
+        }
+    }
+    Report { ok, failures }
 }
 
 #[cfg(test)]
@@ -204,7 +421,9 @@ mod tests {
             base: 0x10000,
             thumb: false,
             entries: &[0x10000],
+            arm_entries: &[],
             externs: &[],
+            redirects: &[],
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
@@ -232,7 +451,9 @@ mod tests {
             base: 0x10000,
             thumb: true,
             entries: &[0x10000],
+            arm_entries: &[],
             externs: &[],
+            redirects: &[],
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
@@ -277,7 +498,9 @@ mod tests {
             base,
             thumb: true,
             entries: &[base],
+            arm_entries: &[],
             externs: &[],
+            redirects: &[],
             noreturn_svc: &[],
             mem_bytes: 0x1_0000,
             discover_code_pointers: false,
@@ -326,7 +549,9 @@ mod tests {
                 base: 0x10000,
                 thumb: false,
                 entries: &[0x10000],
+                arm_entries: &[],
                 externs: &[],
+                redirects: &[],
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,

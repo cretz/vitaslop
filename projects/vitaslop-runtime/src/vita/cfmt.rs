@@ -506,7 +506,7 @@ mod tests {
 
         // Place a word into the argument sequence (word i is r`i`, or the stack
         // slot at sp + (i-4)*4).
-        let mut put = |mem: &mut [u8], regs: &mut [u32; REG_COUNT], word: usize, v: u32| {
+        let put = |mem: &mut [u8], regs: &mut [u32; REG_COUNT], word: usize, v: u32| {
             if word < 4 {
                 regs[word] = v;
             } else {

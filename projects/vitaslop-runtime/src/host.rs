@@ -346,6 +346,28 @@ const FIRST_FD: i32 = 3;
 pub const FD_STDOUT: i32 = 1;
 pub const FD_STDERR: i32 = 2;
 
+/// Resolve a guest file path to a VFS key.
+///
+/// Two Vita filesystem facts are folded in here so a title finds its data files:
+/// - **Mount point.** A Vita mounts the running app's own read-only data at `app0:`,
+///   and the decrypted game files are stored under their paths relative to that mount,
+///   so an `app0:` prefix (with or without the separator) is stripped. Other mounts -
+///   `ux0:`, `savedata0:` - keep their full path, a distinct, writable space.
+/// - **Case-insensitivity.** The Vita's FAT/exFAT filesystem is case-insensitive, so
+///   the key is lowercased. Titles routinely request an asset with different casing
+///   than the shipped filename (e.g. open `Neondecals.gxt` for the file
+///   `neondecals.gxt`); a case-sensitive map would miss it.
+///
+/// Without this a title that opens `app0:/settings/foo.ini` or `.../Foo.GXT` would
+/// miss the file stored as `settings/foo.ini` and take its file-missing (often fatal)
+/// path.
+fn vfs_key(path: &str) -> String {
+    path.strip_prefix("app0:/")
+        .or_else(|| path.strip_prefix("app0:"))
+        .unwrap_or(path)
+        .to_lowercase()
+}
+
 impl FileTable {
     fn new() -> Self {
         FileTable { next_fd: FIRST_FD, ..Default::default() }
@@ -353,30 +375,31 @@ impl FileTable {
 
     /// Open `path` per the SCE_O_* `flags`; returns a new fd or a negative errno.
     fn open(&mut self, path: &str, flags: u32) -> i32 {
+        let path = vfs_key(path);
         let readable = flags & SCE_O_RDWR == SCE_O_RDONLY || flags & SCE_O_RDWR == SCE_O_RDWR;
         let writable = flags & SCE_O_WRONLY != 0;
-        let exists = self.files.contains_key(path);
+        let exists = self.files.contains_key(&path);
 
         if !exists {
             if flags & SCE_O_CREAT != 0 {
-                self.files.insert(path.to_string(), Vec::new());
+                self.files.insert(path.clone(), Vec::new());
             } else {
                 return SCE_ERROR_ERRNO_ENOENT;
             }
         } else if flags & SCE_O_TRUNC != 0 {
-            self.files.insert(path.to_string(), Vec::new());
+            self.files.insert(path.clone(), Vec::new());
         }
 
         // Append seeks to end; every other open starts at the beginning.
         let cursor = if flags & SCE_O_APPEND != 0 {
-            self.files.get(path).map(|d| d.len()).unwrap_or(0)
+            self.files.get(&path).map(|d| d.len()).unwrap_or(0)
         } else {
             0
         };
 
         let fd = self.next_fd;
         self.next_fd += 1;
-        self.open.insert(fd, OpenFile { path: path.to_string(), cursor, readable, writable });
+        self.open.insert(fd, OpenFile { path, cursor, readable, writable });
         fd
     }
 
@@ -447,7 +470,7 @@ impl FileTable {
 
     /// The size of `path` if it exists (for sceIoGetstat).
     fn size_of(&self, path: &str) -> Option<u64> {
-        self.files.get(path).map(|d| d.len() as u64)
+        self.files.get(&vfs_key(path)).map(|d| d.len() as u64)
     }
 }
 
@@ -500,10 +523,17 @@ pub struct VitaState {
     mutexes: Vec<MutexRec>,
     conds: Vec<CondRec>,
     sema_waiters: Vec<SemaWaiter>,
-    /// (waiter thread id, target thread id) for threads parked in a join.
-    join_waiters: Vec<(i32, i32)>,
+    /// (waiter thread id, target thread id, stat pointer) for threads parked in a
+    /// join. `stat` is the guest `int *` the joiner passed to `sceKernelWaitThreadEnd`
+    /// (0 = NULL); the target's exit code is written there when the join completes.
+    join_waiters: Vec<(i32, i32, u32)>,
     pending_spawns: Vec<Reentry>,
     pending_wakes: Vec<i32>,
+    /// Guest memory writes to apply when a blocked joiner is woken: `(stat_ptr,
+    /// exit_code)`. `sceKernelWaitThreadEnd`'s handler cannot re-run at wake time, so
+    /// the exit code it owes the joiner's `stat` out-parameter is queued here and
+    /// applied by the scheduler (which has memory access) before the joiner resumes.
+    pending_stat_writes: Vec<(u32, u32)>,
     // Virtual filesystem backing SceIoFilemgr (open/read/write/lseek/close).
     fs: FileTable,
     pub capture: Capture,
@@ -515,6 +545,40 @@ pub struct VitaState {
     /// entry is `_start`, which spins forever after `main` returns (there is no OS
     /// to exit to yet), so terminate is the clean stopping point after teardown.
     pub halt_on_terminate: bool,
+    /// Guest address of the main module's `SceProcessParam`, returned verbatim by
+    /// `sceKernelGetProcessParam`. libc's crt reads the `SceLibcParam` it points to
+    /// for the heap configuration, so this must be a real address (0 would fault).
+    process_param: u32,
+    /// Per-`(thread, key)` thread-local storage slots handed out by
+    /// `sceKernelGetTLSAddr`. Each is a distinct zero-initialized guest block whose
+    /// address is stable across calls, so a thread stores and reads back its own
+    /// TLS pointer faithfully.
+    tls_slots: Vec<((i32, u32), u32)>,
+    /// `(shaderPatcherId handle, SceGxmProgram* header)` from every
+    /// `sceGxmShaderPatcherRegisterProgram`, so `sceGxmShaderPatcherGetProgramFromId`
+    /// can hand back the real program pointer the guest registered.
+    shader_programs: Vec<(u32, u32)>,
+    /// Fragment textures currently bound by `sceGxmSetFragmentTexture`, keyed by
+    /// sampler unit -> guest `SceGxmTexture*`. Bindings persist across draws until
+    /// rebound (GXM state is sticky), so this is read - not cleared - at each draw.
+    bound_textures: Vec<(u32, u32)>,
+    /// Exact `SceGxmTextureFormat` last set on a guest `SceGxmTexture*` via
+    /// `sceGxmTextureInit*`/`SetFormat`. The 16-byte control words alone lose the
+    /// channel swizzle (only a 3-bit field survives), so we keep the full 32-bit
+    /// format the guest passed for an exact decode; a texture the guest fills
+    /// directly (a `.gxt` blob) is absent here and falls back to control-word parse.
+    texture_formats: Vec<(u32, u32)>,
+    /// Threads parked in `sceKernelWaitLwCond`, as `(thread id, cond work address,
+    /// wake deadline)`. `deadline` is `Some(virtual_us)` for a timed wait (woken by
+    /// a signal or when the clock reaches it) or `None` for an infinite wait (only a
+    /// signal wakes it). Keyed by the cond's guest work pointer, since lightweight
+    /// objects have no kernel handle. See the scheduler's idle-time advance.
+    lwcond_waiters: Vec<(i32, u32, Option<u64>)>,
+    /// The virtual monotonic clock in microseconds, read by
+    /// `sceKernelGetProcessTimeWide`/`GetSystemTimeWide`. The scheduler advances it
+    /// (jumping to the earliest pending deadline when every thread is parked), so a
+    /// timed wait costs one round instead of millions of busy-poll iterations.
+    virtual_us: u64,
 }
 
 impl VitaState {
@@ -549,11 +613,71 @@ impl VitaState {
             join_waiters: Vec::new(),
             pending_spawns: Vec::new(),
             pending_wakes: Vec::new(),
+            pending_stat_writes: Vec::new(),
             fs: FileTable::new(),
             capture: Capture::new(),
             world,
             halt_on_terminate: false,
+            process_param: 0,
+            tls_slots: Vec::new(),
+            shader_programs: Vec::new(),
+            bound_textures: Vec::new(),
+            texture_formats: Vec::new(),
+            lwcond_waiters: Vec::new(),
+            virtual_us: 0,
         }
+    }
+
+    /// Record a registered shader program (its guest `SceGxmProgram*` header) and
+    /// return the opaque `shaderPatcherId` handle the guest will pass around.
+    pub fn register_shader_program(&mut self, program_header: u32) -> u32 {
+        let handle = self.new_handle();
+        self.shader_programs.push((handle, program_header));
+        handle
+    }
+
+    /// The `SceGxmProgram*` header for a `shaderPatcherId`, or 0 if unknown.
+    pub fn shader_program(&self, id: u32) -> u32 {
+        self.shader_programs
+            .iter()
+            .find(|&&(h, _)| h == id)
+            .map(|&(_, p)| p)
+            .unwrap_or(0)
+    }
+
+    /// Record the guest address of the main module's `SceProcessParam` (from
+    /// [`crate::link::LinkedProgram::process_param`]) so `sceKernelGetProcessParam`
+    /// can hand it to libc. Set once before the run.
+    pub fn set_process_param(&mut self, addr: u32) {
+        self.process_param = addr;
+    }
+
+    /// The `SceProcessParam` address (0 if the title carries none).
+    pub fn process_param(&self) -> u32 {
+        self.process_param
+    }
+
+    /// The stable guest address of TLS slot `key` for the currently running thread,
+    /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
+    /// memory starts zeroed, so a never-written slot reads back as NULL.
+    pub fn tls_addr(&mut self, key: u32) -> u32 {
+        let thread = self.current;
+        if let Some(&(_, addr)) = self.tls_slots.iter().find(|&&(k, _)| k == (thread, key)) {
+            return addr;
+        }
+        // A pointer-sized slot per key is what the low-level TLS API hands out; the
+        // caller stores its own per-thread pointer there.
+        let addr = self.galloc(4, 4);
+        self.tls_slots.push(((thread, key), addr));
+        addr
+    }
+
+    /// Move the heap allocation cursor to `addr`. A multi-module linked title
+    /// (see [`crate::link`]) fills far more than the default 1 MiB below the heap,
+    /// so the host must set this above the whole image (`LinkedProgram::alloc_base`)
+    /// before the run, or allocations would overwrite guest code.
+    pub fn set_alloc_base(&mut self, addr: u32) {
+        self.alloc_cursor = addr;
     }
 
     // --- SceIoFilemgr virtual filesystem ---
@@ -561,17 +685,21 @@ impl VitaState {
     /// Preload a read-only file into the virtual filesystem before a run (e.g. a
     /// title's data file). The guest can then `sceIoOpen`/`sceIoRead` it.
     pub fn add_file(&mut self, path: &str, bytes: Vec<u8>) {
-        self.fs.files.insert(path.to_string(), bytes);
+        self.fs.files.insert(vfs_key(path), bytes);
     }
 
     /// Read back a file's current bytes (a write target after the run, for tests).
     pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
-        self.fs.files.get(path).map(|v| v.as_slice())
+        self.fs.files.get(&vfs_key(path)).map(|v| v.as_slice())
     }
 
     /// sceIoOpen: returns a new fd or a negative errno.
     pub fn io_open(&mut self, path: &str, flags: u32) -> i32 {
-        self.fs.open(path, flags)
+        let fd = self.fs.open(path, flags);
+        if std::env::var("VITASLOP_TRACE_IO").is_ok() {
+            eprintln!("[io] open({path:?}, flags={flags:#x}) -> {fd}");
+        }
+        fd
     }
 
     /// sceIoRead: read up to `len` bytes; None on a bad/unreadable fd.
@@ -700,7 +828,15 @@ impl VitaState {
             let mut i = 0;
             while i < self.join_waiters.len() {
                 if self.join_waiters[i].1 == thid {
-                    let (waiter, _) = self.join_waiters.remove(i);
+                    let (waiter, _, stat) = self.join_waiters.remove(i);
+                    // Deliver the exit code to the joiner's `stat` out-parameter now
+                    // that it is known; the wait handler cannot write it at wake time.
+                    if std::env::var("VITASLOP_TRACE_EXIT").is_ok() {
+                        eprintln!("[join] target {thid:#x} exited code={code:#x}; waking {waiter:#x}, stat={stat:#x}");
+                    }
+                    if stat != 0 {
+                        self.pending_stat_writes.push((stat, code));
+                    }
                     self.pending_wakes.push(waiter);
                 } else {
                     i += 1;
@@ -711,14 +847,23 @@ impl VitaState {
 
     /// Park the current thread joining `target`, unless it has already finished.
     /// Returns true if `target` is already done (the caller continues) or false if
-    /// the caller was parked (return [`SvcOutcome::Block`]).
-    pub fn join_block(&mut self, target: i32) -> bool {
+    /// the caller was parked (return [`SvcOutcome::Block`]). `stat` is the joiner's
+    /// `int *` out-parameter (0 = NULL), written with the target's exit code when the
+    /// join completes (at wake time, via [`take_stat_writes`](Self::take_stat_writes)).
+    pub fn join_block(&mut self, target: i32, stat: u32) -> bool {
         if self.thread_finished(target) {
             true
         } else {
-            self.join_waiters.push((self.current, target));
+            self.join_waiters.push((self.current, target, stat));
             false
         }
+    }
+
+    /// Take the queued joiner `stat` writes (`(stat_ptr, exit_code)`) so the scheduler
+    /// can apply them to guest memory before the woken joiners resume. Drained after
+    /// each dispatch alongside spawns and wakes.
+    pub fn take_stat_writes(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.pending_stat_writes)
     }
 
     /// Try to take `need` from semaphore `uid` without blocking. Returns true if
@@ -903,6 +1048,65 @@ impl VitaState {
         }
     }
 
+    // --- lightweight condition variables + virtual clock -------------------
+    //
+    // Lightweight conds (`sceKernelWaitLwCond`/`SignalLwCond`) are identified by a
+    // guest work pointer, not a kernel handle, so they park by work address here
+    // rather than through `CondRec`. A parked wait yields the fiber (the caller
+    // returns `Block`), which lets the scheduler run the thread that will set the
+    // awaited condition and signal it - the whole point, since a non-yielding wait
+    // starves the producer and busy-spins.
+
+    /// The virtual monotonic clock in microseconds.
+    pub fn now_us(&self) -> u64 {
+        self.virtual_us
+    }
+
+    /// Park the current thread in `sceKernelWaitLwCond` on cond `work`. `timeout_us`
+    /// of 0 is an infinite wait (only a signal wakes it); non-zero sets a deadline
+    /// at `now + timeout_us` so the scheduler can time it out even if no signal comes.
+    pub fn lwcond_wait(&mut self, work: u32, timeout_us: u32) {
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
+        self.lwcond_waiters.push((self.current, work, deadline));
+    }
+
+    /// `sceKernelSignalLwCond`/`SignalLwCondAll`: wake one (or all) threads parked on
+    /// cond `work`, moving them onto the scheduler's wake list.
+    pub fn lwcond_signal(&mut self, work: u32, all: bool) {
+        let mut woke_one = false;
+        self.lwcond_waiters.retain(|&(thid, w, _)| {
+            if w == work && (all || !woke_one) {
+                self.pending_wakes.push(thid);
+                woke_one = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The earliest pending lightweight-cond wake deadline, if any timed wait is
+    /// parked. The scheduler uses this to jump the clock forward when every thread
+    /// is blocked, instead of declaring a deadlock.
+    pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
+        self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d).min()
+    }
+
+    /// Advance the virtual clock to at least `to_us` and wake every timed lightweight
+    /// wait whose deadline has now passed. Called by the scheduler when no thread is
+    /// runnable but a timed wait can still fire.
+    pub fn advance_time_to(&mut self, to_us: u64) {
+        self.virtual_us = self.virtual_us.max(to_us);
+        let now = self.virtual_us;
+        self.lwcond_waiters.retain(|&(thid, _, deadline)| match deadline {
+            Some(d) if d <= now => {
+                self.pending_wakes.push(thid);
+                false
+            }
+            _ => true,
+        });
+    }
+
     /// Mint a fresh SceUID (for a mutex, semaphore, event flag, ...).
     pub fn new_uid(&mut self) -> i32 {
         let uid = self.next_uid;
@@ -1025,6 +1229,30 @@ impl VitaState {
         self.bound_stream0 = addr;
     }
 
+    /// Record `sceGxmSetFragmentTexture(unit, texture)`: remember which guest
+    /// `SceGxmTexture*` is bound to sampler `unit`. A zero address unbinds it.
+    pub fn bind_fragment_texture(&mut self, unit: u32, texture_addr: u32) {
+        self.bound_textures.retain(|(u, _)| *u != unit);
+        if texture_addr != 0 {
+            self.bound_textures.push((unit, texture_addr));
+        }
+    }
+
+    /// Record the exact `SceGxmTextureFormat` set on a `SceGxmTexture*` (by
+    /// `sceGxmTextureInit*`/`SetFormat`), so a later decode recovers the exact
+    /// channel swizzle rather than the lossy 3-bit control-word field.
+    pub fn set_texture_format(&mut self, texture_addr: u32, format: u32) {
+        self.texture_formats.retain(|(a, _)| *a != texture_addr);
+        self.texture_formats.push((texture_addr, format));
+    }
+
+    pub fn texture_format(&self, texture_addr: u32) -> Option<u32> {
+        self.texture_formats
+            .iter()
+            .find(|(a, _)| *a == texture_addr)
+            .map(|(_, f)| *f)
+    }
+
     pub fn set_uniforms(&mut self, values: Vec<f32>) {
         self.pending_uniforms = values;
     }
@@ -1068,6 +1296,14 @@ impl VitaState {
             0
         };
         let vertices = ctx.read_bytes(self.bound_stream0, vertex_bytes as usize);
+        // Snapshot every bound fragment texture (decoded from its control words),
+        // sorted by unit so unit 0 is first.
+        let mut units: Vec<(u32, u32)> = self.bound_textures.clone();
+        units.sort_by_key(|(u, _)| *u);
+        let textures: Vec<crate::capture::BoundTexture> = units
+            .iter()
+            .filter_map(|&(unit, addr)| decode_texture(ctx, unit, addr, self.texture_format(addr)))
+            .collect();
         let draw = crate::capture::Draw {
             primitive,
             index_format,
@@ -1077,6 +1313,7 @@ impl VitaState {
             attributes,
             indices,
             uniforms: self.pending_uniforms.clone(),
+            textures,
         };
         if let Some(scene) = self.scene.as_mut() {
             scene.draws.push(draw);
@@ -1097,6 +1334,85 @@ impl VitaState {
     pub fn write_stdout(&mut self, bytes: &[u8]) {
         self.capture.stdout.extend_from_slice(bytes);
     }
+}
+
+/// Bytes per texel for a `SceGxmTextureBaseFormat`, keyed by its full high byte
+/// (`format >> 24`). The high bit (`0x80`) distinguishes 24-bit RGB (`0x98`
+/// U8U8U8) and paletted formats from the low-range formats a bare 5-bit field
+/// would alias them onto (e.g. `0x98 & 0x1f == 0x18`, which alone looks like S32).
+/// Block-compressed formats return `None` (skipped by the renderer for now).
+fn base_format_bpp(base_format: u32) -> Option<u32> {
+    Some(match base_format {
+        // 8-bit single channel (U8/S8) and 8-bit paletted (P8).
+        0x00 | 0x01 | 0x95 => 1,
+        // 16-bit packed (U4U4U4U4, U8U3U3U2, U1U5U5U5, U5U6U5, S5S5U6, U8U8, ...).
+        0x02..=0x0b => 2,
+        // 24-bit three-channel (U8U8U8, S8S8S8).
+        0x98 | 0x99 => 3,
+        // 32-bit (U8U8U8U8, ..., F32, X8U24) and 32-bit single (U32/S32) plus
+        // packed HDR (SE5M9M9M9, F11F11F10).
+        0x0c..=0x1a => 4,
+        _ => return None,
+    })
+}
+
+/// Round `v` up to the next multiple of `align` (a power of two).
+fn align_up(v: u32, align: u32) -> u32 {
+    (v + align - 1) & !(align - 1)
+}
+
+/// Decode a bound `SceGxmTexture` (16 bytes, 4 control words) from guest memory
+/// and snapshot its pixel bytes. Returns `None` for a null/unreadable handle or a
+/// format whose byte size we do not know yet. The layout is the public GXM texture
+/// control-word format (vitasdk `gxm.h` `struct SceGxmTexture`): word 1 holds
+/// width/height (stored as size-1) and the base format, word 2 the data address.
+fn decode_texture(
+    ctx: &GuestCtx,
+    unit: u32,
+    addr: u32,
+    exact_format: Option<u32>,
+) -> Option<crate::capture::BoundTexture> {
+    if addr == 0 {
+        return None;
+    }
+    let w0 = ctx.read_u32(addr);
+    let w1 = ctx.read_u32(addr + 4);
+    let w2 = ctx.read_u32(addr + 8);
+    let w3 = ctx.read_u32(addr + 12);
+
+    let tex_type = (w1 >> 29) & 0x7;
+    // generic2 layout (non-swizzled/non-cube): width/height are 12-bit size-1.
+    let width = ((w1 >> 12) & 0xfff) + 1;
+    let height = (w1 & 0xfff) + 1;
+    let data_addr = w2 & 0xffff_fffc;
+    // Prefer the exact format the guest set (full high byte keeps 24-bit/paletted
+    // formats and the channel swizzle intact); otherwise reconstruct the high byte
+    // from the 5-bit field plus the format0 extension bit (word 0 bit 31), and take
+    // the 3-bit control-word swizzle.
+    let (base_format, swizzle) = match exact_format {
+        Some(f) => ((f >> 24) & 0xff, f & 0x00ff_ffff),
+        None => (((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7), (w3 >> 29) & 0x7),
+    };
+
+    let bpp = base_format_bpp(base_format)?;
+    // LINEAR textures require the row width padded to a multiple of 8 texels; that
+    // padded width times the texel size is the stride we read row by row.
+    let stride = align_up(width, 8) * bpp;
+    let pixels = ctx.read_bytes(data_addr, (stride * height) as usize);
+    if pixels.is_empty() {
+        return None;
+    }
+    Some(crate::capture::BoundTexture {
+        unit,
+        base_format,
+        swizzle,
+        tex_type,
+        width,
+        height,
+        stride,
+        data_addr,
+        pixels,
+    })
 }
 
 /// The Vita host environment: the NID import table plus per-run state. Implements
@@ -1210,6 +1526,25 @@ pub trait ImportDispatch {
     fn take_wakes(&mut self) -> Vec<i32> {
         Vec::new()
     }
+
+    /// Take the guest memory writes (`(addr, value)`) the last dispatch queued for
+    /// woken joiners - the exit code owed to a `sceKernelWaitThreadEnd` `stat`
+    /// out-parameter. The scheduler applies these to guest memory before the woken
+    /// joiner resumes (the wait handler cannot write them at wake time).
+    fn take_stat_writes(&mut self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+
+    /// The earliest pending timed-wait deadline (virtual microseconds), if a thread
+    /// is parked on a timed wait. When no thread is runnable, the scheduler jumps the
+    /// clock to this instead of declaring a deadlock (a busy loop's timed wait).
+    fn earliest_deadline(&self) -> Option<u64> {
+        None
+    }
+
+    /// Advance the virtual clock to `to_us`, waking any timed waits that expire; the
+    /// woken thread ids then surface through [`take_wakes`](Self::take_wakes).
+    fn advance_time_to(&mut self, _to_us: u64) {}
 }
 
 impl ImportDispatch for VitaEnv {
@@ -1228,6 +1563,7 @@ impl ImportDispatch for VitaEnv {
             .copied()
             .unwrap_or((0, 0));
         self.state.capture.trace.push(func_nid);
+        self.state.capture.trace_thid.push(self.state.current);
         let mut ctx = GuestCtx::new(regs, vfp, mem, base);
         vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
     }
@@ -1250,6 +1586,18 @@ impl ImportDispatch for VitaEnv {
 
     fn take_wakes(&mut self) -> Vec<i32> {
         self.state.take_wakes()
+    }
+
+    fn take_stat_writes(&mut self) -> Vec<(u32, u32)> {
+        self.state.take_stat_writes()
+    }
+
+    fn earliest_deadline(&self) -> Option<u64> {
+        self.state.earliest_lwcond_deadline()
+    }
+
+    fn advance_time_to(&mut self, to_us: u64) {
+        self.state.advance_time_to(to_us);
     }
 }
 
@@ -1286,6 +1634,18 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn take_wakes(&mut self) -> Vec<i32> {
         self.borrow_mut().take_wakes()
+    }
+
+    fn take_stat_writes(&mut self) -> Vec<(u32, u32)> {
+        self.borrow_mut().take_stat_writes()
+    }
+
+    fn earliest_deadline(&self) -> Option<u64> {
+        self.borrow().earliest_deadline()
+    }
+
+    fn advance_time_to(&mut self, to_us: u64) {
+        self.borrow_mut().advance_time_to(to_us);
     }
 }
 
@@ -1523,16 +1883,22 @@ mod preemptive_tests {
     fn join_parks_until_the_target_thread_exits() {
         let mut st = state();
         let worker = st.create_thread(0x2000, 0x1000);
-        // Main (thread 0) joins the not-yet-finished worker and parks.
+        // Main (thread 0) joins the not-yet-finished worker and parks, passing a
+        // `stat` out-parameter at guest address 0x5000.
         st.set_current(0);
-        assert!(!st.join_block(worker));
+        assert!(!st.join_block(worker, 0x5000));
         assert!(st.take_wakes().is_empty());
-        // The worker ends: the joiner is woken and the exit code is recorded.
+        assert!(st.take_stat_writes().is_empty(), "no exit code to deliver yet");
+        // The worker ends: the joiner is woken, the exit code is recorded, AND queued
+        // for delivery to the joiner's `stat` pointer (the wait handler cannot write
+        // it at wake time).
         st.set_thread_exit(worker, 7);
         assert_eq!(st.take_wakes(), vec![0]);
         assert_eq!(st.thread_exit_code(worker), Some(7));
-        // A join after the fact does not park.
-        assert!(st.join_block(worker));
+        assert_eq!(st.take_stat_writes(), vec![(0x5000, 7)]);
+        // A join after the fact does not park (and a NULL stat queues no write).
+        assert!(st.join_block(worker, 0));
+        assert!(st.take_stat_writes().is_empty());
     }
 
     #[test]

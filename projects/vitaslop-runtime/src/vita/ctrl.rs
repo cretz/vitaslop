@@ -15,6 +15,8 @@ const CTRL_DATA_PREFIX: usize = 16;
 pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Option<SvcOutcome> {
     match func_nid {
         nid::PEEK_BUFFER_POSITIVE => peek_buffer_positive(ctx, st),
+        // int sceCtrlSetSamplingMode(SceCtrlPadInputMode mode): accept and succeed.
+        nid::SET_SAMPLING_MODE => ctx.ret(0),
         _ => return None,
     }
     Some(SvcOutcome::Continue)

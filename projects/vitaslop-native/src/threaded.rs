@@ -57,6 +57,21 @@ const DEFAULT_QUANTUM_FUEL: u64 = 1_000_000;
 /// live-locking guest cannot spin forever. A round is one fiber poll.
 const MAX_ROUNDS: u64 = 100_000_000;
 
+/// Headroom reserved above the main thread's initial stack pointer, below the top
+/// of the guest region. ELF/crt startup and some libc routines address memory at
+/// and just above the initial SP (the argc/argv/env/auxv block a kernel would have
+/// placed there, plus large formatting scratch buffers), so putting SP exactly at
+/// the region end (`base + mem_bytes`) makes those touches run one past the last
+/// valid byte and trap. This guard gives them valid slack. Spawned threads get
+/// their own allocated stacks and do not need it.
+const MAIN_STACK_HEADROOM: u32 = 0x0010_0000; // 1 MiB
+
+/// The main thread's initial stack pointer: the top of the guest region minus the
+/// startup headroom, 16-byte aligned (AAPCS at a public entry).
+fn main_stack_top(base: u32, mem_bytes: u32) -> u32 {
+    base.wrapping_add(mem_bytes).wrapping_sub(MAIN_STACK_HEADROOM) & !0xF
+}
+
 /// Why a fiber poll returned `Pending` (it suspended rather than finishing). Set
 /// by the host-call closure just before it awaits, read by the scheduler through
 /// the thread's shared signal cell.
@@ -142,6 +157,10 @@ pub enum RunReport {
     Error(String),
     /// The round budget was exhausted (a live-lock backstop).
     RoundLimit,
+    /// The requested number of frame boundaries was reached; the run was stopped
+    /// deliberately (used to bound a title whose render loop never returns). The
+    /// value is the number of frames observed.
+    FramesReached(u64),
 }
 
 /// A preemptive multi-thread guest run: the transpiled module, one shared memory,
@@ -202,7 +221,9 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             base,
             thumb,
             entries: &entries,
+            arm_entries: &[],
             externs,
+            redirects: &[],
             noreturn_svc: &[],
             mem_bytes,
             discover_code_pointers: true,
@@ -218,9 +239,10 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
         let module = Module::from_binary(&engine, &artifact.wasm)?;
 
-        // One shared memory, sized exactly as the transpiler declared, imported
-        // into every thread instance. Seed the image into it once.
-        let pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1) as u32;
+        // One shared memory, sized exactly as the transpiler declared (the guest
+        // region plus the appended indirect-dispatch address table), imported into
+        // every thread instance. Seed the image into it once.
+        let pages = artifact.mem_pages;
         let mem_ty = wasmtime::MemoryType::shared(pages, pages);
         let shared_mem =
             SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -238,12 +260,69 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             cursor: 0,
         };
 
-        // The main thread: sp at the top of the region, no entry args, its thid is
-        // whatever the host reports for the main thread (0 by convention here; the
-        // host maps it as it likes).
-        let main = sched.instantiate_thread(0, entry & !1, 0, 0, base.wrapping_add(mem_bytes))?;
+        // The main thread: sp near the top of the region (with startup headroom), no
+        // entry args, its thid is whatever the host reports for the main thread (0 by
+        // convention here; the host maps it as it likes).
+        let main = sched.instantiate_thread(0, entry & !1, 0, 0, main_stack_top(base, mem_bytes))?;
         sched.threads.push(main);
         Ok(sched)
+    }
+
+    /// Stand up a preemptive run of a multi-module linked title
+    /// ([`vitaslop_runtime::link::LinkedProgram`]) - the faithful counterpart to the
+    /// single-thread [`Vm::from_linked`](crate::Vm::from_linked). Transpiles
+    /// *leniently* (still-unlifted functions become trapping stubs) with an imported
+    /// shared memory and the inter-module redirects, seeds the combined image, and
+    /// makes the main thread run every module's `module_start` in load order (shared
+    /// libraries first, the executable last) before returning control to the
+    /// scheduler loop. Returns the scheduler and the addresses that became stubs (as
+    /// `(guest addr, wasm function index)`).
+    pub fn from_linked(
+        linked: &vitaslop_runtime::link::LinkedProgram,
+        host: H,
+        quantum_fuel: u64,
+    ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
+        let built = transpiler::transpile_lenient(&linked.shared_program());
+        wasmparser::validate(&built.artifact.wasm)
+            .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
+
+        let mut cfg = Config::new();
+        cfg.wasm_threads(true);
+        cfg.shared_memory(true);
+        cfg.consume_fuel(true);
+        let engine = Engine::new(&cfg).map_err(|e| RunError::Wasm(e.to_string()))?;
+        let module = Module::from_binary(&engine, &built.artifact.wasm)?;
+
+        let pages = built.artifact.mem_pages;
+        let mem_ty = wasmtime::MemoryType::shared(pages, pages);
+        let shared_mem =
+            SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
+        write_shared(&shared_mem, 0, &linked.image);
+
+        let mut sched = ThreadedScheduler {
+            engine,
+            module,
+            shared_mem,
+            host: Arc::new(Mutex::new(host)),
+            base: linked.base,
+            quantum_fuel,
+            threads: Vec::new(),
+            cursor: 0,
+        };
+
+        // The main thread runs every module_start in load order, then (as the last
+        // entry) the eboot's - which is where a render loop lives.
+        let sp = main_stack_top(linked.base, linked.mem_bytes);
+        let main = sched.instantiate_thread_seq(0, linked.module_inits.clone(), 0, 0, sp)?;
+        sched.threads.push(main);
+
+        let stubs = built
+            .stubbed
+            .iter()
+            .copied()
+            .zip(built.stub_wasm_indices.iter().copied())
+            .collect();
+        Ok((sched, stubs))
     }
 
     /// Borrow the shared host (e.g. to read captured output after the run).
@@ -251,14 +330,43 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         self.host.lock().unwrap()
     }
 
+    /// Read `len` bytes of guest memory at guest address `addr` (diagnostic; the
+    /// shared image outlives any trap, so a probe can inspect object state after a
+    /// fault). Returns an empty vec if the range is out of bounds.
+    pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
+        let off = addr.wrapping_sub(self.base) as usize;
+        let data = self.shared_mem.data();
+        if off + len > data.len() {
+            return Vec::new();
+        }
+        // SAFETY: bounds checked above; no fiber runs concurrently with the probe.
+        let mut out = vec![0u8; len];
+        for (i, b) in out.iter_mut().enumerate() {
+            unsafe {
+                *b = *data[off + i].get();
+            }
+        }
+        out
+    }
+
     /// Run cooperatively until the process halts, every thread finishes, or the
     /// run deadlocks / errors. Returns the verdict.
     pub fn run(&mut self) -> RunReport {
+        self.run_frames(u64::MAX, MAX_ROUNDS)
+    }
+
+    /// Like [`run`](Self::run) but stop after `max_frames` frame boundaries (display
+    /// flips) even if threads are still running - the way to bound a real title
+    /// whose render loop never returns and capture a fixed number of frames.
+    /// `max_rounds` caps the number of fiber polls (each retiring up to one fuel
+    /// quantum) so a busy-waiting guest cannot run unbounded.
+    pub fn run_frames(&mut self, max_frames: u64, max_rounds: u64) -> RunReport {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut rounds = 0u64;
+        let mut frames = 0u64;
         loop {
-            if rounds >= MAX_ROUNDS {
+            if rounds >= max_rounds {
                 return RunReport::RoundLimit;
             }
             rounds += 1;
@@ -274,7 +382,20 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 if blocked.is_empty() {
                     return RunReport::Finished(self.main_exit_code());
                 }
-                return RunReport::Deadlock(blocked);
+                // Before calling it a deadlock, honor any timed wait: jump the
+                // virtual clock to the earliest deadline and wake what expires. This
+                // is how a frame-pacing / timed condition wait makes progress without
+                // a real signaller (and without busy-spinning). Only a set of
+                // purely infinite waits with no timer is a true deadlock.
+                let deadline = self.host.lock().unwrap().earliest_deadline();
+                match deadline {
+                    Some(t) => {
+                        self.host.lock().unwrap().advance_time_to(t);
+                        self.drain_spawns_and_wakes();
+                        continue;
+                    }
+                    None => return RunReport::Deadlock(blocked),
+                }
             };
             self.cursor = idx + 1;
 
@@ -290,8 +411,16 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                     let stop = self.threads[idx].signal.lock().unwrap().stop;
                     match stop {
                         Stop::Blocked => self.threads[idx].state = ThreadState::Blocked,
-                        // A frame boundary or a fuel slice: still runnable.
-                        Stop::Yielded | Stop::Quantum => {}
+                        Stop::Yielded => {
+                            // A frame boundary (display flip): the thread stays
+                            // runnable, but count it toward the frame budget.
+                            frames += 1;
+                            if frames >= max_frames {
+                                return RunReport::FramesReached(frames);
+                            }
+                        }
+                        // A fuel slice: still runnable, not a frame.
+                        Stop::Quantum => {}
                     }
                 }
             }
@@ -329,10 +458,19 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
 
     /// Start any threads the last host call requested, and wake any it released.
     fn drain_spawns_and_wakes(&mut self) {
-        let (spawns, wakes) = {
+        let (spawns, wakes, stat_writes) = {
             let mut host = self.host.lock().unwrap();
-            (host.take_spawns(), host.take_wakes())
+            (host.take_spawns(), host.take_wakes(), host.take_stat_writes())
         };
+        // Deliver any exit codes owed to a blocked `sceKernelWaitThreadEnd` joiner's
+        // `stat` out-parameter. Done here (the scheduler has memory access) before the
+        // woken joiner resumes; safe because no fiber runs during a drain.
+        for (addr, value) in stat_writes {
+            let off = addr.wrapping_sub(self.base) as usize;
+            if off + 4 <= self.shared_mem.data().len() {
+                write_shared(&self.shared_mem, off, &value.to_le_bytes());
+            }
+        }
         for sp in spawns {
             match self.instantiate_thread(sp.thid, sp.entry, sp.arg_len, sp.arg_ptr, sp.stack_top) {
                 Ok(ctl) => self.threads.push(ctl),
@@ -372,12 +510,29 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             .unwrap_or(0)
     }
 
-    /// Build one thread: a fresh store+instance importing the shared memory, seeded
-    /// registers (r0/r1 = entry args, sp), and its in-flight `call_async` future.
+    /// Build one thread from a single entry (a spawned worker).
     fn instantiate_thread(
         &self,
         thid: i32,
         entry: u32,
+        r0: u32,
+        r1: u32,
+        sp: u32,
+    ) -> Result<ThreadCtl, RunError> {
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, sp)
+    }
+
+    /// Build one thread that runs `entries` in sequence on a single fiber, resetting
+    /// the stack pointer before each so they nest cleanly. This is how the main
+    /// thread runs a linked title's shared-library constructors (in load order)
+    /// before the executable's own entry: each `module_start` runs to completion,
+    /// and the last entry (the eboot's) is the one that may spin a render loop. Only
+    /// the first entry receives `(r0, r1)`; the rest are called with no arguments,
+    /// matching how a loader invokes `module_start(0, NULL)`.
+    fn instantiate_thread_seq(
+        &self,
+        thid: i32,
+        entries: Vec<u32>,
         r0: u32,
         r1: u32,
         sp: u32,
@@ -401,6 +556,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         let mut linker = Linker::new(&self.engine);
         bind_svc(&mut linker)?;
         bind_import(&mut linker)?;
+        bind_dispatch_miss(&mut linker)?;
         linker
             .define(&store, abi::IMPORT_MODULE, abi::MEMORY_EXPORT, self.shared_mem.clone())
             .map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -408,33 +564,46 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // No start section, so instantiation completes without suspending.
         let instance = pollster::block_on(linker.instantiate_async(&mut store, &self.module))?;
 
-        // Seed the entry arguments and stack pointer for this thread.
-        set_reg_store(&mut store, &instance, 0, r0);
-        set_reg_store(&mut store, &instance, 1, r1);
-        set_reg_store(&mut store, &instance, abi::SP, sp);
-
-        let entry_name = abi::func_export(entry);
         let future = Box::pin(async move {
-            let func = match instance.get_typed_func::<(), ()>(&mut store, &entry_name) {
-                Ok(f) => f,
-                // The entry was not a transpiled function; nothing to run.
-                Err(_) => return FiberEnd::Returned(0),
-            };
-            let call_res = func.call_async(&mut store, ()).await;
-            let r0 = get_reg_store(&mut store, &instance, 0);
-            match call_res {
-                Ok(()) => FiberEnd::Returned(r0),
-                Err(e) => {
-                    let d = store.data();
+            let mut last_r0 = 0u32;
+            let last = entries.len().saturating_sub(1);
+            for (i, &entry) in entries.iter().enumerate() {
+                // Each entry starts with a fresh stack; only the first carries args.
+                set_reg_store(&mut store, &instance, abi::SP, sp);
+                set_reg_store(&mut store, &instance, 0, if i == 0 { r0 } else { 0 });
+                set_reg_store(&mut store, &instance, 1, if i == 0 { r1 } else { 0 });
+                let func = match instance
+                    .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
+                {
+                    Ok(f) => f,
+                    // The entry was not a transpiled function; skip it.
+                    Err(_) => continue,
+                };
+                let call_res = func.call_async(&mut store, ()).await;
+                last_r0 = get_reg_store(&mut store, &instance, 0);
+                if let Err(e) = call_res {
+                    let d = store.data_mut();
                     if d.process_halt {
-                        FiberEnd::ProcessHalt(r0)
-                    } else if d.thread_exit {
-                        FiberEnd::ThreadExit(r0)
-                    } else {
-                        FiberEnd::Error(trap_detail(&e))
+                        return FiberEnd::ProcessHalt(last_r0);
                     }
+                    if d.thread_exit {
+                        // A module_start can end its (initial) thread with
+                        // sceKernelExitThread instead of returning. When that entry
+                        // is not the last, it just ends that init - clear the flag
+                        // and run the next one, so an early library constructor
+                        // exiting cannot tear down the whole main thread before the
+                        // executable's own entry has run.
+                        if i != last {
+                            d.thread_exit = false;
+                            continue;
+                        }
+                        return FiberEnd::ThreadExit(last_r0);
+                    }
+                    let regs = reg_dump(&mut store, &instance);
+                    return FiberEnd::Error(format!("{}\n{}", trap_detail(&e), regs));
                 }
             }
+            FiberEnd::Returned(last_r0)
         });
 
         Ok(ThreadCtl { thid, future, signal, state: ThreadState::Runnable })
@@ -453,6 +622,46 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
+}
+
+/// Bind `env.dispatch_miss`: an indirect call that resolves to no translated
+/// function traps here with the faulting `(target, caller)` addresses, so an
+/// unmapped `blx`/`bx` target surfaces as a clear report (with the trapping thread's
+/// register dump, added by `instantiate_thread_seq`) instead of an opaque
+/// `unreachable`.
+fn bind_dispatch_miss<H: ImportDispatch + Send + 'static>(
+    linker: &mut Linker<ThreadData<H>>,
+) -> Result<(), RunError> {
+    linker
+        .func_wrap_async(
+            abi::IMPORT_MODULE,
+            abi::DISPATCH_MISS_NAME,
+            |_caller: Caller<'_, ThreadData<H>>, (target, caller): (i32, i32)| {
+                Box::new(async move {
+                    Err::<(), wasmtime::Error>(wasmtime::Error::msg(format!(
+                        "indirect dispatch to unknown target {:#010x} from f_{:x}",
+                        target as u32, caller as u32
+                    )))
+                })
+            },
+        )
+        .map_err(|e| RunError::Wasm(e.to_string()))?;
+    Ok(())
+}
+
+/// Diagnostic memory watchpoint state (see the poll in `bind_import`).
+static POLL_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static POLL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guest address to sample after each host call, from `VITASLOP_POLL_ADDR` (hex).
+fn poll_addr() -> Option<u32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<u32>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_POLL_ADDR")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+    })
 }
 
 /// Bind the `env.import` NID trap: read guest state, dispatch to the shared host
@@ -492,6 +701,37 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                     }
                     for (i, &v) in vfp.iter().enumerate() {
                         set_vfp_caller(&mut caller, i, v);
+                    }
+
+                    // Diagnostic memory watchpoint (VITASLOP_POLL_ADDR=<hex guest
+                    // addr>): sample the word after every host call and report each
+                    // transition. Path- and thread-agnostic - catches writes my
+                    // transpiler-side store watchpoint misses (NEON/multi stores) or
+                    // that happen on another thread's instance. Brackets the writer
+                    // to a [prev host call, this host call] window by NID.
+                    if let Some(addr) = poll_addr() {
+                        let data = caller.data();
+                        let off = addr.wrapping_sub(data.base) as usize;
+                        let shared = data.shared_mem.data();
+                        if off + 4 <= shared.len() {
+                            let mut b = [0u8; 4];
+                            for (i, bb) in b.iter_mut().enumerate() {
+                                // SAFETY: bounds checked; cooperative scheduling.
+                                unsafe {
+                                    *bb = *shared[off + i].get();
+                                }
+                            }
+                            let now = u32::from_le_bytes(b);
+                            let prev = POLL_LAST.swap(now, std::sync::atomic::Ordering::Relaxed);
+                            let n = POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if now != prev {
+                                eprintln!(
+                                    "[poll] {addr:#010x}: {prev:#010x} -> {now:#010x} \
+                                     after host call #{n} sel={:#x} thid={:#x}",
+                                    selector, data.thid
+                                );
+                            }
+                        }
                     }
 
                     match outcome {
@@ -575,7 +815,9 @@ impl vitaslop_runtime::GuestMemory for SharedView {
 fn write_shared(mem: &SharedMemory, off: usize, bytes: &[u8]) {
     let data = mem.data();
     for (i, &b) in bytes.iter().enumerate() {
-        // SAFETY: called only during setup, before any fiber runs.
+        // SAFETY: called only at points where no fiber is running - initial image
+        // seeding (before any fiber starts) and a scheduler drain (between fiber
+        // steps, one fiber at a time) - so there is no concurrent guest access.
         unsafe {
             *data[off + i].get() = b;
         }
@@ -583,6 +825,28 @@ fn write_shared(mem: &SharedMemory, off: usize, bytes: &[u8]) {
 }
 
 /// A concise trap description (kind + message), matching the sync `Vm`'s detail.
+/// Snapshot the guest core register file (r0..r15) at the point of a trap. Because
+/// every lifted register read/write goes straight to its global (no caching in wasm
+/// locals across statements), the globals hold the exact ARM state at the faulting
+/// instruction - so on a MemoryOutOfBounds this shows the garbage pointer that was
+/// dereferenced (and `this` in r0..r3 for a C++ vtable dispatch). Diagnostic only.
+fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
+    let mut s = String::from("regs at trap:");
+    for i in 0..abi::REG_COUNT {
+        let name = match i {
+            abi::SP => "sp".to_string(),
+            abi::LR => "lr".to_string(),
+            abi::PC => "pc".to_string(),
+            n => format!("r{n}"),
+        };
+        if i % 4 == 0 {
+            s.push_str("\n  ");
+        }
+        s.push_str(&format!("{name}={:#010x} ", get_reg_store(store, instance, i)));
+    }
+    s
+}
+
 fn trap_detail(e: &wasmtime::Error) -> String {
     match e.downcast_ref::<wasmtime::Trap>() {
         Some(t) => format!("{t:?}: {e}"),

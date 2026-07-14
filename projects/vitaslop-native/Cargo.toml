@@ -22,3 +22,7 @@ wasmparser = "0.253"
 # browser path mirrors this over WebGPU in the web crate, sharing the pipeline.
 wgpu = { workspace = true }
 pollster = { workspace = true }
+
+[dev-dependencies]
+# The loader is used by the OlliOlli boot-probe integration test (tests/olliolli_boot.rs).
+vitaslop-loader = { path = "../vitaslop-loader" }

@@ -57,17 +57,11 @@ fn stub(index: u32) -> u32 {
 
 /// `bl <target>` (ARM) encoded so the transpiler routes the call to `target`.
 ///
-/// NOTE: the transpiler currently resolves an ARM `BL`/`B` target as
-/// `addr + 16 + (imm24 << 2)`, not the architectural `addr + 8 + (imm24 << 2)`:
-/// yaxpeax already folds the PC+8 prefetch into its offset (`armv7.rs`: `imm24 +=
-/// 2`), and the transpiler's `branch_target` adds another `addr + 8` on the ARM
-/// path, double-counting by 8 bytes. That path has no conformance coverage (every
-/// branch/loop case in the suite is Thumb, and the Vita is a Thumb target), so the
-/// bug has never surfaced. We encode to the transpiler's actual behavior here so
-/// this scheduler test does not depend on fixing it; when the ARM branch offset is
-/// corrected under a qemu oracle, drop the extra `- 8` below.
+/// The transpiler resolves an ARM `BL`/`B` target as `addr + (off << 2)` where
+/// yaxpeax's `off` already folds the PC+8 prefetch bias in - i.e. the architectural
+/// `addr + 8 + (imm24 << 2)`. So the raw `imm24` encodes `(target - addr - 8) >> 2`.
 fn bl(addr: u32, target: u32) -> u32 {
-    let imm24 = ((target.wrapping_sub(addr).wrapping_sub(16)) >> 2) & 0x00FF_FFFF;
+    let imm24 = ((target.wrapping_sub(addr).wrapping_sub(8)) >> 2) & 0x00FF_FFFF;
     0xEB00_0000 | imm24
 }
 

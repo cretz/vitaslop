@@ -46,6 +46,8 @@ pub mod gxm {
     pub const SHADER_PATCHER_RELEASE_VERTEX_PROGRAM: u32 = 0xAC1F_F2DA;
     pub const SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM: u32 = 0xBE27_43D1;
     pub const PROGRAM_FIND_PARAMETER_BY_NAME: u32 = 0x2777_94C4;
+    pub const SHADER_PATCHER_GET_PROGRAM_FROM_ID: u32 = 0xA949_A803;
+    pub const PROGRAM_PARAMETER_GET_RESOURCE_INDEX: u32 = 0x5C79_D59A;
     pub const BEGIN_SCENE: u32 = 0x8734_FF4E;
     pub const END_SCENE: u32 = 0xFE30_0E2F;
     pub const SET_VERTEX_PROGRAM: u32 = 0x31FF_8ABD;
@@ -58,6 +60,25 @@ pub mod gxm {
     pub const DISPLAY_QUEUE_ADD_ENTRY: u32 = 0xEC5C_26B5;
     pub const DISPLAY_QUEUE_FINISH: u32 = 0xB98C_5B0D;
     pub const FINISH: u32 = 0x0733_D8AE;
+    // Fragment textures.
+    pub const SET_FRAGMENT_TEXTURE: u32 = 0x29C3_4DF5;
+    pub const TEXTURE_INIT_LINEAR: u32 = 0x4811_AECB;
+    pub const TEXTURE_INIT_LINEAR_STRIDED: u32 = 0x6679_BEF0;
+    pub const TEXTURE_INIT_SWIZZLED: u32 = 0xD572_D547;
+    pub const TEXTURE_INIT_TILED: u32 = 0xE6F0_DB27;
+    pub const TEXTURE_SET_DATA: u32 = 0x8558_14C4;
+    pub const TEXTURE_SET_FORMAT: u32 = 0xFC94_3596;
+    pub const TEXTURE_SET_MAG_FILTER: u32 = 0xFA69_5FD7;
+    pub const TEXTURE_SET_MIN_FILTER: u32 = 0x4167_64E3;
+    pub const TEXTURE_SET_MIP_FILTER: u32 = 0x1CA9_FE0B;
+    pub const TEXTURE_SET_U_ADDR_MODE: u32 = 0x4281_763E;
+    pub const TEXTURE_SET_V_ADDR_MODE: u32 = 0x126C_DAA3;
+    pub const TEXTURE_GET_DATA: u32 = 0x5341_BD46;
+    pub const TEXTURE_GET_WIDTH: u32 = 0x126A_3EB3;
+    pub const TEXTURE_GET_HEIGHT: u32 = 0x5420_A086;
+    pub const TEXTURE_GET_FORMAT: u32 = 0xE868_D2B3;
+    pub const SET_FRAGMENT_UNIFORM_BUFFER: u32 = 0xEA0F_C310;
+    pub const RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER: u32 = 0x7B1F_ABB6;
 }
 
 /// SceDisplayUser function NIDs.
@@ -68,6 +89,7 @@ pub mod display {
 /// SceCtrl function NIDs.
 pub mod ctrl {
     pub const PEEK_BUFFER_POSITIVE: u32 = 0xA9C3_CED6;
+    pub const SET_SAMPLING_MODE: u32 = 0xA497_B150;
 }
 
 /// SceSysmem (kernel memory) function NIDs.
@@ -93,6 +115,11 @@ pub mod libkernel {
     pub const CLIB_STRNCPY: u32 = 0xC458_D60A;
     pub const CLIB_STRNCMP: u32 = 0x660D_1F6D;
     pub const CLIB_STRCMP: u32 = 0xA2FB_4D9D;
+    // Thread-local storage: a per-thread pointer slot indexed by key.
+    pub const GET_TLS_ADDR: u32 = 0xB295_EB61;
+    // Process/thread timing and status.
+    pub const GET_PROCESS_TIME_WIDE: u32 = 0xB110_C123;
+    pub const GET_THREAD_EXIT_STATUS: u32 = 0xD5DC_26C4;
     // process control.
     pub const EXIT_PROCESS: u32 = 0x7595_D9AA;
     // thread wrappers (user-facing; the ThreadMgr primitives back them).
@@ -102,12 +129,81 @@ pub mod libkernel {
     pub const GET_THREAD_ID: u32 = 0x0FB9_72F9;
 }
 
+/// SceProcessmgr function NIDs: process parameters and the standard IO handles the
+/// libc crt fetches during startup.
+pub mod processmgr {
+    pub const GET_PROCESS_PARAM: u32 = 0x2BE3_E066;
+    pub const GET_STDIN: u32 = 0xC172_7F59;
+    pub const GET_STDOUT: u32 = 0xE5AA_625C;
+    pub const GET_STDERR: u32 = 0xFA5E_3ADA;
+    pub const LIBC_TIME: u32 = 0x0039_BE45;
+}
+
+/// System and online-service NIDs the boot path touches (SceSysmodule, SceNet,
+/// SceNetCtl, SceHttp, SceSsl, SceNpManager, SceNpBasic, SceRtc, SceFios2, and the
+/// libult object manager). Off-console these have no backing service, so they are
+/// serviced as "initialized but offline": init succeeds, connection state reads as
+/// disconnected, and callback registration succeeds without ever firing.
+pub mod services {
+    // SceSysmodule.
+    pub const SYSMODULE_IS_LOADED: u32 = 0x5309_9B7A;
+    // SceNet / SceNetCtl.
+    pub const NET_INIT: u32 = 0xEB03_E265;
+    pub const NET_CTL_INIT: u32 = 0x495C_A1DB;
+    pub const NET_CTL_INET_GET_STATE: u32 = 0x6D26_AC68;
+    pub const NET_CTL_INET_REGISTER_CALLBACK: u32 = 0xEAEE_6185;
+    // SceHttp / SceSsl.
+    pub const HTTP_INIT: u32 = 0x2149_26D9;
+    pub const SSL_INIT: u32 = 0x3C73_3316;
+    // SceNpManager / SceNpBasic.
+    pub const NP_INIT: u32 = 0x04D9_F484;
+    pub const NP_REGISTER_SERVICE_STATE_CALLBACK: u32 = 0x4423_9C35;
+    pub const NP_BASIC_INIT: u32 = 0xEFB9_1A99;
+    pub const NP_BASIC_REGISTER_HANDLER: u32 = 0x26E6_E048;
+    // SceRtc.
+    pub const RTC_GET_CURRENT_CLOCK_LOCAL_TIME: u32 = 0x0572_EDDC;
+    // SceFios2 overlay + libult object manager.
+    pub const FIOS_OVERLAY_GET_LIST: u32 = 0x1DD8_08D1;
+    pub const ULOBJ_REGISTER_PROTOCOL_REVISION: u32 = 0x50F2_F2AA;
+    // SceAppUtil: app utility init + system parameters (language, button assign, ...).
+    pub const APPUTIL_INIT: u32 = 0xDAFF_E671;
+    pub const APPUTIL_SYSTEM_PARAM_GET_INT: u32 = 0x5DFB_9CA0;
+    // SceNpScore / SceNpManager: online leaderboards and account identity.
+    pub const NP_SCORE_INIT: u32 = 0x0433_069F;
+    pub const NP_SCORE_CREATE_TITLE_CTX: u32 = 0x5685_F225;
+    pub const NP_MANAGER_GET_NP_ID: u32 = 0x3C94_B4B4;
+    // SceTouch.
+    pub const TOUCH_SET_SAMPLING_STATE: u32 = 0x1B9C_5D14;
+}
+
+/// Lightweight synchronization (SceLibKernel LwMutex/LwCond): mutexes and condition
+/// variables whose state lives in a caller-provided work area rather than a kernel
+/// object. Bring-up model matches the heavyweight primitives - uncontended success
+/// in the single-thread-of-control mode (see [`crate::vita::sync`]).
+pub mod lwsync {
+    pub const CREATE_LW_MUTEX: u32 = 0xDA6E_C8EF;
+    pub const DELETE_LW_MUTEX: u32 = 0x244E_76D2;
+    pub const LOCK_LW_MUTEX: u32 = 0x46E7_BE7B;
+    pub const LOCK_LW_MUTEX_CB: u32 = 0x3148_C6B6;
+    pub const TRY_LOCK_LW_MUTEX: u32 = 0xA6A2_C915;
+    pub const UNLOCK_LW_MUTEX: u32 = 0x91FA_6614;
+    pub const UNLOCK_LW_MUTEX2: u32 = 0x120A_FC8C;
+    pub const CREATE_LW_COND: u32 = 0x48C7_EAE6;
+    pub const DELETE_LW_COND: u32 = 0x721F_6CB3;
+    pub const WAIT_LW_COND: u32 = 0xE187_8282;
+    pub const WAIT_LW_COND_CB: u32 = 0x8FA5_4B07;
+    pub const SIGNAL_LW_COND: u32 = 0x3AC6_3B9A;
+    pub const SIGNAL_LW_COND_ALL: u32 = 0xE524_1A0C;
+    pub const SIGNAL_LW_COND_TO: u32 = 0xFC1A_48EB;
+}
+
 /// SceThreadmgr function NIDs: thread-manager primitives not wrapped in
 /// SceLibKernel.
 pub mod threadmgr {
     pub const DELAY_THREAD: u32 = 0x4B67_5D05;
     pub const EXIT_DELETE_THREAD: u32 = 0x1D17_DECF;
     pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
+    pub const GET_PROCESS_ID: u32 = 0x9DCB_4B7A;
 }
 
 /// File IO (SceIoFilemgr). Function NIDs span SceIofilemgr (read/write/close/
@@ -157,8 +253,8 @@ pub mod sync {
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk, sync as sy,
-        sysmem as s, threadmgr as tm,
+        ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk, lwsync as lw,
+        processmgr as pm, services as sv, sync as sy, sysmem as s, threadmgr as tm,
     };
     match func_nid {
         g::INITIALIZE => "sceGxmInitialize",
@@ -183,6 +279,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM => "sceGxmShaderPatcherReleaseVertexProgram",
         g::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherReleaseFragmentProgram",
         g::PROGRAM_FIND_PARAMETER_BY_NAME => "sceGxmProgramFindParameterByName",
+        g::SHADER_PATCHER_GET_PROGRAM_FROM_ID => "sceGxmShaderPatcherGetProgramFromId",
+        g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => "sceGxmProgramParameterGetResourceIndex",
         g::BEGIN_SCENE => "sceGxmBeginScene",
         g::END_SCENE => "sceGxmEndScene",
         g::SET_VERTEX_PROGRAM => "sceGxmSetVertexProgram",
@@ -195,8 +293,27 @@ pub fn name(func_nid: u32) -> &'static str {
         g::DISPLAY_QUEUE_ADD_ENTRY => "sceGxmDisplayQueueAddEntry",
         g::DISPLAY_QUEUE_FINISH => "sceGxmDisplayQueueFinish",
         g::FINISH => "sceGxmFinish",
+        g::SET_FRAGMENT_TEXTURE => "sceGxmSetFragmentTexture",
+        g::TEXTURE_INIT_LINEAR => "sceGxmTextureInitLinear",
+        g::TEXTURE_INIT_LINEAR_STRIDED => "sceGxmTextureInitLinearStrided",
+        g::TEXTURE_INIT_SWIZZLED => "sceGxmTextureInitSwizzled",
+        g::TEXTURE_INIT_TILED => "sceGxmTextureInitTiled",
+        g::TEXTURE_SET_DATA => "sceGxmTextureSetData",
+        g::TEXTURE_SET_FORMAT => "sceGxmTextureSetFormat",
+        g::TEXTURE_SET_MAG_FILTER => "sceGxmTextureSetMagFilter",
+        g::TEXTURE_SET_MIN_FILTER => "sceGxmTextureSetMinFilter",
+        g::TEXTURE_SET_MIP_FILTER => "sceGxmTextureSetMipFilter",
+        g::TEXTURE_SET_U_ADDR_MODE => "sceGxmTextureSetUAddrMode",
+        g::TEXTURE_SET_V_ADDR_MODE => "sceGxmTextureSetVAddrMode",
+        g::TEXTURE_GET_DATA => "sceGxmTextureGetData",
+        g::TEXTURE_GET_WIDTH => "sceGxmTextureGetWidth",
+        g::TEXTURE_GET_HEIGHT => "sceGxmTextureGetHeight",
+        g::TEXTURE_GET_FORMAT => "sceGxmTextureGetFormat",
+        g::SET_FRAGMENT_UNIFORM_BUFFER => "sceGxmSetFragmentUniformBuffer",
+        g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => "sceGxmReserveFragmentDefaultUniformBuffer",
         d::SET_FRAME_BUF => "sceDisplaySetFrameBuf",
         c::PEEK_BUFFER_POSITIVE => "sceCtrlPeekBufferPositive",
+        c::SET_SAMPLING_MODE => "sceCtrlSetSamplingMode",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
         lk::CLIB_PRINTF => "sceClibPrintf",
@@ -211,7 +328,50 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::CLIB_STRNCPY => "sceClibStrncpy",
         lk::CLIB_STRNCMP => "sceClibStrncmp",
         lk::CLIB_STRCMP => "sceClibStrcmp",
+        lk::GET_TLS_ADDR => "sceKernelGetTLSAddr",
+        lk::GET_PROCESS_TIME_WIDE => "sceKernelGetProcessTimeWide",
+        lk::GET_THREAD_EXIT_STATUS => "sceKernelGetThreadExitStatus",
         lk::EXIT_PROCESS => "sceKernelExitProcess",
+        pm::GET_PROCESS_PARAM => "sceKernelGetProcessParam",
+        pm::GET_STDIN => "sceKernelGetStdin",
+        pm::GET_STDOUT => "sceKernelGetStdout",
+        pm::GET_STDERR => "sceKernelGetStderr",
+        pm::LIBC_TIME => "sceKernelLibcTime",
+        tm::GET_PROCESS_ID => "sceKernelGetProcessId",
+        sv::SYSMODULE_IS_LOADED => "sceSysmoduleIsLoaded",
+        sv::NET_INIT => "sceNetInit",
+        sv::NET_CTL_INIT => "sceNetCtlInit",
+        sv::NET_CTL_INET_GET_STATE => "sceNetCtlInetGetState",
+        sv::NET_CTL_INET_REGISTER_CALLBACK => "sceNetCtlInetRegisterCallback",
+        sv::HTTP_INIT => "sceHttpInit",
+        sv::SSL_INIT => "sceSslInit",
+        sv::NP_INIT => "sceNpInit",
+        sv::NP_REGISTER_SERVICE_STATE_CALLBACK => "sceNpRegisterServiceStateCallback",
+        sv::NP_BASIC_INIT => "sceNpBasicInit",
+        sv::NP_BASIC_REGISTER_HANDLER => "sceNpBasicRegisterHandler",
+        sv::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => "sceRtcGetCurrentClockLocalTime",
+        sv::FIOS_OVERLAY_GET_LIST => "sceFiosOverlayGetList02",
+        sv::ULOBJ_REGISTER_PROTOCOL_REVISION => "_sceUlobjMgrRegisterLibultProtocolRevision",
+        sv::APPUTIL_INIT => "sceAppUtilInit",
+        sv::APPUTIL_SYSTEM_PARAM_GET_INT => "sceAppUtilSystemParamGetInt",
+        sv::NP_SCORE_INIT => "sceNpScoreInit",
+        sv::NP_SCORE_CREATE_TITLE_CTX => "sceNpScoreCreateTitleCtx",
+        sv::NP_MANAGER_GET_NP_ID => "sceNpManagerGetNpId",
+        sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
+        lw::CREATE_LW_MUTEX => "sceKernelCreateLwMutex",
+        lw::DELETE_LW_MUTEX => "sceKernelDeleteLwMutex",
+        lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
+        lw::LOCK_LW_MUTEX_CB => "sceKernelLockLwMutexCB",
+        lw::TRY_LOCK_LW_MUTEX => "sceKernelTryLockLwMutex",
+        lw::UNLOCK_LW_MUTEX => "sceKernelUnlockLwMutex",
+        lw::UNLOCK_LW_MUTEX2 => "sceKernelUnlockLwMutex2",
+        lw::CREATE_LW_COND => "sceKernelCreateLwCond",
+        lw::DELETE_LW_COND => "sceKernelDeleteLwCond",
+        lw::WAIT_LW_COND => "sceKernelWaitLwCond",
+        lw::WAIT_LW_COND_CB => "sceKernelWaitLwCondCB",
+        lw::SIGNAL_LW_COND => "sceKernelSignalLwCond",
+        lw::SIGNAL_LW_COND_ALL => "sceKernelSignalLwCondAll",
+        lw::SIGNAL_LW_COND_TO => "sceKernelSignalLwCondTo",
         lk::CREATE_THREAD => "sceKernelCreateThread",
         lk::START_THREAD => "sceKernelStartThread",
         lk::WAIT_THREAD_END => "sceKernelWaitThreadEnd",

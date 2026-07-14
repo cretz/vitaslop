@@ -14,27 +14,40 @@ use std::collections::{BTreeMap, BTreeSet};
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv7::{
     ConditionCode, InstDecoder, Instruction, NeonOp, Opcode, Operand, Reg, RegShift, RegShiftStyle,
-    SIMDDataType, SIMDSizeCode, ShiftStyle, VfpType,
+    SIMDDataType, SIMDElement, SIMDSizeCode, ShiftStyle, VfpType,
 };
 
 use crate::Error;
 use crate::ir::{
-    Block, BinOp, FBinOp, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType, Stmt, Term, Value,
-    VfpOp, VfpReg,
+    Block, BinOp, ElemLane, FBinOp, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType, Stmt, Term,
+    Value, VfpOp, VfpReg,
 };
 
 /// A resolved import: the guest stub address a `bl`/`blx` targets maps to a
 /// dense host-import index.
+///
+/// `redirects` handles inter-module calls in a multi-module link: a call to one
+/// module's import stub is rewritten to a *direct* call to the exporting module's
+/// function (both live in the same unified wasm module), so an inter-module call
+/// is a plain guest-to-guest call with no host round-trip. Redirection is applied
+/// to a branch target before the host-import lookup, so a redirected stub is
+/// never also treated as a host import.
 pub struct Imports<'a> {
     map: &'a BTreeMap<u32, u32>,
+    redirects: &'a BTreeMap<u32, u32>,
 }
 
 impl<'a> Imports<'a> {
-    pub fn new(map: &'a BTreeMap<u32, u32>) -> Self {
-        Imports { map }
+    pub fn new(map: &'a BTreeMap<u32, u32>, redirects: &'a BTreeMap<u32, u32>) -> Self {
+        Imports { map, redirects }
     }
     fn get(&self, addr: u32) -> Option<u32> {
         self.map.get(&addr).copied()
+    }
+    /// Rewrite an inter-module import stub address to the real callee address it
+    /// resolves to; a non-redirected address is returned unchanged.
+    fn resolve(&self, addr: u32) -> u32 {
+        self.redirects.get(&addr).copied().unwrap_or(addr)
     }
 }
 
@@ -53,6 +66,11 @@ pub struct Discovered {
 /// register number; `None` means "not a known constant here". `[7]` doubles as
 /// the r7 tracking a noreturn `svc` needs.
 type RegConsts = [Option<u32>; 16];
+
+/// Upper bound on the instructions in one discovered function. Real ARM functions
+/// are far smaller (the largest in OlliOlli is a few thousand); exceeding this
+/// means discovery is walking data as code, so the "function" is rejected.
+const MAX_FUNC_INSNS: usize = 16384;
 
 /// Decode one instruction at guest `addr`, returning it and its byte length.
 fn decode_at(
@@ -92,12 +110,14 @@ enum Flow {
     Halt,
 }
 
-/// The pc-relative target of a branch instruction, if it has one. yaxpeax's
-/// Thumb offset is measured from the instruction address in halfwords, so the
-/// target is `addr + 2*off`. `blx` switches to ARM and word-aligns the pc
-/// (`Align(PC,4)`), so from a non-word-aligned address its target is rounded
-/// down to the next word - otherwise it lands 2 bytes past the real callee/stub.
-fn branch_target(inst: &Instruction, addr: u32, thumb: bool) -> Option<u32> {
+/// The pc-relative target of a branch instruction, if it has one. yaxpeax measures
+/// the offset from the instruction address (already folding in the pipeline pc bias),
+/// so the target is `addr + 2*off` for a Thumb branch (halfwords) and `addr + 4*off`
+/// for an ARM branch (words) - NOT `pc + off`; adding the `pc+4`/`pc+8` bias again
+/// would land the target 4/8 bytes past the real callee. `blx` switches to ARM and
+/// word-aligns the pc (`Align(PC,4)`), so from a non-word-aligned address its target
+/// is rounded down to the next word - otherwise it lands 2 bytes past the callee.
+fn branch_target(inst: &Instruction, addr: u32, _thumb: bool) -> Option<u32> {
     for op in &inst.operands {
         match op {
             Operand::BranchThumbOffset(off) => {
@@ -105,8 +125,9 @@ fn branch_target(inst: &Instruction, addr: u32, thumb: bool) -> Option<u32> {
                 return Some(if inst.opcode == Opcode::BLX { t & !3 } else { t });
             }
             Operand::BranchOffset(off) => {
-                let pc = if thumb { addr.wrapping_add(4) } else { addr.wrapping_add(8) };
-                return Some(pc.wrapping_add((4 * off) as u32));
+                // ARM branch: yaxpeax's `off` is in words from `addr`, pipeline bias
+                // already included, so the target is `addr + 4*off`.
+                return Some(addr.wrapping_add((4 * off) as u32));
             }
             _ => {}
         }
@@ -133,7 +154,7 @@ fn flow(
     noreturn_svc: &[u32],
 ) -> Flow {
     match inst.opcode {
-        Opcode::B => match branch_target(inst, addr, thumb) {
+        Opcode::B => match branch_target(inst, addr, thumb).map(|t| imports.resolve(t)) {
             // `b .` (branch to self) is an idle spin: treat as Halt so we do not
             // emit an infinite wasm loop the host cannot leave.
             Some(t) if t == addr => Flow::Halt,
@@ -152,7 +173,7 @@ fn flow(
             Some(t) => Flow::Fork(t),
             None => Flow::Halt,
         },
-        Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb) {
+        Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb).map(|t| imports.resolve(t)) {
             Some(t) if imports.get(t).is_some() => Flow::Call { guest: None },
             Some(t) => Flow::Call { guest: Some(t) },
             // A register-target `blx rN` is an indirect call through a function
@@ -169,6 +190,9 @@ fn flow(
             _ => Flow::Halt,
         },
         Opcode::POP | Opcode::LDM(..) if writes_pc(inst) => Flow::Return,
+        // A breakpoint traps (abort path); it has no in-function successor, so
+        // decoding must not run past it into the literal pool that often follows.
+        Opcode::BKPT => Flow::Halt,
         Opcode::SVC => {
             if r7.is_some_and(|n| noreturn_svc.contains(&n)) {
                 Flow::Halt
@@ -259,6 +283,150 @@ fn cond_from_u8(c: u8) -> ConditionCode {
     [EQ, NE, HS, LO, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE, AL, AL][c as usize & 0xF]
 }
 
+/// A statically-recovered `tbb`/`tbh` jump table: the index register, the resolved
+/// target block addresses (`targets[i]` for index `i`), and the out-of-range
+/// default block when the range-check branch is recognized.
+struct SwitchInfo {
+    index: u8,
+    targets: Vec<u32>,
+    default: Option<u32>,
+}
+
+/// The index register of a pc-relative `tbb`/`tbh`. Returns `None` (leaving the
+/// instruction unlowered) for the register-base form, whose table lives at a
+/// runtime address we cannot read statically.
+fn switch_index_reg(inst: &Instruction) -> Option<u8> {
+    match &inst.operands[0] {
+        // `tbb [pc, Rm]`
+        Operand::RegDerefPreindexReg(base, index, _, _) if base.number() == 15 => {
+            Some(index.number())
+        }
+        // `tbh [pc, Rm, lsl #1]`
+        Operand::RegDerefPreindexRegShift(base, rs, _, _) if base.number() == 15 => {
+            match rs.into_shift() {
+                RegShiftStyle::RegImm(s) => Some(s.shiftee().number()),
+                RegShiftStyle::RegReg(s) => Some(s.shiftee().number()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Recover the entry count and default target of a `tbb`/`tbh` switch from the
+/// compiler's range check - the idiomatic `cmp Rn, #k ; b<hi/hs> default` that
+/// guards the table. The guard branch is the instruction immediately before the
+/// table branch; the `cmp` that feeds it is a few flag-neutral instructions back
+/// (GCC schedules loads between them). Returns `(count, default)` when the guard
+/// is recognized; `count` is `None` if no matching `cmp` is found (the caller then
+/// falls back to reading the table's own extent).
+fn recover_switch_bound(
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    tb_addr: u32,
+    index_reg: u8,
+) -> (Option<u32>, Option<u32>) {
+    use ConditionCode::*;
+    // The instruction immediately before the table branch: the range-check branch.
+    let Some((&guard_addr, (guard, _, gcond, _))) = decoded.range(..tb_addr).next_back() else {
+        return (None, None);
+    };
+    if guard.opcode != Opcode::B || !matches!(gcond, HI | HS) {
+        return (None, None);
+    }
+    let default = branch_target(guard, guard_addr, true);
+    // Scan back (a bounded window) for the `cmp index_reg, #imm` feeding the guard,
+    // skipping the flag-neutral loads GCC schedules in between. Stop at the first
+    // compare, or if the index register is overwritten before we find it.
+    let mut count = None;
+    for (_, (ins, _, _, _)) in decoded.range(..guard_addr).rev().take(16) {
+        if ins.opcode == Opcode::CMP {
+            if regnum(&ins.operands[0]) == Some(index_reg) {
+                if let Some(k) = imm(&ins.operands[1]) {
+                    // `bhi` fires on index > k, so in-range is 0..=k (k+1 entries);
+                    // `bhs`/`bcs` fires on index >= k, so in-range is 0..k.
+                    count = Some(if *gcond == HI { k + 1 } else { k });
+                }
+            }
+            break;
+        }
+        if regnum(&ins.operands[0]) == Some(index_reg) {
+            break; // index clobbered before the compare - not this idiom
+        }
+    }
+    (count, default)
+}
+
+/// Read a `tbb`/`tbh` jump table and resolve its targets. The table sits inline
+/// right after the instruction (base `pc = tb_addr + 4`); each entry is a byte
+/// (`tbb`) or halfword (`tbh`) offset, and the target is `pc + 2*entry`.
+///
+/// The entry count comes from the compiler's range check when recognizable
+/// ([`recover_switch_bound`]); otherwise it is inferred from the table's own
+/// extent - the table runs up to the nearest case body, so the smallest offset
+/// bounds the entry count (`count <= min_entry` for `tbh`, `<= 2*min_entry` for
+/// `tbb`). Returns `None` (leaving the branch unlowered, a clean transpile
+/// failure rather than wrong code) if the table cannot be resolved in bounds.
+fn resolve_switch(
+    code: &[u8],
+    base: u32,
+    tb_addr: u32,
+    inst: &Instruction,
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+) -> Option<SwitchInfo> {
+    let index = switch_index_reg(inst)?;
+    let is_tbh = inst.opcode == Opcode::TBH;
+    let pc = tb_addr.wrapping_add(4);
+    let esize = if is_tbh { 2u32 } else { 1 };
+    let read = |i: u32| -> Option<u32> {
+        let off = pc.wrapping_add(i * esize).wrapping_sub(base) as usize;
+        if is_tbh {
+            let b = code.get(off..off + 2)?;
+            Some(u16::from_le_bytes([b[0], b[1]]) as u32)
+        } else {
+            code.get(off).map(|&b| b as u32)
+        }
+    };
+
+    let (cmp_count, default) = recover_switch_bound(decoded, tb_addr, index);
+    let count = match cmp_count {
+        Some(c) => c,
+        None => {
+            // Infer from the table extent: grow the entry list until the next index
+            // would reach the nearest case body.
+            let mut entries: Vec<u32> = Vec::new();
+            loop {
+                let i = entries.len() as u32;
+                if let Some(&m) = entries.iter().min() {
+                    let limit = if is_tbh { m } else { 2 * m };
+                    if i >= limit {
+                        break;
+                    }
+                }
+                if i >= 1024 {
+                    return None; // runaway: not a table we understand
+                }
+                match read(i) {
+                    Some(v) => entries.push(v),
+                    None => break,
+                }
+            }
+            entries.len() as u32
+        }
+    };
+    if count == 0 || count > 1024 {
+        return None;
+    }
+
+    let mut targets = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let target = pc.wrapping_add(2 * read(i)?);
+        if target.wrapping_sub(base) as usize >= code.len() {
+            return None; // target outside the image: bound is wrong, bail cleanly
+        }
+        targets.push(target);
+    }
+    Some(SwitchInfo { index, targets, default })
+}
+
 /// Discover and lower the function at `entry`.
 pub fn discover(
     code: &[u8],
@@ -283,6 +451,10 @@ pub fn discover(
     // callbacks). Collected via `movw`/`movt` tracking; processed as tentative
     // entries by the caller.
     let mut code_pointers: BTreeSet<u32> = BTreeSet::new();
+    // Statically-recovered `tbb`/`tbh` jump tables, keyed by the branch address.
+    // Filled in pass 1 (where the whole decoded stream is available to read the
+    // range check) and consumed in pass 2 to build the computed-jump terminator.
+    let mut switches: BTreeMap<u32, SwitchInfo> = BTreeMap::new();
     // Worklist carries IT state and the tracked register constants along fall-
     // through (a fresh, all-unknown set at every branch target, which may have
     // multiple predecessors).
@@ -302,6 +474,15 @@ pub fn discover(
         }
         if decoded.contains_key(&addr) {
             continue;
+        }
+        // Runaway guard: no real function is this large. Hitting the cap means we
+        // are decoding data as code - almost always a mis-identified code pointer
+        // (a `movw`/`movt` constant that happens to point into the image) whose
+        // straight-line "instructions" never reach a terminator. Reject the whole
+        // function: as a tentative code pointer it is silently dropped; as a hard
+        // callee it surfaces as a failure rather than a multi-megabyte wasm body.
+        if decoded.len() >= MAX_FUNC_INSNS {
+            return Err(Error::Decode { addr });
         }
         let (inst, len) = decode_at(&decoder, code, base, addr, thumb)?;
 
@@ -327,6 +508,27 @@ pub fn discover(
         };
         let next_regs = track_regs(&inst, regs, &in_bounds, discover_pointers, &mut code_pointers);
         let next = addr.wrapping_add(len);
+
+        // Table-branch (`tbb`/`tbh`) switch dispatch: resolve the inline jump table
+        // now, while the whole decoded stream (the range check that bounds it) is in
+        // hand, and seed every case body as a leader. The bytes right after the
+        // instruction are the table itself, never code, so this path never falls
+        // through - resolved or not. An unresolved table is reported per-function in
+        // pass 2 rather than marching the decoder into table data.
+        if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
+            if let Some(info) = resolve_switch(code, base, addr, &inst, &decoded) {
+                for &t in &info.targets {
+                    leaders.insert(t);
+                    work.push((t, 0, init));
+                }
+                if let Some(d) = info.default {
+                    leaders.insert(d);
+                    work.push((d, 0, init));
+                }
+                switches.insert(addr, info);
+            }
+            continue;
+        }
 
         match flow(&inst, addr, len, thumb, imports, regs[7], noreturn_svc) {
             Flow::Seq => work.push((next, next_it, next_regs)),
@@ -367,6 +569,20 @@ pub fn discover(
                 // unreachable): stop the function here.
                 break Term::Halt;
             };
+            // A table branch ends the block with a computed jump built from the table
+            // recovered in pass 1. An unresolved one is a clean per-function failure.
+            if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
+                match switches.get(&cursor) {
+                    Some(info) => {
+                        break Term::Switch {
+                            index: Value::Reg(info.index),
+                            targets: info.targets.clone(),
+                            default: info.default,
+                        };
+                    }
+                    None => return Err(Error::Unsupported { addr: cursor, opcode: inst.opcode }),
+                }
+            }
             let (mut effects, term) =
                 lower_insn(inst, cursor, *len, *applied, *in_it, thumb, imports)?;
             stmts.append(&mut effects);
@@ -384,7 +600,7 @@ pub fn discover(
     blocks.sort_by_key(|b| b.addr);
 
     Ok(Discovered {
-        func: Func { addr: entry, thumb, blocks },
+        func: Func { addr: entry, thumb, blocks, stub: false },
         callees: callees.into_iter().collect(),
         code_pointers: code_pointers.into_iter().collect(),
     })
@@ -639,7 +855,7 @@ fn lower_insn(
     // except conditional branches, which carry their own condition).
     match inst.opcode {
         B => {
-            let target = branch_target(inst, addr, thumb).ok_or_else(err)?;
+            let target = imports.resolve(branch_target(inst, addr, thumb).ok_or_else(err)?);
             if target == addr {
                 return Ok((vec![], Some(Term::Halt)));
             }
@@ -672,7 +888,7 @@ fn lower_insn(
                 // runtime target, then return to our caller (lr is unchanged, so
                 // the callee's own return unwinds past us correctly).
                 Operand::Reg(r) => Ok((
-                    vec![Stmt::CallIndirect { addr: Value::Reg(r.number()) }],
+                    vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: None }],
                     Some(Term::Return),
                 )),
                 _ => Err(err()),
@@ -682,19 +898,24 @@ fn lower_insn(
             let ret = addr.wrapping_add(len);
             // bl/blx set lr = return address (Thumb bit set in Thumb state).
             let lr = if thumb { ret | 1 } else { ret };
-            let stmt = match branch_target(inst, addr, thumb) {
+            let stmts = match branch_target(inst, addr, thumb).map(|t| imports.resolve(t)) {
+                // Direct target: set lr, then call (the target is a constant, so the
+                // order is safe).
                 Some(target) => match imports.get(target) {
-                    Some(index) => Stmt::Import(index),
-                    None => Stmt::Call { target },
+                    Some(index) => vec![Stmt::SetReg(14, Value::Imm(lr)), Stmt::Import(index)],
+                    None => vec![Stmt::SetReg(14, Value::Imm(lr)), Stmt::Call { target }],
                 },
-                // Register-target `blx rN`: indirect call through a function
-                // pointer, resolved at runtime by the dispatcher.
+                // Register-target `blx rN`: indirect call through a function pointer,
+                // resolved at runtime by the dispatcher. The CallIndirect sets lr
+                // itself, AFTER reading the target, so `blx lr` still works.
                 None => match ops[0] {
-                    Operand::Reg(r) => Stmt::CallIndirect { addr: Value::Reg(r.number()) },
+                    Operand::Reg(r) => {
+                        vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: Some(lr) }]
+                    }
                     _ => return Err(err()),
                 },
             };
-            return Ok((vec![Stmt::SetReg(14, Value::Imm(lr)), stmt], None));
+            return Ok((stmts, None));
         }
         POP | LDM(..) if writes_pc(inst) => {
             let mut stmts = lower_ldm(inst, addr)?;
@@ -705,6 +926,13 @@ fn lower_insn(
         SVC => {
             let n = imm(&ops[0]).unwrap_or(0);
             return Ok((vec![Stmt::Svc(n)], None));
+        }
+        // A breakpoint is a debug trap the compiler plants on an unreachable /
+        // abort path (`__builtin_trap`, a failed noreturn guard). Reaching one is
+        // a fault, so it ends the run here; the block terminates and the rest of
+        // the function still translates.
+        BKPT => {
+            return Ok((vec![], Some(Term::Halt)));
         }
         _ => {}
     }
@@ -731,6 +959,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
     let mut out = Vec::new();
     match inst.opcode {
         NOP | IT | HINT => {}
+
+        // Memory barriers and cache preload hints have no effect on the guest's
+        // observable state in our memory model (one guest CPU worker, sequential
+        // consistency at host-call sync points), so they lower to nothing.
+        DMB | DSB | ISB | PLD | PLI => {}
 
         ADR => {
             // adr rd, label => rd = pc-relative constant. pc is addr+8 in ARM,
@@ -844,15 +1077,16 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0) });
         }
 
-        AND | BIC | ORR | EOR | TST => {
+        AND | BIC | ORR | ORN | EOR | TST => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
-            let op2 = if inst.opcode == BIC {
+            // BIC/ORN take the bitwise complement of the second operand.
+            let op2 = if matches!(inst.opcode, BIC | ORN) {
                 Value::Not(Box::new(op2))
             } else {
                 op2
             };
             let binop = match inst.opcode {
-                ORR => BinOp::Or,
+                ORR | ORN => BinOp::Or,
                 EOR => BinOp::Xor,
                 _ => BinOp::And, // AND, BIC, TST
             };
@@ -881,6 +1115,44 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             }
             out.push(Stmt::SetReg(rd, result));
         }
+        // ror rd, rn, rm/#imm: rotate right. Amount is masked mod 32 (wasm rotr,
+        // matching ARM's register-rotate masking); ROR's carry-out is bit 31 of
+        // the result when it sets flags.
+        ROR => {
+            let (rd, rn, sh) = dataproc(inst).ok_or_else(err)?;
+            let result = bin(BinOp::Ror, rn, sh);
+            if sets_flags {
+                let carry = bin(BinOp::And, bin(BinOp::Lsr, result.clone(), Value::Imm(31)), Value::Imm(1));
+                out.push(Stmt::FlagsLogic { value: result.clone(), carry: Some(carry) });
+            }
+            out.push(Stmt::SetReg(rd, result));
+        }
+        // bfi rd, rn, #lsb, #width: insert the low `width` bits of rn into rd at
+        // bit `lsb`, leaving the rest of rd unchanged.
+        BFI => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let lsb = imm(&ops[2]).ok_or_else(err)?;
+            let width = imm(&ops[3]).ok_or_else(err)?;
+            let field = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+            let mask = field.wrapping_shl(lsb);
+            let inserted = bin(
+                BinOp::And,
+                bin(BinOp::Shl, rn, Value::Imm(lsb)),
+                Value::Imm(mask),
+            );
+            let kept = bin(BinOp::And, Value::Reg(rd), Value::Imm(!mask));
+            out.push(Stmt::SetReg(rd, bin(BinOp::Or, kept, inserted)));
+        }
+        // bfc rd, #lsb, #width: clear the `width` bits of rd at bit `lsb`.
+        BFC => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let lsb = imm(&ops[1]).ok_or_else(err)?;
+            let width = imm(&ops[2]).ok_or_else(err)?;
+            let field = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
+            let mask = field.wrapping_shl(lsb);
+            out.push(Stmt::SetReg(rd, bin(BinOp::And, Value::Reg(rd), Value::Imm(!mask))));
+        }
 
         MUL => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
@@ -905,6 +1177,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rm = operand_value(&ops[1]).ok_or_else(err)?;
             out.push(Stmt::SetReg(rd, Value::Clz(Box::new(rm))));
+        }
+        // rbit rd, rm: reverse the 32 bits of rm.
+        RBIT => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::Rbit { rd, rm });
         }
         // mla rd, rn, rm, ra => rd = rn*rm + ra; mls => rd = ra - rn*rm.
         MLA | MLS => {
@@ -949,6 +1227,19 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             out.push(Stmt::SetReg(rd, result));
         }
+        // Extend-and-add: `Xtab rd, rn, rm` => rd = rn + extend(rm's low byte/half).
+        SXTAB | UXTAB | SXTAH | UXTAH => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[2]).ok_or_else(err)?;
+            let ext = match inst.opcode {
+                UXTAB => bin(BinOp::And, rm, Value::Imm(0xFF)),
+                UXTAH => bin(BinOp::And, rm, Value::Imm(0xFFFF)),
+                SXTAB => bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(24)), Value::Imm(24)),
+                _ => bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(16)), Value::Imm(16)),
+            };
+            out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, ext)));
+        }
         // Bitfield extract: ubfx rd, rn, #lsb, #width (zero-extended); sbfx
         // (sign-extended).
         UBFX | SBFX => {
@@ -966,19 +1257,6 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 bin(BinOp::Asr, bin(BinOp::Shl, rn, Value::Imm(top)), Value::Imm(32 - width))
             };
             out.push(Stmt::SetReg(rd, result));
-        }
-
-        BFC => {
-            // bfc rd, #lsb, #width: clear `width` bits starting at `lsb`.
-            let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let lsb = imm(&ops[1]).ok_or_else(err)?;
-            let width = imm(&ops[2]).ok_or_else(err)?;
-            let mask = if width >= 32 {
-                0
-            } else {
-                !(((1u32 << width) - 1) << lsb)
-            };
-            out.push(Stmt::SetReg(rd, bin(BinOp::And, Value::Reg(rd), Value::Imm(mask))));
         }
 
         LDR | LDRB | LDRH | LDRSB | LDRSH => {
@@ -1037,43 +1315,161 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.extend(a.post);
         }
 
+        // Load-exclusive: with one guest CPU worker there is no contending core,
+        // so an exclusive load is a plain load. (When preemptive multi-threading
+        // lands, these need a real exclusive monitor; single-thread bring-up is
+        // faithful as an ordinary load.)
+        LDREX | LDREXB | LDREXH => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
+            let size = match inst.opcode {
+                LDREXB => MemSize::Byte,
+                LDREXH => MemSize::Half,
+                _ => MemSize::Word,
+            };
+            out.extend(a.pre);
+            out.push(Stmt::SetReg(rt, Value::Load { addr: Box::new(a.addr), size, signed: false }));
+            out.extend(a.post);
+        }
+        // Load-exclusive doubleword: two plain 32-bit loads (single guest core).
+        LDREXD => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            let rt2 = regnum(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
+            out.extend(a.pre);
+            out.push(Stmt::SetReg(
+                rt,
+                Value::Load { addr: Box::new(a.addr.clone()), size: MemSize::Word, signed: false },
+            ));
+            out.push(Stmt::SetReg(
+                rt2,
+                Value::Load {
+                    addr: Box::new(bin(BinOp::Add, a.addr, Value::Imm(4))),
+                    size: MemSize::Word,
+                    signed: false,
+                },
+            ));
+            out.extend(a.post);
+        }
+        // Store-exclusive doubleword: store both words, report success (0).
+        STREXD => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rt = regnum(&ops[1]).ok_or_else(err)?;
+            let rt2 = regnum(&ops[2]).ok_or_else(err)?;
+            let a = lower_addr(&ops[3], addr, inst.thumb).ok_or_else(err)?;
+            out.extend(a.pre);
+            out.push(Stmt::Store { addr: a.addr.clone(), data: Value::Reg(rt), size: MemSize::Word });
+            out.push(Stmt::Store {
+                addr: bin(BinOp::Add, a.addr, Value::Imm(4)),
+                data: Value::Reg(rt2),
+                size: MemSize::Word,
+            });
+            out.push(Stmt::SetReg(rd, Value::Imm(0)));
+            out.extend(a.post);
+        }
+        // Store-exclusive: the store always succeeds (no contention), so it writes
+        // the value and reports success (0) in the status register.
+        STREX | STREXB | STREXH => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rt = regnum(&ops[1]).ok_or_else(err)?;
+            let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
+            let size = match inst.opcode {
+                STREXB => MemSize::Byte,
+                STREXH => MemSize::Half,
+                _ => MemSize::Word,
+            };
+            out.extend(a.pre);
+            out.push(Stmt::Store { addr: a.addr, data: Value::Reg(rt), size });
+            out.push(Stmt::SetReg(rd, Value::Imm(0)));
+            out.extend(a.post);
+        }
+
         PUSH => out.extend(lower_push(inst, addr)?),
         POP | LDM(..) => out.extend(lower_ldm(inst, addr)?),
         STM(..) => out.extend(lower_stm(inst, addr)?),
 
         // --- VFP / floating-point ---------------------------------------
         VADD | VSUB | VMUL | VDIV => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rn = s_num(&ops[1]).ok_or_else(err)?;
-            let rm = s_num(&ops[2]).ok_or_else(err)?;
             let op = match inst.opcode {
                 VADD => FBinOp::Add,
                 VSUB => FBinOp::Sub,
                 VMUL => FBinOp::Mul,
                 _ => FBinOp::Div,
             };
-            out.push(Stmt::Vfp(VfpOp::Bin32 { op, rd, rn, rm }));
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rn = d_num(&ops[1]).ok_or_else(err)?;
+                let rm = d_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Bin64 { op, rd, rn, rm }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rn = s_num(&ops[1]).ok_or_else(err)?;
+                let rm = s_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Bin32 { op, rd, rn, rm }));
+            }
         }
-        VMLA | VMLS => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rn = s_num(&ops[1]).ok_or_else(err)?;
-            let rm = s_num(&ops[2]).ok_or_else(err)?;
-            out.push(Stmt::Vfp(VfpOp::MulAcc32 { rd, rn, rm, sub: inst.opcode == VMLS }));
+        // Multiply-accumulate family: vmla/vmls and their negated forms
+        // vnmla/vnmls (which negate the accumulator first).
+        VMLA | VMLS | VNMLA | VNMLS => {
+            let sub = matches!(inst.opcode, VMLS | VNMLA);
+            let neg = matches!(inst.opcode, VNMLA | VNMLS);
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rn = d_num(&ops[1]).ok_or_else(err)?;
+                let rm = d_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::MulAcc64 { rd, rn, rm, sub, neg }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rn = s_num(&ops[1]).ok_or_else(err)?;
+                let rm = s_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::MulAcc32 { rd, rn, rm, sub, neg }));
+            }
+        }
+        VNMUL => {
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rn = d_num(&ops[1]).ok_or_else(err)?;
+                let rm = d_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::NegMul64 { rd, rn, rm }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rn = s_num(&ops[1]).ok_or_else(err)?;
+                let rm = s_num(&ops[2]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::NegMul32 { rd, rn, rm }));
+            }
         }
         VNEG => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rm = s_num(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::Vfp(VfpOp::Neg32 { rd, rm }));
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rm = d_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Neg64 { rd, rm }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rm = s_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Neg32 { rd, rm }));
+            }
         }
         VABS => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rm = s_num(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::Vfp(VfpOp::Abs32 { rd, rm }));
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rm = d_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Abs64 { rd, rm }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rm = s_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Abs32 { rd, rm }));
+            }
         }
         VSQRT => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rm = s_num(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::Vfp(VfpOp::Sqrt32 { rd, rm }));
+            if is_double(&ops[0]) {
+                let rd = d_num(&ops[0]).ok_or_else(err)?;
+                let rm = d_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Sqrt64 { rd, rm }));
+            } else {
+                let rd = s_num(&ops[0]).ok_or_else(err)?;
+                let rm = s_num(&ops[1]).ok_or_else(err)?;
+                out.push(Stmt::Vfp(VfpOp::Sqrt32 { rd, rm }));
+            }
         }
         VMOV => {
             match (&ops[0], &ops[1]) {
@@ -1103,6 +1499,30 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 (Operand::SIMDReg(s), Operand::Reg(rt)) if s.size == SIMDSizeCode::S => {
                     out.push(Stmt::Vfp(VfpOp::CoreToScalar { s: s.num, rt: rt.number() }));
                 }
+                // Double -> core pair: `vmov Rt, Rt2, Dm` (D low half -> rt, high -> rt2).
+                (Operand::Reg(rt), Operand::Reg(rt2)) if d_num(&ops[2]).is_some() => {
+                    let d = d_num(&ops[2]).ok_or_else(err)?;
+                    out.push(Stmt::Vfp(VfpOp::DoubleToCore {
+                        rt: rt.number(),
+                        rt2: rt2.number(),
+                        d,
+                    }));
+                }
+                // Core pair -> double: `vmov Dm, Rt, Rt2`.
+                (Operand::SIMDReg(dst), Operand::Reg(rt)) if dst.size == SIMDSizeCode::D => {
+                    let rt2 = regnum(&ops[2]).ok_or_else(err)?;
+                    out.push(Stmt::Vfp(VfpOp::CoreToDouble {
+                        d: dst.num,
+                        rt: rt.number(),
+                        rt2,
+                    }));
+                }
+                // Double register move (raw 64-bit copy): `vmov Dd, Dm`.
+                (Operand::SIMDReg(dst), Operand::SIMDReg(src))
+                    if dst.size == SIMDSizeCode::D && src.size == SIMDSizeCode::D =>
+                {
+                    out.push(Stmt::Vfp(VfpOp::Mov64 { rd: dst.num, rm: src.num }));
+                }
                 // Register move between two single-precision regs (raw bit copy).
                 _ => {
                     let rd = s_num(&ops[0]).ok_or_else(err)?;
@@ -1112,41 +1532,89 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             }
         }
         VCMP(_) => {
-            let rn = s_num(&ops[0]).ok_or_else(err)?;
-            // Second operand is either a register or `#0.0` (Imm(0)).
-            let rm = match &ops[1] {
-                Operand::SIMDReg(r) if r.size == SIMDSizeCode::S => Some(r.num),
-                Operand::Imm(0) => None,
-                _ => return Err(err()),
-            };
-            out.push(Stmt::Vfp(VfpOp::Cmp32 { rn, rm }));
+            if is_double(&ops[0]) {
+                let rn = d_num(&ops[0]).ok_or_else(err)?;
+                let rm = match &ops[1] {
+                    Operand::SIMDReg(r) if r.size == SIMDSizeCode::D => Some(r.num),
+                    Operand::Imm(0) => None,
+                    _ => return Err(err()),
+                };
+                out.push(Stmt::Vfp(VfpOp::Cmp64 { rn, rm }));
+            } else {
+                let rn = s_num(&ops[0]).ok_or_else(err)?;
+                // Second operand is either a register or `#0.0` (Imm(0)).
+                let rm = match &ops[1] {
+                    Operand::SIMDReg(r) if r.size == SIMDSizeCode::S => Some(r.num),
+                    Operand::Imm(0) => None,
+                    _ => return Err(err()),
+                };
+                out.push(Stmt::Vfp(VfpOp::Cmp32 { rn, rm }));
+            }
         }
         VMRS => {
-            // `vmrs APSR_nzcv, fpscr` (Rt == 15): move FP flags into NZCV. Other
-            // destinations (a real core register) are not used by the cube.
+            // `vmrs APSR_nzcv, fpscr` (Rt == 15) moves the FP flags into NZCV;
+            // `vmrs Rt, fpscr` reads the FPSCR into a core register (we synthesize
+            // it from the tracked NZCV flags, other bits zero - rounding/exception
+            // state is not modeled, matching the fixed round-to-nearest engine).
             match regnum(&ops[0]) {
                 Some(15) => out.push(Stmt::Vfp(VfpOp::MrsNzcv)),
+                Some(rt) => out.push(Stmt::Vfp(VfpOp::MrsFpscr { rt })),
+                None => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+            }
+        }
+        // `vmsr fpscr, Rt`: the only observable FPSCR state we model is the NZCV
+        // flags (set by vcmp, read back by vmrs), so writing rounding / flush-to-
+        // zero / exception control is a no-op on the fixed-mode engine.
+        VMSR => {}
+        VCVT { to, from, .. } => {
+            use VfpType::{F32, F64, S32, U32};
+            match (to, from) {
+                // Single precision: f32 <-> 32-bit integer (S registers).
+                (S32, F32) => {
+                    let (rd, rm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: true }));
+                }
+                (U32, F32) => {
+                    let (rd, rm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: false }));
+                }
+                (F32, S32) => {
+                    let (rd, rm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: true }));
+                }
+                (F32, U32) => {
+                    let (rd, rm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: false }));
+                }
+                // Double precision: f64 (D) <-> 32-bit integer (S).
+                (F64, S32) | (F64, U32) => {
+                    let (d, s) = (d_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtF64FromInt { d, s, signed: from == S32 }));
+                }
+                (S32, F64) | (U32, F64) => {
+                    let (s, d) = (s_num(&ops[0]).ok_or_else(err)?, d_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtIntFromF64 { s, d, signed: to == S32 }));
+                }
+                // Single <-> double width conversion.
+                (F64, F32) => {
+                    let (d, s) = (d_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtF64FromF32 { d, s }));
+                }
+                (F32, F64) => {
+                    let (s, d) = (s_num(&ops[0]).ok_or_else(err)?, d_num(&ops[1]).ok_or_else(err)?);
+                    out.push(Stmt::Vfp(VfpOp::CvtF32FromF64 { s, d }));
+                }
                 _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
             }
         }
-        VCVT { to, from, .. } => {
-            let rd = s_num(&ops[0]).ok_or_else(err)?;
-            let rm = s_num(&ops[1]).ok_or_else(err)?;
-            match (to, from) {
-                (VfpType::S32, VfpType::F32) => {
-                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: true }));
-                }
-                (VfpType::U32, VfpType::F32) => {
-                    out.push(Stmt::Vfp(VfpOp::CvtToInt { rd, rm, signed: false }));
-                }
-                (VfpType::F32, VfpType::S32) => {
-                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: true }));
-                }
-                (VfpType::F32, VfpType::U32) => {
-                    out.push(Stmt::Vfp(VfpOp::CvtFromInt { rd, rm, signed: false }));
-                }
-                _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+        VCVTHalf { to_half, top } => {
+            let (sd, sm) = (s_num(&ops[0]).ok_or_else(err)?, s_num(&ops[1]).ok_or_else(err)?);
+            if to_half {
+                // f32 -> f16 (round-to-nearest-even) is a separate, more involved
+                // conversion; defer it to a safe trapping stub until needed.
+                return Err(Error::Unsupported { addr, opcode: inst.opcode });
             }
+            out.push(Stmt::Vfp(VfpOp::CvtF32FromHalf { sd, sm, top }));
         }
         VLDR | VSTR => {
             let (size, num) = simd(&ops[0]).ok_or_else(err)?;
@@ -1169,11 +1637,22 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let (size, num, count) = simd_list(inst).ok_or_else(err)?;
             out.extend(vfp_multi(size, num, count, 13, false, true, None, true)?);
         }
-        VLDN(1, _) | VSTN(1, _) => {
-            let (size, num, count) = simd_list(inst).ok_or_else(err)?;
-            let (base, wback, post) = simd_deref(inst).ok_or_else(err)?;
+        VLDN(n, dt) | VSTN(n, dt) => {
             let load = matches!(inst.opcode, VLDN(..));
-            out.extend(vfp_multi(size, num, count, base, false, wback, post, load)?);
+            let (first, count, stride, element) = simd_points(inst).ok_or_else(err)?;
+            let (base, wback, post) = simd_deref(inst).ok_or_else(err)?;
+            let esize = neon_type(dt).bits;
+            out.extend(neon_structure_mem(
+                n, first, count, stride, element, esize, base, wback, post, load, addr,
+            )?);
+        }
+        // vdup.N Qd/Dd, Rt: broadcast a core register across every element. (The
+        // lane-source form `vdup Dd, Dm[x]` is a different operand shape, not yet
+        // needed.)
+        VDUP(dt) => {
+            let dst = neon_reg(&ops[0]).ok_or_else(err)?;
+            let rt = regnum(&ops[1]).ok_or_else(err)?;
+            out.push(Stmt::Neon(NeonStmt::DupCore { ty: neon_type(dt), dst, rt }));
         }
         Neon { op, dt } => {
             out.push(Stmt::Neon(lower_neon(op, dt, ops).ok_or_else(err)?));
@@ -1347,6 +1826,20 @@ fn s_num(op: &Operand) -> Option<u8> {
     }
 }
 
+/// A double-precision (`D`) register operand's number.
+fn d_num(op: &Operand) -> Option<u8> {
+    match op {
+        Operand::SIMDReg(r) if r.size == SIMDSizeCode::D => Some(r.num),
+        _ => None,
+    }
+}
+
+/// True if the VFP data-processing operand at `ops[0]` is a double-precision (`D`)
+/// register - the discriminator between the f32 and f64 forms of vadd/vmul/vcmp/...
+fn is_double(op: &Operand) -> bool {
+    matches!(op, Operand::SIMDReg(r) if r.size == SIMDSizeCode::D)
+}
+
 /// The constituent double-register numbers of a VFP register targeted by a NEON
 /// modified-immediate: a `Q` register is two consecutive `D`s; a `D` is itself.
 fn simd_imm_dregs(r: &yaxpeax_arm::armv7::SIMDReg) -> Vec<u8> {
@@ -1381,6 +1874,99 @@ fn simd_list(inst: &Instruction) -> Option<(SIMDSizeCode, u8, u8)> {
         Operand::SIMDRegList(r, count) => Some((r.size, r.num, *count)),
         _ => None,
     })
+}
+
+/// The NEON structure/element register list of a vldN/vstN as
+/// `(first D-register number, register count, register stride, element addressing)`.
+fn simd_points(inst: &Instruction) -> Option<(u8, u8, u8, SIMDElement)> {
+    inst.operands.iter().find_map(|op| match op {
+        Operand::SIMDRegPoints { first, count, stride, element } => {
+            Some((first.num, *count, *stride, *element))
+        }
+        _ => None,
+    })
+}
+
+/// Lower a NEON structure/element load or store (`vld1`-`vld4`/`vst1`-`vst4`).
+///
+/// The one-structure forms (`vld1`/`vst1`, `n == 1`) lower directly and correctly:
+/// a whole-register list is a contiguous D-register memory transfer; a single-lane
+/// form is one masked element transfer into/out of a lane; an all-lanes form
+/// broadcasts one loaded element across every lane of each destination register.
+/// The multi-structure forms (`vld2`-`vld4`, `n >= 2`) deinterleave across registers
+/// and are deferred: returning `Unsupported` makes the containing function a trapping
+/// stub (a loud, safe failure) rather than risking a silent mis-deinterleave. The
+/// decode is capstone-certified, so these never mis-decode - only await their lift.
+#[allow(clippy::too_many_arguments)]
+fn neon_structure_mem(
+    n: u8,
+    first: u8,
+    count: u8,
+    stride: u8,
+    element: SIMDElement,
+    esize: u8,
+    base: u8,
+    wback: bool,
+    post: Option<u8>,
+    load: bool,
+    addr: u32,
+) -> Result<Vec<Stmt>, Error> {
+    let unsupported = || Error::Unsupported { addr, opcode: Opcode::VLDN(n, SIMDDataType::Any(esize)) };
+    if n != 1 || stride != 1 {
+        // vld2/vld3/vld4 (and any strided list) need deinterleaving - deferred.
+        return Err(unsupported());
+    }
+    match element {
+        SIMDElement::Whole => {
+            // vld1/vst1 multiple: `count` contiguous doubleword transfers.
+            vfp_multi(SIMDSizeCode::D, first, count, base, false, wback, post, load)
+        }
+        SIMDElement::Lane(idx) => {
+            // vld1/vst1 single element to one lane: one masked element transfer.
+            let mut out = vec![Stmt::Neon(NeonStmt::ElemMem {
+                d: first,
+                esize,
+                lane: ElemLane::One(idx),
+                addr: Value::Reg(base),
+                load,
+            })];
+            out.extend(elem_writeback(base, esize / 8, wback, post));
+            Ok(out)
+        }
+        SIMDElement::AllLanes => {
+            // vld1 single element to all lanes: broadcast the one loaded element into
+            // every lane of each destination register (store-to-all-lanes has no
+            // encoding, so this is load-only).
+            if !load {
+                return Err(unsupported());
+            }
+            let mut out = Vec::new();
+            for i in 0..count {
+                out.push(Stmt::Neon(NeonStmt::ElemMem {
+                    d: first + i,
+                    esize,
+                    lane: ElemLane::All,
+                    addr: Value::Reg(base),
+                    load: true,
+                }));
+            }
+            out.extend(elem_writeback(base, esize / 8, wback, post));
+            Ok(out)
+        }
+    }
+}
+
+/// The post-transfer base update for a single-element NEON load/store: `bytes` is
+/// the number of bytes the transfer moved (one element). `!` adds that constant;
+/// the `, Rm` form adds a register.
+fn elem_writeback(base: u8, bytes: u8, wback: bool, post: Option<u8>) -> Vec<Stmt> {
+    if let Some(rm) = post {
+        vec![Stmt::SetReg(base, bin(BinOp::Add, Value::Reg(base), Value::Reg(rm)))]
+    } else if wback {
+        vec![Stmt::SetReg(base, bin(BinOp::Add, Value::Reg(base), Value::Imm(bytes as u32)))]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The `[Rn]{!}` / `[Rn], Rm` addressing of a vld1/vst1 as
@@ -1460,6 +2046,14 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
             };
             NeonStmt::MovImm { ty, dst: r(0)?, imm }
         }
+        VAND => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::And, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VORR => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Or, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VEOR => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Xor, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VBIC => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bic, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VORN => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Orn, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VBSL => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bsl, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VBIT => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bit, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VBIF => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bif, dst: r(0)?, a: r(1)?, b: r(2)? },
     };
     neon_emittable(&st).then_some(st)
 }

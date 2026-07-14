@@ -54,6 +54,9 @@ pub enum BinOp {
     Shl,
     Lsr,
     Asr,
+    /// Rotate right (ARM `ror`): the amount is taken modulo 32, matching both
+    /// wasm `i32.rotr` and ARM's register-rotate masking.
+    Ror,
     Mul,
 }
 
@@ -128,6 +131,47 @@ pub enum NeonStmt {
     /// Immediate broadcast: set every `ty.bits`-bit element of `dst` to `imm`
     /// (`vmov.iN`). `imm` is the per-element value.
     MovImm { ty: NeonType, dst: NeonReg, imm: u32 },
+    /// Duplicate the low `ty.bits` bits of core register `rt` into every element
+    /// of `dst` (`vdup.N Qd/Dd, Rt`).
+    DupCore { ty: NeonType, dst: NeonReg, rt: u8 },
+    /// Whole-register bitwise logical op (the 3-same logical family): `vand`,
+    /// `vorr`, `veor`, `vbic`, `vorn`, and the insert/select forms `vbsl`/`vbit`/
+    /// `vbif` (which also read `dst`). Element-size agnostic.
+    Bitwise { op: NeonBitwise, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// NEON single-element load/store to/from one lane of a D register, or a
+    /// broadcast load to all its lanes (`vld1`/`vst1` single-element forms). `esize`
+    /// is the element size in bits (8/16/32). This is the element-wise, deinterleave-
+    /// free 1-structure case: a lane load reads `esize` bits and inserts them into
+    /// lane `lane`, leaving the rest of `d` intact; a broadcast load replicates the
+    /// read element across every lane; a lane store writes one lane's bits out.
+    ElemMem { d: u8, esize: u8, lane: ElemLane, addr: Value, load: bool },
+}
+
+/// Which lane(s) a [`NeonStmt::ElemMem`] transfer touches.
+#[derive(Clone, Copy)]
+pub enum ElemLane {
+    /// A single lane, by index (`{dN[i]}`).
+    One(u8),
+    /// Every lane (a broadcast load, `{dN[]}`); store is not a valid form.
+    All,
+}
+
+/// The NEON bitwise logical operations ([`NeonStmt::Bitwise`]).
+#[derive(Clone, Copy)]
+pub enum NeonBitwise {
+    And,
+    Or,
+    Xor,
+    /// `vbic`: `a AND NOT b`.
+    Bic,
+    /// `vorn`: `a OR NOT b`.
+    Orn,
+    /// `vbsl`: bitwise select with `dst` as the mask.
+    Bsl,
+    /// `vbit`: insert `a` where `b` is set.
+    Bit,
+    /// `vbif`: insert `a` where `b` is clear.
+    Bif,
 }
 
 /// Floating-point binary operators (single precision).
@@ -146,9 +190,13 @@ pub enum FBinOp {
 pub enum VfpOp {
     /// `rd = rn <op> rm` (vadd/vsub/vmul/vdiv, f32).
     Bin32 { op: FBinOp, rd: u8, rn: u8, rm: u8 },
-    /// Multiply-accumulate: `rd = rd +/- (rn * rm)` (vmla `sub=false`, vmls
-    /// `sub=true`), non-fused (two roundings), f32.
-    MulAcc32 { rd: u8, rn: u8, rm: u8, sub: bool },
+    /// Multiply-accumulate: `rd = (-rd if neg else rd) +/- (rn * rm)`, non-fused
+    /// (two roundings), f32. Covers vmla (`neg=false,sub=false`), vmls
+    /// (`neg=false,sub=true`), vnmls (`neg=true,sub=false`), vnmla
+    /// (`neg=true,sub=true`).
+    MulAcc32 { rd: u8, rn: u8, rm: u8, sub: bool, neg: bool },
+    /// `rd = -(rn * rm)` (vnmul, f32).
+    NegMul32 { rd: u8, rn: u8, rm: u8 },
     /// `rd = -rm` (vneg, f32).
     Neg32 { rd: u8, rm: u8 },
     /// `rd = |rm|` (vabs, f32).
@@ -175,11 +223,50 @@ pub enum VfpOp {
     Cmp32 { rn: u8, rm: Option<u8> },
     /// Copy FP condition flags into the integer NZCV flags (`vmrs APSR_nzcv`).
     MrsNzcv,
+    /// Read the FPSCR into core register `rt` (`vmrs Rt, fpscr`): reconstruct the
+    /// NZCV bits [31:28] from the FP flags; all other bits read as zero.
+    MrsFpscr { rt: u8 },
     /// Convert f32 in `rm` to a 32-bit integer in `rd` (round toward zero,
     /// saturating), signed or unsigned (vcvt.s32/u32.f32).
     CvtToInt { rd: u8, rm: u8, signed: bool },
     /// Convert a 32-bit integer in `rm` to f32 in `rd` (vcvt.f32.s32/u32).
     CvtFromInt { rd: u8, rm: u8, signed: bool },
+
+    // --- Double precision (f64). Operands name D-register numbers. ---
+    /// `rd = rn <op> rm` (vadd/vsub/vmul/vdiv, f64).
+    Bin64 { op: FBinOp, rd: u8, rn: u8, rm: u8 },
+    /// `rd = (-rd if neg else rd) +/- (rn * rm)`, f64 (vmla/vmls/vnmls/vnmla).
+    MulAcc64 { rd: u8, rn: u8, rm: u8, sub: bool, neg: bool },
+    /// `rd = -(rn * rm)` (vnmul, f64).
+    NegMul64 { rd: u8, rn: u8, rm: u8 },
+    /// `rd = -rm` (vneg, f64).
+    Neg64 { rd: u8, rm: u8 },
+    /// `rd = |rm|` (vabs, f64).
+    Abs64 { rd: u8, rm: u8 },
+    /// `rd = sqrt(rm)` (vsqrt, f64).
+    Sqrt64 { rd: u8, rm: u8 },
+    /// `rd = rm` raw 64-bit copy (vmov D,D).
+    Mov64 { rd: u8, rm: u8 },
+    /// Compare `rn` against `rm` (or `+0.0` when `None`), setting the FP flags
+    /// (vcmp/vcmpe, f64).
+    Cmp64 { rn: u8, rm: Option<u8> },
+    /// Convert a 32-bit integer in S`s` to f64 in D`d` (vcvt.f64.s32/u32).
+    CvtF64FromInt { d: u8, s: u8, signed: bool },
+    /// Convert f64 in D`d` to a 32-bit integer in S`s`, round toward zero,
+    /// saturating (vcvt.s32/u32.f64).
+    CvtIntFromF64 { s: u8, d: u8, signed: bool },
+    /// Widen f32 in S`s` to f64 in D`d` (vcvt.f64.f32).
+    CvtF64FromF32 { d: u8, s: u8 },
+    /// Narrow f64 in D`d` to f32 in S`s` (vcvt.f32.f64).
+    CvtF32FromF64 { s: u8, d: u8 },
+    /// Widen the IEEE half-precision (f16) value in a 16-bit half of S`sm` to f32 in
+    /// S`sd` (`vcvtb`/`vcvtt.f32.f16`). `top` selects the top half (`vcvtt`) over the
+    /// bottom (`vcvtb`). Emitted as the branchless bit/float conversion.
+    CvtF32FromHalf { sd: u8, sm: u8, top: bool },
+    /// `vmov Rt, Rt2, Dm`: copy D`d`'s low 32 bits to `rt`, high 32 to `rt2`.
+    DoubleToCore { rt: u8, rt2: u8, d: u8 },
+    /// `vmov Dm, Rt, Rt2`: assemble D`d` from `rt` (low) and `rt2` (high).
+    CoreToDouble { d: u8, rt: u8, rt2: u8 },
 }
 
 /// One side-effecting statement within a basic block.
@@ -203,6 +290,9 @@ pub enum Stmt {
     Svc(u32),
     /// Service a Vita NID call through the host `import` import, by dense index.
     Import(u32),
+    /// Reverse the bit order of `rm` into `rd` (ARM `rbit`). No single wasm
+    /// primitive; emitted as the 5-step swap network over a scratch local.
+    Rbit { rd: u8, rm: Value },
     /// A 64-bit widening multiply: `{rdhi:rdlo} = rn * rm`, unsigned or signed
     /// (ARM `umull`/`smull`). The two 32-bit operands are extended to 64 bits
     /// (per `signed`), multiplied, and the product's low/high halves written to
@@ -214,9 +304,12 @@ pub enum Stmt {
     /// An indirect guest call (`blx rN` through a function pointer - init_array
     /// constructors, qsort comparators, C++ vtables): `addr` is the runtime target
     /// (Thumb bit set). Emission routes it through the module's dispatcher, which
-    /// maps the address to the matching translated function. `lr` is set by a
-    /// preceding `SetReg`.
-    CallIndirect { addr: Value },
+    /// maps the address to the matching translated function. `set_lr` is the return
+    /// address to load into `lr` for a call (`blx rN`), or `None` for a tail call
+    /// through a register (`bx rN`) that leaves `lr` untouched. Emission snapshots
+    /// `addr` *before* writing `lr`, so `blx lr` (a compiler using `lr` as the
+    /// call-target scratch) dispatches to the real target, not the clobbered return.
+    CallIndirect { addr: Value, set_lr: Option<u32> },
     /// Execute the inner statements only if `cond` holds (ARM predication / an
     /// `IT` block body).
     Guard(ConditionCode, Vec<Stmt>),
@@ -248,6 +341,14 @@ pub enum Term {
     BranchZero { reg: u8, nonzero: bool, taken: u32 },
     /// Return to the caller (`bx lr`, `pop {..,pc}`, ...).
     Return,
+    /// A computed jump through a dense index (ARM `tbb`/`tbh` switch dispatch):
+    /// branch to `targets[index]`. The jump table was read statically at discovery
+    /// time, so `targets` are resolved block addresses and the runtime only needs
+    /// the index register - no guest-memory table read. `index` is guaranteed in
+    /// `0..targets.len()` by a preceding range-check branch (the compiler's
+    /// `cmp; bhi default`), so `default` (the out-of-range block) is normally
+    /// unreachable from here; it is recorded for faithfulness when known.
+    Switch { index: Value, targets: Vec<u32>, default: Option<u32> },
     /// Stop running this function without returning: an infinite self-loop
     /// (`b .`), a statically-known noreturn `svc`, or undecodable tail.
     Halt,
@@ -269,11 +370,41 @@ pub struct Func {
     #[allow(dead_code)]
     pub thumb: bool,
     pub blocks: Vec<Block>,
+    /// A placeholder for a function that could not be lowered (an unlifted
+    /// instruction). Its body is a single `unreachable` trap, so the module still
+    /// builds and runs; reaching this function at runtime faults loudly, revealing
+    /// that the un-transpiled code is actually on the executed path. Used only by
+    /// the lenient whole-program build ([`crate::transpile_lenient`]).
+    pub stub: bool,
 }
 
 impl Func {
     /// Index of the block starting at `addr`, if any (for branch lowering).
     pub fn block_index(&self, addr: u32) -> Option<usize> {
         self.blocks.iter().position(|b| b.addr == addr)
+    }
+
+    /// A trapping placeholder function at `addr` (see [`Func::stub`]).
+    pub fn new_stub(addr: u32) -> Self {
+        Func { addr, thumb: true, blocks: Vec::new(), stub: true }
+    }
+
+    /// True if every intra-function branch target resolves to a block in this
+    /// function. A tentatively-discovered function (a guessed code pointer) can
+    /// decode into nonsense whose terminator branches to an address that is not a
+    /// block - emitting it would panic in `goto`. Such a function was never real
+    /// and must be dropped. Hard (call-graph-reachable) functions are always
+    /// well-formed by construction; this guards the tentative path.
+    pub fn well_formed(&self) -> bool {
+        let is_block = |a: u32| self.blocks.iter().any(|b| b.addr == a);
+        self.blocks.iter().all(|b| match &b.term {
+            Term::Jump(t) | Term::Branch { taken: t, .. } | Term::BranchZero { taken: t, .. } => {
+                is_block(*t)
+            }
+            Term::Switch { targets, default, .. } => {
+                targets.iter().all(|&t| is_block(t)) && default.map_or(true, is_block)
+            }
+            Term::Fallthrough | Term::Return | Term::Halt => true,
+        })
     }
 }

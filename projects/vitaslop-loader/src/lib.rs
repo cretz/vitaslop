@@ -21,6 +21,7 @@
 #[path = "self.rs"]
 pub mod self_;
 pub mod inflate;
+pub mod reloc;
 
 /// `e_type` of a velf: a relocatable SCE executable.
 const ET_SCE_RELEXEC: u16 = 0xFE04;
@@ -51,6 +52,17 @@ pub struct Import {
     pub stub_addr: u32,
 }
 
+/// One exported function: the library it belongs to, its NID, and the guest
+/// address other modules reach it at (the low bit carries the Thumb state, as in
+/// any ARM function pointer). Parsed from the module's `sce_module_exports`
+/// tables so a multi-module link can resolve an inter-module import to the real
+/// callee instead of a host trap.
+pub struct Export {
+    pub library_nid: u32,
+    pub func_nid: u32,
+    pub addr: u32,
+}
+
 /// A parsed Vita module.
 pub struct Module {
     /// Module name from `SceModuleInfo` (e.g. "cube.elf").
@@ -63,6 +75,14 @@ pub struct Module {
     pub segments: Vec<Segment>,
     /// Function imports, in import-table order.
     pub imports: Vec<Import>,
+    /// Function exports (what other modules can import from this one), in
+    /// export-table order. Empty for a module that exports nothing callable.
+    pub exports: Vec<Export>,
+    /// SCE relocations (`PT_SCE_RELA`), decoded but not yet applied. [`rebase`]
+    /// applies them when the module is placed at a runtime base.
+    ///
+    /// [`rebase`]: Module::rebase
+    pub relocations: Vec<reloc::Reloc>,
     /// Static constructor/destructor function pointers, read from the
     /// `.preinit_array`/`.init_array`/`.fini_array` sections (when the module
     /// keeps section headers). These are reachable only through an indirect call
@@ -70,6 +90,21 @@ pub struct Module {
     /// transpiler discovery that the direct-call closure alone would miss. Empty
     /// for `-nostdlib` modules and for anything with its section headers stripped.
     pub init_pointers: Vec<u32>,
+    /// Absolute function pointers recovered from `R_ARM_ABS32`/`TARGET1`
+    /// relocations whose resolved value has the Thumb bit set (data pointers are
+    /// even, so a bit0-set pointer into code is a function pointer). These sit in
+    /// data tables - vtables, callback arrays, jump tables - reached only through
+    /// an indirect `blx`/`bx`, which the `movw`/`movt` code-pointer scan cannot
+    /// see. Populated by [`rebase`](Module::rebase) with the Thumb bit stripped;
+    /// empty until then. Seeds transpiler discovery.
+    pub code_pointers: Vec<u32>,
+    /// Absolute pointers (`R_ARM_ABS32`/`TARGET1`) that are *even* (Thumb bit clear)
+    /// and land inside an executable segment - i.e. ARM-mode function pointers. A
+    /// Thumb function pointer carries bit 0; an even pointer into code is either ARM
+    /// code (e.g. a table of ARM stubs a `blx` reaches) or a stray data address, so
+    /// these seed discovery *tentatively* as ARM functions (a bad guess that fails to
+    /// decode is dropped). Populated by [`rebase`](Module::rebase); empty until then.
+    pub arm_code_pointers: Vec<u32>,
 }
 
 /// Why loading failed.
@@ -88,6 +123,8 @@ pub enum Error {
     /// A SELF segment is zlib-compressed (`vita-make-fself -c`); the loader is
     /// dependency-free, so inflate is not built in yet.
     CompressedSelf,
+    /// A relocation used a code we do not model (see [`reloc::code`]).
+    UnsupportedReloc(u8),
 }
 
 impl Module {
@@ -99,6 +136,131 @@ impl Module {
             .max()
             .unwrap_or(self.base)
     }
+
+    /// Place this module at runtime base `new_base`, applying every relocation.
+    ///
+    /// A velf links at a nominal base (`self.base`, always `0x8100_0000`); several
+    /// modules that must share one address space each need a distinct base. This
+    /// rigidly shifts the whole image by `delta = new_base - self.base` and, for
+    /// every relocation, patches the embedded absolute address at the fixup site
+    /// so the code and data point at the module's new location. After it returns,
+    /// `base`, `entry`, every segment `vaddr`, every import stub, every export
+    /// address, and the init-pointer table are all expressed at the new base, and
+    /// `relocations` is cleared (a module is relocated exactly once).
+    ///
+    /// Only the relocation codes Vita modules actually emit are handled - absolute
+    /// 32-bit words and Thumb `MOVW`/`MOVT` immediate pairs; an unknown code is a
+    /// hard error (silently skipping a fixup would leave a dangling pointer).
+    pub fn rebase(&mut self, new_base: u32) -> Result<(), Error> {
+        let delta = new_base.wrapping_sub(self.base);
+        if delta == 0 && self.relocations.is_empty() {
+            return Ok(());
+        }
+        // Runtime base of each segment after the shift, indexed as the relocation
+        // `sym_seg` / `data_seg` fields index (PT_LOAD order).
+        let seg_base: Vec<u32> = self
+            .segments
+            .iter()
+            .map(|s| s.vaddr.wrapping_add(delta))
+            .collect();
+
+        // Post-shift executable-segment ranges, to classify even absolute pointers:
+        // one landing in code is an ARM function pointer, one elsewhere is data.
+        let exec_ranges: Vec<(u32, u32)> = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.executable)
+            .map(|(i, s)| (seg_base[i], seg_base[i].wrapping_add(s.mem_size)))
+            .collect();
+        let in_exec = |a: u32| exec_ranges.iter().any(|&(lo, hi)| a >= lo && a < hi);
+
+        let mut code_pointers: Vec<u32> = Vec::new();
+        let mut arm_code_pointers: Vec<u32> = Vec::new();
+        for r in &self.relocations {
+            let s = *seg_base
+                .get(r.sym_seg as usize)
+                .ok_or(Error::OutOfBounds("reloc sym_seg"))?;
+            let target = s.wrapping_add(r.addend);
+            let data = self
+                .segments
+                .get_mut(r.data_seg as usize)
+                .ok_or(Error::OutOfBounds("reloc data_seg"))?;
+            let off = r.offset as usize;
+            match r.code {
+                reloc::code::NONE => {}
+                reloc::code::ABS32 | reloc::code::TARGET1 => {
+                    let slot = data
+                        .data
+                        .get_mut(off..off + 4)
+                        .ok_or(Error::OutOfBounds("reloc abs32 site"))?;
+                    slot.copy_from_slice(&target.to_le_bytes());
+                    // A resolved pointer with the Thumb bit set is a function
+                    // pointer sitting in data - a discovery seed the direct-call /
+                    // movw-movt closures cannot reach.
+                    if target & 1 == 1 {
+                        code_pointers.push(target & !1);
+                    } else if target != 0 && in_exec(target) {
+                        // Even pointer into code: an ARM-mode function pointer.
+                        arm_code_pointers.push(target);
+                    }
+                }
+                reloc::code::THM_MOVW_ABS_NC => {
+                    patch_thumb_mov(&mut data.data, off, (target & 0xFFFF) as u16)?;
+                }
+                reloc::code::THM_MOVT_ABS => {
+                    patch_thumb_mov(&mut data.data, off, (target >> 16) as u16)?;
+                }
+                other => return Err(Error::UnsupportedReloc(other)),
+            }
+        }
+
+        // Shift every address the module reports now that the sites are patched.
+        for s in &mut self.segments {
+            s.vaddr = s.vaddr.wrapping_add(delta);
+        }
+        for imp in &mut self.imports {
+            imp.stub_addr = imp.stub_addr.wrapping_add(delta);
+        }
+        for ex in &mut self.exports {
+            ex.addr = ex.addr.wrapping_add(delta);
+        }
+        for p in &mut self.init_pointers {
+            *p = p.wrapping_add(delta);
+        }
+        self.entry = self.entry.wrapping_add(delta);
+        self.base = new_base;
+        self.relocations.clear();
+        code_pointers.sort_unstable();
+        code_pointers.dedup();
+        self.code_pointers = code_pointers;
+        arm_code_pointers.sort_unstable();
+        arm_code_pointers.dedup();
+        self.arm_code_pointers = arm_code_pointers;
+        Ok(())
+    }
+}
+
+/// Patch the 16-bit immediate of a 32-bit Thumb-2 `MOVW`/`MOVT` (T3 encoding) at
+/// `off` in `data`, preserving the opcode and destination register. The immediate
+/// splits as `imm4:i:imm3:imm8` across the two halfwords (little-endian): the
+/// first halfword carries `i` (bit 10) and `imm4` (bits 3..0); the second carries
+/// `imm3` (bits 14..12) and `imm8` (bits 7..0).
+fn patch_thumb_mov(data: &mut [u8], off: usize, imm16: u16) -> Result<(), Error> {
+    let site = data
+        .get_mut(off..off + 4)
+        .ok_or(Error::OutOfBounds("reloc thumb-mov site"))?;
+    let mut hw1 = u16::from_le_bytes([site[0], site[1]]);
+    let mut hw2 = u16::from_le_bytes([site[2], site[3]]);
+    let imm4 = (imm16 >> 12) & 0xF;
+    let i = (imm16 >> 11) & 0x1;
+    let imm3 = (imm16 >> 8) & 0x7;
+    let imm8 = imm16 & 0xFF;
+    hw1 = (hw1 & 0xFBF0) | (i << 10) | imm4;
+    hw2 = (hw2 & 0x8F00) | (imm3 << 12) | imm8;
+    site[0..2].copy_from_slice(&hw1.to_le_bytes());
+    site[2..4].copy_from_slice(&hw2.to_le_bytes());
+    Ok(())
 }
 
 /// Owned inputs for the transpiler, derived from a [`Module`]. Holds the buffers
@@ -111,6 +273,9 @@ pub struct ProgramInputs {
     pub base: u32,
     pub entries: Vec<u32>,
     pub externs: Vec<vitaslop_transpiler::Extern>,
+    /// Inter-module redirects (empty for a single-module load; the multi-module
+    /// linker populates them).
+    pub redirects: Vec<vitaslop_transpiler::Redirect>,
     /// True if the entry point is Thumb (entry had bit 0 set).
     pub thumb_entry: bool,
     /// Total guest memory to provision (image + stack + heap), in bytes from
@@ -133,7 +298,11 @@ impl ProgramInputs {
             base: self.base,
             thumb: self.thumb_entry,
             entries: &self.entries,
+            // Single-module loads (the conformance corpus) are whole-program Thumb;
+            // the multi-module retail linker is what seeds ARM code pointers.
+            arm_entries: &[],
             externs: &self.externs,
+            redirects: &self.redirects,
             // Vita dispatches host calls through NID stubs (bl/blx to a stub
             // address), not `svc`, so there is no noreturn-syscall set here.
             noreturn_svc: &[],
@@ -202,6 +371,7 @@ impl Module {
             base,
             entries,
             externs,
+            redirects: Vec::new(),
             thumb_entry: self.entry & 1 != 0,
             mem_bytes: DEFAULT_MEM_BYTES,
             import_memory: false,
@@ -341,6 +511,8 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
     // SceModuleInfo fields we need. The top/end pointers here are SEGMENT-
     // RELATIVE offsets (unlike the absolute pointers inside the import structs).
     let name = read_cstr(bytes, mi_file + 0x04, 27);
+    let export_top_off = r.u32(mi_file + 0x24)?;
+    let export_end_off = r.u32(mi_file + 0x28)?;
     let import_top_off = r.u32(mi_file + 0x2c)?;
     let import_end_off = r.u32(mi_file + 0x30)?;
     let module_nid = r.u32(mi_file + 0x34)?;
@@ -348,6 +520,8 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
 
     let seg_base = mi_seg.vaddr;
     let entry = seg_base.wrapping_add(module_start_off);
+    let export_top = seg_base.wrapping_add(export_top_off);
+    let export_end = seg_base.wrapping_add(export_end_off);
     let import_top = seg_base.wrapping_add(import_top_off);
     let import_end = seg_base.wrapping_add(import_end_off);
 
@@ -396,6 +570,44 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         cursor = cursor.wrapping_add(step);
     }
 
+    // Walk the export table: fixed-size 0x20-byte `sce_module_exports` entries.
+    // Each declares num_syms_funcs function symbols followed by num_syms_vars
+    // variables; we keep the functions (what another module can call). The
+    // entry addresses are absolute vaddrs carrying the Thumb bit.
+    let mut exports = Vec::new();
+    let mut cursor = export_top;
+    while cursor < export_end {
+        let base = cursor;
+        let size = read_vaddr_u16(&read_vaddr, base)?;
+        let step = if size == 0 { 0x20 } else { size as u32 };
+        let num_funcs = read_vaddr_u16(&read_vaddr, base + 0x06)?;
+        let library_nid = read_vaddr(base + 0x10)?;
+        let nid_table = read_vaddr(base + 0x18)?;
+        let entry_table = read_vaddr(base + 0x1c)?;
+        for i in 0..num_funcs as u32 {
+            let func_nid = read_vaddr(nid_table + i * 4)?;
+            let addr = read_vaddr(entry_table + i * 4)?;
+            exports.push(Export { library_nid, func_nid, addr });
+        }
+        cursor = cursor.wrapping_add(step);
+    }
+
+    // Decode every SCE relocation (PT_SCE_RELA, p_type 0x60000000). They stay
+    // pending until `rebase` places the module and applies them.
+    let mut relocations = Vec::new();
+    for i in 0..e_phnum {
+        let ph = e_phoff + i * PHDR_SIZE;
+        if r.u32(ph)? != reloc::PT_SCE_RELA {
+            continue;
+        }
+        let p_offset = r.u32(ph + 4)? as usize;
+        let p_filesz = r.u32(ph + 16)? as usize;
+        let blob = bytes
+            .get(p_offset..p_offset + p_filesz)
+            .ok_or(Error::OutOfBounds("reloc segment"))?;
+        relocations.extend(reloc::decode(blob));
+    }
+
     // Build the public segments (owning their file bytes, bss zero-filled).
     let mut segments = Vec::new();
     let mut base = u32::MAX;
@@ -423,7 +635,11 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         entry,
         segments,
         imports,
+        exports,
+        relocations,
         init_pointers,
+        code_pointers: Vec::new(),
+        arm_code_pointers: Vec::new(),
     })
 }
 
