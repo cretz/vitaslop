@@ -11,7 +11,6 @@
 
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::nid::sync as nid;
 use crate::SvcOutcome;
 
 /// A `sceKernelTryLockMutex` failure when another thread owns the mutex (the
@@ -19,43 +18,16 @@ use crate::SvcOutcome;
 /// only checks nonzero.
 const ERR_MUTEX_FAILED_TO_OWN: u32 = 0x8002_8082;
 
-pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Option<SvcOutcome> {
-    match func_nid {
-        nid::CREATE_MUTEX => create_mutex(ctx, st),
-        // Lock and wait can block under the preemptive scheduler, so they return
-        // the outcome directly (Block parks the calling thread).
-        nid::LOCK_MUTEX => return Some(lock_mutex(ctx, st, false)),
-        nid::TRY_LOCK_MUTEX => return Some(lock_mutex(ctx, st, true)),
-        nid::UNLOCK_MUTEX => unlock_mutex(ctx, st),
-        nid::DELETE_MUTEX => delete_object(ctx, st),
-        nid::CREATE_SEMA => create_sema(ctx, st),
-        nid::WAIT_SEMA => return Some(wait_sema(ctx, st)),
-        nid::SIGNAL_SEMA => signal_sema(ctx, st),
-        nid::DELETE_SEMA => delete_object(ctx, st),
-        // Condition variables. Wait can block; signal wakes and hands off the
-        // mutex. Single-thread mode: wait returns immediately, signal is a no-op.
-        nid::CREATE_COND => create_cond(ctx, st),
-        nid::WAIT_COND => return Some(wait_cond(ctx, st)),
-        nid::SIGNAL_COND => signal_cond(ctx, st, false),
-        nid::SIGNAL_COND_ALL => signal_cond(ctx, st, true),
-        nid::DELETE_COND => delete_object(ctx, st),
-        nid::CREATE_EVENT_FLAG => create_event_flag(ctx, st),
-        nid::SET_EVENT_FLAG => set_event_flag(ctx, st),
-        nid::WAIT_EVENT_FLAG => wait_event_flag(ctx, st),
-        nid::CLEAR_EVENT_FLAG => clear_event_flag(ctx, st),
-        nid::DELETE_EVENT_FLAG => delete_object(ctx, st),
-        nid::GET_SYSTEM_TIME_WIDE => get_system_time_wide(ctx, st),
-        _ => return None,
-    }
-    Some(SvcOutcome::Continue)
-}
+/// `SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID`: waiting on / signalling a semaphore id that
+/// names no live semaphore. The kernel returns this at once instead of blocking.
+const SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID: u32 = 0x8002_8101;
 
 // --- mutex ---
 
 /// SceUID sceKernelCreateMutex(const char *name, SceUInt attr, int initCount,
 ///     SceKernelMutexOptParam *option)
 #[hostcall]
-fn create_mutex(st: &mut VitaState, _name: Ptr, _attr: u32, _init: i32, _opt: Ptr) -> i32 {
+pub(super) fn create_mutex(st: &mut VitaState, _name: Ptr, _attr: u32, _init: i32, _opt: Ptr) -> i32 {
     // Recording ownership state is harmless single-thread (lock/unlock take the
     // immediate path there) and necessary for preemptive blocking.
     st.create_mutex()
@@ -67,7 +39,7 @@ fn create_mutex(st: &mut VitaState, _name: Ptr, _attr: u32, _init: i32, _opt: Pt
 /// Single-thread model: uncontended, always succeeds. Preemptive: acquire if free
 /// or already held by this thread (recursive), else the plain lock parks the caller
 /// ([`SvcOutcome::Block`]) while the try-lock returns an error without blocking.
-fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool) -> SvcOutcome {
+pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
     if !st.is_preemptive() {
         ctx.ret(0);
@@ -88,7 +60,7 @@ fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool) -> SvcOutc
 
 /// int sceKernelUnlockMutex(SceUID mutexid, int unlockCount)
 #[hostcall]
-fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
+pub(super) fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
     if st.is_preemptive() {
         st.mutex_unlock(id);
     }
@@ -100,8 +72,12 @@ fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
 /// SceUID sceKernelCreateSema(const char *name, SceUInt attr, int initVal,
 ///     int maxVal, SceKernelSemaOptParam *option)
 #[hostcall]
-fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32, _max: i32, _opt: Ptr) -> i32 {
-    st.create_sema(init)
+pub(super) fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32, _max: i32, _opt: Ptr) -> i32 {
+    let id = st.create_sema(init);
+    if std::env::var("VITASLOP_TRACE_SEMA").is_ok() {
+        eprintln!("[sema] create id={id} init={init} thread={}", st.current_thread());
+    }
+    id
 }
 
 /// int sceKernelWaitSema(SceUID semaid, int signal, unsigned int *timeout)
@@ -109,17 +85,33 @@ fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32, _max: i32,
 /// Single-thread model: take `signal` from the count (floored, never blocks).
 /// Preemptive: take it if available, else park the caller until a signal delivers
 /// it ([`SvcOutcome::Block`]); the return value is 0 either way.
-fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
     let signal = ctx.arg(1) as i32;
+    // A wait on a semaphore that does not exist is not a wait at all: the real kernel
+    // rejects it immediately with SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID rather than parking
+    // the caller forever (id 0 - an uninitialized `SceUID` - is the common case). A
+    // title that reaches such a wait is on an error/cleanup path and expects the error
+    // back so it can carry on, so returning it is what the hardware does.
+    if st.is_preemptive() && !st.sema_exists(id) {
+        ctx.ret(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
+        return SvcOutcome::Continue;
+    }
     ctx.ret(0);
     if !st.is_preemptive() {
         st.sema_wait(id, signal);
         return SvcOutcome::Continue;
     }
+    let trace = std::env::var("VITASLOP_TRACE_SEMA").is_ok();
     if st.sema_try_acquire(id, signal) {
+        if trace {
+            eprintln!("[sema] wait id={id} n={signal} thread={} -> acquired", st.current_thread());
+        }
         SvcOutcome::Continue
     } else {
+        if trace {
+            eprintln!("[sema] wait id={id} n={signal} thread={} -> BLOCK lr={:#010x}", st.current_thread(), ctx.regs[14]);
+        }
         st.sema_block(id, signal);
         SvcOutcome::Block
     }
@@ -127,7 +119,10 @@ fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
 
 /// int sceKernelSignalSema(SceUID semaid, int signal)
 #[hostcall]
-fn signal_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
+pub(super) fn signal_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
+    if std::env::var("VITASLOP_TRACE_SEMA").is_ok() {
+        eprintln!("[sema] signal id={id} n={signal} thread={}", st.current_thread());
+    }
     if st.is_preemptive() {
         st.sema_signal_wake(id, signal);
     } else {
@@ -141,7 +136,7 @@ fn signal_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
 /// SceUID sceKernelCreateCond(const char *name, SceUInt attr, SceUID mutexId,
 ///     const SceKernelCondOptParam *option)
 #[hostcall]
-fn create_cond(st: &mut VitaState, _name: Ptr, _attr: u32, mutex: i32, _opt: Ptr) -> i32 {
+pub(super) fn create_cond(st: &mut VitaState, _name: Ptr, _attr: u32, mutex: i32, _opt: Ptr) -> i32 {
     st.create_cond(mutex)
 }
 
@@ -151,7 +146,7 @@ fn create_cond(st: &mut VitaState, _name: Ptr, _attr: u32, mutex: i32, _opt: Ptr
 /// (the mutex stays held) - correct for the degenerate single-thread use.
 /// Preemptive: release the mutex and park the caller until a signal delivers it
 /// back with the mutex re-acquired ([`SvcOutcome::Block`]).
-fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+pub(super) fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
     ctx.ret(0);
     if !st.is_preemptive() {
@@ -162,7 +157,7 @@ fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
 }
 
 /// int sceKernelSignalCond(SceUID condId) / sceKernelSignalCondAll(SceUID condId)
-fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
+pub(super) fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
     let id = ctx.arg(0) as i32;
     if st.is_preemptive() {
         st.cond_signal(id, all);
@@ -175,20 +170,20 @@ fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
 /// SceUID sceKernelCreateEventFlag(const char *name, int attr, int initPattern,
 ///     SceKernelEventFlagOptParam *opt)
 #[hostcall]
-fn create_event_flag(st: &mut VitaState, _name: Ptr, _attr: u32, init: u32, _opt: Ptr) -> i32 {
+pub(super) fn create_event_flag(st: &mut VitaState, _name: Ptr, _attr: u32, init: u32, _opt: Ptr) -> i32 {
     st.create_event_flag(init)
 }
 
 /// int sceKernelSetEventFlag(SceUID evid, unsigned int bitPattern)
 #[hostcall]
-fn set_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
+pub(super) fn set_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
     st.event_set(id, bits);
     0
 }
 
 /// int sceKernelClearEventFlag(SceUID evid, unsigned int bitPattern)
 #[hostcall]
-fn clear_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
+pub(super) fn clear_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
     st.event_clear(id, bits);
     0
 }
@@ -198,7 +193,7 @@ fn clear_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
 /// Uncontended: the requested bits are assumed already set (the main thread set
 /// them), so it succeeds and reports the current pattern through `outBits`.
 #[hostcall]
-fn wait_event_flag(
+pub(super) fn wait_event_flag(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
     id: i32,
@@ -218,7 +213,7 @@ fn wait_event_flag(
 
 /// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id) - all succeed.
 #[hostcall]
-fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
+pub(super) fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
     0
 }
 
@@ -228,7 +223,7 @@ fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
 /// A 64-bit return goes in r0 (low) and r1 (high), so this is hand-written rather
 /// than `#[hostcall]` (whose value returns are 32-bit). Time is the virtual
 /// monotonic clock, so it never goes backward.
-fn get_system_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) {
+pub(super) fn get_system_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) {
     let t = st.now_us();
     ctx.regs[0] = t as u32;
     ctx.regs[1] = (t >> 32) as u32;

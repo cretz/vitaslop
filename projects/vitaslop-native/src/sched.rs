@@ -394,9 +394,10 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                             YieldNow(false).await;
                         }
                         // A single-worker run has no other thread to switch to, so
-                        // its uncontended waits never block; if one did, treat it as
-                        // Continue rather than deadlock.
-                        SvcOutcome::Continue | SvcOutcome::Block => {}
+                        // its uncontended waits never block and a priority reschedule
+                        // is a no-op; if one occurred, treat it as Continue rather than
+                        // deadlock.
+                        SvcOutcome::Continue | SvcOutcome::Block | SvcOutcome::Reschedule => {}
                     }
                     Ok(())
                 })

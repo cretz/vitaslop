@@ -20,6 +20,10 @@ pub mod lib {
     /// user-facing sceIoOpen/Lseek/Getstat/Mkdir/Remove live under SceLibKernel;
     /// dispatch is by func NID, so the split is only cosmetic.
     pub const SCE_IO_FILEMGR: u32 = 0xF2FF_276E;
+    /// SceNgsUser: the NGS software synthesizer (voices, racks, patches).
+    pub const SCE_NGS: u32 = 0xB015_98D9;
+    /// SceAudio: the low-level PCM audio-output ports (sceAudioOut*).
+    pub const SCE_AUDIO: u32 = 0x438B_B957;
 }
 
 /// SceGxm function NIDs.
@@ -65,6 +69,7 @@ pub mod gxm {
     pub const TEXTURE_INIT_LINEAR: u32 = 0x4811_AECB;
     pub const TEXTURE_INIT_LINEAR_STRIDED: u32 = 0x6679_BEF0;
     pub const TEXTURE_INIT_SWIZZLED: u32 = 0xD572_D547;
+    pub const TEXTURE_INIT_SWIZZLED_ARBITRARY: u32 = 0x5DBF_BA2C;
     pub const TEXTURE_INIT_TILED: u32 = 0xE6F0_DB27;
     pub const TEXTURE_SET_DATA: u32 = 0x8558_14C4;
     pub const TEXTURE_SET_FORMAT: u32 = 0xFC94_3596;
@@ -89,6 +94,9 @@ pub mod display {
 /// SceCtrl function NIDs.
 pub mod ctrl {
     pub const PEEK_BUFFER_POSITIVE: u32 = 0xA9C3_CED6;
+    pub const READ_BUFFER_POSITIVE: u32 = 0x67E7_AB83;
+    pub const PEEK_BUFFER_NEGATIVE: u32 = 0x104E_D1A7;
+    pub const READ_BUFFER_NEGATIVE: u32 = 0x15F9_6FB0;
     pub const SET_SAMPLING_MODE: u32 = 0xA497_B150;
 }
 
@@ -174,6 +182,8 @@ pub mod services {
     pub const NP_MANAGER_GET_NP_ID: u32 = 0x3C94_B4B4;
     // SceTouch.
     pub const TOUCH_SET_SAMPLING_STATE: u32 = 0x1B9C_5D14;
+    pub const TOUCH_READ: u32 = 0x169A_1D58;
+    pub const TOUCH_PEEK: u32 = 0xFF08_2DF0;
 }
 
 /// Lightweight synchronization (SceLibKernel LwMutex/LwCond): mutexes and condition
@@ -216,6 +226,8 @@ pub mod iofilemgr {
     pub const IO_WRITE: u32 = 0x34EF_D876;
     pub const IO_LSEEK: u32 = 0x99BA_173E;
     pub const IO_LSEEK32: u32 = 0x4925_2B9B;
+    pub const IO_PREAD: u32 = 0x5231_5AD7;
+    pub const IO_PWRITE: u32 = 0x8FFF_F5A8;
     pub const IO_GETSTAT: u32 = 0xBCA5_B623;
     pub const IO_MKDIR: u32 = 0x9670_D39F;
     pub const IO_REMOVE: u32 = 0xE20E_D0F3;
@@ -249,14 +261,88 @@ pub mod sync {
     pub const DELETE_COND: u32 = 0x879E_6EBD;
 }
 
+/// SceNgsUser: the NGS software synthesizer. A title creates a system, then racks
+/// of voices, plays AT9/PCM sources through them, and pumps the mix each frame.
+pub mod ngs {
+    pub const SYSTEM_GET_REQUIRED_MEMORY_SIZE: u32 = 0x6CE8_B36F;
+    pub const SYSTEM_INIT: u32 = 0xED14_CF4A;
+    pub const SYSTEM_UPDATE: u32 = 0x684F_080C;
+    pub const SYSTEM_RELEASE: u32 = 0x4A25_BEBC;
+    pub const SYSTEM_SET_FLAGS: u32 = 0x64D8_0013;
+    pub const RACK_GET_REQUIRED_MEMORY_SIZE: u32 = 0x4773_18C0;
+    pub const RACK_INIT: u32 = 0x0A92_E4EC;
+    pub const RACK_GET_VOICE_HANDLE: u32 = 0xFE1A_98E9;
+    pub const VOICE_GET_STATE_DATA: u32 = 0xC9B8_C0B4;
+    pub const VOICE_LOCK_PARAMS: u32 = 0xAB6B_EF8F;
+    pub const VOICE_UNLOCK_PARAMS: u32 = 0x3D46_D8A7;
+    pub const VOICE_PLAY: u32 = 0xFA0A_0F34;
+    pub const VOICE_KEY_OFF: u32 = 0xBB13_373D;
+    pub const VOICE_KILL: u32 = 0x0E29_1AAD;
+    pub const VOICE_PAUSE: u32 = 0xD778_6E99;
+    pub const VOICE_RESUME: u32 = 0x54CF_B981;
+    pub const VOICE_SET_FINISHED_CALLBACK: u32 = 0x17A6_F564;
+    pub const VOICE_SET_MODULE_CALLBACK: u32 = 0x24E9_09A8;
+    pub const VOICE_BYPASS_MODULE: u32 = 0x9AB8_7E71;
+    pub const VOICE_GET_PARAMS_OUT_OF_RANGE: u32 = 0x4CBE_08F3;
+    pub const VOICE_PATCH_SET_VOLUMES_MATRIX: u32 = 0xA0F5_402D;
+    pub const VOICE_DEF_GET_SIMPLE_ATRAC9: u32 = 0x45CF_2A73;
+    pub const VOICE_DEF_GET_MASTER_BUSS: u32 = 0x79A1_21D1;
+    pub const VOICE_DEF_GET_REVERB_BUSS: u32 = 0x9DCF_50F5;
+    pub const VOICE_DEF_GET_EQ_BUSS: u32 = 0xF964_120E;
+    pub const PATCH_CREATE_ROUTING: u32 = 0xD668_B49C;
+    pub const PATCH_GET_INFO: u32 = 0x9870_3DBC;
+    pub const AT9_GET_SECTION_DETAILS: u32 = 0x2A9F_A501;
+}
+
+/// SceAudio: low-level PCM audio-output ports.
+pub mod audio {
+    pub const OUT_OPEN_PORT: u32 = 0x5BC3_41E4;
+    pub const OUT_OUTPUT: u32 = 0x02DB_3F5F;
+    pub const OUT_SET_VOLUME: u32 = 0x6416_7F11;
+    pub const OUT_RELEASE_PORT: u32 = 0x69E2_E6B5;
+}
+
 /// A human-readable name for a `(library_nid, func_nid)` pair, for logging and
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk, lwsync as lw,
-        processmgr as pm, services as sv, sync as sy, sysmem as s, threadmgr as tm,
+        audio as au, ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk,
+        lwsync as lw, ngs as ng, processmgr as pm, services as sv, sync as sy, sysmem as s,
+        threadmgr as tm,
     };
     match func_nid {
+        ng::SYSTEM_GET_REQUIRED_MEMORY_SIZE => "sceNgsSystemGetRequiredMemorySize",
+        ng::SYSTEM_INIT => "sceNgsSystemInit",
+        ng::SYSTEM_UPDATE => "sceNgsSystemUpdate",
+        ng::SYSTEM_RELEASE => "sceNgsSystemRelease",
+        ng::SYSTEM_SET_FLAGS => "sceNgsSystemSetFlags",
+        ng::RACK_GET_REQUIRED_MEMORY_SIZE => "sceNgsRackGetRequiredMemorySize",
+        ng::RACK_INIT => "sceNgsRackInit",
+        ng::RACK_GET_VOICE_HANDLE => "sceNgsRackGetVoiceHandle",
+        ng::VOICE_GET_STATE_DATA => "sceNgsVoiceGetStateData",
+        ng::VOICE_LOCK_PARAMS => "sceNgsVoiceLockParams",
+        ng::VOICE_UNLOCK_PARAMS => "sceNgsVoiceUnlockParams",
+        ng::VOICE_PLAY => "sceNgsVoicePlay",
+        ng::VOICE_KEY_OFF => "sceNgsVoiceKeyOff",
+        ng::VOICE_KILL => "sceNgsVoiceKill",
+        ng::VOICE_PAUSE => "sceNgsVoicePause",
+        ng::VOICE_RESUME => "sceNgsVoiceResume",
+        ng::VOICE_SET_FINISHED_CALLBACK => "sceNgsVoiceSetFinishedCallback",
+        ng::VOICE_SET_MODULE_CALLBACK => "sceNgsVoiceSetModuleCallback",
+        ng::VOICE_BYPASS_MODULE => "sceNgsVoiceBypassModule",
+        ng::VOICE_GET_PARAMS_OUT_OF_RANGE => "sceNgsVoiceGetParamsOutOfRange",
+        ng::VOICE_PATCH_SET_VOLUMES_MATRIX => "sceNgsVoicePatchSetVolumesMatrix",
+        ng::VOICE_DEF_GET_SIMPLE_ATRAC9 => "sceNgsVoiceDefGetSimpleAtrac9Voice",
+        ng::VOICE_DEF_GET_MASTER_BUSS => "sceNgsVoiceDefGetMasterBuss",
+        ng::VOICE_DEF_GET_REVERB_BUSS => "sceNgsVoiceDefGetReverbBuss",
+        ng::VOICE_DEF_GET_EQ_BUSS => "sceNgsVoiceDefGetEqBuss",
+        ng::PATCH_CREATE_ROUTING => "sceNgsPatchCreateRouting",
+        ng::PATCH_GET_INFO => "sceNgsPatchGetInfo",
+        ng::AT9_GET_SECTION_DETAILS => "sceNgsAT9GetSectionDetails",
+        au::OUT_OPEN_PORT => "sceAudioOutOpenPort",
+        au::OUT_OUTPUT => "sceAudioOutOutput",
+        au::OUT_SET_VOLUME => "sceAudioOutSetVolume",
+        au::OUT_RELEASE_PORT => "sceAudioOutReleasePort",
         g::INITIALIZE => "sceGxmInitialize",
         g::TERMINATE => "sceGxmTerminate",
         g::MAP_MEMORY => "sceGxmMapMemory",
@@ -297,6 +383,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::TEXTURE_INIT_LINEAR => "sceGxmTextureInitLinear",
         g::TEXTURE_INIT_LINEAR_STRIDED => "sceGxmTextureInitLinearStrided",
         g::TEXTURE_INIT_SWIZZLED => "sceGxmTextureInitSwizzled",
+        g::TEXTURE_INIT_SWIZZLED_ARBITRARY => "sceGxmTextureInitSwizzledArbitrary",
         g::TEXTURE_INIT_TILED => "sceGxmTextureInitTiled",
         g::TEXTURE_SET_DATA => "sceGxmTextureSetData",
         g::TEXTURE_SET_FORMAT => "sceGxmTextureSetFormat",
@@ -313,6 +400,9 @@ pub fn name(func_nid: u32) -> &'static str {
         g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => "sceGxmReserveFragmentDefaultUniformBuffer",
         d::SET_FRAME_BUF => "sceDisplaySetFrameBuf",
         c::PEEK_BUFFER_POSITIVE => "sceCtrlPeekBufferPositive",
+        c::READ_BUFFER_POSITIVE => "sceCtrlReadBufferPositive",
+        c::PEEK_BUFFER_NEGATIVE => "sceCtrlPeekBufferNegative",
+        c::READ_BUFFER_NEGATIVE => "sceCtrlReadBufferNegative",
         c::SET_SAMPLING_MODE => "sceCtrlSetSamplingMode",
         s::ALLOC_MEM_BLOCK => "sceKernelAllocMemBlock",
         s::GET_MEM_BLOCK_BASE => "sceKernelGetMemBlockBase",
@@ -358,6 +448,8 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_SCORE_CREATE_TITLE_CTX => "sceNpScoreCreateTitleCtx",
         sv::NP_MANAGER_GET_NP_ID => "sceNpManagerGetNpId",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
+        sv::TOUCH_READ => "sceTouchRead",
+        sv::TOUCH_PEEK => "sceTouchPeek",
         lw::CREATE_LW_MUTEX => "sceKernelCreateLwMutex",
         lw::DELETE_LW_MUTEX => "sceKernelDeleteLwMutex",
         lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
@@ -382,6 +474,8 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_WRITE => "sceIoWrite",
         io::IO_LSEEK => "sceIoLseek",
         io::IO_LSEEK32 => "sceIoLseek32",
+        io::IO_PREAD => "sceIoPread",
+        io::IO_PWRITE => "sceIoPwrite",
         io::IO_GETSTAT => "sceIoGetstat",
         io::IO_MKDIR => "sceIoMkdir",
         io::IO_REMOVE => "sceIoRemove",

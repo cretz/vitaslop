@@ -20,7 +20,7 @@ pub mod threaded;
 pub use threaded::{RunReport, ThreadSpawn, ThreadedScheduler};
 
 pub mod wgpu_render;
-pub use wgpu_render::WgpuRenderer;
+pub use wgpu_render::{GeneralRenderer, WgpuRenderer};
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store, Val};
@@ -672,6 +672,61 @@ mod switch_tests {
         }
     }
 
+    /// A GCC clustered `switch` whose table is indexed by a REBASED copy of the
+    /// switch value: `subs r0,#11` folds the case-label base into the index, and the
+    /// range is fenced by two reverse-polarity signed guards (`cmp;ble default` low,
+    /// `cmp;bgt default` high) - the table has only 3 real entries but its offsets
+    /// are large enough that a naive extent read would over-run into the case bodies.
+    /// The bound must come from the range check (upper guard `cmp r0,#13`), rebased
+    /// by the `subs` (count = 13 - 11 + 1 = 3). Assembled with the Vita toolchain.
+    const SWITCH_REBASED_SUB: [u8; 36] = [
+        0x0a, 0x28, 0x0d, 0xdd, 0x0d, 0x28, 0x0b, 0xdc, 0x0b, 0x38, 0xdf, 0xe8, 0x10, 0xf0, 0x03,
+        0x00, 0x05, 0x00, 0x07, 0x00, 0x0a, 0x20, 0x70, 0x47, 0x14, 0x20, 0x70, 0x47, 0x1e, 0x20,
+        0x70, 0x47, 0x63, 0x20, 0x70, 0x47,
+    ];
+
+    #[test]
+    fn tbh_rebased_sub_immediate_bound() {
+        let base = 0x10000u32;
+        let abi = HostAbi::default();
+        for (v, want) in [(11u32, 10u32), (12, 20), (13, 30)] {
+            let r = run(&SWITCH_REBASED_SUB, base, base, true, &[], &[(0, v)], &abi).expect("run");
+            assert_eq!(r.regs[0], want, "rebased-sub switch value {v} dispatched wrong");
+        }
+        for v in [10u32, 14, 0, 100] {
+            let r = run(&SWITCH_REBASED_SUB, base, base, true, &[], &[(0, v)], &abi).expect("run");
+            assert_eq!(r.regs[0], 99, "out-of-range value {v} should hit default");
+        }
+    }
+
+    /// The OlliOlli shape: the compared value is the raw switch variable, fenced by a
+    /// register bound (`movw r1,#0x8003 ; cmp r0,r1 ; ble .Lin`) whose in-range branch
+    /// jumps FORWARD to the table setup (reverse polarity), and the table index is a
+    /// rebased copy (`sub r0,r0,#0x8000`). Recovering the count needs the register
+    /// bound and the `+k` rebase together: 0x8003 - 0x8000 + 1 = 4. Vita-assembled.
+    const SWITCH_REBASED_REGBOUND: [u8; 58] = [
+        0x48, 0xf2, 0x03, 0x01, 0x88, 0x42, 0x00, 0xdd, 0x15, 0xe0, 0x48, 0xf2, 0x00, 0x01, 0x88,
+        0x42, 0x11, 0xdb, 0x48, 0xf2, 0x00, 0x01, 0xa0, 0xeb, 0x01, 0x00, 0xdf, 0xe8, 0x10, 0xf0,
+        0x04, 0x00, 0x06, 0x00, 0x08, 0x00, 0x0a, 0x00, 0x0a, 0x20, 0x70, 0x47, 0x14, 0x20, 0x70,
+        0x47, 0x1e, 0x20, 0x70, 0x47, 0x28, 0x20, 0x70, 0x47, 0x63, 0x20, 0x70, 0x47,
+    ];
+
+    #[test]
+    fn tbh_rebased_register_bound() {
+        let base = 0x10000u32;
+        let abi = HostAbi::default();
+        for (v, want) in [(0x8000u32, 10u32), (0x8001, 20), (0x8002, 30), (0x8003, 40)] {
+            let r =
+                run(&SWITCH_REBASED_REGBOUND, base, base, true, &[], &[(0, v)], &abi).expect("run");
+            assert_eq!(r.regs[0], want, "regbound switch value {v:#x} dispatched wrong");
+        }
+        for v in [0x7fffu32, 0x8004, 0] {
+            let r =
+                run(&SWITCH_REBASED_REGBOUND, base, base, true, &[], &[(0, v)], &abi).expect("run");
+            assert_eq!(r.regs[0], 99, "out-of-range value {v:#x} should hit default");
+        }
+    }
+
     // Each of the following is a Vita-toolchain-assembled Thumb-2 function that
     // exercises one newly-lifted instruction family end to end on the engine, and
     // is checked against a reference computed here. All return their result in r0
@@ -715,6 +770,32 @@ mod switch_tests {
         vm.set_reg(0, target | 1); // r0 = target with the Thumb bit set
         vm.call(base).expect("blx lr must dispatch to the target, not trap");
         assert_eq!(vm.get_reg(0), 0x42, "blx lr dispatched to the wrong function");
+    }
+
+    #[test]
+    fn ldrd_base_equal_dest_reads_both_from_original_base() {
+        // `ldrd r6, r7, [r6, #8]` - the base register (r6) is also the low
+        // destination. ARM (no writeback) reads BOTH words from the ORIGINAL base;
+        // a naive lowering writes r6 from the first word, then computes the second
+        // address off the already-clobbered r6 (a data value) -> a wild load
+        // (MemoryOutOfBounds in practice). Assembled with the Vita toolchain:
+        //   movw r2,#0xBEEF ; str r2,[r6,#8] ; movw r3,#0xCAFE ; str r3,[r6,#12]
+        //   ldrd r6,r7,[r6,#8] ; mov r0,r6 ; mov r1,r7 ; bx lr
+        // r6 is seeded to a writable scratch address. Correct: r0=0xBEEF (from
+        // orig+8), r1=0xCAFE (from orig+12). The bug would trap or read garbage in r1.
+        let code = [
+            0x4b, 0xf6, 0xef, 0x62, // movw r2, #0xBEEF
+            0xb2, 0x60, // str r2, [r6, #8]
+            0x4c, 0xf6, 0xfe, 0x23, // movw r3, #0xCAFE
+            0xf3, 0x60, // str r3, [r6, #12]
+            0xd6, 0xe9, 0x02, 0x67, // ldrd r6, r7, [r6, #8]
+            0x30, 0x46, // mov r0, r6
+            0x39, 0x46, // mov r1, r7
+            0x70, 0x47, // bx lr
+        ];
+        let r = run1(&code, &[(6, 0x10000 + 0x100)]);
+        assert_eq!(r[0], 0xBEEF, "ldrd low word read off the clobbered base");
+        assert_eq!(r[1], 0xCAFE, "ldrd high word read off the clobbered base");
     }
 
     #[test]

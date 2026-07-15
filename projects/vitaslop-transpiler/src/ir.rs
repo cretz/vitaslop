@@ -9,7 +9,7 @@
 pub use yaxpeax_arm::armv7::ConditionCode;
 
 /// Width of a memory access.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemSize {
     Byte,
     Half,
@@ -19,7 +19,7 @@ pub enum MemSize {
 /// A pure, side-effect-free value expression. Emitted post-order onto the wasm
 /// stack. Loads are here (not statements) because ARM addressing folds a load
 /// into an operand; stores, which have an effect, are statements.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Value {
     /// A 32-bit constant.
     Imm(u32),
@@ -38,13 +38,20 @@ pub enum Value {
     /// The current value (0 or 1) of a condition flag. Used as the runtime
     /// carry-in of `adc`/`sbc` (and their flag computation).
     Flag(crate::abi::Flag),
+    /// The `a + b + carry_in` sum the immediately preceding [`Stmt::FlagsAdd`] just
+    /// computed (held in a scratch local). `adc`/`sbc` that set flags use this for
+    /// their result register instead of recomputing `... + Flag(C)`, because
+    /// `FlagsAdd` has already overwritten the C flag with the carry-*out* - reading
+    /// `Flag(C)` again would fold in the wrong carry. Valid only right after a
+    /// `FlagsAdd`.
+    CarryAddResult,
     /// Count leading zeros of the inner value (ARM `clz`, wasm `i32.clz`).
     Clz(Box<Value>),
 }
 
 /// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
 /// forms; ARM shift-amount masking is applied during lowering when needed.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum BinOp {
     Add,
     Sub,
@@ -63,7 +70,7 @@ pub enum BinOp {
 /// A VFP register reference: single-precision `S` (32-bit) or double `D` (64-bit).
 /// `Q`/lane forms are not modeled yet (the cube uses only S arithmetic and whole-D
 /// memory moves).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum VfpReg {
     S(u8),
     D(u8),
@@ -72,7 +79,7 @@ pub enum VfpReg {
 /// A NEON vector register operand: a 128-bit quad `Q` (0..15) or a 64-bit double
 /// `D` (0..31). NEON data-processing operates on these; [`crate::emit`] maps each
 /// onto a wasm `v128` (a `D` uses the low 64 bits, high 64 discarded on store).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum NeonReg {
     Q(u8),
     D(u8),
@@ -81,7 +88,7 @@ pub enum NeonReg {
 /// Element data type for a NEON operation: element size in bits (8/16/32/64) plus
 /// how to interpret it. `signed` matters for the widening / min-max / abs-diff /
 /// pairwise-long ops; `float` selects the f32 element (only `vabs`/`vneg`).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct NeonType {
     pub bits: u8,
     pub signed: bool,
@@ -89,7 +96,7 @@ pub struct NeonType {
 }
 
 /// The same-length elementwise NEON binary operations ([`NeonStmt::Bin`]).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum NeonBin {
     Add,
     Sub,
@@ -104,6 +111,7 @@ pub enum NeonBin {
 /// register (except the `vmov` immediate). [`crate::emit::emit_neon`] turns each
 /// into wasm 128-bit SIMD - see there for the exact instruction sequences and why
 /// each maps cleanly (extend/extmul/extadd-pairwise cover the widening family).
+#[derive(Debug)]
 pub enum NeonStmt {
     /// Same-length elementwise: `dst = a <op> b`.
     Bin { op: NeonBin, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
@@ -148,7 +156,7 @@ pub enum NeonStmt {
 }
 
 /// Which lane(s) a [`NeonStmt::ElemMem`] transfer touches.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum ElemLane {
     /// A single lane, by index (`{dN[i]}`).
     One(u8),
@@ -157,7 +165,7 @@ pub enum ElemLane {
 }
 
 /// The NEON bitwise logical operations ([`NeonStmt::Bitwise`]).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum NeonBitwise {
     And,
     Or,
@@ -175,7 +183,7 @@ pub enum NeonBitwise {
 }
 
 /// Floating-point binary operators (single precision).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum FBinOp {
     Add,
     Sub,
@@ -187,6 +195,7 @@ pub enum FBinOp {
 /// precision (f32); operands name S-register numbers unless noted. Kept separate
 /// from the integer [`Value`] tree because these produce/consume f32 on the wasm
 /// stack rather than i32.
+#[derive(Debug)]
 pub enum VfpOp {
     /// `rd = rn <op> rm` (vadd/vsub/vmul/vdiv, f32).
     Bin32 { op: FBinOp, rd: u8, rn: u8, rm: u8 },
@@ -270,6 +279,7 @@ pub enum VfpOp {
 }
 
 /// One side-effecting statement within a basic block.
+#[derive(Debug)]
 pub enum Stmt {
     /// `r[reg] = value`.
     SetReg(u8, Value),
@@ -327,6 +337,7 @@ pub enum Stmt {
 /// and an explicit fall-through both continue into the textually-next block
 /// (blocks are emitted in ascending address order, so that successor is
 /// adjacent and needs no wasm branch).
+#[derive(Debug)]
 pub enum Term {
     /// Continue into the next block (this block ended only because its successor
     /// is a branch target).
@@ -352,9 +363,16 @@ pub enum Term {
     /// Stop running this function without returning: an infinite self-loop
     /// (`b .`), a statically-known noreturn `svc`, or undecodable tail.
     Halt,
+    /// A block reached only speculatively - a heuristically-recovered branch/switch
+    /// target that turned out to be undecodable (e.g. a mis-recovered jump-table
+    /// entry pointing into data). Emitted as a `wasm` trap: the rest of the function
+    /// lifts normally, and if this block is ever actually executed it faults loudly
+    /// (the same posture as a whole-function stub), rather than silently corrupting.
+    Unreachable,
 }
 
 /// A basic block: its start address, its statements, and how it terminates.
+#[derive(Debug)]
 pub struct Block {
     pub addr: u32,
     pub stmts: Vec<Stmt>,
@@ -404,7 +422,7 @@ impl Func {
             Term::Switch { targets, default, .. } => {
                 targets.iter().all(|&t| is_block(t)) && default.map_or(true, is_block)
             }
-            Term::Fallthrough | Term::Return | Term::Halt => true,
+            Term::Fallthrough | Term::Return | Term::Halt | Term::Unreachable => true,
         })
     }
 }

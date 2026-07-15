@@ -25,6 +25,48 @@ impl Default for CtrlFrame {
     }
 }
 
+/// The most simultaneous touch points a panel reports (`SceTouchData.report[8]`).
+/// A `TouchFrame` carries a fixed array of this size so the poll path never
+/// allocates; only the first `count` are live.
+pub const MAX_TOUCH_POINTS: usize = 8;
+
+/// One active touch point, in PANEL coordinates (the front panel is 1920x1088,
+/// twice the 960x544 screen; back is 1920x890). Mirrors the fields a title reads
+/// out of a `SceTouchReport`: an id that is stable while a finger stays down, a
+/// force, and the position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TouchPoint {
+    pub id: u8,
+    pub force: u8,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// One frame of touch-panel state for a port: the set of points currently down.
+/// The default is "no finger" (`count == 0`), which a handler reports as a valid
+/// sample with `reportNum = 0` - deliberately not the same as "no buffers".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TouchFrame {
+    pub points: [TouchPoint; MAX_TOUCH_POINTS],
+    pub count: u8,
+}
+
+impl TouchFrame {
+    /// A single finger held at panel `(x, y)` - the common menu/tap case. Force is
+    /// the panel's typical full-press value and the id is 0 (a lone finger).
+    pub fn single(x: u16, y: u16) -> Self {
+        let mut f = TouchFrame::default();
+        f.points[0] = TouchPoint { id: 0, force: 128, x, y };
+        f.count = 1;
+        f
+    }
+
+    /// The live points this frame.
+    pub fn active(&self) -> &[TouchPoint] {
+        &self.points[..self.count as usize]
+    }
+}
+
 /// The external world a guest observes. The only source of non-determinism the
 /// emulator admits. Implementations decide whether time is real, virtual, or
 /// replayed, and whether the clocks move together.
@@ -40,8 +82,20 @@ pub trait World {
     /// Controller state for `port` this poll.
     fn poll_ctrl(&mut self, port: u32) -> CtrlFrame;
 
+    /// Touch-panel state for `port` this poll (port 0 = front, 1 = back). The
+    /// default is no finger down, so a time-free or pad-only world needs no touch
+    /// source; worlds that script or capture touch override this.
+    fn poll_touch(&mut self, _port: u32) -> TouchFrame {
+        TouchFrame::default()
+    }
+
     /// Fill `buf` with entropy.
     fn fill_random(&mut self, buf: &mut [u8]);
+
+    /// Notify the world that display frame `frame` (a flip just completed) is now
+    /// current, so a frame-keyed input source (a scripted TAS recipe) can advance.
+    /// The default ignores it - time-free and input-free worlds do not need it.
+    fn set_frame(&mut self, _frame: u64) {}
 }
 
 /// A deterministic, input-free world: a virtual monotonic clock advanced only by
@@ -108,6 +162,7 @@ pub enum WorldEvent {
     Monotonic(u64),
     Wall(u64),
     Ctrl { port: u32, frame: CtrlFrame },
+    Touch { port: u32, frame: TouchFrame },
     Random(Vec<u8>),
 }
 
@@ -151,9 +206,19 @@ impl<W: World> World for Record<W> {
         self.events.lock().unwrap().push(WorldEvent::Ctrl { port, frame });
         frame
     }
+    fn poll_touch(&mut self, port: u32) -> TouchFrame {
+        let frame = self.inner.poll_touch(port);
+        self.events.lock().unwrap().push(WorldEvent::Touch { port, frame });
+        frame
+    }
     fn fill_random(&mut self, buf: &mut [u8]) {
         self.inner.fill_random(buf);
         self.events.lock().unwrap().push(WorldEvent::Random(buf.to_vec()));
+    }
+    fn set_frame(&mut self, frame: u64) {
+        // A frame tick is not a recorded answer (it is driven by the scheduler, which
+        // is deterministic), but the inner world still needs it to advance input.
+        self.inner.set_frame(frame);
     }
 }
 
@@ -190,6 +255,12 @@ impl World for Replay {
         match self.next() {
             WorldEvent::Ctrl { port: p, frame } if p == port => frame,
             e => panic!("replay expected Ctrl(port={port}), got {e:?}"),
+        }
+    }
+    fn poll_touch(&mut self, port: u32) -> TouchFrame {
+        match self.next() {
+            WorldEvent::Touch { port: p, frame } if p == port => frame,
+            e => panic!("replay expected Touch(port={port}), got {e:?}"),
         }
     }
     fn fill_random(&mut self, buf: &mut [u8]) {

@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-loader = { path = "../vitaslop-loader" }
+vitaslop-atrac9 = { path = "../vitaslop-atrac9" }
 vitaslop-platform = { path = "../vitaslop-platform" }
 # The #[hostcall] attribute macro that generates AAPCS-VFP arg marshalling for the
 # Vita host handlers in vita/. A proc-macro crate, so it is host-side only and

@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction as W, MemArg, MemorySection, MemoryType, Module, RefType, TableSection, TableType,
-    TypeSection, ValType,
+    Instruction as W, MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 use crate::abi;
@@ -62,6 +62,59 @@ fn watch_store_nonzero() -> bool {
     *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_NZ").is_ok())
 }
 
+/// Diagnostic read watchpoint. When `VITASLOP_WATCH_READ=<hex guest addr>` is set at
+/// transpile time, every load whose address equals that exact guest address AND whose
+/// loaded value is non-zero is preceded by an `unreachable`, so the first non-zero
+/// reader traps with a full backtrace. Paired with `VITASLOP_TRACK_PC` this pinpoints
+/// the exact guest instruction that consumes a field - the mirror of the store
+/// watchpoint, used to find who reads a value (e.g. which code consumes an input-edge
+/// field that no static reference reveals because the object is heap-allocated). The
+/// non-zero filter skips the idle reads (a per-frame poll that sees 0) so the trap
+/// lands on the consumer that actually acts on a set value. Zero cost when unset.
+fn watch_read_addr() -> Option<u32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<u32>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_WATCH_READ").ok().and_then(|s| {
+            u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+        })
+    })
+}
+
+/// When set alongside `VITASLOP_WATCH_READ`, only a load of a non-zero value from the
+/// watched address traps (skip idle polls that see 0). Default (unset) traps on the
+/// first read of any value, which confirms whether the consumer runs at all.
+fn watch_read_nonzero() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_READ_NZ").is_ok())
+}
+
+/// When `VITASLOP_WASM_NAMES` is set, emit a wasm `name` custom section labelling
+/// every function with its guest address (`g_<addr>`), so a wasmtime trap backtrace
+/// prints the guest function directly instead of a bare module index that has to be
+/// hand-mapped. Purely a debugging aid: the name section is never touched during
+/// execution (zero runtime cost), but it grows the module by ~1.5% and adds a small
+/// per-instantiation parse, so it stays off for shipped builds. Cached once; the
+/// module is byte-identical to a normal build when unset.
+fn emit_wasm_names() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_WASM_NAMES").is_ok())
+}
+
+/// When `VITASLOP_TRACK_PC` is set, each basic block writes its own guest start
+/// address into [`GUEST_PC_GLOBAL`] before executing, so a trap's register dump can
+/// report exactly which guest instruction faulted (block granularity - the block is
+/// short enough that the fault site is unambiguous once disassembled). A debugging
+/// aid with a small runtime cost (one `global.set` per block), so it stays off for
+/// shipped builds; the module is byte-identical to a normal build when unset.
+fn track_pc() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_TRACK_PC").is_ok())
+}
+
 /// Function indices of the host imports (imports occupy the low function-index
 /// space, in declaration order).
 const SVC_FUNC: u32 = 0;
@@ -70,12 +123,56 @@ const IMPORT_FUNC: u32 = 1;
 /// when a runtime function-pointer matches no translated function, so an unmapped
 /// target becomes a reported, debuggable trap instead of an opaque `unreachable`.
 const DISPATCH_MISS_FUNC: u32 = 2;
-/// Number of imported functions before the guest functions.
-pub(crate) const IMPORT_FUNCS: u32 = 3;
+/// Number of imported functions before the guest functions. Re-exported through
+/// [`abi::IMPORT_FUNC_COUNT`] so hosts mapping a trap backtrace stay in lockstep.
+pub(crate) const IMPORT_FUNCS: u32 = abi::IMPORT_FUNC_COUNT;
 
 /// WASM global index of the diagnostic store-watchpoint "armed" latch, appended
 /// after the whole register file (see [`emit_module`]).
 const WATCH_ARMED_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT;
+
+/// WASM global index of the diagnostic guest-PC tracker, appended just after the
+/// watchpoint latch (see [`track_pc`] and [`emit_module`]). Holds the address of
+/// the basic block currently executing; on a trap the host reads it back to name
+/// the faulting guest instruction.
+const GUEST_PC_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 1;
+
+/// WASM global index of the read-watchpoint match counter, appended after the guest-PC
+/// tracker. Counts matching loads so `VITASLOP_WATCH_READ_SKIP` can skip the first N
+/// (init/idle) hits and trap on a later one - the way to see a consumer that runs every
+/// frame without the trap always landing on the first (startup) read.
+const WATCH_READ_COUNT_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 2;
+
+/// Number of matching read-watchpoint hits to skip before trapping (`VITASLOP_WATCH_
+/// READ_SKIP`, default 0 = trap on the first). Lets the trap land past startup reads.
+fn watch_read_skip() -> u32 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u32> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_WATCH_READ_SKIP")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Optional guest-PC EXCLUDE window for the read watchpoint (`VITASLOP_WATCH_READ_
+/// PC_EXCL=<lo>-<hi>` hex): when set, a match only traps if the currently-executing
+/// block's guest address (from `VITASLOP_TRACK_PC`) is OUTSIDE `[lo, hi)`. This peels
+/// one consumer of a hot field apart from others - e.g. a menu/dialog read of an input
+/// field that a per-frame input *system* (a known address window) also reads, which
+/// would otherwise always trap first. Requires `VITASLOP_TRACK_PC`.
+fn watch_read_pc_exclude() -> Option<(u32, u32)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_WATCH_READ_PC_EXCL").ok()?;
+        let (lo, hi) = s.trim().split_once('-')?;
+        let lo = u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?;
+        let hi = u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((lo, hi))
+    })
+}
 
 /// Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`):
 /// `any` traps on any store to the address, `nz` only on a non-zero store, `arm`
@@ -247,10 +344,13 @@ pub fn emit_module(
     for _ in 0..abi::FP_FLAG_COUNT {
         globals.global(i32_global, &ConstExpr::i32_const(0));
     }
-    // One extra i32 global for the diagnostic store watchpoint's "armed" latch (see
-    // `watch_store_addr`). Always present so its index is stable; unused and zero
-    // when no watchpoint is active, so it costs nothing in a normal build.
-    globals.global(i32_global, &ConstExpr::i32_const(0));
+    // Three extra i32 globals, always present so their indices are stable and unused
+    // (zero, no runtime cost) in a normal build: the store watchpoint's "armed" latch
+    // (see `watch_store_addr`), the guest-PC tracker (see `track_pc`), and the
+    // read-watchpoint match counter (see `watch_read_skip`).
+    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_ARMED_GLOBAL
+    globals.global(i32_global, &ConstExpr::i32_const(0)); // GUEST_PC_GLOBAL
+    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_READ_COUNT_GLOBAL
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -273,6 +373,9 @@ pub fn emit_module(
     for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
         exports.export(abi::fp_flag_export(f), ExportKind::Global, abi::fp_flag_global(f));
     }
+    // The guest-PC tracker, so the host can read the faulting block address on a trap
+    // (zero unless `VITASLOP_TRACK_PC` is set at emit time; see `track_pc`).
+    exports.export(abi::GUEST_PC_EXPORT, ExportKind::Global, GUEST_PC_GLOBAL);
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -317,6 +420,25 @@ pub fn emit_module(
         .section(&elements)
         .section(&code)
         .section(&data);
+
+    // Optional debug `name` section (see `emit_wasm_names`): map each wasm function
+    // index to a human-readable name so trap backtraces symbolize directly. Imports
+    // occupy indices 0..IMPORT_FUNCS, guest functions IMPORT_FUNCS.., and the
+    // dispatcher is last. Emitted only when opted in; the module is otherwise
+    // byte-identical to a shipped build.
+    if emit_wasm_names() {
+        let mut names = NameMap::new();
+        names.append(SVC_FUNC, "svc");
+        names.append(IMPORT_FUNC, "host_import");
+        names.append(DISPATCH_MISS_FUNC, "dispatch_miss");
+        for (i, func) in funcs.iter().enumerate() {
+            names.append(IMPORT_FUNCS + i as u32, &format!("g_{:08x}", func.addr));
+        }
+        names.append(IMPORT_FUNCS + n, "dispatch");
+        let mut name_section = NameSection::new();
+        name_section.functions(&names);
+        module.section(&name_section);
+    }
     EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32 }
 }
 
@@ -474,6 +596,12 @@ fn emit_block(
     base: u32,
     loop_depth: u32,
 ) {
+    // Diagnostic guest-PC tracking (opt-in): record this block's start address before
+    // running it, so a trap's register dump can name the faulting instruction.
+    if track_pc() {
+        f.instruction(&W::I32Const(block.addr as i32));
+        f.instruction(&W::GlobalSet(GUEST_PC_GLOBAL));
+    }
     for stmt in &block.stmts {
         emit_stmt(f, stmt, func_index, base, func.addr);
     }
@@ -497,6 +625,9 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
         Term::Fallthrough => {} // flow into the next block's code
         Term::Return | Term::Halt => {
             f.instruction(&W::Return);
+        }
+        Term::Unreachable => {
+            f.instruction(&W::Unreachable);
         }
         Term::Jump(target) => {
             goto(f, func, *target, loop_depth, 0);
@@ -609,6 +740,51 @@ fn emit_cond(f: &mut Function, cond: ConditionCode) {
         }
         AL => { f.instruction(&W::I32Const(1)); }
     }
+}
+
+/// Emit the read-watchpoint trap check. Precondition: the load's memory offset (guest
+/// addr - base) is in `L_T0` and the loaded value is on top of the stack. Consumes the
+/// value into `L_T1`, traps (`unreachable`) when the offset matches the watched address
+/// (and, with `VITASLOP_WATCH_READ_NZ`, the value is non-zero) once more than
+/// `VITASLOP_WATCH_READ_SKIP` earlier matches have passed, then leaves the value on the
+/// stack. Shared by the integer and VFP-single load paths.
+fn emit_read_watch_check(f: &mut Function, w: u32, base: u32) {
+    f.instruction(&W::LocalSet(L_T1)); // value -> L_T1
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Const(w.wrapping_sub(base) as i32));
+    f.instruction(&W::I32Eq);
+    if watch_read_nonzero() {
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32And);
+    }
+    if let Some((lo, hi)) = watch_read_pc_exclude() {
+        // AND (guest_pc < lo OR guest_pc >= hi): only trap when the reader is OUTSIDE
+        // the excluded address window (the known per-frame consumer).
+        f.instruction(&W::GlobalGet(GUEST_PC_GLOBAL));
+        f.instruction(&W::I32Const(lo as i32));
+        f.instruction(&W::I32LtU);
+        f.instruction(&W::GlobalGet(GUEST_PC_GLOBAL));
+        f.instruction(&W::I32Const(hi as i32));
+        f.instruction(&W::I32GeU);
+        f.instruction(&W::I32Or);
+        f.instruction(&W::I32And);
+    }
+    f.instruction(&W::If(BlockType::Empty));
+    // Matched: bump the counter and trap once past the skip window.
+    f.instruction(&W::GlobalGet(WATCH_READ_COUNT_GLOBAL));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Add);
+    f.instruction(&W::GlobalSet(WATCH_READ_COUNT_GLOBAL));
+    f.instruction(&W::GlobalGet(WATCH_READ_COUNT_GLOBAL));
+    f.instruction(&W::I32Const(watch_read_skip() as i32));
+    f.instruction(&W::I32GtU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::Unreachable);
+    f.instruction(&W::End);
+    f.instruction(&W::End);
+    f.instruction(&W::LocalGet(L_T1)); // value back on the stack
 }
 
 fn emit_stmt(
@@ -754,8 +930,20 @@ fn emit_stmt(
             f.instruction(&W::GlobalSet(abi::reg_global(*rdhi as usize)));
         }
         Stmt::Call { target } => {
-            let idx = *func_index.get(target).expect("callee index");
-            f.instruction(&W::Call(idx));
+            // A direct call to a discovered function. In the strict build every callee
+            // is discovered, so the lookup always succeeds. In the lenient build a
+            // block reached only speculatively (runaway decode of data) can hold a
+            // `bl` to a bogus address that is not a real function; trap there rather
+            // than fail the whole emit - the block is off the real execution path, and
+            // if somehow reached it faults loudly.
+            match func_index.get(target) {
+                Some(&idx) => {
+                    f.instruction(&W::Call(idx));
+                }
+                None => {
+                    f.instruction(&W::Unreachable);
+                }
+            }
         }
         Stmt::CallIndirect { addr, set_lr } => {
             // Push the runtime target address and this function's own address (as the
@@ -1211,6 +1399,15 @@ fn emit_vfp_mem(f: &mut Function, reg: crate::ir::VfpReg, addr: &Value, load: bo
         S(n) => {
             if load {
                 emit_addr(f, addr, base);
+                if let Some(w) = watch_read_addr() {
+                    // Read watchpoint over VFP single loads too (analog/float fields are
+                    // read via `vldr`, invisible to the integer-load watch).
+                    f.instruction(&W::LocalTee(L_T0));
+                    f.instruction(&W::I32Load(mem_arg()));
+                    emit_read_watch_check(f, w, base);
+                    f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
+                    return;
+                }
                 f.instruction(&W::I32Load(mem_arg()));
                 f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
             } else {
@@ -1814,6 +2011,10 @@ fn emit_value(f: &mut Function, v: &Value, base: u32) {
             // Flag globals hold 0 or 1, so a plain read is the flag's value.
             f.instruction(&W::GlobalGet(abi::flag_global(*flag)));
         }
+        Value::CarryAddResult => {
+            // `emit_flags_add` left `a + b + cin` in L_T2; reuse it (see the IR doc).
+            f.instruction(&W::LocalGet(L_T2));
+        }
         Value::Clz(a) => {
             emit_value(f, a, base);
             f.instruction(&W::I32Clz);
@@ -1825,7 +2026,15 @@ fn emit_value(f: &mut Function, v: &Value, base: u32) {
         }
         Value::Load { addr, size, signed } => {
             emit_addr(f, addr, base);
-            f.instruction(&load_op(*size, *signed));
+            if let Some(w) = watch_read_addr() {
+                // Diagnostic: trap on a load from the watched guest address so the
+                // reader surfaces with a backtrace (guest PC via VITASLOP_TRACK_PC).
+                f.instruction(&W::LocalTee(L_T0)); // L_T0 = guest addr - base (kept)
+                f.instruction(&load_op(*size, *signed));
+                emit_read_watch_check(f, w, base);
+            } else {
+                f.instruction(&load_op(*size, *signed));
+            }
         }
     }
 }

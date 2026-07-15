@@ -312,47 +312,158 @@ fn switch_index_reg(inst: &Instruction) -> Option<u8> {
     }
 }
 
-/// Recover the entry count and default target of a `tbb`/`tbh` switch from the
-/// compiler's range check - the idiomatic `cmp Rn, #k ; b<hi/hs> default` that
-/// guards the table. The guard branch is the instruction immediately before the
-/// table branch; the `cmp` that feeds it is a few flag-neutral instructions back
-/// (GCC schedules loads between them). Returns `(count, default)` when the guard
-/// is recognized; `count` is `None` if no matching `cmp` is found (the caller then
-/// falls back to reading the table's own extent).
+/// The logical negation of an ARM condition code (the condition that holds on the
+/// fall-through when the branch is not taken).
+fn negate_cond(c: ConditionCode) -> ConditionCode {
+    use ConditionCode::*;
+    match c {
+        EQ => NE, NE => EQ,
+        HS => LO, LO => HS,
+        HI => LS, LS => HI,
+        GE => LT, LT => GE,
+        GT => LE, LE => GT,
+        MI => PL, PL => MI,
+        VS => VC, VC => VS,
+        AL => AL,
+    }
+}
+
+/// The value of a data-processing source operand as a constant: an immediate, or a
+/// register whose materialized constant is known in `regs`.
+fn const_operand(op: &Operand, regs: &RegConsts) -> Option<u32> {
+    if let Some(v) = imm(op) {
+        return Some(v);
+    }
+    regnum(op).and_then(|r| regs[r as usize])
+}
+
+/// Recover the entry count and out-of-range default of a `tbb`/`tbh` switch from
+/// the compiler's range check.
+///
+/// GCC lowers a `switch` to a range check guarding a table branch, but in more
+/// shapes than the textbook `cmp idx,#k ; bhi default ; tbh`:
+///  - the value compared can be the raw switch variable, while the table is
+///    indexed by a *rebased* copy `idx = switch + k` (an `add`/`sub` folding the
+///    case-label base into the index, so table entry `i` means `switch = i - k`);
+///  - the bound can be a register materialized by `movw`/`movt`, not an immediate;
+///  - the guard can branch *to* the table setup on the in-range condition
+///    (`... ; ble .Lin ; b .Ldefault ; .Lin: ... ; tbh`), the reverse polarity of
+///    the textbook form, and it need not sit immediately before the table branch.
+///
+/// The recovery walks a bounded window before the table branch tracking `movw`/
+/// `movt` constants (so register bounds resolve), finds how the index register was
+/// produced from the switch variable (`idx = switch + k`), then picks the range
+/// check closest to the table branch whose in-range side is an upper bound on the
+/// switch value and whose branch actually steers control toward the table. The
+/// entry count follows from `bound + k` (+1 when the bound is inclusive). Returns
+/// `(count, default)`; `count` is `None` when no such guard is recognized (the
+/// caller then falls back to reading the table's own extent).
 fn recover_switch_bound(
     decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
     tb_addr: u32,
     index_reg: u8,
 ) -> (Option<u32>, Option<u32>) {
     use ConditionCode::*;
-    // The instruction immediately before the table branch: the range-check branch.
-    let Some((&guard_addr, (guard, _, gcond, _))) = decoded.range(..tb_addr).next_back() else {
-        return (None, None);
-    };
-    if guard.opcode != Opcode::B || !matches!(gcond, HI | HS) {
-        return (None, None);
+    // A window before the table branch, with the tracked constant state *before*
+    // each instruction (so a `cmp`/`add` against a `movw`/`movt` register resolves).
+    const WINDOW: u32 = 0x100;
+    let mut regs: RegConsts = [None; 16];
+    let mut throwaway = BTreeSet::new();
+    let mut snaps: Vec<(u32, &Instruction, u32, RegConsts)> = Vec::new();
+    for (&a, (ins, len, _, _)) in decoded.range(tb_addr.wrapping_sub(WINDOW)..tb_addr) {
+        snaps.push((a, ins, *len, regs));
+        regs = track_regs(ins, regs, &|_| false, false, &mut throwaway);
     }
-    let default = branch_target(guard, guard_addr, true);
-    // Scan back (a bounded window) for the `cmp index_reg, #imm` feeding the guard,
-    // skipping the flag-neutral loads GCC schedules in between. Stop at the first
-    // compare, or if the index register is overwritten before we find it.
-    let mut count = None;
-    for (_, (ins, _, _, _)) in decoded.range(..guard_addr).rev().take(16) {
-        if ins.opcode == Opcode::CMP {
-            if regnum(&ins.operands[0]) == Some(index_reg) {
-                if let Some(k) = imm(&ins.operands[1]) {
-                    // `bhi` fires on index > k, so in-range is 0..=k (k+1 entries);
-                    // `bhs`/`bcs` fires on index >= k, so in-range is 0..k.
-                    count = Some(if *gcond == HI { k + 1 } else { k });
+
+    // How the index register was produced from the switch variable: `idx = switch + k`.
+    // The nearest writer of the index register wins; an `add`/`sub` folds the label
+    // base into `k`, a `mov` copies (k = 0), and anything else (a load, arithmetic we
+    // do not model) means the index *is* the switch variable (k = 0).
+    let (switch_reg, k) = {
+        let def = snaps.iter().rev().find(|(_, ins, _, _)| {
+            ins.operands.first().and_then(regnum) == Some(index_reg)
+        });
+        match def {
+            Some((_, ins, _, before)) => match ins.opcode {
+                // `idx = a +/- b`, where the label base folds into `k`. Both the
+                // two-operand (`add rd,#imm` == `rd = rd +/- imm`) and three-operand
+                // (`add rd,rn,rm`) forms appear; a source register carrying a tracked
+                // constant is the base, the other is the switch variable.
+                Opcode::ADD | Opcode::SUB => {
+                    let neg = ins.opcode == Opcode::SUB;
+                    let signed = |kk: u32| if neg { kk.wrapping_neg() } else { kk };
+                    let o1 = &ins.operands[1];
+                    let o2 = &ins.operands[2];
+                    if matches!(o2, Operand::Nothing) {
+                        // Two-operand: `rd = rd (op) o1`. The switch value is the
+                        // destination (also the implicit first source).
+                        if let Some(kk) = imm(o1) {
+                            (index_reg, signed(kk))
+                        } else if let Some(kk) = regnum(o1).and_then(|r| before[r as usize]) {
+                            (index_reg, signed(kk))
+                        } else {
+                            (index_reg, 0)
+                        }
+                    } else if let (Some(rs), Some(kk)) = (regnum(o1), const_operand(o2, before)) {
+                        (rs, signed(kk))
+                    } else if let (Some(kk), Some(rs)) = (const_operand(o1, before), regnum(o2)) {
+                        // `rd = imm (op) rs`: only `imm + rs` keeps `rs` a straight
+                        // index; `imm - rs` negates the index, which we do not model.
+                        if neg { (index_reg, 0) } else { (rs, kk) }
+                    } else {
+                        (index_reg, 0)
+                    }
                 }
-            }
-            break;
+                Opcode::MOV => regnum(&ins.operands[1]).map_or((index_reg, 0), |rs| (rs, 0)),
+                _ => (index_reg, 0),
+            },
+            None => (index_reg, 0),
         }
-        if regnum(&ins.operands[0]) == Some(index_reg) {
-            break; // index clobbered before the compare - not this idiom
+    };
+
+    // Pick the range check closest to the table branch whose in-range side is an
+    // upper bound on the switch variable. A `cmp switch, bound` paired with the next
+    // conditional branch; the branch's taken target tells us which side is in-range.
+    let mut best: Option<(u32, u32, Option<u32>)> = None; // (cmp_addr, count, default)
+    for (i, (cmp_addr, cmp, _, before)) in snaps.iter().enumerate() {
+        if cmp.opcode != Opcode::CMP || regnum(&cmp.operands[0]) != Some(switch_reg) {
+            continue;
+        }
+        let Some(bound) = const_operand(&cmp.operands[1], before) else { continue };
+        // The conditional branch this compare feeds: the next branch in the window.
+        let Some((br_addr, br, br_len, _)) =
+            snaps[i + 1..].iter().find(|(_, ins, _, _)| ins.opcode == Opcode::B).copied()
+        else {
+            continue;
+        };
+        if br.condition == AL {
+            continue;
+        }
+        let Some(gt) = branch_target(br, br_addr, true) else { continue };
+        // In-range is the side that steers toward the table branch. The taken branch
+        // does so when its target lands in the setup between the guard and the table.
+        let in_range_taken = gt > br_addr && gt <= tb_addr;
+        let effective = if in_range_taken { br.condition } else { negate_cond(br.condition) };
+        // Only an upper bound on the switch value fixes the entry count.
+        let max_index = match effective {
+            LE | LS => bound.wrapping_add(k),            // switch <= bound  (inclusive)
+            LT | LO => bound.wrapping_add(k).wrapping_sub(1), // switch <  bound  (exclusive)
+            _ => continue,                                // a lower bound: not the count
+        };
+        let count = max_index.wrapping_add(1);
+        if count == 0 || count > 1024 {
+            continue; // implausible: a wrong pairing (wrapped) - reject
+        }
+        let default = if in_range_taken { br_addr.wrapping_add(br_len) } else { gt };
+        // Closest compare to the table branch wins (the innermost cluster's guard).
+        if best.is_none_or(|(a, _, _)| *cmp_addr > a) {
+            best = Some((*cmp_addr, count, Some(default)));
         }
     }
-    (count, default)
+    match best {
+        Some((_, count, default)) => (Some(count), default),
+        None => (None, None),
+    }
 }
 
 /// Read a `tbb`/`tbh` jump table and resolve its targets. The table sits inline
@@ -416,11 +527,21 @@ fn resolve_switch(
         return None;
     }
 
+    // Case bodies of one switch are local to their function; a real target lands
+    // within a function's span of the table. A target further than that means the
+    // count is wrong (we read code/data past the table's end as entries) - reject
+    // the whole switch rather than seed far-flung leaders that would drag unrelated
+    // code into this function (and trip the runaway span guard). Defense in depth:
+    // the range-check recovery already bounds the count, this guards a misfire.
+    const MAX_REACH: u32 = 0x1_0000; // 64 KiB, matches the discovery span guard
     let mut targets = Vec::with_capacity(count as usize);
     for i in 0..count {
         let target = pc.wrapping_add(2 * read(i)?);
         if target.wrapping_sub(base) as usize >= code.len() {
             return None; // target outside the image: bound is wrong, bail cleanly
+        }
+        if target.wrapping_sub(tb_addr).min(tb_addr.wrapping_sub(target)) > MAX_REACH {
+            return None; // implausibly far from the table: bound is wrong, bail cleanly
         }
         targets.push(target);
     }
@@ -436,6 +557,7 @@ pub fn discover(
     imports: &Imports,
     noreturn_svc: &[u32],
     discover_pointers: bool,
+    isolate: bool,
 ) -> Result<Discovered, Error> {
     let decoder = InstDecoder::default().with_thumb_mode(thumb);
 
@@ -455,6 +577,10 @@ pub fn discover(
     // Filled in pass 1 (where the whole decoded stream is available to read the
     // range check) and consumed in pass 2 to build the computed-jump terminator.
     let mut switches: BTreeMap<u32, SwitchInfo> = BTreeMap::new();
+    // Leaders whose first instruction failed to decode (a speculative target that ran
+    // into data / an unlifted op). Pass 2 turns each into a single trapping block, so
+    // one bad target does not stub the whole function. See the decode-failure arm.
+    let mut trap_leaders: BTreeSet<u32> = BTreeSet::new();
     // Worklist carries IT state and the tracked register constants along fall-
     // through (a fresh, all-unknown set at every branch target, which may have
     // multiple predecessors).
@@ -484,7 +610,27 @@ pub fn discover(
         if decoded.len() >= MAX_FUNC_INSNS {
             return Err(Error::Decode { addr });
         }
-        let (inst, len) = decode_at(&decoder, code, base, addr, thumb)?;
+        let (inst, len) = match decode_at(&decoder, code, base, addr, thumb) {
+            Ok(v) => v,
+            // A decode failure at the entry is a genuine whole-function failure (the
+            // caller stubs it). Anywhere else it is a block reached only speculatively
+            // - a heuristically-recovered branch/switch target that ran into data or
+            // an unlifted instruction. Isolate it: record a trap leader (pass 2 emits
+            // a trapping block) and stop following this path, so the rest of the
+            // function still lifts instead of the whole thing becoming a stub.
+            Err(e) => {
+                // Strict callers (the diagnostic report, the abort-on-error build)
+                // surface every gap. The lenient runtime build isolates a non-entry
+                // failure to a trap block so one speculatively-reached bad target does
+                // not stub the whole function.
+                if !isolate || addr == entry {
+                    return Err(e);
+                }
+                trap_leaders.insert(addr);
+                leaders.insert(addr);
+                continue;
+            }
+        };
 
         // Applied condition: an explicit branch condition wins; otherwise the IT
         // condition if we are in a block; otherwise unconditional.
@@ -556,6 +702,13 @@ pub fn discover(
     // terminating instruction or the address just before the next leader.
     let mut blocks = Vec::new();
     for &addr in &leaders {
+        // A leader whose first instruction failed to decode becomes a lone trapping
+        // block, so a branch/switch that targets it stays well-formed (the target is
+        // a real block) while executing it faults loudly.
+        if trap_leaders.contains(&addr) {
+            blocks.push(Block { addr, stmts: Vec::new(), term: Term::Unreachable });
+            continue;
+        }
         // A leader can be out of bounds (a branch target past the image); such a
         // block is unreachable in practice - skip it.
         if !decoded.contains_key(&addr) {
@@ -580,11 +733,22 @@ pub fn discover(
                             default: info.default,
                         };
                     }
+                    // An unresolved table branch cannot be lowered. Strict: a clean
+                    // per-function failure. Lenient: trap here so the rest lifts.
+                    None if isolate => break Term::Unreachable,
                     None => return Err(Error::Unsupported { addr: cursor, opcode: inst.opcode }),
                 }
             }
             let (mut effects, term) =
-                lower_insn(inst, cursor, *len, *applied, *in_it, thumb, imports)?;
+                match lower_insn(inst, cursor, *len, *applied, *in_it, thumb, imports) {
+                    Ok(v) => v,
+                    // An unlifted instruction (e.g. `udf`, or a NEON op not yet
+                    // covered). Strict callers report it; the lenient build runs the
+                    // block's valid prefix then traps, isolating the gap to this block
+                    // instead of stubbing the whole function.
+                    Err(_) if isolate => break Term::Unreachable,
+                    Err(e) => return Err(e),
+                };
             stmts.append(&mut effects);
             cursor = cursor.wrapping_add(*len);
             if let Some(t) = term {
@@ -598,6 +762,22 @@ pub fn discover(
         blocks.push(Block { addr, stmts, term });
     }
     blocks.sort_by_key(|b| b.addr);
+
+    // Runaway guard: a real function's blocks cluster tightly, but a mis-recovered
+    // computed jump (a `tbh` whose bound we could not read from the range check, so
+    // the extent fallback over-reads the table into data) seeds "case" leaders
+    // scattered across the image, dragging unrelated code into this function as one
+    // enormous, sometimes self-looping blob. When the block span is implausibly wide,
+    // the discovery is not a single function: reject it. Strict callers see the
+    // failure; the lenient build stubs it cleanly (a loud trap on entry) rather than
+    // emitting - and running - the garbage. Keyed on span, not block count, so a
+    // legitimately large but contiguous function is unaffected.
+    const MAX_FUNC_SPAN: u32 = 0x1_0000; // 64 KiB - larger than any real function
+    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+        if last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
+            return Err(Error::Decode { addr: last.addr });
+        }
+    }
 
     Ok(Discovered {
         func: Func { addr: entry, thumb, blocks, stub: false },
@@ -1027,32 +1207,36 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, rn, op2)));
         }
         // adc rd, rn, op2 => rd = rn + op2 + C. The carry-in is the runtime C flag.
+        // When it also sets flags, `FlagsAdd` computes the sum (and overwrites C with
+        // the carry-out), so the result must read that already-computed sum rather
+        // than re-adding `Flag(C)` - which would now be the carry-out, not the
+        // carry-in (and `rd` may alias `rn`, so there is no re-reading it either).
         ADC => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
             if sets_flags {
-                out.push(Stmt::FlagsAdd {
-                    a: rn.clone(),
-                    b: op2.clone(),
-                    cin: Value::Flag(crate::abi::Flag::C),
-                });
+                out.push(Stmt::FlagsAdd { a: rn, b: op2, cin: Value::Flag(crate::abi::Flag::C) });
+                out.push(Stmt::SetReg(rd, Value::CarryAddResult));
+            } else {
+                let sum =
+                    bin(BinOp::Add, bin(BinOp::Add, rn, op2), Value::Flag(crate::abi::Flag::C));
+                out.push(Stmt::SetReg(rd, sum));
             }
-            let sum = bin(BinOp::Add, bin(BinOp::Add, rn, op2), Value::Flag(crate::abi::Flag::C));
-            out.push(Stmt::SetReg(rd, sum));
         }
         // sbc rd, rn, op2 => rd = rn - op2 - NOT(C) = rn + ~op2 + C.
         SBC => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
             let not_op2 = Value::Not(Box::new(op2));
             if sets_flags {
-                out.push(Stmt::FlagsAdd {
-                    a: rn.clone(),
-                    b: not_op2.clone(),
-                    cin: Value::Flag(crate::abi::Flag::C),
-                });
+                out.push(Stmt::FlagsAdd { a: rn, b: not_op2, cin: Value::Flag(crate::abi::Flag::C) });
+                out.push(Stmt::SetReg(rd, Value::CarryAddResult));
+            } else {
+                let diff = bin(
+                    BinOp::Add,
+                    bin(BinOp::Add, rn, not_op2),
+                    Value::Flag(crate::abi::Flag::C),
+                );
+                out.push(Stmt::SetReg(rd, diff));
             }
-            let diff =
-                bin(BinOp::Add, bin(BinOp::Add, rn, not_op2), Value::Flag(crate::abi::Flag::C));
-            out.push(Stmt::SetReg(rd, diff));
         }
         RSB => {
             // rsb rd, rn, op2 => rd = op2 - rn.
@@ -1283,18 +1467,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let rt2 = regnum(&ops[1]).ok_or_else(err)?;
             let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
-            out.push(Stmt::SetReg(
-                rt,
-                Value::Load { addr: Box::new(a.addr.clone()), size: MemSize::Word, signed: false },
-            ));
-            out.push(Stmt::SetReg(
-                rt2,
-                Value::Load {
-                    addr: Box::new(bin(BinOp::Add, a.addr, Value::Imm(4))),
-                    size: MemSize::Word,
-                    signed: false,
-                },
-            ));
+            emit_load_pair(&mut out, rt, rt2, a.addr);
             out.extend(a.post);
         }
         STRD => {
@@ -1337,18 +1510,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let rt2 = regnum(&ops[1]).ok_or_else(err)?;
             let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
-            out.push(Stmt::SetReg(
-                rt,
-                Value::Load { addr: Box::new(a.addr.clone()), size: MemSize::Word, signed: false },
-            ));
-            out.push(Stmt::SetReg(
-                rt2,
-                Value::Load {
-                    addr: Box::new(bin(BinOp::Add, a.addr, Value::Imm(4))),
-                    size: MemSize::Word,
-                    signed: false,
-                },
-            ));
+            emit_load_pair(&mut out, rt, rt2, a.addr);
             out.extend(a.post);
         }
         // Store-exclusive doubleword: store both words, report success (0).
@@ -1740,27 +1902,79 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     let regs = reglist(inst);
     let base = ldm_base(inst);
     let wback = ldm_wback(inst);
+    // If the base register is itself in the list, ARM loads every word from the
+    // ORIGINAL base and the loaded value wins (writeback is then not permitted). A
+    // naive in-order lowering would overwrite the base with an early word and then
+    // address the remaining words off that garbage (underflowing linear memory ->
+    // MemoryOutOfBounds). Defer the base's own load to last so every other element's
+    // address still sees the original base.
+    let base_in_list = regs.iter().any(|&r| r == base);
     let mut out = Vec::new();
-    for (i, r) in regs.iter().enumerate() {
-        if *r == 15 {
-            continue; // pc -> return, handled by terminator
-        }
-        out.push(Stmt::SetReg(
-            *r,
+    let load_at = |i: usize, r: u8| {
+        Stmt::SetReg(
+            r,
             Value::Load {
                 addr: Box::new(bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * i as u32))),
                 size: MemSize::Word,
                 signed: false,
             },
-        ));
+        )
+    };
+    for (i, r) in regs.iter().enumerate() {
+        if *r == 15 {
+            continue; // pc -> return, handled by terminator
+        }
+        if base_in_list && *r == base {
+            continue; // deferred below so it does not clobber the base early
+        }
+        out.push(load_at(i, *r));
     }
-    if wback {
+    if base_in_list {
+        let i = regs.iter().position(|&r| r == base).unwrap();
+        out.push(load_at(i, base));
+    } else if wback {
+        // Writeback only when the base is not loaded (base-in-list forbids it).
         out.push(Stmt::SetReg(
             base,
             bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * regs.len() as u32)),
         ));
     }
     Ok(out)
+}
+
+/// True if evaluating `v` reads guest register `r` (so writing `r` first would
+/// change `v`). Used to order multi-register loads so the base register, when it is
+/// also a destination, is written last.
+fn value_uses_reg(v: &Value, r: u8) -> bool {
+    match v {
+        Value::Reg(x) => *x == r,
+        Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult => false,
+        Value::Not(a) | Value::Clz(a) => value_uses_reg(a, r),
+        Value::Bin(_, a, b) => value_uses_reg(a, r) || value_uses_reg(b, r),
+        Value::Load { addr, .. } => value_uses_reg(addr, r),
+    }
+}
+
+/// Emit a two-word load: `rt` <- [addr], `rt2` <- [addr + 4]. When the address's
+/// base register is `rt` (e.g. `ldrd r6, r7, [r6, #8]`), the base is written last so
+/// both element addresses are computed from the original base. ARM defines a
+/// no-writeback doubleword load with the base among the destinations to read both
+/// words from the original base; writing `rt` first would clobber it and make the
+/// second address garbage (a latent MemoryOutOfBounds).
+fn emit_load_pair(out: &mut Vec<Stmt>, rt: u8, rt2: u8, addr: Value) {
+    let lo = Value::Load { addr: Box::new(addr.clone()), size: MemSize::Word, signed: false };
+    let hi = Value::Load {
+        addr: Box::new(bin(BinOp::Add, addr.clone(), Value::Imm(4))),
+        size: MemSize::Word,
+        signed: false,
+    };
+    if rt != rt2 && value_uses_reg(&addr, rt) {
+        out.push(Stmt::SetReg(rt2, hi));
+        out.push(Stmt::SetReg(rt, lo));
+    } else {
+        out.push(Stmt::SetReg(rt, lo));
+        out.push(Stmt::SetReg(rt2, hi));
+    }
 }
 
 /// `stmia rn(!), {list}`: store each register ascending, then writeback.

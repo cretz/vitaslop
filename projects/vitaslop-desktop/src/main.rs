@@ -12,6 +12,7 @@
 mod gfx;
 mod input;
 mod live;
+mod retail;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +37,34 @@ const HEIGHT: u32 = 544;
 const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 fn main() {
+    // `--game <dir>` plays a real extracted retail title (decrypt -> link -> transpile
+    // -> preemptive scheduler -> general GXM renderer) in a live window. With no
+    // argument, run the built-in clean-room cube demo below.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--game" || a == "-g") {
+        let Some(dir) = args.get(i + 1).cloned() else {
+            eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>]");
+            std::process::exit(2);
+        };
+        // `--headless <dir>` validates the retail path without opening a window (drive
+        // the tutorial + render one frame to a PNG); useful on a display-less box.
+        let result = match args.iter().position(|a| a == "--headless") {
+            Some(h) => match args.get(h + 1) {
+                Some(shot) => retail::headless_check(dir.into(), shot.into()),
+                None => {
+                    eprintln!("--headless requires a shot directory");
+                    std::process::exit(2);
+                }
+            },
+            None => retail::run(dir.into()),
+        };
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Load, transpile, and instantiate the cube for cooperative execution.
     let guest = match LiveGuest::new() {
         Ok(g) => g,

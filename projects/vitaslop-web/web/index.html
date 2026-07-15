@@ -29,6 +29,11 @@
         text-align: center;
         min-height: 2.5em;
       }
+      #fps {
+        font-family: ui-monospace, monospace;
+        font-weight: 600;
+        color: #8fe0a0;
+      }
       a {
         color: #7fb0ff;
       }
@@ -42,6 +47,7 @@
       drawn with WebGPU. No emulated GPU shader blob, no server.
     </p>
     <canvas id="screen" width="960" height="544"></canvas>
+    <div id="fps" aria-live="off">fps: --</div>
     <div id="status">Loading...</div>
     <script type="module">
       import init, { run } from "./pkg/vitaslop_web.js";

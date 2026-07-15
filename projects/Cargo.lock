@@ -2827,6 +2827,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vitaslop-atrac9"
+version = "0.0.0"
+
+[[package]]
 name = "vitaslop-conformance-harness"
 version = "0.0.0"
 dependencies = [
@@ -2910,6 +2914,7 @@ dependencies = [
  "miniz_oxide",
  "sha1",
  "sha2",
+ "vitaslop-atrac9",
  "vitaslop-hostcall",
  "vitaslop-loader",
  "vitaslop-platform",

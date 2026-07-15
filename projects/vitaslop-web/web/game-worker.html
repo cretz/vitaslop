@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop - retail boot in a web worker</title>
+    <style>
+      body { margin: 0; background: #101018; color: #d8d8e0; font: 14px/1.5 ui-monospace, monospace; padding: 24px; }
+      canvas { width: 960px; max-width: 100%; aspect-ratio: 960/544; border: 1px solid #2a2a3a; image-rendering: pixelated; display: block; }
+      #fps { font-weight: 600; color: #8fe0a0; }
+      #perf { color: #a0c0e0; }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" width="960" height="544"></canvas>
+    <div id="fps">fps: --</div>
+    <div id="perf">perf: --</div>
+    <pre id="status">loading...</pre>
+    <script type="module">
+      import { forwardInput } from "./worker-input.js";
+      const canvas = document.getElementById("screen");
+      const status = document.getElementById("status");
+
+      // Driven by the Playwright harness (game-boot.mjs WORKER=1): fetch the container
+      // this origin serves, transfer the on-page canvas + the bytes to a Web Worker, and
+      // let the worker run the whole emulator (JSPI scheduler + guest + WebGPU render)
+      // there. The worker posts { id, text } metrics back, which we apply to the page.
+      window.__boot = async (recipe, maxFrames, maxRounds) => {
+        status.textContent = "fetching manifest...";
+        const manifest = await (await fetch("/game-manifest.json")).json();
+        const files = {};
+        let bytes = 0;
+        for (let i = 0; i < manifest.length; i++) {
+          const buf = await (await fetch("/game/" + manifest[i])).arrayBuffer();
+          files[manifest[i]] = new Uint8Array(buf);
+          bytes += buf.byteLength;
+          if (i % 40 === 0) status.textContent = `fetched ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
+        }
+        status.textContent = `fetched ${manifest.length} files (${(bytes/1e6)|0} MB); starting worker...`;
+
+        const worker = new Worker("./worker.js", { type: "module" });
+        worker.onmessage = (e) => {
+          const d = e.data;
+          if (d.type === "report") {
+            const el = document.getElementById(d.id);
+            if (el) el.textContent = d.text;
+          } else if (d.type === "error") {
+            status.textContent = "worker error: " + d.message;
+            console.error("[worker]", d.message);
+          }
+        };
+
+        // Forward live pointer/keyboard from the page into the worker.
+        forwardInput(worker, canvas);
+
+        // Move canvas render control + the file buffers to the worker (transfer, not
+        // copy - the file ArrayBuffers become owned by the worker).
+        const offscreen = canvas.transferControlToOffscreen();
+        const transfer = [offscreen, ...Object.values(files).map((u) => u.buffer)];
+        worker.postMessage({ offscreen, files, recipe: recipe || "", maxFrames }, transfer);
+        return "worker started";
+      };
+    </script>
+  </body>
+</html>

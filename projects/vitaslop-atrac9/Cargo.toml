@@ -1,0 +1,15 @@
+[package]
+name = "vitaslop-atrac9"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A clean-room-free port is not claimed: this is a faithful Rust port of the MIT
+# LibAtrac9 C decoder (Alex Barney, https://github.com/Thealexbarney/LibAtrac9).
+# The port carries that MIT attribution; see src/lib.rs. Pure Rust, no
+# dependencies, no_std-friendly compute so it builds identically for native and
+# wasm.
+
+[dependencies]

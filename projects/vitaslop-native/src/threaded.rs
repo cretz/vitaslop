@@ -40,22 +40,25 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use vitaslop_runtime::{ImportDispatch, SvcOutcome, VFP_ARG_COUNT};
+use vitaslop_runtime::sched::{
+    FiberEnd, GuestEngine, GuestThread, Scheduler, Stop, ThreadHandle, ThreadStep,
+};
+use vitaslop_runtime::{ImportDispatch, Reentry, SvcOutcome, VFP_ARG_COUNT};
 use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, SharedMemory, Store, Val};
 
 use crate::RunError;
 
+/// The scheduler verdict is shared policy; re-export it so `vitaslop_native`'s public
+/// path (`threaded::RunReport`) is unchanged.
+pub use vitaslop_runtime::sched::RunReport;
+
 /// Fuel a thread may retire before the fiber yields back to the scheduler even
 /// without a host call. A deterministic (retired-instruction) quantum so the
 /// interleaving is reproducible; large enough that a normal run of guest code
 /// between host calls completes in one slice.
 const DEFAULT_QUANTUM_FUEL: u64 = 1_000_000;
-
-/// Backstop on scheduler rounds in [`ThreadedScheduler::run`], so a runaway or
-/// live-locking guest cannot spin forever. A round is one fiber poll.
-const MAX_ROUNDS: u64 = 100_000_000;
 
 /// Headroom reserved above the main thread's initial stack pointer, below the top
 /// of the guest region. ELF/crt startup and some libc routines address memory at
@@ -72,41 +75,12 @@ fn main_stack_top(base: u32, mem_bytes: u32) -> u32 {
     base.wrapping_add(mem_bytes).wrapping_sub(MAIN_STACK_HEADROOM) & !0xF
 }
 
-/// Why a fiber poll returned `Pending` (it suspended rather than finishing). Set
-/// by the host-call closure just before it awaits, read by the scheduler through
-/// the thread's shared signal cell.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Stop {
-    /// A fuel-quantum preemption: no host call blocked, the thread is still
-    /// runnable and simply used up its slice.
-    Quantum,
-    /// The thread hit a blocking primitive and must be parked until woken.
-    Blocked,
-    /// The thread reached a frame boundary (display flip).
-    Yielded,
-}
-
 /// The one-word channel from a thread's host-call closure (running inside its
-/// fiber, hence inside its store) out to the scheduler's poll loop, which cannot
-/// otherwise see into the borrowed store. Only the `Stop` reason needs to cross;
-/// exit codes and halt/exit kinds ride the fiber's own return value.
+/// fiber, hence inside its store) out to the [`WasmtimeThread::resume`] that polled
+/// it, which cannot otherwise see into the borrowed store. Only the [`Stop`] reason
+/// needs to cross; exit codes and halt/exit kinds ride the fiber's own return value.
 struct Signal {
     stop: Stop,
-}
-
-/// How a thread's fiber finished (the `Future`'s output).
-enum FiberEnd {
-    /// The guest entry returned normally; the value is its r0 (the thread's exit
-    /// code).
-    Returned(u32),
-    /// The thread called `sceKernelExitThread` (or equivalent): it ends, but the
-    /// process continues. The value is its r0.
-    ThreadExit(u32),
-    /// The thread called `sceKernelExitProcess`: the whole run stops. The value is
-    /// the process exit code (r0).
-    ProcessHalt(u32),
-    /// The guest trapped for a reason that was not a clean halt/exit.
-    Error(String),
 }
 
 /// The scheduler's per-thread store data: the shared host, this thread's id, the
@@ -124,57 +98,87 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     thread_exit: bool,
 }
 
-/// One scheduled guest thread.
-struct ThreadCtl {
+/// One suspendable guest thread on the wasmtime engine: an async fiber (the in-flight
+/// `call_async`) that owns its store and suspends at each switch point. This is the
+/// wasmtime implementation of the engine-agnostic [`GuestThread`]; the shared
+/// [`Scheduler`] drives it.
+pub struct WasmtimeThread {
     thid: i32,
     /// The in-flight guest call; owns its store, suspends at each switch point.
     future: Pin<Box<dyn Future<Output = FiberEnd> + Send>>,
     signal: Arc<Mutex<Signal>>,
-    state: ThreadState,
+    /// SceKernel priority (lower number = higher priority). The scheduler always
+    /// runs the highest-priority runnable thread, matching the real kernel.
+    priority: i32,
 }
 
-/// A scheduled thread's lifecycle state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ThreadState {
-    /// On the run queue; the scheduler may poll it.
-    Runnable,
-    /// Parked at a blocking primitive; not polled until a wake makes it runnable.
-    Blocked,
-    /// Done. The value is its exit code.
-    Finished(u32),
+impl ThreadHandle for WasmtimeThread {
+    fn thid(&self) -> i32 {
+        self.thid
+    }
+    fn priority(&self) -> i32 {
+        self.priority
+    }
 }
 
-/// The verdict of a [`ThreadedScheduler::run`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RunReport {
-    /// Every thread finished cleanly (or the process exited). The value is the
-    /// process exit code (the halting thread's r0, or the main thread's).
-    Finished(u32),
-    /// No thread is runnable but some remain blocked: a deadlock (e.g. a wait with
-    /// no possible signaller). The value lists the still-blocked thread ids.
-    Deadlock(Vec<i32>),
-    /// A thread trapped. The run cannot continue.
-    Error(String),
-    /// The round budget was exhausted (a live-lock backstop).
-    RoundLimit,
-    /// The requested number of frame boundaries was reached; the run was stopped
-    /// deliberately (used to bound a title whose render loop never returns). The
-    /// value is the number of frames observed.
-    FramesReached(u64),
+impl GuestThread for WasmtimeThread {
+    fn resume(&mut self) -> ThreadStep {
+        // Poll the fiber once: it runs until its next `.await` (a switch point) or
+        // returns. A no-op waker is right because the scheduler, not a reactor,
+        // decides when to poll again. Reset the reason first; the host-call closure
+        // overwrites it only if it suspends.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        self.signal.lock().unwrap().stop = Stop::Quantum;
+        match self.future.as_mut().poll(&mut cx) {
+            Poll::Ready(end) => ThreadStep::Finished(end),
+            Poll::Pending => ThreadStep::Suspended(self.signal.lock().unwrap().stop),
+        }
+    }
 }
 
-/// A preemptive multi-thread guest run: the transpiled module, one shared memory,
-/// a shared host, and the live thread table.
-pub struct ThreadedScheduler<H: ImportDispatch + Send + 'static> {
+/// The wasmtime execution engine: the transpiled module, the one shared memory every
+/// thread instance imports, the shared host, and the knobs to stand up a new thread.
+/// This is the wasmtime implementation of the engine-agnostic [`GuestEngine`].
+pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     engine: Engine,
     module: Module,
     shared_mem: SharedMemory,
     host: Arc<Mutex<H>>,
     base: u32,
     quantum_fuel: u64,
-    threads: Vec<ThreadCtl>,
-    /// Round-robin cursor: the index after the last thread polled.
-    cursor: usize,
+}
+
+impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
+    type Thread = WasmtimeThread;
+
+    fn spawn(&mut self, reentry: &Reentry) -> Result<WasmtimeThread, ()> {
+        self.instantiate_thread(
+            reentry.thid,
+            reentry.entry,
+            reentry.arg_len,
+            reentry.arg_ptr,
+            reentry.stack_top,
+            reentry.priority,
+        )
+        .map_err(|_| ())
+    }
+
+    fn write_mem(&mut self, addr: u32, bytes: &[u8]) {
+        let off = addr.wrapping_sub(self.base) as usize;
+        if off + bytes.len() <= self.shared_mem.data().len() {
+            write_shared(&self.shared_mem, off, bytes);
+        }
+    }
+}
+
+/// A preemptive multi-thread guest run. A thin wasmtime front for the shared
+/// [`Scheduler`] policy: it stands up the wasmtime [`WasmtimeEngine`] plus the main
+/// thread, then hands both to the policy, which owns the thread table and the
+/// scheduling loop. All the discipline (priority, deadlock/timed-wait, frame
+/// counting) is in `vitaslop_runtime::sched`, shared with the browser scheduler.
+pub struct ThreadedScheduler<H: ImportDispatch + Send + 'static> {
+    inner: Scheduler<WasmtimeEngine<H>, H>,
 }
 
 impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
@@ -249,23 +253,20 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, 0, code);
 
         let host = Arc::new(Mutex::new(host));
-        let mut sched = ThreadedScheduler {
-            engine,
-            module,
-            shared_mem,
-            host,
-            base,
-            quantum_fuel,
-            threads: Vec::new(),
-            cursor: 0,
-        };
+        let engine = WasmtimeEngine { engine, module, shared_mem, host: host.clone(), base, quantum_fuel };
 
         // The main thread: sp near the top of the region (with startup headroom), no
         // entry args, its thid is whatever the host reports for the main thread (0 by
         // convention here; the host maps it as it likes).
-        let main = sched.instantiate_thread(0, entry & !1, 0, 0, main_stack_top(base, mem_bytes))?;
-        sched.threads.push(main);
-        Ok(sched)
+        let main = engine.instantiate_thread(
+            0,
+            entry & !1,
+            0,
+            0,
+            main_stack_top(base, mem_bytes),
+            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+        )?;
+        Ok(ThreadedScheduler { inner: Scheduler::new(engine, host, main) })
     }
 
     /// Stand up a preemptive run of a multi-module linked title
@@ -299,22 +300,27 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
         write_shared(&shared_mem, 0, &linked.image);
 
-        let mut sched = ThreadedScheduler {
+        let host = Arc::new(Mutex::new(host));
+        let engine = WasmtimeEngine {
             engine,
             module,
             shared_mem,
-            host: Arc::new(Mutex::new(host)),
+            host: host.clone(),
             base: linked.base,
             quantum_fuel,
-            threads: Vec::new(),
-            cursor: 0,
         };
 
         // The main thread runs every module_start in load order, then (as the last
         // entry) the eboot's - which is where a render loop lives.
         let sp = main_stack_top(linked.base, linked.mem_bytes);
-        let main = sched.instantiate_thread_seq(0, linked.module_inits.clone(), 0, 0, sp)?;
-        sched.threads.push(main);
+        let main = engine.instantiate_thread_seq(
+            0,
+            linked.module_inits.clone(),
+            0,
+            0,
+            sp,
+            vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
+        )?;
 
         let stubs = built
             .stubbed
@@ -322,18 +328,44 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             .copied()
             .zip(built.stub_wasm_indices.iter().copied())
             .collect();
-        Ok((sched, stubs))
+        Ok((ThreadedScheduler { inner: Scheduler::new(engine, host, main) }, stubs))
     }
 
     /// Borrow the shared host (e.g. to read captured output after the run).
     pub fn host(&self) -> std::sync::MutexGuard<'_, H> {
-        self.host.lock().unwrap()
+        self.inner.engine().host.lock().unwrap()
     }
 
     /// Read `len` bytes of guest memory at guest address `addr` (diagnostic; the
     /// shared image outlives any trap, so a probe can inspect object state after a
     /// fault). Returns an empty vec if the range is out of bounds.
     pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
+        self.inner.engine().read_guest(addr, len)
+    }
+
+    /// Display frame boundaries (flips) observed so far. A live windowed front-end
+    /// steps one frame per redraw via `run_frames(frames() + 1, ..)`.
+    pub fn frames(&self) -> u64 {
+        self.inner.frames()
+    }
+
+    /// Run cooperatively until the process halts, every thread finishes, or the run
+    /// deadlocks / errors. Delegates to the shared scheduler policy.
+    pub fn run(&mut self) -> RunReport {
+        self.inner.run()
+    }
+
+    /// Like [`run`](Self::run) but stop after `max_frames` frame boundaries; `max_rounds`
+    /// caps thread resumes so a busy-waiting guest cannot run unbounded.
+    pub fn run_frames(&mut self, max_frames: u64, max_rounds: u64) -> RunReport {
+        self.inner.run_frames(max_frames, max_rounds)
+    }
+}
+
+impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
+    /// Read `len` bytes of guest memory at guest address `addr`. Returns an empty vec
+    /// if the range is out of bounds.
+    fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
         let off = addr.wrapping_sub(self.base) as usize;
         let data = self.shared_mem.data();
         if off + len > data.len() {
@@ -349,167 +381,6 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         out
     }
 
-    /// Run cooperatively until the process halts, every thread finishes, or the
-    /// run deadlocks / errors. Returns the verdict.
-    pub fn run(&mut self) -> RunReport {
-        self.run_frames(u64::MAX, MAX_ROUNDS)
-    }
-
-    /// Like [`run`](Self::run) but stop after `max_frames` frame boundaries (display
-    /// flips) even if threads are still running - the way to bound a real title
-    /// whose render loop never returns and capture a fixed number of frames.
-    /// `max_rounds` caps the number of fiber polls (each retiring up to one fuel
-    /// quantum) so a busy-waiting guest cannot run unbounded.
-    pub fn run_frames(&mut self, max_frames: u64, max_rounds: u64) -> RunReport {
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        let mut rounds = 0u64;
-        let mut frames = 0u64;
-        loop {
-            if rounds >= max_rounds {
-                return RunReport::RoundLimit;
-            }
-            rounds += 1;
-
-            let Some(idx) = self.next_runnable() else {
-                // Nobody can run. Either all finished, or the rest are blocked.
-                let blocked: Vec<i32> = self
-                    .threads
-                    .iter()
-                    .filter(|t| t.state == ThreadState::Blocked)
-                    .map(|t| t.thid)
-                    .collect();
-                if blocked.is_empty() {
-                    return RunReport::Finished(self.main_exit_code());
-                }
-                // Before calling it a deadlock, honor any timed wait: jump the
-                // virtual clock to the earliest deadline and wake what expires. This
-                // is how a frame-pacing / timed condition wait makes progress without
-                // a real signaller (and without busy-spinning). Only a set of
-                // purely infinite waits with no timer is a true deadlock.
-                let deadline = self.host.lock().unwrap().earliest_deadline();
-                match deadline {
-                    Some(t) => {
-                        self.host.lock().unwrap().advance_time_to(t);
-                        self.drain_spawns_and_wakes();
-                        continue;
-                    }
-                    None => return RunReport::Deadlock(blocked),
-                }
-            };
-            self.cursor = idx + 1;
-
-            // Fresh reason each poll; the closure overwrites it if it awaits.
-            self.threads[idx].signal.lock().unwrap().stop = Stop::Quantum;
-            match self.threads[idx].future.as_mut().poll(&mut cx) {
-                Poll::Ready(end) => {
-                    if let Some(report) = self.on_finish(idx, end) {
-                        return report;
-                    }
-                }
-                Poll::Pending => {
-                    let stop = self.threads[idx].signal.lock().unwrap().stop;
-                    match stop {
-                        Stop::Blocked => self.threads[idx].state = ThreadState::Blocked,
-                        Stop::Yielded => {
-                            // A frame boundary (display flip): the thread stays
-                            // runnable, but count it toward the frame budget.
-                            frames += 1;
-                            if frames >= max_frames {
-                                return RunReport::FramesReached(frames);
-                            }
-                        }
-                        // A fuel slice: still runnable, not a frame.
-                        Stop::Quantum => {}
-                    }
-                }
-            }
-
-            // A host call in this poll may have asked to start threads or woken
-            // parked ones; act on both before the next round.
-            self.drain_spawns_and_wakes();
-        }
-    }
-
-    /// Handle a finished fiber; returns `Some(report)` if the whole run must stop.
-    fn on_finish(&mut self, idx: usize, end: FiberEnd) -> Option<RunReport> {
-        let thid = self.threads[idx].thid;
-        match end {
-            FiberEnd::Returned(code) | FiberEnd::ThreadExit(code) => {
-                self.threads[idx].state = ThreadState::Finished(code);
-                // Tell the host this thread ended, so any sibling waiting on it can
-                // be woken (the wake is drained right after, by the caller).
-                self.host.lock().unwrap().set_thread_exit(thid, code);
-                None
-            }
-            FiberEnd::ProcessHalt(code) => {
-                self.threads[idx].state = ThreadState::Finished(code);
-                // The process is over: mark every other live thread finished too.
-                for t in self.threads.iter_mut() {
-                    if let ThreadState::Runnable | ThreadState::Blocked = t.state {
-                        t.state = ThreadState::Finished(code);
-                    }
-                }
-                Some(RunReport::Finished(code))
-            }
-            FiberEnd::Error(e) => Some(RunReport::Error(format!("thread {thid:#x}: {e}"))),
-        }
-    }
-
-    /// Start any threads the last host call requested, and wake any it released.
-    fn drain_spawns_and_wakes(&mut self) {
-        let (spawns, wakes, stat_writes) = {
-            let mut host = self.host.lock().unwrap();
-            (host.take_spawns(), host.take_wakes(), host.take_stat_writes())
-        };
-        // Deliver any exit codes owed to a blocked `sceKernelWaitThreadEnd` joiner's
-        // `stat` out-parameter. Done here (the scheduler has memory access) before the
-        // woken joiner resumes; safe because no fiber runs during a drain.
-        for (addr, value) in stat_writes {
-            let off = addr.wrapping_sub(self.base) as usize;
-            if off + 4 <= self.shared_mem.data().len() {
-                write_shared(&self.shared_mem, off, &value.to_le_bytes());
-            }
-        }
-        for sp in spawns {
-            match self.instantiate_thread(sp.thid, sp.entry, sp.arg_len, sp.arg_ptr, sp.stack_top) {
-                Ok(ctl) => self.threads.push(ctl),
-                // A spawn whose entry was not transpiled: record it as finished
-                // with code 0 so a later join does not hang.
-                Err(_) => self.host.lock().unwrap().set_thread_exit(sp.thid, 0),
-            }
-        }
-        for thid in wakes {
-            if let Some(t) = self
-                .threads
-                .iter_mut()
-                .find(|t| t.thid == thid && t.state == ThreadState::Blocked)
-            {
-                t.state = ThreadState::Runnable;
-            }
-        }
-    }
-
-    /// The next runnable thread index in round-robin order from the cursor, or
-    /// None if none is runnable.
-    fn next_runnable(&self) -> Option<usize> {
-        let n = self.threads.len();
-        (0..n)
-            .map(|k| (self.cursor + k) % n)
-            .find(|&i| self.threads[i].state == ThreadState::Runnable)
-    }
-
-    /// The process exit code: the main thread's finished code if it has one, else 0.
-    fn main_exit_code(&self) -> u32 {
-        self.threads
-            .first()
-            .and_then(|t| match t.state {
-                ThreadState::Finished(c) => Some(c),
-                _ => None,
-            })
-            .unwrap_or(0)
-    }
-
     /// Build one thread from a single entry (a spawned worker).
     fn instantiate_thread(
         &self,
@@ -518,8 +389,9 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         r0: u32,
         r1: u32,
         sp: u32,
-    ) -> Result<ThreadCtl, RunError> {
-        self.instantiate_thread_seq(thid, vec![entry], r0, r1, sp)
+        priority: i32,
+    ) -> Result<WasmtimeThread, RunError> {
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, sp, priority)
     }
 
     /// Build one thread that runs `entries` in sequence on a single fiber, resetting
@@ -536,7 +408,8 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         r0: u32,
         r1: u32,
         sp: u32,
-    ) -> Result<ThreadCtl, RunError> {
+        priority: i32,
+    ) -> Result<WasmtimeThread, RunError> {
         let signal = Arc::new(Mutex::new(Signal { stop: Stop::Quantum }));
         let data = ThreadData {
             host: self.host.clone(),
@@ -606,7 +479,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             FiberEnd::Returned(last_r0)
         });
 
-        Ok(ThreadCtl { thid, future, signal, state: ThreadState::Runnable })
+        Ok(WasmtimeThread { thid, future, signal, priority })
     }
 }
 
@@ -736,6 +609,13 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
 
                     match outcome {
                         SvcOutcome::Continue => {}
+                        SvcOutcome::Reschedule => {
+                            // Stay runnable but suspend so the scheduler re-picks by
+                            // priority now (a higher-priority thread just became
+                            // runnable and must preempt us).
+                            caller.data().signal.lock().unwrap().stop = Stop::Quantum;
+                            YieldNow(false).await;
+                        }
                         SvcOutcome::Block => {
                             caller.data().signal.lock().unwrap().stop = Stop::Blocked;
                             YieldNow(false).await;
@@ -843,6 +723,14 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
             s.push_str("\n  ");
         }
         s.push_str(&format!("{name}={:#010x} ", get_reg_store(store, instance, i)));
+    }
+    // Diagnostic guest-PC tracker (nonzero only when the module was emitted with
+    // VITASLOP_TRACK_PC): the address of the basic block executing at the trap.
+    if let Some(g) = instance.get_global(&mut *store, abi::GUEST_PC_EXPORT) {
+        let pc = g.get(&mut *store).i32().unwrap_or(0) as u32;
+        if pc != 0 {
+            s.push_str(&format!("\n  guest_block={pc:#010x}"));
+        }
     }
     s
 }

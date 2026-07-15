@@ -41,7 +41,14 @@ export function startServer(root) {
         return;
       }
       const body = await readFile(file);
-      res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream" });
+      res.writeHead(200, {
+        "content-type": MIME[extname(file)] || "application/octet-stream",
+        // A shared WebAssembly.Memory (SharedArrayBuffer) - which the preemptive
+        // scheduler imports into every guest instance - is only allowed on a
+        // cross-origin-isolated page.
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+      });
       res.end(body);
     } catch {
       res.writeHead(404).end("not found");

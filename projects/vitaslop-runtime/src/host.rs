@@ -248,7 +248,14 @@ struct ThreadRec {
     entry: u32,
     stack_top: u32,
     exit_code: Option<u32>,
+    /// SceKernel thread priority (lower number = higher priority). The scheduler
+    /// runs the highest-priority runnable thread, matching the real kernel.
+    priority: i32,
 }
+
+/// The default SceKernel user-thread priority (`SCE_KERNEL_DEFAULT_PRIORITY_USER`),
+/// used for the initial (main) thread, which is not created via `create_thread`.
+pub const DEFAULT_THREAD_PRIORITY: i32 = 0x1000_0100;
 
 /// A recursive mutex's state (preemptive mode only; the single-thread model needs
 /// none). `owner` is the holding thread's id (None if free), `count` the recursion
@@ -298,6 +305,9 @@ pub struct Reentry {
     pub stack_top: u32,
     /// The thread whose exit code the result becomes.
     pub thid: i32,
+    /// The new thread's SceKernel priority (lower = higher), so the scheduler can
+    /// place it correctly on the run queue.
+    pub priority: i32,
 }
 
 /// One open file descriptor: which path it refers to, the read/write cursor, and
@@ -416,6 +426,39 @@ impl FileTable {
         let out = data[start..end].to_vec();
         of.cursor = end;
         Some(out)
+    }
+
+    /// Read up to `len` bytes from `fd` starting at absolute `offset` WITHOUT moving
+    /// the descriptor's cursor (sceIoPread). Returns the bytes, or None on a
+    /// bad/unreadable descriptor. This is how a streaming reader (e.g. the AT9 music
+    /// streamer) pulls the file header and successive chunks from a shared fd.
+    fn pread(&self, fd: i32, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let of = self.open.get(&fd)?;
+        if !of.readable {
+            return None;
+        }
+        let data = self.files.get(&of.path)?;
+        let start = (offset as usize).min(data.len());
+        let end = (start + len).min(data.len());
+        Some(data[start..end].to_vec())
+    }
+
+    /// Write `bytes` to `fd` at absolute `offset` WITHOUT moving the cursor
+    /// (sceIoPwrite), extending the file with zeros if needed. Returns the count, or
+    /// None on a bad/unwritable descriptor.
+    fn pwrite(&mut self, fd: i32, offset: u64, bytes: &[u8]) -> Option<usize> {
+        let of = self.open.get(&fd)?;
+        if !of.writable {
+            return None;
+        }
+        let path = of.path.clone();
+        let data = self.files.entry(path).or_default();
+        let end = offset as usize + bytes.len();
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[offset as usize..end].copy_from_slice(bytes);
+        Some(bytes.len())
     }
 
     /// Write `bytes` to `fd` at its cursor (extending the file); advances it.
@@ -541,6 +584,12 @@ pub struct VitaState {
     // cooperative scheduler runs the guest on a fiber, which wasmtime may resume
     // on any thread). Everything stays single-threaded in practice.
     pub world: Box<dyn World + Send>,
+    /// The audio-output sink every `sceAudioOut` port feeds. A `NullSink` by default
+    /// (silent), replaced by a host that wants real playback (native device / Web
+    /// Audio). See [`crate::audio`].
+    pub audio: Box<dyn crate::audio::AudioSink + Send>,
+    /// Opened NGS/audio port and handle bookkeeping (see `vita::ngs` / `vita::audio`).
+    pub(crate) audio_state: crate::vita::audio::AudioState,
     /// Bring-up aid: halt the run when the guest calls sceGxmTerminate. The cube
     /// entry is `_start`, which spins forever after `main` returns (there is no OS
     /// to exit to yet), so terminate is the clean stopping point after teardown.
@@ -574,6 +623,14 @@ pub struct VitaState {
     /// signal wakes it). Keyed by the cond's guest work pointer, since lightweight
     /// objects have no kernel handle. See the scheduler's idle-time advance.
     lwcond_waiters: Vec<(i32, u32, Option<u64>)>,
+    /// Threads sleeping until a virtual-clock deadline, as `(thread id, deadline_us)`.
+    /// Unlike a lwcond waiter these are woken purely by time - `sceKernelDelayThread`
+    /// and, crucially, `sceAudioOutOutput` pacing: an audio mixer thread hands one
+    /// grain per call and on hardware blocks until it drains, which paces it to real
+    /// time. Parking it here means the audio thread stops busy-spinning and, because
+    /// it now yields, the scheduler goes idle and can advance the clock - so a title's
+    /// time-based loading wait actually progresses instead of being starved.
+    sleep_waiters: Vec<(i32, u64)>,
     /// The virtual monotonic clock in microseconds, read by
     /// `sceKernelGetProcessTimeWide`/`GetSystemTimeWide`. The scheduler advances it
     /// (jumping to the earliest pending deadline when every thread is parked), so a
@@ -617,6 +674,8 @@ impl VitaState {
             fs: FileTable::new(),
             capture: Capture::new(),
             world,
+            audio: Box::new(crate::audio::NullSink::default()),
+            audio_state: crate::vita::audio::AudioState::default(),
             halt_on_terminate: false,
             process_param: 0,
             tls_slots: Vec::new(),
@@ -624,6 +683,7 @@ impl VitaState {
             bound_textures: Vec::new(),
             texture_formats: Vec::new(),
             lwcond_waiters: Vec::new(),
+            sleep_waiters: Vec::new(),
             virtual_us: 0,
         }
     }
@@ -707,6 +767,16 @@ impl VitaState {
         self.fs.read(fd, len)
     }
 
+    /// sceIoPread: positioned read at `offset` that leaves the cursor untouched.
+    pub fn io_pread(&mut self, fd: i32, offset: u64, len: usize) -> Option<Vec<u8>> {
+        self.fs.pread(fd, offset, len)
+    }
+
+    /// sceIoPwrite: positioned write at `offset` that leaves the cursor untouched.
+    pub fn io_pwrite(&mut self, fd: i32, offset: u64, bytes: &[u8]) -> Option<usize> {
+        self.fs.pwrite(fd, offset, bytes)
+    }
+
     /// sceIoWrite: fd 1/2 go to the captured console; other fds to the vfs.
     /// Returns the byte count written (always the full length for the console).
     pub fn io_write(&mut self, fd: i32, bytes: &[u8]) -> Option<usize> {
@@ -775,15 +845,23 @@ impl VitaState {
 
     /// Create a thread: allocate its own stack and record it, returning its
     /// SceUID. The entry's Thumb bit is cleared so it names the transpiled export.
-    pub fn create_thread(&mut self, entry: u32, stack_size: u32) -> i32 {
+    pub fn create_thread(&mut self, entry: u32, stack_size: u32, priority: i32) -> i32 {
         let size = stack_size.max(0x1000);
         let stack = self.galloc(size, 16);
         // The stack grows down from an 8-byte-aligned top (AAPCS at a public call).
         let stack_top = stack.wrapping_add(size) & !0xF;
         let uid = self.next_uid;
         self.next_uid += 1;
-        self.threads.push(ThreadRec { uid, entry: entry & !1, stack_top, exit_code: None });
+        self.threads.push(ThreadRec { uid, entry: entry & !1, stack_top, exit_code: None, priority });
         uid
+    }
+
+    /// The priority the current thread is running at (lower = higher priority).
+    pub fn current_priority(&self) -> i32 {
+        self.threads
+            .iter()
+            .find(|t| t.uid == self.current)
+            .map_or(DEFAULT_THREAD_PRIORITY, |t| t.priority)
     }
 
     /// Start a thread. In the single-thread model this raises a *synchronous*
@@ -791,14 +869,28 @@ impl VitaState {
     /// anything past the start call). Under the preemptive scheduler it instead
     /// queues a *spawn*: the entry becomes its own concurrent fiber, and the
     /// starting thread keeps running.
-    pub fn start_thread(&mut self, thid: i32, arg_len: u32, arg_ptr: u32) {
-        if let Some(t) = self.threads.iter().find(|t| t.uid == thid) {
-            let req = Reentry { entry: t.entry, arg_len, arg_ptr, stack_top: t.stack_top, thid };
-            if self.preemptive {
-                self.pending_spawns.push(req);
-            } else {
-                self.pending_reentry = Some(req);
-            }
+    /// Returns true if the started thread outranks the current one (lower priority
+    /// number), so the caller should reschedule at once - the real kernel preempts
+    /// the starter and runs the higher-priority thread until it blocks. This is the
+    /// ordering guarantee titles rely on when a worker must initialize (e.g. create
+    /// and store a semaphore the starter then waits on) before the starter proceeds.
+    pub fn start_thread(&mut self, thid: i32, arg_len: u32, arg_ptr: u32) -> bool {
+        let Some(t) = self.threads.iter().find(|t| t.uid == thid) else { return false };
+        let new_priority = t.priority;
+        let req = Reentry {
+            entry: t.entry,
+            arg_len,
+            arg_ptr,
+            stack_top: t.stack_top,
+            thid,
+            priority: new_priority,
+        };
+        if self.preemptive {
+            self.pending_spawns.push(req);
+            new_priority < self.current_priority()
+        } else {
+            self.pending_reentry = Some(req);
+            false
         }
     }
 
@@ -864,6 +956,11 @@ impl VitaState {
     /// each dispatch alongside spawns and wakes.
     pub fn take_stat_writes(&mut self) -> Vec<(u32, u32)> {
         std::mem::take(&mut self.pending_stat_writes)
+    }
+
+    /// Whether a semaphore with this uid currently exists.
+    pub fn sema_exists(&self, uid: i32) -> bool {
+        self.semaphores.iter().any(|(u, _)| *u == uid)
     }
 
     /// Try to take `need` from semaphore `uid` without blocking. Returns true if
@@ -1085,16 +1182,24 @@ impl VitaState {
         });
     }
 
-    /// The earliest pending lightweight-cond wake deadline, if any timed wait is
-    /// parked. The scheduler uses this to jump the clock forward when every thread
-    /// is blocked, instead of declaring a deadlock.
-    pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
-        self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d).min()
+    /// Park the current thread until `now + us` on the virtual clock, woken only by
+    /// time. Used for `sceKernelDelayThread` and `sceAudioOutOutput` grain pacing.
+    pub fn sleep_park(&mut self, us: u64) {
+        self.sleep_waiters.push((self.current, self.virtual_us.wrapping_add(us)));
     }
 
-    /// Advance the virtual clock to at least `to_us` and wake every timed lightweight
-    /// wait whose deadline has now passed. Called by the scheduler when no thread is
-    /// runnable but a timed wait can still fire.
+    /// The earliest pending timed-wake deadline across lightweight-cond waits and
+    /// pure sleeps. The scheduler uses this to jump the clock forward when every
+    /// thread is blocked, instead of declaring a deadlock.
+    pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
+        let lw = self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d);
+        let sl = self.sleep_waiters.iter().map(|&(_, d)| d);
+        lw.chain(sl).min()
+    }
+
+    /// Advance the virtual clock to at least `to_us` and wake every timed wait -
+    /// lightweight cond or pure sleep - whose deadline has now passed. Called by the
+    /// scheduler when no thread is runnable but a timed wait can still fire.
     pub fn advance_time_to(&mut self, to_us: u64) {
         self.virtual_us = self.virtual_us.max(to_us);
         let now = self.virtual_us;
@@ -1104,6 +1209,14 @@ impl VitaState {
                 false
             }
             _ => true,
+        });
+        self.sleep_waiters.retain(|&(thid, deadline)| {
+            if deadline <= now {
+                self.pending_wakes.push(thid);
+                false
+            } else {
+                true
+            }
         });
     }
 
@@ -1336,26 +1449,6 @@ impl VitaState {
     }
 }
 
-/// Bytes per texel for a `SceGxmTextureBaseFormat`, keyed by its full high byte
-/// (`format >> 24`). The high bit (`0x80`) distinguishes 24-bit RGB (`0x98`
-/// U8U8U8) and paletted formats from the low-range formats a bare 5-bit field
-/// would alias them onto (e.g. `0x98 & 0x1f == 0x18`, which alone looks like S32).
-/// Block-compressed formats return `None` (skipped by the renderer for now).
-fn base_format_bpp(base_format: u32) -> Option<u32> {
-    Some(match base_format {
-        // 8-bit single channel (U8/S8) and 8-bit paletted (P8).
-        0x00 | 0x01 | 0x95 => 1,
-        // 16-bit packed (U4U4U4U4, U8U3U3U2, U1U5U5U5, U5U6U5, S5S5U6, U8U8, ...).
-        0x02..=0x0b => 2,
-        // 24-bit three-channel (U8U8U8, S8S8S8).
-        0x98 | 0x99 => 3,
-        // 32-bit (U8U8U8U8, ..., F32, X8U24) and 32-bit single (U32/S32) plus
-        // packed HDR (SE5M9M9M9, F11F11F10).
-        0x0c..=0x1a => 4,
-        _ => return None,
-    })
-}
-
 /// Round `v` up to the next multiple of `align` (a power of two).
 fn align_up(v: u32, align: u32) -> u32 {
     (v + align - 1) & !(align - 1)
@@ -1394,11 +1487,23 @@ fn decode_texture(
         None => (((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7), (w3 >> 29) & 0x7),
     };
 
-    let bpp = base_format_bpp(base_format)?;
-    // LINEAR textures require the row width padded to a multiple of 8 texels; that
-    // padded width times the texel size is the stride we read row by row.
-    let stride = align_up(width, 8) * bpp;
-    let pixels = ctx.read_bytes(data_addr, (stride * height) as usize);
+    // Block geometry: uncompressed formats are 1x1 texel "blocks"; BC/DXT are 4x4.
+    let (block_w, block_h, block_bytes) = crate::render::block_layout(base_format)?;
+    let blocks_x = width.div_ceil(block_w);
+    let blocks_y = height.div_ceil(block_h);
+    // `stride` is the bytes per block-row we snapshot, and `total` the bytes to read.
+    // A SWIZZLED (Morton) texture is stored over a power-of-two-padded block grid; a
+    // LINEAR one is row-major, with uncompressed rows padded to a multiple of 8
+    // texels (the GXM linear alignment) and compressed rows block-packed.
+    let (stride, total) = if crate::render::swizzled_type(tex_type) {
+        let padded_x = blocks_x.next_power_of_two();
+        let padded_y = blocks_y.next_power_of_two();
+        (padded_x * block_bytes, padded_x * padded_y * block_bytes)
+    } else {
+        let row_blocks = if block_w == 1 { align_up(width, 8) } else { blocks_x };
+        (row_blocks * block_bytes, row_blocks * block_bytes * blocks_y)
+    };
+    let pixels = ctx.read_bytes(data_addr, total as usize);
     if pixels.is_empty() {
         return None;
     }
@@ -1545,6 +1650,11 @@ pub trait ImportDispatch {
     /// Advance the virtual clock to `to_us`, waking any timed waits that expire; the
     /// woken thread ids then surface through [`take_wakes`](Self::take_wakes).
     fn advance_time_to(&mut self, _to_us: u64) {}
+
+    /// A display frame just flipped (`frame` flips so far). Lets a frame-keyed input
+    /// source - a scripted TAS recipe - advance in lockstep with the render loop.
+    /// The default ignores it.
+    fn on_frame_boundary(&mut self, _frame: u64) {}
 }
 
 impl ImportDispatch for VitaEnv {
@@ -1598,6 +1708,27 @@ impl ImportDispatch for VitaEnv {
 
     fn advance_time_to(&mut self, to_us: u64) {
         self.state.advance_time_to(to_us);
+    }
+
+    fn on_frame_boundary(&mut self, frame: u64) {
+        self.state.world.set_frame(frame);
+        // Advance the virtual clock by one full 60 Hz frame per display flip: a
+        // rendered frame represents ~16.6 ms of wall time passing, so the game's
+        // animation and dialog timers progress at the right rate. `advance_time_to`
+        // wakes every timed wait (cond timeout, sleep, audio grain park) whose
+        // deadline falls within the frame, so those still fire - just at frame
+        // granularity. This advance is essential: while a title renders continuously
+        // its main thread never blocks, so the scheduler's "nothing runnable -> jump
+        // the clock" idle path never runs and only this drives wall time.
+        //
+        // It must NOT be clamped down to the earliest pending deadline: a thread that
+        // perpetually re-waits with a near-zero timeout (a 1 us cond poll) would then
+        // pin the per-frame advance to ~1 us and freeze the game clock, so every
+        // time-based state (a dialog's fade-in / input-enable timer) would never
+        // elapse and the title would sit frozen and input-inert.
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let target = self.state.now_us() + FRAME_US;
+        self.state.advance_time_to(target);
     }
 }
 
@@ -1882,7 +2013,7 @@ mod preemptive_tests {
     #[test]
     fn join_parks_until_the_target_thread_exits() {
         let mut st = state();
-        let worker = st.create_thread(0x2000, 0x1000);
+        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY);
         // Main (thread 0) joins the not-yet-finished worker and parks, passing a
         // `stat` out-parameter at guest address 0x5000.
         st.set_current(0);
@@ -1904,7 +2035,7 @@ mod preemptive_tests {
     #[test]
     fn start_thread_queues_a_spawn_not_a_synchronous_reentry() {
         let mut st = state();
-        let worker = st.create_thread(0x2000, 0x1000);
+        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY);
         st.start_thread(worker, 4, 0x1234);
         assert!(st.take_reentry().is_none(), "preemptive start does not re-enter synchronously");
         let spawns = st.take_spawns();
@@ -1992,5 +2123,37 @@ mod filesystem_tests {
         assert_eq!(st.io_write(FD_STDERR, b"err"), Some(3));
         assert_eq!(st.capture.stdout, b"out");
         assert_eq!(st.capture.stderr, b"err");
+    }
+
+    #[test]
+    fn pread_is_positioned_and_leaves_the_cursor_put() {
+        // sceIoPread reads at an absolute offset without disturbing the descriptor
+        // cursor - the AT9 music streamer relies on this to pull the header and then
+        // interleave chunk reads on one shared fd.
+        let mut st = state();
+        st.add_file("app0:/song.at9", b"RIFF....fmt ....data".to_vec());
+        let fd = st.io_open("app0:/song.at9", SCE_O_RDONLY);
+        // A normal read advances the cursor to 4.
+        assert_eq!(st.io_read(fd, 4).as_deref(), Some(&b"RIFF"[..]));
+        // pread at offset 8 does not move the cursor...
+        assert_eq!(st.io_pread(fd, 8, 4).as_deref(), Some(&b"fmt "[..]));
+        // ...so the next sequential read continues from 4.
+        assert_eq!(st.io_read(fd, 4).as_deref(), Some(&b"...."[..]));
+        // Reading past the end clamps to the available bytes.
+        assert_eq!(st.io_pread(fd, 16, 100).as_deref(), Some(&b"data"[..]));
+        // A bad fd yields None (mapped to EBADF by the handler).
+        assert!(st.io_pread(999, 0, 4).is_none());
+    }
+
+    #[test]
+    fn pwrite_is_positioned_and_extends_with_zeros() {
+        let mut st = state();
+        st.add_file("ux0:/save.bin", vec![0u8; 4]);
+        let fd = st.io_open("ux0:/save.bin", SCE_O_RDWR);
+        // Positioned write past the current end zero-fills the gap.
+        assert_eq!(st.io_pwrite(fd, 6, b"AB"), Some(2));
+        assert_eq!(st.file_bytes("ux0:/save.bin"), Some(&[0, 0, 0, 0, 0, 0, b'A', b'B'][..]));
+        // The cursor is untouched, so a sequential read still starts at 0.
+        assert_eq!(st.io_read(fd, 2).as_deref(), Some(&[0, 0][..]));
     }
 }

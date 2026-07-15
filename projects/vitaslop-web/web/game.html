@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop - retail boot in the browser</title>
+    <style>
+      body { margin: 0; background: #101018; color: #d8d8e0; font: 14px/1.5 ui-monospace, monospace; padding: 24px; }
+      canvas { width: 960px; max-width: 100%; aspect-ratio: 960/544; border: 1px solid #2a2a3a; image-rendering: pixelated; display: block; }
+      #fps { font-weight: 600; color: #8fe0a0; }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" width="960" height="544"></canvas>
+    <div id="fps">fps: --</div>
+    <div id="perf">perf: --</div>
+    <pre id="status">loading wasm...</pre>
+    <script type="module">
+      import init, { run_game } from "./pkg/vitaslop_web.js";
+      const status = document.getElementById("status");
+      const canvas = document.getElementById("screen");
+
+      // Driven by the Playwright harness (game-boot.mjs): fetch the container files
+      // this page's own origin serves, then boot the retail title LIVE through the JSPI
+      // scheduler with the general GXM->WebGPU renderer. `recipe` is an optional
+      // scripted-input string that drives the touch front-end (e.g. to the tutorial).
+      // run_game returns after setup and spawns the live loop, which then updates
+      // #status ("frame N ...") and #fps as it runs. Exposed on window so the harness
+      // can await setup and watch the live frame count.
+      window.__boot = async (recipe, maxFrames, maxRounds) => {
+        await init();
+        status.textContent = "fetching manifest...";
+        const manifest = await (await fetch("/game-manifest.json")).json();
+        const files = {};
+        let bytes = 0;
+        for (let i = 0; i < manifest.length; i++) {
+          const buf = await (await fetch("/game/" + manifest[i])).arrayBuffer();
+          files[manifest[i]] = new Uint8Array(buf);
+          bytes += buf.byteLength;
+          if (i % 40 === 0) status.textContent = `fetched ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
+        }
+        status.textContent = `fetched ${manifest.length} files (${(bytes/1e6)|0} MB); booting...`;
+        const msg = await run_game(canvas, files, recipe || "", maxFrames, maxRounds);
+        return msg;
+      };
+    </script>
+  </body>
+</html>

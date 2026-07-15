@@ -2,38 +2,12 @@
 //! user-facing create/start/wait wrappers live in `libkernel`; what remains here
 //! are the direct primitives a program can also call.
 
-use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::nid::threadmgr as nid;
-use crate::SvcOutcome;
-
-pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Option<SvcOutcome> {
-    match func_nid {
-        nid::DELAY_THREAD => {
-            delay_thread(ctx, st);
-            Some(SvcOutcome::Continue)
-        }
-        // A thread ending itself. Under the preemptive scheduler this ends just
-        // this thread ([`SvcOutcome::ThreadExit`]); in the single-thread-of-control
-        // bring-up the only thread that reaches here is main's (workers return
-        // normally instead), so it is a clean whole-run stop.
-        nid::EXIT_THREAD | nid::EXIT_DELETE_THREAD => Some(if st.is_preemptive() {
-            SvcOutcome::ThreadExit
-        } else {
-            SvcOutcome::Halt
-        }),
-        nid::GET_PROCESS_ID => {
-            get_process_id(ctx, st);
-            Some(SvcOutcome::Continue)
-        }
-        _ => None,
-    }
-}
 
 /// SceUID sceKernelGetProcessId(void)
 /// A single process, so a fixed nonzero id is faithful and stable.
 #[hostcall]
-fn get_process_id(_st: &mut VitaState) -> i32 {
+pub(super) fn get_process_id(_st: &mut VitaState) -> i32 {
     0x1000
 }
 
@@ -42,6 +16,6 @@ fn get_process_id(_st: &mut VitaState) -> i32 {
 /// succeeds. (The monotonic clock advances at the host's chosen cadence, not from
 /// guest sleeps, which keeps runs deterministic.)
 #[hostcall]
-fn delay_thread(_st: &mut VitaState, _delay_us: u32) -> i32 {
+pub(super) fn delay_thread(_st: &mut VitaState, _delay_us: u32) -> i32 {
     0
 }

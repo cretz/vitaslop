@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop - play</title>
+    <style>
+      body { margin: 0; background: #0d0d14; color: #d8d8e0; font: 14px/1.5 ui-monospace, monospace; padding: 20px; }
+      h1 { font-size: 16px; font-weight: 600; margin: 0 0 12px; color: #8fe0a0; }
+      canvas { width: 960px; max-width: 100%; aspect-ratio: 960/544; border: 1px solid #2a2a3a; image-rendering: pixelated; display: block; touch-action: none; }
+      .meters { display: flex; gap: 20px; margin: 8px 0; }
+      #fps { font-weight: 600; color: #8fe0a0; }
+      #perf { color: #a0c0e0; }
+      #status { color: #808090; margin: 4px 0; white-space: pre-wrap; }
+      .controls { margin-top: 12px; color: #b0b0c0; }
+      .controls b { color: #d8d8e0; }
+      kbd { background: #22222e; border: 1px solid #3a3a4a; border-radius: 3px; padding: 0 5px; color: #e0e0e8; }
+    </style>
+  </head>
+  <body>
+    <h1>vitaslop</h1>
+    <canvas id="screen" width="960" height="544"></canvas>
+    <div class="meters"><div id="fps">fps: --</div><div id="perf">perf: --</div></div>
+    <div id="status">loading...</div>
+    <div class="controls">
+      <b>Menus:</b> click/tap on the screen (the front-end is touch driven).
+      <b>Play:</b> <kbd>&larr;&uarr;&darr;&rarr;</kbd> d-pad,
+      <kbd>Z</kbd> cross, <kbd>X</kbd> circle, <kbd>I</kbd> square, <kbd>L</kbd> triangle,
+      <kbd>Q</kbd>/<kbd>E</kbd> L/R, <kbd>Enter</kbd> start.
+    </div>
+    <script type="module">
+      import { forwardInput } from "./worker-input.js";
+      const canvas = document.getElementById("screen");
+      const status = document.getElementById("status");
+
+      // Auto-boot: fetch the container this origin serves, then run the whole emulator
+      // in a Web Worker (the flag-free production path) rendering to this canvas. No
+      // scripted recipe - it is fully interactive (click menus, keyboard to play). The
+      // run is effectively unbounded (u32::MAX frames) so it plays until the tab closes.
+      const MAX_FRAMES = 0xffffffff;
+      (async () => {
+        try {
+          status.textContent = "fetching game files...";
+          const manifest = await (await fetch("/game-manifest.json")).json();
+          const files = {};
+          let bytes = 0;
+          for (let i = 0; i < manifest.length; i++) {
+            const buf = await (await fetch("/game/" + manifest[i])).arrayBuffer();
+            files[manifest[i]] = new Uint8Array(buf);
+            bytes += buf.byteLength;
+            if (i % 40 === 0) status.textContent = `fetching ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
+          }
+          status.textContent = `loaded ${manifest.length} files (${(bytes/1e6)|0} MB); starting (one-time decrypt + transpile takes a few seconds)...`;
+
+          const worker = new Worker("./worker.js", { type: "module" });
+          worker.onmessage = (e) => {
+            const d = e.data;
+            if (d.type === "report") {
+              const el = document.getElementById(d.id);
+              if (el) el.textContent = d.text;
+            } else if (d.type === "error") {
+              status.textContent = "error: " + d.message;
+              console.error("[worker]", d.message);
+            }
+          };
+          forwardInput(worker, canvas);
+          const offscreen = canvas.transferControlToOffscreen();
+          const transfer = [offscreen, ...Object.values(files).map((u) => u.buffer)];
+          worker.postMessage({ offscreen, files, recipe: "", maxFrames: MAX_FRAMES }, transfer);
+        } catch (err) {
+          status.textContent = "failed to start: " + (err && err.message || err);
+          console.error(err);
+        }
+      })();
+    </script>
+  </body>
+</html>

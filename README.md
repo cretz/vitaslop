@@ -17,6 +17,8 @@ MIT (see [LICENSE](LICENSE)). The project is developed clean-room: no copyleft
   SELF/ELF and VELF executable-format tools.
 - [dynarmic](https://github.com/yuzu-mirror/dynarmic) (0BSD) - a permissive
   ARMv7 + Thumb-2 + NEON + VFP recompiler, used as decode and semantics reference.
+- [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) (MIT) - an ATRAC9
+  (the Vita's standard audio codec) decoder, referenced for the audio path.
 - [psdevwiki](https://www.psdevwiki.com/vita/) and
   [henkaku wiki](https://wiki.henkaku.xyz/) - hardware and reverse-engineering
   documentation.

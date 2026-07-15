@@ -209,6 +209,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             &imports,
             program.noreturn_svc,
             program.discover_code_pointers,
+            false,
         ) {
             Ok(found) => found,
             // A tentative code pointer that does not decode was not a function;
@@ -298,6 +299,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
             &imports,
             program.noreturn_svc,
             program.discover_code_pointers,
+            true,
         ) {
             // A tentative guess that decoded into a malformed function (a branch to
             // a non-block) was never real; drop it before it can be emitted.
@@ -340,6 +342,75 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact { artifact: Artifact { wasm, funcs, mem_pages }, stubbed, stub_wasm_indices }
+}
+
+/// Diagnostic: discover the single function at `addr` and return its lowered IR
+/// (blocks, statements, terminators) as a human-readable string, or `None` if it
+/// does not decode. This is the authoritative decode/lowering the emitter uses, so
+/// a trap's `guest_block` (from `VITASLOP_TRACK_PC`) can be read against the exact
+/// statements - unlike a naive linear disassembly, which misaligns after any op the
+/// decoder skips. `addr`'s Thumb bit is ignored; ARM mode is used when the address
+/// is one of the program's [`arm_entries`](Program::arm_entries).
+pub fn dump_func(program: &Program, addr: u32) -> Option<String> {
+    use std::fmt::Write;
+    let addr = addr & !1;
+    let mut import_map: BTreeMap<u32, u32> =
+        program.externs.iter().map(|e| (e.addr, e.import)).collect();
+    for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
+        import_map.insert(veneer, idx);
+    }
+    let redirect_map: BTreeMap<u32, u32> =
+        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let imports = Imports::new(&import_map, &redirect_map);
+    let seeded_thumb = !program.arm_entries.contains(&addr);
+    let disc = |thumb: bool| {
+        lower::discover(
+            program.code,
+            program.base,
+            addr,
+            thumb,
+            &imports,
+            program.noreturn_svc,
+            program.discover_code_pointers,
+            true,
+        )
+    };
+    // Try the mode the program seeded this address in first, then the other mode, so
+    // an ARM/Thumb misclassification is visible (a function stubbed only because it
+    // was decoded in the wrong mode still dumps cleanly in the right one).
+    let (thumb, found) = match disc(seeded_thumb) {
+        Ok(f) => (seeded_thumb, f),
+        Err(e_seeded) => {
+            // The seeded mode is the one the program actually uses; surface its error
+            // even if the other mode happens to decode into a garbage function.
+            let other = disc(!seeded_thumb);
+            return Some(format!(
+                "== g_{addr:08x}: seeded thumb={seeded_thumb} FAILED: {e_seeded:?}; \
+                 other mode: {} ==\n",
+                match other {
+                    Ok(f) => format!("decoded {} blocks", f.func.blocks.len()),
+                    Err(e) => format!("also failed: {e:?}"),
+                }
+            ));
+        }
+    };
+    let f = found.func;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "== function g_{:08x} (seeded_thumb={seeded_thumb}, decoded thumb={thumb}, {} blocks, stub={}) ==",
+        f.addr,
+        f.blocks.len(),
+        f.stub
+    );
+    for b in &f.blocks {
+        let _ = writeln!(s, "  block {:#010x}:", b.addr);
+        for st in &b.stmts {
+            let _ = writeln!(s, "    {st:?}");
+        }
+        let _ = writeln!(s, "    term: {:?}", b.term);
+    }
+    Some(s)
 }
 
 /// A single function the report could not translate: the discovery root it was
@@ -386,6 +457,7 @@ pub fn transpile_report(program: &Program) -> Report {
             &imports,
             program.noreturn_svc,
             program.discover_code_pointers,
+            false,
         ) {
             Ok(found) if tentative && !found.func.well_formed() => {}
             Ok(found) => {

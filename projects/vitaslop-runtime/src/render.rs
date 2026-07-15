@@ -269,15 +269,140 @@ fn index_at(d: &Draw, i: usize) -> usize {
     0
 }
 
-/// Bytes per texel for a `SceGxmTextureBaseFormat` high byte. Mirrors the
-/// host-side `base_format_bpp`; the two must agree on stride.
-fn texel_bytes(base_format: u32) -> u32 {
-    match base_format {
-        0x00 | 0x01 | 0x95 => 1,
-        0x02..=0x0b => 2,
-        0x98 | 0x99 => 3,
-        0x0c..=0x1a => 4,
-        _ => 4,
+/// Texel block geometry for a `SceGxmTextureBaseFormat` high byte:
+/// `(block_width, block_height, bytes_per_block)`. Uncompressed formats are 1x1
+/// texel blocks; the BC/DXT family is 4x4 blocks of 8 bytes (BC1/BC4) or 16 bytes
+/// (BC2/BC3/BC5). Shared with the host-side snapshot so both agree on the byte
+/// layout; `None` for a format whose size we do not know.
+pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
+    Some(match base_format {
+        // 8-bit single channel (U8/S8) and 8-bit paletted (P8).
+        0x00 | 0x01 | 0x95 => (1, 1, 1),
+        // 16-bit packed (U4U4U4U4, U1U5U5U5, U5U6U5, ...).
+        0x02..=0x0b => (1, 1, 2),
+        // 24-bit three-channel (U8U8U8, S8S8S8).
+        0x98 | 0x99 => (1, 1, 3),
+        // 32-bit (U8U8U8U8, ..., F32) and 32-bit single (U32/S32).
+        0x0c..=0x1a => (1, 1, 4),
+        // BC1 (DXT1) and BC4: 8-byte 4x4 blocks.
+        0x85 | 0x88 => (4, 4, 8),
+        // BC2 (DXT3), BC3 (DXT5), BC5: 16-byte 4x4 blocks.
+        0x86 | 0x87 | 0x8a => (4, 4, 16),
+        _ => return None,
+    })
+}
+
+/// Whether a `SceGxmTextureType` selector uses the GPU's Morton (Z-order) swizzled
+/// memory layout: `SCE_GXM_TEXTURE_SWIZZLED` (0) and `SWIZZLED_ARBITRARY` (5).
+pub fn swizzled_type(tex_type: u32) -> bool {
+    matches!(tex_type, 0 | 5)
+}
+
+/// Interleave the low bits of `x` and `y` (Morton / Z-order) up to the square
+/// formed by the smaller dimension, then append the remaining high bits of the
+/// larger dimension linearly. This is the GXM swizzle for a power-of-two-padded
+/// block grid `pw x ph`, matching how the GPU addresses a SWIZZLED texture.
+fn morton_index(mut x: u32, mut y: u32, pw: u32, ph: u32) -> u32 {
+    let min_log = pw.min(ph).trailing_zeros();
+    let mut index = 0u32;
+    for i in 0..min_log {
+        index |= ((x >> i) & 1) << (2 * i + 1);
+        index |= ((y >> i) & 1) << (2 * i);
+    }
+    // Strip the interleaved low bits; the remaining bits of the longer axis follow
+    // the square in row/column-major order.
+    x >>= min_log;
+    y >>= min_log;
+    let interleaved_bits = 2 * min_log;
+    if pw >= ph {
+        // Wider than tall: leftover columns tile to the right of the square.
+        index | (((y * (pw >> min_log)) + x) << interleaved_bits)
+    } else {
+        // Taller than wide: leftover rows tile below the square.
+        index | (((x * (ph >> min_log)) + y) << interleaved_bits)
+    }
+}
+
+/// Expand a 16-bit 5:6:5 color to RGB8.
+fn rgb565(c: u16) -> [u8; 3] {
+    let r = ((c >> 11) & 0x1f) as u32;
+    let g = ((c >> 5) & 0x3f) as u32;
+    let b = (c & 0x1f) as u32;
+    [(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8]
+}
+
+/// Decode one texel `(px, py)` in `[0,4)` from a 4x4 BC/DXT block. Handles BC1
+/// (`0x85`, 8-byte block, optional 1-bit alpha), BC2 (`0x86`, explicit 4-bit
+/// alpha) and BC3 (`0x87`, interpolated alpha). Returns straight RGBA8.
+fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) -> [u8; 4] {
+    let t = (py * 4 + px) as usize;
+    // The BC1 color sub-block sits after the 8-byte alpha block for BC2/BC3.
+    let color_off = if base_format == 0x85 { 0 } else { 8 };
+    let g = |i: usize| -> u8 { *block.get(i).unwrap_or(&0) };
+    let c0 = u16::from_le_bytes([g(color_off), g(color_off + 1)]);
+    let c1 = u16::from_le_bytes([g(color_off + 2), g(color_off + 3)]);
+    let e0 = rgb565(c0);
+    let e1 = rgb565(c1);
+    let idx = (g(color_off + 4 + t / 4) >> ((t % 4) * 2)) & 0x3;
+    // BC1 with c0 <= c1 selects the 3-color + punch-through-alpha mode; BC2/BC3
+    // colors always use the 4-color interpolation.
+    let punchthrough = base_format == 0x85 && c0 <= c1;
+    let mix = |a: [u8; 3], b: [u8; 3], na: u32, nb: u32, d: u32| -> [u8; 3] {
+        [
+            ((a[0] as u32 * na + b[0] as u32 * nb) / d) as u8,
+            ((a[1] as u32 * na + b[1] as u32 * nb) / d) as u8,
+            ((a[2] as u32 * na + b[2] as u32 * nb) / d) as u8,
+        ]
+    };
+    let rgb = match idx {
+        0 => e0,
+        1 => e1,
+        2 if punchthrough => mix(e0, e1, 1, 1, 2),
+        2 => mix(e0, e1, 2, 1, 3),
+        _ if punchthrough => [0, 0, 0],
+        _ => mix(e0, e1, 1, 2, 3),
+    };
+    let a = match base_format {
+        // BC1: opaque, except the punch-through index in 3-color mode.
+        0x85 => {
+            if punchthrough && idx == 3 {
+                0
+            } else {
+                255
+            }
+        }
+        // BC2: 4-bit alpha per texel, two texels per byte, low nibble first.
+        0x86 => {
+            let byte = g(t / 2);
+            let a4 = if t % 2 == 0 { byte & 0xf } else { byte >> 4 };
+            (a4 as u32 * 255 / 15) as u8
+        }
+        // BC3: two 8-bit endpoints + 3-bit interpolation indices.
+        0x87 => bc3_alpha(block, t),
+        _ => 255,
+    };
+    [rgb[0], rgb[1], rgb[2], a]
+}
+
+/// Decode the interpolated alpha of texel `t` from a BC3 (DXT5) 16-byte block.
+fn bc3_alpha(block: &[u8], t: usize) -> u8 {
+    let a0 = *block.first().unwrap_or(&0);
+    let a1 = *block.get(1).unwrap_or(&0);
+    // 16 texels x 3-bit indices packed little-endian across bytes 2..8.
+    let bit = t * 3;
+    let byte = 2 + bit / 8;
+    let shift = bit % 8;
+    let raw = (*block.get(byte).unwrap_or(&0) as u32)
+        | ((*block.get(byte + 1).unwrap_or(&0) as u32) << 8);
+    let code = ((raw >> shift) & 0x7) as u8;
+    let (a0i, a1i) = (a0 as u32, a1 as u32);
+    match code {
+        0 => a0,
+        1 => a1,
+        c if a0 > a1 => (((8 - c as u32) * a0i + (c as u32 - 1) * a1i) / 7) as u8,
+        6 => 0,
+        7 => 255,
+        c => (((6 - c as u32) * a0i + (c as u32 - 1) * a1i) / 5) as u8,
     }
 }
 
@@ -293,8 +418,56 @@ fn sample_texture(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
     let vv = v - v.floor();
     let x = ((uu * t.width as f32) as i64).clamp(0, t.width as i64 - 1) as u32;
     let y = ((vv * t.height as f32) as i64).clamp(0, t.height as i64 - 1) as u32;
-    let bpp = texel_bytes(t.base_format);
-    let off = (y * t.stride + x * bpp) as usize;
+    texel_rgba(t, x, y)
+}
+
+/// Decode a whole captured texture to a tightly-packed linear RGBA8 image at its
+/// native `width x height`, using the exact per-texel decode the software sampler
+/// uses. This is the seam the wgpu backend samples through: the format/swizzle/BC/
+/// Morton complexity stays here (one tested place), and the GPU sees a plain
+/// `Rgba8Unorm` image it can point-sample with a REPEAT sampler for the identical
+/// result. Returns `(width, height, rgba)`; a zero-sized texture yields a 1x1 opaque
+/// magenta so an unexpected empty binding is visible rather than a GPU error.
+pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
+    if t.width == 0 || t.height == 0 {
+        return (1, 1, vec![255, 0, 255, 255]);
+    }
+    let mut rgba = Vec::with_capacity((t.width * t.height * 4) as usize);
+    for y in 0..t.height {
+        for x in 0..t.width {
+            rgba.extend_from_slice(&texel_rgba(t, x, y));
+        }
+    }
+    (t.width, t.height, rgba)
+}
+
+/// Decode the single texel at integer coordinates `(x, y)` (already wrapped/clamped
+/// into `[0, width) x [0, height)`) to straight RGBA8. Handles the block-compressed
+/// (BC/DXT, optionally Morton-swizzled) and the uncompressed format families; an
+/// unknown format returns opaque magenta so it is visible, not silent.
+fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
+    let Some((block_w, block_h, block_bytes)) = block_layout(t.base_format) else {
+        return [255, 0, 255, 255];
+    };
+    // Block-compressed (BC/DXT): locate the 4x4 block (Morton-addressed when the
+    // texture is swizzled, else row-major), decode it, and apply the channel
+    // swizzle to the decoded RGBA (ABGR/field 0 is the identity).
+    if block_w > 1 {
+        let (bx, by) = (x / block_w, y / block_h);
+        let block_index = if swizzled_type(t.tex_type) {
+            let pw = t.width.div_ceil(block_w).next_power_of_two();
+            let ph = t.height.div_ceil(block_h).next_power_of_two();
+            morton_index(bx, by, pw, ph)
+        } else {
+            by * (t.stride / block_bytes) + bx
+        };
+        let off = (block_index * block_bytes) as usize;
+        let block = t.pixels.get(off..off + block_bytes as usize).unwrap_or(&[]);
+        let rgba = decode_bc_texel(block, t.base_format, x % block_w, y % block_h);
+        let swizzle = (t.swizzle >> 12) & 0x7;
+        return swizzle4(rgba[0], rgba[1], rgba[2], rgba[3], swizzle);
+    }
+    let off = (y * t.stride + x * block_bytes) as usize;
     let px = &t.pixels;
     let byte = |i: usize| -> u8 { *px.get(off + i).unwrap_or(&0) };
     // Channel swizzle field (bits 12..14 of the full SceGxmTextureFormat).
@@ -366,6 +539,66 @@ fn swizzle4(b0: u8, b1: u8, b2: u8, b3: u8, swizzle: u32) -> [u8; 4] {
     }
 }
 
+/// The recovered rendering intent of one draw: how its interleaved vertex maps to
+/// position/texcoord/color, what coordinate space its positions live in, whether it
+/// samples a texture, and the texcoord divisor. Shared by the software rasterizer and
+/// the [`RenderScene`](vitaslop_platform::gpu::RenderScene) builder so the two paths
+/// make identical per-draw decisions - the GPU renderer stays the faithful twin of
+/// the CPU oracle.
+struct DrawInterp {
+    layout: Layout,
+    space: Space,
+    /// The texture the draw samples (its first bound texture), or `None` if it reads
+    /// no texcoord.
+    textured: bool,
+    /// Divisor applied to texcoords to normalize atlas-in-pixels coords to [0,1].
+    uv_div: [f32; 2],
+}
+
+/// Recover a draw's [`DrawInterp`] the same way for both render paths.
+fn interpret_draw(d: &Draw) -> DrawInterp {
+    let layout = layout_of(d);
+    // Recover the draw's coordinate space (see `Space`). A 4x4 MVP uniform is the 3D
+    // cube path (depth-tested, opaque). Otherwise a 2D draw: a texcoord marks a
+    // pixel-space sprite, a bare position is an NDC fullscreen pass.
+    let space = if d.uniforms.len() >= 16 {
+        let mut m = [0f32; 16];
+        m.copy_from_slice(&d.uniforms[..16]);
+        Space::Mvp(m)
+    } else if layout.uv_off.is_some() {
+        Space::Pixel
+    } else {
+        Space::Ndc
+    };
+    // Texture the draw only if it actually reads a texcoord; a sticky texture binding
+    // left over from a previous draw must not tint an untextured fill.
+    let textured = layout.uv_off.is_some() && !d.textures.is_empty();
+
+    // GXM texcoords are either normalized [0,1] or in texel units, chosen by the
+    // (unavailable) fragment program's sampler. Infer from magnitude: a coord well
+    // past 1 is a texel index into an atlas (OlliOlli's text quads index a font atlas
+    // in pixels), which we normalize by the texture size. Normalized sprite UVs
+    // (<= ~1) pass through unchanged.
+    let uv_div = match (textured, d.textures.first()) {
+        (true, Some(tex)) => {
+            let stride = d.vertex_stride.max(1) as usize;
+            let nverts = d.vertices.len() / stride;
+            let mut max_uv = 0f32;
+            for i in 0..nverts {
+                let vv = decode_vertex(d, &layout, i);
+                max_uv = max_uv.max(vv.uv[0].abs()).max(vv.uv[1].abs());
+            }
+            if max_uv > 1.5 {
+                [tex.width.max(1) as f32, tex.height.max(1) as f32]
+            } else {
+                [1.0, 1.0]
+            }
+        }
+        _ => [1.0, 1.0],
+    };
+    DrawInterp { layout, space, textured, uv_div }
+}
+
 /// Rasterize one scene into a fresh framebuffer. `clear` is the background color.
 pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> Framebuffer {
     let mut fb = Framebuffer::new(width, height, clear);
@@ -376,25 +609,11 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
         if d.primitive != 0 {
             continue;
         }
-        let layout = layout_of(d);
-        // Recover the draw's coordinate space (see `Space`). A 4x4 MVP uniform is
-        // the 3D cube path (depth-tested, opaque). Otherwise a 2D draw: a texcoord
-        // marks a pixel-space sprite, a bare position is an NDC fullscreen pass.
-        let space = if d.uniforms.len() >= 16 {
-            let mut m = [0f32; 16];
-            m.copy_from_slice(&d.uniforms[..16]);
-            Space::Mvp(m)
-        } else if layout.uv_off.is_some() {
-            Space::Pixel
-        } else {
-            Space::Ndc
-        };
+        let DrawInterp { layout, space, textured, uv_div } = interpret_draw(d);
         // Depth-test and replace only in the 3D path; 2D draws paint in submission
         // order with alpha blending.
         let depth_test = matches!(space, Space::Mvp(_));
-        // Texture the draw only if it actually reads a texcoord; a sticky texture
-        // binding left over from a previous draw must not tint an untextured fill.
-        let texture = if layout.uv_off.is_some() { d.textures.first() } else { None };
+        let texture = if textured { d.textures.first() } else { None };
 
         let tri_count = d.index_count as usize / 3;
         for t in 0..tri_count {
@@ -416,7 +635,7 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
             if behind {
                 continue;
             }
-            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, depth_test);
+            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test);
         }
     }
     fb
@@ -431,6 +650,7 @@ fn raster_triangle(
     s: &[[f32; 4]; 3],
     verts: &[Vertex],
     texture: Option<&BoundTexture>,
+    uv_div: [f32; 2],
     depth_test: bool,
 ) {
     let (w, h) = (fb.width as i32, fb.height as i32);
@@ -487,8 +707,8 @@ fn raster_triangle(
             // Modulate by the sampled texel (texture * vertex color, the standard
             // 2D sprite fragment program).
             if let Some(tex) = texture {
-                let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]);
-                let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]);
+                let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
+                let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
                 let texel = sample_texture(tex, u, v);
                 for ch in 0..4 {
                     src[ch] = src[ch] * texel[ch] as f32 / 255.0;
@@ -519,6 +739,156 @@ fn raster_triangle(
 /// Twice the signed area of triangle (a, b, c) in screen space (only x,y used).
 fn edge(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4]) -> f32 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use vitaslop_platform::gpu::{DrawSpace, GxmDraw, GxmTexture, RenderScene, GXM_VERTEX_STRIDE};
+
+/// Map the software rasterizer's internal [`Space`] to the neutral GPU
+/// [`DrawSpace`] the renderer consumes. One-to-one; kept as a small function so the
+/// two enums can not drift silently.
+fn to_draw_space(space: &Space) -> DrawSpace {
+    match space {
+        Space::Mvp(m) => DrawSpace::Mvp(*m),
+        Space::Ndc => DrawSpace::Ndc,
+        Space::Pixel => DrawSpace::Pixel,
+    }
+}
+
+/// A cheap content/identity fingerprint of a captured texture, used to cache its
+/// decode (here) and its GPU upload (in the renderer). It folds the control words
+/// (address, format, swizzle, type, geometry) and a strided sample of the pixel
+/// bytes - enough to notice a same-address atlas whose contents changed without
+/// hashing every byte every frame. FNV-1a/64.
+fn tex_key(t: &BoundTexture) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    };
+    mix(t.data_addr as u64);
+    mix(t.base_format as u64);
+    mix(t.swizzle as u64);
+    mix(t.tex_type as u64);
+    mix(((t.width as u64) << 32) | t.height as u64);
+    mix(((t.stride as u64) << 32) | t.pixels.len() as u64);
+    // Sample at most ~256 bytes spread across the buffer so a content change is seen
+    // cheaply regardless of texture size.
+    let n = t.pixels.len();
+    if n > 0 {
+        let step = (n / 256).max(1);
+        let mut i = 0;
+        while i < n {
+            mix(t.pixels[i] as u64);
+            i += step;
+        }
+    }
+    h
+}
+
+/// Builds a neutral [`RenderScene`] from a captured GXM [`Scene`] for the GPU
+/// renderer, reusing the exact per-draw interpretation ([`interpret_draw`]) and
+/// texture decode ([`decode_texture_rgba8`]) the software rasterizer uses, so the
+/// GPU output matches the CPU oracle. Holds a cross-frame texture-decode cache keyed
+/// by [`tex_key`] so an unchanged atlas is decoded once and thereafter only its
+/// shared `Arc` is handed back; persist one builder across a run's frames to keep the
+/// cache warm.
+pub struct RenderSceneBuilder {
+    decode_cache: HashMap<u64, GxmTexture>,
+}
+
+/// Cap on the decode cache; cleared wholesale if exceeded (a title's working texture
+/// set is far smaller, so this only fires on a pathological churn and just forces a
+/// re-decode, never incorrectness).
+const DECODE_CACHE_CAP: usize = 512;
+
+impl Default for RenderSceneBuilder {
+    fn default() -> Self {
+        RenderSceneBuilder::new()
+    }
+}
+
+impl RenderSceneBuilder {
+    pub fn new() -> Self {
+        RenderSceneBuilder { decode_cache: HashMap::new() }
+    }
+
+    /// Decode (or reuse a cached) GPU-ready texture for `t`.
+    fn texture(&mut self, t: &BoundTexture) -> GxmTexture {
+        let key = tex_key(t);
+        if let Some(g) = self.decode_cache.get(&key) {
+            return g.clone();
+        }
+        if self.decode_cache.len() >= DECODE_CACHE_CAP {
+            self.decode_cache.clear();
+        }
+        let (width, height, rgba) = decode_texture_rgba8(t);
+        let g = GxmTexture { key, width, height, rgba: Arc::new(rgba) };
+        self.decode_cache.insert(key, g.clone());
+        g
+    }
+
+    /// Reduce a captured scene to general draws. Each triangle-list draw is decoded
+    /// into the canonical vertex layout (position, uv already divided by the draw's uv
+    /// scale, color) with a 32-bit index buffer, and its texture (if it samples one)
+    /// decoded to linear RGBA8. Non-triangle-list draws are skipped, matching the
+    /// software rasterizer.
+    pub fn build(&mut self, scene: &Scene) -> RenderScene {
+        let mut draws = Vec::with_capacity(scene.draws.len());
+        for d in &scene.draws {
+            if d.primitive != 0 || d.index_count == 0 {
+                continue;
+            }
+            let interp = interpret_draw(d);
+            let layout = &interp.layout;
+
+            // The largest index referenced, so the vertex buffer covers every index
+            // (an out-of-range index decodes to a zero vertex, matching the software
+            // path's clamped reads, rather than a GPU out-of-bounds fetch).
+            let mut max_idx = 0usize;
+            for i in 0..d.index_count as usize {
+                max_idx = max_idx.max(index_at(d, i));
+            }
+            let stride = d.vertex_stride.max(1) as usize;
+            let nverts = (d.vertices.len() / stride).max(max_idx + 1);
+
+            let mut vertices = Vec::with_capacity(nverts * GXM_VERTEX_STRIDE as usize);
+            for i in 0..nverts {
+                let v = decode_vertex(d, layout, i);
+                vertices.extend_from_slice(&v.pos[0].to_le_bytes());
+                vertices.extend_from_slice(&v.pos[1].to_le_bytes());
+                vertices.extend_from_slice(&v.pos[2].to_le_bytes());
+                // Fold the uv divisor in here (constant per draw, so pre-dividing per
+                // vertex is identical to dividing the interpolated coord).
+                vertices.extend_from_slice(&(v.uv[0] / interp.uv_div[0]).to_le_bytes());
+                vertices.extend_from_slice(&(v.uv[1] / interp.uv_div[1]).to_le_bytes());
+                vertices.extend_from_slice(&v.color);
+            }
+
+            let mut indices = Vec::with_capacity(d.index_count as usize * 4);
+            for i in 0..d.index_count as usize {
+                indices.extend_from_slice(&(index_at(d, i) as u32).to_le_bytes());
+            }
+
+            let texture = if interp.textured {
+                d.textures.first().map(|t| self.texture(t))
+            } else {
+                None
+            };
+
+            draws.push(GxmDraw {
+                space: to_draw_space(&interp.space),
+                vertices,
+                indices,
+                index_count: d.index_count,
+                texture,
+            });
+        }
+        RenderScene { draws }
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +995,76 @@ mod texture_tests {
         let t = tex(0x0c, 0, 1, 2, 8, vec![1, 2, 3, 4, 0, 0, 0, 0, 9, 8, 7, 6]);
         assert_eq!(sample_texture(&t, 0.5, u_of(0, 2)), [1, 2, 3, 4]);
         assert_eq!(sample_texture(&t, 0.5, u_of(1, 2)), [9, 8, 7, 6]);
+    }
+
+    // Build a texture with an explicit `SceGxmTextureType` selector (LINEAR = 3,
+    // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
+    fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels }
+    }
+
+    #[test]
+    fn bc2_block_alpha_and_color() {
+        // One BC2 (DXT3) 4x4 block: 8 bytes 4-bit alpha, then a BC1 color sub-block.
+        // Color endpoint c0 = white 565 with all-zero indices, so every texel is
+        // white; alpha byte 0 holds texel 0 (low nibble = 15) and texel 1 (high
+        // nibble = 0). This is the OlliOlli menu-font case: white RGB, glyph coverage
+        // carried entirely in the 4-bit alpha.
+        let mut block = vec![0u8; 16];
+        block[0] = 0x0F; // texel0 alpha=15 (opaque), texel1 alpha=0 (transparent)
+        block[8] = 0xFF; // c0 low byte
+        block[9] = 0xFF; // c0 high byte -> 0xFFFF = white
+        let t = tex_typed(0x86, 3, 4, 4, 16, block); // LINEAR layout
+        assert_eq!(sample_texture(&t, u_of(0, 4), u_of(0, 4)), [255, 255, 255, 255]);
+        assert_eq!(sample_texture(&t, u_of(1, 4), u_of(0, 4)), [255, 255, 255, 0]);
+    }
+
+    #[test]
+    fn bc1_punchthrough_alpha() {
+        // BC1 with c0 <= c1 selects the 3-color + punch-through mode: index 3 is
+        // transparent black. c0 = 0, c1 = white, index 3 for texel 0.
+        let mut block = vec![0u8; 8];
+        block[0] = 0x00;
+        block[1] = 0x00; // c0 = 0
+        block[2] = 0xFF;
+        block[3] = 0xFF; // c1 = white (c0 <= c1 -> punch-through)
+        block[4] = 0x03; // texel 0 index = 3 -> transparent
+        let t = tex_typed(0x85, 3, 4, 4, 8, block);
+        assert_eq!(sample_texture(&t, u_of(0, 4), u_of(0, 4)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn morton_zorder_matches_reference() {
+        // Z-order over a square power-of-two block grid: bit(2i)=y_i, bit(2i+1)=x_i.
+        assert_eq!(morton_index(0, 0, 4, 4), 0);
+        assert_eq!(morton_index(1, 0, 4, 4), 2);
+        assert_eq!(morton_index(0, 1, 4, 4), 1);
+        assert_eq!(morton_index(1, 1, 4, 4), 3);
+        assert_eq!(morton_index(2, 1, 4, 4), 9);
+        // Wider-than-tall grid: leftover columns tile as whole 4x4 squares to the
+        // right, so block (4,0) begins the second square at index 16.
+        assert_eq!(morton_index(4, 0, 8, 4), 16);
+    }
+
+    #[test]
+    fn bc2_swizzled_block_addressing() {
+        // A 16x16-texel swizzled BC2 texture = a 4x4 grid of 16-byte blocks. Block
+        // (2,1) is at Morton index 9 (vs linear index 6), so a correct swizzle read
+        // must fetch from byte 9*16. Mark that block white-transparent and the rest
+        // opaque, then sample a texel inside block (2,1) and require alpha 0.
+        let mut px = vec![0u8; 16 * 16]; // 16 blocks
+        for b in 0..16 {
+            px[b * 16] = 0xFF; // both low texels opaque
+            px[b * 16 + 8] = 0xFF;
+            px[b * 16 + 9] = 0xFF; // c0 white
+        }
+        let target = morton_index(2, 1, 4, 4) as usize; // = 9
+        assert_eq!(target, 9);
+        px[target * 16] = 0x00; // block (2,1): texel 0 alpha 0
+        let t = tex_typed(0x86, 0, 16, 16, 0, px); // SWIZZLED
+                                                   // Texel (8,4) is texel 0 of block (2,1).
+        assert_eq!(sample_texture(&t, u_of(8, 16), u_of(4, 16))[3], 0);
+        // A neighboring block (texel (0,0), block (0,0)) stays opaque.
+        assert_eq!(sample_texture(&t, u_of(0, 16), u_of(0, 16))[3], 255);
     }
 }

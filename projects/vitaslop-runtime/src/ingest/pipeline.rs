@@ -325,4 +325,36 @@ mod tests {
             }
         }
     }
+
+    /// Diagnostic: decrypt the container and write named plaintext files out to
+    /// `VITASLOP_DUMP_DIR`, so a decrypted asset (e.g. an `.at9`) can be inspected
+    /// or fed to an external reference decoder. Comma-separated relative paths come
+    /// from `VITASLOP_DUMP_FILES`. Nothing is written into the repo. Ignored; run
+    /// with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic: needs fixture + VITASLOP_DUMP_DIR/VITASLOP_DUMP_FILES"]
+    fn dump_plaintext_files() {
+        let Some(dir) = testfix::game_dir() else {
+            return;
+        };
+        let Some(out) = std::env::var_os("VITASLOP_DUMP_DIR") else {
+            eprintln!("set VITASLOP_DUMP_DIR");
+            return;
+        };
+        let files = std::env::var("VITASLOP_DUMP_FILES").unwrap_or_default();
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).expect("create dump dir");
+        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        for rel in files.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match game.file(rel) {
+                Ok(bytes) => {
+                    let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+                    let dest = out.join(name);
+                    std::fs::write(&dest, &bytes).expect("write plaintext");
+                    eprintln!("dumped {rel} -> {} ({} bytes)", dest.display(), bytes.len());
+                }
+                Err(e) => eprintln!("skip {rel}: {e:?}"),
+            }
+        }
+    }
 }

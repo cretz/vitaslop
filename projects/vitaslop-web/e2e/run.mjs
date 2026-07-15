@@ -51,11 +51,19 @@ async function main() {
       { timeout: 120000 }
     );
     const status = await page.locator("#status").textContent();
-    await page.waitForTimeout(500);
+    // Let the render loop run long enough for the live FPS meter (500ms window) to
+    // publish a couple of readings before we sample it.
+    await page.waitForFunction(
+      () => /fps:\s*\d/.test(document.getElementById("fps")?.textContent || ""),
+      { timeout: 10000 }
+    );
+    await page.waitForTimeout(1500);
+    const fps = await page.locator("#fps").textContent();
     const buf = await page.locator("#screen").screenshot({ path: join(shotDir, "cube.png") });
     const cov = cubeCoverage(buf);
 
     console.log("[cube] status:", status);
+    console.log("[cube] live", fps);
     console.log("[cube] coverage:", JSON.stringify(cov));
     ok = /cube ran/i.test(status) && cov.frac > 0.05 && cov.frac < 0.9;
   } catch (e) {

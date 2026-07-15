@@ -140,6 +140,14 @@ fn retail_boot_probe() {
         }
         decode_addrs.sort_unstable();
         eprintln!("decode gaps: {}, lift gaps: {}", decode_addrs.len(), lift_count);
+        // Lift gaps: an instruction that decodes but is not lowered yet. Print the
+        // function root, the offending instruction address, and the opcode.
+        for f in &report.failures {
+            let s = format!("{:?}", f.error);
+            if !s.starts_with("Decode") {
+                eprintln!("  lift-gap in g_{:08x}: {s}", f.root);
+            }
+        }
         for addr in decode_addrs.iter().take(60) {
             let off = (addr - linked.base) as usize;
             if off + 4 <= linked.image.len() {
@@ -150,13 +158,15 @@ fn retail_boot_probe() {
         }
     }
     // Map wasm function indices (from a trap backtrace) to guest addresses. The
-    // lenient build orders functions by address and assigns wasm index 2 + i, so a
-    // fresh build reproduces the same mapping.
+    // lenient build orders functions by address and assigns wasm index
+    // IMPORT_FUNC_COUNT + i, so a fresh build reproduces the same mapping. (Set
+    // VITASLOP_WASM_NAMES to have the backtrace print `g_<addr>` directly instead.)
+    let import_funcs = vitaslop_transpiler::abi::IMPORT_FUNC_COUNT as usize;
     if let Ok(list) = std::env::var("VITASLOP_WASM_INDICES") {
         let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
         for tok in list.split(',') {
             if let Ok(widx) = tok.trim().parse::<usize>() {
-                let addr = widx.checked_sub(2).and_then(|i| built.artifact.funcs.get(i)).map(|fe| fe.addr);
+                let addr = widx.checked_sub(import_funcs).and_then(|i| built.artifact.funcs.get(i)).map(|fe| fe.addr);
                 match addr {
                     Some(a) => eprintln!("  wasm[{widx}] = guest {a:#x}"),
                     None => eprintln!("  wasm[{widx}] = <out of range>"),
@@ -185,6 +195,60 @@ fn retail_boot_probe() {
             eprintln!("  check {a:#010x} (masked {masked:#010x}): {status}");
         }
     }
+    // Dump a discovered function's lowered IR (VITASLOP_DUMP_FUNC=hex[,hex...]): the
+    // authoritative decode/lowering the emitter uses, so a trap's `guest_block` can be
+    // read against the exact statements (not a naive linear disassembly that may
+    // misalign on undecoded ops). Prints each block's address, statements, terminator.
+    if let Ok(list) = std::env::var("VITASLOP_DUMP_FUNC") {
+        let program = linked.shared_program();
+        if list.trim() == "all" {
+            // Dump every discovered function's IR to <shot_dir>/allfuncs.ir, so a
+            // global address's readers/writers can be found by grep (e.g. who stores
+            // to an uninitialized singleton slot).
+            let built = vitaslop_transpiler::transpile_lenient(&program);
+            let mut all = String::new();
+            for fe in &built.artifact.funcs {
+                if let Some(text) = vitaslop_transpiler::dump_func(&program, fe.addr) {
+                    all.push_str(&text);
+                }
+            }
+            match &shot_dir {
+                Some(dir) => {
+                    let path = format!("{dir}/allfuncs.ir");
+                    std::fs::write(&path, &all).unwrap();
+                    eprintln!("wrote {} funcs IR to {path}", built.artifact.funcs.len());
+                }
+                None => eprintln!("VITASLOP_DUMP_FUNC=all needs VITASLOP_SHOT_DIR"),
+            }
+        } else {
+            for tok in list.split(',') {
+                let want = u32::from_str_radix(tok.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                match vitaslop_transpiler::dump_func(&program, want) {
+                    Some(text) => eprint!("{text}"),
+                    None => eprintln!("VITASLOP_DUMP_FUNC: no function decodes at {want:#x}"),
+                }
+            }
+        }
+    }
+    // Dump host-import index -> (library nid, function nid) for the indices listed in
+    // VITASLOP_DUMP_IMPORTS (decimal, comma-separated), so an `Import(N)` seen in a
+    // dumped block or trap can be resolved to a NID (and thence a name via the db).
+    if let Ok(list) = std::env::var("VITASLOP_DUMP_IMPORTS") {
+        if list.trim() == "all" {
+            for (idx, (lib, nid)) in linked.imports.iter().enumerate() {
+                eprintln!("  import[{idx}] = lib={lib:#010x} nid={nid:#010x}");
+            }
+        } else {
+            for tok in list.split(',') {
+                if let Ok(idx) = tok.trim().parse::<usize>() {
+                    match linked.imports.get(idx) {
+                        Some((lib, nid)) => eprintln!("  import[{idx}] = lib={lib:#010x} nid={nid:#010x}"),
+                        None => eprintln!("  import[{idx}] = <out of range ({} imports)>", linked.imports.len()),
+                    }
+                }
+            }
+        }
+    }
     eprintln!("process_param at {:#x}", linked.process_param);
     eprintln!("main_entry (executable module_start) = {:#x}", linked.main_entry);
     if std::env::var("VITASLOP_DUMP_IMAGE").is_ok() {
@@ -202,7 +266,23 @@ fn retail_boot_probe() {
     //    PREEMPTIVE mode so blocking primitives really park a thread (a real title
     //    boots its render loop on threads that a synchronous run-to-completion model
     //    cannot interleave). The heap is moved above the whole linked image.
-    let world = Box::new(BootWorld::default());
+    // Input: a scripted TAS recipe when VITASLOP_INPUT_RECIPE points at a recipe
+    // file (frame-keyed button/analog directives; see `vitaslop_runtime::recipe`),
+    // else the deterministic input-free BootWorld. The recipe drives menus/dialogs
+    // reproducibly (e.g. dismiss the "not signed in" dialog, then move the cursor).
+    let world: Box<dyn World + Send> = match std::env::var("VITASLOP_INPUT_RECIPE") {
+        Ok(path) => {
+            let text = std::fs::read_to_string(&path).expect("read input recipe");
+            match vitaslop_runtime::RecipeWorld::parse(&text) {
+                Ok(w) => {
+                    eprintln!("input: scripted recipe from {path}");
+                    Box::new(w)
+                }
+                Err(e) => panic!("input recipe parse error: {e}"),
+            }
+        }
+        Err(_) => Box::new(BootWorld::default()),
+    };
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
@@ -235,7 +315,11 @@ fn retail_boot_probe() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_FRAMES);
-    let report = sched.run_frames(max_frames, MAX_ROUNDS);
+    let max_rounds = std::env::var("VITASLOP_MAX_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_ROUNDS);
+    let report = sched.run_frames(max_frames, max_rounds);
     eprintln!("run report: {report:?}");
 
     // If the run trapped, auto-map every "wasm function N" in the backtrace to its
@@ -250,7 +334,7 @@ fn retail_boot_probe() {
             if let Ok(widx) = n.parse::<usize>() {
                 if seen.insert(widx) {
                     let addr = widx
-                        .checked_sub(2)
+                        .checked_sub(import_funcs)
                         .and_then(|i| built.artifact.funcs.get(i))
                         .map(|fe| fe.addr);
                     match addr {
@@ -390,6 +474,29 @@ fn retail_boot_probe() {
     for (thid, n) in &by_thread {
         eprintln!("  thread {thid:>3}: {n}");
     }
+    // The last few calls each thread made, in order. A stalled producer/consumer
+    // shows its final blocking primitive here (what a worker parked on, what the
+    // main loop polls) - the ground truth for a livelock on the loading screen.
+    {
+        let trace = &st.capture.trace;
+        let thids = &st.capture.trace_thid;
+        for thid in by_thread.keys() {
+            let mut last: Vec<String> = Vec::new();
+            for i in (0..trace.len()).rev() {
+                if thids.get(i).copied() == Some(*thid) {
+                    let nid = trace[i];
+                    let nm = vitaslop_runtime::nid::name(nid);
+                    last.push(if nm == "<unknown>" { format!("nid:{nid:#010x}") } else { nm.to_string() });
+                    if last.len() >= 16 {
+                        break;
+                    }
+                }
+            }
+            last.reverse();
+            eprintln!("  thread {thid:>3} last: {}", last.join(" "));
+        }
+    }
+    vitaslop_runtime::vita::dump_call_sites(14);
     eprintln!("--- sceKernelWaitLwCond samples (work, timeout_ptr, timeout) ---");
     for (work, tp, to) in &st.capture.lwcond_wait_samples {
         eprintln!("  work={work:#010x} timeout_ptr={tp:#010x} timeout={to}");
@@ -410,6 +517,23 @@ fn retail_boot_probe() {
                 frames_written += 1;
             }
             eprintln!("wrote {frames_written} frame PNG(s) + trace to {dir}/");
+            // VITASLOP_GPU also renders each scene through the general GXM->WebGPU
+            // renderer (the browser's real path) to frame_gpu_XXXX.png, so the GPU
+            // output can be compared to the software oracle on the real title's frames.
+            if std::env::var("VITASLOP_GPU").is_ok() {
+                match vitaslop_native::GeneralRenderer::new() {
+                    Some(mut gpu) => {
+                        eprintln!("GPU render via {}", gpu.adapter_name);
+                        for (i, scene) in st.capture.scenes.iter().enumerate() {
+                            let fb = gpu.render_scene(scene, WIDTH, HEIGHT, CLEAR);
+                            std::fs::write(format!("{dir}/frame_gpu_{i:04}.png"), fb.to_png())
+                                .expect("write gpu png");
+                        }
+                        eprintln!("wrote {} GPU frame PNG(s) to {dir}/", st.capture.scenes.len());
+                    }
+                    None => eprintln!("VITASLOP_GPU set but no GPU adapter available"),
+                }
+            }
         }
         None => eprintln!(
             "VITASLOP_SHOT_DIR unset: not writing frames/trace ({} scene(s) captured)",

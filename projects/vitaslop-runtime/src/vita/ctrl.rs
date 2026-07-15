@@ -1,47 +1,80 @@
-//! SceCtrl: controller input. The one place the cube reads a non-deterministic
-//! external input, so it goes through the World seam (`poll_ctrl`), which a
-//! record or replay wrapper can capture.
+//! SceCtrl: controller input. The one place a title reads a non-deterministic
+//! external input, so it goes through the World seam (`poll_ctrl`), which a record
+//! or replay wrapper - or a scripted TAS recipe - drives.
+//!
+//! Titles reach the pad through several entry points with the same `SceCtrlData`
+//! payload: `Peek` returns the latest sample immediately, `Read` classically blocks
+//! until the next vblank. We serve both from the current [`World`] frame; frame
+//! pacing comes from the display flip, so a non-blocking `Read` still advances one
+//! input frame per rendered frame. The `Positive`/`Positive2` variants differ only
+//! in button remapping we do not model, so they share one filler.
 
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
-use crate::nid::ctrl as nid;
-use crate::SvcOutcome;
 
-/// Bytes of SceCtrlData we populate: timeStamp (8) + buttons (4) + the four
-/// analog bytes (4). The real struct is larger but the guest reads these fields;
-/// we zero this prefix and fill it.
+/// Bytes of SceCtrlData we populate: timeStamp (8) + buttons (4) + the four analog
+/// bytes lx/ly/rx/ry (4). The real struct is larger but the guest reads these
+/// fields; we fill this prefix and leave the rest zeroed.
 const CTRL_DATA_PREFIX: usize = 16;
 
-pub fn try_dispatch(func_nid: u32, ctx: &mut GuestCtx, st: &mut VitaState) -> Option<SvcOutcome> {
-    match func_nid {
-        nid::PEEK_BUFFER_POSITIVE => peek_buffer_positive(ctx, st),
-        // int sceCtrlSetSamplingMode(SceCtrlPadInputMode mode): accept and succeed.
-        nid::SET_SAMPLING_MODE => ctx.ret(0),
-        _ => return None,
-    }
-    Some(SvcOutcome::Continue)
-}
-
-/// int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count)
-#[hostcall]
-fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
+/// Fill one `SceCtrlData` at `data` from the current world frame for `port`, then
+/// return the number of buffers reported (always 1 - a single latest sample). When
+/// `negative` is set the button mask is inverted (the `*Negative` family reports a
+/// pressed button as a cleared bit).
+fn fill_ctrl(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, negative: bool) -> i32 {
     let frame = st.world.poll_ctrl(port);
     let ts = st.world.monotonic_us();
+    let buttons = if negative { !frame.buttons } else { frame.buttons };
 
-    // SceCtrlData stride is larger than the prefix we write; but each entry's
-    // read fields all sit in the prefix, so writing one filled prefix per entry
-    // (zeroing the rest is unnecessary as the guest only reads these fields) is
-    // faithful for polling. We conservatively write only entry 0's fields, which
-    // is what a single-buffer peek reads.
+    // Diagnostic (env `VITASLOP_TRACE_INPUT`): log the pad state the guest reads and
+    // its caller, to see whether input reaches the code that should act on it and
+    // what buttons/analog value it sees. Only non-neutral samples, to stay readable.
+    if (frame.buttons != 0 || frame.lx != 128 || frame.ly != 128)
+        && std::env::var("VITASLOP_TRACE_INPUT").is_ok()
+    {
+        eprintln!(
+            "ctrl port={port} buttons={:#06x} lx={} ly={} rx={} ry={} neg={} lr={:#010x} r5={:#010x} r4={:#010x}",
+            frame.buttons, frame.lx, frame.ly, frame.rx, frame.ry, negative, ctx.regs[14],
+            ctx.regs[5], ctx.regs[4]
+        );
+    }
+
     let mut buf = [0u8; CTRL_DATA_PREFIX];
     buf[0..8].copy_from_slice(&ts.to_le_bytes());
-    buf[8..12].copy_from_slice(&frame.buttons.to_le_bytes());
+    buf[8..12].copy_from_slice(&buttons.to_le_bytes());
     buf[12] = frame.lx;
     buf[13] = frame.ly;
     buf[14] = frame.rx;
     buf[15] = frame.ry;
-    ctx.write_bytes(data.addr(), &buf);
-
-    // Return the number of buffers filled.
+    if data != 0 {
+        ctx.write_bytes(data, &buf);
+    }
     1
+}
+
+/// int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count)
+#[hostcall]
+pub(super) fn peek_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), false)
+}
+
+/// int sceCtrlReadBufferPositive(int port, SceCtrlData *pad_data, int count)
+/// The classically-blocking read. We return the current sample without parking:
+/// the render loop's display flip is the frame-pacing yield, so input still
+/// advances one frame per rendered frame and other threads still interleave there.
+#[hostcall]
+pub(super) fn read_buffer_positive(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), false)
+}
+
+/// int sceCtrlPeekBufferNegative(int port, SceCtrlData *pad_data, int count)
+#[hostcall]
+pub(super) fn peek_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), true)
+}
+
+/// int sceCtrlReadBufferNegative(int port, SceCtrlData *pad_data, int count)
+#[hostcall]
+pub(super) fn read_buffer_negative(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: Ptr, _count: i32) -> i32 {
+    fill_ctrl(ctx, st, port, data.addr(), true)
 }

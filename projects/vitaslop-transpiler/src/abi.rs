@@ -44,6 +44,14 @@
 //! enters guest code (initial entry and callbacks) by calling an exported
 //! `f_<addr>`.
 
+/// Number of imported functions the module declares before any guest function
+/// (`svc`, `host_import`, `dispatch_miss`), so wasm function index
+/// `IMPORT_FUNC_COUNT + i` is the i-th translated guest function in
+/// ascending-address order. A wasmtime backtrace's "wasm function N" is a module
+/// index that counts these imports, so mapping it back to a guest function is
+/// `funcs[N - IMPORT_FUNC_COUNT]`.
+pub const IMPORT_FUNC_COUNT: u32 = 3;
+
 /// Number of general-purpose ARM registers (r0..r15).
 pub const REG_COUNT: usize = 16;
 
@@ -55,7 +63,7 @@ pub const LR: usize = 14;
 pub const PC: usize = 15;
 
 /// The four condition flags, in bit order N(31) Z(30) C(29) V(28).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flag {
     N = 0,
     Z = 1,
@@ -179,6 +187,11 @@ pub const LOCAL_PROMOTION_THRESHOLD: u32 = 2;
 
 /// Exported name of the linear memory.
 pub const MEMORY_EXPORT: &str = "memory";
+
+/// Exported name of the diagnostic guest-PC tracker global. Holds the address of
+/// the basic block currently executing when `VITASLOP_TRACK_PC` is set at emit time;
+/// zero otherwise. Hosts read it on a trap to name the faulting guest instruction.
+pub const GUEST_PC_EXPORT: &str = "guest_pc";
 
 /// Import module every host function/memory comes from.
 pub const IMPORT_MODULE: &str = "env";

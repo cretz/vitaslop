@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "vitaslop-atrac9",
     "vitaslop-conformance-harness",
     "vitaslop-conformance-suite-arm",
     "vitaslop-desktop",

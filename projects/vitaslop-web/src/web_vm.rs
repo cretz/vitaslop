@@ -302,7 +302,9 @@ fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> 
         // hint (Yield at a flip, or a would-block wait) just keeps running,
         // identical to the native sync Vm. The browser's cooperative-scheduler path
         // will handle these distinctly.
-        SvcOutcome::Continue | SvcOutcome::Yield | SvcOutcome::Block => Ok(()),
+        SvcOutcome::Continue | SvcOutcome::Yield | SvcOutcome::Block | SvcOutcome::Reschedule => {
+            Ok(())
+        }
     }
 }
 

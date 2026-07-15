@@ -16,11 +16,14 @@ use vitaslop_transpiler::abi;
 // downstream crates.
 extern crate self as vitaslop_runtime;
 
+pub mod audio;
 pub mod capture;
 pub mod host;
 pub mod ingest;
 pub mod link;
 pub mod nid;
+pub mod recipe;
+pub mod sched;
 pub mod render;
 pub mod vita;
 pub mod world;
@@ -29,7 +32,16 @@ pub use host::{
     GuestCtx, GuestMemory, ImportDispatch, Ptr, Reentry, SliceMemory, SvcDispatch, VitaEnv,
     VitaState, VFP_ARG_COUNT,
 };
-pub use world::{CtrlFrame, DeterministicWorld, Record, Replay, World, WorldEvent};
+pub use audio::{AudioFormat, AudioSink, NullSink};
+pub use recipe::{RecipeError, RecipeWorld};
+pub use sched::{
+    FiberEnd, GuestEngine, GuestThread, IdleStep, RunReport, SchedCore, Scheduler, Stop,
+    ThreadHandle, ThreadStep,
+};
+pub use world::{
+    CtrlFrame, DeterministicWorld, Record, Replay, TouchFrame, TouchPoint, World, WorldEvent,
+    MAX_TOUCH_POINTS,
+};
 
 /// Write a Vita host handler as a typed function; the macro generates the AAPCS-
 /// VFP argument marshalling and return write. See [`vitaslop_hostcall`].
@@ -75,6 +87,13 @@ pub enum SvcOutcome {
     ///
     /// [`vitaslop_native::ThreadedScheduler`]: https://docs.rs/vitaslop-native
     Block,
+    /// The call serviced fine and the thread stays runnable, but the scheduler
+    /// should re-pick now rather than let this thread run on. Emitted when a host
+    /// call makes a higher-priority thread runnable (e.g. `sceKernelStartThread` of
+    /// a higher-priority worker): the real kernel preempts the caller and runs the
+    /// higher-priority thread until it blocks, then resumes the caller. A host with
+    /// no scheduler treats this like [`Continue`](Self::Continue).
+    Reschedule,
     /// The calling thread has ended (a worker returned, or called
     /// `sceKernelExitThread`), but the process keeps running. The preemptive
     /// scheduler finishes just this thread's fiber, keeping its siblings alive; the
