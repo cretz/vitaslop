@@ -126,7 +126,7 @@ pub enum EgressKind {
     /// after being written: the game persisted state. `bytes` is the final size and
     /// `ascii` is a printable-ASCII preview (non-printable bytes shown as `.`), so a
     /// human-readable save - a high score, an unlocked level id - is visible without
-    /// a pixel. This is where OlliOlli's score lands on the offline path.
+    /// a pixel. This is where a title's score often lands on the offline path.
     SaveWrite { path: String, bytes: usize, ascii: String },
     /// A trophy was unlocked (`sceNpTrophyUnlockTrophy`): the trophy id.
     Trophy { id: i32 },

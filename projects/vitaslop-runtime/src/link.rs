@@ -1,9 +1,10 @@
 //! The multi-module linker: several loaded [`Module`]s into one unified program
 //! image the transpiler compiles as a single wasm module.
 //!
-//! A real title is not one executable. OlliOlli is an `eboot.bin` plus five
-//! shared libraries (`libc`, `libfios2`, `libsmart`, `libult`, `libface`), and
-//! every one of them links at the same nominal base (`0x8100_0000`) - they
+//! A real title is not one executable. A game is typically an `eboot.bin` plus
+//! several shared libraries (`libc`, `libfios2`, `libsmart`, `libult`, `libface`
+//! are common ones), and every one of them links at the same nominal base
+//! (`0x8100_0000`) - they
 //! overlap completely. To run them together this linker:
 //!
 //! 1. **Lays them out** at distinct, page-aligned bases in one shared guest
@@ -285,10 +286,11 @@ mod tests {
     use crate::ingest::testfix;
     use crate::ingest::vfs::DirVfs;
 
-    /// Load every OlliOlli module, link them, and check the structural invariants
-    /// the whole downstream pipeline depends on. Skips without the fixture.
+    /// Load every module from a privately-supplied dump, link them, and check the
+    /// structural invariants the whole downstream pipeline depends on. Skips without
+    /// the fixture; all assertions are title-independent.
     #[test]
-    fn links_olliolli_modules() {
+    fn links_fixture_modules() {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
@@ -310,10 +312,10 @@ mod tests {
             assert!(w[0] != w[1], "two modules share an init address");
         }
 
-        // The inter-module set is real: OlliOlli's eboot imports SceLibc /
+        // The inter-module set is real: a game's eboot imports SceLibc /
         // SceLibm / SceLibstdcxx (libc.suprx) and SceFios2 (libfios2.suprx), so a
         // substantial number of imports must resolve to redirects, not host
-        // imports. (The DB says 64 such imports across the eboot; other modules
+        // imports. (A real title had 64 such imports across the eboot; other modules
         // add their own cross-references.)
         assert!(
             linked.redirects.len() >= 60,
@@ -331,14 +333,14 @@ mod tests {
         assert!(linked.image.len() as u32 <= linked.mem_bytes);
     }
 
-    /// The whole linked OlliOlli program must emit one valid wasm module (with the
-    /// handful of still-unlifted functions as trapping stubs). This is the emit-side
-    /// counterpart to `transpiles_olliolli` (which only exercises decode/lower): it
-    /// proves the computed-jump, VFP-double, and NEON-logical emission all validate
-    /// together on the real 800+-function image, not just on unit cases.
+    /// The whole linked program must emit one valid wasm module (with the handful of
+    /// still-unlifted functions as trapping stubs). This is the emit-side counterpart
+    /// to `transpiles_fixture` (which only exercises decode/lower): it proves the
+    /// computed-jump, VFP-double, and NEON-logical emission all validate together on
+    /// the real 800+-function image, not just on unit cases.
     #[test]
     #[ignore = "needs fixture"]
-    fn olliolli_emits_valid_wasm() {
+    fn fixture_emits_valid_wasm() {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
@@ -356,7 +358,7 @@ mod tests {
             built.artifact.funcs.len(),
             built.stubbed.len(),
         );
-        wasmparser::validate(&built.artifact.wasm).expect("OlliOlli wasm must validate");
+        wasmparser::validate(&built.artifact.wasm).expect("linked wasm must validate");
         // Stubs are the still-unlifted remainder (dominated by NEON structure
         // load/store); they must stay a small fraction of the whole program.
         let total = built.artifact.funcs.len();
@@ -367,14 +369,14 @@ mod tests {
         );
     }
 
-    /// Diagnostic: attempt to transpile the whole linked OlliOlli program and
-    /// report how far it gets - success, or the exact address and opcode of the
-    /// first instruction the transpiler cannot yet handle. This is the signal for
-    /// what CPU work (NEON decode/lift, mixed ARM/Thumb, ...) remains. Ignored;
-    /// run with `--ignored --nocapture`.
+    /// Diagnostic: attempt to transpile the whole linked program and report how far
+    /// it gets - success, or the exact address and opcode of the first instruction the
+    /// transpiler cannot yet handle. This is the signal for what CPU work (NEON
+    /// decode/lift, mixed ARM/Thumb, ...) remains. Ignored; run with
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore = "diagnostic: needs fixture"]
-    fn transpiles_olliolli() {
+    fn transpiles_fixture() {
         let Some(dir) = testfix::game_dir() else {
             return;
         };

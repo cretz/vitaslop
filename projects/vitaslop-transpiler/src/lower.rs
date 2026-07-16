@@ -68,7 +68,7 @@ pub struct Discovered {
 type RegConsts = [Option<u32>; 16];
 
 /// Upper bound on the instructions in one discovered function. Real ARM functions
-/// are far smaller (the largest in OlliOlli is a few thousand); exceeding this
+/// are far smaller (the largest seen in a shipping title is a few thousand); exceeding this
 /// means discovery is walking data as code, so the "function" is rejected.
 const MAX_FUNC_INSNS: usize = 16384;
 

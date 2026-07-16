@@ -49,7 +49,7 @@ pub struct GameModule {
 /// before the `eboot.bin` that imports them.
 pub struct Game {
     /// The container's content id (from the RIF), e.g.
-    /// `"UP4409-PCSE00341_00-OLLIOLLIOLLIOLLI"`.
+    /// `"XXYYYY-ABCD00001_00-0123456789ABCDEF"`.
     pub content_id: String,
     /// Every PFS file, decrypted to plaintext, keyed by app-relative path. The
     /// executable modules are present here too, as their raw SELF bytes; the guest
@@ -193,9 +193,10 @@ mod tests {
     use crate::ingest::testfix;
     use crate::ingest::vfs::DirVfs;
 
-    /// The whole retail chain over the fixture: mount the extracted app dir,
-    /// decrypt every file, and unwrap all six modules to loadable ELFs. Skips
+    /// The whole retail chain over a privately-supplied dump: mount the extracted
+    /// app dir, decrypt every file, and unwrap the modules to loadable ELFs. Skips
     /// without the fixture, so `cargo test --workspace` stays green everywhere.
+    /// Universal invariants only - no title-specific content id or module list.
     #[test]
     fn decrypts_full_game_offline() {
         let Some(dir) = testfix::game_dir() else {
@@ -204,21 +205,14 @@ mod tests {
         let vfs = DirVfs::new(dir);
         let game = decrypt_container(&vfs).expect("decrypt container");
 
-        assert_eq!(game.content_id, "UP4409-PCSE00341_00-OLLIOLLIOLLIOLLI");
+        // A content id is present (its value is title-specific).
+        assert!(!game.content_id.is_empty());
 
-        // All six executables: the eboot plus five shared libraries, each a real
-        // ELF, and the eboot ordered last (after its libraries).
+        // A game is an eboot plus its shared libraries: more than one module, each a
+        // real ELF, and the eboot ordered last (after the libraries it imports).
         let names: Vec<&str> = game.modules.iter().map(|m| m.path.as_str()).collect();
-        assert!(names.contains(&"eboot.bin"));
-        for lib in [
-            "sce_module/libc.suprx",
-            "sce_module/libfios2.suprx",
-            "sce_module/libsmart.suprx",
-            "sce_module/libult.suprx",
-            "sce_module/libface.suprx",
-        ] {
-            assert!(names.contains(&lib), "missing module {lib}");
-        }
+        assert!(names.contains(&"eboot.bin"), "no eboot.bin among {names:?}");
+        assert!(game.modules.len() > 1, "expected eboot plus at least one library");
         assert_eq!(game.modules.last().unwrap().path, "eboot.bin");
         for m in &game.modules {
             assert_eq!(&m.elf[..4], b"\x7fELF", "module {} is not an ELF", m.path);

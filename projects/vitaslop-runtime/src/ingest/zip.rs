@@ -109,8 +109,9 @@ mod tests {
     use crate::ingest::testfix;
 
     #[test]
-    fn reads_olliolli_zip() {
-        // The committed fixture is the zip itself; VITASLOP_GAME_ZIP points at it.
+    fn reads_fixture_zip() {
+        // Opt-in acid test: VITASLOP_GAME_ZIP points at a privately-supplied NoNpDrm
+        // zip. Universal invariants only; the title id in the paths is not assumed.
         let Some(path) = std::env::var_os("VITASLOP_GAME_ZIP") else {
             return;
         };
@@ -118,14 +119,18 @@ mod tests {
             return;
         };
         let vfs = read_zip(&bytes).expect("read zip");
-        // param.sfo is stored non-encrypted; it must inflate to the PSF magic.
-        let sfo = vfs
-            .read("app/PCSE00341/sce_sys/param.sfo")
+        let list = vfs.list();
+        // param.sfo is stored non-encrypted; it must inflate to the PSF magic. Find it
+        // by suffix so the title id in the path does not need to be known.
+        let sfo_path = list
+            .iter()
+            .find(|p| p.ends_with("sce_sys/param.sfo"))
             .expect("param.sfo in zip");
+        let sfo = vfs.read(sfo_path).expect("read param.sfo");
         assert_eq!(&sfo[0..4], b"\x00PSF");
-        // The eboot is present (still PFS-encrypted at this layer).
-        assert!(vfs.exists("app/PCSE00341/eboot.bin"));
-        assert!(vfs.list().len() > 100);
+        // An eboot is present (still PFS-encrypted at this layer).
+        assert!(list.iter().any(|p| p.ends_with("eboot.bin")));
+        assert!(list.len() > 100);
         let _ = &testfix::read; // keep import used when zip env is unset
     }
 }

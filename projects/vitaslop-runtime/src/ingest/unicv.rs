@@ -138,7 +138,8 @@ mod tests {
     use crate::ingest::testfix;
 
     #[test]
-    fn parses_olliolli_unicv() {
+    fn parses_fixture_unicv() {
+        // Opt-in acid test against a privately-supplied dump; universal invariants only.
         let Some(bytes) = testfix::read("sce_pfs/unicv.db") else {
             return;
         };

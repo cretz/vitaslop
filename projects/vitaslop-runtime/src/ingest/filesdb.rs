@@ -206,27 +206,33 @@ mod tests {
     use crate::ingest::testfix;
 
     #[test]
-    fn parses_olliolli_filesdb() {
+    fn parses_fixture_filesdb() {
+        // Opt-in acid test against a privately-supplied dump; universal PFS files.db
+        // invariants only, no title-specific sizes or seeds.
         let Some(bytes) = testfix::read("sce_pfs/files.db") else {
             return; // fixture absent - skip (VITASLOP_GAME_DIR unset)
         };
         let db = FilesDb::parse(&bytes).expect("parse files.db");
         assert_eq!(db.header.version, 5);
         assert_eq!(db.header.block_size, 0x400);
-        assert_eq!(db.header.seed, 0x74f4_145f);
+        assert_ne!(db.header.seed, 0); // a real seed is present (value is title-specific)
 
         let paths = db.file_paths();
         let by_path = |want: &str| paths.iter().find(|(p, _)| p == want).map(|(_, n)| *n);
 
-        // eboot.bin: root-level, normal (encrypted), known size.
+        // eboot.bin: root-level, normal (encrypted), non-empty.
         let eboot = by_path("eboot.bin").expect("eboot.bin in files.db");
         assert_eq!(eboot.ftype, ftype::NORMAL);
         assert!(eboot.is_encrypted());
-        assert_eq!(eboot.size, 412816);
+        assert!(eboot.size > 0);
 
-        // A nested module resolves its full path and is encrypted.
-        let libc = by_path("sce_module/libc.suprx").expect("libc.suprx path");
-        assert!(libc.is_encrypted());
+        // A nested module resolves its full slash-joined path and is encrypted.
+        let nested = paths
+            .iter()
+            .find(|(p, _)| p.contains('/') && p.ends_with(".suprx"))
+            .map(|(_, n)| *n)
+            .expect("a nested .suprx module path");
+        assert!(nested.is_encrypted());
 
         // param.sfo is stored non-encrypted (nenc), matching its plaintext bytes.
         let sfo = by_path("sce_sys/param.sfo").expect("param.sfo path");

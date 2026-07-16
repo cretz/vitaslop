@@ -43,7 +43,7 @@ use vfs::Vfs;
 pub enum Container {
     /// A raw PFS app dump: `<root>/sce_pfs/files.db` present, app files
     /// PFS-encrypted on disk. `root` is the app directory (possibly nested, e.g.
-    /// `"app/PCSE00341"` inside a zip).
+    /// `"app/ABCD00001"` inside a zip).
     Pfs { root: String },
     /// A `.pkg` archive (AES-CTR transport layer): `path` is the entry.
     Pkg { path: String },
@@ -104,13 +104,15 @@ mod detect_tests {
             return;
         };
         let vfs = zip::read_zip(&bytes).expect("read zip");
-        // The zip nests the app under app/PCSE00341/; detect finds that root.
-        assert_eq!(
-            detect(&vfs).expect("detect"),
-            Container::Pfs {
-                root: "app/PCSE00341".to_string()
-            }
-        );
+        // The zip nests the app under app/<TITLE_ID>/; detect finds that root
+        // whatever the title id is.
+        match detect(&vfs).expect("detect") {
+            Container::Pfs { root } => assert!(
+                root.starts_with("app/"),
+                "detected root {root:?} is not an app/<id> path"
+            ),
+            other => panic!("expected a PFS container, got {other:?}"),
+        }
     }
 }
 
@@ -121,7 +123,7 @@ mod detect_tests {
 pub(crate) mod testfix {
     use std::path::PathBuf;
 
-    /// The extracted app root (e.g. `.../app/PCSE00341`), or `None` if unset.
+    /// The extracted app root (e.g. `.../app/ABCD00001`), or `None` if unset.
     pub fn game_dir() -> Option<PathBuf> {
         std::env::var_os("VITASLOP_GAME_DIR").map(PathBuf::from)
     }

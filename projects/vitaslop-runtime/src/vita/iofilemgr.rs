@@ -78,7 +78,7 @@ pub(super) fn io_lseek(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// A positioned read that does not move the descriptor's cursor. `SceOff` is
 /// 64-bit: with `fd`, `data`, `size` filling r0-r2, r3 is the alignment pad and the
 /// 64-bit offset spills to the even-aligned first stack slot (`arg(4):arg(5)`), like
-/// `sceIoLseek`. This is the path OlliOlli's AT9 music streamer uses to read the
+/// `sceIoLseek`. This is the path an AT9 music streamer uses to read the
 /// file header and successive chunks from a shared descriptor.
 pub(super) fn io_pread(ctx: &mut GuestCtx, st: &mut VitaState) {
     let fd = ctx.arg(0) as i32;

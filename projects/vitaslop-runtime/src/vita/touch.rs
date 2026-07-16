@@ -6,8 +6,8 @@
 //! sample with *no* active touch (`reportNum = 0`) when nothing is pressed. That
 //! empty-but-valid sample is deliberately not the old zero-return stub:
 //! `sceTouchRead`/`sceTouchPeek` return the number of buffers filled (between 1 and
-//! `nBufs`), and a title's per-frame touch update reads a zero return as an error
-//! (OlliOlli logs `touchUpdate::351 ret=0` every frame and can wedge its input
+//! `nBufs`), and a title's per-frame touch update can read a zero return as an error
+//! (one observed title logs `touchUpdate::351 ret=0` every frame and wedges its input
 //! pipeline on it). Reporting one valid sample keeps that update on its normal path.
 
 use crate::host::{GuestCtx, VitaState};

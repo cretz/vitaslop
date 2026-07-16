@@ -1,9 +1,9 @@
-// Boot the REAL retail title (OlliOlli) in the browser through the JSPI preemptive
+// Boot the REAL retail title in the browser through the JSPI preemptive
 // scheduler, driven by Playwright. Serves the extracted container dir + the wasm
 // bundle (cross-origin isolated for shared memory), lets the page fetch the files and
 // call run_game, and reports the boot result.
 //
-// Env:  GAME_DIR   the extracted app dir (default: the OlliOlli fixture)
+// Env:  GAME_DIR   the extracted app dir (default: $VITASLOP_GAME_DIR)
 //       MAX_FRAMES display flips to run to (default 3)
 //       MAX_ROUNDS scheduler round cap (default 50_000_000)
 //       HEADED=1   show the browser
@@ -15,9 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const here = join(fileURLToPath(import.meta.url), "..");
 const webDir = join(here, "..", "web");
-const gameDir =
-  process.env.GAME_DIR ||
-  "C:/work/personal/vitaslop-work/working-area/games/olliolli/extracted/app/PCSE00341";
+const gameDir = process.env.GAME_DIR || process.env.VITASLOP_GAME_DIR || "";
 // Live run: render frame-by-frame through the real GXM->WebGPU renderer, driven by a
 // scripted recipe that navigates the touch front-end to the Tutorial level. Run past
 // the frame the level appears (~175) so the screenshot lands on live gameplay.
@@ -26,11 +24,10 @@ const maxRounds = Number(process.env.MAX_ROUNDS || 50_000_000);
 // The display flip by which the tutorial level is on screen; the harness waits for the
 // live loop to pass it before screenshotting.
 const targetFrame = Number(process.env.TARGET_FRAME || 178);
-// The scripted-input recipe (frame-keyed touch taps). Defaults to the tutorial recipe
-// in working-area; override with RECIPE=<path>, or RECIPE="" for a live-input session.
-const recipePath =
-  process.env.RECIPE ??
-  "C:/work/personal/vitaslop-work/working-area/recipes/olliolli-tutorial.recipe";
+// The scripted-input recipe (frame-keyed touch taps). Override with RECIPE=<path>, or
+// RECIPE="" for a live-input session. No default: pass a recipe from the
+// vitaslop-gamerun-recipes crate for the title under test.
+const recipePath = process.env.RECIPE ?? "";
 const recipe = recipePath ? await readFile(recipePath, "utf8").catch(() => "") : "";
 
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".json": "application/json" };
@@ -128,8 +125,8 @@ async function main() {
     const status = await page.locator("#status").textContent().catch(() => "?");
     const shotDir = process.env.SHOT_DIR || join(here, "screenshots");
     await import("node:fs/promises").then((fs) => fs.mkdir(shotDir, { recursive: true }));
-    await page.locator("#screen").screenshot({ path: join(shotDir, "olliolli.png") });
-    console.log(`[game] live render ${fps} | ${perf} | ${status} -> screenshot ${join(shotDir, "olliolli.png")}`);
+    await page.locator("#screen").screenshot({ path: join(shotDir, "game.png") });
+    console.log(`[game] live render ${fps} | ${perf} | ${status} -> screenshot ${join(shotDir, "game.png")}`);
     ok = /frame (\d+)/.test(status) && Number(status.match(/frame (\d+)/)[1]) >= targetFrame;
   } catch (e) {
     console.error("[game] error:", e.message);

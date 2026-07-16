@@ -584,7 +584,7 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
 
     // GXM texcoords are either normalized [0,1] or in texel units, chosen by the
     // (unavailable) fragment program's sampler. Infer from magnitude: a coord well
-    // past 1 is a texel index into an atlas (OlliOlli's text quads index a font atlas
+    // past 1 is a texel index into an atlas (some titles' text quads index a font atlas
     // in pixels), which we normalize by the texture size. Normalized sprite UVs
     // (<= ~1) pass through unchanged.
     let uv_div = match (textured, d.textures.first()) {
@@ -976,7 +976,7 @@ mod texture_tests {
 
     #[test]
     fn argb_keeps_low_alpha_translucent_not_a_color() {
-        // The regression that motivated the swizzle fix: OlliOlli's "Loading" text
+        // The regression that motivated the swizzle fix: a "Loading" text
         // highlight is an ARGB U8U8U8U8 texel [ff ff ff 40] = white at 25% alpha.
         // A wrong swizzle turned the 0x40 alpha byte into a color -> opaque yellow.
         let t = tex(0x0c, 1, 1, 1, 4, vec![0xff, 0xff, 0xff, 0x40]);
@@ -1043,7 +1043,7 @@ mod texture_tests {
         // One BC2 (DXT3) 4x4 block: 8 bytes 4-bit alpha, then a BC1 color sub-block.
         // Color endpoint c0 = white 565 with all-zero indices, so every texel is
         // white; alpha byte 0 holds texel 0 (low nibble = 15) and texel 1 (high
-        // nibble = 0). This is the OlliOlli menu-font case: white RGB, glyph coverage
+        // nibble = 0). This is the common menu-font case: white RGB, glyph coverage
         // carried entirely in the 4-bit alpha.
         let mut block = vec![0u8; 16];
         block[0] = 0x0F; // texel0 alpha=15 (opaque), texel1 alpha=0 (transparent)

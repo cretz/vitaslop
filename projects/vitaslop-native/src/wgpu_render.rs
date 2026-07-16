@@ -165,7 +165,7 @@ impl GeneralRenderer {
             required_features: wgpu::Features::empty(),
             // Raise the resolution-derived limits (max texture dimension, buffer/binding
             // sizes) to what the adapter really supports: a real title binds textures
-            // larger than the 2048 downlevel floor (OlliOlli has a ~2480px atlas).
+            // larger than the 2048 downlevel floor (some titles have a ~2480px atlas).
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),

@@ -268,7 +268,7 @@ mod tests {
     }
 
     /// Diagnostic: run the decrypted eboot ELF through the loader and report what
-    /// the real OlliOlli module needs (name, entry, imports by library). Ignored;
+    /// the module needs (name, entry, imports by library). Ignored;
     /// run with `--ignored --nocapture`.
     #[test]
     #[ignore = "diagnostic: needs fixture"]

@@ -321,7 +321,7 @@ impl RetailGfx {
             label: Some("vitaslop-desktop-gxm"),
             required_features: wgpu::Features::empty(),
             // Raise resolution-derived limits to the adapter's: a real title binds
-            // textures past the 2048 downlevel floor (OlliOlli has a ~2480px atlas).
+            // textures past the 2048 downlevel floor (some titles have a ~2480px atlas).
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
@@ -414,7 +414,7 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     println!("headless: loaded (build {:.0} ms), driving to the tutorial...", guest.build_ms);
 
     // (active_from, active_until, panel_x, panel_y) - a sticky tap held across a few
-    // frames then released, matching working-area/recipes/olliolli-tutorial.recipe.
+    // frames then released, the same touch model recipes use to navigate a menu.
     let taps = [
         (12u64, 19u64, 450u16, 674u16),
         (30, 37, 230, 230),

@@ -14,9 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const here = join(fileURLToPath(import.meta.url), "..");
 const webDir = join(here, "..", "web");
-const gameDir =
-  process.env.GAME_DIR ||
-  "C:/work/personal/vitaslop-work/working-area/games/olliolli/extracted/app/PCSE00341";
+const gameDir = process.env.GAME_DIR || process.env.VITASLOP_GAME_DIR || "";
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".json": "application/json", ".css": "text/css" };
 
 // The Tutorial tap sequence in SCREEN coords (960x544) = the recipe's panel coords / 2,

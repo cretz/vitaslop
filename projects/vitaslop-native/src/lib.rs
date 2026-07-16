@@ -702,7 +702,7 @@ mod switch_tests {
         }
     }
 
-    /// The OlliOlli shape: the compared value is the raw switch variable, fenced by a
+    /// A common retail shape: the compared value is the raw switch variable, fenced by a
     /// register bound (`movw r1,#0x8003 ; cmp r0,r1 ; ble .Lin`) whose in-range branch
     /// jumps FORWARD to the table setup (reverse polarity), and the table index is a
     /// rebased copy (`sub r0,r0,#0x8000`). Recovering the count needs the register

@@ -407,8 +407,8 @@ impl LivePlayback {
                 label: Some("vitaslop-web-gxm"),
                 required_features: wgpu::Features::empty(),
                 // Raise the resolution-derived limits to the adapter's: a real title
-                // binds textures past the conservative WebGL2 floor (OlliOlli has a
-                // ~2480px atlas). WebGPU guarantees at least 8192, so this is safe.
+                // binds textures past the conservative WebGL2 floor (some titles have
+                // a ~2480px atlas). WebGPU guarantees at least 8192, so this is safe.
                 required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(adapter.limits()),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -557,7 +557,7 @@ impl GameSetup {
     /// The one-line setup status, tagged with where the run lives (main thread / worker).
     fn status(&self, home: &str) -> String {
         format!(
-            "OlliOlli live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time){} | rendering live via WebGPU",
+            "retail title live in browser ({home}): {} files, {} modules, image {} KiB | decrypt/link {:.0} ms + transpile {:.0} ms (one-time){} | rendering live via WebGPU",
             self.nfiles,
             self.n_modules,
             self.image_kib,

@@ -25,7 +25,7 @@ pub const NONPDRM_FAKE_AID: u64 = 0x0123_4567_89AB_CDEF;
 pub struct Rif {
     /// Account id (`NONPDRM_FAKE_AID` for a NoNpDrm fake RIF).
     pub account_id: u64,
-    /// Content id, e.g. `"UP4409-PCSE00341_00-OLLIOLLIOLLIOLLI"`.
+    /// Content id, e.g. `"XXYYYY-ABCD00001_00-0123456789ABCDEF"`.
     pub content_id: String,
     /// The 16-byte klicensee at 0x50 (used verbatim for a NoNpDrm license).
     pub key: [u8; KEY_LEN],
@@ -64,14 +64,18 @@ mod tests {
     use crate::ingest::testfix;
 
     #[test]
-    fn parses_olliolli_rif() {
+    fn parses_fixture_rif() {
+        // Opt-in acid test against a privately-supplied dump (skips if absent).
+        // Asserts only universal NoNpDrm RIF invariants, no title-specific values.
         let Some(bytes) = testfix::read("sce_sys/package/work.bin") else {
             return;
         };
         let rif = Rif::parse(&bytes).expect("parse work.bin");
         assert_eq!(rif.account_id, NONPDRM_FAKE_AID);
         assert!(rif.is_fake());
-        assert_eq!(rif.content_id, "UP4409-PCSE00341_00-OLLIOLLIOLLIOLLI");
+        // A content id is present and printable ASCII (format is title-independent).
+        assert!(!rif.content_id.is_empty());
+        assert!(rif.content_id.bytes().all(|b| b.is_ascii_graphic() || b == b'-' || b == b'_'));
         // The key field is present and non-zero.
         assert_ne!(rif.key, [0u8; 16]);
     }

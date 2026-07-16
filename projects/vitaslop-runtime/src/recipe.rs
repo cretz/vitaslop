@@ -67,14 +67,14 @@
 //!   strongly encouraged: record why an input is timed as it is and what was learned.
 //!
 //! ```text
-//! @title OlliOlli tutorial - Pushing lesson
-//! @game  PCSE00341
+//! @title Tutorial - first lesson
+//! @game  ABCD00001
 //! @watch vpos i32 0x81502058   # skater vertical: 60 ground, negative airborne
 //!
 //! 0: @section navigate
-//! 12: touch=450,674            # dismiss the connect dialog
+//! 12: touch=450,674            # dismiss a startup dialog
 //! 19:
-//! 150: cross                   # rhythmic X pushes the skater to full speed
+//! 150: cross                   # rhythmic input drives the character forward
 //! 154:
 //! 480: @assert vpos ~ 60 +-3   # touchdown reached
 //! 480: @shot pushing-land
@@ -795,11 +795,11 @@ mod tests {
     #[test]
     fn parses_header_metadata() {
         let r = Recipe::parse(
-            "@title My Run\n@game PCSE00341\n@sig 0x3f9a1c04\n@watch vpos i32 0x81502058\n0: cross\n",
+            "@title My Run\n@game ABCD00001\n@sig 0x3f9a1c04\n@watch vpos i32 0x81502058\n0: cross\n",
         )
         .unwrap();
         assert_eq!(r.meta.title.as_deref(), Some("My Run"));
-        assert_eq!(r.meta.game.as_deref(), Some("PCSE00341"));
+        assert_eq!(r.meta.game.as_deref(), Some("ABCD00001"));
         assert_eq!(r.meta.sig, Some(0x3f9a_1c04));
         assert_eq!(r.meta.shot_every, None);
         assert_eq!(r.watches.len(), 1);

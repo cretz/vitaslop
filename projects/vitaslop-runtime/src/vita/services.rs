@@ -36,8 +36,8 @@ const SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS: u32 = 1;
 /// `value`. Language and the enter-button assignment are the two that actually
 /// affect behaviour (locale selection, confirm/cancel mapping); everything else gets
 /// a safe, in-range 0 rather than an uninitialized read. NOTE: this is a faithfulness
-/// fix, not the fix for OlliOlli's touch-driven front-end (that was `sceTouchRead`);
-/// no button, Cross or Circle, drove the game-drawn connect dialog.
+/// fix, not a fix for a touch-driven front-end (that is `sceTouchRead`'s job); on such
+/// a title no button, Cross or Circle, drives a game-drawn touch dialog.
 #[hostcall]
 pub(super) fn apputil_system_param_get_int(ctx: &mut GuestCtx, _st: &mut VitaState, id: u32, value: Ptr) -> i32 {
     if !value.is_null() {
