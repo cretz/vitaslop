@@ -22,3 +22,7 @@ vitaslop-native = { path = "../vitaslop-native" }
 [[bin]]
 name = "play"
 path = "src/bin/play.rs"
+
+[[bin]]
+name = "sweep"
+path = "src/bin/sweep.rs"

@@ -130,6 +130,64 @@ button presses is a recipe nobody can safely touch.
 - **Screenshot the outcome, not every frame.** Put a `@shot` at the moment that
   decides pass/fail (the land frame, the results screen) and eyeball just that PNG.
 
+## sweep - searching one timing parameter fast
+
+Authoring a frame-precise input (when to press X to land a trick) is a search over one
+frame number. The `sweep` binary automates it and uses the determinism signature as a
+free equivalence oracle: it injects a button press at each frame in a range, groups the
+runs by outcome signature, and writes one screenshot per DISTINCT outcome. You eyeball
+two or three images instead of thirty.
+
+```
+cargo run --release -p vitaslop-gamerun-recipes --bin sweep -- \
+  --game /path/to/app/PCSE00341 \
+  --recipe recipes/PCSE00341/basics.recipe \
+  --at 719-731 --button cross --hold 1 \
+  --shots /tmp/scratch/sweep --shot-frame 742
+```
+
+It prints the baseline (no-press) signature and each bucket:
+
+```
+SIG 0x6397...  frames [719,720,721,722,723,724]  repr shot sweep-f00719.png  (no effect - same as baseline)
+SIG 0xd693...  frames [725,726,727]               repr shot sweep-f00725.png
+```
+
+A bucket equal to the baseline pressed too late or outside the input window - the input
+changed nothing. Distinct buckets are the outcomes worth looking at. This is also a
+diagnosis: if the WHOLE range collapses to one bucket, the timing you are sweeping is
+not the lever (look at speed, the trick gesture, or a different parameter).
+
+## Lessons for agents playing games (general, not title-specific)
+
+These came out of authoring real recipes and are worth internalizing before you grind a
+new title:
+
+1. **Get a machine-readable outcome, not just screenshots.** The slowest part of the
+   loop is a human eyeballing a PNG to tell success from failure. The game already
+   computes its verdict (PASS/FAIL, score, combo) and usually renders it. Capture that
+   as a scalar: a `@watch` on the score/combo/state, the egress ledger (`@assert
+   egress ...`), or the on-screen HUD. An outcome you can compare in code is what lets
+   the loop run without a human in it - essential when you have dozens of titles.
+2. **Use the signature as an equivalence oracle.** Many inputs collapse to the same
+   observable outcome. Bucketing a sweep by signature finds the DISTINCT outcomes
+   without rendering, so you only look at one representative per bucket. `sweep` does
+   this; reach for it before hand-authoring N variants.
+3. **"No effect" is a diagnosis.** If perturbing the variable you are tuning does not
+   move the signature, you are tuning the wrong variable. Cheap to check, saves hours.
+4. **Iteration cost is prefix replay.** Every attempt re-runs the whole setup (menus +
+   earlier gameplay) to reach the decision frame. That, not the engine, dominates
+   wall-clock. A state snapshot at the decision frame - fork many candidate inputs from
+   one saved state - is the biggest available accelerator and is clean because the
+   scheduler is deterministic single-baton. (Not built yet; the highest-value next
+   tool.)
+5. **Live-state addresses are not stable across builds.** A `@watch` address found by
+   RE in one build can be a stale constant in the next (the live object relocates).
+   Prefer re-discovering state by behavioral signature (a value that is constant then
+   dips, or traces an arc, or ramps) over trusting a fixed address. A first-class
+   value-finder (dump a region across a known behavior, diff for the signature) belongs
+   in the harness; today it is done with an external script.
+
 ## Determinism and @sig
 
 The engine runs the guest deterministically (single-baton cooperative scheduling: one
