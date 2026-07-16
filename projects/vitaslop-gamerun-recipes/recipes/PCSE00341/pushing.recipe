@@ -1,0 +1,92 @@
+@title OlliOlli tutorial - Pushing lesson
+@game  PCSE00341
+@shot-every 40   # in-game shots through the run so a human can assess render quality
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Navigates the forced first-launch tutorial to the "Pushing" lesson and clears
+# it. A save-less first launch routes straight into the tutorial, so this is the
+# entry point every deeper OlliOlli recipe builds on.
+#
+# HOW IT WAS AUTHORED (lessons for the next agent)
+# - The front-end is TOUCH, not buttons: menu items are hit-tested on the front
+#   touch panel. Panel coords are screen*2 (front panel 1920x1088, screen
+#   960x544). A tap is a sticky touch=X,Y on one line then a later line drops it.
+# - Gameplay is BUTTONS: X (cross) both PUSHES on the ground and LANDS in the
+#   air. "Two pushes reach full speed", so a steady X-tap cadence carries the
+#   skater to the goal. No trick/land timing is needed in THIS lesson (that is
+#   The Basics), which is why Pushing is the reliable warm-up.
+# - The nav tap frames below were tuned on the native `play` binary (which
+#   renders PNGs you can eyeball via --shots) and then hold verbatim on desktop
+#   and in the browser, because a recipe is keyed on display flips, not wall
+#   time. If a tap misses after an engine change, re-eyeball with --shots.
+# ============================================================================
+
+@watch vpos i32 0x81502058   # skater vertical: 60 on the ground, negative airborne,
+                             # returns through 60 at touchdown. The landing-timing
+                             # signal for the trick lessons; here it just confirms the
+                             # skater is grounded and rolling.
+
+# --- navigate the touch front-end to the Pushing lesson ---
+0: @section navigate
+12: touch=450,674     # "Offline Mode" -> dismiss the "Get yourself connected" dialog
+19:
+30: touch=230,230     # into the tutorial (a save-less first launch is forced here)
+37:
+80: touch=930,674     # OK on the "Let's learn to Skate" intro dialog
+87:
+112: touch=1620,376   # tutorial list
+121:
+128: touch=630,870    # "Pushing" -> load the lesson
+137:
+
+# --- clear the lesson: rhythmic X pushes to full speed and along to the goal ---
+150: @section push-to-goal
+150: cross
+154:
+166: cross
+170:
+182: cross
+186:
+198: cross
+202:
+214: cross
+218:
+230: cross
+234:
+246: cross
+250:
+262: cross
+266:
+278: cross
+282:
+294: cross
+298:
+310: cross
+314:
+326: cross
+330:
+342: cross
+346:
+358: cross
+362:
+374: cross
+378:
+390: cross
+394:
+406: cross
+410:
+422: cross
+426:
+438: cross
+442:
+454: cross
+458:
+
+# --- confirm progress: the skater should be grounded and rolling by now ---
+460: @section confirm
+460: @assert vpos ~ 60 +-6    # grounded (pushing keeps the skater on the deck)
+470: @shot pushing-rolling    # eyeball frame for a human: skater mid-lesson
+480: @note Pushing reliably reaches here. The PASS panel and its savedata write
+480: @note land a bit later - extend this recipe and add an egress SaveWrite
+480: @todo assert egress SaveWrite once the PASS-screen save frame is pinned

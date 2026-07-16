@@ -46,6 +46,16 @@ fn main() {
             eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>]");
             std::process::exit(2);
         };
+        // `--recipe <file>` replays a scripted TAS recipe in the live window so a
+        // recorded playthrough can be watched (live keyboard/mouse still nudge it).
+        let recipe = args
+            .iter()
+            .position(|a| a == "--recipe" || a == "-r")
+            .and_then(|i| args.get(i + 1))
+            .map(|p| std::fs::read_to_string(p).unwrap_or_else(|e| {
+                eprintln!("cannot read recipe {p}: {e}");
+                std::process::exit(2);
+            }));
         // `--headless <dir>` validates the retail path without opening a window (drive
         // the tutorial + render one frame to a PNG); useful on a display-less box.
         let result = match args.iter().position(|a| a == "--headless") {
@@ -56,7 +66,7 @@ fn main() {
                     std::process::exit(2);
                 }
             },
-            None => retail::run(dir.into()),
+            None => retail::run(dir.into(), recipe),
         };
         if let Err(e) = result {
             eprintln!("error: {e}");

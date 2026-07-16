@@ -378,6 +378,15 @@ fn vfs_key(path: &str) -> String {
         .to_lowercase()
 }
 
+/// Whether a (already-lowercased [`vfs_key`]) path lives on a writable, persisted
+/// Vita mount - `savedata0:` (the title's own save slot) or `ux0:` (the memory
+/// card). A write-then-close on one of these is game-authored persistent state, so
+/// the egress ledger records it. `app0:` (read-only game data) never qualifies, and
+/// is stripped by `vfs_key` anyway.
+fn is_persisted_mount(key: &str) -> bool {
+    key.starts_with("savedata") || key.starts_with("ux0:")
+}
+
 impl FileTable {
     fn new() -> Self {
         FileTable { next_fd: FIRST_FD, ..Default::default() }
@@ -636,6 +645,10 @@ pub struct VitaState {
     /// (jumping to the earliest pending deadline when every thread is parked), so a
     /// timed wait costs one round instead of millions of busy-poll iterations.
     virtual_us: u64,
+    /// The current display-frame index, updated each flip by the scheduler
+    /// (`on_frame_boundary`). Frame-tags egress-ledger events so a recipe can assert
+    /// roughly when a milestone occurred, not only that it did.
+    cur_frame: u64,
 }
 
 impl VitaState {
@@ -685,7 +698,21 @@ impl VitaState {
             lwcond_waiters: Vec::new(),
             sleep_waiters: Vec::new(),
             virtual_us: 0,
+            cur_frame: 0,
         }
+    }
+
+    /// The current display-frame index (set by the scheduler each flip). Read by the
+    /// egress ledger to frame-tag events and by an observation harness sampling per
+    /// frame.
+    pub fn cur_frame(&self) -> u64 {
+        self.cur_frame
+    }
+
+    /// Set the current display-frame index. Called by the scheduler's frame boundary
+    /// so egress events and per-frame samples carry the right frame number.
+    pub fn set_cur_frame(&mut self, frame: u64) {
+        self.cur_frame = frame;
     }
 
     /// Record a registered shader program (its guest `SceGxmProgram*` header) and
@@ -799,7 +826,29 @@ impl VitaState {
     }
 
     /// sceIoClose: 0 or a negative errno.
+    ///
+    /// Egress ledger: if the descriptor being closed was a writable file under a
+    /// persisted mount (`savedata0:`/`ux0:`), record a [`SaveWrite`](crate::capture::EgressKind::SaveWrite)
+    /// with the path, final size, and an ASCII preview - the title-agnostic,
+    /// human-readable "the game persisted state" signal a conformance recipe asserts
+    /// on. Close is the natural commit point (the whole file is present by then).
     pub fn io_close(&mut self, fd: i32) -> i32 {
+        if let Some(of) = self.fs.open.get(&fd) {
+            if of.writable && is_persisted_mount(&of.path) {
+                let path = of.path.clone();
+                if let Some(data) = self.fs.files.get(&path) {
+                    let ev = crate::capture::EgressEvent {
+                        frame: self.cur_frame,
+                        kind: crate::capture::EgressKind::SaveWrite {
+                            path,
+                            bytes: data.len(),
+                            ascii: crate::capture::ascii_preview(data, 96),
+                        },
+                    };
+                    self.capture.egress.push(ev);
+                }
+            }
+        }
         self.fs.close(fd)
     }
 
@@ -1712,6 +1761,7 @@ impl ImportDispatch for VitaEnv {
 
     fn on_frame_boundary(&mut self, frame: u64) {
         self.state.world.set_frame(frame);
+        self.state.set_cur_frame(frame);
         // Advance the virtual clock by one full 60 Hz frame per display flip: a
         // rendered frame represents ~16.6 ms of wall time passing, so the game's
         // animation and dialog timers progress at the right rate. `advance_time_to`

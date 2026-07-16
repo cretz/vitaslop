@@ -378,6 +378,7 @@ struct LivePlayback {
     gxm: GxmRenderer,
     builder: RenderSceneBuilder,
     depth: wgpu::TextureView,
+    render_format: wgpu::TextureFormat,
     fps: FpsMeter,
 }
 
@@ -419,6 +420,13 @@ impl LivePlayback {
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
+        // The GXM decode yields final display-ready (sRGB-encoded) byte values, matching
+        // the `Rgba8Unorm` software oracle. Render through a non-sRGB view so those bytes
+        // land verbatim rather than getting a second sRGB encode (see the desktop
+        // `RetailGfx` for the full note). WebGPU's preferred canvas format is normally
+        // already non-sRGB, so this is usually a no-op in the browser.
+        let render_format = format.remove_srgb_suffix();
+        let view_formats = if render_format == format { vec![] } else { vec![render_format] };
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -429,12 +437,12 @@ impl LivePlayback {
                 height: HEIGHT,
                 present_mode: wgpu::PresentMode::Fifo,
                 alpha_mode: caps.alpha_modes[0],
-                view_formats: vec![],
+                view_formats,
                 desired_maximum_frame_latency: 2,
             },
         );
 
-        let gxm = GxmRenderer::new(&device, &queue, format);
+        let gxm = GxmRenderer::new(&device, &queue, render_format);
         let depth = make_depth(&device);
         let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
         let fps = FpsMeter::new(perf, report);
@@ -445,6 +453,7 @@ impl LivePlayback {
             gxm,
             builder: RenderSceneBuilder::new(),
             depth,
+            render_format,
             fps,
         })
     }
@@ -456,7 +465,10 @@ impl LivePlayback {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => return,
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.render_format),
+            ..Default::default()
+        });
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

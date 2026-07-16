@@ -553,6 +553,14 @@ struct DrawInterp {
     textured: bool,
     /// Divisor applied to texcoords to normalize atlas-in-pixels coords to [0,1].
     uv_div: [f32; 2],
+    /// Skip the draw entirely: it carries neither a texcoord nor a per-vertex color, so
+    /// its fragment color comes only from the (uncaptured) fragment program / a uniform
+    /// we cannot interpret. Such position-only geometry is typically a full-screen effect
+    /// pass (a fog/tint/clear over an NDC cover triangle); with no color source we would
+    /// otherwise fall back to OPAQUE WHITE and white out the background wherever nothing
+    /// draws over it. Skipping (leaving what is behind) is the strictly-safer fallback -
+    /// an invisible pass we can't reproduce, not a screen-filling white artifact.
+    skip: bool,
 }
 
 /// Recover a draw's [`DrawInterp`] the same way for both render paths.
@@ -596,7 +604,10 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
         }
         _ => [1.0, 1.0],
     };
-    DrawInterp { layout, space, textured, uv_div }
+    // Position-only geometry (no texcoord AND no per-vertex color) has no color source
+    // we can honor - see `DrawInterp::skip`. Skip it rather than paint opaque white.
+    let skip = layout.uv_off.is_none() && layout.color_off.is_none();
+    DrawInterp { layout, space, textured, uv_div, skip }
 }
 
 /// Rasterize one scene into a fresh framebuffer. `clear` is the background color.
@@ -604,12 +615,23 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
     let mut fb = Framebuffer::new(width, height, clear);
     let mut depth = vec![f32::INFINITY; (width * height) as usize];
 
-    for d in &scene.draws {
+    // Diagnostic: VITASLOP_PIXEL_TRACE=x,y logs every draw that writes that pixel (index,
+    // whether textured/depth-tested, the source RGBA) - the definitive "which draw painted
+    // this glitch" probe. Zero cost when unset.
+    let trace: Option<(i32, i32)> = std::env::var("VITASLOP_PIXEL_TRACE").ok().and_then(|s| {
+        let (a, b) = s.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+
+    for (di, d) in scene.draws.iter().enumerate() {
         // Only triangle lists are handled (SCE_GXM_PRIMITIVE_TRIANGLES = 0).
         if d.primitive != 0 {
             continue;
         }
-        let DrawInterp { layout, space, textured, uv_div } = interpret_draw(d);
+        let DrawInterp { layout, space, textured, uv_div, skip } = interpret_draw(d);
+        if skip {
+            continue;
+        }
         // Depth-test and replace only in the 3D path; 2D draws paint in submission
         // order with alpha blending.
         let depth_test = matches!(space, Space::Mvp(_));
@@ -635,7 +657,7 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
             if behind {
                 continue;
             }
-            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test);
+            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test, trace, di);
         }
     }
     fb
@@ -652,6 +674,8 @@ fn raster_triangle(
     texture: Option<&BoundTexture>,
     uv_div: [f32; 2],
     depth_test: bool,
+    trace: Option<(i32, i32)>,
+    draw_idx: usize,
 ) {
     let (w, h) = (fb.width as i32, fb.height as i32);
     let min_x = s.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
@@ -715,6 +739,14 @@ fn raster_triangle(
                 }
             }
 
+            if let Some((tx, ty)) = trace {
+                if x == tx && y == ty {
+                    eprintln!(
+                        "PXTRACE ({tx},{ty}) draw {draw_idx} textured={} depth_test={} src=[{:.0},{:.0},{:.0},{:.0}]",
+                        texture.is_some(), depth_test, src[0], src[1], src[2], src[3]
+                    );
+                }
+            }
             let dst = idx * 4;
             if depth_test {
                 // Opaque replace (with the z-buffer already updated).
@@ -843,6 +875,9 @@ impl RenderSceneBuilder {
                 continue;
             }
             let interp = interpret_draw(d);
+            if interp.skip {
+                continue;
+            }
             let layout = &interp.layout;
 
             // The largest index referenced, so the vertex buffer covers every index

@@ -29,6 +29,9 @@ const gameDir = opt("--game") || process.env.GAME_DIR;
 const port = Number(opt("--port") || process.env.PORT || 8080);
 const noBuild = args.includes("--no-build");
 const noOpen = args.includes("--no-open");
+// --recipe <file>: serve this frame-keyed TAS recipe at /recipe.txt so the page can
+// replay a recorded playthrough via play.html?recipe=/recipe.txt (auto-appended below).
+const recipeFile = opt("--recipe");
 
 if (!gameDir) {
   console.error("error: --game <dir> is required (the extracted app directory).");
@@ -84,6 +87,10 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json", ...coi });
       return res.end(JSON.stringify(manifest));
     }
+    if (url === "/recipe.txt" && recipeFile) {
+      res.writeHead(200, { "content-type": "text/plain", ...coi });
+      return res.end(await readFile(recipeFile));
+    }
     const file = url.startsWith("/game/")
       ? join(gameDir, url.slice("/game/".length))
       : join(webDir, url === "/" ? "/play.html" : url);
@@ -96,8 +103,9 @@ const server = createServer(async (req, res) => {
 });
 
 await new Promise((r) => server.listen(port, "127.0.0.1", r));
-const url = `http://127.0.0.1:${port}/`;
+const url = `http://127.0.0.1:${port}/${recipeFile ? "?recipe=/recipe.txt" : ""}`;
 console.log(`serving at ${url}  (Ctrl+C to stop)`);
+if (recipeFile) console.log(`replaying recipe: ${recipeFile}`);
 
 if (!noOpen) {
   // Open the default browser, cross-platform.

@@ -103,6 +103,48 @@ impl Scene {
     }
 }
 
+/// A game->OS "egress" event: something the guest handed to the system that
+/// carries game-authored, human-readable meaning - a savedata write, a trophy
+/// unlock, a leaderboard score submission. This is the content-ful, title-agnostic
+/// seam a conformance recipe asserts on: it is the Vita OS API surface, NOT the
+/// game's private memory (which would be per-title RE and brittle). Every event is
+/// tagged with the display frame it occurred on, so a recipe can assert both what
+/// the game did and (loosely) when - the human-readable proof a run reached a game
+/// milestone, replacing a screenshot assertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EgressEvent {
+    pub frame: u64,
+    pub kind: EgressKind,
+}
+
+/// The kinds of game-authored egress the ledger records. Deliberately small and
+/// generic - each variant is a Vita OS surface every title shares, so the ledger
+/// generalizes to the next game with no per-title work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EgressKind {
+    /// A writable file under a persisted mount (`savedata0:`, `ux0:`) was closed
+    /// after being written: the game persisted state. `bytes` is the final size and
+    /// `ascii` is a printable-ASCII preview (non-printable bytes shown as `.`), so a
+    /// human-readable save - a high score, an unlocked level id - is visible without
+    /// a pixel. This is where OlliOlli's score lands on the offline path.
+    SaveWrite { path: String, bytes: usize, ascii: String },
+    /// A trophy was unlocked (`sceNpTrophyUnlockTrophy`): the trophy id.
+    Trophy { id: i32 },
+    /// A score was submitted to a leaderboard (`sceNpScore*`): board id and value.
+    /// Only fires if the online path is enabled (offline forces signed-out).
+    ScoreSubmit { board: u32, score: i64 },
+}
+
+/// Render up to `max` bytes of `data` as a printable-ASCII preview: printable bytes
+/// verbatim, everything else as `.`. Keeps the egress ledger human-readable and
+/// content-bounded (no raw blobs) for logs and assertions.
+pub fn ascii_preview(data: &[u8], max: usize) -> String {
+    data.iter()
+        .take(max)
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect()
+}
+
 /// The whole recorded stream across a run.
 #[derive(Default)]
 pub struct Capture {
@@ -133,6 +175,10 @@ pub struct Capture {
     /// a producer/consumer wait (no timeout) from a timed delay loop (finite
     /// timeout) without a full trace. Capped so it costs nothing after warm-up.
     pub lwcond_wait_samples: Vec<(u32, u32, u32)>,
+    /// The game->OS egress ledger: game-authored, human-readable events (savedata
+    /// writes, trophies, score submissions) in occurrence order, each frame-tagged.
+    /// This is the content-free conformance-assertion surface (see [`EgressEvent`]).
+    pub egress: Vec<EgressEvent>,
 }
 
 impl Capture {

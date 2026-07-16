@@ -62,9 +62,15 @@ pub struct DesktopInput {
 pub type SharedInput = Arc<Mutex<DesktopInput>>;
 
 /// The world the retail guest polls: a virtual 60 Hz clock, a seeded PRNG, and input
-/// drawn from the shared [`DesktopInput`] cell the window updates each frame.
+/// drawn from the shared [`DesktopInput`] cell the window updates each frame. An
+/// optional [`RecipeWorld`] overlays a scripted TAS recipe on top of live input, so a
+/// recorded playthrough replays in the window while the user watches (and can still
+/// nudge with the keyboard/mouse) - the native twin of the browser's `BrowserWorld`.
 struct DesktopWorld {
     input: SharedInput,
+    /// A scripted recipe driving input as a function of frame, if `--recipe` was given.
+    /// Frame-keyed, so it replays identically on desktop, browser, and headless.
+    recipe: Option<vitaslop_runtime::RecipeWorld>,
     monotonic_us: u64,
     wall_us: u64,
     rng: u64,
@@ -72,7 +78,20 @@ struct DesktopWorld {
 
 impl DesktopWorld {
     fn new(input: SharedInput) -> Self {
-        DesktopWorld { input, monotonic_us: 0, wall_us: 1_500_000_000_000_000, rng: 0x9E37_79B9_7F4A_7C15 }
+        DesktopWorld {
+            input,
+            recipe: None,
+            monotonic_us: 0,
+            wall_us: 1_500_000_000_000_000,
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// With a scripted recipe overlaid on the live input.
+    fn with_recipe(input: SharedInput, recipe: vitaslop_runtime::RecipeWorld) -> Self {
+        let mut w = DesktopWorld::new(input);
+        w.recipe = Some(recipe);
+        w
     }
 }
 
@@ -83,18 +102,41 @@ impl World for DesktopWorld {
     fn wall_us(&mut self) -> u64 {
         self.wall_us
     }
-    fn poll_ctrl(&mut self, _port: u32) -> CtrlFrame {
-        self.input.lock().unwrap().ctrl
+    fn poll_ctrl(&mut self, port: u32) -> CtrlFrame {
+        let live = self.input.lock().unwrap().ctrl;
+        let Some(r) = self.recipe.as_mut() else { return live };
+        // Recipe drives; live input is additive so the watcher can nudge. Buttons OR
+        // together; a stick the recipe leaves centered falls back to the live stick.
+        let scripted = r.poll_ctrl(port);
+        CtrlFrame {
+            buttons: scripted.buttons | live.buttons,
+            lx: if scripted.lx != 128 { scripted.lx } else { live.lx },
+            ly: if scripted.ly != 128 { scripted.ly } else { live.ly },
+            rx: if scripted.rx != 128 { scripted.rx } else { live.rx },
+            ry: if scripted.ry != 128 { scripted.ry } else { live.ry },
+        }
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
-        if port == 0 {
-            self.input.lock().unwrap().touch.unwrap_or_default()
+        if port != 0 {
+            return TouchFrame::default();
+        }
+        let live = self.input.lock().unwrap().touch.unwrap_or_default();
+        let Some(r) = self.recipe.as_mut() else { return live };
+        // Prefer the recipe's scripted finger; fall back to the live mouse-as-touch.
+        let scripted = r.poll_touch(port);
+        if scripted.count > 0 {
+            scripted
         } else {
-            TouchFrame::default()
+            live
         }
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
-        // SplitMix64, matching the runtime worlds.
+        // Prefer the recipe's deterministic PRNG when replaying, so a scripted run is
+        // reproducible; otherwise SplitMix64, matching the runtime worlds.
+        if let Some(r) = self.recipe.as_mut() {
+            r.fill_random(buf);
+            return;
+        }
         for chunk in buf.chunks_mut(8) {
             self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = self.rng;
@@ -107,6 +149,9 @@ impl World for DesktopWorld {
         }
     }
     fn set_frame(&mut self, frame: u64) {
+        if let Some(r) = self.recipe.as_mut() {
+            r.set_frame(frame);
+        }
         self.monotonic_us = frame.wrapping_mul(16_666);
         self.wall_us = 1_500_000_000_000_000u64.wrapping_add(self.monotonic_us);
     }
@@ -154,8 +199,10 @@ pub struct RetailGuest {
 
 impl RetailGuest {
     /// Load, decrypt, link, transpile, and instantiate the title in `dir` for live
-    /// execution over the shared `input` cell.
-    pub fn new(dir: &Path, input: SharedInput) -> Result<RetailGuest, String> {
+    /// execution over the shared `input` cell. An optional scripted `recipe` (a
+    /// frame-keyed TAS text) is overlaid on the live input so a recorded playthrough
+    /// replays in the window.
+    pub fn new(dir: &Path, input: SharedInput, recipe: Option<&str>) -> Result<RetailGuest, String> {
         let t0 = Instant::now();
         let files = read_dir_files(dir)?;
         let mut vfs = MemVfs::new();
@@ -171,7 +218,14 @@ impl RetailGuest {
             .map_err(|e| format!("load module: {e:?}"))?;
         let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
 
-        let world = Box::new(DesktopWorld::new(input));
+        let world: Box<dyn World + Send> = match recipe {
+            Some(text) => {
+                let r = vitaslop_runtime::RecipeWorld::parse(text)
+                    .map_err(|e| format!("recipe parse: {e}"))?;
+                Box::new(DesktopWorld::with_recipe(input, r))
+            }
+            None => Box::new(DesktopWorld::new(input)),
+        };
         let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
@@ -243,6 +297,7 @@ struct RetailGfx {
     gxm: GxmRenderer,
     builder: RenderSceneBuilder,
     depth: wgpu::TextureView,
+    render_format: wgpu::TextureFormat,
     adapter_name: String,
 }
 
@@ -276,6 +331,15 @@ impl RetailGfx {
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
+        // The GXM color decode already yields final display-ready (sRGB-encoded) byte
+        // values - the software oracle just writes them into an `Rgba8Unorm` PNG. If the
+        // surface's preferred format is an sRGB variant (native Vulkan/DX usually prefer
+        // `Bgra8UnormSrgb`), writing those straight values applies a SECOND sRGB encode
+        // and washes the image out. Render through a non-sRGB view of the same surface so
+        // the bytes land verbatim, matching the oracle. On WebGPU the preferred canvas
+        // format is already non-sRGB, so this is a no-op there.
+        let render_format = format.remove_srgb_suffix();
+        let view_formats = if render_format == format { vec![] } else { vec![render_format] };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -284,14 +348,14 @@ impl RetailGfx {
             height: h,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats,
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
 
-        let gxm = GxmRenderer::new(&device, &queue, format);
+        let gxm = GxmRenderer::new(&device, &queue, render_format);
         let depth = make_depth(&device, w, h);
-        Ok(RetailGfx { surface, device, queue, config, gxm, builder: RenderSceneBuilder::new(), depth, adapter_name })
+        Ok(RetailGfx { surface, device, queue, config, gxm, builder: RenderSceneBuilder::new(), depth, render_format, adapter_name })
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -310,7 +374,10 @@ impl RetailGfx {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => return,
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.render_format),
+            ..Default::default()
+        });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // Project against the 960x544 GAME resolution (not the window size), so pixel-
         // space 2D coords map correctly; the window-sized framebuffer stretches the
@@ -343,7 +410,7 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 /// display. Frame-keyed touches mirror the browser tutorial recipe.
 pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let mut guest = RetailGuest::new(&dir, input.clone())?;
+    let mut guest = RetailGuest::new(&dir, input.clone(), None)?;
     println!("headless: loaded (build {:.0} ms), driving to the tutorial...", guest.build_ms);
 
     // (active_from, active_until, panel_x, panel_y) - a sticky tap held across a few
@@ -380,11 +447,15 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
 }
 
 /// Run the retail title in `dir` in a live window until the window closes or the guest
-/// exits. Blocks until the event loop ends.
-pub fn run(dir: PathBuf) -> Result<(), String> {
+/// exits. Blocks until the event loop ends. With `recipe` set, a scripted playthrough
+/// replays in the window (live keyboard/mouse still nudges it).
+pub fn run(dir: PathBuf, recipe: Option<String>) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let guest = RetailGuest::new(&dir, input.clone())?;
+    let guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
     println!("loaded {} (decrypt + link + transpile {:.0} ms)", dir.display(), guest.build_ms);
+    if recipe.is_some() {
+        println!("replaying scripted recipe (keyboard/mouse still nudge live)");
+    }
     println!("controls:");
     println!("  menus  : click the window (the front-end is touch driven)");
     println!("  d-pad  : arrow keys        faces: Z cross / X circle / A square / S triangle");

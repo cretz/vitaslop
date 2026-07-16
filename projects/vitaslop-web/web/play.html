@@ -37,8 +37,18 @@
       // scripted recipe - it is fully interactive (click menus, keyboard to play). The
       // run is effectively unbounded (u32::MAX frames) so it plays until the tab closes.
       const MAX_FRAMES = 0xffffffff;
+      // Optional scripted playthrough: `?recipe=<url>` fetches a frame-keyed TAS recipe
+      // and replays it (live keyboard/mouse still nudge). The dev server serves the
+      // active recipe at /recipe.txt when launched with --recipe, so `?recipe=/recipe.txt`
+      // watches a recorded run. No param = fully interactive.
+      const RECIPE_URL = new URLSearchParams(location.search).get("recipe");
       (async () => {
         try {
+          let recipe = "";
+          if (RECIPE_URL) {
+            status.textContent = "fetching recipe " + RECIPE_URL + "...";
+            recipe = await (await fetch(RECIPE_URL)).text();
+          }
           status.textContent = "fetching game files...";
           const manifest = await (await fetch("/game-manifest.json")).json();
           const files = {};
@@ -65,7 +75,7 @@
           forwardInput(worker, canvas);
           const offscreen = canvas.transferControlToOffscreen();
           const transfer = [offscreen, ...Object.values(files).map((u) => u.buffer)];
-          worker.postMessage({ offscreen, files, recipe: "", maxFrames: MAX_FRAMES }, transfer);
+          worker.postMessage({ offscreen, files, recipe, maxFrames: MAX_FRAMES }, transfer);
         } catch (err) {
           status.textContent = "failed to start: " + (err && err.message || err);
           console.error(err);

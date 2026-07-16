@@ -1,0 +1,12 @@
+# Registry of titles that have game-run recipes. Maps a title id (the name of the
+# subdir under recipes/) to a friendly name. The engine never reads this file - it is
+# provenance for humans and a listing for tooling (the `play` binary, a future recipe
+# picker in the front-ends).
+#
+# A title id here plus a recipe under recipes/<id>/ are the ONLY places a specific
+# game is named in this project. The engine crates stay game-agnostic.
+
+[[game]]
+id = "PCSE00341"
+name = "OlliOlli"
+region = "PAL"

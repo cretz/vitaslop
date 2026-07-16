@@ -86,6 +86,63 @@ impl World for BootWorld {
     }
 }
 
+/// One memory address to sample each frame in observation mode: guest address, how
+/// to interpret the bytes, and a human label for the CSV column.
+struct Watch {
+    addr: u32,
+    ty: &'static str,
+    label: String,
+}
+
+/// Parse `VITASLOP_WATCH_MEM=addr:type:label,addr:type:label,...` into watches.
+/// `addr` is hex (with or without `0x`), `type` is one of u8|u16|u32|i32|f32, and
+/// `label` is the CSV column name. Silently drops malformed entries.
+fn parse_watches(spec: Option<&str>) -> Vec<Watch> {
+    let Some(spec) = spec else { return Vec::new() };
+    let mut out = Vec::new();
+    for item in spec.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let mut parts = item.splitn(3, ':');
+        let (Some(a), Some(t)) = (parts.next(), parts.next()) else { continue };
+        let Ok(addr) = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16) else { continue };
+        let ty = match t.trim() {
+            "u8" => "u8",
+            "u16" => "u16",
+            "u32" => "u32",
+            "i32" => "i32",
+            "f32" => "f32",
+            _ => continue,
+        };
+        let label = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| format!("{addr:#x}"));
+        out.push(Watch { addr, ty, label });
+    }
+    out
+}
+
+/// Read and format one watched value from current guest memory.
+fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &Watch) -> String {
+    let n = match w.ty {
+        "u8" => 1,
+        "u16" => 2,
+        _ => 4,
+    };
+    let b = sched.read_guest(w.addr, n);
+    if b.len() < n {
+        return "oob".to_string();
+    }
+    match w.ty {
+        "u8" => format!("{}", b[0]),
+        "u16" => format!("{}", u16::from_le_bytes([b[0], b[1]])),
+        "u32" => format!("{}", u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        "i32" => format!("{}", i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        "f32" => format!("{}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        _ => "?".to_string(),
+    }
+}
+
 #[test]
 #[ignore = "boot probe: needs VITASLOP_GAME_DIR fixture"]
 fn retail_boot_probe() {
@@ -319,8 +376,93 @@ fn retail_boot_probe() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_ROUNDS);
-    let report = sched.run_frames(max_frames, max_rounds);
-    eprintln!("run report: {report:?}");
+    // Observation/steering mode (VITASLOP_WATCH_MEM=addr:type:label,...): step the
+    // run one display flip at a time and sample the listed guest addresses each
+    // frame, logging them to <shot>/watch.csv (and stderr). This is the frame-scrub
+    // loop for reverse-engineering a title's live state (skater x, score, a
+    // level-complete flag) without pixels - the values guide input authoring. Types:
+    // u8|u16|u32|i32|f32. When unset, the run is a single bounded call as before.
+    let watch = parse_watches(std::env::var("VITASLOP_WATCH_MEM").ok().as_deref());
+    // Generic RE tool: VITASLOP_DUMP_REGION=hexaddr:len writes the raw guest bytes of that
+    // region to <shot>/mem/f<frame>.bin on each stepped frame (optionally only within
+    // VITASLOP_DUMP_REGION_RANGE=lo-hi). Diffing those dumps across a known behaviour
+    // (skater grounded vs airborne) finds the address of a live state value - the
+    // value-search an agent needs to steer a game precisely. Also triggers frame-stepping.
+    let dump_region: Option<(u32, usize)> = std::env::var("VITASLOP_DUMP_REGION").ok().and_then(|s| {
+        let (a, l) = s.split_once(':')?;
+        let addr = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((addr, l.trim().parse().ok()?))
+    });
+    let dump_range: Option<(u64, u64)> = std::env::var("VITASLOP_DUMP_REGION_RANGE").ok().and_then(|s| {
+        let (lo, hi) = s.split_once('-')?;
+        Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
+    });
+    let report = if watch.is_empty() && dump_region.is_none() {
+        let r = sched.run_frames(max_frames, max_rounds);
+        eprintln!("run report: {r:?}");
+        r
+    } else {
+        // Per-frame round budget: one flip's worth of guest work. The overall
+        // max_rounds still applies per step, but a flip rarely needs the full budget.
+        let per_frame_rounds = std::env::var("VITASLOP_ROUNDS_PER_FRAME")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4_000_000u64);
+        let header: String =
+            std::iter::once("frame".to_string()).chain(watch.iter().map(|w| w.label.clone())).collect::<Vec<_>>().join(",");
+        let mut csv = format!("{header}\n");
+        eprintln!("watch: {header}");
+        if let (Some((a, l)), Some(dir)) = (dump_region, &shot_dir) {
+            std::fs::create_dir_all(format!("{dir}/mem")).ok();
+            eprintln!("dump region {a:#x}..+{l} to {dir}/mem/f<frame>.bin");
+        }
+        // VITASLOP_WATCH_FROM=N runs the uninteresting prefix (frames 0..N) as ONE fast
+        // batched call, then steps/watches from N on. Cuts a watch run's wall time from
+        // ~stepping-every-frame to just the window that matters - the difference between
+        // a ~90s and a ~30s iteration when the prefix is a long menu+lesson navigation.
+        let mut last = RunReport::FramesReached(0);
+        if let Some(from) = std::env::var("VITASLOP_WATCH_FROM").ok().and_then(|s| s.parse::<u64>().ok()) {
+            if from > 0 && from < max_frames {
+                last = sched.run_frames(from, max_rounds);
+                eprintln!("batched prefix to frame {} ({last:?})", sched.frames());
+            }
+        }
+        while sched.frames() < max_frames {
+            let target = sched.frames() + 1;
+            last = sched.run_frames(target, per_frame_rounds);
+            let f = sched.frames();
+            let mut row = vec![f.to_string()];
+            for w in &watch {
+                row.push(sample_watch(&sched, w));
+            }
+            let line = row.join(",");
+            csv.push_str(&line);
+            csv.push('\n');
+            if !watch.is_empty() {
+                eprintln!("w {line}");
+            }
+            // Per-frame raw region dump (for value-search diffing), bounded to the range.
+            if let (Some((a, l)), Some(dir)) = (dump_region, &shot_dir) {
+                let in_range = dump_range.map(|(lo, hi)| f >= lo && f <= hi).unwrap_or(true);
+                if in_range {
+                    let bytes = sched.read_guest(a, l);
+                    if !bytes.is_empty() {
+                        let _ = std::fs::write(format!("{dir}/mem/f{f:05}.bin"), &bytes);
+                    }
+                }
+            }
+            // Stop early if the guest actually finished/trapped (not just a flip).
+            if !matches!(last, RunReport::FramesReached(_)) {
+                break;
+            }
+        }
+        eprintln!("run report: {last:?}");
+        if let Some(dir) = &shot_dir {
+            let _ = std::fs::write(format!("{dir}/watch.csv"), &csv);
+            eprintln!("wrote watch.csv to {dir}/");
+        }
+        last
+    };
 
     // If the run trapped, auto-map every "wasm function N" in the backtrace to its
     // guest address, so a fault is immediately readable without a second run.
@@ -384,6 +526,43 @@ fn retail_boot_probe() {
     eprintln!("\n== result ==");
     eprintln!("reached executable main: {reached_main}");
     eprintln!("GXM scenes captured: {}", st.capture.scenes.len());
+    // The game->OS egress ledger: the human-readable milestones a conformance recipe
+    // asserts on (savedata writes, trophies, score submits), each frame-tagged. This
+    // is the content-free "the game reached a real state" signal - no pixels needed.
+    eprintln!("egress ledger ({} events):", st.capture.egress.len());
+    for ev in &st.capture.egress {
+        eprintln!("  f{:>5} {:?}", ev.frame, ev.kind);
+    }
+    // Determinism signature: a cheap FNV-1a hash over the captured render stream
+    // (per scene: color target + every draw's vertex/index/uniform bytes) and the
+    // egress ledger. Two runs of the same recipe must print the SAME signature - that
+    // is what makes a recipe a reproducible test rather than a one-off. Run the probe
+    // twice with a recipe and diff this line to prove the run is deterministic.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for s in &st.capture.scenes {
+        if let Some(c) = &s.color {
+            mix(&c.data_addr.to_le_bytes());
+            mix(&c.format.to_le_bytes());
+        }
+        for d in &s.draws {
+            mix(&d.vertices);
+            mix(&d.indices);
+            for u in &d.uniforms {
+                mix(&u.to_le_bytes());
+            }
+        }
+    }
+    for ev in &st.capture.egress {
+        mix(&ev.frame.to_le_bytes());
+        mix(format!("{:?}", ev.kind).as_bytes());
+    }
+    eprintln!("determinism signature: {h:#018x} (scenes={}, egress={})", st.capture.scenes.len(), st.capture.egress.len());
     // VITASLOP_DUMP_DRAWS dumps every captured scene's draw stream - primitive,
     // vertex stride, index count, the attribute layout (format/components/offset/
     // reg), the uniform vector, any bound fragment textures, and a few decoded
@@ -510,13 +689,21 @@ fn retail_boot_probe() {
                 .map(|(i, &nid)| format!("{i} {} {nid:#010x}\n", vitaslop_runtime::nid::name(nid)))
                 .collect();
             let _ = std::fs::write(format!("{dir}/trace.txt"), trace_txt);
+            // Rendering + PNG-encoding every scene is the dominant per-run cost, but when
+            // iterating on input timing only the OUTCOME frames matter. `VITASLOP_SHOT_LAST=K`
+            // renders just the last K scenes (keeping their real frame indices), so a
+            // tuning run that only needs the final PASS/FAIL screen is a few PNGs, not
+            // thousands. Unset = render all (full-fidelity diagnostic).
+            let shot_last: Option<usize> = std::env::var("VITASLOP_SHOT_LAST").ok().and_then(|s| s.parse().ok());
+            let total = st.capture.scenes.len();
+            let start = shot_last.map(|k| total.saturating_sub(k)).unwrap_or(0);
             let mut frames_written = 0;
-            for (i, scene) in st.capture.scenes.iter().enumerate() {
+            for (i, scene) in st.capture.scenes.iter().enumerate().skip(start) {
                 let fb = render::render_scene(scene, WIDTH, HEIGHT, CLEAR);
                 std::fs::write(format!("{dir}/frame_{i:04}.png"), fb.to_png()).expect("write png");
                 frames_written += 1;
             }
-            eprintln!("wrote {frames_written} frame PNG(s) + trace to {dir}/");
+            eprintln!("wrote {frames_written} frame PNG(s) (of {total}) + trace to {dir}/");
             // VITASLOP_GPU also renders each scene through the general GXM->WebGPU
             // renderer (the browser's real path) to frame_gpu_XXXX.png, so the GPU
             // output can be compared to the software oracle on the real title's frames.

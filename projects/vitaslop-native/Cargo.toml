@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }
+# SELF/ELF loader. Used by the recipe runner's boot path (boot_retail) and the
+# retail integration tests.
+vitaslop-loader = { path = "../vitaslop-loader" }
 # The shared cube render pipeline (shader, layout, per-draw encoding). The `gpu`
 # feature pulls in wgpu here; the browser path enables the same feature.
 vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
@@ -23,6 +26,3 @@ wasmparser = "0.253"
 wgpu = { workspace = true }
 pollster = { workspace = true }
 
-[dev-dependencies]
-# The loader is used by the OlliOlli boot-probe integration test (tests/olliolli_boot.rs).
-vitaslop-loader = { path = "../vitaslop-loader" }

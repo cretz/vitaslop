@@ -33,7 +33,7 @@ pub use host::{
     VitaState, VFP_ARG_COUNT,
 };
 pub use audio::{AudioFormat, AudioSink, NullSink};
-pub use recipe::{RecipeError, RecipeWorld};
+pub use recipe::{Recipe, RecipeError, RecipeWorld};
 pub use sched::{
     FiberEnd, GuestEngine, GuestThread, IdleStep, RunReport, SchedCore, Scheduler, Stop,
     ThreadHandle, ThreadStep,

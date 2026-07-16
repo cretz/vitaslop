@@ -21,6 +21,9 @@ pub use threaded::{RunReport, ThreadSpawn, ThreadedScheduler};
 
 pub mod wgpu_render;
 pub use wgpu_render::{GeneralRenderer, WgpuRenderer};
+
+pub mod recipe_runner;
+pub use recipe_runner::{boot_retail, run_recipe, RecipeReport, RunOpts};
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store, Val};
