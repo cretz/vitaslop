@@ -110,10 +110,14 @@ pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, _ty: i32, l
 pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let port = ctx.arg(0) as i32;
     let buf = ctx.arg(1);
-    if std::env::var("VITASLOP_TRACE_NGS").is_ok() && buf != 0 {
+    if buf != 0 && tracing::enabled!(target: "vitaslop::ngs", tracing::Level::TRACE) {
         let head = ctx.read_bytes(buf, 32);
         let nonzero = head.iter().any(|&b| b != 0);
-        eprintln!("AudioOutOutput port={port} buf={buf:#x} nonzero={nonzero} head={head:02x?}");
+        tracing::trace!(
+            target: "vitaslop::ngs",
+            port, buf = format_args!("{buf:#x}"), nonzero, head = format_args!("{head:02x?}"),
+            "AudioOutOutput"
+        );
     }
     let (backend_port, format) = match st.audio_state.format_of(port) {
         None => {

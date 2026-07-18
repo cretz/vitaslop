@@ -104,6 +104,7 @@ impl PfsImage {
             icv_salt: self.unicv.tables[file.table_index].page_no,
             table_index: file.table_index,
             iv_seed: file_table_iv_seed(self, file.table_index),
+            has_dbseed: self.unicv.header.version > 1,
             page_size: file.table.page_size,
             signatures: file_table_signatures(self, file.table_index),
             plaintext_size: file.node.size as usize,
@@ -155,6 +156,10 @@ pub struct FileCtx<'a> {
     pub table_index: usize,
     /// The file's per-file IV seed from unicv.
     pub iv_seed: &'a [u8; 20],
+    /// Whether this image carries per-file dbseeds (unicv `icv_version > 1`). When
+    /// false (the older v1 read-only format, e.g. launch-window titles) there is no
+    /// dbseed and the sector IV uses no tweak mask - see [`crate::ingest::pfscrypt`].
+    pub has_dbseed: bool,
     /// Data page size (0x8000).
     pub page_size: u32,
     /// Per-page HMAC-SHA1 signatures.

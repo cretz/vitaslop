@@ -21,6 +21,28 @@ const MAX_PATH: usize = 1024;
 /// and `st_attr` (u32).
 const STAT_SIZE_OFFSET: u32 = 8;
 
+/// SceIoStat `st_mode` for a readable regular file: SCE_S_IFREG plus user/system
+/// read permission (octal 020000 | 0400 | 04). A title that checks `SCE_S_ISREG`
+/// before trusting the size needs the format bits set, not a bare zero.
+const STAT_MODE_REGULAR_READABLE: u32 = 0o20000 | 0o400 | 0o4;
+/// SceIoStat `st_attr` for a regular file: SCE_SO_IFREG.
+const STAT_ATTR_REGULAR: u32 = 0x0020;
+
+/// Fill the size-relevant fields of a guest SceIoStat: mark it a readable regular
+/// file and write the 64-bit size. The remaining fields (timestamps, private) are
+/// left untouched - a size query is all a title needs from these handlers, and the
+/// guest zeroes its stat buffer before the call. Shared by the by-path and by-fd
+/// stat handlers so both report a file identically.
+fn write_file_stat(ctx: &mut GuestCtx, stat_addr: u32, size: u64) {
+    if stat_addr == 0 {
+        return;
+    }
+    ctx.write_u32(stat_addr, STAT_MODE_REGULAR_READABLE); // st_mode
+    ctx.write_u32(stat_addr + 4, STAT_ATTR_REGULAR); // st_attr
+    ctx.write_u32(stat_addr + STAT_SIZE_OFFSET, size as u32);
+    ctx.write_u32(stat_addr + STAT_SIZE_OFFSET + 4, (size >> 32) as u32);
+}
+
 /// SceUID sceIoOpen(const char *file, int flags, SceMode mode)
 #[hostcall]
 pub(super) fn io_open(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, flags: u32, _mode: u32) -> i32 {
@@ -92,9 +114,7 @@ pub(super) fn io_pread(ctx: &mut GuestCtx, st: &mut VitaState) {
         }
         None => EBADF,
     };
-    if std::env::var_os("VITASLOP_TRACE_IO").is_some() {
-        eprintln!("[io] pread(fd={fd}, off={offset}, size={size}) -> {ret}");
-    }
+    tracing::trace!(target: "vitaslop::io", fd, offset, size, ret, "pread");
     ctx.ret(ret as u32);
 }
 
@@ -120,23 +140,87 @@ pub(super) fn io_close(st: &mut VitaState, fd: i32) -> i32 {
 }
 
 /// int sceIoGetstat(const char *file, SceIoStat *stat)
-/// Fills only what a size query needs: zero the mode/attr words and write the
-/// 64-bit size. Returns a negative errno if the path does not exist.
+/// Fills what a size query needs: the regular-file mode/attr and the 64-bit size
+/// (see [`write_file_stat`]). Returns a negative errno if the path does not exist.
 #[hostcall]
 pub(super) fn io_getstat(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, stat: Ptr) -> i32 {
     let path = read_cstr(ctx, file.addr());
     match st.io_size(&path) {
         Some(size) => {
-            if !stat.is_null() {
-                ctx.write_u32(stat.addr(), 0); // st_mode
-                ctx.write_u32(stat.addr() + 4, 0); // st_attr
-                ctx.write_u32(stat.addr() + STAT_SIZE_OFFSET, size as u32);
-                ctx.write_u32(stat.addr() + STAT_SIZE_OFFSET + 4, (size >> 32) as u32);
-            }
+            write_file_stat(ctx, stat.addr(), size);
             0
         }
         None => ENOENT,
     }
+}
+
+/// int sceIoGetstatByFd(SceUID fd, SceIoStat *stat)
+/// The open-descriptor counterpart of [`io_getstat`]: a title that has already
+/// opened a file often stats it by fd to size a read buffer before reading. Fills
+/// the same regular-file stat from the descriptor's backing file.
+#[hostcall]
+pub(super) fn io_getstat_by_fd(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, stat: Ptr) -> i32 {
+    match st.io_size_fd(fd) {
+        Some(size) => {
+            write_file_stat(ctx, stat.addr(), size);
+            0
+        }
+        None => EBADF,
+    }
+}
+
+/// Size of a guest SceIoStat: st_mode (4) + st_attr (4) + st_size (8) + three
+/// SceDateTime (16 each) + st_private[6] (24).
+const STAT_SIZE: usize = 88;
+/// Size of a guest SceIoDirent: SceIoStat d_stat + char d_name[256] + void
+/// *d_private + int dummy.
+const DIRENT_SIZE: usize = STAT_SIZE + 256 + 4 + 4;
+
+/// SceIoStat `st_mode` for a traversable directory: SCE_S_IFDIR plus user/system
+/// read+exec permission (octal 010000 | 0500 | 05).
+const STAT_MODE_DIR: u32 = 0o10000 | 0o500 | 0o5;
+/// SceIoStat `st_attr` for a directory: SCE_SO_IFDIR.
+const STAT_ATTR_DIR: u32 = 0x0010;
+
+/// SceUID sceIoDopen(const char *dirname)
+#[hostcall]
+pub(super) fn io_dopen(ctx: &mut GuestCtx, st: &mut VitaState, dirname: Ptr) -> i32 {
+    let path = read_cstr(ctx, dirname.addr());
+    st.io_dopen(&path)
+}
+
+/// int sceIoDread(SceUID fd, SceIoDirent *dirent)
+/// Returns >0 with an entry filled in, 0 at the end of the listing, or a negative
+/// errno on a bad descriptor. The whole dirent is written (zeroed then filled) so a
+/// title reading name or stat fields sees no stale guest memory.
+#[hostcall]
+pub(super) fn io_dread(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, dirent: Ptr) -> i32 {
+    match st.io_dread(fd) {
+        Some(Some(entry)) => {
+            let mut buf = [0u8; DIRENT_SIZE];
+            let (mode, attr) = if entry.is_dir {
+                (STAT_MODE_DIR, STAT_ATTR_DIR)
+            } else {
+                (STAT_MODE_REGULAR_READABLE, STAT_ATTR_REGULAR)
+            };
+            buf[0..4].copy_from_slice(&mode.to_le_bytes());
+            buf[4..8].copy_from_slice(&attr.to_le_bytes());
+            buf[8..16].copy_from_slice(&entry.size.to_le_bytes());
+            let name = entry.name.as_bytes();
+            let n = name.len().min(255); // keep the trailing NUL
+            buf[STAT_SIZE..STAT_SIZE + n].copy_from_slice(&name[..n]);
+            ctx.write_bytes(dirent.addr(), &buf);
+            1
+        }
+        Some(None) => 0,
+        None => EBADF,
+    }
+}
+
+/// int sceIoDclose(SceUID fd)
+#[hostcall]
+pub(super) fn io_dclose(st: &mut VitaState, fd: i32) -> i32 {
+    st.io_dclose(fd)
 }
 
 /// int sceIoMkdir(const char *dir, SceMode mode)

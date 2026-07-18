@@ -7,8 +7,7 @@ derived from the (unlicensed) vitasdk gxm sample.
 It exists to drive the emulator bring-up **work-backwards**: a real,
 compiler-produced ARM binary with real NID imports is a far better forcing
 function for the loader, the transpiler CFG buildout, and the host-module ABI
-than any hand-written stub. See `working-area/agent-notes.md` for the staged
-milestones.
+than any hand-written stub. See the project notes for the staged milestones.
 
 ## Artifacts (committed fixtures)
 - `cube.c`      - the source.

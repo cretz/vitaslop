@@ -49,6 +49,11 @@ pub enum Container {
     Pkg { path: String },
     /// A bare velf or SELF at `path` - no outer container.
     Velf { path: String },
+    /// A decrypted-dump tree previously written by this pipeline (see
+    /// [`pipeline::dump_entries`]): `<root>/vitaslop-dump.txt` present, plaintext
+    /// files under `<root>/files/`, unwrapped ELF modules under `<root>/modules/`.
+    /// Loading one needs no key material and no crypto.
+    Dump { root: String },
 }
 
 /// Sniff the container format of a mounted VFS.
@@ -57,6 +62,19 @@ pub enum Container {
 /// the app root); a file beginning with the `\x7fPKG` magic means a pkg; an
 /// `eboot.bin` beginning with `SCE\0` or `\x7fELF` means a bare executable.
 pub fn detect(vfs: &dyn Vfs) -> Result<Container, Error> {
+    // Decrypted dump: its manifest marks the tree unambiguously. Checked first -
+    // a dump also contains an (already-plaintext) `files/eboot.bin` that the bare
+    // velf sniff below would otherwise claim.
+    for p in vfs.list() {
+        if p == pipeline::DUMP_MANIFEST || p.ends_with(&format!("/{}", pipeline::DUMP_MANIFEST)) {
+            let root = p
+                .strip_suffix(pipeline::DUMP_MANIFEST)
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string();
+            return Ok(Container::Dump { root });
+        }
+    }
     // PFS: locate `.../sce_pfs/files.db`.
     for p in vfs.list() {
         if p == "sce_pfs/files.db" || p.ends_with("/sce_pfs/files.db") {

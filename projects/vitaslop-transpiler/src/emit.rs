@@ -174,6 +174,129 @@ fn watch_read_pc_exclude() -> Option<(u32, u32)> {
     })
 }
 
+/// Diagnostic callee-saved-register guard. When `VITASLOP_GUARD_REG=<n>` (a single
+/// ARM register number, e.g. `7`) is set at transpile time, the value of that register
+/// is snapshotted into a scratch local immediately before every direct `Call` and
+/// indirect `blx`/`bx`, and compared against the register right after the call returns;
+/// a mismatch traps (`unreachable`) so the first callee that fails to preserve a
+/// callee-saved register (a mislifted push/pop or LDM/STM, or a wrong indirect
+/// dispatch) is pinpointed. Pair with `VITASLOP_TRACK_PC` + `VITASLOP_WASM_NAMES`: the
+/// trap's `guest_block` names the call site and the backtrace names the caller, so the
+/// call target in that block is the culprit. Zero cost and byte-identical when unset.
+fn guard_reg() -> Option<u8> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<u8>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_GUARD_REG")
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .filter(|&r| (r as usize) < 15)
+    })
+}
+
+/// Diagnostic guest-function entry tracer. When `VITASLOP_TRACE_FUNCS=<hex>[,<hex>...]`
+/// is set at transpile time, each listed guest function emits `svc #<its own address>`
+/// as its first instruction, so the host `svc` handler logs the entry (address + the
+/// incoming argument registers) before the body runs. Guest `svc` immediates are 24-bit,
+/// so an immediate with the top bit set (a guest address, always >= 0x81000000) is
+/// unambiguously a trace marker, never a real syscall. Zero cost and byte-identical when
+/// unset. Pairs with `VITASLOP_WASM_NAMES` to name the call chain.
+fn trace_funcs() -> &'static std::collections::BTreeSet<u32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<std::collections::BTreeSet<u32>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        std::env::var("VITASLOP_TRACE_FUNCS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| {
+                        u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Diagnostic indirect-call tracer. `VITASLOP_TRACE_INDIRECT=<lo>-<hi>` (hex, inclusive)
+/// makes the module dispatcher log every indirect (`blx`/`bx`) call whose resolved target
+/// lands in `[lo, hi]`, by routing the target through the `svc` handler (which prints the
+/// target address plus the live argument registers r0..r3 and lr = the caller's return).
+/// This reveals the runtime vtable dispatch graph that static call-graph analysis cannot
+/// follow. Zero cost / byte-identical when unset.
+fn trace_indirect_range() -> Option<(u32, u32)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_TRACE_INDIRECT").ok()?;
+        let (lo, hi) = s.split_once('-')?;
+        let lo = u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?;
+        let hi = u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((lo, hi))
+    })
+}
+
+/// Diagnostic per-basic-block execution tracer. `VITASLOP_TRACE_BLOCKS=<lo>-<hi>` (hex,
+/// inclusive) makes every basic block whose guest start address lands in `[lo, hi]` emit
+/// `svc #<block address>` as its first instruction, so the host `svc` handler logs the
+/// block entry (address + live registers r0..r3, r8, lr) in execution order. This is the
+/// ground-truth "which path did the function actually take" trace: run it over a single
+/// function's address span and compare the observed block sequence to the static CFG to
+/// find where a mis-lifted branch/computation steers control the wrong way. Zero cost /
+/// byte-identical when unset.
+fn trace_blocks_range() -> Option<(u32, u32)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_TRACE_BLOCKS").ok()?;
+        let (lo, hi) = s.split_once('-')?;
+        let lo = u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?;
+        let hi = u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((lo, hi))
+    })
+}
+
+/// Diagnostic forced return. `VITASLOP_FORCE_RET=<hex addr>:<dec value>[,...]` makes each
+/// listed guest function immediately `return value` (value left in the r0 global) as its
+/// first action, skipping its body. This tests downstream causality: force a readiness /
+/// predicate function to a fixed result and observe how far the boot then progresses,
+/// without needing to find and fix its real producer first. Zero cost / byte-identical when
+/// unset. Pairs with `VITASLOP_TRACE_FUNCS` to confirm the forced function actually runs.
+fn force_ret() -> &'static std::collections::BTreeMap<u32, u32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<std::collections::BTreeMap<u32, u32>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        std::env::var("VITASLOP_FORCE_RET")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| {
+                        let (a, v) = t.trim().split_once(':')?;
+                        let addr = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+                        let val: u32 = v.trim().parse().ok()?;
+                        Some((addr, val))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// When `VITASLOP_TRAP_HALT` is set, a `Term::Halt` (a block that ran off the end of decoded
+/// code, i.e. an undecoded-op cutoff) traps instead of returning, so the first such cutoff
+/// actually reached at runtime faults loudly instead of silently returning an incomplete
+/// function. A debugging aid to drive the decode-gap grind along the real boot path.
+fn trap_halt() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_TRAP_HALT").is_ok())
+}
+
+/// Scratch local holding the pre-call snapshot of the guarded register (see
+/// [`guard_reg`]). Only declared when the guard is enabled, so an unguarded build is
+/// byte-identical; it follows the v128 scratch locals.
+const L_GUARD: u32 = L_V128C + 1;
+
 /// Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`):
 /// `any` traps on any store to the address, `nz` only on a non-zero store, `arm`
 /// arms on a non-zero store and traps on a later zero store (catches a field that
@@ -202,6 +325,10 @@ const L_D64: u32 = L_I32_COUNT;
 /// scratch.
 const L_V128A: u32 = L_D64 + 1;
 const L_V128B: u32 = L_D64 + 2;
+/// A third `v128` scratch, used by the two-register permutes (`vtrn`/`vzip`/`vuzp`) to stash the
+/// first result register while the second is computed and written (a plain low-bank `neon_set`
+/// itself reuses `L_V128A`, so the staged result must live elsewhere).
+const L_V128C: u32 = L_D64 + 3;
 
 /// The exported linear-memory layout, returned by [`emit_module`] so the host can
 /// provision a shared memory that exactly matches what the module declares.
@@ -351,6 +478,9 @@ pub fn emit_module(
     globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_ARMED_GLOBAL
     globals.global(i32_global, &ConstExpr::i32_const(0)); // GUEST_PC_GLOBAL
     globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_READ_COUNT_GLOBAL
+    // The per-thread pointer (TPIDRURO / TLS base). Per-instance, set by the host at
+    // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
+    globals.global(i32_global, &ConstExpr::i32_const(0)); // TP_GLOBAL
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -376,6 +506,8 @@ pub fn emit_module(
     // The guest-PC tracker, so the host can read the faulting block address on a trap
     // (zero unless `VITASLOP_TRACK_PC` is set at emit time; see `track_pc`).
     exports.export(abi::GUEST_PC_EXPORT, ExportKind::Global, GUEST_PC_GLOBAL);
+    // The per-thread pointer, so the host seeds each thread's TLS base at instantiation.
+    exports.export(abi::TP_EXPORT, ExportKind::Global, abi::TP_GLOBAL);
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -502,11 +634,28 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
     f.instruction(&W::I32Load(MemArg { offset: addr_table_off, align: 2, memory_index: 0 }));
     f.instruction(&W::LocalSet(L_V));
 
-    // if v == target { call_indirect table[mid]; return }
+    // if v == target { [trace if in range]; call_indirect table[mid]; return }
     f.instruction(&W::LocalGet(L_V));
     f.instruction(&W::LocalGet(P_TARGET));
     f.instruction(&W::I32Eq);
     f.instruction(&W::If(BlockType::Empty));
+    // Diagnostic: log resolved indirect targets in the configured range (see
+    // `trace_indirect_range`). The target is passed to the `svc` handler as its
+    // selector; because guest addresses have bit 31 set, the handler treats it as a
+    // trace marker and logs it with the live registers (r0 = `this`, lr = caller).
+    if let Some((lo, hi)) = trace_indirect_range() {
+        f.instruction(&W::LocalGet(P_TARGET));
+        f.instruction(&W::I32Const(lo as i32));
+        f.instruction(&W::I32GeU);
+        f.instruction(&W::LocalGet(P_TARGET));
+        f.instruction(&W::I32Const(hi as i32));
+        f.instruction(&W::I32LeU);
+        f.instruction(&W::I32And);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::LocalGet(P_TARGET));
+        f.instruction(&W::Call(SVC_FUNC));
+        f.instruction(&W::End);
+    }
     f.instruction(&W::LocalGet(L_MID));
     f.instruction(&W::CallIndirect { type_index: 1 /* guest () -> () */, table_index: 0 });
     f.instruction(&W::Return);
@@ -543,17 +692,42 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
 fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Function {
     // Locals: $bb + i32 scratch temps (flag computation), then one i64 scratch
     // (double-register split/merge) and one v128 scratch (NEON quad staging).
-    let mut f = Function::new([
-        (L_I32_COUNT, ValType::I32),
-        (1, ValType::I64),
-        (2, ValType::V128),
-    ]);
+    let mut f = if guard_reg().is_some() {
+        Function::new([
+            (L_I32_COUNT, ValType::I32),
+            (1, ValType::I64),
+            (3, ValType::V128),
+            (1, ValType::I32), // L_GUARD: pre-call snapshot for the CSR guard
+        ])
+    } else {
+        Function::new([
+            (L_I32_COUNT, ValType::I32),
+            (1, ValType::I64),
+            (3, ValType::V128),
+        ])
+    };
 
     // A stub for an un-liftable function: trap if ever executed.
     if func.stub {
         f.instruction(&W::Unreachable);
         f.instruction(&W::End);
         return f;
+    }
+
+    // Diagnostic entry tracer (opt-in): announce this function's entry to the host
+    // `svc` handler, which logs the address and incoming argument registers. Emitted
+    // before any block so it fires exactly once per call, on entry (see `trace_funcs`).
+    if trace_funcs().contains(&func.addr) {
+        f.instruction(&W::I32Const(func.addr as i32));
+        f.instruction(&W::Call(SVC_FUNC));
+    }
+
+    // Diagnostic forced return (opt-in): set r0 to the configured value and return before
+    // running the body, so a readiness/predicate function can be pinned to test downstream.
+    if let Some(&val) = force_ret().get(&func.addr) {
+        f.instruction(&W::I32Const(val as i32));
+        f.instruction(&W::GlobalSet(abi::reg_global(0)));
+        f.instruction(&W::Return);
     }
 
     let n = func.blocks.len() as u32;
@@ -602,6 +776,14 @@ fn emit_block(
         f.instruction(&W::I32Const(block.addr as i32));
         f.instruction(&W::GlobalSet(GUEST_PC_GLOBAL));
     }
+    // Diagnostic per-block execution trace (opt-in): announce this block's entry to the
+    // host `svc` handler in execution order (see `trace_blocks_range`).
+    if let Some((lo, hi)) = trace_blocks_range() {
+        if block.addr >= lo && block.addr <= hi {
+            f.instruction(&W::I32Const(block.addr as i32));
+            f.instruction(&W::Call(SVC_FUNC));
+        }
+    }
     for stmt in &block.stmts {
         emit_stmt(f, stmt, func_index, base, func.addr);
     }
@@ -623,8 +805,21 @@ fn goto(f: &mut Function, func: &Func, target: u32, loop_depth: u32, extra: u32)
 fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: u32) {
     match term {
         Term::Fallthrough => {} // flow into the next block's code
-        Term::Return | Term::Halt => {
+        Term::Return => {
             f.instruction(&W::Return);
+        }
+        // A `Halt` is a block that ran off the end of decoded code - almost always the
+        // boundary just before an instruction the decoder could not lift. Normally it
+        // returns (letting the rest of the program run, at the risk of an incomplete
+        // function silently corrupting state downstream); with `VITASLOP_TRAP_HALT` it
+        // traps instead, so the first undecoded-op cutoff actually reached at runtime
+        // faults loudly with a backtrace (pair with `VITASLOP_TRACK_PC`/`_WASM_NAMES`).
+        Term::Halt => {
+            if trap_halt() {
+                f.instruction(&W::Unreachable);
+            } else {
+                f.instruction(&W::Return);
+            }
         }
         Term::Unreachable => {
             f.instruction(&W::Unreachable);
@@ -787,6 +982,28 @@ fn emit_read_watch_check(f: &mut Function, w: u32, base: u32) {
     f.instruction(&W::LocalGet(L_T1)); // value back on the stack
 }
 
+/// Snapshot the guarded callee-saved register into [`L_GUARD`] just before a call
+/// (no-op unless `VITASLOP_GUARD_REG` is set). See [`guard_reg`].
+fn guard_snapshot(f: &mut Function) {
+    if let Some(r) = guard_reg() {
+        f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
+        f.instruction(&W::LocalSet(L_GUARD));
+    }
+}
+
+/// After a call returns, trap if the guarded register differs from its pre-call
+/// snapshot - the callee failed to preserve it (no-op unless the guard is set).
+fn guard_check(f: &mut Function) {
+    if let Some(r) = guard_reg() {
+        f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
+        f.instruction(&W::LocalGet(L_GUARD));
+        f.instruction(&W::I32Ne);
+        f.instruction(&W::If(BlockType::Empty));
+        f.instruction(&W::Unreachable);
+        f.instruction(&W::End);
+    }
+}
+
 fn emit_stmt(
     f: &mut Function,
     stmt: &Stmt,
@@ -936,6 +1153,7 @@ fn emit_stmt(
             // `bl` to a bogus address that is not a real function; trap there rather
             // than fail the whole emit - the block is off the real execution path, and
             // if somehow reached it faults loudly.
+            guard_snapshot(f);
             match func_index.get(target) {
                 Some(&idx) => {
                     f.instruction(&W::Call(idx));
@@ -944,8 +1162,10 @@ fn emit_stmt(
                     f.instruction(&W::Unreachable);
                 }
             }
+            guard_check(f);
         }
         Stmt::CallIndirect { addr, set_lr } => {
+            guard_snapshot(f);
             // Push the runtime target address and this function's own address (as the
             // caller, for a `dispatch_miss` report), then call the module dispatcher,
             // which resolves the target to the matching translated function. The
@@ -972,6 +1192,7 @@ fn emit_stmt(
                     f.instruction(&W::Call(dispatch));
                 }
             }
+            guard_check(f);
         }
         Stmt::Guard(cond, body) => {
             emit_cond(f, *cond);
@@ -984,6 +1205,10 @@ fn emit_stmt(
         Stmt::Vfp(op) => emit_vfp(f, op),
         Stmt::VfpMem { reg, addr, load } => emit_vfp_mem(f, *reg, addr, *load, base),
         Stmt::Neon(op) => emit_neon(f, op, base),
+        Stmt::SetThreadPtr(v) => {
+            emit_value(f, v, base);
+            f.instruction(&W::GlobalSet(abi::TP_GLOBAL));
+        }
     }
 }
 
@@ -1525,6 +1750,45 @@ fn simd_mul(bits: u8) -> W<'static> {
     }
 }
 
+/// Lanewise floating-point `f{bits}x{n}.{add|sub|mul}` for a NEON `.f32`/`.f64`
+/// vector op. NEON float SIMD is F32 (and F16, which wasm SIMD has no lanewise
+/// arithmetic for - filtered out at lift).
+fn simd_fadd(bits: u8) -> W<'static> {
+    match bits {
+        32 => W::F32x4Add,
+        64 => W::F64x2Add,
+        _ => unreachable!("neon fadd width {bits}"),
+    }
+}
+fn simd_fsub(bits: u8) -> W<'static> {
+    match bits {
+        32 => W::F32x4Sub,
+        64 => W::F64x2Sub,
+        _ => unreachable!("neon fsub width {bits}"),
+    }
+}
+fn simd_fmul(bits: u8) -> W<'static> {
+    match bits {
+        32 => W::F32x4Mul,
+        64 => W::F64x2Mul,
+        _ => unreachable!("neon fmul width {bits}"),
+    }
+}
+fn simd_fmax(bits: u8) -> W<'static> {
+    match bits {
+        32 => W::F32x4Max,
+        64 => W::F64x2Max,
+        _ => unreachable!("neon fmax width {bits}"),
+    }
+}
+fn simd_fmin(bits: u8) -> W<'static> {
+    match bits {
+        32 => W::F32x4Min,
+        64 => W::F64x2Min,
+        _ => unreachable!("neon fmin width {bits}"),
+    }
+}
+
 /// Lanewise signed/unsigned min.
 fn simd_min(bits: u8, signed: bool) -> W<'static> {
     match (bits, signed) {
@@ -1610,6 +1874,162 @@ fn simd_extadd_pairwise(bits: u8, signed: bool) -> W<'static> {
     }
 }
 
+/// Lanewise integer equality (`i{bits}x{n}.eq`), producing all-ones on true.
+fn simd_cmp_eq(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Eq,
+        16 => W::I16x8Eq,
+        32 => W::I32x4Eq,
+        64 => W::I64x2Eq,
+        _ => unreachable!("neon cmpeq width {bits}"),
+    }
+}
+
+/// Lanewise integer greater-than (`i{bits}x{n}.gt_s`/`gt_u`).
+fn simd_cmp_gt(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I8x16GtS,
+        (8, false) => W::I8x16GtU,
+        (16, true) => W::I16x8GtS,
+        (16, false) => W::I16x8GtU,
+        (32, true) => W::I32x4GtS,
+        (32, false) => W::I32x4GtU,
+        (64, true) => W::I64x2GtS,
+        _ => unreachable!("neon cmpgt width {bits} signed {signed}"),
+    }
+}
+
+/// Lanewise integer greater-or-equal (`i{bits}x{n}.ge_s`/`ge_u`).
+fn simd_cmp_ge(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I8x16GeS,
+        (8, false) => W::I8x16GeU,
+        (16, true) => W::I16x8GeS,
+        (16, false) => W::I16x8GeU,
+        (32, true) => W::I32x4GeS,
+        (32, false) => W::I32x4GeU,
+        (64, true) => W::I64x2GeS,
+        _ => unreachable!("neon cmpge width {bits} signed {signed}"),
+    }
+}
+
+/// Lanewise `i{bits}x{n}.shl` (the shift count is an `i32` operand, taken modulo the lane width).
+fn simd_shl(bits: u8) -> W<'static> {
+    match bits {
+        8 => W::I8x16Shl,
+        16 => W::I16x8Shl,
+        32 => W::I32x4Shl,
+        64 => W::I64x2Shl,
+        _ => unreachable!("neon shl width {bits}"),
+    }
+}
+
+/// Lanewise `i{bits}x{n}.shr_s`/`shr_u` (the shift count is an `i32` operand, modulo the lane width).
+fn simd_shr(bits: u8, signed: bool) -> W<'static> {
+    match (bits, signed) {
+        (8, true) => W::I8x16ShrS,
+        (8, false) => W::I8x16ShrU,
+        (16, true) => W::I16x8ShrS,
+        (16, false) => W::I16x8ShrU,
+        (32, true) => W::I32x4ShrS,
+        (32, false) => W::I32x4ShrU,
+        (64, true) => W::I64x2ShrS,
+        (64, false) => W::I64x2ShrU,
+        _ => unreachable!("neon shr width {bits}"),
+    }
+}
+
+/// A v128 constant with `val`'s low `bits` bits replicated into every `bits`-wide lane, for the
+/// per-lane insert masks of `vsli`/`vsri`.
+fn splat_lane_mask(bits: u8, val: u64) -> i128 {
+    let nbytes = (bits / 8) as usize;
+    let v = val.to_le_bytes();
+    let mut bytes = [0u8; 16];
+    let mut off = 0;
+    while off < 16 {
+        bytes[off..off + nbytes].copy_from_slice(&v[0..nbytes]);
+        off += nbytes;
+    }
+    i128::from_le_bytes(bytes)
+}
+
+/// Emit an immediate NEON shift (`vshr`/`vsra`/`vshl`/`vsli`/`vsri`). wasm SIMD takes the shift
+/// count modulo the lane width, so a right shift by the full element width (a valid NEON encoding)
+/// is special-cased: a logical one yields zero, an arithmetic one is clamped to `bits-1` (which
+/// already produces the sign broadcast). Left shifts are always in `0..bits-1`.
+fn emit_shift_imm(
+    f: &mut Function,
+    op: crate::ir::NeonShift,
+    ty: crate::ir::NeonType,
+    dst: crate::ir::NeonReg,
+    src: crate::ir::NeonReg,
+    amount: u8,
+) {
+    use crate::ir::NeonShift::*;
+    let bits = ty.bits;
+    let amt = amount as u32;
+    // Push `src >> amt` (arithmetic iff `ty.signed`), handling the shift-out-everything case.
+    let push_shifted_src = |f: &mut Function| {
+        if !ty.signed && amt >= bits as u32 {
+            f.instruction(&W::V128Const(0)); // logical shift by >= width clears the lane
+        } else {
+            neon_get(f, src);
+            f.instruction(&W::I32Const(amt.min(bits as u32 - 1) as i32));
+            f.instruction(&simd_shr(bits, ty.signed));
+        }
+    };
+    match op {
+        Shr => {
+            push_shifted_src(f);
+            neon_set(f, dst);
+        }
+        Sra => {
+            neon_get(f, dst);
+            push_shifted_src(f);
+            f.instruction(&simd_add(bits));
+            neon_set(f, dst);
+        }
+        Shl => {
+            neon_get(f, src);
+            f.instruction(&W::I32Const(amt as i32));
+            f.instruction(&simd_shl(bits));
+            neon_set(f, dst);
+        }
+        Sli => {
+            // dst = (dst & lowmask) | (src << amt); lowmask keeps the low `amt` bits of dst.
+            let lowmask = if amt == 0 { 0 } else { ((1u128 << amt) - 1) as u64 };
+            neon_get(f, dst);
+            f.instruction(&W::V128Const(splat_lane_mask(bits, lowmask)));
+            f.instruction(&W::V128And);
+            neon_get(f, src);
+            f.instruction(&W::I32Const(amt as i32));
+            f.instruction(&simd_shl(bits));
+            f.instruction(&W::V128Or);
+            neon_set(f, dst);
+        }
+        Sri => {
+            // dst = (dst & highmask) | (src >>u amt); highmask keeps the high `amt` bits of dst.
+            let highmask = if amt >= bits as u32 {
+                u64::MAX
+            } else {
+                !(((1u128 << (bits as u32 - amt)) - 1) as u64)
+            };
+            neon_get(f, dst);
+            f.instruction(&W::V128Const(splat_lane_mask(bits, highmask)));
+            f.instruction(&W::V128And);
+            if amt >= bits as u32 {
+                f.instruction(&W::V128Const(0));
+            } else {
+                neon_get(f, src);
+                f.instruction(&W::I32Const(amt as i32));
+                f.instruction(&simd_shr(bits, false));
+            }
+            f.instruction(&W::V128Or);
+            neon_set(f, dst);
+        }
+    }
+}
+
 fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
     use crate::ir::NeonStmt::*;
     match op {
@@ -1619,20 +2039,24 @@ fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
                 Add | Sub | Mul => {
                     neon_get(f, *a);
                     neon_get(f, *b);
-                    f.instruction(&match bop {
-                        Add => simd_add(ty.bits),
-                        Sub => simd_sub(ty.bits),
-                        _ => simd_mul(ty.bits),
+                    f.instruction(&match (bop, ty.float) {
+                        (Add, true) => simd_fadd(ty.bits),
+                        (Sub, true) => simd_fsub(ty.bits),
+                        (_, true) => simd_fmul(ty.bits),
+                        (Add, false) => simd_add(ty.bits),
+                        (Sub, false) => simd_sub(ty.bits),
+                        (_, false) => simd_mul(ty.bits),
                     });
                     neon_set(f, *dst);
                 }
                 Max | Min => {
                     neon_get(f, *a);
                     neon_get(f, *b);
-                    f.instruction(&if matches!(bop, Max) {
-                        simd_max(ty.bits, ty.signed)
-                    } else {
-                        simd_min(ty.bits, ty.signed)
+                    f.instruction(&match (matches!(bop, Max), ty.float) {
+                        (true, true) => simd_fmax(ty.bits),
+                        (false, true) => simd_fmin(ty.bits),
+                        (true, false) => simd_max(ty.bits, ty.signed),
+                        (false, false) => simd_min(ty.bits, ty.signed),
                     });
                     neon_set(f, *dst);
                 }
@@ -1658,8 +2082,13 @@ fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
             neon_get(f, *dst);
             neon_get(f, *a);
             neon_get(f, *b);
-            f.instruction(&simd_mul(ty.bits));
-            f.instruction(&if *sub { simd_sub(ty.bits) } else { simd_add(ty.bits) });
+            f.instruction(&if ty.float { simd_fmul(ty.bits) } else { simd_mul(ty.bits) });
+            f.instruction(&match (*sub, ty.float) {
+                (true, true) => simd_fsub(ty.bits),
+                (false, true) => simd_fadd(ty.bits),
+                (true, false) => simd_sub(ty.bits),
+                (false, false) => simd_add(ty.bits),
+            });
             neon_set(f, *dst);
         }
         PairAdd { ty, dst, a, b } => {
@@ -1690,7 +2119,8 @@ fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
             f.instruction(&W::LocalGet(L_V128A));
             f.instruction(&W::LocalGet(L_V128B));
             f.instruction(&W::I8x16Shuffle(ymask));
-            f.instruction(&simd_add(ty.bits));
+            // `vpadd.f32` adds the same gathered even/odd lanes with float arithmetic.
+            f.instruction(&if ty.float { simd_fadd(ty.bits) } else { simd_add(ty.bits) });
             neon_set(f, *dst);
         }
         Widen { ty, dst, a } => {
@@ -1851,8 +2281,255 @@ fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
             });
             neon_set(f, *dst);
         }
+        DupLane { esize, dst, src, lane } => {
+            // Broadcast one lane of source `Dsrc` to every lane. `neon_get(D)` splats
+            // the 64-bit doubleword across both halves of the v128, so the wanted
+            // element sits at `lane` within the low half; extract it, then splat.
+            neon_get(f, crate::ir::NeonReg::D(*src));
+            f.instruction(&match esize {
+                8 => W::I8x16ExtractLaneU(*lane),
+                16 => W::I16x8ExtractLaneU(*lane),
+                32 => W::I32x4ExtractLane(*lane),
+                _ => unreachable!("vdup lane width {esize}"),
+            });
+            f.instruction(&match esize {
+                8 => W::I8x16Splat,
+                16 => W::I16x8Splat,
+                32 => W::I32x4Splat,
+                _ => unreachable!("vdup lane width {esize}"),
+            });
+            neon_set(f, *dst);
+        }
+        MovLane { to_core, bits, signed, dreg, lane, rt } => {
+            // `neon_get(D)` splats the 64-bit doubleword across the v128, so lane
+            // `lane` (< lanes-per-D) sits in the low half - exactly where `ReplaceLane`
+            // writes and `neon_set(D)` (which keeps the low 64 bits) reads back.
+            let d = crate::ir::NeonReg::D(*dreg);
+            if *to_core {
+                neon_get(f, d);
+                f.instruction(&match (*bits, *signed) {
+                    (8, false) => W::I8x16ExtractLaneU(*lane),
+                    (8, true) => W::I8x16ExtractLaneS(*lane),
+                    (16, false) => W::I16x8ExtractLaneU(*lane),
+                    (16, true) => W::I16x8ExtractLaneS(*lane),
+                    (32, _) => W::I32x4ExtractLane(*lane),
+                    _ => unreachable!("vmov lane->core width {bits}"),
+                });
+                f.instruction(&W::GlobalSet(abi::reg_global(*rt as usize)));
+            } else {
+                neon_get(f, d);
+                f.instruction(&W::GlobalGet(abi::reg_global(*rt as usize)));
+                f.instruction(&match bits {
+                    8 => W::I8x16ReplaceLane(*lane),
+                    16 => W::I16x8ReplaceLane(*lane),
+                    32 => W::I32x4ReplaceLane(*lane),
+                    _ => unreachable!("vmov core->lane width {bits}"),
+                });
+                neon_set(f, d);
+            }
+        }
+        MovImm64 { dst, val } => {
+            // `vmov.i64`: every doubleword lane gets the full 64-bit pattern.
+            let lo = val.to_le_bytes();
+            let mut bytes = [0u8; 16];
+            bytes[0..8].copy_from_slice(&lo);
+            bytes[8..16].copy_from_slice(&lo);
+            f.instruction(&W::V128Const(i128::from_le_bytes(bytes)));
+            neon_set(f, *dst);
+        }
+        ShiftImm { op, ty, dst, src, amount } => {
+            emit_shift_imm(f, *op, *ty, *dst, *src, *amount);
+        }
+        Ext { dst, a, b, byte_off } => {
+            // The destination byte width picks which shuffle: a `Q` extract is a full
+            // 16-byte window into `a:b`; a `D` extract is an 8-byte window (the source
+            // doublewords sit in the low half of each staged v128, so `b`'s bytes are at
+            // shuffle indices 16..24). Unused upper lanes of a `D` result are dropped by
+            // `neon_set`.
+            let q = matches!(dst, crate::ir::NeonReg::Q(_));
+            let width: u8 = if q { 16 } else { 8 };
+            let mut mask = [0u8; 16];
+            for i in 0..width {
+                let src_byte = *byte_off + i;
+                mask[i as usize] = if src_byte < width {
+                    src_byte // from `a`
+                } else {
+                    16 + (src_byte - width) // from `b`
+                };
+            }
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&W::I8x16Shuffle(mask));
+            neon_set(f, *dst);
+        }
+        CvtFloatInt { to_int, signed, dst, src } => {
+            neon_get(f, *src);
+            f.instruction(&match (to_int, signed) {
+                // Float->int rounds toward zero; wasm's saturating trunc matches NEON's
+                // out-of-range clamping (NEON VCVT saturates rather than wrapping).
+                (true, true) => W::I32x4TruncSatF32x4S,
+                (true, false) => W::I32x4TruncSatF32x4U,
+                (false, true) => W::F32x4ConvertI32x4S,
+                (false, false) => W::F32x4ConvertI32x4U,
+            });
+            neon_set(f, *dst);
+        }
+        Cmp { op, ty, dst, a, b } => {
+            use crate::ir::NeonCmp::*;
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&match (op, ty.float) {
+                (Eq, true) => W::F32x4Eq,
+                (Gt, true) => W::F32x4Gt,
+                (Ge, true) => W::F32x4Ge,
+                (Eq, false) => simd_cmp_eq(ty.bits),
+                (Gt, false) => simd_cmp_gt(ty.bits, ty.signed),
+                (Ge, false) => simd_cmp_ge(ty.bits, ty.signed),
+            });
+            neon_set(f, *dst);
+        }
+        MulScalar { ty, dst, a, src, lane, acc, sub } => {
+            // dst = [dst -/+] a * broadcast(D[src].lane). Push the accumulator first (if any) so it
+            // sits under the product for the trailing add/sub.
+            if *acc {
+                neon_get(f, *dst);
+            }
+            neon_get(f, *a);
+            // Broadcast the scalar lane: `neon_get(D)` splats the doubleword, so the wanted lane
+            // sits at index `lane` of the low half; extract it and splat across the vector.
+            neon_get(f, crate::ir::NeonReg::D(*src));
+            match ty.bits {
+                16 => {
+                    f.instruction(&W::I16x8ExtractLaneU(*lane));
+                    f.instruction(&W::I16x8Splat);
+                }
+                _ => {
+                    f.instruction(&W::I32x4ExtractLane(*lane));
+                    f.instruction(&W::I32x4Splat);
+                }
+            }
+            f.instruction(&if ty.float { simd_fmul(ty.bits) } else { simd_mul(ty.bits) });
+            if *acc {
+                f.instruction(&match (*sub, ty.float) {
+                    (true, true) => simd_fsub(ty.bits),
+                    (false, true) => simd_fadd(ty.bits),
+                    (true, false) => simd_sub(ty.bits),
+                    (false, false) => simd_add(ty.bits),
+                });
+            }
+            neon_set(f, *dst);
+        }
+        RecipEstimate { sqrt, dst, src } => {
+            // Full-precision reciprocal: 1 / (sqrt?)(src). f32x4 only.
+            f.instruction(&f32x4_splat_const(1.0));
+            neon_get(f, *src);
+            if *sqrt {
+                f.instruction(&W::F32x4Sqrt);
+            }
+            f.instruction(&W::F32x4Div);
+            neon_set(f, *dst);
+        }
+        RecipStep { sqrt, dst, a, b } => {
+            // vrecps: 2 - a*b. vrsqrts: (3 - a*b) / 2 (multiply by 0.5, exact). Non-fused.
+            f.instruction(&f32x4_splat_const(if *sqrt { 3.0 } else { 2.0 }));
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&W::F32x4Mul);
+            f.instruction(&W::F32x4Sub);
+            if *sqrt {
+                f.instruction(&f32x4_splat_const(0.5));
+                f.instruction(&W::F32x4Mul);
+            }
+            neon_set(f, *dst);
+        }
+        Permute { op, esize, a, b } => {
+            // Two shuffles of the concatenation `a:b` produce the two result registers. Both results
+            // depend on both inputs, so stage the inputs in scratch, stash the first result (a) in
+            // `L_V128C`, write b, then write a (a plain low-bank `neon_set` clobbers `L_V128A`).
+            let q = matches!(a, crate::ir::NeonReg::Q(_));
+            let (mask_a, mask_b) = permute_masks(*op, *esize, q);
+            neon_get(f, *a);
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *b);
+            f.instruction(&W::LocalSet(L_V128B));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(mask_a));
+            f.instruction(&W::LocalSet(L_V128C));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(mask_b));
+            neon_set(f, *b);
+            f.instruction(&W::LocalGet(L_V128C));
+            neon_set(f, *a);
+        }
         ElemMem { d, esize, lane, addr, load } => emit_elem_mem(f, *d, *esize, *lane, addr, *load, base),
     }
+}
+
+/// A `v128` constant with `v` broadcast into all four f32 lanes.
+fn f32x4_splat_const(v: f32) -> W<'static> {
+    let bits = v.to_bits().to_le_bytes();
+    let mut b = [0u8; 16];
+    for i in 0..4 {
+        b[i * 4..i * 4 + 4].copy_from_slice(&bits);
+    }
+    W::V128Const(i128::from_le_bytes(b))
+}
+
+/// Byte-shuffle masks for the two result registers of a two-register permute
+/// ([`crate::ir::NeonStmt::Permute`]). Input `a` is shuffle bytes 0..width, `b` is 16..16+width
+/// (`width` = 16 for the quad form, 8 for the double form). Elements are `esize` bits.
+fn permute_masks(op: crate::ir::PermuteOp, esize: u8, q: bool) -> ([u8; 16], [u8; 16]) {
+    use crate::ir::PermuteOp::*;
+    let ebytes = (esize / 8) as usize;
+    let width = if q { 16 } else { 8 };
+    let n = width / ebytes; // elements per register
+    // Per-output-element source: `(from_b, index)`.
+    let mut a_el: Vec<(bool, usize)> = Vec::with_capacity(n);
+    let mut b_el: Vec<(bool, usize)> = Vec::with_capacity(n);
+    match op {
+        Trn => {
+            // Transpose adjacent pairs: a_new = [a0,b0,a2,b2,...], b_new = [a1,b1,a3,b3,...].
+            for k in 0..n / 2 {
+                a_el.push((false, 2 * k));
+                a_el.push((true, 2 * k));
+                b_el.push((false, 2 * k + 1));
+                b_el.push((true, 2 * k + 1));
+            }
+        }
+        Zip => {
+            // Interleave into [a0,b0,a1,b1,...]; low n -> a_new, high n -> b_new.
+            let comb = |i: usize| if i % 2 == 0 { (false, i / 2) } else { (true, i / 2) };
+            for j in 0..n {
+                a_el.push(comb(j));
+            }
+            for j in 0..n {
+                b_el.push(comb(n + j));
+            }
+        }
+        Uzp => {
+            // De-interleave the concatenation c = [a0..an, b0..bn]: a_new = c[even], b_new = c[odd].
+            let c = |i: usize| if i < n { (false, i) } else { (true, i - n) };
+            for j in 0..n {
+                a_el.push(c(2 * j));
+            }
+            for j in 0..n {
+                b_el.push(c(2 * j + 1));
+            }
+        }
+    }
+    let expand = |src: &[(bool, usize)]| -> [u8; 16] {
+        let mut m = [0u8; 16];
+        for (j, (from_b, idx)) in src.iter().enumerate() {
+            let base = if *from_b { 16 } else { 0 } + idx * ebytes;
+            for wb in 0..ebytes {
+                m[j * ebytes + wb] = (base + wb) as u8;
+            }
+        }
+        m
+    };
+    (expand(&a_el), expand(&b_el))
 }
 
 /// Emit a NEON single-element load/store ([`crate::ir::NeonStmt::ElemMem`]). A `D`
@@ -2018,6 +2695,9 @@ fn emit_value(f: &mut Function, v: &Value, base: u32) {
         Value::Clz(a) => {
             emit_value(f, a, base);
             f.instruction(&W::I32Clz);
+        }
+        Value::ThreadPtr => {
+            f.instruction(&W::GlobalGet(abi::TP_GLOBAL));
         }
         Value::Bin(op, a, b) => {
             emit_value(f, a, base);

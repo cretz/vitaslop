@@ -17,6 +17,9 @@ vitaslop-runtime = { path = "../vitaslop-runtime" }
 # wgpu-backed CubeRenderer this window presents through, the same one the browser
 # canvas and the native headless oracle use.
 vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
+# Installs the fmt/EnvFilter subscriber so the runtime's `tracing` diagnostics
+# surface via RUST_LOG (e.g. vitaslop::io=trace).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Window + input + GPU. winit 0.30 (latest stable; the 0.31 line is a pre-release
 # beta) integrates with wgpu 30 through raw-window-handle 0.6. gilrs reads real

@@ -137,6 +137,7 @@ pub struct BrowserThread {
     sp: u32,
     r0: u32,
     r1: u32,
+    r2: u32,
     /// The resolver for the *current* resume's step Promise. The import closure (on a
     /// block/yield) or an entry's completion fills it with the encoded event; the
     /// scheduler awaits the matching Promise. Reset each loop turn.
@@ -248,6 +249,7 @@ impl BrowserEngine {
         entries: &[u32],
         r0: u32,
         r1: u32,
+        r2: u32,
         sp: u32,
         priority: i32,
     ) -> Result<BrowserThread, JsValue> {
@@ -317,6 +319,27 @@ impl BrowserEngine {
         let instance = WebAssembly::Instance::new(&self.module, &imports)?;
         let exports = instance.exports();
 
+        // This thread's thread-local storage, mirroring native `instantiate_thread_seq`:
+        // allocate the private block whose base is the thread pointer (TPIDRURO), copy
+        // the template's initialized `.tdata` head into it (the `.tbss` tail is already
+        // zero), and seed the instance's per-thread `tp` global before any entry runs
+        // (a `MRC p15,0,Rt,c13,c0,3` reads it). No guest code is running yet, so the
+        // shared-memory copy is safe. A title with no TLS template yields tp == 0 and
+        // this is a no-op.
+        let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
+        if tp != 0 {
+            if tls_len != 0 {
+                let view = Uint8Array::new(&self.shared_mem.buffer());
+                let src = tls_src.wrapping_sub(self.base);
+                let dst = tp.wrapping_sub(self.base);
+                let head = view.subarray(src, src + tls_len).to_vec();
+                view.subarray(dst, dst + tls_len).copy_from(&head);
+            }
+            let tp_global = Reflect::get(&exports, &JsValue::from_str(abi::TP_EXPORT))?
+                .dyn_into::<WebAssembly::Global>()?;
+            tp_global.set_value(&JsValue::from(tp));
+        }
+
         let regs = read_globals(&exports, |i| abi::reg_export(i), abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
         let rt = Rc::new(ThreadRt { regs, vfp, mem: self.shared_mem.clone(), base: self.base });
@@ -343,6 +366,7 @@ impl BrowserEngine {
             sp,
             r0,
             r1,
+            r2,
             signal,
             cont,
             _import: import_closure,
@@ -354,7 +378,7 @@ impl GuestEngine for BrowserEngine {
     type Thread = BrowserThread;
 
     fn spawn(&mut self, r: &Reentry) -> Result<BrowserThread, ()> {
-        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.stack_top, r.priority)
+        self.make_thread(r.thid, &[r.entry], r.arg_len, r.arg_ptr, r.r2, r.stack_top, r.priority)
             .map_err(|_| ())
     }
 
@@ -424,6 +448,7 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             t.rt.set_reg(abi::SP, t.sp);
             t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
             t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
+            t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
             let done: Promise = match t.entries[t.entry_idx].call0(&JsValue::UNDEFINED) {
                 Ok(p) => p.unchecked_into(),
                 Err(e) => return ThreadStep::Finished(FiberEnd::Error(format!("start: {e:?}"))),
@@ -539,6 +564,7 @@ impl BrowserSched {
             &[entry & !1],
             0,
             0,
+            0,
             main_sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
@@ -564,6 +590,7 @@ impl BrowserSched {
         let main = engine.make_thread(
             0,
             entries,
+            0,
             0,
             0,
             main_sp,

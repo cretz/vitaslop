@@ -111,6 +111,12 @@ fn secret_salt(files_salt: u32, icv_salt: u32) -> Vec<u8> {
     }
 }
 
+/// Test/diagnostic accessor for [`integrity_secret`].
+#[cfg(test)]
+pub(crate) fn integrity_secret_pub(drv_key: &[u8; 16], files_salt: u32, icv_salt: u32) -> [u8; 20] {
+    integrity_secret(drv_key, files_salt, icv_salt)
+}
+
 /// The 20-byte integrity secret (per-sector HMAC key).
 fn integrity_secret(drv_key: &[u8; 16], files_salt: u32, icv_salt: u32) -> [u8; 20] {
     let combo = hmac_sha1(&keys::PFS_INTEGRITY_BASE, &secret_salt(files_salt, icv_salt));
@@ -132,12 +138,30 @@ pub fn f00d_drv_key(klicensee: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// The 16-byte sector-IV mask, from the file's `dbseed`.
-fn tweak_key(dbseed: &[u8; 20]) -> [u8; 16] {
-    let h = hmac_sha1(&keys::PFS_TWEAK_BASE, dbseed);
+/// Test/diagnostic accessor for [`tweak_key`].
+#[cfg(test)]
+pub(crate) fn tweak_key_pub(dbseed: &[u8; 20]) -> [u8; 16] {
+    tweak_key(dbseed)
+}
+
+/// The 16-byte sector-IV mask: `HMAC-SHA1(PFS_TWEAK_BASE, msg)[..16]`.
+///
+/// The XOR mask applied to each sector's little-endian byte offset to form its
+/// AES-CBC IV. The two read-only format generations differ only in `msg`:
+/// - the newer format (unicv `icv_version > 1`) hashes the file's 20-byte dbseed;
+/// - the older v1 format has no dbseed and instead hashes the salt(s) -
+///   `LE32(icv_salt)`, or `LE32(files_salt)||LE32(icv_salt)` when `files_salt != 0`
+///   (the same `secret_salt` message the integrity secret uses).
+fn tweak_mask(msg: &[u8]) -> [u8; 16] {
+    let h = hmac_sha1(&keys::PFS_TWEAK_BASE, msg);
     let mut out = [0u8; 16];
     out.copy_from_slice(&h[..16]);
     out
+}
+
+/// The newer-format tweak mask, keyed by the per-file dbseed.
+fn tweak_key(dbseed: &[u8; 20]) -> [u8; 16] {
+    tweak_mask(dbseed)
 }
 
 /// PFS crypto for a read-only gamedata image, parameterised by the title's
@@ -169,7 +193,14 @@ impl GameData {
 impl PfsCrypto for GameData {
     fn decrypt_file(&self, ctx: &FileCtx, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let secret = integrity_secret(&self.drv_key, ctx.files_salt, ctx.icv_salt);
-        let tweak = tweak_key(ctx.iv_seed);
+        // The sector-IV tweak mask is HMAC-keyed on the per-file dbseed in the
+        // newer read-only format (unicv icv_version > 1); the older v1 format
+        // (launch-window titles) has no dbseed and keys it on the salt(s) instead.
+        let tweak = if ctx.has_dbseed {
+            tweak_key(ctx.iv_seed)
+        } else {
+            tweak_mask(&secret_salt(ctx.files_salt, ctx.icv_salt))
+        };
         let page_size = ctx.page_size.max(1) as usize;
         let mut out = Vec::with_capacity(ciphertext.len());
 

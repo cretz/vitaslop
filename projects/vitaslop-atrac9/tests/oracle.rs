@@ -1,7 +1,7 @@
 //! Bit-exactness test against the upstream LibAtrac9 C decoder.
 //!
-//! The C reference is compiled separately (see
-//! `working-area/scripts/build-at9-oracle.sh`) into `name.oracle.s16` files next to
+//! The C reference is compiled separately by the AT9 oracle build script into
+//! `name.oracle.s16` files next to
 //! the decrypted `name.at9` inputs. Point `VITASLOP_AT9_DIR` at that directory and
 //! run `cargo test -p vitaslop-atrac9 --test oracle -- --ignored --nocapture`. The
 //! test skips when the env var is unset, so `cargo test --workspace` stays green

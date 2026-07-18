@@ -47,6 +47,10 @@ pub enum Value {
     CarryAddResult,
     /// Count leading zeros of the inner value (ARM `clz`, wasm `i32.clz`).
     Clz(Box<Value>),
+    /// The per-thread pointer (ARM `TPIDRURO`, read by `MRC p15,0,Rt,c13,c0,3`): the
+    /// base of this thread's thread-local-storage block. Reads the per-instance `tp`
+    /// global (see [`crate::abi::TP_GLOBAL`]).
+    ThreadPtr,
 }
 
 /// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
@@ -117,6 +121,23 @@ pub enum NeonStmt {
     Bin { op: NeonBin, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
     /// Same-length multiply-accumulate: `dst = dst -/+ (a * b)` (`vmls`/`vmla`).
     MulAcc { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg, sub: bool },
+    /// Multiply[-accumulate] by a broadcast scalar lane: `dst = [dst -/+] a * broadcast(D[src].lane)`
+    /// (`vmul`/`vmla`/`vmls` by scalar). `acc` enables the accumulate; `sub` picks its sign. `ty`
+    /// gives the element size (16 or 32) and float-ness, which also drives how the lane is extracted.
+    MulScalar { ty: NeonType, dst: NeonReg, a: NeonReg, src: u8, lane: u8, acc: bool, sub: bool },
+    /// Reciprocal (`sqrt = false`) or reciprocal-square-root (`sqrt = true`) of each f32 lane
+    /// (`vrecpe`/`vrsqrte`). Computed to full f32 precision (`1/x` / `1/sqrt(x)`) rather than
+    /// NEON's ~8-bit table seed: the Newton-Raphson steps that accompany it converge to this same
+    /// value, and code consuming the estimate directly only gains accuracy. Deterministic across
+    /// our backends (the conformance requirement); not bit-identical to Cortex-A9 hardware.
+    RecipEstimate { sqrt: bool, dst: NeonReg, src: NeonReg },
+    /// Newton-Raphson refinement step, f32 (`vrecps`/`vrsqrts`): `2 - a*b` (`sqrt = false`) or
+    /// `(3 - a*b) / 2` (`sqrt = true`). Non-fused, matching the two-rounding NEON definition.
+    RecipStep { sqrt: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Two-register permute (`vtrn`/`vzip`/`vuzp`): rearranges the `esize`-bit elements between the
+    /// two registers, writing BOTH. The register form (`D` vs `Q`) comes from `a`/`b`. See emit for
+    /// the shuffle masks.
+    Permute { op: PermuteOp, esize: u8, a: NeonReg, b: NeonReg },
     /// Pairwise add of adjacent elements of `a` then `b` into `dst` (`vpadd`).
     PairAdd { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
     /// Widening move: `dst(Q) = widen(a(D))` (`vmovl`). `ty` is the source element.
@@ -142,6 +163,35 @@ pub enum NeonStmt {
     /// Duplicate the low `ty.bits` bits of core register `rt` into every element
     /// of `dst` (`vdup.N Qd/Dd, Rt`).
     DupCore { ty: NeonType, dst: NeonReg, rt: u8 },
+    /// Broadcast one `esize`-bit lane of source D register `src` (element `lane`)
+    /// into every element of `dst` (`vdup.<size> Qd/Dd, Dm[lane]`, the scalar form).
+    DupLane { esize: u8, dst: NeonReg, src: u8, lane: u8 },
+    /// Move one `bits`-wide lane (`bits` = 8/16/32) between D register `dreg`
+    /// (element `lane`) and core register `rt` (`vmov Rt, Dn[x]` / `vmov Dn[x], Rt`).
+    /// `to_core` picks the direction: lane->core reads the lane and, for the 8/16-bit
+    /// forms, sign-extends it to 32 bits when `signed` (else zero-extends; 32-bit
+    /// lanes ignore `signed`); core->lane writes the low `bits` bits of `rt` into the
+    /// lane, leaving the rest of `dreg` intact.
+    MovLane { to_core: bool, bits: u8, signed: bool, dreg: u8, lane: u8, rt: u8 },
+    /// 64-bit-per-lane immediate broadcast: every D lane of `dst` receives `val`
+    /// (`vmov.i64`, whose per-byte 0x00/0xff pattern no narrower broadcast matches).
+    MovImm64 { dst: NeonReg, val: u64 },
+    /// Immediate shift-by-N (`vshr`/`vsra`/`vshl`/`vsli`/`vsri`). Every `ty.bits`-bit
+    /// lane of `src` is shifted by `amount`; `op` picks the direction, whether the
+    /// result accumulates into or inserts through `dst`, and (via `ty.signed`) an
+    /// arithmetic vs logical right shift.
+    ShiftImm { op: NeonShift, ty: NeonType, dst: NeonReg, src: NeonReg, amount: u8 },
+    /// Vector extract (`vext`): `dst` is the `byte_off`-byte window into the byte
+    /// concatenation `a : b` (a's bytes low), taking the destination's byte width.
+    Ext { dst: NeonReg, a: NeonReg, b: NeonReg, byte_off: u8 },
+    /// Vector convert between f32 and 32-bit integer lanes (`vcvt`). `to_int` picks
+    /// the direction (f32->int when true, int->f32 when false); `signed` picks the
+    /// integer signedness. Float->int rounds toward zero (saturating).
+    CvtFloatInt { to_int: bool, signed: bool, dst: NeonReg, src: NeonReg },
+    /// Vector compare (`vceq`/`vcgt`/`vcge`): each `dst` lane is all-ones when the
+    /// relation holds and zero otherwise, matching wasm SIMD compare semantics.
+    /// `ty.float`/`ty.signed`/`ty.bits` select the lane type.
+    Cmp { op: NeonCmp, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
     /// Whole-register bitwise logical op (the 3-same logical family): `vand`,
     /// `vorr`, `veor`, `vbic`, `vorn`, and the insert/select forms `vbsl`/`vbit`/
     /// `vbif` (which also read `dst`). Element-size agnostic.
@@ -180,6 +230,43 @@ pub enum NeonBitwise {
     Bit,
     /// `vbif`: insert `a` where `b` is clear.
     Bif,
+}
+
+/// The NEON two-register permutes ([`NeonStmt::Permute`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermuteOp {
+    /// `vtrn`: transpose adjacent element pairs across the two registers.
+    Trn,
+    /// `vzip`: interleave the two registers.
+    Zip,
+    /// `vuzp`: de-interleave (the inverse of `vzip`).
+    Uzp,
+}
+
+/// The NEON vector-compare relations ([`NeonStmt::Cmp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeonCmp {
+    /// `vceq`: equal.
+    Eq,
+    /// `vcgt`: greater-than.
+    Gt,
+    /// `vcge`: greater-than-or-equal.
+    Ge,
+}
+
+/// The NEON immediate-shift operations ([`NeonStmt::ShiftImm`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeonShift {
+    /// `vshr`: right shift (arithmetic if the element type is signed, else logical).
+    Shr,
+    /// `vsra`: right shift, accumulated into `dst` (`dst += src >> n`).
+    Sra,
+    /// `vshl`: left shift by an immediate.
+    Shl,
+    /// `vsli`: shift left and insert - the low `n` bits of `dst` are preserved.
+    Sli,
+    /// `vsri`: shift right and insert - the high `n` bits of `dst` are preserved.
+    Sri,
 }
 
 /// Floating-point binary operators (single precision).
@@ -331,6 +418,11 @@ pub enum Stmt {
     VfpMem { reg: VfpReg, addr: Value, load: bool },
     /// A NEON (Advanced SIMD) data-processing operation.
     Neon(NeonStmt),
+    /// Set the per-thread pointer (ARM `MCR p15,0,Rt,c13,c0,{2,3}` write of
+    /// `TPIDRURW`/`TPIDRURO`): write the per-instance `tp` global (see
+    /// [`crate::abi::TP_GLOBAL`]). The kernel normally owns this register, but a
+    /// module that manages its own thread pointer may write it.
+    SetThreadPtr(Value),
 }
 
 /// How a basic block hands control to the next. The not-taken side of a branch

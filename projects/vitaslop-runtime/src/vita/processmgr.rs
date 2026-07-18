@@ -48,3 +48,12 @@ pub(super) fn libc_time(ctx: &mut GuestCtx, st: &mut VitaState, tloc: Ptr) -> i3
     }
     secs
 }
+
+/// clock_t sceKernelLibcClock(void)
+/// CPU time consumed by the process in CLOCKS_PER_SEC (1 MHz on the Vita's newlib) -
+/// the virtual monotonic clock is the faithful stand-in. A title polls this every
+/// frame for its delta-time, so a constant 0 freezes its animations.
+#[hostcall]
+pub(super) fn libc_clock(st: &mut VitaState) -> u32 {
+    st.world.monotonic_us() as u32
+}

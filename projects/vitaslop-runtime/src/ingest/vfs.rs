@@ -46,6 +46,13 @@ impl MemVfs {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+
+    /// Consume the vfs, yielding every `(path, bytes)` pair by move. The bulk
+    /// handoff into the guest filesystem uses this so a game's assets (hundreds of
+    /// megabytes for a 3D title) are not cloned a second time.
+    pub fn into_files(self) -> impl Iterator<Item = (String, Vec<u8>)> {
+        self.files.into_iter()
+    }
 }
 
 impl Vfs for MemVfs {

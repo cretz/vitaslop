@@ -6,6 +6,7 @@
 
 use crate::capture::{ColorSurface, VertexAttribute};
 use crate::host::{GuestCtx, VitaState};
+use crate::hostcall;
 
 /// SceGxmInitializeParams: displayQueueCallback at offset 8, its data size at 12.
 const INIT_CB_OFFSET: u32 = 8;
@@ -61,13 +62,108 @@ pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
-/// const SceGxmProgramParameter *sceGxmProgramFindParameterByName(program, name)
-/// We have no real parameter table (placeholder shaders), so hand back a nonzero
-/// token. The uniform write path uses the explicit component offset/count the
-/// guest passes to sceGxmSetUniformDataF, so the token is never dereferenced.
-pub(super) fn find_parameter(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let token = st.new_handle();
-    ctx.ret(token);
+// --- SceGxmProgram reflection over the real gxp parameter table -------------
+//
+// The compiled shader (`SceGxmProgram`) carries a table of `SceGxmProgramParameter`
+// records that a title reflects over to build its own uniform/attribute bookkeeping.
+// Layout (stable across the public permissive gxp tooling, verified against the real
+// shaders in the game image): the program header holds `parameter_count` at +0x24 and
+// `parameters_offset` at +0x28 (relative to the +0x28 field itself); each parameter is
+// a 16-byte record - `name_offset` (i32, relative to the record) at +0x00, a packed
+// u16 at +0x04 (`category`:4, `type`:4, `component_count`:4, `container_index`:4),
+// `array_size` (u32) at +0x08, and `resource_index` (u32) at +0x0C.
+const GXP_PARAM_COUNT_OFF: u32 = 0x24;
+const GXP_PARAMS_OFF_OFF: u32 = 0x28;
+const GXM_PARAM_SIZE: u32 = 16;
+
+/// Base guest address of the parameter array for `program`.
+fn params_base(ctx: &GuestCtx, program: u32) -> u32 {
+    program
+        .wrapping_add(GXP_PARAMS_OFF_OFF)
+        .wrapping_add(ctx.read_u32(program.wrapping_add(GXP_PARAMS_OFF_OFF)))
+}
+
+/// The packed u16 attribute word (`category`/`type`/`component_count`/`container_index`).
+fn param_word(ctx: &GuestCtx, param: u32) -> u32 {
+    ctx.read_u32(param.wrapping_add(4)) & 0xffff
+}
+
+/// unsigned int sceGxmProgramGetParameterCount(const SceGxmProgram *program)
+pub(super) fn program_get_parameter_count(ctx: &mut GuestCtx) {
+    let program = ctx.arg(0);
+    let count = ctx.read_u32(program.wrapping_add(GXP_PARAM_COUNT_OFF));
+    ctx.ret(count);
+}
+
+/// const SceGxmProgramParameter *sceGxmProgramGetParameter(program, unsigned int index)
+pub(super) fn program_get_parameter(ctx: &mut GuestCtx) {
+    let program = ctx.arg(0);
+    let index = ctx.arg(1);
+    ctx.ret(params_base(ctx, program).wrapping_add(index.wrapping_mul(GXM_PARAM_SIZE)));
+}
+
+/// SceGxmParameterCategory sceGxmProgramParameterGetCategory(param)
+pub(super) fn param_get_category(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret(param_word(ctx, param) & 0xf);
+}
+
+/// SceGxmParameterType sceGxmProgramParameterGetType(param)
+pub(super) fn param_get_type(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret((param_word(ctx, param) >> 4) & 0xf);
+}
+
+/// unsigned int sceGxmProgramParameterGetComponentCount(param)
+pub(super) fn param_get_component_count(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret((param_word(ctx, param) >> 8) & 0xf);
+}
+
+/// unsigned int sceGxmProgramParameterGetContainerIndex(param)
+pub(super) fn param_get_container_index(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret((param_word(ctx, param) >> 12) & 0xf);
+}
+
+/// unsigned int sceGxmProgramParameterGetArraySize(param)
+pub(super) fn param_get_array_size(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret(ctx.read_u32(param.wrapping_add(8)));
+}
+
+/// unsigned int sceGxmProgramParameterGetResourceIndex(param)
+pub(super) fn param_get_resource_index(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    ctx.ret(ctx.read_u32(param.wrapping_add(0xC)));
+}
+
+/// const char *sceGxmProgramParameterGetName(param): the name string lives at
+/// `param + name_offset` (a signed byte offset relative to the record).
+pub(super) fn param_get_name(ctx: &mut GuestCtx) {
+    let param = ctx.arg(0);
+    let name_off = ctx.read_u32(param) as i32;
+    ctx.ret(param.wrapping_add(name_off as u32));
+}
+
+/// const SceGxmProgramParameter *sceGxmProgramFindParameterByName(program, name):
+/// walk the real parameter table and return the first record whose name matches, or
+/// null. Returning a real record (not an opaque token) lets a title reflect on the
+/// match with the accessors above - the resource index, container, type, etc.
+pub(super) fn find_parameter(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let program = ctx.arg(0);
+    let want = ctx.read_cstr(ctx.arg(1), 256);
+    let count = ctx.read_u32(program.wrapping_add(GXP_PARAM_COUNT_OFF));
+    let base = params_base(ctx, program);
+    for i in 0..count {
+        let p = base.wrapping_add(i.wrapping_mul(GXM_PARAM_SIZE));
+        let name_off = ctx.read_u32(p) as i32;
+        if ctx.read_cstr(p.wrapping_add(name_off as u32), 256) == want {
+            ctx.ret(p);
+            return;
+        }
+    }
+    ctx.ret(0);
 }
 
 /// int sceGxmColorSurfaceInit(surface, format, type, scale, outputRegisterSize,
@@ -111,6 +207,14 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     }
     // SceGxmVertexStream: u16 stride at offset 0 of streams[0].
     let stride = (ctx.read_u32(streams_addr) & 0xFFFF) as u32;
+
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        attribute_count, stride, attrs = attributes.len(),
+        attrs_addr = format_args!("{attributes_addr:#x}"),
+        streams_addr = format_args!("{streams_addr:#x}"),
+        "createVertexProgram"
+    );
 
     let handle = st.new_handle();
     st.set_vertex_program(handle, attributes, stride);
@@ -194,6 +298,7 @@ pub(super) fn draw(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// `SceGxmTextureType` 3-bit selector (the top 3 bits of the full type enum), as
 /// stored in control word 1 bits 29..31.
 pub(super) const TYPE_SWIZZLED: u32 = 0;
+pub(super) const TYPE_CUBE: u32 = 2; // 0x4000_0000 >> 29
 pub(super) const TYPE_LINEAR: u32 = 3; // 0x6000_0000 >> 29
 pub(super) const TYPE_TILED: u32 = 4; // 0x8000_0000 >> 29
 pub(super) const TYPE_SWIZZLED_ARBITRARY: u32 = 5; // 0xA000_0000 >> 29
@@ -286,5 +391,224 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     if buffer != 0 {
         st.present(buffer);
     }
+    // Run the registered display callback as guest code (preemptive mode): the
+    // game's own buffer bookkeeping lives there, and a double-buffered title
+    // spins forever after two frames if it never runs.
+    st.enqueue_display_callback(ctx, callback_data);
     ctx.ret(0);
+}
+
+// --- Fixed-function pipeline state setters ----------------------------------
+//
+// Each `sceGxmSet*` below mutates one field of the sticky GXM context state
+// ([`crate::capture::RenderState`]); the current state is snapshotted into every
+// draw at record time (see `VitaState::record_draw`). All return `void` on the
+// Vita - the `-> i32` (0) here just parks a defined value in r0 the caller ignores.
+// The first argument is the `SceGxmContext *` (a single implicit context here, so
+// it is unused); the enum arguments are stored verbatim as their raw GXM words.
+
+/// void sceGxmSetCullMode(SceGxmContext *context, SceGxmCullMode mode)
+#[hostcall]
+pub(super) fn set_cull_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
+    st.render_state_mut().cull_mode = mode;
+    0
+}
+
+/// void sceGxmSetTwoSidedEnable(SceGxmContext *context, SceGxmTwoSidedMode enable)
+#[hostcall]
+pub(super) fn set_two_sided_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().two_sided = enable;
+    0
+}
+
+/// void sceGxmSetFrontDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
+#[hostcall]
+pub(super) fn set_front_depth_func(st: &mut VitaState, _context: u32, func: u32) -> i32 {
+    st.render_state_mut().front_depth_func = func;
+    0
+}
+
+/// void sceGxmSetBackDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
+#[hostcall]
+pub(super) fn set_back_depth_func(st: &mut VitaState, _context: u32, func: u32) -> i32 {
+    st.render_state_mut().back_depth_func = func;
+    0
+}
+
+/// void sceGxmSetFrontDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
+#[hostcall]
+pub(super) fn set_front_depth_write_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().front_depth_write = enable;
+    0
+}
+
+/// void sceGxmSetFrontFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
+#[hostcall]
+pub(super) fn set_front_fragment_program_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().front_fragment_program_enable = enable;
+    0
+}
+
+/// void sceGxmSetFrontPointLineWidth(SceGxmContext *context, unsigned int width)
+#[hostcall]
+pub(super) fn set_front_point_line_width(st: &mut VitaState, _context: u32, width: u32) -> i32 {
+    st.render_state_mut().front_point_line_width = width;
+    0
+}
+
+/// void sceGxmSetFrontPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
+#[hostcall]
+pub(super) fn set_front_polygon_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
+    st.render_state_mut().front_polygon_mode = mode;
+    0
+}
+
+/// void sceGxmSetFrontStencilRef(SceGxmContext *context, unsigned int sref)
+#[hostcall]
+pub(super) fn set_front_stencil_ref(st: &mut VitaState, _context: u32, sref: u32) -> i32 {
+    st.render_state_mut().front_stencil_ref = sref;
+    0
+}
+
+/// void sceGxmSetFrontStencilFunc(SceGxmContext *context, SceGxmStencilFunc func,
+///     SceGxmStencilOp stencilFail, SceGxmStencilOp depthFail, SceGxmStencilOp
+///     depthPass, unsigned char compareMask, unsigned char writeMask)
+#[hostcall]
+pub(super) fn set_front_stencil_func(
+    st: &mut VitaState,
+    _context: u32,
+    func: u32,
+    stencil_fail: u32,
+    depth_fail: u32,
+    depth_pass: u32,
+    compare_mask: u32,
+    write_mask: u32,
+) -> i32 {
+    let rs = st.render_state_mut();
+    rs.front_stencil_func = func;
+    rs.front_stencil_op_fail = stencil_fail;
+    rs.front_stencil_op_depth_fail = depth_fail;
+    rs.front_stencil_op_depth_pass = depth_pass;
+    rs.front_stencil_compare_mask = compare_mask & 0xff;
+    rs.front_stencil_write_mask = write_mask & 0xff;
+    0
+}
+
+/// void sceGxmSetViewport(SceGxmContext *context, float xOffset, float xScale,
+///     float yOffset, float yScale, float zOffset, float zScale)
+#[hostcall]
+pub(super) fn set_viewport(
+    st: &mut VitaState,
+    _context: u32,
+    x_offset: f32,
+    x_scale: f32,
+    y_offset: f32,
+    y_scale: f32,
+    z_offset: f32,
+    z_scale: f32,
+) -> i32 {
+    st.render_state_mut().viewport = [x_offset, x_scale, y_offset, y_scale, z_offset, z_scale];
+    0
+}
+
+/// void sceGxmSetViewportEnable(SceGxmContext *context, SceGxmViewportMode enable)
+#[hostcall]
+pub(super) fn set_viewport_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().viewport_enable = enable;
+    0
+}
+
+/// void sceGxmSetRegionClip(SceGxmContext *context, SceGxmRegionClipMode mode,
+///     unsigned int xMin, unsigned int yMin, unsigned int xMax, unsigned int yMax)
+#[hostcall]
+pub(super) fn set_region_clip(
+    st: &mut VitaState,
+    _context: u32,
+    mode: u32,
+    x_min: u32,
+    y_min: u32,
+    x_max: u32,
+    y_max: u32,
+) -> i32 {
+    let rs = st.render_state_mut();
+    rs.region_clip_mode = mode;
+    rs.region_clip = [x_min, y_min, x_max, y_max];
+    0
+}
+
+// --- Getters ----------------------------------------------------------------
+
+/// SceGxmColorFormat sceGxmColorSurfaceGetFormat(const SceGxmColorSurface *surface)
+/// Returns the exact format the guest set on this surface (recorded at
+/// `sceGxmColorSurfaceInit`), or 0 if the surface was never initialized here.
+#[hostcall]
+pub(super) fn color_surface_get_format(st: &mut VitaState, surface: u32) -> u32 {
+    st.color_surface(surface).map(|s| s.format).unwrap_or(0)
+}
+
+/// void sceGxmColorSurfaceSetClip(SceGxmColorSurface *surface, unsigned int xMin,
+///     unsigned int yMin, unsigned int xMax, unsigned int yMax)
+/// The color-surface clip rectangle constrains where a scene writes. Our capture
+/// records the surface geometry (not a sub-clip) and the renderer draws the whole
+/// surface, so this is accepted with no state change; a title sets it and proceeds.
+#[hostcall]
+pub(super) fn color_surface_set_clip(_context: u32) -> i32 {
+    0
+}
+
+/// SceGxmTextureType sceGxmTextureGetType(const SceGxmTexture *texture)
+/// The 3-bit type selector lives in control word 1 bits 29..31; return it back in
+/// the enum's high-bit position (e.g. LINEAR = 0x6000_0000).
+#[hostcall]
+pub(super) fn texture_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, texture: Ptr) -> u32 {
+    let w1 = ctx.read_u32(texture.addr().wrapping_add(4));
+    ((w1 >> 29) & 0x7) << 29
+}
+
+/// The `semantic` u16 packed into a `SceGxmProgramParameter` at record offset +6
+/// (following the +4 category/type/component/container word verified against the
+/// real shaders in the image). Per the public gxp layout the field carries both the
+/// `SceGxmParameterSemantic` (high 4 bits) and its index (low 12 bits), e.g.
+/// TEXCOORD3 -> semantic TEXCOORD, index 3. The exact bit-split is the documented
+/// encoding but not yet cross-checked against a decoded attribute here; it feeds the
+/// render frontier (attribute->semantic mapping), not the boot path, so a title that
+/// only reflects on it during setup is unaffected either way. Validate the split when
+/// the renderer consumes semantics.
+fn param_semantic_word(ctx: &GuestCtx, param: u32) -> u32 {
+    (ctx.read_u32(param.wrapping_add(4)) >> 16) & 0xffff
+}
+
+/// SceGxmParameterSemantic sceGxmProgramParameterGetSemantic(const SceGxmProgramParameter *param)
+#[hostcall]
+pub(super) fn param_get_semantic(ctx: &mut GuestCtx, _st: &mut VitaState, param: Ptr) -> u32 {
+    (param_semantic_word(ctx, param.addr()) >> 12) & 0xf
+}
+
+/// unsigned int sceGxmProgramParameterGetSemanticIndex(const SceGxmProgramParameter *param)
+#[hostcall]
+pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, param: Ptr) -> u32 {
+    param_semantic_word(ctx, param.addr()) & 0xfff
+}
+
+// --- Sampler state ----------------------------------------------------------
+
+/// int sceGxmTextureSetUAddrMode[Safe](SceGxmTexture *texture, SceGxmTextureAddrMode mode)
+#[hostcall]
+pub(super) fn texture_set_u_addr_mode(st: &mut VitaState, texture: u32, mode: u32) -> i32 {
+    st.set_texture_sampler(texture, 0, mode);
+    0
+}
+
+/// int sceGxmTextureSetVAddrMode[Safe](SceGxmTexture *texture, SceGxmTextureAddrMode mode)
+#[hostcall]
+pub(super) fn texture_set_v_addr_mode(st: &mut VitaState, texture: u32, mode: u32) -> i32 {
+    st.set_texture_sampler(texture, 1, mode);
+    0
+}
+
+/// int sceGxmTextureSetLodBias(SceGxmTexture *texture, unsigned int bias)
+#[hostcall]
+pub(super) fn texture_set_lod_bias(st: &mut VitaState, texture: u32, bias: u32) -> i32 {
+    st.set_texture_sampler(texture, 2, bias);
+    0
 }

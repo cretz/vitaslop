@@ -10,7 +10,7 @@
 
 pub use vitaslop_runtime::{
     capture, nid, render, CtrlFrame, DeterministicWorld, Flags, GuestMemory, ImportDispatch, Record,
-    Replay, RunResult, SvcOutcome, VitaEnv, VitaState, World, WorldEvent,
+    Replay, RunResult, SvcOutcome, TouchFrame, VitaEnv, VitaState, World, WorldEvent,
 };
 
 pub mod sched;
@@ -873,6 +873,163 @@ mod switch_tests {
             let b = run1(&vbic, &ins);
             assert_eq!((b[0], b[1]), (lo0 & !lo1, hi0 & !hi1), "vbic");
         }
+    }
+
+    #[test]
+    fn neon_vdup_scalar_broadcasts_lane() {
+        // vmov d0,r0,r1 ; vdup.32 d2,d0[1] ; vmov r0,r1,d2 ; bx lr
+        // Lane 1 of d0 is r1, broadcast to both lanes of d2 -> r0 == r1 == input r1.
+        let code = [0x41, 0xec, 0x10, 0x0b, 0xbc, 0xff, 0x00, 0x2c, 0x51, 0xec, 0x12, 0x0b, 0x70, 0x47];
+        for (a, b) in [(0x1111_1111u32, 0x2222_2222u32), (0xdead_beef, 0xcafe_babe)] {
+            let r = run1(&code, &[(0, a), (1, b)]);
+            assert_eq!((r[0], r[1]), (b, b), "vdup.32 scalar {a:#x},{b:#x}");
+        }
+    }
+
+    #[test]
+    fn neon_vmov_i64_immediate() {
+        // vmov.i64 d0,#0xff00ff00ff00ff00 ; vmov r0,r1,d0 ; bx lr
+        let code = [0x82, 0xff, 0x3a, 0x0e, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let r = run1(&code, &[]);
+        assert_eq!((r[0], r[1]), (0xff00_ff00, 0xff00_ff00), "vmov.i64");
+    }
+
+    #[test]
+    fn neon_shift_immediate_family() {
+        // Each: vmov d0,r0,r1 [; vmov d1,r2,r3] ; <shift> ; vmov r0,r1,d0 ; bx lr.
+        let vshr_u = [0x41, 0xec, 0x10, 0x0b, 0xbc, 0xff, 0x10, 0x00, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vshr_s = [0x41, 0xec, 0x10, 0x0b, 0xbc, 0xef, 0x10, 0x00, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vsra_u = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xbc, 0xff, 0x11, 0x01, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vshl = [0x41, 0xec, 0x10, 0x0b, 0xa4, 0xef, 0x10, 0x05, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vsli = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xa8, 0xff, 0x11, 0x05, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vsri = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xb8, 0xff, 0x11, 0x04, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+
+        // vshr.u32 #4 (logical) and vshr.s32 #4 (arithmetic).
+        let r = run1(&vshr_u, &[(0, 0xF000_0000), (1, 0x0000_0010)]);
+        assert_eq!((r[0], r[1]), (0x0F00_0000, 0x0000_0001), "vshr.u32");
+        let r = run1(&vshr_s, &[(0, 0xF000_0000), (1, 0x0000_0010)]);
+        assert_eq!((r[0], r[1]), (0xFF00_0000, 0x0000_0001), "vshr.s32");
+        // vsra.u32 #4: dst += src>>4.
+        let r = run1(&vsra_u, &[(0, 0x1), (1, 0x2), (2, 0xF0), (3, 0x100)]);
+        assert_eq!((r[0], r[1]), (0x1 + 0xF, 0x2 + 0x10), "vsra.u32");
+        // vshl.i32 #4: high lane overflows out of 32 bits.
+        let r = run1(&vshl, &[(0, 0x1), (1, 0xF000_0000)]);
+        assert_eq!((r[0], r[1]), (0x10, 0x0), "vshl.i32");
+        // vsli.32 #8: keep low 8 of dst, insert src<<8.
+        let r = run1(&vsli, &[(0, 0xAB), (1, 0xCD), (2, 0x00CD_EF12), (3, 0x0034_5678)]);
+        assert_eq!((r[0], r[1]), (0xCDEF_12AB, 0x3456_78CD), "vsli.32");
+        // vsri.32 #8: keep high 8 of dst, insert src>>8.
+        let r = run1(&vsri, &[(0, 0xAB00_0000), (1, 0xCD00_0000), (2, 0x1234_5678), (3, 0x8765_4321)]);
+        assert_eq!((r[0], r[1]), (0xAB12_3456, 0xCD87_6543), "vsri.32");
+    }
+
+    #[test]
+    fn neon_vext_byte_window() {
+        // vmov d0,r0,r1 ; vmov d1,r2,r3 ; vext.8 d0,d0,d1,#4 ; vmov r0,r1,d0 ; bx lr
+        // Window bytes 4..12 of (d0:d1): r0 <- input r1, r1 <- input r2.
+        let code = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xb0, 0xef, 0x01, 0x04, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let r = run1(&code, &[(0, 0x1111_1111), (1, 0x2222_2222), (2, 0x3333_3333), (3, 0x4444_4444)]);
+        assert_eq!((r[0], r[1]), (0x2222_2222, 0x3333_3333), "vext.8 d-form");
+    }
+
+    #[test]
+    fn neon_vmov_lane_core_transfers() {
+        // vmov between one lane of a D register and a core register, both directions
+        // and all element widths, with the 8/16-bit lane->core sign/zero extension.
+
+        // lane->core .32: vmov d0,r0,r1 ; vmov.32 r0,d0[1] ; vmov.32 r1,d0[0]
+        // -> r0 = lane1 = input r1, r1 = lane0 = input r0 (a lane swap).
+        let l2c_32 = [0x41, 0xec, 0x10, 0x0b, 0x30, 0xee, 0x10, 0x0b, 0x10, 0xee, 0x10, 0x1b, 0x70, 0x47];
+        let r = run1(&l2c_32, &[(0, 0x1111_1111), (1, 0x2222_2222)]);
+        assert_eq!((r[0], r[1]), (0x2222_2222, 0x1111_1111), "vmov.32 lane->core");
+
+        // core->lane .32: vmov d0,r0,r1 ; vmov.32 d0[0],r2 ; vmov r0,r1,d0
+        // -> lane0 overwritten by r2, lane1 (input r1) preserved.
+        let c2l_32 = [0x41, 0xec, 0x10, 0x0b, 0x00, 0xee, 0x10, 0x2b, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let r = run1(&c2l_32, &[(0, 0xAAAA_AAAA), (1, 0xBBBB_BBBB), (2, 0xCCCC_CCCC)]);
+        assert_eq!((r[0], r[1]), (0xCCCC_CCCC, 0xBBBB_BBBB), "vmov.32 core->lane");
+
+        // lane->core .16: read 16-bit lane 0 (low half of r0) zero- then sign-extended.
+        let l2c_16 = [0x41, 0xec, 0x10, 0x0b, 0x90, 0xee, 0x30, 0x0b, 0x10, 0xee, 0x30, 0x1b, 0x70, 0x47];
+        let r = run1(&l2c_16, &[(0, 0x1234_ABCD), (1, 0)]);
+        assert_eq!((r[0], r[1]), (0x0000_ABCD, 0xFFFF_ABCD), "vmov.u16/.s16 lane->core");
+
+        // lane->core .8: read byte lane 1 (bits 8..15 of r0) zero- then sign-extended.
+        let l2c_8 = [0x41, 0xec, 0x10, 0x0b, 0xd0, 0xee, 0x30, 0x0b, 0x50, 0xee, 0x30, 0x1b, 0x70, 0x47];
+        let r = run1(&l2c_8, &[(0, 0x1234_ABCD), (1, 0)]);
+        assert_eq!((r[0], r[1]), (0x0000_00AB, 0xFFFF_FFAB), "vmov.u8/.s8 lane->core");
+
+        // core->lane .8: overwrite byte lane 0 of d0 with r2, keeping the rest.
+        let c2l_8 = [0x41, 0xec, 0x10, 0x0b, 0x40, 0xee, 0x10, 0x2b, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let r = run1(&c2l_8, &[(0, 0x1234_ABCD), (1, 0xBBBB_BBBB), (2, 0x0000_00EE)]);
+        assert_eq!((r[0], r[1]), (0x1234_ABEE, 0xBBBB_BBBB), "vmov.8 core->lane");
+    }
+
+    #[test]
+    fn neon_by_scalar_multiply() {
+        // Each: vmov d0,r0,r1 ; vmov d1,r2,r3 ; <op>.f32 d0,d0,d1[0] ; vmov r0,r1,d0 ; bx lr.
+        // Both f32 lanes of d0 use the single scalar d1[0] (= r2). vmul/vmla/vmls (non-fused).
+        let vmul_scalar = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xa0, 0xef, 0x41, 0x09, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vmla_scalar = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xa0, 0xef, 0x41, 0x01, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vmls_scalar = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xa0, 0xef, 0x41, 0x05, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let (a0, a1, s) = (1.5f32, -2.0f32, 3.0f32);
+        let ins = [(0, a0.to_bits()), (1, a1.to_bits()), (2, s.to_bits()), (3, 0)];
+        let r = run1(&vmul_scalar, &ins);
+        assert_eq!((r[0], r[1]), ((a0 * s).to_bits(), (a1 * s).to_bits()), "vmul.f32 scalar");
+        let r = run1(&vmla_scalar, &ins);
+        assert_eq!((r[0], r[1]), ((a0 + a0 * s).to_bits(), (a1 + a1 * s).to_bits()), "vmla.f32 scalar");
+        let r = run1(&vmls_scalar, &ins);
+        assert_eq!((r[0], r[1]), ((a0 - a0 * s).to_bits(), (a1 - a1 * s).to_bits()), "vmls.f32 scalar");
+    }
+
+    #[test]
+    fn neon_reciprocal_estimate_and_step() {
+        // vrecpe/vrsqrte: full-precision 1/x and 1/sqrt(x). vrecps/vrsqrts: the NR refinement steps.
+        let vrecpe = [0x41, 0xec, 0x10, 0x0b, 0xbb, 0xff, 0x00, 0x05, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vrsqrte = [0x41, 0xec, 0x10, 0x0b, 0xbb, 0xff, 0x80, 0x05, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vrecps = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0x00, 0xef, 0x11, 0x0f, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let vrsqrts = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0x20, 0xef, 0x11, 0x0f, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let (x0, x1) = (2.0f32, 4.0f32);
+        let r = run1(&vrecpe, &[(0, x0.to_bits()), (1, x1.to_bits())]);
+        assert_eq!((r[0], r[1]), ((1.0f32 / x0).to_bits(), (1.0f32 / x1).to_bits()), "vrecpe.f32");
+        let (q0, q1) = (4.0f32, 16.0f32);
+        let r = run1(&vrsqrte, &[(0, q0.to_bits()), (1, q1.to_bits())]);
+        assert_eq!((r[0], r[1]), ((1.0f32 / q0.sqrt()).to_bits(), (1.0f32 / q1.sqrt()).to_bits()), "vrsqrte.f32");
+        // vrecps d0,d0,d1 = 2 - a*b (per lane).
+        let (a0, a1, b0, b1) = (3.0f32, 2.0f32, 0.5f32, 0.25f32);
+        let ins = [(0, a0.to_bits()), (1, a1.to_bits()), (2, b0.to_bits()), (3, b1.to_bits())];
+        let r = run1(&vrecps, &ins);
+        assert_eq!((r[0], r[1]), ((2.0 - a0 * b0).to_bits(), (2.0 - a1 * b1).to_bits()), "vrecps.f32");
+        // vrsqrts d0,d0,d1 = (3 - a*b)/2 (per lane).
+        let r = run1(&vrsqrts, &ins);
+        assert_eq!((r[0], r[1]), (((3.0 - a0 * b0) * 0.5).to_bits(), ((3.0 - a1 * b1) * 0.5).to_bits()), "vrsqrts.f32");
+    }
+
+    #[test]
+    fn neon_vpadd_f32_pairwise() {
+        // vmov d0,r0,r1 ; vmov d1,r2,r3 ; vpadd.f32 d0,d0,d1 ; vmov r0,r1,d0 ; bx lr.
+        // vpadd.f32: d0[0] = d0[0]+d0[1], d0[1] = d1[0]+d1[1] (pairwise add across the pair).
+        let vpadd = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0x00, 0xff, 0x01, 0x0d, 0x51, 0xec, 0x10, 0x0b, 0x70, 0x47];
+        let (a0, a1, b0, b1) = (1.5f32, -2.0f32, 3.25f32, 0.75f32);
+        let ins = [(0, a0.to_bits()), (1, a1.to_bits()), (2, b0.to_bits()), (3, b1.to_bits())];
+        let r = run1(&vpadd, &ins);
+        assert_eq!((r[0], r[1]), ((a0 + a1).to_bits(), (b0 + b1).to_bits()), "vpadd.f32");
+    }
+
+    #[test]
+    fn neon_permutes() {
+        // vtrn.32 d0,d1: d0=[a0,b0], d1=[a1,b1]; read both registers back (r0,r1 <- d0; r2,r3 <- d1).
+        let vtrn32 = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xba, 0xff, 0x81, 0x00, 0x51, 0xec, 0x10, 0x0b, 0x53, 0xec, 0x11, 0x2b, 0x70, 0x47];
+        let r = run1(&vtrn32, &[(0, 0x11), (1, 0x22), (2, 0x33), (3, 0x44)]);
+        assert_eq!((r[0], r[1], r[2], r[3]), (0x11, 0x33, 0x22, 0x44), "vtrn.32");
+        // vzip.16 d0,d1: interleave 16-bit lanes a=[1,2,3,4], b=[5,6,7,8] -> d0=[1,5,2,6], d1=[3,7,4,8].
+        let vzip16 = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xb6, 0xff, 0x81, 0x01, 0x51, 0xec, 0x10, 0x0b, 0x53, 0xec, 0x11, 0x2b, 0x70, 0x47];
+        let r = run1(&vzip16, &[(0, 0x0002_0001), (1, 0x0004_0003), (2, 0x0006_0005), (3, 0x0008_0007)]);
+        assert_eq!((r[0], r[1], r[2], r[3]), (0x0005_0001, 0x0006_0002, 0x0007_0003, 0x0008_0004), "vzip.16");
+        // vuzp.16 d0,d1: de-interleave -> d0=[1,3,5,7], d1=[2,4,6,8].
+        let vuzp16 = [0x41, 0xec, 0x10, 0x0b, 0x43, 0xec, 0x11, 0x2b, 0xb6, 0xff, 0x01, 0x01, 0x51, 0xec, 0x10, 0x0b, 0x53, 0xec, 0x11, 0x2b, 0x70, 0x47];
+        let r = run1(&vuzp16, &[(0, 0x0002_0001), (1, 0x0004_0003), (2, 0x0006_0005), (3, 0x0008_0007)]);
+        assert_eq!((r[0], r[1], r[2], r[3]), (0x0003_0001, 0x0007_0005, 0x0004_0002, 0x0008_0006), "vuzp.16");
     }
 
     #[test]

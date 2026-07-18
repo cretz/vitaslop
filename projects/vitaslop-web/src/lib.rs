@@ -574,7 +574,7 @@ async fn setup_game(
     live: Arc<Mutex<InputState>>,
 ) -> Result<GameSetup, JsValue> {
     use vitaslop_runtime::ingest::pipeline::decrypt_container;
-    use vitaslop_runtime::ingest::vfs::{MemVfs, Vfs};
+    use vitaslop_runtime::ingest::vfs::MemVfs;
     use vitaslop_runtime::link::link;
 
     let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
@@ -600,6 +600,10 @@ async fn setup_game(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| JsValue::from_str(&format!("load module: {e:?}")))?;
     let linked = link(modules).map_err(|e| JsValue::from_str(&format!("link: {e:?}")))?;
+    // The raw container bytes are done with; release them now - for a large title
+    // this is hundreds of megabytes the transpile step should not have to share the
+    // wasm heap with.
+    drop(vfs);
     let decrypt_ms = perf.now() - t_dec;
 
     // The input world: a scripted recipe (if given) overlaid with live pointer/keyboard
@@ -614,11 +618,13 @@ async fn setup_game(
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
-    for path in game.files.list() {
-        if let Ok(bytes) = game.files.read(&path) {
-            env.state.add_file(&path, bytes);
-        }
+    // Move (not clone) the decrypted assets into the guest filesystem: for a large
+    // 3D title this is hundreds of megabytes, and the browser heap is the tightest
+    // memory budget we run in.
+    for (path, bytes) in game.files.into_files() {
+        env.state.add_file(&path, bytes);
     }
 
     let t_tr = perf.now();

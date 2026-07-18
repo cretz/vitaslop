@@ -37,6 +37,11 @@ const HEIGHT: u32 = 544;
 const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 fn main() {
+    // Surface the runtime's `tracing` diagnostics (RUST_LOG=vitaslop::io=trace, ...).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     // `--game <dir>` plays a real extracted retail title (decrypt -> link -> transpile
     // -> preemptive scheduler -> general GXM renderer) in a live window. With no
     // argument, run the built-in clean-room cube demo below.

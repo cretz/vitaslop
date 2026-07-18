@@ -1,6 +1,6 @@
 //! VFP memory milestone: exercise every VFP load/store form the cube uses, plus
 //! the S/D register aliasing that makes them correct. A hand-assembled Thumb leaf
-//! (working-area/scripts/vfp-mem.s) runs:
+//! runs:
 //!   vldr/vstr of a low double D1 (aliased over S2:S3),
 //!   an `vadd s2` that must show through D1 (aliasing),
 //!   vldr/vstr of an upper double D16 (its own i64 global, no alias),

@@ -15,14 +15,12 @@
 
 use crate::hostcall;
 use crate::host::{GuestCtx, VitaState};
-use std::sync::LazyLock;
 
-/// Diagnostic: dump NGS param/output buffers to understand AT9 routing.
-static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var("VITASLOP_TRACE_NGS").is_ok());
-
+/// Diagnostic (`RUST_LOG=vitaslop::ngs=trace`): dump an NGS param/output buffer to
+/// understand AT9 routing.
 fn dump_mem(ctx: &GuestCtx, label: &str, addr: u32, len: usize) {
     if addr == 0 {
-        eprintln!("  {label}: <null>");
+        tracing::trace!(target: "vitaslop::ngs", label, "<null>");
         return;
     }
     let bytes = ctx.read_bytes(addr, len);
@@ -33,7 +31,7 @@ fn dump_mem(ctx: &GuestCtx, label: &str, addr: u32, len: usize) {
         }
         s.push_str(&format!("{b:02x} "));
     }
-    eprintln!("  {label} @ {addr:#010x}:{s}");
+    tracing::trace!(target: "vitaslop::ngs", label, addr = format_args!("{addr:#010x}"), "dump:{s}");
 }
 
 /// SceInt32 sceNgsVoiceUnlockParams(SceNgsHVoice voice, SceUInt32 moduleId)
@@ -50,8 +48,12 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
         .find(|((v, m, _), _)| *v == voice && *m == module)
         .map(|(_, a)| *a);
     if let Some(addr) = addr {
-        if *TRACE {
-            eprintln!("UnlockParams voice={voice:#x} module={module:#x}");
+        if tracing::enabled!(target: "vitaslop::ngs", tracing::Level::TRACE) {
+            tracing::trace!(
+                target: "vitaslop::ngs",
+                voice = format_args!("{voice:#x}"), module = format_args!("{module:#x}"),
+                "UnlockParams"
+            );
             dump_mem(ctx, "params", addr, 96);
             let data_ptr = ctx.read_u32(addr + 0x08);
             if data_ptr != 0 {
@@ -83,7 +85,7 @@ pub(super) fn voice_stop(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// SceInt32 sceNgsSystemUpdate(SceNgsHSynSystem system) - dump the surrounding
 /// output/work region so the master-buss mix destination becomes visible.
 pub(super) fn system_update(ctx: &mut GuestCtx, _st: &mut VitaState) {
-    if *TRACE {
+    if tracing::enabled!(target: "vitaslop::ngs", tracing::Level::TRACE) {
         let a3 = ctx.arg(3);
         dump_mem(ctx, "sysupdate-a3", a3, 64);
     }

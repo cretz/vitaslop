@@ -23,6 +23,10 @@ const REPORT_BASE: usize = 16;
 /// `sizeof(SceTouchReport)`: id(1) force(1) x(2) y(2) reserved[8] info(2).
 const REPORT_SIZE: usize = 0x10;
 
+/// Size of one `SceTouchPanelInfo`: 8 SceInt16 area/display bounds + minForce/maxForce
+/// (u8 each) + reserved[30] = 0x30 bytes.
+const PANEL_INFO_SIZE: usize = 0x30;
+
 /// Upper bound on how many history samples we will materialise for one call, so a
 /// bogus `nBufs` cannot ask for an unbounded write. The real panel keeps 64 internal
 /// samples; a title asks for a handful.
@@ -56,6 +60,48 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
         }
     }
     n as i32
+}
+
+/// Front-panel port (SCE_TOUCH_PORT_FRONT). The back panel is port 1.
+const PORT_FRONT: u32 = 0;
+
+/// Fill one `SceTouchPanelInfo` (0x30 bytes) for `port`.
+///
+/// The active-area range we report is deliberately the SAME coordinate space our
+/// `sceTouchRead`/`sceTouchPeek` samples emit (front 0..1919 x 0..1087, twice the
+/// 960x544 screen; back 0..1919 x 0..889), so a title mapping a touch report through
+/// `(coord - minAa) / (maxAa - minAa) * (maxDisp - minDisp)` lands exactly on the
+/// screen pixel we intend. The display range is the physical 0..1919 x 0..1087 both
+/// panels project onto. Reporting a zeroed struct (the un-implemented fall-through)
+/// would give `maxAa - minAa == 0` and a divide-by-zero in that mapping, which is why
+/// this is filled explicitly rather than left to the default `ret(0)`.
+fn panel_info_bytes(port: u32) -> [u8; PANEL_INFO_SIZE] {
+    // Active-area Y extent differs per panel; X and the display extent match.
+    let max_aa_y: i16 = if port == PORT_FRONT { 1087 } else { 889 };
+    let mut buf = [0u8; PANEL_INFO_SIZE];
+    let mut put = |off: usize, v: i16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put(0x00, 0); // minAaX
+    put(0x02, 0); // minAaY
+    put(0x04, 1919); // maxAaX
+    put(0x06, max_aa_y); // maxAaY
+    put(0x08, 0); // minDispX
+    put(0x0a, 0); // minDispY
+    put(0x0c, 1919); // maxDispX
+    put(0x0e, 1087); // maxDispY
+    buf[0x10] = 0; // minForce
+    buf[0x11] = 128; // maxForce (matches the report force we emit)
+    buf
+}
+
+/// int sceTouchGetPanelInfo(SceUInt32 port, SceTouchPanelInfo *pPanelInfo)
+/// Report the panel's active area / display extent / force range so the title can map
+/// raw touch samples to screen coordinates. See [`panel_info_bytes`].
+#[hostcall]
+pub(super) fn get_panel_info(ctx: &mut GuestCtx, _st: &mut VitaState, port: u32, info: Ptr) -> i32 {
+    if !info.is_null() {
+        ctx.write_bytes(info.addr(), &panel_info_bytes(port));
+    }
+    0
 }
 
 /// int sceTouchRead(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs)

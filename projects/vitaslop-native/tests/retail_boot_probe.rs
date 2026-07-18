@@ -79,7 +79,37 @@ impl World for BootWorld {
         0
     }
     fn poll_ctrl(&mut self, _port: u32) -> CtrlFrame {
+        // Diagnostic: VITASLOP_HOLD_BUTTONS=0xHEX holds those SceCtrl buttons down every
+        // poll after VITASLOP_HOLD_FROM polls (default 0). Lets the probe test whether an
+        // idle attract/title screen is waiting on input. Pulses ~30 polls on / 30 off so a
+        // title reacting to an edge (press, not hold) still sees a rising edge repeatedly.
+        let hold = std::env::var("VITASLOP_HOLD_BUTTONS")
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+        if let Some(buttons) = hold {
+            let from = std::env::var("VITASLOP_HOLD_FROM").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            if self.polls >= from && (self.polls / 30) % 2 == 0 {
+                let mut f = CtrlFrame::default();
+                f.buttons = buttons;
+                return f;
+            }
+        }
         CtrlFrame::default()
+    }
+    fn poll_touch(&mut self, _port: u32) -> vitaslop_native::TouchFrame {
+        // Diagnostic: VITASLOP_HOLD_TOUCH=x,y pulses a front-panel finger at (x,y) ~30
+        // polls on / 30 off after VITASLOP_HOLD_FROM. Tests a touch-driven attract screen.
+        if let Ok(spec) = std::env::var("VITASLOP_HOLD_TOUCH") {
+            if let Some((xs, ys)) = spec.split_once(',') {
+                if let (Ok(x), Ok(y)) = (xs.trim().parse::<u16>(), ys.trim().parse::<u16>()) {
+                    let from = std::env::var("VITASLOP_HOLD_FROM").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    if self.polls >= from && (self.polls / 30) % 2 == 0 {
+                        return vitaslop_native::TouchFrame::single(x, y);
+                    }
+                }
+            }
+        }
+        vitaslop_native::TouchFrame::default()
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
         buf.fill(0);
@@ -144,12 +174,21 @@ fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &Watch) -> String {
 }
 
 #[test]
-#[ignore = "boot probe: needs VITASLOP_GAME_DIR fixture"]
+#[ignore = "boot probe: needs VITASLOP_GAME_DIR or VITASLOP_GAME_PKG+_WORK"]
 fn retail_boot_probe() {
-    let Ok(dir) = std::env::var("VITASLOP_GAME_DIR") else {
-        eprintln!("VITASLOP_GAME_DIR not set; skipping");
+    // Surface the runtime's `tracing` diagnostics (RUST_LOG=vitaslop::io=trace, ...).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    // Two ingest sources: an extracted PFS dir (VITASLOP_GAME_DIR) or a NoNpDrm
+    // pkg + standalone work.bin (VITASLOP_GAME_PKG + VITASLOP_GAME_WORK).
+    let pkg = std::env::var("VITASLOP_GAME_PKG").ok();
+    let dir = std::env::var("VITASLOP_GAME_DIR").ok();
+    if pkg.is_none() && dir.is_none() {
+        eprintln!("neither VITASLOP_GAME_DIR nor VITASLOP_GAME_PKG set; skipping");
         return;
-    };
+    }
     // Artifacts are written only when a shot dir is provided, and only there - never
     // inside the repo. Without it the probe is print-only.
     let shot_dir: Option<String> = std::env::var("VITASLOP_SHOT_DIR").ok();
@@ -158,8 +197,14 @@ fn retail_boot_probe() {
     }
 
     // 1. Decrypt + link the whole title.
-    let game = decrypt_container(&DirVfs::new(&dir)).expect("decrypt container");
-    let files = game.files.list();
+    let game = if let Some(pkg) = &pkg {
+        let work = std::env::var("VITASLOP_GAME_WORK").expect("VITASLOP_GAME_WORK for pkg");
+        let pkg_bytes = std::fs::read(pkg).expect("read pkg");
+        let work_bytes = std::fs::read(work).expect("read work.bin");
+        vitaslop_runtime::ingest::pipeline::decrypt_pkg(&pkg_bytes, &work_bytes).expect("decrypt pkg")
+    } else {
+        decrypt_container(&DirVfs::new(dir.as_ref().unwrap())).expect("decrypt container")
+    };
     let modules: Vec<loader::Module> = game
         .modules
         .iter()
@@ -343,13 +388,14 @@ fn retail_boot_probe() {
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
-    for path in &files {
-        if let Ok(bytes) = game.files.read(path) {
-            env.state.add_file(path, bytes);
-        }
+    let mut preloaded = 0usize;
+    for (path, bytes) in game.files.into_files() {
+        env.state.add_file(&path, bytes);
+        preloaded += 1;
     }
-    eprintln!("preloaded {} files into the guest filesystem", files.len());
+    eprintln!("preloaded {preloaded} files into the guest filesystem");
 
     // 3. Transpile (lenient) + stand up the preemptive scheduler. The main thread
     //    runs every module_start in load order, then the executable's; spawned
@@ -427,7 +473,160 @@ fn retail_boot_probe() {
                 eprintln!("batched prefix to frame {} ({last:?})", sched.frames());
             }
         }
+        // Diagnostic steering: VITASLOP_POKE=addr:frame:value (hex addr, decimal frame,
+        // decimal u32 value) writes `value` to guest `addr` once, at the start of the
+        // given frame. Lets a probe force a stuck state variable to test causality.
+        let poke: Option<(u32, u64, u32)> = std::env::var("VITASLOP_POKE").ok().and_then(|s| {
+            let mut it = s.split(':');
+            let addr = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+            let frame: u64 = it.next()?.trim().parse().ok()?;
+            let value: u32 = it.next()?.trim().parse().ok()?;
+            Some((addr, frame, value))
+        });
+        // Diagnostic steering: VITASLOP_SET_EVF=id:frame[:bits],... force-sets event
+        // flag `id` (bits default all-ones) at the start of every frame >= `frame`,
+        // waking any parked waiter exactly as a guest sceKernelSetEventFlag would. This
+        // tests, without guessing at the producer, whether waking a stuck worker thread
+        // actually unblocks the boot (causality check for a never-fired completion event).
+        let set_evfs: Vec<(i32, u64, u32)> = std::env::var("VITASLOP_SET_EVF")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|item| {
+                        let mut it = item.split(':');
+                        let id: i32 = it.next()?.trim().parse().ok()?;
+                        let frame: u64 = it.next()?.trim().parse().ok()?;
+                        let bits: u32 = it
+                            .next()
+                            .and_then(|b| u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(0xFFFF_FFFF);
+                        Some((id, frame, bits))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // VITASLOP_HOLD_MEM=addr:value[:fromframe],... writes `value` (hex or dec) to guest
+        // `addr` at the START of every frame >= fromframe (default 0). Unlike POKE (one shot),
+        // this re-asserts each frame, so a per-frame-cleared word (e.g. a completion mask) can
+        // be held set long enough for that frame's consumers to observe it.
+        let hold_mems: Vec<(u32, u32, u64)> = std::env::var("VITASLOP_HOLD_MEM")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|item| {
+                        let mut it = item.split(':');
+                        let addr = u32::from_str_radix(it.next()?.trim().trim_start_matches("0x"), 16).ok()?;
+                        let vs = it.next()?.trim();
+                        let value = u32::from_str_radix(vs.trim_start_matches("0x"), 16)
+                            .or_else(|_| vs.parse::<u32>())
+                            .ok()?;
+                        let from: u64 = it.next().and_then(|f| f.trim().parse().ok()).unwrap_or(0);
+                        Some((addr, value, from))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // VITASLOP_FORCE_READY=vtable[:lo-hi] (hex): at the start of every frame, scan the
+        // guest heap range [lo,hi) (default 0x82000000-0x82c00000) for any 4-byte word equal
+        // to `vtable`, and if found at offset 0 of an object, set that object's +84 byte-word
+        // to 1. This simulates "resource completion always succeeds" for EVERY resObj of that
+        // class (not just one fixed address), so the boot coroutine can flow through its whole
+        // sequence of sequential resource waits. Causality test for the never-firing streaming
+        // completion: if the boot advances through all screens / the state machine leaves 2,
+        // the completion model is confirmed and this is the forcing path to make real.
+        let force_ready: Option<(u32, u32, u32)> = std::env::var("VITASLOP_FORCE_READY")
+            .ok()
+            .and_then(|s| {
+                let (vt_s, range) = s.split_once(':').unwrap_or((s.as_str(), ""));
+                let vt = u32::from_str_radix(vt_s.trim().trim_start_matches("0x"), 16).ok()?;
+                let (lo, hi) = if let Some((a, b)) = range.split_once('-') {
+                    (
+                        u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?,
+                    )
+                } else {
+                    (0x8200_0000u32, 0x82c0_0000u32)
+                };
+                Some((vt, lo, hi))
+            });
+        // VITASLOP_FORCE_READY_V2=vtable2[:lo-hi]: like FORCE_READY but matches the SHARED
+        // base-class vtable at object offset +4 (0x811fbba4 for RR's resource items), so it
+        // covers EVERY resource-item subclass (text/font/etc) at once, and only marks an item
+        // ready if its data pointer (+92) is non-null (i.e. it actually finished loading).
+        // This is the general "HLE resource completion" stand-in for the streaming subsystem
+        // whose real completion trigger never fires under our synchronous HLE.
+        let force_ready_v2: Option<(u32, u32, u32)> = std::env::var("VITASLOP_FORCE_READY_V2")
+            .ok()
+            .and_then(|s| {
+                let (vt_s, range) = s.split_once(':').unwrap_or((s.as_str(), ""));
+                let vt = u32::from_str_radix(vt_s.trim().trim_start_matches("0x"), 16).ok()?;
+                let (lo, hi) = if let Some((a, b)) = range.split_once('-') {
+                    (
+                        u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?,
+                    )
+                } else {
+                    (0x8200_0000u32, 0x8300_0000u32)
+                };
+                Some((vt, lo, hi))
+            });
         while sched.frames() < max_frames {
+            if let Some((vt, lo, hi)) = force_ready {
+                let bytes = sched.read_guest(lo, (hi - lo) as usize);
+                let mut hits = 0u32;
+                let mut i = 0usize;
+                while i + 4 <= bytes.len() {
+                    let w = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    if w == vt {
+                        let obj = lo + i as u32;
+                        sched.write_guest(obj + 84, &1u32.to_le_bytes());
+                        hits += 1;
+                    }
+                    i += 4;
+                }
+                if sched.frames() < 3 {
+                    eprintln!("FORCE_READY frame {}: set +84=1 on {hits} obj(s) with vtable {vt:#x}", sched.frames());
+                }
+            }
+            if let Some((vt, lo, hi)) = force_ready_v2 {
+                let bytes = sched.read_guest(lo, (hi - lo) as usize);
+                let mut hits = 0u32;
+                let mut i = 4usize; // candidate obj+4 position
+                while i + 4 <= bytes.len() {
+                    let w = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    // match vtable2 at +4; object starts 4 bytes earlier
+                    if w == vt && i + 92 <= bytes.len() {
+                        let data = u32::from_le_bytes([bytes[i + 88], bytes[i + 89], bytes[i + 90], bytes[i + 91]]);
+                        let ready = u32::from_le_bytes([bytes[i + 80], bytes[i + 81], bytes[i + 82], bytes[i + 83]]);
+                        if data != 0 && ready == 0 {
+                            let obj = lo + (i as u32) - 4;
+                            sched.write_guest(obj + 84, &1u32.to_le_bytes());
+                            hits += 1;
+                        }
+                    }
+                    i += 4;
+                }
+                if sched.frames() < 3 || hits > 0 {
+                    eprintln!("FORCE_READY_V2 frame {}: set +84 on {hits} loaded item(s) (vtable2 {vt:#x})", sched.frames());
+                }
+            }
+            if let Some((addr, frame, value)) = poke {
+                if sched.frames() == frame {
+                    sched.write_guest(addr, &value.to_le_bytes());
+                    eprintln!("POKE {addr:#x} = {value} at frame {frame}");
+                }
+            }
+            for &(addr, value, from) in &hold_mems {
+                if sched.frames() >= from {
+                    sched.write_guest(addr, &value.to_le_bytes());
+                }
+            }
+            for &(id, frame, bits) in &set_evfs {
+                if sched.frames() >= frame {
+                    let mut h = sched.host();
+                    h.state.event_set_wake(id, bits);
+                }
+            }
             let target = sched.frames() + 1;
             last = sched.run_frames(target, per_frame_rounds);
             let f = sched.frames();
@@ -514,6 +713,41 @@ fn retail_boot_probe() {
                 eprintln!("  {:#010x}: {}", addr + (i * 16) as u32, words.join(" "));
             }
         }
+    }
+
+    // Post-mortem word scan: VITASLOP_SCAN_WORD=0xVAL[:lo-hi] finds every guest
+    // address whose 32-bit word == VAL. Reloc-filled function-pointer tables (bound
+    // completion callbacks / dispatch vectors) are invisible to the static image and
+    // IR - their pointers are written at load time - so scanning live memory is the
+    // only way to find who holds a given handler and where it is dispatched from.
+    if let Ok(spec) = std::env::var("VITASLOP_SCAN_WORD") {
+        let (val_s, range) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
+        let val = u32::from_str_radix(val_s.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let (lo, hi) = if let Some((a, b)) = range.split_once('-') {
+            (
+                u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap_or(0x8120_0000),
+                u32::from_str_radix(b.trim().trim_start_matches("0x"), 16).unwrap_or(0x8160_0000),
+            )
+        } else {
+            (0x8120_0000u32, 0x8300_0000u32)
+        };
+        eprintln!("scan for {val:#010x} in [{lo:#010x}, {hi:#010x}):");
+        let bytes = sched.read_guest(lo, (hi - lo) as usize);
+        let mut hits = 0u32;
+        let mut a = 0usize;
+        while a + 4 <= bytes.len() {
+            let w = u32::from_le_bytes([bytes[a], bytes[a + 1], bytes[a + 2], bytes[a + 3]]);
+            if w == val {
+                eprintln!("  hit @ {:#010x}", lo + a as u32);
+                hits += 1;
+                if hits >= 200 {
+                    eprintln!("  ...(capped at 200)");
+                    break;
+                }
+            }
+            a += 4;
+        }
+        eprintln!("  {hits} hit(s)");
     }
 
     // 5. Report the boot ladder and render whatever was captured.
@@ -679,6 +913,37 @@ fn retail_boot_probe() {
     eprintln!("--- sceKernelWaitLwCond samples (work, timeout_ptr, timeout) ---");
     for (work, tp, to) in &st.capture.lwcond_wait_samples {
         eprintln!("  work={work:#010x} timeout_ptr={tp:#010x} timeout={to}");
+    }
+    // Scene introspection (VITASLOP_DUMP_SCENES=N): print the last N captured scenes'
+    // structure - color surface, and per draw the primitive/index/vertex shape,
+    // uniform count, attributes, and bound textures. This answers "the frame is
+    // black: what is the game actually drawing?" without rendering anything.
+    if let Some(n) = std::env::var("VITASLOP_DUMP_SCENES").ok().and_then(|s| s.parse::<usize>().ok()) {
+        let total = st.capture.scenes.len();
+        for (i, scene) in st.capture.scenes.iter().enumerate().skip(total.saturating_sub(n)) {
+            match &scene.color {
+                Some(c) => eprintln!(
+                    "scene[{i}]: color fmt={:#x} {}x{} stride={} addr={:#010x}, {} draw(s)",
+                    c.format, c.width, c.height, c.stride_pixels, c.data_addr,
+                    scene.draws.len()
+                ),
+                None => eprintln!("scene[{i}]: NO color surface, {} draw(s)", scene.draws.len()),
+            }
+            for (j, d) in scene.draws.iter().enumerate() {
+                eprintln!(
+                    "  draw[{j}]: prim={} idxfmt={} idxcount={} vstride={} vbytes={} uniforms={} attrs={:?}",
+                    d.primitive, d.index_format, d.index_count, d.vertex_stride,
+                    d.vertices.len(), d.uniforms.len(), d.attributes,
+                );
+                for t in &d.textures {
+                    eprintln!(
+                        "    tex unit={} base_fmt={:#04x} type={:#x} {}x{} stride={} addr={:#010x} pixels={}",
+                        t.unit, t.base_format, t.tex_type, t.width, t.height, t.stride,
+                        t.data_addr, t.pixels.len()
+                    );
+                }
+            }
+        }
     }
     // Artifacts (call trace + frame PNGs) go to the shot dir only when one was given.
     match &shot_dir {

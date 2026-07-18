@@ -149,6 +149,17 @@ pub trait GuestEngine {
 struct Slot<T> {
     thread: T,
     state: ThreadState,
+    /// Anti-starvation cooldown. Set when this thread was preempted by exhausting a
+    /// full quantum WITHOUT ever blocking - i.e. it is CPU-bound (a busy spin), not
+    /// cooperatively yielding. A cooled thread steps aside so every other runnable
+    /// thread gets a turn before it runs again (see [`SchedCore::pick_next`]). This
+    /// models real multicore hardware, where a lower-priority worker on another core
+    /// keeps making progress while a higher-priority thread spins - without it, a
+    /// spin-wait on a lower-priority worker's result deadlocks the single baton.
+    /// Only [`Stop::Quantum`] sets it, so purely cooperative threads (which yield via
+    /// a host call long before a full quantum) are never cooled and their interleave
+    /// is unchanged.
+    cooled: bool,
 }
 
 /// What to do when no thread is runnable (see [`SchedCore::handle_idle`]).
@@ -182,7 +193,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         SchedCore {
             engine,
             host,
-            threads: vec![Slot { thread: main, state: ThreadState::Runnable }],
+            threads: vec![Slot { thread: main, state: ThreadState::Runnable, cooled: false }],
             cursor: 0,
             frames: 0,
         }
@@ -217,16 +228,23 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// rely on (a higher-priority worker started by a lower-priority thread runs to its
     /// first block before the starter continues). `None` if nothing is runnable.
     pub fn pick_next(&mut self) -> Option<usize> {
+        // Strict priority, but only among threads not on the spin cooldown: a CPU-bound
+        // thread that just burned a whole quantum steps aside so peers get a turn. When
+        // every runnable thread is cooled (all spinning), the cycle is complete - clear
+        // the cooldowns and start a fresh round. This keeps strict priority for the
+        // normal case (cooperative threads never cool) while guaranteeing every runnable
+        // thread makes progress, the way separate cores do on real hardware.
+        if !self.threads.iter().any(|t| t.state == ThreadState::Runnable && !t.cooled) {
+            for t in self.threads.iter_mut() {
+                t.cooled = false;
+            }
+        }
         let n = self.threads.len();
-        let best = self
-            .threads
-            .iter()
-            .filter(|t| t.state == ThreadState::Runnable)
-            .map(|t| t.thread.priority())
-            .min()?;
-        let idx = (0..n).map(|k| (self.cursor + k) % n).find(|&i| {
-            self.threads[i].state == ThreadState::Runnable && self.threads[i].thread.priority() == best
-        })?;
+        let runnable = |t: &Slot<E::Thread>| t.state == ThreadState::Runnable && !t.cooled;
+        let best = self.threads.iter().filter(|t| runnable(t)).map(|t| t.thread.priority()).min()?;
+        let idx = (0..n)
+            .map(|k| (self.cursor + k) % n)
+            .find(|&i| runnable(&self.threads[i]) && self.threads[i].thread.priority() == best)?;
         self.cursor = idx + 1;
         Some(idx)
     }
@@ -248,8 +266,13 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 self.host.lock().unwrap().on_frame_boundary(self.frames);
                 (self.frames >= max_frames).then_some(RunReport::FramesReached(self.frames))
             }
-            // A preemption slice: still runnable, not a frame.
-            Stop::Quantum => None,
+            // A preemption slice: the thread used a whole quantum without blocking, so
+            // it is CPU-bound. Keep it runnable but put it on the spin cooldown so peers
+            // run before it does again (anti-starvation; see [`Slot::cooled`]).
+            Stop::Quantum => {
+                self.threads[idx].cooled = true;
+                None
+            }
         }
     }
 
@@ -321,7 +344,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         }
         for sp in spawns {
             match self.engine.spawn(&sp) {
-                Ok(thread) => self.threads.push(Slot { thread, state: ThreadState::Runnable }),
+                Ok(thread) => self.threads.push(Slot { thread, state: ThreadState::Runnable, cooled: false }),
                 // A spawn whose entry was not translated: record it as finished with
                 // code 0 so a later join does not hang.
                 Err(()) => self.host.lock().unwrap().set_thread_exit(sp.thid, 0),
@@ -334,6 +357,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 .find(|t| t.thread.thid() == thid && t.state == ThreadState::Blocked)
             {
                 t.state = ThreadState::Runnable;
+                // A freshly woken thread is immediately eligible: it did cooperative
+                // work (it blocked), so it must not inherit a stale spin cooldown.
+                t.cooled = false;
             }
         }
     }

@@ -23,8 +23,13 @@ pub mod self_;
 pub mod inflate;
 pub mod reloc;
 
-/// `e_type` of a velf: a relocatable SCE executable.
+/// `e_type` of a velf: a relocatable SCE executable (position-independent, laid
+/// out relative to a link base and carrying SCE relocations).
 const ET_SCE_RELEXEC: u16 = 0xFE04;
+/// `e_type` of a fixed-address SCE executable: its segments carry absolute load
+/// vaddrs and it ships no SCE relocations, so it must load at its native base and
+/// cannot be shifted. Common for launch-window titles.
+const ET_SCE_EXEC: u16 = 0xFE00;
 const PT_LOAD: u32 = 1;
 const EHDR_SIZE: usize = 52;
 const PHDR_SIZE: usize = 32;
@@ -70,6 +75,12 @@ pub struct Module {
     pub module_nid: u32,
     /// Lowest segment vaddr - where the image begins.
     pub base: u32,
+    /// Whether this image may be relocated to a different base. A `ET_SCE_RELEXEC`
+    /// velf can (it carries SCE relocations); a fixed `ET_SCE_EXEC` cannot - it has
+    /// absolute internal pointers and no relocations, so it must load at [`base`].
+    ///
+    /// [`base`]: Module::base
+    pub relocatable: bool,
     /// The entry point (`SceModuleInfo::module_start`), where execution begins.
     pub entry: u32,
     pub segments: Vec<Segment>,
@@ -105,6 +116,16 @@ pub struct Module {
     /// these seed discovery *tentatively* as ARM functions (a bad guess that fails to
     /// decode is dropped). Populated by [`rebase`](Module::rebase); empty until then.
     pub arm_code_pointers: Vec<u32>,
+    /// Thread-local-storage template, from `SceModuleInfo` (`tls_start`/`tls_filesz`/
+    /// `tls_memsz`). `tls_vaddr` is the guest address of the init image (`.tdata`),
+    /// `tls_filesz` its initialized byte count, `tls_memsz` the full per-thread block
+    /// size (init data plus zero-filled `.tbss`). Each thread gets its own copy, and
+    /// the compiler reaches `__thread` variables at `thread_pointer + offset` after a
+    /// `MRC p15,0,Rt,c13,c0,3` read of the thread pointer. `tls_vaddr` is 0 (and the
+    /// sizes 0) for a module with no TLS. [`rebase`](Module::rebase) shifts `tls_vaddr`.
+    pub tls_vaddr: u32,
+    pub tls_filesz: u32,
+    pub tls_memsz: u32,
 }
 
 /// Why loading failed.
@@ -229,6 +250,10 @@ impl Module {
             *p = p.wrapping_add(delta);
         }
         self.entry = self.entry.wrapping_add(delta);
+        // The TLS init image moves with the module (0 = no TLS, leave it 0).
+        if self.tls_vaddr != 0 {
+            self.tls_vaddr = self.tls_vaddr.wrapping_add(delta);
+        }
         self.base = new_base;
         self.relocations.clear();
         code_pointers.sort_unstable();
@@ -445,12 +470,19 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
     }
 
     let e_type = r.u16(16)?;
-    if e_type != ET_SCE_RELEXEC {
-        return Err(Error::UnsupportedType(e_type));
-    }
+    // Both SCE executable shapes carry SceModuleInfo the same way and are parsed
+    // identically here; they differ only in placement (a RELEXEC relocates to any
+    // base, a fixed EXEC must stay at its absolute vaddrs), recorded in
+    // `relocatable` so the linker never shifts a fixed image (which has no
+    // relocations to patch).
+    let relocatable = match e_type {
+        ET_SCE_RELEXEC => true,
+        ET_SCE_EXEC => false,
+        other => return Err(Error::UnsupportedType(other)),
+    };
 
-    // For ET_SCE_RELEXEC, e_entry locates SceModuleInfo: top two bits are the
-    // program-header (segment) index, the rest is the offset within it.
+    // e_entry locates SceModuleInfo: top two bits are the program-header (segment)
+    // index, the rest is the offset within it. (Same encoding for both e_types.)
     let e_entry = r.u32(24)?;
     let e_phoff = r.u32(28)? as usize;
     let e_phnum = r.u16(44)? as usize;
@@ -516,10 +548,17 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
     let import_top_off = r.u32(mi_file + 0x2c)?;
     let import_end_off = r.u32(mi_file + 0x30)?;
     let module_nid = r.u32(mi_file + 0x34)?;
+    let tls_start_off = r.u32(mi_file + 0x38)?;
+    let tls_filesz = r.u32(mi_file + 0x3c)?;
+    let tls_memsz = r.u32(mi_file + 0x40)?;
     let module_start_off = r.u32(mi_file + 0x44)?;
 
     let seg_base = mi_seg.vaddr;
     let entry = seg_base.wrapping_add(module_start_off);
+    // TLS template address is a segment-relative offset like the export/import
+    // pointers; 0 means the module has no TLS. Keep it 0 in that case so a consumer
+    // can cheaply test `tls_memsz == 0`.
+    let tls_vaddr = if tls_start_off == 0 { 0 } else { seg_base.wrapping_add(tls_start_off) };
     let export_top = seg_base.wrapping_add(export_top_off);
     let export_end = seg_base.wrapping_add(export_end_off);
     let import_top = seg_base.wrapping_add(import_top_off);
@@ -628,18 +667,39 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
 
     let init_pointers = read_init_pointers(&r, bytes).unwrap_or_default();
 
+    // A fixed `ET_SCE_EXEC` image ships no SCE relocations, so the code-pointer
+    // seeds a RELEXEC gets from its `R_ARM_ABS32` fixups (function pointers sitting
+    // in data tables - vtables, callback arrays, jump tables, reached only through
+    // an indirect `blx`/`bx`) are unavailable, and the transpiler's `movw`/`movt`
+    // scan cannot see a pointer that is loaded from memory rather than materialized
+    // as an immediate. Recover them by scanning the image's word-aligned data for
+    // values that address one of its own executable segments: an odd value is a
+    // Thumb function pointer, an even one a tentative ARM pointer. Both are
+    // discovery seeds the transpiler verifies (a bad guess fails to decode and is
+    // dropped). A RELEXEC gets these from `rebase` instead, so only scan a fixed
+    // image here.
+    let (code_pointers, arm_code_pointers) = if relocatable {
+        (Vec::new(), Vec::new())
+    } else {
+        scan_fixed_code_pointers(&segments)
+    };
+
     Ok(Module {
         name,
         module_nid,
         base,
+        relocatable,
         entry,
         segments,
         imports,
         exports,
         relocations,
         init_pointers,
-        code_pointers: Vec::new(),
-        arm_code_pointers: Vec::new(),
+        code_pointers,
+        arm_code_pointers,
+        tls_vaddr,
+        tls_filesz,
+        tls_memsz,
     })
 }
 
@@ -680,6 +740,46 @@ fn read_init_pointers(r: &Reader, bytes: &[u8]) -> Option<Vec<u32>> {
         }
     }
     Some(out)
+}
+
+/// Scan a fixed image's segments for word-aligned code pointers into its own
+/// executable segments. Returns `(thumb_pointers, arm_pointers)`: an odd value
+/// addressing executable code is a Thumb function pointer (Thumb bit stripped); an
+/// even one is a tentative ARM function pointer. Values are absolute (a fixed
+/// image is never rebased). Used only for `ET_SCE_EXEC`, whose function-pointer
+/// tables carry no relocations to recover these from.
+fn scan_fixed_code_pointers(segments: &[Segment]) -> (Vec<u32>, Vec<u32>) {
+    let exec: Vec<(u32, u32)> = segments
+        .iter()
+        .filter(|s| s.executable)
+        .map(|s| (s.vaddr, s.vaddr.wrapping_add(s.mem_size)))
+        .collect();
+    let in_exec = |a: u32| exec.iter().any(|&(lo, hi)| a >= lo && a < hi);
+
+    let mut thumb = Vec::new();
+    let mut arm = Vec::new();
+    for s in segments {
+        // Word-aligned scan: a function-pointer table entry is 4-byte aligned. The
+        // segment's file-backed bytes hold every stored pointer (bss is zero).
+        let n = s.data.len() & !3;
+        let mut i = 0;
+        while i < n {
+            let w = u32::from_le_bytes([s.data[i], s.data[i + 1], s.data[i + 2], s.data[i + 3]]);
+            if w != 0 && in_exec(w & !1) {
+                if w & 1 == 1 {
+                    thumb.push(w & !1);
+                } else {
+                    arm.push(w);
+                }
+            }
+            i += 4;
+        }
+    }
+    thumb.sort_unstable();
+    thumb.dedup();
+    arm.sort_unstable();
+    arm.dedup();
+    (thumb, arm)
 }
 
 /// Read a u16 at a guest vaddr (via the u32 reader, masking).

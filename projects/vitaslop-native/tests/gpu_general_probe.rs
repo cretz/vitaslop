@@ -52,6 +52,7 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         indices,
         uniforms: vec![],
         textures,
+        render_state: Default::default(),
     }
 }
 
@@ -73,6 +74,9 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         stride: size * 4,
         data_addr: 0x1000,
         pixels,
+        u_addr_mode: 0,
+        v_addr_mode: 0,
+        lod_bias: 0,
     }
 }
 
@@ -165,6 +169,7 @@ fn general_renderer_matches_software_oracle() {
             indices,
             uniforms: vec![],
             textures: vec![],
+            render_state: Default::default(),
         };
         assert_parity(&mut gpu, &Scene { color: None, draws: vec![draw] }, "ndc-vertexcolor");
     }

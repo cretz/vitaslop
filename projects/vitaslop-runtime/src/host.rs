@@ -253,9 +253,31 @@ struct ThreadRec {
     priority: i32,
 }
 
-/// The default SceKernel user-thread priority (`SCE_KERNEL_DEFAULT_PRIORITY_USER`),
-/// used for the initial (main) thread, which is not created via `create_thread`.
-pub const DEFAULT_THREAD_PRIORITY: i32 = 0x1000_0100;
+/// `SCE_KERNEL_DEFAULT_PRIORITY` - the *sentinel* a title passes to
+/// `sceKernelCreateThread` to mean "the default priority", and the base for
+/// relative priorities (`base + delta`). It is NOT an actual runnable priority;
+/// [`resolve_priority`] maps it (and the relative range around it) to a concrete
+/// value before it ever reaches the scheduler.
+pub const SCE_KERNEL_DEFAULT_PRIORITY: i32 = 0x1000_0100;
+
+/// The concrete default user-thread priority (`SCE_KERNEL_DEFAULT_PRIORITY_USER`,
+/// 0xA0). Absolute user priorities run 0x40 (highest) .. 0xBF (lowest); 0xA0 is the
+/// middle default the initial (main) thread and a defaulted worker resolve to.
+pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
+
+/// Resolve a `sceKernelCreateThread` priority argument to a concrete scheduler
+/// priority. Absolute user priorities (small numbers, ~0x40..0xBF) pass through;
+/// the relative range around [`SCE_KERNEL_DEFAULT_PRIORITY`] (e.g. the sentinel
+/// itself, or `default - 1`) is rebased onto [`DEFAULT_THREAD_PRIORITY`]. Without
+/// this the sentinel (a huge number) would read as the lowest possible priority,
+/// so any concrete-priority worker would outrank - and starve - the main thread.
+pub fn resolve_priority(prio: i32) -> i32 {
+    if prio >= 0x1000_0000 {
+        DEFAULT_THREAD_PRIORITY + (prio - SCE_KERNEL_DEFAULT_PRIORITY)
+    } else {
+        prio
+    }
+}
 
 /// A recursive mutex's state (preemptive mode only; the single-thread model needs
 /// none). `owner` is the holding thread's id (None if free), `count` the recursion
@@ -286,6 +308,21 @@ struct SemaWaiter {
     need: i32,
 }
 
+/// A thread parked in `sceKernelWaitEventFlag`: which flag, which thread, the bit
+/// pattern and wait mode it asked for, the guest address of its `outBits`
+/// out-parameter (0 = NULL), and an optional virtual-clock deadline for a timed
+/// wait. Released when a `sceKernelSetEventFlag` satisfies the pattern (the match
+/// pattern is then written through `out_addr` via the pending stat-write channel)
+/// or the deadline passes.
+struct EvfWaiter {
+    uid: i32,
+    thid: i32,
+    bits: u32,
+    mode: u32,
+    out_addr: u32,
+    deadline: Option<u64>,
+}
+
 /// A request to synchronously run guest code (a thread entry) that a host call
 /// raised. The engine-agnostic runtime cannot itself re-enter the wasm engine, so
 /// it records this intent and the engine host ([`vitaslop_native::Vm`]) executes
@@ -301,6 +338,11 @@ pub struct Reentry {
     pub arg_len: u32,
     /// r1 for the entry: the argument-block pointer (`void *argp`).
     pub arg_ptr: u32,
+    /// r2 for the entry. Zero for a `sceKernelStartThread` entry (whose ABI is only
+    /// `(SceSize args, void *argp)`); nonzero only for a host-delivered callback
+    /// whose ABI passes a third register (e.g. an NP service-state callback thunk
+    /// that takes its `this`/userdata in r2).
+    pub r2: u32,
     /// sp for the entry: the top of the thread's own stack.
     pub stack_top: u32,
     /// The thread whose exit code the result becomes.
@@ -327,8 +369,30 @@ struct OpenFile {
 #[derive(Default)]
 pub struct FileTable {
     files: std::collections::HashMap<String, Vec<u8>>,
+    /// Original (as-added) spelling per lowercased key, so a directory listing can
+    /// return real mixed-case names for a title's own glob matching. Lookup stays
+    /// case-insensitive through the lowercased `files` key.
+    originals: std::collections::HashMap<String, String>,
     open: std::collections::HashMap<i32, OpenFile>,
+    open_dirs: std::collections::HashMap<i32, OpenDir>,
     next_fd: i32,
+}
+
+/// One entry a directory descriptor yields: the child's original-case name, whether
+/// it is a subdirectory (synthesized from deeper paths in the flat map), and the
+/// file size (0 for a directory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// An open directory descriptor: the listing snapshotted at `sceIoDopen` time and
+/// a read cursor advanced by each `sceIoDread`.
+struct OpenDir {
+    entries: Vec<DirEntry>,
+    cursor: usize,
 }
 
 // Vita open flags (SCE_O_*), from the MIT vita-headers.
@@ -372,10 +436,22 @@ pub const FD_STDERR: i32 = 2;
 /// miss the file stored as `settings/foo.ini` and take its file-missing (often fatal)
 /// path.
 fn vfs_key(path: &str) -> String {
-    path.strip_prefix("app0:/")
-        .or_else(|| path.strip_prefix("app0:"))
-        .unwrap_or(path)
-        .to_lowercase()
+    strip_app0(path).to_ascii_lowercase()
+}
+
+/// Strip an `app0:` mount prefix (with or without the separator), case-insensitively:
+/// titles spell the mount both `app0:` and `APP0:`. The rest of the path keeps its
+/// case - [`vfs_key`] lowercases for lookup, while the original spelling is preserved
+/// for directory listings (a title pattern-matches `sceIoDread` names against
+/// mixed-case globs like `Foo_*`).
+fn strip_app0(path: &str) -> &str {
+    let b = path.as_bytes();
+    if b.len() >= 5 && b[..5].eq_ignore_ascii_case(b"app0:") {
+        let rest = &path[5..];
+        rest.strip_prefix('/').unwrap_or(rest)
+    } else {
+        path
+    }
 }
 
 /// Whether a (already-lowercased [`vfs_key`]) path lives on a writable, persisted
@@ -520,9 +596,89 @@ impl FileTable {
         }
     }
 
+    /// Open a directory listing (sceIoDopen): returns a new descriptor or a negative
+    /// errno if nothing exists under the path.
+    ///
+    /// The vfs is a flat path->bytes map, so the listing is synthesized: every stored
+    /// key under `path/` contributes its next path component, deduplicated - a
+    /// component with deeper structure is a subdirectory, a terminal one a file.
+    /// Names are returned in their original (as-added) case because titles glob
+    /// listings against mixed-case patterns, while dedup/order use the lowercased
+    /// form to match the case-insensitive lookup rules. The listing is snapshotted at
+    /// open, ordered by lowercased name, and consumed by [`Self::dread`].
+    fn dopen(&mut self, path: &str) -> i32 {
+        let key = vfs_key(path);
+        let key = key.trim_end_matches('/');
+        let prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
+        // Child components sit at this index when a full key is split on '/'.
+        let comp_index = prefix.matches('/').count();
+        let mut children: std::collections::BTreeMap<String, DirEntry> =
+            std::collections::BTreeMap::new();
+        for (k, data) in &self.files {
+            let Some(rest) = k.strip_prefix(&prefix) else { continue };
+            if rest.is_empty() {
+                continue;
+            }
+            let (comp, is_dir) = match rest.split_once('/') {
+                Some((first, _)) => (first, true),
+                None => (rest, false),
+            };
+            let entry = children.entry(comp.to_string()).or_insert_with(|| {
+                // Recover the child's original spelling from the as-added path; the
+                // lowercased and original paths split identically ('/' survives
+                // ASCII lowercasing), so the component index lines up.
+                let name = self
+                    .originals
+                    .get(k)
+                    .and_then(|orig| orig.split('/').nth(comp_index))
+                    .unwrap_or(comp)
+                    .to_string();
+                DirEntry { name, is_dir, size: 0 }
+            });
+            if !is_dir {
+                entry.size = data.len() as u64;
+            }
+        }
+        if children.is_empty() {
+            return SCE_ERROR_ERRNO_ENOENT;
+        }
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.open_dirs.insert(fd, OpenDir { entries: children.into_values().collect(), cursor: 0 });
+        fd
+    }
+
+    /// Read the next entry from a directory descriptor (sceIoDread). Returns
+    /// `None` on a bad descriptor, `Some(None)` when the listing is exhausted, and
+    /// `Some(Some(entry))` otherwise (advancing the cursor).
+    fn dread(&mut self, fd: i32) -> Option<Option<DirEntry>> {
+        let od = self.open_dirs.get_mut(&fd)?;
+        let entry = od.entries.get(od.cursor).cloned();
+        if entry.is_some() {
+            od.cursor += 1;
+        }
+        Some(entry)
+    }
+
+    /// Close a directory descriptor (sceIoDclose); returns 0 or a negative errno.
+    fn dclose(&mut self, fd: i32) -> i32 {
+        if self.open_dirs.remove(&fd).is_some() {
+            0
+        } else {
+            SCE_ERROR_ERRNO_EBADF
+        }
+    }
+
     /// The size of `path` if it exists (for sceIoGetstat).
     fn size_of(&self, path: &str) -> Option<u64> {
         self.files.get(&vfs_key(path)).map(|d| d.len() as u64)
+    }
+
+    /// The size of the file behind an open descriptor (for sceIoGetstatByFd).
+    /// Returns None on a bad descriptor - the path is already the vfs key.
+    fn size_of_fd(&self, fd: i32) -> Option<u64> {
+        let of = self.open.get(&fd)?;
+        self.files.get(&of.path).map(|d| d.len() as u64)
     }
 }
 
@@ -564,6 +720,10 @@ pub struct VitaState {
     // state is faithful for single-thread use (guarding data, wait-then-read).
     semaphores: Vec<(i32, i32)>,
     event_flags: Vec<(i32, u32)>,
+    /// One bit per open SceCommonDialog family (see `vita::services::DialogFamily`):
+    /// set by `*DialogInit`, read by `*DialogGetStatus` (open reports FINISHED -
+    /// dialogs complete instantly offline), cleared by `*DialogTerm`.
+    pub(crate) open_dialogs: u32,
     // Preemptive-mode state (unused in the single-thread model). When `preemptive`
     // is set, blocking primitives actually park the calling thread (`current`) and
     // are woken by another thread's signal/unlock/thread-end; the scheduler drains
@@ -575,6 +735,28 @@ pub struct VitaState {
     mutexes: Vec<MutexRec>,
     conds: Vec<CondRec>,
     sema_waiters: Vec<SemaWaiter>,
+    evf_waiters: Vec<EvfWaiter>,
+    // Display-queue callback execution (preemptive mode; see
+    // [`Self::enqueue_display_callback`]): the dedicated guest stack and
+    // callback-data slot ring (lazily allocated), entries waiting to run, and the
+    // in-flight callback's thread id. The queue is serial - one callback at a
+    // time, in submission order - matching the real display queue's single
+    // internal thread.
+    display_cb_stack: u32,
+    display_cb_slots: u32,
+    display_cb_next_slot: u32,
+    display_cb_queue: std::collections::VecDeque<u32>,
+    display_cb_running: Option<i32>,
+    // Registered service-state callbacks (preemptive mode). A title registers
+    // these at boot and pumps them every frame (`sce*CheckCallback`), waiting for
+    // the one-time state notification (offline: signed-out / disconnected) before
+    // it leaves its boot screen. Each is `Some((entry, userdata))` once registered
+    // and `delivered` once its callback has been run. See
+    // [`Self::pump_service_callbacks`].
+    np_service_cb: Option<(u32, u32)>,
+    np_cb_delivered: bool,
+    net_inet_cb: Option<(u32, u32)>,
+    net_cb_delivered: bool,
     /// (waiter thread id, target thread id, stat pointer) for threads parked in a
     /// join. `stat` is the guest `int *` the joiner passed to `sceKernelWaitThreadEnd`
     /// (0 = NULL); the target's exit code is written there when the join completes.
@@ -612,6 +794,15 @@ pub struct VitaState {
     /// address is stable across calls, so a thread stores and reads back its own
     /// TLS pointer faithfully.
     tls_slots: Vec<((i32, u32), u32)>,
+    /// The main executable's TLS template `(init image address, initialized byte
+    /// count, full block size)`, from [`crate::link::LinkedProgram::tls_template`].
+    /// Each thread gets a private block of `memsz` bytes; the compiler reaches
+    /// `__thread` variables at `thread_pointer + offset`. `(0, 0, 0)` = no TLS.
+    tls_template: (u32, u32, u32),
+    /// Per-thread thread-pointer (`TPIDRURO`) block base, keyed by thread id, from
+    /// [`Self::ensure_tls_block`]. The engine reads it via [`Self::thread_tls_base`]
+    /// when it instantiates a thread and seeds the `tp` register from it.
+    tls_bases: Vec<(i32, u32)>,
     /// `(shaderPatcherId handle, SceGxmProgram* header)` from every
     /// `sceGxmShaderPatcherRegisterProgram`, so `sceGxmShaderPatcherGetProgramFromId`
     /// can hand back the real program pointer the guest registered.
@@ -626,6 +817,16 @@ pub struct VitaState {
     /// format the guest passed for an exact decode; a texture the guest fills
     /// directly (a `.gxt` blob) is absent here and falls back to control-word parse.
     texture_formats: Vec<(u32, u32)>,
+    /// Sampler wrap/LOD state per guest `SceGxmTexture*`, as `(addr, (u_addr_mode,
+    /// v_addr_mode, lod_bias))`, set by `sceGxmTextureSet{U,V}AddrMode[Safe]` /
+    /// `SetLodBias`. Kept beside `texture_formats` (rather than mutated into the
+    /// guest control words) so recording the state never risks corrupting a struct
+    /// the guest re-reads. Absent = GXM defaults (REPEAT/REPEAT/0).
+    texture_samplers: Vec<(u32, (u32, u32, u32))>,
+    /// The live GXM fixed-function pipeline state (cull/depth/stencil/viewport/...),
+    /// mutated by the `sceGxmSet*` setters and snapshotted into each recorded draw.
+    /// Sticky across scenes, exactly like the real GXM context.
+    render_state: crate::capture::RenderState,
     /// Threads parked in `sceKernelWaitLwCond`, as `(thread id, cond work address,
     /// wake deadline)`. `deadline` is `Some(virtual_us)` for a timed wait (woken by
     /// a signal or when the clock reaches it) or `None` for an infinite wait (only a
@@ -675,11 +876,22 @@ impl VitaState {
             pending_reentry: None,
             semaphores: Vec::new(),
             event_flags: Vec::new(),
+            open_dialogs: 0,
             preemptive: false,
             current: 0,
             mutexes: Vec::new(),
             conds: Vec::new(),
             sema_waiters: Vec::new(),
+            evf_waiters: Vec::new(),
+            display_cb_stack: 0,
+            display_cb_slots: 0,
+            display_cb_next_slot: 0,
+            display_cb_queue: std::collections::VecDeque::new(),
+            display_cb_running: None,
+            np_service_cb: None,
+            np_cb_delivered: false,
+            net_inet_cb: None,
+            net_cb_delivered: false,
             join_waiters: Vec::new(),
             pending_spawns: Vec::new(),
             pending_wakes: Vec::new(),
@@ -692,9 +904,13 @@ impl VitaState {
             halt_on_terminate: false,
             process_param: 0,
             tls_slots: Vec::new(),
+            tls_template: (0, 0, 0),
+            tls_bases: Vec::new(),
             shader_programs: Vec::new(),
             bound_textures: Vec::new(),
             texture_formats: Vec::new(),
+            texture_samplers: Vec::new(),
+            render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
             sleep_waiters: Vec::new(),
             virtual_us: 0,
@@ -744,6 +960,40 @@ impl VitaState {
         self.process_param
     }
 
+    /// Record the main executable's TLS template (from
+    /// [`crate::link::LinkedProgram::tls_template`]) so each thread can be given its
+    /// own thread-local-storage block. Set once before the run.
+    pub fn set_tls_template(&mut self, template: (u32, u32, u32)) {
+        self.tls_template = template;
+    }
+
+    /// The thread pointer (`TPIDRURO`) for thread `thid`: the base of its private TLS
+    /// block, allocating the block on first request. The block is `memsz` bytes; its
+    /// `.tbss` tail is zero (guest memory starts zeroed) and its `.tdata` head is
+    /// copied from the template by the engine at thread instantiation (it owns guest
+    /// memory). Returns 0 when the title has no TLS - the compiler then never reads
+    /// the thread pointer, so 0 is never dereferenced.
+    pub fn ensure_tls_block(&mut self, thid: i32) -> u32 {
+        let (_, _, memsz) = self.tls_template;
+        if memsz == 0 {
+            return 0;
+        }
+        if let Some(&(_, base)) = self.tls_bases.iter().find(|&&(t, _)| t == thid) {
+            return base;
+        }
+        // 8-byte aligned so a `__thread` double or 64-bit value in the block is aligned.
+        let base = self.galloc(memsz, 8);
+        self.tls_bases.push((thid, base));
+        base
+    }
+
+    /// The TLS init image `(source address, initialized byte count)` for the template,
+    /// so the engine can copy `.tdata` into a freshly allocated block. `(_, 0)` when
+    /// there is nothing to copy (a pure `.tbss` template stays zero).
+    pub fn tls_init_image(&self) -> (u32, u32) {
+        (self.tls_template.0, self.tls_template.1)
+    }
+
     /// The stable guest address of TLS slot `key` for the currently running thread,
     /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
     /// memory starts zeroed, so a never-written slot reads back as NULL.
@@ -772,7 +1022,9 @@ impl VitaState {
     /// Preload a read-only file into the virtual filesystem before a run (e.g. a
     /// title's data file). The guest can then `sceIoOpen`/`sceIoRead` it.
     pub fn add_file(&mut self, path: &str, bytes: Vec<u8>) {
-        self.fs.files.insert(vfs_key(path), bytes);
+        let key = vfs_key(path);
+        self.fs.originals.insert(key.clone(), strip_app0(path).trim_start_matches('/').to_string());
+        self.fs.files.insert(key, bytes);
     }
 
     /// Read back a file's current bytes (a write target after the run, for tests).
@@ -783,9 +1035,7 @@ impl VitaState {
     /// sceIoOpen: returns a new fd or a negative errno.
     pub fn io_open(&mut self, path: &str, flags: u32) -> i32 {
         let fd = self.fs.open(path, flags);
-        if std::env::var("VITASLOP_TRACE_IO").is_ok() {
-            eprintln!("[io] open({path:?}, flags={flags:#x}) -> {fd}");
-        }
+        tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), fd, "open");
         fd
     }
 
@@ -852,9 +1102,32 @@ impl VitaState {
         self.fs.close(fd)
     }
 
+    /// sceIoDopen: open a directory listing; a new fd or a negative errno.
+    pub fn io_dopen(&mut self, path: &str) -> i32 {
+        let fd = self.fs.dopen(path);
+        tracing::trace!(target: "vitaslop::io", path, fd, "dopen");
+        fd
+    }
+
+    /// sceIoDread: the next entry of an open directory. `None` = bad descriptor,
+    /// `Some(None)` = end of listing.
+    pub fn io_dread(&mut self, fd: i32) -> Option<Option<DirEntry>> {
+        self.fs.dread(fd)
+    }
+
+    /// sceIoDclose: 0 or a negative errno.
+    pub fn io_dclose(&mut self, fd: i32) -> i32 {
+        self.fs.dclose(fd)
+    }
+
     /// File size for sceIoGetstat, or None if the path does not exist.
     pub fn io_size(&self, path: &str) -> Option<u64> {
         self.fs.size_of(path)
+    }
+
+    /// The size of the file behind an open descriptor (for sceIoGetstatByFd).
+    pub fn io_size_fd(&self, fd: i32) -> Option<u64> {
+        self.fs.size_of_fd(fd)
     }
 
     /// Enable preemptive multithreading: blocking primitives now actually park the
@@ -901,6 +1174,18 @@ impl VitaState {
         let stack_top = stack.wrapping_add(size) & !0xF;
         let uid = self.next_uid;
         self.next_uid += 1;
+        // Resolve the sentinel/relative priority to a concrete value now, so every
+        // scheduler comparison against it (and against the main thread's default)
+        // is meaningful.
+        let priority = resolve_priority(priority);
+        tracing::trace!(
+            target: "vitaslop::thread",
+            uid,
+            entry = format_args!("{:#x}", entry & !1),
+            priority = format_args!("{priority:#x}"),
+            main_priority = format_args!("{DEFAULT_THREAD_PRIORITY:#x}"),
+            "create"
+        );
         self.threads.push(ThreadRec { uid, entry: entry & !1, stack_top, exit_code: None, priority });
         uid
     }
@@ -930,6 +1215,7 @@ impl VitaState {
             entry: t.entry,
             arg_len,
             arg_ptr,
+            r2: 0,
             stack_top: t.stack_top,
             thid,
             priority: new_priority,
@@ -972,9 +1258,14 @@ impl VitaState {
                     let (waiter, _, stat) = self.join_waiters.remove(i);
                     // Deliver the exit code to the joiner's `stat` out-parameter now
                     // that it is known; the wait handler cannot write it at wake time.
-                    if std::env::var("VITASLOP_TRACE_EXIT").is_ok() {
-                        eprintln!("[join] target {thid:#x} exited code={code:#x}; waking {waiter:#x}, stat={stat:#x}");
-                    }
+                    tracing::debug!(
+                        target: "vitaslop::exit",
+                        target_thid = format_args!("{thid:#x}"),
+                        code = format_args!("{code:#x}"),
+                        waking = format_args!("{waiter:#x}"),
+                        stat = format_args!("{stat:#x}"),
+                        "join delivered"
+                    );
                     if stat != 0 {
                         self.pending_stat_writes.push((stat, code));
                     }
@@ -982,6 +1273,12 @@ impl VitaState {
                 } else {
                     i += 1;
                 }
+            }
+            // A finished display callback unblocks the next queued one (the
+            // display queue runs its callbacks serially, in submission order).
+            if self.display_cb_running == Some(thid) {
+                self.display_cb_running = None;
+                self.pump_display_callback();
             }
         }
     }
@@ -1237,13 +1534,157 @@ impl VitaState {
         self.sleep_waiters.push((self.current, self.virtual_us.wrapping_add(us)));
     }
 
+    /// Guest stack for the display-callback thread. One callback runs at a time,
+    /// so a single stack serves every invocation.
+    const DISPLAY_CB_STACK_BYTES: u32 = 0x1_0000;
+    /// Callback-data copy slots. The queue is drained one entry per callback run;
+    /// the ring only needs to cover entries submitted while earlier ones are still
+    /// pending (the display queue itself is at most a few frames deep).
+    const DISPLAY_CB_SLOT_COUNT: u32 = 8;
+
+    /// Queue the registered sceGxmInitialize display callback to run as guest code
+    /// with this entry's `callback_data` (preemptive mode only).
+    ///
+    /// On hardware every `sceGxmDisplayQueueAddEntry` eventually runs the
+    /// callback - typically `sceDisplaySetFrameBuf` plus the game's own buffer
+    /// bookkeeping - on the display queue's internal thread. A double-buffered
+    /// title waits (often a bare memory-poll loop, no host calls) for that
+    /// bookkeeping to release the older buffer, so a host that never runs the
+    /// callback stalls it after exactly two frames. GXM copies `callback_data`
+    /// into the queue at AddEntry time; mirrored here via a slot ring so the
+    /// caller can immediately reuse its buffer.
+    pub fn enqueue_display_callback(&mut self, ctx: &mut GuestCtx, callback_data: u32) {
+        if !self.preemptive || self.display_queue_cb == 0 {
+            return;
+        }
+        let size = self.display_queue_cb_data_size.max(4);
+        if self.display_cb_slots == 0 {
+            self.display_cb_slots = self.galloc(size * Self::DISPLAY_CB_SLOT_COUNT, 8);
+            self.display_cb_stack = self.galloc(Self::DISPLAY_CB_STACK_BYTES, 16);
+            if self.display_cb_slots == 0 || self.display_cb_stack == 0 {
+                self.display_queue_cb = 0; // OOM: disable rather than corrupt
+                return;
+            }
+        }
+        let slot =
+            self.display_cb_slots + (self.display_cb_next_slot % Self::DISPLAY_CB_SLOT_COUNT) * size;
+        self.display_cb_next_slot = self.display_cb_next_slot.wrapping_add(1);
+        if callback_data != 0 {
+            let bytes = ctx.read_bytes(callback_data, size as usize);
+            ctx.write_bytes(slot, &bytes);
+        }
+        self.display_cb_queue.push_back(slot);
+        self.pump_display_callback();
+    }
+
+    /// Start the next queued display callback if none is in flight. Chained from
+    /// [`Self::set_thread_exit`] when the in-flight one ends, preserving
+    /// submission order.
+    fn pump_display_callback(&mut self) {
+        if self.display_cb_running.is_some() {
+            return;
+        }
+        let Some(data) = self.display_cb_queue.pop_front() else { return };
+        let thid = self.new_uid();
+        self.pending_spawns.push(Reentry {
+            entry: self.display_queue_cb & !1,
+            arg_len: data, // r0: the callback's `const void *callbackData`
+            arg_ptr: 0,
+            r2: 0,
+            stack_top: self.display_cb_stack + Self::DISPLAY_CB_STACK_BYTES,
+            thid,
+            priority: DEFAULT_THREAD_PRIORITY - 0x10, // above game threads: presents promptly
+        });
+        self.display_cb_running = Some(thid);
+    }
+
+    /// Guest stack bytes for a one-shot service-state callback delivery.
+    const SERVICE_CB_STACK_BYTES: u32 = 0x8000;
+
+    /// Record the SceNpManager service-state callback a title registered
+    /// (`sceNpRegisterServiceStateCallback`); pumped by
+    /// [`Self::pump_service_callbacks`].
+    pub fn set_np_service_callback(&mut self, entry: u32, userdata: u32) {
+        self.np_service_cb = (entry != 0).then_some((entry, userdata));
+        self.np_cb_delivered = false;
+    }
+
+    /// Record the SceNetCtl inet-state callback a title registered
+    /// (`sceNetCtlInetRegisterCallback`).
+    pub fn set_net_inet_callback(&mut self, entry: u32, userdata: u32) {
+        self.net_inet_cb = (entry != 0).then_some((entry, userdata));
+        self.net_cb_delivered = false;
+    }
+
+    /// Spawn a one-shot guest callback `entry(r0, r1, r2)` on its own fresh stack
+    /// (preemptive mode). Used to deliver the service-state notifications a title
+    /// waits for; the callback typically just records the state into a global the
+    /// boot state machine polls. Returns false if not spawned (single-thread mode
+    /// or heap exhausted).
+    fn spawn_oneshot_callback(&mut self, entry: u32, r0: u32, r1: u32, r2: u32) -> bool {
+        if !self.preemptive || entry == 0 {
+            return false;
+        }
+        let stack = self.galloc(Self::SERVICE_CB_STACK_BYTES, 16);
+        if stack == 0 {
+            return false;
+        }
+        let thid = self.new_uid();
+        self.pending_spawns.push(Reentry {
+            entry: entry & !1,
+            arg_len: r0,
+            arg_ptr: r1,
+            r2,
+            stack_top: stack + Self::SERVICE_CB_STACK_BYTES,
+            thid,
+            priority: DEFAULT_THREAD_PRIORITY,
+        });
+        true
+    }
+
+    /// Deliver any registered-but-undelivered service-state callback (called from
+    /// the per-frame `sce*CheckCallback` pumps). Each fires exactly once, with the
+    /// offline state the title expects: NP signed-out, net disconnected. Without
+    /// this a title that gates its boot on the notification waits forever.
+    ///
+    /// `state` is the `SceNpServiceState` enum to deliver (signed-out offline).
+    pub fn pump_np_callback(&mut self, state: u32) {
+        if self.np_cb_delivered {
+            return;
+        }
+        if let Some((entry, userdata)) = self.np_service_cb {
+            // The registered NP callback is a C++ member-function thunk taking its
+            // `this`/userdata in r2, the service-state enum in r0, and a second
+            // reserved argument in r1 (verified by disassembling the game's handler,
+            // which does `switch(r0)` on the state): callback(state, 0, userdata).
+            if self.spawn_oneshot_callback(entry, state, 0, userdata) {
+                self.np_cb_delivered = true;
+            }
+        }
+    }
+
+    /// Deliver the net inet-state callback once with `event` (a `SceNetCtlState`).
+    /// The SceNetCtl callback ABI is `cb(int event_type, void *arg)`: r0=event,
+    /// r1=arg (the registered userdata), r2 unused.
+    pub fn pump_net_callback(&mut self, event: u32) {
+        if self.net_cb_delivered {
+            return;
+        }
+        if let Some((entry, userdata)) = self.net_inet_cb {
+            if self.spawn_oneshot_callback(entry, event, userdata, 0) {
+                self.net_cb_delivered = true;
+            }
+        }
+    }
+
     /// The earliest pending timed-wake deadline across lightweight-cond waits and
     /// pure sleeps. The scheduler uses this to jump the clock forward when every
     /// thread is blocked, instead of declaring a deadlock.
     pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
         let lw = self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d);
         let sl = self.sleep_waiters.iter().map(|&(_, d)| d);
-        lw.chain(sl).min()
+        let ev = self.evf_waiters.iter().filter_map(|w| w.deadline);
+        lw.chain(sl).chain(ev).min()
     }
 
     /// Advance the virtual clock to at least `to_us` and wake every timed wait -
@@ -1266,6 +1707,21 @@ impl VitaState {
             } else {
                 true
             }
+        });
+        // Timed event flag waits whose deadline passed: wake with the CURRENT
+        // pattern written through outBits (the caller re-checks its condition; see
+        // `vita::sync::wait_event_flag` on why the return value stays 0).
+        let patterns: Vec<(i32, u32)> = self.event_flags.clone();
+        self.evf_waiters.retain(|w| match w.deadline {
+            Some(d) if d <= now => {
+                if w.out_addr != 0 {
+                    let p = patterns.iter().find(|(u, _)| *u == w.uid).map(|(_, p)| *p).unwrap_or(0);
+                    self.pending_stat_writes.push((w.out_addr, p));
+                }
+                self.pending_wakes.push(w.thid);
+                false
+            }
+            _ => true,
         });
     }
 
@@ -1312,6 +1768,70 @@ impl VitaState {
         }
     }
 
+    /// SceEventFlagWaitTypes: OR (any requested bit) vs the default AND (all of
+    /// them), plus the two clear-on-match ops.
+    const EVF_WAITOR: u32 = 1;
+    const EVF_WAITCLEAR: u32 = 2;
+    const EVF_WAITCLEAR_PAT: u32 = 4;
+
+    /// Whether `pattern` satisfies a wait for `bits` under `mode`.
+    fn evf_satisfied(pattern: u32, bits: u32, mode: u32) -> bool {
+        if mode & Self::EVF_WAITOR != 0 {
+            pattern & bits != 0
+        } else {
+            pattern & bits == bits
+        }
+    }
+
+    /// Try to satisfy an event flag wait without blocking. On a match, applies the
+    /// mode's clear op and returns the pattern AT the match (what `outBits` should
+    /// report); `None` means the caller must park ([`Self::evf_block`]).
+    pub fn evf_try_wait(&mut self, uid: i32, bits: u32, mode: u32) -> Option<u32> {
+        let (_, p) = self.event_flags.iter_mut().find(|(u, _)| *u == uid)?;
+        if !Self::evf_satisfied(*p, bits, mode) {
+            return None;
+        }
+        let at_match = *p;
+        if mode & Self::EVF_WAITCLEAR != 0 {
+            *p = 0;
+        } else if mode & Self::EVF_WAITCLEAR_PAT != 0 {
+            *p &= !bits;
+        }
+        Some(at_match)
+    }
+
+    /// Park the current thread on event flag `uid` until `bits` is satisfied under
+    /// `mode` (or `timeout_us` passes; 0 = wait forever). `out_addr` is the guest
+    /// `outBits` pointer the wake will write the match pattern through.
+    pub fn evf_block(&mut self, uid: i32, bits: u32, mode: u32, out_addr: u32, timeout_us: u32) {
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
+        self.evf_waiters.push(EvfWaiter { uid, thid: self.current, bits, mode, out_addr, deadline });
+    }
+
+    /// Set bits on an event flag, then release every parked waiter the new pattern
+    /// satisfies (in FIFO order; each match applies its clear op before the next
+    /// waiter is evaluated, matching kernel release order). The preemptive
+    /// counterpart of [`event_set`](Self::event_set).
+    pub fn event_set_wake(&mut self, uid: i32, bits: u32) {
+        self.event_set(uid, bits);
+        loop {
+            let pattern = self.event_pattern(uid);
+            let next = self
+                .evf_waiters
+                .iter()
+                .position(|w| w.uid == uid && Self::evf_satisfied(pattern, w.bits, w.mode));
+            let Some(idx) = next else { break };
+            let w = self.evf_waiters.remove(idx);
+            let at_match = self
+                .evf_try_wait(uid, w.bits, w.mode)
+                .expect("matched waiter satisfies its own condition");
+            if w.out_addr != 0 {
+                self.pending_stat_writes.push((w.out_addr, at_match));
+            }
+            self.pending_wakes.push(w.thid);
+        }
+    }
+
     /// Clear an event flag's bits: keep only the bits also set in `bits` (the
     /// sceKernelClearEventFlag semantics, `pattern &= bits`).
     pub fn event_clear(&mut self, uid: i32, bits: u32) {
@@ -1326,12 +1846,22 @@ impl VitaState {
     }
 
     /// Allocate `size` bytes of real guest memory aligned to `align`, returning
-    /// the guest address. Deterministic: a pure function of the allocation order.
+    /// the guest address (0 on exhaustion). Deterministic: a pure function of the
+    /// allocation order. The bump cursor is capped at the guest region ceiling
+    /// (`base + mem_bytes`): the indirect-dispatch address table lives immediately
+    /// above that, so an unbounded heap must never be handed an address that reaches
+    /// it (a stray guest/host write there would corrupt the table and fault every
+    /// later indirect call). An allocation past the ceiling is a real
+    /// out-of-memory: return 0 rather than a colliding pointer.
     pub fn galloc(&mut self, size: u32, align: u32) -> u32 {
         let a = align.max(4);
-        self.alloc_cursor = (self.alloc_cursor + a - 1) & !(a - 1);
-        let p = self.alloc_cursor;
-        self.alloc_cursor = self.alloc_cursor.wrapping_add(size.max(4));
+        let p = (self.alloc_cursor + a - 1) & !(a - 1);
+        let ceiling = self.base.wrapping_add(self.mem_bytes);
+        let end = p.wrapping_add(size.max(4));
+        if end > ceiling || end < p {
+            return 0; // heap exhausted; do not encroach on the dispatch table
+        }
+        self.alloc_cursor = end;
         p
     }
 
@@ -1415,6 +1945,56 @@ impl VitaState {
             .map(|(_, f)| *f)
     }
 
+    /// Mutable access to the live GXM fixed-function state, so a `sceGxmSet*` setter
+    /// updates the single field it owns (the state is sticky and snapshotted per draw).
+    pub fn render_state_mut(&mut self) -> &mut crate::capture::RenderState {
+        &mut self.render_state
+    }
+
+    /// The recorded sampler wrap/LOD state for a `SceGxmTexture*`, defaulting to the
+    /// GXM defaults (REPEAT/REPEAT/0) when the guest never set it.
+    fn texture_sampler(&self, texture_addr: u32) -> (u32, u32, u32) {
+        self.texture_samplers
+            .iter()
+            .find(|(a, _)| *a == texture_addr)
+            .map(|(_, s)| *s)
+            .unwrap_or((0, 0, 0))
+    }
+
+    /// Update one component of a texture's sampler state, keyed by its guest address.
+    /// `which`: 0 = U addr mode, 1 = V addr mode, 2 = LOD bias.
+    pub fn set_texture_sampler(&mut self, texture_addr: u32, which: u8, value: u32) {
+        let slot = match self.texture_samplers.iter_mut().find(|(a, _)| *a == texture_addr) {
+            Some((_, s)) => s,
+            None => {
+                self.texture_samplers.push((texture_addr, (0, 0, 0)));
+                &mut self.texture_samplers.last_mut().unwrap().1
+            }
+        };
+        match which {
+            0 => slot.0 = value,
+            1 => slot.1 = value,
+            _ => slot.2 = value,
+        }
+    }
+
+    /// The color surface recorded for `addr` (its `SceGxmColorSurface*` struct
+    /// address), if the guest initialized one there.
+    pub fn color_surface(&self, addr: u32) -> Option<crate::capture::ColorSurface> {
+        self.color_surfaces.iter().find(|(a, _)| *a == addr).map(|(_, s)| *s)
+    }
+
+    /// Release a memory block by SceUID (`sceKernelFreeMemBlock`). Returns true if a
+    /// block was registered under `uid`. The deterministic bump allocation itself is
+    /// not reclaimed (the arena only grows), but the registry entry is removed so a
+    /// later `sceKernelGetMemBlockBase(uid)` no longer resolves it, matching the guest-
+    /// visible contract that the id is now invalid.
+    pub fn free_memblock(&mut self, uid: i32) -> bool {
+        let before = self.memblocks.len();
+        self.memblocks.retain(|b| b.uid != uid);
+        self.memblocks.len() != before
+    }
+
     pub fn set_uniforms(&mut self, values: Vec<f32>) {
         self.pending_uniforms = values;
     }
@@ -1464,7 +2044,9 @@ impl VitaState {
         units.sort_by_key(|(u, _)| *u);
         let textures: Vec<crate::capture::BoundTexture> = units
             .iter()
-            .filter_map(|&(unit, addr)| decode_texture(ctx, unit, addr, self.texture_format(addr)))
+            .filter_map(|&(unit, addr)| {
+                decode_texture(ctx, unit, addr, self.texture_format(addr), self.texture_sampler(addr))
+            })
             .collect();
         let draw = crate::capture::Draw {
             primitive,
@@ -1476,6 +2058,7 @@ impl VitaState {
             indices,
             uniforms: self.pending_uniforms.clone(),
             textures,
+            render_state: self.render_state,
         };
         if let Some(scene) = self.scene.as_mut() {
             scene.draws.push(draw);
@@ -1513,6 +2096,7 @@ fn decode_texture(
     unit: u32,
     addr: u32,
     exact_format: Option<u32>,
+    sampler: (u32, u32, u32),
 ) -> Option<crate::capture::BoundTexture> {
     if addr == 0 {
         return None;
@@ -1566,6 +2150,9 @@ fn decode_texture(
         stride,
         data_addr,
         pixels,
+        u_addr_mode: sampler.0,
+        v_addr_mode: sampler.1,
+        lod_bias: sampler.2,
     })
 }
 
@@ -1665,6 +2252,16 @@ pub trait ImportDispatch {
     /// sets this before each dispatch.
     fn set_current_thread(&mut self, _thid: i32) {}
 
+    /// The thread pointer (`TPIDRURO`) for thread `thid`: the base of its private
+    /// thread-local-storage block, allocated on first request. The engine reads it
+    /// when it instantiates the thread and seeds the guest `tp` register, so a
+    /// `MRC p15,0,Rt,c13,c0,3` reads a per-thread pointer. Also returns the TLS init
+    /// image `(source, len)` to copy into the block's `.tdata` head (`len == 0` for a
+    /// pure-`.tbss` template). Default `(0, 0, 0)`: a host with no TLS model.
+    fn thread_tls_base(&mut self, _thid: i32) -> (u32, u32, u32) {
+        (0, 0, 0)
+    }
+
     /// Take the threads the last dispatch asked to *start* (each becomes its own
     /// fiber sharing the guest address space), if any. The preemptive counterpart
     /// of [`take_reentry`](Self::take_reentry): instead of running the entry
@@ -1715,14 +2312,12 @@ impl ImportDispatch for VitaEnv {
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
-        self.state.capture.call_count += 1;
         let (library_nid, func_nid) = self
             .imports
             .get(index as usize)
             .copied()
             .unwrap_or((0, 0));
-        self.state.capture.trace.push(func_nid);
-        self.state.capture.trace_thid.push(self.state.current);
+        self.state.capture.record_call(func_nid, self.state.current);
         let mut ctx = GuestCtx::new(regs, vfp, mem, base);
         vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
     }
@@ -1737,6 +2332,12 @@ impl ImportDispatch for VitaEnv {
 
     fn set_current_thread(&mut self, thid: i32) {
         self.state.set_current(thid);
+    }
+
+    fn thread_tls_base(&mut self, thid: i32) -> (u32, u32, u32) {
+        let base = self.state.ensure_tls_block(thid);
+        let (src, len) = self.state.tls_init_image();
+        (base, src, len)
     }
 
     fn take_spawns(&mut self) -> Vec<Reentry> {
@@ -1807,6 +2408,10 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn set_current_thread(&mut self, thid: i32) {
         self.borrow_mut().set_current_thread(thid);
+    }
+
+    fn thread_tls_base(&mut self, thid: i32) -> (u32, u32, u32) {
+        self.borrow_mut().thread_tls_base(thid)
     }
 
     fn take_spawns(&mut self) -> Vec<Reentry> {
@@ -1954,6 +2559,62 @@ mod preemptive_tests {
         assert_eq!(st.take_wakes(), vec![1]);
         // The count was consumed by the wake, so a fresh acquire would block again.
         assert!(!st.sema_try_acquire(sem, 1));
+    }
+
+    #[test]
+    fn event_flag_parks_then_a_set_wakes_with_the_match_pattern() {
+        let mut st = state();
+        let ev = st.create_event_flag(0);
+        // Thread 1 waits (AND) for bits 0x3: unsatisfied, parks.
+        st.set_current(1);
+        assert_eq!(st.evf_try_wait(ev, 0x3, 0), None);
+        st.evf_block(ev, 0x3, 0, 0x2000, 0);
+        assert!(st.take_wakes().is_empty());
+        // Setting only bit 0 does not satisfy an AND wait for 0x3.
+        st.set_current(2);
+        st.event_set_wake(ev, 0x1);
+        assert!(st.take_wakes().is_empty());
+        // Completing the pattern wakes thread 1 and delivers 0x3 to its outBits.
+        st.event_set_wake(ev, 0x2);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_stat_writes(), vec![(0x2000, 0x3)]);
+    }
+
+    #[test]
+    fn event_flag_wait_modes_or_and_clear() {
+        let mut st = state();
+        let ev = st.create_event_flag(0b110);
+        // OR: any requested bit satisfies; no clear op leaves the pattern intact.
+        assert_eq!(st.evf_try_wait(ev, 0b010, 1), Some(0b110));
+        assert_eq!(st.event_pattern(ev), 0b110);
+        // WAITCLEAR_PAT clears only the requested bits at match.
+        assert_eq!(st.evf_try_wait(ev, 0b100, 1 | 4), Some(0b110));
+        assert_eq!(st.event_pattern(ev), 0b010);
+        // WAITCLEAR zeroes the whole pattern at match.
+        assert_eq!(st.evf_try_wait(ev, 0b010, 1 | 2), Some(0b010));
+        assert_eq!(st.event_pattern(ev), 0);
+        // AND on a partial pattern does not match.
+        st.event_set(ev, 0b01);
+        assert_eq!(st.evf_try_wait(ev, 0b11, 0), None);
+    }
+
+    #[test]
+    fn timed_event_flag_wait_wakes_at_its_deadline() {
+        let mut st = state();
+        let ev = st.create_event_flag(0);
+        st.set_current(1);
+        st.evf_block(ev, 0x1, 0, 0x3000, 500);
+        assert_eq!(st.earliest_lwcond_deadline(), Some(500));
+        // Short of the deadline: still parked.
+        st.advance_time_to(499);
+        assert!(st.take_wakes().is_empty());
+        // At the deadline: woken with the (still unset) current pattern delivered.
+        st.advance_time_to(500);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_stat_writes(), vec![(0x3000, 0)]);
+        // The expired waiter is gone: a later set wakes no one.
+        st.event_set_wake(ev, 0x1);
+        assert!(st.take_wakes().is_empty());
     }
 
     #[test]
@@ -2164,6 +2825,61 @@ mod filesystem_tests {
         assert!(st.io_write(999, b"x").is_none());
         assert!(st.io_lseek(999, 0, SCE_SEEK_SET) < 0);
         assert!(st.io_close(999) < 0);
+    }
+
+    #[test]
+    fn uppercase_app0_mount_finds_the_same_file() {
+        // Titles spell the mount both ways; both must resolve to the same key.
+        let mut st = state();
+        st.add_file("Disc/Data/File.bin", b"x".to_vec());
+        assert!(st.io_open("APP0:Disc/Data/File.bin", SCE_O_RDONLY) >= 3);
+        assert!(st.io_open("app0:/disc/data/file.bin", SCE_O_RDONLY) >= 3);
+        assert_eq!(st.io_size("APP0:Disc/Data/File.bin"), Some(1));
+    }
+
+    #[test]
+    fn dopen_lists_children_with_original_case() {
+        let mut st = state();
+        st.add_file("Disc/Course/Course_601/a.dat", vec![0; 3]);
+        st.add_file("Disc/Course/Course_601/b.dat", vec![0; 4]);
+        st.add_file("Disc/Course/Course_700/a.dat", vec![0; 5]);
+        st.add_file("Disc/Course/Readme.txt", vec![0; 7]);
+
+        let fd = st.io_dopen("APP0:Disc/Course");
+        assert!(fd >= 3);
+        // Ordered by lowercased name; subdirectories deduplicated; names keep the
+        // original mixed case a title's glob (e.g. `Course_*`) expects.
+        let e1 = st.io_dread(fd).unwrap().unwrap();
+        assert_eq!((e1.name.as_str(), e1.is_dir, e1.size), ("Course_601", true, 0));
+        let e2 = st.io_dread(fd).unwrap().unwrap();
+        assert_eq!((e2.name.as_str(), e2.is_dir, e2.size), ("Course_700", true, 0));
+        let e3 = st.io_dread(fd).unwrap().unwrap();
+        assert_eq!((e3.name.as_str(), e3.is_dir, e3.size), ("Readme.txt", false, 7));
+        // Exhausted: end-of-listing, repeatably.
+        assert_eq!(st.io_dread(fd), Some(None));
+        assert_eq!(st.io_dread(fd), Some(None));
+        assert_eq!(st.io_dclose(fd), 0);
+        // Closed (and never-opened) descriptors are bad.
+        assert!(st.io_dread(fd).is_none());
+        assert!(st.io_dclose(fd) < 0);
+    }
+
+    #[test]
+    fn dopen_of_a_subdir_and_missing_dir() {
+        let mut st = state();
+        st.add_file("Disc/Course/Course_601/Deep/x.bin", vec![0; 2]);
+        // A trailing slash and mixed-case path still resolve.
+        let fd = st.io_dopen("app0:Disc/COURSE/Course_601/");
+        assert!(fd >= 3);
+        let e = st.io_dread(fd).unwrap().unwrap();
+        assert_eq!((e.name.as_str(), e.is_dir), ("Deep", true));
+        assert_eq!(st.io_dread(fd), Some(None));
+        st.io_dclose(fd);
+        // Nothing under the path: a negative errno.
+        assert!(st.io_dopen("app0:Disc/Nope") < 0);
+        // A file fd is not a directory fd and vice versa.
+        let ffd = st.io_open("app0:disc/course/course_601/deep/x.bin", SCE_O_RDONLY);
+        assert!(st.io_dread(ffd).is_none());
     }
 
     #[test]

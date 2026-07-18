@@ -229,6 +229,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         let callee: fn(u32, bool) -> WorkItem = if tentative { WorkItem::tentative } else { WorkItem::hard };
         work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
         work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+        work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
         funcs.insert(addr, found.func);
     }
 
@@ -309,6 +310,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
                     if tentative { WorkItem::tentative } else { WorkItem::hard };
                 work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
                 work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+                work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
                 funcs.insert(addr, found.func);
             }
             // A tentative code pointer that does not decode was never a function.
@@ -465,6 +467,7 @@ pub fn transpile_report(program: &Program) -> Report {
                     if tentative { WorkItem::tentative } else { WorkItem::hard };
                 work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
                 work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+                work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
                 ok.push(addr);
             }
             // A tentative code pointer that does not decode was never a function.

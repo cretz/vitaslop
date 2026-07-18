@@ -25,3 +25,21 @@ pub(super) fn get_mem_block_base(ctx: &mut GuestCtx, st: &mut VitaState, uid: i3
     ctx.write_u32(out.addr(), base);
     0
 }
+
+/// `SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID`: freeing a block id that names no live
+/// allocation. The real kernel rejects the id rather than pretending it freed.
+const SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID: i32 = 0x8002_0064u32 as i32;
+
+/// int sceKernelFreeMemBlock(SceUID uid)
+/// Release a memory block. The registry entry is removed so a later
+/// `sceKernelGetMemBlockBase(uid)` no longer resolves it; the deterministic arena
+/// does not physically reclaim the bytes (it only grows), which is invisible to the
+/// guest. Rejecting an unknown id matches the kernel contract.
+#[hostcall]
+pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
+    if st.free_memblock(uid) {
+        0
+    } else {
+        SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID
+    }
+}

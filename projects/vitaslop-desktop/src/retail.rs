@@ -14,7 +14,7 @@ use vitaslop_native::{RunReport, ThreadedScheduler};
 use vitaslop_platform::gpu::{GxmRenderer, DEPTH_FORMAT};
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
-use vitaslop_runtime::ingest::vfs::{MemVfs, Vfs};
+use vitaslop_runtime::ingest::vfs::MemVfs;
 use vitaslop_runtime::link::link;
 use vitaslop_runtime::render::RenderSceneBuilder;
 use vitaslop_runtime::{CtrlFrame, TouchFrame, VitaEnv, World};
@@ -229,11 +229,12 @@ impl RetailGuest {
         let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
+        env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
-        for path in game.files.list() {
-            if let Ok(bytes) = game.files.read(&path) {
-                env.state.add_file(&path, bytes);
-            }
+        // Move (not clone) the decrypted assets into the guest filesystem - for a
+        // large 3D title this is hundreds of megabytes.
+        for (path, bytes) in game.files.into_files() {
+            env.state.add_file(&path, bytes);
         }
 
         let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
@@ -402,19 +403,38 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     tex.create_view(&Default::default())
 }
 
-/// Headless self-check of the retail path (NO window): load `dir`, drive the built-in
-/// Tutorial touch script through the shared input cell, and render the final scene via
-/// the native GPU renderer (the same `GxmRenderer`) to `<shot_dir>/desktop.png`. This
+/// Headless self-check of the retail path (NO window): load `dir`, optionally drive a
+/// touch script through the shared input cell, and render the final scene via the
+/// native GPU renderer (the same `GxmRenderer`) to `<shot_dir>/desktop.png`. This
 /// exercises the whole load -> decrypt -> link -> transpile -> run -> input -> render
 /// chain minus the winit window glue, so the desktop path is verifiable without a
-/// display. Frame-keyed touches mirror the browser tutorial recipe.
+/// display.
+///
+/// Env knobs (so one entry point serves any title without recompiling):
+/// - `VITASLOP_HEADLESS_FRAMES` - display flips to run to (default 180). A title that
+///   boots through intro/attract screens before its first interactive frame needs a
+///   higher target.
+/// - `VITASLOP_HEADLESS_RECIPE` - a frame-keyed TAS recipe to drive input with. When
+///   set, the recipe supplies the touches/buttons; when unset, the built-in Tutorial
+///   tap script runs (the historical title navigation), unless
+///   `VITASLOP_HEADLESS_NO_TAPS` is set, which runs input-free to the title screen.
 pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let mut guest = RetailGuest::new(&dir, input.clone(), None)?;
-    println!("headless: loaded (build {:.0} ms), driving to the tutorial...", guest.build_ms);
+    let recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
+        .ok()
+        .map(|p| std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}")))
+        .transpose()?;
+    let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    let target: u64 = std::env::var("VITASLOP_HEADLESS_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(180);
+    println!("headless: loaded (build {:.0} ms), running to frame {target}...", guest.build_ms);
 
-    // (active_from, active_until, panel_x, panel_y) - a sticky tap held across a few
-    // frames then released, the same touch model recipes use to navigate a menu.
+    // The built-in Tutorial tap script (title menu navigation): used only when no
+    // recipe is given and taps are not disabled. (active_from, active_until, x, y) - a
+    // sticky tap held across a few frames then released.
+    let use_builtin_taps = recipe.is_none() && std::env::var_os("VITASLOP_HEADLESS_NO_TAPS").is_none();
     let taps = [
         (12u64, 19u64, 450u16, 674u16),
         (30, 37, 230, 230),
@@ -422,14 +442,15 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         (112, 121, 1620, 376),
         (128, 137, 630, 870),
     ];
-    let target = 180u64;
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
-        let touch = taps
-            .iter()
-            .find(|(a, b, _, _)| f >= *a && f < *b)
-            .map(|(_, _, x, y)| TouchFrame::single(*x, *y));
-        input.lock().unwrap().touch = touch;
+        if use_builtin_taps {
+            let touch = taps
+                .iter()
+                .find(|(a, b, _, _)| f >= *a && f < *b)
+                .map(|(_, _, x, y)| TouchFrame::single(*x, *y));
+            input.lock().unwrap().touch = touch;
+        }
         guest.advance();
     }
     if let Some(e) = guest.error() {

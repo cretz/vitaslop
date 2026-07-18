@@ -158,6 +158,7 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
             reentry.entry,
             reentry.arg_len,
             reentry.arg_ptr,
+            reentry.r2,
             reentry.stack_top,
             reentry.priority,
         )
@@ -263,6 +264,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             entry & !1,
             0,
             0,
+            0,
             main_stack_top(base, mem_bytes),
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
@@ -318,6 +320,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             linked.module_inits.clone(),
             0,
             0,
+            0,
             sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
@@ -341,6 +344,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// fault). Returns an empty vec if the range is out of bounds.
     pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
         self.inner.engine().read_guest(addr, len)
+    }
+
+    /// Diagnostic: overwrite guest memory at `addr` (used by the probe's POKE knob).
+    pub fn write_guest(&self, addr: u32, bytes: &[u8]) {
+        self.inner.engine().write_guest(addr, bytes)
     }
 
     /// Display frame boundaries (flips) observed so far. A live windowed front-end
@@ -381,6 +389,21 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         out
     }
 
+    /// Diagnostic write into guest memory. No-op if out of bounds.
+    fn write_guest(&self, addr: u32, bytes: &[u8]) {
+        let off = addr.wrapping_sub(self.base) as usize;
+        let data = self.shared_mem.data();
+        if off + bytes.len() > data.len() {
+            return;
+        }
+        // SAFETY: bounds checked; no fiber runs concurrently with the probe.
+        for (i, b) in bytes.iter().enumerate() {
+            unsafe {
+                *data[off + i].get() = *b;
+            }
+        }
+    }
+
     /// Build one thread from a single entry (a spawned worker).
     fn instantiate_thread(
         &self,
@@ -388,10 +411,11 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         entry: u32,
         r0: u32,
         r1: u32,
+        r2: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
-        self.instantiate_thread_seq(thid, vec![entry], r0, r1, sp, priority)
+        self.instantiate_thread_seq(thid, vec![entry], r0, r1, r2, sp, priority)
     }
 
     /// Build one thread that runs `entries` in sequence on a single fiber, resetting
@@ -407,6 +431,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         entries: Vec<u32>,
         r0: u32,
         r1: u32,
+        r2: u32,
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
@@ -437,7 +462,21 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         // No start section, so instantiation completes without suspending.
         let instance = pollster::block_on(linker.instantiate_async(&mut store, &self.module))?;
 
+        // This thread's thread-local-storage: a private block whose base becomes the
+        // thread pointer (TPIDRURO). Copy the template's initialized `.tdata` head into
+        // it (its `.tbss` tail is already zero); the guest reaches `__thread` variables
+        // at `tp + offset`. No fiber is running here, so the shared-memory copy is safe.
+        let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
+        if tls_len != 0 && tp != 0 {
+            let src_off = tls_src.wrapping_sub(self.base) as usize;
+            let dst_off = tp.wrapping_sub(self.base) as usize;
+            copy_shared(&self.shared_mem, src_off, dst_off, tls_len as usize);
+        }
+
         let future = Box::pin(async move {
+            // The thread pointer is a per-thread constant: set it once before running
+            // any entry (a `MRC p15,0,Rt,c13,c0,3` reads it via the `tp` global).
+            set_tp_store(&mut store, &instance, tp);
             let mut last_r0 = 0u32;
             let last = entries.len().saturating_sub(1);
             for (i, &entry) in entries.iter().enumerate() {
@@ -445,6 +484,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 set_reg_store(&mut store, &instance, abi::SP, sp);
                 set_reg_store(&mut store, &instance, 0, if i == 0 { r0 } else { 0 });
                 set_reg_store(&mut store, &instance, 1, if i == 0 { r1 } else { 0 });
+                set_reg_store(&mut store, &instance, 2, if i == 0 { r2 } else { 0 });
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
@@ -483,7 +523,12 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
     }
 }
 
-/// Bind `env.svc` (unused on the Vita NID path, but the module may declare it).
+/// Bind `env.svc`. Unused by the Vita NID path (which never traps a real `svc`), but
+/// the diagnostic function tracer (`VITASLOP_TRACE_FUNCS`) routes guest-function-entry
+/// announcements through it: a selector with the top bit set is a traced function's own
+/// address (guest addresses are always >= 0x81000000; real `svc` immediates are 24-bit),
+/// and we log the entry with its incoming argument registers. A real (small) selector is
+/// a genuine syscall and stays a no-op on this path.
 fn bind_svc<H: ImportDispatch + Send + 'static>(
     linker: &mut Linker<ThreadData<H>>,
 ) -> Result<(), RunError> {
@@ -491,7 +536,21 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
         .func_wrap_async(
             abi::IMPORT_MODULE,
             abi::SVC_NAME,
-            |_caller: Caller<'_, ThreadData<H>>, (_selector,): (i32,)| Box::new(async { Ok(()) }),
+            |mut caller: Caller<'_, ThreadData<H>>, (selector,): (i32,)| {
+                Box::new(async move {
+                    let sel = selector as u32;
+                    if sel & 0x8000_0000 != 0 {
+                        let thid = caller.data().thid;
+                        let r: [u32; 9] = std::array::from_fn(|i| get_reg(&mut caller, i));
+                        eprintln!(
+                            "[trace] t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
+                             r3={:#010x} r8={:#010x} lr={:#010x}",
+                            r[0], r[1], r[2], r[3], r[8], get_reg(&mut caller, 14),
+                        );
+                    }
+                    Ok(())
+                })
+            },
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
@@ -788,6 +847,30 @@ fn set_reg_store<T>(store: &mut Store<T>, instance: &Instance, i: usize, v: u32)
         .expect("module exports registers")
         .set(&mut *store, Val::I32(v as i32))
         .expect("register global is mutable i32");
+}
+
+/// Seed the per-thread pointer global (`tp`, ARM `TPIDRURO`) for this thread's
+/// instance. A title with no TLS leaves the export absent and every read of the
+/// thread pointer is dead code, so a missing global is not an error.
+fn set_tp_store<T>(store: &mut Store<T>, instance: &Instance, tp: u32) {
+    if let Some(g) = instance.get_global(&mut *store, abi::TP_EXPORT) {
+        let _ = g.set(&mut *store, Val::I32(tp as i32));
+    }
+}
+
+/// Copy `len` bytes within the shared guest memory (`src_off` -> `dst_off`, both
+/// linear offsets). Used to lay a TLS template's initialized data into a thread's
+/// private block. Called only when no fiber is running (thread instantiation), so
+/// there is no concurrent guest access.
+fn copy_shared(mem: &SharedMemory, src_off: usize, dst_off: usize, len: usize) {
+    let data = mem.data();
+    for i in 0..len {
+        // SAFETY: as write_shared - no fiber runs during instantiation. The TLS
+        // block is freshly allocated above the image, so it never overlaps the source.
+        unsafe {
+            *data[dst_off + i].get() = *data[src_off + i].get();
+        }
+    }
 }
 
 fn get_reg_store<T>(store: &mut Store<T>, instance: &Instance, i: usize) -> u32 {

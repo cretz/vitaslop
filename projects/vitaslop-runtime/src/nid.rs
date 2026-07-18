@@ -52,6 +52,14 @@ pub mod gxm {
     pub const PROGRAM_FIND_PARAMETER_BY_NAME: u32 = 0x2777_94C4;
     pub const SHADER_PATCHER_GET_PROGRAM_FROM_ID: u32 = 0xA949_A803;
     pub const PROGRAM_PARAMETER_GET_RESOURCE_INDEX: u32 = 0x5C79_D59A;
+    pub const PROGRAM_GET_PARAMETER_COUNT: u32 = 0xD5D5_FCCD;
+    pub const PROGRAM_GET_PARAMETER: u32 = 0x06FF_9151;
+    pub const PROGRAM_PARAMETER_GET_CATEGORY: u32 = 0x1997_DC17;
+    pub const PROGRAM_PARAMETER_GET_TYPE: u32 = 0x7B90_23C3;
+    pub const PROGRAM_PARAMETER_GET_COMPONENT_COUNT: u32 = 0xBD29_98D1;
+    pub const PROGRAM_PARAMETER_GET_CONTAINER_INDEX: u32 = 0xBB58_267D;
+    pub const PROGRAM_PARAMETER_GET_ARRAY_SIZE: u32 = 0xDBA8_D061;
+    pub const PROGRAM_PARAMETER_GET_NAME: u32 = 0x6AF8_8A5D;
     pub const BEGIN_SCENE: u32 = 0x8734_FF4E;
     pub const END_SCENE: u32 = 0xFE30_0E2F;
     pub const SET_VERTEX_PROGRAM: u32 = 0x31FF_8ABD;
@@ -84,11 +92,39 @@ pub mod gxm {
     pub const TEXTURE_GET_FORMAT: u32 = 0xE868_D2B3;
     pub const SET_FRAGMENT_UNIFORM_BUFFER: u32 = 0xEA0F_C310;
     pub const RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER: u32 = 0x7B1F_ABB6;
+    // Fixed-function pipeline state setters (see `vita::gxm` render-state handlers).
+    pub const SET_CULL_MODE: u32 = 0xE1CA_72AE;
+    pub const SET_TWO_SIDED_ENABLE: u32 = 0x0DE9_AEB7;
+    pub const SET_FRONT_DEPTH_FUNC: u32 = 0x14BD_831F;
+    pub const SET_BACK_DEPTH_FUNC: u32 = 0xB042_A4D2;
+    pub const SET_FRONT_DEPTH_WRITE_ENABLE: u32 = 0xF32C_BF34;
+    pub const SET_FRONT_FRAGMENT_PROGRAM_ENABLE: u32 = 0x5759_58A8;
+    pub const SET_FRONT_POINT_LINE_WIDTH: u32 = 0x0675_2183;
+    pub const SET_FRONT_POLYGON_MODE: u32 = 0xFD93_209D;
+    pub const SET_FRONT_STENCIL_REF: u32 = 0x8FA6_FE44;
+    pub const SET_FRONT_STENCIL_FUNC: u32 = 0xB864_5A9A;
+    pub const SET_VIEWPORT: u32 = 0x3EB3_380B;
+    pub const SET_VIEWPORT_ENABLE: u32 = 0x814F_61EB;
+    pub const SET_REGION_CLIP: u32 = 0x70C8_6868;
+    // Surface / texture / parameter getters and sampler-state setters.
+    pub const COLOR_SURFACE_GET_FORMAT: u32 = 0xF3C1_C6C6;
+    pub const COLOR_SURFACE_SET_CLIP: u32 = 0x8645_6F7B;
+    pub const TEXTURE_GET_TYPE: u32 = 0xF65D_4917;
+    /// `_sceGxmProgramParameterGetSemantic` (the exported user variant).
+    pub const PROGRAM_PARAMETER_GET_SEMANTIC: u32 = 0xAAFD_61D5;
+    pub const PROGRAM_PARAMETER_GET_SEMANTIC_INDEX: u32 = 0xB85C_C13E;
+    pub const TEXTURE_INIT_CUBE: u32 = 0x11DC_8DC9;
+    pub const TEXTURE_SET_U_ADDR_MODE_SAFE: u32 = 0x8699_ECF4;
+    pub const TEXTURE_SET_V_ADDR_MODE_SAFE: u32 = 0xFA22_F6CC;
+    pub const TEXTURE_SET_LOD_BIAS: u32 = 0xB65E_E6F7;
 }
 
-/// SceDisplayUser function NIDs.
+/// SceDisplayUser / SceDisplay function NIDs. `SET_FRAME_BUF` is SceDisplayUser
+/// (lib 0x4FAACD11); `WAIT_VBLANK_START_MULTI` is SceDisplay (lib 0x5ED8F994).
+/// Dispatch is by func NID, so the two libraries are grouped by concept here.
 pub mod display {
     pub const SET_FRAME_BUF: u32 = 0x7A41_0B64;
+    pub const WAIT_VBLANK_START_MULTI: u32 = 0xDD0A_13B8;
 }
 
 /// SceCtrl function NIDs.
@@ -104,6 +140,7 @@ pub mod ctrl {
 pub mod sysmem {
     pub const ALLOC_MEM_BLOCK: u32 = 0xB9D5_EBDE;
     pub const GET_MEM_BLOCK_BASE: u32 = 0xB8EF_5818;
+    pub const FREE_MEM_BLOCK: u32 = 0xA91E_15EE;
 }
 
 /// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
@@ -135,6 +172,10 @@ pub mod libkernel {
     pub const START_THREAD: u32 = 0xF08D_E149;
     pub const WAIT_THREAD_END: u32 = 0xDDB3_95A9;
     pub const GET_THREAD_ID: u32 = 0x0FB9_72F9;
+    /// An unnamed SceLibKernel export the title imports (present in no vita-headers
+    /// revision, any firmware). Serviced as a clib no-op success (return 0) so the
+    /// call is handled rather than left as an unimplemented gap.
+    pub const UNKNOWN_023EAA62: u32 = 0x023E_AA62;
 }
 
 /// SceProcessmgr function NIDs: process parameters and the standard IO handles the
@@ -145,6 +186,7 @@ pub mod processmgr {
     pub const GET_STDOUT: u32 = 0xE5AA_625C;
     pub const GET_STDERR: u32 = 0xFA5E_3ADA;
     pub const LIBC_TIME: u32 = 0x0039_BE45;
+    pub const LIBC_CLOCK: u32 = 0x9E45_DA09;
 }
 
 /// System and online-service NIDs the boot path touches (SceSysmodule, SceNet,
@@ -160,30 +202,107 @@ pub mod services {
     pub const NET_CTL_INIT: u32 = 0x495C_A1DB;
     pub const NET_CTL_INET_GET_STATE: u32 = 0x6D26_AC68;
     pub const NET_CTL_INET_REGISTER_CALLBACK: u32 = 0xEAEE_6185;
+    pub const NET_CTL_CHECK_CALLBACK: u32 = 0xDFFC_3ED4;
     // SceHttp / SceSsl.
     pub const HTTP_INIT: u32 = 0x2149_26D9;
     pub const SSL_INIT: u32 = 0x3C73_3316;
     // SceNpManager / SceNpBasic.
     pub const NP_INIT: u32 = 0x04D9_F484;
     pub const NP_REGISTER_SERVICE_STATE_CALLBACK: u32 = 0x4423_9C35;
+    pub const NP_CHECK_CALLBACK: u32 = 0x3B0A_E9A9;
     pub const NP_BASIC_INIT: u32 = 0xEFB9_1A99;
     pub const NP_BASIC_REGISTER_HANDLER: u32 = 0x26E6_E048;
     // SceRtc.
     pub const RTC_GET_CURRENT_CLOCK_LOCAL_TIME: u32 = 0x0572_EDDC;
+    pub const RTC_GET_CURRENT_TICK: u32 = 0x23F7_9274;
+    // SceMotion.
+    pub const MOTION_GET_STATE: u32 = 0xBDB3_2767;
     // SceFios2 overlay + libult object manager.
     pub const FIOS_OVERLAY_GET_LIST: u32 = 0x1DD8_08D1;
     pub const ULOBJ_REGISTER_PROTOCOL_REVISION: u32 = 0x50F2_F2AA;
     // SceAppUtil: app utility init + system parameters (language, button assign, ...).
     pub const APPUTIL_INIT: u32 = 0xDAFF_E671;
     pub const APPUTIL_SYSTEM_PARAM_GET_INT: u32 = 0x5DFB_9CA0;
+    pub const APPUTIL_DRM_OPEN: u32 = 0x2DB7_BE3B;
+    pub const APPUTIL_DRM_CLOSE: u32 = 0x6A14_0498;
     // SceNpScore / SceNpManager: online leaderboards and account identity.
     pub const NP_SCORE_INIT: u32 = 0x0433_069F;
     pub const NP_SCORE_CREATE_TITLE_CTX: u32 = 0x5685_F225;
     pub const NP_MANAGER_GET_NP_ID: u32 = 0x3C94_B4B4;
+    // SceCommonDialog: the per-frame pump plus each dialog family's
+    // Init/GetStatus/GetResult/Term lifecycle (see `services::dialog_*`).
+    pub const COMMON_DIALOG_UPDATE: u32 = 0x9053_0F2F;
+    pub const MSG_DIALOG_INIT: u32 = 0x755F_F270;
+    pub const MSG_DIALOG_GET_STATUS: u32 = 0x4107_019E;
+    pub const MSG_DIALOG_GET_RESULT: u32 = 0xBB3B_FC89;
+    pub const MSG_DIALOG_TERM: u32 = 0x81AC_F695;
+    pub const NET_CHECK_DIALOG_INIT: u32 = 0xA38A_4A0D;
+    pub const NET_CHECK_DIALOG_GET_STATUS: u32 = 0x8027_292A;
+    pub const NET_CHECK_DIALOG_GET_RESULT: u32 = 0xB05F_CE9E;
+    pub const NET_CHECK_DIALOG_TERM: u32 = 0x8BE5_1C15;
+    pub const SAVEDATA_DIALOG_INIT: u32 = 0xBF52_48FA;
+    pub const SAVEDATA_DIALOG_GET_STATUS: u32 = 0x6E25_8046;
+    pub const SAVEDATA_DIALOG_GET_SUB_STATUS: u32 = 0xBA05_42CA;
+    pub const SAVEDATA_DIALOG_GET_RESULT: u32 = 0xB2FF_576E;
+    pub const SAVEDATA_DIALOG_CONTINUE: u32 = 0x1919_2C8B;
+    pub const SAVEDATA_DIALOG_FINISH: u32 = 0x6C49_924B;
+    pub const SAVEDATA_DIALOG_SUB_CLOSE: u32 = 0x415D_6068;
+    pub const SAVEDATA_DIALOG_TERM: u32 = 0x2192_A10A;
+    pub const NP_MESSAGE_DIALOG_INIT: u32 = 0x4535_A358;
+    pub const NP_MESSAGE_DIALOG_GET_STATUS: u32 = 0x2A0D_060F;
+    pub const NP_MESSAGE_DIALOG_GET_RESULT: u32 = 0x7EC9_5C61;
+    pub const NP_MESSAGE_DIALOG_ABORT: u32 = 0x47AB_6D04;
+    pub const NP_MESSAGE_DIALOG_TERM: u32 = 0x7AB5_0F63;
+    pub const NP_TROPHY_SETUP_DIALOG_INIT: u32 = 0x9E2C_02C9;
+    pub const NP_TROPHY_SETUP_DIALOG_GET_STATUS: u32 = 0xC3A5_9547;
+    pub const NP_TROPHY_SETUP_DIALOG_TERM: u32 = 0xA810_82DD;
+    pub const STORE_CHECKOUT_DIALOG_INIT: u32 = 0x52EC_D8A5;
+    pub const STORE_CHECKOUT_DIALOG_GET_STATUS: u32 = 0x7004_BB2E;
+    pub const STORE_CHECKOUT_DIALOG_GET_RESULT: u32 = 0x07ED_1E26;
+    pub const STORE_CHECKOUT_DIALOG_TERM: u32 = 0xB787_F4B0;
+    pub const NP_SNS_FACEBOOK_DIALOG_INIT: u32 = 0x6821_F09B;
+    pub const NP_SNS_FACEBOOK_DIALOG_GET_STATUS: u32 = 0x1476_50E8;
+    pub const NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN: u32 = 0xA868_2304;
     // SceTouch.
     pub const TOUCH_SET_SAMPLING_STATE: u32 = 0x1B9C_5D14;
     pub const TOUCH_READ: u32 = 0x169A_1D58;
     pub const TOUCH_PEEK: u32 = 0xFF08_2DF0;
+    pub const TOUCH_GET_PANEL_INFO: u32 = 0x10A2_CA25;
+    // SceSysmodule load: off-console the requested module is already linked in, so a
+    // load request just reports success.
+    pub const SYSMODULE_LOAD_MODULE: u32 = 0x79A0_160A;
+    // SceAppUtil: fetch a system-parameter string (e.g. the account username).
+    pub const APPUTIL_SYSTEM_PARAM_GET_STRING: u32 = 0x6E6A_A267;
+    // SceScreenShot: the OS screenshot feature (enable/disable + overlay/param). Off
+    // console there is nothing to capture, so each call succeeds with no effect.
+    pub const SCREENSHOT_DISABLE: u32 = 0x50AE_9FF9;
+    pub const SCREENSHOT_ENABLE: u32 = 0x76E6_74D1;
+    pub const SCREENSHOT_SET_PARAM: u32 = 0x05DB_59C7;
+    pub const SCREENSHOT_SET_OVERLAY_IMAGE: u32 = 0x7061_665B;
+    // SceNpTrophy: trophies work offline (persisted locally, unlocked via the egress
+    // ledger). Init + context/handle creation succeed with real non-zero out-handles.
+    pub const NP_TROPHY_INIT: u32 = 0x3451_6838;
+    pub const NP_TROPHY_CREATE_CONTEXT: u32 = 0xC49F_D33F;
+    pub const NP_TROPHY_CREATE_HANDLE: u32 = 0x4EBC_6977;
+    // SceNp* subsystem inits with no backing service off-console: succeed so the
+    // title proceeds (SceNpActivity/SceNpCommon-auth/SceNpUtility-lookup/SceNpTus).
+    pub const NP_ACTIVITY_INIT: u32 = 0xE0FF_EE97;
+    pub const NP_AUTH_INIT: u32 = 0x441D_8B4E;
+    pub const NP_LOOKUP_INIT: u32 = 0x9246_A673;
+    pub const NP_TUS_INIT: u32 = 0xB214_1F8D;
+    // SceLibLocation / SceMotion / SceNetCtl(adhoc) / ScePower: device-service inits
+    // and config that succeed with a neutral/offline result.
+    pub const LOCATION_INIT: u32 = 0x09C4_F674;
+    pub const MOTION_START_SAMPLING: u32 = 0x2803_4AC9;
+    pub const NETCTL_ADHOC_REGISTER_CALLBACK: u32 = 0xFFA9_D594;
+    pub const POWER_SET_CONFIGURATION_MODE: u32 = 0x3CE1_87B6;
+    // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
+    // dialog's result read.
+    pub const COMMON_DIALOG_SET_CONFIG_PARAM: u32 = 0xBECD_35C8;
+    pub const NP_TROPHY_SETUP_DIALOG_GET_RESULT: u32 = 0xE370_69D5;
+    /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
+    /// app; present in no vita-headers revision). Serviced as an offline success.
+    pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
 }
 
 /// Lightweight synchronization (SceLibKernel LwMutex/LwCond): mutexes and condition
@@ -214,6 +333,21 @@ pub mod threadmgr {
     pub const EXIT_DELETE_THREAD: u32 = 0x1D17_DECF;
     pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
     pub const GET_PROCESS_ID: u32 = 0x9DCB_4B7A;
+    pub const GET_THREAD_CURRENT_PRIORITY: u32 = 0x0141_4F0B;
+    /// `sceKernelCloseSema`: releases a semaphore id (same effect as DeleteSema in
+    /// this model - the id becomes invalid). Routed to the shared delete handler.
+    pub const CLOSE_SEMA: u32 = 0xA2D8_1F9E;
+}
+
+/// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
+/// skew, and opens fonts. Handles are opaque; the surface is satisfied without a
+/// glyph rasterizer (text is drawn through the captured GXM stream).
+pub mod pvf {
+    pub const NEW_LIB: u32 = 0x72E5_8672;
+    pub const SET_EM: u32 = 0xDFB6_77C5;
+    pub const OPEN: u32 = 0xE354_34BB;
+    pub const SET_RESOLUTION: u32 = 0xC444_4FB3;
+    pub const SET_SKEW_VALUE: u32 = 0x3DD0_9BC9;
 }
 
 /// File IO (SceIoFilemgr). Function NIDs span SceIofilemgr (read/write/close/
@@ -229,8 +363,12 @@ pub mod iofilemgr {
     pub const IO_PREAD: u32 = 0x5231_5AD7;
     pub const IO_PWRITE: u32 = 0x8FFF_F5A8;
     pub const IO_GETSTAT: u32 = 0xBCA5_B623;
+    pub const IO_GETSTAT_BY_FD: u32 = 0x57F8_CD25;
     pub const IO_MKDIR: u32 = 0x9670_D39F;
     pub const IO_REMOVE: u32 = 0xE20E_D0F3;
+    pub const IO_DOPEN: u32 = 0xA928_3DD0;
+    pub const IO_DREAD: u32 = 0x9C8B_6624;
+    pub const IO_DCLOSE: u32 = 0x422A_221A;
 }
 
 /// Synchronization primitives (mutex, semaphore, event flag) and system time.
@@ -244,12 +382,22 @@ pub mod sync {
     pub const UNLOCK_MUTEX: u32 = 0x1A37_2EC8;
     pub const DELETE_MUTEX: u32 = 0xCB78_710D;
     pub const CREATE_SEMA: u32 = 0x1BD6_7366;
+    /// `sceKernelCreateSema_16XX`: the pre-3.60 firmware NID for the same call the
+    /// SDK later re-exported as `CREATE_SEMA`. Titles built against an older SDK
+    /// import this one; it dispatches to the identical handler.
+    pub const CREATE_SEMA_16XX: u32 = 0x297A_A2AE;
     pub const WAIT_SEMA: u32 = 0x0C7B_834B;
     pub const SIGNAL_SEMA: u32 = 0xE6B7_61D1;
     pub const DELETE_SEMA: u32 = 0xDB32_948A;
     pub const CREATE_EVENT_FLAG: u32 = 0x8516_D040;
     pub const SET_EVENT_FLAG: u32 = 0xEC94_DFF7;
     pub const WAIT_EVENT_FLAG: u32 = 0x83C0_E2AF;
+    /// `sceKernelWaitEventFlagCB`: identical to `WAIT_EVENT_FLAG` but also pumps the
+    /// calling thread's async callbacks while blocked. Same 5-arg signature; we have
+    /// no user-callback delivery to pump, so it shares the plain wait handler - the
+    /// crucial behaviour is that it actually BLOCKS until the bits are set (a stub
+    /// that returns success immediately lets a thread race past the worker it waits on).
+    pub const WAIT_EVENT_FLAG_CB: u32 = 0xE737_B1DF;
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
     pub const GET_SYSTEM_TIME_WIDE: u32 = 0xF4EE_4FA9;
@@ -292,6 +440,14 @@ pub mod ngs {
     pub const PATCH_CREATE_ROUTING: u32 = 0xD668_B49C;
     pub const PATCH_GET_INFO: u32 = 0x9870_3DBC;
     pub const AT9_GET_SECTION_DETAILS: u32 = 0x2A9F_A501;
+    // Additional voice-definition getters (return an opaque definition pointer), a
+    // patch volume/routing edit, and the system lock/unlock (no-contention here).
+    pub const VOICE_DEF_GET_SIMPLE_VOICE: u32 = 0x0D53_99CF;
+    pub const VOICE_DEF_GET_MIXER_BUSS: u32 = 0xE0AC_8776;
+    pub const VOICE_PATCH_SET_VOLUME: u32 = 0xA3C8_07BC;
+    pub const PATCH_REMOVE_ROUTING: u32 = 0xD0C9_AE5A;
+    pub const SYSTEM_LOCK: u32 = 0xB9D9_71F2;
+    pub const SYSTEM_UNLOCK: u32 = 0x0A93_EA96;
 }
 
 /// SceAudio: low-level PCM audio-output ports.
@@ -307,8 +463,8 @@ pub mod audio {
 pub fn name(func_nid: u32) -> &'static str {
     use {
         audio as au, ctrl as c, display as d, gxm as g, iofilemgr as io, libkernel as lk,
-        lwsync as lw, ngs as ng, processmgr as pm, services as sv, sync as sy, sysmem as s,
-        threadmgr as tm,
+        lwsync as lw, ngs as ng, processmgr as pm, pvf as pv, services as sv, sync as sy,
+        sysmem as s, threadmgr as tm,
     };
     match func_nid {
         ng::SYSTEM_GET_REQUIRED_MEMORY_SIZE => "sceNgsSystemGetRequiredMemorySize",
@@ -367,6 +523,14 @@ pub fn name(func_nid: u32) -> &'static str {
         g::PROGRAM_FIND_PARAMETER_BY_NAME => "sceGxmProgramFindParameterByName",
         g::SHADER_PATCHER_GET_PROGRAM_FROM_ID => "sceGxmShaderPatcherGetProgramFromId",
         g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => "sceGxmProgramParameterGetResourceIndex",
+        g::PROGRAM_GET_PARAMETER_COUNT => "sceGxmProgramGetParameterCount",
+        g::PROGRAM_GET_PARAMETER => "sceGxmProgramGetParameter",
+        g::PROGRAM_PARAMETER_GET_CATEGORY => "sceGxmProgramParameterGetCategory",
+        g::PROGRAM_PARAMETER_GET_TYPE => "sceGxmProgramParameterGetType",
+        g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => "sceGxmProgramParameterGetComponentCount",
+        g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => "sceGxmProgramParameterGetContainerIndex",
+        g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => "sceGxmProgramParameterGetArraySize",
+        g::PROGRAM_PARAMETER_GET_NAME => "sceGxmProgramParameterGetName",
         g::BEGIN_SCENE => "sceGxmBeginScene",
         g::END_SCENE => "sceGxmEndScene",
         g::SET_VERTEX_PROGRAM => "sceGxmSetVertexProgram",
@@ -427,6 +591,7 @@ pub fn name(func_nid: u32) -> &'static str {
         pm::GET_STDOUT => "sceKernelGetStdout",
         pm::GET_STDERR => "sceKernelGetStderr",
         pm::LIBC_TIME => "sceKernelLibcTime",
+        pm::LIBC_CLOCK => "sceKernelLibcClock",
         tm::GET_PROCESS_ID => "sceKernelGetProcessId",
         sv::SYSMODULE_IS_LOADED => "sceSysmoduleIsLoaded",
         sv::NET_INIT => "sceNetInit",
@@ -447,9 +612,16 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_SCORE_INIT => "sceNpScoreInit",
         sv::NP_SCORE_CREATE_TITLE_CTX => "sceNpScoreCreateTitleCtx",
         sv::NP_MANAGER_GET_NP_ID => "sceNpManagerGetNpId",
+        sv::NET_CTL_CHECK_CALLBACK => "sceNetCtlCheckCallback",
+        sv::APPUTIL_DRM_OPEN => "sceAppUtilDrmOpen",
+        sv::APPUTIL_DRM_CLOSE => "sceAppUtilDrmClose",
+        sv::NP_CHECK_CALLBACK => "sceNpCheckCallback",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
         sv::TOUCH_READ => "sceTouchRead",
         sv::TOUCH_PEEK => "sceTouchPeek",
+        sv::TOUCH_GET_PANEL_INFO => "sceTouchGetPanelInfo",
+        sv::SYSMODULE_LOAD_MODULE => "sceSysmoduleLoadModule",
+        sv::APPUTIL_SYSTEM_PARAM_GET_STRING => "sceAppUtilSystemParamGetString",
         lw::CREATE_LW_MUTEX => "sceKernelCreateLwMutex",
         lw::DELETE_LW_MUTEX => "sceKernelDeleteLwMutex",
         lw::LOCK_LW_MUTEX => "sceKernelLockLwMutex",
@@ -477,8 +649,12 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_PREAD => "sceIoPread",
         io::IO_PWRITE => "sceIoPwrite",
         io::IO_GETSTAT => "sceIoGetstat",
+        io::IO_GETSTAT_BY_FD => "sceIoGetstatByFd",
         io::IO_MKDIR => "sceIoMkdir",
         io::IO_REMOVE => "sceIoRemove",
+        io::IO_DOPEN => "sceIoDopen",
+        io::IO_DREAD => "sceIoDread",
+        io::IO_DCLOSE => "sceIoDclose",
         tm::DELAY_THREAD => "sceKernelDelayThread",
         tm::EXIT_DELETE_THREAD => "sceKernelExitDeleteThread",
         tm::EXIT_THREAD => "sceKernelExitThread",
@@ -487,13 +663,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::TRY_LOCK_MUTEX => "sceKernelTryLockMutex",
         sy::UNLOCK_MUTEX => "sceKernelUnlockMutex",
         sy::DELETE_MUTEX => "sceKernelDeleteMutex",
-        sy::CREATE_SEMA => "sceKernelCreateSema",
+        sy::CREATE_SEMA | sy::CREATE_SEMA_16XX => "sceKernelCreateSema",
         sy::WAIT_SEMA => "sceKernelWaitSema",
         sy::SIGNAL_SEMA => "sceKernelSignalSema",
         sy::DELETE_SEMA => "sceKernelDeleteSema",
         sy::CREATE_EVENT_FLAG => "sceKernelCreateEventFlag",
         sy::SET_EVENT_FLAG => "sceKernelSetEventFlag",
         sy::WAIT_EVENT_FLAG => "sceKernelWaitEventFlag",
+        sy::WAIT_EVENT_FLAG_CB => "sceKernelWaitEventFlagCB",
         sy::CLEAR_EVENT_FLAG => "sceKernelClearEventFlag",
         sy::DELETE_EVENT_FLAG => "sceKernelDeleteEventFlag",
         sy::GET_SYSTEM_TIME_WIDE => "sceKernelGetSystemTimeWide",
@@ -502,6 +679,67 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::SIGNAL_COND => "sceKernelSignalCond",
         sy::SIGNAL_COND_ALL => "sceKernelSignalCondAll",
         sy::DELETE_COND => "sceKernelDeleteCond",
+        // GXM render-state setters, getters, cube texture, sampler-state setters.
+        g::SET_CULL_MODE => "sceGxmSetCullMode",
+        g::SET_TWO_SIDED_ENABLE => "sceGxmSetTwoSidedEnable",
+        g::SET_FRONT_DEPTH_FUNC => "sceGxmSetFrontDepthFunc",
+        g::SET_BACK_DEPTH_FUNC => "sceGxmSetBackDepthFunc",
+        g::SET_FRONT_DEPTH_WRITE_ENABLE => "sceGxmSetFrontDepthWriteEnable",
+        g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => "sceGxmSetFrontFragmentProgramEnable",
+        g::SET_FRONT_POINT_LINE_WIDTH => "sceGxmSetFrontPointLineWidth",
+        g::SET_FRONT_POLYGON_MODE => "sceGxmSetFrontPolygonMode",
+        g::SET_FRONT_STENCIL_REF => "sceGxmSetFrontStencilRef",
+        g::SET_FRONT_STENCIL_FUNC => "sceGxmSetFrontStencilFunc",
+        g::SET_VIEWPORT => "sceGxmSetViewport",
+        g::SET_VIEWPORT_ENABLE => "sceGxmSetViewportEnable",
+        g::SET_REGION_CLIP => "sceGxmSetRegionClip",
+        g::COLOR_SURFACE_GET_FORMAT => "sceGxmColorSurfaceGetFormat",
+        g::COLOR_SURFACE_SET_CLIP => "sceGxmColorSurfaceSetClip",
+        g::TEXTURE_GET_TYPE => "sceGxmTextureGetType",
+        g::PROGRAM_PARAMETER_GET_SEMANTIC => "sceGxmProgramParameterGetSemantic",
+        g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX => "sceGxmProgramParameterGetSemanticIndex",
+        g::TEXTURE_INIT_CUBE => "sceGxmTextureInitCube",
+        g::TEXTURE_SET_U_ADDR_MODE_SAFE => "sceGxmTextureSetUAddrModeSafe",
+        g::TEXTURE_SET_V_ADDR_MODE_SAFE => "sceGxmTextureSetVAddrModeSafe",
+        g::TEXTURE_SET_LOD_BIAS => "sceGxmTextureSetLodBias",
+        // NGS.
+        ng::VOICE_DEF_GET_SIMPLE_VOICE => "sceNgsVoiceDefGetSimpleVoice",
+        ng::VOICE_DEF_GET_MIXER_BUSS => "sceNgsVoiceDefGetMixerBuss",
+        ng::VOICE_PATCH_SET_VOLUME => "sceNgsVoicePatchSetVolume",
+        ng::PATCH_REMOVE_ROUTING => "sceNgsPatchRemoveRouting",
+        ng::SYSTEM_LOCK => "sceNgsSystemLock",
+        ng::SYSTEM_UNLOCK => "sceNgsSystemUnlock",
+        // ScePvf (font).
+        pv::NEW_LIB => "scePvfNewLib",
+        pv::SET_EM => "scePvfSetEM",
+        pv::OPEN => "scePvfOpen",
+        pv::SET_RESOLUTION => "scePvfSetResolution",
+        pv::SET_SKEW_VALUE => "scePvfSetSkewValue",
+        // Threadmgr, sysmem, display additions.
+        tm::GET_THREAD_CURRENT_PRIORITY => "sceKernelGetThreadCurrentPriority",
+        tm::CLOSE_SEMA => "sceKernelCloseSema",
+        s::FREE_MEM_BLOCK => "sceKernelFreeMemBlock",
+        d::WAIT_VBLANK_START_MULTI => "sceDisplayWaitVblankStartMulti",
+        lk::UNKNOWN_023EAA62 => "SceLibKernel_023EAA62",
+        // Offline services: screenshot, trophy, Np inits, location/motion/power/net.
+        sv::SCREENSHOT_DISABLE => "sceScreenShotDisable",
+        sv::SCREENSHOT_ENABLE => "sceScreenShotEnable",
+        sv::SCREENSHOT_SET_PARAM => "sceScreenShotSetParam",
+        sv::SCREENSHOT_SET_OVERLAY_IMAGE => "sceScreenShotSetOverlayImage",
+        sv::NP_TROPHY_INIT => "sceNpTrophyInit",
+        sv::NP_TROPHY_CREATE_CONTEXT => "sceNpTrophyCreateContext",
+        sv::NP_TROPHY_CREATE_HANDLE => "sceNpTrophyCreateHandle",
+        sv::NP_ACTIVITY_INIT => "sceNpActivityInit",
+        sv::NP_AUTH_INIT => "sceNpAuthInit",
+        sv::NP_LOOKUP_INIT => "sceNpLookupInit",
+        sv::NP_TUS_INIT => "sceNpTusInit",
+        sv::LOCATION_INIT => "sceLocationInit",
+        sv::MOTION_START_SAMPLING => "sceMotionStartSampling",
+        sv::NETCTL_ADHOC_REGISTER_CALLBACK => "sceNetCtlAdhocRegisterCallback",
+        sv::POWER_SET_CONFIGURATION_MODE => "scePowerSetConfigurationMode",
+        sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
+        sv::NP_TROPHY_SETUP_DIALOG_GET_RESULT => "sceNpTrophySetupDialogGetResult",
+        sv::NEAR_UTIL_UNKNOWN_A412E9CA => "SceNearUtil_A412E9CA",
         _ => "<unknown>",
     }
 }

@@ -27,6 +27,67 @@ pub struct ColorSurface {
     pub data_addr: u32,
 }
 
+/// The fixed-function pipeline state a title sets on the GXM context between draws
+/// with the `sceGxmSet*` family (cull, depth, stencil, viewport, region clip,
+/// polygon mode). GXM context state is sticky - a setter mutates the current state
+/// and every later draw inherits it until it is changed again - so the host tracks
+/// the live values and snapshots them into each [`Draw`], exactly as uniforms and
+/// bound textures are captured. A renderer reproduces a draw from this snapshot
+/// without replaying the call stream. Every field is the raw GXM enum word (e.g.
+/// `cull_mode` is a `SceGxmCullMode` value, `front_depth_func` a `SceGxmDepthFunc`
+/// value); [`Default`] is GXM's documented context default for a field a title
+/// leaves unset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderState {
+    pub cull_mode: u32,
+    pub two_sided: u32,
+    pub front_depth_func: u32,
+    pub back_depth_func: u32,
+    pub front_depth_write: u32,
+    pub front_fragment_program_enable: u32,
+    pub front_polygon_mode: u32,
+    pub front_point_line_width: u32,
+    pub front_stencil_ref: u32,
+    pub front_stencil_func: u32,
+    pub front_stencil_op_fail: u32,
+    pub front_stencil_op_depth_fail: u32,
+    pub front_stencil_op_depth_pass: u32,
+    pub front_stencil_compare_mask: u32,
+    pub front_stencil_write_mask: u32,
+    pub viewport_enable: u32,
+    /// `xOffset, xScale, yOffset, yScale, zOffset, zScale` from sceGxmSetViewport.
+    pub viewport: [f32; 6],
+    pub region_clip_mode: u32,
+    /// `xMin, yMin, xMax, yMax` from sceGxmSetRegionClip.
+    pub region_clip: [u32; 4],
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        RenderState {
+            cull_mode: 0x0000_0000,               // SCE_GXM_CULL_NONE
+            two_sided: 0x0000_0000,               // SCE_GXM_TWO_SIDED_DISABLED
+            front_depth_func: 0x00C0_0000,        // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            back_depth_func: 0x00C0_0000,         // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            front_depth_write: 0x0000_0000,       // SCE_GXM_DEPTH_WRITE_ENABLED
+            front_fragment_program_enable: 0x0,   // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
+            front_polygon_mode: 0x0000_0000,      // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
+            front_point_line_width: 1,
+            front_stencil_ref: 0,
+            front_stencil_func: 0x0E00_0000,      // SCE_GXM_STENCIL_FUNC_ALWAYS
+            front_stencil_op_fail: 0,             // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_op_depth_fail: 0,       // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_op_depth_pass: 0,       // SCE_GXM_STENCIL_OP_KEEP
+            front_stencil_compare_mask: 0xff,
+            front_stencil_write_mask: 0xff,
+            viewport_enable: 0x0000_0000,         // SCE_GXM_VIEWPORT_ENABLED
+            viewport: [0.0; 6],
+            region_clip_mode: 0x0000_0000,        // SCE_GXM_REGION_CLIP_NONE
+            region_clip: [0; 4],
+        }
+    }
+}
+
 /// A texture bound to a fragment sampler unit at draw time. Decoded from the
 /// guest's 16-byte `SceGxmTexture` control words (format, dimensions, memory
 /// layout, data address) with a snapshot of the referenced pixel bytes, so a
@@ -46,6 +107,11 @@ pub struct BoundTexture {
     pub stride: u32,
     pub data_addr: u32,
     pub pixels: Vec<u8>,
+    /// Sampler wrap modes (`SceGxmTextureAddrMode`, 0 = REPEAT) and LOD bias set on
+    /// this texture via `sceGxmTextureSet{U,V}AddrMode[Safe]` / `SetLodBias`.
+    pub u_addr_mode: u32,
+    pub v_addr_mode: u32,
+    pub lod_bias: u32,
 }
 
 /// A single draw call with everything needed to reproduce it, snapshotted from
@@ -67,6 +133,9 @@ pub struct Draw {
     /// Fragment textures bound at draw time (one per active sampler unit),
     /// snapshotted from guest memory. Empty for an untextured (vertex-color) draw.
     pub textures: Vec<BoundTexture>,
+    /// The fixed-function pipeline state (cull/depth/stencil/viewport/...) in effect
+    /// for this draw, snapshotted from the sticky GXM context state. See [`RenderState`].
+    pub render_state: RenderState,
 }
 
 /// One scene (BeginScene to EndScene): its render target color buffer and the
@@ -157,7 +226,11 @@ pub struct Capture {
     pub unimplemented: Vec<(u32, u32, String)>,
     /// Total host calls serviced, for sanity.
     pub call_count: u64,
-    /// Ordered trace of every serviced call's function NID, for debugging.
+    /// Ordered trace of recently serviced calls' function NIDs, for debugging.
+    /// Bounded to the most recent [`TRACE_CAP`] entries (see [`Capture::record_call`]):
+    /// a 3D title makes tens of millions of host calls during boot, and every
+    /// consumer of this trace (the exit dump, the probe's trace.txt and per-thread
+    /// tails) only reads the recent window.
     pub trace: Vec<u32>,
     /// The guest thread id that made each serviced call, parallel to [`trace`](Self::trace)
     /// (0 outside the preemptive scheduler). Lets a trace be split by thread - e.g. to
@@ -181,9 +254,27 @@ pub struct Capture {
     pub egress: Vec<EgressEvent>,
 }
 
+/// Upper bound on retained trace entries. When the trace reaches this, the oldest
+/// half is dropped, so memory stays bounded (~32 MB at the cap) while every
+/// consumer keeps at least [`TRACE_CAP`]/2 of recent history.
+pub const TRACE_CAP: usize = 4 << 20;
+
 impl Capture {
     pub fn new() -> Self {
         Capture::default()
+    }
+
+    /// Record one serviced call in the bounded debug trace (hot path: a push, plus
+    /// an amortized front-drain every [`TRACE_CAP`]/2 calls once the cap is hit).
+    #[inline]
+    pub fn record_call(&mut self, func_nid: u32, thid: i32) {
+        self.call_count += 1;
+        if self.trace.len() >= TRACE_CAP {
+            self.trace.drain(..TRACE_CAP / 2);
+            self.trace_thid.drain(..TRACE_CAP / 2);
+        }
+        self.trace.push(func_nid);
+        self.trace_thid.push(thid);
     }
 
     /// Note an unimplemented call once (deduplicated by NID pair).

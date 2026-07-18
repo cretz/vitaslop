@@ -25,4 +25,7 @@ wasmparser = "0.253"
 # browser path mirrors this over WebGPU in the web crate, sharing the pipeline.
 wgpu = { workspace = true }
 pollster = { workspace = true }
+# Installs the fmt/EnvFilter subscriber in the probe tests and CLI tools so the
+# runtime's `tracing` diagnostics surface via RUST_LOG (e.g. vitaslop::io=trace).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

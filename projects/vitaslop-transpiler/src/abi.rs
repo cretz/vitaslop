@@ -193,6 +193,18 @@ pub const MEMORY_EXPORT: &str = "memory";
 /// zero otherwise. Hosts read it on a trap to name the faulting guest instruction.
 pub const GUEST_PC_EXPORT: &str = "guest_pc";
 
+/// WASM global index of the per-thread pointer (ARM `TPIDRURO`, the read-only
+/// user-mode thread ID register read by `MRC p15,0,Rt,c13,c0,3`). It holds the base
+/// of this thread's thread-local-storage block; the compiler reaches `__thread`
+/// variables at `tp + offset`. A per-instance global (like the register file), so
+/// every thread sees its own value; the host sets it when it instantiates the
+/// thread. Placed after the three diagnostic globals so their indices stay stable.
+pub const TP_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 3;
+
+/// Exported name of the per-thread pointer global (see [`TP_GLOBAL`]). The host
+/// writes it per thread with that thread's TLS block base.
+pub const TP_EXPORT: &str = "tp";
+
 /// Import module every host function/memory comes from.
 pub const IMPORT_MODULE: &str = "env";
 /// Import name of the ARM `svc` host trap: `(i32 imm) -> ()`.

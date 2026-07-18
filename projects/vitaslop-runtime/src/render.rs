@@ -946,6 +946,9 @@ mod texture_tests {
             stride,
             data_addr: 0,
             pixels,
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
         }
     }
 
@@ -1035,7 +1038,7 @@ mod texture_tests {
     // Build a texture with an explicit `SceGxmTextureType` selector (LINEAR = 3,
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels }
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0 }
     }
 
     #[test]

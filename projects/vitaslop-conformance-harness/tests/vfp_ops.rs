@@ -5,7 +5,7 @@
 //! vneg/vabs/vsqrt, register move, float<->int convert, and the compare + `vmrs
 //! APSR_nzcv` bridge from FP flags into the integer condition flags.
 //!
-//! Source in `working-area/scripts/vfp-test.s`, assembled with
+//! Source is a hand-assembled Thumb leaf, assembled with
 //! `arm-none-eabi-as -mthumb -mcpu=cortex-a9 -mfpu=neon`.
 
 use vitaslop_native::{DEFAULT_MEM_BYTES, HostAbi, Vm};

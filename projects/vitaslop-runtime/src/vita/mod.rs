@@ -13,6 +13,7 @@ pub mod libkernel;
 pub mod lwsync;
 pub mod ngs;
 pub mod processmgr;
+pub mod pvf;
 pub mod services;
 pub mod sync;
 pub mod sysmem;
@@ -23,8 +24,8 @@ use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
     audio as audio_nid, ctrl as ctrl_nid, display as display_nid, gxm as gxm_nid,
     iofilemgr as io_nid, libkernel as lk_nid, lwsync as lw_nid, ngs as ngs_nid,
-    processmgr as pm_nid, services as sv_nid, sync as sync_nid, sysmem as sm_nid,
-    threadmgr as tm_nid,
+    processmgr as pm_nid, pvf as pvf_nid, services as sv_nid, sync as sync_nid,
+    sysmem as sm_nid, threadmgr as tm_nid,
 };
 use crate::{nid, SvcOutcome};
 
@@ -36,12 +37,16 @@ use std::sync::{LazyLock, Mutex};
 /// (nid, lr) pair with an enormous count - the exact instruction to investigate.
 static DBG_CALLSITES: LazyLock<bool> =
     LazyLock::new(|| std::env::var("VITASLOP_DBG_CALLSITES").is_ok());
-/// Diagnostic (env `VITASLOP_TRACE_NGS`): log every NGS and sceAudioOut call with
-/// its first four args and caller, to see exactly how a title feeds AT9 data to a
-/// voice and where the final mix goes - the facts needed before HLE'ing the mixer.
-static TRACE_NGS: LazyLock<bool> = LazyLock::new(|| std::env::var("VITASLOP_TRACE_NGS").is_ok());
-static DBG_ERR: LazyLock<bool> = LazyLock::new(|| std::env::var("VITASLOP_DBG_ERR").is_ok());
 static CALLSITE_HIST: Mutex<BTreeMap<(u32, u32), u64>> = Mutex::new(BTreeMap::new());
+
+/// Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful*
+/// host call live, in global order, with a monotonic index and thread id. Unlike
+/// the counting profiler this shows the boot NARRATIVE and the exact point it
+/// flatlines into a pure lock/poll spin. The high-frequency lock/unlock and shader-
+/// reflection calls are filtered so the interesting sequence is not drowned out.
+static TRACE_ORDER: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("VITASLOP_TRACE_ORDER").is_ok());
+static TRACE_ORDER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Print the hottest call sites (by count) gathered when `VITASLOP_DBG_CALLSITES` is
 /// set. Call from a probe after the run to localize a spin.
@@ -98,19 +103,50 @@ pub fn dispatch(
         *CALLSITE_HIST.lock().unwrap().entry((func_nid, caller)).or_insert(0u64) += 1;
     }
 
-    if *TRACE_NGS && (library_nid == nid::lib::SCE_NGS || library_nid == nid::lib::SCE_AUDIO) {
-        eprintln!(
-            "NGS {} a0={:#010x} a1={:#010x} a2={:#010x} a3={:#010x} lr={:#010x}",
-            nid::name(func_nid),
-            ctx.arg(0),
-            ctx.arg(1),
-            ctx.arg(2),
-            ctx.arg(3),
-            ctx.regs[14],
-        );
+    // Diagnostic (env `VITASLOP_TRACE_ORDER`): live, globally-ordered timeline of
+    // meaningful calls. Filters the lock/unlock and shader-reflection storm so the
+    // boot sequence and its flatline-into-spin are legible. Zero cost when unset.
+    if *TRACE_ORDER {
+        let nm = nid::name(func_nid);
+        let noise = nm.contains("LwMutex")
+            || nm.contains("LockMutex")
+            || nm.contains("UnlockMutex")
+            || nm.starts_with("sceGxmProgram")
+            || nm == "sceKernelGetTLSAddr";
+        if !noise {
+            let seq = TRACE_ORDER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let label = if nm == "<unknown>" {
+                format!("nid:{func_nid:#010x}")
+            } else {
+                nm.to_string()
+            };
+            eprintln!(
+                "[ord {seq:>7} t{:<3}] {label}({:#x}, {:#x}, {:#x}, {:#x}) lr={:#010x}",
+                st.current_thread(),
+                ctx.arg(0),
+                ctx.arg(1),
+                ctx.arg(2),
+                ctx.arg(3),
+                ctx.regs[14],
+            );
+        }
     }
 
-    let dbg_err = *DBG_ERR;
+    // Diagnostic (`RUST_LOG=vitaslop::ngs=trace`): log every NGS and sceAudioOut
+    // call with its first four args and caller, to see exactly how a title feeds AT9
+    // data to a voice and where the final mix goes.
+    if library_nid == nid::lib::SCE_NGS || library_nid == nid::lib::SCE_AUDIO {
+        tracing::trace!(
+            target: "vitaslop::ngs",
+            name = nid::name(func_nid),
+            a0 = format_args!("{:#010x}", ctx.arg(0)),
+            a1 = format_args!("{:#010x}", ctx.arg(1)),
+            a2 = format_args!("{:#010x}", ctx.arg(2)),
+            a3 = format_args!("{:#010x}", ctx.arg(3)),
+            lr = format_args!("{:#010x}", ctx.regs[14]),
+            "call"
+        );
+    }
     let outcome = match func_nid {
         // --- lwsync: lightweight mutex / cond (the hottest surface) --------------
         lw_nid::CREATE_LW_MUTEX => cont!(lwsync::init_work(ctx, lwsync::LW_MUTEX_WORK_SIZE)),
@@ -137,7 +173,7 @@ pub fn dispatch(
         sync_nid::TRY_LOCK_MUTEX => sync::lock_mutex(ctx, st, true),
         sync_nid::UNLOCK_MUTEX => cont!(sync::unlock_mutex(ctx, st)),
         sync_nid::DELETE_MUTEX => cont!(sync::delete_object(ctx, st)),
-        sync_nid::CREATE_SEMA => cont!(sync::create_sema(ctx, st)),
+        sync_nid::CREATE_SEMA | sync_nid::CREATE_SEMA_16XX => cont!(sync::create_sema(ctx, st)),
         sync_nid::WAIT_SEMA => sync::wait_sema(ctx, st),
         sync_nid::SIGNAL_SEMA => cont!(sync::signal_sema(ctx, st)),
         sync_nid::DELETE_SEMA => cont!(sync::delete_object(ctx, st)),
@@ -148,7 +184,9 @@ pub fn dispatch(
         sync_nid::DELETE_COND => cont!(sync::delete_object(ctx, st)),
         sync_nid::CREATE_EVENT_FLAG => cont!(sync::create_event_flag(ctx, st)),
         sync_nid::SET_EVENT_FLAG => cont!(sync::set_event_flag(ctx, st)),
-        sync_nid::WAIT_EVENT_FLAG => cont!(sync::wait_event_flag(ctx, st)),
+        // A real wait: parks under the preemptive scheduler until SetEventFlag
+        // satisfies the pattern (or the timeout passes).
+        sync_nid::WAIT_EVENT_FLAG | sync_nid::WAIT_EVENT_FLAG_CB => sync::wait_event_flag(ctx, st),
         sync_nid::CLEAR_EVENT_FLAG => cont!(sync::clear_event_flag(ctx, st)),
         sync_nid::DELETE_EVENT_FLAG => cont!(sync::delete_object(ctx, st)),
         sync_nid::GET_SYSTEM_TIME_WIDE => cont!(sync::get_system_time_wide(ctx, st)),
@@ -179,7 +217,8 @@ pub fn dispatch(
         }
 
         // --- threadmgr: delay, exit, process id --------------------------------
-        tm_nid::DELAY_THREAD => cont!(threadmgr::delay_thread(ctx, st)),
+        // A real timed sleep: parks under the preemptive scheduler (see the handler).
+        tm_nid::DELAY_THREAD => threadmgr::delay_thread(ctx, st),
         // A thread ending itself: just this thread under the preemptive scheduler;
         // a whole-run stop in single-thread-of-control bring-up (only main reaches
         // here there - workers return normally instead).
@@ -191,6 +230,11 @@ pub fn dispatch(
             }
         }
         tm_nid::GET_PROCESS_ID => cont!(threadmgr::get_process_id(ctx, st)),
+        tm_nid::GET_THREAD_CURRENT_PRIORITY => {
+            cont!(threadmgr::get_thread_current_priority(ctx, st))
+        }
+        // Closing a semaphore invalidates its id, same as deleting it in this model.
+        tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
 
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE => cont!(gxm::initialize(ctx, st)),
@@ -224,8 +268,16 @@ pub fn dispatch(
         gxm_nid::SYNC_OBJECT_CREATE => cont!(gxm::out_handle(ctx, st, 0)),
         gxm_nid::SHADER_PATCHER_REGISTER_PROGRAM => cont!(gxm::register_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_GET_PROGRAM_FROM_ID => cont!(gxm::get_program_from_id(ctx, st)),
-        gxm_nid::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => cont!(ctx.ret(0)),
+        gxm_nid::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => cont!(gxm::param_get_resource_index(ctx)),
         gxm_nid::PROGRAM_FIND_PARAMETER_BY_NAME => cont!(gxm::find_parameter(ctx, st)),
+        gxm_nid::PROGRAM_GET_PARAMETER_COUNT => cont!(gxm::program_get_parameter_count(ctx)),
+        gxm_nid::PROGRAM_GET_PARAMETER => cont!(gxm::program_get_parameter(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_CATEGORY => cont!(gxm::param_get_category(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_TYPE => cont!(gxm::param_get_type(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => cont!(gxm::param_get_component_count(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => cont!(gxm::param_get_container_index(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_ARRAY_SIZE => cont!(gxm::param_get_array_size(ctx)),
+        gxm_nid::PROGRAM_PARAMETER_GET_NAME => cont!(gxm::param_get_name(ctx)),
         gxm_nid::COLOR_SURFACE_INIT => cont!(gxm::color_surface_init(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::out_handle(ctx, st, 6)),
@@ -255,9 +307,41 @@ pub fn dispatch(
         gxm_nid::TEXTURE_SET_MAG_FILTER
         | gxm_nid::TEXTURE_SET_MIN_FILTER
         | gxm_nid::TEXTURE_SET_MIP_FILTER
-        | gxm_nid::TEXTURE_SET_U_ADDR_MODE
-        | gxm_nid::TEXTURE_SET_V_ADDR_MODE
         | gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::ok(ctx)),
+        gxm_nid::TEXTURE_INIT_CUBE => cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE)),
+        // Fixed-function pipeline state: record into the sticky render state that is
+        // snapshotted per draw (see `capture::RenderState`).
+        gxm_nid::SET_CULL_MODE => cont!(gxm::set_cull_mode(ctx, st)),
+        gxm_nid::SET_TWO_SIDED_ENABLE => cont!(gxm::set_two_sided_enable(ctx, st)),
+        gxm_nid::SET_FRONT_DEPTH_FUNC => cont!(gxm::set_front_depth_func(ctx, st)),
+        gxm_nid::SET_BACK_DEPTH_FUNC => cont!(gxm::set_back_depth_func(ctx, st)),
+        gxm_nid::SET_FRONT_DEPTH_WRITE_ENABLE => cont!(gxm::set_front_depth_write_enable(ctx, st)),
+        gxm_nid::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => {
+            cont!(gxm::set_front_fragment_program_enable(ctx, st))
+        }
+        gxm_nid::SET_FRONT_POINT_LINE_WIDTH => cont!(gxm::set_front_point_line_width(ctx, st)),
+        gxm_nid::SET_FRONT_POLYGON_MODE => cont!(gxm::set_front_polygon_mode(ctx, st)),
+        gxm_nid::SET_FRONT_STENCIL_REF => cont!(gxm::set_front_stencil_ref(ctx, st)),
+        gxm_nid::SET_FRONT_STENCIL_FUNC => cont!(gxm::set_front_stencil_func(ctx, st)),
+        gxm_nid::SET_VIEWPORT => cont!(gxm::set_viewport(ctx, st)),
+        gxm_nid::SET_VIEWPORT_ENABLE => cont!(gxm::set_viewport_enable(ctx, st)),
+        gxm_nid::SET_REGION_CLIP => cont!(gxm::set_region_clip(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_FORMAT => cont!(gxm::color_surface_get_format(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_CLIP => cont!(gxm::color_surface_set_clip(ctx, st)),
+        gxm_nid::TEXTURE_GET_TYPE => cont!(gxm::texture_get_type(ctx, st)),
+        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC => cont!(gxm::param_get_semantic(ctx, st)),
+        gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX => {
+            cont!(gxm::param_get_semantic_index(ctx, st))
+        }
+        // Texture sampler state: record wrap modes / LOD bias per texture (the plain
+        // and "safe" variants set the same state; the safe one also validates on HW).
+        gxm_nid::TEXTURE_SET_U_ADDR_MODE | gxm_nid::TEXTURE_SET_U_ADDR_MODE_SAFE => {
+            cont!(gxm::texture_set_u_addr_mode(ctx, st))
+        }
+        gxm_nid::TEXTURE_SET_V_ADDR_MODE | gxm_nid::TEXTURE_SET_V_ADDR_MODE_SAFE => {
+            cont!(gxm::texture_set_v_addr_mode(ctx, st))
+        }
+        gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx, st)),
         gxm_nid::DRAW => cont!(gxm::draw(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {
             // The frame is complete and queued to flip; on hardware the caller waits
@@ -276,15 +360,22 @@ pub fn dispatch(
         io_nid::IO_PREAD => cont!(iofilemgr::io_pread(ctx, st)),
         io_nid::IO_PWRITE => cont!(iofilemgr::io_pwrite(ctx, st)),
         io_nid::IO_GETSTAT => cont!(iofilemgr::io_getstat(ctx, st)),
+        io_nid::IO_GETSTAT_BY_FD => cont!(iofilemgr::io_getstat_by_fd(ctx, st)),
         io_nid::IO_MKDIR => cont!(iofilemgr::io_mkdir(ctx, st)),
         io_nid::IO_REMOVE => cont!(iofilemgr::io_remove(ctx, st)),
+        io_nid::IO_DOPEN => cont!(iofilemgr::io_dopen(ctx, st)),
+        io_nid::IO_DREAD => cont!(iofilemgr::io_dread(ctx, st)),
+        io_nid::IO_DCLOSE => cont!(iofilemgr::io_dclose(ctx, st)),
 
         // --- sysmem: memory blocks ---------------------------------------------
         sm_nid::ALLOC_MEM_BLOCK => cont!(sysmem::alloc_mem_block(ctx, st)),
         sm_nid::GET_MEM_BLOCK_BASE => cont!(sysmem::get_mem_block_base(ctx, st)),
+        sm_nid::FREE_MEM_BLOCK => cont!(sysmem::free_mem_block(ctx, st)),
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
+        // A real timed vblank wait (parks under the preemptive scheduler).
+        display_nid::WAIT_VBLANK_START_MULTI => display::wait_vblank_start_multi(ctx, st),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
@@ -304,7 +395,9 @@ pub fn dispatch(
         ngs_nid::VOICE_DEF_GET_SIMPLE_ATRAC9
         | ngs_nid::VOICE_DEF_GET_MASTER_BUSS
         | ngs_nid::VOICE_DEF_GET_REVERB_BUSS
-        | ngs_nid::VOICE_DEF_GET_EQ_BUSS => cont!(ngs::voice_def_get(ctx, st)),
+        | ngs_nid::VOICE_DEF_GET_EQ_BUSS
+        | ngs_nid::VOICE_DEF_GET_SIMPLE_VOICE
+        | ngs_nid::VOICE_DEF_GET_MIXER_BUSS => cont!(ngs::voice_def_get(ctx, st)),
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
@@ -320,7 +413,13 @@ pub fn dispatch(
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         | ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX
+        | ngs_nid::VOICE_PATCH_SET_VOLUME
         | ngs_nid::PATCH_GET_INFO
+        | ngs_nid::PATCH_REMOVE_ROUTING
+        // System lock/unlock guard the mix graph; single-thread-of-control here, so
+        // there is no contention - both succeed immediately.
+        | ngs_nid::SYSTEM_LOCK
+        | ngs_nid::SYSTEM_UNLOCK
         | ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ctx.ret(0)),
         ngs_nid::VOICE_PLAY => cont!(ngs::voice_play(ctx, st)),
         ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL | ngs_nid::VOICE_PAUSE => {
@@ -331,23 +430,51 @@ pub fn dispatch(
         audio_nid::OUT_SET_VOLUME => cont!(audio::out_set_volume(ctx, st)),
         audio_nid::OUT_RELEASE_PORT => cont!(audio::out_release_port(ctx, st)),
 
+        // --- pvf: font library --------------------------------------------------
+        pvf_nid::NEW_LIB => cont!(pvf::new_lib(ctx, st)),
+        pvf_nid::OPEN => cont!(pvf::open(ctx, st)),
+        pvf_nid::SET_EM => cont!(pvf::set_em(ctx, st)),
+        pvf_nid::SET_RESOLUTION => cont!(pvf::set_resolution(ctx, st)),
+        pvf_nid::SET_SKEW_VALUE => cont!(pvf::set_skew_value(ctx, st)),
+
         // --- processmgr: process param, std streams, time ----------------------
         pm_nid::GET_PROCESS_PARAM => cont!(processmgr::get_process_param(ctx, st)),
         pm_nid::GET_STDIN => cont!(processmgr::get_stdin(ctx, st)),
         pm_nid::GET_STDOUT => cont!(processmgr::get_stdout(ctx, st)),
         pm_nid::GET_STDERR => cont!(processmgr::get_stderr(ctx, st)),
         pm_nid::LIBC_TIME => cont!(processmgr::libc_time(ctx, st)),
+        pm_nid::LIBC_CLOCK => cont!(processmgr::libc_clock(ctx, st)),
 
         // --- services: sysmodule / net / http / np / rtc / apputil / touch -----
         sv_nid::SYSMODULE_IS_LOADED => cont!(services::sysmodule_is_loaded(ctx, st)),
         sv_nid::NET_CTL_INET_GET_STATE => cont!(services::netctl_inet_get_state(ctx, st)),
         sv_nid::NET_CTL_INET_REGISTER_CALLBACK => cont!(services::netctl_register_callback(ctx, st)),
+        sv_nid::NET_CTL_CHECK_CALLBACK => cont!(services::net_check_callback(ctx, st)),
+        sv_nid::NP_REGISTER_SERVICE_STATE_CALLBACK => {
+            cont!(services::np_register_service_state_callback(ctx, st))
+        }
+        sv_nid::NP_CHECK_CALLBACK => cont!(services::np_check_callback(ctx, st)),
         sv_nid::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => {
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
+        sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::MOTION_GET_STATE => cont!(services::motion_get_state(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
+        sv_nid::APPUTIL_SYSTEM_PARAM_GET_STRING => cont!(services::apputil_system_param_get_string(ctx, st)),
+        sv_nid::APPUTIL_DRM_OPEN => cont!(services::apputil_drm_open(ctx, st)),
+        sv_nid::APPUTIL_DRM_CLOSE => cont!(services::apputil_drm_close(ctx, st)),
+        // Offline services with an out-param handle to hand back.
+        sv_nid::NETCTL_ADHOC_REGISTER_CALLBACK => {
+            cont!(services::netctl_adhoc_register_callback(ctx, st))
+        }
+        sv_nid::NP_TROPHY_CREATE_CONTEXT => cont!(services::np_trophy_create_context(ctx, st)),
+        sv_nid::NP_TROPHY_CREATE_HANDLE => cont!(services::np_trophy_create_handle(ctx, st)),
+        // The trophy-setup dialog's result read (zeroed result = OK), like the other
+        // dialog GetResult calls.
+        sv_nid::NP_TROPHY_SETUP_DIALOG_GET_RESULT => cont!(services::dialog_ok(ctx, st)),
         sv_nid::TOUCH_READ => cont!(touch::read(ctx, st)),
         sv_nid::TOUCH_PEEK => cont!(touch::peek(ctx, st)),
+        sv_nid::TOUCH_GET_PANEL_INFO => cont!(touch::get_panel_info(ctx, st)),
         // No online account off-console: identity calls report signed-out so the
         // title takes its offline path instead of dereferencing a null identity.
         sv_nid::NP_MANAGER_GET_NP_ID | sv_nid::NP_SCORE_CREATE_TITLE_CTX => {
@@ -359,14 +486,76 @@ pub fn dispatch(
         | sv_nid::HTTP_INIT
         | sv_nid::SSL_INIT
         | sv_nid::NP_INIT
-        | sv_nid::NP_REGISTER_SERVICE_STATE_CALLBACK
         | sv_nid::NP_BASIC_INIT
         | sv_nid::NP_BASIC_REGISTER_HANDLER
         | sv_nid::FIOS_OVERLAY_GET_LIST
         | sv_nid::ULOBJ_REGISTER_PROTOCOL_REVISION
         | sv_nid::APPUTIL_INIT
         | sv_nid::NP_SCORE_INIT
-        | sv_nid::TOUCH_SET_SAMPLING_STATE => cont!(ctx.ret(0)),
+        // The requested module is already linked into the image, so a load succeeds.
+        | sv_nid::SYSMODULE_LOAD_MODULE
+        | sv_nid::TOUCH_SET_SAMPLING_STATE
+        // SceScreenShot: nothing to capture off-console.
+        | sv_nid::SCREENSHOT_DISABLE
+        | sv_nid::SCREENSHOT_ENABLE
+        | sv_nid::SCREENSHOT_SET_PARAM
+        | sv_nid::SCREENSHOT_SET_OVERLAY_IMAGE
+        // SceNpTrophy init + the Np subsystem inits: offline success.
+        | sv_nid::NP_TROPHY_INIT
+        | sv_nid::NP_ACTIVITY_INIT
+        | sv_nid::NP_AUTH_INIT
+        | sv_nid::NP_LOOKUP_INIT
+        | sv_nid::NP_TUS_INIT
+        // Device services: location/motion sampling, ad-hoc power/config.
+        | sv_nid::LOCATION_INIT
+        | sv_nid::MOTION_START_SAMPLING
+        | sv_nid::POWER_SET_CONFIGURATION_MODE
+        // Shared dialog config accepted for every family.
+        | sv_nid::COMMON_DIALOG_SET_CONFIG_PARAM
+        // Unnamed exports absent from every vita-headers revision, serviced as an
+        // offline no-op success so they are handled rather than left as gaps.
+        | sv_nid::NEAR_UTIL_UNKNOWN_A412E9CA
+        | lk_nid::UNKNOWN_023EAA62 => cont!(ctx.ret(0)),
+
+        // --- SceCommonDialog: system dialogs complete instantly offline ---------
+        sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
+        sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
+        sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
+        sv_nid::NET_CHECK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NetCheck)),
+        sv_nid::NET_CHECK_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NetCheck)),
+        sv_nid::NET_CHECK_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::NetCheck)),
+        sv_nid::SAVEDATA_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::SaveData)),
+        sv_nid::SAVEDATA_DIALOG_GET_STATUS | sv_nid::SAVEDATA_DIALOG_GET_SUB_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::SaveData))
+        }
+        sv_nid::SAVEDATA_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::SaveData)),
+        sv_nid::NP_MESSAGE_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NpMessage)),
+        sv_nid::NP_MESSAGE_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpMessage)),
+        sv_nid::NP_MESSAGE_DIALOG_TERM | sv_nid::NP_MESSAGE_DIALOG_ABORT => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpMessage))
+        }
+        sv_nid::NP_TROPHY_SETUP_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NpTrophySetup)),
+        sv_nid::NP_TROPHY_SETUP_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpTrophySetup)),
+        sv_nid::NP_TROPHY_SETUP_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::NpTrophySetup)),
+        sv_nid::STORE_CHECKOUT_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::StoreCheckout)),
+        sv_nid::STORE_CHECKOUT_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::StoreCheckout)),
+        sv_nid::STORE_CHECKOUT_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::StoreCheckout)),
+        sv_nid::NP_SNS_FACEBOOK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NpSnsFacebook)),
+        sv_nid::NP_SNS_FACEBOOK_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpSnsFacebook)),
+        // Result reads and per-frame pumping succeed with the caller's (zeroed)
+        // result struct untouched; the update pump has no system UI to animate.
+        sv_nid::COMMON_DIALOG_UPDATE
+        | sv_nid::MSG_DIALOG_GET_RESULT
+        | sv_nid::NET_CHECK_DIALOG_GET_RESULT
+        | sv_nid::SAVEDATA_DIALOG_GET_RESULT
+        | sv_nid::SAVEDATA_DIALOG_CONTINUE
+        | sv_nid::SAVEDATA_DIALOG_FINISH
+        | sv_nid::SAVEDATA_DIALOG_SUB_CLOSE
+        | sv_nid::NP_MESSAGE_DIALOG_GET_RESULT
+        | sv_nid::STORE_CHECKOUT_DIALOG_GET_RESULT
+        | sv_nid::NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN => {
+            cont!(services::dialog_ok(ctx, st))
+        }
 
         _ => {
             st.capture.note_unimplemented(library_nid, func_nid, nid::name(func_nid));
@@ -374,18 +563,19 @@ pub fn dispatch(
             SvcOutcome::Continue
         }
     };
-    // Diagnostic (env `VITASLOP_DBG_ERR`): log any handler that returns an SCE error
-    // code (top bit set) - the fastest way to find an HLE call whose failure sends the
-    // guest down an unexpected (error/cleanup) path.
-    if dbg_err {
-        let r = ctx.regs[0];
-        if r & 0x8000_0000 != 0 {
-            eprintln!(
-                "ERR_RET thid={} {} nid={func_nid:#010x} -> {r:#010x}",
-                st.current_thread(),
-                nid::name(func_nid)
-            );
-        }
+    // Diagnostic (`RUST_LOG=vitaslop::err=debug`): log any handler that returns an
+    // SCE error code (top bit set) - the fastest way to find an HLE call whose
+    // failure sends the guest down an unexpected (error/cleanup) path.
+    let r = ctx.regs[0];
+    if r & 0x8000_0000 != 0 {
+        tracing::debug!(
+            target: "vitaslop::err",
+            thid = st.current_thread(),
+            name = nid::name(func_nid),
+            nid = format_args!("{func_nid:#010x}"),
+            ret = format_args!("{r:#010x}"),
+            "error return"
+        );
     }
     outcome
 }

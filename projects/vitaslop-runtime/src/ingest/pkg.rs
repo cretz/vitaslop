@@ -16,6 +16,7 @@
 //! replace it. Algorithm from the public psdevwiki pkg description; key is the
 //! published Type-2 constant.
 
+use super::vfs::MemVfs;
 use super::{keys, Error, Reader};
 use aes::cipher::{
     BlockEncrypt, KeyInit, KeyIvInit, StreamCipher, StreamCipherSeek, generic_array::GenericArray,
@@ -47,6 +48,13 @@ pub struct PkgItem {
     pub data_offset: u64,
     pub data_size: u64,
     pub flags: u32,
+}
+
+/// Whether an item-table entry is a directory (no file data) rather than a file,
+/// per the low byte of its `flags`. A pkg records directories as their own
+/// entries; types 4 and 18 are the directory codes, everything else is a file.
+fn is_directory(flags: u32) -> bool {
+    matches!(flags & 0xff, 4 | 18)
 }
 
 /// Big-endian reads (the pkg header/table are big-endian).
@@ -139,6 +147,23 @@ impl<'a> Pkg<'a> {
         c.seek(rel);
         c.apply_keystream(&mut buf);
         Ok(buf)
+    }
+
+    /// Extract every file entry into a [`MemVfs`], CTR-decrypting each item's
+    /// data. Directory entries carry no data and only imply structure, so they are
+    /// skipped (the tree is implicit in the '/'-separated file paths). The result
+    /// is the app's on-disk file tree - for a retail app that is still the
+    /// PFS-encrypted "raw dump" form the PFS layer then decrypts.
+    pub fn extract(&self) -> Result<MemVfs, Error> {
+        let mut vfs = MemVfs::new();
+        for item in self.items()? {
+            if is_directory(item.flags) {
+                continue;
+            }
+            let data = self.decrypt_at(item.data_offset, item.data_size as usize)?;
+            vfs.insert(item.name, data);
+        }
+        Ok(vfs)
     }
 
     /// Decrypt and parse the item (file) table.

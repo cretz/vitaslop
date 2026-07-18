@@ -4,7 +4,7 @@
 # Requires a Vita toolchain on PATH via $VITASDK (arm-vita-eabi-gcc,
 # vita-elf-create). The toolchain is a build tool only - compiling our MIT,
 # -nostdlib source with it does not attach any GPL/LGPL obligation to the
-# output. See ../README.md and working-area/agent-notes.md for the plan.
+# output. See ../README.md for the plan.
 #
 # Deterministic: run this, then `git diff` should be clean (like the arm suite's
 # regen). Run under WSL:

@@ -38,9 +38,13 @@ pub const IMAGE_BASE: u32 = 0x8100_0000;
 const MODULE_ALIGN: u32 = 0x1_0000;
 
 /// Total guest memory the unified program runs in (image + heap + stack), matching
-/// the order of magnitude of a Vita game partition. Allocations begin above the
-/// image (see [`LinkedProgram::alloc_base`]) and the stack descends from the top.
-pub const GUEST_MEM_BYTES: u32 = 0x1000_0000; // 256 MiB
+/// the order of magnitude of a Vita game partition (the console has 512 MiB of
+/// physical LPDDR2, most of which a game may map). Allocations begin above the image
+/// (see [`LinkedProgram::alloc_base`]) and the stack descends from the top; the
+/// indirect-dispatch address table is appended immediately above this ceiling and is
+/// protected by the [`VitaState::galloc`](crate::host::VitaState::galloc) cap. A 3D
+/// title can need well over 256 MiB of heap before its first frame.
+pub const GUEST_MEM_BYTES: u32 = 0x2000_0000; // 512 MiB
 
 /// A linked, ready-to-transpile program: the combined image plus everything the
 /// transpiler and the host environment need to compile and run it.
@@ -75,6 +79,13 @@ pub struct LinkedProgram {
     /// libc's `module_start` fetches via `sceKernelGetProcessParam` to read the
     /// `SceLibcParam` heap configuration), or 0 if the module carries none.
     pub process_param: u32,
+    /// The main executable's thread-local-storage template: `(init image address,
+    /// initialized byte count, full per-thread block size)`, taken from the eboot's
+    /// `SceModuleInfo`. The host gives each thread its own copy of this block and
+    /// sets the thread pointer (`TPIDRURO`, read by `MRC p15,0,Rt,c13,c0,3`) to its
+    /// base, so `__thread` accesses at `thread_pointer + offset` land in per-thread
+    /// memory. `(0, 0, 0)` when the main module has no TLS.
+    pub tls_template: (u32, u32, u32),
     /// Guest address above the whole image where host allocations may begin.
     pub alloc_base: u32,
     /// Imports that resolved to neither a loaded export nor - as far as the linker
@@ -129,10 +140,25 @@ fn align_up(v: u32, align: u32) -> u32 {
 /// an unresolved import is *not* an error - it becomes a host import so the run
 /// proceeds and the gap is visible in the capture.
 pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::Error> {
-    // 1. Assign each module a distinct base and relocate it there.
+    // 1. Assign each module a base and relocate it there, in two passes.
+    //
+    //    A fixed `ET_SCE_EXEC` image (a launch-title eboot) has no relocations and
+    //    absolute internal pointers, so it can only load at its native base -
+    //    `IMAGE_BASE`. A relocatable `ET_SCE_RELEXEC` library can go anywhere. So
+    //    we pin every fixed module at its native base first (reserving those
+    //    ranges), then lay the relocatable modules into the free space above. This
+    //    keeps the eboot at `0x8100_0000` while its bundled `.suprx` libraries -
+    //    which the naive single cursor would have collided onto that same base -
+    //    are placed after it.
+    let span_of = |m: &Module| m.image_end().wrapping_sub(m.base);
     let mut cursor = IMAGE_BASE;
-    for m in &mut modules {
-        let span = m.image_end().wrapping_sub(m.base);
+    for m in modules.iter_mut().filter(|m| !m.relocatable) {
+        let native = m.base;
+        m.rebase(native)?; // delta 0: validated, no shift of a fixed image
+        cursor = cursor.max(align_up(native.wrapping_add(span_of(m)), MODULE_ALIGN));
+    }
+    for m in modules.iter_mut().filter(|m| m.relocatable) {
+        let span = span_of(m);
         m.rebase(cursor)?;
         cursor = align_up(cursor.wrapping_add(span), MODULE_ALIGN);
     }
@@ -218,6 +244,14 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         .last()
         .and_then(|m| find_process_param(&image, IMAGE_BASE, m))
         .unwrap_or(0);
+    // The main executable's TLS template drives per-thread thread-local storage. A
+    // shared library's own TLS is reached through the key-based `sceKernelGetTLSAddr`
+    // path instead, so only the eboot's static template is needed here.
+    let tls_template = modules
+        .last()
+        .filter(|m| m.tls_memsz != 0)
+        .map(|m| (m.tls_vaddr, m.tls_filesz, m.tls_memsz))
+        .unwrap_or((0, 0, 0));
 
     let host_import_count = imports.len();
     Ok(LinkedProgram {
@@ -234,6 +268,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         alloc_base: align_up(image_end, MODULE_ALIGN),
         host_import_count,
         process_param,
+        tls_template,
     })
 }
 
@@ -258,8 +293,15 @@ fn find_process_param(image: &[u8], image_base: u32, m: &Module) -> Option<u32> 
             if magic == PROCESS_PARAM_MAGIC {
                 let size = u32::from_le_bytes([seg[i], seg[i + 1], seg[i + 2], seg[i + 3]]);
                 let ver = u32::from_le_bytes([seg[i + 8], seg[i + 9], seg[i + 10], seg[i + 11]]);
-                // A real block is version 6 and a small header (0x30..=0x40 bytes).
-                if ver == 6 && (0x28..=0x48).contains(&size) {
+                // A real block is a small header (0x28..=0x48 bytes) and a known
+                // version. The toolchain has emitted several over the years - v6 is
+                // the common recent one, but older titles ship v5 (the SceLibcParam
+                // pointer sits one word later, which is the guest crt's concern, not
+                // ours - we only hand back the block's address). The exact "PSP2"
+                // magic, confined to this module's own segments and paired with a sane
+                // size, already identifies the block uniquely; the version is a final
+                // sanity guard, so accept the whole real range rather than pinning v6.
+                if (1..=6).contains(&ver) && (0x28..=0x48).contains(&size) {
                     return Some(image_base + (off + i) as u32);
                 }
             }

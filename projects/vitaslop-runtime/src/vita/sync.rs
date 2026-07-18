@@ -74,9 +74,7 @@ pub(super) fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
 #[hostcall]
 pub(super) fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32, _max: i32, _opt: Ptr) -> i32 {
     let id = st.create_sema(init);
-    if std::env::var("VITASLOP_TRACE_SEMA").is_ok() {
-        eprintln!("[sema] create id={id} init={init} thread={}", st.current_thread());
-    }
+    tracing::trace!(target: "vitaslop::sema", id, init, thread = st.current_thread(), "create");
     id
 }
 
@@ -102,16 +100,15 @@ pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         st.sema_wait(id, signal);
         return SvcOutcome::Continue;
     }
-    let trace = std::env::var("VITASLOP_TRACE_SEMA").is_ok();
     if st.sema_try_acquire(id, signal) {
-        if trace {
-            eprintln!("[sema] wait id={id} n={signal} thread={} -> acquired", st.current_thread());
-        }
+        tracing::trace!(target: "vitaslop::sema", id, n = signal, thread = st.current_thread(), "wait acquired");
         SvcOutcome::Continue
     } else {
-        if trace {
-            eprintln!("[sema] wait id={id} n={signal} thread={} -> BLOCK lr={:#010x}", st.current_thread(), ctx.regs[14]);
-        }
+        tracing::trace!(
+            target: "vitaslop::sema",
+            id, n = signal, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]),
+            "wait BLOCK"
+        );
         st.sema_block(id, signal);
         SvcOutcome::Block
     }
@@ -120,9 +117,7 @@ pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
 /// int sceKernelSignalSema(SceUID semaid, int signal)
 #[hostcall]
 pub(super) fn signal_sema(st: &mut VitaState, id: i32, signal: i32) -> i32 {
-    if std::env::var("VITASLOP_TRACE_SEMA").is_ok() {
-        eprintln!("[sema] signal id={id} n={signal} thread={}", st.current_thread());
-    }
+    tracing::trace!(target: "vitaslop::sema", id, n = signal, thread = st.current_thread(), "signal");
     if st.is_preemptive() {
         st.sema_signal_wake(id, signal);
     } else {
@@ -175,9 +170,15 @@ pub(super) fn create_event_flag(st: &mut VitaState, _name: Ptr, _attr: u32, init
 }
 
 /// int sceKernelSetEventFlag(SceUID evid, unsigned int bitPattern)
+/// Preemptive: also releases any parked waiters the new pattern satisfies.
 #[hostcall]
 pub(super) fn set_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
-    st.event_set(id, bits);
+    tracing::trace!(target: "vitaslop::sema", id, bits, thread = st.current_thread(), "evf set");
+    if st.is_preemptive() {
+        st.event_set_wake(id, bits);
+    } else {
+        st.event_set(id, bits);
+    }
     0
 }
 
@@ -190,23 +191,56 @@ pub(super) fn clear_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
 
 /// int sceKernelWaitEventFlag(SceUID evid, unsigned int bits, unsigned int wait,
 ///     unsigned int *outBits, SceUInt *timeout)
-/// Uncontended: the requested bits are assumed already set (the main thread set
-/// them), so it succeeds and reports the current pattern through `outBits`.
-#[hostcall]
-pub(super) fn wait_event_flag(
-    ctx: &mut GuestCtx,
-    st: &mut VitaState,
-    id: i32,
-    _bits: u32,
-    _wait: u32,
-    out: Ptr,
-    _timeout: Ptr,
-) -> i32 {
-    let pattern = st.event_pattern(id);
-    if !out.is_null() {
-        ctx.write_u32(out.addr(), pattern);
+///
+/// Single-thread model: report the current pattern and succeed (workers ran
+/// synchronously, so whatever would set the bits already ran).
+///
+/// Preemptive: a REAL wait. If the pattern already satisfies `bits` under the
+/// wait mode, apply the mode's clear op and return; otherwise PARK the caller
+/// until a `sceKernelSetEventFlag` satisfies it (the match pattern is delivered
+/// to `outBits` at wake through the scheduler's stat-write channel) or the
+/// timeout passes. A stub that returns success without blocking makes every
+/// waiter a busy-spin - tens of millions of no-op host calls that starve the
+/// threads doing real work.
+///
+/// The return value is fixed at 0 before parking (a woken thread resumes inside
+/// the call with the registers it parked with), so a timed-out wait also reads
+/// as success with the then-current pattern in `outBits`; a caller distinguishes
+/// by re-checking its condition, which is exactly what the wait-in-a-loop shape
+/// that uses timeouts does.
+pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let id = ctx.arg(0) as i32;
+    let bits = ctx.arg(1);
+    let mode = ctx.arg(2);
+    let out = ctx.arg(3);
+    let timeout_ptr = ctx.arg(4);
+    ctx.ret(0);
+    if !st.is_preemptive() {
+        let pattern = st.event_pattern(id);
+        if out != 0 {
+            ctx.write_u32(out, pattern);
+        }
+        return SvcOutcome::Continue;
     }
-    0
+    match st.evf_try_wait(id, bits, mode) {
+        Some(at_match) => {
+            tracing::trace!(target: "vitaslop::sema", id, bits, mode, thread = st.current_thread(), "evf wait satisfied");
+            if out != 0 {
+                ctx.write_u32(out, at_match);
+            }
+            SvcOutcome::Continue
+        }
+        None => {
+            let timeout_us = if timeout_ptr != 0 { ctx.read_u32(timeout_ptr) } else { 0 };
+            tracing::trace!(
+                target: "vitaslop::sema",
+                id, bits, mode, timeout_us, thread = st.current_thread(),
+                "evf wait BLOCK"
+            );
+            st.evf_block(id, bits, mode, out, timeout_us);
+            SvcOutcome::Block
+        }
+    }
 }
 
 // --- delete (shared: no teardown needed for these lightweight handles) ---

@@ -15,7 +15,7 @@ files are the human-readable spec (description + golden) alongside each test.
 Each is clean-room from the MIT vita-headers API and built `-nostdlib` with a tiny
 self-contained runtime, so the committed binary is license-clean and its import
 surface is only Sony NID stubs. Reproduce with the sibling `build.sh` (needs a
-Vita toolchain via `$VITASDK`; see working-area/agent-notes.md).
+Vita toolchain via `$VITASDK`).
 
 - **`hello-src/`** (`vita_hello`): sceClibPrintf-heavy hello world. Exercises the
   variadic host call - the C formatter and the AAPCS variadic argument walk (core
@@ -43,5 +43,4 @@ Vita toolchain via `$VITASDK`; see working-area/agent-notes.md).
 
 `hello`, `clib`, `thread`, `kernel`, `compute`, `compute2`, and `cube` are all
 RUNNABLE and green. Remaining north-star rungs (SELF/ELF loading of a signed
-title, richer module surface, Chocolate Doom) are staged in
-working-area/agent-notes.md.
+title, richer module surface, Chocolate Doom) are staged in the project notes.

@@ -58,7 +58,13 @@ impl<'a> Imports<'a> {
 pub struct Discovered {
     pub func: Func,
     pub callees: Vec<u32>,
+    /// Thumb code pointers this function materializes (odd `movw`/`movt`
+    /// constants, and odd targets of a register-indirect `blx`/`bx`).
     pub code_pointers: Vec<u32>,
+    /// ARM-mode code pointers: even constants used as the target of a
+    /// register-indirect `blx`/`bx` (a Thumb function reaching an ARM helper via
+    /// `blx reg`). Seeded as tentative ARM entries, dropped if they fail to decode.
+    pub arm_code_pointers: Vec<u32>,
 }
 
 /// Per-register tracked immediate constants along a straight run, so a `movt`
@@ -573,6 +579,10 @@ pub fn discover(
     // callbacks). Collected via `movw`/`movt` tracking; processed as tentative
     // entries by the caller.
     let mut code_pointers: BTreeSet<u32> = BTreeSet::new();
+    // Even code pointers reached via a register-indirect `blx`/`bx` (ARM-mode
+    // helpers a Thumb function calls). Kept separate so the caller seeds them as
+    // tentative ARM entries rather than Thumb.
+    let mut arm_code_pointers: BTreeSet<u32> = BTreeSet::new();
     // Statically-recovered `tbb`/`tbh` jump tables, keyed by the branch address.
     // Filled in pass 1 (where the whole decoded stream is available to read the
     // range check) and consumed in pass 2 to build the computed-jump terminator.
@@ -654,6 +664,24 @@ pub fn discover(
         };
         let next_regs = track_regs(&inst, regs, &in_bounds, discover_pointers, &mut code_pointers);
         let next = addr.wrapping_add(len);
+
+        // A register-indirect `blx`/`bx` whose target register holds a tracked
+        // `movw`/`movt` constant is a definite code pointer: its low bit selects
+        // the mode the call switches to. An odd target is Thumb; an even target is
+        // an ARM-mode helper (which the odd-only `movw`/`movt` scan would miss).
+        // Seeds discovery so the runtime dispatcher can resolve the target instead
+        // of trapping on it. `bx lr`/returns carry no tracked constant, so skip.
+        if discover_pointers && matches!(inst.opcode, Opcode::BLX | Opcode::BX) {
+            if let Some(v) = inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize]) {
+                if in_bounds(v & !1) {
+                    if v & 1 == 1 {
+                        code_pointers.insert(v & !1);
+                    } else {
+                        arm_code_pointers.insert(v);
+                    }
+                }
+            }
+        }
 
         // Table-branch (`tbb`/`tbh`) switch dispatch: resolve the inline jump table
         // now, while the whole decoded stream (the range check that bounds it) is in
@@ -783,6 +811,7 @@ pub fn discover(
         func: Func { addr: entry, thumb, blocks, stub: false },
         callees: callees.into_iter().collect(),
         code_pointers: code_pointers.into_iter().collect(),
+        arm_code_pointers: arm_code_pointers.into_iter().collect(),
     })
 }
 
@@ -807,6 +836,27 @@ fn regnum(op: &Operand) -> Option<u8> {
         Operand::RegWBack(r, _) => Some(r.number()),
         _ => None,
     }
+}
+
+/// The coprocessor number of a `CReg` operand (`c0`..`c15`), or None.
+fn cregnum(op: &Operand) -> Option<u8> {
+    match op {
+        Operand::CReg(c) => Some(c.number()),
+        _ => None,
+    }
+}
+
+/// Whether a coprocessor register-move (`MRC`/`MCR`) names the ARM thread-ID
+/// register: `p15, 0, Rt, c13, c0, {2,3}`. `c13,c0,opc2=2` is TPIDRURW and
+/// `opc2=3` TPIDRURO - both the user-mode thread pointer the C runtime uses for
+/// thread-local storage. `crn`/`crm` are the `CReg` operands; `coproc`/`opc1`/
+/// `opc2` come from the decoded opcode.
+fn is_thread_pointer_reg(coproc: u8, opc1: u8, crn: &Operand, crm: &Operand, opc2: u8) -> bool {
+    coproc == 15
+        && opc1 == 0
+        && cregnum(crn) == Some(13)
+        && cregnum(crm) == Some(0)
+        && (opc2 == 2 || opc2 == 3)
 }
 
 fn imm(op: &Operand) -> Option<u32> {
@@ -1144,6 +1194,29 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // observable state in our memory model (one guest CPU worker, sequential
         // consistency at host-call sync points), so they lower to nothing.
         DMB | DSB | ISB | PLD | PLI => {}
+
+        // Coprocessor register move: the only coprocessor a user-mode Vita title
+        // touches is the thread-ID register, `MRC/MCR p15, 0, Rt, c13, c0, {2,3}`
+        // (TPIDRURW / TPIDRURO). `MRC` reads the per-thread pointer into `Rt`; `MCR`
+        // writes it. The compiler emits the read to reach ELF thread-local storage
+        // (`__thread` variables at `tp + offset`). Any other coprocessor access is a
+        // privileged / system operation a user title never issues; leave it a gap.
+        MRC(coproc, opc1, opc2, _) => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            if is_thread_pointer_reg(coproc, opc1, &ops[1], &ops[2], opc2) {
+                out.push(Stmt::SetReg(rt, Value::ThreadPtr));
+            } else {
+                return Err(Error::Unsupported { addr, opcode: inst.opcode });
+            }
+        }
+        MCR(coproc, opc1, opc2, _) => {
+            let rt = regnum(&ops[0]).ok_or_else(err)?;
+            if is_thread_pointer_reg(coproc, opc1, &ops[1], &ops[2], opc2) {
+                out.push(Stmt::SetThreadPtr(Value::Reg(rt)));
+            } else {
+                return Err(Error::Unsupported { addr, opcode: inst.opcode });
+            }
+        }
 
         ADR => {
             // adr rd, label => rd = pc-relative constant. pc is addr+8 in ARM,
@@ -1808,13 +1881,55 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 n, first, count, stride, element, esize, base, wback, post, load, addr,
             )?);
         }
-        // vdup.N Qd/Dd, Rt: broadcast a core register across every element. (The
-        // lane-source form `vdup Dd, Dm[x]` is a different operand shape, not yet
-        // needed.)
+        // vdup.N broadcast: from a core register (`vdup Qd/Dd, Rt`) or from one lane
+        // of a D source (the scalar form `vdup Qd/Dd, Dm[x]`), told apart by ops[1].
         VDUP(dt) => {
             let dst = neon_reg(&ops[0]).ok_or_else(err)?;
-            let rt = regnum(&ops[1]).ok_or_else(err)?;
-            out.push(Stmt::Neon(NeonStmt::DupCore { ty: neon_type(dt), dst, rt }));
+            match &ops[1] {
+                Operand::SIMDRegLane(src, lane) if src.size == SIMDSizeCode::D => {
+                    out.push(Stmt::Neon(NeonStmt::DupLane {
+                        esize: neon_type(dt).bits,
+                        dst,
+                        src: src.num,
+                        lane: *lane,
+                    }));
+                }
+                _ => {
+                    let rt = regnum(&ops[1]).ok_or_else(err)?;
+                    out.push(Stmt::Neon(NeonStmt::DupCore { ty: neon_type(dt), dst, rt }));
+                }
+            }
+        }
+        // vmov between a core register and one lane of a D register, in either
+        // direction, told apart by which operand is the `Dn[x]` lane. Lane->core
+        // (`vmov Rt, Dn[x]`) has ops = [Reg, SIMDRegLane] and sign/zero-extends the
+        // 8/16-bit sub-word per `dt`; core->lane (`vmov Dn[x], Rt`) has ops =
+        // [SIMDRegLane, Reg] and `dt` is always `Any(size)`.
+        VMOVLane(dt) => {
+            let nt = neon_type(dt);
+            match (&ops[0], &ops[1]) {
+                (Operand::Reg(rt), Operand::SIMDRegLane(src, lane)) if src.size == SIMDSizeCode::D => {
+                    out.push(Stmt::Neon(NeonStmt::MovLane {
+                        to_core: true,
+                        bits: nt.bits,
+                        signed: nt.signed,
+                        dreg: src.num,
+                        lane: *lane,
+                        rt: rt.number(),
+                    }));
+                }
+                (Operand::SIMDRegLane(dst, lane), Operand::Reg(rt)) if dst.size == SIMDSizeCode::D => {
+                    out.push(Stmt::Neon(NeonStmt::MovLane {
+                        to_core: false,
+                        bits: nt.bits,
+                        signed: false,
+                        dreg: dst.num,
+                        lane: *lane,
+                        rt: rt.number(),
+                    }));
+                }
+                _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
+            }
         }
         Neon { op, dt } => {
             out.push(Stmt::Neon(lower_neon(op, dt, ops).ok_or_else(err)?));
@@ -1948,7 +2063,7 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
 fn value_uses_reg(v: &Value, r: u8) -> bool {
     match v {
         Value::Reg(x) => *x == r,
-        Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult => false,
+        Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult | Value::ThreadPtr => false,
         Value::Not(a) | Value::Clz(a) => value_uses_reg(a, r),
         Value::Bin(_, a, b) => value_uses_reg(a, r) || value_uses_reg(b, r),
         Value::Load { addr, .. } => value_uses_reg(addr, r),
@@ -2232,12 +2347,23 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
     let st = match op {
         VADD => NeonStmt::Bin { op: NeonBin::Add, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VSUB => NeonStmt::Bin { op: NeonBin::Sub, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VMUL => NeonStmt::Bin { op: NeonBin::Mul, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        // The multiply family has a "by scalar" form where the second factor is one broadcast lane
+        // `Dm[x]` (ops[2] is a `SIMDRegLane`); tell it apart from the 3-same register form here.
+        VMUL => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::MulScalar { ty, dst: r(0)?, a: r(1)?, src, lane, acc: false, sub: false },
+            None => NeonStmt::Bin { op: NeonBin::Mul, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        },
         VMAX => NeonStmt::Bin { op: NeonBin::Max, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VMIN => NeonStmt::Bin { op: NeonBin::Min, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VABD => NeonStmt::Bin { op: NeonBin::Abd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VMLA => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: false },
-        VMLS => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: true },
+        VMLA => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::MulScalar { ty, dst: r(0)?, a: r(1)?, src, lane, acc: true, sub: false },
+            None => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: false },
+        },
+        VMLS => match scalar_lane(&ops[2]) {
+            Some((src, lane)) => NeonStmt::MulScalar { ty, dst: r(0)?, a: r(1)?, src, lane, acc: true, sub: true },
+            None => NeonStmt::MulAcc { ty, dst: r(0)?, a: r(1)?, b: r(2)?, sub: true },
+        },
         VPADD => NeonStmt::PairAdd { ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VMOVL => NeonStmt::Widen { ty, dst: r(0)?, a: r(1)? },
         VADDL => NeonStmt::WideAddSub { sub: false, wide: false, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
@@ -2254,11 +2380,21 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VABS => NeonStmt::Unary { neg: false, ty, dst: r(0)?, a: r(1)? },
         VNEG => NeonStmt::Unary { neg: true, ty, dst: r(0)?, a: r(1)? },
         VMOVI => {
-            let imm = match ops[1] {
-                Operand::Imm(v) => v,
-                _ => return None,
-            };
-            NeonStmt::MovImm { ty, dst: r(0)?, imm }
+            // `vmov.i64` carries its 64-bit-per-lane value as low/high immediates; the
+            // narrower `vmov.iN` forms carry a single per-element value in ops[1].
+            if ty.bits == 64 {
+                let (lo, hi) = match (&ops[1], &ops[2]) {
+                    (Operand::Imm(lo), Operand::Imm(hi)) => (*lo, *hi),
+                    _ => return None,
+                };
+                NeonStmt::MovImm64 { dst: r(0)?, val: (lo as u64) | ((hi as u64) << 32) }
+            } else {
+                let imm = match ops[1] {
+                    Operand::Imm(v) => v,
+                    _ => return None,
+                };
+                NeonStmt::MovImm { ty, dst: r(0)?, imm }
+            }
         }
         VAND => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::And, dst: r(0)?, a: r(1)?, b: r(2)? },
         VORR => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Or, dst: r(0)?, a: r(1)?, b: r(2)? },
@@ -2268,8 +2404,56 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VBSL => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bsl, dst: r(0)?, a: r(1)?, b: r(2)? },
         VBIT => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bit, dst: r(0)?, a: r(1)?, b: r(2)? },
         VBIF => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bif, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VSHR | VSRA | VSHL | VSLI | VSRI => {
+            use crate::ir::NeonShift;
+            let sop = match op {
+                VSHR => NeonShift::Shr,
+                VSRA => NeonShift::Sra,
+                VSHL => NeonShift::Shl,
+                VSLI => NeonShift::Sli,
+                _ => NeonShift::Sri,
+            };
+            let amount = match ops[2] {
+                Operand::Imm(v) => v as u8,
+                _ => return None,
+            };
+            NeonStmt::ShiftImm { op: sop, ty, dst: r(0)?, src: r(1)?, amount }
+        }
+        VEXT => {
+            // The immediate is in element units of `ty.bits`; recover the byte offset.
+            let elem = match ops[3] {
+                Operand::Imm(v) => v,
+                _ => return None,
+            };
+            let byte_off = (elem * (ty.bits as u32) / 8) as u8;
+            NeonStmt::Ext { dst: r(0)?, a: r(1)?, b: r(2)?, byte_off }
+        }
+        VCVTFtoI => NeonStmt::CvtFloatInt { to_int: true, signed: ty.signed, dst: r(0)?, src: r(1)? },
+        VCVTItoF => NeonStmt::CvtFloatInt { to_int: false, signed: ty.signed, dst: r(0)?, src: r(1)? },
+        VCEQ => NeonStmt::Cmp { op: crate::ir::NeonCmp::Eq, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VCGT => NeonStmt::Cmp { op: crate::ir::NeonCmp::Gt, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VCGE => NeonStmt::Cmp { op: crate::ir::NeonCmp::Ge, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VRECPE => NeonStmt::RecipEstimate { sqrt: false, dst: r(0)?, src: r(1)? },
+        VRSQRTE => NeonStmt::RecipEstimate { sqrt: true, dst: r(0)?, src: r(1)? },
+        VRECPS => NeonStmt::RecipStep { sqrt: false, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VRSQRTS => NeonStmt::RecipStep { sqrt: true, dst: r(0)?, a: r(1)?, b: r(2)? },
+        // The permutes read and write both register operands (ops[0], ops[1]).
+        VTRN => NeonStmt::Permute { op: crate::ir::PermuteOp::Trn, esize: ty.bits, a: r(0)?, b: r(1)? },
+        VZIP => NeonStmt::Permute { op: crate::ir::PermuteOp::Zip, esize: ty.bits, a: r(0)?, b: r(1)? },
+        VUZP => NeonStmt::Permute { op: crate::ir::PermuteOp::Uzp, esize: ty.bits, a: r(0)?, b: r(1)? },
+        // VSWP is decoded but not lifted yet (it would land here as a permute swap).
+        VSWP => return None,
     };
     neon_emittable(&st).then_some(st)
+}
+
+/// If `op` is a scalar lane operand `Dm[x]` (the "by scalar" second factor), return the source D
+/// register number and lane index; otherwise `None` (a plain register or immediate).
+fn scalar_lane(op: &Operand) -> Option<(u8, u8)> {
+    match op {
+        Operand::SIMDRegLane(src, lane) if src.size == SIMDSizeCode::D => Some((src.num, *lane)),
+        _ => None,
+    }
 }
 
 /// Whether the emitter has a wasm-SIMD sequence for this NEON statement. A few width
@@ -2277,19 +2461,44 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
 /// min/max, no 32->64 pairwise widen); those are reported as `Unsupported` at lift
 /// rather than reached at emit. gcc's auto-vectorizer does not emit them.
 fn neon_emittable(s: &NeonStmt) -> bool {
+    // wasm SIMD has lanewise float arithmetic only for f32x4 and f64x2; NEON's F16
+    // vector float has no wasm primitive. Integer widths are checked per op below.
+    if let NeonStmt::Bin { ty, .. } | NeonStmt::MulAcc { ty, .. } | NeonStmt::Unary { ty, .. } = s {
+        if ty.float && ty.bits != 32 && ty.bits != 64 {
+            return false;
+        }
+    }
     match s {
         NeonStmt::Bin { op, ty, .. } => match op {
-            // wasm has no `i8x16.mul`.
-            NeonBin::Mul => ty.bits != 8,
-            // wasm has no 64-bit lanewise min/max (`abd` uses them).
-            NeonBin::Max | NeonBin::Min | NeonBin::Abd => ty.bits != 64,
+            // wasm has no `i8x16.mul` (but f32x4.mul is fine).
+            NeonBin::Mul => ty.float || ty.bits != 8,
+            // float min/max map straight to f32x4.min/max; wasm has no 64-bit
+            // lanewise integer min/max.
+            NeonBin::Max | NeonBin::Min => ty.float || ty.bits != 64,
+            // `abd` (|a-b|) is emitted from integer min/max/sub only.
+            NeonBin::Abd => !ty.float && ty.bits != 64,
             NeonBin::Add | NeonBin::Sub => true,
         },
-        NeonStmt::MulAcc { ty, .. } => ty.bits != 8,
+        // `vpadd` gathers even/odd lanes with shuffles then adds; the float form (f32x4.add)
+        // is emittable at 32-bit, the F16 form has no wasm primitive.
+        NeonStmt::PairAdd { ty, .. } => !ty.float || ty.bits == 32,
+        NeonStmt::MulAcc { ty, .. } => ty.float || ty.bits != 8,
+        // by-scalar multiply is decoded only for 16/32-bit elements (f32 or integer), all of which
+        // have a wasm lane-multiply; the 8-bit form does not exist in this encoding class.
+        NeonStmt::MulScalar { ty, .. } => ty.float || ty.bits != 8,
         // `extadd_pairwise` widens only 8->16 and 16->32.
         NeonStmt::PairLong { ty, .. } => ty.bits == 8 || ty.bits == 16,
         // the widened `|a-b|` needs 16/32-bit min/max, so the source is 8/16-bit.
         NeonStmt::WideAbd { ty, .. } => ty.bits == 8 || ty.bits == 16,
+        // Float compares are f32x4 only; wasm has no unsigned 64-bit lane compare, so
+        // a 64-bit unsigned ordered compare has no direct primitive.
+        NeonStmt::Cmp { op, ty, .. } => {
+            if ty.float {
+                ty.bits == 32
+            } else {
+                !(ty.bits == 64 && !ty.signed && !matches!(op, crate::ir::NeonCmp::Eq))
+            }
+        }
         _ => true,
     }
 }

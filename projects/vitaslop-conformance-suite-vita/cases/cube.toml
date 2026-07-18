@@ -6,7 +6,7 @@ description = "minimal GXM spinning cube, blob-free - the graphics north star"
 # built -nostdlib, and carries 38 NID imports across SceGxm/SceDisplayUser/
 # SceCtrl/SceSysmem.
 #
-# Bring-up is work-backwards over this artifact (see working-area/agent-notes):
+# Bring-up is work-backwards over this artifact:
 #   M1 artifact (done): cube.velf builds and inspects.
 #   M2 loader: parse the velf + resolve NID imports (vitaslop-loader).
 #   M3 execute-to-first-GXM-call: grow the transpiler (CFG, branches, VFP) until

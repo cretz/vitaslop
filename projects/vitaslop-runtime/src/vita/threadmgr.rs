@@ -2,7 +2,9 @@
 //! user-facing create/start/wait wrappers live in `libkernel`; what remains here
 //! are the direct primitives a program can also call.
 
+use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
+use crate::SvcOutcome;
 
 /// SceUID sceKernelGetProcessId(void)
 /// A single process, so a fixed nonzero id is faithful and stable.
@@ -11,11 +13,36 @@ pub(super) fn get_process_id(_st: &mut VitaState) -> i32 {
     0x1000
 }
 
-/// int sceKernelDelayThread(SceUInt delay)
-/// Time is virtual and host-driven, so a delay does not actually sleep; it just
-/// succeeds. (The monotonic clock advances at the host's chosen cadence, not from
-/// guest sleeps, which keeps runs deterministic.)
+/// int sceKernelGetThreadCurrentPriority(void)
+/// The scheduler priority of the calling thread (lower value = higher priority).
+/// A title reads this to spawn a worker at a relative priority or to briefly raise
+/// its own; returning the real running priority keeps that arithmetic correct.
 #[hostcall]
-pub(super) fn delay_thread(_st: &mut VitaState, _delay_us: u32) -> i32 {
-    0
+pub(super) fn get_thread_current_priority(st: &mut VitaState) -> i32 {
+    st.current_priority()
+}
+
+/// int sceKernelDelayThread(SceUInt delay)
+///
+/// Preemptive: a REAL timed sleep - park the caller until the virtual clock
+/// reaches `now + delay` ([`VitaState::sleep_park`]); the scheduler wakes it on a
+/// display flip's clock advance, or jumps the clock straight to the deadline when
+/// nothing else is runnable. A no-op "just succeed" here turns every
+/// delay-then-poll loop into a full-speed busy spin (millions of host calls
+/// starving the threads doing real work).
+///
+/// Single-thread model: still a no-op success (workers run synchronously, so
+/// there is nothing to yield to and the clock is host-driven).
+pub(super) fn delay_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let delay_us = ctx.arg(0);
+    ctx.ret(0);
+    if !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    // A zero/one-us delay is "give someone else the CPU", not a real sleep.
+    if delay_us <= 1 {
+        return SvcOutcome::Yield;
+    }
+    st.sleep_park(delay_us as u64);
+    SvcOutcome::Block
 }

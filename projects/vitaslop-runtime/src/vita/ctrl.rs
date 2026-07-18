@@ -26,16 +26,19 @@ fn fill_ctrl(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, negat
     let ts = st.world.monotonic_us();
     let buttons = if negative { !frame.buttons } else { frame.buttons };
 
-    // Diagnostic (env `VITASLOP_TRACE_INPUT`): log the pad state the guest reads and
-    // its caller, to see whether input reaches the code that should act on it and
-    // what buttons/analog value it sees. Only non-neutral samples, to stay readable.
-    if (frame.buttons != 0 || frame.lx != 128 || frame.ly != 128)
-        && std::env::var("VITASLOP_TRACE_INPUT").is_ok()
-    {
-        eprintln!(
-            "ctrl port={port} buttons={:#06x} lx={} ly={} rx={} ry={} neg={} lr={:#010x} r5={:#010x} r4={:#010x}",
-            frame.buttons, frame.lx, frame.ly, frame.rx, frame.ry, negative, ctx.regs[14],
-            ctx.regs[5], ctx.regs[4]
+    // Diagnostic (`RUST_LOG=vitaslop::input=trace`): log the pad state the guest
+    // reads and its caller, to see whether input reaches the code that should act on
+    // it and what buttons/analog value it sees. Only non-neutral samples, to stay
+    // readable.
+    if frame.buttons != 0 || frame.lx != 128 || frame.ly != 128 {
+        tracing::trace!(
+            target: "vitaslop::input",
+            port,
+            buttons = format_args!("{:#06x}", frame.buttons),
+            lx = frame.lx, ly = frame.ly, rx = frame.rx, ry = frame.ry,
+            negative,
+            lr = format_args!("{:#010x}", ctx.regs[14]),
+            "ctrl"
         );
     }
 

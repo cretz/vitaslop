@@ -16,6 +16,12 @@ vitaslop-platform = { path = "../vitaslop-platform" }
 # adds nothing to the guest wasm.
 vitaslop-hostcall = { path = "../vitaslop-hostcall" }
 
+# Structured, env-filterable diagnostics (`RUST_LOG=vitaslop::io=trace`, etc.).
+# Zero cost when no subscriber is installed, so the hot NID-dispatch paths can
+# carry trace points without a release-run penalty (wasm32-safe: events are
+# simply dropped in the browser unless a subscriber is set up there).
+tracing = { workspace = true }
+
 # ROM ingestion (the `ingest` module): decrypting a retail app container down to
 # the plaintext velf the loader parses. Pure-Rust RustCrypto primitives, all
 # wasm-safe so the browser decrypts in OPFS exactly as native does on disk.

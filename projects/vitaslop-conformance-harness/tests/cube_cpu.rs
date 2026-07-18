@@ -11,7 +11,7 @@ use vitaslop_native::{DEFAULT_MEM_BYTES, HostAbi, Vm};
 const CUBE: &[u8] =
     include_bytes!("../../vitaslop-conformance-suite-vita/cube-src/cube.velf");
 
-// Addresses from the cube disassembly (see working-area/scripts/cube-disasm.txt).
+// Addresses from the cube disassembly.
 const MEMCPY: u32 = 0x8100_092c;
 const MEMSET: u32 = 0x8100_0948;
 

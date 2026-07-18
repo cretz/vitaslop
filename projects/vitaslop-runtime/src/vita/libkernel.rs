@@ -27,14 +27,17 @@ const MAX_STR: usize = 4096;
 /// control, plus synchronously-run workers).
 const MAIN_THREAD_ID: i32 = 0x40;
 
-/// Diagnostic (env-gated by `VITASLOP_TRACE_EXIT`): when the guest calls
+/// Diagnostic (`RUST_LOG=vitaslop::exit=debug`): when the guest calls
 /// `sceKernelExitProcess`, dump the exit code, the immediate caller (LR), and a
 /// window of the stack top. Return addresses saved on the stack (even words that
 /// point into the code image) reveal the call chain that decided to quit, so the
-/// deciding function can be disassembled. Zero cost when the env var is unset.
+/// deciding function can be disassembled. Zero cost when the log target is off.
 pub(super) fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
-    if std::env::var("VITASLOP_TRACE_EXIT").is_err() {
+    if !tracing::enabled!(target: "vitaslop::exit", tracing::Level::DEBUG) {
         return;
+    }
+    macro_rules! exit_log {
+        ($($arg:tt)*) => { tracing::debug!(target: "vitaslop::exit", $($arg)*) };
     }
     // The last serviced calls, tagged by thread, so the exiting (main) thread's final
     // decisions are legible apart from any worker's interleaved calls.
@@ -51,16 +54,16 @@ pub(super) fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
         let _ = std::fs::write(&path, out);
     }
     let start = trace.len().saturating_sub(30);
-    eprintln!("[exit] last {} calls (idx thid name):", trace.len() - start);
+    exit_log!("last {} calls (idx thid name):", trace.len() - start);
     for i in start..trace.len() {
         let thid = thids.get(i).copied().unwrap_or(0);
-        eprintln!("[exit]   {i} t{thid:#x} {}", crate::nid::name(trace[i]));
+        exit_log!("  {i} t{thid:#x} {}", crate::nid::name(trace[i]));
     }
     let r0 = ctx.regs[0];
     let lr = ctx.regs[14];
     let sp = ctx.regs[13];
-    eprintln!("[exit] code={r0:#x} (r0={} signed) lr={lr:#010x} sp={sp:#010x}", r0 as i32);
-    eprintln!("[exit] r0..r12: {:08x?}", &ctx.regs[0..13]);
+    exit_log!("code={r0:#x} (r0={} signed) lr={lr:#010x} sp={sp:#010x}", r0 as i32);
+    exit_log!("r0..r12: {:08x?}", &ctx.regs[0..13]);
     // Print stack words; flag any that fall inside the loaded code image (a plausible
     // return address, Thumb or ARM) so the manual backtrace is quick. The image spans
     // [base, base + ~5 MiB); use a generous 8 MiB window to stay title-agnostic.
@@ -70,7 +73,7 @@ pub(super) fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
         let a = sp.wrapping_add(i * 4);
         let v = ctx.read_u32(a);
         let tag = if v >= base && v < code_end { "  <- code?" } else { "" };
-        eprintln!("[exit]   sp+{:<3} {a:#010x}: {v:#010x}{tag}", i * 4);
+        exit_log!("  sp+{:<3} {a:#010x}: {v:#010x}{tag}", i * 4);
     }
 }
 
