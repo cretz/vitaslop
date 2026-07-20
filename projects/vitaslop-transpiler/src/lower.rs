@@ -108,12 +108,37 @@ enum Flow {
     Call { guest: Option<u32> },
     /// Unconditional branch: successor is `target` only.
     Jump(u32),
+    /// An unconditional branch that leaves this function to another translated
+    /// function - a tail call (`return other(...)`). `target` is discovered as its
+    /// own callee, run as a call, then this function returns to its caller (lr is
+    /// unchanged, so the callee's return unwinds past us). It is NOT pulled into
+    /// this body. Distinguished from [`Jump`] (a local branch) by [`is_tail_call`].
+    TailCall(u32),
     /// Conditional/zero branch: successors are `target` and `addr + len`.
     Fork(u32),
     /// Returns to caller; no successors.
     Return,
     /// Stops without returning; no successors.
     Halt,
+}
+
+/// Forward reach of a local (in-function) unconditional branch. A branch beyond
+/// this from the function entry cannot be a local label - no real function is this
+/// large (the largest in a shipping title is a few thousand instructions, well
+/// under 32 KiB) - so it is a tail call into another function. Kept comfortably
+/// below the cross-function hops that motivate this (library tail calls in a
+/// statically-linked image land tens of KiB away) yet above any real function.
+const TAIL_CALL_FORWARD: u32 = 0x8000;
+
+/// True if an unconditional `b`/`b.w` to `target` from a function entered at
+/// `entry` is a tail call into a different function rather than a local branch. A
+/// local label always lies at or after the entry and within the function body; a
+/// target before the entry, or far past it, belongs to another function. This is
+/// what lets a `b.w` to a library routine (common in a statically-linked image,
+/// where calls are not import stubs) be run as a call instead of dragging the
+/// callee - and its own tail-call chain - into this function's body.
+fn is_tail_call(target: u32, entry: u32) -> bool {
+    target < entry || target.wrapping_sub(entry) >= TAIL_CALL_FORWARD
 }
 
 /// The pc-relative target of a branch instruction, if it has one. yaxpeax measures
@@ -155,6 +180,7 @@ fn flow(
     addr: u32,
     len: u32,
     thumb: bool,
+    entry: u32,
     imports: &Imports,
     r7: Option<u32>,
     noreturn_svc: &[u32],
@@ -170,6 +196,14 @@ fn flow(
             // import then returns.
             Some(t) if inst.condition == ConditionCode::AL && imports.get(t).is_some() => {
                 Flow::Return
+            }
+            // An unconditional branch out of this function to another translated
+            // function is a tail call: run it as a call and return, rather than
+            // inlining the callee (and its own tail-call chain) into this body -
+            // which is what makes statically-linked `b.w library_fn` explode the
+            // function span. A near forward branch is a local label - inline it.
+            Some(t) if inst.condition == ConditionCode::AL && is_tail_call(t, entry) => {
+                Flow::TailCall(t)
             }
             Some(t) if inst.condition == ConditionCode::AL => Flow::Jump(t),
             Some(t) => Flow::Fork(t),
@@ -704,13 +738,19 @@ pub fn discover(
             continue;
         }
 
-        match flow(&inst, addr, len, thumb, imports, regs[7], noreturn_svc) {
+        match flow(&inst, addr, len, thumb, entry, imports, regs[7], noreturn_svc) {
             Flow::Seq => work.push((next, next_it, next_regs)),
             Flow::Call { guest } => {
                 if let Some(t) = guest {
                     callees.insert(t);
                 }
                 work.push((next, next_it, next_regs));
+            }
+            // A tail call records the callee (a separate function to discover) and
+            // terminates this path: no fall-through, and the target is not a leader
+            // in this function's body.
+            Flow::TailCall(t) => {
+                callees.insert(t);
             }
             Flow::Jump(t) => {
                 leaders.insert(t);
@@ -768,7 +808,7 @@ pub fn discover(
                 }
             }
             let (mut effects, term) =
-                match lower_insn(inst, cursor, *len, *applied, *in_it, thumb, imports) {
+                match lower_insn(inst, cursor, *len, *applied, *in_it, thumb, entry, imports) {
                     Ok(v) => v,
                     // An unlifted instruction (e.g. `udf`, or a NEON op not yet
                     // covered). Strict callers report it; the lenient build runs the
@@ -1075,6 +1115,7 @@ fn lower_insn(
     cond: ConditionCode,
     in_it: bool,
     thumb: bool,
+    entry: u32,
     imports: &Imports,
 ) -> Result<(Vec<Stmt>, Option<Term>), Error> {
     use Opcode::*;
@@ -1094,6 +1135,13 @@ fn lower_insn(
                 // to our caller (lr already holds the caller's return address).
                 if let Some(index) = imports.get(target) {
                     return Ok((vec![Stmt::Import(index)], Some(Term::Return)));
+                }
+                // Tail call to another translated function: call it and return.
+                // lr is left untouched, so the callee returns straight to our
+                // caller. Must match the pass-1 classification in `flow` exactly,
+                // or the block's terminator disagrees with its successor set.
+                if is_tail_call(target, entry) {
+                    return Ok((vec![Stmt::Call { target }], Some(Term::Return)));
                 }
                 return Ok((vec![], Some(Term::Jump(target))));
             }
@@ -1236,7 +1284,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let src = operand_value(&ops[1]).ok_or_else(err)?;
             // Flags before the write: the value expression reads original regs.
             if sets_flags {
-                out.push(Stmt::FlagsLogic { value: src.clone(), carry: None });
+                let carry = match src {
+                    Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+                    _ => None,
+                };
+                out.push(Stmt::FlagsLogic { value: src.clone(), carry });
             }
             out.push(Stmt::SetReg(rd, src));
         }
@@ -1254,11 +1306,33 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         MVN => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let src = operand_value(&ops[1]).ok_or_else(err)?;
+            // MVN's carry-out comes from the raw immediate expansion, not the ~value.
+            let carry = match src {
+                Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+                _ => None,
+            };
             let value = Value::Not(Box::new(src));
             if sets_flags {
-                out.push(Stmt::FlagsLogic { value: value.clone(), carry: None });
+                out.push(Stmt::FlagsLogic { value: value.clone(), carry });
             }
             out.push(Stmt::SetReg(rd, value));
+        }
+
+        UADD8 => {
+            // Byte-wise unsigned add setting the per-byte GE flags (consumed by
+            // `sel`). Operands: rd, rn, rm.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = regnum(&ops[1]).ok_or_else(err)?;
+            let rm = regnum(&ops[2]).ok_or_else(err)?;
+            out.push(Stmt::Uadd8 { rd, rn, rm });
+        }
+        SEL => {
+            // Byte-wise select by the GE flags a prior parallel add/sub set.
+            // Operands: rd, rn, rm.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = regnum(&ops[1]).ok_or_else(err)?;
+            let rm = regnum(&ops[2]).ok_or_else(err)?;
+            out.push(Stmt::Sel { rd, rn, rm });
         }
 
         ADD => {
@@ -1336,6 +1410,13 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
         AND | BIC | ORR | ORN | EOR | TST => {
             let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            // A flag-setting logical op with a rotate-form immediate updates C from the
+            // immediate expansion (ThumbExpandImm_C). Read it from the *raw* immediate,
+            // before BIC/ORN complement the operand below.
+            let imm_carry = match op2 {
+                Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+                _ => None,
+            };
             // BIC/ORN take the bitwise complement of the second operand.
             let op2 = if matches!(inst.opcode, BIC | ORN) {
                 Value::Not(Box::new(op2))
@@ -1349,10 +1430,10 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             let result = bin(binop, rn, op2);
             if inst.opcode == TST {
-                out.push(Stmt::FlagsLogic { value: result, carry: None });
+                out.push(Stmt::FlagsLogic { value: result, carry: imm_carry });
             } else {
                 if sets_flags {
-                    out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
+                    out.push(Stmt::FlagsLogic { value: result.clone(), carry: imm_carry });
                 }
                 out.push(Stmt::SetReg(rd, result));
             }
@@ -1935,6 +2016,29 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::Neon(lower_neon(op, dt, ops).ok_or_else(err)?));
         }
 
+        // `uadd16 Rd, Rn, Rm`: independent unsigned add of the two 16-bit halfwords
+        // (each wraps modulo 2^16). Rd[15:0] = Rn[15:0]+Rm[15:0], Rd[31:16] =
+        // Rn[31:16]+Rm[31:16]. The APSR.GE bits it also sets are not modeled (nothing
+        // in the engine reads them - there is no `sel`), matching how GE is elided
+        // everywhere else.
+        UADD16 => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = Value::Reg(regnum(&ops[1]).ok_or_else(err)?);
+            let rm = Value::Reg(regnum(&ops[2]).ok_or_else(err)?);
+            let bin = |op, a, b| Value::Bin(op, Box::new(a), Box::new(b));
+            let mask = |v| bin(BinOp::And, v, Value::Imm(0xffff));
+            // low halfword sum, truncated to 16 bits.
+            let lo = mask(bin(BinOp::Add, mask(rn.clone()), mask(rm.clone())));
+            // high halfword sum: shift each source down, add, truncate, shift back up.
+            let hi_sum = mask(bin(
+                BinOp::Add,
+                bin(BinOp::Lsr, rn, Value::Imm(16)),
+                bin(BinOp::Lsr, rm, Value::Imm(16)),
+            ));
+            let hi = bin(BinOp::Shl, hi_sum, Value::Imm(16));
+            out.push(Stmt::SetReg(rd, bin(BinOp::Or, lo, hi)));
+        }
+
         _ => return Err(Error::Unsupported { addr, opcode: inst.opcode }),
     }
     Ok(out)
@@ -1956,6 +2060,29 @@ fn store_size(op: Opcode) -> MemSize {
         Opcode::STRH => MemSize::Half,
         _ => MemSize::Word,
     }
+}
+
+/// Carry-out of the modified-immediate expansion (`ThumbExpandImm_C` in Thumb,
+/// `ARMExpandImm_C` in ARM) for a flag-setting logical op with an immediate operand.
+/// ARM leaves C unchanged when the value fits a zero-extended byte (rotation 0) and
+/// otherwise sets C = result<31>; Thumb additionally leaves C unchanged for the three
+/// byte-replication forms (0x00XY00XY, 0xXY00XY00, 0xXYXYXYXY). Because the rotate form
+/// yields the value verbatim, its carry-out is just bit 31 of the expanded immediate.
+/// Returns `None` when the encoding leaves C unchanged, `Some(bit31)` otherwise.
+fn modified_imm_carry(value: u32, thumb: bool) -> Option<Value> {
+    if value <= 0xff {
+        return None; // zero-extended byte (Thumb 00-form / ARM rotation 0): C unchanged
+    }
+    if thumb {
+        let b = value & 0xff;
+        if value == (b << 16) | b            // 0x00XY00XY
+            || value == (b << 24) | (b << 8) // 0xXY00XY00
+            || value == (b << 24) | (b << 16) | (b << 8) | b // 0xXYXYXYXY
+        {
+            return None;
+        }
+    }
+    Some(Value::Imm(value >> 31))
 }
 
 /// The shifter carry-out for a flag-setting immediate shift.
@@ -2404,6 +2531,13 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VBSL => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bsl, dst: r(0)?, a: r(1)?, b: r(2)? },
         VBIT => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bit, dst: r(0)?, a: r(1)?, b: r(2)? },
         VBIF => NeonStmt::Bitwise { op: crate::ir::NeonBitwise::Bif, dst: r(0)?, a: r(1)?, b: r(2)? },
+        // VSHL is both an immediate shift (`vshl.iN Qd, Qm, #n`, the two-registers-and-shift form)
+        // and a per-lane variable shift (`vshl Qd, Qm, Qn`, the three-registers form). The register
+        // form has a register third operand rather than an immediate.
+        VSHL if !matches!(ops[2], Operand::Imm(_)) => {
+            NeonStmt::ShiftReg { sat: false, ty, dst: r(0)?, src: r(1)?, amt: r(2)? }
+        }
+        VQSHL => NeonStmt::ShiftReg { sat: true, ty, dst: r(0)?, src: r(1)?, amt: r(2)? },
         VSHR | VSRA | VSHL | VSLI | VSRI => {
             use crate::ir::NeonShift;
             let sop = match op {
@@ -2430,9 +2564,30 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         }
         VCVTFtoI => NeonStmt::CvtFloatInt { to_int: true, signed: ty.signed, dst: r(0)?, src: r(1)? },
         VCVTItoF => NeonStmt::CvtFloatInt { to_int: false, signed: ty.signed, dst: r(0)?, src: r(1)? },
-        VCEQ => NeonStmt::Cmp { op: crate::ir::NeonCmp::Eq, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VCGT => NeonStmt::Cmp { op: crate::ir::NeonCmp::Gt, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VCGE => NeonStmt::Cmp { op: crate::ir::NeonCmp::Ge, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        // VCEQ/VCGT/VCGE take either a register second operand (`a <rel> b`) or a `#0`
+        // immediate (`a <rel> 0`, the two-registers-misc form). VCLE/VCLT exist only as the
+        // compare-against-`#0` form.
+        VCEQ | VCGT | VCGE => {
+            let rel = match op {
+                VCEQ => crate::ir::NeonCmp::Eq,
+                VCGT => crate::ir::NeonCmp::Gt,
+                _ => crate::ir::NeonCmp::Ge,
+            };
+            if matches!(ops[2], Operand::Imm(_)) {
+                NeonStmt::CmpZero { op: rel, ty, dst: r(0)?, src: r(1)? }
+            } else {
+                NeonStmt::Cmp { op: rel, ty, dst: r(0)?, a: r(1)?, b: r(2)? }
+            }
+        }
+        VCLE => NeonStmt::CmpZero { op: crate::ir::NeonCmp::Le, ty, dst: r(0)?, src: r(1)? },
+        VCLT => NeonStmt::CmpZero { op: crate::ir::NeonCmp::Lt, ty, dst: r(0)?, src: r(1)? },
+        VACGE => NeonStmt::CmpAbs { ge: true, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VACGT => NeonStmt::CmpAbs { ge: false, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VPMAX => NeonStmt::PairMinMax { min: false, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VPMIN => NeonStmt::PairMinMax { min: true, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VREV16 => NeonStmt::Rev { esize: ty.bits, container: 16, dst: r(0)?, src: r(1)? },
+        VREV32 => NeonStmt::Rev { esize: ty.bits, container: 32, dst: r(0)?, src: r(1)? },
+        VREV64 => NeonStmt::Rev { esize: ty.bits, container: 64, dst: r(0)?, src: r(1)? },
         VRECPE => NeonStmt::RecipEstimate { sqrt: false, dst: r(0)?, src: r(1)? },
         VRSQRTE => NeonStmt::RecipEstimate { sqrt: true, dst: r(0)?, src: r(1)? },
         VRECPS => NeonStmt::RecipStep { sqrt: false, dst: r(0)?, a: r(1)?, b: r(2)? },
@@ -2441,6 +2596,9 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VTRN => NeonStmt::Permute { op: crate::ir::PermuteOp::Trn, esize: ty.bits, a: r(0)?, b: r(1)? },
         VZIP => NeonStmt::Permute { op: crate::ir::PermuteOp::Zip, esize: ty.bits, a: r(0)?, b: r(1)? },
         VUZP => NeonStmt::Permute { op: crate::ir::PermuteOp::Uzp, esize: ty.bits, a: r(0)?, b: r(1)? },
+        VTST => NeonStmt::Test { ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        // VMOVN result element is half the encoded (source) size.
+        VMOVN => NeonStmt::Narrow { esize: ty.bits / 2, dst: r(0)?, src: r(1)? },
         // VSWP is decoded but not lifted yet (it would land here as a permute swap).
         VSWP => return None,
     };
@@ -2499,6 +2657,18 @@ fn neon_emittable(s: &NeonStmt) -> bool {
                 !(ty.bits == 64 && !ty.signed && !matches!(op, crate::ir::NeonCmp::Eq))
             }
         }
+        // Compare-against-zero: f32 lanes only for the float form; the integer form is 8/16/32
+        // (the decoder rejects the 64-bit element case).
+        NeonStmt::CmpZero { ty, .. } => {
+            if ty.float {
+                ty.bits == 32
+            } else {
+                ty.bits != 64
+            }
+        }
+        // Per-lane variable shift is emitted lane-by-lane over i32; the 8/16/32-bit unsaturated
+        // form is supported. The saturating VQSHL and the 64-bit form lift as unsupported.
+        NeonStmt::ShiftReg { sat, ty, .. } => !sat && ty.bits != 64,
         _ => true,
     }
 }

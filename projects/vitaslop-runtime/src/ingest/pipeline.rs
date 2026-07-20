@@ -725,7 +725,7 @@ mod tests {
                         _ => break,
                     }
                 }
-                for r in vitaslop_loader::reloc::decode(blob) {
+                for r in vitaslop_loader::reloc::decode(blob).unwrap_or_default() {
                     *by_code.entry(r.code).or_default() += 1;
                 }
             }

@@ -192,6 +192,28 @@ pub enum NeonStmt {
     /// relation holds and zero otherwise, matching wasm SIMD compare semantics.
     /// `ty.float`/`ty.signed`/`ty.bits` select the lane type.
     Cmp { op: NeonCmp, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Vector compare against zero (`vceq`/`vcgt`/`vcge`/`vcle`/`vclt` with a `#0`
+    /// operand): each `dst` lane is all-ones when `src <rel> 0` and zero otherwise.
+    CmpZero { op: NeonCmp, ty: NeonType, dst: NeonReg, src: NeonReg },
+    /// Absolute-value f32 compare (`vacge`/`vacgt`): `dst` lane is all-ones when
+    /// `|a| >= |b|` (`ge = true`) or `|a| > |b|` (`ge = false`), zero otherwise.
+    CmpAbs { ge: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Pairwise f32 max/min (`vpmax`/`vpmin`): adjacent element pairs within the
+    /// concatenation `a : b` are reduced (`min` picks min over max). Doubleword only.
+    PairMinMax { min: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Reverse the order of the `esize`-bit elements within each `container`-bit group
+    /// (`vrev16`/`vrev32`/`vrev64`). `container` is 16/32/64 and is a multiple of `esize`.
+    Rev { esize: u8, container: u8, dst: NeonReg, src: NeonReg },
+    /// Shift-left by a signed per-lane amount, register form (`vshl`/`vqshl`): each
+    /// `ty.bits`-bit lane of `src` is shifted by the signed low byte of the matching
+    /// lane of `amt` (negative shifts right; `vshl` truncates, `vqshl` saturates).
+    ShiftReg { sat: bool, ty: NeonType, dst: NeonReg, src: NeonReg, amt: NeonReg },
+    /// Bitwise test (`vtst`): each `ty.bits`-bit lane of `dst` is all-ones when
+    /// `a AND b` is nonzero in that lane, and zero otherwise.
+    Test { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Narrowing move (`vmovn`): truncate each `2*esize`-bit element of the `Qm`
+    /// source `src` to its low `esize` bits and write the `Dd` result `dst`.
+    Narrow { esize: u8, dst: NeonReg, src: NeonReg },
     /// Whole-register bitwise logical op (the 3-same logical family): `vand`,
     /// `vorr`, `veor`, `vbic`, `vorn`, and the insert/select forms `vbsl`/`vbit`/
     /// `vbif` (which also read `dst`). Element-size agnostic.
@@ -243,7 +265,9 @@ pub enum PermuteOp {
     Uzp,
 }
 
-/// The NEON vector-compare relations ([`NeonStmt::Cmp`]).
+/// The NEON vector-compare relations ([`NeonStmt::Cmp`] and [`NeonStmt::CmpZero`]).
+/// `Le`/`Lt` occur only against `#0` (the register `a <= b`/`a < b` forms are assembled as
+/// `Ge`/`Gt` with the operands swapped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeonCmp {
     /// `vceq`: equal.
@@ -252,6 +276,10 @@ pub enum NeonCmp {
     Gt,
     /// `vcge`: greater-than-or-equal.
     Ge,
+    /// `vcle`: less-than-or-equal (against `#0` only).
+    Le,
+    /// `vclt`: less-than (against `#0` only).
+    Lt,
 }
 
 /// The NEON immediate-shift operations ([`NeonStmt::ShiftImm`]).
@@ -423,6 +451,16 @@ pub enum Stmt {
     /// [`crate::abi::TP_GLOBAL`]). The kernel normally owns this register, but a
     /// module that manages its own thread pointer may write it.
     SetThreadPtr(Value),
+    /// Byte-wise unsigned parallel add (`uadd8`): for each of the four bytes,
+    /// `rd.byte[i] = (rn.byte[i] + rm.byte[i]) mod 256`, and set APSR `GE[i]` to
+    /// the unsigned carry-out (1 iff the byte sum is >= 256). The GE bits are held
+    /// in a scratch local for a later [`Sel`] to consume. This pair is the core of
+    /// the word-at-a-time zero-byte search in optimized `strlen`/`memchr`.
+    Uadd8 { rd: u8, rn: u8, rm: u8 },
+    /// Byte-wise select by the GE flags (`sel`): for each byte, `rd.byte[i] =
+    /// GE[i] ? rn.byte[i] : rm.byte[i]`, reading the GE bits a preceding parallel
+    /// add/sub (e.g. [`Uadd8`]) deposited.
+    Sel { rd: u8, rn: u8, rm: u8 },
 }
 
 /// How a basic block hands control to the next. The not-taken side of a branch

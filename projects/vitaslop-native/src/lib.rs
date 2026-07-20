@@ -223,6 +223,65 @@ impl Vm {
         Ok(vm)
     }
 
+    /// Like [`Vm::new`] but transpiles a single module *leniently*: a function
+    /// that fails to lower becomes a trapping stub instead of aborting the whole
+    /// build, so the module still instantiates and runs. Returns the VM plus the
+    /// guest addresses that became stubs (each faults loudly if actually called).
+    /// Used by diagnostic probes that only exercise a hot sub-path and can tolerate
+    /// cold, never-called functions (e.g. an exception unwinder) remaining stubbed.
+    pub fn new_lenient(
+        code: &[u8],
+        base: u32,
+        thumb: bool,
+        entries: &[u32],
+        externs: &[transpiler::Extern],
+        mem_bytes: u32,
+        host_abi: &HostAbi,
+    ) -> Result<(Vm, Vec<u32>), RunError> {
+        let built = transpiler::transpile_lenient(&transpiler::Program {
+            code,
+            base,
+            thumb,
+            entries,
+            arm_entries: &[],
+            externs,
+            redirects: &[],
+            noreturn_svc: host_abi.noreturn_svc,
+            mem_bytes,
+            discover_code_pointers: true,
+            import_memory: false,
+        });
+
+        wasmparser::validate(&built.artifact.wasm)
+            .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
+
+        let engine = Engine::default();
+        let module = Module::from_binary(&engine, &built.artifact.wasm)?;
+        let mut store = Store::new(
+            &engine,
+            Host {
+                output: Vec::new(),
+                halted: false,
+                base,
+                import_fn: host_abi.import,
+                import_env: None,
+                instance: None,
+            },
+        );
+
+        let mut linker = Linker::new(&engine);
+        bind_host(&mut linker, abi::SVC_NAME, host_abi.svc)?;
+        bind_import(&mut linker)?;
+        bind_dispatch_miss(&mut linker)?;
+        let instance = linker.instantiate(&mut store, &module)?;
+        store.data_mut().instance = Some(instance);
+
+        let mut vm = Vm { store, instance, base };
+        vm.write_mem(base, code)?;
+        vm.set_reg(abi::SP, base.wrapping_add(mem_bytes));
+        Ok((vm, built.stubbed))
+    }
+
     /// Instantiate a multi-module linked title ([`vitaslop_runtime::link::LinkedProgram`])
     /// for a headless boot. Unlike [`Vm::new`] this transpiles *leniently* (a
     /// handful of still-unlifted functions become trapping stubs so the whole game

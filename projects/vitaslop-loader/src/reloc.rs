@@ -60,11 +60,12 @@ pub struct Reloc {
 /// `PT_SCE_RELA` segment).
 ///
 /// The blob is a tight sequence of variable-length entries. A short entry is 8
-/// bytes; a long entry is 12 and may carry a second piggybacked fixup. Decoding
-/// stops when fewer than 8 bytes remain. Unknown tags abort (returning what was
-/// decoded so far would silently drop fixups, corrupting the image), so a
-/// malformed blob is reported by the caller as a load failure.
-pub fn decode(blob: &[u8]) -> Vec<Reloc> {
+/// bytes; a long entry is 12 and may carry a second piggybacked fixup. An entry
+/// whose format nibble we do not model is a HARD ERROR ([`crate::Error::UnknownRelocFormat`]):
+/// returning the fixups decoded so far would silently drop every following
+/// relocation, leaving zeroed dangling pointers that only fault much later (a
+/// wrong-answer far from its cause). Fail loudly at the offending entry instead.
+pub fn decode(blob: &[u8]) -> Result<Vec<Reloc>, crate::Error> {
     let mut out = Vec::new();
     let mut o = 0usize;
     let rd = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
@@ -118,9 +119,10 @@ pub fn decode(blob: &[u8]) -> Vec<Reloc> {
                 }
                 o += 12;
             }
-            // Any other tag is a format we do not model; stop rather than guess.
-            _ => break,
+            // Any other tag is a format we do not model. Fail loudly - dropping the
+            // rest of the blob would corrupt the image with dangling pointers.
+            _ => return Err(crate::Error::UnknownRelocFormat(format as u8, o)),
         }
     }
-    out
+    Ok(out)
 }

@@ -182,6 +182,18 @@ pub(super) fn get_thread_exit_status(ctx: &mut GuestCtx, st: &mut VitaState, thi
 /// SceUInt64 sceKernelGetProcessTimeWide(void)
 /// The 64-bit process-runtime clock in microseconds. Returned in r0 (low)/r1 (high),
 /// so it is hand-written rather than `#[hostcall]`. Uses the virtual monotonic clock.
+pub(super) fn get_process_time(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    // sceKernelGetProcessTime(SceKernelSysClock *pClock): write the 64-bit virtual
+    // monotonic process time (microseconds) to *pClock and return 0. Same clock the
+    // wide form returns in registers.
+    let t = st.now_us();
+    let ptr = ctx.regs[0];
+    ctx.write_u32(ptr, t as u32);
+    ctx.write_u32(ptr.wrapping_add(4), (t >> 32) as u32);
+    ctx.regs[0] = 0;
+    SvcOutcome::Continue
+}
+
 pub(super) fn get_process_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     // The virtual monotonic clock the scheduler advances (jumping over idle waits),
     // so a timed wait loop reads real elapsed time instead of a frozen value.

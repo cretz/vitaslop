@@ -47,6 +47,7 @@ fn write_file_stat(ctx: &mut GuestCtx, stat_addr: u32, size: u64) {
 #[hostcall]
 pub(super) fn io_open(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, flags: u32, _mode: u32) -> i32 {
     let path = read_cstr(ctx, file.addr());
+    tracing::trace!(target: "vitaslop::io", path, flags = format_args!("{flags:#x}"), lr = format_args!("{:#x}", ctx.regs[14]), "open_from");
     st.io_open(&path, flags)
 }
 

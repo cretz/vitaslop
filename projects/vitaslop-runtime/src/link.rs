@@ -181,6 +181,38 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         }
     }
 
+    // 3b. Resolve variable (data-symbol) imports. Unlike a function import - a
+    //     single call stub redirected to the callee - a variable import carries a
+    //     fixup blob listing every code/data site that references the symbol. We
+    //     bind each site to the exporting module's copy of the variable, exactly as
+    //     the SCE loader does. This matters for statically-linked titles that import
+    //     the C library's ctype tables (`_Tolotab`/`_Ctype`/`_Touptab`) and stdio
+    //     handles as variables: unresolved, `tolower()` reads a garbage table and
+    //     every case-folded path (archive names, config keys) comes out corrupt.
+    //     Patch the image in place before transpilation so the decoder sees the
+    //     resolved immediates.
+    let var_exports: HashMap<(u32, u32), u32> = modules
+        .iter()
+        .flat_map(|m| m.var_exports.iter())
+        .map(|e| ((e.library_nid, e.var_nid), e.addr))
+        .collect();
+    let mut var_fixups_applied = 0u32;
+    let mut var_imports_unresolved = 0u32;
+    for m in &modules {
+        for vi in &m.var_imports {
+            let Some(&sym) = var_exports.get(&(vi.library_nid, vi.var_nid)) else {
+                var_imports_unresolved += 1;
+                continue;
+            };
+            apply_var_fixups(&mut image, m.base, vi.blob_ptr, sym, &mut var_fixups_applied)?;
+        }
+    }
+    if var_imports_unresolved != 0 {
+        // A missing variable export is a real gap (the importing code will read an
+        // unbound placeholder), so surface it rather than failing silently.
+        eprintln!("link: {var_imports_unresolved} variable import(s) unresolved (no matching export)");
+    }
+
     // 4. Resolve every module's imports: an exported one becomes a direct
     //    inter-module redirect, everything else a host import.
     let mut externs = Vec::new();
@@ -319,6 +351,64 @@ fn blit(image: &mut [u8], image_base: u32, seg: &Segment) {
     if end <= image.len() {
         image[off..end].copy_from_slice(&seg.data);
     }
+}
+
+/// Apply one variable import's fixup blob, binding every listed site to the
+/// resolved symbol address `sym`.
+///
+/// The blob (at guest address `blob_ptr`, inside `image`) is a `u32` header whose
+/// value is `byte_len << 4` (the length, header included), followed by
+/// `{ code_word: u32, site_offset: u32 }` entries. `code_word`'s byte 1 is an
+/// `R_ARM_*` relocation code; `site_offset` is the fixup site's byte offset from the
+/// importing module's link base, so its runtime address is `module_base +
+/// site_offset`. The addend is always zero for a variable import (the site holds no
+/// prior displacement). Supports the codes Vita variable imports emit: the Thumb
+/// `MOVW`/`MOVT` pair that materializes the address in a register, and `ABS32` for a
+/// plain pointer word.
+fn apply_var_fixups(
+    image: &mut [u8],
+    module_base: u32,
+    blob_ptr: u32,
+    sym: u32,
+    applied: &mut u32,
+) -> Result<(), vitaslop_loader::Error> {
+    use vitaslop_loader::reloc::code;
+    let rd32 = |img: &[u8], addr: u32| -> Option<u32> {
+        let o = addr.checked_sub(IMAGE_BASE)? as usize;
+        img.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let header = rd32(image, blob_ptr).ok_or(vitaslop_loader::Error::OutOfBounds("var fixup header"))?;
+    let byte_len = (header >> 4) as usize;
+    if byte_len < 4 {
+        return Ok(());
+    }
+    // Entries begin after the 4-byte header and run to the declared length.
+    let mut entry_addr = blob_ptr.wrapping_add(4);
+    let mut remaining = byte_len - 4;
+    while remaining >= 8 {
+        let code_word = rd32(image, entry_addr).ok_or(vitaslop_loader::Error::OutOfBounds("var fixup entry"))?;
+        let site_offset = rd32(image, entry_addr.wrapping_add(4))
+            .ok_or(vitaslop_loader::Error::OutOfBounds("var fixup entry"))?;
+        let rcode = ((code_word >> 8) & 0xFF) as u8;
+        let site = module_base.wrapping_add(site_offset);
+        let off = site.wrapping_sub(IMAGE_BASE) as usize;
+        match rcode {
+            code::NONE => {}
+            code::THM_MOVW_ABS_NC => vitaslop_loader::patch_thumb_mov(image, off, (sym & 0xFFFF) as u16)?,
+            code::THM_MOVT_ABS => vitaslop_loader::patch_thumb_mov(image, off, (sym >> 16) as u16)?,
+            code::ABS32 | code::TARGET1 => {
+                let slot = image
+                    .get_mut(off..off + 4)
+                    .ok_or(vitaslop_loader::Error::OutOfBounds("var fixup abs32 site"))?;
+                slot.copy_from_slice(&sym.to_le_bytes());
+            }
+            other => return Err(vitaslop_loader::Error::UnsupportedReloc(other)),
+        }
+        *applied += 1;
+        entry_addr = entry_addr.wrapping_add(8);
+        remaining -= 8;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

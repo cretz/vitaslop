@@ -160,13 +160,25 @@ impl FilesDb {
         let by_id: HashMap<u32, &Node> = self.nodes.iter().map(|n| (n.id, n)).collect();
 
         let mut out = Vec::new();
+        let mut dropped = 0usize;
         for node in &self.nodes {
             if node.is_dir() {
                 continue;
             }
             if let Some(path) = resolve_path(node, &by_id) {
                 out.push((path, node));
+            } else {
+                dropped += 1;
+                if std::env::var("VITASLOP_INGEST_DEBUG").is_ok() {
+                    eprintln!(
+                        "[filesdb] DROPPED unresolved file node id={} parent={} name={:?} size={}",
+                        node.id, node.parent_id, node.name, node.size
+                    );
+                }
             }
+        }
+        if dropped > 0 && std::env::var("VITASLOP_INGEST_DEBUG").is_ok() {
+            eprintln!("[filesdb] {dropped} file node(s) dropped (unresolved parent chain)");
         }
         out
     }

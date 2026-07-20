@@ -1041,7 +1041,10 @@ impl VitaState {
 
     /// sceIoRead: read up to `len` bytes; None on a bad/unreadable fd.
     pub fn io_read(&mut self, fd: i32, len: usize) -> Option<Vec<u8>> {
-        self.fs.read(fd, len)
+        let r = self.fs.read(fd, len);
+        let path = self.fs.open.get(&fd).map(|o| o.path.clone()).unwrap_or_default();
+        tracing::trace!(target: "vitaslop::io", fd, len, path, got = r.as_ref().map(|d| d.len()).unwrap_or(0), "read");
+        r
     }
 
     /// sceIoPread: positioned read at `offset` that leaves the cursor untouched.
@@ -1112,7 +1115,10 @@ impl VitaState {
     /// sceIoDread: the next entry of an open directory. `None` = bad descriptor,
     /// `Some(None)` = end of listing.
     pub fn io_dread(&mut self, fd: i32) -> Option<Option<DirEntry>> {
-        self.fs.dread(fd)
+        let r = self.fs.dread(fd);
+        let name = match &r { Some(Some(e)) => e.name.clone(), Some(None) => "<end>".into(), None => "<badfd>".into() };
+        tracing::trace!(target: "vitaslop::io", fd, name, "dread");
+        r
     }
 
     /// sceIoDclose: 0 or a negative errno.
@@ -1122,7 +1128,9 @@ impl VitaState {
 
     /// File size for sceIoGetstat, or None if the path does not exist.
     pub fn io_size(&self, path: &str) -> Option<u64> {
-        self.fs.size_of(path)
+        let r = self.fs.size_of(path);
+        tracing::trace!(target: "vitaslop::io", path, size = r.unwrap_or(u64::MAX), found = r.is_some(), "getstat");
+        r
     }
 
     /// The size of the file behind an open descriptor (for sceIoGetstatByFd).

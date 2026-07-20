@@ -250,7 +250,11 @@ fn retail_boot_probe() {
                 eprintln!("  lift-gap in g_{:08x}: {s}", f.root);
             }
         }
-        for addr in decode_addrs.iter().take(60) {
+        let gap_cap: usize = std::env::var("VITASLOP_GAP_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        for addr in decode_addrs.iter().take(gap_cap) {
             let off = (addr - linked.base) as usize;
             if off + 4 <= linked.image.len() {
                 let hw1 = u16::from_le_bytes([linked.image[off], linked.image[off + 1]]);
@@ -391,7 +395,11 @@ fn retail_boot_probe() {
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     let mut preloaded = 0usize;
+    let dump_paths = std::env::var("VITASLOP_DUMP_PATHS").is_ok();
     for (path, bytes) in game.files.into_files() {
+        if dump_paths {
+            eprintln!("  vfs: {path} ({} bytes)", bytes.len());
+        }
         env.state.add_file(&path, bytes);
         preloaded += 1;
     }
@@ -400,9 +408,52 @@ fn retail_boot_probe() {
     // 3. Transpile (lenient) + stand up the preemptive scheduler. The main thread
     //    runs every module_start in load order, then the executable's; spawned
     //    threads run concurrently, switched at their blocking points and frame flips.
+    // VITASLOP_QUANTUM_FUEL overrides the preemption granularity. Set it huge to run
+    // thread 0 uninterrupted (it runs essentially alone until the config-resolution
+    // crash), making the boot deterministic so block/watch tracing does not shift the
+    // schedule and change the outcome.
+    let quantum = std::env::var("VITASLOP_QUANTUM_FUEL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(QUANTUM_FUEL);
     let (mut sched, stubbed) =
-        ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL).expect("scheduler");
+        ThreadedScheduler::from_linked(&linked, env, quantum).expect("scheduler");
     eprintln!("transpiled + instantiated; {} trapping stubs (unlifted funcs)", stubbed.len());
+    // qemu-diff faithfulness (VITASLOP_PATCH_STUBS): the on-disk inter-module import
+    // stubs are unresolved placeholders (e.g. `mvn r0,#0; bx lr` = return -1); our
+    // transpiler resolves those calls by redirection at transpile time and never writes
+    // the resolved target into the guest stub. An external reference CPU (qemu) replaying
+    // the raw snapshot would therefore run the placeholder and diverge. Patch each stub
+    // with a tiny ARM trampoline to its resolved guest target, so qemu follows the SAME
+    // routine our engine reaches. Harmless to our own run - we never execute the memory
+    // stub (the call is redirected in wasm). The trampoline is `ldr pc, [pc, #-4]; .word
+    // target|1`: LDR-to-PC interworks (selects Thumb from bit0) in ARMv7 and clobbers NO
+    // general register, so it leaves the exact same register state our direct redirect does
+    // (a `bx ip` veneer would perturb r12/ip). Assumes the stub is entered in ARM via `blx`
+    // (true for the observed placeholders); the diff flags any exception.
+    if std::env::var("VITASLOP_PATCH_STUBS").is_ok() {
+        let mut patched = 0u32;
+        for r in &linked.redirects {
+            let mut tramp = Vec::with_capacity(8);
+            tramp.extend_from_slice(&0xe51f_f004u32.to_le_bytes()); // ldr pc, [pc, #-4]
+            tramp.extend_from_slice(&(r.target | 1).to_le_bytes()); // target (thumb bit set)
+            sched.write_guest(r.addr & !1, &tramp);
+            patched += 1;
+        }
+        eprintln!("[qdiff] patched {patched} import stubs with resolved trampolines");
+    }
+    // VITASLOP_PREPOKE=0xaddr=0xval,... write words to guest memory once before the run
+    // starts (causality test for uninitialized globals the CRT should have set).
+    if let Ok(s) = std::env::var("VITASLOP_PREPOKE") {
+        for item in s.split(',') {
+            if let Some((a, v)) = item.split_once('=') {
+                let addr = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).unwrap();
+                let val = u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).unwrap();
+                sched.write_guest(addr, &val.to_le_bytes());
+                eprintln!("[prepoke] {addr:#x} = {val:#x}");
+            }
+        }
+    }
     if std::env::var("VITASLOP_DUMP_STUBS").is_ok() {
         let stub_by_windex: std::collections::BTreeMap<u32, u32> =
             stubbed.iter().map(|&(addr, widx)| (widx, addr)).collect();
@@ -446,6 +497,73 @@ fn retail_boot_probe() {
     let report = if watch.is_empty() && dump_region.is_none() {
         let r = sched.run_frames(max_frames, max_rounds);
         eprintln!("run report: {r:?}");
+        // VITASLOP_DUMP_MAP=<hex ptr-to-map-object>: after the run, in-order walk a
+        // libstdc++/Sony std::map<string,V> red-black tree and print every key. Node
+        // layout (from RE): parent@+0, left@+4, right@+8, key SSO buffer@+0x10,
+        // size@+0x20 (data is inline at +0x10 when size<=15 else a heap ptr at +0x10).
+        // Map object: node_count@+0x10, root@+0x14. Telemetry for "why did find() miss".
+        if let Ok(mv) = std::env::var("VITASLOP_DUMP_MAP") {
+            let rdu = |a: u32| -> u32 {
+                if a < 0x8000_0000 { return 0; }
+                let b = sched.read_guest(a, 4);
+                if b.len() < 4 { return 0; }
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            let rdkey = |node: u32| -> String {
+                let sz = (rdu(node + 0x20) as usize).min(256);
+                let dptr = if sz <= 15 { node + 0x10 } else { rdu(node + 0x10) };
+                if dptr < 0x8000_0000 { return String::new(); }
+                let raw = sched.read_guest(dptr, sz);
+                String::from_utf8_lossy(&raw).into_owned()
+            };
+            for tok in mv.split(',') {
+                let holder = u32::from_str_radix(tok.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                let mapobj = rdu(holder); // the global holds a pointer to the map object
+                eprintln!("MAP holder @{holder:#x} -> obj {mapobj:#x}");
+                let count = rdu(mapobj + 0x10);
+                let root = rdu(mapobj + 0x14);
+                eprintln!("MAP @{mapobj:#x}: count={count} root={root:#x}");
+                // Show the raw first-8-words of the map object header and the root node so
+                // the true link layout is visible (in-order offsets were guessed wrong).
+                for base in [mapobj, root, 0x8775e650u32, 0x8775e7d0u32, 0x8775e760u32] {
+                    let words: Vec<String> = (0..12).map(|i| format!("{:#x}", rdu(base + i * 4))).collect();
+                    eprintln!("  node@{base:#x} words: {}", words.join(" "));
+                }
+                // Cycle-safe DFS: treat +4 and +8 (and +0xc) as candidate child links,
+                // dedupe via a visited set, cap at 400 nodes. Print each node's key under
+                // all plausible interpretations so the layout is unambiguous.
+                let _ = root;
+                // The nodes are a contiguous pool. Linear-scan a window for node-like
+                // records: a valid key (size@+0x20 in 1..=200, printable path bytes at
+                // +0x10 inline or via heap ptr). Collect distinct keys with their addrs.
+                let is_key_at = |p: u32| -> Option<String> {
+                    let sz = rdu(p + 0x20);
+                    if sz == 0 || sz > 200 { return None; }
+                    let dptr = if (sz as usize) <= 15 { p + 0x10 } else { rdu(p + 0x10) };
+                    if dptr < 0x8000_0000 { return None; }
+                    let cap = rdu(p + 0x24);
+                    if (sz as usize) <= 15 && cap != 15 { return None; }
+                    let raw = sched.read_guest(dptr, sz as usize);
+                    if raw.len() != sz as usize { return None; }
+                    if !raw.iter().all(|&b| b == b'/' || b == b'.' || b == b'_' || b == b'-' || b == b' ' || b.is_ascii_alphanumeric()) { return None; }
+                    Some(String::from_utf8_lossy(&raw).into_owned())
+                };
+                let mut found: Vec<(u32, String)> = Vec::new();
+                let mut p = mapobj & !0xf;
+                let end = p + 0x20000; // 128 KiB window over the node pool
+                while p < end {
+                    if let Some(k) = is_key_at(p) { found.push((p, k)); }
+                    p += 4;
+                }
+                found.sort_by(|a, b| a.1.cmp(&b.1));
+                for (a, k) in &found { eprintln!("  key @{a:#x} {k:?}"); }
+                eprintln!("MAP scan found {} node-like keys (count field={count})", found.len());
+                // Count occurrences of the crash lookup key to spot duplicates/variants.
+                let target = "configs/msrc.cfg";
+                let hits: Vec<&(u32,String)> = found.iter().filter(|(_,k)| k.eq_ignore_ascii_case(target)).collect();
+                eprintln!("  target {target:?}: {} case-insensitive match(es): {:?}", hits.len(), hits);
+            }
+        }
         r
     } else {
         // Per-frame round budget: one flip's worth of guest work. The overall

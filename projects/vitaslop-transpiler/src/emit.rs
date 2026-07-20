@@ -143,6 +143,24 @@ const GUEST_PC_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 1;
 /// frame without the trap always landing on the first (startup) read.
 const WATCH_READ_COUNT_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 2;
 
+/// WASM global index of the store-watchpoint match counter (appended after `TP_GLOBAL`).
+/// Lets `VITASLOP_WATCH_STORE_SKIP` skip the first N matching stores and trap on a later
+/// one - e.g. to catch a map's node-count *decrement* past its earlier increments.
+const WATCH_STORE_COUNT_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 4;
+
+/// Number of matching store-watchpoint hits to skip before trapping (`VITASLOP_WATCH_
+/// STORE_SKIP`, default 0 = trap on the first).
+fn watch_store_skip() -> u32 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u32> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_WATCH_STORE_SKIP")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Number of matching read-watchpoint hits to skip before trapping (`VITASLOP_WATCH_
 /// READ_SKIP`, default 0 = trap on the first). Lets the trap land past startup reads.
 fn watch_read_skip() -> u32 {
@@ -315,7 +333,13 @@ const L_T2: u32 = 3;
 /// Fourth i32 scratch: the carry-in of add/sub-family flag computation (an
 /// immediate, or the C flag for adc/sbc).
 const L_T3: u32 = 4;
-const L_I32_COUNT: u32 = 5;
+/// The four APSR `GE` bits (bits [3:0]) that a byte-wise parallel add/sub
+/// (`uadd8`) deposits and a later `sel` reads. A dedicated local, not one of the
+/// `L_T*` scratches, because `sel` can be several instructions after the
+/// `uadd8` and the scratches are clobbered in between (the byte-search loop in
+/// `strlen` interleaves loads).
+const L_GE: u32 = 5;
+const L_I32_COUNT: u32 = 6;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
@@ -481,6 +505,7 @@ pub fn emit_module(
     // The per-thread pointer (TPIDRURO / TLS base). Per-instance, set by the host at
     // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
     globals.global(i32_global, &ConstExpr::i32_const(0)); // TP_GLOBAL
+    globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_STORE_COUNT_GLOBAL
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -1056,7 +1081,17 @@ fn emit_stmt(
                         f.instruction(&W::I32And);
                     }
                     f.instruction(&W::If(BlockType::Empty));
+                    // Matched: bump the counter and trap once past the skip window.
+                    f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
+                    f.instruction(&W::I32Const(1));
+                    f.instruction(&W::I32Add);
+                    f.instruction(&W::GlobalSet(WATCH_STORE_COUNT_GLOBAL));
+                    f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
+                    f.instruction(&W::I32Const(watch_store_skip() as i32));
+                    f.instruction(&W::I32GtU);
+                    f.instruction(&W::If(BlockType::Empty));
                     f.instruction(&W::Unreachable);
+                    f.instruction(&W::End);
                     f.instruction(&W::End);
                 }
                 f.instruction(&W::LocalGet(L_T0));
@@ -1209,7 +1244,106 @@ fn emit_stmt(
             emit_value(f, v, base);
             f.instruction(&W::GlobalSet(abi::TP_GLOBAL));
         }
+        Stmt::Uadd8 { rd, rn, rm } => emit_uadd8(f, *rd, *rn, *rm),
+        Stmt::Sel { rd, rn, rm } => emit_sel(f, *rd, *rn, *rm),
     }
+}
+
+/// Push byte `i` (0..3) of register `r`, zero-extended: `(r >> 8i) & 0xff`.
+fn push_reg_byte(f: &mut Function, r: u8, i: u32) {
+    f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
+    if i != 0 {
+        f.instruction(&W::I32Const((8 * i) as i32));
+        f.instruction(&W::I32ShrU);
+    }
+    f.instruction(&W::I32Const(0xff));
+    f.instruction(&W::I32And);
+}
+
+/// `uadd8 rd, rn, rm`: four independent byte adds, each depositing its unsigned
+/// carry-out into an APSR GE bit (held in `L_GE`) for a later `sel`. The full
+/// result is staged in `L_T2` and the GE mask in `L_GE` before `rd` is written,
+/// so `rd` aliasing `rn`/`rm` (e.g. `uadd8 r2, r2, ip`) is safe.
+fn emit_uadd8(f: &mut Function, rd: u8, rn: u8, rm: u8) {
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::LocalSet(L_T2)); // result accumulator
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::LocalSet(L_GE)); // GE bits accumulator
+    for i in 0..4u32 {
+        // L_T0 = rn.byte[i] + rm.byte[i]  (0..510)
+        push_reg_byte(f, rn, i);
+        push_reg_byte(f, rm, i);
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalSet(L_T0));
+        // result |= (L_T0 & 0xff) << 8i
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(0xff));
+        f.instruction(&W::I32And);
+        if i != 0 {
+            f.instruction(&W::I32Const((8 * i) as i32));
+            f.instruction(&W::I32Shl);
+        }
+        f.instruction(&W::I32Or);
+        f.instruction(&W::LocalSet(L_T2));
+        // GE |= (L_T0 >> 8) << i   (the sum is <= 510, so bit 8 is the carry-out)
+        f.instruction(&W::LocalGet(L_GE));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Const(8));
+        f.instruction(&W::I32ShrU);
+        if i != 0 {
+            f.instruction(&W::I32Const(i as i32));
+            f.instruction(&W::I32Shl);
+        }
+        f.instruction(&W::I32Or);
+        f.instruction(&W::LocalSet(L_GE));
+    }
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
+}
+
+/// `sel rd, rn, rm`: for each byte, pick `rn`'s byte where the GE bit (in `L_GE`)
+/// is set, else `rm`'s. Branchless per byte via a 0x00/0xff mask; staged in
+/// `L_T2` before writing `rd` so aliasing is safe.
+fn emit_sel(f: &mut Function, rd: u8, rn: u8, rm: u8) {
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::LocalSet(L_T2)); // result accumulator
+    for i in 0..4u32 {
+        // L_T1 = mask = 0 - ((GE >> i) & 1)   (0x00000000 or 0xffffffff)
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::LocalGet(L_GE));
+        if i != 0 {
+            f.instruction(&W::I32Const(i as i32));
+            f.instruction(&W::I32ShrU);
+        }
+        f.instruction(&W::I32Const(1));
+        f.instruction(&W::I32And);
+        f.instruction(&W::I32Sub);
+        f.instruction(&W::LocalSet(L_T1));
+        // L_T0 = rn.byte[i], L_T3 = rm.byte[i]
+        push_reg_byte(f, rn, i);
+        f.instruction(&W::LocalSet(L_T0));
+        push_reg_byte(f, rm, i);
+        f.instruction(&W::LocalSet(L_T3));
+        // chosen = rm ^ ((rn ^ rm) & mask)  == mask ? rn : rm
+        f.instruction(&W::LocalGet(L_T3));
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T3));
+        f.instruction(&W::I32Xor);
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32And);
+        f.instruction(&W::I32Xor);
+        // result |= chosen << 8i
+        if i != 0 {
+            f.instruction(&W::I32Const((8 * i) as i32));
+            f.instruction(&W::I32Shl);
+        }
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Or);
+        f.instruction(&W::LocalSet(L_T2));
+    }
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
 }
 
 // --- VFP / floating-point emission ---------------------------------------
@@ -2385,7 +2519,225 @@ fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
                 (Eq, false) => simd_cmp_eq(ty.bits),
                 (Gt, false) => simd_cmp_gt(ty.bits, ty.signed),
                 (Ge, false) => simd_cmp_ge(ty.bits, ty.signed),
+                // Le/Lt reach the IR only as compare-against-zero (`CmpZero`), never the
+                // register-register `Cmp`, since the assembler folds them into Ge/Gt.
+                (Le, _) | (Lt, _) => unreachable!("vcle/vclt only exist against #0"),
             });
+            neon_set(f, *dst);
+        }
+        CmpZero { op, ty, dst, src } => {
+            use crate::ir::NeonCmp::*;
+            // `src <rel> 0`. Le/Lt reuse the Ge/Gt primitives with the operands swapped
+            // (`src <= 0` is `0 >= src`, `src < 0` is `0 > src`), so no le/lt op is needed.
+            let zero = W::V128Const(0);
+            let swap = matches!(op, Le | Lt);
+            if swap {
+                f.instruction(&zero);
+                neon_get(f, *src);
+            } else {
+                neon_get(f, *src);
+                f.instruction(&zero);
+            }
+            f.instruction(&match (op, ty.float) {
+                (Eq, true) => W::F32x4Eq,
+                (Gt, true) | (Lt, true) => W::F32x4Gt,
+                (Ge, true) | (Le, true) => W::F32x4Ge,
+                (Eq, false) => simd_cmp_eq(ty.bits),
+                (Gt, false) | (Lt, false) => simd_cmp_gt(ty.bits, ty.signed),
+                (Ge, false) | (Le, false) => simd_cmp_ge(ty.bits, ty.signed),
+            });
+            neon_set(f, *dst);
+        }
+        CmpAbs { ge, dst, a, b } => {
+            // `|a| >= |b|` / `|a| > |b|`, f32 lanes.
+            neon_get(f, *a);
+            f.instruction(&W::F32x4Abs);
+            neon_get(f, *b);
+            f.instruction(&W::F32x4Abs);
+            f.instruction(&if *ge { W::F32x4Ge } else { W::F32x4Gt });
+            neon_set(f, *dst);
+        }
+        PairMinMax { min, dst, a, b } => {
+            // f32 pairwise max/min, doubleword only: gather the even/odd f32 lanes of the
+            // concatenation `a : b` (a is bytes 0..16, b is 16..32) with two shuffles, then
+            // reduce. Mirrors `PairAdd` for the two-lane f32 case.
+            let mut xmask = [0u8; 16];
+            let mut ymask = [0u8; 16];
+            // Two D registers -> two source elements each. Output lane 0/1 <- pairs of `a`,
+            // output lane... only the low two lanes are meaningful for a D result.
+            for k in 0..2usize {
+                let (src_base, within) = if k < 1 { (0usize, k) } else { (16usize, k - 1) };
+                let even = src_base + (2 * within) * 4;
+                let odd = src_base + (2 * within + 1) * 4;
+                for j in 0..4 {
+                    xmask[k * 4 + j] = (even + j) as u8;
+                    ymask[k * 4 + j] = (odd + j) as u8;
+                }
+            }
+            neon_get(f, *a);
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *b);
+            f.instruction(&W::LocalSet(L_V128B));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(xmask));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128B));
+            f.instruction(&W::I8x16Shuffle(ymask));
+            f.instruction(&if *min { W::F32x4Min } else { W::F32x4Max });
+            neon_set(f, *dst);
+        }
+        Rev { esize, container, dst, src } => {
+            // Reverse the `esize`-bit elements within each `container`-bit group: a pure byte
+            // permutation of the source with itself.
+            let ebytes = (*esize / 8) as usize;
+            let cbytes = (*container / 8) as usize;
+            let nel = cbytes / ebytes;
+            let mut mask = [0u8; 16];
+            for i in 0..16usize {
+                let c = i / cbytes;
+                let p = i % cbytes;
+                let e = p / ebytes;
+                let j = p % ebytes;
+                mask[i] = (c * cbytes + (nel - 1 - e) * ebytes + j) as u8;
+            }
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::I8x16Shuffle(mask));
+            neon_set(f, *dst);
+        }
+        ShiftReg { sat: _, ty, dst, src, amt } => {
+            // Per-lane variable shift-left by a signed amount (`vshl` register form): each lane of
+            // `src` is shifted by the signed low byte of the matching `amt` lane; a negative amount
+            // shifts right (arithmetic when the type is signed, else logical). wasm SIMD has no
+            // vector variable shift, so extract, shift, and reinsert each lane. `sat` (VQSHL) would
+            // additionally saturate the left-shift overflow; the unsaturated VSHL is emitted here and
+            // the saturating form is gated to lift as unsupported in `neon_emittable`.
+            let w = ty.bits as i32;
+            let signed = ty.signed;
+            let lanes = 16 / (ty.bits as usize / 8);
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_get(f, *amt);
+            f.instruction(&W::LocalSet(L_V128B));
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128C)); // result accumulator, lanes overwritten below
+            let extract_amt = |k: u8| -> W<'static> {
+                match ty.bits {
+                    8 => W::I8x16ExtractLaneU(k),
+                    16 => W::I16x8ExtractLaneU(k),
+                    _ => W::I32x4ExtractLane(k),
+                }
+            };
+            let extract_src = |k: u8| -> W<'static> {
+                match (ty.bits, signed) {
+                    (8, true) => W::I8x16ExtractLaneS(k),
+                    (8, false) => W::I8x16ExtractLaneU(k),
+                    (16, true) => W::I16x8ExtractLaneS(k),
+                    (16, false) => W::I16x8ExtractLaneU(k),
+                    _ => W::I32x4ExtractLane(k),
+                }
+            };
+            let replace = |k: u8| -> W<'static> {
+                match ty.bits {
+                    8 => W::I8x16ReplaceLane(k),
+                    16 => W::I16x8ReplaceLane(k),
+                    _ => W::I32x4ReplaceLane(k),
+                }
+            };
+            for k in 0..lanes as u8 {
+                // s = sign-extended low byte of amt lane k.
+                f.instruction(&W::LocalGet(L_V128B));
+                f.instruction(&extract_amt(k));
+                f.instruction(&W::I32Const(24));
+                f.instruction(&W::I32Shl);
+                f.instruction(&W::I32Const(24));
+                f.instruction(&W::I32ShrS);
+                f.instruction(&W::LocalSet(L_T0)); // s
+                // x = extended src lane k.
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&extract_src(k));
+                f.instruction(&W::LocalSet(L_T1)); // x
+                // shifted = (s >= 0) ? (s >= w ? 0 : x << s)
+                //                    : (r=-s >= w ? sign/0 : x >> r)
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::I32GeS);
+                f.instruction(&W::If(BlockType::Result(ValType::I32)));
+                {
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(w));
+                    f.instruction(&W::I32GeS);
+                    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+                    f.instruction(&W::I32Const(0));
+                    f.instruction(&W::Else);
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Shl);
+                    f.instruction(&W::End);
+                }
+                f.instruction(&W::Else);
+                {
+                    f.instruction(&W::I32Const(0));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Sub);
+                    f.instruction(&W::LocalSet(L_T2)); // r = -s
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&W::I32Const(w));
+                    f.instruction(&W::I32GeS);
+                    f.instruction(&W::If(BlockType::Result(ValType::I32)));
+                    if signed {
+                        // arithmetic shift by (w-1) replicates the sign bit across the lane.
+                        f.instruction(&W::LocalGet(L_T1));
+                        f.instruction(&W::I32Const(w - 1));
+                        f.instruction(&W::I32ShrS);
+                    } else {
+                        f.instruction(&W::I32Const(0));
+                    }
+                    f.instruction(&W::Else);
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&if signed { W::I32ShrS } else { W::I32ShrU });
+                    f.instruction(&W::End);
+                }
+                f.instruction(&W::End);
+                f.instruction(&W::LocalSet(L_T1)); // shifted result
+                f.instruction(&W::LocalGet(L_V128C));
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&replace(k));
+                f.instruction(&W::LocalSet(L_V128C));
+            }
+            f.instruction(&W::LocalGet(L_V128C));
+            neon_set(f, *dst);
+        }
+        Test { ty, dst, a, b } => {
+            // `(a AND b) != 0` per lane: AND, compare-equal-zero (all-ones where zero), then invert.
+            neon_get(f, *a);
+            neon_get(f, *b);
+            f.instruction(&W::V128And);
+            f.instruction(&W::V128Const(0));
+            f.instruction(&simd_cmp_eq(ty.bits));
+            f.instruction(&W::V128Not);
+            neon_set(f, *dst);
+        }
+        Narrow { esize, dst, src } => {
+            // Truncate each `2*esize`-bit source element to its low `esize` bits, packing the results
+            // into the low 8 bytes (the `D` result). A pure byte gather from the source.
+            let rbytes = (*esize / 8) as usize;
+            let n = 8 / rbytes; // result elements (fill the low 64 bits)
+            let mut mask = [0u8; 16];
+            for i in 0..n {
+                for j in 0..rbytes {
+                    mask[i * rbytes + j] = (i * 2 * rbytes + j) as u8;
+                }
+            }
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::I8x16Shuffle(mask));
             neon_set(f, *dst);
         }
         MulScalar { ty, dst, a, src, lane, acc, sub } => {

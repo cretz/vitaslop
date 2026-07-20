@@ -208,7 +208,9 @@ fn out_from_dump(dump: &[u8], seeds: &BTreeMap<u8, u32>) -> Result<GenOut, Strin
 
 fn header(mode: &str) -> String {
     let m = if mode == "thumb" { ".thumb" } else { ".arm" };
-    format!(".syntax unified\n.arch armv7-a\n{m}\n.text\n")
+    // `.fpu neon` enables the VFP/NEON mnemonics (the Cortex-A9 the Vita uses has NEON);
+    // integer-only cases are unaffected.
+    format!(".syntax unified\n.arch armv7-a\n.fpu neon\n{m}\n.text\n")
 }
 
 /// In Thumb mode `_start` must be a thumb_func so the ELF entry has bit 0 set and

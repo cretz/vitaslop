@@ -302,6 +302,20 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             SharedMemory::new(&engine, mem_ty).map_err(|e| RunError::Wasm(e.to_string()))?;
         write_shared(&shared_mem, 0, &linked.image);
 
+        // The main module's `module_start(SceSize args, void *argp)` is handed the launch
+        // arguments the way a Vita loader passes them: `argp` points to a run of
+        // NUL-terminated strings (argv), `args` is their total byte length. The executable's
+        // `main` parses this argv and derives its data paths from `argv[0]` (the self path);
+        // handed an empty block it walks off an uninitialized path and faults deep in startup.
+        // Seed a one-argument block (the app's own eboot path) in the stack headroom - the
+        // region the crt already expects the kernel to have populated.
+        let arg_block: &[u8] = b"app0:/eboot.bin\0";
+        // High in the 1 MiB headroom (well above the initial SP and its crt scratch, below the
+        // region end), so nothing the stack does can clobber it.
+        let arg_ptr = linked.base.wrapping_add(linked.mem_bytes).wrapping_sub(0x1000);
+        write_shared(&shared_mem, (arg_ptr - linked.base) as usize, arg_block);
+        let arg_len = arg_block.len() as u32;
+
         let host = Arc::new(Mutex::new(host));
         let engine = WasmtimeEngine {
             engine,
@@ -318,8 +332,8 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         let main = engine.instantiate_thread_seq(
             0,
             linked.module_inits.clone(),
-            0,
-            0,
+            arg_len,
+            arg_ptr,
             0,
             sp,
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
@@ -480,11 +494,14 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             let mut last_r0 = 0u32;
             let last = entries.len().saturating_sub(1);
             for (i, &entry) in entries.iter().enumerate() {
-                // Each entry starts with a fresh stack; only the first carries args.
+                // Each entry starts with a fresh stack. The executable's `module_start` (the
+                // LAST entry - shared libraries are constructed first and take no arguments)
+                // is the one a loader hands the launch argv to; give the args to it.
+                let carries_args = i == last;
                 set_reg_store(&mut store, &instance, abi::SP, sp);
-                set_reg_store(&mut store, &instance, 0, if i == 0 { r0 } else { 0 });
-                set_reg_store(&mut store, &instance, 1, if i == 0 { r1 } else { 0 });
-                set_reg_store(&mut store, &instance, 2, if i == 0 { r2 } else { 0 });
+                set_reg_store(&mut store, &instance, 0, if carries_args { r0 } else { 0 });
+                set_reg_store(&mut store, &instance, 1, if carries_args { r1 } else { 0 });
+                set_reg_store(&mut store, &instance, 2, if carries_args { r2 } else { 0 });
                 let func = match instance
                     .get_typed_func::<(), ()>(&mut store, &abi::func_export(entry))
                 {
@@ -538,15 +555,41 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
             abi::SVC_NAME,
             |mut caller: Caller<'_, ThreadData<H>>, (selector,): (i32,)| {
                 Box::new(async move {
+                    use std::sync::atomic::Ordering::Relaxed;
                     let sel = selector as u32;
                     if sel & 0x8000_0000 != 0 {
-                        let thid = caller.data().thid;
-                        let r: [u32; 9] = std::array::from_fn(|i| get_reg(&mut caller, i));
-                        eprintln!(
-                            "[trace] t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
-                             r3={:#010x} r8={:#010x} lr={:#010x}",
-                            r[0], r[1], r[2], r[3], r[8], get_reg(&mut caller, 14),
-                        );
+                        // The verbose per-block eprintln is the human trace; suppress it when
+                        // a machine register trace is being captured (the file is the record,
+                        // and a wide qdiff hook range would otherwise flood stderr).
+                        if qdiff_regtrace().is_none() {
+                            let thid = caller.data().thid;
+                            let r: [u32; 13] = std::array::from_fn(|i| get_reg(&mut caller, i));
+                            eprintln!(
+                                "[trace] t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
+                                 r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} \
+                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} lr={:#010x}",
+                                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                                r[8], r[9], r[10], r[11], r[12], get_reg(&mut caller, 14),
+                            );
+                        }
+                        // qemu-diff capture (opt-in; see the qdiff_* helpers below). The
+                        // snapshot fires on the (skip+1)-th entry to its block, so a specific
+                        // invocation of a repeatedly-called function can be targeted.
+                        if let Some((snap_pc, path)) = qdiff_snapshot() {
+                            if *snap_pc == sel && !QDIFF_SNAP_FIRED.load(Relaxed) {
+                                let seen = QDIFF_SNAP_SEEN.fetch_add(1, Relaxed);
+                                if seen >= qdiff_snapshot_skip() {
+                                    QDIFF_SNAP_FIRED.store(true, Relaxed);
+                                    qdiff_dump_snapshot(&mut caller, sel, path);
+                                }
+                            }
+                        }
+                        if let Some((lo, hi, path)) = qdiff_regtrace() {
+                            let armed = qdiff_snapshot().is_none() || QDIFF_SNAP_FIRED.load(Relaxed);
+                            if armed && sel >= *lo && sel <= *hi {
+                                qdiff_log_regtrace(&mut caller, sel, path);
+                            }
+                        }
                     }
                     Ok(())
                 })
@@ -554,6 +597,173 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
+}
+
+// --- qemu-diff capture: full-state snapshot + per-block register trace ------------
+//
+// A REUSABLE differential-oracle capture (not game-specific): piggyback the per-block
+// `svc` hook (emitted by VITASLOP_TRACE_BLOCKS) to (a) dump the whole guest state once
+// at a chosen block PC and (b) log the register+flag file at every block entry from that
+// point on. An external reference ARMv7 CPU (qemu-arm, driven by the qdiff host tool)
+// then replays the SAME instruction stream from the SAME state, and a per-block diff
+// pinpoints the first block whose entry state departs from the reference - i.e. the
+// mis-lifted op lives in the preceding block. To use, transpile with VITASLOP_TRACE_BLOCKS
+// covering the window (so the hooks are emitted) plus these two knobs.
+
+/// `VITASLOP_SNAPSHOT=<hexpc>:<path>` - dump full state on first entry to block `hexpc`.
+fn qdiff_snapshot() -> &'static Option<(u32, String)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, String)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_SNAPSHOT").ok()?;
+        // First ':' splits the (colon-free) hex PC from the path (which may be a
+        // Windows path containing a drive-letter colon).
+        let (pc, path) = s.split_once(':')?;
+        let pc = u32::from_str_radix(pc.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((pc, path.trim().to_string()))
+    })
+}
+
+/// `VITASLOP_REGTRACE=<lo>-<hi>:<path>` - append the reg+flag file per block entry in
+/// `[lo,hi]` (starting once the snapshot has fired, or immediately if none is configured).
+fn qdiff_regtrace() -> &'static Option<(u32, u32, String)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, u32, String)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_REGTRACE").ok()?;
+        // The range "lo-hi" is colon-free, so the first ':' delimits range from path.
+        let (range, path) = s.split_once(':')?;
+        let (lo, hi) = range.split_once('-')?;
+        let lo = u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?;
+        let hi = u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((lo, hi, path.trim().to_string()))
+    })
+}
+
+/// Set once the snapshot block has been dumped, so the register trace records only the
+/// window from the snapshot forward (not earlier passes through the same blocks).
+static QDIFF_SNAP_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many matching block entries have been seen (to honor the skip count).
+static QDIFF_SNAP_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `VITASLOP_SNAPSHOT_SKIP=<n>` - skip the first `n` entries to the snapshot block before
+/// firing (default 0 = first entry). Targets a specific call of a re-entered function
+/// (e.g. the 4th `find` invocation) without the colon-ambiguity of packing it into the path.
+fn qdiff_snapshot_skip() -> u32 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u32> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_SNAPSHOT_SKIP")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Lazily-opened register-trace file (plain `File`: each line is written straight
+/// through, so no flush is needed at process exit where the static is leaked).
+fn qdiff_regtrace_writer() -> &'static Mutex<Option<std::fs::File>> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Dump the full guest state (all non-zero pages + r0..r15 + NZCV) to `path`, in the
+/// simple `VSNP` container the qdiff host tool reads. Fired once, at block `pc`.
+fn qdiff_dump_snapshot<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    pc: u32,
+    path: &str,
+) {
+    let mut regs = [0u32; 16];
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = get_reg(caller, i);
+    }
+    let flags = [
+        get_flag(caller, abi::Flag::N),
+        get_flag(caller, abi::Flag::Z),
+        get_flag(caller, abi::Flag::C),
+        get_flag(caller, abi::Flag::V),
+    ];
+    let base = caller.data().base;
+    let shared = caller.data().shared_mem.clone();
+    let data = shared.data();
+    // SAFETY: `UnsafeCell<u8>` is repr(transparent) over `u8`; under the cooperative
+    // scheduler no other fiber runs while this svc handler executes on the live thread.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+    // Coalesce contiguous non-zero 4 KiB pages into regions (sparse: skips the huge
+    // zero gaps between image, heap, and stack).
+    const PAGE: usize = 4096;
+    let mut regions: Vec<(u32, usize, usize)> = Vec::new(); // (guest_addr, linear_off, len)
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let end = (i + PAGE).min(bytes.len());
+        if bytes[i..end].iter().any(|&b| b != 0) {
+            if let Some(last) = regions.last_mut() {
+                if last.1 + last.2 == i {
+                    last.2 += end - i;
+                    i = end;
+                    continue;
+                }
+            }
+            regions.push((base + i as u32, i, end - i));
+        }
+        i = end;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"VSNP");
+    buf.extend_from_slice(&1u32.to_le_bytes()); // version
+    buf.extend_from_slice(&pc.to_le_bytes());
+    for r in regs {
+        buf.extend_from_slice(&r.to_le_bytes());
+    }
+    for f in flags {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    buf.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+    for (addr, off, len) in &regions {
+        buf.extend_from_slice(&addr.to_le_bytes());
+        buf.extend_from_slice(&(*len as u32).to_le_bytes());
+        buf.extend_from_slice(&bytes[*off..*off + *len]);
+    }
+    match std::fs::write(path, &buf) {
+        Ok(()) => eprintln!(
+            "[qdiff] snapshot at {pc:#010x}: {} region(s), {} bytes -> {path}",
+            regions.len(),
+            buf.len()
+        ),
+        Err(e) => eprintln!("[qdiff] snapshot write to {path} failed: {e}"),
+    }
+}
+
+/// Append one `pc r0..r15 n z c v` line (all hex, flags 0/1) to the register trace.
+fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    pc: u32,
+    path: &str,
+) {
+    let mut line = format!("{pc:08x}");
+    for i in 0..16 {
+        line.push_str(&format!(" {:08x}", get_reg(caller, i)));
+    }
+    for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
+        line.push_str(&format!(" {}", get_flag(caller, f)));
+    }
+    line.push('\n');
+    let mut guard = qdiff_regtrace_writer().lock().unwrap();
+    if guard.is_none() {
+        match std::fs::File::create(path) {
+            Ok(f) => *guard = Some(f),
+            Err(e) => {
+                eprintln!("[qdiff] regtrace create {path} failed: {e}");
+                return;
+            }
+        }
+    }
+    use std::io::Write;
+    if let Some(w) = guard.as_mut() {
+        let _ = w.write_all(line.as_bytes());
+    }
 }
 
 /// Bind `env.dispatch_miss`: an indirect call that resolves to no translated
@@ -811,6 +1021,16 @@ fn get_reg<T>(caller: &mut Caller<'_, T>, i: usize) -> u32 {
         .get(&mut *caller)
         .i32()
         .expect("register global is i32") as u32
+}
+
+/// Read condition flag `f` (0 or 1) from its wasm global. Absent global (a title that
+/// never uses the flag) reads as 0.
+fn get_flag<T>(caller: &mut Caller<'_, T>, f: abi::Flag) -> u32 {
+    caller
+        .get_export(abi::flag_export(f))
+        .and_then(|e| e.into_global())
+        .map(|g| g.get(&mut *caller).i32().unwrap_or(0) as u32)
+        .unwrap_or(0)
 }
 
 fn set_reg_caller<T>(caller: &mut Caller<'_, T>, i: usize, v: u32) {

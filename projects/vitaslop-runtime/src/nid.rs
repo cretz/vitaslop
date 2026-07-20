@@ -163,6 +163,7 @@ pub mod libkernel {
     // Thread-local storage: a per-thread pointer slot indexed by key.
     pub const GET_TLS_ADDR: u32 = 0xB295_EB61;
     // Process/thread timing and status.
+    pub const GET_PROCESS_TIME: u32 = 0x4C46_72BF;
     pub const GET_PROCESS_TIME_WIDE: u32 = 0xB110_C123;
     pub const GET_THREAD_EXIT_STATUS: u32 = 0xD5DC_26C4;
     // process control.
@@ -583,6 +584,7 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::CLIB_STRNCMP => "sceClibStrncmp",
         lk::CLIB_STRCMP => "sceClibStrcmp",
         lk::GET_TLS_ADDR => "sceKernelGetTLSAddr",
+        lk::GET_PROCESS_TIME => "sceKernelGetProcessTime",
         lk::GET_PROCESS_TIME_WIDE => "sceKernelGetProcessTimeWide",
         lk::GET_THREAD_EXIT_STATUS => "sceKernelGetThreadExitStatus",
         lk::EXIT_PROCESS => "sceKernelExitProcess",

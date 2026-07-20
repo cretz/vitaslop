@@ -209,6 +209,7 @@ pub fn dispatch(
         lk_nid::GET_THREAD_ID => cont!(libkernel::get_thread_id(ctx, st)),
         lk_nid::GET_THREAD_EXIT_STATUS => cont!(libkernel::get_thread_exit_status(ctx, st)),
         lk_nid::GET_TLS_ADDR => cont!(libkernel::get_tls_addr(ctx, st)),
+        lk_nid::GET_PROCESS_TIME => libkernel::get_process_time(ctx, st),
         lk_nid::GET_PROCESS_TIME_WIDE => libkernel::get_process_time_wide(ctx, st),
         lk_nid::EXIT_PROCESS => {
             // r0 (exit code) is left as the guest set it; any exit is a clean stop.

@@ -68,6 +68,35 @@ pub struct Export {
     pub addr: u32,
 }
 
+/// One imported *variable* (data symbol): the library and NID it comes from, and
+/// the guest address of its SCE fixup blob. Unlike a function import (which patches
+/// a single call stub), a variable import carries a list of code/data sites that
+/// reference the symbol; resolving it applies that list, pointing every site at the
+/// exporting module's copy of the variable. Vita's C library exports its ctype
+/// tables (`_Ctype`, `_Tolotab`, `_Touptab`) and stdio handles (`_Stdout`,
+/// `_Stderr`, ...) this way, so a statically-linked title whose variable imports go
+/// unresolved reads a garbage tolower table and corrupts every case-folded path.
+#[derive(Debug, Clone, Copy)]
+pub struct VarImport {
+    pub library_nid: u32,
+    pub var_nid: u32,
+    /// Guest address of the fixup blob: a `u32` header (byte length = `header >> 4`,
+    /// including the header) followed by `{ code_word: u32, offset: u32 }` entries.
+    /// `code_word`'s byte 1 is an `R_ARM_*` code; `offset` is the site's byte offset
+    /// from the module's link base.
+    pub blob_ptr: u32,
+}
+
+/// One exported *variable* (data symbol): the library, NID, and the guest address
+/// of the variable itself in this module. A [`VarImport`] with the same NID binds
+/// its fixup sites to this address.
+#[derive(Debug, Clone, Copy)]
+pub struct VarExport {
+    pub library_nid: u32,
+    pub var_nid: u32,
+    pub addr: u32,
+}
+
 /// A parsed Vita module.
 pub struct Module {
     /// Module name from `SceModuleInfo` (e.g. "cube.elf").
@@ -89,6 +118,11 @@ pub struct Module {
     /// Function exports (what other modules can import from this one), in
     /// export-table order. Empty for a module that exports nothing callable.
     pub exports: Vec<Export>,
+    /// Variable (data-symbol) imports, in import-table order. Resolved at link time
+    /// by applying each one's fixup blob against the matching [`VarExport`].
+    pub var_imports: Vec<VarImport>,
+    /// Variable (data-symbol) exports this module provides to others.
+    pub var_exports: Vec<VarExport>,
     /// SCE relocations (`PT_SCE_RELA`), decoded but not yet applied. [`rebase`]
     /// applies them when the module is placed at a runtime base.
     ///
@@ -146,6 +180,11 @@ pub enum Error {
     CompressedSelf,
     /// A relocation used a code we do not model (see [`reloc::code`]).
     UnsupportedReloc(u8),
+    /// The SCE relocation blob carried an entry format we do not model (the low
+    /// nibble of the entry's first word). Carries `(format, byte_offset)`. Silently
+    /// dropping the rest of the blob would leave dangling zeroed pointers that only
+    /// fault much later, so this is a hard load failure.
+    UnknownRelocFormat(u8, usize),
 }
 
 impl Module {
@@ -246,6 +285,15 @@ impl Module {
         for ex in &mut self.exports {
             ex.addr = ex.addr.wrapping_add(delta);
         }
+        // Variable-import fixup blobs and variable-export addresses are module data:
+        // they move with the module. The site offsets inside each blob stay
+        // link-base-relative (resolved against the module base at apply time).
+        for vi in &mut self.var_imports {
+            vi.blob_ptr = vi.blob_ptr.wrapping_add(delta);
+        }
+        for ve in &mut self.var_exports {
+            ve.addr = ve.addr.wrapping_add(delta);
+        }
         for p in &mut self.init_pointers {
             *p = p.wrapping_add(delta);
         }
@@ -271,7 +319,7 @@ impl Module {
 /// splits as `imm4:i:imm3:imm8` across the two halfwords (little-endian): the
 /// first halfword carries `i` (bit 10) and `imm4` (bits 3..0); the second carries
 /// `imm3` (bits 14..12) and `imm8` (bits 7..0).
-fn patch_thumb_mov(data: &mut [u8], off: usize, imm16: u16) -> Result<(), Error> {
+pub fn patch_thumb_mov(data: &mut [u8], off: usize, imm16: u16) -> Result<(), Error> {
     let site = data
         .get_mut(off..off + 4)
         .ok_or(Error::OutOfBounds("reloc thumb-mov site"))?;
@@ -566,6 +614,7 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
 
     // Walk the import table: fixed-size entries from import_top to import_end.
     let mut imports = Vec::new();
+    let mut var_imports = Vec::new();
     let mut cursor = import_top;
     while cursor < import_end {
         let base = cursor;
@@ -606,6 +655,20 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
             });
         }
 
+        // Variable (data) imports follow the functions in the same import entry.
+        // The short (0x24) form drops the two reserved words, shifting the var
+        // tables up by 8, exactly as the function tables shift.
+        let (num_vars, var_nid_table, var_entry_table) = if step == 0x24 {
+            (read_vaddr_u16(&read_vaddr, base + 0x08)?, read_vaddr(base + 0x1c)?, read_vaddr(base + 0x20)?)
+        } else {
+            (read_vaddr_u16(&read_vaddr, base + 0x08)?, read_vaddr(base + 0x24)?, read_vaddr(base + 0x28)?)
+        };
+        for i in 0..num_vars as u32 {
+            let var_nid = read_vaddr(var_nid_table + i * 4)?;
+            let blob_ptr = read_vaddr(var_entry_table + i * 4)?;
+            var_imports.push(VarImport { library_nid, var_nid, blob_ptr });
+        }
+
         cursor = cursor.wrapping_add(step);
     }
 
@@ -614,12 +677,14 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
     // variables; we keep the functions (what another module can call). The
     // entry addresses are absolute vaddrs carrying the Thumb bit.
     let mut exports = Vec::new();
+    let mut var_exports = Vec::new();
     let mut cursor = export_top;
     while cursor < export_end {
         let base = cursor;
         let size = read_vaddr_u16(&read_vaddr, base)?;
         let step = if size == 0 { 0x20 } else { size as u32 };
         let num_funcs = read_vaddr_u16(&read_vaddr, base + 0x06)?;
+        let num_vars = read_vaddr_u16(&read_vaddr, base + 0x08)?;
         let library_nid = read_vaddr(base + 0x10)?;
         let nid_table = read_vaddr(base + 0x18)?;
         let entry_table = read_vaddr(base + 0x1c)?;
@@ -627,6 +692,12 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
             let func_nid = read_vaddr(nid_table + i * 4)?;
             let addr = read_vaddr(entry_table + i * 4)?;
             exports.push(Export { library_nid, func_nid, addr });
+        }
+        // Variable exports follow the functions in the shared nid/entry tables.
+        for i in num_funcs as u32..(num_funcs as u32 + num_vars as u32) {
+            let var_nid = read_vaddr(nid_table + i * 4)?;
+            let addr = read_vaddr(entry_table + i * 4)?;
+            var_exports.push(VarExport { library_nid, var_nid, addr });
         }
         cursor = cursor.wrapping_add(step);
     }
@@ -644,7 +715,7 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         let blob = bytes
             .get(p_offset..p_offset + p_filesz)
             .ok_or(Error::OutOfBounds("reloc segment"))?;
-        relocations.extend(reloc::decode(blob));
+        relocations.extend(reloc::decode(blob)?);
     }
 
     // Build the public segments (owning their file bytes, bss zero-filled).
@@ -693,6 +764,8 @@ pub fn load(bytes: &[u8]) -> Result<Module, Error> {
         segments,
         imports,
         exports,
+        var_imports,
+        var_exports,
         relocations,
         init_pointers,
         code_pointers,
