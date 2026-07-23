@@ -22,6 +22,9 @@ struct AudioPort {
     guest_port: i32,
     /// Backend port id from [`AudioSink::open_port`](crate::audio::AudioSink::open_port).
     backend_port: i32,
+    /// `SceAudioOutPortType` the port was opened with (MAIN 0 / BGM 1 / VOICE 2).
+    /// Tracked so `sceAudioOutGetAdopt` can report whether a type is in use.
+    ty: i32,
     format: AudioFormat,
 }
 
@@ -85,7 +88,7 @@ impl AudioState {
 /// `len` is the grain (frames per output), `mode` 0 = mono / 1 = stereo. Returns
 /// the guest port number (>= 0).
 #[hostcall]
-pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, _ty: i32, len: i32, freq: i32, mode: i32) -> i32 {
+pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32, len: i32, freq: i32, mode: i32) -> i32 {
     let channels = if mode == 1 { 2 } else { 1 };
     let format = AudioFormat {
         channels,
@@ -98,9 +101,18 @@ pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, _ty: i32, l
     } else {
         let guest_port = st.audio_state.next_guest_port;
         st.audio_state.next_guest_port += 1;
-        st.audio_state.ports.push(AudioPort { guest_port, backend_port, format });
+        st.audio_state.ports.push(AudioPort { guest_port, backend_port, ty, format });
         guest_port
     }
+}
+
+/// int sceAudioOutGetAdopt(SceAudioOutPortType type)
+/// "Get status of port type": returns (1) if a port of `type` is currently in use
+/// for sound generation, (0) otherwise. A title polls this before opening a port to
+/// see whether the type is already claimed; we report it from the open-port set.
+#[hostcall]
+pub(super) fn out_get_adopt(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32) -> i32 {
+    i32::from(st.audio_state.ports.iter().any(|p| p.ty == ty))
 }
 
 /// int sceAudioOutOutput(int port, const void *buf)

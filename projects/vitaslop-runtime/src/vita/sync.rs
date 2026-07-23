@@ -82,10 +82,16 @@ pub(super) fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32,
 ///
 /// Single-thread model: take `signal` from the count (floored, never blocks).
 /// Preemptive: take it if available, else park the caller until a signal delivers
-/// it ([`SvcOutcome::Block`]); the return value is 0 either way.
+/// it ([`SvcOutcome::Block`]) or the timeout passes. A satisfied wait (now or by a
+/// later signal) returns 0; a `*timeout`-armed wait that expires first returns
+/// `SCE_KERNEL_ERROR_WAIT_TIMEOUT`, delivered at wake through the resume-code channel
+/// (the return value is set to 0 before parking, since a woken thread resumes with
+/// the registers it parked with).
 pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
     let signal = ctx.arg(1) as i32;
+    let timeout_ptr = ctx.arg(2);
+    let timeout_us = if timeout_ptr != 0 { ctx.read_u32(timeout_ptr) } else { 0 };
     // A wait on a semaphore that does not exist is not a wait at all: the real kernel
     // rejects it immediately with SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID rather than parking
     // the caller forever (id 0 - an uninitialized `SceUID` - is the common case). A
@@ -109,7 +115,7 @@ pub(super) fn wait_sema(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             id, n = signal, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]),
             "wait BLOCK"
         );
-        st.sema_block(id, signal);
+        st.sema_block(id, signal, timeout_us);
         SvcOutcome::Block
     }
 }
@@ -140,14 +146,19 @@ pub(super) fn create_cond(st: &mut VitaState, _name: Ptr, _attr: u32, mutex: i32
 /// Single-thread model: nothing else can signal, so the wait returns immediately
 /// (the mutex stays held) - correct for the degenerate single-thread use.
 /// Preemptive: release the mutex and park the caller until a signal delivers it
-/// back with the mutex re-acquired ([`SvcOutcome::Block`]).
+/// back with the mutex re-acquired ([`SvcOutcome::Block`]), or the timeout passes -
+/// on which the caller still re-acquires the mutex but the wait returns
+/// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` (via the resume-code channel). A null timeout
+/// waits forever.
 pub(super) fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let id = ctx.arg(0) as i32;
+    let timeout_ptr = ctx.arg(1);
+    let timeout_us = if timeout_ptr != 0 { ctx.read_u32(timeout_ptr) } else { 0 };
     ctx.ret(0);
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    st.cond_wait(id);
+    st.cond_wait(id, timeout_us);
     SvcOutcome::Block
 }
 

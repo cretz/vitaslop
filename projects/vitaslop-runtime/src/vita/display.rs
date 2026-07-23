@@ -30,6 +30,22 @@ pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) ->
     SvcOutcome::Block
 }
 
+/// int sceDisplayWaitSetFrameBuf(void)
+///
+/// Block until the framebuffer queued by the most recent `sceDisplaySetFrameBuf` has
+/// been latched, which hardware does at the next vblank. We apply a set-framebuffer
+/// immediately, so the latch is a single vblank away: park for one vblank period
+/// (preemptive) so a present-then-wait loop paces to 60 Hz and yields the CPU, or a
+/// plain yield in the single-thread model. Returns 0.
+pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    ctx.ret(0);
+    if !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    st.sleep_park(VBLANK_US);
+    SvcOutcome::Block
+}
+
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)
 /// SceDisplayFrameBuf: { SceSize size; void *base; uint32 pitch; uint32 fmt;
 ///                       uint32 width; uint32 height; } (0x18 bytes).

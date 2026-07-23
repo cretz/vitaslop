@@ -96,6 +96,10 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     process_halt: bool,
     /// Set by a host call that returned `ThreadExit`.
     thread_exit: bool,
+    /// Set by a host call that returned `Fatal`: the run must stop with this message
+    /// (surfaced as `FiberEnd::Error` -> `RunReport::Error`). Read by the fiber's
+    /// async block after the guest call unwinds.
+    fatal: Option<String>,
 }
 
 /// One suspendable guest thread on the wasmtime engine: an async fiber (the in-flight
@@ -458,6 +462,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             signal: signal.clone(),
             process_halt: false,
             thread_exit: false,
+            fatal: None,
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -513,6 +518,9 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
                 last_r0 = get_reg_store(&mut store, &instance, 0);
                 if let Err(e) = call_res {
                     let d = store.data_mut();
+                    if let Some(msg) = d.fatal.take() {
+                        return FiberEnd::Error(msg);
+                    }
                     if d.process_halt {
                         return FiberEnd::ProcessHalt(last_r0);
                     }
@@ -558,10 +566,18 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                     use std::sync::atomic::Ordering::Relaxed;
                     let sel = selector as u32;
                     if sel & 0x8000_0000 != 0 {
+                        // Block-visit histogram: count entries per block PC (and record the
+                        // exact entry sequence for the first few thousand) instead of printing.
+                        // Reveals a hot loop's structure without flooding stderr or perturbing
+                        // the schedule the way a per-block eprintln does.
+                        if block_hist_enabled() {
+                            block_hist_record(sel);
+                        }
                         // The verbose per-block eprintln is the human trace; suppress it when
                         // a machine register trace is being captured (the file is the record,
-                        // and a wide qdiff hook range would otherwise flood stderr).
-                        if qdiff_regtrace().is_none() {
+                        // and a wide qdiff hook range would otherwise flood stderr), or when
+                        // only the histogram is wanted.
+                        if qdiff_regtrace().is_none() && !block_hist_enabled() {
                             let thid = caller.data().thid;
                             let r: [u32; 13] = std::array::from_fn(|i| get_reg(&mut caller, i));
                             eprintln!(
@@ -694,11 +710,33 @@ fn qdiff_dump_snapshot<H: ImportDispatch + Send + 'static>(
     // Coalesce contiguous non-zero 4 KiB pages into regions (sparse: skips the huge
     // zero gaps between image, heap, and stack).
     const PAGE: usize = 4096;
+    // `VITASLOP_SNAPSHOT_DENSE=lo-hi` (hex guest addrs) forces every page in that range
+    // into the snapshot even when it reads as all-zero. The default sparse dump omits
+    // zero pages to stay small, but a loop that WRITES to fresh (currently-zero) pages
+    // ahead of a marching pointer - a table build, memset, hash fill - would leave qemu
+    // (which maps only the snapshot's pages) faulting on the first such store while our
+    // engine, holding the whole linear memory, does not. Including those pages as zeros
+    // lets the reference CPU follow the same stores. Multiple ranges are comma-separated.
+    let dense_ranges: Vec<(u32, u32)> = std::env::var("VITASLOP_SNAPSHOT_DENSE")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|item| {
+                    let (lo, hi) = item.split_once('-')?;
+                    Some((
+                        u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let page_dense = |page_addr: u32| dense_ranges.iter().any(|&(lo, hi)| page_addr < hi && page_addr + PAGE as u32 > lo);
     let mut regions: Vec<(u32, usize, usize)> = Vec::new(); // (guest_addr, linear_off, len)
     let mut i = 0usize;
     while i < bytes.len() {
         let end = (i + PAGE).min(bytes.len());
-        if bytes[i..end].iter().any(|&b| b != 0) {
+        if bytes[i..end].iter().any(|&b| b != 0) || page_dense(base + i as u32) {
             if let Some(last) = regions.last_mut() {
                 if last.1 + last.2 == i {
                     last.2 += end - i;
@@ -736,12 +774,32 @@ fn qdiff_dump_snapshot<H: ImportDispatch + Send + 'static>(
     }
 }
 
+/// `VITASLOP_REGTRACE_MAX=<n>` caps the register trace at `n` lines (0 = unbounded).
+/// Bounds the qdiff replay: a host-call-free loop emits millions of in-range blocks, but
+/// a few hundred (a dozen loop iterations) already decide escape-vs-loop, and qdiff single
+/// -continues qemu once per record, so an uncapped trace makes it crawl.
+fn qdiff_regtrace_max() -> u64 {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_REGTRACE_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+static QDIFF_REGTRACE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Append one `pc r0..r15 n z c v` line (all hex, flags 0/1) to the register trace.
 fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     caller: &mut Caller<'_, ThreadData<H>>,
     pc: u32,
     path: &str,
 ) {
+    let cap = qdiff_regtrace_max();
+    if cap != 0 && QDIFF_REGTRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= cap {
+        return;
+    }
     let mut line = format!("{pc:08x}");
     for i in 0..16 {
         line.push_str(&format!(" {:08x}", get_reg(caller, i)));
@@ -763,6 +821,115 @@ fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     use std::io::Write;
     if let Some(w) = guard.as_mut() {
         let _ = w.write_all(line.as_bytes());
+    }
+}
+
+// --- block-visit histogram (VITASLOP_BLOCK_HIST) --------------------------------
+//
+// A cheap, non-flooding companion to VITASLOP_TRACE_BLOCKS. For a hot loop, printing
+// every block entry both floods stderr and (because the print costs guest fuel) shifts
+// the preemptive schedule so successive runs cannot be cross-correlated. Instead this
+// counts entries per block PC and records the exact PC sequence for the first few
+// thousand entries. The result maps a loop's structure empirically: the hottest blocks
+// are the loop body, the relative counts give the nesting/trip counts, and the recorded
+// prefix shows the exact repeating cycle - whose head is the loop head (the block to
+// snapshot for qemu-diff). Enable by transpiling with VITASLOP_TRACE_BLOCKS=lo-hi (so
+// the per-block svc hooks are emitted) plus VITASLOP_BLOCK_HIST=1; dumped at run end by
+// `dump_block_hist`. Zero cost when unset.
+struct BlockHist {
+    counts: std::collections::HashMap<u32, u64>,
+    /// The most recent `SEQ_CAP` block PCs in execution order (a ring buffer, so it
+    /// holds the STEADY-STATE cycle at run end, not the warmup prefix).
+    seq: std::collections::VecDeque<u32>,
+    total: u64,
+}
+const BLOCK_HIST_SEQ_CAP: usize = 8192;
+static BLOCK_HIST: Mutex<Option<BlockHist>> = Mutex::new(None);
+
+fn block_hist_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_BLOCK_HIST").is_ok())
+}
+
+fn block_hist_record(pc: u32) {
+    let mut g = BLOCK_HIST.lock().unwrap();
+    let h = g.get_or_insert_with(|| BlockHist {
+        counts: std::collections::HashMap::new(),
+        seq: std::collections::VecDeque::new(),
+        total: 0,
+    });
+    *h.counts.entry(pc).or_insert(0) += 1;
+    if h.seq.len() >= BLOCK_HIST_SEQ_CAP {
+        h.seq.pop_front();
+    }
+    h.seq.push_back(pc);
+    h.total += 1;
+}
+
+/// Print the block-visit histogram gathered under `VITASLOP_BLOCK_HIST`: the `top`
+/// most-entered block PCs with their counts, the recorded entry-sequence prefix, and
+/// the shortest exact repeating period detected in that prefix (the loop's cycle
+/// length, if it settled into one). Call once after the run.
+pub fn dump_block_hist(top: usize) {
+    let g = BLOCK_HIST.lock().unwrap();
+    let Some(h) = g.as_ref() else {
+        return;
+    };
+    // If VITASLOP_BLOCK_HIST_SEQ=<path> is set, write the full recorded steady-state
+    // entry sequence (one hex PC per line) there, so the macro-structure (outer-loop
+    // period, pass boundaries) can be analyzed offline when it is not a short cycle.
+    if let Ok(path) = std::env::var("VITASLOP_BLOCK_HIST_SEQ") {
+        let mut s = String::with_capacity(h.seq.len() * 11);
+        for pc in &h.seq {
+            s.push_str(&format!("{pc:08x}\n"));
+        }
+        match std::fs::write(&path, &s) {
+            Ok(()) => eprintln!("wrote {} block-seq entries to {path}", h.seq.len()),
+            Err(e) => eprintln!("block-seq write to {path} failed: {e}"),
+        }
+    }
+    eprintln!(
+        "--- block histogram: {} distinct blocks, {} total entries (seq prefix {} of them) ---",
+        h.counts.len(),
+        h.total,
+        h.seq.len()
+    );
+    let mut pairs: Vec<(u32, u64)> = h.counts.iter().map(|(&a, &c)| (a, c)).collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (addr, count) in pairs.iter().take(top) {
+        eprintln!("  {addr:#010x}: {count}");
+    }
+    if pairs.len() > top {
+        eprintln!("  ...({} more blocks)", pairs.len() - top);
+    }
+    // Detect the shortest period p such that the tail of the recorded sequence repeats
+    // with period p (loop cycle length). Check the last 4*p entries agree. Searches up
+    // to a long period so a big nested body (many blocks per outer iteration) is still
+    // caught. The ring buffer holds the steady-state tail, so this is the real cycle.
+    let seq: Vec<u32> = h.seq.iter().copied().collect();
+    if seq.len() >= 8 {
+        let mut period = None;
+        for p in 1..=(seq.len() / 4) {
+            let window = 4 * p;
+            let start = seq.len() - window;
+            if (start..seq.len() - p).all(|i| seq[i] == seq[i + p]) {
+                period = Some(p);
+                break;
+            }
+        }
+        match period {
+            Some(p) => {
+                let cycle: Vec<String> =
+                    seq[seq.len() - p..].iter().map(|a| format!("{a:#x}")).collect();
+                eprintln!("  detected loop cycle length {p}; blocks in one cycle (order):");
+                // Wrap the (possibly long) cycle over several lines for readability.
+                for chunk in cycle.chunks(12) {
+                    eprintln!("    {}", chunk.join(" -> "));
+                }
+            }
+            None => eprintln!("  no exact short period in the recorded tail (nested/irregular)"),
+        }
     }
 }
 
@@ -888,6 +1055,18 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         SvcOutcome::Block => {
                             caller.data().signal.lock().unwrap().stop = Stop::Blocked;
                             YieldNow(false).await;
+                            // Resumed. A timed wait that expired owes this thread a
+                            // return code other than the 0 it parked with (a
+                            // WAIT_TIMEOUT); apply it to r0 before returning to the
+                            // guest. A signal wake has no code and keeps r0 = 0.
+                            let code = {
+                                let data = caller.data();
+                                let thid = data.thid;
+                                data.host.lock().unwrap().take_resume_code(thid)
+                            };
+                            if let Some(code) = code {
+                                set_reg_caller(&mut caller, 0, code); // r0 = return value
+                            }
                         }
                         SvcOutcome::Yield => {
                             caller.data().signal.lock().unwrap().stop = Stop::Yielded;
@@ -900,6 +1079,13 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         SvcOutcome::Halt => {
                             caller.data_mut().process_halt = true;
                             return Err(wasmtime::Error::msg("process halt"));
+                        }
+                        SvcOutcome::Fatal(msg) => {
+                            // Unfaithful call (e.g. unimplemented NID): stop the run
+                            // loudly. Stash the message and unwind; the fiber surfaces
+                            // it as FiberEnd::Error -> RunReport::Error.
+                            caller.data_mut().fatal = Some(msg.clone());
+                            return Err(wasmtime::Error::msg(msg));
                         }
                     }
                     Ok(())

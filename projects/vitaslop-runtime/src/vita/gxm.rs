@@ -171,13 +171,14 @@ pub(super) fn find_parameter(ctx: &mut GuestCtx, _st: &mut VitaState) {
 pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     let surface = ctx.arg(0);
     let format = ctx.arg(1);
+    let surface_type = ctx.arg(2);
     let width = ctx.arg(5);
     let height = ctx.arg(6);
     let stride_pixels = ctx.arg(7);
     let data_addr = ctx.arg(8);
     st.set_color_surface(
         surface,
-        ColorSurface { format, width, height, stride_pixels, data_addr },
+        ColorSurface { format, surface_type, width, height, stride_pixels, data_addr },
     );
     ctx.ret(0);
 }
@@ -185,6 +186,7 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceGxmShaderPatcherCreateVertexProgram(patcher, programId, attributes,
 ///     attributeCount, streams, streamCount, vertexProgram)  -- 7 args.
 pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program_id = ctx.arg(1);
     let attributes_addr = ctx.arg(2);
     let attribute_count = ctx.arg(3);
     let streams_addr = ctx.arg(4);
@@ -216,8 +218,26 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         "createVertexProgram"
     );
 
+    // Resolve the shader-patcher id back to its `SceGxmProgram*` so a precomputed
+    // vertex state built from this vertex program can size its default uniform buffer.
+    let program_header = st.shader_program(program_id);
     let handle = st.new_handle();
-    st.set_vertex_program(handle, attributes, stride);
+    st.set_vertex_program(handle, attributes, stride, program_header);
+    ctx.write_u32(out, handle);
+    ctx.ret(0);
+}
+
+/// int sceGxmShaderPatcherCreateFragmentProgram(patcher, programId, outputFormat,
+///     multisampleMode, blendInfo, vertexProgram, fragmentProgram)  -- 7 args.
+/// Hand back a fresh handle (as the generic `out_handle` did) and additionally record
+/// the handle -> `SceGxmProgram*` mapping, so a precomputed fragment state built from
+/// this fragment program can size its default uniform buffer.
+pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program_id = ctx.arg(1);
+    let out = ctx.arg(6);
+    let program_header = st.shader_program(program_id);
+    let handle = st.new_handle();
+    st.set_fragment_program(handle, program_header);
     ctx.write_u32(out, handle);
     ctx.ret(0);
 }
@@ -244,9 +264,22 @@ pub(super) fn set_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
 }
 
 /// int sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)
-/// Hand back a small real guest buffer so a guest read-back would be faithful;
-/// the uniform values are captured from the sceGxmSetUniformDataF source anyway.
-pub(super) fn reserve_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) {
+/// Hand back a real guest buffer AND bind it as the vertex uniform source, so the
+/// uniforms the guest writes into it (its MVP and friends, on the direct draw path)
+/// are captured at draw time - see [`VitaState::reserve_vertex_uniform_buffer`].
+pub(super) fn reserve_vertex_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let out = ctx.arg(1);
+    let buf = st.reserve_vertex_uniform_buffer(ctx);
+    ctx.write_u32(out, buf);
+    ctx.ret(0);
+}
+
+/// int sceGxmReserveFragmentDefaultUniformBuffer(context, void **uniformBuffer)
+/// Hand back a real guest buffer for the fragment stage's default uniforms so a guest
+/// read-back is faithful. The software/GPU renderers reproduce a draw from the vertex
+/// transform + textures and do not consume fragment default uniforms, so this buffer
+/// is allocated but not bound as a capture source.
+pub(super) fn reserve_fragment_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) {
     let out = ctx.arg(1);
     let buf = st.galloc(256, 16);
     ctx.write_u32(out, buf);
@@ -324,6 +357,16 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
     let tex_format = ctx.arg(2);
     let width = ctx.arg(3);
     let height = ctx.arg(4);
+
+    // The 6th argument is `mipCount` for every layout except LINEAR_STRIDED, where it
+    // is the explicit byte stride. Record it so GetMipmapCountUnsafe / GetStride read
+    // back the exact value the guest passed.
+    let mip_or_stride = ctx.arg(5);
+    if type_field == TYPE_LINEAR_STRIDED {
+        st.set_texture_init_extra(texture, 1, mip_or_stride);
+    } else {
+        st.set_texture_init_extra(texture, mip_or_stride, 0);
+    }
 
     let base_format = (tex_format >> 24) & 0x1f;
     let w1 = (height.saturating_sub(1) & 0xfff)
@@ -449,6 +492,13 @@ pub(super) fn set_front_fragment_program_enable(st: &mut VitaState, _context: u3
     0
 }
 
+/// void sceGxmSetBackFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
+#[hostcall]
+pub(super) fn set_back_fragment_program_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().back_fragment_program_enable = enable;
+    0
+}
+
 /// void sceGxmSetFrontPointLineWidth(SceGxmContext *context, unsigned int width)
 #[hostcall]
 pub(super) fn set_front_point_line_width(st: &mut VitaState, _context: u32, width: u32) -> i32 {
@@ -546,6 +596,14 @@ pub(super) fn color_surface_get_format(st: &mut VitaState, surface: u32) -> u32 
     st.color_surface(surface).map(|s| s.format).unwrap_or(0)
 }
 
+/// SceGxmColorSurfaceType sceGxmColorSurfaceGetType(const SceGxmColorSurface *surface)
+/// Returns the surface layout type (LINEAR/TILED/SWIZZLED) the guest set at
+/// `sceGxmColorSurfaceInit`, or 0 (LINEAR, the enum default) if never initialized here.
+#[hostcall]
+pub(super) fn color_surface_get_type(st: &mut VitaState, surface: u32) -> u32 {
+    st.color_surface(surface).map(|s| s.surface_type).unwrap_or(0)
+}
+
 /// void sceGxmColorSurfaceSetClip(SceGxmColorSurface *surface, unsigned int xMin,
 ///     unsigned int yMin, unsigned int xMax, unsigned int yMax)
 /// The color-surface clip rectangle constrains where a scene writes. Our capture
@@ -610,5 +668,320 @@ pub(super) fn texture_set_v_addr_mode(st: &mut VitaState, texture: u32, mode: u3
 #[hostcall]
 pub(super) fn texture_set_lod_bias(st: &mut VitaState, texture: u32, bias: u32) -> i32 {
     st.set_texture_sampler(texture, 2, bias);
+    0
+}
+
+/// int sceGxmTextureSetMinFilter(SceGxmTexture *texture, SceGxmTextureFilter minFilter)
+#[hostcall]
+pub(super) fn texture_set_min_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
+    st.set_texture_filter(texture, 0, filter);
+    0
+}
+
+/// int sceGxmTextureSetMagFilter(SceGxmTexture *texture, SceGxmTextureFilter magFilter)
+#[hostcall]
+pub(super) fn texture_set_mag_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
+    st.set_texture_filter(texture, 1, filter);
+    0
+}
+
+/// int sceGxmTextureSetMipFilter(SceGxmTexture *texture, SceGxmTextureMipFilter mipFilter)
+#[hostcall]
+pub(super) fn texture_set_mip_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
+    st.set_texture_filter(texture, 2, filter);
+    0
+}
+
+/// int sceGxmTextureSetGammaMode(SceGxmTexture *texture, SceGxmTextureGammaMode gammaMode)
+#[hostcall]
+pub(super) fn texture_set_gamma_mode(st: &mut VitaState, texture: u32, gamma: u32) -> i32 {
+    st.set_texture_gamma(texture, gamma);
+    0
+}
+
+// --- Texture getters (read back the sticky sampler/format state) -------------
+
+/// unsigned int sceGxmTextureGetMipmapCountUnsafe(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_mipmap_count(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_mip_count(texture)
+}
+
+/// unsigned int sceGxmTextureGetLodBias(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_lod_bias(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_lod_bias(texture)
+}
+
+/// SceGxmTextureAddrMode sceGxmTextureGetUAddrModeSafe(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_u_addr_mode(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_addr_mode(texture, 0)
+}
+
+/// SceGxmTextureAddrMode sceGxmTextureGetVAddrModeSafe(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_v_addr_mode(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_addr_mode(texture, 1)
+}
+
+/// SceGxmTextureFilter sceGxmTextureGetMinFilter(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_min_filter(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_filter(texture, 0)
+}
+
+/// SceGxmTextureFilter sceGxmTextureGetMagFilter(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_mag_filter(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_filter(texture, 1)
+}
+
+/// SceGxmTextureGammaMode sceGxmTextureGetGammaMode(const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn texture_get_gamma_mode(st: &mut VitaState, texture: u32) -> u32 {
+    st.texture_filter(texture, 2)
+}
+
+/// unsigned int sceGxmTextureGetStride(const SceGxmTexture *texture)
+pub(super) fn texture_get_stride(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let texture = ctx.arg(0);
+    let stride = st.texture_stride(ctx, texture);
+    ctx.ret(stride);
+}
+
+// --- Color surface getters/setters beyond format ----------------------------
+
+/// void *sceGxmColorSurfaceGetData(const SceGxmColorSurface *surface)
+#[hostcall]
+pub(super) fn color_surface_get_data(st: &mut VitaState, surface: u32) -> u32 {
+    st.color_surface(surface).map(|s| s.data_addr).unwrap_or(0)
+}
+
+/// unsigned int sceGxmColorSurfaceGetStrideInPixels(const SceGxmColorSurface *surface)
+#[hostcall]
+pub(super) fn color_surface_get_stride_in_pixels(st: &mut VitaState, surface: u32) -> u32 {
+    st.color_surface(surface).map(|s| s.stride_pixels).unwrap_or(0)
+}
+
+/// int sceGxmColorSurfaceSetGammaMode(SceGxmColorSurface *surface, SceGxmColorSurfaceGammaMode gammaMode)
+#[hostcall]
+pub(super) fn color_surface_set_gamma_mode(st: &mut VitaState, surface: u32, gamma: u32) -> i32 {
+    st.set_color_surface_gamma(surface, gamma);
+    0
+}
+
+// --- Render-target sizing + GPU notification region -------------------------
+
+/// int sceGxmGetRenderTargetMemSize(const SceGxmRenderTargetParams *params,
+///     unsigned int *driverMemSize)
+/// We emulate no GPU render-target control structures, but a title reads this size to
+/// allocate the `driverMemBlock` it hands to `sceGxmCreateRenderTarget`. Return a
+/// page-aligned size proportionate to the render-target dimensions (`width` u16 at
+/// +4, `height` u16 at +6), so the guest's allocation is plausible and never zero.
+/// The block is opaque to us. This is a deliberate proxy, not the driver's exact
+/// formula (which is proprietary); the returned block is never interpreted here.
+pub(super) fn get_render_target_mem_size(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let params = ctx.arg(0);
+    let out = ctx.arg(1);
+    let wh = ctx.read_u32(params + 4);
+    let width = wh & 0xffff;
+    let height = (wh >> 16) & 0xffff;
+    // ~one control word per 8x8 tile plus a fixed header, page-aligned.
+    let tiles = (width.div_ceil(8)) * (height.div_ceil(8));
+    let size = (0x1000 + tiles * 16 + 0xfff) & !0xfff;
+    ctx.write_u32(out, size);
+    ctx.ret(0);
+}
+
+/// volatile unsigned int *sceGxmGetNotificationRegion(void)
+pub(super) fn get_notification_region(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let region = st.notification_region();
+    ctx.ret(region);
+}
+
+// --- Program reflection: default uniform buffer size + pass type ------------
+
+/// unsigned int sceGxmProgramGetDefaultUniformBufferSize(const SceGxmProgram *program)
+/// The gxp header stores the default uniform buffer's size word at +0x2C - the field
+/// immediately after `parameter_count` (+0x24) and `parameters_offset` (+0x28), the
+/// two offsets this module already verified against the real shaders in the image.
+/// A title reads this only to size its own default-uniform allocation; the actual
+/// uniform values are captured from `sceGxmSetUniformDataF`'s source, and the reserved
+/// buffer pointer is handed back by this engine, so a title's allocation is bookkeeping
+/// we do not consume. Returned verbatim (0 when the shader has no default uniforms).
+pub(super) fn program_get_default_uniform_buffer_size(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let program = ctx.arg(0);
+    ctx.ret(ctx.read_u32(program + 0x2C));
+}
+
+/// SceGxmPassType sceGxmFragmentProgramGetPassType(const SceGxmFragmentProgram *fp)
+/// Fragment programs are opaque handles here (no struct is emulated), so we cannot
+/// reflect a stored pass type; return SCE_GXM_PASS_TYPE_OPAQUE (0), the pass type of
+/// the standard opaque/blended fragment programs a title builds. Revisit if a title
+/// is found to branch on a non-opaque pass type.
+#[hostcall]
+pub(super) fn fragment_program_get_pass_type(_fragment_program: u32) -> u32 {
+    0
+}
+
+// --- Precomputed draw family ------------------------------------------------
+
+/// unsigned int sceGxmGetPrecomputedDrawSize(const SceGxmVertexProgram *vertexProgram)
+/// The guest allocates a memblock of this size for a `SceGxmPrecomputedDraw`. The
+/// public struct is `SCE_GXM_PRECOMPUTED_DRAW_WORD_COUNT` (11) u32 words = 44 bytes.
+#[hostcall]
+pub(super) fn get_precomputed_draw_size(_vertex_program: u32) -> u32 {
+    11 * 4
+}
+
+/// int sceGxmPrecomputedDrawInit(SceGxmPrecomputedDraw *precomputedDraw,
+///     const SceGxmVertexProgram *vertexProgram, void *memBlock)
+#[hostcall]
+pub(super) fn precomputed_draw_init(
+    st: &mut VitaState,
+    precomputed: u32,
+    vertex_program: u32,
+    _mem_block: u32,
+) -> i32 {
+    st.precomputed_draw_init(precomputed, vertex_program);
+    0
+}
+
+/// int sceGxmPrecomputedDrawSetVertexStream(SceGxmPrecomputedDraw *precomputedDraw,
+///     unsigned int streamIndex, const void *streamData)
+#[hostcall]
+pub(super) fn precomputed_draw_set_vertex_stream(
+    st: &mut VitaState,
+    precomputed: u32,
+    stream_index: u32,
+    stream_data: u32,
+) -> i32 {
+    st.precomputed_draw_set_stream(precomputed, stream_index, stream_data);
+    0
+}
+
+/// void sceGxmPrecomputedDrawSetParams(SceGxmPrecomputedDraw *precomputedDraw,
+///     SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, const void
+///     *indexData, unsigned int indexCount)
+#[hostcall]
+pub(super) fn precomputed_draw_set_params(
+    st: &mut VitaState,
+    precomputed: u32,
+    prim_type: u32,
+    index_type: u32,
+    index_data: u32,
+    index_count: u32,
+) -> i32 {
+    st.precomputed_draw_set_params(precomputed, prim_type, index_type, index_data, index_count);
+    0
+}
+
+/// int sceGxmDrawPrecomputed(SceGxmContext *context, const SceGxmPrecomputedDraw
+///     *precomputedDraw): replay the bundled draw into the current scene.
+pub(super) fn draw_precomputed(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let precomputed = ctx.arg(1);
+    st.draw_precomputed(ctx, precomputed);
+    ctx.ret(0);
+}
+
+// --- Precomputed vertex/fragment state family -------------------------------
+//
+// A precomputed state bundles one shader stage's default uniform buffer + textures
+// into a guest struct the game builds once and binds per draw (this title draws
+// almost entirely through this path - `sceGxmSetUniformDataF` is never called). The
+// struct is opaque, so we key the recorded state by its guest address, mirroring the
+// precomputed-draw family. `Init`/`SetDefaultUniformBuffer`/`SetTexture` record the
+// bundle; `sceGxmSetPrecomputed{Vertex,Fragment}State` applies it to the live bind
+// state so `record_draw` snapshots the same uniforms and textures the direct path would.
+
+/// unsigned int sceGxmGetPrecomputedVertexStateSize(const SceGxmVertexProgram *program)
+/// The size the guest allocates for the state's memBlock. The public struct is
+/// SCE_GXM_PRECOMPUTED_VERTEX_STATE_WORD_COUNT (7) u32 words = 0x1C bytes; the state
+/// data lives in our side table, so the guest's block is bookkeeping we do not consume.
+#[hostcall]
+pub(super) fn get_precomputed_vertex_state_size(_program: u32) -> u32 {
+    7 * 4
+}
+
+/// unsigned int sceGxmGetPrecomputedFragmentStateSize(const SceGxmFragmentProgram *program)
+/// As above; the fragment state is SCE_GXM_PRECOMPUTED_FRAGMENT_STATE_WORD_COUNT (9)
+/// u32 words = 0x24 bytes.
+#[hostcall]
+pub(super) fn get_precomputed_fragment_state_size(_program: u32) -> u32 {
+    9 * 4
+}
+
+/// int sceGxmPrecomputedVertexStateInit(SceGxmPrecomputedVertexState *state,
+///     const SceGxmVertexProgram *vertexProgram, void *memBlock)
+#[hostcall]
+pub(super) fn precomputed_vertex_state_init(st: &mut VitaState, state: u32, vertex_program: u32, _mem_block: u32) -> i32 {
+    st.precomputed_vertex_state_init(state, vertex_program);
+    0
+}
+
+/// int sceGxmPrecomputedFragmentStateInit(SceGxmPrecomputedFragmentState *state,
+///     const SceGxmFragmentProgram *fragmentProgram, void *memBlock)
+#[hostcall]
+pub(super) fn precomputed_fragment_state_init(st: &mut VitaState, state: u32, fragment_program: u32, _mem_block: u32) -> i32 {
+    st.precomputed_fragment_state_init(state, fragment_program);
+    0
+}
+
+/// void sceGxmPrecomputedVertexStateSetDefaultUniformBuffer(state, void *defaultBuffer)
+#[hostcall]
+pub(super) fn precomputed_vertex_state_set_default_uniform_buffer(st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+    st.precomputed_vertex_state_set_uniform_buffer(state, buffer);
+    0
+}
+
+/// void sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer(state, void *defaultBuffer)
+#[hostcall]
+pub(super) fn precomputed_fragment_state_set_default_uniform_buffer(st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+    st.precomputed_fragment_state_set_uniform_buffer(state, buffer);
+    0
+}
+
+/// void *sceGxmPrecomputedVertexStateGetDefaultUniformBuffer(const ...State *state)
+#[hostcall]
+pub(super) fn precomputed_vertex_state_get_default_uniform_buffer(st: &mut VitaState, state: u32) -> u32 {
+    st.precomputed_vertex_state_uniform_buffer(state)
+}
+
+/// void *sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer(const ...State *state)
+#[hostcall]
+pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(st: &mut VitaState, state: u32) -> u32 {
+    st.precomputed_fragment_state_uniform_buffer(state)
+}
+
+/// int sceGxmPrecomputedVertexStateSetTexture(state, unsigned int textureIndex,
+///     const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn precomputed_vertex_state_set_texture(st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+    st.precomputed_vertex_state_set_texture(state, index, texture);
+    0
+}
+
+/// int sceGxmPrecomputedFragmentStateSetTexture(state, unsigned int textureIndex,
+///     const SceGxmTexture *texture)
+#[hostcall]
+pub(super) fn precomputed_fragment_state_set_texture(st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+    st.precomputed_fragment_state_set_texture(state, index, texture);
+    0
+}
+
+/// void sceGxmSetPrecomputedVertexState(SceGxmContext *context,
+///     const SceGxmPrecomputedVertexState *precomputedState)
+#[hostcall]
+pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
+    st.bind_precomputed_vertex_state(ctx, state);
+    0
+}
+
+/// void sceGxmSetPrecomputedFragmentState(SceGxmContext *context,
+///     const SceGxmPrecomputedFragmentState *precomputedState)
+#[hostcall]
+pub(super) fn set_precomputed_fragment_state(st: &mut VitaState, _context: u32, state: u32) -> i32 {
+    st.bind_precomputed_fragment_state(state);
     0
 }

@@ -461,6 +461,24 @@ pub enum Stmt {
     /// GE[i] ? rn.byte[i] : rm.byte[i]`, reading the GE bits a preceding parallel
     /// add/sub (e.g. [`Uadd8`]) deposited.
     Sel { rd: u8, rn: u8, rm: u8 },
+    /// A register-controlled shift (`lsl/lsr/asr Rd, Rn, Rm`) where the amount is a
+    /// runtime value (ARM uses `Rm[7:0]`, range 0..255). Both the result and the
+    /// shifter carry-out depend on the amount in a way wasm's mod-32-masked shifts
+    /// cannot express (e.g. `lsl` by >=32 yields 0, not `Rn << (amt & 31)`; the
+    /// carry-out for `amt==0` is the OLD carry, unchanged), so this is emitted as a
+    /// dedicated exact model rather than a `Bin` shift plus `FlagsLogic`. When
+    /// `set_flags`, sets N,Z from the result and C to the exact shifter carry-out
+    /// (V unchanged); otherwise only writes `rd`. Immediate-amount shifts keep the
+    /// simpler `Bin`+`FlagsLogic` path (their amount is known at lowering).
+    ShiftRegFlags { kind: ShiftKind, rd: u8, rn: Value, amount: Value, set_flags: bool },
+}
+
+/// Which register-controlled shift [`Stmt::ShiftRegFlags`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    Lsl,
+    Lsr,
+    Asr,
 }
 
 /// How a basic block hands control to the next. The not-taken side of a branch

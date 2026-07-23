@@ -9,7 +9,7 @@
 //! (there is no network event to deliver). This keeps a title on its offline path -
 //! menus and gameplay - without waiting on a connection that will never come.
 
-use crate::host::{GuestCtx, VitaState};
+use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
 
 /// SceNetCtl connection state: disconnected (no link).
@@ -235,6 +235,111 @@ pub(super) fn rtc_get_current_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick:
     0
 }
 
+/// SceRtc error codes (psp2common/kernel/rtc.h). sceRtcGetTick validates each field
+/// of the broken-down time and reports the first one out of range, so a title that
+/// probes validity by feeding a bad component sees the same rejection the kernel gives.
+const SCE_RTC_ERROR_INVALID_POINTER: i32 = 0x8025_1001u32 as i32;
+const SCE_RTC_ERROR_INVALID_YEAR: i32 = 0x8025_1081u32 as i32;
+const SCE_RTC_ERROR_INVALID_MONTH: i32 = 0x8025_1082u32 as i32;
+const SCE_RTC_ERROR_INVALID_DAY: i32 = 0x8025_1083u32 as i32;
+const SCE_RTC_ERROR_INVALID_HOUR: i32 = 0x8025_1084u32 as i32;
+const SCE_RTC_ERROR_INVALID_MINUTE: i32 = 0x8025_1085u32 as i32;
+const SCE_RTC_ERROR_INVALID_SECOND: i32 = 0x8025_1086u32 as i32;
+const SCE_RTC_ERROR_INVALID_MICROSECOND: i32 = 0x8025_1087u32 as i32;
+
+/// True for a proleptic-Gregorian leap year (the rule sceRtcIsLeapYear applies).
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days in `month` (1..=12) of `year`, honoring February in a leap year.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Days from the civil date `y-m-d` (proleptic Gregorian) to 1970-01-01: the count of
+/// days since the Unix epoch, negative for earlier dates. Howard Hinnant's algorithm,
+/// exact across the whole SceRtcTime year range. Added to the RTC-to-Unix epoch offset
+/// this yields the same 0001-01-01 timeline sceRtcGetCurrentTick reports.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719_468
+}
+
+/// int sceRtcGetTick(const SceRtcTime *pTime, SceRtcTick *pTick)
+/// Convert a broken-down SceRtcTime {u16 year, month, day, hour, minute, second;
+/// u32 microsecond} into a 64-bit microsecond tick since the RTC epoch 0001-01-01.
+/// A title uses this to fold a date it built (a savedata timestamp, a scheduled event)
+/// into one comparable scalar; a wrong or unwritten tick would corrupt every ordering
+/// or delta it later derives. Each field is range-checked exactly as the kernel does so
+/// an invalid time is rejected rather than silently producing a bogus tick, and the
+/// epoch matches sceRtcGetCurrentTick so ticks from both share one timeline.
+#[hostcall]
+pub(super) fn rtc_get_tick(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, tick: Ptr) -> i32 {
+    // The #[hostcall]-generated body cannot early-return, so the work (which needs
+    // early exits for each validation failure) lives in a plain helper.
+    rtc_get_tick_impl(ctx, time, tick)
+}
+
+fn rtc_get_tick_impl(ctx: &mut GuestCtx, time: Ptr, tick: Ptr) -> i32 {
+    if time.is_null() || tick.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    let raw = ctx.read_bytes(time.addr(), 16);
+    let u16_at = |off: usize| u16::from_le_bytes([raw[off], raw[off + 1]]) as i64;
+    let year = u16_at(0);
+    let month = u16_at(2);
+    let day = u16_at(4);
+    let hour = u16_at(6);
+    let minute = u16_at(8);
+    let second = u16_at(10);
+    let micro = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as i64;
+
+    if year < 1 || year > 9999 {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    if month < 1 || month > 12 {
+        return SCE_RTC_ERROR_INVALID_MONTH;
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return SCE_RTC_ERROR_INVALID_DAY;
+    }
+    if hour > 23 {
+        return SCE_RTC_ERROR_INVALID_HOUR;
+    }
+    if minute > 59 {
+        return SCE_RTC_ERROR_INVALID_MINUTE;
+    }
+    if second > 59 {
+        return SCE_RTC_ERROR_INVALID_SECOND;
+    }
+    if micro > 999_999 {
+        return SCE_RTC_ERROR_INVALID_MICROSECOND;
+    }
+
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let t = RTC_UNIX_EPOCH_TICKS as i64 + secs * 1_000_000 + micro;
+    ctx.write_u32(tick.addr(), t as u32);
+    ctx.write_u32(tick.addr() + 4, (t >> 32) as u32);
+    0
+}
+
 /// Size of SceMotionState (vitasdk asserts 0xF8).
 const MOTION_STATE_SIZE: usize = 0xF8;
 
@@ -292,6 +397,144 @@ pub(super) fn apputil_drm_close(_st: &mut VitaState, _dir: Ptr, _mount: Ptr) -> 
     0
 }
 
+/// SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND: the queried save-data slot does not exist.
+const SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND: i32 = 0x8010_0641u32 as i32;
+/// SCE_APPUTIL_ERROR_SAVEDATA_SLOT_EXISTS: create was asked to make a slot that already exists.
+const SCE_APPUTIL_ERROR_SAVEDATA_SLOT_EXISTS: i32 = 0x8010_0640u32 as i32;
+/// Size of a guest SceAppUtilSaveDataSlotParam (vitasdk asserts 0x34C): the localized
+/// title/subtitle/detail plus icon path, user param, size, modified time, reserved.
+const SAVEDATA_SLOT_PARAM_SIZE: usize = 0x34C;
+
+/// Read the mount-point name (SceAppUtilSaveDataMountPoint, 16 opaque bytes) from a
+/// guest pointer as a NUL-trimmed string, used as the savedata-store namespace so a
+/// title with more than one mount keeps its slots distinct. A null pointer maps to the
+/// empty mount (a title that always passes the same - possibly null - handle stays
+/// self-consistent, which is all read-after-write needs).
+fn read_mount_name(ctx: &GuestCtx, mount: Ptr) -> String {
+    if mount.is_null() {
+        return String::new();
+    }
+    let raw = ctx.read_bytes(mount.addr(), 16);
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// int sceAppUtilSaveDataSlotGetParam(unsigned int slotId,
+///     SceAppUtilSaveDataSlotParam *param, SceAppUtilSaveDataMountPoint *mountPoint)
+/// Read back a slot the title created earlier this session (in-memory savedata store).
+/// A slot that was never created truthfully reports SAVEDATA_SLOT_NOT_FOUND - the title
+/// then follows its "no save present" path (new game / defaults). On success the stored
+/// param is copied back verbatim so create-then-get round-trips faithfully; a blanket-
+/// success stub would instead leave `param` as stack garbage the title reads as a real
+/// save. The kernel leaves `param` untouched on error, so we do too.
+#[hostcall]
+pub(super) fn apputil_savedata_slot_get_param(ctx: &mut GuestCtx, st: &mut VitaState, slot_id: u32, param: Ptr, mount: Ptr) -> i32 {
+    let mount_name = read_mount_name(ctx, mount);
+    match st.savedata_slot_get(&mount_name, slot_id) {
+        Some(bytes) => {
+            if !param.is_null() {
+                ctx.write_bytes(param.addr(), &bytes);
+            }
+            tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotGetParam -> OK");
+            0
+        }
+        None => {
+            tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotGetParam -> SLOT_NOT_FOUND");
+            SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND
+        }
+    }
+}
+
+/// int sceAppUtilSaveDataSlotCreate(SceUInt32 slotId,
+///     const SceAppUtilSaveDataSlotParam *param, const SceAppUtilSaveDataMountPoint *mountPoint)
+/// The title reached the fresh-save path (SaveDataSlotGetParam returned SLOT_NOT_FOUND,
+/// it built a default param) and now creates the slot. We record the param blob in the
+/// in-memory savedata store keyed by (mount, slot), so a later GetParam reads it back -
+/// faithful read-after-write. Creating a slot that already exists reports SLOT_EXISTS,
+/// as the kernel does. A null `param` stores a zeroed blob (the slot exists but carries
+/// no metadata). Nothing is persisted to a real disk - the store is per-run and offline.
+#[hostcall]
+pub(super) fn apputil_savedata_slot_create(ctx: &mut GuestCtx, st: &mut VitaState, slot_id: u32, param: Ptr, mount: Ptr) -> i32 {
+    let mount_name = read_mount_name(ctx, mount);
+    if st.savedata_slot_exists(&mount_name, slot_id) {
+        tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotCreate -> SLOT_EXISTS");
+        SCE_APPUTIL_ERROR_SAVEDATA_SLOT_EXISTS
+    } else {
+        let bytes = if param.is_null() {
+            vec![0u8; SAVEDATA_SLOT_PARAM_SIZE]
+        } else {
+            ctx.read_bytes(param.addr(), SAVEDATA_SLOT_PARAM_SIZE)
+        };
+        st.savedata_slot_put(&mount_name, slot_id, bytes);
+        tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotCreate -> OK");
+        0
+    }
+}
+
+/// Size of SceAppMgrAppState (vitasdk asserts 0x80): {u32 systemEventNum, u32
+/// appEventNum, SceBool isSystemUiOverlaid, u8 reserved[116]}.
+const APP_MGR_APP_STATE_SIZE: usize = 0x80;
+
+/// int _sceAppMgrGetAppState(SceAppMgrAppState *appState, SceSize len, uint32_t version)
+/// Poll the app-lifecycle state. The title's main thread calls this every frame to learn
+/// whether any system event (a notification, a resume, a system-UI overlay) is pending
+/// before it drains them. Off-console the app runs foregrounded with no system shell
+/// around it, so the honest state is zero pending system/app events and no overlay - the
+/// title then skips its receive-event path (there is nothing to receive) rather than
+/// reading stack garbage that could invent a phantom event count and loop draining events
+/// that never arrive. Only `len` bytes are written (the caller-declared buffer size),
+/// capped at the real struct size.
+#[hostcall]
+pub(super) fn app_mgr_get_app_state(ctx: &mut GuestCtx, _st: &mut VitaState, state: Ptr, len: u32, _version: u32) -> i32 {
+    if !state.is_null() {
+        let n = (len as usize).min(APP_MGR_APP_STATE_SIZE);
+        ctx.write_bytes(state.addr(), &vec![0u8; n]);
+    }
+    0
+}
+
+/// SceAppUtilAppParamId SCE_APPUTIL_APPPARAM_ID_SKU_FLAG: the sole documented launch
+/// app-param, read to tell a trial SKU from a full one. (The vitasdk headers only
+/// typedef the id as `unsigned int`; the id and its values are from the SCE SDK.)
+const SCE_APPUTIL_APPPARAM_ID_SKU_FLAG: u32 = 0;
+/// SCE_APPUTIL_APPPARAM_SKU_FLAG_FULL: a full (non-trial) game. We boot a full retail
+/// dump, so this is the faithful value - a blanket 0 is an undefined SKU flag that can
+/// drop a title into trial mode (limited levels, nag screens).
+const SCE_APPUTIL_APPPARAM_SKU_FLAG_FULL: u32 = 3;
+/// SCE_APPUTIL_ERROR_PARAMETER: returned for an app-param id we carry no value for,
+/// rather than inventing one.
+const SCE_APPUTIL_ERROR_PARAMETER: i32 = 0x8010_0600u32 as i32;
+
+/// int sceAppUtilAppParamGetInt(SceAppUtilAppParamId paramId, int *value)
+/// Read an integer launch parameter. The only one titles query at boot is the SKU flag,
+/// which we report as FULL (this is a full retail launch). Any other id has no backing
+/// value off-console, so it truthfully errors rather than returning a fabricated int the
+/// title would trust. The kernel leaves `value` untouched on error, so we do too.
+#[hostcall]
+pub(super) fn apputil_app_param_get_int(ctx: &mut GuestCtx, _st: &mut VitaState, param_id: u32, value: Ptr) -> i32 {
+    if param_id == SCE_APPUTIL_APPPARAM_ID_SKU_FLAG {
+        if !value.is_null() {
+            ctx.write_u32(value.addr(), SCE_APPUTIL_APPPARAM_SKU_FLAG_FULL);
+        }
+        0
+    } else {
+        SCE_APPUTIL_ERROR_PARAMETER
+    }
+}
+
+/// int sceLiveAreaGetStatus(...): query the app's LiveArea (its home-screen tile)
+/// state. LiveArea lives on the system home screen, which does not exist off-console,
+/// so the query simply succeeds and the title proceeds to its (no-op offline) LiveArea
+/// update. The out-param layout (`SceLiveAreaStatus`) is undocumented in the permissive
+/// headers; the caller passed a heap pointer in r0 but the observed boot advances with
+/// it left untouched (the title reads the return code, not the struct), so we return 0
+/// rather than fabricate a status word of unknown meaning. Revisit if a title is found
+/// to branch on the struct contents.
+#[hostcall]
+pub(super) fn live_area_get_status(_st: &mut VitaState) -> i32 {
+    0
+}
+
 /// int sceNetCtlAdhocRegisterCallback(SceNetCtlCallback func, void *arg, int *cid)
 /// Ad-hoc (device-to-device) networking has no peers off-console. Registration
 /// succeeds and hands back a callback id through `cid`; the callback never fires
@@ -330,11 +573,72 @@ pub(super) fn np_trophy_create_handle(ctx: &mut GuestCtx, st: &mut VitaState, ha
     0
 }
 
-/// int sceRtcGetCurrentClockLocalTime(SceDateTime *time)
-/// Fill a fixed, deterministic local date/time. `SceDateTime` is
-/// {u16 year, month, day, hour, minute, second; u32 microsecond}.
+/// Zero every field of an OUT struct except its leading caller-set `.size` word, which
+/// the trophy APIs take as an input version tag. Guarantees defined content regardless
+/// of whether the caller pre-zeroed the buffer.
+fn zero_out_struct_keep_size(ctx: &mut GuestCtx, p: Ptr, size: usize) {
+    if p.is_null() {
+        return;
+    }
+    let mut buf = vec![0u8; size];
+    // Preserve the caller-written size field at offset 0.
+    let sz = ctx.read_u32(p.addr());
+    buf[0..4].copy_from_slice(&sz.to_le_bytes());
+    ctx.write_bytes(p.addr(), &buf);
+}
+
+/// sizeof(SceNpTrophyGameDetails): {u32 size, numGroups, numTrophies, numPlatinum,
+/// numGold, numSilver, numBronze; char title[128]; char description[1024]} = 0x49C.
+/// Confirmed by the caller-set `.size` (=1180) this title writes before the call.
+const NP_TROPHY_GAME_DETAILS_SIZE: usize = 0x49C;
+/// sizeof(SceNpTrophyGameData): {u32 size, unlockedTrophies, unlockedPlatinum,
+/// unlockedGold, unlockedSilver, unlockedBronze, progressPercentage} = 0x1C. Confirmed
+/// by the caller-set `.size` (=28) this title writes before the call.
+const NP_TROPHY_GAME_DATA_SIZE: usize = 0x1C;
+
+/// int sceNpTrophyGetGameInfo(SceNpTrophyContext context, SceNpTrophyHandle handle,
+///     SceNpTrophyGameDetails *details, SceNpTrophyGameData *data)
+/// Report a defined EMPTY trophy set for this game: zero counts, empty title/description,
+/// zero unlocks. Trophies have no backing service off-console, so an empty-but-defined
+/// result is the honest state - the title reads "0 of 0 trophies" and takes its no-progress
+/// path rather than looping over an invented count or reading stack garbage. Either OUT
+/// pointer may be null (the caller can request only one of the two structs), so each is
+/// filled independently. The caller-set `.size` version tag at offset 0 is preserved.
 #[hostcall]
-pub(super) fn rtc_get_current_clock_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr) -> i32 {
+pub(super) fn np_trophy_get_game_info(ctx: &mut GuestCtx, _st: &mut VitaState, _context: u32, _handle: u32, details: Ptr, data: Ptr) -> i32 {
+    zero_out_struct_keep_size(ctx, details, NP_TROPHY_GAME_DETAILS_SIZE);
+    zero_out_struct_keep_size(ctx, data, NP_TROPHY_GAME_DATA_SIZE);
+    0
+}
+
+/// sizeof(SceNpTrophyFlagArray): a fixed 128-bit unlock bitmap, {u32 flag_bits[4]} = 16
+/// bytes (SCE_NP_TROPHY_FLAG_BITS_LENGTH = 128, one bit per trophy id). Fixed by the API,
+/// not caller-set. With `count` reported as 0 the caller inspects no bits, so the exact
+/// span barely matters, but we clear the full array to leave defined content.
+const NP_TROPHY_FLAG_ARRAY_SIZE: usize = 16;
+
+/// int sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context, SceNpTrophyHandle
+///     handle, SceNpTrophyFlagArray *flags, SceUInt32 *count)
+/// Report no unlocked trophies: an all-zero unlock bitmap and a total `count` of 0,
+/// consistent with the empty trophy set sceNpTrophyGetGameInfo reports. The title reads
+/// count 0 and skips iterating per-trophy info, so this is the tail of the offline trophy
+/// query path. Both OUT pointers are written so neither is left as stack garbage.
+#[hostcall]
+pub(super) fn np_trophy_get_trophy_unlock_state(ctx: &mut GuestCtx, _st: &mut VitaState, _context: u32, _handle: u32, flags: Ptr, count: Ptr) -> i32 {
+    if !flags.is_null() {
+        ctx.write_bytes(flags.addr(), &[0u8; NP_TROPHY_FLAG_ARRAY_SIZE]);
+    }
+    if !count.is_null() {
+        ctx.write_u32(count.addr(), 0);
+    }
+    0
+}
+
+/// Write the fixed, deterministic wall-clock date into a `SceDateTime`, which is
+/// {u16 year, month, day, hour, minute, second; u32 microsecond}. Both RTC clock
+/// getters serve the same constant so a title reading the struct sees a defined
+/// value rather than stack garbage.
+fn write_fixed_date_time(ctx: &mut GuestCtx, time: Ptr) {
     if !time.is_null() {
         let mut buf = [0u8; 16];
         buf[0..2].copy_from_slice(&2016u16.to_le_bytes()); // year
@@ -343,5 +647,22 @@ pub(super) fn rtc_get_current_clock_local_time(ctx: &mut GuestCtx, _st: &mut Vit
         // hour/minute/second/microsecond stay zero.
         ctx.write_bytes(time.addr(), &buf);
     }
+}
+
+/// int sceRtcGetCurrentClock(SceDateTime *time, int tzMinutes)
+/// The UTC wall clock adjusted by a caller-supplied timezone offset in minutes.
+/// We serve a fixed deterministic date regardless of `tz` (the emulated clock has
+/// no real timezone), matching the local-time variant.
+#[hostcall]
+pub(super) fn rtc_get_current_clock(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, _tz: i32) -> i32 {
+    write_fixed_date_time(ctx, time);
+    0
+}
+
+/// int sceRtcGetCurrentClockLocalTime(SceDateTime *time)
+/// Fill a fixed, deterministic local date/time.
+#[hostcall]
+pub(super) fn rtc_get_current_clock_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr) -> i32 {
+    write_fixed_date_time(ctx, time);
     0
 }

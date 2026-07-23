@@ -305,6 +305,9 @@ fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> 
         SvcOutcome::Continue | SvcOutcome::Yield | SvcOutcome::Block | SvcOutcome::Reschedule => {
             Ok(())
         }
+        // Unfaithful call (e.g. unimplemented NID): throw the message as a real JS
+        // error so the run fails loudly instead of faking a success and desyncing.
+        SvcOutcome::Fatal(msg) => Err(JsValue::from_str(&msg)),
     }
 }
 

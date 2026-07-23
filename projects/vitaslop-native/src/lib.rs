@@ -17,7 +17,7 @@ pub mod sched;
 pub use sched::{FrameStop, Scheduler};
 
 pub mod threaded;
-pub use threaded::{RunReport, ThreadSpawn, ThreadedScheduler};
+pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
 pub mod wgpu_render;
 pub use wgpu_render::{GeneralRenderer, WgpuRenderer};

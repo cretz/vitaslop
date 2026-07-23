@@ -149,8 +149,8 @@ pub fn dispatch(
     }
     let outcome = match func_nid {
         // --- lwsync: lightweight mutex / cond (the hottest surface) --------------
-        lw_nid::CREATE_LW_MUTEX => cont!(lwsync::init_work(ctx, lwsync::LW_MUTEX_WORK_SIZE)),
-        lw_nid::CREATE_LW_COND => cont!(lwsync::init_work(ctx, lwsync::LW_COND_WORK_SIZE)),
+        lw_nid::CREATE_LW_MUTEX => cont!(lwsync::create_lw_mutex(ctx, st)),
+        lw_nid::CREATE_LW_COND => cont!(lwsync::create_lw_cond(ctx, st)),
         lw_nid::WAIT_LW_COND | lw_nid::WAIT_LW_COND_CB => lwsync::wait_lw_cond(ctx, st),
         lw_nid::SIGNAL_LW_COND => cont!(lwsync::signal_lw_cond(ctx, st, false)),
         // SignalLwCondAll wakes every waiter; SignalLwCondTo targets one thread,
@@ -158,13 +158,20 @@ pub fn dispatch(
         lw_nid::SIGNAL_LW_COND_ALL | lw_nid::SIGNAL_LW_COND_TO => {
             cont!(lwsync::signal_lw_cond(ctx, st, true))
         }
-        lw_nid::LOCK_LW_MUTEX
-        | lw_nid::LOCK_LW_MUTEX_CB
-        | lw_nid::TRY_LOCK_LW_MUTEX
-        | lw_nid::UNLOCK_LW_MUTEX
-        | lw_nid::UNLOCK_LW_MUTEX2
-        | lw_nid::DELETE_LW_MUTEX
-        | lw_nid::DELETE_LW_COND => cont!(lwsync::succeed(ctx)),
+        // A lightweight mutex genuinely blocks on contention and enforces mutual
+        // exclusion (keyed by its guest work-area address). The `_CB` lock variant
+        // additionally processes pending callbacks - none are queued in this model, so
+        // it takes the same path.
+        lw_nid::LOCK_LW_MUTEX | lw_nid::LOCK_LW_MUTEX_CB => lwsync::lock_lw_mutex(ctx, st, false),
+        lw_nid::TRY_LOCK_LW_MUTEX => lwsync::lock_lw_mutex(ctx, st, true),
+        lw_nid::UNLOCK_LW_MUTEX | lw_nid::UNLOCK_LW_MUTEX2 => {
+            cont!(lwsync::unlock_lw_mutex(ctx, st))
+        }
+        lw_nid::DELETE_LW_MUTEX => cont!(lwsync::delete_lw_mutex(ctx, st)),
+        // A lightweight cond has no persistent host record beyond its parked waiters
+        // (keyed by work address in `wait_lw_cond`/`signal_lw_cond`), so delete is a
+        // bare success.
+        lw_nid::DELETE_LW_COND => cont!(lwsync::succeed(ctx)),
 
         // --- sync: heavyweight mutex / sema / cond / event flag -----------------
         sync_nid::CREATE_MUTEX => cont!(sync::create_mutex(ctx, st)),
@@ -236,6 +243,7 @@ pub fn dispatch(
         }
         // Closing a semaphore invalidates its id, same as deleting it in this model.
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
+        tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
 
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE => cont!(gxm::initialize(ctx, st)),
@@ -281,12 +289,12 @@ pub fn dispatch(
         gxm_nid::PROGRAM_PARAMETER_GET_NAME => cont!(gxm::param_get_name(ctx)),
         gxm_nid::COLOR_SURFACE_INIT => cont!(gxm::color_surface_init(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
-        gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::out_handle(ctx, st, 6)),
+        gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::create_fragment_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
         gxm_nid::END_SCENE => cont!(gxm::end_scene(ctx, st)),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
-        gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER
-        | gxm_nid::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_uniforms(ctx, st)),
+        gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_vertex_uniforms(ctx, st)),
+        gxm_nid::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_fragment_uniforms(ctx, st)),
         gxm_nid::SET_UNIFORM_DATA_F => cont!(gxm::set_uniform_data_f(ctx, st)),
         gxm_nid::SET_VERTEX_STREAM => cont!(gxm::set_vertex_stream(ctx, st)),
         gxm_nid::SET_FRAGMENT_TEXTURE => cont!(gxm::set_fragment_texture(ctx, st)),
@@ -305,11 +313,64 @@ pub fn dispatch(
         gxm_nid::TEXTURE_GET_WIDTH => cont!(gxm::texture_get_dim(ctx, 12)),
         gxm_nid::TEXTURE_GET_HEIGHT => cont!(gxm::texture_get_dim(ctx, 0)),
         gxm_nid::TEXTURE_GET_FORMAT => cont!(gxm::texture_get_format(ctx, st)),
-        gxm_nid::TEXTURE_SET_MAG_FILTER
-        | gxm_nid::TEXTURE_SET_MIN_FILTER
-        | gxm_nid::TEXTURE_SET_MIP_FILTER
-        | gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::ok(ctx)),
+        // Texture filters: record the sticky min/mag/mip filter per texture so the
+        // getters read them back (and a future renderer can sample faithfully).
+        gxm_nid::TEXTURE_SET_MIN_FILTER => cont!(gxm::texture_set_min_filter(ctx, st)),
+        gxm_nid::TEXTURE_SET_MAG_FILTER => cont!(gxm::texture_set_mag_filter(ctx, st)),
+        gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx, st)),
+        gxm_nid::TEXTURE_SET_GAMMA_MODE => cont!(gxm::texture_set_gamma_mode(ctx, st)),
+        gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::ok(ctx)),
+        // Texture getters: read back the sticky sampler/format state a setter stored.
+        gxm_nid::TEXTURE_GET_MIPMAP_COUNT_UNSAFE => cont!(gxm::texture_get_mipmap_count(ctx, st)),
+        gxm_nid::TEXTURE_GET_STRIDE => cont!(gxm::texture_get_stride(ctx, st)),
+        gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx, st)),
+        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx, st)),
+        gxm_nid::TEXTURE_GET_V_ADDR_MODE_SAFE => cont!(gxm::texture_get_v_addr_mode(ctx, st)),
+        gxm_nid::TEXTURE_GET_MIN_FILTER => cont!(gxm::texture_get_min_filter(ctx, st)),
+        gxm_nid::TEXTURE_GET_MAG_FILTER => cont!(gxm::texture_get_mag_filter(ctx, st)),
+        gxm_nid::TEXTURE_GET_GAMMA_MODE => cont!(gxm::texture_get_gamma_mode(ctx, st)),
         gxm_nid::TEXTURE_INIT_CUBE => cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE)),
+        // Color-surface getters/setters beyond format.
+        gxm_nid::COLOR_SURFACE_GET_DATA => cont!(gxm::color_surface_get_data(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS => {
+            cont!(gxm::color_surface_get_stride_in_pixels(ctx, st))
+        }
+        gxm_nid::COLOR_SURFACE_SET_GAMMA_MODE => cont!(gxm::color_surface_set_gamma_mode(ctx, st)),
+        // Render-target sizing + GPU notification region + program reflection.
+        gxm_nid::GET_RENDER_TARGET_MEM_SIZE => cont!(gxm::get_render_target_mem_size(ctx, st)),
+        gxm_nid::GET_NOTIFICATION_REGION => cont!(gxm::get_notification_region(ctx, st)),
+        gxm_nid::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE => {
+            cont!(gxm::program_get_default_uniform_buffer_size(ctx, st))
+        }
+        gxm_nid::FRAGMENT_PROGRAM_GET_PASS_TYPE => cont!(gxm::fragment_program_get_pass_type(ctx, st)),
+        // Precomputed draws: record the bundle, replay it as a draw on DrawPrecomputed.
+        gxm_nid::GET_PRECOMPUTED_DRAW_SIZE => cont!(gxm::get_precomputed_draw_size(ctx, st)),
+        gxm_nid::PRECOMPUTED_DRAW_INIT => cont!(gxm::precomputed_draw_init(ctx, st)),
+        gxm_nid::PRECOMPUTED_DRAW_SET_VERTEX_STREAM => {
+            cont!(gxm::precomputed_draw_set_vertex_stream(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_DRAW_SET_PARAMS => cont!(gxm::precomputed_draw_set_params(ctx, st)),
+        gxm_nid::DRAW_PRECOMPUTED => cont!(gxm::draw_precomputed(ctx, st)),
+        gxm_nid::GET_PRECOMPUTED_VERTEX_STATE_SIZE => cont!(gxm::get_precomputed_vertex_state_size(ctx, st)),
+        gxm_nid::GET_PRECOMPUTED_FRAGMENT_STATE_SIZE => cont!(gxm::get_precomputed_fragment_state_size(ctx, st)),
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_INIT => cont!(gxm::precomputed_vertex_state_init(ctx, st)),
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_INIT => cont!(gxm::precomputed_fragment_state_init(ctx, st)),
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_vertex_state_set_default_uniform_buffer(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_fragment_state_set_default_uniform_buffer(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_GET_DEFAULT_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_vertex_state_get_default_uniform_buffer(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_GET_DEFAULT_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_fragment_state_get_default_uniform_buffer(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_TEXTURE => cont!(gxm::precomputed_vertex_state_set_texture(ctx, st)),
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE => cont!(gxm::precomputed_fragment_state_set_texture(ctx, st)),
+        gxm_nid::SET_PRECOMPUTED_VERTEX_STATE => cont!(gxm::set_precomputed_vertex_state(ctx, st)),
+        gxm_nid::SET_PRECOMPUTED_FRAGMENT_STATE => cont!(gxm::set_precomputed_fragment_state(ctx, st)),
         // Fixed-function pipeline state: record into the sticky render state that is
         // snapshotted per draw (see `capture::RenderState`).
         gxm_nid::SET_CULL_MODE => cont!(gxm::set_cull_mode(ctx, st)),
@@ -320,6 +381,9 @@ pub fn dispatch(
         gxm_nid::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => {
             cont!(gxm::set_front_fragment_program_enable(ctx, st))
         }
+        gxm_nid::SET_BACK_FRAGMENT_PROGRAM_ENABLE => {
+            cont!(gxm::set_back_fragment_program_enable(ctx, st))
+        }
         gxm_nid::SET_FRONT_POINT_LINE_WIDTH => cont!(gxm::set_front_point_line_width(ctx, st)),
         gxm_nid::SET_FRONT_POLYGON_MODE => cont!(gxm::set_front_polygon_mode(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_REF => cont!(gxm::set_front_stencil_ref(ctx, st)),
@@ -328,6 +392,7 @@ pub fn dispatch(
         gxm_nid::SET_VIEWPORT_ENABLE => cont!(gxm::set_viewport_enable(ctx, st)),
         gxm_nid::SET_REGION_CLIP => cont!(gxm::set_region_clip(ctx, st)),
         gxm_nid::COLOR_SURFACE_GET_FORMAT => cont!(gxm::color_surface_get_format(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_TYPE => cont!(gxm::color_surface_get_type(ctx, st)),
         gxm_nid::COLOR_SURFACE_SET_CLIP => cont!(gxm::color_surface_set_clip(ctx, st)),
         gxm_nid::TEXTURE_GET_TYPE => cont!(gxm::texture_get_type(ctx, st)),
         gxm_nid::PROGRAM_PARAMETER_GET_SEMANTIC => cont!(gxm::param_get_semantic(ctx, st)),
@@ -377,6 +442,7 @@ pub fn dispatch(
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
         // A real timed vblank wait (parks under the preemptive scheduler).
         display_nid::WAIT_VBLANK_START_MULTI => display::wait_vblank_start_multi(ctx, st),
+        display_nid::WAIT_SET_FRAME_BUF => display::wait_set_frame_buf(ctx, st),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
@@ -430,13 +496,24 @@ pub fn dispatch(
         audio_nid::OUT_OUTPUT => audio::out_output(ctx, st),
         audio_nid::OUT_SET_VOLUME => cont!(audio::out_set_volume(ctx, st)),
         audio_nid::OUT_RELEASE_PORT => cont!(audio::out_release_port(ctx, st)),
+        audio_nid::OUT_GET_ADOPT => cont!(audio::out_get_adopt(ctx, st)),
 
         // --- pvf: font library --------------------------------------------------
         pvf_nid::NEW_LIB => cont!(pvf::new_lib(ctx, st)),
+        pvf_nid::DONE_LIB => cont!(pvf::done_lib(ctx, st)),
         pvf_nid::OPEN => cont!(pvf::open(ctx, st)),
+        pvf_nid::OPEN_USER_FILE => cont!(pvf::open_user_file(ctx, st)),
         pvf_nid::SET_EM => cont!(pvf::set_em(ctx, st)),
         pvf_nid::SET_RESOLUTION => cont!(pvf::set_resolution(ctx, st)),
+        pvf_nid::SET_CHAR_SIZE => cont!(pvf::set_char_size(ctx, st)),
         pvf_nid::SET_SKEW_VALUE => cont!(pvf::set_skew_value(ctx, st)),
+        pvf_nid::IS_ELEMENT => cont!(pvf::is_element(ctx, st)),
+        pvf_nid::GET_FONT_INFO => cont!(pvf::get_font_info(ctx, st)),
+        pvf_nid::GET_CHAR_INFO => cont!(pvf::get_char_info(ctx, st)),
+        pvf_nid::GET_CHAR_IMAGE_RECT => cont!(pvf::get_char_image_rect(ctx, st)),
+        pvf_nid::GET_CHAR_GLYPH_IMAGE => cont!(pvf::get_char_glyph_image(ctx, st)),
+        pvf_nid::PIXEL_TO_POINT_H => cont!(pvf::pixel_to_point_h(ctx, st)),
+        pvf_nid::PIXEL_TO_POINT_V => cont!(pvf::pixel_to_point_v(ctx, st)),
 
         // --- processmgr: process param, std streams, time ----------------------
         pm_nid::GET_PROCESS_PARAM => cont!(processmgr::get_process_param(ctx, st)),
@@ -445,6 +522,7 @@ pub fn dispatch(
         pm_nid::GET_STDERR => cont!(processmgr::get_stderr(ctx, st)),
         pm_nid::LIBC_TIME => cont!(processmgr::libc_time(ctx, st)),
         pm_nid::LIBC_CLOCK => cont!(processmgr::libc_clock(ctx, st)),
+        pm_nid::POWER_TICK => cont!(ctx.ret(0)),
 
         // --- services: sysmodule / net / http / np / rtc / apputil / touch -----
         sv_nid::SYSMODULE_IS_LOADED => cont!(services::sysmodule_is_loaded(ctx, st)),
@@ -455,21 +533,34 @@ pub fn dispatch(
             cont!(services::np_register_service_state_callback(ctx, st))
         }
         sv_nid::NP_CHECK_CALLBACK => cont!(services::np_check_callback(ctx, st)),
+        sv_nid::RTC_GET_CURRENT_CLOCK => cont!(services::rtc_get_current_clock(ctx, st)),
         sv_nid::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => {
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::RTC_GET_TICK => cont!(services::rtc_get_tick(ctx, st)),
         sv_nid::MOTION_GET_STATE => cont!(services::motion_get_state(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
+        sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
+        sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_STRING => cont!(services::apputil_system_param_get_string(ctx, st)),
         sv_nid::APPUTIL_DRM_OPEN => cont!(services::apputil_drm_open(ctx, st)),
         sv_nid::APPUTIL_DRM_CLOSE => cont!(services::apputil_drm_close(ctx, st)),
+        sv_nid::APPUTIL_SAVEDATA_SLOT_GET_PARAM => {
+            cont!(services::apputil_savedata_slot_get_param(ctx, st))
+        }
+        sv_nid::APPUTIL_SAVEDATA_SLOT_CREATE => {
+            cont!(services::apputil_savedata_slot_create(ctx, st))
+        }
+        sv_nid::APP_MGR_GET_APP_STATE => cont!(services::app_mgr_get_app_state(ctx, st)),
         // Offline services with an out-param handle to hand back.
         sv_nid::NETCTL_ADHOC_REGISTER_CALLBACK => {
             cont!(services::netctl_adhoc_register_callback(ctx, st))
         }
         sv_nid::NP_TROPHY_CREATE_CONTEXT => cont!(services::np_trophy_create_context(ctx, st)),
         sv_nid::NP_TROPHY_CREATE_HANDLE => cont!(services::np_trophy_create_handle(ctx, st)),
+        sv_nid::NP_TROPHY_GET_GAME_INFO => cont!(services::np_trophy_get_game_info(ctx, st)),
+        sv_nid::NP_TROPHY_GET_TROPHY_UNLOCK_STATE => cont!(services::np_trophy_get_trophy_unlock_state(ctx, st)),
         // The trophy-setup dialog's result read (zeroed result = OK), like the other
         // dialog GetResult calls.
         sv_nid::NP_TROPHY_SETUP_DIALOG_GET_RESULT => cont!(services::dialog_ok(ctx, st)),
@@ -478,7 +569,14 @@ pub fn dispatch(
         sv_nid::TOUCH_GET_PANEL_INFO => cont!(touch::get_panel_info(ctx, st)),
         // No online account off-console: identity calls report signed-out so the
         // title takes its offline path instead of dereferencing a null identity.
-        sv_nid::NP_MANAGER_GET_NP_ID | sv_nid::NP_SCORE_CREATE_TITLE_CTX => {
+        // sceNpManagerGetAccountRegion is an account-identity query (account
+        // country + language); with no account off-console the faithful signal is
+        // signed-out, same as GetNpId, not a fabricated region.
+        sv_nid::NP_MANAGER_GET_NP_ID
+        | sv_nid::NP_MANAGER_GET_ACCOUNT_REGION
+        | sv_nid::NP_MANAGER_GET_CONTENT_RATING_FLAG
+        | sv_nid::NP_MANAGER_GET_CHAT_RESTRICTION_FLAG
+        | sv_nid::NP_SCORE_CREATE_TITLE_CTX => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
         // Everything else here is an init/register that simply succeeds offline.
@@ -489,6 +587,8 @@ pub fn dispatch(
         | sv_nid::NP_INIT
         | sv_nid::NP_BASIC_INIT
         | sv_nid::NP_BASIC_REGISTER_HANDLER
+        // NpBasic per-frame pump: no presence/friend events exist off-console.
+        | sv_nid::NP_BASIC_CHECK_CALLBACK
         | sv_nid::FIOS_OVERLAY_GET_LIST
         | sv_nid::ULOBJ_REGISTER_PROTOCOL_REVISION
         | sv_nid::APPUTIL_INIT
@@ -496,6 +596,7 @@ pub fn dispatch(
         // The requested module is already linked into the image, so a load succeeds.
         | sv_nid::SYSMODULE_LOAD_MODULE
         | sv_nid::TOUCH_SET_SAMPLING_STATE
+        | sv_nid::TOUCH_ENABLE_TOUCH_FORCE
         // SceScreenShot: nothing to capture off-console.
         | sv_nid::SCREENSHOT_DISABLE
         | sv_nid::SCREENSHOT_ENABLE
@@ -507,12 +608,17 @@ pub fn dispatch(
         | sv_nid::NP_AUTH_INIT
         | sv_nid::NP_LOOKUP_INIT
         | sv_nid::NP_TUS_INIT
+        | sv_nid::NP_SNS_FACEBOOK_INIT
         // Device services: location/motion sampling, ad-hoc power/config.
         | sv_nid::LOCATION_INIT
         | sv_nid::MOTION_START_SAMPLING
         | sv_nid::POWER_SET_CONFIGURATION_MODE
         // Shared dialog config accepted for every family.
         | sv_nid::COMMON_DIALOG_SET_CONFIG_PARAM
+        // SceLiveArea: the app's home-screen tile. No home screen exists off-console,
+        // so a frame update is an accepted no-op (the async variant has no completion
+        // to deliver - there is no LiveArea state that changes).
+        | sv_nid::LIVE_AREA_UPDATE_FRAME_ASYNC
         // Unnamed exports absent from every vita-headers revision, serviced as an
         // offline no-op success so they are handled rather than left as gaps.
         | sv_nid::NEAR_UTIL_UNKNOWN_A412E9CA
@@ -559,9 +665,20 @@ pub fn dispatch(
         }
 
         _ => {
+            // No handler for this NID. Do NOT fake a success: a silent `ret(0)` lets
+            // the guest continue on a false premise and desync into a spin or memory
+            // corruption far from here (the exact failure mode this project keeps
+            // hitting). Record it for the report and stop the run loudly, naming the
+            // call so the fix is "implement this NID", pinpointed. Every legitimate
+            // offline no-op has its own explicit arm above returning 0 deliberately;
+            // reaching here means the NID is genuinely unhandled.
             st.capture.note_unimplemented(library_nid, func_nid, nid::name(func_nid));
-            ctx.ret(0);
-            SvcOutcome::Continue
+            let name = nid::name(func_nid);
+            return SvcOutcome::Fatal(format!(
+                "unimplemented NID {name} (lib={library_nid:#010x} nid={func_nid:#010x}) \
+                 called by thread {:#x}; implement it (no silent stub)",
+                st.current_thread(),
+            ));
         }
     };
     // Diagnostic (`RUST_LOG=vitaslop::err=debug`): log any handler that returns an

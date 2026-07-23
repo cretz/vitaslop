@@ -18,6 +18,7 @@ extern crate self as vitaslop_runtime;
 
 pub mod audio;
 pub mod capture;
+pub mod font;
 pub mod host;
 pub mod ingest;
 pub mod link;
@@ -100,4 +101,11 @@ pub enum SvcOutcome {
     /// exit code is the guest's r0. A single-worker host has only the one thread,
     /// so it treats this exactly like [`Halt`](Self::Halt).
     ThreadExit,
+    /// The host cannot faithfully service this call, so the run must stop LOUDLY
+    /// rather than fake a result. The classic case is an unimplemented NID: silently
+    /// returning 0 (a fake success) lets the guest proceed on a false premise and
+    /// desync into a spin or corruption far from the cause. Every driver surfaces
+    /// this as [`RunReport::Error`](crate::sched::RunReport::Error) with the message,
+    /// which names the exact call - so the fix is "implement this NID", pinpointed.
+    Fatal(String),
 }

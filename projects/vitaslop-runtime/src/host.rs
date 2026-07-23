@@ -265,6 +265,13 @@ pub const SCE_KERNEL_DEFAULT_PRIORITY: i32 = 0x1000_0100;
 /// middle default the initial (main) thread and a defaulted worker resolve to.
 pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
 
+/// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` - the value a *timed* blocking wait
+/// (`sceKernelWaitSema`/`WaitCond`/`WaitLwCond`/`WaitEventFlag` with a non-null
+/// timeout) returns when its deadline passes before the wait is satisfied. Delivered
+/// to the woken thread's `r0` through the resume-code channel (see
+/// [`VitaState::take_resume_code`]); a wait satisfied by a signal returns 0 instead.
+pub const SCE_KERNEL_ERROR_WAIT_TIMEOUT: u32 = 0x8002_8005;
+
 /// Resolve a `sceKernelCreateThread` priority argument to a concrete scheduler
 /// priority. Absolute user priorities (small numbers, ~0x40..0xBF) pass through;
 /// the relative range around [`SCE_KERNEL_DEFAULT_PRIORITY`] (e.g. the sentinel
@@ -289,23 +296,47 @@ struct MutexRec {
     waiters: Vec<i32>,
 }
 
+/// A lightweight mutex's state (preemptive mode only), keyed by its guest work-area
+/// address rather than a kernel handle - a lightweight object's state lives in memory
+/// the title owns, not a kernel id. Otherwise identical to [`MutexRec`]: `owner` (None
+/// if free), recursion `count`, and the FIFO `waiters` parked in `sceKernelLockLwMutex`.
+struct LwMutexRec {
+    work: u32,
+    owner: Option<i32>,
+    count: i32,
+    waiters: Vec<i32>,
+}
+
 /// A condition variable's state (preemptive mode only). `mutex` is the associated
 /// mutex it releases on wait and re-acquires on wake; `waiters` are the threads
-/// parked in `sceKernelWaitCond` in FIFO order. A condition variable has no
+/// parked in `sceKernelWaitCond` in FIFO order, each with an optional virtual-clock
+/// `deadline` for a timed wait (`None` = wait forever). A condition variable has no
 /// memory: a signal with no waiter is lost.
 struct CondRec {
     uid: i32,
     mutex: i32,
-    waiters: Vec<i32>,
+    waiters: Vec<CondWaiter>,
 }
 
-/// A thread parked in `sceKernelWaitSema`: which semaphore, which thread, and how
-/// many signals it still needs. It is released (and the count consumed) when a
-/// signal makes `need` available.
+/// A thread parked in `sceKernelWaitCond`: which thread and an optional virtual-clock
+/// deadline (`Some` for a timed wait, woken by a signal or when the clock reaches it;
+/// `None` for an infinite wait). A timed-out cond wait still re-acquires the mutex
+/// before it resumes (see [`VitaState::advance_time_to`]).
+struct CondWaiter {
+    thid: i32,
+    deadline: Option<u64>,
+}
+
+/// A thread parked in `sceKernelWaitSema`: which semaphore, which thread, how many
+/// signals it still needs, and an optional virtual-clock `deadline` for a timed wait
+/// (`None` = wait forever). It is released (and the count consumed) when a signal
+/// makes `need` available, or woken with `SCE_KERNEL_ERROR_WAIT_TIMEOUT` when the
+/// deadline passes.
 struct SemaWaiter {
     uid: i32,
     thid: i32,
     need: i32,
+    deadline: Option<u64>,
 }
 
 /// A thread parked in `sceKernelWaitEventFlag`: which flag, which thread, the bit
@@ -378,6 +409,42 @@ pub struct FileTable {
     next_fd: i32,
 }
 
+/// In-memory savedata slot store: the metadata layer SceAppUtil exposes on top of a
+/// title's savedata mount. Real hardware persists each slot's SceAppUtilSaveDataSlotParam
+/// (the localized title/subtitle/detail and bookkeeping) to the mounted savedata
+/// partition; this keeps the raw param blob per (mount, slot) in memory so a slot the
+/// title creates is visible to a later get - faithful read-after-write - without touching
+/// a real disk. Deterministic and host-only, like [`FileTable`]. A future backend (native
+/// disk, browser OPFS) can persist these blobs; the offline oracle keeps them in RAM.
+#[derive(Default)]
+pub struct SaveDataStore {
+    /// (mount name, slot id) -> the exact SceAppUtilSaveDataSlotParam bytes the title
+    /// wrote at create/set time, echoed back verbatim on get.
+    slots: std::collections::HashMap<(String, u32), Vec<u8>>,
+}
+
+impl SaveDataStore {
+    fn key(mount: &str, slot_id: u32) -> (String, u32) {
+        (mount.to_string(), slot_id)
+    }
+    /// Whether a slot exists under this mount.
+    pub fn contains(&self, mount: &str, slot_id: u32) -> bool {
+        self.slots.contains_key(&Self::key(mount, slot_id))
+    }
+    /// Store (create or overwrite) a slot's param blob.
+    pub fn put(&mut self, mount: &str, slot_id: u32, param: Vec<u8>) {
+        self.slots.insert(Self::key(mount, slot_id), param);
+    }
+    /// The stored param blob for a slot, or `None` if it was never created.
+    pub fn get(&self, mount: &str, slot_id: u32) -> Option<&[u8]> {
+        self.slots.get(&Self::key(mount, slot_id)).map(Vec::as_slice)
+    }
+    /// Remove a slot; returns whether it existed.
+    pub fn remove(&mut self, mount: &str, slot_id: u32) -> bool {
+        self.slots.remove(&Self::key(mount, slot_id)).is_some()
+    }
+}
+
 /// One entry a directory descriptor yields: the child's original-case name, whether
 /// it is a subdirectory (synthesized from deeper paths in the flat map), and the
 /// file size (0 for a directory).
@@ -436,7 +503,25 @@ pub const FD_STDERR: i32 = 2;
 /// miss the file stored as `settings/foo.ini` and take its file-missing (often fatal)
 /// path.
 fn vfs_key(path: &str) -> String {
-    strip_app0(path).to_ascii_lowercase()
+    // Normalize like a real Vita FS before matching: collapse repeated separators,
+    // drop `.` and empty segments, and resolve `..`. Titles build paths by joining a
+    // directory (often with a trailing `/`) to a subpath (often with a leading `/`),
+    // yielding runs like `usrdir//ui/fonts//x.ttf`; an exact-match store would miss
+    // those. Both the store side (`add_file`) and every lookup route through here, so
+    // the normalization stays symmetric. Backslashes are folded to `/` for the rare
+    // title that uses them. Lowercased last (see the case note above).
+    let stripped = strip_app0(path).replace('\\', "/");
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in stripped.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    segs.join("/").to_ascii_lowercase()
 }
 
 /// Strip an `app0:` mount prefix (with or without the separator), case-insensitively:
@@ -674,6 +759,12 @@ impl FileTable {
         self.files.get(&vfs_key(path)).map(|d| d.len() as u64)
     }
 
+    /// The whole contents of `path` if it exists, cloned. For consumers that need a
+    /// file's bytes in one shot without managing a descriptor (e.g. loading a font).
+    fn read_all(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.get(&vfs_key(path)).cloned()
+    }
+
     /// The size of the file behind an open descriptor (for sceIoGetstatByFd).
     /// Returns None on a bad descriptor - the path is already the vfs key.
     fn size_of_fd(&self, fd: i32) -> Option<u64> {
@@ -687,6 +778,65 @@ impl FileTable {
 struct VertexProgramInfo {
     attributes: Vec<crate::capture::VertexAttribute>,
     stride: u32,
+    /// The `SceGxmProgram*` this vertex program was created from, so a precomputed
+    /// vertex state (which references the vertex program) can size its default uniform
+    /// buffer from the program header (+0x2C). 0 if it could not be resolved.
+    program_header: u32,
+}
+
+/// A precomputed vertex- or fragment-state object (`sceGxmPrecomputed{Vertex,Fragment}
+/// State*`): the default uniform buffer the guest writes its uniforms into, the bound
+/// fragment/vertex textures, and the `SceGxmProgram*` (for uniform-buffer sizing).
+/// Keyed by the guest state-struct address, applied to the live bind state when the
+/// guest issues `sceGxmSetPrecomputed{Vertex,Fragment}State`, exactly as the individual
+/// `sceGxmSetUniformDataF`/`sceGxmSetFragmentTexture` calls would be on the direct path.
+#[derive(Clone, Default)]
+struct PrecomputedState {
+    program_header: u32,
+    default_uniform_buffer: u32,
+    /// (textureIndex, `SceGxmTexture*` addr).
+    textures: Vec<(u32, u32)>,
+}
+
+/// Extra sticky per-texture state the `sceGxmTextureGet*` getters read back. The
+/// hardware packs these into the 16-byte control words; we keep them in a shadow
+/// (like `texture_samplers`) so a setter never risks corrupting a struct the guest
+/// re-reads, and a getter returns exactly what the guest set. Absent = GXM defaults.
+#[derive(Clone, Copy)]
+struct TextureExtra {
+    /// Mip-map level count (1-based), from the `mipCount` argument to a non-strided
+    /// `sceGxmTextureInit*`. `SetData`/`SetFormat` leave it unchanged.
+    mip_count: u32,
+    /// Explicit byte stride for a `LINEAR_STRIDED` texture (0 = derive from width x
+    /// bytes-per-pixel, as the driver does for every other layout).
+    byte_stride: u32,
+    /// Minification/magnification/mip filters (`SceGxmTextureFilter`).
+    min_filter: u32,
+    mag_filter: u32,
+    mip_filter: u32,
+    /// Gamma-correction mode (`SceGxmTextureGammaMode`, the raw enum word).
+    gamma: u32,
+}
+
+impl Default for TextureExtra {
+    fn default() -> Self {
+        // GXM defaults: one mip level, driver-derived stride, POINT filtering, no gamma.
+        TextureExtra { mip_count: 1, byte_stride: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
+    }
+}
+
+/// A precomputed draw: the vertex program, stream-0 vertex buffer, and draw
+/// parameters the guest bundled with `sceGxmPrecomputedDraw{Init,SetVertexStream,
+/// SetParams}`, keyed by the guest `SceGxmPrecomputedDraw*` block address. Replayed
+/// as a normal draw when the guest issues `sceGxmDrawPrecomputed`.
+#[derive(Clone, Copy, Default)]
+struct PrecomputedDraw {
+    vertex_program: u32,
+    stream0: u32,
+    primitive: u32,
+    index_format: u32,
+    index_addr: u32,
+    index_count: u32,
 }
 
 /// All host state for one run: the guest allocator, handle tables, the capture
@@ -733,6 +883,7 @@ pub struct VitaState {
     preemptive: bool,
     current: i32,
     mutexes: Vec<MutexRec>,
+    lwmutexes: Vec<LwMutexRec>,
     conds: Vec<CondRec>,
     sema_waiters: Vec<SemaWaiter>,
     evf_waiters: Vec<EvfWaiter>,
@@ -768,8 +919,21 @@ pub struct VitaState {
     /// the exit code it owes the joiner's `stat` out-parameter is queued here and
     /// applied by the scheduler (which has memory access) before the joiner resumes.
     pending_stat_writes: Vec<(u32, u32)>,
+    /// The `r0` value to hand a parked thread when it resumes, keyed by thread id:
+    /// `(thid, code)`. A blocking wait sets its return value (`ctx.ret(0)`) *before* it
+    /// parks, so a wake that must return something other than 0 - a timed wait that
+    /// expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT` - cannot write it then.
+    /// Instead the timeout is queued here and the engine applies it to the woken
+    /// thread's `r0` at the point it resumes (see the native/browser schedulers).
+    /// Absent (the common case, a signal wake) leaves the pre-park `r0` (0) in place.
+    pending_resume_codes: Vec<(i32, u32)>,
     // Virtual filesystem backing SceIoFilemgr (open/read/write/lseek/close).
     fs: FileTable,
+    // In-memory savedata slot metadata (SceAppUtil), so a created slot round-trips on get.
+    savedata: SaveDataStore,
+    /// ScePvf font engine: open lib/font handles, size config, glyph cache. Public so
+    /// the ScePvf NID handlers in `vita/pvf.rs` can drive it.
+    pub fonts: crate::font::FontLibrary,
     pub capture: Capture,
     // `Send` so a `VitaEnv` can be the data of a wasmtime async Store (the
     // cooperative scheduler runs the guest on a fiber, which wasmtime may resume
@@ -823,6 +987,36 @@ pub struct VitaState {
     /// guest control words) so recording the state never risks corrupting a struct
     /// the guest re-reads. Absent = GXM defaults (REPEAT/REPEAT/0).
     texture_samplers: Vec<(u32, (u32, u32, u32))>,
+    /// Extra sticky per-texture state (`mipCount`, byte stride, min/mag/mip filter,
+    /// gamma) the `sceGxmTextureGet*` getters read back, keyed by `SceGxmTexture*`.
+    texture_extra: Vec<(u32, TextureExtra)>,
+    /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`,
+    /// keyed by `SceGxmColorSurface*`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
+    color_surface_gamma: Vec<(u32, u32)>,
+    /// Precomputed draws (`sceGxmPrecomputedDrawInit` + setters), keyed by the guest
+    /// `SceGxmPrecomputedDraw*` block address, replayed by `sceGxmDrawPrecomputed`.
+    precomputed_draws: Vec<(u32, PrecomputedDraw)>,
+    /// Precomputed vertex/fragment states (`sceGxmPrecomputed{Vertex,Fragment}StateInit`
+    /// + setters), keyed by the guest state-struct address, applied to the live bind
+    /// state by `sceGxmSetPrecomputed{Vertex,Fragment}State`. A HashMap (not the Vec the
+    /// other GXM tables use) because the bind lookup runs once per draw - thousands of
+    /// times per frame - so the lookup must be O(1), not a linear scan over every state.
+    precomputed_vertex_states: std::collections::HashMap<u32, PrecomputedState>,
+    precomputed_fragment_states: std::collections::HashMap<u32, PrecomputedState>,
+    /// `SceGxmFragmentProgram*` handle -> its `SceGxmProgram*`, recorded at
+    /// `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed fragment state can
+    /// size its default uniform buffer. (Vertex programs carry this in `VertexProgramInfo`.)
+    fragment_programs: Vec<(u32, u32)>,
+    /// The vertex default uniform buffer bound for the next draw (guest ptr, byte size),
+    /// from `sceGxmSetPrecomputedVertexState`. Read into the draw's uniforms at record
+    /// time; 0 = fall back to the `sceGxmSetUniformDataF` path (`pending_uniforms`).
+    bound_vertex_uniform_buf: u32,
+    bound_vertex_uniform_size: u32,
+    /// The GPU notification region: a guest buffer of `SCE_GXM_NOTIFICATION_COUNT`
+    /// u32 slots handed out by `sceGxmGetNotificationRegion`, lazily allocated on
+    /// first use (0 = not yet allocated). Scenes complete synchronously here, so a
+    /// notification the guest waits on is treated as already signalled.
+    notification_region: u32,
     /// The live GXM fixed-function pipeline state (cull/depth/stencil/viewport/...),
     /// mutated by the `sceGxmSet*` setters and snapshotted into each recorded draw.
     /// Sticky across scenes, exactly like the real GXM context.
@@ -833,6 +1027,13 @@ pub struct VitaState {
     /// signal wakes it). Keyed by the cond's guest work pointer, since lightweight
     /// objects have no kernel handle. See the scheduler's idle-time advance.
     lwcond_waiters: Vec<(i32, u32, Option<u64>)>,
+    /// Each lightweight condition variable's associated lightweight mutex, as `(cond
+    /// work address, mutex work address)`, recorded at `sceKernelCreateLwCond` (which
+    /// is handed the `SceKernelLwMutexWork*` it binds to). `sceKernelWaitLwCond`
+    /// atomically releases this mutex as it parks and re-acquires it before the woken
+    /// thread runs - exactly like the heavyweight cond/mutex pair. Without it a thread
+    /// would hold the mutex across the wait and deadlock any thread that then locks it.
+    lwcond_mutex: Vec<(u32, u32)>,
     /// Threads sleeping until a virtual-clock deadline, as `(thread id, deadline_us)`.
     /// Unlike a lwcond waiter these are woken purely by time - `sceKernelDelayThread`
     /// and, crucially, `sceAudioOutOutput` pacing: an audio mixer thread hands one
@@ -880,6 +1081,7 @@ impl VitaState {
             preemptive: false,
             current: 0,
             mutexes: Vec::new(),
+            lwmutexes: Vec::new(),
             conds: Vec::new(),
             sema_waiters: Vec::new(),
             evf_waiters: Vec::new(),
@@ -896,7 +1098,10 @@ impl VitaState {
             pending_spawns: Vec::new(),
             pending_wakes: Vec::new(),
             pending_stat_writes: Vec::new(),
+            pending_resume_codes: Vec::new(),
             fs: FileTable::new(),
+            savedata: SaveDataStore::default(),
+            fonts: crate::font::FontLibrary::default(),
             capture: Capture::new(),
             world,
             audio: Box::new(crate::audio::NullSink::default()),
@@ -910,8 +1115,18 @@ impl VitaState {
             bound_textures: Vec::new(),
             texture_formats: Vec::new(),
             texture_samplers: Vec::new(),
+            texture_extra: Vec::new(),
+            color_surface_gamma: Vec::new(),
+            precomputed_draws: Vec::new(),
+            precomputed_vertex_states: std::collections::HashMap::new(),
+            precomputed_fragment_states: std::collections::HashMap::new(),
+            fragment_programs: Vec::new(),
+            bound_vertex_uniform_buf: 0,
+            bound_vertex_uniform_size: 0,
+            notification_region: 0,
             render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
+            lwcond_mutex: Vec::new(),
             sleep_waiters: Vec::new(),
             virtual_us: 0,
             cur_frame: 0,
@@ -1138,6 +1353,33 @@ impl VitaState {
         self.fs.size_of_fd(fd)
     }
 
+    /// The whole contents of a guest file by path (for one-shot loads like a font
+    /// file), or `None` if it does not exist.
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.fs.read_all(path)
+    }
+
+    /// Whether a savedata slot exists (SceAppUtil metadata layer).
+    pub fn savedata_slot_exists(&self, mount: &str, slot_id: u32) -> bool {
+        self.savedata.contains(mount, slot_id)
+    }
+
+    /// Create or overwrite a savedata slot's param blob.
+    pub fn savedata_slot_put(&mut self, mount: &str, slot_id: u32, param: Vec<u8>) {
+        self.savedata.put(mount, slot_id, param);
+    }
+
+    /// The stored param blob for a savedata slot, cloned for the caller to write back
+    /// into guest memory (`None` if the slot was never created).
+    pub fn savedata_slot_get(&self, mount: &str, slot_id: u32) -> Option<Vec<u8>> {
+        self.savedata.get(mount, slot_id).map(<[u8]>::to_vec)
+    }
+
+    /// Remove a savedata slot; returns whether it existed.
+    pub fn savedata_slot_remove(&mut self, mount: &str, slot_id: u32) -> bool {
+        self.savedata.remove(mount, slot_id)
+    }
+
     /// Enable preemptive multithreading: blocking primitives now actually park the
     /// calling thread instead of succeeding uncontended. Set once, before the run,
     /// by the [`ThreadedScheduler`](vitaslop_native::ThreadedScheduler); the single-
@@ -1330,8 +1572,12 @@ impl VitaState {
     }
 
     /// Park the current thread waiting for `need` signals on semaphore `uid`.
-    pub fn sema_block(&mut self, uid: i32, need: i32) {
-        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need });
+    /// `timeout_us` of 0 is an infinite wait; non-zero arms a deadline at
+    /// `now + timeout_us`, after which the wait is woken with
+    /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` even if no signal arrives.
+    pub fn sema_block(&mut self, uid: i32, need: i32, timeout_us: u32) {
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
+        self.sema_waiters.push(SemaWaiter { uid, thid: self.current, need, deadline });
     }
 
     /// Signal semaphore `uid` by `n`, then release every parked waiter the new
@@ -1453,6 +1699,126 @@ impl VitaState {
         }
     }
 
+    // --- lightweight mutexes (preemptive mode), keyed by guest work address -----
+    //
+    // A lightweight mutex has no kernel handle; its state lives in the caller's work
+    // area, so the host tracks ownership by that guest address. These mirror the
+    // heavyweight [`mutex_lock`]/[`mutex_contended`]/[`mutex_unlock`] exactly, so a
+    // `sceKernelLockLwMutex` genuinely blocks on contention and enforces mutual
+    // exclusion (the old "always succeed" stub did neither, so two threads could hold
+    // the same lightweight mutex across a yield and race the data it guards).
+
+    /// The record for the lightweight mutex at guest work address `work`, created
+    /// (unlocked) on first use - a title may lock a work area it zero-initialized
+    /// itself without a distinct create call.
+    fn lwmutex_rec(&mut self, work: u32) -> &mut LwMutexRec {
+        if !self.lwmutexes.iter().any(|m| m.work == work) {
+            self.lwmutexes.push(LwMutexRec { work, owner: None, count: 0, waiters: Vec::new() });
+        }
+        self.lwmutexes.iter_mut().find(|m| m.work == work).expect("just inserted")
+    }
+
+    /// Register the lightweight mutex at `work` (its canonical work-area address) at
+    /// `sceKernelCreateLwMutex`, so a later lock/unlock on a *copy* of the work area can
+    /// be resolved back to it by the identity stamped in the work area (see the lwsync
+    /// `resolve_mutex`). Idempotent - a re-create just keeps the existing record.
+    pub fn lwmutex_register(&mut self, work: u32) {
+        let _ = self.lwmutex_rec(work);
+    }
+
+    /// Whether `work` is a lightweight mutex we have a record for (created, or already
+    /// locked at least once). Used to resolve a possibly-copied work pointer.
+    pub fn lwmutex_is_known(&self, work: u32) -> bool {
+        self.lwmutexes.iter().any(|m| m.work == work)
+    }
+
+    /// Lock the lightweight mutex at `work` for the current thread. Returns true if
+    /// acquired (free, or already held by this thread - recursive), false if the caller
+    /// was parked behind the owner (return [`SvcOutcome::Block`]).
+    pub fn lwmutex_lock(&mut self, work: u32) -> bool {
+        let cur = self.current;
+        let m = self.lwmutex_rec(work);
+        match m.owner {
+            None => {
+                m.owner = Some(cur);
+                m.count = 1;
+                true
+            }
+            Some(o) if o == cur => {
+                m.count += 1;
+                true
+            }
+            Some(_) => {
+                m.waiters.push(cur);
+                false
+            }
+        }
+    }
+
+    /// Whether locking the lightweight mutex at `work` now would contend (another
+    /// thread owns it). Used by `sceKernelTryLockLwMutex`, which fails rather than blocks.
+    pub fn lwmutex_contended(&self, work: u32) -> bool {
+        let cur = self.current;
+        self.lwmutexes
+            .iter()
+            .find(|m| m.work == work)
+            .map(|m| matches!(m.owner, Some(o) if o != cur))
+            .unwrap_or(false)
+    }
+
+    /// Unlock the lightweight mutex at `work`. On full release, hand ownership to the
+    /// next parked waiter (FIFO) and wake it.
+    pub fn lwmutex_unlock(&mut self, work: u32) {
+        let mut wake = None;
+        if let Some(m) = self.lwmutexes.iter_mut().find(|m| m.work == work) {
+            if m.count > 0 {
+                m.count -= 1;
+            }
+            if m.count == 0 {
+                if m.waiters.is_empty() {
+                    m.owner = None;
+                } else {
+                    let next = m.waiters.remove(0);
+                    m.owner = Some(next);
+                    m.count = 1;
+                    wake = Some(next);
+                }
+            }
+        }
+        if let Some(next) = wake {
+            self.pending_wakes.push(next);
+        }
+    }
+
+    /// Forget the lightweight mutex at `work` (`sceKernelDeleteLwMutex`).
+    pub fn lwmutex_delete(&mut self, work: u32) {
+        self.lwmutexes.retain(|m| m.work != work);
+    }
+
+    /// Acquire the lightweight mutex at `work` on behalf of thread `thid` (not the
+    /// current thread). Used when a lightweight-cond signal/timeout transfers a waiter
+    /// back to its mutex: if free the thread takes it and is woken now, else it queues
+    /// behind the owner and is woken when the owner unlocks. Work-keyed twin of
+    /// [`mutex_acquire_for`](Self::mutex_acquire_for).
+    fn lwmutex_acquire_for(&mut self, work: u32, thid: i32) {
+        let mut wake = true;
+        let m = self.lwmutex_rec(work);
+        match m.owner {
+            None => {
+                m.owner = Some(thid);
+                m.count = 1;
+            }
+            Some(o) if o == thid => m.count += 1,
+            Some(_) => {
+                m.waiters.push(thid);
+                wake = false; // woken later, when the owner unlocks
+            }
+        }
+        if wake {
+            self.pending_wakes.push(thid);
+        }
+    }
+
     // --- condition variables (preemptive mode) ---
 
     /// Create a condition variable bound to mutex `mutex_uid`.
@@ -1465,15 +1831,18 @@ impl VitaState {
     /// `sceKernelWaitCond`: release the associated mutex (handing it to any waiter)
     /// and park the current thread on the condition variable. The caller returns
     /// [`SvcOutcome::Block`]; on wake it has re-acquired the mutex (see
-    /// [`cond_signal`](Self::cond_signal)) and the wait returns 0.
-    pub fn cond_wait(&mut self, uid: i32) {
+    /// [`cond_signal`](Self::cond_signal)) and the wait returns 0. `timeout_us` of 0
+    /// is an infinite wait; non-zero arms a deadline after which the wait times out
+    /// (still re-acquiring the mutex) and returns `SCE_KERNEL_ERROR_WAIT_TIMEOUT`.
+    pub fn cond_wait(&mut self, uid: i32, timeout_us: u32) {
         let Some(mutex) = self.conds.iter().find(|c| c.uid == uid).map(|c| c.mutex) else {
             return;
         };
         self.mutex_unlock(mutex);
         let cur = self.current;
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
         if let Some(c) = self.conds.iter_mut().find(|c| c.uid == uid) {
-            c.waiters.push(cur);
+            c.waiters.push(CondWaiter { thid: cur, deadline });
         }
     }
 
@@ -1486,11 +1855,11 @@ impl VitaState {
                 return;
             };
             let woken: Vec<i32> = if all {
-                std::mem::take(&mut c.waiters)
+                std::mem::take(&mut c.waiters).into_iter().map(|w| w.thid).collect()
             } else if c.waiters.is_empty() {
                 Vec::new()
             } else {
-                vec![c.waiters.remove(0)]
+                vec![c.waiters.remove(0).thid]
             };
             (c.mutex, woken)
         };
@@ -1513,27 +1882,75 @@ impl VitaState {
         self.virtual_us
     }
 
-    /// Park the current thread in `sceKernelWaitLwCond` on cond `work`. `timeout_us`
-    /// of 0 is an infinite wait (only a signal wakes it); non-zero sets a deadline
-    /// at `now + timeout_us` so the scheduler can time it out even if no signal comes.
-    pub fn lwcond_wait(&mut self, work: u32, timeout_us: u32) {
-        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
-        self.lwcond_waiters.push((self.current, work, deadline));
+    /// Record a lightweight condition variable's associated lightweight mutex at
+    /// `sceKernelCreateLwCond(cond_work, .., mutex_work, ..)`, so a later
+    /// `sceKernelWaitLwCond` on `cond_work` knows which mutex to release and re-acquire.
+    pub fn lwcond_bind_mutex(&mut self, cond_work: u32, mutex_work: u32) {
+        self.lwcond_mutex.retain(|&(c, _)| c != cond_work);
+        self.lwcond_mutex.push((cond_work, mutex_work));
     }
 
+    /// The lightweight mutex work address bound to lightweight cond `cond_work`, if
+    /// its `CreateLwCond` was seen.
+    fn lwcond_mutex_of(&self, cond_work: u32) -> Option<u32> {
+        self.lwcond_mutex.iter().find(|&&(c, _)| c == cond_work).map(|&(_, m)| m)
+    }
+
+    /// Whether `cond_work` is a lightweight cond we recorded at `sceKernelCreateLwCond`
+    /// (every created cond binds a mutex, so a recorded binding is its existence).
+    pub fn lwcond_is_known(&self, cond_work: u32) -> bool {
+        self.lwcond_mutex_of(cond_work).is_some()
+    }
+
+    /// Park the current thread in `sceKernelWaitLwCond` on cond `work`, atomically
+    /// releasing its bound lightweight mutex (handing it to any waiter) - exactly like
+    /// the heavyweight [`cond_wait`](Self::cond_wait). `timeout_us` of 0 is an infinite
+    /// wait (only a signal wakes it); non-zero sets a deadline at `now + timeout_us`.
+    /// On wake (signal or timeout) the thread re-acquires the mutex before it runs.
+    ///
+    /// Returns `false` if `work` is not a cond we recorded a `CreateLwCond` for: the
+    /// kernel rejects an unknown lightweight cond (`SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID`)
+    /// rather than releasing a mutex or blocking, so the caller must surface that error
+    /// and the thread must NOT park. A cond with no binding reaching here means its
+    /// creation was never observed upstream (the real bug lives there); faithful
+    /// behavior here refuses to invent a binding.
+    #[must_use]
+    pub fn lwcond_wait(&mut self, work: u32, timeout_us: u32) -> bool {
+        let Some(mutex_work) = self.lwcond_mutex_of(work) else {
+            return false;
+        };
+        self.lwmutex_unlock(mutex_work);
+        let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
+        self.lwcond_waiters.push((self.current, work, deadline));
+        true
+    }
+
+
     /// `sceKernelSignalLwCond`/`SignalLwCondAll`: wake one (or all) threads parked on
-    /// cond `work`, moving them onto the scheduler's wake list.
+    /// cond `work`. Each woken thread must re-acquire the cond's bound lightweight mutex
+    /// before it runs (taken now if free, else queued behind the owner), mirroring the
+    /// heavyweight [`cond_signal`](Self::cond_signal).
     pub fn lwcond_signal(&mut self, work: u32, all: bool) {
         let mut woke_one = false;
+        let mut woken: Vec<i32> = Vec::new();
         self.lwcond_waiters.retain(|&(thid, w, _)| {
             if w == work && (all || !woke_one) {
-                self.pending_wakes.push(thid);
+                woken.push(thid);
                 woke_one = true;
                 false
             } else {
                 true
             }
         });
+        match self.lwcond_mutex_of(work) {
+            Some(mutex_work) => {
+                for thid in woken {
+                    self.lwmutex_acquire_for(mutex_work, thid);
+                }
+            }
+            // No bound mutex recorded (a bare cond): just make the waiters runnable.
+            None => self.pending_wakes.extend(woken),
+        }
     }
 
     /// Park the current thread until `now + us` on the virtual clock, woken only by
@@ -1685,29 +2102,61 @@ impl VitaState {
         }
     }
 
-    /// The earliest pending timed-wake deadline across lightweight-cond waits and
-    /// pure sleeps. The scheduler uses this to jump the clock forward when every
-    /// thread is blocked, instead of declaring a deadlock.
+    /// The earliest pending timed-wake deadline across every timed blocking wait -
+    /// lightweight-cond, heavyweight cond, semaphore, event flag - and pure sleeps.
+    /// The scheduler uses this to jump the clock forward when every thread is blocked,
+    /// instead of declaring a deadlock. A timed wait omitted here would be turned into
+    /// an infinite park (it could never wake by timeout), so every timed-wait kind
+    /// must contribute its deadline.
     pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
         let lw = self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d);
         let sl = self.sleep_waiters.iter().map(|&(_, d)| d);
         let ev = self.evf_waiters.iter().filter_map(|w| w.deadline);
-        lw.chain(sl).chain(ev).min()
+        let sem = self.sema_waiters.iter().filter_map(|w| w.deadline);
+        let cnd = self.conds.iter().flat_map(|c| c.waiters.iter().filter_map(|w| w.deadline));
+        lw.chain(sl).chain(ev).chain(sem).chain(cnd).min()
     }
 
-    /// Advance the virtual clock to at least `to_us` and wake every timed wait -
-    /// lightweight cond or pure sleep - whose deadline has now passed. Called by the
-    /// scheduler when no thread is runnable but a timed wait can still fire.
+    /// Take the `r0` value owed to thread `thid` when it resumes from a block (a timed
+    /// wait that expired), if any. Drained once, by the engine, at the point the thread
+    /// resumes; `None` (a signal wake) leaves the thread's pre-park return value intact.
+    pub fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
+        let idx = self.pending_resume_codes.iter().position(|&(t, _)| t == thid)?;
+        Some(self.pending_resume_codes.remove(idx).1)
+    }
+
+    /// Advance the virtual clock to at least `to_us` and wake every timed wait whose
+    /// deadline has now passed. Called by the scheduler when no thread is runnable but
+    /// a timed wait can still fire. Every kind of timed *wait* (lightweight cond,
+    /// heavyweight cond, semaphore, event flag) is woken with
+    /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` delivered through the resume-code channel; a
+    /// pure `sceKernelDelayThread` sleep instead completes with success (0), since a
+    /// delay elapsing is not a timeout. A timed-out cond wait additionally re-acquires
+    /// its mutex before resuming (it may re-block on the mutex first).
     pub fn advance_time_to(&mut self, to_us: u64) {
         self.virtual_us = self.virtual_us.max(to_us);
         let now = self.virtual_us;
-        self.lwcond_waiters.retain(|&(thid, _, deadline)| match deadline {
+        // Timed lightweight-cond waits: like the heavyweight cond, a timed-out
+        // WaitLwCond re-acquires its bound mutex before resuming, so collect the
+        // expirees, then hand each to its mutex (or wake directly if none is bound).
+        let mut expired_lw: Vec<(i32, u32)> = Vec::new(); // (thid, cond work address)
+        self.lwcond_waiters.retain(|&(thid, work, deadline)| match deadline {
             Some(d) if d <= now => {
-                self.pending_wakes.push(thid);
+                expired_lw.push((thid, work));
                 false
             }
             _ => true,
         });
+        for (thid, work) in expired_lw {
+            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            match self.lwcond_mutex_of(work) {
+                Some(mutex_work) => self.lwmutex_acquire_for(mutex_work, thid),
+                None => self.pending_wakes.push(thid),
+            }
+        }
+        // A pure sleep (sceKernelDelayThread / audio grain pacing) that elapses is a
+        // successful completion, not a timed-out wait: wake it with its return value
+        // (0) unchanged - no resume code.
         self.sleep_waiters.retain(|&(thid, deadline)| {
             if deadline <= now {
                 self.pending_wakes.push(thid);
@@ -1716,9 +2165,38 @@ impl VitaState {
                 true
             }
         });
-        // Timed event flag waits whose deadline passed: wake with the CURRENT
-        // pattern written through outBits (the caller re-checks its condition; see
-        // `vita::sync::wait_event_flag` on why the return value stays 0).
+        // Timed semaphore waits whose deadline passed: wake with WAIT_TIMEOUT. The
+        // count is untouched (nothing was available to consume).
+        self.sema_waiters.retain(|w| match w.deadline {
+            Some(d) if d <= now => {
+                self.pending_wakes.push(w.thid);
+                self.pending_resume_codes.push((w.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+                false
+            }
+            _ => true,
+        });
+        // Timed heavyweight cond waits whose deadline passed: a timed-out WaitCond must
+        // re-acquire its mutex before returning, so collect the expirees first, then
+        // hand each to its mutex (taken now if free, else queued behind the owner). The
+        // WAIT_TIMEOUT code is delivered whenever the thread ultimately resumes.
+        let mut expired_cond: Vec<(i32, i32)> = Vec::new(); // (thid, mutex uid)
+        for c in self.conds.iter_mut() {
+            let mutex = c.mutex;
+            c.waiters.retain(|w| match w.deadline {
+                Some(d) if d <= now => {
+                    expired_cond.push((w.thid, mutex));
+                    false
+                }
+                _ => true,
+            });
+        }
+        for (thid, mutex) in expired_cond {
+            self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+            self.mutex_acquire_for(mutex, thid);
+        }
+        // Timed event flag waits whose deadline passed: wake with WAIT_TIMEOUT and the
+        // CURRENT pattern written through outBits (the caller reads the pattern back
+        // and re-checks; see `vita::sync::wait_event_flag`).
         let patterns: Vec<(i32, u32)> = self.event_flags.clone();
         self.evf_waiters.retain(|w| match w.deadline {
             Some(d) if d <= now => {
@@ -1727,6 +2205,7 @@ impl VitaState {
                     self.pending_stat_writes.push((w.out_addr, p));
                 }
                 self.pending_wakes.push(w.thid);
+                self.pending_resume_codes.push((w.thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
                 false
             }
             _ => true,
@@ -1900,8 +2379,23 @@ impl VitaState {
         handle: u32,
         attributes: Vec<crate::capture::VertexAttribute>,
         stride: u32,
+        program_header: u32,
     ) {
-        self.vertex_programs.push((handle, VertexProgramInfo { attributes, stride }));
+        self.vertex_programs.push((handle, VertexProgramInfo { attributes, stride, program_header }));
+    }
+
+    /// The `SceGxmProgram*` a vertex program handle was created from, if recorded.
+    fn vertex_program_header(&self, handle: u32) -> u32 {
+        self.vertex_programs.iter().find(|(h, _)| *h == handle).map(|(_, i)| i.program_header).unwrap_or(0)
+    }
+
+    /// Record `sceGxmShaderPatcherCreateFragmentProgram`'s handle -> `SceGxmProgram*`.
+    pub fn set_fragment_program(&mut self, handle: u32, program_header: u32) {
+        self.fragment_programs.push((handle, program_header));
+    }
+
+    fn fragment_program_header(&self, handle: u32) -> u32 {
+        self.fragment_programs.iter().find(|(h, _)| *h == handle).map(|(_, p)| *p).unwrap_or(0)
     }
 
     /// Record a color surface, keyed by its guest struct address.
@@ -1992,6 +2486,295 @@ impl VitaState {
         self.color_surfaces.iter().find(|(a, _)| *a == addr).map(|(_, s)| *s)
     }
 
+    /// The sticky extra state for a `SceGxmTexture*`, or GXM defaults if never set.
+    fn texture_extra(&self, texture_addr: u32) -> TextureExtra {
+        self.texture_extra
+            .iter()
+            .find(|(a, _)| *a == texture_addr)
+            .map(|(_, e)| *e)
+            .unwrap_or_default()
+    }
+
+    /// Mutable slot for a texture's extra state, inserting GXM defaults on first touch.
+    fn texture_extra_mut(&mut self, texture_addr: u32) -> &mut TextureExtra {
+        if let Some(i) = self.texture_extra.iter().position(|(a, _)| *a == texture_addr) {
+            &mut self.texture_extra[i].1
+        } else {
+            self.texture_extra.push((texture_addr, TextureExtra::default()));
+            &mut self.texture_extra.last_mut().unwrap().1
+        }
+    }
+
+    /// Record the mip count / explicit byte stride a `sceGxmTextureInit*` established
+    /// (the 6th argument is `mipCount` for every layout except `LINEAR_STRIDED`, where
+    /// it is the byte stride). Called from the texture-init handler.
+    pub fn set_texture_init_extra(&mut self, texture_addr: u32, mip_count: u32, byte_stride: u32) {
+        let e = self.texture_extra_mut(texture_addr);
+        e.mip_count = mip_count.max(1);
+        e.byte_stride = byte_stride;
+    }
+
+    /// Record a texture filter. `which`: 0 = min, 1 = mag, 2 = mip.
+    pub fn set_texture_filter(&mut self, texture_addr: u32, which: u8, value: u32) {
+        let e = self.texture_extra_mut(texture_addr);
+        match which {
+            0 => e.min_filter = value,
+            1 => e.mag_filter = value,
+            _ => e.mip_filter = value,
+        }
+    }
+
+    /// Record a texture's gamma-correction mode (`sceGxmTextureSetGammaMode`).
+    pub fn set_texture_gamma(&mut self, texture_addr: u32, gamma: u32) {
+        self.texture_extra_mut(texture_addr).gamma = gamma;
+    }
+
+    /// `sceGxmTextureGetMipmapCountUnsafe`.
+    pub fn texture_mip_count(&self, texture_addr: u32) -> u32 {
+        self.texture_extra(texture_addr).mip_count
+    }
+
+    /// `sceGxmTextureGetLodBias`.
+    pub fn texture_lod_bias(&self, texture_addr: u32) -> u32 {
+        self.texture_sampler(texture_addr).2
+    }
+
+    /// `sceGxmTextureGet{U,V}AddrModeSafe`. `which`: 0 = U, 1 = V.
+    pub fn texture_addr_mode(&self, texture_addr: u32, which: u8) -> u32 {
+        let s = self.texture_sampler(texture_addr);
+        if which == 0 { s.0 } else { s.1 }
+    }
+
+    /// `sceGxmTextureGet{Min,Mag}Filter` / gamma. `which`: 0 = min, 1 = mag, 2 = gamma.
+    pub fn texture_filter(&self, texture_addr: u32, which: u8) -> u32 {
+        let e = self.texture_extra(texture_addr);
+        match which {
+            0 => e.min_filter,
+            1 => e.mag_filter,
+            _ => e.gamma,
+        }
+    }
+
+    /// `sceGxmTextureGetStride`: the row pitch in bytes. Returns the explicit byte
+    /// stride for a `LINEAR_STRIDED` texture, otherwise the driver-derived linear
+    /// stride: uncompressed rows are padded to a multiple of 8 texels (the GXM linear
+    /// alignment), compressed rows are block-packed - the same formula the capture
+    /// decoder uses (`decode_texture`).
+    pub fn texture_stride(&self, ctx: &GuestCtx, texture_addr: u32) -> u32 {
+        let e = self.texture_extra(texture_addr);
+        if e.byte_stride != 0 {
+            return e.byte_stride;
+        }
+        let w0 = ctx.read_u32(texture_addr);
+        let w1 = ctx.read_u32(texture_addr.wrapping_add(4));
+        let width = ((w1 >> 12) & 0xfff) + 1;
+        // Reconstruct the full base-format high byte exactly as decode_texture does:
+        // prefer the exact 32-bit format the guest set, else the 5-bit control-word
+        // field plus the format0 extension bit (word 0 bit 31).
+        let base_format = match self.texture_format(texture_addr) {
+            Some(f) => (f >> 24) & 0xff,
+            None => ((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7),
+        };
+        match crate::render::block_layout(base_format) {
+            Some((block_w, _block_h, block_bytes)) => {
+                if block_w == 1 {
+                    align_up(width, 8) * block_bytes
+                } else {
+                    width.div_ceil(block_w) * block_bytes
+                }
+            }
+            None => width * 4,
+        }
+    }
+
+    /// Record a color surface's gamma-correction mode (`sceGxmColorSurfaceSetGammaMode`).
+    pub fn set_color_surface_gamma(&mut self, surface_addr: u32, gamma: u32) {
+        self.color_surface_gamma.retain(|(a, _)| *a != surface_addr);
+        self.color_surface_gamma.push((surface_addr, gamma));
+    }
+
+    /// The GPU notification region, allocating it on first use. Returns a guest
+    /// pointer to `SCE_GXM_NOTIFICATION_COUNT` (512) u32 slots.
+    pub fn notification_region(&mut self) -> u32 {
+        if self.notification_region == 0 {
+            self.notification_region = self.galloc(512 * 4, 16);
+        }
+        self.notification_region
+    }
+
+    /// Record `sceGxmPrecomputedDrawInit(precomputedDraw, vertexProgram, memBlock)`:
+    /// start a precomputed-draw record keyed by the guest block address, bound to the
+    /// given vertex program (its handle). Any prior record at that address is replaced.
+    pub fn precomputed_draw_init(&mut self, precomputed: u32, vertex_program: u32) {
+        self.precomputed_draws.retain(|(a, _)| *a != precomputed);
+        self.precomputed_draws.push((
+            precomputed,
+            PrecomputedDraw { vertex_program, ..PrecomputedDraw::default() },
+        ));
+    }
+
+    /// Mutable access to a precomputed-draw record (created lazily so a `SetParams`
+    /// before `Init`, though not expected, still records rather than being lost).
+    fn precomputed_draw_mut(&mut self, precomputed: u32) -> &mut PrecomputedDraw {
+        if let Some(i) = self.precomputed_draws.iter().position(|(a, _)| *a == precomputed) {
+            &mut self.precomputed_draws[i].1
+        } else {
+            self.precomputed_draws.push((precomputed, PrecomputedDraw::default()));
+            &mut self.precomputed_draws.last_mut().unwrap().1
+        }
+    }
+
+    /// Record `sceGxmPrecomputedDrawSetVertexStream(precomputedDraw, streamIndex, data)`.
+    pub fn precomputed_draw_set_stream(&mut self, precomputed: u32, stream_index: u32, data: u32) {
+        if stream_index == 0 {
+            self.precomputed_draw_mut(precomputed).stream0 = data;
+        }
+    }
+
+    /// Record `sceGxmPrecomputedDrawSetParams(precomputedDraw, prim, indexType,
+    /// indexData, indexCount)`.
+    pub fn precomputed_draw_set_params(
+        &mut self,
+        precomputed: u32,
+        primitive: u32,
+        index_format: u32,
+        index_addr: u32,
+        index_count: u32,
+    ) {
+        let d = self.precomputed_draw_mut(precomputed);
+        d.primitive = primitive;
+        d.index_format = index_format;
+        d.index_addr = index_addr;
+        d.index_count = index_count;
+    }
+
+    /// Replay `sceGxmDrawPrecomputed(context, precomputedDraw)`: bind the precomputed
+    /// draw's vertex program + stream-0 buffer and record it into the current scene,
+    /// exactly as a `sceGxmDraw` would. The bound textures and reserved uniform buffer
+    /// are whatever the guest set on the context around this call (sticky GXM state).
+    pub fn draw_precomputed(&mut self, ctx: &GuestCtx, precomputed: u32) {
+        let Some((_, d)) = self.precomputed_draws.iter().find(|(a, _)| *a == precomputed).copied()
+        else {
+            return;
+        };
+        self.bound_vertex_program = d.vertex_program;
+        self.bound_stream0 = d.stream0;
+        self.record_draw(ctx, d.primitive, d.index_format, d.index_addr, d.index_count);
+    }
+
+    // --- Precomputed vertex/fragment state ----------------------------------
+    //
+    // A precomputed state bundles the uniform buffer + textures for one shader stage
+    // into a guest struct the game builds once and binds each draw. We record the
+    // guest-set pointers per state address, then `bind_precomputed_*_state` copies them
+    // into the live bind state so `record_draw` snapshots the same bytes it would on the
+    // direct `sceGxmSetUniformDataF`/`sceGxmSetFragmentTexture` path.
+
+    /// `sceGxmPrecomputedVertexStateInit(state, vertexProgram, memBlock)`: start a fresh
+    /// vertex-state record bound to the vertex program (resolved to its `SceGxmProgram*`
+    /// for later uniform-buffer sizing). Replaces any prior record at that address.
+    pub fn precomputed_vertex_state_init(&mut self, state: u32, vertex_program: u32) {
+        let program_header = self.vertex_program_header(vertex_program);
+        self.precomputed_vertex_states
+            .insert(state, PrecomputedState { program_header, ..PrecomputedState::default() });
+    }
+
+    /// `sceGxmPrecomputedFragmentStateInit(state, fragmentProgram, memBlock)`.
+    pub fn precomputed_fragment_state_init(&mut self, state: u32, fragment_program: u32) {
+        let program_header = self.fragment_program_header(fragment_program);
+        self.precomputed_fragment_states
+            .insert(state, PrecomputedState { program_header, ..PrecomputedState::default() });
+    }
+
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetDefaultUniformBuffer(state, buffer)`:
+    /// store the guest pointer the game will write this stage's uniforms into. The record
+    /// is created lazily so a setter before `Init` (unexpected) still lands.
+    pub fn precomputed_vertex_state_set_uniform_buffer(&mut self, state: u32, buffer: u32) {
+        self.precomputed_vertex_states.entry(state).or_default().default_uniform_buffer = buffer;
+    }
+    pub fn precomputed_fragment_state_set_uniform_buffer(&mut self, state: u32, buffer: u32) {
+        self.precomputed_fragment_states.entry(state).or_default().default_uniform_buffer = buffer;
+    }
+
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateGetDefaultUniformBuffer(state)`: the pointer
+    /// last set (0 if never set), so a Set/Get round-trips faithfully.
+    pub fn precomputed_vertex_state_uniform_buffer(&self, state: u32) -> u32 {
+        self.precomputed_vertex_states.get(&state).map(|s| s.default_uniform_buffer).unwrap_or(0)
+    }
+    pub fn precomputed_fragment_state_uniform_buffer(&self, state: u32) -> u32 {
+        self.precomputed_fragment_states.get(&state).map(|s| s.default_uniform_buffer).unwrap_or(0)
+    }
+
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetTexture(state, index, texture)`: bind a
+    /// `SceGxmTexture*` to this stage's sampler `index` (0 unbinds), replacing any prior
+    /// binding at that index. Textures are kept sorted by index so the bound order is
+    /// stable when the state is applied.
+    pub fn precomputed_vertex_state_set_texture(&mut self, state: u32, index: u32, texture: u32) {
+        Self::state_set_texture(self.precomputed_vertex_states.entry(state).or_default(), index, texture);
+    }
+    pub fn precomputed_fragment_state_set_texture(&mut self, state: u32, index: u32, texture: u32) {
+        Self::state_set_texture(self.precomputed_fragment_states.entry(state).or_default(), index, texture);
+    }
+
+    fn state_set_texture(s: &mut PrecomputedState, index: u32, texture: u32) {
+        s.textures.retain(|(i, _)| *i != index);
+        if texture != 0 {
+            s.textures.push((index, texture));
+            s.textures.sort_by_key(|(i, _)| *i);
+        }
+    }
+
+    /// Apply `sceGxmSetPrecomputedVertexState(context, state)`: bind this stage's default
+    /// uniform buffer (pointer + size, sized from the vertex program header at +0x2C) so
+    /// the next `record_draw` reads its uniforms from guest memory. A state that was never
+    /// built (or a null bind) clears the binding, restoring the direct uniform path.
+    pub fn bind_precomputed_vertex_state(&mut self, ctx: &GuestCtx, state: u32) {
+        match self.precomputed_vertex_states.get(&state) {
+            Some(s) => {
+                self.bound_vertex_uniform_buf = s.default_uniform_buffer;
+                self.bound_vertex_uniform_size = if s.program_header != 0 {
+                    ctx.read_u32(s.program_header + 0x2C)
+                } else {
+                    0
+                };
+            }
+            None => {
+                self.bound_vertex_uniform_buf = 0;
+                self.bound_vertex_uniform_size = 0;
+            }
+        }
+    }
+
+    /// Apply `sceGxmSetPrecomputedFragmentState(context, state)`: bind this stage's
+    /// textures to the context sampler units, exactly as a sequence of
+    /// `sceGxmSetFragmentTexture` calls would, so `record_draw` snapshots them.
+    pub fn bind_precomputed_fragment_state(&mut self, state: u32) {
+        let textures = match self.precomputed_fragment_states.get(&state) {
+            Some(s) => s.textures.clone(),
+            None => return,
+        };
+        self.bound_textures = textures;
+    }
+
+    /// `sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)`: hand
+    /// back a fresh guest buffer sized to the bound vertex program's default uniform
+    /// block, and bind it as the vertex uniform source so `record_draw` reads whatever
+    /// the guest writes into it (this is the direct-path counterpart of a precomputed
+    /// vertex state's default uniform buffer). `sceGxmSetUniformDataF` also copies into
+    /// this same buffer, so reading it captures both ways the guest sets uniforms. The
+    /// size is read from the program header (+0x2C) and clamped so an unresolved header
+    /// cannot request an absurd allocation; a program with no default uniforms yields
+    /// size 0, and the draw falls back to the `sceGxmSetUniformDataF` capture.
+    pub fn reserve_vertex_uniform_buffer(&mut self, ctx: &GuestCtx) -> u32 {
+        let header = self.vertex_program_header(self.bound_vertex_program);
+        let size = if header != 0 { ctx.read_u32(header + 0x2C) } else { 0 };
+        let size = size.min(4096);
+        let buf = self.galloc(size.max(256), 16);
+        self.bound_vertex_uniform_buf = buf;
+        self.bound_vertex_uniform_size = size;
+        buf
+    }
+
     /// Release a memory block by SceUID (`sceKernelFreeMemBlock`). Returns true if a
     /// block was registered under `uid`. The deterministic bump allocation itself is
     /// not reclaimed (the arena only grows), but the registry entry is removed so a
@@ -2007,12 +2790,69 @@ impl VitaState {
         self.pending_uniforms = values;
     }
 
+    /// Human-readable dump of every preemptive sync primitive's ownership/waiter state
+    /// plus the sleep/timed-wait queues, for diagnosing a boot that stalls without
+    /// reaching a frame. The decisive question it answers: is a given thread parked in
+    /// some waiter list (blocked, and on what) or absent from all of them (running -
+    /// i.e. spinning in pure guest compute)? Content-free (ids/addresses only).
+    pub fn debug_sync_dump(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = writeln!(s, "current thread = {:#x}, virtual_us = {}", self.current, self.virtual_us);
+        let _ = writeln!(s, "lwmutexes ({}):", self.lwmutexes.len());
+        for m in &self.lwmutexes {
+            let _ = writeln!(
+                s, "  work={:#010x} owner={:?} count={} waiters={:x?}",
+                m.work, m.owner, m.count, m.waiters
+            );
+        }
+        let _ = writeln!(s, "mutexes ({}):", self.mutexes.len());
+        for m in &self.mutexes {
+            let _ = writeln!(
+                s, "  uid={:#x} owner={:?} count={} waiters={:x?}",
+                m.uid, m.owner, m.count, m.waiters
+            );
+        }
+        let _ = writeln!(s, "semaphores ({}):", self.semaphores.len());
+        for (uid, count) in &self.semaphores {
+            let waiters: Vec<(i32, i32)> =
+                self.sema_waiters.iter().filter(|w| w.uid == *uid).map(|w| (w.thid, w.need)).collect();
+            let _ = writeln!(s, "  uid={uid:#x} count={count} waiters(thid,need)={waiters:x?}");
+        }
+        let _ = writeln!(s, "cond waiters:");
+        for c in &self.conds {
+            let w: Vec<i32> = c.waiters.iter().map(|x| x.thid).collect();
+            if !w.is_empty() {
+                let _ = writeln!(s, "  cond uid={:#x} mutex={:#x} waiters={:x?}", c.uid, c.mutex, w);
+            }
+        }
+        let _ = writeln!(s, "lwcond waiters (thid, cond_work, deadline): {:x?}", self.lwcond_waiters);
+        let _ = writeln!(s, "lwcond->mutex bindings (cond_work, mutex_work): {:x?}", self.lwcond_mutex);
+        let _ = writeln!(s, "sleep waiters (thid, deadline_us): {:x?}", self.sleep_waiters);
+        s
+    }
+
     /// The bound vertex program's layout, if recorded.
     fn bound_layout(&self) -> Option<&VertexProgramInfo> {
         self.vertex_programs
             .iter()
             .find(|(h, _)| *h == self.bound_vertex_program)
             .map(|(_, info)| info)
+    }
+
+    /// The vertex uniforms in effect for the next draw. On the precomputed path
+    /// (`bound_vertex_uniform_buf` set by `sceGxmSetPrecomputedVertexState`) read the
+    /// default uniform buffer straight from guest memory, sized by the program's default
+    /// uniform buffer size. Otherwise use the `sceGxmSetUniformDataF` capture.
+    fn current_vertex_uniforms(&self, ctx: &GuestCtx) -> Vec<f32> {
+        if self.bound_vertex_uniform_buf != 0 && self.bound_vertex_uniform_size >= 4 {
+            let count = (self.bound_vertex_uniform_size / 4) as usize;
+            (0..count)
+                .map(|i| ctx.read_f32(self.bound_vertex_uniform_buf + (i as u32) * 4))
+                .collect()
+        } else {
+            self.pending_uniforms.clone()
+        }
     }
 
     /// Append a draw to the current scene, snapshotting vertex and index bytes.
@@ -2053,9 +2893,22 @@ impl VitaState {
         let textures: Vec<crate::capture::BoundTexture> = units
             .iter()
             .filter_map(|&(unit, addr)| {
-                decode_texture(ctx, unit, addr, self.texture_format(addr), self.texture_sampler(addr))
+                let e = self.texture_extra(addr);
+                decode_texture(
+                    ctx,
+                    unit,
+                    addr,
+                    self.texture_format(addr),
+                    self.texture_sampler(addr),
+                    (e.min_filter, e.mag_filter),
+                )
             })
             .collect();
+        // Vertex uniforms: on the precomputed path the game wrote them into a default
+        // uniform buffer bound by `sceGxmSetPrecomputedVertexState`, so read that guest
+        // buffer now (its contents are current at draw time). On the direct path the
+        // buffer is 0 and we fall back to the `sceGxmSetUniformDataF` capture.
+        let uniforms = self.current_vertex_uniforms(ctx);
         let draw = crate::capture::Draw {
             primitive,
             index_format,
@@ -2064,7 +2917,7 @@ impl VitaState {
             vertex_stride: stride,
             attributes,
             indices,
-            uniforms: self.pending_uniforms.clone(),
+            uniforms,
             textures,
             render_state: self.render_state,
         };
@@ -2105,6 +2958,7 @@ fn decode_texture(
     addr: u32,
     exact_format: Option<u32>,
     sampler: (u32, u32, u32),
+    filters: (u32, u32),
 ) -> Option<crate::capture::BoundTexture> {
     if addr == 0 {
         return None;
@@ -2161,6 +3015,8 @@ fn decode_texture(
         u_addr_mode: sampler.0,
         v_addr_mode: sampler.1,
         lod_bias: sampler.2,
+        min_filter: filters.0,
+        mag_filter: filters.1,
     })
 }
 
@@ -2305,6 +3161,14 @@ pub trait ImportDispatch {
     /// woken thread ids then surface through [`take_wakes`](Self::take_wakes).
     fn advance_time_to(&mut self, _to_us: u64) {}
 
+    /// The `r0` value owed to thread `thid` as it resumes from a block (a timed wait
+    /// that expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT`), if any. The engine
+    /// calls this at the point the woken thread resumes and, on `Some`, overwrites its
+    /// `r0`; `None` (a signal wake) leaves the pre-park return value (0) in place.
+    fn take_resume_code(&mut self, _thid: i32) -> Option<u32> {
+        None
+    }
+
     /// A display frame just flipped (`frame` flips so far). Lets a frame-keyed input
     /// source - a scripted TAS recipe - advance in lockstep with the render loop.
     /// The default ignores it.
@@ -2366,6 +3230,10 @@ impl ImportDispatch for VitaEnv {
 
     fn advance_time_to(&mut self, to_us: u64) {
         self.state.advance_time_to(to_us);
+    }
+
+    fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
+        self.state.take_resume_code(thid)
     }
 
     fn on_frame_boundary(&mut self, frame: u64) {
@@ -2440,6 +3308,10 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn advance_time_to(&mut self, to_us: u64) {
         self.borrow_mut().advance_time_to(to_us);
+    }
+
+    fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
+        self.borrow_mut().take_resume_code(thid)
     }
 }
 
@@ -2538,6 +3410,51 @@ mod hostcall_tests {
 }
 
 #[cfg(test)]
+mod savedata_tests {
+    //! The in-memory savedata slot store: a created slot must round-trip on get, be
+    //! namespaced per mount, and delete cleanly - the read-after-write faithfulness
+    //! the SceAppUtil slot API depends on.
+    use super::*;
+    use crate::world::DeterministicWorld;
+
+    fn dummy_state() -> VitaState {
+        VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
+    }
+
+    #[test]
+    fn create_then_get_round_trips() {
+        let mut st = dummy_state();
+        assert!(!st.savedata_slot_exists("savedata0:", 0));
+        assert_eq!(st.savedata_slot_get("savedata0:", 0), None);
+
+        let param = vec![0xABu8; 0x34C];
+        st.savedata_slot_put("savedata0:", 0, param.clone());
+
+        assert!(st.savedata_slot_exists("savedata0:", 0));
+        assert_eq!(st.savedata_slot_get("savedata0:", 0).as_deref(), Some(param.as_slice()));
+    }
+
+    #[test]
+    fn slots_are_namespaced_by_mount_and_id() {
+        let mut st = dummy_state();
+        st.savedata_slot_put("savedata0:", 0, vec![1]);
+        // A different slot id or mount is a distinct, still-empty slot.
+        assert!(!st.savedata_slot_exists("savedata0:", 1));
+        assert!(!st.savedata_slot_exists("savedata1:", 0));
+        assert_eq!(st.savedata_slot_get("savedata0:", 0).as_deref(), Some([1].as_slice()));
+    }
+
+    #[test]
+    fn remove_reports_prior_existence() {
+        let mut st = dummy_state();
+        st.savedata_slot_put("", 3, vec![9, 9]);
+        assert!(st.savedata_slot_remove("", 3));
+        assert!(!st.savedata_slot_remove("", 3)); // already gone
+        assert!(!st.savedata_slot_exists("", 3));
+    }
+}
+
+#[cfg(test)]
 mod preemptive_tests {
     //! The preemptive block/wake bookkeeping in `VitaState`, exercised directly
     //! (no wasm engine): a parked thread and its release for each primitive. The
@@ -2559,7 +3476,7 @@ mod preemptive_tests {
         // Thread 1 wants 1 but the count is 0: it cannot acquire and parks.
         st.set_current(1);
         assert!(!st.sema_try_acquire(sem, 1));
-        st.sema_block(sem, 1);
+        st.sema_block(sem, 1, 0);
         assert!(st.take_wakes().is_empty());
         // Thread 2 signals: thread 1 is released and the token is consumed for it.
         st.set_current(2);
@@ -2626,6 +3543,138 @@ mod preemptive_tests {
     }
 
     #[test]
+    fn multiple_semaphore_waiters_release_fifo() {
+        let mut st = state();
+        let sem = st.create_sema(0);
+        // Threads 1, 2, 3 park in order, each needing one permit.
+        for t in [1, 2, 3] {
+            st.set_current(t);
+            assert!(!st.sema_try_acquire(sem, 1));
+            st.sema_block(sem, 1, 0);
+        }
+        // Three single posts release them in FIFO (block) order, one permit each.
+        st.set_current(4);
+        st.sema_signal_wake(sem, 1);
+        st.sema_signal_wake(sem, 1);
+        st.sema_signal_wake(sem, 1);
+        assert_eq!(st.take_wakes(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn semaphore_need_greater_than_one_waits_for_accumulation() {
+        let mut st = state();
+        let sem = st.create_sema(0);
+        st.set_current(1);
+        st.sema_block(sem, 3, 0); // needs 3
+        st.set_current(2);
+        st.sema_signal_wake(sem, 2); // count 2 < 3: not released
+        assert!(st.take_wakes().is_empty());
+        st.sema_signal_wake(sem, 1); // count 3: released, consuming all 3
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert!(!st.sema_try_acquire(sem, 1), "the wake consumed the whole count");
+    }
+
+    #[test]
+    fn timed_semaphore_wait_times_out_with_wait_timeout_code() {
+        let mut st = state();
+        let sem = st.create_sema(0);
+        st.set_current(1);
+        assert!(!st.sema_try_acquire(sem, 1));
+        st.sema_block(sem, 1, 500);
+        // The semaphore deadline participates in the scheduler's clock jump.
+        assert_eq!(st.earliest_lwcond_deadline(), Some(500));
+        // Short of the deadline: still parked, nothing owed.
+        st.advance_time_to(499);
+        assert!(st.take_wakes().is_empty());
+        assert_eq!(st.take_resume_code(1), None);
+        // At the deadline: woken and owed SCE_KERNEL_ERROR_WAIT_TIMEOUT for its r0.
+        st.advance_time_to(500);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+        assert_eq!(st.take_resume_code(1), None, "the code is drained once");
+    }
+
+    #[test]
+    fn timed_semaphore_wait_satisfied_before_deadline_returns_zero() {
+        let mut st = state();
+        let sem = st.create_sema(0);
+        st.set_current(1);
+        st.sema_block(sem, 1, 500);
+        // A signal before the deadline releases it with NO resume code (r0 stays 0).
+        st.set_current(2);
+        st.sema_signal_wake(sem, 1);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_resume_code(1), None);
+        // Its deadline no longer holds the scheduler's clock.
+        assert_eq!(st.earliest_lwcond_deadline(), None);
+    }
+
+    #[test]
+    fn timed_cond_wait_times_out_reacquires_free_mutex_and_returns_code() {
+        let mut st = state();
+        let m = st.create_mutex();
+        let cv = st.create_cond(m);
+        // Thread 1 holds the mutex, then waits with a 500 us timeout: the wait releases
+        // the mutex, parks, and registers a deadline.
+        st.set_current(1);
+        assert!(st.mutex_lock(m));
+        st.cond_wait(cv, 500);
+        assert_eq!(st.earliest_lwcond_deadline(), Some(500));
+        assert!(st.take_wakes().is_empty());
+        // No signaller comes: at the deadline the wait times out, re-acquires the (now
+        // free) mutex, is woken, and is owed WAIT_TIMEOUT.
+        st.advance_time_to(500);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+        st.set_current(2);
+        assert!(st.mutex_contended(m), "the timed-out cond wait re-acquired its mutex");
+    }
+
+    #[test]
+    fn timed_cond_wait_timeout_queues_behind_a_held_mutex() {
+        let mut st = state();
+        let m = st.create_mutex();
+        let cv = st.create_cond(m);
+        // Thread 1 waits with a timeout (releasing the mutex as it parks).
+        st.set_current(1);
+        assert!(st.mutex_lock(m));
+        st.cond_wait(cv, 500);
+        // Thread 2 grabs the mutex before the deadline.
+        st.set_current(2);
+        assert!(st.mutex_lock(m));
+        // At the deadline the wait times out, but the mutex is held: thread 1 queues
+        // behind thread 2 (not woken yet) while its WAIT_TIMEOUT code is already owed.
+        st.advance_time_to(500);
+        assert!(st.take_wakes().is_empty(), "the timed-out waiter queues behind the owner");
+        // Thread 2 unlocks: thread 1 finally gets the mutex, is woken, and the owed
+        // timeout code is delivered when it resumes.
+        st.mutex_unlock(m);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+    }
+
+    #[test]
+    fn timed_lwcond_wait_times_out_with_code_but_a_signal_returns_zero() {
+        let mut st = state();
+        // A timed lightweight-cond wait that expires is owed WAIT_TIMEOUT. A cond
+        // always has a bound mutex (set at CreateLwCond) - bind one so the wait parks.
+        st.lwcond_bind_mutex(0x9000, 0x9100);
+        st.set_current(1);
+        assert!(st.lwcond_wait(0x9000, 250)); // work-area address, 250 us timeout
+        assert_eq!(st.earliest_lwcond_deadline(), Some(250));
+        st.advance_time_to(250);
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
+        // A timed wait released by a signal instead returns 0 (no resume code).
+        st.set_current(2);
+        assert!(st.lwcond_wait(0x9000, 250));
+        st.set_current(3);
+        st.lwcond_signal(0x9000, false);
+        assert_eq!(st.take_wakes(), vec![2]);
+        assert_eq!(st.take_resume_code(2), None);
+    }
+
+    #[test]
     fn mutex_hands_ownership_to_the_next_waiter_on_unlock() {
         let mut st = state();
         let m = st.create_mutex();
@@ -2643,6 +3692,69 @@ mod preemptive_tests {
         // Thread 2 now owns it, so thread 3 would contend.
         st.set_current(3);
         assert!(st.mutex_contended(m));
+    }
+
+    #[test]
+    fn lightweight_mutex_blocks_and_hands_over_keyed_by_work_address() {
+        let mut st = state();
+        let work = 0x8000; // guest work-area address (no kernel handle)
+        // Thread 1 locks the lightweight mutex; thread 2 contends and parks.
+        st.set_current(1);
+        assert!(st.lwmutex_lock(work));
+        st.set_current(2);
+        assert!(st.lwmutex_contended(work));
+        assert!(!st.lwmutex_lock(work), "contender must block, not silently succeed");
+        assert!(st.take_wakes().is_empty());
+        // Thread 1 unlocks: ownership passes to thread 2, which is woken.
+        st.set_current(1);
+        st.lwmutex_unlock(work);
+        assert_eq!(st.take_wakes(), vec![2]);
+        // A different work address is an independent lock (thread 3 takes it freely).
+        st.set_current(3);
+        assert!(st.lwmutex_lock(0x9000));
+        assert!(st.lwmutex_contended(work), "the first lock is still held by thread 2");
+    }
+
+    #[test]
+    fn lightweight_mutex_is_recursive_for_the_owner() {
+        let mut st = state();
+        let work = 0x8000;
+        st.set_current(1);
+        assert!(st.lwmutex_lock(work)); // count 1
+        assert!(st.lwmutex_lock(work)); // count 2 (recursive, same owner)
+        st.lwmutex_unlock(work); // count 1, still owned
+        st.set_current(2);
+        assert!(st.lwmutex_contended(work), "still held after one of two unlocks");
+        st.set_current(1);
+        st.lwmutex_unlock(work); // count 0, released
+        st.set_current(2);
+        assert!(!st.lwmutex_contended(work), "free after the matching unlock");
+    }
+
+    #[test]
+    fn lightweight_cond_wait_releases_and_reacquires_its_bound_mutex() {
+        let mut st = state();
+        let mutex_work = 0x8000;
+        let cond_work = 0x8100;
+        st.lwcond_bind_mutex(cond_work, mutex_work);
+        // Thread 1 holds the lwmutex, then waits on the lwcond: the wait releases the
+        // mutex (so a sibling can take it) and parks thread 1.
+        st.set_current(1);
+        assert!(st.lwmutex_lock(mutex_work));
+        assert!(st.lwcond_wait(cond_work, 0));
+        assert!(st.take_wakes().is_empty(), "waiter is parked, not runnable");
+        st.set_current(2);
+        assert!(!st.lwmutex_contended(mutex_work), "the lwmutex was released by the wait");
+        // Thread 2 takes the lwmutex, then signals: the waiter must re-acquire the
+        // mutex first, so it queues behind thread 2 (not woken yet).
+        assert!(st.lwmutex_lock(mutex_work));
+        st.lwcond_signal(cond_work, false);
+        assert!(st.take_wakes().is_empty(), "waiter must re-acquire the lwmutex first");
+        // Thread 2 unlocks: ownership passes to the waiter, which is finally woken.
+        st.lwmutex_unlock(mutex_work);
+        assert_eq!(st.take_wakes(), vec![1]);
+        st.set_current(3);
+        assert!(st.lwmutex_contended(mutex_work), "the woken waiter re-acquired the lwmutex");
     }
 
     #[test]
@@ -2671,7 +3783,7 @@ mod preemptive_tests {
         // the mutex (so another thread can take it) and parks thread 1.
         st.set_current(1);
         assert!(st.mutex_lock(m));
-        st.cond_wait(cv);
+        st.cond_wait(cv, 0);
         assert!(st.take_wakes().is_empty(), "waiter is parked, not runnable");
         st.set_current(2);
         assert!(!st.mutex_contended(m), "mutex was released by the wait");
@@ -2697,7 +3809,7 @@ mod preemptive_tests {
         let cv = st.create_cond(m);
         st.set_current(1);
         assert!(st.mutex_lock(m));
-        st.cond_wait(cv); // releases m, parks thread 1
+        st.cond_wait(cv, 0); // releases m, parks thread 1
         // The signaller does not hold the mutex, so the woken waiter takes it now.
         st.set_current(2);
         st.cond_signal(cv, false);
@@ -2715,7 +3827,7 @@ mod preemptive_tests {
         for t in [1, 2] {
             st.set_current(t);
             st.mutex_lock(m);
-            st.cond_wait(cv);
+            st.cond_wait(cv, 0);
             st.mutex_unlock(m); // no-op: wait already released it
         }
         st.set_current(3);
@@ -2794,6 +3906,26 @@ mod filesystem_tests {
         // At EOF a further read is empty, not an error.
         assert_eq!(st.io_read(r, 100).as_deref(), Some(&b""[..]));
         st.io_close(r);
+    }
+
+    #[test]
+    fn doubled_slashes_and_dot_segments_resolve_to_the_same_file() {
+        // A title that joins a dir with a trailing `/` to a subpath with a leading `/`
+        // produces `//`; a real Vita FS collapses it. The font-load path
+        // `app0:/usrdir//ui/fonts//x.ttf` regressed a whole title before this
+        // normalization landed (font missed -> every glyph "missing" -> null-glyph copy).
+        let mut st = state();
+        st.add_file("app0:/usrdir/ui/fonts/x.ttf", b"FONTDATA".to_vec());
+        assert_eq!(
+            st.read_file("app0:/usrdir//ui/fonts//x.ttf").as_deref(),
+            Some(&b"FONTDATA"[..])
+        );
+        // `.` and `..` segments resolve too, and open() shares the same key.
+        assert_eq!(
+            st.read_file("app0:/usrdir/./ui/bogus/../fonts/x.ttf").as_deref(),
+            Some(&b"FONTDATA"[..])
+        );
+        assert!(st.io_open("app0:/usrdir//ui/fonts//x.ttf", SCE_O_RDONLY) >= 3);
     }
 
     #[test]

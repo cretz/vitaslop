@@ -22,6 +22,19 @@ pub(super) fn get_thread_current_priority(st: &mut VitaState) -> i32 {
     st.current_priority()
 }
 
+/// int sceKernelChangeThreadVfpException(int clearMask, int setMask)
+///
+/// Selects which VFP/NEON floating-point exceptions (invalid, div-by-zero, overflow,
+/// underflow, inexact, input-denormal) trap for the calling thread by clearing then
+/// setting bits in its FPSCR exception-enable field. We evaluate every float and NEON
+/// op with standard non-trapping IEEE semantics (no host trap is ever raised), so this
+/// only records intent - it never changes a numeric result or control flow. Accepted
+/// with success. Returns 0.
+#[hostcall]
+pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i32 {
+    0
+}
+
 /// int sceKernelDelayThread(SceUInt delay)
 ///
 /// Preemptive: a REAL timed sleep - park the caller until the virtual clock

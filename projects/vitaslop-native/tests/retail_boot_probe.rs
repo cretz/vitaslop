@@ -495,7 +495,49 @@ fn retail_boot_probe() {
         Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
     });
     let report = if watch.is_empty() && dump_region.is_none() {
-        let r = sched.run_frames(max_frames, max_rounds);
+        // Causality probe VITASLOP_STALL_WAKE=<id|0xwork>,...: run the boot in
+        // `VITASLOP_STALL_CHUNK` (default 200k) round chunks, and each time the run
+        // stalls (RoundLimit - one thread spinning while the rest are parked) force
+        // deliver a signal to the listed semaphores (decimal id) and lightweight conds
+        // (0x-prefixed work pointer), then continue, up to VITASLOP_STALL_WAVES (default
+        // 40). This tests whether a boot freeze is a missing/lost worker wakeup: if
+        // injecting the signal a real title's producer would have sent unblocks the
+        // boot, the freeze is a sync-handoff bug, not a data/lift bug.
+        let r = if let Ok(spec) = std::env::var("VITASLOP_STALL_WAKE") {
+            let mut sema_ids: Vec<i32> = Vec::new();
+            let mut cond_works: Vec<u32> = Vec::new();
+            for t in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(h) = t.strip_prefix("0x") {
+                    if let Ok(w) = u32::from_str_radix(h, 16) { cond_works.push(w); }
+                } else if let Ok(id) = t.parse::<i32>() { sema_ids.push(id); }
+            }
+            let chunk: u64 = std::env::var("VITASLOP_STALL_CHUNK").ok()
+                .and_then(|s| s.parse().ok()).unwrap_or(200_000);
+            let max_waves: u32 = std::env::var("VITASLOP_STALL_WAVES").ok()
+                .and_then(|s| s.parse().ok()).unwrap_or(40);
+            eprintln!("STALL_WAKE: semas={sema_ids:?} conds={cond_works:?} chunk={chunk} waves<={max_waves}");
+            let mut done;
+            let mut waves = 0u32;
+            loop {
+                let rep = sched.run_frames(max_frames, chunk);
+                match rep {
+                    RunReport::RoundLimit if waves < max_waves => {
+                        {
+                            let mut h = sched.host();
+                            for &id in &sema_ids { h.state.sema_signal_wake(id, 1); }
+                            for &w in &cond_works { h.state.lwcond_signal(w, true); }
+                        }
+                        waves += 1;
+                        eprintln!("  wave {waves}: signalled at frame {}", sched.frames());
+                    }
+                    other => { done = other; break; }
+                }
+            }
+            eprintln!("STALL_WAKE done: {waves} wake wave(s), frames={}", sched.frames());
+            done
+        } else {
+            sched.run_frames(max_frames, max_rounds)
+        };
         eprintln!("run report: {r:?}");
         // VITASLOP_DUMP_MAP=<hex ptr-to-map-object>: after the run, in-order walk a
         // libstdc++/Sony std::map<string,V> red-black tree and print every key. Node
@@ -781,6 +823,15 @@ fn retail_boot_probe() {
         last
     };
 
+    // Block-visit histogram (VITASLOP_BLOCK_HIST, with VITASLOP_TRACE_BLOCKS emitting
+    // the hooks): the empirical map of a hot loop's structure - hottest blocks, trip
+    // counts, and the exact repeating cycle whose head is the loop head to snapshot.
+    let hist_top = std::env::var("VITASLOP_BLOCK_HIST")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(40);
+    vitaslop_native::dump_block_hist(hist_top);
+
     // If the run trapped, auto-map every "wasm function N" in the backtrace to its
     // guest address, so a fault is immediately readable without a second run.
     if let RunReport::Error(msg) = &report {
@@ -1032,6 +1083,11 @@ fn retail_boot_probe() {
     for (work, tp, to) in &st.capture.lwcond_wait_samples {
         eprintln!("  work={work:#010x} timeout_ptr={tp:#010x} timeout={to}");
     }
+    // Final preemptive-sync state: which threads are parked on which primitive (vs.
+    // absent from every waiter list = spinning in pure compute). The decisive read for
+    // a boot that stalls before its first frame - is the main thread blocked on a lock a
+    // worker holds, or busy-waiting on a datum a worker never produces?
+    eprintln!("--- final sync state ---\n{}", st.debug_sync_dump());
     // Scene introspection (VITASLOP_DUMP_SCENES=N): print the last N captured scenes'
     // structure - color surface, and per draw the primitive/index/vertex shape,
     // uniform count, attributes, and bound textures. This answers "the frame is
@@ -1048,17 +1104,48 @@ fn retail_boot_probe() {
                 None => eprintln!("scene[{i}]: NO color surface, {} draw(s)", scene.draws.len()),
             }
             for (j, d) in scene.draws.iter().enumerate() {
+                let rs = &d.render_state;
                 eprintln!(
-                    "  draw[{j}]: prim={} idxfmt={} idxcount={} vstride={} vbytes={} uniforms={} attrs={:?}",
+                    "  draw[{j}]: prim={} idxfmt={} idxcount={} vstride={} vbytes={} uniforms={} depth_func={:#x} depth_write={:#x} cull={:#x} attrs={:?}",
                     d.primitive, d.index_format, d.index_count, d.vertex_stride,
-                    d.vertices.len(), d.uniforms.len(), d.attributes,
+                    d.vertices.len(), d.uniforms.len(), rs.front_depth_func, rs.front_depth_write, rs.cull_mode, d.attributes,
                 );
                 for t in &d.textures {
                     eprintln!(
-                        "    tex unit={} base_fmt={:#04x} type={:#x} {}x{} stride={} addr={:#010x} pixels={}",
-                        t.unit, t.base_format, t.tex_type, t.width, t.height, t.stride,
-                        t.data_addr, t.pixels.len()
+                        "    tex unit={} base_fmt={:#04x} swizzle={:#08x} type={:#x} {}x{} stride={} addr={:#010x} pixels={} minf={} magf={}",
+                        t.unit, t.base_format, t.swizzle, t.tex_type, t.width, t.height, t.stride,
+                        t.data_addr, t.pixels.len(), t.min_filter, t.mag_filter
                     );
+                    // VITASLOP_DUMP_TEX: also decode the first few vertices as f32 lanes
+                    // + trailing bytes, so the real attribute semantics (which lane is
+                    // uv vs color) are visible.
+                    if std::env::var("VITASLOP_DUMP_TEX").is_ok() {
+                        let stride = d.vertex_stride.max(1) as usize;
+                        let nv = (d.vertices.len() / stride).min(16);
+                        for vi in 0..nv {
+                            let b = &d.vertices[vi * stride..(vi + 1) * stride];
+                            let lanes: Vec<String> = (0..stride / 4)
+                                .map(|k| {
+                                    let o = k * 4;
+                                    let f = f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                                    format!("{f:.3}")
+                                })
+                                .collect();
+                            let bytes: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+                            eprintln!("      v{vi} f32=[{}] bytes=[{}]", lanes.join(" "), bytes.join(" "));
+                        }
+                    }
+                    // VITASLOP_DUMP_TEX: write each bound texture's decoded RGBA8 + raw
+                    // bytes to the shot dir, so the atlas can be inspected directly.
+                    if std::env::var("VITASLOP_DUMP_TEX").is_ok() {
+                        if let Ok(dir) = std::env::var("VITASLOP_SHOT_DIR") {
+                            let (tw, th, rgba) = render::decode_texture_rgba8(t);
+                            let raw = format!("{dir}/tex_s{i}_d{j}_{tw}x{th}.rgba");
+                            let _ = std::fs::write(&raw, &rgba);
+                            let g = format!("{dir}/tex_s{i}_d{j}_{}x{}.gray", t.width, t.height);
+                            let _ = std::fs::write(&g, &t.pixels);
+                        }
+                    }
                 }
             }
         }

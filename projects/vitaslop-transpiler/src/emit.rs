@@ -1246,6 +1246,9 @@ fn emit_stmt(
         }
         Stmt::Uadd8 { rd, rn, rm } => emit_uadd8(f, *rd, *rn, *rm),
         Stmt::Sel { rd, rn, rm } => emit_sel(f, *rd, *rn, *rm),
+        Stmt::ShiftRegFlags { kind, rd, rn, amount, set_flags } => {
+            emit_shift_reg_flags(f, *kind, *rd, rn, amount, *set_flags, base)
+        }
     }
 }
 
@@ -1344,6 +1347,144 @@ fn emit_sel(f: &mut Function, rd: u8, rn: u8, rm: u8) {
     }
     f.instruction(&W::LocalGet(L_T2));
     f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
+}
+
+/// Emit the exact ARM register-controlled shift `lsl/lsr/asr Rd, Rn, Rm` where the
+/// amount is a runtime value (`Rm[7:0]`, 0..255). wasm shifts mask the amount mod 32,
+/// so `lsl` by >=32 must be forced to 0 (not `Rn << (amt & 31)`); and ARM's shifter
+/// carry-out for a ZERO amount is the OLD carry (unchanged), which no constant carry
+/// expression captures - so both the result and the carry are modeled explicitly. Sets
+/// N,Z,C when `set_flags` (a shift never affects V). Scratch: L_T0=value, L_T1=amount,
+/// L_T2=result, L_T3=carry. `value`/`amount` are read before `rd` is written, so a
+/// shift whose amount or source aliases `rd` (e.g. `lsls r0, r3, r0`) is correct.
+fn emit_shift_reg_flags(
+    f: &mut Function,
+    kind: crate::ir::ShiftKind,
+    rd: u8,
+    rn: &Value,
+    amount: &Value,
+    set_flags: bool,
+    base: u32,
+) {
+    use crate::ir::ShiftKind::*;
+    emit_value(f, rn, base);
+    f.instruction(&W::LocalSet(L_T0)); // value
+    emit_value(f, amount, base);
+    f.instruction(&W::I32Const(0xff));
+    f.instruction(&W::I32And);
+    f.instruction(&W::LocalSet(L_T1)); // amt = Rm[7:0]
+
+    // result -> L_T2. wasm Select is `a b c -> (c != 0 ? a : b)`.
+    match kind {
+        Lsl => {
+            // amt < 32 ? val << amt : 0
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Shl);
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LtU);
+            f.instruction(&W::Select);
+        }
+        Lsr => {
+            // amt < 32 ? val >>u amt : 0
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32ShrU);
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LtU);
+            f.instruction(&W::Select);
+        }
+        Asr => {
+            // amt < 32 ? val >>s amt : val >>s 31  (arithmetic sign-fill for amt>=32)
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32ShrS);
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(31));
+            f.instruction(&W::I32ShrS);
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LtU);
+            f.instruction(&W::Select);
+        }
+    }
+    f.instruction(&W::LocalSet(L_T2));
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::GlobalSet(abi::reg_global(rd as usize)));
+
+    if !set_flags {
+        return;
+    }
+    // Z = (result == 0); N = result[31].
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::I32Const(31));
+    f.instruction(&W::I32ShrU);
+    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+    // Shifter carry-out for a NON-zero amount -> L_T3 (the amt==0 case is folded in
+    // by the final select, which keeps the old C).
+    match kind {
+        Lsl => {
+            // amt <= 32 ? (val >>u (32 - amt)) & 1 : 0   [amt in 1..=32 -> shift 0..=31]
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::I32ShrU);
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LeU);
+            f.instruction(&W::Select);
+        }
+        Lsr => {
+            // amt <= 32 ? (val >>u (amt - 1)) & 1 : 0    [amt in 1..=32 -> shift 0..=31]
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::I32ShrU);
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LeU);
+            f.instruction(&W::Select);
+        }
+        Asr => {
+            // (val >>s min(amt - 1, 31)) & 1   [amt>=32 -> the sign bit; ASR carry is
+            // defined for all amounts, so no amt>32 zero branch].
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::I32Const(31));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(32));
+            f.instruction(&W::I32LtU);
+            f.instruction(&W::Select); // min(amt-1, 31)
+            f.instruction(&W::I32ShrS);
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32And);
+        }
+    }
+    f.instruction(&W::LocalSet(L_T3));
+    // C = (amt == 0) ? old_C : L_T3
+    f.instruction(&W::GlobalGet(abi::flag_global(abi::Flag::C)));
+    f.instruction(&W::LocalGet(L_T3));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::Select);
+    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::C)));
 }
 
 // --- VFP / floating-point emission ---------------------------------------

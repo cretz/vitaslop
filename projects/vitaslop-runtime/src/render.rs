@@ -413,12 +413,51 @@ fn sample_texture(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
     if t.width == 0 || t.height == 0 {
         return [255, 0, 255, 255];
     }
-    // REPEAT wrap: fractional part into [0, 1).
+    // Honor the guest-set magnification filter (SceGxmTextureFilter: 0 = POINT,
+    // 1 = LINEAR). LINEAR is what UI/font-atlas text is drawn with; point-sampling it
+    // at sub-native scale breaks thin glyph strokes.
+    const SCE_GXM_TEXTURE_FILTER_LINEAR: u32 = 1;
+    if t.mag_filter == SCE_GXM_TEXTURE_FILTER_LINEAR {
+        return sample_texture_bilinear(t, u, v);
+    }
+    // POINT: nearest texel, REPEAT wrap (fractional part into [0, 1)).
     let uu = u - u.floor();
     let vv = v - v.floor();
     let x = ((uu * t.width as f32) as i64).clamp(0, t.width as i64 - 1) as u32;
     let y = ((vv * t.height as f32) as i64).clamp(0, t.height as i64 - 1) as u32;
     texel_rgba(t, x, y)
+}
+
+/// Bilinear texel fetch: the four texels around the sample point, lerped by the
+/// sub-texel fraction. Texel centers sit at integer+0.5, so the sample coordinate is
+/// `uv * size - 0.5`; the four integer taps wrap REPEAT (matching the point path's
+/// REPEAT assumption, and what a 2D title's tiled/atlas textures use).
+fn sample_texture_bilinear(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
+    let uu = u - u.floor();
+    let vv = v - v.floor();
+    let fx = uu * t.width as f32 - 0.5;
+    let fy = vv * t.height as f32 - 0.5;
+    let x0 = fx.floor();
+    let y0 = fy.floor();
+    let dx = fx - x0;
+    let dy = fy - y0;
+    // REPEAT-wrap an integer texel coordinate into range.
+    let wrap = |c: i64, n: u32| -> u32 { c.rem_euclid(n as i64) as u32 };
+    let x0i = wrap(x0 as i64, t.width);
+    let x1i = wrap(x0 as i64 + 1, t.width);
+    let y0i = wrap(y0 as i64, t.height);
+    let y1i = wrap(y0 as i64 + 1, t.height);
+    let c00 = texel_rgba(t, x0i, y0i);
+    let c10 = texel_rgba(t, x1i, y0i);
+    let c01 = texel_rgba(t, x0i, y1i);
+    let c11 = texel_rgba(t, x1i, y1i);
+    let mut out = [0u8; 4];
+    for ch in 0..4 {
+        let top = c00[ch] as f32 * (1.0 - dx) + c10[ch] as f32 * dx;
+        let bot = c01[ch] as f32 * (1.0 - dx) + c11[ch] as f32 * dx;
+        out[ch] = (top * (1.0 - dy) + bot * dy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// Decode a whole captured texture to a tightly-packed linear RGBA8 image at its
@@ -515,12 +554,32 @@ fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
             // n0 = LSB nibble .. n3 = MSB nibble, matching b0..b3 lane roles.
             swizzle4(n(0), n(4), n(8), n(12), swizzle)
         }
-        // Single channel U8 (fonts / masks): replicate to grey, full alpha.
-        0x00 | 0x01 => {
-            let c = byte(0);
-            [c, c, c, 255]
-        }
-        _ => [255, 0, 255, 255],
+        // Single channel U8/S8 (fonts, coverage masks): route the one channel to RGBA
+        // per the format's SWIZZLE1 selector. Font atlases are typically RRRR (coverage
+        // in every channel, so alpha carries it) or 000R/111R (coverage in alpha);
+        // forcing alpha to 255 would turn the transparent inter-glyph gaps into opaque
+        // boxes that overwrite neighbouring glyphs.
+        0x00 | 0x01 => swizzle1(byte(0), swizzle),
+        _ => [255, 0, 255, 255], // unknown format: opaque magenta
+    }
+}
+
+/// Route a single-channel (U8/S8) texel to straight RGBA per its GXM `SWIZZLE1`
+/// selector (already reduced to `(format >> 12) & 0x7` by the caller, exactly as
+/// `swizzle4` receives its selector). Each output channel is either the channel byte
+/// `r`, constant 0, or constant 255 (`1`), in the order the selector names RGBA (e.g.
+/// `111R` = white RGB with the byte as alpha, `RRRR` = the byte in all four).
+/// `SWIZZLE1_R` (0) maps to R in red, opaque.
+fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
+    match swizzle {
+        0 => [r, 0, 0, 255],     // R
+        1 => [0, 0, 0, r],       // 000R
+        2 => [255, 255, 255, r], // 111R
+        3 => [r, r, r, r],       // RRRR
+        4 => [0, r, r, r],       // 0RRR
+        5 => [255, r, r, r],     // 1RRR
+        6 => [r, 0, 0, 0],       // R000
+        _ => [r, 255, 255, 255], // R111 (7)
     }
 }
 
@@ -632,9 +691,14 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
         if skip {
             continue;
         }
-        // Depth-test and replace only in the 3D path; 2D draws paint in submission
-        // order with alpha blending.
-        let depth_test = matches!(space, Space::Mvp(_));
+        // Opaque, z-buffered replace only for genuinely opaque 3D geometry: an MVP draw
+        // that also WRITES depth. A 2D UI overlay positions itself with an MVP too but
+        // disables depth writes (SCE_GXM_DEPTH_WRITE_DISABLED) and is alpha-blended in
+        // submission order - so keying "opaque" off the mere presence of an MVP splats
+        // such a sprite's transparent texels as solid colour over everything behind it.
+        const SCE_GXM_DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
+        let depth_test = matches!(space, Space::Mvp(_))
+            && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED;
         let texture = if textured { d.textures.first() } else { None };
 
         let tri_count = d.index_count as usize / 3;
@@ -728,22 +792,45 @@ fn raster_triangle(
                     verts[2].color[ch] as f32,
                 );
             }
-            // Modulate by the sampled texel (texture * vertex color, the standard
-            // 2D sprite fragment program).
+            // Combine the sampled texel with the interpolated vertex color. The shape
+            // alpha comes from the TEXTURE, not the vertex alpha - titles routinely draw
+            // a UI sprite whose vertices carry alpha 0 while the texture's own alpha (a
+            // BC3 sprite mask, or a font atlas's coverage) defines what is opaque; using
+            // the vertex alpha there would erase the sprite entirely.
             if let Some(tex) = texture {
                 let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
                 let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
                 let texel = sample_texture(tex, u, v);
-                for ch in 0..4 {
-                    src[ch] = src[ch] * texel[ch] as f32 / 255.0;
+                if matches!(tex.base_format, 0x00 | 0x01) {
+                    // Single-channel coverage mask (font/alpha atlas): the texel is pure
+                    // coverage. Keep the vertex color and take coverage as alpha;
+                    // modulating the color by coverage as well would double-darken the
+                    // anti-aliased glyph edges.
+                    src[3] = texel[3] as f32;
+                } else {
+                    // Color texture: modulate rgb (texture * vertex color), shape alpha
+                    // from the texture.
+                    for ch in 0..3 {
+                        src[ch] = src[ch] * texel[ch] as f32 / 255.0;
+                    }
+                    src[3] = texel[3] as f32;
                 }
             }
 
             if let Some((tx, ty)) = trace {
                 if x == tx && y == ty {
+                    let (tu, tv, texel) = match texture {
+                        Some(tex) => {
+                            let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
+                            let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
+                            (u, v, sample_texture(tex, u, v))
+                        }
+                        None => (0.0, 0.0, [0, 0, 0, 0]),
+                    };
                     eprintln!(
-                        "PXTRACE ({tx},{ty}) draw {draw_idx} textured={} depth_test={} src=[{:.0},{:.0},{:.0},{:.0}]",
-                        texture.is_some(), depth_test, src[0], src[1], src[2], src[3]
+                        "PXTRACE ({tx},{ty}) draw {draw_idx} textured={} depth_test={} src=[{:.0},{:.0},{:.0},{:.0}] vcol0={:?} uv=({tu:.3},{tv:.3}) texel={:?}",
+                        texture.is_some(), depth_test, src[0], src[1], src[2], src[3],
+                        verts[0].color, texel
                     );
                 }
             }
@@ -949,6 +1036,8 @@ mod texture_tests {
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
+            min_filter: 0,
+            mag_filter: 0,
         }
     }
 
@@ -1020,6 +1109,41 @@ mod texture_tests {
     }
 
     #[test]
+    fn u8_single_channel_swizzle1() {
+        // A single-channel U8 (base 0x00) coverage texel routes to RGBA per SWIZZLE1.
+        // Regression guard: the selector must be read once (not double-shifted), or a
+        // font atlas's RRRR coverage would decode to red [r,0,0,255] instead of grey.
+        let c = 200u8;
+        // RRRR (3): the byte in all four channels - a coverage mask carrying its own
+        // alpha (what the PCSA00027 UI font uses); must NOT come out red.
+        let t = tex(0x00, 3, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [c, c, c, c]);
+        // 111R (2): white RGB, coverage in alpha.
+        let t = tex(0x00, 2, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [255, 255, 255, c]);
+        // 000R (1): coverage in alpha only.
+        let t = tex(0x00, 1, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [0, 0, 0, c]);
+        // R (0): the byte in red, opaque.
+        let t = tex(0x00, 0, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [c, 0, 0, 255]);
+    }
+
+    #[test]
+    fn linear_filter_bilerps() {
+        // A 2x1 U8 RRRR texture [0, 200] with LINEAR magnify: sampling the midpoint
+        // between the two texel centers yields the average, not a nearest texel.
+        let mut t = tex(0x00, 3, 2, 1, 2, vec![0, 200]);
+        t.mag_filter = 1; // SCE_GXM_TEXTURE_FILTER_LINEAR
+        // Texel centers at u=0.25 and u=0.75; the midpoint u=0.5 averages to ~100.
+        let mid = sample_texture(&t, 0.5, 0.0);
+        assert!((mid[0] as i32 - 100).abs() <= 1, "expected ~100, got {}", mid[0]);
+        // POINT (default) at the same point snaps to one texel (0 or 200), not ~100.
+        let p = tex(0x00, 3, 2, 1, 2, vec![0, 200]);
+        assert!(sample_texture(&p, 0.5, 0.0)[0] == 0 || sample_texture(&p, 0.5, 0.0)[0] == 200);
+    }
+
+    #[test]
     fn repeat_wrap_is_fractional() {
         let t = tex(0x0c, 0, 2, 1, 8, vec![10, 0, 0, 255, 20, 0, 0, 255]);
         // u = 1.25 wraps to 0.25 -> texel 0; u = -0.25 wraps to 0.75 -> texel 1.
@@ -1038,7 +1162,7 @@ mod texture_tests {
     // Build a texture with an explicit `SceGxmTextureType` selector (LINEAR = 3,
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0 }
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0 }
     }
 
     #[test]

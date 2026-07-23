@@ -852,6 +852,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "font-types"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad67eced03f5504d9cbd3a879b5958b5c54d4e5fd794361c6eb21b05fb703411"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,6 +2226,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-fonts"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f5b57a46adc0197129244fa0f3bb562694d50a66c62f9163b85f74d4d31585e"
+dependencies = [
+ "bytemuck",
+ "font-types",
+ "once_cell",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2508,6 +2528,16 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "skrifa"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59c8f89e824f1cff425e9452ae023727e6608266cc247ea1bd44c4d752b392b1"
+dependencies = [
+ "bytemuck",
+ "read-fonts",
+]
 
 [[package]]
 name = "slab"
@@ -3043,6 +3073,7 @@ dependencies = [
  "miniz_oxide",
  "sha1",
  "sha2",
+ "skrifa",
  "tracing",
  "vitaslop-atrac9",
  "vitaslop-hostcall",
@@ -3050,6 +3081,7 @@ dependencies = [
  "vitaslop-platform",
  "vitaslop-transpiler",
  "wasmparser 0.253.0",
+ "zeno",
 ]
 
 [[package]]
@@ -4215,6 +4247,12 @@ dependencies = [
  "bitvec",
  "yaxpeax-arch",
 ]
+
+[[package]]
+name = "zeno"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"

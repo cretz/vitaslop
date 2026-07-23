@@ -77,6 +77,8 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         u_addr_mode: 0,
         v_addr_mode: 0,
         lod_bias: 0,
+        min_filter: 0,
+        mag_filter: 0,
     }
 }
 

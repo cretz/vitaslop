@@ -201,6 +201,12 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         if funcs.contains_key(&addr) {
             continue;
         }
+        // Never lift an import/redirect stub's unresolved placeholder as a function
+        // (see the note in `transpile_lenient`): a dispatch that reaches an unresolved
+        // stub must trap loudly, not silently run the `mvn r0,#0; bx lr` no-op.
+        if import_map.contains_key(&addr) || redirect_map.contains_key(&addr) {
+            continue;
+        }
         let found = match lower::discover(
             program.code,
             program.base,
@@ -290,6 +296,16 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     let mut work = seed_worklist(program);
     while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
         if funcs.contains_key(&addr) {
+            continue;
+        }
+        // Never lift an import/redirect stub's unresolved placeholder (`mvn r0,#0;
+        // bx lr`) as a function. Direct calls to a stub are already resolved to the
+        // import/callee, and register-indirect calls with a tracked target are too
+        // (see `lower::discover`). Lifting the placeholder would make an unresolved
+        // indirect dispatch land on a silent no-op returning -1 (e.g. a `memset`
+        // reached through a function pointer doing nothing). Leaving it unlifted makes
+        // that dispatch a loud `dispatch_miss` trap instead.
+        if import_map.contains_key(&addr) || redirect_map.contains_key(&addr) {
             continue;
         }
         match lower::discover(

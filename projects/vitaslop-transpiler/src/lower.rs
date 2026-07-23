@@ -617,6 +617,17 @@ pub fn discover(
     // helpers a Thumb function calls). Kept separate so the caller seeds them as
     // tentative ARM entries rather than Thumb.
     let mut arm_code_pointers: BTreeSet<u32> = BTreeSet::new();
+    // Register-indirect `blx`/`bx` sites whose tracked target constant is a known
+    // host-import stub: the compiler routed a host import (e.g. `memset`) through a
+    // function pointer. Keyed by the call-site address so pass 2 lowers it as the
+    // import instead of dispatching to the stub's `mvn r0,#0; bx lr` placeholder
+    // (which would silently return -1 and do nothing).
+    let mut indirect_imports: BTreeMap<u32, u32> = BTreeMap::new();
+    // Register-indirect `blx`/`bx` sites whose tracked target is an inter-module
+    // import stub that the linker resolved to a guest export (a Redirect). Keyed by
+    // call-site address -> resolved guest target, so pass 2 lowers a direct call to
+    // the real routine instead of dispatching to the unresolved-stub placeholder.
+    let mut indirect_redirects: BTreeMap<u32, u32> = BTreeMap::new();
     // Statically-recovered `tbb`/`tbh` jump tables, keyed by the branch address.
     // Filled in pass 1 (where the whole decoded stream is available to read the
     // range check) and consumed in pass 2 to build the computed-jump terminator.
@@ -707,9 +718,27 @@ pub fn discover(
         // of trapping on it. `bx lr`/returns carry no tracked constant, so skip.
         if discover_pointers && matches!(inst.opcode, Opcode::BLX | Opcode::BX) {
             if let Some(v) = inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize]) {
-                if in_bounds(v & !1) {
+                // A register-indirect call whose tracked target is a host-import
+                // stub is a host-import call reached through a function pointer
+                // (a compiler routing e.g. `memset` through one thunk). Record the
+                // site so pass 2 lowers it as the import, and do NOT seed the stub
+                // placeholder as a lifted function - dispatching to that placeholder
+                // silently returns -1 and skips the call's effect (e.g. a hash table
+                // never gets its 0xffffffff sentinels, so a probe loops forever).
+                let s = v & !1;
+                let resolved = imports.resolve(s);
+                if let Some(idx) = imports.get(s) {
+                    // Host import reached through a function pointer.
+                    indirect_imports.insert(addr, idx);
+                } else if resolved != s {
+                    // Inter-module import stub resolved to a guest export: call the
+                    // real routine directly and seed it for discovery, instead of
+                    // dispatching to the stub's placeholder.
+                    indirect_redirects.insert(addr, resolved);
+                    callees.insert(resolved);
+                } else if in_bounds(s) {
                     if v & 1 == 1 {
-                        code_pointers.insert(v & !1);
+                        code_pointers.insert(s);
                     } else {
                         arm_code_pointers.insert(v);
                     }
@@ -808,7 +837,7 @@ pub fn discover(
                 }
             }
             let (mut effects, term) =
-                match lower_insn(inst, cursor, *len, *applied, *in_it, thumb, entry, imports) {
+                match lower_insn(inst, cursor, *len, *applied, *in_it, thumb, entry, imports, &indirect_imports, &indirect_redirects) {
                     Ok(v) => v,
                     // An unlifted instruction (e.g. `udf`, or a NEON op not yet
                     // covered). Strict callers report it; the lenient build runs the
@@ -1117,6 +1146,8 @@ fn lower_insn(
     thumb: bool,
     entry: u32,
     imports: &Imports,
+    indirect_imports: &BTreeMap<u32, u32>,
+    indirect_redirects: &BTreeMap<u32, u32>,
 ) -> Result<(Vec<Stmt>, Option<Term>), Error> {
     use Opcode::*;
     let err = || Error::Operand { addr };
@@ -1164,9 +1195,15 @@ fn lower_insn(
                 Operand::Reg(r) if r.number() == 14 => Ok((vec![], Some(Term::Return))),
                 // `bx rN` tail-calls through a function pointer: dispatch to the
                 // runtime target, then return to our caller (lr is unchanged, so
-                // the callee's own return unwinds past us correctly).
+                // the callee's own return unwinds past us correctly). If the target
+                // is a known import stub (tracked constant), tail-call the host
+                // import directly instead of dispatching to its placeholder.
                 Operand::Reg(r) => Ok((
-                    vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: None }],
+                    match (indirect_imports.get(&addr), indirect_redirects.get(&addr)) {
+                        (Some(&index), _) => vec![Stmt::Import(index)],
+                        (_, Some(&target)) => vec![Stmt::Call { target }],
+                        _ => vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: None }],
+                    },
                     Some(Term::Return),
                 )),
                 _ => Err(err()),
@@ -1185,11 +1222,16 @@ fn lower_insn(
                 },
                 // Register-target `blx rN`: indirect call through a function pointer,
                 // resolved at runtime by the dispatcher. The CallIndirect sets lr
-                // itself, AFTER reading the target, so `blx lr` still works.
+                // itself, AFTER reading the target, so `blx lr` still works. If the
+                // target is a known import stub (tracked constant), lower it as the
+                // host import (set lr, then call) rather than dispatching to the
+                // stub's return-(-1) placeholder.
                 None => match ops[0] {
-                    Operand::Reg(r) => {
-                        vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: Some(lr) }]
-                    }
+                    Operand::Reg(r) => match (indirect_imports.get(&addr), indirect_redirects.get(&addr)) {
+                        (Some(&index), _) => vec![Stmt::SetReg(14, Value::Imm(lr)), Stmt::Import(index)],
+                        (_, Some(&target)) => vec![Stmt::SetReg(14, Value::Imm(lr)), Stmt::Call { target }],
+                        _ => vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: Some(lr) }],
+                    },
                     _ => return Err(err()),
                 },
             };
@@ -1441,17 +1483,32 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
         LSL | LSR | ASR => {
             let (rd, rn, sh) = dataproc(inst).ok_or_else(err)?;
-            let binop = match inst.opcode {
-                LSL => BinOp::Shl,
-                LSR => BinOp::Lsr,
-                _ => BinOp::Asr,
-            };
-            let result = bin(binop, rn.clone(), sh.clone());
-            if sets_flags {
-                let carry = shift_carry(inst.opcode, &rn, &sh);
-                out.push(Stmt::FlagsLogic { value: result.clone(), carry });
+            if let Value::Imm(_) = sh {
+                // Immediate-amount shift: the amount is known at lowering, so wasm's
+                // masked shift and the constant-folded `shift_carry` are already exact.
+                let binop = match inst.opcode {
+                    LSL => BinOp::Shl,
+                    LSR => BinOp::Lsr,
+                    _ => BinOp::Asr,
+                };
+                let result = bin(binop, rn.clone(), sh.clone());
+                if sets_flags {
+                    let carry = shift_carry(inst.opcode, &rn, &sh);
+                    out.push(Stmt::FlagsLogic { value: result.clone(), carry });
+                }
+                out.push(Stmt::SetReg(rd, result));
+            } else {
+                // Register-amount shift: the exact ARM result AND carry-out depend on
+                // the runtime amount (`Rm[7:0]`), which wasm's mod-32 shift and a
+                // constant carry expression cannot model. Emit the dedicated exact form.
+                use crate::ir::ShiftKind;
+                let kind = match inst.opcode {
+                    LSL => ShiftKind::Lsl,
+                    LSR => ShiftKind::Lsr,
+                    _ => ShiftKind::Asr,
+                };
+                out.push(Stmt::ShiftRegFlags { kind, rd, rn, amount: sh, set_flags: sets_flags });
             }
-            out.push(Stmt::SetReg(rd, result));
         }
         // ror rd, rn, rm/#imm: rotate right. Amount is masked mod 32 (wasm rotr,
         // matching ARM's register-rotate masking); ROR's carry-out is bit 31 of
@@ -1551,10 +1608,18 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let lo = bin(BinOp::And, bin(BinOp::Shl, rm, Value::Imm(8)), Value::Imm(0xFF00_FF00));
             out.push(Stmt::SetReg(rd, bin(BinOp::Or, hi, lo)));
         }
-        // Sign/zero extend a byte or halfword (the plain form, no pre-rotate).
+        // Sign/zero extend a byte or halfword. An optional `ROR #rot` (rot in
+        // {8,16,24}, carried by yaxpeax as a trailing Imm32 operand) rotates the
+        // source right BEFORE the byte/half is extracted - the endian-swap idiom
+        // `uxtb rd, rm, ror #16` relies on it. Dropping the rotate corrupts every
+        // byte-swapped word (e.g. a big-endian table count read back as the wrong
+        // value), so honour it here.
         SXTB | UXTB | SXTH | UXTH => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let mut rm = operand_value(&ops[1]).ok_or_else(err)?;
+            if let Some(rot) = imm(&ops[2]).filter(|&r| r != 0) {
+                rm = bin(BinOp::Ror, rm, Value::Imm(rot));
+            }
             let result = match inst.opcode {
                 UXTB => bin(BinOp::And, rm, Value::Imm(0xFF)),
                 UXTH => bin(BinOp::And, rm, Value::Imm(0xFFFF)),
@@ -1565,11 +1630,16 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             out.push(Stmt::SetReg(rd, result));
         }
-        // Extend-and-add: `Xtab rd, rn, rm` => rd = rn + extend(rm's low byte/half).
+        // Extend-and-add: `Xtab rd, rn, rm{, ror #rot}` => rd = rn + extend(rm's
+        // low byte/half), with the same optional pre-rotate (trailing Imm32 in
+        // ops[3]).
         SXTAB | UXTAB | SXTAH | UXTAH => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rn = operand_value(&ops[1]).ok_or_else(err)?;
-            let rm = operand_value(&ops[2]).ok_or_else(err)?;
+            let mut rm = operand_value(&ops[2]).ok_or_else(err)?;
+            if let Some(rot) = imm(&ops[3]).filter(|&r| r != 0) {
+                rm = bin(BinOp::Ror, rm, Value::Imm(rot));
+            }
             let ext = match inst.opcode {
                 UXTAB => bin(BinOp::And, rm, Value::Imm(0xFF)),
                 UXTAH => bin(BinOp::And, rm, Value::Imm(0xFFFF)),

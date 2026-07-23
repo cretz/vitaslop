@@ -145,6 +145,11 @@ pub struct BrowserThread {
     /// The resolver of the Promise a suspended thread is parked on; the scheduler calls
     /// it to un-park (resume) the thread.
     cont: Rc<RefCell<Option<Function>>>,
+    /// The shared host, so the un-park path can claim any return code owed to this
+    /// thread (a timed wait that expired -> WAIT_TIMEOUT) and write it into r0 before
+    /// the guest stack resumes. Native does this inside its import closure after the
+    /// block await; the browser has no such re-entry, so it applies it here.
+    host: Host,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
 }
@@ -298,6 +303,12 @@ impl BrowserEngine {
                         deliver(&signal, &Ev::Halt(regs[0]));
                         never()
                     }
+                    // Unfaithful call (e.g. unimplemented NID): stop the run loudly as
+                    // an error rather than fake a success (which would desync the guest).
+                    SvcOutcome::Fatal(msg) => {
+                        deliver(&signal, &Ev::Error(msg));
+                        never()
+                    }
                 }
             }) as Box<dyn FnMut(i32) -> JsValue>)
         };
@@ -369,6 +380,7 @@ impl BrowserEngine {
             r2,
             signal,
             cont,
+            host: self.host.clone(),
             _import: import_closure,
         })
     }
@@ -469,6 +481,13 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             on_ok.forget();
             on_err.forget();
         } else if let Some(res) = t.cont.borrow_mut().take() {
+            // A timed wait that expired owes this thread a return code other than the
+            // 0 it parked with (a WAIT_TIMEOUT); write it into r0 before the guest
+            // stack resumes. A signal wake has no code and keeps r0 = 0. (Native does
+            // the equivalent inside its import closure after the block await.)
+            if let Some(code) = t.host.lock().unwrap().take_resume_code(t.thid) {
+                t.rt.set_reg(0, code);
+            }
             // Un-park: resolving the parked Promise resumes the suspended guest stack.
             let _ = res.call0(&JsValue::UNDEFINED);
         }

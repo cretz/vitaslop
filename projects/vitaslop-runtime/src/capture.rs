@@ -21,6 +21,11 @@ pub struct VertexAttribute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorSurface {
     pub format: u32,
+    /// The `SceGxmColorSurfaceType` (LINEAR/TILED/SWIZZLED) the guest set at init,
+    /// read back by `sceGxmColorSurfaceGetType`. Not consumed by the renderer (it
+    /// resolves the pixel layout from the data pointer and stride), but recorded so
+    /// the getter round-trips exactly what the guest set.
+    pub surface_type: u32,
     pub width: u32,
     pub height: u32,
     pub stride_pixels: u32,
@@ -45,6 +50,7 @@ pub struct RenderState {
     pub back_depth_func: u32,
     pub front_depth_write: u32,
     pub front_fragment_program_enable: u32,
+    pub back_fragment_program_enable: u32,
     pub front_polygon_mode: u32,
     pub front_point_line_width: u32,
     pub front_stencil_ref: u32,
@@ -71,6 +77,7 @@ impl Default for RenderState {
             back_depth_func: 0x00C0_0000,         // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
             front_depth_write: 0x0000_0000,       // SCE_GXM_DEPTH_WRITE_ENABLED
             front_fragment_program_enable: 0x0,   // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
+            back_fragment_program_enable: 0x0,    // SCE_GXM_FRAGMENT_PROGRAM_ENABLED
             front_polygon_mode: 0x0000_0000,      // SCE_GXM_POLYGON_MODE_TRIANGLE_FILL
             front_point_line_width: 1,
             front_stencil_ref: 0,
@@ -112,6 +119,13 @@ pub struct BoundTexture {
     pub u_addr_mode: u32,
     pub v_addr_mode: u32,
     pub lod_bias: u32,
+    /// Minification/magnification filters (`SceGxmTextureFilter`, 0 = POINT/nearest,
+    /// 1 = LINEAR) set via `sceGxmTextureSetMinFilter`/`SetMagFilter`. The renderer
+    /// bilinear-samples a LINEAR magnified texture and point-samples a POINT one, so
+    /// small UI/font-atlas text a title draws with LINEAR filtering is smooth rather
+    /// than the broken thin strokes nearest sampling gives at sub-native scale.
+    pub min_filter: u32,
+    pub mag_filter: u32,
 }
 
 /// A single draw call with everything needed to reproduce it, snapshotted from

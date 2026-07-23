@@ -92,6 +92,12 @@ pub struct LinkedProgram {
     /// knows - a host handler are still wired as host imports; this records them
     /// for diagnostics (a still-missing NID surfaces here and in the capture).
     pub host_import_count: usize,
+    /// Variable (data-symbol) imports no loaded module exported, as `(library_nid,
+    /// var_nid)`. Empty on a clean link. Unlike an unresolved function import (a host
+    /// stub that traps when called), an unresolved variable silently leaves a garbage
+    /// pointer/value in the image, so a consumer (probe, front-end) must surface this
+    /// list - a non-empty one means some data table the guest reads is unbound.
+    pub unresolved_var_imports: Vec<(u32, u32)>,
 }
 
 impl LinkedProgram {
@@ -191,26 +197,77 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     //     every case-folded path (archive names, config keys) comes out corrupt.
     //     Patch the image in place before transpilation so the decoder sees the
     //     resolved immediates.
-    let var_exports: HashMap<(u32, u32), u32> = modules
+    let mut var_exports: HashMap<(u32, u32), u32> = modules
         .iter()
         .flat_map(|m| m.var_exports.iter())
         .map(|e| ((e.library_nid, e.var_nid), e.addr))
         .collect();
-    let mut var_fixups_applied = 0u32;
-    let mut var_imports_unresolved = 0u32;
-    for m in &modules {
-        for vi in &m.var_imports {
-            let Some(&sym) = var_exports.get(&(vi.library_nid, vi.var_nid)) else {
-                var_imports_unresolved += 1;
-                continue;
-            };
-            apply_var_fixups(&mut image, m.base, vi.blob_ptr, sym, &mut var_fixups_applied)?;
+    // Special case: `__sce_libcparam` (SceLibcParam library 0x5ad9c136, var
+    // 0xdf084dfa). A statically-linked SceLibc imports this variable to size and
+    // configure its heap (heap size, extension policy, optional malloc replacement),
+    // but the main module does not export it through the normal export table - the
+    // real kernel resolves it to `SceProcessParam->sce_libcparam`. Mirror that: read
+    // the pointer out of the main module's SceProcessParam and register it as the
+    // export so the normal fixup loop binds SceLibc's import to the real struct.
+    // Unresolved, SceLibc reads a null/garbage param and falls back to a default heap
+    // whose layout differs from the title's, which misplaces later allocations.
+    if let Some(pp) = modules.last().and_then(|m| find_process_param(&image, IMAGE_BASE, m)) {
+        let off = pp.wrapping_sub(IMAGE_BASE) as usize;
+        let rd = |o: usize| -> u32 {
+            image.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+        };
+        let ver = rd(off + 8);
+        // v6+ carries the SceLibcParam pointer at +0x28; v5 (and earlier) one word
+        // later at +0x2c. Pick whichever slot holds a non-zero in-image pointer.
+        let (a, b) = if ver >= 6 { (rd(off + 0x28), rd(off + 0x2c)) } else { (rd(off + 0x2c), rd(off + 0x28)) };
+        let libcparam = if a != 0 { a } else { b };
+        if libcparam != 0 {
+            var_exports.entry((0x5ad9_c136, 0xdf08_4dfa)).or_insert(libcparam);
         }
     }
-    if var_imports_unresolved != 0 {
-        // A missing variable export is a real gap (the importing code will read an
-        // unbound placeholder), so surface it rather than failing silently.
-        eprintln!("link: {var_imports_unresolved} variable import(s) unresolved (no matching export)");
+    let mut var_fixups_applied = 0u32;
+    let mut unresolved_var_imports: Vec<(u32, u32)> = Vec::new();
+    // Opt-in: bind every unresolved variable-import site to a poison address well outside
+    // the guest region, so the FIRST guest access of the missing symbol traps loudly
+    // (MemoryOutOfBounds, with the recognizable 0xE000_xxxx pointer in the reg dump)
+    // instead of silently reading whatever the image left in the slot. This converts the
+    // exact silent-corruption class that hid the `_Tolotab`/ctype-table gap for six
+    // sessions into an immediate, addressed fault. Left off by default because a title may
+    // read a genuinely-unused import's value without dereferencing it; on when hunting a
+    // suspected data-import corruption.
+    let poison_unresolved = std::env::var("VITASLOP_POISON_UNRESOLVED_VARS").is_ok();
+    for m in &modules {
+        for vi in &m.var_imports {
+            match var_exports.get(&(vi.library_nid, vi.var_nid)) {
+                Some(&sym) => {
+                    apply_var_fixups(&mut image, m.base, vi.blob_ptr, sym, &mut var_fixups_applied)?
+                }
+                None => {
+                    if poison_unresolved {
+                        // Distinct per unresolved symbol so a trap names which one.
+                        let poison = 0xE000_0000u32.wrapping_add(unresolved_var_imports.len() as u32 * 4);
+                        apply_var_fixups(&mut image, m.base, vi.blob_ptr, poison, &mut var_fixups_applied)?;
+                    }
+                    unresolved_var_imports.push((vi.library_nid, vi.var_nid));
+                }
+            }
+        }
+    }
+    if !unresolved_var_imports.is_empty() {
+        // A missing variable export is a real gap: unlike a function import (which becomes
+        // a host stub that traps loudly when CALLED), an unresolved variable silently
+        // leaves a garbage pointer/value in the image that reads with no trap. Name each
+        // one - the (library, symbol) NID pair is enough to look the symbol up in the NID
+        // db and see immediately what data table is unbound (e.g. `_Tolotab` -> the ctype
+        // tables). Never fold this to a bare count: a count is the silent failure.
+        eprintln!(
+            "link: WARNING {} variable import(s) unresolved (no matching export){}:",
+            unresolved_var_imports.len(),
+            if poison_unresolved { " - bound to poison, first access will trap" } else { "" },
+        );
+        for (lib, var) in &unresolved_var_imports {
+            eprintln!("  unresolved var import: library_nid={lib:#010x} var_nid={var:#010x}");
+        }
     }
 
     // 4. Resolve every module's imports: an exported one becomes a direct
@@ -285,6 +342,48 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         .map(|m| (m.tls_vaddr, m.tls_filesz, m.tls_memsz))
         .unwrap_or((0, 0, 0));
 
+    if std::env::var("VITASLOP_DUMP_EXPORTS").is_ok() {
+        for (mi, m) in modules.iter().enumerate() {
+            eprintln!(
+                "  module[{mi}] base={:#x} exports={} var_exports={} var_imports={}",
+                m.base,
+                m.exports.len(),
+                m.var_exports.len(),
+                m.var_imports.len()
+            );
+            for ve in &m.var_exports {
+                eprintln!(
+                    "    var_export lib={:#010x} nid={:#010x} addr={:#x}",
+                    ve.library_nid, ve.var_nid, ve.addr
+                );
+            }
+            // Distinct export library NIDs this module provides.
+            let mut libs: Vec<u32> = m.exports.iter().map(|e| e.library_nid).collect();
+            libs.sort_unstable();
+            libs.dedup();
+            eprintln!("    export libs: {:?}", libs.iter().map(|l| format!("{l:#010x}")).collect::<Vec<_>>());
+        }
+        // SceProcessParam+0x28 = pointer to SceLibcParam (__sce_libcparam).
+        if process_param != 0 {
+            let off = process_param.wrapping_sub(IMAGE_BASE) as usize;
+            let rd = |o: usize| -> u32 {
+                if o + 4 <= image.len() {
+                    u32::from_le_bytes([image[o], image[o + 1], image[o + 2], image[o + 3]])
+                } else {
+                    0
+                }
+            };
+            eprintln!(
+                "  process_param={:#x} size={:#x} ver={:#x} libcparam_ptr(+0x28)={:#x} (+0x2c)={:#x}",
+                process_param,
+                rd(off),
+                rd(off + 8),
+                rd(off + 0x28),
+                rd(off + 0x2c)
+            );
+        }
+    }
+
     let host_import_count = imports.len();
     Ok(LinkedProgram {
         base: IMAGE_BASE,
@@ -301,6 +400,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         host_import_count,
         process_param,
         tls_template,
+        unresolved_var_imports,
     })
 }
 

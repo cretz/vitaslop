@@ -398,6 +398,12 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                         // is a no-op; if one occurred, treat it as Continue rather than
                         // deadlock.
                         SvcOutcome::Continue | SvcOutcome::Block | SvcOutcome::Reschedule => {}
+                        // Unfaithful call (e.g. unimplemented NID): unwind WITHOUT
+                        // setting `halted`, so the guest-call future surfaces it as a
+                        // run error (a loud stop) rather than a clean exit.
+                        SvcOutcome::Fatal(msg) => {
+                            return Err(wasmtime::Error::msg(msg));
+                        }
                     }
                     Ok(())
                 })

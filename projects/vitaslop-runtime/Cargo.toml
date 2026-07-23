@@ -37,6 +37,8 @@ sha2 = "0.10"
 # Raw DEFLATE for the SELF segment decompression and the container zip. Permissive
 # (MIT/Apache), pure Rust, wasm-clean - unlike a zlib-crate C dependency.
 miniz_oxide = "0.8"
+skrifa = "0.45.0"
+zeno = "0.3.3"
 
 [dev-dependencies]
 # Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.

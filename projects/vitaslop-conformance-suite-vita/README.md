@@ -38,9 +38,15 @@ Vita toolchain via `$VITASDK`).
   (UBFX). Surfaced and lifted all of them (+ MLS/UXTH/SBFX), qemu-certified.
 - **`cube-src/`** (`cube_*`): the minimal GXM spinning cube - the graphics north
   star. See its README; bring-up was work-backwards over this artifact.
+- **`pvf-src/`** (`vita_pvf`): the ScePvf vector-font engine end to end - create a
+  library, open a real font file through the host filesystem (the first case to
+  read a data file the way a title does), configure size/resolution, and query
+  metrics + rasterize a glyph. Ships the public-domain Ahem font (predictable
+  geometry, so the advance/coverage assertions are exact). See its README.
 
 ## Status
 
-`hello`, `clib`, `thread`, `kernel`, `compute`, `compute2`, and `cube` are all
-RUNNABLE and green. Remaining north-star rungs (SELF/ELF loading of a signed
-title, richer module surface, Chocolate Doom) are staged in the project notes.
+`hello`, `clib`, `thread`, `kernel`, `compute`, `compute2`, `cube`, `io`, and
+`pvf` are all RUNNABLE and green. Remaining north-star rungs (SELF/ELF loading of
+a signed title, richer module surface, Chocolate Doom) are staged in the project
+notes.
