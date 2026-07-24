@@ -157,6 +157,10 @@ pub fn boot_retail(
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    // The TLS template seeds each thread's thread-local block; without it an early
+    // thread-local access reads uninitialized memory and traps (MemoryOutOfBounds at
+    // boot). The boot probe sets this too - keep the shared helper in parity.
+    env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     for path in game.files.list() {
         if let Ok(bytes) = game.files.read(&path) {
@@ -481,7 +485,14 @@ fn write_shot(
         host.state.capture.scenes.last().cloned()
     }?;
     std::fs::create_dir_all(dir).ok()?;
-    let fb = render::render_scene(&scene, WIDTH, HEIGHT, CLEAR);
+    // Supersample the software shot (VITASLOP_SSAA=N): rasterize at N x native and
+    // box-downsample. Antialiases the geometric aliasing of the heavily-tessellated vehicle
+    // meshes (dozens of sub-pixel triangles per final pixel, plus coincident-panel z-fighting)
+    // that one sample/pixel renders as speckle - a distant 3D vehicle is unreadable at 1x and
+    // clean at 2x. A review shot is occasional, so the 4x fill cost of 2x SSAA is immaterial;
+    // 2x is the quality default, overridable (1 disables, higher for close scrutiny).
+    let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(2);
+    let fb = render::render_scene_supersampled(&scene, WIDTH, HEIGHT, CLEAR, ssaa);
     let path = dir.join(format!("{name}.png"));
     std::fs::write(&path, fb.to_png()).ok()?;
     Some(path)

@@ -158,6 +158,7 @@ pub(super) fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
+    tracing::trace!(target: "vitaslop::sema", cond = id, timeout_us, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]), "cond WAIT");
     st.cond_wait(id, timeout_us);
     SvcOutcome::Block
 }
@@ -165,6 +166,7 @@ pub(super) fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
 /// int sceKernelSignalCond(SceUID condId) / sceKernelSignalCondAll(SceUID condId)
 pub(super) fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
     let id = ctx.arg(0) as i32;
+    tracing::trace!(target: "vitaslop::sema", cond = id, all, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]), "cond SIGNAL");
     if st.is_preemptive() {
         st.cond_signal(id, all);
     }

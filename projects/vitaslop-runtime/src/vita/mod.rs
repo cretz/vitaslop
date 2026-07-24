@@ -37,6 +37,22 @@ use std::sync::{LazyLock, Mutex};
 /// (nid, lr) pair with an enormous count - the exact instruction to investigate.
 static DBG_CALLSITES: LazyLock<bool> =
     LazyLock::new(|| std::env::var("VITASLOP_DBG_CALLSITES").is_ok());
+
+/// The guest code range scanned for the game-level caller in [`dispatch`] (env
+/// `VITASLOP_CODE_RANGE=lo-hi`, hex). A title's executable module is not always in
+/// the same place, so the profiler's "skip the libc/lock veneer, find the first
+/// return address in the game's own code" heuristic needs the right window. Default
+/// covers a typical executable's .text just above IMAGE_BASE.
+static CALLSITE_CODE_RANGE: LazyLock<(u32, u32)> = LazyLock::new(|| {
+    std::env::var("VITASLOP_CODE_RANGE")
+        .ok()
+        .and_then(|s| {
+            let (lo, hi) = s.split_once('-')?;
+            let p = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+            Some((p(lo)?, p(hi)?))
+        })
+        .unwrap_or((0x8110_0000, 0x8130_0000))
+});
 static CALLSITE_HIST: Mutex<BTreeMap<(u32, u32), u64>> = Mutex::new(BTreeMap::new());
 
 /// Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful*
@@ -93,9 +109,10 @@ pub fn dispatch(
     if *DBG_CALLSITES {
         let mut caller = ctx.regs[14];
         let sp = ctx.regs[13];
+        let (lo, hi) = *CALLSITE_CODE_RANGE;
         for i in 0..40u32 {
             let v = ctx.read_u32(sp.wrapping_add(i * 4));
-            if (0x8130_0000..0x8150_0000).contains(&v) {
+            if (lo..hi).contains(&v) {
                 caller = v;
                 break;
             }
@@ -258,8 +275,12 @@ pub fn dispatch(
         | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
         | gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
         | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM
-        | gxm_nid::DEPTH_STENCIL_SURFACE_INIT
-        | gxm_nid::SET_FRAGMENT_PROGRAM => cont!(gxm::ok(ctx)),
+        | gxm_nid::SYNC_OBJECT_DESTROY
+        | gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::ok(ctx)),
+        // Record the bound fragment program so a draw can reflect its samplers (albedo
+        // selection). The direct-draw path binds it here rather than via a precomputed
+        // fragment state.
+        gxm_nid::SET_FRAGMENT_PROGRAM => cont!(gxm::set_fragment_program(ctx, st)),
         gxm_nid::TERMINATE => {
             ctx.ret(0);
             if st.halt_on_terminate {
@@ -409,6 +430,7 @@ pub fn dispatch(
         }
         gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx, st)),
         gxm_nid::DRAW => cont!(gxm::draw(ctx, st)),
+        gxm_nid::DRAW_INSTANCED => cont!(gxm::draw_instanced(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {
             // The frame is complete and queued to flip; on hardware the caller waits
             // for the flip here, so this is the guest's per-frame yield point.
@@ -533,6 +555,9 @@ pub fn dispatch(
             cont!(services::np_register_service_state_callback(ctx, st))
         }
         sv_nid::NP_CHECK_CALLBACK => cont!(services::np_check_callback(ctx, st)),
+        sv_nid::NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT => {
+            cont!(services::np_basic_get_friend_list_entry_count(ctx, st))
+        }
         sv_nid::RTC_GET_CURRENT_CLOCK => cont!(services::rtc_get_current_clock(ctx, st)),
         sv_nid::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => {
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
@@ -551,6 +576,9 @@ pub fn dispatch(
         }
         sv_nid::APPUTIL_SAVEDATA_SLOT_CREATE => {
             cont!(services::apputil_savedata_slot_create(ctx, st))
+        }
+        sv_nid::APPUTIL_SAVEDATA_DATA_SAVE => {
+            cont!(services::apputil_savedata_data_save(ctx, st))
         }
         sv_nid::APP_MGR_GET_APP_STATE => cont!(services::app_mgr_get_app_state(ctx, st)),
         // Offline services with an out-param handle to hand back.
@@ -576,6 +604,11 @@ pub fn dispatch(
         | sv_nid::NP_MANAGER_GET_ACCOUNT_REGION
         | sv_nid::NP_MANAGER_GET_CONTENT_RATING_FLAG
         | sv_nid::NP_MANAGER_GET_CHAT_RESTRICTION_FLAG
+        | sv_nid::NP_LOOKUP_CREATE_REQUEST
+        | sv_nid::NP_MESSAGE_SYNC_MESSAGE
+        | sv_nid::NP_TUS_CREATE_REQUEST
+        | sv_nid::NP_COMMERCE2_START_EMPTY_STORE_CHECK
+        | sv_nid::NP_COMMERCE2_CREATE_SESSION_GET_RESULT
         | sv_nid::NP_SCORE_CREATE_TITLE_CTX => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
@@ -608,6 +641,14 @@ pub fn dispatch(
         | sv_nid::NP_AUTH_INIT
         | sv_nid::NP_LOOKUP_INIT
         | sv_nid::NP_TUS_INIT
+        | sv_nid::NP_MESSAGE_INIT_WITH_PARAM
+        | sv_nid::NP_MESSAGE_TERM
+        | sv_nid::NP_COMMERCE2_INIT
+        // SceNpCommerce2 context/request creation: local handle setup that succeeds; the
+        // actual store fetch has no server to reach off-console and returns no content.
+        | sv_nid::NP_COMMERCE2_CREATE_CTX
+        | sv_nid::NP_COMMERCE2_CREATE_SESSION_CREATE_REQ
+        | sv_nid::NP_COMMERCE2_CREATE_SESSION_START
         | sv_nid::NP_SNS_FACEBOOK_INIT
         // Device services: location/motion sampling, ad-hoc power/config.
         | sv_nid::LOCATION_INIT
@@ -651,8 +692,8 @@ pub fn dispatch(
         sv_nid::NP_SNS_FACEBOOK_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpSnsFacebook)),
         // Result reads and per-frame pumping succeed with the caller's (zeroed)
         // result struct untouched; the update pump has no system UI to animate.
+        sv_nid::MSG_DIALOG_GET_RESULT => cont!(services::msg_dialog_get_result(ctx, st)),
         sv_nid::COMMON_DIALOG_UPDATE
-        | sv_nid::MSG_DIALOG_GET_RESULT
         | sv_nid::NET_CHECK_DIALOG_GET_RESULT
         | sv_nid::SAVEDATA_DIALOG_GET_RESULT
         | sv_nid::SAVEDATA_DIALOG_CONTINUE

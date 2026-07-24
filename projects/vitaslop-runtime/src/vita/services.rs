@@ -160,6 +160,20 @@ pub(super) fn np_check_callback(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// int sceNpBasicGetFriendListEntryCount(SceUInt32 *count)
+/// The number of PSN friends in the local NpBasic cache. Off-console there is no PSN
+/// session and no friend list, so the faithful count is zero: a title enumerating
+/// friends then retrieves none rather than reading stack garbage as a bogus count and
+/// walking a friend array that was never filled. The kernel writes the count out-param;
+/// an unwritten one would leave the title's loop bound undefined.
+#[hostcall]
+pub(super) fn np_basic_get_friend_list_entry_count(ctx: &mut GuestCtx, _st: &mut VitaState, count: Ptr) -> i32 {
+    if !count.is_null() {
+        ctx.write_u32(count.addr(), 0);
+    }
+    0
+}
+
 // --- SceCommonDialog families -------------------------------------------------
 //
 // System-drawn dialogs (trophy setup, message boxes, the network check, savedata
@@ -214,6 +228,31 @@ pub(super) fn dialog_term(ctx: &mut GuestCtx, st: &mut VitaState, family: Dialog
 /// and leave the caller's result struct as the caller prepared it (a zeroed
 /// result reads as "OK / no selection" in every family).
 pub(super) fn dialog_ok(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    ctx.ret(0);
+}
+
+/// `SceMsgDialogButtonId`: which button the user pressed. INVALID (0) reads as "no
+/// choice made yet"; a title that instantly finishes its prompt and sees INVALID
+/// re-opens the same dialog every frame forever. YES/OK (1) is the affirmative
+/// default - a MsgDialog offline off-console has no user, so reporting the affirmative
+/// press is the faithful auto-confirm that lets the title's dialog-completion path run
+/// its "button pressed" action and proceed.
+const SCE_MSG_DIALOG_BUTTON_ID_YESOK: u32 = 1;
+/// `SceMsgDialogResult.buttonId` field offset (after `mode`:i32 and `result`:i32).
+const MSG_DIALOG_RESULT_BUTTON_ID_OFFSET: u32 = 8;
+
+/// int sceMsgDialogGetResult(SceMsgDialogResult *result)
+/// Unlike the other dialog GetResult calls (a zeroed result reads fine), a MsgDialog
+/// carries the user's button choice, and a zeroed `buttonId` (INVALID) makes a title
+/// re-prompt indefinitely. Off-console we auto-confirm the affirmative button so the
+/// "could not connect - play offline?" prompt behind a boot online-check resolves and
+/// boot proceeds. `mode`/`result` stay 0 (SCE_COMMON_DIALOG_RESULT_OK), as the caller
+/// zeroed them.
+pub(super) fn msg_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let result = ctx.arg(0);
+    if result != 0 {
+        ctx.write_u32(result + MSG_DIALOG_RESULT_BUTTON_ID_OFFSET, SCE_MSG_DIALOG_BUTTON_ID_YESOK);
+    }
     ctx.ret(0);
 }
 
@@ -469,6 +508,79 @@ pub(super) fn apputil_savedata_slot_create(ctx: &mut GuestCtx, st: &mut VitaStat
         tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotCreate -> OK");
         0
     }
+}
+
+/// `SceAppUtilSaveDataFile` layout (psp2/apputil.h). `offset` is a 64-bit `SceOff`
+/// 8-byte-aligned after the three leading words, so the struct is 64 bytes:
+///   filePath*(0) buf*(4) bufSize(8) pad(12) offset:u64(16) mode(24) progDelta(28)
+///   reserved[32](32).
+const SAVEDATA_FILE_STRIDE: u32 = 64;
+const SAVEDATA_FILE_PATH_OFF: u32 = 0;
+const SAVEDATA_FILE_BUF_OFF: u32 = 4;
+const SAVEDATA_FILE_BUFSIZE_OFF: u32 = 8;
+const SAVEDATA_FILE_OFFSET_OFF: u32 = 16;
+const SAVEDATA_FILE_MODE_OFF: u32 = 24;
+
+/// int sceAppUtilSaveDataDataSave(SceAppUtilSaveDataFileSlot *slot,
+///     SceAppUtilSaveDataFile *files, unsigned int fileNum,
+///     SceAppUtilSaveDataMountPoint *mountPoint, SceSize *requiredSizeKiB)
+/// Persist `fileNum` file writes into the title's savedata mount. Each entry names a
+/// path relative to the mount, a source buffer, a size, and a byte offset. We apply
+/// each write to the in-memory guest filesystem (the same store `sceIoOpen`/`Read`
+/// serve), so a later read of the same path round-trips - a title that writes its
+/// "online terms accepted" / progress record here and re-reads it next boot sees its
+/// own data instead of a phantom. A directory-mode entry creates no file. Faithful
+/// enough for bring-up: writes land in the guest FS; a future disk/OPFS backend can
+/// persist them across sessions. `requiredSizeKiB` (an out estimate) is reported as 0.
+#[hostcall]
+pub(super) fn apputil_savedata_data_save(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _slot: Ptr,
+    files: Ptr,
+    file_num: u32,
+    mount: Ptr,
+    required_kib: Ptr,
+) -> i32 {
+    let mount_name = read_mount_name(ctx, mount);
+    for i in 0..file_num {
+        let entry = files.addr() + i * SAVEDATA_FILE_STRIDE;
+        let path_ptr = ctx.read_u32(entry + SAVEDATA_FILE_PATH_OFF);
+        let buf_ptr = ctx.read_u32(entry + SAVEDATA_FILE_BUF_OFF);
+        let buf_size = ctx.read_u32(entry + SAVEDATA_FILE_BUFSIZE_OFF);
+        let offset = ctx.read_u32(entry + SAVEDATA_FILE_OFFSET_OFF);
+        let mode = ctx.read_u32(entry + SAVEDATA_FILE_MODE_OFF);
+        let rel = if path_ptr != 0 { ctx.read_cstr(path_ptr, 512) } else { String::new() };
+        // Resolve to a mount-qualified path (e.g. "savedata0:/foo"); vfs_key normalizes.
+        let full = if rel.contains(':') {
+            rel.clone()
+        } else {
+            format!("{}/{}", mount_name.trim_end_matches('/'), rel.trim_start_matches('/'))
+        };
+        tracing::debug!(
+            target: "vitaslop::io",
+            path = %full, size = buf_size, offset, mode,
+            "sceAppUtilSaveDataDataSave file",
+        );
+        // A directory-create entry carries no source buffer; every file mode (truncate
+        // at 0, write-at-offset) has one. Skip the entries with nothing to write.
+        if buf_ptr == 0 || buf_size == 0 {
+            continue;
+        }
+        let data = ctx.read_bytes(buf_ptr, buf_size as usize);
+        // Apply the write at `offset` over any existing content, growing as needed.
+        let mut cur = st.read_file(&full).unwrap_or_default();
+        let end = offset as usize + data.len();
+        if cur.len() < end {
+            cur.resize(end, 0);
+        }
+        cur[offset as usize..end].copy_from_slice(&data);
+        st.add_file(&full, cur);
+    }
+    if !required_kib.is_null() {
+        ctx.write_u32(required_kib.addr(), 0);
+    }
+    0
 }
 
 /// Size of SceAppMgrAppState (vitasdk asserts 0x80): {u32 systemEventNum, u32

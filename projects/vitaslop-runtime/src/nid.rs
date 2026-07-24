@@ -40,6 +40,7 @@ pub mod gxm {
     pub const COLOR_SURFACE_INIT: u32 = 0xED0F_6E25;
     pub const DEPTH_STENCIL_SURFACE_INIT: u32 = 0xCA9D_41D1;
     pub const SYNC_OBJECT_CREATE: u32 = 0x6A60_13E1;
+    pub const SYNC_OBJECT_DESTROY: u32 = 0x889A_E88C;
     pub const SHADER_PATCHER_CREATE: u32 = 0x0503_2658;
     pub const SHADER_PATCHER_DESTROY: u32 = 0xEAA5_B100;
     pub const PROGRAM_CHECK: u32 = 0xED8B_6C69;
@@ -68,6 +69,7 @@ pub mod gxm {
     pub const SET_UNIFORM_DATA_F: u32 = 0x65DD_0C84;
     pub const SET_VERTEX_STREAM: u32 = 0x895D_F2E9;
     pub const DRAW: u32 = 0xBC05_9AFC;
+    pub const DRAW_INSTANCED: u32 = 0x14C4_E7D3;
     pub const PAD_HEARTBEAT: u32 = 0x3D25_FCE9;
     pub const DISPLAY_QUEUE_ADD_ENTRY: u32 = 0xEC5C_26B5;
     pub const DISPLAY_QUEUE_FINISH: u32 = 0xB98C_5B0D;
@@ -262,6 +264,7 @@ pub mod services {
     pub const NP_BASIC_INIT: u32 = 0xEFB9_1A99;
     pub const NP_BASIC_REGISTER_HANDLER: u32 = 0x26E6_E048;
     pub const NP_BASIC_CHECK_CALLBACK: u32 = 0x2014_6AEC;
+    pub const NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT: u32 = 0xDF41_F308;
     // SceRtc.
     pub const RTC_GET_CURRENT_CLOCK: u32 = 0x70FD_E8F1;
     pub const RTC_GET_CURRENT_CLOCK_LOCAL_TIME: u32 = 0x0572_EDDC;
@@ -282,6 +285,7 @@ pub mod services {
     pub const APPUTIL_DRM_CLOSE: u32 = 0x6A14_0498;
     pub const APPUTIL_SAVEDATA_SLOT_GET_PARAM: u32 = 0x93F0_D89F;
     pub const APPUTIL_SAVEDATA_SLOT_CREATE: u32 = 0x7E8F_E96A;
+    pub const APPUTIL_SAVEDATA_DATA_SAVE: u32 = 0x6076_47BA;
     // SceAppMgr: app-lifecycle state poll (system/app event counts, overlay flag).
     pub const APP_MGR_GET_APP_STATE: u32 = 0x5E86_319A;
     // SceNpScore / SceNpManager: online leaderboards and account identity.
@@ -291,6 +295,20 @@ pub mod services {
     pub const NP_MANAGER_GET_ACCOUNT_REGION: u32 = 0xFE83_5967;
     pub const NP_MANAGER_GET_CONTENT_RATING_FLAG: u32 = 0xAF00_73B2;
     pub const NP_MANAGER_GET_CHAT_RESTRICTION_FLAG: u32 = 0x60C5_75B1;
+    // SceNpUtility: online player lookup (NP id -> profile). No PSN session off-console.
+    pub const NP_LOOKUP_CREATE_REQUEST: u32 = 0x9E42_E922;
+    // SceNpMessage: server message sync - unreachable off-console (signed out).
+    pub const NP_MESSAGE_SYNC_MESSAGE: u32 = 0x35BE_21C5;
+    // SceNpTus: title user storage (online cloud stats) request - no session off-console.
+    pub const NP_TUS_CREATE_REQUEST: u32 = 0x99DC_7420;
+    // SceNpCommerce2: PS Store content check - store unreachable off-console (signed out).
+    pub const NP_COMMERCE2_START_EMPTY_STORE_CHECK: u32 = 0x7132_EAA5;
+    // The async store request's result poll - offline the request failed to reach the
+    // server, so the poll reports the signed-out failure and the store check concludes.
+    pub const NP_COMMERCE2_CREATE_SESSION_GET_RESULT: u32 = 0xAEE8_D3DF;
+    pub const NP_COMMERCE2_CREATE_CTX: u32 = 0x123E_55F4;
+    pub const NP_COMMERCE2_CREATE_SESSION_CREATE_REQ: u32 = 0xFDB3_9774;
+    pub const NP_COMMERCE2_CREATE_SESSION_START: u32 = 0xBBDD_F866;
     // SceCommonDialog: the per-frame pump plus each dialog family's
     // Init/GetStatus/GetResult/Term lifecycle (see `services::dialog_*`).
     pub const COMMON_DIALOG_UPDATE: u32 = 0x9053_0F2F;
@@ -355,6 +373,13 @@ pub mod services {
     pub const NP_AUTH_INIT: u32 = 0x441D_8B4E;
     pub const NP_LOOKUP_INIT: u32 = 0x9246_A673;
     pub const NP_TUS_INIT: u32 = 0xB214_1F8D;
+    // SceNpMessage: in-game messaging subsystem init (succeeds offline; no messages then).
+    pub const NP_MESSAGE_INIT_WITH_PARAM: u32 = 0x26AF_5306;
+    // SceNpMessage: subsystem teardown (the title tears messaging down after its offline
+    // sync fails); a cleanup call that just succeeds.
+    pub const NP_MESSAGE_TERM: u32 = 0x3802_30A1;
+    // SceNpCommerce2: PS Store commerce subsystem init (succeeds offline; no store then).
+    pub const NP_COMMERCE2_INIT: u32 = 0xC73F_209A;
     // SceNpSnsFacebook: social-network integration; the library init succeeds offline
     // (no online SNS features are then available, and the title stays on its offline path).
     pub const NP_SNS_FACEBOOK_INIT: u32 = 0x8055_7AA0;
@@ -595,6 +620,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::COLOR_SURFACE_INIT => "sceGxmColorSurfaceInit",
         g::DEPTH_STENCIL_SURFACE_INIT => "sceGxmDepthStencilSurfaceInit",
         g::SYNC_OBJECT_CREATE => "sceGxmSyncObjectCreate",
+        g::SYNC_OBJECT_DESTROY => "sceGxmSyncObjectDestroy",
         g::SHADER_PATCHER_CREATE => "sceGxmShaderPatcherCreate",
         g::SHADER_PATCHER_DESTROY => "sceGxmShaderPatcherDestroy",
         g::PROGRAM_CHECK => "sceGxmProgramCheck",
@@ -623,6 +649,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_UNIFORM_DATA_F => "sceGxmSetUniformDataF",
         g::SET_VERTEX_STREAM => "sceGxmSetVertexStream",
         g::DRAW => "sceGxmDraw",
+        g::DRAW_INSTANCED => "sceGxmDrawInstanced",
         g::PAD_HEARTBEAT => "sceGxmPadHeartbeat",
         g::DISPLAY_QUEUE_ADD_ENTRY => "sceGxmDisplayQueueAddEntry",
         g::DISPLAY_QUEUE_FINISH => "sceGxmDisplayQueueFinish",
@@ -691,6 +718,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_BASIC_INIT => "sceNpBasicInit",
         sv::NP_BASIC_REGISTER_HANDLER => "sceNpBasicRegisterHandler",
         sv::NP_BASIC_CHECK_CALLBACK => "sceNpBasicCheckCallback",
+        sv::NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT => "sceNpBasicGetFriendListEntryCount",
         sv::RTC_GET_CURRENT_CLOCK => "sceRtcGetCurrentClock",
         sv::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => "sceRtcGetCurrentClockLocalTime",
         sv::RTC_GET_TICK => "sceRtcGetTick",
@@ -707,12 +735,21 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_MANAGER_GET_ACCOUNT_REGION => "sceNpManagerGetAccountRegion",
         sv::NP_MANAGER_GET_CONTENT_RATING_FLAG => "sceNpManagerGetContentRatingFlag",
         sv::NP_MANAGER_GET_CHAT_RESTRICTION_FLAG => "sceNpManagerGetChatRestrictionFlag",
+        sv::NP_LOOKUP_CREATE_REQUEST => "sceNpLookupCreateRequest",
+        sv::NP_MESSAGE_SYNC_MESSAGE => "sceNpMessageSyncMessage",
+        sv::NP_TUS_CREATE_REQUEST => "sceNpTusCreateRequest",
+        sv::NP_COMMERCE2_START_EMPTY_STORE_CHECK => "sceNpCommerce2StartEmptyStoreCheck",
+        sv::NP_COMMERCE2_CREATE_SESSION_GET_RESULT => "sceNpCommerce2CreateSessionGetResult",
+        sv::NP_COMMERCE2_CREATE_CTX => "sceNpCommerce2CreateCtx",
+        sv::NP_COMMERCE2_CREATE_SESSION_CREATE_REQ => "sceNpCommerce2CreateSessionCreateReq",
+        sv::NP_COMMERCE2_CREATE_SESSION_START => "sceNpCommerce2CreateSessionStart",
         sv::APP_MGR_GET_APP_STATE => "_sceAppMgrGetAppState",
         sv::NET_CTL_CHECK_CALLBACK => "sceNetCtlCheckCallback",
         sv::APPUTIL_DRM_OPEN => "sceAppUtilDrmOpen",
         sv::APPUTIL_DRM_CLOSE => "sceAppUtilDrmClose",
         sv::APPUTIL_SAVEDATA_SLOT_GET_PARAM => "sceAppUtilSaveDataSlotGetParam",
         sv::APPUTIL_SAVEDATA_SLOT_CREATE => "sceAppUtilSaveDataSlotCreate",
+        sv::APPUTIL_SAVEDATA_DATA_SAVE => "sceAppUtilSaveDataDataSave",
         sv::NP_CHECK_CALLBACK => "sceNpCheckCallback",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
         sv::TOUCH_READ => "sceTouchRead",
@@ -881,6 +918,9 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_AUTH_INIT => "sceNpAuthInit",
         sv::NP_LOOKUP_INIT => "sceNpLookupInit",
         sv::NP_TUS_INIT => "sceNpTusInit",
+        sv::NP_MESSAGE_INIT_WITH_PARAM => "sceNpMessageInitWithParam",
+        sv::NP_MESSAGE_TERM => "sceNpMessageTerm",
+        sv::NP_COMMERCE2_INIT => "sceNpCommerce2Init",
         sv::NP_SNS_FACEBOOK_INIT => "sceNpSnsFacebookInit",
         sv::LOCATION_INIT => "sceLocationInit",
         sv::MOTION_START_SAMPLING => "sceMotionStartSampling",

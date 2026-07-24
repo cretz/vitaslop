@@ -354,7 +354,12 @@ impl RetailGfx {
         };
         surface.configure(&device, &config);
 
-        let gxm = GxmRenderer::new(&device, &queue, render_format);
+        let mut gxm = GxmRenderer::new(&device, &queue, render_format);
+        // Antialias the native path (which has the GPU headroom): 2x supersample resolves the
+        // sub-pixel-triangle / coincident-panel speckle a distant 3D vehicle shows, matching the
+        // software review shots. `VITASLOP_SSAA` overrides (1 disables). See GxmRenderer::set_supersample.
+        let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(2);
+        gxm.set_supersample(ssaa);
         let depth = make_depth(&device, w, h);
         Ok(RetailGfx { surface, device, queue, config, gxm, builder: RenderSceneBuilder::new(), depth, render_format, adapter_name })
     }

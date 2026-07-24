@@ -214,6 +214,18 @@ impl<'a> GuestCtx<'a> {
         f32::from_bits(self.read_u32(addr))
     }
 
+    /// Read a little-endian u16 at guest address `addr` (0 if out of range).
+    pub fn read_u16(&self, addr: u32) -> u16 {
+        match self.offset(addr) {
+            Some(o) if o + 2 <= self.mem.len() => {
+                let mut b = [0u8; 2];
+                self.mem.read(o, &mut b);
+                u16::from_le_bytes(b)
+            }
+            _ => 0,
+        }
+    }
+
     /// Read a NUL-terminated ASCII string at guest address `addr` (bounded).
     pub fn read_cstr(&self, addr: u32, max: usize) -> String {
         let bytes = self.read_bytes(addr, max);
@@ -858,6 +870,11 @@ pub struct VitaState {
     // In-progress scene (BeginScene..EndScene).
     scene: Option<crate::capture::Scene>,
     bound_vertex_program: u32,
+    // The `SceGxmProgram*` of the fragment program bound by the last precomputed
+    // fragment state, so a draw can reflect which sampler unit is the albedo (base
+    // colour) and prefer it over a normal/spec/env map when picking the one texture
+    // the capture renderer samples. 0 when no fragment program is bound.
+    bound_fragment_program_header: u32,
     bound_stream0: u32,
     pending_uniforms: Vec<f32>,
     // Threads the program created, and any pending synchronous thread run raised
@@ -1012,6 +1029,16 @@ pub struct VitaState {
     /// time; 0 = fall back to the `sceGxmSetUniformDataF` path (`pending_uniforms`).
     bound_vertex_uniform_buf: u32,
     bound_vertex_uniform_size: u32,
+    /// The FRAGMENT default uniform buffer bound for the next draw (guest ptr, byte size),
+    /// from `sceGxmSetPrecomputedFragmentState` or `sceGxmReserveFragmentDefaultUniformBuffer`.
+    /// Holds the per-material fragment uniforms - base-colour tint (`AlbedoColour`/
+    /// `Primarytint`), the directional light direction/colour, fog colour - which the real
+    /// fragment program multiplies the sampled albedo by. Read into the draw's material at
+    /// record time so the capture renderer can reproduce the lit colour instead of the raw
+    /// albedo texel (which, for e.g. a tyre whose albedo texture is near-white detail scaled
+    /// by a dark `AlbedoColour`, is why unlit wheels rendered as white rings). 0 = unbound.
+    bound_fragment_uniform_buf: u32,
+    bound_fragment_uniform_size: u32,
     /// The GPU notification region: a guest buffer of `SCE_GXM_NOTIFICATION_COUNT`
     /// u32 slots handed out by `sceGxmGetNotificationRegion`, lazily allocated on
     /// first use (0 = not yet allocated). Scenes complete synchronously here, so a
@@ -1071,6 +1098,7 @@ impl VitaState {
             display_queue_cb_data_size: 0,
             scene: None,
             bound_vertex_program: 0,
+            bound_fragment_program_header: 0,
             bound_stream0: 0,
             pending_uniforms: Vec::new(),
             threads: Vec::new(),
@@ -1123,6 +1151,8 @@ impl VitaState {
             fragment_programs: Vec::new(),
             bound_vertex_uniform_buf: 0,
             bound_vertex_uniform_size: 0,
+            bound_fragment_uniform_buf: 0,
+            bound_fragment_uniform_size: 0,
             notification_region: 0,
             render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
@@ -2419,6 +2449,13 @@ impl VitaState {
         self.bound_vertex_program = handle;
     }
 
+    /// `sceGxmSetFragmentProgram`: resolve the bound fragment program handle to its
+    /// `SceGxmProgram*` and remember it, so a draw can reflect its samplers to choose the
+    /// albedo texture. A null/unknown handle clears the binding (header 0).
+    pub fn bind_fragment_program(&mut self, handle: u32) {
+        self.bound_fragment_program_header = self.fragment_program_header(handle);
+    }
+
     pub fn bind_stream0(&mut self, addr: u32) {
         self.bound_stream0 = addr;
     }
@@ -2732,11 +2769,9 @@ impl VitaState {
         match self.precomputed_vertex_states.get(&state) {
             Some(s) => {
                 self.bound_vertex_uniform_buf = s.default_uniform_buffer;
-                self.bound_vertex_uniform_size = if s.program_header != 0 {
-                    ctx.read_u32(s.program_header + 0x2C)
-                } else {
-                    0
-                };
+                self.bound_vertex_uniform_size = self
+                    .reflected_uniform_size_bytes(ctx, s.program_header)
+                    .max(if s.program_header != 0 { ctx.read_u32(s.program_header + 0x2C) } else { 0 });
             }
             None => {
                 self.bound_vertex_uniform_buf = 0;
@@ -2748,12 +2783,21 @@ impl VitaState {
     /// Apply `sceGxmSetPrecomputedFragmentState(context, state)`: bind this stage's
     /// textures to the context sampler units, exactly as a sequence of
     /// `sceGxmSetFragmentTexture` calls would, so `record_draw` snapshots them.
-    pub fn bind_precomputed_fragment_state(&mut self, state: u32) {
-        let textures = match self.precomputed_fragment_states.get(&state) {
-            Some(s) => s.textures.clone(),
+    pub fn bind_precomputed_fragment_state(&mut self, ctx: &GuestCtx, state: u32) {
+        let (textures, header, uniform_buf) = match self.precomputed_fragment_states.get(&state) {
+            Some(s) => (s.textures.clone(), s.program_header, s.default_uniform_buffer),
             None => return,
         };
         self.bound_textures = textures;
+        self.bound_fragment_program_header = header;
+        // Bind this stage's default uniform buffer (pointer + reflected size) so the draw
+        // reads the per-material fragment uniforms (tint / light / fog) from guest memory,
+        // exactly as the precomputed vertex path binds the vertex uniform buffer.
+        self.bound_fragment_uniform_buf = uniform_buf;
+        self.bound_fragment_uniform_size = self
+            .reflected_uniform_size_bytes(ctx, header)
+            .max(if header != 0 { ctx.read_u32(header + 0x2C) } else { 0 })
+            .min(4096);
     }
 
     /// `sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)`: hand
@@ -2767,11 +2811,26 @@ impl VitaState {
     /// size 0, and the draw falls back to the `sceGxmSetUniformDataF` capture.
     pub fn reserve_vertex_uniform_buffer(&mut self, ctx: &GuestCtx) -> u32 {
         let header = self.vertex_program_header(self.bound_vertex_program);
-        let size = if header != 0 { ctx.read_u32(header + 0x2C) } else { 0 };
-        let size = size.min(4096);
+        let header_size = if header != 0 { ctx.read_u32(header + 0x2C) } else { 0 };
+        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
         let buf = self.galloc(size.max(256), 16);
         self.bound_vertex_uniform_buf = buf;
         self.bound_vertex_uniform_size = size;
+        buf
+    }
+
+    /// `sceGxmReserveFragmentDefaultUniformBuffer`: the fragment-stage counterpart of
+    /// [`Self::reserve_vertex_uniform_buffer`]. Hand back a guest buffer sized to the bound
+    /// fragment program's default uniform block and bind it as the fragment uniform source,
+    /// so a title that writes its per-material uniforms (tint / light / fog) directly into
+    /// this buffer has them captured into the draw's material.
+    pub fn reserve_fragment_uniform_buffer(&mut self, ctx: &GuestCtx) -> u32 {
+        let header = self.bound_fragment_program_header;
+        let header_size = if header != 0 { ctx.read_u32(header + 0x2C) } else { 0 };
+        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
+        let buf = self.galloc(size.max(256), 16);
+        self.bound_fragment_uniform_buf = buf;
+        self.bound_fragment_uniform_size = size;
         buf
     }
 
@@ -2890,7 +2949,7 @@ impl VitaState {
         // sorted by unit so unit 0 is first.
         let mut units: Vec<(u32, u32)> = self.bound_textures.clone();
         units.sort_by_key(|(u, _)| *u);
-        let textures: Vec<crate::capture::BoundTexture> = units
+        let mut textures: Vec<crate::capture::BoundTexture> = units
             .iter()
             .filter_map(|&(unit, addr)| {
                 let e = self.texture_extra(addr);
@@ -2904,11 +2963,49 @@ impl VitaState {
                 )
             })
             .collect();
+        // The capture renderer samples a single texture (`textures.first()`). This title
+        // binds the NORMAL map at unit 0, so pick the albedo sampler by fragment-program
+        // reflection and move it to the front; without this every surface is tinted by a
+        // normal map (flat blue/purple). Falls back to the unit-0 order when reflection
+        // finds no albedo or that unit is not currently bound.
+        if let Some(unit) = self.fragment_albedo_unit(ctx) {
+            if let Some(pos) = textures.iter().position(|t| t.unit == unit) {
+                textures[..=pos].rotate_right(1);
+            }
+        }
+        if std::env::var("VITASLOP_DUMP_FPROG").is_ok() {
+            self.dump_fragment_program_samplers(ctx);
+        }
+        self.dump_draw_gxp(ctx, &textures, &attributes, primitive, index_count, stride);
         // Vertex uniforms: on the precomputed path the game wrote them into a default
         // uniform buffer bound by `sceGxmSetPrecomputedVertexState`, so read that guest
         // buffer now (its contents are current at draw time). On the direct path the
         // buffer is 0 and we fall back to the `sceGxmSetUniformDataF` capture.
-        let uniforms = self.current_vertex_uniforms(ctx);
+        let mut uniforms = self.current_vertex_uniforms(ctx);
+        // The model-to-world matrix (for bringing the vertex normal into world space for
+        // lighting). Read from the ORIGINAL uniforms, before `composed_mvp` below overwrites
+        // uniforms[0..16] (which is exactly where `vsModelToWorldMatrix` usually sits).
+        let world = self.reflected_world_matrix(ctx, &uniforms);
+        // Recover the true clip-space transform from the vertex program's reflected
+        // uniforms. A 3D shader keeps a per-object model->world matrix and a shared
+        // world->projection matrix as separate uniforms (named e.g. `vsModelToWorldMatrix`
+        // / `vsWorldToProjectionMatrix`), and multiplies them in the shader. The capture
+        // renderer has no shader, so compose that product here and stamp it over the
+        // first 16 floats, which the software/GPU paths read as the MVP. A shader with a
+        // single combined transform (2D UI: `vsPrimRenderTransform` at offset 0) has no
+        // projection matrix, so this leaves its MVP untouched.
+        if let Some(mvp) = self.composed_mvp(ctx, &uniforms) {
+            if uniforms.len() >= 16 {
+                uniforms[..16].copy_from_slice(&mvp);
+            }
+        }
+        if std::env::var("VITASLOP_DUMP_VPROG").is_ok() {
+            self.dump_vertex_program_params(ctx);
+        }
+        let exposure = self.reflected_exposure(ctx, &uniforms);
+        // The per-material fragment inputs (tint / directional light / ambient), reflected
+        // from the fragment program's uniforms so the renderer reproduces the LIT colour.
+        let material = self.reflect_fragment_material(ctx, &textures);
         let draw = crate::capture::Draw {
             primitive,
             index_format,
@@ -2920,9 +3017,527 @@ impl VitaState {
             uniforms,
             textures,
             render_state: self.render_state,
+            exposure,
+            material,
+            world,
         };
         if let Some(scene) = self.scene.as_mut() {
             scene.draws.push(draw);
+        }
+    }
+
+    /// Size in bytes of a vertex program's default uniform buffer, computed from its
+    /// reflected parameter table: the maximum `resource_index + component_count *
+    /// array_size` (in floats) over the uniform (`category == 1`) parameters, times 4.
+    /// The program header's own size field (+0x2C) under-reports for shaders with a
+    /// large uniform block (e.g. a world matrix at float 0 plus a world-to-projection
+    /// matrix at float 16 plus lighting/fog), truncating the captured buffer and
+    /// dropping the view-projection - so the reflected extent is the reliable size.
+    fn reflected_uniform_size_bytes(&self, ctx: &GuestCtx, header: u32) -> u32 {
+        if header == 0 {
+            return 0;
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let mut max_floats = 0u32;
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 1 {
+                continue; // category 1 == uniform (0 is a vertex attribute)
+            }
+            let comp = ((word >> 8) & 0xf).max(1);
+            let array = ctx.read_u32(p.wrapping_add(8)).max(1);
+            let res = ctx.read_u32(p.wrapping_add(0xc));
+            max_floats = max_floats.max(res.wrapping_add(comp.wrapping_mul(array)));
+        }
+        max_floats.wrapping_mul(4)
+    }
+
+    /// Compose the model->projection MVP for the bound vertex program from its captured
+    /// `uniforms`, using reflection to locate the model->world and world->projection
+    /// matrices by their declared names. Returns `None` when the shader has no separate
+    /// projection matrix (a single-transform 2D/UI shader), so the caller keeps the
+    /// offset-0 matrix as-is. Both matrices are column-major 4x4 float blocks at their
+    /// reflected `resource_index` (in floats); the result is `projection * world`.
+    fn composed_mvp(&self, ctx: &GuestCtx, uniforms: &[f32]) -> Option<[f32; 16]> {
+        let (world, proj) = self.reflected_world_proj(ctx, uniforms)?;
+        // Column-major 4x4 multiply: out = proj * world.
+        let mut out = [0f32; 16];
+        for col in 0..4 {
+            for row in 0..4 {
+                let mut s = 0f32;
+                for k in 0..4 {
+                    s += proj[k * 4 + row] * world[col * 4 + k];
+                }
+                out[col * 4 + row] = s;
+            }
+        }
+        Some(out)
+    }
+
+    /// The model-to-world matrix reflected from the vertex program's `vsModelToWorldMatrix`
+    /// (column-major 4x4), or identity if the shader declares no world matrix. Used to bring
+    /// the object-space vertex normal into world space for lighting.
+    fn reflected_world_matrix(&self, ctx: &GuestCtx, uniforms: &[f32]) -> [f32; 16] {
+        const IDENTITY: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        self.reflected_world_proj(ctx, uniforms).map(|(w, _)| w).unwrap_or(IDENTITY)
+    }
+
+    /// Reflect the vertex program's model->world and world->projection 4x4 matrices from its
+    /// captured `uniforms`, located by their declared names. Returns `(world, proj)` or `None`
+    /// when the shader has no separate projection matrix (a single-transform 2D/UI shader).
+    fn reflected_world_proj(&self, ctx: &GuestCtx, uniforms: &[f32]) -> Option<([f32; 16], [f32; 16])> {
+        let header = self.vertex_program_header(self.bound_vertex_program);
+        if header == 0 {
+            return None;
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let (mut world_off, mut proj_off) = (None, None);
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            // Category 1 (uniform), a 4x4 matrix: component_count 4 and array_size 4.
+            if word & 0xf != 1 || (word >> 8) & 0xf != 4 || ctx.read_u32(p.wrapping_add(8)) != 4 {
+                continue;
+            }
+            let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 48);
+            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
+            if name.contains("toprojection") || name.contains("worldtoclip") || name.contains("viewprojection") {
+                proj_off = Some(res);
+            } else if name.contains("modeltoworld") {
+                world_off = Some(res);
+            }
+        }
+        let (wo, po) = (world_off?, proj_off?);
+        let read4x4 = |off: usize| -> Option<[f32; 16]> {
+            let mut m = [0f32; 16];
+            m.copy_from_slice(uniforms.get(off..off + 16)?);
+            Some(m)
+        };
+        Some((read4x4(wo)?, read4x4(po)?))
+    }
+
+    /// Recover the scene exposure from the bound vertex program's reflected
+    /// `vsCoarseExposureReg` uniform (a float4 whose first component is the linear
+    /// exposure scale the shaders multiply lit albedo by before tone-mapping). Returns
+    /// `1.0` when the shader declares no exposure uniform (2D/UI shaders), or when the
+    /// value is not a sane positive number, so it is a safe no-op there.
+    fn reflected_exposure(&self, ctx: &GuestCtx, uniforms: &[f32]) -> f32 {
+        let header = self.vertex_program_header(self.bound_vertex_program);
+        if header == 0 {
+            return 1.0;
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 1 {
+                continue; // category 1 == uniform
+            }
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 48);
+            let name: String =
+                raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
+            if name.contains("coarseexposure") {
+                let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
+                if let Some(&e) = uniforms.get(res) {
+                    if e.is_finite() && e > 0.0 {
+                        return e;
+                    }
+                }
+            }
+        }
+        1.0
+    }
+
+    /// Diagnostic (VITASLOP_DUMP_VPROG): reflect the bound vertex program's parameter
+    /// table (name / category / type / component_count / container / array_size /
+    /// resource_index) once per unique program, so the uniform-buffer layout (which
+    /// slots are the world matrix vs the shared view-projection) is known by name.
+    fn dump_vertex_program_params(&self, ctx: &GuestCtx) {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let ph = self.vertex_program_header(self.bound_vertex_program);
+        if ph == 0 {
+            return;
+        }
+        {
+            let mut seen = SEEN.lock().unwrap();
+            if seen.contains(&ph) {
+                return;
+            }
+            seen.push(ph);
+        }
+        let count = ctx.read_u32(ph.wrapping_add(0x24));
+        let base = ph.wrapping_add(0x28).wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
+        eprintln!("VPROG header={ph:#x} params={count}");
+        for i in 0..count.min(64) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let name_off = ctx.read_u32(p) as i32;
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            let array_size = ctx.read_u32(p.wrapping_add(8));
+            let res_index = ctx.read_u32(p.wrapping_add(0xc));
+            let name_addr = (p as i64 + name_off as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 48);
+            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            eprintln!(
+                "  param[{i}] name={name:?} cat={} type={} comp={} container={} array={array_size} res_index={res_index}",
+                word & 0xf, (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf,
+            );
+        }
+    }
+
+    /// Reflect the bound fragment program's SAMPLER parameters (parameter category 2)
+    /// and return the texture unit (`resource_index`) of the one that is the base-colour
+    /// / albedo map, so the capture renderer - which samples a single texture - picks the
+    /// diffuse colour rather than whatever happens to sit at unit 0 (this title binds the
+    /// NORMAL map at unit 0, so a naive unit-0 pick paints every surface flat blue).
+    ///
+    /// Selection is by the sampler's declared name: a diffuse/albedo/base-colour name
+    /// wins; names that are clearly a different map role (normal, specular, environment/
+    /// cube, reflection, gloss, light, shadow, detail, bump, height, mask, ao) are
+    /// rejected. Returns `None` when there is no fragment program or no sampler reads as
+    /// an albedo, leaving the caller on its default unit-0 pick.
+    fn fragment_albedo_unit(&self, ctx: &GuestCtx) -> Option<u32> {
+        let header = self.bound_fragment_program_header;
+        if header == 0 {
+            return None;
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        let mut best: Option<(i32, u32)> = None; // (score, unit)
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 2 {
+                continue; // category 2 == sampler
+            }
+            let unit = ctx.read_u32(p.wrapping_add(0xc));
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 64);
+            let name: String =
+                raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
+            let score = albedo_name_score(&name);
+            if score > 0 && best.map(|(s, _)| score > s).unwrap_or(true) {
+                best = Some((score, unit));
+            }
+        }
+        best.map(|(_, u)| u)
+    }
+
+    /// Reflect the bound fragment program's per-material inputs (base-colour tint, the
+    /// directional light, and a flat ambient term) from its parameter table read against the
+    /// captured fragment default uniform buffer. The material model is uniform across this
+    /// engine's shaders (verified empirically): a `*tint*`/`*albedocolour*` float3 multiplies
+    /// the sampled albedo, and `directionalLight0Colour` * saturate(N.L) + ambient lights it.
+    ///
+    /// Uniform packing (also verified empirically against the real shaders): a parameter's
+    /// `resource_index` is a 4-byte-register offset into the default uniform buffer; each of
+    /// its `component_count` components is an F16 (`type == 1`, 2 bytes) or an F32 (`type ==
+    /// 0`, 4 bytes). `textures` is the draw's bound textures (albedo reordered to the front),
+    /// used to resolve the ambient colour from the tiny `diffuseAmbientMap` irradiance map.
+    fn reflect_fragment_material(&self, ctx: &GuestCtx, textures: &[crate::capture::BoundTexture]) -> crate::capture::FragmentMaterial {
+        let mut m = crate::capture::FragmentMaterial::default();
+        let header = self.bound_fragment_program_header;
+        let buf = self.bound_fragment_uniform_buf;
+        if header != 0 && buf != 0 {
+            let count = ctx.read_u32(header.wrapping_add(0x24));
+            let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+            // Read `comp` scalar components of a uniform parameter from the fragment default
+            // uniform buffer at its register offset, honouring the F16/F32 component type.
+            let read_vals = |res_index: u32, comp: usize, is_f16: bool| -> Vec<f32> {
+                let byte_off = buf.wrapping_add(res_index.wrapping_mul(4));
+                (0..comp)
+                    .map(|i| {
+                        if is_f16 {
+                            crate::render::half_to_f32(ctx.read_u16(byte_off.wrapping_add((i as u32) * 2)))
+                        } else {
+                            ctx.read_f32(byte_off.wrapping_add((i as u32) * 4))
+                        }
+                    })
+                    .collect()
+            };
+            for i in 0..count.min(256) {
+                let p = base.wrapping_add(i.wrapping_mul(16));
+                let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+                if word & 0xf != 1 {
+                    continue; // category 1 == uniform
+                }
+                let ptype = (word >> 4) & 0xf;
+                let comp = ((word >> 8) & 0xf).max(1) as usize;
+                let res = ctx.read_u32(p.wrapping_add(0xc));
+                let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+                let raw = ctx.read_bytes(name_addr, 64);
+                let name: String =
+                    raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
+                let is_f16 = ptype == 1;
+                let take3 = |v: &[f32]| [*v.first().unwrap_or(&0.0), *v.get(1).unwrap_or(&0.0), *v.get(2).unwrap_or(&0.0)];
+                // The base-colour tint: the primary layer's tint (or a wheel's AlbedoColour).
+                // A "secondary" tint belongs to a second material layer we do not composite,
+                // so only the primary/albedo tint drives the base colour.
+                if (name.contains("albedocolour") || name.contains("albedocolor") || name.contains("primarytint"))
+                    && comp >= 3
+                {
+                    let t = take3(&read_vals(res, 3, is_f16));
+                    if t.iter().all(|c| c.is_finite() && *c >= 0.0 && *c <= 8.0) {
+                        m.tint = t;
+                    }
+                } else if name.contains("light0direction") && comp >= 3 {
+                    let d = take3(&read_vals(res, 3, is_f16));
+                    if d.iter().all(|c| c.is_finite()) && d.iter().any(|c| *c != 0.0) {
+                        m.light_dir = d;
+                        m.has_light = true;
+                    }
+                } else if name.contains("light0colour") || name.contains("light0color") {
+                    if comp >= 3 {
+                        let c = take3(&read_vals(res, 3, is_f16));
+                        if c.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 16.0) {
+                            m.light_col = c;
+                        }
+                    }
+                }
+            }
+        }
+        // Ambient: the average colour of the small `diffuseAmbientMap` irradiance texture, if
+        // one is bound. It is a coarse (16x16 / 128x128) light probe, so its mean is a good
+        // flat ambient for a renderer that does not sample it per-normal. Leaves the default
+        // grey ambient when no such map is present.
+        if let Some(amb) = textures.iter().find(|t| t.unit == 15) {
+            if let Some(mean) = crate::render::texture_mean_rgb(amb) {
+                m.ambient = mean;
+            }
+        }
+        m
+    }
+
+    /// Diagnostic (VITASLOP_DUMP_FPROG): print the bound fragment program's sampler
+    /// parameters (name + unit) once per unique program, so the albedo-selection name
+    /// matching can be grounded in the real sampler names a title declares.
+    fn dump_fragment_program_samplers(&self, ctx: &GuestCtx) {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let header = self.bound_fragment_program_header;
+        if header == 0 {
+            return;
+        }
+        {
+            let mut seen = SEEN.lock().unwrap();
+            if seen.contains(&header) {
+                return;
+            }
+            seen.push(header);
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        eprintln!("FPROG header={header:#x} params={count}");
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 2 {
+                continue;
+            }
+            let unit = ctx.read_u32(p.wrapping_add(0xc));
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 64);
+            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            eprintln!("  sampler name={name:?} unit={unit} score={}", albedo_name_score(&name.to_ascii_lowercase()));
+        }
+    }
+
+    /// Diagnostic (VITASLOP_DUMP_DRAW_GXP=<frame>): dump, per draw of the matching
+    /// display frame, everything needed to reason about the fragment-program compositing
+    /// the capture renderer cannot yet reproduce - the vertex attribute layout (how many
+    /// texcoord SETS the mesh carries), the bound fragment program's FULL parameter table
+    /// (samplers with their unit, and the fragment INPUT varyings / category-0 attributes
+    /// that tell which TEXCOORD each stage reads), and the bound textures with the sampler
+    /// name at each unit. This is the empirical instrument for the wheel-ring artifact: it
+    /// shows whether a draw feeds one UV set to several samplers (a composite we must
+    /// reproduce) or picks the wrong UV set for a sampler (a binding we can correct).
+    fn dump_draw_gxp(&self, ctx: &GuestCtx, textures: &[crate::capture::BoundTexture], attributes: &[crate::capture::VertexAttribute], primitive: u32, index_count: u32, stride: u32) {
+        let want = match std::env::var("VITASLOP_DUMP_DRAW_GXP").ok() {
+            Some(s) => s,
+            None => return,
+        };
+        // The frame the dump keys on is the scheduler frame (`cur_frame`, the display-flip /
+        // yield count set at each `on_frame_boundary`), which is exactly the `fNNNN` a shot is
+        // labelled with in the recipe runner. (`presents.len()` is NOT it: this title renders
+        // through the GXM display queue and calls the raw `present` path only a couple of times.)
+        let disp = self.cur_frame;
+        // "all", a single frame "N", or an inclusive range "LO-HI".
+        let match_frame = want == "all"
+            || match want.split_once('-') {
+                Some((lo, hi)) => match (lo.parse::<u64>(), hi.parse::<u64>()) {
+                    (Ok(lo), Ok(hi)) => (lo..=hi).contains(&disp),
+                    _ => false,
+                },
+                None => want.parse::<u64>().map(|f| f == disp).unwrap_or(false),
+            };
+        if !match_frame {
+            return;
+        }
+        // Bound the total lines dumped (a wide window over a 90-draws/frame scene is a lot of
+        // output); `VITASLOP_DUMP_DRAW_GXP_CAP` raises it when a full multi-frame trace is wanted.
+        let cap = std::env::var("VITASLOP_DUMP_DRAW_GXP_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(400);
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DUMPED: AtomicU32 = AtomicU32::new(0);
+        if DUMPED.fetch_add(1, Ordering::Relaxed) >= cap {
+            return;
+        }
+        let seq = self.scene.as_ref().map(|s| s.draws.len()).unwrap_or(0);
+        let vh = self.vertex_program_header(self.bound_vertex_program);
+        let fh = self.bound_fragment_program_header;
+        let mat = self.reflect_fragment_material(ctx, textures);
+        eprintln!(
+            "DRAW frame={disp} seq={seq} prim={primitive:#010x} idx={index_count} stride={stride} vprog={vh:#x} fprog={fh:#x} fubuf={:#x}",
+            self.bound_fragment_uniform_buf
+        );
+        eprintln!(
+            "  MATERIAL tint=[{:.3},{:.3},{:.3}] has_light={} light_dir=[{:.3},{:.3},{:.3}] light_col=[{:.3},{:.3},{:.3}] ambient=[{:.3},{:.3},{:.3}]",
+            mat.tint[0], mat.tint[1], mat.tint[2], mat.has_light,
+            mat.light_dir[0], mat.light_dir[1], mat.light_dir[2],
+            mat.light_col[0], mat.light_col[1], mat.light_col[2],
+            mat.ambient[0], mat.ambient[1], mat.ambient[2],
+        );
+        // Vertex stream attributes (bytes -> shader register): the count of distinct UV-ish
+        // float2/float4 lanes is the number of texcoord sets the mesh actually carries.
+        for a in attributes {
+            eprintln!("  attr off={} fmt={} comp={} reg={}", a.offset, a.format, a.component_count, a.reg_index);
+        }
+        // Sampler name at a given unit, by reflecting the fragment program.
+        let sampler_name = |unit: u32| -> String { self.gxp_sampler_name(ctx, fh, unit) };
+        for t in textures {
+            eprintln!(
+                "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} sampler={:?}",
+                t.unit, t.width, t.height, t.base_format, t.swizzle, t.tex_type, sampler_name(t.unit)
+            );
+        }
+        if std::env::var("VITASLOP_DUMP_DRAW_GXP_FULL").is_ok() {
+            eprintln!("  -- fragment program params --");
+            self.dump_all_params(ctx, fh);
+            eprintln!("  -- vertex program params --");
+            self.dump_all_params(ctx, vh);
+        }
+        // VITASLOP_DUMP_TEX_DIR=<dir>: also write each bound texture, decoded to RGBA8 via the
+        // exact sampler decode, as a PNG named `f<frame>_seq<seq>_u<unit>_<sampler>.png`. Lets a
+        // human see the ACTUAL texel content a draw sampled (is the sampled albedo the paint, or
+        // a decal atlas whose UVs the shader would remap?) - the instrument for deciding whether
+        // a render artifact is a decode/pick bug or the untranslated fragment-program composite.
+        if let Ok(dir) = std::env::var("VITASLOP_DUMP_TEX_DIR") {
+            use std::sync::Mutex;
+            // De-dup by guest data address: the shared shadow/ambient/atlas maps are bound in
+            // every draw, so writing them per-draw would emit gigabytes. Each unique texture is
+            // written once. Large maps (> 1 Mtexel, e.g. the 4096x2048 shadMap) are skipped -
+            // the material inputs worth eyeballing are the small per-part albedo/normal sheets.
+            static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+            let _ = std::fs::create_dir_all(&dir);
+            for t in textures {
+                if t.width == 0 || t.height == 0 || t.width * t.height > 1 << 20 {
+                    continue;
+                }
+                {
+                    let mut seen = SEEN.lock().unwrap();
+                    if seen.contains(&t.data_addr) {
+                        continue;
+                    }
+                    seen.push(t.data_addr);
+                }
+                let (w, h, rgba) = crate::render::decode_texture_rgba8(t);
+                let samp = self.gxp_sampler_name(ctx, fh, t.unit);
+                let safe: String = samp.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                let path = std::path::Path::new(&dir)
+                    .join(format!("f{disp}_seq{seq}_u{}_{}.png", t.unit, safe));
+                let _ = std::fs::write(path, crate::render::rgba_to_png(w, h, &rgba));
+            }
+        }
+        // VITASLOP_DUMP_GXP_BIN=<dir>: write the raw SceGxmProgram blobs (the whole container -
+        // header + parameter table + USSE bytecode) for the bound fragment and vertex programs,
+        // named `<type>_<header-addr>.gxp`, deduped by address. These are the durable artifacts
+        // the clean-room GXP->WGSL shader recompiler decodes. `SceGxmProgram.size` is the u32 at
+        // header+0x08 (the container's total byte length; clamped defensively).
+        if let Ok(dir) = std::env::var("VITASLOP_DUMP_GXP_BIN") {
+            use std::sync::Mutex;
+            static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+            let _ = std::fs::create_dir_all(&dir);
+            for (kind, header) in [("frag", fh), ("vert", vh)] {
+                if header == 0 {
+                    continue;
+                }
+                {
+                    let mut seen = SEEN.lock().unwrap();
+                    if seen.contains(&header) {
+                        continue;
+                    }
+                    seen.push(header);
+                }
+                let size = ctx.read_u32(header.wrapping_add(0x08)).clamp(0x40, 0x40000);
+                let bytes = ctx.read_bytes(header, size as usize);
+                let path = std::path::Path::new(&dir).join(format!("{kind}_{header:08x}.gxp"));
+                let _ = std::fs::write(path, &bytes);
+            }
+        }
+    }
+
+    /// Reflect the name of the fragment sampler bound to texture `unit`, or "" if none.
+    fn gxp_sampler_name(&self, ctx: &GuestCtx, header: u32, unit: u32) -> String {
+        if header == 0 {
+            return String::new();
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        for i in 0..count.min(256) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 2 {
+                continue;
+            }
+            if ctx.read_u32(p.wrapping_add(0xc)) == unit {
+                let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+                let raw = ctx.read_bytes(name_addr, 64);
+                return raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            }
+        }
+        String::new()
+    }
+
+    /// Dump every parameter (all categories) of a GXP program: category / type /
+    /// component_count / container_index / array_size / resource_index / name. Category
+    /// 0 = attribute (a fragment program's INPUT varyings, e.g. TEXCOORD0/1), 1 = uniform,
+    /// 2 = sampler, 4 = uniform buffer.
+    fn dump_all_params(&self, ctx: &GuestCtx, header: u32) {
+        if header == 0 {
+            eprintln!("    (no program)");
+            return;
+        }
+        let count = ctx.read_u32(header.wrapping_add(0x24));
+        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+        for i in 0..count.min(128) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            let array_size = ctx.read_u32(p.wrapping_add(8));
+            let res_index = ctx.read_u32(p.wrapping_add(0xc));
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 64);
+            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let cat = match word & 0xf {
+                0 => "attr",
+                1 => "unif",
+                2 => "samp",
+                4 => "ubuf",
+                _ => "?",
+            };
+            eprintln!(
+                "    [{i}] {cat} type={} comp={} container={} array={array_size} res={res_index} name={name:?}",
+                (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf,
+            );
         }
     }
 
@@ -2945,6 +3560,49 @@ impl VitaState {
 /// Round `v` up to the next multiple of `align` (a power of two).
 fn align_up(v: u32, align: u32) -> u32 {
     (v + align - 1) & !(align - 1)
+}
+
+/// Score a fragment-sampler name (already lowercased) for how strongly it reads as the
+/// albedo / base-colour map. Positive = a diffuse colour source (higher is a better
+/// match); 0 = not an albedo, or a name that clearly names a different map role
+/// (normal/spec/env/etc). Used to pick the one texture the capture renderer samples.
+fn albedo_name_score(name: &str) -> i32 {
+    // A name that clearly identifies a non-colour map role is never the albedo, even if
+    // it also contains a generic "map"/"tex" token.
+    const NON_ALBEDO: [&str; 14] = [
+        "normal", "spec", "gloss", "rough", "env", "cube", "reflect", "light", "shadow",
+        "detail", "bump", "height", "mask", "emiss",
+    ];
+    if NON_ALBEDO.iter().any(|k| name.contains(k)) {
+        return 0;
+    }
+    // Explicit albedo names rank highest; generic colour names next; a bare "diffuse"
+    // fragment (some engines name the sole colour sampler just "tex"/"map") lowest.
+    //
+    // NOTE (empirical, this title): an `AlbedoTexture`/`LiveryAlbedo` sampler is this
+    // engine's base colour for a body panel (the blue livery) BUT is also the livery/decal
+    // SOURCE sheet on other parts (a gauge/number sheet that, sampled whole at a tiling UV,
+    // paints white rings on the wheels). Both use the identical sampler name and role - the
+    // only difference is the mesh's UV mapping, which the (untranslated) fragment program
+    // resolves. So this name-based pick CANNOT separate them; ranking diffuse over albedo
+    // to kill the wheel rings also flattens the body's livery (a worse regression). The
+    // rings are left as a known artifact until the GXP fragment/vertex texcoord binding is
+    // reflected (or the fragment program is translated) - do not "fix" it by name score.
+    for (kw, score) in [
+        ("albedo", 100),
+        ("basecolor", 95),
+        ("basecolour", 95),
+        ("diffuse", 90),
+        ("diff", 70),
+        ("colour", 60),
+        ("color", 60),
+        ("base", 40),
+    ] {
+        if name.contains(kw) {
+            return score;
+        }
+    }
+    0
 }
 
 /// Decode a bound `SceGxmTexture` (16 bytes, 4 control words) from guest memory

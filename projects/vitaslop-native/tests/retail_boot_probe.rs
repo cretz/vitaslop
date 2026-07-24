@@ -69,6 +69,7 @@ const MAX_ROUNDS: u64 = 200_000;
 #[derive(Default)]
 struct BootWorld {
     polls: u64,
+    frame: u64,
 }
 impl World for BootWorld {
     fn monotonic_us(&mut self) -> u64 {
@@ -76,7 +77,16 @@ impl World for BootWorld {
         self.polls.wrapping_mul(16_666)
     }
     fn wall_us(&mut self) -> u64 {
-        0
+        // A faithful wall clock ADVANCES with real time. Driving it from the display
+        // frame count (60 Hz -> 16.6 ms/frame) atop a fixed calendar epoch gives the
+        // game a monotonically advancing sceRtcGetCurrentTick. A frozen wall clock
+        // (the old `0`) makes any timeout the game measures via the wall clock never
+        // elapse - e.g. the offline-determination timeout behind "Communicating with
+        // server...", which then waits forever even though process time advances.
+        1_500_000_000_000_000u64.wrapping_add(self.frame.wrapping_mul(16_666))
+    }
+    fn set_frame(&mut self, frame: u64) {
+        self.frame = frame;
     }
     fn poll_ctrl(&mut self, _port: u32) -> CtrlFrame {
         // Diagnostic: VITASLOP_HOLD_BUTTONS=0xHEX holds those SceCtrl buttons down every
@@ -1078,7 +1088,7 @@ fn retail_boot_probe() {
             eprintln!("  thread {thid:>3} last: {}", last.join(" "));
         }
     }
-    vitaslop_runtime::vita::dump_call_sites(14);
+    vitaslop_runtime::vita::dump_call_sites(80);
     eprintln!("--- sceKernelWaitLwCond samples (work, timeout_ptr, timeout) ---");
     for (work, tp, to) in &st.capture.lwcond_wait_samples {
         eprintln!("  work={work:#010x} timeout_ptr={tp:#010x} timeout={to}");
@@ -1110,6 +1120,10 @@ fn retail_boot_probe() {
                     d.primitive, d.index_format, d.index_count, d.vertex_stride,
                     d.vertices.len(), d.uniforms.len(), rs.front_depth_func, rs.front_depth_write, rs.cull_mode, d.attributes,
                 );
+                if !d.uniforms.is_empty() {
+                    let n = d.uniforms.len().min(32);
+                    eprintln!("    uniforms[..{n}]: {:?}", &d.uniforms[..n]);
+                }
                 for t in &d.textures {
                     eprintln!(
                         "    tex unit={} base_fmt={:#04x} swizzle={:#08x} type={:#x} {}x{} stride={} addr={:#010x} pixels={} minf={} magf={}",
@@ -1174,6 +1188,112 @@ fn retail_boot_probe() {
                 frames_written += 1;
             }
             eprintln!("wrote {frames_written} frame PNG(s) (of {total}) + trace to {dir}/");
+            // VITASLOP_DUMP_DRAW=i,j,k prints those scene-draw indices' raw vertex format
+            // (attributes, stride, primitive) and the first few vertices as f32 + f16 + u8
+            // lanes - to diagnose a mesh that decodes to scatter (wrong position attr,
+            // multi-stream, or a half-float layout the decoder mis-reads).
+            if let Ok(list) = std::env::var("VITASLOP_DUMP_DRAW") {
+                if let Some(scene) = st.capture.scenes.last() {
+                    let h2f = |h: u16| -> f32 {
+                        let s = (h >> 15) & 1;
+                        let e = ((h >> 10) & 0x1f) as i32;
+                        let m = (h & 0x3ff) as f32;
+                        let v = if e == 0 { m * 2f32.powi(-24) } else { (m / 1024.0 + 1.0) * 2f32.powi(e - 15) };
+                        if s == 1 { -v } else { v }
+                    };
+                    for idx in list.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
+                        let Some(d) = scene.draws.get(idx) else { continue };
+                        eprintln!(
+                            "DRAW {idx}: prim={:#010x} idxfmt={} idxcount={} stride={} nverts={} cull={:#x} two_sided={:#x} depth_write={:#x} depth_func={:#x}",
+                            d.primitive, d.index_format, d.index_count, d.vertex_stride,
+                            d.vertices.len() / d.vertex_stride.max(1) as usize,
+                            d.render_state.cull_mode, d.render_state.two_sided,
+                            d.render_state.front_depth_write, d.render_state.front_depth_func
+                        );
+                        for a in &d.attributes {
+                            eprintln!("   attr stream={} off={} fmt={} comps={} reg={}",
+                                a.stream_index, a.offset, a.format, a.component_count, a.reg_index);
+                        }
+                        let stride = d.vertex_stride.max(1) as usize;
+                        for vi in 0..4.min(d.vertices.len() / stride) {
+                            let b = &d.vertices[vi * stride..(vi + 1) * stride];
+                            let f32s: Vec<String> = (0..stride / 4)
+                                .map(|k| format!("{:.2}", f32::from_le_bytes([b[k*4], b[k*4+1], b[k*4+2], b[k*4+3]])))
+                                .collect();
+                            let f16s: Vec<String> = (0..stride / 2)
+                                .map(|k| format!("{:.2}", h2f(u16::from_le_bytes([b[k*2], b[k*2+1]]))))
+                                .collect();
+                            eprintln!("   v{vi}: bytes={:02x?}", b);
+                            eprintln!("        f32={f32s:?}");
+                            eprintln!("        f16={f16s:?}");
+                        }
+                    }
+                }
+            }
+            // VITASLOP_DUMP_RENDERSCENE prints, for the last captured scene, how the GPU
+            // builder classifies each draw (space / opaque / exposure / textured) plus, for
+            // MVP draws, the transformed NDC-z range and on-screen vertex count - the data
+            // that tells us why an opaque 3D draw might render on the software oracle but
+            // vanish on the GPU (wrong pipeline, off-screen, or out-of-range depth).
+            if std::env::var("VITASLOP_DUMP_RENDERSCENE").is_ok() {
+                if let Some(scene) = st.capture.scenes.last() {
+                    let rs = vitaslop_runtime::render::RenderSceneBuilder::new().build(scene);
+                    eprintln!("RENDERSCENE last scene: {} draws", rs.draws.len());
+                    let lanef = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                    for (di, d) in rs.draws.iter().enumerate() {
+                        let (sp, mvp) = match d.space {
+                            vitaslop_platform::gpu::DrawSpace::Mvp(m) => ("Mvp", Some(m)),
+                            vitaslop_platform::gpu::DrawSpace::Ndc => ("Ndc", None),
+                            vitaslop_platform::gpu::DrawSpace::Pixel => ("Pixel", None),
+                        };
+                        let mut extra = String::new();
+                        if let Some(m) = mvp {
+                            let nv = d.vertices.len() / 24;
+                            let (mut zmin, mut zmax) = (f32::INFINITY, f32::NEG_INFINITY);
+                            let (mut wpos, mut onscreen) = (0usize, 0usize);
+                            for i in 0..nv {
+                                let o = i * 24;
+                                let (x, y, z) = (lanef(&d.vertices, o), lanef(&d.vertices, o + 4), lanef(&d.vertices, o + 8));
+                                let cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+                                let cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+                                let cz = m[2] * x + m[6] * y + m[10] * z + m[14];
+                                let cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+                                if cw > 0.0 {
+                                    wpos += 1;
+                                    let (nx, ny, nz) = (cx / cw, cy / cw, cz / cw);
+                                    zmin = zmin.min(nz);
+                                    zmax = zmax.max(nz);
+                                    if nx.abs() <= 1.0 && ny.abs() <= 1.0 {
+                                        onscreen += 1;
+                                    }
+                                }
+                            }
+                            extra = format!("nv={nv} w>0={wpos} onscreen={onscreen} ndcz=[{zmin:.3},{zmax:.3}]");
+                        }
+                        // First vertex color + uv, and the decoded texture's dims + center texel.
+                        let vc = if d.vertices.len() >= 24 {
+                            format!("vcol0=[{},{},{},{}] uv0=({:.2},{:.2})",
+                                d.vertices[20], d.vertices[21], d.vertices[22], d.vertices[23],
+                                lanef(&d.vertices, 12), lanef(&d.vertices, 16))
+                        } else { String::new() };
+                        let tx = match &d.texture {
+                            Some(t) => {
+                                let n = t.rgba.len();
+                                let c = (n / 2) & !3;
+                                format!("tex={}x{} centerTexel=[{},{},{},{}]",
+                                    t.width, t.height,
+                                    t.rgba.get(c).copied().unwrap_or(0), t.rgba.get(c+1).copied().unwrap_or(0),
+                                    t.rgba.get(c+2).copied().unwrap_or(0), t.rgba.get(c+3).copied().unwrap_or(0))
+                            }
+                            None => "tex=none".into(),
+                        };
+                        eprintln!(
+                            "  [{di:3}] {sp:5} opaque={} exp={:.2} idx={} {extra} {vc} {tx}",
+                            d.opaque, d.exposure, d.index_count
+                        );
+                    }
+                }
+            }
             // VITASLOP_GPU also renders each scene through the general GXM->WebGPU
             // renderer (the browser's real path) to frame_gpu_XXXX.png, so the GPU
             // output can be compared to the software oracle on the real title's frames.
@@ -1181,12 +1301,28 @@ fn retail_boot_probe() {
                 match vitaslop_native::GeneralRenderer::new() {
                     Some(mut gpu) => {
                         eprintln!("GPU render via {}", gpu.adapter_name);
-                        for (i, scene) in st.capture.scenes.iter().enumerate() {
+                        // Honor VITASLOP_SHOT_LAST here too (keeping real frame indices), so
+                        // a tuning run renders a few GPU frames, not thousands.
+                        let mut gpu_written = 0;
+                        for (i, scene) in st.capture.scenes.iter().enumerate().skip(start) {
                             let fb = gpu.render_scene(scene, WIDTH, HEIGHT, CLEAR);
+                            // Mean per-channel abs diff vs the software oracle for this scene,
+                            // so GPU/oracle agreement on the real title's frames is a number,
+                            // not just an eyeball of the two PNGs.
+                            let sw = render::render_scene(scene, WIDTH, HEIGHT, CLEAR);
+                            let sum: u64 = sw
+                                .rgba
+                                .iter()
+                                .zip(&fb.rgba)
+                                .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
+                                .sum();
+                            let mean = sum as f64 / sw.rgba.len() as f64;
+                            eprintln!("frame {i}: mean_abs_diff sw-vs-gpu = {mean:.3}");
                             std::fs::write(format!("{dir}/frame_gpu_{i:04}.png"), fb.to_png())
                                 .expect("write gpu png");
+                            gpu_written += 1;
                         }
-                        eprintln!("wrote {} GPU frame PNG(s) to {dir}/", st.capture.scenes.len());
+                        eprintln!("wrote {gpu_written} GPU frame PNG(s) (of {total}) to {dir}/");
                     }
                     None => eprintln!("VITASLOP_GPU set but no GPU adapter available"),
                 }

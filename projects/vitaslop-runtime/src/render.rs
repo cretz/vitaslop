@@ -30,6 +30,46 @@ impl Framebuffer {
         self.rgba.chunks(4).filter(|p| *p != clear).count()
     }
 
+    /// Box-downsample by an integer `factor` (supersample resolve): each output pixel is
+    /// the average of its `factor x factor` source block. This is how the renderer turns a
+    /// scene rasterized at `factor`x resolution into an antialiased final frame - averaging
+    /// resolves the geometric aliasing of a heavily-tessellated mesh (dozens of sub-pixel
+    /// triangles per final pixel, e.g. a distant vehicle) and coincident-panel z-fighting
+    /// into smooth pixels, the same edge/coverage integration hardware MSAA gives. `factor`
+    /// == 1 returns an identical image. A remainder row/column (source size not a multiple of
+    /// factor) is ignored, so callers should rasterize at exactly `factor * out` dimensions.
+    pub fn downsampled(&self, factor: u32) -> Framebuffer {
+        if factor <= 1 {
+            return Framebuffer { width: self.width, height: self.height, rgba: self.rgba.clone() };
+        }
+        let ow = self.width / factor;
+        let oh = self.height / factor;
+        let mut rgba = Vec::with_capacity((ow * oh * 4) as usize);
+        let inv = (factor * factor) as u32;
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut acc = [0u32; 4];
+                for sy in 0..factor {
+                    let row = ((oy * factor + sy) * self.width + ox * factor) as usize * 4;
+                    for sx in 0..factor as usize {
+                        let p = row + sx * 4;
+                        acc[0] += self.rgba[p] as u32;
+                        acc[1] += self.rgba[p + 1] as u32;
+                        acc[2] += self.rgba[p + 2] as u32;
+                        acc[3] += self.rgba[p + 3] as u32;
+                    }
+                }
+                rgba.extend_from_slice(&[
+                    (acc[0] / inv) as u8,
+                    (acc[1] / inv) as u8,
+                    (acc[2] / inv) as u8,
+                    (acc[3] / inv) as u8,
+                ]);
+            }
+        }
+        Framebuffer { width: ow, height: oh, rgba }
+    }
+
     /// The RGBA color at `(x, y)`.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
@@ -39,23 +79,30 @@ impl Framebuffer {
     /// Encode as a PNG (8-bit RGBA). Self-contained: uncompressed DEFLATE (stored
     /// blocks) so there is no compression dependency. Fine for reference dumps.
     pub fn to_png(&self) -> Vec<u8> {
-        let mut raw = Vec::with_capacity((self.width * self.height * 4 + self.height) as usize);
-        for y in 0..self.height {
-            raw.push(0); // filter: None
-            let row = (y * self.width * 4) as usize;
-            raw.extend_from_slice(&self.rgba[row..row + (self.width * 4) as usize]);
-        }
-
-        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&self.width.to_be_bytes());
-        ihdr.extend_from_slice(&self.height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, no filter, no interlace
-        write_chunk(&mut png, b"IHDR", &ihdr);
-        write_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
-        write_chunk(&mut png, b"IEND", &[]);
-        png
+        rgba_to_png(self.width, self.height, &self.rgba)
     }
+}
+
+/// Encode a tightly-packed RGBA8 image to PNG bytes (8-bit, no filter, stored deflate).
+/// The blob-free image sink shared by [`Framebuffer::to_png`] and diagnostics that want to
+/// write a decoded texture to disk (e.g. inspecting the albedo a draw sampled).
+pub fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let row_bytes = (width * 4) as usize;
+    let mut raw = Vec::with_capacity(rgba.len() + height as usize);
+    for y in 0..height as usize {
+        raw.push(0); // filter: None
+        let row = y * row_bytes;
+        raw.extend_from_slice(&rgba[row..row + row_bytes]);
+    }
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, no filter, no interlace
+    write_chunk(&mut png, b"IHDR", &ihdr);
+    write_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+    write_chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 /// Append a PNG chunk (length, type, data, CRC32).
@@ -124,6 +171,7 @@ impl Crc32 {
 
 /// GXM vertex attribute formats we decode (`SceGxmAttributeFormat`).
 const FORMAT_U8N: u8 = 4;
+const FORMAT_F16: u8 = 8;
 const FORMAT_F32: u8 = 9;
 
 /// A vertex pulled out of the stream in its native form: the raw position lanes
@@ -134,6 +182,10 @@ struct Vertex {
     pos: [f32; 3],
     uv: [f32; 2],
     color: [u8; 4],
+    /// Object-space vertex normal (unit-ish), or `[0,0,0]` when the mesh carries none. The
+    /// lit-material path brings it into world space (via the draw's model-to-world matrix)
+    /// for the directional-light N.L term.
+    normal: [f32; 3],
 }
 
 /// The coordinate space a draw's vertex positions live in - i.e. what the guest's
@@ -157,28 +209,79 @@ enum Space {
 struct Layout {
     pos_off: usize,
     pos_comps: usize,
+    pos_fmt: u8,
     uv_off: Option<usize>,
+    uv_fmt: u8,
     color_off: Option<usize>,
+    /// The vertex normal attribute (byte offset + float format), for lighting. It is the
+    /// lowest-offset >= 3-component float attribute that is NOT the position - the universal
+    /// interleaved layout puts the normal right after the position (`pos, normal, [tangent],
+    /// uv, color`). `None` when the mesh carries no such attribute (unlit / 2D geometry).
+    normal_off: Option<usize>,
+    normal_fmt: u8,
+}
+
+/// Whether an attribute format is a float lane the position/texcoord path decodes:
+/// F32 (`9`) or F16 half-float (`8`). 3D meshes commonly store UV/normal as F16.
+fn is_float_fmt(fmt: u8) -> bool {
+    fmt == FORMAT_F32 || fmt == FORMAT_F16
 }
 
 fn layout_of(d: &Draw) -> Layout {
-    // Float attributes, sorted by byte offset: the first is position, a second
-    // float2 is the texcoord (the near-universal 2D sprite layout pos.xy, uv.xy).
-    let mut floats: Vec<(usize, usize)> = d
+    // Float-lane attributes (F32 or F16), sorted by byte offset. The lowest-offset one
+    // with >= 3 components is the position; a 2-component float attribute is the
+    // texcoord (pos.xyz + uv.xy - the universal mesh layout, and pos.xy + uv.xy for a
+    // 2D sprite). Formats are tracked per lane so an F16 texcoord decodes correctly.
+    let mut floats: Vec<(usize, usize, u8)> = d
         .attributes
         .iter()
-        .filter(|a| a.format == FORMAT_F32 && a.component_count >= 2)
-        .map(|a| (a.offset as usize, a.component_count as usize))
+        .filter(|a| is_float_fmt(a.format) && a.component_count >= 2)
+        .map(|a| (a.offset as usize, a.component_count as usize, a.format))
         .collect();
     floats.sort_unstable();
-    let (pos_off, pos_comps) = floats.first().copied().unwrap_or((0, 3));
-    let uv_off = floats.get(1).map(|(o, _)| *o);
+    // Position: the first attribute with >= 3 components, else the first of any.
+    let pos = floats.iter().find(|(_, c, _)| *c >= 3).or_else(|| floats.first());
+    let (pos_off, pos_comps, pos_fmt) = pos.copied().unwrap_or((0, 3, FORMAT_F32));
+    // Texcoord: prefer a dedicated 2-component attribute (the classic pos.xyz + uv.xy
+    // layout); otherwise fall back to the lowest-offset non-position float attribute
+    // with >= 2 components, using its first two lanes. This title's world meshes pack
+    // the texcoord as the xy of a float4 (uv + an unused pair), so a strict comp==2
+    // match would miss it and draw the geometry untextured (a flat white fill).
+    let uv = floats
+        .iter()
+        .find(|(o, c, _)| *c == 2 && *o != pos_off)
+        .or_else(|| floats.iter().find(|(o, c, _)| *c >= 2 && *o != pos_off));
+    let (uv_off, uv_fmt) = match uv {
+        Some((o, _, f)) => (Some(*o), *f),
+        None => (None, FORMAT_F32),
+    };
     let color_off = d
         .attributes
         .iter()
         .find(|a| a.format == FORMAT_U8N && a.component_count >= 3)
         .map(|a| a.offset as usize);
-    Layout { pos_off, pos_comps, uv_off, color_off }
+    // Normal: the lowest-offset >= 3-component float attribute that is not the position
+    // (position is `floats[0]` after the sort; the normal is the next such attribute).
+    let (normal_off, normal_fmt) = match floats.iter().find(|(o, c, _)| *c >= 3 && *o != pos_off) {
+        Some((o, _, f)) => (Some(*o), *f),
+        None => (None, FORMAT_F32),
+    };
+    Layout { pos_off, pos_comps, pos_fmt, uv_off, uv_fmt, color_off, normal_off, normal_fmt }
+}
+
+/// Decode an IEEE-754 half-float (F16) to f32.
+pub fn half_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as f32;
+    let v = if exp == 0 {
+        mant * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        if h & 0x3ff == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (mant / 1024.0 + 1.0) * 2f32.powi(exp - 15)
+    };
+    if sign == 1 { -v } else { v }
 }
 
 /// Multiply column-major 4x4 `m` by the column vector `(x, y, z, 1)`.
@@ -197,19 +300,30 @@ fn transform(m: &[f32; 16], x: f32, y: f32, z: f32) -> [f32; 4] {
 fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
     let stride = d.vertex_stride.max(1) as usize;
     let base = i * stride;
-    let f = |off: usize| -> f32 {
+    // Read one lane as F32 (4 bytes) or F16 (2 bytes) per the attribute's format, so
+    // an F16-packed position or texcoord decodes to the right value. `stride_of` is the
+    // per-lane byte step (4 for F32, 2 for F16).
+    let lane = |off: usize, fmt: u8| -> f32 {
         let o = base + off;
-        if o + 4 <= d.vertices.len() {
+        if fmt == FORMAT_F16 {
+            if o + 2 <= d.vertices.len() {
+                half_to_f32(u16::from_le_bytes([d.vertices[o], d.vertices[o + 1]]))
+            } else {
+                0.0
+            }
+        } else if o + 4 <= d.vertices.len() {
             f32::from_le_bytes([d.vertices[o], d.vertices[o + 1], d.vertices[o + 2], d.vertices[o + 3]])
         } else {
             0.0
         }
     };
-    let px = f(layout.pos_off);
-    let py = f(layout.pos_off + 4);
-    let pz = if layout.pos_comps >= 3 { f(layout.pos_off + 8) } else { 0.0 };
+    let pstep = if layout.pos_fmt == FORMAT_F16 { 2 } else { 4 };
+    let px = lane(layout.pos_off, layout.pos_fmt);
+    let py = lane(layout.pos_off + pstep, layout.pos_fmt);
+    let pz = if layout.pos_comps >= 3 { lane(layout.pos_off + 2 * pstep, layout.pos_fmt) } else { 0.0 };
+    let ustep = if layout.uv_fmt == FORMAT_F16 { 2 } else { 4 };
     let uv = match layout.uv_off {
-        Some(o) => [f(o), f(o + 4)],
+        Some(o) => [lane(o, layout.uv_fmt), lane(o + ustep, layout.uv_fmt)],
         None => [0.0, 0.0],
     };
     let color = match layout.color_off {
@@ -223,13 +337,65 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
         }
         None => [255, 255, 255, 255],
     };
-    Vertex { pos: [px, py, pz], uv, color }
+    let normal = match layout.normal_off {
+        Some(o) => {
+            let nstep = if layout.normal_fmt == FORMAT_F16 { 2 } else { 4 };
+            [lane(o, layout.normal_fmt), lane(o + nstep, layout.normal_fmt), lane(o + 2 * nstep, layout.normal_fmt)]
+        }
+        None => [0.0, 0.0, 0.0],
+    };
+    Vertex { pos: [px, py, pz], uv, color, normal }
+}
+
+/// Transform an object-space normal by the model-to-world matrix's upper 3x3 (column-major)
+/// and normalize. Car/world parts use near-uniform scale, so the plain 3x3 (not the
+/// inverse-transpose) is faithful. A zero/degenerate result falls back to `[0,1,0]` (up).
+fn world_normal(n: [f32; 3], world: &[f32; 16]) -> [f32; 3] {
+    let x = world[0] * n[0] + world[4] * n[1] + world[8] * n[2];
+    let y = world[1] * n[0] + world[5] * n[1] + world[9] * n[2];
+    let z = world[2] * n[0] + world[6] * n[1] + world[10] * n[2];
+    let len = (x * x + y * y + z * z).sqrt();
+    if len > 1e-6 {
+        [x / len, y / len, z / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+/// The lit fragment colour for an opaque 3D draw: the standard forward-lit material the real
+/// fragment programs run - `albedo * tint`, lit by one directional light (`saturate(N.L) *
+/// light_col`) plus a flat `ambient` term - then scaled by scene `exposure` and Reinhard
+/// tone-mapped so HDR light (this title's key light is ~2.8x) rolls off instead of clipping.
+/// `n_world` is the interpolated, world-space surface normal (already normalized). Shared by
+/// the software rasterizer and mirrored exactly in the WGSL `fs_opaque` so the two agree.
+fn shade_lit(albedo: [f32; 3], n_world: [f32; 3], mat: &crate::capture::FragmentMaterial, exposure: f32) -> [u8; 3] {
+    // Light direction is world-space "direction to the light"; N.L is clamped to the front.
+    let l = {
+        let d = mat.light_dir;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len > 1e-6 { [d[0] / len, d[1] / len, d[2] / len] } else { [0.0, 1.0, 0.0] }
+    };
+    let ndotl = (n_world[0] * l[0] + n_world[1] * l[1] + n_world[2] * l[2]).max(0.0);
+    let mut out = [0u8; 3];
+    for ch in 0..3 {
+        let base = albedo[ch] / 255.0 * mat.tint[ch];
+        let light = mat.ambient[ch] + mat.light_col[ch] * ndotl;
+        let l = base * light * exposure;
+        // Reinhard tone-map keeps the HDR bright end from hard-clipping to flat white.
+        out[ch] = (l / (1.0 + l) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// Project a vertex's raw position into screen space for the given draw `space`,
 /// returning `[screen_x, screen_y, depth, 1/w]`, or `None` if the vertex is behind
-/// the eye (perspective `w <= 0`) and the triangle must be dropped.
-fn project(v: &Vertex, space: &Space, width: u32, height: u32) -> Option<[f32; 4]> {
+/// the eye (perspective `w <= 0`) and the triangle must be dropped. `width`/`height` are
+/// the RASTER dimensions (already scaled by any supersample factor). `ssaa` is that factor:
+/// clip-space draws (Mvp/Ndc) fill the raster via `width`/`height` and so scale for free, but
+/// a Pixel-space draw carries absolute native pixel coords, so they are multiplied by `ssaa`
+/// to cover the enlarged raster - exactly what the GPU's Pixel path does by mapping through the
+/// native `surf_w`/`surf_h` into a full-viewport clip space.
+fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Option<[f32; 4]> {
     let (wf, hf) = (width as f32, height as f32);
     match space {
         Space::Mvp(m) => {
@@ -248,8 +414,65 @@ fn project(v: &Vertex, space: &Space, width: u32, height: u32) -> Option<[f32; 4
             let sy = (1.0 - (v.pos[1] * 0.5 + 0.5)) * hf;
             Some([sx, sy, 0.0, 1.0])
         }
-        // Screen pixels already, Y down - straight through.
-        Space::Pixel => Some([v.pos[0], v.pos[1], 0.0, 1.0]),
+        // Screen pixels already, Y down - scaled to the (possibly supersampled) raster.
+        Space::Pixel => Some([v.pos[0] * ssaa, v.pos[1] * ssaa, 0.0, 1.0]),
+    }
+}
+
+/// SceGxmPrimitiveType selectors (the high-bit-encoded enum, gxm.h): triangle list,
+/// strip and fan all rasterize to triangles; lines/points/edges are not drawn.
+const PRIM_TRIANGLES: u32 = 0x0000_0000;
+const PRIM_TRIANGLE_STRIP: u32 = 0x0C00_0000;
+const PRIM_TRIANGLE_FAN: u32 = 0x1000_0000;
+
+/// SceGxmCullMode: which screen-space winding the GPU discards. NONE draws both
+/// faces; CW/CCW discard clockwise/counter-clockwise triangles respectively.
+const SCE_GXM_CULL_NONE: u32 = 0x0000_0000;
+const SCE_GXM_CULL_CW: u32 = 0x0000_0001;
+const SCE_GXM_CULL_CCW: u32 = 0x0000_0002;
+
+/// SCE_GXM_DEPTH_WRITE_DISABLED - depth writes off (a 2D alpha overlay, not opaque 3D).
+const SCE_GXM_DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
+
+/// The number of triangles a draw's topology emits from its index count.
+fn triangle_count(d: &Draw) -> usize {
+    match d.primitive {
+        PRIM_TRIANGLES => d.index_count as usize / 3,
+        PRIM_TRIANGLE_STRIP | PRIM_TRIANGLE_FAN => (d.index_count as usize).saturating_sub(2),
+        _ => 0,
+    }
+}
+
+/// The three vertex indices of triangle `t`, with winding NORMALIZED so every
+/// triangle presents the facing a triangle-list triangle would - a strip flips
+/// winding on odd triangles, so the last two indices are swapped there to undo it.
+/// Fill is winding-agnostic, but a consistent winding is what lets both the software
+/// rasterizer and the GPU cull back faces uniformly (the GPU sees an expanded
+/// triangle LIST, so the strip's alternation must be folded out here).
+fn tri_indices(d: &Draw, t: usize) -> [usize; 3] {
+    match d.primitive {
+        PRIM_TRIANGLE_STRIP => {
+            let (a, b, c) = (index_at(d, t), index_at(d, t + 1), index_at(d, t + 2));
+            if t & 1 == 0 { [a, b, c] } else { [a, c, b] }
+        }
+        PRIM_TRIANGLE_FAN => [index_at(d, 0), index_at(d, t + 1), index_at(d, t + 2)],
+        _ => [index_at(d, t * 3), index_at(d, t * 3 + 1), index_at(d, t * 3 + 2)],
+    }
+}
+
+/// Whether a triangle with signed screen-space area `area` (from [`edge`], in the
+/// Y-down framebuffer space [`project`] emits) is culled under `cull_mode`. The winding
+/// sign is pinned EMPIRICALLY against this title's ground plane: the ground is a
+/// `SCE_GXM_CULL_CCW` mesh whose camera-facing front faces must survive, and in the
+/// Y-down screen space `project` emits (with strip winding normalized by `tri_indices`)
+/// those front faces have POSITIVE `edge` area - so CCW-cull discards `area < 0` and
+/// CW-cull discards `area > 0`. A near-zero area (an edge-on / degenerate triangle) is
+/// left to the caller's separate degeneracy check.
+fn cull_backface(area: f32, cull_mode: u32) -> bool {
+    match cull_mode {
+        SCE_GXM_CULL_CCW => area < 0.0,
+        SCE_GXM_CULL_CW => area > 0.0,
+        _ => false,
     }
 }
 
@@ -404,6 +627,36 @@ fn bc3_alpha(block: &[u8], t: usize) -> u8 {
         7 => 255,
         c => (((6 - c as u32) * a0i + (c as u32 - 1) * a1i) / 5) as u8,
     }
+}
+
+/// The mean RGB (each channel in [0,1]) of a captured texture, decoded through the exact
+/// per-texel path the sampler uses. Used to reduce a small `diffuseAmbientMap` irradiance
+/// probe to a single flat ambient colour for the lit material model. Samples on a bounded
+/// grid (at most ~32x32 taps) so a large texture costs no more than a small one. Returns
+/// `None` for an empty or undecodable texture (the caller keeps its default ambient).
+pub fn texture_mean_rgb(t: &BoundTexture) -> Option<[f32; 3]> {
+    if t.width == 0 || t.height == 0 || block_layout(t.base_format).is_none() {
+        return None;
+    }
+    let steps_x = t.width.min(32);
+    let steps_y = t.height.min(32);
+    let (mut r, mut g, mut b) = (0f32, 0f32, 0f32);
+    let mut n = 0f32;
+    for sy in 0..steps_y {
+        for sx in 0..steps_x {
+            let x = sx * t.width / steps_x;
+            let y = sy * t.height / steps_y;
+            let px = texel_rgba(t, x.min(t.width - 1), y.min(t.height - 1));
+            r += px[0] as f32;
+            g += px[1] as f32;
+            b += px[2] as f32;
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        return None;
+    }
+    Some([r / n / 255.0, g / n / 255.0, b / n / 255.0])
 }
 
 /// Point-sample a captured texture at normalized `(u, v)` (REPEAT wrap) and decode
@@ -641,13 +894,15 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
     // left over from a previous draw must not tint an untextured fill.
     let textured = layout.uv_off.is_some() && !d.textures.is_empty();
 
-    // GXM texcoords are either normalized [0,1] or in texel units, chosen by the
-    // (unavailable) fragment program's sampler. Infer from magnitude: a coord well
-    // past 1 is a texel index into an atlas (some titles' text quads index a font atlas
-    // in pixels), which we normalize by the texture size. Normalized sprite UVs
-    // (<= ~1) pass through unchanged.
+    // Texcoord divisor. A 2D UI text quad can index a font atlas in PIXEL units (coords
+    // well past 1), which we normalize by the texture size. A 3D mesh (MVP space) instead
+    // uses normalized coords that legitimately exceed 1 to TILE the texture (REPEAT wrap),
+    // e.g. a ground plane whose detail texture repeats ~17x - dividing those by the texture
+    // size would collapse the whole surface onto one corner texel (a flat smear). So only
+    // apply the texel-unit normalization to non-MVP (2D) draws; 3D UVs pass through and the
+    // sampler's REPEAT wrap handles the tiling.
     let uv_div = match (textured, d.textures.first()) {
-        (true, Some(tex)) => {
+        (true, Some(tex)) if !matches!(space, Space::Mvp(_)) => {
             let stride = d.vertex_stride.max(1) as usize;
             let nverts = d.vertices.len() / stride;
             let mut max_uv = 0f32;
@@ -669,8 +924,32 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
     DrawInterp { layout, space, textured, uv_div, skip }
 }
 
-/// Rasterize one scene into a fresh framebuffer. `clear` is the background color.
+/// Rasterize one scene into a fresh framebuffer at native resolution. `clear` is the
+/// background color. This is the 1x path (the oracle the GPU parity probe compares against);
+/// [`render_scene_supersampled`] wraps it with antialiasing.
 pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> Framebuffer {
+    render_scene_raster(scene, width, height, clear, 1)
+}
+
+/// Rasterize a scene with `ssaa`x supersampling: render at `ssaa * (width, height)` and
+/// box-downsample to `width x height`. This antialiases the geometric aliasing a
+/// heavily-tessellated distant mesh (dozens of sub-pixel triangles per final pixel) and
+/// coincident-panel z-fighting produce as speckle at 1x, and mirrors the GPU renderer's
+/// `set_supersample` so the software oracle and the GPU stay in lockstep at any factor.
+/// `ssaa == 1` is identical to [`render_scene`].
+pub fn render_scene_supersampled(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
+    let s = ssaa.max(1);
+    if s == 1 {
+        return render_scene(scene, width, height, clear);
+    }
+    render_scene_raster(scene, width * s, height * s, clear, s).downsampled(s)
+}
+
+/// The rasterizer core. `width`/`height` are the RASTER dimensions and `ssaa` the supersample
+/// factor those already fold in (so Pixel-space draws scale by it - see [`project`]); the
+/// caller downsamples the result. `clear` is the background color.
+fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
+    let ssaa = ssaa.max(1) as f32;
     let mut fb = Framebuffer::new(width, height, clear);
     let mut depth = vec![f32::INFINITY; (width * height) as usize];
 
@@ -682,35 +961,68 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
         Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
     });
 
+    // Diagnostic: VITASLOP_DRAW_STATS prints, per draw, whether it was skipped/culled and
+    // how many framebuffer pixels it actually wrote - so a big environment mesh that renders
+    // to nothing (off-screen projection, wrongly skipped, or fully culled) is visible instead
+    // of a silently-missing background. Off by default (a per-draw drawn-pixel diff).
+    let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+
+    // Diagnostic: VITASLOP_UV_DEBUG paints each depth-tested draw by its interpolated texcoord
+    // (R=u.fract, G=v.fract) - a coherent per-panel UV reads as smooth gradients, a scrambled one
+    // as noise. Read once here (not per triangle) so the hot path stays clean.
+    let uv_debug = std::env::var("VITASLOP_UV_DEBUG").is_ok();
+
     for (di, d) in scene.draws.iter().enumerate() {
-        // Only triangle lists are handled (SCE_GXM_PRIMITIVE_TRIANGLES = 0).
-        if d.primitive != 0 {
+        // A list emits idx/3 triangles; a strip or fan emits idx-2 (each new index adds
+        // one triangle). Any other topology (lines, points) emits none and is skipped.
+        let tri_count = triangle_count(d);
+        if tri_count == 0 {
+            if stats {
+                eprintln!("DSTAT draw {di} SKIP=nontriangle prim={:#x} idx={}", d.primitive, d.index_count);
+            }
             continue;
         }
         let DrawInterp { layout, space, textured, uv_div, skip } = interpret_draw(d);
         if skip {
+            if stats {
+                eprintln!("DSTAT draw {di} SKIP=no-color-no-uv tris={tri_count} stride={}", d.vertex_stride);
+            }
             continue;
         }
+        let pixels_before = if stats { fb.drawn_pixels(clear) } else { 0 };
         // Opaque, z-buffered replace only for genuinely opaque 3D geometry: an MVP draw
         // that also WRITES depth. A 2D UI overlay positions itself with an MVP too but
         // disables depth writes (SCE_GXM_DEPTH_WRITE_DISABLED) and is alpha-blended in
         // submission order - so keying "opaque" off the mere presence of an MVP splats
         // such a sprite's transparent texels as solid colour over everything behind it.
-        const SCE_GXM_DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
         let depth_test = matches!(space, Space::Mvp(_))
             && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED;
+        let depth_func = d.render_state.front_depth_func;
+        // Back-face culling as the GPU does it, per the draw's SceGxmCullMode. Real 3D
+        // titles enable it on nearly every world/vehicle mesh; without it the hidden
+        // interior faces of a thin shell z-fight the outer faces into speckle. Only
+        // 3D (MVP) draws are culled - a 2D sprite has no meaningful facing and its
+        // winding is submission-defined. NONE (the double-sided body panels) skips it.
+        let cull_mode = if matches!(space, Space::Mvp(_)) {
+            d.render_state.cull_mode
+        } else {
+            SCE_GXM_CULL_NONE
+        };
         let texture = if textured { d.textures.first() } else { None };
+        let (mut n_behind, mut n_off, mut n_on) = (0u32, 0u32, 0u32);
+        let (mut bb_lo, mut bb_hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
 
-        let tri_count = d.index_count as usize / 3;
         for t in 0..tri_count {
-            let vs = [index_at(d, t * 3), index_at(d, t * 3 + 1), index_at(d, t * 3 + 2)];
+            // Winding-normalized triangle (a strip's odd triangles are un-flipped) so the
+            // cull test below is uniform across list/strip/fan.
+            let vs = tri_indices(d, t);
             let verts: Vec<Vertex> = vs.iter().map(|&i| decode_vertex(d, &layout, i)).collect();
 
             // Project to screen; drop the triangle if any vertex is behind the eye.
             let mut screen = [[0f32; 4]; 3]; // x, y, depth, 1/w
             let mut behind = false;
             for (k, v) in verts.iter().enumerate() {
-                match project(v, &space, width, height) {
+                match project(v, &space, width, height, ssaa) {
                     Some(s) => screen[k] = s,
                     None => {
                         behind = true;
@@ -719,9 +1031,31 @@ pub fn render_scene(scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> F
                 }
             }
             if behind {
+                n_behind += 1;
                 continue;
             }
-            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test, trace, di);
+            if stats {
+                let on = screen.iter().any(|s| s[0] >= 0.0 && s[0] < width as f32 && s[1] >= 0.0 && s[1] < height as f32);
+                if on { n_on += 1 } else { n_off += 1 }
+                for s in &screen {
+                    bb_lo[0] = bb_lo[0].min(s[0]); bb_lo[1] = bb_lo[1].min(s[1]);
+                    bb_hi[0] = bb_hi[0].max(s[0]); bb_hi[1] = bb_hi[1].max(s[1]);
+                }
+            }
+            // Cull back faces before rasterizing (screen-space winding).
+            if cull_mode != SCE_GXM_CULL_NONE && cull_backface(edge(&screen[0], &screen[1], &screen[2]), cull_mode) {
+                continue;
+            }
+            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug);
+        }
+        if stats {
+            let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
+            let sp = match space { Space::Mvp(_) => "mvp", Space::Ndc => "ndc", Space::Pixel => "pixel" };
+            eprintln!(
+                "DSTAT draw {di} space={sp} dtest={depth_test} cull={:#x} tris={tri_count} on={n_on} off={n_off} behind={n_behind} wrote+{wrote} bbox=[{:.0},{:.0}..{:.0},{:.0}] tex={}",
+                cull_mode, bb_lo[0], bb_lo[1], bb_hi[0], bb_hi[1],
+                d.textures.first().map(|t| format!("{}x{}", t.width, t.height)).unwrap_or_default()
+            );
         }
     }
     fb
@@ -738,10 +1072,21 @@ fn raster_triangle(
     texture: Option<&BoundTexture>,
     uv_div: [f32; 2],
     depth_test: bool,
+    depth_func: u32,
+    exposure: f32,
+    material: &crate::capture::FragmentMaterial,
+    world: &[f32; 16],
     trace: Option<(i32, i32)>,
     draw_idx: usize,
+    uv_debug: bool,
 ) {
     let (w, h) = (fb.width as i32, fb.height as i32);
+    // World-space normals at the three vertices (constant per triangle), interpolated per
+    // pixel below for the lit opaque path. Object-space normals are brought to world space
+    // by the draw's model-to-world matrix so N.L matches the world-space light direction.
+    let wn: [[f32; 3]; 3] =
+        [world_normal(verts[0].normal, world), world_normal(verts[1].normal, world), world_normal(verts[2].normal, world)];
+    let has_normal = verts.iter().any(|v| v.normal != [0.0, 0.0, 0.0]);
     let min_x = s.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
     let max_x = s.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil().min((w - 1) as f32) as i32;
     let min_y = s.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
@@ -770,13 +1115,6 @@ fn raster_triangle(
             }
             let (b0, b1, b2) = (w0 / area, w1 / area, w2 / area);
             let idx = (y * w + x) as usize;
-            if depth_test {
-                let z = b0 * s[0][2] + b1 * s[1][2] + b2 * s[2][2];
-                if z >= depth[idx] {
-                    continue;
-                }
-                depth[idx] = z;
-            }
 
             // Perspective-correct interpolation: weight each attribute by 1/w and
             // renormalize by the interpolated 1/w.
@@ -784,6 +1122,37 @@ fn raster_triangle(
             let interp = |a: f32, b: f32, c: f32| -> f32 {
                 (b0 * s[0][3] * a + b1 * s[1][3] * b + b2 * s[2][3] * c) / iw
             };
+            // Depth COMPARE first (an early reject that avoids sampling occluded pixels), then
+            // the texel, then - for an opaque decal layer - the alpha-test, then the depth WRITE.
+            // Splitting compare from write lets a transparent decal texel be discarded WITHOUT
+            // writing depth, while occluded pixels still skip the texture sample (perf).
+            let z = b0 * s[0][2] + b1 * s[1][2] + b2 * s[2][2];
+            if depth_test && !depth_passes(z, depth[idx], depth_func) {
+                continue;
+            }
+            // Sample the albedo/detail texel. `uv_div` normalizes an atlas-in-pixels 2D coord.
+            let texel = texture.map(|tex| {
+                let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
+                let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
+                sample_texture(tex, u, v)
+            });
+            // Alpha-test for opaque LIVERY / DECAL layers: this title draws a car's numbers and
+            // logos as a separate opaque, depth-writing mesh whose picked albedo is a BC2/BC3
+            // sheet carrying a COVERAGE alpha (transparent between the marks). Rendered as a flat
+            // opaque replace this paints the sheet's black background as speckle over the body;
+            // discarding the transparent texels (and NOT writing depth) lets the body panel drawn
+            // behind it show through, the faithful decal result. Safe for the ordinary opaque
+            // BC1 albedo (its alpha is always 255, so nothing is discarded).
+            const ALPHA_TEST: u8 = 128;
+            if depth_test {
+                if let Some(t) = texel {
+                    if t[3] < ALPHA_TEST {
+                        continue;
+                    }
+                }
+                depth[idx] = z;
+            }
+
             let mut src = [0f32; 4];
             for ch in 0..4 {
                 src[ch] = interp(
@@ -792,28 +1161,32 @@ fn raster_triangle(
                     verts[2].color[ch] as f32,
                 );
             }
-            // Combine the sampled texel with the interpolated vertex color. The shape
-            // alpha comes from the TEXTURE, not the vertex alpha - titles routinely draw
-            // a UI sprite whose vertices carry alpha 0 while the texture's own alpha (a
-            // BC3 sprite mask, or a font atlas's coverage) defines what is opaque; using
-            // the vertex alpha there would erase the sprite entirely.
-            if let Some(tex) = texture {
-                let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
-                let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
-                let texel = sample_texture(tex, u, v);
-                if matches!(tex.base_format, 0x00 | 0x01) {
-                    // Single-channel coverage mask (font/alpha atlas): the texel is pure
-                    // coverage. Keep the vertex color and take coverage as alpha;
-                    // modulating the color by coverage as well would double-darken the
-                    // anti-aliased glyph edges.
-                    src[3] = texel[3] as f32;
+            // Combine the sampled texel with the interpolated vertex color as the GXM
+            // fixed-function "modulate" default does: per-channel product after the
+            // texture's own swizzle is applied. This is correct for every texel role
+            // because the swizzle already encodes intent:
+            //   - a color texture (RGBA) modulates the vertex tint straight;
+            //   - a font/coverage atlas (single channel swizzled 111R/000R) leaves rgb
+            //     at 1/0 and carries coverage in alpha, so rgb passes the vertex color
+            //     through and alpha becomes vertex-alpha * coverage - no double-darkening;
+            //   - a single-channel LUMINANCE map (swizzled RRRR, e.g. this title's ground
+            //     detail texture) replicates into rgba, tinting the vertex color by
+            //     luminance instead of being mistaken for a pure alpha mask.
+            if let Some(texel) = texel {
+                if depth_test {
+                    // 3D opaque geometry (world / vehicles): the base colour is the albedo
+                    // texture. This title's meshes carry NON-colour data in the vertex
+                    // colour attribute (e.g. [255,0,255] mask/lighting encodings the real
+                    // fragment program consumes), so modulating the albedo by it would
+                    // tint whole surfaces magenta. Take the albedo texel straight; the
+                    // opaque path forces alpha to 255 below.
+                    src[..3].copy_from_slice(&[texel[0] as f32, texel[1] as f32, texel[2] as f32]);
                 } else {
-                    // Color texture: modulate rgb (texture * vertex color), shape alpha
-                    // from the texture.
-                    for ch in 0..3 {
+                    // 2D / overlay: vertex colour is the real tint and the texture supplies
+                    // coverage/detail, so modulate per channel (swizzle already applied).
+                    for ch in 0..4 {
                         src[ch] = src[ch] * texel[ch] as f32 / 255.0;
                     }
-                    src[3] = texel[3] as f32;
                 }
             }
 
@@ -836,11 +1209,38 @@ fn raster_triangle(
             }
             let dst = idx * 4;
             if depth_test {
-                // Opaque replace (with the z-buffer already updated).
-                for ch in 0..4 {
-                    fb.rgba[dst + ch] = src[ch].round().clamp(0.0, 255.0) as u8;
+                // Opaque 3D replace (z-buffer already updated): run the reflected forward-lit
+                // material. `src[..3]` is the albedo (the sampled texel, or the vertex colour
+                // for an untextured opaque draw); shade it by the per-material tint + the
+                // directional light (interpolated world-space normal) + ambient, then apply
+                // scene exposure and tone-map. This is what turns a near-white tyre albedo
+                // (tint ~0.01) into dark rubber instead of a white ring, and gives the body
+                // panels form instead of a flat over-bright fill.
+                let n = if has_normal {
+                    let nx = interp(wn[0][0], wn[1][0], wn[2][0]);
+                    let ny = interp(wn[0][1], wn[1][1], wn[2][1]);
+                    let nz = interp(wn[0][2], wn[1][2], wn[2][2]);
+                    let len = (nx * nx + ny * ny + nz * nz).sqrt();
+                    if len > 1e-6 { [nx / len, ny / len, nz / len] } else { [0.0, 1.0, 0.0] }
+                } else {
+                    [0.0, 1.0, 0.0]
+                };
+                let lit = shade_lit([src[0], src[1], src[2]], n, material, exposure);
+                // DEBUG (VITASLOP_UV_DEBUG): paint the interpolated texcoord as R=u.fract,
+                // G=v.fract so a coherent per-panel UV mapping reads as smooth red/green
+                // gradients, while a scrambled/mis-decoded UV reads as noise - the decisive
+                // test for whether a speckled textured draw is a UV bug or genuine atlas content.
+                if uv_debug && texture.is_some() {
+                    let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
+                    let v = interp(verts[0].uv[1], verts[1].uv[1], verts[2].uv[1]) / uv_div[1];
+                    fb.rgba[dst] = ((u - u.floor()) * 255.0) as u8;
+                    fb.rgba[dst + 1] = ((v - v.floor()) * 255.0) as u8;
+                    fb.rgba[dst + 2] = 40;
+                    fb.rgba[dst + 3] = 255;
+                } else {
+                    fb.rgba[dst..dst + 3].copy_from_slice(&lit);
+                    fb.rgba[dst + 3] = 255;
                 }
-                fb.rgba[dst + 3] = 255;
             } else {
                 // Straight-alpha src-over blend for 2D sprites.
                 let a = (src[3] / 255.0).clamp(0.0, 1.0);
@@ -858,6 +1258,35 @@ fn raster_triangle(
 /// Twice the signed area of triangle (a, b, c) in screen space (only x,y used).
 fn edge(a: &[f32; 4], b: &[f32; 4], c: &[f32; 4]) -> f32 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// Whether a fragment at depth `z` passes the z-test against the stored depth
+/// `stored` under a `SceGxmDepthFunc`. The z-buffer stores nearer = smaller (cleared
+/// to +inf), so `LESS`/`LESS_EQUAL` are the ordinary "closer wins" tests. Real titles
+/// use `LESS_EQUAL` (its default), which lets a coincident later face tie and repaint -
+/// the correct behaviour for the double-sided body panels a strict `LESS` would leave to
+/// whichever face happened to draw first. The full enum is honoured so an unusual pass
+/// (an ALWAYS/GREATER overlay) reproduces rather than being forced to LESS.
+fn depth_passes(z: f32, stored: f32, func: u32) -> bool {
+    const NEVER: u32 = 0x0000_0000;
+    const LESS: u32 = 0x0040_0000;
+    const EQUAL: u32 = 0x0080_0000;
+    const LESS_EQUAL: u32 = 0x00C0_0000;
+    const GREATER: u32 = 0x0100_0000;
+    const NOT_EQUAL: u32 = 0x0140_0000;
+    const GREATER_EQUAL: u32 = 0x0180_0000;
+    const ALWAYS: u32 = 0x01C0_0000;
+    match func {
+        NEVER => false,
+        LESS => z < stored,
+        EQUAL => z == stored,
+        GREATER => z > stored,
+        NOT_EQUAL => z != stored,
+        GREATER_EQUAL => z >= stored,
+        ALWAYS => true,
+        // LESS_EQUAL is the GXM default; treat any unrecognized encoding as it.
+        LESS_EQUAL | _ => z <= stored,
+    }
 }
 
 use std::collections::HashMap;
@@ -945,20 +1374,35 @@ impl RenderSceneBuilder {
             self.decode_cache.clear();
         }
         let (width, height, rgba) = decode_texture_rgba8(t);
-        let g = GxmTexture { key, width, height, rgba: Arc::new(rgba) };
+        // Carry the magnification filter so the GPU picks the matching sampler (LINEAR ->
+        // bilinear, as the software `sample_texture_bilinear` does). SceGxmTextureFilter:
+        // 1 = LINEAR, 0 = POINT.
+        let filter_linear = t.mag_filter == 1;
+        let g = GxmTexture { key, width, height, rgba: Arc::new(rgba), filter_linear };
         self.decode_cache.insert(key, g.clone());
         g
     }
 
     /// Reduce a captured scene to general draws. Each triangle-list draw is decoded
     /// into the canonical vertex layout (position, uv already divided by the draw's uv
-    /// scale, color) with a 32-bit index buffer, and its texture (if it samples one)
-    /// decoded to linear RGBA8. Non-triangle-list draws are skipped, matching the
-    /// software rasterizer.
+    /// scale, color) with a triangle-LIST 32-bit index buffer, and its texture (if it
+    /// samples one) decoded to linear RGBA8. Triangle list/strip/fan are all supported and
+    /// expanded to a flat list (the GPU pipeline is TriangleList topology); non-triangle
+    /// topologies (lines/points) are skipped, matching the software rasterizer. Getting
+    /// strips right is essential: a real 3D title emits the overwhelming majority of its
+    /// world/vehicle meshes as triangle STRIPS, so dropping them (as an earlier
+    /// list-only build did) rendered the whole 3D world black while the 2D UI still showed.
     pub fn build(&mut self, scene: &Scene) -> RenderScene {
         let mut draws = Vec::with_capacity(scene.draws.len());
+        // Visible opaque depth range (post-divide c.z/c.w), accumulated across draws for
+        // the GPU's linear depth normalization.
+        let mut dmin = f32::INFINITY;
+        let mut dmax = f32::NEG_INFINITY;
         for d in &scene.draws {
-            if d.primitive != 0 || d.index_count == 0 {
+            // A list emits idx/3 triangles; a strip or fan emits idx-2. Any other topology
+            // (lines/points) emits none and is skipped.
+            let tri_count = triangle_count(d);
+            if tri_count == 0 {
                 continue;
             }
             let interp = interpret_draw(d);
@@ -966,6 +1410,21 @@ impl RenderSceneBuilder {
                 continue;
             }
             let layout = &interp.layout;
+
+            // The opaque (depth-tested, texel-only, tone-mapped) decision - identical to
+            // the software rasterizer's `depth_test`: an MVP-space draw that also writes
+            // depth. An MVP draw with depth writes DISABLED is a 2D alpha-blended overlay.
+            let opaque = matches!(interp.space, Space::Mvp(_))
+                && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED;
+            // The MVP of any MVP-space draw (for the cull test / behind-eye drop below);
+            // depth-range accumulation additionally requires it be opaque.
+            let mvp = match &interp.space {
+                Space::Mvp(m) => Some(*m),
+                _ => None,
+            };
+            // Cull mode: only 3D (MVP) draws have a meaningful facing; a 2D sprite's
+            // winding is submission-defined, so it is never culled (matches `render_scene`).
+            let cull_mode = if mvp.is_some() { d.render_state.cull_mode } else { SCE_GXM_CULL_NONE };
 
             // The largest index referenced, so the vertex buffer covers every index
             // (an out-of-range index decodes to a zero vertex, matching the software
@@ -976,6 +1435,14 @@ impl RenderSceneBuilder {
             }
             let stride = d.vertex_stride.max(1) as usize;
             let nverts = (d.vertices.len() / stride).max(max_idx + 1);
+
+            // Screen positions of every vertex for MVP draws, so the cull test and
+            // behind-eye drop below reuse one projection per vertex (not per triangle).
+            // `project` applies the same Y-flip the software rasterizer uses; only the
+            // winding SIGN matters here, so any positive surface size gives the identical
+            // cull decision as the real target. `None` = behind the eye (w <= 0).
+            let mut screen_pos: Vec<Option<[f32; 4]>> =
+                if mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
 
             let mut vertices = Vec::with_capacity(nverts * GXM_VERTEX_STRIDE as usize);
             for i in 0..nverts {
@@ -988,12 +1455,58 @@ impl RenderSceneBuilder {
                 vertices.extend_from_slice(&(v.uv[0] / interp.uv_div[0]).to_le_bytes());
                 vertices.extend_from_slice(&(v.uv[1] / interp.uv_div[1]).to_le_bytes());
                 vertices.extend_from_slice(&v.color);
+                // World-space normal for the opaque lighting term, baked here (object normal
+                // through the draw's model-to-world matrix) so the GPU shader uses it directly
+                // and matches the software rasterizer's `world_normal` exactly. A mesh with no
+                // normal yields `[0,1,0]` (up), the same fallback the software path uses.
+                let wn = world_normal(v.normal, &d.world);
+                vertices.extend_from_slice(&wn[0].to_le_bytes());
+                vertices.extend_from_slice(&wn[1].to_le_bytes());
+                vertices.extend_from_slice(&wn[2].to_le_bytes());
+                if mvp.is_some() {
+                    // Cull only needs the winding SIGN, so any uniform scale works; ssaa is 1
+                    // here (the GPU applies supersampling itself via an enlarged render target).
+                    screen_pos.push(project(&v, &interp.space, 4096, 4096, 1.0));
+                }
+                // Accumulate the visible opaque depth range (post-divide c.z/c.w over
+                // on-screen vertices) so the GPU can linearly normalize depth into [0,1]
+                // at full precision - see `RenderScene::depth_min`/`depth_scale`.
+                if opaque {
+                    if let Some(m) = mvp {
+                        let c = transform(&m, v.pos[0], v.pos[1], v.pos[2]);
+                        if c[3] > 1e-4 {
+                            let (nx, ny, nz) = (c[0] / c[3], c[1] / c[3], c[2] / c[3]);
+                            if nx.abs() <= 1.0 && ny.abs() <= 1.0 && nz.is_finite() {
+                                dmin = dmin.min(nz);
+                                dmax = dmax.max(nz);
+                            }
+                        }
+                    }
+                }
             }
 
-            let mut indices = Vec::with_capacity(d.index_count as usize * 4);
-            for i in 0..d.index_count as usize {
-                indices.extend_from_slice(&(index_at(d, i) as u32).to_le_bytes());
+            // Expand the topology into a flat triangle-LIST index buffer with winding
+            // NORMALIZED (`tri_indices` un-flips a strip's odd triangles), CPU-culling back
+            // faces and dropping behind-eye triangles exactly as the software rasterizer
+            // does. Doing the cull here (not via GPU pipeline state) keeps the GPU a
+            // pixel-faithful twin with one cull-free pipeline and no per-draw facing state.
+            let mut indices = Vec::with_capacity(tri_count * 3 * 4);
+            for t in 0..tri_count {
+                let vs = tri_indices(d, t);
+                if mvp.is_some() {
+                    let s: [[f32; 4]; 3] = match [screen_pos[vs[0]], screen_pos[vs[1]], screen_pos[vs[2]]] {
+                        [Some(a), Some(b), Some(c)] => [a, b, c],
+                        _ => continue, // a vertex is behind the eye - drop the triangle
+                    };
+                    if cull_mode != SCE_GXM_CULL_NONE && cull_backface(edge(&s[0], &s[1], &s[2]), cull_mode) {
+                        continue;
+                    }
+                }
+                for k in vs {
+                    indices.extend_from_slice(&(k as u32).to_le_bytes());
+                }
             }
+            let index_count = (indices.len() / 4) as u32;
 
             let texture = if interp.textured {
                 d.textures.first().map(|t| self.texture(t))
@@ -1005,11 +1518,276 @@ impl RenderSceneBuilder {
                 space: to_draw_space(&interp.space),
                 vertices,
                 indices,
-                index_count: d.index_count,
+                index_count,
                 texture,
+                opaque,
+                exposure: d.exposure,
+                material: vitaslop_platform::gpu::GxmMaterial {
+                    tint: d.material.tint,
+                    light_dir: d.material.light_dir,
+                    light_col: d.material.light_col,
+                    ambient: d.material.ambient,
+                },
             });
         }
-        RenderScene { draws }
+        // Linear depth-normalization params: map the visible opaque depth range to [0,1].
+        // A degenerate range (no opaque geometry, or a single coplanar depth) yields
+        // scale 0, so every opaque fragment maps to depth 0 (submission order decides, as
+        // the software oracle's +INF-clear Less test does among equal depths).
+        let (depth_min, depth_scale) = if dmax > dmin {
+            (dmin, 1.0 / (dmax - dmin))
+        } else {
+            (0.0, 0.0)
+        };
+        RenderScene { draws, depth_min, depth_scale }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    //! Content-free tests for the geometry-stage logic the render output depends on:
+    //! triangle-strip winding normalization, per-`SceGxmCullMode` back-face culling, and
+    //! the depth-compare function. No game data. These pin the decisions the software
+    //! rasterizer and the GPU builder ([`RenderSceneBuilder::build`]) both make, so the two
+    //! paths stay in lockstep.
+    use super::*;
+    use crate::capture::RenderState;
+
+    fn strip_draw(indices: &[u16]) -> Draw {
+        Draw {
+            primitive: PRIM_TRIANGLE_STRIP,
+            index_format: 0,
+            index_count: indices.len() as u32,
+            vertices: vec![],
+            vertex_stride: 1,
+            attributes: vec![],
+            indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect(),
+            uniforms: vec![],
+            textures: vec![],
+            render_state: RenderState::default(),
+            exposure: 1.0,
+            material: crate::capture::FragmentMaterial::default(),
+            world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn strip_winding_is_normalized_per_triangle() {
+        // A strip's triangles alternate winding; `tri_indices` un-flips the odd ones so
+        // every triangle presents the facing a triangle-list triangle would - the premise
+        // the cull test relies on.
+        let d = strip_draw(&[0, 1, 2, 3, 4]);
+        assert_eq!(tri_indices(&d, 0), [0, 1, 2]); // even: as-is
+        assert_eq!(tri_indices(&d, 1), [1, 3, 2]); // odd: [1,2,3] with last two swapped
+        assert_eq!(tri_indices(&d, 2), [2, 3, 4]); // even: as-is
+    }
+
+    #[test]
+    fn list_and_fan_indices() {
+        let mut d = strip_draw(&[0, 1, 2, 3, 4, 5]);
+        d.primitive = PRIM_TRIANGLES;
+        assert_eq!(tri_indices(&d, 0), [0, 1, 2]);
+        assert_eq!(tri_indices(&d, 1), [3, 4, 5]);
+        d.primitive = PRIM_TRIANGLE_FAN;
+        assert_eq!(tri_indices(&d, 0), [0, 1, 2]);
+        assert_eq!(tri_indices(&d, 1), [0, 2, 3]);
+        assert_eq!(tri_indices(&d, 2), [0, 3, 4]);
+    }
+
+    #[test]
+    fn triangle_count_by_topology() {
+        let mut d = strip_draw(&[0, 1, 2, 3, 4]); // 5 indices
+        assert_eq!(triangle_count(&d), 3); // strip / fan: idx - 2
+        d.primitive = PRIM_TRIANGLE_FAN;
+        assert_eq!(triangle_count(&d), 3);
+        d.primitive = PRIM_TRIANGLES;
+        d.index_count = 6;
+        assert_eq!(triangle_count(&d), 2); // list: idx / 3
+        d.primitive = 0x0400_0000; // lines: not drawn
+        assert_eq!(triangle_count(&d), 0);
+    }
+
+    /// A screen triangle (Y-down, as `project` emits) with a chosen facing. `[a,b,c]` here
+    /// has POSITIVE `edge` area (the front face by the convention pinned in `cull_backface`
+    /// and validated against the title's ground plane); swapping the last two flips it.
+    fn tri(front: bool) -> [[f32; 4]; 3] {
+        let a = [0.0, 0.0, 0.0, 1.0];
+        let b = [1.0, 0.0, 0.0, 1.0];
+        let c = [0.0, 1.0, 0.0, 1.0];
+        if front { [a, b, c] } else { [a, c, b] }
+    }
+
+    #[test]
+    fn cull_mode_discards_the_back_face_only() {
+        let (f, b) = (tri(true), tri(false));
+        let (af, ab) = (edge(&f[0], &f[1], &f[2]), edge(&b[0], &b[1], &b[2]));
+        assert!(af > 0.0 && ab < 0.0, "front area positive, back negative: {af} {ab}");
+        // CCW-cull discards the back face (area < 0), keeps the front.
+        assert!(!cull_backface(af, SCE_GXM_CULL_CCW));
+        assert!(cull_backface(ab, SCE_GXM_CULL_CCW));
+        // CW-cull is the mirror image.
+        assert!(cull_backface(af, SCE_GXM_CULL_CW));
+        assert!(!cull_backface(ab, SCE_GXM_CULL_CW));
+        // NONE keeps both faces (the double-sided body panels).
+        assert!(!cull_backface(af, SCE_GXM_CULL_NONE));
+        assert!(!cull_backface(ab, SCE_GXM_CULL_NONE));
+    }
+
+    #[test]
+    fn depth_func_semantics() {
+        const NEVER: u32 = 0x0000_0000;
+        const LESS: u32 = 0x0040_0000;
+        const EQUAL: u32 = 0x0080_0000;
+        const LESS_EQUAL: u32 = 0x00C0_0000;
+        const GREATER: u32 = 0x0100_0000;
+        const ALWAYS: u32 = 0x01C0_0000;
+        // LESS_EQUAL (GXM default + this title's opaque draws): nearer passes AND a
+        // coincident later face ties and repaints.
+        assert!(depth_passes(4.0, 5.0, LESS_EQUAL));
+        assert!(depth_passes(5.0, 5.0, LESS_EQUAL));
+        assert!(!depth_passes(6.0, 5.0, LESS_EQUAL));
+        // LESS is strict: a coincident face does NOT repaint (first-drawn wins).
+        assert!(depth_passes(4.0, 5.0, LESS));
+        assert!(!depth_passes(5.0, 5.0, LESS));
+        // The rest of the enum reproduces rather than collapsing to LESS.
+        assert!(depth_passes(6.0, 5.0, GREATER) && !depth_passes(4.0, 5.0, GREATER));
+        assert!(depth_passes(5.0, 5.0, EQUAL) && !depth_passes(4.0, 5.0, EQUAL));
+        assert!(depth_passes(9.0, 5.0, ALWAYS) && !depth_passes(9.0, 5.0, NEVER));
+        // The +inf-cleared buffer: any finite fragment passes LESS_EQUAL.
+        assert!(depth_passes(100.0, f32::INFINITY, LESS_EQUAL));
+    }
+}
+
+#[cfg(test)]
+mod supersample_tests {
+    //! Content-free tests for the supersample antialiasing path: the box-downsample resolve,
+    //! Pixel-space scaling under supersampling, and that supersampling actually reduces the
+    //! per-pixel variance a sub-pixel-triangle mesh produces. No game data.
+    use super::*;
+    use crate::capture::{Draw, RenderState, Scene, VertexAttribute};
+
+    /// A 2x2 block of four solid colours box-downsamples to their exact integer average.
+    #[test]
+    fn downsample_box_averages() {
+        let mut fb = Framebuffer::new(2, 2, [0, 0, 0, 0]);
+        fb.rgba = vec![
+            40, 0, 0, 255, 80, 0, 0, 255, // row 0: two reds
+            0, 40, 0, 255, 0, 80, 0, 255, // row 1: two greens
+        ];
+        let d = fb.downsampled(2);
+        assert_eq!((d.width, d.height), (1, 1));
+        // avg of (40,0,0),(80,0,0),(0,40,0),(0,80,0) = (30,30,0), alpha 255.
+        assert_eq!(d.pixel(0, 0), [30, 30, 0, 255]);
+    }
+
+    /// `downsampled(1)` is the identity, and a solid uniform image is unchanged by any factor.
+    #[test]
+    fn downsample_identity_and_uniform() {
+        let fb = Framebuffer::new(4, 4, [11, 22, 33, 255]);
+        assert_eq!(fb.downsampled(1).rgba, fb.rgba);
+        let d = fb.downsampled(2);
+        assert_eq!((d.width, d.height), (2, 2));
+        assert!(d.rgba.chunks(4).all(|p| p == [11, 22, 33, 255]));
+    }
+
+    /// A full-frame Pixel-space quad must cover the frame identically at ssaa 1 and 2: the
+    /// Pixel projection scales native coords by the factor, so supersampling then downsampling
+    /// reproduces the same solid fill (not a quarter-size sprite in the corner).
+    #[test]
+    fn pixel_space_scales_under_supersample() {
+        let (w, h) = (16u32, 12u32);
+        // A pixel-space quad covering [0,w]x[0,h]: pos.xy f32 @0, uv.xy f32 @8, no color.
+        let mut verts = Vec::new();
+        for (x, y, u, v) in [(0.0, 0.0, 0.0, 0.0), (w as f32, 0.0, 1.0, 0.0), (w as f32, h as f32, 1.0, 1.0), (0.0, h as f32, 0.0, 1.0)] {
+            for f in [x, y, u, v] {
+                verts.extend_from_slice(&(f as f32).to_le_bytes());
+            }
+        }
+        let tex = BoundTexture {
+            unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
+            pixels: vec![200, 100, 50, 255], data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
+            lod_bias: 0, min_filter: 0, mag_filter: 0,
+        };
+        let draw = Draw {
+            primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
+            vertices: verts, vertex_stride: 16,
+            attributes: vec![
+                VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
+                VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
+            ],
+            indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
+            uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
+            exposure: 1.0, material: Default::default(), world: [0.0; 16],
+        };
+        let scene = Scene { color: None, draws: vec![draw] };
+        let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
+        let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
+        assert_eq!((b.width, b.height), (w, h));
+        // Center pixel is the (blend-modulated) texel in both; supersampling must not shrink it.
+        assert_eq!(a.pixel(w / 2, h / 2), b.pixel(w / 2, h / 2));
+        // The whole interior is covered (not a corner quarter): a mid pixel is not the clear.
+        assert_ne!(b.pixel(w / 2, h / 2), [0, 0, 0, 255]);
+    }
+
+    /// Supersampling reduces the per-pixel high-frequency variance minified high-detail content
+    /// produces - the aliasing "speckle" the car's fine textures and sub-pixel-triangle body
+    /// show at 1x. A fine black/white checker texture minified onto a quad point-samples to a
+    /// harsh scatter at 1x and averages toward a smooth mid-grey at 4x; assert the 4x frame's
+    /// neighbouring-pixel variance is far lower.
+    #[test]
+    fn supersample_reduces_speckle_variance() {
+        // A 96x96 1-bit checker as a U8U8U8U8 texture: alternating black/white texels. Minified
+        // 3x onto the 32px frame it point-samples to a per-pixel black/white checker (maximal
+        // adjacent-pixel variance) at 1x - the aliasing a single sample per pixel cannot resolve.
+        let (tw, th) = (96u32, 96u32);
+        let mut pixels = Vec::with_capacity((tw * th * 4) as usize);
+        for y in 0..th {
+            for x in 0..tw {
+                let c = if (x + y) % 2 == 0 { 255 } else { 0 };
+                pixels.extend_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let tex = BoundTexture {
+            unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
+            pixels, data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0,
+        };
+        // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
+        // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
+        let (w, h) = (32u32, 32u32);
+        let mut verts = Vec::new();
+        for (x, y, u, v) in [(0.0f32, 0.0, 0.0, 0.0), (w as f32, 0.0, 1.0, 0.0), (w as f32, h as f32, 1.0, 1.0), (0.0, h as f32, 0.0, 1.0)] {
+            for f in [x, y, u, v] {
+                verts.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let draw = Draw {
+            primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
+            vertices: verts, vertex_stride: 16,
+            attributes: vec![
+                VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
+                VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
+            ],
+            indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
+            uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
+            exposure: 1.0, material: Default::default(), world: [0.0; 16],
+        };
+        let s = Scene { color: None, draws: vec![draw] };
+        // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
+        fn h_variance(fb: &Framebuffer) -> f64 {
+            let mut acc = 0f64;
+            let mut n = 0f64;
+            for y in 0..fb.height {
+                for x in 1..fb.width {
+                    acc += (fb.pixel(x, y)[0] as f64 - fb.pixel(x - 1, y)[0] as f64).abs();
+                    n += 1.0;
+                }
+            }
+            acc / n.max(1.0)
+        }
+        let one = h_variance(&render_scene_supersampled(&s, w, h, [0, 0, 0, 255], 1));
+        let four = h_variance(&render_scene_supersampled(&s, w, h, [0, 0, 0, 255], 4));
+        // 4x must markedly smooth the aliased checker: adjacent-pixel jumps shrink substantially.
+        assert!(four < one * 0.6, "supersampling should reduce speckle variance: 1x={one:.1} 4x={four:.1}");
     }
 }
 
@@ -1115,7 +1893,7 @@ mod texture_tests {
         // font atlas's RRRR coverage would decode to red [r,0,0,255] instead of grey.
         let c = 200u8;
         // RRRR (3): the byte in all four channels - a coverage mask carrying its own
-        // alpha (what the PCSA00027 UI font uses); must NOT come out red.
+        // alpha (what this title's UI font uses); must NOT come out red.
         let t = tex(0x00, 3, 1, 1, 1, vec![c]);
         assert_eq!(sample_texture(&t, 0.5, 0.5), [c, c, c, c]);
         // 111R (2): white RGB, coverage in alpha.

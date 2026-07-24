@@ -128,6 +128,44 @@ pub struct BoundTexture {
     pub mag_filter: u32,
 }
 
+/// The per-material fragment-shader inputs recovered by reflecting the bound fragment
+/// program's parameter table against its captured default uniform buffer. The real
+/// fragment program is a standard forward-lit material - `albedo = baseTexture.rgb *
+/// tint`, lit by one directional light plus an ambient term, then fogged - so these are
+/// the values the capture renderer needs to reproduce the LIT colour instead of the raw
+/// albedo texel. Everything is optional: a 2D/UI shader declares none of it and the fields
+/// stay at their neutral defaults (tint white, no light), so the material is a no-op there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FragmentMaterial {
+    /// Base-colour multiplier (`AlbedoColour` / `Primarytint`). The sampled albedo texel is
+    /// multiplied by this; it is why an unlit near-white tyre albedo must be scaled down.
+    pub tint: [f32; 3],
+    /// World-space direction of the key directional light (`directionalLight0Direction
+    /// WorldSpace`) and its colour (`directionalLight0Colour`). `has_light` is false when the
+    /// shader declares no directional light (then only ambient/flat albedo applies).
+    pub light_dir: [f32; 3],
+    pub light_col: [f32; 3],
+    pub has_light: bool,
+    /// A flat ambient colour (the average of the tiny `diffuseAmbientMap` irradiance texture,
+    /// resolved by the renderer) added to the directional term so surfaces facing away from
+    /// the light are not pure black. Defaults to a neutral mid-grey when no ambient map is
+    /// bound. This is a scene-lighting term, not per-material, but stored per draw for the
+    /// stateless renderer.
+    pub ambient: [f32; 3],
+}
+
+impl Default for FragmentMaterial {
+    fn default() -> Self {
+        FragmentMaterial {
+            tint: [1.0, 1.0, 1.0],
+            light_dir: [0.0, -1.0, 0.0],
+            light_col: [1.0, 1.0, 1.0],
+            has_light: false,
+            ambient: [0.35, 0.35, 0.35],
+        }
+    }
+}
+
 /// A single draw call with everything needed to reproduce it, snapshotted from
 /// guest memory at draw time (so later guest writes cannot perturb it).
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +188,21 @@ pub struct Draw {
     /// The fixed-function pipeline state (cull/depth/stencil/viewport/...) in effect
     /// for this draw, snapshotted from the sticky GXM context state. See [`RenderState`].
     pub render_state: RenderState,
+    /// Scene exposure (linear multiplier) recovered from the vertex program's reflected
+    /// `vsCoarseExposureReg` uniform. The shaders scale lit albedo by this before
+    /// tone-mapping, so a capture renderer that skips it draws the world ~10x too dark.
+    /// 1.0 when the shader declares no exposure (2D/UI), so it is a no-op there.
+    pub exposure: f32,
+    /// The per-material fragment inputs (base-colour tint + directional/ambient light)
+    /// reflected from the fragment program and its default uniform buffer. Neutral (a no-op)
+    /// for 2D/UI draws and any shader that declares no lit material. See [`FragmentMaterial`].
+    pub material: FragmentMaterial,
+    /// The model-to-world matrix (column-major 4x4) reflected from the vertex program's
+    /// `vsModelToWorldMatrix`, used to bring the per-vertex object-space normal into world
+    /// space for the directional-light N.L term (the light direction is world space). Identity
+    /// when the shader has no separate world matrix (2D/UI), so lighting there uses the raw
+    /// normal - harmless because such draws are not depth-lit.
+    pub world: [f32; 16],
 }
 
 /// One scene (BeginScene to EndScene): its render target color buffer and the

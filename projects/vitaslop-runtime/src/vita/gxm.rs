@@ -263,6 +263,16 @@ pub(super) fn set_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// void sceGxmSetFragmentProgram(context, fragmentProgram)
+/// Record the bound fragment program's `SceGxmProgram*` so `record_draw` can reflect
+/// its samplers to pick the albedo texture. Rendering does not otherwise consume the
+/// fragment program (the capture renderer is fixed-function).
+pub(super) fn set_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let fp = ctx.arg(1);
+    st.bind_fragment_program(fp);
+    ctx.ret(0);
+}
+
 /// int sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)
 /// Hand back a real guest buffer AND bind it as the vertex uniform source, so the
 /// uniforms the guest writes into it (its MVP and friends, on the direct draw path)
@@ -281,7 +291,7 @@ pub(super) fn reserve_vertex_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// is allocated but not bound as a capture source.
 pub(super) fn reserve_fragment_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) {
     let out = ctx.arg(1);
-    let buf = st.galloc(256, 16);
+    let buf = st.reserve_fragment_uniform_buffer(ctx);
     ctx.write_u32(out, buf);
     ctx.ret(0);
 }
@@ -320,6 +330,22 @@ pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceGxmDraw(context, SceGxmPrimitiveType primitive, SceGxmIndexFormat
 ///     indexType, const void *indexData, unsigned int indexCount)  -- 5 args.
 pub(super) fn draw(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let primitive = ctx.arg(1);
+    let index_format = ctx.arg(2);
+    let index_data = ctx.arg(3);
+    let index_count = ctx.arg(4);
+    st.record_draw(ctx, primitive, index_format, index_data, index_count);
+    ctx.ret(0);
+}
+
+/// int sceGxmDrawInstanced(context, SceGxmPrimitiveType primitive, SceGxmIndexFormat
+///     indexType, const void *indexData, unsigned int indexCount, unsigned int
+///     indexWrap)  -- 6 args. Same draw as `sceGxmDraw` with hardware instancing: the
+/// index buffer is replayed once per instance, incrementing the instance index every
+/// `indexWrap` indices. We capture the base geometry (the `indexCount` index run) - the
+/// per-instance transform is a vertex-program input the capture already carries, so the
+/// first instance renders correctly; broader instancing can layer on later.
+pub(super) fn draw_instanced(ctx: &mut GuestCtx, st: &mut VitaState) {
     let primitive = ctx.arg(1);
     let index_format = ctx.arg(2);
     let index_data = ctx.arg(3);
@@ -981,7 +1007,7 @@ pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaStat
 /// void sceGxmSetPrecomputedFragmentState(SceGxmContext *context,
 ///     const SceGxmPrecomputedFragmentState *precomputedState)
 #[hostcall]
-pub(super) fn set_precomputed_fragment_state(st: &mut VitaState, _context: u32, state: u32) -> i32 {
-    st.bind_precomputed_fragment_state(state);
+pub(super) fn set_precomputed_fragment_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
+    st.bind_precomputed_fragment_state(ctx, state);
     0
 }

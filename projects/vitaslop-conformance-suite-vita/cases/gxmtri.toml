@@ -1,0 +1,22 @@
+category = "vita"
+description = "minimal GXM offscreen triangle: real libgxm -> capture -> render - RUNNABLE"
+
+# Source: ../gxmtri-src/gxmtri.c (clean-room, MIT vita-headers, -nostdlib, placeholder
+# shaders). A real Vita executable that drives libgxm through init -> one offscreen
+# scene -> one indexed triangle draw -> finish -> exit cleanly. It is the render north
+# star's runnable milestone (M5): the emulator loads it, resolves its SceGxm/SceSysmem/
+# SceLibKernel/SceProcessmgr NID imports, transpiles + executes its ARM, captures the
+# GXM command stream, and then BOTH renderers (the software rasterizer and the wgpu GPU
+# path) turn the capture into pixels - the end-to-end proof that our GXM->pixels
+# translation is faithful on a real artifact, not only synthetic Rust scenes.
+#
+# Unlike the spinning display-loop cube (cube.c, still aspirational), this returns via
+# sceKernelExitProcess so the plain single-thread Vm runs it to completion. The draw
+# uses NDC vertex positions and no uniform buffer, so it needs NO shader reflection: the
+# capture recovers the triangle from the app-declared vertex ATTRIBUTES and the vertex/
+# index streams - the parts independent of the (absent) compiled shader blob.
+#
+# Executable form: tests/vita_gxm.rs. It asserts one scene / one 3-index untextured draw
+# is captured, the software raster covers the expected area with a red/green/blue corner
+# blend at the centroid, a background corner stays clear, and (when a GPU adapter is
+# present) the wgpu render agrees with the software oracle within a mean-abs-diff of 6.

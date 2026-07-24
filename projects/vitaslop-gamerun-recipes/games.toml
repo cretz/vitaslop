@@ -10,3 +10,8 @@
 id = "PCSE00341"
 name = "OlliOlli"
 region = "PAL"
+
+[[game]]
+id = "PCSA00027"
+name = "MotorStorm RC"
+region = "NTSC"

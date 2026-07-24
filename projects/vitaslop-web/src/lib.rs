@@ -442,7 +442,12 @@ impl LivePlayback {
             },
         );
 
-        let gxm = GxmRenderer::new(&device, &queue, render_format);
+        let mut gxm = GxmRenderer::new(&device, &queue, render_format);
+        // 2x supersample: resolve the sub-pixel-triangle / coincident-panel speckle a distant 3D
+        // vehicle shows, matching the software review shots and the desktop path. The car content
+        // is light on fill, so 2x (4x the fragments of a 960x544 frame) stays within a flagship
+        // mobile GPU's budget; it is the one knob to turn down if a heavier scene needs it.
+        gxm.set_supersample(2);
         let depth = make_depth(&device);
         let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
         let fps = FpsMeter::new(perf, report);

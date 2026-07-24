@@ -176,6 +176,13 @@ impl GeneralRenderer {
         Some(GeneralRenderer { device, queue, gxm, builder: RenderSceneBuilder::new(), adapter_name })
     }
 
+    /// Set the GPU supersample factor (1 = off). Mirrors the software oracle's
+    /// [`render_scene_supersampled`](vitaslop_runtime::render::render_scene_supersampled) so
+    /// both paths antialias identically. See [`GxmRenderer::set_supersample`].
+    pub fn set_supersample(&mut self, scale: u32) {
+        self.gxm.set_supersample(scale);
+    }
+
     /// Render one captured scene to an RGBA framebuffer on the GPU via the general path.
     pub fn render_scene(
         &mut self,

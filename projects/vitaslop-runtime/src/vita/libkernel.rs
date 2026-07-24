@@ -83,8 +83,9 @@ pub(super) fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
 /// The last three args sit past r3 on the stack; `#[hostcall]` reads them there.
 #[hostcall]
 pub(super) fn create_thread(
+    ctx: &mut GuestCtx,
     st: &mut VitaState,
-    _name: Ptr,
+    name: Ptr,
     entry: Ptr,
     prio: i32,
     stack_size: u32,
@@ -92,7 +93,17 @@ pub(super) fn create_thread(
     _cpu: i32,
     _opt: Ptr,
 ) -> i32 {
-    st.create_thread(entry.addr(), stack_size, prio)
+    let thid = st.create_thread(entry.addr(), stack_size, prio);
+    // Thread names are the fastest way to identify a worker's purpose when diagnosing
+    // a boot stall (RUST_LOG=vitaslop::thread=debug): a pure-poll thread's name
+    // ("Online", "Sync", ...) names the subsystem the title is waiting on.
+    if !name.is_null() {
+        let raw = ctx.read_bytes(name.addr(), 32);
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let nm = String::from_utf8_lossy(&raw[..end]);
+        tracing::debug!(target: "vitaslop::thread", thid, entry = format_args!("{:#010x}", entry.addr()), prio, name = %nm, "createThread");
+    }
+    thid
 }
 
 /// int sceKernelStartThread(SceUID thid, SceSize arglen, void *argp)

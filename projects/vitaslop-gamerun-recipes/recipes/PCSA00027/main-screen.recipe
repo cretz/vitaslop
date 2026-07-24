@@ -1,0 +1,44 @@
+@title MotorStorm RC - reach the main-screen sandbox
+@game  PCSA00027
+@shot-every 60   # in-game shots through the boot so a human can judge render quality
+
+# ============================================================================
+# GOAL
+# Reach the MAIN SCREEN: a top-down RC car sitting in a skatepark bowl with a
+# beach ball, the "MotorStorm RC" logo, and a SELECT prompt. The main screen is a
+# live 3D sandbox, so this recipe is also the render-quality proving ground.
+#
+# THE ONE GATE BEFORE THE MAIN SCREEN
+# A save-less first boot lands on an ONLINE TERMS (EULA) accept/decline screen
+# and waits there forever with no input. Cross = ACCEPT. On real hardware you
+# accept once and it is saved, so later boots skip straight to the sandbox; we
+# have no saved acceptance, so this recipe scripts the accept every run.
+#
+# HOW IT IS AUTHORED (do NOT use env-var button holding - that is not a recipe,
+# and holding Cross runs PAST the terms into a first-boot TUTORIAL flow that is
+# NOT the main screen). We want a SINGLE, briefly-held Cross right at the moment
+# the terms screen is interactive, then release, landing on the sandbox.
+#
+# STATUS: timing is being calibrated. This first pass observes with NO input to
+# find the frame the terms screen becomes interactive; the accept press below is
+# a placeholder to be pinned from the shots.
+# ============================================================================
+
+0: @section boot
+# (no input) - boot through legal/Havok, the offline MsgDialog auto-resolves
+# (host-side buttonId=1), and the game settles on the ONLINE TERMS screen. The
+# terms screen (a text panel + 3 button-prompt legends) is interactive by ~f700.
+
+# --- accept the terms with a single brief Cross tap (WIP timing) ---
+720: @section accept-terms
+720: cross          # ACCEPT. A short tap only - HOLDING Cross detours into a
+728:                 # first-boot tutorial flow, which is NOT the main screen.
+
+# --- watch for the sandbox to load in after the accept ---
+780: @section post-accept
+780: @shot post-accept-780
+900: @shot post-accept-900
+1050: @shot post-accept-1050
+1200: @shot post-accept-1200
+1350: @shot post-accept-1350
+1500: @shot post-accept-1500
