@@ -313,6 +313,13 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
     for (i, v) in values.iter().enumerate() {
         ctx.write_u32(uniform_buffer + (component_offset + i as u32) * 4, v.to_bits());
     }
+    tracing::trace!(
+        target: "vitaslop::gxm",
+        buffer = format_args!("{uniform_buffer:#x}"),
+        component_offset,
+        component_count,
+        "setUniformDataF"
+    );
     st.set_uniforms(values);
     ctx.ret(0);
 }
@@ -323,6 +330,10 @@ pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, st: &mut VitaState) {
     let data = ctx.arg(2);
     if stream_index == 0 {
         st.bind_stream0(data);
+    } else {
+        // Only stream 0 is captured. An attribute declared on a higher stream would then be
+        // decoded out of stream 0's bytes, so log the binding rather than lose it silently.
+        tracing::debug!(target: "vitaslop::gxm", stream_index, data = format_args!("{data:#x}"), "setVertexStream (uncaptured stream)");
     }
     ctx.ret(0);
 }
@@ -350,6 +361,15 @@ pub(super) fn draw_instanced(ctx: &mut GuestCtx, st: &mut VitaState) {
     let index_format = ctx.arg(2);
     let index_data = ctx.arg(3);
     let index_count = ctx.arg(4);
+    let index_wrap = ctx.arg(5);
+    // Only the first instance is captured, so record how many the guest asked for: a title
+    // that instances its scenery would otherwise silently render one copy of it.
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        index_count, index_wrap,
+        instances = if index_wrap > 0 { index_count / index_wrap } else { 1 },
+        "drawInstanced"
+    );
     st.record_draw(ctx, primitive, index_format, index_data, index_count);
     ctx.ret(0);
 }
@@ -829,16 +849,22 @@ pub(super) fn get_notification_region(ctx: &mut GuestCtx, st: &mut VitaState) {
 // --- Program reflection: default uniform buffer size + pass type ------------
 
 /// unsigned int sceGxmProgramGetDefaultUniformBufferSize(const SceGxmProgram *program)
-/// The gxp header stores the default uniform buffer's size word at +0x2C - the field
-/// immediately after `parameter_count` (+0x24) and `parameters_offset` (+0x28), the
-/// two offsets this module already verified against the real shaders in the image.
-/// A title reads this only to size its own default-uniform allocation; the actual
-/// uniform values are captured from `sceGxmSetUniformDataF`'s source, and the reserved
-/// buffer pointer is handed back by this engine, so a title's allocation is bookkeeping
-/// we do not consume. Returned verbatim (0 when the shader has no default uniforms).
+///
+/// The size is the container's `default_uniform_buffer_count` (header +0x64) - a count of
+/// 32-bit SA registers - times four. This is NOT bookkeeping we can ignore: a title uses the
+/// answer as the LENGTH of the block it memcpys into the buffer
+/// `sceGxmReserveVertexDefaultUniformBuffer` handed it, so under-reporting truncates the
+/// title's own uniform upload and the shader then reads zeros for everything past the cut.
+///
+/// This previously read +0x2C, which is the varyings-block offset, not a size: it is a fixed
+/// 108 on every program of a title regardless of that program's real uniform block (verified
+/// across the whole captured corpus, vertex and fragment). A title given 108 writes exactly 27
+/// floats into a buffer whose shader declares up to 74 registers, so its shared camera, light
+/// and exposure uniforms never arrive - which is precisely what was observed.
 pub(super) fn program_get_default_uniform_buffer_size(ctx: &mut GuestCtx, _st: &mut VitaState) {
     let program = ctx.arg(0);
-    ctx.ret(ctx.read_u32(program + 0x2C));
+    let size = crate::host::default_uniform_buffer_bytes(ctx, program);
+    ctx.ret(size);
 }
 
 /// SceGxmPassType sceGxmFragmentProgramGetPassType(const SceGxmFragmentProgram *fp)
@@ -865,12 +891,13 @@ pub(super) fn get_precomputed_draw_size(_vertex_program: u32) -> u32 {
 ///     const SceGxmVertexProgram *vertexProgram, void *memBlock)
 #[hostcall]
 pub(super) fn precomputed_draw_init(
+    ctx: &mut GuestCtx,
     st: &mut VitaState,
     precomputed: u32,
     vertex_program: u32,
     _mem_block: u32,
 ) -> i32 {
-    st.precomputed_draw_init(precomputed, vertex_program);
+    st.precomputed_draw_init(ctx, precomputed, vertex_program);
     0
 }
 
@@ -878,12 +905,13 @@ pub(super) fn precomputed_draw_init(
 ///     unsigned int streamIndex, const void *streamData)
 #[hostcall]
 pub(super) fn precomputed_draw_set_vertex_stream(
+    ctx: &mut GuestCtx,
     st: &mut VitaState,
     precomputed: u32,
     stream_index: u32,
     stream_data: u32,
 ) -> i32 {
-    st.precomputed_draw_set_stream(precomputed, stream_index, stream_data);
+    st.precomputed_draw_set_stream(ctx, precomputed, stream_index, stream_data);
     0
 }
 
@@ -892,6 +920,7 @@ pub(super) fn precomputed_draw_set_vertex_stream(
 ///     *indexData, unsigned int indexCount)
 #[hostcall]
 pub(super) fn precomputed_draw_set_params(
+    ctx: &mut GuestCtx,
     st: &mut VitaState,
     precomputed: u32,
     prim_type: u32,
@@ -899,7 +928,7 @@ pub(super) fn precomputed_draw_set_params(
     index_data: u32,
     index_count: u32,
 ) -> i32 {
-    st.precomputed_draw_set_params(precomputed, prim_type, index_type, index_data, index_count);
+    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count);
     0
 }
 

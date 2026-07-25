@@ -1,0 +1,28 @@
+[package]
+name = "vitaslop-gxp-shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Clean-room GXP (SceGxmProgram) -> WGSL recompiler. Decodes the PowerVR SGX543
+# "USSE" bytecode a Vita fragment/vertex shader carries and re-emits it as WGSL so
+# the real guest shading runs on WebGPU. wasm32-safe (no fs/threads/time); ships
+# only the decoder + emitter - never any game data. All facts come from the public
+# SGX543 instruction-set encoding and vitasdk/psdevwiki definitions - permissive,
+# fact-only sources; no copyleft or proprietary code is read, linked, or derived from.
+
+[dependencies]
+
+[dev-dependencies]
+# Test-only: validate that emitted WGSL actually parses + validates as real WGSL (not just
+# plausible strings). naga is the same WebGPU shader compiler wgpu uses on the shipped path,
+# permissively licensed, and dev-only so it never affects the wasm-safe library build.
+naga = { version = "30", features = ["wgsl-in"] }
+# Test-only: prove a LINKED vertex+fragment module builds a REAL wgpu render pipeline (bind
+# group layouts + the guest vertex-buffer layout), one step past naga validation - the exact
+# thing the eventual live GxmRenderer wiring must do. Skips cleanly when no GPU adapter is
+# present, so it never breaks a headless build. Dev-only: the shipped library stays wasm-safe.
+wgpu = { workspace = true }
+pollster = { workspace = true }

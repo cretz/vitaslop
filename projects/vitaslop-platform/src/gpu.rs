@@ -99,6 +99,9 @@ pub struct GxmTexture {
     pub key: u64,
     pub width: u32,
     pub height: u32,
+    /// Number of `width x height` RGBA8 images `rgba` holds back to back: 1 normally, 6 for a
+    /// cube map (in +X, -X, +Y, -Y, +Z, -Z order, which is WebGPU's array-layer order).
+    pub faces: u32,
     pub rgba: std::sync::Arc<Vec<u8>>,
     /// True if the guest set this texture's magnification filter to LINEAR
     /// (`SceGxmTextureFilter` == 1); the renderer then bilinear-samples it, matching
@@ -162,6 +165,79 @@ pub struct GxmDraw {
     /// draws before a Reinhard tonemap. 1.0 is a no-op (2D/UI and any shader with no
     /// exposure uniform), so the tonemap is skipped and the color passes through.
     pub exposure: f32,
+    /// The guest's real vertex+fragment shaders + their draw inputs, for the GXP->WGSL
+    /// recompiler (live guest-shader) path. `Some` only when the runtime captured it
+    /// (`VITASLOP_GXP_LIVE`); the renderer links + caches a pipeline and ALWAYS falls back
+    /// to the fixed-function fields above on any link/format error. See [`GxpRecompile`].
+    pub gxp: Option<GxpRecompile>,
+}
+
+/// Everything the GXP->WGSL recompiler needs to draw one call with the guest's real
+/// vertex+fragment shaders, snapshotted by the runtime and carried as plain data (no GPU or
+/// runtime dependency). The renderer links the pair on first sight, caches the pipeline by
+/// shader identity, and ALWAYS falls back to the fixed-function path on any link/format
+/// error - a wrong translation never paints a pixel.
+#[derive(Clone, Debug)]
+pub struct GxpRecompile {
+    /// The vertex `SceGxmProgram` container bytes.
+    pub vprog: Vec<u8>,
+    /// The fragment `SceGxmProgram` container bytes.
+    pub fprog: Vec<u8>,
+    /// Raw vertex default-uniform-buffer (SA bank) bytes, as the guest wrote them.
+    pub vert_sa: Vec<u8>,
+    /// Raw fragment default-uniform-buffer (SA bank) bytes, as the guest wrote them.
+    pub frag_sa: Vec<u8>,
+    /// Raw guest vertex stream bytes (stream 0) exactly as bound.
+    pub vertices: Vec<u8>,
+    /// Byte stride of one guest vertex within `vertices`.
+    pub vertex_stride: u32,
+    /// Guest vertex attributes: stream byte offset + raw GXM format + component count, keyed
+    /// to the recompiler's vertex-input `@location` by `reg_index` (the attribute base lane).
+    pub attributes: Vec<GxpAttr>,
+    /// Raw guest index bytes.
+    pub indices: Vec<u8>,
+    /// Number of indices.
+    pub index_count: u32,
+    /// True = 32-bit indices, false = 16-bit (GXM index format 0).
+    pub index_u32: bool,
+    /// GXM primitive type word (drives the pipeline topology).
+    pub primitive: u32,
+    /// Decoded textures bound per fragment sampler unit.
+    pub textures: Vec<GxpTex>,
+    /// Depth write enabled for this draw (GXM `front_depth_write != DISABLED`).
+    pub depth_write: bool,
+    /// GXM depth-compare function word (`SceGxmDepthFunc`).
+    pub depth_func: u32,
+    /// GXM cull-mode word (`SceGxmCullMode`).
+    pub cull_mode: u32,
+    /// Whether this draw is alpha-blended (a 2D/overlay draw, not opaque geometry).
+    pub blend: bool,
+    /// GXM viewport `[xOffset,xScale,yOffset,yScale,zOffset,zScale]` mapping the guest clip
+    /// output to the framebuffer. All-zero means the guest left the default (fullscreen).
+    pub viewport: [f32; 6],
+}
+
+/// One guest vertex attribute for the recompiler path: where it sits in the stream and its
+/// raw GXM format, so the pipeline builds a matching `wgpu` vertex layout.
+#[derive(Clone, Copy, Debug)]
+pub struct GxpAttr {
+    /// The vertex program's attribute resource index = the recompiler's `@location` base lane.
+    pub reg_index: u16,
+    /// Byte offset of this attribute within a vertex.
+    pub offset: u16,
+    /// Raw `SceGxmAttributeFormat` value.
+    pub gxm_format: u8,
+    /// Component count (1..4).
+    pub components: u8,
+}
+
+/// A decoded texture bound to a specific fragment sampler unit for the recompiler path.
+#[derive(Clone, Debug)]
+pub struct GxpTex {
+    /// The sampler unit the fragment program samples this from (`t{unit}`/`s{unit}`).
+    pub unit: u8,
+    /// The decoded, GPU-ready texture.
+    pub tex: GxmTexture,
 }
 
 /// Stride of the canonical [`GxmDraw`] vertex: pos(12) + uv(8) + color(4) + world-normal(12).
@@ -462,20 +538,18 @@ fn vs(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>, @location(2)
     var out: VsOut;
     var clip: vec4<f32>;
     if (u.mode == 0u) {
-        // Mvp: object space through the captured MVP. The software rasterizer depth-tests
-        // the RAW post-divide depth c.z/c.w (an unbounded f32) with an +INF clear and a
-        // Less test - so only the ORDERING of depths matters, not their range. A real
-        // title's captured matrices produce c.z/c.w in an arbitrary, often huge range (the
-        // composed MVP is not a normalized [0,1] projection), which a WebGPU depth buffer
-        // (limited to [0,1]) would clamp to 1.0, dropping the whole 3D world to black.
-        // Map the depth LINEARLY across the scene's visible opaque range (computed on the
-        // CPU, see RenderScene::depth_min/scale): linear preserves every Less comparison
-        // (identical ordering to the oracle) AND keeps full f32 resolution across the range
-        // - enough to separate a vehicle from the ground it rests on, which a saturating
-        // nonlinear squash loses when both sit at a large depth. X and Y pass through.
+        // Mvp: object space through the captured MVP. Depth is the projected view distance
+        // `w`, NOT the clip `z` - GXM/PowerVR resolves visibility from `w`, and this title's
+        // vertex programs emit a clip `z` whose post-divide value depends only on the screen
+        // position (see `render::project`, which measured it identical across the ground and
+        // every car draw covering one pixel). The software rasterizer stores `-1/w`, which is
+        // screen-linear and increases with distance; the CPU scene builder measures that
+        // quantity's visible range so it can be mapped LINEARLY onto the WebGPU depth buffer's
+        // [0,1] without changing a single comparison - identical ordering to the oracle, at
+        // full f32 resolution across the range. X and Y pass through.
         clip = u.mvp * vec4<f32>(position, 1.0);
-        let d = clip.z / clip.w;
-        let nz = clamp((d - u.depth_min) * u.depth_scale, 0.0, 1.0);
+        let depth = -1.0 / clip.w;
+        let nz = clamp((depth - u.depth_min) * u.depth_scale, 0.0, 1.0);
         clip.z = nz * clip.w;
     } else if (u.mode == 1u) {
         // Ndc: clip coords emitted directly.
@@ -640,6 +714,11 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// The lazily-(re)created offscreen supersample target (colour + depth + resolve bind
         /// group), sized to `ss_scale * surf`. Rebuilt when the scale or target size changes.
         ss_target: Option<SsTarget>,
+        /// The live GXP->WGSL recompiler: a per-shader-pair pipeline cache. When enabled
+        /// (`VITASLOP_GXP_LIVE`) a draw carrying [`super::GxpRecompile`] is rendered with the
+        /// guest's real shaders; a pair that fails to link falls back to the fixed-function
+        /// pipelines above. Disabled -> zero cost (the payload is simply ignored).
+        gxp: GxpLive,
     }
 
     /// The offscreen supersample render target: an `ss_scale * surf` colour + depth buffer the
@@ -658,6 +737,805 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Round `v` up to a multiple of `align` (a power of two).
     fn align_up(v: u64, align: u64) -> u64 {
         (v + align - 1) & !(align - 1)
+    }
+
+    // ==================== Live GXP->WGSL recompiler path ====================
+    //
+    // When enabled (`VITASLOP_GXP_LIVE`), a draw that carries the guest's real vertex +
+    // fragment `SceGxmProgram` blobs (see [`super::GxpRecompile`]) is rendered with those
+    // shaders, translated to one linked WGSL module by `vitaslop_gxp_shader::link_programs`
+    // and executed on a real pipeline. A pair that fails to link (or uses a vertex format /
+    // 3D sampler we do not yet map) falls back to the fixed-function pipeline for that draw -
+    // a wrong translation never paints a pixel. Pipelines are cached by shader identity;
+    // per-draw vertex/index/uniform buffers + bind groups are built each frame (a real title's
+    // recompilable draw count is small, and this keeps the path simple and correct first).
+
+    use super::{GxpAttr, GxpRecompile, GxmTexture};
+
+    /// A linked + compiled pipeline for one guest shader pair, cached by shader identity.
+    struct GxpPipeline {
+        /// Opaque variant: depth test LessEqual + depth write, no blend.
+        opaque: wgpu::RenderPipeline,
+        /// Blend variant: depth test but no write, straight-alpha src-over.
+        blend: wgpu::RenderPipeline,
+        /// group0 = vertex SA uniform, group1 = fragment SA uniform, group2 = samplers.
+        /// Empty layouts where the stage declares nothing, so the pipeline layout still
+        /// covers every group index the WGSL might reference.
+        layouts: [wgpu::BindGroupLayout; 4],
+        /// Vertex SA scalar-lane count (the group0 uniform holds `ceil(n/4)` vec4s).
+        vsa_lanes: u32,
+        /// Fragment SA scalar-lane count.
+        fsa_lanes: u32,
+        /// `(sampler unit, is_3d)` per group2 sampler, in binding order.
+        samplers: Vec<(u8, SamplerDim)>,
+        /// How to repack the guest vertex stream into the tightly-packed `Float32xN` buffer
+        /// this pipeline's vertex layout expects (one entry per attribute), + the packed
+        /// stride. Repacking to f32 on the CPU sidesteps wgpu's vertex-format gaps (no
+        /// `Float16x3`, etc.) and matches the recompiled shader, which reads f32 anyway.
+        repack: Vec<RepackAttr>,
+        packed_stride: u32,
+    }
+
+    /// One attribute's recipe for repacking the guest vertex stream to packed f32.
+    struct RepackAttr {
+        guest_offset: u32,
+        gxm_format: u8,
+        components: u8,
+        packed_offset: u32,
+    }
+
+    /// Per-draw GPU resources for one recompiled draw, kept alive through the render pass.
+    struct GxpPrepared {
+        /// Cache key of the pipeline this draw uses (looked up immutably during the pass).
+        key: u64,
+        vbuf: wgpu::Buffer,
+        ibuf: wgpu::Buffer,
+        index_count: u32,
+        /// Bind groups for group0/1/2 (empty where the stage declares nothing).
+        bg: [wgpu::BindGroup; 4],
+        /// True = alpha-blended (2D/overlay), false = opaque geometry.
+        blend: bool,
+    }
+
+    /// One entry in the submission-order draw plan: either a fixed-function [`Item`] (by index
+    /// into the arena-packed `items`) or a recompiled draw (by index into `gxp_prepared`). The
+    /// two kinds interleave in the one render pass so depth and overlay ordering stay correct.
+    enum Enc {
+        Fixed(usize),
+        Gxp(usize),
+    }
+
+    /// The live recompiler's pipeline cache + config. Held by [`GxmRenderer`].
+    struct GxpLive {
+        /// Master switch (`VITASLOP_GXP_LIVE`).
+        enabled: bool,
+        /// Render ONLY recompiled draws, skipping the fixed-function draw for any call that
+        /// has a working recompiled pipeline (`VITASLOP_GXP_ONLY`) - isolates the recompiler
+        /// output for review.
+        only: bool,
+        /// Apply the GXM (GL-style, NDC z in [-1,1]) -> WebGPU (z in [0,1]) clip-depth remap
+        /// in the vertex output (`VITASLOP_GXP_ZFIX`, default on). Off passes clip z straight.
+        zfix: bool,
+        /// Flip clip Y (`VITASLOP_GXP_YFLIP`, default off). The fixed-function MVP path passes
+        /// guest clip X/Y straight to WebGPU and renders upright, so the real shaders should
+        /// too; the toggle is here for empirical confirmation.
+        yflip: bool,
+        /// Diagnostic (`VITASLOP_GXP_FORCE`): bind a neutral fallback texture for a sampler
+        /// unit whose real texture we could not capture/decode (e.g. a 3D/LUT format) or a 3D
+        /// sampler, so the recompiled GEOMETRY renders and the vertex/clip/depth path can be
+        /// validated even before the special textures are handled. Off = strict (fall back to
+        /// fixed-function rather than sample a wrong texel).
+        force: bool,
+        /// Diagnostic (`VITASLOP_GXP_SOLID`): every recompiled draw outputs solid magenta with
+        /// the depth test disabled, to answer "does the geometry rasterize on-screen at all?"
+        /// independent of fragment shading and depth. Magenta visible -> vertex/clip is right.
+        solid: bool,
+        /// Diagnostic (`VITASLOP_GXP_KEYS=<hex>,<hex>`): recompile ONLY these shader-pair keys
+        /// (the `gxp draw key` value `VITASLOP_GXP_DUMP` prints), letting every other draw fall
+        /// back. Rendering one pair at a time is how a visual artifact is attributed to the
+        /// shader that produced it. Empty = no filter (recompile every linkable pair).
+        keys: Vec<u64>,
+        /// `key -> Some(pipeline)` for a linkable pair, `key -> None` for one that failed to
+        /// link (cached so we never retry it and always fall back).
+        pipelines: HashMap<u64, Option<GxpPipeline>>,
+        /// Uploaded texture views, keyed by the decoded texture's content fingerprint and the
+        /// view dimension it is bound as. A scene binds a handful of textures across hundreds
+        /// of draws, so uploading per draw (as this path first did) re-sends the same
+        /// multi-megabyte shadow map thousands of times a frame and exhausts GPU memory.
+        views: HashMap<(u64, SamplerDim), wgpu::TextureView>,
+        sampler_point: Option<wgpu::Sampler>,
+        sampler_linear: Option<wgpu::Sampler>,
+    }
+
+    impl GxpLive {
+        fn from_env() -> Self {
+            let flag = |k: &str| std::env::var_os(k).is_some();
+            GxpLive {
+                enabled: flag("VITASLOP_GXP_LIVE"),
+                only: flag("VITASLOP_GXP_ONLY"),
+                zfix: std::env::var("VITASLOP_GXP_ZFIX").map(|v| v != "0").unwrap_or(true),
+                yflip: std::env::var("VITASLOP_GXP_YFLIP").map(|v| v != "0").unwrap_or(false),
+                force: flag("VITASLOP_GXP_FORCE"),
+                solid: flag("VITASLOP_GXP_SOLID"),
+                keys: std::env::var("VITASLOP_GXP_KEYS")
+                    .ok()
+                    .map(|v| {
+                        v.split(',')
+                            .filter_map(|k| u64::from_str_radix(k.trim().trim_start_matches("0x"), 16).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                pipelines: HashMap::new(),
+                views: HashMap::new(),
+                sampler_point: None,
+                sampler_linear: None,
+            }
+        }
+
+        /// Stable cache key for a shader pair: FNV-1a over the vertex then fragment blob.
+        fn key(gxp: &GxpRecompile) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in gxp.vprog.iter().chain(gxp.fprog.iter()) {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        }
+
+        /// Prepare the GPU resources for one recompiled draw. Returns `None` (caller falls
+        /// back to fixed-function) if the pair does not link or a resource cannot be built.
+        fn prepare(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            color_format: wgpu::TextureFormat,
+            gxp: &GxpRecompile,
+            depth_range: [f32; 2],
+        ) -> Option<GxpPrepared> {
+            if gxp.index_count == 0 || gxp.vertices.is_empty() {
+                return None;
+            }
+            let key = Self::key(gxp);
+            if !self.keys.is_empty() && !self.keys.contains(&key) {
+                return None;
+            }
+            if !self.pipelines.contains_key(&key) {
+                let built = build_gxp_pipeline(device, color_format, gxp, self.zfix, self.yflip, self.solid);
+                self.pipelines.insert(key, built);
+            }
+            if self.sampler_point.is_none() {
+                self.sampler_point = Some(make_gxp_sampler(device, false));
+                self.sampler_linear = Some(make_gxp_sampler(device, true));
+            }
+            // Split the borrows: the sampler bind group needs the texture-view cache mutably
+            // while the pipeline (its layouts, its sampler plan) stays borrowed.
+            let GxpLive { pipelines, views: view_cache, sampler_point, sampler_linear, force, .. } = self;
+            // Borrow the cached pipeline; None = link failed -> fall back.
+            let pipe = pipelines.get(&key)?.as_ref()?;
+
+            if std::env::var_os("VITASLOP_GXP_DUMP").is_some() {
+                let f: Vec<f32> = gxp
+                    .vert_sa
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let attrs: Vec<(u16, u16, u8, u8)> =
+                    gxp.attributes.iter().map(|a| (a.reg_index, a.offset, a.gxm_format, a.components)).collect();
+                let ff: Vec<f32> = gxp
+                    .frag_sa
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                // The guest stream's own extent next to what the indices actually reference: a
+                // mesh whose highest index is beyond the captured vertices renders only the
+                // triangles that fall inside the buffer, i.e. a PREFIX of the geometry.
+                let nverts = gxp.vertices.len() / (gxp.vertex_stride.max(1) as usize);
+                let max_index = if gxp.index_u32 {
+                    gxp.indices.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).max()
+                } else {
+                    gxp.indices.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).max()
+                }
+                .unwrap_or(0);
+                eprintln!(
+                    "gxp draw key {:x}: vsa_lanes={} vert_sa_lanes={} fsa_lanes={} frag_sa_lanes={} samplers={:?} stride={} idx={} nverts={nverts} max_index={max_index} vbytes={} attrs(reg,off,fmt,comp)={:?}\n  vsa={:?}\n  fsa={:?}",
+                    key, pipe.vsa_lanes, f.len(), pipe.fsa_lanes, ff.len(), pipe.samplers, gxp.vertex_stride, gxp.index_count, gxp.vertices.len(), attrs, f, ff
+                );
+            }
+
+            // Repack the guest vertex stream into the tightly-packed f32 layout the pipeline
+            // expects (per the cached repack plan). Same vertex count/order, so the index
+            // buffer is unchanged.
+            let packed = repack_vertices(&gxp.vertices, gxp.vertex_stride, &pipe.repack, pipe.packed_stride);
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gxp-vbo"),
+                contents: &packed,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gxp-ibo"),
+                contents: &gxp.indices,
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+            let bg0 = make_uniform_bg(device, &pipe.layouts[0], pipe.vsa_lanes, &gxp.vert_sa);
+            let bg1 = make_uniform_bg(device, &pipe.layouts[1], pipe.fsa_lanes, &gxp.frag_sa);
+            let bg2 = Self::make_sampler_bg(
+                device, queue, &pipe.layouts[2], &pipe.samplers, gxp,
+                view_cache, sampler_point.as_ref().unwrap(), sampler_linear.as_ref().unwrap(), *force,
+            )?;
+            // group3: the scene depth range the injected clip fixup maps through, as one vec4
+            // (min, scale, unused, unused) - the same values the fixed-function path uses, so
+            // both kinds of draw write comparable depth.
+            let dbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gxp-depth"),
+                contents: &[depth_range[0].to_le_bytes(), depth_range[1].to_le_bytes(), [0; 4], [0; 4]].concat(),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bg3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gxp-depth-bind"),
+                layout: &pipe.layouts[3],
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: dbuf.as_entire_binding() }],
+            });
+
+            Some(GxpPrepared { key, vbuf, ibuf, index_count: gxp.index_count, bg: [bg0, bg1, bg2, bg3], blend: gxp.blend })
+        }
+
+        /// The cached pipeline for a prepared draw (only called after `prepare` succeeded).
+        fn pipeline(&self, key: u64) -> &GxpPipeline {
+            self.pipelines.get(&key).and_then(|p| p.as_ref()).expect("prepared key present")
+        }
+
+        /// Build the group2 sampler bind group: for each declared sampler unit, upload the
+        /// bound texture and bind it with the matching filter sampler. `None` (fall back) if a
+        /// unit has no bound texture or needs a 3D texture (not yet mapped).
+        #[allow(clippy::too_many_arguments)]
+        fn make_sampler_bg(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            layout: &wgpu::BindGroupLayout,
+            samplers: &[(u8, SamplerDim)],
+            gxp: &GxpRecompile,
+            view_cache: &mut HashMap<(u64, SamplerDim), wgpu::TextureView>,
+            sampler_point: &wgpu::Sampler,
+            sampler_linear: &wgpu::Sampler,
+            force: bool,
+        ) -> Option<wgpu::BindGroup> {
+            if samplers.is_empty() {
+                return Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gxp-samplers-empty"),
+                    layout,
+                    entries: &[],
+                }));
+            }
+            let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
+            // Upload every needed texture first so the views outlive the bind-group build.
+            let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(samplers.len());
+            // Cloning a `TextureView` is a refcount bump, so cached views are shared, not copied.
+            let mut linears: Vec<bool> = Vec::with_capacity(samplers.len());
+            for &(unit, want) in samplers {
+                let bound = gxp.textures.iter().find(|t| t.unit == unit);
+                // The bound texture must actually supply the dimension the shader declared: a
+                // cube sampler needs the six captured faces, a 2D sampler a single image. A
+                // mismatch means the container and the guest state disagree, so bind nothing.
+                let usable = bound.filter(|gt| match want {
+                    SamplerDim::Cube => gt.tex.faces == 6,
+                    SamplerDim::Two => gt.tex.faces == 1,
+                    SamplerDim::Three => false,
+                });
+                match usable {
+                    Some(gt) => {
+                        let cache_key = (gt.tex.key, want);
+                        if !view_cache.contains_key(&cache_key) {
+                            // Bound the cache: the keys are content fingerprints, so clearing
+                            // wholesale only costs a re-upload, never correctness.
+                            if view_cache.len() >= TEX_CACHE_CAP {
+                                view_cache.clear();
+                            }
+                            let tex = upload_gxp_texture(device, queue, &gt.tex);
+                            let view = tex.create_view(&wgpu::TextureViewDescriptor {
+                                dimension: Some(want.view_dimension()),
+                                ..Default::default()
+                            });
+                            view_cache.insert(cache_key, view);
+                        }
+                        views.push(view_cache[&cache_key].clone());
+                        linears.push(gt.tex.filter_linear);
+                    }
+                    // A volume sampler (not yet mapped), or a unit whose real texture we could
+                    // not capture/decode: strict mode falls back; force mode binds a neutral
+                    // fallback so geometry still renders (a diagnostic, never the default).
+                    None => {
+                        if !force {
+                            if debug {
+                                eprintln!(
+                                    "gxp prepare: sampler unit {unit} wants {want:?} but bound units are {:?}",
+                                    gxp.textures
+                                        .iter()
+                                        .map(|t| (t.unit, t.tex.faces))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                            return None;
+                        }
+                        views.push(make_fallback_view(device, queue, want.view_dimension()));
+                        linears.push(false);
+                    }
+                }
+            }
+            let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(samplers.len() * 2);
+            for (i, view) in views.iter().enumerate() {
+                let samp = if linears[i] { sampler_linear } else { sampler_point };
+                entries.push(wgpu::BindGroupEntry { binding: i as u32 * 2, resource: wgpu::BindingResource::TextureView(view) });
+                entries.push(wgpu::BindGroupEntry { binding: i as u32 * 2 + 1, resource: wgpu::BindingResource::Sampler(samp) });
+            }
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gxp-samplers"), layout, entries: &entries }))
+        }
+    }
+
+    /// The texture dimension a recompiled fragment's sampler binding needs. It comes from the
+    /// GXP container (the sampler parameter's cube flag plus the SMP coordinate count), and it
+    /// must match on both sides: the WGSL declares the type, the bind-group layout declares the
+    /// view dimension, and the bound texture must be able to supply it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum SamplerDim {
+        Two,
+        Three,
+        Cube,
+    }
+
+    impl SamplerDim {
+        fn view_dimension(self) -> wgpu::TextureViewDimension {
+            match self {
+                SamplerDim::Two => wgpu::TextureViewDimension::D2,
+                SamplerDim::Three => wgpu::TextureViewDimension::D3,
+                SamplerDim::Cube => wgpu::TextureViewDimension::Cube,
+            }
+        }
+    }
+
+    /// A REPEAT sampler for the recompiler path (point or linear), mirroring the
+    /// fixed-function samplers.
+    fn make_gxp_sampler(device: &wgpu::Device, linear: bool) -> wgpu::Sampler {
+        let f = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("gxp-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: f,
+            min_filter: f,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        })
+    }
+
+    /// Upload a decoded [`GxmTexture`] (linear RGBA8) to a GPU texture for the recompiler path.
+    fn upload_gxp_texture(device: &wgpu::Device, queue: &wgpu::Queue, t: &GxmTexture) -> wgpu::Texture {
+        let (w, h) = (t.width.max(1), t.height.max(1));
+        // A cube map uploads as six array layers; the view below then reads them as a cube.
+        let layers = t.faces.max(1);
+        // Guard against a short pixel buffer (a not-fully-decoded format): pad to w*h*layers*4.
+        let need = (w as usize) * (h as usize) * (layers as usize) * 4;
+        let data: std::borrow::Cow<[u8]> = if t.rgba.len() >= need {
+            std::borrow::Cow::Borrowed(&t.rgba[..need])
+        } else {
+            let mut v = t.rgba.to_vec();
+            v.resize(need, 0);
+            std::borrow::Cow::Owned(v)
+        };
+        device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("gxp-tex"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &data,
+        )
+    }
+
+    /// A 1x1 (or 1x1x1) neutral-grey fallback texture view of the given dimension, for the
+    /// `VITASLOP_GXP_FORCE` diagnostic: bound where a sampler's real texture is unavailable so
+    /// the recompiled geometry still renders. Opaque alpha so an alpha-test does not discard.
+    fn make_fallback_view(device: &wgpu::Device, queue: &wgpu::Queue, dim: wgpu::TextureViewDimension) -> wgpu::TextureView {
+        let is_3d = dim == wgpu::TextureViewDimension::D3;
+        let tex = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("gxp-fallback"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: if is_3d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[180, 180, 180, 255],
+        );
+        tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() })
+    }
+
+    /// Build a group0/group1 uniform bind group from raw guest SA bytes, sized to the WGSL
+    /// `array<vec4<f32>, ceil(lanes/4)>` and zero-padded. An empty (0-lane) stage gets an
+    /// empty bind group so the pipeline layout's group is still satisfied at draw time.
+    fn make_uniform_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, lanes: u32, guest: &[u8]) -> wgpu::BindGroup {
+        if lanes == 0 {
+            return device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gxp-ubo-empty"), layout, entries: &[] });
+        }
+        let need = (lanes.div_ceil(4) as usize) * 16;
+        let mut data = vec![0u8; need];
+        let n = guest.len().min(need);
+        data[..n].copy_from_slice(&guest[..n]);
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gxp-ubo"),
+            contents: &data,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gxp-ubo-bind"),
+            layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+        })
+    }
+
+    /// Convert an IEEE-754 half (binary16) to f32.
+    fn half_to_f32(h: u16) -> f32 {
+        let sign = (h >> 15) & 1;
+        let exp = (h >> 10) & 0x1f;
+        let mant = h & 0x3ff;
+        let v = if exp == 0 {
+            (mant as f32) * (1.0 / 16_777_216.0) // subnormal: mant * 2^-24
+        } else if exp == 0x1f {
+            if mant == 0 { f32::INFINITY } else { f32::NAN }
+        } else {
+            (1.0 + mant as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
+        };
+        if sign == 1 { -v } else { v }
+    }
+
+    /// Byte size of one component of a `SceGxmAttributeFormat`.
+    fn attr_component_size(gxm_format: u8) -> usize {
+        match gxm_format {
+            0 | 1 | 4 | 5 => 1,     // U8 / S8 / U8N / S8N
+            2 | 3 | 6 | 7 | 8 => 2, // U16 / S16 / U16N / S16N / F16
+            _ => 4,                 // F32 (9) and any unknown -> treat as 4-byte float
+        }
+    }
+
+    /// Read one attribute component from the guest stream and convert it to f32, matching the
+    /// GXM fixed-function vertex fetch (normalized formats scale to [0,1]/[-1,1], F16 expands).
+    /// Out-of-range reads yield 0.0 (a benign over-read on a short buffer, never a panic).
+    fn read_attr_component(buf: &[u8], base: usize, gxm_format: u8, c: usize) -> f32 {
+        let o = base + c * attr_component_size(gxm_format);
+        let u16at = |o: usize| -> Option<u16> { buf.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]])) };
+        match gxm_format {
+            9 => buf.get(o..o + 4).map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]])).unwrap_or(0.0),
+            8 => u16at(o).map(half_to_f32).unwrap_or(0.0),
+            4 => buf.get(o).map(|&b| b as f32 / 255.0).unwrap_or(0.0),
+            5 => buf.get(o).map(|&b| (b as i8 as f32 / 127.0).max(-1.0)).unwrap_or(0.0),
+            6 => u16at(o).map(|v| v as f32 / 65535.0).unwrap_or(0.0),
+            7 => u16at(o).map(|v| (v as i16 as f32 / 32767.0).max(-1.0)).unwrap_or(0.0),
+            0 => buf.get(o).map(|&b| b as f32).unwrap_or(0.0),
+            1 => buf.get(o).map(|&b| b as i8 as f32).unwrap_or(0.0),
+            2 => u16at(o).map(|v| v as f32).unwrap_or(0.0),
+            3 => u16at(o).map(|v| v as i16 as f32).unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// Repack a guest vertex stream into the tightly-packed `Float32xN` layout the recompiled
+    /// pipeline expects. One packed vertex per guest vertex, in order, so the index buffer is
+    /// unchanged.
+    fn repack_vertices(vertices: &[u8], guest_stride: u32, repack: &[RepackAttr], packed_stride: u32) -> Vec<u8> {
+        let gstride = guest_stride.max(1) as usize;
+        let nverts = vertices.len() / gstride;
+        let mut out = Vec::with_capacity(nverts * packed_stride as usize);
+        for i in 0..nverts {
+            let vbase = i * gstride;
+            // Zero-fill this packed vertex, then write each attribute at its packed offset.
+            let start = out.len();
+            out.resize(start + packed_stride as usize, 0);
+            for a in repack {
+                for c in 0..a.components as usize {
+                    let f = read_attr_component(vertices, vbase + a.guest_offset as usize, a.gxm_format, c);
+                    let po = start + a.packed_offset as usize + c * 4;
+                    out[po..po + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Inject the GXM->WebGPU clip fixup into a linked module: wrap the vertex stage's
+    /// `out.position` assignment in a helper that remaps clip Z (and optionally flips Y).
+    ///
+    /// The linker emits exactly one `  out.position = <expr>;` statement, but the exact shape of
+    /// `<expr>` is the emitter's business and has changed. So this matches the STATEMENT and
+    /// wraps whatever it assigns. Returns `None` when the statement is not found, which makes
+    /// the pair fall back rather than render with no depth remap at all: this transform is not
+    /// cosmetic, it is what puts the guest's clip depth inside WebGPU's `0 <= z <= w` clip
+    /// volume, and without it the hardware clips away every triangle whose raw clip z runs past
+    /// w (this title's does, by roughly 5x) - which looks like a mesh mysteriously missing its
+    /// far half, not like a broken depth buffer.
+    fn inject_clip_fixup(wgsl: &str, zfix: bool, yflip: bool, solid: bool) -> Option<String> {
+        // Replace the guest's clip z with the SAME depth the fixed-function path writes, so
+        // recompiled and fixed-function draws share one comparable depth buffer: the projected
+        // view distance through `-1/w`, mapped linearly onto [0,1] over the scene's visible
+        // range (see `render::project` for why the guest's own clip z is not a depth here).
+        // Keeping xy exact leaves the real shader's projection untouched. w<=0 (behind the eye)
+        // is left to wgpu's clip.
+        let z = if zfix {
+            "  if (c.w > 0.0) { let q = -1.0 / c.w;\n    r.z = clamp((q - gxp_depth.range.x) * gxp_depth.range.y, 0.0, 1.0) * c.w; }\n"
+        } else {
+            ""
+        };
+        let y = if yflip { "  r.y = -c.y;\n" } else { "" };
+        let helper = format!(
+            "struct GxpDepth {{ range: vec4<f32> }};\n\
+             @group(3) @binding(0) var<uniform> gxp_depth: GxpDepth;\n\
+             fn gxp_clipfix(c: vec4<f32>) -> vec4<f32> {{\n  var r = c;\n{z}{y}  return r;\n}}\n"
+        );
+        const ASSIGN: &str = "\n  out.position = ";
+        let at = wgsl.find(ASSIGN)?;
+        let rhs_start = at + ASSIGN.len();
+        let rhs_end = rhs_start + wgsl[rhs_start..].find(";")?;
+        let mut patched = String::with_capacity(wgsl.len() + 64);
+        patched.push_str(&wgsl[..rhs_start]);
+        patched.push_str("gxp_clipfix(");
+        patched.push_str(&wgsl[rhs_start..rhs_end]);
+        patched.push(')');
+        patched.push_str(&wgsl[rhs_end..]);
+        if solid {
+            // Diagnostic: force the fragment to solid magenta so any on-screen triangle is
+            // visible regardless of shading. The colour expression depends on which register
+            // holds the colour and at what precision, so this matches the fragment entry's
+            // LAST `return` statement structurally rather than by its exact text - an
+            // enumerate-the-spellings version silently stopped substituting anything the first
+            // time the emitter's return line changed, which made the diagnostic lie.
+            match patched.rfind("\n  return ") {
+                Some(at) => {
+                    let end = patched[at + 1..]
+                        .find(";\n")
+                        .map(|e| at + 1 + e + 1)
+                        .unwrap_or(patched.len());
+                    patched.replace_range(at + 1..end, "  return vec4<f32>(1.0, 0.0, 1.0, 1.0);");
+                }
+                None => eprintln!(
+                    "gxp build: VITASLOP_GXP_SOLID found no fragment return to replace - \
+                     the module shape changed; solid-fill is NOT in effect"
+                ),
+            }
+        }
+        Some(format!("{helper}{patched}"))
+    }
+
+    /// Link a guest shader pair and build its two pipeline variants + bind-group layouts.
+    /// `None` (fall back) on any link error or an unmappable vertex format.
+    fn build_gxp_pipeline(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        gxp: &GxpRecompile,
+        zfix: bool,
+        yflip: bool,
+        solid: bool,
+    ) -> Option<GxpPipeline> {
+        let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
+        let linked = match vitaslop_gxp_shader::link_programs(&gxp.vprog, &gxp.fprog) {
+            Ok(l) => l,
+            Err(e) => {
+                if debug {
+                    eprintln!("gxp build: link failed: {e}");
+                }
+                return None;
+            }
+        };
+
+        // Vertex layout: each linked attribute (@location L, base lane B) is fed by the guest
+        // stream attribute whose reg_index == B. We repack it to tightly-packed `Float32xN`
+        // (converting F16/U8N/etc. on the CPU) so wgpu's vertex-format gaps (no Float16x3, no
+        // Unorm8x3, ...) never block a draw, and the shader (which reads f32) gets exact values.
+        let mut wattrs: Vec<wgpu::VertexAttribute> = Vec::with_capacity(linked.vertex_bindings.attributes.len());
+        let mut repack: Vec<RepackAttr> = Vec::with_capacity(linked.vertex_bindings.attributes.len());
+        let mut packed_offset: u32 = 0;
+        for a in &linked.vertex_bindings.attributes {
+            let ga: &GxpAttr = match gxp.attributes.iter().find(|g| g.reg_index as u32 == a.base_lane) {
+                Some(g) => g,
+                None => {
+                    if debug {
+                        eprintln!(
+                            "gxp build: no guest attribute for linked @location {} base_lane {} (guest reg_indices {:?})",
+                            a.location, a.base_lane,
+                            gxp.attributes.iter().map(|g| g.reg_index).collect::<Vec<_>>()
+                        );
+                    }
+                    return None;
+                }
+            };
+            let comps = ga.components.clamp(1, 4);
+            let format = match comps {
+                1 => wgpu::VertexFormat::Float32,
+                2 => wgpu::VertexFormat::Float32x2,
+                3 => wgpu::VertexFormat::Float32x3,
+                _ => wgpu::VertexFormat::Float32x4,
+            };
+            wattrs.push(wgpu::VertexAttribute { format, offset: packed_offset as u64, shader_location: a.location });
+            repack.push(RepackAttr { guest_offset: ga.offset as u32, gxm_format: ga.gxm_format, components: comps, packed_offset });
+            packed_offset += comps as u32 * 4;
+        }
+        let packed_stride = packed_offset.max(4);
+
+        // Decisive diagnostic (`VITASLOP_GXP_INTERP`): run the recompiled vertex shader on the
+        // CPU interpreter with the real captured SA + the first vertex's attributes, and print
+        // the clip output o[0..3]. If the recompiler math + uniforms are right, this is a
+        // sensible clip position; if it is off-screen/NaN, the problem is upstream of the GPU.
+        if std::env::var_os("VITASLOP_GXP_INTERP").is_some() {
+            if let Ok(vrc) = vitaslop_gxp_shader::recompile_vertex(&gxp.vprog) {
+                let mut regs = vitaslop_gxp_shader::interp::RegFile::with_lanes(512);
+                for (k, c) in gxp.vert_sa.chunks_exact(4).enumerate() {
+                    if k < regs.sa.len() {
+                        regs.sa[k] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
+                }
+                for a in &linked.vertex_bindings.attributes {
+                    if let Some(ga) = gxp.attributes.iter().find(|g| g.reg_index as u32 == a.base_lane) {
+                        for c in 0..ga.components as usize {
+                            let lane = a.base_lane as usize + c;
+                            if lane < regs.pa.len() {
+                                regs.pa[lane] = read_attr_component(&gxp.vertices, ga.offset as usize, ga.gxm_format, c);
+                            }
+                        }
+                    }
+                }
+                match vitaslop_gxp_shader::interp::run(&vrc.shader, &mut regs) {
+                    Ok(()) => {
+                        let w = regs.o[3];
+                        let ndc = if w.abs() > 1e-6 { [regs.o[0] / w, regs.o[1] / w, regs.o[2] / w] } else { [0.0; 3] };
+                        eprintln!("gxp interp: o={:?} ndc={:?} viewport(xo,xs,yo,ys,zo,zs)={:?}", &regs.o[0..4], ndc, gxp.viewport);
+                    }
+                    Err(e) => eprintln!("gxp interp: run failed: {e}"),
+                }
+            }
+        }
+
+        let wgsl = match inject_clip_fixup(&linked.wgsl, zfix, yflip, solid) {
+            Some(w) => w,
+            None => {
+                eprintln!(
+                    "gxp build: link failed: no `out.position` assignment to wrap with the clip \
+                     fixup - refusing to render without the depth remap"
+                );
+                return None;
+            }
+        };
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gxp-linked"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+
+        // group0 vertex uniform, group1 fragment uniform, group2 samplers (empty where unused).
+        let uniform_entry = |vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: vis,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let vsa_lanes = linked.vertex_bindings.sa_lane_count;
+        let fsa_lanes = linked.fragment_bindings.sa_lane_count;
+        let g0_entries: Vec<wgpu::BindGroupLayoutEntry> = if vsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::VERTEX)] } else { vec![] };
+        let g1_entries: Vec<wgpu::BindGroupLayoutEntry> = if fsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::FRAGMENT)] } else { vec![] };
+        let mut g2_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::new();
+        let mut samplers: Vec<(u8, SamplerDim)> = Vec::new();
+        for (i, b) in linked.fragment_bindings.samplers.iter().enumerate() {
+            // Mirrors `TexBinding::wgsl_type` exactly - the layout and the shader must agree.
+            let dim = match (b.coords >= 3, b.cube) {
+                (true, true) => SamplerDim::Cube,
+                (true, false) => SamplerDim::Three,
+                _ => SamplerDim::Two,
+            };
+            // The binding plan already names the GXM texture unit the guest bound to: the SMP
+            // sampler operand is resolved through the container's texture-control table when the
+            // instruction stream is decoded, and a prefetched sample names its unit outright.
+            let gxm_unit = b.unit as u32;
+            g2_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: i as u32 * 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: dim.view_dimension(),
+                    multisampled: false,
+                },
+                count: None,
+            });
+            g2_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: i as u32 * 2 + 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+            if debug {
+                eprintln!("gxp build: gxm texture unit {gxm_unit} (coords {}, {dim:?})", b.coords);
+            }
+            samplers.push((gxm_unit as u8, dim));
+        }
+        // group3 carries the scene depth range the injected clip fixup remaps through - one
+        // vec4 the renderer refills per frame, so the pipeline stays cached by shader identity.
+        let layouts = [
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g0"), entries: &g0_entries }),
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g1"), entries: &g1_entries }),
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g2"), entries: &g2_entries }),
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gxp-g3"),
+                entries: &[uniform_entry(wgpu::ShaderStages::VERTEX)],
+            }),
+        ];
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gxp-pl"),
+            bind_group_layouts: &[Some(&layouts[0]), Some(&layouts[1]), Some(&layouts[2]), Some(&layouts[3])],
+            immediate_size: 0,
+        });
+
+        let vbuffers: Vec<Option<wgpu::VertexBufferLayout>> = if wattrs.is_empty() {
+            vec![]
+        } else {
+            vec![Some(wgpu::VertexBufferLayout { array_stride: packed_stride as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wattrs })]
+        };
+
+        let make = |opaque: bool| {
+            let (mut blend, mut depth_write, mut depth_compare) = if opaque {
+                (Some(wgpu::BlendState::REPLACE), true, wgpu::CompareFunction::LessEqual)
+            } else {
+                (
+                    Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                    }),
+                    false,
+                    wgpu::CompareFunction::Always,
+                )
+            };
+            if solid {
+                // Diagnostic: REPLACE (ignore alpha) + depth Always, so a magenta triangle shows
+                // unconditionally wherever geometry lands.
+                blend = Some(wgpu::BlendState::REPLACE);
+                depth_write = false;
+                depth_compare = wgpu::CompareFunction::Always;
+            }
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(if opaque { "gxp-opaque" } else { "gxp-blend" }),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), buffers: &vbuffers, compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState { format: color_format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                    compilation_options: Default::default(),
+                }),
+                // No GPU cull yet: guest facing/winding under the recompiled clip is not yet
+                // confirmed, so draw both windings (the fixed-function path does the same) and
+                // rely on the depth test. A cull mode is a later refinement.
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(depth_compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        Some(GxpPipeline { opaque: make(true), blend: make(false), layouts, vsa_lanes, fsa_lanes, samplers, repack, packed_stride })
     }
 
     impl GxmRenderer {
@@ -981,6 +1859,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 resolve_layout,
                 resolve_scale_buf,
                 ss_target: None,
+                gxp: GxpLive::from_env(),
             }
         }
 
@@ -1171,7 +2050,34 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let mut idata: Vec<u8> = Vec::new();
             let mut udata: Vec<u8> = Vec::new();
             let mut items: Vec<Item> = Vec::with_capacity(scene.draws.len());
+            // The live recompiler's per-draw resources + a submission-order plan interleaving
+            // recompiled and fixed-function draws (so they share one depth-tested pass).
+            let gxp_enabled = self.gxp.enabled;
+            let gxp_only = self.gxp.only;
+            let color_format = self.color_format;
+            let mut gxp_prepared: Vec<GxpPrepared> = Vec::new();
+            let mut order: Vec<Enc> = Vec::with_capacity(scene.draws.len());
             for d in &scene.draws {
+                // Live GXP path: draw with the guest's real shaders when the pair links. On a
+                // link/format failure fall through to the fixed-function packing below (unless
+                // isolate mode, which renders only the recompiled draws).
+                if gxp_enabled {
+                    if let Some(g) = &d.gxp {
+                        if let Some(mut prep) = self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale]) {
+                            if self.gxp.solid {
+                                prep.blend = false; // REPLACE + depth-Always variant (see make)
+                            }
+                            order.push(Enc::Gxp(gxp_prepared.len()));
+                            gxp_prepared.push(prep);
+                            continue;
+                        }
+                        if gxp_only {
+                            continue;
+                        }
+                    } else if gxp_only {
+                        continue;
+                    }
+                }
                 if d.index_count == 0 || d.vertices.is_empty() {
                     continue;
                 }
@@ -1229,6 +2135,17 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     opaque: d.opaque,
                     bind,
                 });
+                order.push(Enc::Fixed(items.len() - 1));
+            }
+            if gxp_enabled {
+                let with_payload = scene.draws.iter().filter(|d| d.gxp.is_some()).count();
+                eprintln!(
+                    "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
+                    scene.draws.len(),
+                    with_payload,
+                    gxp_prepared.len(),
+                    items.len(),
+                );
             }
 
             // 2. Size the arenas and upload. Rebuild the uniform bind group if the uniform
@@ -1299,20 +2216,39 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                if items.is_empty() && !ss {
+                if order.is_empty() && !ss {
                     return; // clear-only frame; the pass above already cleared the target.
                 }
-                if !items.is_empty() {
-                    let ubo_bind = self.ubo_bind.as_ref().unwrap();
-                    let vbo = self.vbo.as_ref().unwrap();
-                    let ibo = self.ibo.as_ref().unwrap();
-                    for it in &items {
-                        pass.set_pipeline(if it.opaque { &self.opaque } else { &self.blend });
-                        pass.set_bind_group(0, ubo_bind, &[it.uniform_offset]);
-                        pass.set_bind_group(1, self.bind_for(it.bind), &[]);
-                        pass.set_vertex_buffer(0, vbo.slice(it.v_off..it.v_off + it.v_len));
-                        pass.set_index_buffer(ibo.slice(it.i_off..it.i_off + it.i_len), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..it.index_count, 0, 0..1);
+                // Draw in submission order, switching between the fixed-function arenas and the
+                // recompiled per-draw resources. The fixed-function handles are unwrapped only
+                // inside a Fixed arm, where `items` is non-empty so the arenas were uploaded.
+                let ubo_bind = self.ubo_bind.as_ref();
+                let vbo = self.vbo.as_ref();
+                let ibo = self.ibo.as_ref();
+                for e in &order {
+                    match e {
+                        Enc::Fixed(i) => {
+                            let it = &items[*i];
+                            let (ubo_bind, vbo, ibo) = (ubo_bind.unwrap(), vbo.unwrap(), ibo.unwrap());
+                            pass.set_pipeline(if it.opaque { &self.opaque } else { &self.blend });
+                            pass.set_bind_group(0, ubo_bind, &[it.uniform_offset]);
+                            pass.set_bind_group(1, self.bind_for(it.bind), &[]);
+                            pass.set_vertex_buffer(0, vbo.slice(it.v_off..it.v_off + it.v_len));
+                            pass.set_index_buffer(ibo.slice(it.i_off..it.i_off + it.i_len), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..it.index_count, 0, 0..1);
+                        }
+                        Enc::Gxp(idx) => {
+                            let p = &gxp_prepared[*idx];
+                            let pipe = self.gxp.pipeline(p.key);
+                            pass.set_pipeline(if p.blend { &pipe.blend } else { &pipe.opaque });
+                            pass.set_bind_group(0, &p.bg[0], &[]);
+                            pass.set_bind_group(1, &p.bg[1], &[]);
+                            pass.set_bind_group(2, &p.bg[2], &[]);
+                            pass.set_bind_group(3, &p.bg[3], &[]);
+                            pass.set_vertex_buffer(0, p.vbuf.slice(..));
+                            pass.set_index_buffer(p.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..p.index_count, 0, 0..1);
+                        }
                     }
                 }
             }

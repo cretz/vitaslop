@@ -254,6 +254,21 @@ impl RetailGuest {
         {
             let mut host = self.sched.host();
             let cap = &mut host.state.capture;
+            // Diagnostic (VITASLOP_DUMP_SCENES): a frame can contain several GXM scenes
+            // (render-to-texture passes plus the display pass). Only the last is kept, so
+            // knowing how many there were - and how big each is - is the difference between
+            // "the geometry is missing" and "the geometry is in a pass we discard".
+            if std::env::var_os("VITASLOP_DUMP_SCENES").is_some() && !cap.scenes.is_empty() {
+                let shape: Vec<String> = cap
+                    .scenes
+                    .iter()
+                    .map(|s| match &s.color {
+                        Some(c) => format!("{}draws@{}x{}", s.draws.len(), c.width, c.height),
+                        None => format!("{}draws@no-surface", s.draws.len()),
+                    })
+                    .collect();
+                eprintln!("SCENES frame={}: [{}]", self.sched.frames(), shape.join(", "));
+            }
             if let Some(scene) = cap.scenes.pop() {
                 self.scene = Some(scene);
             }
@@ -468,6 +483,17 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = shot_dir.join("desktop.png");
     std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
+    // Diagnostic (VITASLOP_SOFTWARE=1): also render the SAME captured scene through the
+    // software rasterizer and write it beside the GPU shot. The two paths share the scene
+    // but nothing else, so a defect present in both is upstream of rendering (geometry,
+    // capture, uniforms) rather than a shading bug - and the software path is the one that
+    // reports per-draw `DSTAT` coverage under VITASLOP_DRAW_STATS.
+    if std::env::var_os("VITASLOP_SOFTWARE").is_some() {
+        let sw = vitaslop_runtime::render::render_scene(scene, GAME_W, GAME_H, CLEAR);
+        let sw_path = shot_dir.join("software.png");
+        std::fs::write(&sw_path, sw.to_png()).map_err(|e| format!("write png: {e}"))?;
+        println!("headless: wrote {}", sw_path.display());
+    }
     println!("headless: reached frame {}, wrote {}", guest.frames(), path.display());
     Ok(())
 }

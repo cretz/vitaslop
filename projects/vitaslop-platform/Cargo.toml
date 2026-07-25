@@ -11,7 +11,11 @@ publish.workspace = true
 # vitaslop-runtime (the engine-agnostic browser blob) can depend on this crate
 # for the neutral seam types without dragging in a GPU stack. The frontends
 # (vitaslop-native, vitaslop-web) enable it.
-gpu = ["dep:wgpu"]
+gpu = ["dep:wgpu", "dep:vitaslop-gxp-shader"]
 
 [dependencies]
 wgpu = { workspace = true, optional = true }
+# The clean-room GXP->WGSL recompiler, used only by the GPU `GxmRenderer` to link a
+# guest vertex+fragment shader pair into a live pipeline (falls back to fixed-function
+# on any LinkError). Its lib is wasm-safe, so the web build keeps working.
+vitaslop-gxp-shader = { path = "../vitaslop-gxp-shader", optional = true }

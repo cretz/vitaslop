@@ -3024,6 +3024,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vitaslop-gxp-shader"
+version = "0.0.0"
+dependencies = [
+ "naga",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "vitaslop-hostcall"
 version = "0.0.0"
 dependencies = [
@@ -3058,6 +3067,7 @@ dependencies = [
 name = "vitaslop-platform"
 version = "0.0.0"
 dependencies = [
+ "vitaslop-gxp-shader",
  "wgpu",
 ]
 
@@ -3076,6 +3086,7 @@ dependencies = [
  "skrifa",
  "tracing",
  "vitaslop-atrac9",
+ "vitaslop-gxp-shader",
  "vitaslop-hostcall",
  "vitaslop-loader",
  "vitaslop-platform",

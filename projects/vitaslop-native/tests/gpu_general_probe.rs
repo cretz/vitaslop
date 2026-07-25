@@ -56,6 +56,12 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         exposure: 1.0,
         material: FragmentMaterial::default(),
         world: IDENTITY_MVP,
+        // The GXP recompiler payload: empty off that path, which is what these fixed-function
+        // probes exercise.
+        vprog: Vec::new(),
+        fprog: Vec::new(),
+        vert_sa: Vec::new(),
+        frag_sa: Vec::new(),
     }
 }
 
@@ -75,8 +81,10 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         width: size,
         height: size,
         stride: size * 4,
+        faces: 1,
+        face_bytes: size * size * 4,
         data_addr: 0x1000,
-        pixels,
+        pixels: pixels.into(),
         u_addr_mode: 0,
         v_addr_mode: 0,
         lod_bias: 0,
@@ -206,6 +214,12 @@ fn mvp_quad(
         exposure,
         material,
         world: IDENTITY_MVP,
+        // The GXP recompiler payload: empty off that path, which is what these fixed-function
+        // probes exercise.
+        vprog: Vec::new(),
+        fprog: Vec::new(),
+        vert_sa: Vec::new(),
+        frag_sa: Vec::new(),
     }
 }
 
@@ -268,6 +282,12 @@ fn general_renderer_matches_software_oracle() {
             exposure: 1.0,
             material: FragmentMaterial::default(),
             world: IDENTITY_MVP,
+        // The GXP recompiler payload: empty off that path, which is what these fixed-function
+        // probes exercise.
+        vprog: Vec::new(),
+        fprog: Vec::new(),
+        vert_sa: Vec::new(),
+        frag_sa: Vec::new(),
         };
         assert_parity(&mut gpu, &Scene { color: None, draws: vec![draw] }, "ndc-vertexcolor");
     }
@@ -375,8 +395,10 @@ fn general_renderer_matches_software_oracle() {
             width: 2,
             height: 2,
             stride: 8,
+            faces: 1,
+            face_bytes: 16,
             data_addr: 0x2000,
-            pixels: px,
+            pixels: px.into(),
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
@@ -427,6 +449,12 @@ fn general_renderer_matches_software_oracle() {
             // Flat material (unit ambient, no directional light) isolates the exposure ramp.
             material: flat_material(),
             world: IDENTITY_MVP,
+        // The GXP recompiler payload: empty off that path, which is what these fixed-function
+        // probes exercise.
+        vprog: Vec::new(),
+        fprog: Vec::new(),
+        vert_sa: Vec::new(),
+        frag_sa: Vec::new(),
         };
         let scene = Scene { color: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-untextured");
@@ -463,6 +491,12 @@ fn general_renderer_matches_software_oracle() {
                 exposure: 1.0,
                 material: FragmentMaterial::default(),
                 world: IDENTITY_MVP,
+        // The GXP recompiler payload: empty off that path, which is what these fixed-function
+        // probes exercise.
+        vprog: Vec::new(),
+        fprog: Vec::new(),
+        vert_sa: Vec::new(),
+        frag_sa: Vec::new(),
             };
             Scene { color: None, draws: vec![draw] }
         };
@@ -535,7 +569,8 @@ fn general_renderer_supersample_matches_software() {
     };
     let tex = BoundTexture {
         unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 2, height: 2, stride: 8,
-        pixels: checker, data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0,
+        faces: 1, face_bytes: 16,
+        pixels: checker.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0,
         min_filter: 0, mag_filter: 0,
     };
     let mut sprite_v = Vec::new();

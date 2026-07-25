@@ -11,6 +11,10 @@ vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-loader = { path = "../vitaslop-loader" }
 vitaslop-atrac9 = { path = "../vitaslop-atrac9" }
 vitaslop-platform = { path = "../vitaslop-platform" }
+# Clean-room GXP (SceGxmProgram) -> WGSL shader recompiler. Engaged only in the
+# explicit VITASLOP_GXP_RECOMPILE grind mode; hard-fails naming the unimplemented
+# opcode (never a silent fixed-function fallback). wasm-safe, ships no game data.
+vitaslop-gxp-shader = { path = "../vitaslop-gxp-shader" }
 # The #[hostcall] attribute macro that generates AAPCS-VFP arg marshalling for the
 # Vita host handlers in vita/. A proc-macro crate, so it is host-side only and
 # adds nothing to the guest wasm.

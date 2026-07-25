@@ -3,6 +3,8 @@
 //! vertex/index/uniform snapshots) without emulating a GPU or drawing a pixel.
 //! A software rasterizer or wgpu backend later consumes this to produce frames.
 
+use std::sync::Arc;
+
 /// One vertex attribute as declared by the guest's vertex program: which stream,
 /// byte offset within a vertex, source format, and component count. `format` and
 /// the counts are the raw GXM enum values so the consumer decodes exactly what
@@ -112,8 +114,21 @@ pub struct BoundTexture {
     pub height: u32,
     /// Bytes per row of the snapshotted `pixels` (== the source stride).
     pub stride: u32,
+    /// How many `width x height` faces `pixels` holds: 1 for an ordinary texture, 6 for a
+    /// CUBE map (`SCE_GXM_TEXTURE_CUBE`/`CUBE_ARBITRARY`), whose faces are stored back to
+    /// back in +X, -X, +Y, -Y, +Z, -Z order - the same order WebGPU expects its array layers
+    /// in. Face `f` starts at byte `f * face_bytes`.
+    pub faces: u32,
+    /// Byte size of one face in `pixels` (the whole buffer when `faces` is 1).
+    pub face_bytes: u32,
     pub data_addr: u32,
-    pub pixels: Vec<u8>,
+    /// The raw guest bytes of the texture, exactly as laid out in guest memory.
+    ///
+    /// Shared (`Arc`) rather than owned: one scene binds the same few textures across
+    /// hundreds of draws, and a per-draw copy of a 4096x2048 shadow map costs gigabytes a
+    /// frame. Sharing also gives consumers a cheap identity key (the pointer) for caching
+    /// GPU uploads, so an unchanged texture is uploaded once per frame rather than per draw.
+    pub pixels: Arc<[u8]>,
     /// Sampler wrap modes (`SceGxmTextureAddrMode`, 0 = REPEAT) and LOD bias set on
     /// this texture via `sceGxmTextureSet{U,V}AddrMode[Safe]` / `SetLodBias`.
     pub u_addr_mode: u32,
@@ -184,6 +199,10 @@ pub struct Draw {
     pub uniforms: Vec<f32>,
     /// Fragment textures bound at draw time (one per active sampler unit),
     /// snapshotted from guest memory. Empty for an untextured (vertex-color) draw.
+    ///
+    /// Ordered so that index 0 is the draw's surface albedo when it has one - see
+    /// [`Draw::albedo`], which is what the fixed-function approximation samples. The full list
+    /// is what the GXP recompiler binds by unit, so nothing is ever dropped from it.
     pub textures: Vec<BoundTexture>,
     /// The fixed-function pipeline state (cull/depth/stencil/viewport/...) in effect
     /// for this draw, snapshotted from the sticky GXM context state. See [`RenderState`].
@@ -203,6 +222,36 @@ pub struct Draw {
     /// when the shader has no separate world matrix (2D/UI), so lighting there uses the raw
     /// normal - harmless because such draws are not depth-lit.
     pub world: [f32; 16],
+    /// The bound vertex `SceGxmProgram` container bytes, snapshotted for the GXP->WGSL
+    /// recompiler (live guest-shader) path. Empty unless recompile-capture is enabled
+    /// (env `VITASLOP_GXP_LIVE`), so the default capture pays no read/clone cost.
+    pub vprog: Vec<u8>,
+    /// The bound fragment `SceGxmProgram` container bytes. Empty off the recompiler path.
+    pub fprog: Vec<u8>,
+    /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
+    /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
+    /// above (which the fixed-function path needs but the real shader recomputes itself).
+    pub vert_sa: Vec<u8>,
+    /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
+    /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
+    pub frag_sa: Vec<u8>,
+}
+
+impl Draw {
+    /// The texture the fixed-function approximation samples across this draw's triangles.
+    ///
+    /// This is index 0 by the ordering contract on [`Draw::textures`]. Note that a draw can
+    /// bind textures that are not surface albedo at all - a one-dimensional lookup table (a fog
+    /// ramp, indexed by depth) or a cube map (an irradiance probe, indexed by a direction) - and
+    /// for a draw that binds ONLY those, the approximation stretches one across the surface. It
+    /// is visibly not what the guest draws (a start-line decal paints as vertical bands of the
+    /// fog ramp), but it is better than the alternative: refusing to pick one leaves the draw
+    /// with no texture at all, which the renderers paint as the magenta missing-texture marker,
+    /// and it hides real geometry. Reproducing these materials needs the recompiled fragment
+    /// shader that reads each sampler for what it is.
+    pub fn albedo(&self) -> Option<&BoundTexture> {
+        self.textures.first()
+    }
 }
 
 /// One scene (BeginScene to EndScene): its render target color buffer and the

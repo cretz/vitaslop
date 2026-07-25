@@ -395,6 +395,22 @@ fn shade_lit(albedo: [f32; 3], n_world: [f32; 3], mat: &crate::capture::Fragment
 /// a Pixel-space draw carries absolute native pixel coords, so they are multiplied by `ssaa`
 /// to cover the enlarged raster - exactly what the GPU's Pixel path does by mapping through the
 /// native `surf_w`/`surf_h` into a full-viewport clip space.
+/// Project a vertex to screen space, returning `[x, y, depth, 1/w]`.
+///
+/// DEPTH IS `-1/w`, NOT the clip `z/w`. GXM/PowerVR SGX resolves visibility from the clip
+/// `w` (the projected view distance), not from a normalized clip `z`, and this title proves
+/// it: its vertex programs emit a clip `z` that is a linear combination of the `x`, `y` and
+/// `w` rows, so `z/w` is a function of the SCREEN POSITION ALONE - measured identical to
+/// nine digits across the ground and every car draw covering one pixel, while `w` correctly
+/// separated them (car 20.81 in front of ground 21.62). A `z/w` depth buffer therefore
+/// carries no depth at all for this title and rejects geometry essentially at random.
+///
+/// `-1/w` is the faithful choice, not merely a workaround: it is screen-linear (so it
+/// interpolates exactly across a triangle, like any projection's depth), it increases with
+/// view distance so the guest's own depth func keeps its meaning ("nearer wins" for a LESS
+/// test against a `+INF` clear), and for a well-formed projection - where `z/w = A + B/w` -
+/// it is an increasing affine function of that `z/w`, so it produces the IDENTICAL ordering
+/// a correct clip `z` would. It agrees with a conventional title and rescues this one.
 fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Option<[f32; 4]> {
     let (wf, hf) = (width as f32, height as f32);
     match space {
@@ -407,7 +423,7 @@ fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Opt
             let sx = (c[0] * inv_w * 0.5 + 0.5) * wf;
             // Flip Y: NDC +Y is up, image +Y is down.
             let sy = (1.0 - (c[1] * inv_w * 0.5 + 0.5)) * hf;
-            Some([sx, sy, c[2] * inv_w, inv_w])
+            Some([sx, sy, -inv_w, inv_w])
         }
         Space::Ndc => {
             let sx = (v.pos[0] * 0.5 + 0.5) * wf;
@@ -507,18 +523,28 @@ pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
         0x98 | 0x99 => (1, 1, 3),
         // 32-bit (U8U8U8U8, ..., F32) and 32-bit single (U32/S32).
         0x0c..=0x1a => (1, 1, 4),
-        // BC1 (DXT1) and BC4: 8-byte 4x4 blocks.
-        0x85 | 0x88 => (4, 4, 8),
-        // BC2 (DXT3), BC3 (DXT5), BC5: 16-byte 4x4 blocks.
-        0x86 | 0x87 | 0x8a => (4, 4, 16),
+        // 64-bit four/two-channel: F16F16F16F16, U16U16U16U16, S16S16S16S16, F32F32, U32U32.
+        0x1b..=0x1f => (1, 1, 8),
+        // BC1 (DXT1) and BC4 (both signs): 8-byte 4x4 blocks.
+        0x85 | 0x88 | 0x89 => (4, 4, 8),
+        // BC2 (DXT3), BC3 (DXT5), BC5 (both signs): 16-byte 4x4 blocks.
+        0x86 | 0x87 | 0x8a | 0x8b => (4, 4, 16),
         _ => return None,
     })
 }
 
 /// Whether a `SceGxmTextureType` selector uses the GPU's Morton (Z-order) swizzled
-/// memory layout: `SCE_GXM_TEXTURE_SWIZZLED` (0) and `SWIZZLED_ARBITRARY` (5).
+/// memory layout: `SCE_GXM_TEXTURE_SWIZZLED` (0), `SWIZZLED_ARBITRARY` (5), and both CUBE
+/// layouts (2, 7), whose individual faces are swizzled images.
 pub fn swizzled_type(tex_type: u32) -> bool {
-    matches!(tex_type, 0 | 5)
+    matches!(tex_type, 0 | 2 | 5 | 7)
+}
+
+/// Whether a `SceGxmTextureType` selector is a CUBE map, whose data holds six faces rather
+/// than one image: `SCE_GXM_TEXTURE_CUBE` (2) and `SCE_GXM_TEXTURE_CUBE_ARBITRARY` (7). Both
+/// use the swizzled per-face layout [`swizzled_type`] describes.
+pub fn cube_type(tex_type: u32) -> bool {
+    matches!(tex_type, 2 | 7)
 }
 
 /// Interleave the low bits of `x` and `y` (Morton / Z-order) up to the square
@@ -724,10 +750,15 @@ pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
     if t.width == 0 || t.height == 0 {
         return (1, 1, vec![255, 0, 255, 255]);
     }
-    let mut rgba = Vec::with_capacity((t.width * t.height * 4) as usize);
-    for y in 0..t.height {
-        for x in 0..t.width {
-            rgba.extend_from_slice(&texel_rgba(t, x, y));
+    // A cube map decodes to its six faces stacked in `BoundTexture::faces` order, which is the
+    // layer order the GPU binds them in.
+    let faces = t.faces.max(1);
+    let mut rgba = Vec::with_capacity((t.width * t.height * faces * 4) as usize);
+    for f in 0..faces {
+        for y in 0..t.height {
+            for x in 0..t.width {
+                rgba.extend_from_slice(&texel_rgba_face(t, f, x, y));
+            }
         }
     }
     (t.width, t.height, rgba)
@@ -738,9 +769,17 @@ pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
 /// (BC/DXT, optionally Morton-swizzled) and the uncompressed format families; an
 /// unknown format returns opaque magenta so it is visible, not silent.
 fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
+    texel_rgba_face(t, 0, x, y)
+}
+
+/// [`texel_rgba`] for a chosen `face` of a cube map (face 0 for an ordinary texture). Faces
+/// are stored back to back, each laid out exactly like a standalone texture of the same size,
+/// so a face is just a byte offset applied to every fetch.
+fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
     let Some((block_w, block_h, block_bytes)) = block_layout(t.base_format) else {
         return [255, 0, 255, 255];
     };
+    let face_base = (face * t.face_bytes) as usize;
     // Block-compressed (BC/DXT): locate the 4x4 block (Morton-addressed when the
     // texture is swizzled, else row-major), decode it, and apply the channel
     // swizzle to the decoded RGBA (ABGR/field 0 is the identity).
@@ -753,13 +792,13 @@ fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
         } else {
             by * (t.stride / block_bytes) + bx
         };
-        let off = (block_index * block_bytes) as usize;
+        let off = face_base + (block_index * block_bytes) as usize;
         let block = t.pixels.get(off..off + block_bytes as usize).unwrap_or(&[]);
         let rgba = decode_bc_texel(block, t.base_format, x % block_w, y % block_h);
         let swizzle = (t.swizzle >> 12) & 0x7;
         return swizzle4(rgba[0], rgba[1], rgba[2], rgba[3], swizzle);
     }
-    let off = (y * t.stride + x * block_bytes) as usize;
+    let off = face_base + (y * t.stride + x * block_bytes) as usize;
     let px = &t.pixels;
     let byte = |i: usize| -> u8 { *px.get(off + i).unwrap_or(&0) };
     // Channel swizzle field (bits 12..14 of the full SceGxmTextureFormat).
@@ -806,6 +845,23 @@ fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
             let n = |sh: u32| (((w >> sh) & 0xf) as u32 * 255 / 15) as u8;
             // n0 = LSB nibble .. n3 = MSB nibble, matching b0..b3 lane roles.
             swizzle4(n(0), n(4), n(8), n(12), swizzle)
+        }
+        // 64-bit four-channel. The four lanes sit in memory order exactly as the 8888 case's
+        // four bytes do, so the same SWIZZLE4 selector permutes them. Each lane is reduced to
+        // 8 bits for the shared RGBA8 texture seam: F16 saturates to [0,1] (these are HDR
+        // lookup tables - a value above 1.0 clamps, which the seam cannot represent), while
+        // U16/S16 are normalized ranges that map exactly.
+        0x1b | 0x1c | 0x1d => {
+            let lane = |i: usize| -> u8 {
+                let raw = u16::from_le_bytes([byte(i * 2), byte(i * 2 + 1)]);
+                let v = match t.base_format {
+                    0x1b => half_to_f32(raw),
+                    0x1c => raw as f32 / 65535.0,
+                    _ => ((raw as i16) as f32 / 32767.0).max(0.0),
+                };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            swizzle4(lane(0), lane(1), lane(2), lane(3), swizzle)
         }
         // Single channel U8/S8 (fonts, coverage masks): route the one channel to RGBA
         // per the format's SWIZZLE1 selector. Font atlases are typically RRRR (coverage
@@ -901,7 +957,7 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
     // size would collapse the whole surface onto one corner texel (a flat smear). So only
     // apply the texel-unit normalization to non-MVP (2D) draws; 3D UVs pass through and the
     // sampler's REPEAT wrap handles the tiling.
-    let uv_div = match (textured, d.textures.first()) {
+    let uv_div = match (textured, d.albedo()) {
         (true, Some(tex)) if !matches!(space, Space::Mvp(_)) => {
             let stride = d.vertex_stride.max(1) as usize;
             let nverts = d.vertices.len() / stride;
@@ -972,7 +1028,25 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
     // as noise. Read once here (not per triangle) so the hot path stays clean.
     let uv_debug = std::env::var("VITASLOP_UV_DEBUG").is_ok();
 
+    // Diagnostic: VITASLOP_DRAW_ONLY=<i>,<i>.. rasterizes only those draw indices (the `di`
+    // DSTAT prints), leaving the rest of the frame at the clear colour. Attributing a hole
+    // or an artifact to one draw is otherwise guesswork on a 90-draw scene.
+    let only: Option<Vec<usize>> = std::env::var("VITASLOP_DRAW_ONLY").ok().map(|s| {
+        s.split(',').filter_map(|p| p.trim().parse().ok()).collect()
+    });
+
+    // Diagnostic: VITASLOP_DUMP_TRIS=<draw>:<n> prints the first `n` triangles of that draw
+    // as (index triple, model-space positions, screen positions). This is what distinguishes
+    // "the mesh really is a set of ribbons" from "we are decoding its vertices wrongly".
+    let dump_tris: Option<(usize, usize)> = std::env::var("VITASLOP_DUMP_TRIS").ok().and_then(|s| {
+        let (a, b) = s.split_once(':')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+
     for (di, d) in scene.draws.iter().enumerate() {
+        if only.as_ref().is_some_and(|list| !list.contains(&di)) {
+            continue;
+        }
         // A list emits idx/3 triangles; a strip or fan emits idx-2 (each new index adds
         // one triangle). Any other topology (lines, points) emits none and is skipped.
         let tri_count = triangle_count(d);
@@ -1008,8 +1082,8 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
         } else {
             SCE_GXM_CULL_NONE
         };
-        let texture = if textured { d.textures.first() } else { None };
-        let (mut n_behind, mut n_off, mut n_on) = (0u32, 0u32, 0u32);
+        let texture = if textured { d.albedo() } else { None };
+        let (mut n_behind, mut n_off, mut n_on, mut n_culled) = (0u32, 0u32, 0u32, 0u32);
         let (mut bb_lo, mut bb_hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
 
         for t in 0..tri_count {
@@ -1034,6 +1108,14 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
                 n_behind += 1;
                 continue;
             }
+            if dump_tris.is_some_and(|(want, n)| want == di && t < n) {
+                let p = |v: &Vertex| format!("({:.2},{:.2},{:.2})", v.pos[0], v.pos[1], v.pos[2]);
+                eprintln!(
+                    "TRI draw {di} #{t} idx={vs:?} model={} {} {} screen=({:.0},{:.0}) ({:.0},{:.0}) ({:.0},{:.0})",
+                    p(&verts[0]), p(&verts[1]), p(&verts[2]),
+                    screen[0][0], screen[0][1], screen[1][0], screen[1][1], screen[2][0], screen[2][1]
+                );
+            }
             if stats {
                 let on = screen.iter().any(|s| s[0] >= 0.0 && s[0] < width as f32 && s[1] >= 0.0 && s[1] < height as f32);
                 if on { n_on += 1 } else { n_off += 1 }
@@ -1044,6 +1126,7 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
             }
             // Cull back faces before rasterizing (screen-space winding).
             if cull_mode != SCE_GXM_CULL_NONE && cull_backface(edge(&screen[0], &screen[1], &screen[2]), cull_mode) {
+                n_culled += 1;
                 continue;
             }
             raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug);
@@ -1052,7 +1135,7 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
             let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
             let sp = match space { Space::Mvp(_) => "mvp", Space::Ndc => "ndc", Space::Pixel => "pixel" };
             eprintln!(
-                "DSTAT draw {di} space={sp} dtest={depth_test} cull={:#x} tris={tri_count} on={n_on} off={n_off} behind={n_behind} wrote+{wrote} bbox=[{:.0},{:.0}..{:.0},{:.0}] tex={}",
+                "DSTAT draw {di} space={sp} dtest={depth_test} cull={:#x} tris={tri_count} on={n_on} off={n_off} behind={n_behind} culled={n_culled} wrote+{wrote} bbox=[{:.0},{:.0}..{:.0},{:.0}] tex={}",
                 cull_mode, bb_lo[0], bb_lo[1], bb_hi[0], bb_hi[1],
                 d.textures.first().map(|t| format!("{}x{}", t.width, t.height)).unwrap_or_default()
             );
@@ -1378,7 +1461,8 @@ impl RenderSceneBuilder {
         // bilinear, as the software `sample_texture_bilinear` does). SceGxmTextureFilter:
         // 1 = LINEAR, 0 = POINT.
         let filter_linear = t.mag_filter == 1;
-        let g = GxmTexture { key, width, height, rgba: Arc::new(rgba), filter_linear };
+        let g =
+            GxmTexture { key, width, height, faces: t.faces.max(1), rgba: Arc::new(rgba), filter_linear };
         self.decode_cache.insert(key, g.clone());
         g
     }
@@ -1398,7 +1482,10 @@ impl RenderSceneBuilder {
         // the GPU's linear depth normalization.
         let mut dmin = f32::INFINITY;
         let mut dmax = f32::NEG_INFINITY;
-        for d in &scene.draws {
+        // Diagnostic: VITASLOP_DRAW_STATS also reports each opaque draw's own visible depth
+        // span, which is what the GPU's normalization has to keep separable.
+        let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+        for (di, d) in scene.draws.iter().enumerate() {
             // A list emits idx/3 triangles; a strip or fan emits idx-2. Any other topology
             // (lines/points) emits none and is skipped.
             let tri_count = triangle_count(d);
@@ -1444,6 +1531,7 @@ impl RenderSceneBuilder {
             let mut screen_pos: Vec<Option<[f32; 4]>> =
                 if mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
 
+            let (mut draw_dmin, mut draw_dmax) = (f32::INFINITY, f32::NEG_INFINITY);
             let mut vertices = Vec::with_capacity(nverts * GXM_VERTEX_STRIDE as usize);
             for i in 0..nverts {
                 let v = decode_vertex(d, layout, i);
@@ -1475,10 +1563,12 @@ impl RenderSceneBuilder {
                     if let Some(m) = mvp {
                         let c = transform(&m, v.pos[0], v.pos[1], v.pos[2]);
                         if c[3] > 1e-4 {
-                            let (nx, ny, nz) = (c[0] / c[3], c[1] / c[3], c[2] / c[3]);
-                            if nx.abs() <= 1.0 && ny.abs() <= 1.0 && nz.is_finite() {
-                                dmin = dmin.min(nz);
-                                dmax = dmax.max(nz);
+                            let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
+                            if nx.abs() <= 1.0 && ny.abs() <= 1.0 && depth.is_finite() {
+                                dmin = dmin.min(depth);
+                                dmax = dmax.max(depth);
+                                draw_dmin = draw_dmin.min(depth);
+                                draw_dmax = draw_dmax.max(depth);
                             }
                         }
                     }
@@ -1507,9 +1597,70 @@ impl RenderSceneBuilder {
                 }
             }
             let index_count = (indices.len() / 4) as u32;
+            if stats && opaque && draw_dmax >= draw_dmin {
+                println!(
+                    "draw {di:>3}: tris={tri_count:<5} depth [{draw_dmin:.9}, {draw_dmax:.9}] func={:#x} write={:#x} cull={:#x}",
+                    d.render_state.front_depth_func,
+                    d.render_state.front_depth_write,
+                    d.render_state.cull_mode
+                );
+            }
 
-            let texture = if interp.textured {
-                d.textures.first().map(|t| self.texture(t))
+            let texture =
+                if interp.textured { d.albedo().map(|t| self.texture(t)) } else { None };
+
+            // When the runtime captured the raw shader blobs (recompiler path enabled),
+            // attach everything the GXP->WGSL recompiler needs to draw this call with the
+            // guest's real shaders. The renderer links + caches a pipeline and falls back to
+            // the fixed-function fields above on any link/format error. We carry the RAW guest
+            // vertex/index buffers (not the culled canonical ones) so the recompiled pipeline
+            // does its own attribute fetch + facing cull.
+            let gxp = if !d.vprog.is_empty() {
+                let attributes = d
+                    .attributes
+                    .iter()
+                    .map(|a| vitaslop_platform::gpu::GxpAttr {
+                        reg_index: a.reg_index,
+                        offset: a.offset,
+                        gxm_format: a.format,
+                        components: a.component_count,
+                    })
+                    .collect();
+                let textures = d
+                    .textures
+                    .iter()
+                    .map(|t| vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t) })
+                    .collect();
+                // Expand the guest topology into a flat, winding-normalized triangle-LIST u32
+                // index buffer (NO CPU cull - the recompiled pipeline culls on the GPU via the
+                // guest cull mode, using its own real-shader projection). Indexes into the RAW
+                // guest vertex stream `d.vertices`.
+                let mut gxp_indices = Vec::with_capacity(tri_count * 3 * 4);
+                for t in 0..tri_count {
+                    for k in tri_indices(d, t) {
+                        gxp_indices.extend_from_slice(&(k as u32).to_le_bytes());
+                    }
+                }
+                let gxp_index_count = (gxp_indices.len() / 4) as u32;
+                Some(vitaslop_platform::gpu::GxpRecompile {
+                    vprog: d.vprog.clone(),
+                    fprog: d.fprog.clone(),
+                    vert_sa: d.vert_sa.clone(),
+                    frag_sa: d.frag_sa.clone(),
+                    vertices: d.vertices.clone(),
+                    vertex_stride: d.vertex_stride,
+                    attributes,
+                    indices: gxp_indices,
+                    index_count: gxp_index_count,
+                    index_u32: true,
+                    primitive: d.primitive,
+                    textures,
+                    depth_write: d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED,
+                    depth_func: d.render_state.front_depth_func,
+                    cull_mode: d.render_state.cull_mode,
+                    blend: !opaque,
+                    viewport: d.render_state.viewport,
+                })
             } else {
                 None
             };
@@ -1528,6 +1679,7 @@ impl RenderSceneBuilder {
                     light_col: d.material.light_col,
                     ambient: d.material.ambient,
                 },
+                gxp,
             });
         }
         // Linear depth-normalization params: map the visible opaque depth range to [0,1].
@@ -1568,6 +1720,10 @@ mod geometry_tests {
             exposure: 1.0,
             material: crate::capture::FragmentMaterial::default(),
             world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            vprog: vec![],
+            fprog: vec![],
+            vert_sa: vec![],
+            frag_sa: vec![],
         }
     }
 
@@ -1656,6 +1812,56 @@ mod geometry_tests {
         // The +inf-cleared buffer: any finite fragment passes LESS_EQUAL.
         assert!(depth_passes(100.0, f32::INFINITY, LESS_EQUAL));
     }
+
+    /// [`project`] must resolve visibility from the projected view distance `w`, not the clip
+    /// `z` - see its doc comment for the measurement that established this. The two properties
+    /// that matter are pinned here: a nearer surface must produce a SMALLER depth (so the
+    /// guest's LESS/LESS_EQUAL func means "nearer wins"), and the clip `z` must not influence
+    /// it at all (this title emits a clip `z` that is a combination of the x/y/w rows, so
+    /// `z/w` is constant per screen position and carries no depth).
+    #[test]
+    fn depth_comes_from_w_not_clip_z() {
+        // A projection whose z row is a copy of the w row plus an x/y mix - the degenerate
+        // shape this title's vertex programs emit, where z/w depends only on screen position.
+        // Column-major, as `transform` reads it: m[2],m[6],m[10],m[14] is the z column.
+        let mut m = [0.0f32; 16];
+        m[0] = 1.0; // x = X
+        m[5] = 1.0; // y = Y
+        m[11] = 1.0; // w = Z  (view distance)
+        m[2] = 0.5; // z = 0.5*X + 0.25*Y + Z  -> z/w = 0.5*(x/w) + 0.25*(y/w) + 1
+        m[6] = 0.25;
+        m[10] = 1.0;
+        let space = Space::Mvp(m);
+        let at = |x: f32, y: f32, z: f32| {
+            let v = Vertex { pos: [x, y, z], uv: [0.0; 2], color: [255; 4], normal: [0.0; 3] };
+            project(&v, &space, 100, 100, 1.0).expect("in front of the eye")
+        };
+
+        // Same screen position (x/w, y/w equal), different distances.
+        let near = at(2.0, 4.0, 10.0);
+        let far = at(4.0, 8.0, 20.0);
+        assert!((near[0] - far[0]).abs() < 1e-5 && (near[1] - far[1]).abs() < 1e-5, "same pixel");
+        assert!(near[2] < far[2], "nearer must be smaller: {} vs {}", near[2], far[2]);
+        assert!(depth_passes(near[2], far[2], 0x00C0_0000), "nearer wins under LESS_EQUAL");
+
+        // The clip z of both is identical (the degenerate case), so a z/w depth would tie and
+        // let submission order decide - which is exactly the failure this model removes.
+        let zw = |x: f32, y: f32, z: f32| {
+            let c = transform(&m, x, y, z);
+            c[2] / c[3]
+        };
+        assert!(
+            (zw(2.0, 4.0, 10.0) - zw(4.0, 8.0, 20.0)).abs() < 1e-6,
+            "the fixture's clip z/w carries no depth, by construction"
+        );
+
+        // Depth is screen-linear (affine in 1/w), so it interpolates exactly across a triangle:
+        // the midpoint in screen space of two vertices has the mean of their depths.
+        let mid = at(3.0, 6.0, 15.0);
+        let half = 0.5 * (1.0 / 10.0 + 1.0 / 20.0);
+        assert!((mid[3] - 1.0 / 15.0).abs() < 1e-6);
+        assert!((-half - (near[2] + far[2]) / 2.0).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]
@@ -1705,7 +1911,8 @@ mod supersample_tests {
         }
         let tex = BoundTexture {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
-            pixels: vec![200, 100, 50, 255], data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
+            faces: 1, face_bytes: 4,
+            pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
             lod_bias: 0, min_filter: 0, mag_filter: 0,
         };
         let draw = Draw {
@@ -1718,6 +1925,7 @@ mod supersample_tests {
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
+            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![],
         };
         let scene = Scene { color: None, draws: vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -1749,7 +1957,8 @@ mod supersample_tests {
         }
         let tex = BoundTexture {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
-            pixels, data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0,
+            faces: 1, face_bytes: tw * th * 4,
+            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0,
         };
         // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
         // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
@@ -1770,6 +1979,7 @@ mod supersample_tests {
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
+            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![],
         };
         let s = Scene { color: None, draws: vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
@@ -1809,8 +2019,10 @@ mod texture_tests {
             width: w,
             height: h,
             stride,
+            faces: 1,
+            face_bytes: pixels.len() as u32,
             data_addr: 0,
-            pixels,
+            pixels: pixels.into(),
             u_addr_mode: 0,
             v_addr_mode: 0,
             lod_bias: 0,
@@ -1940,7 +2152,8 @@ mod texture_tests {
     // Build a texture with an explicit `SceGxmTextureType` selector (LINEAR = 3,
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, data_addr: 0, pixels, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0 }
+        let face_bytes = pixels.len() as u32;
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0 }
     }
 
     #[test]

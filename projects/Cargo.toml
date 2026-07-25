@@ -6,6 +6,7 @@ members = [
     "vitaslop-conformance-suite-arm",
     "vitaslop-desktop",
     "vitaslop-gamerun-recipes",
+    "vitaslop-gxp-shader",
     "vitaslop-hostcall",
     "vitaslop-loader",
     "vitaslop-native",
