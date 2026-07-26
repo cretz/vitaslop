@@ -189,7 +189,7 @@ fn encode(ev: &Ev) -> JsValue {
             let code = match stop {
                 Stop::Quantum => 0.0,
                 Stop::Blocked => 1.0,
-                Stop::Yielded => 2.0,
+                Stop::Flip => 2.0,
             };
             Array::of2(&f(0.0), &f(code)).into()
         }
@@ -207,7 +207,7 @@ fn decode(val: &JsValue) -> Ev {
     match arr.get(0).as_f64().unwrap_or(4.0) as u32 {
         0 => Ev::Suspend(match a {
             1 => Stop::Blocked,
-            2 => Stop::Yielded,
+            2 => Stop::Flip,
             _ => Stop::Quantum,
         }),
         1 => Ev::Returned(a),
@@ -290,7 +290,7 @@ impl BrowserEngine {
                     // pending Promise so the guest stack suspends until it resolves.
                     SvcOutcome::Reschedule => suspend(&signal, &cont, Stop::Quantum),
                     SvcOutcome::Block => suspend(&signal, &cont, Stop::Blocked),
-                    SvcOutcome::Yield => suspend(&signal, &cont, Stop::Yielded),
+                    SvcOutcome::Flip => suspend(&signal, &cont, Stop::Flip),
                     // The thread (or process) ends here: report the event and park on a
                     // never-resolving Promise (this stack is abandoned - on a thread exit
                     // the scheduler may still start the thread's next entry on a fresh

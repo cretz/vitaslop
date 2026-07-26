@@ -39,6 +39,8 @@ impl Engine for WebEngine {
             arm_entries: &[],
             externs: &[],
             redirects: &[],
+            // The ARM corpus has no NID imports at all, so nothing to inline.
+            inline_imports: &[],
             noreturn_svc: NORETURN_SVC,
             mem_bytes: MEM_BYTES,
             // The ARM corpus is tightly controlled and takes no function

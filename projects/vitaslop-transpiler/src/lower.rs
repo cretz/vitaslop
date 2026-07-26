@@ -2207,13 +2207,68 @@ fn lower_push(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     Ok(out)
 }
 
-/// `pop {list}` / `ldmia rn(!), {list}`: load each register ascending, then
-/// writeback. When the list has pc, the pc slot is consumed (sp advances) but
-/// not written - the caller turns that into a return.
+/// The address of the FIRST (lowest-numbered) register's slot, relative to the base,
+/// for a block transfer of `n` registers in mode `(add, pre)` - the U and P bits.
+///
+/// All four ARM modes put the lowest-numbered register at the lowest address; they
+/// differ only in where the block sits relative to the base:
+///
+/// | mode | add | pre | first slot   | writeback |
+/// |------|-----|-----|--------------|-----------|
+/// | IA   | 1   | 0   | base         | base + 4n |
+/// | IB   | 1   | 1   | base + 4     | base + 4n |
+/// | DA   | 0   | 0   | base - 4n + 4| base - 4n |
+/// | DB   | 0   | 1   | base - 4n    | base - 4n |
+///
+/// Ignoring these bits (treating everything as IA) is not a rounding error: a
+/// `stmdb rN!, {..}` then writes its block ABOVE the base instead of below it,
+/// scribbling over whatever lives there - a caller's saved registers, typically -
+/// and moves the base the wrong way afterwards.
+fn block_first_offset(add: bool, pre: bool, n: u32) -> i32 {
+    match (add, pre) {
+        (true, false) => 0,
+        (true, true) => 4,
+        (false, false) => -(4 * n as i32) + 4,
+        (false, true) => -(4 * n as i32),
+    }
+}
+
+/// The base's post-transfer value for a writeback block transfer of `n` registers.
+fn block_writeback(base: u8, add: bool, n: u32) -> Stmt {
+    let delta = Value::Imm(4 * n);
+    let op = if add { BinOp::Add } else { BinOp::Sub };
+    Stmt::SetReg(base, bin(op, Value::Reg(base), delta))
+}
+
+/// Address of the `i`-th register's slot: `base + first + 4i`, folded into an
+/// unsigned add because guest addresses wrap modulo 2^32.
+fn block_slot_addr(base: u8, first: i32, i: usize) -> Value {
+    let off = (first + 4 * i as i32) as u32;
+    bin(BinOp::Add, Value::Reg(base), Value::Imm(off))
+}
+
+/// The `(add, pre)` addressing mode of a block transfer. `push`/`pop` are the
+/// dedicated `stmdb sp!` / `ldmia sp!` forms and carry no flags of their own:
+/// `pop` is increment-after, and `push` is lowered separately by [`lower_push`].
+fn ldm_mode(inst: &Instruction) -> (bool, bool) {
+    match inst.opcode {
+        Opcode::POP | Opcode::PUSH => (true, false),
+        Opcode::LDM(add, pre, _, _) | Opcode::STM(add, pre, _, _) => (add, pre),
+        // Not a block transfer; the caller only reaches here for one, so keep the
+        // common mode rather than inventing a failure path.
+        _ => (true, false),
+    }
+}
+
+/// `pop {list}` / `ldm{ia,ib,da,db} rn(!), {list}`: load each register from its
+/// slot, then writeback. When the list has pc, the pc slot is consumed (sp advances)
+/// but not written - the caller turns that into a return.
 fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     let regs = reglist(inst);
     let base = ldm_base(inst);
     let wback = ldm_wback(inst);
+    let (add, pre) = ldm_mode(inst);
+    let first = block_first_offset(add, pre, regs.len() as u32);
     // If the base register is itself in the list, ARM loads every word from the
     // ORIGINAL base and the loaded value wins (writeback is then not permitted). A
     // naive in-order lowering would overwrite the base with an early word and then
@@ -2226,7 +2281,7 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
         Stmt::SetReg(
             r,
             Value::Load {
-                addr: Box::new(bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * i as u32))),
+                addr: Box::new(block_slot_addr(base, first, i)),
                 size: MemSize::Word,
                 signed: false,
             },
@@ -2246,10 +2301,7 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
         out.push(load_at(i, base));
     } else if wback {
         // Writeback only when the base is not loaded (base-in-list forbids it).
-        out.push(Stmt::SetReg(
-            base,
-            bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * regs.len() as u32)),
-        ));
+        out.push(block_writeback(base, add, regs.len() as u32));
     }
     Ok(out)
 }
@@ -2289,24 +2341,24 @@ fn emit_load_pair(out: &mut Vec<Stmt>, rt: u8, rt2: u8, addr: Value) {
     }
 }
 
-/// `stmia rn(!), {list}`: store each register ascending, then writeback.
+/// `stm{ia,ib,da,db} rn(!), {list}`: store each register into its slot, then
+/// writeback. See [`block_first_offset`] for why the U/P bits are load-bearing.
 fn lower_stm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     let regs = reglist(inst);
     let base = ldm_base(inst);
     let wback = ldm_wback(inst);
+    let (add, pre) = ldm_mode(inst);
+    let first = block_first_offset(add, pre, regs.len() as u32);
     let mut out = Vec::new();
     for (i, r) in regs.iter().enumerate() {
         out.push(Stmt::Store {
-            addr: bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * i as u32)),
+            addr: block_slot_addr(base, first, i),
             data: Value::Reg(*r),
             size: MemSize::Word,
         });
     }
     if wback {
-        out.push(Stmt::SetReg(
-            base,
-            bin(BinOp::Add, Value::Reg(base), Value::Imm(4 * regs.len() as u32)),
-        ));
+        out.push(block_writeback(base, add, regs.len() as u32));
     }
     Ok(out)
 }
@@ -2822,3 +2874,100 @@ fn vfp_multi(
 /// Unused import guard for `Reg` (kept for future indirect-branch handling).
 #[allow(dead_code)]
 fn _reg_marker(_: Reg) {}
+
+#[cfg(test)]
+mod block_transfer_tests {
+    use super::*;
+
+    /// Decode one ARM-mode word and lower it.
+    fn lower_arm_word(word: u32) -> Vec<Stmt> {
+        let decoder = InstDecoder::default().with_thumb_mode(false);
+        let bytes = word.to_le_bytes();
+        let mut reader = U8Reader::new(&bytes);
+        let inst = decoder.decode(&mut reader).expect("decodes");
+        match inst.opcode {
+            Opcode::STM(..) => lower_stm(&inst, 0).expect("lowers"),
+            Opcode::LDM(..) => lower_ldm(&inst, 0).expect("lowers"),
+            other => panic!("expected a block transfer, got {other:?}"),
+        }
+    }
+
+    /// The constant offset a `Stmt::Store`'s `base + imm` address adds.
+    fn store_offsets(stmts: &[Stmt]) -> Vec<u32> {
+        stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Store { addr: Value::Bin(BinOp::Add, _, imm), .. } => match **imm {
+                    Value::Imm(v) => Some(v),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A block transfer's U (increment) and P (pre-index) bits decide WHERE the block
+    /// sits relative to the base. Lowering everything as increment-after - which this
+    /// did until 2026-07-25 - makes `stmdb rN!, {..}` write its registers ABOVE the
+    /// base instead of below it, scribbling over whatever lives there (a caller's
+    /// saved registers, typically) and then moving the base the wrong way. The bug is
+    /// silent: the store succeeds, and the damage only surfaces later as a wrong value
+    /// restored from a stack slot nobody appears to have touched.
+    #[test]
+    fn block_transfer_honours_the_increment_and_preindex_bits() {
+        // The four modes for a 2-register block, per ARM ARM A5.4.
+        assert_eq!(block_first_offset(true, false, 2), 0, "IA starts at the base");
+        assert_eq!(block_first_offset(true, true, 2), 4, "IB starts one word above");
+        assert_eq!(block_first_offset(false, false, 2), -4, "DA ends AT the base");
+        assert_eq!(block_first_offset(false, true, 2), -8, "DB ends one word below");
+
+        // Real encodings: stmia/stmdb r0!, {r4, r5} (cond=AL, Rn=r0, list=0x0030).
+        // stmia = 0xe8a00030, stmdb = 0xe9200030.
+        let ia = lower_arm_word(0xe8a0_0030);
+        assert_eq!(store_offsets(&ia), vec![0, 4], "stmia writes at base, base+4");
+        let db = lower_arm_word(0xe920_0030);
+        assert_eq!(
+            store_offsets(&db),
+            vec![(-8i32) as u32, (-4i32) as u32],
+            "stmdb writes BELOW the base, at base-8 and base-4"
+        );
+
+        // Writeback follows the same direction: +4n up, -4n down.
+        // BinOp has no PartialEq, so name the direction rather than compare values.
+        let wb = |stmts: &[Stmt]| -> Option<(&'static str, u32)> {
+            stmts.iter().rev().find_map(|s| match s {
+                Stmt::SetReg(0, Value::Bin(op, _, imm)) => {
+                    let dir = match op {
+                        BinOp::Add => "add",
+                        BinOp::Sub => "sub",
+                        _ => "other",
+                    };
+                    match **imm {
+                        Value::Imm(v) => Some((dir, v)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(wb(&ia), Some(("add", 8)), "stmia! advances the base");
+        assert_eq!(wb(&db), Some(("sub", 8)), "stmdb! retreats the base");
+
+        // ldmdb r0!, {r4, r5} = 0xe930_0030 loads from the same slots it would store to.
+        let ldb = lower_arm_word(0xe930_0030);
+        let loads: Vec<u32> = ldb
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::SetReg(_, Value::Load { addr, .. }) => match &**addr {
+                    Value::Bin(BinOp::Add, _, imm) => match **imm {
+                        Value::Imm(v) => Some(v),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loads, vec![(-8i32) as u32, (-4i32) as u32], "ldmdb reads below the base");
+    }
+}

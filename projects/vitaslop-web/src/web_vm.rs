@@ -299,10 +299,10 @@ fn finish(halted: &Rc<RefCell<bool>>, outcome: vitaslop_runtime::SvcOutcome) -> 
             Err(halt_sentinel())
         }
         // This run-to-completion path has no scheduler to yield to, so a blocking
-        // hint (Yield at a flip, or a would-block wait) just keeps running,
+        // hint (Flip at a frame end, or a would-block wait) just keeps running,
         // identical to the native sync Vm. The browser's cooperative-scheduler path
         // will handle these distinctly.
-        SvcOutcome::Continue | SvcOutcome::Yield | SvcOutcome::Block | SvcOutcome::Reschedule => {
+        SvcOutcome::Continue | SvcOutcome::Flip | SvcOutcome::Block | SvcOutcome::Reschedule => {
             Ok(())
         }
         // Unfaithful call (e.g. unimplemented NID): throw the message as a real JS

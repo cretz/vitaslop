@@ -56,7 +56,9 @@ impl RegFile {
             Bank::SecondaryAttr => &mut self.sa,
             Bank::Output => &mut self.o,
             Bank::Internal => &mut self.i,
-            Bank::Constant | Bank::Raw(_) => return None,
+            // Constant is materialised inline; Global is a hardware register the interpreter
+            // has no state for (its value is pipeline state, not register-file storage).
+            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
         })
     }
 
@@ -67,7 +69,9 @@ impl RegFile {
             Bank::SecondaryAttr => &self.sa,
             Bank::Output => &self.o,
             Bank::Internal => &self.i,
-            Bank::Constant | Bank::Raw(_) => return None,
+            // Constant is materialised inline; Global is a hardware register the interpreter
+            // has no state for (its value is pipeline state, not register-file storage).
+            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
         })
     }
 }

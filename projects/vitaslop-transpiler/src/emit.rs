@@ -37,6 +37,52 @@ use wasm_encoder::{
 use crate::abi;
 use crate::ir::{BinOp, Block, ConditionCode, Func, MemSize, Stmt, Term, Value};
 
+/// `VITASLOP_ARM_AT_FRAME=<n>` - hold every trapping diagnostic DISARMED until the
+/// run reaches display frame `n`.
+///
+/// Almost every diagnostic here fires on its FIRST hit, and the first hit of
+/// anything interesting is during boot - which makes them useless for a question
+/// about frame 2000 of a live game. Arming them by frame fixes that generally, in
+/// one place, instead of each knob growing its own "skip the first N" counter (and
+/// instead of bisecting such a counter by hand, which is a long, dull dead end).
+///
+/// The gate is a single 4-byte word in LINEAR MEMORY rather than a wasm global,
+/// because the scheduler runs each guest thread as its own instance: a global is
+/// per-instance, so arming it would mean reaching into every live thread's store,
+/// while linear memory is shared by all of them and the host can write it at any
+/// moment. The word sits on its own page above the dispatch table (see
+/// [`emit_module`]), so it can never collide with guest memory.
+///
+/// Zero cost when unset: no gate is emitted at all and the module is byte-identical.
+pub fn arm_at_frame() -> Option<u64> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<u64>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_ARM_AT_FRAME").ok().and_then(|s| s.trim().parse().ok())
+    })
+}
+
+thread_local! {
+    /// Linear-memory byte offset of the "diagnostics armed" word for the module
+    /// being emitted on this thread, or 0 when this build has no frame gate. A
+    /// thread-local (not a global) because emission is single-threaded per module
+    /// while a test binary may emit several modules at once.
+    static ARM_WORD_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// AND the "diagnostics are armed" condition into the value already on the stack.
+/// A no-op when this build has no frame gate, so an ungated diagnostic keeps its
+/// exact previous shape.
+fn and_armed(f: &mut Function) {
+    let off = ARM_WORD_OFF.with(|c| c.get());
+    if off == 0 {
+        return;
+    }
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32Load(MemArg { offset: off, align: 2, memory_index: 0 }));
+    f.instruction(&W::I32And);
+}
+
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
 /// at transpile time, every word store to that exact guest address is preceded by an
 /// `unreachable`, so the first writer traps with a full wasm backtrace (and the
@@ -365,6 +411,11 @@ pub struct EmitOutput {
     /// this many pages; a host that lets the module define its own memory ignores
     /// this (the module already carries the right size).
     pub mem_pages: u32,
+    /// Linear-memory byte offset of the "diagnostics armed" word, when this build
+    /// was emitted with `VITASLOP_ARM_AT_FRAME` (see [`arm_at_frame`]). The host
+    /// writes 1 there once the run reaches the armed frame; until then every
+    /// trapping diagnostic is inert. `None` in an ordinary build.
+    pub arm_word_off: Option<u64>,
 }
 
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
@@ -386,8 +437,10 @@ pub fn emit_module(
     func_index: &BTreeMap<u32, u32>,
     base: u32,
     mem_bytes: u32,
+    inline_imports: &[crate::InlineImport],
     import_memory: bool,
 ) -> EmitOutput {
+    let inline = InlineImports::new(inline_imports, mem_bytes);
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
     let host_ty = 0;
@@ -405,7 +458,15 @@ pub fn emit_module(
     let guest_pages = (mem_bytes as u64).div_ceil(abi::PAGE_SIZE as u64).max(1);
     let addr_table_off = guest_pages * abi::PAGE_SIZE as u64;
     let addr_table_bytes = n as u64 * 4;
-    let total_pages = guest_pages + addr_table_bytes.div_ceil(abi::PAGE_SIZE as u64);
+    let addr_table_pages = addr_table_bytes.div_ceil(abi::PAGE_SIZE as u64);
+    // One more page above the dispatch table holds the "diagnostics armed" word
+    // (see `arm_at_frame`), and only when that knob is set - an ordinary build's
+    // memory layout is unchanged. Its own page, so no guest allocation or dispatch
+    // entry can ever share a cache line with it.
+    let arm_word_off =
+        arm_at_frame().map(|_| (guest_pages + addr_table_pages) * abi::PAGE_SIZE as u64);
+    ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
+    let total_pages = guest_pages + addr_table_pages + u64::from(arm_word_off.is_some());
 
     // Preemptive multithreading (the native `ThreadedScheduler`) runs each guest
     // thread as its own instance so their register globals stay independent, but
@@ -548,7 +609,7 @@ pub fn emit_module(
     for (i, func) in funcs.iter().enumerate() {
         let idx = IMPORT_FUNCS + i as u32;
         exports.export(&abi::func_export(func.addr), ExportKind::Func, idx);
-        code.function(&emit_func(func, func_index, base));
+        code.function(&emit_func(func, func_index, base, &inline));
     }
     code.function(&emit_dispatch(funcs, addr_table_off));
 
@@ -596,7 +657,7 @@ pub fn emit_module(
         name_section.functions(&names);
         module.section(&name_section);
     }
-    EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32 }
+    EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32, arm_word_off }
 }
 
 /// Emit the indirect-call dispatcher: `(target: i32, caller: i32) -> ()`. It masks
@@ -714,7 +775,12 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
 }
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
-fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Function {
+fn emit_func(
+    func: &Func,
+    func_index: &BTreeMap<u32, u32>,
+    base: u32,
+    inline: &InlineImports,
+) -> Function {
     // Locals: $bb + i32 scratch temps (flag computation), then one i64 scratch
     // (double-register split/merge) and one v128 scratch (NEON quad staging).
     let mut f = if guard_reg().is_some() {
@@ -759,7 +825,7 @@ fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Functio
 
     // Single-block functions need no dispatch machinery.
     if n == 1 {
-        emit_block(&mut f, &func.blocks[0], func, func_index, base, 0);
+        emit_block(&mut f, &func.blocks[0], func, func_index, base, inline, 0);
         f.instruction(&W::End);
         return f;
     }
@@ -777,7 +843,7 @@ fn emit_func(func: &Func, func_index: &BTreeMap<u32, u32>, base: u32) -> Functio
     // Close $B0 (its body follows), then $B1, ...
     for (k, block) in func.blocks.iter().enumerate() {
         f.instruction(&W::End); // closes $B{k}
-        emit_block(&mut f, block, func, func_index, base, n - 1 - k as u32);
+        emit_block(&mut f, block, func, func_index, base, inline, n - 1 - k as u32);
     }
     f.instruction(&W::End); // loop
     f.instruction(&W::End); // $exit block
@@ -793,6 +859,7 @@ fn emit_block(
     func: &Func,
     func_index: &BTreeMap<u32, u32>,
     base: u32,
+    inline: &InlineImports,
     loop_depth: u32,
 ) {
     // Diagnostic guest-PC tracking (opt-in): record this block's start address before
@@ -810,7 +877,7 @@ fn emit_block(
         }
     }
     for stmt in &block.stmts {
-        emit_stmt(f, stmt, func_index, base, func.addr);
+        emit_stmt(f, stmt, func_index, base, inline, func.addr);
     }
     emit_term(f, &block.term, func, base, loop_depth);
 }
@@ -991,6 +1058,7 @@ fn emit_read_watch_check(f: &mut Function, w: u32, base: u32) {
         f.instruction(&W::I32Or);
         f.instruction(&W::I32And);
     }
+    and_armed(f);
     f.instruction(&W::If(BlockType::Empty));
     // Matched: bump the counter and trap once past the skip window.
     f.instruction(&W::GlobalGet(WATCH_READ_COUNT_GLOBAL));
@@ -1023,6 +1091,7 @@ fn guard_check(f: &mut Function) {
         f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
         f.instruction(&W::LocalGet(L_GUARD));
         f.instruction(&W::I32Ne);
+        and_armed(f);
         f.instruction(&W::If(BlockType::Empty));
         f.instruction(&W::Unreachable);
         f.instruction(&W::End);
@@ -1034,6 +1103,7 @@ fn emit_stmt(
     stmt: &Stmt,
     func_index: &BTreeMap<u32, u32>,
     base: u32,
+    inline: &InlineImports,
     func_addr: u32,
 ) {
     match stmt {
@@ -1057,6 +1127,7 @@ fn emit_stmt(
                     f.instruction(&W::LocalGet(L_T0));
                     f.instruction(&W::I32Const(w.wrapping_sub(base) as i32));
                     f.instruction(&W::I32Eq);
+                    and_armed(f);
                     f.instruction(&W::If(BlockType::Empty));
                     f.instruction(&W::LocalGet(L_T1));
                     f.instruction(&W::If(BlockType::Empty)); // value != 0 -> arm
@@ -1080,6 +1151,7 @@ fn emit_stmt(
                         f.instruction(&W::I32Eqz);
                         f.instruction(&W::I32And);
                     }
+                    and_armed(f);
                     f.instruction(&W::If(BlockType::Empty));
                     // Matched: bump the counter and trap once past the skip window.
                     f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
@@ -1124,10 +1196,7 @@ fn emit_stmt(
             f.instruction(&W::I32Const(*imm as i32));
             f.instruction(&W::Call(SVC_FUNC));
         }
-        Stmt::Import(index) => {
-            f.instruction(&W::I32Const(*index as i32));
-            f.instruction(&W::Call(IMPORT_FUNC));
-        }
+        Stmt::Import(index) => emit_import(f, *index, base, inline),
         Stmt::Rbit { rd, rm } => {
             // Reverse all 32 bits with the classic swap network, over a scratch
             // local (the input is read twice per step). Four masked adjacent-group
@@ -1233,7 +1302,7 @@ fn emit_stmt(
             emit_cond(f, *cond);
             f.instruction(&W::If(BlockType::Empty));
             for s in body {
-                emit_stmt(f, s, func_index, base, func_addr);
+                emit_stmt(f, s, func_index, base, inline, func_addr);
             }
             f.instruction(&W::End);
         }
@@ -3229,6 +3298,79 @@ fn binop(op: BinOp) -> W<'static> {
 
 fn mem_arg() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
+}
+
+/// Which host imports may be emitted inline, and how far into linear memory an
+/// inline load may reach. Built once per module from
+/// [`Program::inline_imports`](crate::Program::inline_imports).
+#[derive(Default)]
+pub struct InlineImports {
+    ops: BTreeMap<u32, crate::InlineOp>,
+    /// Guest region size in bytes - the bound an inline load must stay inside.
+    mem_bytes: u32,
+}
+
+impl InlineImports {
+    fn new(list: &[crate::InlineImport], mem_bytes: u32) -> Self {
+        InlineImports {
+            ops: list.iter().map(|i| (i.import, i.op)).collect(),
+            mem_bytes,
+        }
+    }
+
+    /// The inline form of import `index`, together with the highest REBASED address
+    /// at which it may be used. `None` when the import has no inline form, or when
+    /// guest memory is too small for the load to ever be in range (in which case the
+    /// host call is not merely correct but the only option).
+    fn lower(&self, index: u32) -> Option<(crate::InlineOp, u32)> {
+        let op = *self.ops.get(&index)?;
+        // The load reads 4 bytes at `offset + op.offset()`, so the last rebased
+        // address it may start from is `mem_bytes - 4 - op.offset()`.
+        let limit = self.mem_bytes.checked_sub(4)?.checked_sub(op.offset())?;
+        Some((op, limit))
+    }
+}
+
+/// Emit a host-import call: either the real trap, or - for an import with an inline
+/// form - the guest-memory read it amounts to.
+///
+/// The inline form is guarded so it is EXACTLY equivalent to the host call, never
+/// merely equivalent in the expected case. `r0 - base` is compared unsigned against
+/// the highest address the load may start from, which rejects both a pointer below
+/// the image base (the subtraction wraps to a huge value - this is the null-pointer
+/// case) and one too near the end of guest memory, in a single comparison. Either way
+/// the real host call runs, so the handler stays the definition of the behaviour and
+/// the odd cases keep their exact old semantics.
+fn emit_import(f: &mut Function, index: u32, base: u32, inline: &InlineImports) {
+    let Some((op, limit)) = inline.lower(index) else {
+        f.instruction(&W::I32Const(index as i32));
+        f.instruction(&W::Call(IMPORT_FUNC));
+        return;
+    };
+    let crate::InlineOp::LoadShiftMask { offset, shift, mask } = op;
+    // t0 = r0 - base, the rebased address of the pointer argument.
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Sub);
+    f.instruction(&W::LocalTee(L_T0));
+    f.instruction(&W::I32Const(limit as i32));
+    f.instruction(&W::I32GtU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::I32Const(index as i32));
+    f.instruction(&W::Call(IMPORT_FUNC));
+    f.instruction(&W::Else);
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+    if shift != 0 {
+        f.instruction(&W::I32Const(shift as i32));
+        f.instruction(&W::I32ShrU);
+    }
+    if mask != u32::MAX {
+        f.instruction(&W::I32Const(mask as i32));
+        f.instruction(&W::I32And);
+    }
+    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+    f.instruction(&W::End);
 }
 
 fn load_op(size: MemSize, signed: bool) -> W<'static> {

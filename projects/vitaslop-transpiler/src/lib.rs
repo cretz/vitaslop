@@ -11,6 +11,10 @@
 
 pub mod abi;
 mod emit;
+/// The one emit-time diagnostic knob a HOST also needs to see: the frame at which
+/// trapping diagnostics become live (`VITASLOP_ARM_AT_FRAME`). The host arms them by
+/// writing [`Artifact::arm_word_off`] when the run reaches it.
+pub use emit::arm_at_frame;
 mod ir;
 mod lower;
 
@@ -49,6 +53,10 @@ pub struct Program<'a> {
     /// (no host trap), so a call across module boundaries is as cheap as one
     /// within a module. Empty for a single-module link.
     pub redirects: &'a [Redirect],
+    /// Host imports to emit INLINE rather than as a host trap (see [`InlineImport`]).
+    /// Empty leaves every import a host call, which is what every earlier build did
+    /// and what the ARM conformance corpus still wants.
+    pub inline_imports: &'a [InlineImport],
     /// Syscall numbers (guest r7) that do not return, so a `svc` with a
     /// statically-known one of them ends decoding (before trailing data).
     pub noreturn_svc: &'a [u32],
@@ -85,6 +93,72 @@ pub struct Redirect {
     pub target: u32,
 }
 
+/// A host import whose whole behaviour is one guest-memory read, emitted INLINE
+/// instead of trapping to the host.
+///
+/// # Why
+/// Some system calls are pure accessors over a guest structure - the GXM shader
+/// reflection getters are the clearest case: given a `SceGxmProgramParameter *` they
+/// return one bitfield of one word. On a real title those dominate the host-call
+/// traffic by a wide margin (measured: four of them are 60% of every host call a
+/// gameplay frame makes), and each costs a wasm-to-host transition plus marshalling
+/// the guest register file both ways, to compute a shift and a mask.
+///
+/// Emitting the load directly turns each into a handful of wasm instructions with no
+/// boundary crossing at all.
+///
+/// # Staying exactly equivalent
+/// An inlined call must be indistinguishable from the host one, including on the
+/// error paths, so the emitted code FALLS BACK to the real host call whenever the
+/// address is not one the inline load can serve (below the image base, or too near
+/// the end of guest memory) - see [`emit`]. The host handler remains the definition
+/// of the behaviour; the inline form is an optimisation of the common case only.
+///
+/// # The one observable difference
+/// An inlined call never reaches the host, so it does NOT appear in the host-call
+/// trace, the call histogram, or `Capture::call_count`. That is a deliberate
+/// trade and a safe one for what is inlined here - the ordered-timeline tracer
+/// already filters `sceGxmProgram*` out as noise - but it means a NID must not be
+/// inlined if anyone would go looking for it in a trace. It does not touch the
+/// determinism signature, which folds the render stream and the egress ledger, not
+/// the call trace.
+pub struct InlineImport {
+    /// The dense host-import index this replaces (the same index `Extern::import`
+    /// carries).
+    pub import: u32,
+    pub op: InlineOp,
+}
+
+/// What an [`InlineImport`] computes.
+///
+/// Deliberately ONE shape rather than a general expression language: every operation
+/// admitted here has to be proven equivalent to its host handler, and a closed, tiny
+/// set is what makes that provable. Widen it only with a matching test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineOp {
+    /// `r0 = (u32_at(r0 + offset) >> shift) & mask` - read a word at a fixed offset
+    /// from the pointer argument and extract a bitfield. `mask` is applied after the
+    /// shift, so `mask = u32::MAX` means "the whole word".
+    LoadShiftMask { offset: u32, shift: u32, mask: u32 },
+}
+
+impl InlineOp {
+    /// The operation's meaning, over the word it reads. The single definition of what
+    /// the emitted code must compute, so a test can hold a host handler to it.
+    pub fn eval(self, word: u32) -> u32 {
+        match self {
+            InlineOp::LoadShiftMask { shift, mask, .. } => (word >> shift) & mask,
+        }
+    }
+
+    /// Byte offset from the pointer argument at which the word is read.
+    pub fn offset(self) -> u32 {
+        match self {
+            InlineOp::LoadShiftMask { offset, .. } => offset,
+        }
+    }
+}
+
 /// The transpiler output: the WASM blob plus the map the runtime needs to enter
 /// guest code by address.
 pub struct Artifact {
@@ -97,6 +171,9 @@ pub struct Artifact {
     /// must create it with exactly this many pages; a host that lets the module define
     /// its own memory can ignore this. See [`emit::EmitOutput`].
     pub mem_pages: u32,
+    /// Linear-memory offset of the "diagnostics armed" word, present only when this
+    /// build was emitted with `VITASLOP_ARM_AT_FRAME` (see [`emit::arm_at_frame`]).
+    pub arm_word_off: Option<u64>,
 }
 
 /// A transpiled function: the guest address it starts at and its wasm export.
@@ -248,8 +325,15 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let emit::EmitOutput { wasm, mem_pages } =
-        emit::emit_module(&ordered, &func_index, program.base, program.mem_bytes, program.import_memory);
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off } =
+        emit::emit_module(
+            &ordered,
+            &func_index,
+            program.base,
+            program.mem_bytes,
+            program.inline_imports,
+            program.import_memory,
+        );
     let funcs = ordered
         .iter()
         .map(|f| FuncExport {
@@ -257,7 +341,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, funcs, mem_pages })
+    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off })
 }
 
 /// The output of a lenient whole-program build ([`transpile_lenient`]): the module
@@ -346,11 +430,12 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         .enumerate()
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
-    let emit::EmitOutput { wasm, mem_pages } = emit::emit_module(
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off } = emit::emit_module(
         &ordered,
         &func_index,
         program.base,
         program.mem_bytes,
+        program.inline_imports,
         program.import_memory,
     );
     let funcs = ordered
@@ -359,7 +444,11 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         .collect();
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
-    LenientArtifact { artifact: Artifact { wasm, funcs, mem_pages }, stubbed, stub_wasm_indices }
+    LenientArtifact {
+        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off },
+        stubbed,
+        stub_wasm_indices,
+    }
 }
 
 /// Diagnostic: discover the single function at `addr` and return its lowered IR
@@ -515,6 +604,7 @@ mod tests {
             arm_entries: &[],
             externs: &[],
             redirects: &[],
+            inline_imports: &[],
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
@@ -545,6 +635,7 @@ mod tests {
             arm_entries: &[],
             externs: &[],
             redirects: &[],
+            inline_imports: &[],
             noreturn_svc: &[],
             mem_bytes: 0x20000,
             discover_code_pointers: false,
@@ -592,6 +683,7 @@ mod tests {
             arm_entries: &[],
             externs: &[],
             redirects: &[],
+            inline_imports: &[],
             noreturn_svc: &[],
             mem_bytes: 0x1_0000,
             discover_code_pointers: false,
@@ -643,6 +735,7 @@ mod tests {
                 arm_entries: &[],
                 externs: &[],
                 redirects: &[],
+            inline_imports: &[],
                 noreturn_svc: &[],
                 mem_bytes: 0x20000,
                 discover_code_pointers: false,

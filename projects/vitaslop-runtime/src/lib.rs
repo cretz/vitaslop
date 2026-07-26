@@ -23,6 +23,8 @@ pub mod host;
 pub mod ingest;
 pub mod link;
 pub mod nid;
+pub mod knobs;
+pub mod perf;
 pub mod recipe;
 pub mod sched;
 pub mod render;
@@ -34,7 +36,7 @@ pub use host::{
     VitaState, VFP_ARG_COUNT,
 };
 pub use audio::{AudioFormat, AudioSink, NullSink};
-pub use recipe::{Recipe, RecipeError, RecipeWorld};
+pub use recipe::{InputSegment, Recipe, RecipeError, RecipeWorld, SharedTimeline, Timeline};
 pub use sched::{
     FiberEnd, GuestEngine, GuestThread, IdleStep, RunReport, SchedCore, Scheduler, Stop,
     ThreadHandle, ThreadStep,
@@ -69,13 +71,21 @@ pub struct RunResult {
 pub enum SvcOutcome {
     /// Keep running.
     Continue,
-    /// The call was serviced, but the guest hit a blocking primitive and should
-    /// now suspend here, yielding to the cooperative scheduler. The classic case
-    /// is the per-frame display flip: the frame is complete and on hardware the
-    /// thread would wait for the flip. A host with no scheduler (the run-to-
+    /// **One display frame ended.** The guest queued a finished frame for scanout
+    /// and on hardware would wait here for the flip, so the thread suspends and the
+    /// scheduler counts a frame boundary. A host with no scheduler (the run-to-
     /// completion conformance and capture paths) treats this exactly like
     /// `Continue`, so the outcome is a safe hint, never a requirement.
-    Yield,
+    ///
+    /// This is the ONLY outcome that counts a frame, and the distinction is
+    /// load-bearing: the frame count paces frame-keyed input (a TAS recipe), bounds
+    /// a run (`--max-frames`), names screenshots and is the x-axis of every timing
+    /// figure. A plain "give someone else the CPU" yield - `sceKernelDelayThread(0)`,
+    /// `sceDisplayWaitVblankStartMulti(0)` - is NOT a frame and must return
+    /// [`Reschedule`](Self::Reschedule). Conflating the two lets one spinning worker
+    /// inflate the frame count by an arbitrary factor, which desynchronises scripted
+    /// input from the game entirely.
+    Flip,
     /// The program asked to exit the whole process; unwind and stop the run.
     Halt,
     /// The calling thread must wait on an unavailable primitive (an empty
@@ -89,11 +99,18 @@ pub enum SvcOutcome {
     /// [`vitaslop_native::ThreadedScheduler`]: https://docs.rs/vitaslop-native
     Block,
     /// The call serviced fine and the thread stays runnable, but the scheduler
-    /// should re-pick now rather than let this thread run on. Emitted when a host
-    /// call makes a higher-priority thread runnable (e.g. `sceKernelStartThread` of
-    /// a higher-priority worker): the real kernel preempts the caller and runs the
-    /// higher-priority thread until it blocks, then resumes the caller. A host with
-    /// no scheduler treats this like [`Continue`](Self::Continue).
+    /// should re-pick now rather than let this thread run on. Two cases:
+    ///
+    /// - A host call made a higher-priority thread runnable (e.g.
+    ///   `sceKernelStartThread` of a higher-priority worker): the real kernel
+    ///   preempts the caller and runs it until it blocks, then resumes the caller.
+    /// - The guest explicitly gave up the CPU without asking to sleep:
+    ///   `sceKernelDelayThread(0)`, `sceDisplayWaitVblankStartMulti(0)`. These are
+    ///   spin-and-yield loops, so the thread is put on the spin cooldown and every
+    ///   peer runs before it does again.
+    ///
+    /// Neither counts a display frame - that is [`Flip`](Self::Flip) alone. A host
+    /// with no scheduler treats this like [`Continue`](Self::Continue).
     Reschedule,
     /// The calling thread has ended (a worker returned, or called
     /// `sceKernelExitThread`), but the process keeps running. The preemptive

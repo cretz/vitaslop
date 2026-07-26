@@ -29,7 +29,9 @@
 //! # The switch points
 //! Each host call returns an [`SvcOutcome`]. [`Continue`](SvcOutcome::Continue)
 //! keeps the thread running; [`Block`](SvcOutcome::Block) parks it until another
-//! thread wakes it; [`Yield`](SvcOutcome::Yield) is a frame boundary;
+//! thread wakes it; [`Flip`](SvcOutcome::Flip) is a display frame boundary (and the
+//! only thing that counts one - [`Reschedule`](SvcOutcome::Reschedule) is the
+//! voluntary yield that does not);
 //! [`ThreadExit`](SvcOutcome::ThreadExit) ends just this thread;
 //! [`Halt`](SvcOutcome::Halt) ends the whole process. Thread creation and wakeups
 //! are side channels the host and scheduler agree on through
@@ -100,6 +102,46 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     /// (surfaced as `FiberEnd::Error` -> `RunReport::Error`). Read by the fiber's
     /// async block after the guest call unwinds.
     fatal: Option<String>,
+    /// This thread's guest register/VFP globals, resolved once at instantiation.
+    /// `None` only in the window before the instance exists. See [`GuestGlobals`].
+    globals: Option<GuestGlobals>,
+}
+
+/// The wasm globals holding the guest register file, resolved once per thread.
+///
+/// Every host call marshals the whole ARM register file plus the VFP argument
+/// registers across the boundary in both directions - 64 global accesses per call on
+/// this ABI. Resolving each one by its export NAME (`format!("r{i}")` into
+/// `Caller::get_export`) makes that 64 string allocations and 64 export-table lookups
+/// per host call, on a path a title takes millions of times. The handles are constant
+/// for the life of the instance, so they are resolved once here and the closure just
+/// indexes them.
+///
+/// Diagnostic paths (the function tracer, register dumps) still resolve by name: they
+/// run at most thousands of times and the name is what they are reporting.
+struct GuestGlobals {
+    regs: [wasmtime::Global; abi::REG_COUNT],
+    vfp: [wasmtime::Global; VFP_ARG_COUNT],
+}
+
+impl GuestGlobals {
+    /// Resolve every register and VFP-argument global of `instance`. The transpiler
+    /// always emits the full register file and `s0..s31`, so a missing export is a
+    /// broken module rather than a title that happens not to use the register - it
+    /// panics here, at instantiation, instead of on the first host call.
+    fn resolve<T>(store: &mut Store<T>, instance: &Instance) -> Self {
+        let regs = std::array::from_fn(|i| {
+            instance
+                .get_global(&mut *store, &abi::reg_export(i))
+                .expect("module exports registers")
+        });
+        let vfp = std::array::from_fn(|i| {
+            instance
+                .get_global(&mut *store, &abi::vfp_s_export(i as u8))
+                .expect("module exports vfp registers")
+        });
+        GuestGlobals { regs, vfp }
+    }
 }
 
 /// One suspendable guest thread on the wasmtime engine: an async fiber (the in-flight
@@ -151,6 +193,10 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     host: Arc<Mutex<H>>,
     base: u32,
     quantum_fuel: u64,
+    /// Linear-memory offset of the "diagnostics armed" word, when this build was
+    /// transpiled with `VITASLOP_ARM_AT_FRAME` (see
+    /// [`vitaslop_transpiler::arm_at_frame`]). `None` in an ordinary build.
+    arm_word_off: Option<u64>,
 }
 
 impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
@@ -175,6 +221,33 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
             write_shared(&self.shared_mem, off, bytes);
         }
     }
+
+    /// Arm the frame-gated diagnostics the instant the run reaches the requested
+    /// frame. One word in shared linear memory covers every guest thread at once,
+    /// which is the whole reason the gate is not a wasm global.
+    fn on_frame(&mut self, frames: u64) {
+        let (Some(off), Some(at)) = (self.arm_word_off, transpiler::arm_at_frame()) else {
+            return;
+        };
+        if frames != at {
+            return;
+        }
+        write_shared(&self.shared_mem, off as usize, &1u32.to_le_bytes());
+        DIAG_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[diag] armed at frame {frames} (VITASLOP_ARM_AT_FRAME)");
+    }
+}
+
+/// Set once the run reaches `VITASLOP_ARM_AT_FRAME`, for the HOST-side diagnostics
+/// (the qemu-diff snapshot and register trace) that live in this file rather than in
+/// emitted code. True from the start when no frame gate was requested, so an
+/// ungated run behaves exactly as before.
+static DIAG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Are the frame-gated diagnostics live yet?
+fn diag_armed() -> bool {
+    transpiler::arm_at_frame().is_none()
+        || DIAG_ARMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A preemptive multi-thread guest run. A thin wasmtime front for the shared
@@ -233,6 +306,10 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             arm_entries: &[],
             externs,
             redirects: &[],
+            // Raw-image entry point (the ARM corpus and tests): no NID import table,
+            // so nothing here is known to be inlinable. The retail path goes through
+            // `from_linked`, which passes the linker's list.
+            inline_imports: &[],
             noreturn_svc: &[],
             mem_bytes,
             discover_code_pointers: true,
@@ -258,7 +335,15 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         write_shared(&shared_mem, 0, code);
 
         let host = Arc::new(Mutex::new(host));
-        let engine = WasmtimeEngine { engine, module, shared_mem, host: host.clone(), base, quantum_fuel };
+        let engine = WasmtimeEngine {
+            engine,
+            module,
+            shared_mem,
+            host: host.clone(),
+            base,
+            quantum_fuel,
+            arm_word_off: artifact.arm_word_off,
+        };
 
         // The main thread: sp near the top of the region (with startup headroom), no
         // entry args, its thid is whatever the host reports for the main thread (0 by
@@ -328,6 +413,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             host: host.clone(),
             base: linked.base,
             quantum_fuel,
+            arm_word_off: built.artifact.arm_word_off,
         };
 
         // The main thread runs every module_start in load order, then (as the last
@@ -369,10 +455,31 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         self.inner.engine().write_guest(addr, bytes)
     }
 
+    /// Bulk-read `buf.len()` bytes of guest memory at `addr` into `buf`. Returns
+    /// false (leaving `buf` untouched) if the range is out of bounds. This is the
+    /// whole-region read a memory scanner does repeatedly, so it is one block copy
+    /// rather than [`read_guest`](Self::read_guest)'s allocate-and-loop.
+    pub fn read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool {
+        self.inner.engine().read_guest_into(addr, buf)
+    }
+
+    /// The guest address range backed by linear memory, as `(base, len)`. A memory
+    /// scanner needs it to know what there is to search.
+    pub fn guest_region(&self) -> (u32, usize) {
+        let e = self.inner.engine();
+        (e.base, e.shared_mem.data().len())
+    }
+
     /// Display frame boundaries (flips) observed so far. A live windowed front-end
     /// steps one frame per redraw via `run_frames(frames() + 1, ..)`.
     pub fn frames(&self) -> u64 {
         self.inner.frames()
+    }
+
+    /// Thread resumes so far - the scheduler's own activity, for a profiler that has
+    /// to separate the guest's work from the cost of switching between guest threads.
+    pub fn rounds_total(&self) -> u64 {
+        self.inner.rounds_total()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run
@@ -405,6 +512,27 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             }
         }
         out
+    }
+
+    /// Bulk-read guest memory into `buf`; false if the range is out of bounds.
+    fn read_guest_into(&self, addr: u32, buf: &mut [u8]) -> bool {
+        let off = addr.wrapping_sub(self.base) as usize;
+        let data = self.shared_mem.data();
+        let Some(end) = off.checked_add(buf.len()) else { return false };
+        if end > data.len() {
+            return false;
+        }
+        // SAFETY: bounds checked above, and the scheduler holds the baton - no fiber
+        // runs concurrently with a host-side read. `UnsafeCell<u8>` has the same
+        // layout as `u8`, so the region is one contiguous byte block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data[off].get() as *const u8,
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+        }
+        true
     }
 
     /// Diagnostic write into guest memory. No-op if out of bounds.
@@ -463,6 +591,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             process_halt: false,
             thread_exit: false,
             fatal: None,
+            globals: None,
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -480,6 +609,10 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
 
         // No start section, so instantiation completes without suspending.
         let instance = pollster::block_on(linker.instantiate_async(&mut store, &self.module))?;
+        // Resolve the register-file globals once, now, so no host call ever looks one
+        // up by name (see `GuestGlobals`).
+        let globals = GuestGlobals::resolve(&mut store, &instance);
+        store.data_mut().globals = Some(globals);
 
         // This thread's thread-local-storage: a private block whose base becomes the
         // thread pointer (TPIDRURO). Copy the template's initialized `.tdata` head into
@@ -591,7 +724,7 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                         // qemu-diff capture (opt-in; see the qdiff_* helpers below). The
                         // snapshot fires on the (skip+1)-th entry to its block, so a specific
                         // invocation of a repeatedly-called function can be targeted.
-                        if let Some((snap_pc, path)) = qdiff_snapshot() {
+                        if let Some((snap_pc, path)) = qdiff_snapshot().as_ref().filter(|_| diag_armed()) {
                             if *snap_pc == sel && !QDIFF_SNAP_FIRED.load(Relaxed) {
                                 let seen = QDIFF_SNAP_SEEN.fetch_add(1, Relaxed);
                                 if seen >= qdiff_snapshot_skip() {
@@ -601,7 +734,8 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                             }
                         }
                         if let Some((lo, hi, path)) = qdiff_regtrace() {
-                            let armed = qdiff_snapshot().is_none() || QDIFF_SNAP_FIRED.load(Relaxed);
+                            let armed = diag_armed()
+                                && (qdiff_snapshot().is_none() || QDIFF_SNAP_FIRED.load(Relaxed));
                             if armed && sel >= *lo && sel <= *hi {
                                 qdiff_log_regtrace(&mut caller, sel, path);
                             }
@@ -653,6 +787,32 @@ fn qdiff_regtrace() -> &'static Option<(u32, u32, String)> {
         let lo = u32::from_str_radix(lo.trim().trim_start_matches("0x"), 16).ok()?;
         let hi = u32::from_str_radix(hi.trim().trim_start_matches("0x"), 16).ok()?;
         Some((lo, hi, path.trim().to_string()))
+    })
+}
+
+/// `VITASLOP_REGTRACE_WATCH=<hex guest addr>[,<hex guest addr>...]` - append the WORD
+/// AT each address to every register-trace line, as extra `mNNNNNNNN=VVVVVVVV` fields.
+///
+/// The register trace alone answers "which block did the register go bad after"; this
+/// answers the same question for a memory location, which is the one a corrupted stack
+/// slot needs. It is deliberately not a watchpoint: `VITASLOP_WATCH_STORE` traps on the
+/// first (or Nth) GUEST store to an address, which is useless for a heavily-reused
+/// stack slot and blind to host-side writes - a host call writes guest memory straight
+/// from Rust and never goes through a lifted store at all. Sampling the word at every
+/// block entry catches the change whoever made it, and names the block it happened
+/// under.
+fn qdiff_regtrace_watch() -> &'static Vec<u32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Vec<u32>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        std::env::var("VITASLOP_REGTRACE_WATCH")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|a| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -806,6 +966,29 @@ fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     }
     for f in [abi::Flag::N, abi::Flag::Z, abi::Flag::C, abi::Flag::V] {
         line.push_str(&format!(" {}", get_flag(caller, f)));
+    }
+    // Optional watched memory words (VITASLOP_REGTRACE_WATCH). Appended after the
+    // fixed reg+flag columns so the qdiff host tool's parser, which reads the leading
+    // 21 fields, is unaffected.
+    let watch = qdiff_regtrace_watch();
+    if !watch.is_empty() {
+        let base = caller.data().base;
+        let shared = caller.data().shared_mem.clone();
+        let data = shared.data();
+        // SAFETY: as in `qdiff_dump_snapshot` - `UnsafeCell<u8>` is repr(transparent)
+        // over `u8`, and no other fiber runs while this svc handler executes.
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+        for &addr in watch {
+            let off = addr.wrapping_sub(base) as usize;
+            match bytes.get(off..off + 4) {
+                Some(w) => line.push_str(&format!(
+                    " m{addr:08x}={:08x}",
+                    u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+                )),
+                None => line.push_str(&format!(" m{addr:08x}=oob")),
+            }
+        }
     }
     line.push('\n');
     let mut guard = qdiff_regtrace_writer().lock().unwrap();
@@ -985,15 +1168,17 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
             abi::IMPORT_NAME,
             |mut caller: Caller<'_, ThreadData<H>>, (selector,): (i32,)| {
                 Box::new(async move {
-                    let mut regs = [0u32; abi::REG_COUNT];
-                    for (i, r) in regs.iter_mut().enumerate() {
-                        *r = get_reg(&mut caller, i);
-                    }
-                    let mut vfp = [0u32; VFP_ARG_COUNT];
-                    for (i, s) in vfp.iter_mut().enumerate() {
-                        *s = get_vfp(&mut caller, i);
-                    }
+                    let perf = crate::perf::enabled();
+                    let call_start = perf.then(std::time::Instant::now);
 
+                    let mut regs = [0u32; abi::REG_COUNT];
+                    let mut vfp = [0u32; VFP_ARG_COUNT];
+                    read_guest_regs(&mut caller, &mut regs, &mut vfp);
+                    // The state as the guest left it, so write-back can skip every
+                    // register the handler did not touch.
+                    let before = (regs, vfp);
+
+                    let dispatch_start = perf.then(std::time::Instant::now);
                     let outcome = {
                         let data = caller.data();
                         let thid = data.thid;
@@ -1004,12 +1189,19 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         host.set_current_thread(thid);
                         host.dispatch(selector as u32, &mut regs, &mut vfp, &mut view, base)
                     };
+                    let dispatch_ns = dispatch_start.map_or(0, |t| t.elapsed().as_nanos() as u64);
 
-                    for (i, &v) in regs.iter().enumerate() {
-                        set_reg_caller(&mut caller, i, v);
-                    }
-                    for (i, &v) in vfp.iter().enumerate() {
-                        set_vfp_caller(&mut caller, i, v);
+                    write_guest_regs(&mut caller, &before, &regs, &vfp);
+
+                    // Charged before the outcome is acted on: a `Block` outcome parks
+                    // the fiber here, and the time the thread spends descheduled is the
+                    // scheduler's, not this call's.
+                    if let Some(t) = call_start {
+                        crate::perf::note_import(
+                            selector as u32,
+                            t.elapsed().as_nanos() as u64,
+                            dispatch_ns,
+                        );
                     }
 
                     // Diagnostic memory watchpoint (VITASLOP_POLL_ADDR=<hex guest
@@ -1068,8 +1260,8 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                                 set_reg_caller(&mut caller, 0, code); // r0 = return value
                             }
                         }
-                        SvcOutcome::Yield => {
-                            caller.data().signal.lock().unwrap().stop = Stop::Yielded;
+                        SvcOutcome::Flip => {
+                            caller.data().signal.lock().unwrap().stop = Stop::Flip;
                             YieldNow(false).await;
                         }
                         SvcOutcome::ThreadExit => {
@@ -1144,6 +1336,15 @@ impl vitaslop_runtime::GuestMemory for SharedView {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
         }
     }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if off.checked_add(len)? > self.len {
+            return None;
+        }
+        // SAFETY: bounds checked above, and the scheduler is cooperative - no fiber
+        // runs while a host call holds this borrow, so the bytes cannot change under
+        // it. The lifetime is tied to `&self`, which lives only for the host call.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
+    }
 }
 
 /// Write `bytes` into the shared memory at `off` (host-side seeding).
@@ -1199,6 +1400,55 @@ fn trap_detail(e: &wasmtime::Error) -> String {
 
 // --- register/vfp accessors (Caller during a call, Store during setup) --------
 
+/// Marshal the guest register file and VFP argument registers OUT of the wasm
+/// globals into host arrays, through this thread's cached handles ([`GuestGlobals`]).
+/// This and its write-back counterpart are the whole host-call marshalling cost, so
+/// they take the register file in one call rather than per register.
+fn read_guest_regs<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    regs: &mut [u32; abi::REG_COUNT],
+    vfp: &mut [u32; VFP_ARG_COUNT],
+) {
+    let g = caller.data().globals.as_ref().expect("globals resolved at instantiation");
+    // `Global` is a Copy handle; copy them out so the store can be borrowed mutably.
+    let (rg, vg) = (g.regs, g.vfp);
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = rg[i].get(&mut *caller).i32().expect("register global is i32") as u32;
+    }
+    for (i, s) in vfp.iter_mut().enumerate() {
+        *s = vg[i].get(&mut *caller).i32().expect("vfp global is i32") as u32;
+    }
+}
+
+/// Marshal the register file back INTO the wasm globals after a host call.
+///
+/// Any register a handler CHANGED is written, not just the ABI's return registers: a
+/// handler may rewrite the whole file (a context switch does). But a register it left
+/// alone is written back to the identical value it was read from, so comparing against
+/// `before` and skipping those is exactly equivalent and much cheaper - a compare is a
+/// couple of instructions where a `Global::set` is a store lookup, a type check and a
+/// `Val` round trip. The typical call returns in r0 and touches nothing else, so this
+/// turns 32 global writes into one.
+fn write_guest_regs<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    before: &([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]),
+    regs: &[u32; abi::REG_COUNT],
+    vfp: &[u32; VFP_ARG_COUNT],
+) {
+    let g = caller.data().globals.as_ref().expect("globals resolved at instantiation");
+    let (rg, vg) = (g.regs, g.vfp);
+    for (i, &v) in regs.iter().enumerate() {
+        if v != before.0[i] {
+            rg[i].set(&mut *caller, Val::I32(v as i32)).expect("register global is mutable i32");
+        }
+    }
+    for (i, &v) in vfp.iter().enumerate() {
+        if v != before.1[i] {
+            vg[i].set(&mut *caller, Val::I32(v as i32)).expect("vfp global is mutable i32");
+        }
+    }
+}
+
 fn get_reg<T>(caller: &mut Caller<'_, T>, i: usize) -> u32 {
     caller
         .get_export(&abi::reg_export(i))
@@ -1226,25 +1476,6 @@ fn set_reg_caller<T>(caller: &mut Caller<'_, T>, i: usize, v: u32) {
         .expect("module exports registers")
         .set(&mut *caller, Val::I32(v as i32))
         .expect("register global is mutable i32");
-}
-
-fn get_vfp<T>(caller: &mut Caller<'_, T>, i: usize) -> u32 {
-    caller
-        .get_export(&abi::vfp_s_export(i as u8))
-        .and_then(|e| e.into_global())
-        .expect("module exports vfp registers")
-        .get(&mut *caller)
-        .i32()
-        .expect("vfp global is i32") as u32
-}
-
-fn set_vfp_caller<T>(caller: &mut Caller<'_, T>, i: usize, v: u32) {
-    caller
-        .get_export(&abi::vfp_s_export(i as u8))
-        .and_then(|e| e.into_global())
-        .expect("module exports vfp registers")
-        .set(&mut *caller, Val::I32(v as i32))
-        .expect("vfp global is mutable i32");
 }
 
 fn set_reg_store<T>(store: &mut Store<T>, instance: &Instance, i: usize, v: u32) {

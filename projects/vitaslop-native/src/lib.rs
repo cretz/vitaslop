@@ -20,10 +20,17 @@ pub mod threaded;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
 pub mod wgpu_render;
-pub use wgpu_render::{GeneralRenderer, WgpuRenderer};
+pub use wgpu_render::{GeneralRenderer, RenderSplit, WgpuRenderer};
+
+pub mod observe;
+
+pub mod perf;
 
 pub mod recipe_runner;
 pub use recipe_runner::{boot_retail, run_recipe, RecipeReport, RunOpts};
+
+pub mod session;
+pub use session::{ControlDir, Session, SessionOpts};
 pub use vitaslop_transpiler::abi;
 use vitaslop_transpiler::{self as transpiler};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store, Val};
@@ -181,6 +188,8 @@ impl Vm {
             arm_entries: &[],
             externs,
             redirects: &[],
+            // Raw-image entry point: no NID import table, nothing known inlinable.
+            inline_imports: &[],
             noreturn_svc: host_abi.noreturn_svc,
             mem_bytes,
             // Vita modules take function addresses (thread entries, GXM
@@ -246,6 +255,8 @@ impl Vm {
             arm_entries: &[],
             externs,
             redirects: &[],
+            // Raw-image entry point: no NID import table, nothing known inlinable.
+            inline_imports: &[],
             noreturn_svc: host_abi.noreturn_svc,
             mem_bytes,
             discover_code_pointers: true,

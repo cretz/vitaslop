@@ -52,9 +52,11 @@ pub(super) fn delay_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    // A zero/one-us delay is "give someone else the CPU", not a real sleep.
+    // A zero/one-us delay is "give someone else the CPU", not a real sleep - and not
+    // a display frame either (see [`SvcOutcome::Flip`]). A worker polling in a
+    // delay(0) loop hits this thousands of times per rendered frame.
     if delay_us <= 1 {
-        return SvcOutcome::Yield;
+        return SvcOutcome::Reschedule;
     }
     st.sleep_park(delay_us as u64);
     SvcOutcome::Block

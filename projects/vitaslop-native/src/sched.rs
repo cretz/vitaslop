@@ -8,7 +8,7 @@
 //! # Why a fiber and not a second thread
 //! The guest's `_start` runs its whole render loop internally; there is no
 //! per-frame entry to call. To hand control back to the window each frame without
-//! a second OS thread, the guest's per-frame display flip (`SvcOutcome::Yield`)
+//! a second OS thread, the guest's per-frame display flip (`SvcOutcome::Flip`)
 //! suspends the fiber. wasmtime requires the async Store's data to be `Send` (a
 //! fiber may resume on any thread), which is why `World` is `Send`; in practice
 //! everything here runs on one thread.
@@ -178,6 +178,9 @@ impl Scheduler {
             arm_entries: &[],
             externs,
             redirects: &[],
+            // This entry point builds from a raw code image with no NID import table,
+            // so nothing here is known to be inlinable.
+            inline_imports: &[],
             noreturn_svc: &[],
             mem_bytes,
             // Vita modules take function addresses (thread entries, callbacks).
@@ -380,7 +383,7 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
                             caller.data_mut().halted = true;
                             return Err(wasmtime::Error::msg("guest halted"));
                         }
-                        SvcOutcome::Yield => {
+                        SvcOutcome::Flip => {
                             // Record the just-finished frame, flag it, and suspend
                             // the fiber so the scheduler can present and refresh
                             // input before we resume into the next frame.

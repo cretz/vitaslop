@@ -105,6 +105,110 @@ pub fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     png
 }
 
+/// Decode a PNG written by [`rgba_to_png`] back to `(width, height, rgba)`.
+///
+/// Deliberately narrow: it reads 8-bit RGBA, non-interlaced, filter-0 rows out of
+/// stored (uncompressed) DEFLATE - exactly and only what this module writes. That
+/// is enough for every consumer that exists (tools which montage, diff or measure
+/// screenshots THIS emulator produced) and it keeps a general PNG/zlib decoder out
+/// of the dependency set. Anything else is an ERROR naming what it found, never a
+/// silent partial decode: a tool that quietly renders half an image is worse than
+/// one that stops.
+pub fn png_to_rgba(png: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    if png.len() < 8 || png[..8] != [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Err("not a PNG (bad signature)".into());
+    }
+    let mut pos = 8;
+    let (mut width, mut height) = (0u32, 0u32);
+    let mut idat = Vec::new();
+    let mut saw_ihdr = false;
+    while pos + 8 <= png.len() {
+        let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+        let kind = &png[pos + 4..pos + 8];
+        let body_at = pos + 8;
+        let end = body_at.checked_add(len).ok_or("chunk length overflow")?;
+        if end + 4 > png.len() {
+            return Err(format!("truncated {} chunk", String::from_utf8_lossy(kind)));
+        }
+        let body = &png[body_at..end];
+        match kind {
+            b"IHDR" => {
+                if len < 13 {
+                    return Err("short IHDR".into());
+                }
+                width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                let (depth, color, comp, filter, interlace) =
+                    (body[8], body[9], body[10], body[11], body[12]);
+                if (depth, color, comp, filter, interlace) != (8, 6, 0, 0, 0) {
+                    return Err(format!(
+                        "unsupported PNG: depth={depth} color={color} compression={comp} filter={filter} interlace={interlace} (only 8-bit RGBA, non-interlaced)"
+                    ));
+                }
+                saw_ihdr = true;
+            }
+            b"IDAT" => idat.extend_from_slice(body),
+            b"IEND" => break,
+            _ => {}
+        }
+        pos = end + 4;
+    }
+    if !saw_ihdr {
+        return Err("no IHDR chunk".into());
+    }
+    let raw = zlib_stored_inflate(&idat)?;
+    let row_bytes = width as usize * 4;
+    let expect = (row_bytes + 1) * height as usize;
+    if raw.len() != expect {
+        return Err(format!("image data is {} bytes, expected {expect}", raw.len()));
+    }
+    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height as usize {
+        let at = y * (row_bytes + 1);
+        if raw[at] != 0 {
+            return Err(format!("row {y} uses filter {} (only filter 0 is supported)", raw[at]));
+        }
+        rgba.extend_from_slice(&raw[at + 1..at + 1 + row_bytes]);
+    }
+    Ok((width, height, rgba))
+}
+
+/// Undo [`zlib_stored`]: read a zlib stream made only of stored DEFLATE blocks.
+fn zlib_stored_inflate(z: &[u8]) -> Result<Vec<u8>, String> {
+    if z.len() < 2 {
+        return Err("zlib stream too short".into());
+    }
+    let mut out = Vec::new();
+    let mut i = 2; // skip the 2-byte zlib header
+    loop {
+        if i + 5 > z.len() {
+            return Err("truncated DEFLATE block header".into());
+        }
+        let header = z[i];
+        if header & 0x06 != 0 {
+            return Err(format!(
+                "DEFLATE block type {} is compressed (this decoder reads only stored blocks)",
+                (header >> 1) & 3
+            ));
+        }
+        let final_block = header & 1 == 1;
+        let n = u16::from_le_bytes([z[i + 1], z[i + 2]]) as usize;
+        let inv = u16::from_le_bytes([z[i + 3], z[i + 4]]);
+        if inv != !(n as u16) {
+            return Err("stored block length check failed".into());
+        }
+        let at = i + 5;
+        if at + n > z.len() {
+            return Err("truncated stored block".into());
+        }
+        out.extend_from_slice(&z[at..at + n]);
+        i = at + n;
+        if final_block {
+            return Ok(out);
+        }
+    }
+}
+
 /// Append a PNG chunk (length, type, data, CRC32).
 fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -931,6 +1035,18 @@ struct DrawInterp {
     skip: bool,
 }
 
+/// Latch for the once-per-run notice that shader-expanded draws are being skipped.
+static SKIPPED_EXPANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print `msg` the first time this latch is raised. Used for "the renderer cannot
+/// reproduce this class of draw" notices, which are properties of the title's shaders and
+/// so would otherwise repeat every frame forever.
+fn report_once(latch: &std::sync::atomic::AtomicBool, msg: &str) {
+    if !latch.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{msg}");
+    }
+}
+
 /// Recover a draw's [`DrawInterp`] the same way for both render paths.
 fn interpret_draw(d: &Draw) -> DrawInterp {
     let layout = layout_of(d);
@@ -976,8 +1092,180 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
     };
     // Position-only geometry (no texcoord AND no per-vertex color) has no color source
     // we can honor - see `DrawInterp::skip`. Skip it rather than paint opaque white.
-    let skip = layout.uv_off.is_none() && layout.color_off.is_none();
+    //
+    // A shader-expanded draw is skipped for the same reason one step earlier: its stream
+    // holds sprite RECORDS, not vertices, so there is no primitive here to rasterize at
+    // all. Joining the records as triangles stretches one textured smear across unrelated
+    // sprite centres - which is exactly how a shadow-blob pass reads on screen as a
+    // striped quad welded to the object casting it.
+    let skip = d.shader_expanded || (layout.uv_off.is_none() && layout.color_off.is_none());
     DrawInterp { layout, space, textured, uv_div, skip }
+}
+
+/// One locatable object in a captured scene: the draws that share a model-to-world
+/// placement, and where that placement puts them.
+///
+/// See [`locate_scene`] for why this is worth having.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectLoc {
+    /// A stable identity for this object across frames: a hash of its OBJECT-SPACE
+    /// geometry (each contributing draw's vertex and index bytes).
+    ///
+    /// The draw index cannot serve as an identity. A scene's draw list is rebuilt
+    /// every frame and its length changes as things come into view, so "draw 13" is a
+    /// different object one frame later - and a delta computed against it reports
+    /// enormous motion for a world that barely moved. A rigid object's vertex buffer,
+    /// by contrast, is in object space and does not change as the object moves: only
+    /// its world matrix does, which is exactly the quantity being measured.
+    pub id: u64,
+    /// Indices into [`Scene::draws`] of every draw at this placement.
+    pub draws: Vec<usize>,
+    /// The model-to-world translation these draws share - the object's world
+    /// position, straight out of the vertex program's reflected world matrix.
+    pub world: [f32; 3],
+    /// The object's HEADING: the compass bearing, in degrees, of its local +X and
+    /// local +Z axes after the world matrix rotates them, measured in the world XZ
+    /// plane. `None` for a degenerate (non-rotating) matrix.
+    ///
+    /// Position alone makes steering an integration problem: to learn which way a
+    /// vehicle is pointing you have to drive it and watch where it ends up, which
+    /// takes long enough that it drives into something first, and the answer is
+    /// contaminated by the turn it made getting there. The rotation is already in the
+    /// same matrix as the translation, so the heading is a direct reading taken in one
+    /// frame. Both axes are reported because which one a given mesh calls "forward" is
+    /// a property of that mesh, and the difference is a constant that cancels the
+    /// moment you compare two readings.
+    pub heading: Option<[f32; 2]>,
+    /// Screen-space bounding box `[min_x, min_y, max_x, max_y]` over every projected
+    /// vertex, in the requested raster size. `None` when nothing projected in front
+    /// of the eye (entirely off-camera or behind it).
+    pub screen: Option<[f32; 4]>,
+    /// Centre of `screen`, for the common "where is it on screen" question.
+    pub centroid: Option<[f32; 2]>,
+    /// Mean projected view distance (the clip `w`) - how far from the camera it is.
+    pub distance: Option<f32>,
+    pub triangles: usize,
+    /// This placement's draws are shader-expanded sprite records, so `screen` locates
+    /// the sprite CENTRES and not a rasterized shape. Flagged rather than dropped:
+    /// the centres are still where the object is.
+    pub sprites: bool,
+}
+
+/// Where every object in a captured scene is, in world and on screen.
+///
+/// # Why this exists
+/// An agent driving a game through this emulator is otherwise blind. It can take a
+/// screenshot, but "the car is a few pixels left of the concrete circle" is not a
+/// quantity - it cannot be compared, asserted on, or fed back into the next input, so
+/// every navigation decision needs a human to look at a PNG. That is the slowest step
+/// in the whole loop and it is what keeps a playthrough from running unattended.
+///
+/// The position is already in the capture and needs no reverse engineering at all:
+/// [`Draw::world`] is the model-to-world matrix reflected from the vertex program, so
+/// its translation column IS the object's world position, and the draw's MVP projects
+/// it to exactly where the renderer puts it. Grouping draws by that placement turns a
+/// scene of hundreds of draws into the handful of OBJECTS the frame actually contains
+/// - one of which is the thing the player is steering.
+///
+/// This deliberately does not try to name anything. Which group is the player is a
+/// title-specific fact, and the way to establish it is behavioural: hold the throttle,
+/// see which world position moves. That belongs in a recipe, not in the engine.
+///
+/// `width`/`height` are the raster size the screen coordinates are expressed in.
+pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
+    // Group by quantized world translation. Millimetre buckets: fine enough that two
+    // genuinely distinct objects never merge, coarse enough that float noise in a
+    // shared placement does not split one object into several.
+    let key_of = |w: [f32; 3]| {
+        [
+            (w[0] * 1000.0).round() as i64,
+            (w[1] * 1000.0).round() as i64,
+            (w[2] * 1000.0).round() as i64,
+        ]
+    };
+    let mut groups: HashMap<[i64; 3], ObjectLoc> = HashMap::new();
+    for (di, d) in scene.draws.iter().enumerate() {
+        let interp = interpret_draw(d);
+        let Space::Mvp(mvp) = interp.space else { continue };
+        let stride = d.vertex_stride.max(1) as usize;
+        let nverts = d.vertices.len() / stride;
+        if nverts == 0 {
+            continue;
+        }
+        // Column-major 4x4: columns 0..2 are the rotated basis vectors, column 3 the
+        // translation.
+        let world = [d.world[12], d.world[13], d.world[14]];
+        // Bearing of each in-plane basis axis, in the same convention the pad's polar
+        // stick directive uses: 0 along world +X, increasing toward world -Z.
+        let bearing = |x: f32, z: f32| -> f32 { (-z).atan2(x).to_degrees() };
+        let ax = [d.world[0], d.world[2]];
+        let az = [d.world[8], d.world[10]];
+        let heading = if ax[0].hypot(ax[1]) > 1e-6 && az[0].hypot(az[1]) > 1e-6 {
+            Some([bearing(ax[0], ax[1]), bearing(az[0], az[1])])
+        } else {
+            None
+        };
+        let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut wsum = 0.0f64;
+        let mut wcount = 0usize;
+        for i in 0..nverts {
+            let v = decode_vertex(d, &interp.layout, i);
+            let Some(p) = project(&v, &Space::Mvp(mvp), width, height, 1.0) else { continue };
+            bbox[0] = bbox[0].min(p[0]);
+            bbox[1] = bbox[1].min(p[1]);
+            bbox[2] = bbox[2].max(p[0]);
+            bbox[3] = bbox[3].max(p[1]);
+            // `project` returns 1/w in slot 3; the view distance is its reciprocal.
+            if p[3] > 0.0 {
+                wsum += (1.0 / p[3]) as f64;
+                wcount += 1;
+            }
+        }
+        // FNV-1a over the draw's object-space geometry: the identity that survives the
+        // draw list being rebuilt. Folded in per draw so a multi-draw object's id
+        // covers all of its parts.
+        let mut geo: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in d.vertices.iter().chain(d.indices.iter()) {
+            geo ^= *b as u64;
+            geo = geo.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let e = groups.entry(key_of(world)).or_insert_with(|| ObjectLoc {
+            id: 0,
+            draws: Vec::new(),
+            world,
+            heading,
+            screen: None,
+            centroid: None,
+            distance: None,
+            triangles: 0,
+            sprites: false,
+        });
+        e.draws.push(di);
+        // Commutative fold, so the id does not depend on the order draws were visited.
+        e.id ^= geo;
+        e.triangles += triangle_count(d);
+        e.sprites |= d.shader_expanded;
+        if wcount > 0 {
+            let mean = (wsum / wcount as f64) as f32;
+            e.distance = Some(match e.distance {
+                Some(prev) => (prev + mean) * 0.5,
+                None => mean,
+            });
+            e.screen = Some(match e.screen {
+                Some(b) => [b[0].min(bbox[0]), b[1].min(bbox[1]), b[2].max(bbox[2]), b[3].max(bbox[3])],
+                None => bbox,
+            });
+        }
+    }
+    let mut out: Vec<ObjectLoc> = groups.into_values().collect();
+    for o in &mut out {
+        o.draws.sort_unstable();
+        o.centroid = o.screen.map(|b| [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5]);
+    }
+    // Lowest draw index first, so the ordering is the scene's own submission order and
+    // stays stable frame to frame - which is what makes two `locate`s comparable.
+    out.sort_by_key(|o| o.draws.first().copied().unwrap_or(usize::MAX));
+    out
 }
 
 /// Rasterize one scene into a fresh framebuffer at native resolution. `clear` is the
@@ -1058,8 +1346,22 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
         }
         let DrawInterp { layout, space, textured, uv_div, skip } = interpret_draw(d);
         if skip {
+            // An approximation that drops geometry must say so unconditionally - a silently
+            // skipped draw is indistinguishable on screen from one the game never made. This
+            // is a static property of the title's shaders rather than a per-frame event, so
+            // it is announced once per kind instead of once per draw.
+            if d.shader_expanded {
+                report_once(
+                    &SKIPPED_EXPANDED,
+                    "software render: SKIPPING shader-expanded (point-sprite/billboard) draws - \
+                     their vertex stream holds sprite records, not triangles, so the \
+                     fixed-function approximation cannot build the primitive. The GXP \
+                     recompiler renders these correctly; `play` shots will not show them.",
+                );
+            }
             if stats {
-                eprintln!("DSTAT draw {di} SKIP=no-color-no-uv tris={tri_count} stride={}", d.vertex_stride);
+                let why = if d.shader_expanded { "shader-expanded" } else { "no-color-no-uv" };
+                eprintln!("DSTAT draw {di} SKIP={why} tris={tri_count} stride={}", d.vertex_stride);
             }
             continue;
         }
@@ -1724,7 +2026,147 @@ mod geometry_tests {
             fprog: vec![],
             vert_sa: vec![],
             frag_sa: vec![],
+            shader_expanded: false,
         }
+    }
+
+    /// A minimal MVP triangle-list draw placed at `world`, with a position-only vertex
+    /// stream and a per-vertex colour (so `interpret_draw` does not skip it).
+    fn located_draw(world: [f32; 3], verts: &[[f32; 3]], mvp: [f32; 16]) -> Draw {
+        let mut d = strip_draw(&[0, 1, 2]);
+        d.primitive = PRIM_TRIANGLES;
+        d.vertex_stride = 16;
+        d.vertices = verts
+            .iter()
+            .flat_map(|p| {
+                let mut b: Vec<u8> = p.iter().flat_map(|c| c.to_le_bytes()).collect();
+                b.extend_from_slice(&[255, 255, 255, 255]); // colour, at offset 12
+                b
+            })
+            .collect();
+        d.attributes = vec![
+            crate::capture::VertexAttribute {
+                stream_index: 0,
+                offset: 0,
+                format: 3, // F32
+                component_count: 3,
+                reg_index: 0,
+            },
+            crate::capture::VertexAttribute {
+                stream_index: 0,
+                offset: 12,
+                format: 0, // U8N
+                component_count: 4,
+                reg_index: 1,
+            },
+        ];
+        d.uniforms = mvp.to_vec();
+        d.world[12] = world[0];
+        d.world[13] = world[1];
+        d.world[14] = world[2];
+        d
+    }
+
+    #[test]
+    fn locate_groups_draws_by_placement_and_projects_them() {
+        // An MVP that just translates z into w, so a vertex at z=1 lands at the centre
+        // of the raster: the projection is exercised without inventing a camera.
+        let mut mvp = [0f32; 16];
+        mvp[0] = 1.0;
+        mvp[5] = 1.0;
+        mvp[10] = 1.0;
+        mvp[11] = 1.0; // w = z
+        let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
+        let scene = Scene {
+            color: None,
+            draws: vec![
+                located_draw([10.0, 0.0, 5.0], &tri, mvp),
+                // Same placement as the first: one object drawn in two passes.
+                located_draw([10.0, 0.0, 5.0], &tri, mvp),
+                located_draw([-3.0, 1.0, 2.0], &tri, mvp),
+            ],
+        };
+        let found = locate_scene(&scene, 100, 100);
+        assert_eq!(found.len(), 2, "draws sharing a placement are ONE object");
+        assert_eq!(found[0].draws, vec![0, 1]);
+        assert_eq!(found[0].world, [10.0, 0.0, 5.0]);
+        assert_eq!(found[1].world, [-3.0, 1.0, 2.0]);
+        // Ordering is the scene's own submission order, so two reports line up.
+        assert!(found[0].draws[0] < found[1].draws[0]);
+        // x=0,y=0 with w=z projects to the centre of the raster.
+        assert_eq!(found[0].centroid, Some([50.0, 50.0]));
+        assert_eq!(found[0].distance, Some(1.0));
+    }
+
+    #[test]
+    fn locate_reports_object_heading_in_pad_bearing_convention() {
+        let mut mvp = [0f32; 16];
+        mvp[0] = 1.0;
+        mvp[5] = 1.0;
+        mvp[10] = 1.0;
+        mvp[11] = 1.0;
+        let tri = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+
+        // Identity rotation: local +X lies along world +X (bearing 0) and local +Z
+        // along world +Z (bearing -90, since bearings increase toward world -Z). Same
+        // convention as the `lang=` stick directive, so a commanded bearing and a
+        // measured heading are directly comparable numbers.
+        let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
+        let found = locate_scene(&Scene { color: None, draws: vec![d.clone()] }, 100, 100);
+        let h = found[0].heading.expect("an identity rotation has a heading");
+        assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
+        assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
+
+        // Rotate 90 degrees so local +X points along world -Z: bearing 90.
+        let mut turned = d.clone();
+        turned.world[0] = 0.0;
+        turned.world[2] = -1.0;
+        turned.world[8] = 1.0;
+        turned.world[10] = 0.0;
+        let found = locate_scene(&Scene { color: None, draws: vec![turned] }, 100, 100);
+        let h = found[0].heading.unwrap();
+        assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
+
+        // A world matrix with no in-plane rotation at all reports no heading rather
+        // than a fabricated zero.
+        let mut flat = d;
+        flat.world[0] = 0.0;
+        flat.world[2] = 0.0;
+        let found = locate_scene(&Scene { color: None, draws: vec![flat] }, 100, 100);
+        assert_eq!(found[0].heading, None);
+    }
+
+    #[test]
+    fn locate_ids_track_geometry_not_draw_index() {
+        // The identity has to survive the draw list being rebuilt, because that is what
+        // happens every frame: a delta matched on draw index reports huge motion for a
+        // world that barely moved.
+        let mut mvp = [0f32; 16];
+        mvp[0] = 1.0;
+        mvp[5] = 1.0;
+        mvp[10] = 1.0;
+        mvp[11] = 1.0;
+        let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+        let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
+
+        let before = Scene { color: None, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        // Next frame: something new is submitted first, and the car has moved.
+        let after = Scene {
+            color: None,
+            draws: vec![
+                located_draw([99.0, 0.0, 0.0], &other, mvp),
+                located_draw([1.0, 0.0, 0.0], &car, mvp),
+            ],
+        };
+        let a = locate_scene(&before, 100, 100);
+        let b = locate_scene(&after, 100, 100);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 2);
+        // The car is at draw 0 in one frame and draw 1 in the next, but keeps its id.
+        assert_eq!(a[0].draws, vec![0]);
+        assert_eq!(b[1].draws, vec![1]);
+        assert_eq!(a[0].id, b[1].id, "same geometry, same identity");
+        assert_ne!(a[0].id, b[0].id, "different geometry, different identity");
     }
 
     #[test]
@@ -1925,7 +2367,7 @@ mod supersample_tests {
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![],
+            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
         let scene = Scene { color: None, draws: vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -1979,7 +2421,7 @@ mod supersample_tests {
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![],
+            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
         let s = Scene { color: None, draws: vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
@@ -2219,5 +2661,45 @@ mod texture_tests {
         assert_eq!(sample_texture(&t, u_of(8, 16), u_of(4, 16))[3], 0);
         // A neighboring block (texel (0,0), block (0,0)) stays opaque.
         assert_eq!(sample_texture(&t, u_of(0, 16), u_of(0, 16))[3], 255);
+    }
+}
+
+#[cfg(test)]
+mod png_tests {
+    use super::*;
+
+    /// The decoder exists to read this module's own output, so the round trip is the
+    /// whole specification.
+    #[test]
+    fn png_round_trips_through_encode_and_decode() {
+        let (w, h) = (7u32, 3u32);
+        let rgba: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 7 % 251) as u8).collect();
+        let png = rgba_to_png(w, h, &rgba);
+        let (dw, dh, out) = png_to_rgba(&png).expect("decode");
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(out, rgba);
+    }
+
+    /// A big image spans several 64 KiB stored blocks; the block walk must not stop
+    /// at the first one.
+    #[test]
+    fn png_round_trips_across_multiple_stored_blocks() {
+        let (w, h) = (200u32, 120u32); // 200*4+1 per row * 120 = 96120 bytes > 65535
+        let rgba: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 256) as u8).collect();
+        let (dw, dh, out) = png_to_rgba(&rgba_to_png(w, h, &rgba)).expect("decode");
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(out, rgba);
+    }
+
+    /// Anything outside the narrow supported shape must NAME what it found rather
+    /// than decode part of an image.
+    #[test]
+    fn png_decode_rejects_what_it_cannot_read() {
+        assert!(png_to_rgba(b"not a png at all").unwrap_err().contains("signature"));
+        let mut png = rgba_to_png(2, 2, &[0u8; 16]);
+        // Flip the colour type to greyscale (0) in IHDR: byte 8+8+4+4+1 = 25.
+        png[25] = 0;
+        let err = png_to_rgba(&png).unwrap_err();
+        assert!(err.contains("color=0"), "error should name the field: {err}");
     }
 }

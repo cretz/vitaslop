@@ -15,8 +15,10 @@ const VBLANK_US: u64 = 1_000_000 / 60;
 /// timed park until the virtual clock reaches `now + vcount * (1/60 s)` - the same
 /// mechanism as `sceKernelDelayThread`, so a frame-pacing loop that waits on vblank
 /// yields the CPU to the threads doing work instead of busy-spinning. A `vcount` of
-/// 0 is a plain yield. Single-thread model: nothing to yield to, so it just succeeds
-/// (the clock is host-driven). Returns 0.
+/// 0 is a plain yield - NOT a frame boundary (see [`SvcOutcome::Flip`]); it asks for
+/// no wait at all, so a loop doing it spins as fast as the scheduler allows and must
+/// not be allowed to advance the display frame count. Single-thread model: nothing to
+/// yield to, so it just succeeds (the clock is host-driven). Returns 0.
 pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let vcount = ctx.arg(0);
     ctx.ret(0);
@@ -24,7 +26,7 @@ pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) ->
         return SvcOutcome::Continue;
     }
     if vcount == 0 {
-        return SvcOutcome::Yield;
+        return SvcOutcome::Reschedule;
     }
     st.sleep_park(vcount as u64 * VBLANK_US);
     SvcOutcome::Block

@@ -266,7 +266,7 @@ pub struct RenderScene {
 pub use render::{CubeRenderer, DEPTH_FORMAT};
 
 #[cfg(feature = "gpu")]
-pub use gxm::GxmRenderer;
+pub use gxm::{EncodePhases, GxmRenderer};
 
 #[cfg(feature = "gpu")]
 mod render {
@@ -491,8 +491,40 @@ mod render {
 #[cfg(feature = "gpu")]
 mod gxm {
     use super::{DrawSpace, RenderScene, DEPTH_FORMAT, GXM_VERTEX_STRIDE};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use wgpu::util::DeviceExt;
+
+    /// A CPU stopwatch that is INERT in the browser.
+    ///
+    /// This renderer is shared with the wasm build, and `std::time::Instant` is not
+    /// implemented on `wasm32-unknown-unknown`: constructing one panics at runtime.
+    /// A diagnostic must never be able to take down the thing it is measuring, so on
+    /// wasm this compiles to a zero-sized struct that always reports 0 ms. Native
+    /// builds get the real clock.
+    #[derive(Clone, Copy)]
+    struct Stopwatch {
+        #[cfg(not(target_arch = "wasm32"))]
+        start: std::time::Instant,
+    }
+
+    impl Stopwatch {
+        #[cfg(not(target_arch = "wasm32"))]
+        fn start() -> Self {
+            Stopwatch { start: std::time::Instant::now() }
+        }
+        #[cfg(target_arch = "wasm32")]
+        fn start() -> Self {
+            Stopwatch {}
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        fn ms(&self) -> f64 {
+            self.start.elapsed().as_secs_f64() * 1000.0
+        }
+        #[cfg(target_arch = "wasm32")]
+        fn ms(&self) -> f64 {
+            0.0
+        }
+    }
 
     /// The general fragment/vertex shader: the blob-free equivalent of a title's GXP
     /// shaders, a faithful per-fragment twin of `vitaslop_runtime::render`. The vertex
@@ -706,6 +738,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// dimensions into an offscreen buffer and box-downsamples it into the caller's view).
         /// See [`GxmRenderer::set_supersample`] and the `resolve_*` fields below.
         ss_scale: u32,
+        /// Last reported `(draws, with_payload, prepared, fixed)` recompiler summary. The
+        /// summary is per-RENDER, so printing it unconditionally writes a line every frame -
+        /// 60 a second in a live window. Reporting only when the tuple CHANGES keeps the whole
+        /// signal (the first frame, and any draw moving between the recompiled and
+        /// fixed-function paths) without the spam.
+        last_gxp_summary: Option<(usize, usize, usize, usize)>,
         /// The box-downsample resolve pipeline + its bind-group layout and scale uniform,
         /// used only when `ss_scale > 1`. Built once in [`GxmRenderer::new`].
         resolve_pipeline: wgpu::RenderPipeline,
@@ -719,6 +757,33 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// guest's real shaders; a pair that fails to link falls back to the fixed-function
         /// pipelines above. Disabled -> zero cost (the payload is simply ignored).
         gxp: GxpLive,
+        /// What the last [`GxmRenderer::encode`] spent, phase by phase. See [`EncodePhases`].
+        last_phases: EncodePhases,
+    }
+
+    /// Where one `encode` went, in milliseconds of CPU.
+    ///
+    /// The recompiler path renders this title's main screen in ~30 ms warm against the
+    /// fixed-function path's ~8 ms, and the interesting question is WHICH SIDE that
+    /// delta is on: per-draw CPU work building GPU objects, or genuinely heavier
+    /// shaders on the GPU. They call for opposite fixes, so guessing is expensive.
+    ///
+    /// `prepare` is the scene walk - for a recompiled draw that means creating its
+    /// buffers and bind groups, where the fixed-function path only appends bytes to a
+    /// grow-only arena. `upload` is the arena writes, `pass` is command encoding. All
+    /// three are CPU; GPU time shows up in the caller's submit-and-wait, which is why
+    /// the caller times that separately. Recorded unconditionally - three `Instant`s a
+    /// frame cost nothing next to the milliseconds they measure, and a diagnostic that
+    /// has to be switched on is one nobody has on when they need it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct EncodePhases {
+        pub prepare_ms: f64,
+        pub upload_ms: f64,
+        pub pass_ms: f64,
+        /// Draws that took the recompiled path, and draws that took the fixed-function
+        /// path - the denominator for any per-draw cost.
+        pub gxp_draws: usize,
+        pub fixed_draws: usize,
     }
 
     /// The offscreen supersample render target: an `ss_scale * surf` colour + depth buffer the
@@ -845,6 +910,25 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         views: HashMap<(u64, SamplerDim), wgpu::TextureView>,
         sampler_point: Option<wgpu::Sampler>,
         sampler_linear: Option<wgpu::Sampler>,
+        /// The `@group(3)` depth-range bind group, keyed by `(pipeline key, the depth
+        /// range's bits)`.
+        ///
+        /// That group holds ONE vec4 - the scene's depth min and scale - which is the
+        /// same for every draw in a scene. Building a fresh 16-byte buffer and bind
+        /// group per draw meant a couple of hundred GPU allocations a frame to say the
+        /// same thing each time. Keyed by pipeline as well as by value because each
+        /// pipeline owns its own `BindGroupLayout` object; a shared group-3 layout
+        /// would collapse this to one entry, and is the right follow-up.
+        depth_bgs: HashMap<(u64, u64), wgpu::BindGroup>,
+    }
+
+    /// Diagnostic (`VITASLOP_GXP_DUMP`): print each recompiled draw's inputs.
+    ///
+    /// Cached, because this is tested once per DRAW and reading an unset environment
+    /// variable on Windows copies and re-encodes the whole environment block.
+    fn gxp_dump() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VITASLOP_GXP_DUMP").is_some())
     }
 
     impl GxpLive {
@@ -869,6 +953,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 views: HashMap::new(),
                 sampler_point: None,
                 sampler_linear: None,
+                depth_bgs: HashMap::new(),
             }
         }
 
@@ -900,7 +985,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 return None;
             }
             if !self.pipelines.contains_key(&key) {
-                let built = build_gxp_pipeline(device, color_format, gxp, self.zfix, self.yflip, self.solid);
+                let built = build_gxp_pipeline(device, color_format, gxp, key, self.zfix, self.yflip, self.solid);
                 self.pipelines.insert(key, built);
             }
             if self.sampler_point.is_none() {
@@ -909,11 +994,19 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             // Split the borrows: the sampler bind group needs the texture-view cache mutably
             // while the pipeline (its layouts, its sampler plan) stays borrowed.
-            let GxpLive { pipelines, views: view_cache, sampler_point, sampler_linear, force, .. } = self;
+            let GxpLive {
+                pipelines,
+                views: view_cache,
+                sampler_point,
+                sampler_linear,
+                force,
+                depth_bgs,
+                ..
+            } = self;
             // Borrow the cached pipeline; None = link failed -> fall back.
             let pipe = pipelines.get(&key)?.as_ref()?;
 
-            if std::env::var_os("VITASLOP_GXP_DUMP").is_some() {
+            if gxp_dump() {
                 let f: Vec<f32> = gxp
                     .vert_sa
                     .chunks_exact(4)
@@ -960,22 +1053,28 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let bg0 = make_uniform_bg(device, &pipe.layouts[0], pipe.vsa_lanes, &gxp.vert_sa);
             let bg1 = make_uniform_bg(device, &pipe.layouts[1], pipe.fsa_lanes, &gxp.frag_sa);
             let bg2 = Self::make_sampler_bg(
-                device, queue, &pipe.layouts[2], &pipe.samplers, gxp,
+                device, queue, &pipe.layouts[2], &pipe.samplers, gxp, key,
                 view_cache, sampler_point.as_ref().unwrap(), sampler_linear.as_ref().unwrap(), *force,
             )?;
             // group3: the scene depth range the injected clip fixup maps through, as one vec4
             // (min, scale, unused, unused) - the same values the fixed-function path uses, so
-            // both kinds of draw write comparable depth.
-            let dbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gxp-depth"),
-                contents: &[depth_range[0].to_le_bytes(), depth_range[1].to_le_bytes(), [0; 4], [0; 4]].concat(),
-                usage: wgpu::BufferUsages::UNIFORM,
+            // both kinds of draw write comparable depth. Per SCENE, not per draw, so it is
+            // cached (see `GxpLive::depth_bgs`); the bit pattern is the key so a changed
+            // range builds a new one rather than reusing a stale buffer.
+            let depth_key = (depth_range[0].to_bits() as u64) << 32 | depth_range[1].to_bits() as u64;
+            let bg3 = depth_bgs.entry((key, depth_key)).or_insert_with(|| {
+                let dbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("gxp-depth"),
+                    contents: &[depth_range[0].to_le_bytes(), depth_range[1].to_le_bytes(), [0; 4], [0; 4]].concat(),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gxp-depth-bind"),
+                    layout: &pipe.layouts[3],
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: dbuf.as_entire_binding() }],
+                })
             });
-            let bg3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gxp-depth-bind"),
-                layout: &pipe.layouts[3],
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: dbuf.as_entire_binding() }],
-            });
+            let bg3 = bg3.clone();
 
             Some(GxpPrepared { key, vbuf, ibuf, index_count: gxp.index_count, bg: [bg0, bg1, bg2, bg3], blend: gxp.blend })
         }
@@ -995,6 +1094,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             layout: &wgpu::BindGroupLayout,
             samplers: &[(u8, SamplerDim)],
             gxp: &GxpRecompile,
+            key: u64,
             view_cache: &mut HashMap<(u64, SamplerDim), wgpu::TextureView>,
             sampler_point: &wgpu::Sampler,
             sampler_linear: &wgpu::Sampler,
@@ -1007,7 +1107,6 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entries: &[],
                 }));
             }
-            let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
             // Upload every needed texture first so the views outlive the bind-group build.
             let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(samplers.len());
             // Cloning a `TextureView` is a refcount bump, so cached views are shared, not copied.
@@ -1046,15 +1145,16 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // fallback so geometry still renders (a diagnostic, never the default).
                     None => {
                         if !force {
-                            if debug {
-                                eprintln!(
-                                    "gxp prepare: sampler unit {unit} wants {want:?} but bound units are {:?}",
+                            report_fallback(
+                                key,
+                                &format!(
+                                    "sampler unit {unit} wants {want:?} but the bound units are {:?}",
                                     gxp.textures
                                         .iter()
                                         .map(|t| (t.unit, t.tex.faces))
                                         .collect::<Vec<_>>()
-                                );
-                            }
+                                ),
+                            );
                             return None;
                         }
                         views.push(make_fallback_view(device, queue, want.view_dimension()));
@@ -1317,12 +1417,43 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         Some(format!("{helper}{patched}"))
     }
 
+    /// Report, ONCE PER SHADER PAIR, that a draw is rendering the fixed-function
+    /// approximation instead of the guest's own translated shaders, and exactly why.
+    ///
+    /// This is deliberately not gated behind a debug flag. The recompiler's contract is
+    /// no-guess: an unknown opcode hard-fails naming its raw word, an unfed shader input
+    /// hard-fails, a clip fixup that finds nothing to patch hard-fails. But the RENDERER
+    /// answers all of those by drawing the older capture-based approximation for that pair,
+    /// and a silent approximation is indistinguishable on screen from a faithful render -
+    /// which is how session 8's "36 draws render with their real guest shaders" turned out
+    /// to be 36 draws that linked and never ran. The reason line is the only signal that a
+    /// pair is still owed work, so it must be visible in an ordinary run.
+    ///
+    /// The dedupe is global rather than per-renderer: a pair is submitted hundreds of times a
+    /// frame, and nothing is gained by repeating it for a second render target.
+    fn report_fallback(key: u64, reason: &str) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        // A poisoned lock must not lose the diagnostic - recover the set and report anyway.
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(key) {
+            eprintln!("gxp pair {key:016x}: FALLS BACK to fixed-function - {reason}");
+        }
+    }
+
     /// Link a guest shader pair and build its two pipeline variants + bind-group layouts.
     /// `None` (fall back) on any link error or an unmappable vertex format.
+    ///
+    /// Every `None` here is REPORTED, unconditionally and by name - see [`report_fallback`].
+    /// The translator itself never guesses (an unknown opcode hard-fails naming its raw word),
+    /// but the renderer's answer to that hard failure is to draw the fixed-function
+    /// approximation, and an unreported approximation reads exactly like a faithful render.
     fn build_gxp_pipeline(
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         gxp: &GxpRecompile,
+        key: u64,
         zfix: bool,
         yflip: bool,
         solid: bool,
@@ -1331,9 +1462,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let linked = match vitaslop_gxp_shader::link_programs(&gxp.vprog, &gxp.fprog) {
             Ok(l) => l,
             Err(e) => {
-                if debug {
-                    eprintln!("gxp build: link failed: {e}");
-                }
+                report_fallback(key, &format!("link failed: {e}"));
                 return None;
             }
         };
@@ -1349,13 +1478,15 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let ga: &GxpAttr = match gxp.attributes.iter().find(|g| g.reg_index as u32 == a.base_lane) {
                 Some(g) => g,
                 None => {
-                    if debug {
-                        eprintln!(
-                            "gxp build: no guest attribute for linked @location {} base_lane {} (guest reg_indices {:?})",
-                            a.location, a.base_lane,
+                    report_fallback(
+                        key,
+                        &format!(
+                            "no guest attribute for linked @location {} base_lane {} (guest reg_indices {:?})",
+                            a.location,
+                            a.base_lane,
                             gxp.attributes.iter().map(|g| g.reg_index).collect::<Vec<_>>()
-                        );
-                    }
+                        ),
+                    );
                     return None;
                 }
             };
@@ -1408,9 +1539,10 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let wgsl = match inject_clip_fixup(&linked.wgsl, zfix, yflip, solid) {
             Some(w) => w,
             None => {
-                eprintln!(
-                    "gxp build: link failed: no `out.position` assignment to wrap with the clip \
-                     fixup - refusing to render without the depth remap"
+                report_fallback(
+                    key,
+                    "no `out.position` assignment to wrap with the clip fixup - refusing to \
+                     render without the depth remap",
                 );
                 return None;
             }
@@ -1855,6 +1987,8 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 uniform_stride,
                 color_format,
                 ss_scale: 1,
+                last_gxp_summary: None,
+                last_phases: EncodePhases::default(),
                 resolve_pipeline,
                 resolve_layout,
                 resolve_scale_buf,
@@ -2045,6 +2179,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         ) {
             // 1. Walk the scene once: pack vertex/index/uniform bytes into per-frame
             //    arenas and ensure each draw's texture upload + bind group exist.
+            let t_prepare = Stopwatch::start();
             let stride = self.uniform_stride as usize;
             let mut vdata: Vec<u8> = Vec::new();
             let mut idata: Vec<u8> = Vec::new();
@@ -2139,17 +2274,27 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             if gxp_enabled {
                 let with_payload = scene.draws.iter().filter(|d| d.gxp.is_some()).count();
-                eprintln!(
-                    "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
-                    scene.draws.len(),
-                    with_payload,
-                    gxp_prepared.len(),
-                    items.len(),
-                );
+                let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
+                if self.last_gxp_summary != Some(summary) {
+                    self.last_gxp_summary = Some(summary);
+                    eprintln!(
+                        "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
+                        summary.0, summary.1, summary.2, summary.3,
+                    );
+                }
             }
+
+            self.last_phases = EncodePhases {
+                prepare_ms: t_prepare.ms(),
+                upload_ms: 0.0,
+                pass_ms: 0.0,
+                gxp_draws: gxp_prepared.len(),
+                fixed_draws: items.len(),
+            };
 
             // 2. Size the arenas and upload. Rebuild the uniform bind group if the uniform
             //    buffer was (re)created.
+            let t_upload = Stopwatch::start();
             if !items.is_empty() {
                 Self::ensure_buffer(device, &mut self.vbo, &mut self.vbo_cap, vdata.len() as u64, wgpu::BufferUsages::VERTEX, "gxm-vbo");
                 Self::ensure_buffer(device, &mut self.ibo, &mut self.ibo_cap, idata.len() as u64, wgpu::BufferUsages::INDEX, "gxm-ibo");
@@ -2174,9 +2319,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 queue.write_buffer(self.ubo.as_ref().unwrap(), 0, &udata);
             }
 
+            self.last_phases.upload_ms = t_upload.ms();
+
             // 3. One render pass over the whole scene. When supersampling, the scene is drawn
             //    into the offscreen `scale x` target (built here) and a resolve pass below
             //    box-downsamples it into the caller's view; otherwise it is drawn straight in.
+            let t_pass = Stopwatch::start();
             let ss = self.ss_scale > 1;
             if ss {
                 self.ensure_ss_target(device, queue, surf_w, surf_h);
@@ -2217,7 +2365,11 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     multiview_mask: None,
                 });
                 if order.is_empty() && !ss {
-                    return; // clear-only frame; the pass above already cleared the target.
+                    // Clear-only frame; the pass above already cleared the target. The
+                    // phase timing is still closed out, so a caller reading it never sees
+                    // a stale value from an earlier, busier frame.
+                    self.last_phases.pass_ms = t_pass.ms();
+                    return;
                 }
                 // Draw in submission order, switching between the fixed-function arenas and the
                 // recompiled per-draw resources. The fixed-function handles are unwrapped only
@@ -2272,6 +2424,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 rpass.set_bind_group(0, &t.resolve_bind, &[]);
                 rpass.draw(0..3, 0..1);
             }
+            self.last_phases.pass_ms = t_pass.ms();
+        }
+
+        /// What the last [`GxmRenderer::encode`] spent, phase by phase.
+        pub fn last_phases(&self) -> EncodePhases {
+            self.last_phases
         }
     }
 }

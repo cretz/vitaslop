@@ -349,6 +349,11 @@ pub struct ProgramInputs {
     /// Inter-module redirects (empty for a single-module load; the multi-module
     /// linker populates them).
     pub redirects: Vec<vitaslop_transpiler::Redirect>,
+    /// Imports to emit inline rather than as a host trap. The loader does not decide
+    /// this - it has no idea what a NID means - so the runtime fills it in from the
+    /// import table (see `vitaslop_runtime::link`). Empty leaves every import a host
+    /// call, which is what the ARM conformance corpus wants.
+    pub inline_imports: Vec<vitaslop_transpiler::InlineImport>,
     /// True if the entry point is Thumb (entry had bit 0 set).
     pub thumb_entry: bool,
     /// Total guest memory to provision (image + stack + heap), in bytes from
@@ -376,6 +381,7 @@ impl ProgramInputs {
             arm_entries: &[],
             externs: &self.externs,
             redirects: &self.redirects,
+            inline_imports: &self.inline_imports,
             // Vita dispatches host calls through NID stubs (bl/blx to a stub
             // address), not `svc`, so there is no noreturn-syscall set here.
             noreturn_svc: &[],
@@ -445,6 +451,7 @@ impl Module {
             entries,
             externs,
             redirects: Vec::new(),
+            inline_imports: Vec::new(),
             thumb_entry: self.entry & 1 != 0,
             mem_bytes: DEFAULT_MEM_BYTES,
             import_memory: false,

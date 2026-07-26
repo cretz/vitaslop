@@ -146,6 +146,27 @@ pub struct GeneralRenderer {
     builder: RenderSceneBuilder,
     /// The adapter name, for logging which GPU serviced the render.
     pub adapter_name: String,
+    /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
+    last_split: RenderSplit,
+}
+
+/// Where one whole `render_scene` went, in milliseconds.
+///
+/// The point of the breakdown is to answer a question that cannot be settled by
+/// looking at the total: when one render path costs several times another, is the
+/// difference CPU work building GPU objects per draw, or the GPU actually shading
+/// more? Optimising the wrong one is wasted effort, and a total hides which it is.
+///
+/// `build` decodes the captured scene into the neutral render scene, `encode` is the
+/// three CPU phases inside the renderer (see
+/// [`EncodePhases`](vitaslop_platform::gpu::EncodePhases)), and `submit` is
+/// submit-and-wait - the only figure here that contains GPU execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderSplit {
+    pub build_ms: f64,
+    pub encode_ms: f64,
+    pub submit_ms: f64,
+    pub phases: vitaslop_platform::gpu::EncodePhases,
 }
 
 impl GeneralRenderer {
@@ -173,7 +194,14 @@ impl GeneralRenderer {
         }))
         .ok()?;
         let gxm = GxmRenderer::new(&device, &queue, OUTPUT_FORMAT);
-        Some(GeneralRenderer { device, queue, gxm, builder: RenderSceneBuilder::new(), adapter_name })
+        Some(GeneralRenderer {
+            device,
+            queue,
+            gxm,
+            builder: RenderSceneBuilder::new(),
+            adapter_name,
+            last_split: RenderSplit::default(),
+        })
     }
 
     /// Set the GPU supersample factor (1 = off). Mirrors the software oracle's
@@ -214,7 +242,10 @@ impl GeneralRenderer {
         });
         let depth_view = depth_tex.create_view(&Default::default());
 
+        let t_build = std::time::Instant::now();
         let render_scene = self.builder.build(scene);
+        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        let t_encode = std::time::Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -229,6 +260,8 @@ impl GeneralRenderer {
             height,
             clear,
         );
+        let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+        let t_submit = std::time::Instant::now();
 
         let bytes_per_row = width * 4;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -265,6 +298,18 @@ impl GeneralRenderer {
         rx.recv().unwrap().unwrap();
         let rgba = slice.get_mapped_range().unwrap().to_vec();
         readback.unmap();
+        self.last_split = RenderSplit {
+            build_ms,
+            encode_ms,
+            // Submit-and-wait: the only part of this that contains GPU execution.
+            submit_ms: t_submit.elapsed().as_secs_f64() * 1000.0,
+            phases: self.gxm.last_phases(),
+        };
         Framebuffer { width, height, rgba }
+    }
+
+    /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
+    pub fn last_split(&self) -> RenderSplit {
+        self.last_split
     }
 }

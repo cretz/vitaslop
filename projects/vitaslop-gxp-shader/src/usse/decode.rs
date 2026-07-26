@@ -319,6 +319,13 @@ fn decode_grp_test(word: u64) -> Instr {
     // SPECIAL/IMMEDIATE extension banks are never scaled either.
     let mut source = |bank_sel: u8, field_val: u32, ext: bool| -> Operand {
         if ext {
+            // The IMMEDIATE row is assembled per group, so the shared [`ext_source`] leaves it
+            // to the caller. The TEST layout carries no extended-immediate assembly fields, so
+            // the operand's own 7-bit number IS the literal (spec T.5b step 6) - the form the
+            // corpus's flag-bit tests use.
+            if bank_sel & 3 == 2 {
+                return Operand::plain(Bank::Immediate, (field_val & 0x7f) as u8, bank_sel);
+            }
             match ext_source(bank_sel, field_val) {
                 Ok(o) => return o,
                 Err(why) => {
@@ -507,17 +514,19 @@ fn exotic_source(opt_sel: u8, op_field: u32, swizzle: [u8; 4], abs: bool, neg: b
 /// lookup, the same CNST6 table [`exotic_source`] reads. Neither SPECIAL nor IMMEDIATE is ever
 /// double-register scaled.
 ///
-/// Only the FPCONSTANT case yields an operand. The others return `Err(reason)`: the two
-/// indexed modes need RIO6 addressing, GLOBAL is a hardware register whose value is not
-/// modelled, and IMMEDIATE is assembled from group-specific fields so the groups that allow it
-/// resolve it themselves before reaching here. The caller blocks emit naming the reason rather
-/// than substituting a guess.
+/// The FPCONSTANT and GLOBAL cases yield an operand - both are structural decodes, and which
+/// register a GLOBAL operand names is as much a fact as which constant an FPCONSTANT one does.
+/// What a GLOBAL register CONTAINS is a separate question, and it is settled (or hard-failed,
+/// per index) by the emitter, not here. The remaining rows return `Err(reason)`: the two
+/// indexed modes need RIO6 addressing, and IMMEDIATE is assembled from group-specific fields so
+/// the groups that allow it resolve it themselves before reaching here. The caller blocks emit
+/// naming the reason rather than substituting a guess.
 fn ext_source(bank_sel: u8, field_val: u32) -> Result<Operand, &'static str> {
     match bank_sel & 3 {
         1 if field_val & 0x40 == 0 => {
             Ok(Operand::plain(Bank::Constant, (field_val & 0x3f) as u8, bank_sel))
         }
-        1 => Err("extended bank SPECIAL selects a GLOBAL hardware register - value not modeled"),
+        1 => Ok(Operand::plain(Bank::Global, (field_val & 0x3f) as u8, bank_sel)),
         2 => Err("extended bank IMMEDIATE not modeled for this group"),
         _ => Err("extended bank INDEXED (RIO6 addressing) not modeled"),
     }
@@ -1728,6 +1737,68 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// registers, so treating them as no-ops could mis-address and paint a wrong pixel; BR is
 /// control flow; KILL/DEPTHF/LIMM have real data effects (discard / depth write / immediate
 /// load) not yet plumbed. Each is wired as it becomes needed by a real shader.
+/// Whether `word` provably executes EXACTLY ONCE, i.e. carries no repeat.
+///
+/// This is what decides whether an SMLSI ahead of it can be ignored: SMLSI only sets the
+/// per-operand increment/swizzle state that a REPEATED instruction steps its registers by
+/// (spec F8.8 - "metadata for repeated instructions; emits nothing directly"). An instruction
+/// that runs once never consults it, so a program in which nothing repeats is one where SMLSI
+/// has no observable effect at all. See [`repeats_nowhere`].
+///
+/// `None` means "cannot be established for this group" and must be treated as "might repeat".
+/// The two ways a group qualifies:
+///
+///  * its `repeat_count` field position is established (spec: 4-bit at 47:44 for 0x30/0x40/
+///    0x50, 2-bit at 45:44 for 0x38/0x48), so it is simply read; or
+///  * its field table accounts for every bit and names no repeat count at all (0x08/0x10,
+///    whose 47:44 is `src2_swiz`; 0xE0 SMP; 0xF8 flow) - those forms cannot encode one.
+///
+/// The 0x00/0x18 vector-MAD groups are the awkward case: the operand grammar names all 32
+/// high bits but several are `unk*`, so a repeat count could hide among them. They qualify
+/// only when every one of those unknown bits is ZERO - whatever an unknown field means, at
+/// zero it is at its default, and the default repeat count is "execute once".
+fn executes_once(word: u64) -> Option<bool> {
+    match opcode1(word) {
+        // Established repeat_count fields.
+        0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44) == 0), // 0x30, 0x40, 0x50 family
+        0x07 | 0x09 | 0x0f => Some(bits(word, 45, 44) == 0),        // 0x38 VMOV, 0x48 VTST
+        // No repeat_count field exists in these layouts.
+        0x01 | 0x02 => Some(true), // 0x08/0x10 V32NMAD/V16NMAD - 47:44 is src2_swiz
+        0x1c => Some(true),        // 0xE0 SMP
+        0x1f => Some(true),        // 0xF8 complex flow
+        // Vector MAD/DP: qualifies only with every unknown bit at its default.
+        0x00 | 0x03 => Some(grp_mad_unknown_bits_are_zero(word)),
+        _ => None,
+    }
+}
+
+/// True when every `unk*` bit of a 0x00/0x18 word is zero (see [`executes_once`]). The names
+/// come from the operand grammar's own field table, so this asks exactly "is every bit whose
+/// purpose is undocumented at its default?".
+fn grp_mad_unknown_bits_are_zero(word: u64) -> bool {
+    let (hi, _) = halves(word);
+    let table = if opcode1(word) == 0x00 {
+        // 0x00 VMAD2 is decoded through the shared MAD path; use the same table the decoder
+        // reads so this can never disagree with what was actually decoded.
+        G18_MAD_HIGH
+    } else if field(hi, G18_DOT_HIGH, "opcode2") == 0 {
+        G18_DOT_HIGH
+    } else {
+        G18_MAD_HIGH
+    };
+    table
+        .iter()
+        .filter(|(name, _)| name.starts_with("unk"))
+        .all(|(name, _)| field(hi, table, name) == 0)
+}
+
+/// True when NO instruction in `code` can repeat, so any SMLSI among them is inert. A single
+/// instruction whose repeat state cannot be established makes the whole answer `false` - the
+/// point is to be sure, not to be optimistic.
+pub(crate) fn repeats_nowhere(code: &[u64]) -> bool {
+    code.iter().all(|&w| executes_once(w) == Some(true))
+}
+
 fn decode_grp_flow(word: u64) -> Instr {
     let op2 = bits(word, 58, 56);
     let opcat = bits(word, 53, 52);
@@ -2603,16 +2674,55 @@ mod tests {
         assert_eq!(ins.dest.as_ref().map(|d| (d.bank, d.index)), Some((Bank::PrimaryAttr, 8)));
     }
 
-    /// The extension row's OTHER members stay blocked rather than decoding to something
-    /// plausible: a register field with `0x40` set names a GLOBAL hardware register whose
-    /// value this translator does not model, and the indexed modes need RIO6 addressing.
+    /// The SPECIAL row's GLOBAL half DECODES (which register it names is as structural as
+    /// which constant its FPCONSTANT half names); what a GLOBAL register CONTAINS is settled
+    /// per index by the emitter, so decode leaves `blocked` clear here and the emitter
+    /// hard-fails on any index it has not established. The indexed modes still block at
+    /// decode - they need RIO6 addressing, so their operand cannot even be named.
     #[test]
-    fn group_50_extended_src1_blocks_global_and_indexed_banks() {
+    /// The SMLSI-is-inert test, pinned in BOTH directions on the real corpus.
+    ///
+    /// The captured vertex program that carries SMLSI genuinely REPEATS: its `mov` (group 0x38)
+    /// encodes `repeat_count = 3` in bits 45:44, so that one instruction executes four times
+    /// with the stepping SMLSI configures. Reading the disassembly as though every instruction
+    /// ran once - which is how the surrounding code looks - gets this wrong, so it is pinned
+    /// here: the guard must refuse this program, and only retire SMLSI where nothing repeats.
+    #[test]
+    fn smlsi_is_retired_only_where_no_instruction_repeats() {
+        // vert_82c14da0's prologue: SMLSI, then a VMOV with repeat_count 3.
+        const SMLSI: u64 = 0xfa10000201014e01;
+        const MOV_REPEAT_3: u64 = 0x3880352183080080;
+        assert_eq!(bits(MOV_REPEAT_3, 45, 44), 3, "the VMOV really does encode a repeat");
+        assert!(
+            !repeats_nowhere(&[SMLSI, MOV_REPEAT_3]),
+            "a program containing a repeating instruction must keep SMLSI blocked"
+        );
+
+        // The same SMLSI with only non-repeating instructions after it: a VMOV whose
+        // repeat_count is 0 (real word, instruction #12 of the same program).
+        const MOV_ONCE: u64 = 0x38800d0902000f40;
+        assert_eq!(bits(MOV_ONCE, 45, 44), 0);
+        assert!(repeats_nowhere(&[SMLSI, MOV_ONCE]));
+
+        // A group whose repeat encoding is not established leaves the answer unknown, which
+        // must read as "might repeat" rather than as "safe".
+        const UNESTABLISHED_GROUP: u64 = 0xa000_0000_0000_0000; // opcode1 = 0x14, no table
+        assert_eq!(opcode1(UNESTABLISHED_GROUP), 0x14);
+        assert!(!repeats_nowhere(&[SMLSI, UNESTABLISHED_GROUP]));
+    }
+
+    #[test]
+    fn group_50_extended_src1_names_the_global_register_and_blocks_indexed_banks() {
         // Same word with the src1 field's 0x40 bit set (field 4 -> 68): SPECIAL -> GLOBAL.
         const MOV_GLOBAL: u64 = 0x5083000a61002200;
         let g = decode(MOV_GLOBAL);
         assert_eq!(bits(MOV_GLOBAL, 13, 7) & 0x40, 0x40, "test word must select the GLOBAL half");
-        assert!(g.blocked.is_some_and(|b| b.contains("GLOBAL")));
+        assert!(g.blocked.is_none(), "GLOBAL is a structural decode: {:?}", g.blocked);
+        assert_eq!(
+            (g.srcs[0].bank, g.srcs[0].index),
+            (Bank::Global, 4),
+            "the 0x40 discriminator is cleared from the index, leaving GLOBAL[4]"
+        );
         // Selector 0 (bits 31:30 cleared) with the extension bit still set is INDEXED1.
         const MOV_INDEXED: u64 = 0x5083000a21000200;
         assert!(decode(MOV_INDEXED).blocked.is_some_and(|b| b.contains("INDEXED")));

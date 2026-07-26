@@ -235,6 +235,16 @@ pub struct Draw {
     /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
     /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
     pub frag_sa: Vec<u8>,
+    /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
+    /// stream holds one record per sprite (a centre plus an expansion basis - a
+    /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
+    /// the corners. See [`crate::host::VitaState::reflected_shader_expanded`].
+    ///
+    /// The fixed-function approximation has no shader, so there is nothing here it can
+    /// rasterize: joining the raw records as triangles connects unrelated sprite centres
+    /// into geometry the game never draws. The software renderer skips such a draw and
+    /// says so; the GXP recompiler runs the real vertex program and renders it properly.
+    pub shader_expanded: bool,
 }
 
 impl Draw {
@@ -368,6 +378,23 @@ pub struct Capture {
     /// writes, trophies, score submissions) in occurrence order, each frame-tagged.
     /// This is the content-free conformance-assertion surface (see [`EgressEvent`]).
     pub egress: Vec<EgressEvent>,
+    /// How many completed scenes to keep. `None` (the default) keeps every scene,
+    /// which is what a short capture-and-inspect run wants.
+    ///
+    /// A LONG run must set it. Each scene holds a snapshot of every draw's vertex
+    /// window and indices - on a real 3D title, hundreds of draws and megabytes per
+    /// frame - so retaining them all costs gigabytes within a couple of thousand
+    /// frames and eventually ends the run. That is a hard ceiling on how far into a
+    /// game anything can get, which makes it a ceiling on playing the game at all.
+    /// See [`Capture::push_scene`]: eviction folds the dropped scene into
+    /// [`retired_digest`](Self::retired_digest), so bounding retention does NOT change
+    /// the determinism signature by one bit.
+    pub scene_limit: Option<usize>,
+    /// The running signature fold over scenes already evicted by `scene_limit`.
+    pub retired_digest: u64,
+    /// How many scenes have been evicted (so `scenes.len() + retired_scenes` is the
+    /// true count for a report).
+    pub retired_scenes: u64,
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -375,9 +402,137 @@ pub struct Capture {
 /// consumer keeps at least [`TRACE_CAP`]/2 of recent history.
 pub const TRACE_CAP: usize = 4 << 20;
 
+/// The FNV-1a offset basis, the seed of the determinism signature fold.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Fold `bytes` into an FNV-1a accumulator.
+fn fnv(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    }
+}
+
+/// How many independent FNV chains [`fnv_bulk`] runs over a blob. Each lane is an
+/// ordinary FNV-1a over a strided subsequence, so they are independent and the CPU
+/// pipelines them; one chain is bound by the 64-bit multiply's latency, not its
+/// throughput, and spends most of its cycles waiting.
+const FNV_LANES: usize = 8;
+
+/// Fold a LARGE byte blob into the accumulator.
+///
+/// Same construction as [`fnv`] - xor-then-multiply, defined purely on the byte
+/// sequence - but run as [`FNV_LANES`] interleaved chains that are combined at the
+/// end, because these blobs are the scene's vertex and index buffers: megabytes per
+/// frame, and the single serial chain was the whole cost of `sceGxmEndScene`.
+///
+/// Still exactly as deterministic and as engine-independent as the serial version:
+/// the result is a pure function of the byte sequence, with no endianness, word size
+/// or allocation dependence. It is NOT the same VALUE as the serial fold, so
+/// signatures do not compare across this change - they never had to, since a
+/// signature is only ever compared between runs of the same build (`explore`'s
+/// bucketing, a recipe's `@sig`).
+fn fnv_bulk(h: &mut u64, bytes: &[u8]) {
+    // Length first, so appending zero bytes cannot leave the digest unchanged and two
+    // differently-split blobs cannot collide by concatenation.
+    fnv(h, &(bytes.len() as u64).to_le_bytes());
+    let mut lanes = [*h; FNV_LANES];
+    // Lane `i` takes bytes i, i+LANES, i+2*LANES, ... - a fixed, size-independent
+    // assignment, so the same blob always distributes the same way.
+    let chunks = bytes.chunks_exact(FNV_LANES);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (lane, &b) in lanes.iter_mut().zip(c) {
+            *lane ^= b as u64;
+            *lane = lane.wrapping_mul(FNV_PRIME);
+        }
+    }
+    for (lane, &b) in lanes.iter_mut().zip(tail) {
+        *lane ^= b as u64;
+        *lane = lane.wrapping_mul(FNV_PRIME);
+    }
+    // Combine in lane order, through the same primitive, so the lanes' contributions
+    // stay ordered and one lane's change cannot be cancelled by another's.
+    for lane in lanes {
+        fnv(h, &lane.to_le_bytes());
+    }
+}
+
+/// Fold one scene's observable content into the signature accumulator.
+fn fold_scene(h: &mut u64, s: &Scene) {
+    if let Some(c) = &s.color {
+        fnv(h, &c.data_addr.to_le_bytes());
+        fnv(h, &c.format.to_le_bytes());
+    }
+    for d in &s.draws {
+        fnv_bulk(h, &d.vertices);
+        fnv_bulk(h, &d.indices);
+        // One pass over the uniform floats as bytes, rather than a call per float.
+        // `to_le_bytes` per element is what makes this a copy rather than a cast.
+        let mut buf = Vec::with_capacity(d.uniforms.len() * 4);
+        for u in &d.uniforms {
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+        fnv_bulk(h, &buf);
+    }
+}
+
 impl Capture {
     pub fn new() -> Self {
-        Capture::default()
+        Capture { retired_digest: FNV_OFFSET, ..Capture::default() }
+    }
+
+    /// Record a completed scene, evicting the oldest if `scene_limit` is set.
+    ///
+    /// Eviction folds the dropped scene into [`retired_digest`](Self::retired_digest)
+    /// FIRST, so [`signature`](Self::signature) still covers the whole run. Bounding
+    /// memory must not quietly change what a run reports about itself: a signature
+    /// that depended on the retention window would compare unequal between a short
+    /// run and a long one and destroy the only cross-engine equivalence check there
+    /// is.
+    pub fn push_scene(&mut self, scene: Scene) {
+        self.scenes.push(scene);
+        let Some(limit) = self.scene_limit else { return };
+        let limit = limit.max(1);
+        while self.scenes.len() > limit {
+            let old = self.scenes.remove(0);
+            // A `Capture` built by `Default` starts at 0, not the FNV basis; seed it
+            // on first use so both construction paths fold identically.
+            if self.retired_scenes == 0 && self.retired_digest == 0 {
+                self.retired_digest = FNV_OFFSET;
+            }
+            let mut h = self.retired_digest;
+            crate::perf::time(crate::perf::Phase::SceneFold, || fold_scene(&mut h, &old));
+            self.retired_digest = h;
+            self.retired_scenes += 1;
+        }
+    }
+
+    /// The determinism signature over the run's whole observable output: every
+    /// scene's render stream (evicted ones via `retired_digest`) then the egress
+    /// ledger. Engine-independent by construction - it covers what the guest
+    /// PRODUCED, never internal RAM or thread timing - so native, headless and
+    /// browser runs of the same recipe must agree on it.
+    pub fn signature(&self) -> u64 {
+        let mut h = if self.retired_scenes == 0 && self.retired_digest == 0 {
+            FNV_OFFSET
+        } else {
+            self.retired_digest
+        };
+        for s in &self.scenes {
+            fold_scene(&mut h, s);
+        }
+        for ev in &self.egress {
+            fnv(&mut h, &ev.frame.to_le_bytes());
+            fnv(&mut h, format!("{:?}", ev.kind).as_bytes());
+        }
+        h
+    }
+
+    /// Scenes the run has completed, including any evicted by `scene_limit`.
+    pub fn total_scenes(&self) -> u64 {
+        self.retired_scenes + self.scenes.len() as u64
     }
 
     /// Record one serviced call in the bounded debug trace (hot path: a push, plus
@@ -398,5 +553,133 @@ impl Capture {
         if !self.unimplemented.iter().any(|(l, f, _)| *l == library_nid && *f == func_nid) {
             self.unimplemented.push((library_nid, func_nid, name.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn digest(bytes: &[u8]) -> u64 {
+        let mut h = FNV_OFFSET;
+        fnv_bulk(&mut h, bytes);
+        h
+    }
+
+    /// Flipping ANY single bit of the blob changes the digest. The lanes are what make
+    /// this worth asserting: a byte only ever reaches one lane, so a lane that was
+    /// dropped or aliased would silently stop covering a whole eighth of every buffer -
+    /// and a signature blind to an eighth of the vertex data still looks like a working
+    /// signature.
+    #[test]
+    fn every_byte_is_covered() {
+        // Longer than one lane group and NOT a multiple of it, so the tail path is
+        // exercised too.
+        let base: Vec<u8> = (0..67u8).collect();
+        let want = digest(&base);
+        for i in 0..base.len() {
+            for bit in 0..8 {
+                let mut v = base.clone();
+                v[i] ^= 1 << bit;
+                assert_ne!(digest(&v), want, "byte {i} bit {bit} did not affect the digest");
+            }
+        }
+    }
+
+    /// Order matters: swapping two bytes that land in DIFFERENT lanes, and two that
+    /// land in the SAME lane, must both change the digest. A per-lane sum would pass
+    /// the first and fail the second.
+    #[test]
+    fn order_matters_within_and_across_lanes() {
+        let base: Vec<u8> = (0..64u8).collect();
+        let want = digest(&base);
+        let mut across = base.clone();
+        across.swap(0, 1);
+        assert_ne!(digest(&across), want, "swap across lanes");
+        let mut within = base.clone();
+        within.swap(0, FNV_LANES);
+        assert_ne!(digest(&within), want, "swap within one lane");
+    }
+
+    /// Length is folded in, so appending zeros - which leave every lane's xor-multiply
+    /// chain looking plausible - cannot leave the digest unchanged, and two blobs that
+    /// concatenate to the same bytes do not collide.
+    #[test]
+    fn length_is_part_of_the_digest() {
+        assert_ne!(digest(&[1, 2, 3]), digest(&[1, 2, 3, 0]));
+        let mut a = FNV_OFFSET;
+        fnv_bulk(&mut a, &[1, 2]);
+        fnv_bulk(&mut a, &[3]);
+        let mut b = FNV_OFFSET;
+        fnv_bulk(&mut b, &[1]);
+        fnv_bulk(&mut b, &[2, 3]);
+        assert_ne!(a, b, "the split between two folds must be visible");
+    }
+
+    /// An empty blob is still folded (its length), so a draw with no indices is
+    /// distinguishable from one with none of that field at all.
+    #[test]
+    fn empty_is_folded() {
+        assert_ne!(digest(&[]), FNV_OFFSET);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    /// A scene distinguishable by `tag` through the part of it the signature folds.
+    fn scene(tag: u8) -> Scene {
+        Scene {
+            color: Some(ColorSurface {
+                format: tag as u32,
+                surface_type: 0,
+                width: 960,
+                height: 544,
+                stride_pixels: 960,
+                data_addr: 0x8000_0000 + tag as u32,
+            }),
+            draws: Vec::new(),
+        }
+    }
+
+    /// Bounding memory must not change what the run reports about itself. If the
+    /// signature moved with the retention window, a long run and a short one would
+    /// compare unequal and the cross-engine equivalence check - the only one there
+    /// is - would be worthless.
+    #[test]
+    fn the_signature_is_invariant_under_scene_retention() {
+        let mut unbounded = Capture::new();
+        let mut bounded = Capture::new();
+        bounded.scene_limit = Some(3);
+        for i in 0..40u8 {
+            unbounded.push_scene(scene(i));
+            bounded.push_scene(scene(i));
+        }
+        for c in [&mut unbounded, &mut bounded] {
+            c.egress.push(EgressEvent { frame: 7, kind: EgressKind::Trophy { id: 3 } });
+        }
+        assert_eq!(unbounded.scenes.len(), 40);
+        assert_eq!(bounded.scenes.len(), 3, "retention did not bound the scene list");
+        assert_eq!(bounded.total_scenes(), 40, "evicted scenes must still be counted");
+        assert_eq!(
+            unbounded.signature(),
+            bounded.signature(),
+            "the determinism signature changed when scenes were evicted"
+        );
+    }
+
+    /// A `Default`-constructed capture folds identically to a `new` one (the seed is
+    /// applied lazily), so nothing depends on which constructor a host happened to use.
+    #[test]
+    fn default_and_new_captures_agree() {
+        let mut a = Capture::new();
+        let mut b = Capture::default();
+        b.scene_limit = Some(1);
+        for i in 0..5u8 {
+            a.push_scene(scene(i));
+            b.push_scene(scene(i));
+        }
+        assert_eq!(a.signature(), b.signature());
     }
 }

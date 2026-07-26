@@ -7,7 +7,10 @@
 //! harness additionally validates the COMPLETE bindable modules of every real recompilable
 //! shader; this file pins the per-op emit in isolation.)
 
-use vitaslop_gxp_shader::ir::{Bank, BitwiseKind, CompareMethod, Instr, Op, Operand, Predicate, Shader, TexLod};
+use vitaslop_gxp_shader::ir::{
+    Bank, BitwiseKind, CompareMethod, Instr, Op, Operand, Predicate, Shader, TestAlu, TestCmp,
+    TestReduce, TexLod,
+};
 use vitaslop_gxp_shader::container::ProgramKind;
 use vitaslop_gxp_shader::wgsl::{emit_body, emit_fragment, tex_units, wrap_module, wrap_vertex_module, TexBinding};
 
@@ -91,6 +94,20 @@ fn every_emittable_op_produces_valid_wgsl() {
         ("const", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Mul, d(0), vec![r(4), k(2)], full)] }),
         // The NaN constant table entries must also materialise as valid WGSL (via bitcast).
         ("const-nan", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Mul, d(0), vec![r(4), k(0x38)], full)] }),
+        // VTST in both families. The BITWISE form emits an integer expression rather than a
+        // float one, and WGSL binds `!=` tighter than `&`, so an unparenthesised AND compiles
+        // to `u32 & bool` and fails validation - which is exactly how it shipped until a real
+        // shader first reached emit. Both families are covered here so neither can regress.
+        ("test-float", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(
+            Op::Test { alu: TestAlu::Sub, cmp: TestCmp::Lt, reduce: TestReduce::Channel(0), pdst: 1, write_back: false },
+            d(0), vec![r(4), sa(8)], full)] }),
+        ("test-bitand", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(
+            Op::Test { alu: TestAlu::BitAnd, cmp: TestCmp::Ne, reduce: TestReduce::Channel(0), pdst: 0, write_back: false },
+            d(0), vec![r(4), Operand::plain(Bank::Immediate, 1, 2)], full)] }),
+        // The established facing GLOBAL, in the shape the real shaders use it.
+        ("test-facing", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(
+            Op::Test { alu: TestAlu::BitAnd, cmp: TestCmp::Ne, reduce: TestReduce::Channel(0), pdst: 0, write_back: false },
+            d(0), vec![Operand::plain(Bank::Global, 16, 1), Operand::plain(Bank::Immediate, 1, 2)], full)] }),
     ];
 
     for (name, sh) in &cases {

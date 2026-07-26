@@ -16,16 +16,11 @@ use vitaslop_runtime::ingest::pipeline::decrypt_container;
 use vitaslop_runtime::ingest::vfs::{DirVfs, Vfs};
 use vitaslop_runtime::link::link;
 use vitaslop_runtime::recipe::{
-    AssertKind, CmpOp, EgressAssert, FieldMatch, FieldOp, MemAssert, Recipe, WatchDecl,
+    AssertKind, CmpOp, EgressAssert, FieldMatch, FieldOp, MemAssert, Recipe,
 };
-use vitaslop_runtime::render;
 
+use crate::observe::{format_f64, sample_watch, signature, write_shot};
 use crate::{RunReport, ThreadedScheduler, VitaEnv};
-
-/// Front-panel render size and clear color (the retail titles present at 960x544).
-const WIDTH: u32 = 960;
-const HEIGHT: u32 = 544;
-const CLEAR: [u8; 4] = [0, 0, 0, 255];
 
 /// Options controlling one recipe run.
 pub struct RunOpts {
@@ -48,6 +43,15 @@ pub struct RunOpts {
     /// `Some(0)` disables cadence shots even if the recipe sets one; `None` uses the
     /// recipe's value.
     pub shot_every: Option<u64>,
+    /// How many completed scenes the capture keeps
+    /// ([`Capture::scene_limit`](vitaslop_runtime::capture::Capture::scene_limit)).
+    ///
+    /// ONE by default, which is all a run reads (`@shot` renders the latest scene,
+    /// and the signature folds each scene as it is evicted). Retaining more is
+    /// megabytes a frame of per-draw vertex snapshots nobody looks at; a
+    /// 4000-frame run of a real 3D title retaining all of them costs gigabytes.
+    /// Raise it only for a tool that genuinely inspects a window of past frames.
+    pub scene_limit: Option<usize>,
 }
 
 impl Default for RunOpts {
@@ -60,6 +64,7 @@ impl Default for RunOpts {
             observe_from: None,
             shot_dir: None,
             shot_every: None,
+            scene_limit: Some(1),
         }
     }
 }
@@ -178,6 +183,7 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     // asserts, shots) stays with `recipe` for the runner to interpret.
     let world = recipe.clone().into_world();
     let mut sched = boot_retail(game_dir, Box::new(world), opts.quantum_fuel)?;
+    sched.host().state.capture.scene_limit = opts.scene_limit;
 
     // Auto-pick the observation start: full log when watching, else just before the
     // first assert/shot so a deep-level run does not step thousands of idle frames.
@@ -223,7 +229,12 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     let mut asserts_out: Vec<AssertOutcome> = Vec::new();
     let mut shots_out: Vec<ShotOutcome> = Vec::new();
 
-    while sched.frames() < opts.max_frames {
+    // A guest that trapped or halted DURING the fast-forward prefix is finished, and
+    // stepping it further resumes an already-completed fiber (a host panic). Report
+    // what happened instead: the verdict is the whole point of the run, and it must
+    // survive being reached from the batch path as readably as from the stepped one.
+    let prefix_ok = matches!(last, RunReport::FramesReached(_));
+    while prefix_ok && sched.frames() < opts.max_frames {
         let target = sched.frames() + 1;
         last = sched.run_frames(target, opts.per_frame_rounds);
         let f = sched.frames();
@@ -252,7 +263,7 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
 
         // Screenshots due at this frame: explicit @shot points...
         for sh in recipe.shots.iter().filter(|s| s.frame == f) {
-            let path = write_shot(&sched, &opts.shot_dir, &sh.name);
+            let path = write_shot(&sched, opts.shot_dir.as_deref(), &sh.name);
             shots_out.push(ShotOutcome { frame: f, name: sh.name.clone(), path });
         }
         // ...plus a cadence shot every N frames, named by the active section.
@@ -268,7 +279,7 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
                     Some(sec) => format!("{sec}-f{f:05}"),
                     None => format!("f{f:05}"),
                 };
-                let path = write_shot(&sched, &opts.shot_dir, &name);
+                let path = write_shot(&sched, opts.shot_dir.as_deref(), &name);
                 shots_out.push(ShotOutcome { frame: f, name, path });
             }
         }
@@ -319,15 +330,6 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
         watch_csv: csv,
         egress,
     })
-}
-
-/// Sample one watched value from current guest memory, widened to `f64`.
-fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &WatchDecl) -> Option<f64> {
-    let bytes = sched.read_guest(w.addr, w.ty.width());
-    if bytes.len() < w.ty.width() {
-        return None;
-    }
-    w.ty.decode(&bytes)
 }
 
 /// Evaluate one assertion at `frame` and describe the outcome.
@@ -472,68 +474,3 @@ fn describe_assert(kind: &AssertKind) -> String {
     }
 }
 
-/// Render the current frame (the last captured scene) to a PNG named `name` in
-/// `shot_dir`. Returns the written path, or `None` if no dir or no scene.
-fn write_shot(
-    sched: &ThreadedScheduler<VitaEnv>,
-    shot_dir: &Option<PathBuf>,
-    name: &str,
-) -> Option<PathBuf> {
-    let dir = shot_dir.as_ref()?;
-    let scene = {
-        let host = sched.host();
-        host.state.capture.scenes.last().cloned()
-    }?;
-    std::fs::create_dir_all(dir).ok()?;
-    // Supersample the software shot (VITASLOP_SSAA=N): rasterize at N x native and
-    // box-downsample. Antialiases the geometric aliasing of the heavily-tessellated vehicle
-    // meshes (dozens of sub-pixel triangles per final pixel, plus coincident-panel z-fighting)
-    // that one sample/pixel renders as speckle - a distant 3D vehicle is unreadable at 1x and
-    // clean at 2x. A review shot is occasional, so the 4x fill cost of 2x SSAA is immaterial;
-    // 2x is the quality default, overridable (1 disables, higher for close scrutiny).
-    let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(2);
-    let fb = render::render_scene_supersampled(&scene, WIDTH, HEIGHT, CLEAR, ssaa);
-    let path = dir.join(format!("{name}.png"));
-    std::fs::write(&path, fb.to_png()).ok()?;
-    Some(path)
-}
-
-/// The FNV-1a determinism signature over the observable output (render stream +
-/// egress). Identical to the boot probe's, so signatures are comparable across the
-/// probe, the runner, and different engines.
-fn signature(cap: &vitaslop_runtime::capture::Capture) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    for s in &cap.scenes {
-        if let Some(c) = &s.color {
-            mix(&c.data_addr.to_le_bytes());
-            mix(&c.format.to_le_bytes());
-        }
-        for d in &s.draws {
-            mix(&d.vertices);
-            mix(&d.indices);
-            for u in &d.uniforms {
-                mix(&u.to_le_bytes());
-            }
-        }
-    }
-    for ev in &cap.egress {
-        mix(&ev.frame.to_le_bytes());
-        mix(format!("{:?}", ev.kind).as_bytes());
-    }
-    h
-}
-
-/// Format an `f64` compactly: integers without a trailing `.0`.
-fn format_f64(x: f64) -> String {
-    if x.fract() == 0.0 && x.abs() < 1e15 {
-        format!("{}", x as i64)
-    } else {
-        format!("{x}")
-    }
-}

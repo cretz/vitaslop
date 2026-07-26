@@ -41,12 +41,16 @@ pub const MAX_ROUNDS: u64 = 100_000_000;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stop {
     /// A preemption slice: no host call blocked, the thread is still runnable and
-    /// simply used up its quantum.
+    /// simply used up its quantum. Also how a voluntary yield that is NOT a frame
+    /// boundary arrives (`SvcOutcome::Reschedule`) - both mean "still runnable, let
+    /// someone else go", and both earn the spin cooldown.
     Quantum,
     /// The thread hit a blocking primitive and must be parked until woken.
     Blocked,
-    /// The thread reached a frame boundary (display flip).
-    Yielded,
+    /// The thread ended one DISPLAY FRAME (it queued a finished frame for scanout).
+    /// The only stop that advances the frame count; see [`crate::SvcOutcome::Flip`]
+    /// for why nothing else may.
+    Flip,
 }
 
 /// How a thread's guest execution finished.
@@ -143,6 +147,12 @@ pub trait GuestEngine {
     /// writes are dropped. Used to deliver exit codes owed to a woken joiner's `stat`
     /// out-parameter while no thread is live.
     fn write_mem(&mut self, addr: u32, bytes: &[u8]);
+
+    /// Called once per display frame boundary, with the new frame count. The default
+    /// ignores it; an engine that supports frame-armed diagnostics
+    /// (`VITASLOP_ARM_AT_FRAME`) uses it to arm them at the requested frame, which is
+    /// what lets a first-hit trap fire deep inside a run instead of during boot.
+    fn on_frame(&mut self, _frames: u64) {}
 }
 
 /// One entry in the live thread table: the engine's thread plus the policy's state.
@@ -258,17 +268,22 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 self.threads[idx].state = ThreadState::Blocked;
                 None
             }
-            Stop::Yielded => {
-                // A frame boundary (display flip): the thread stays runnable, but count
-                // it toward the frame budget and advance any frame-keyed input (a
-                // scripted TAS recipe) in lockstep with the render loop.
+            Stop::Flip => {
+                // A display frame ended: the thread stays runnable, but count the frame
+                // and advance any frame-keyed input (a scripted TAS recipe) in lockstep
+                // with the render loop.
                 self.frames += 1;
                 self.host.lock().unwrap().on_frame_boundary(self.frames);
+                // Let the engine arm anything keyed to a frame (see
+                // [`GuestEngine::on_frame`]); a no-op in an ordinary build.
+                self.engine.on_frame(self.frames);
                 (self.frames >= max_frames).then_some(RunReport::FramesReached(self.frames))
             }
-            // A preemption slice: the thread used a whole quantum without blocking, so
-            // it is CPU-bound. Keep it runnable but put it on the spin cooldown so peers
-            // run before it does again (anti-starvation; see [`Slot::cooled`]).
+            // Either a preemption slice (the thread used a whole quantum without
+            // blocking, so it is CPU-bound) or a voluntary non-frame yield. Both mean
+            // the thread keeps running but should step aside: put it on the spin
+            // cooldown so peers run before it does again (anti-starvation; see
+            // [`Slot::cooled`]).
             Stop::Quantum => {
                 self.threads[idx].cooled = true;
                 None
@@ -401,6 +416,10 @@ where
 /// the browser's async loop.
 pub struct Scheduler<E: GuestEngine, H: ImportDispatch> {
     core: SchedCore<E, H>,
+    /// Thread resumes over the scheduler's whole life. One round is a pick plus a
+    /// fiber switch plus a drain, so rounds-per-frame is the scheduler's own share of
+    /// a frame - the part of "guest CPU" that is not the guest at all.
+    rounds_total: u64,
 }
 
 impl<E, H> Scheduler<E, H>
@@ -411,7 +430,12 @@ where
 {
     /// A scheduler seeded with its `main` thread, ready to run.
     pub fn new(engine: E, host: Arc<Mutex<H>>, main: E::Thread) -> Self {
-        Scheduler { core: SchedCore::new(engine, host, main) }
+        Scheduler { core: SchedCore::new(engine, host, main), rounds_total: 0 }
+    }
+
+    /// Thread resumes so far. See [`rounds_total`](Self::rounds_total)'s field docs.
+    pub fn rounds_total(&self) -> u64 {
+        self.rounds_total
     }
 
     /// Borrow the engine (e.g. to read guest memory or the shared host after a run).
@@ -439,23 +463,33 @@ where
         let mut rounds = 0u64;
         loop {
             if rounds >= max_rounds {
+                self.rounds_total += rounds;
                 return RunReport::RoundLimit;
             }
             rounds += 1;
+            self.rounds_total += 1;
 
+            // The scheduler's own work is timed; the RESUME between them is not,
+            // because resuming runs the guest (see `Phase::SchedOverhead`).
+            let pick = crate::perf::scope(crate::perf::Phase::SchedOverhead);
             let Some(idx) = self.core.pick_next() else {
-                match self.core.handle_idle() {
+                let step = self.core.handle_idle();
+                drop(pick);
+                match step {
                     IdleStep::Done(report) => return report,
                     IdleStep::Continue => continue,
                 }
             };
+            drop(pick);
 
             if let Some(report) = self.core.resume_sync(idx, max_frames) {
                 return report;
             }
             // A host call in this resume may have asked to start threads or woken
             // parked ones; act on both before the next round.
+            let drain = crate::perf::scope(crate::perf::Phase::SchedOverhead);
             self.core.drain();
+            drop(drain);
         }
     }
 }

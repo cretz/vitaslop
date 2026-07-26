@@ -40,6 +40,10 @@ pub enum EmitError {
     /// their pre-shader (iterator/PDS) contents are unmodeled - emitting a read of one
     /// would translate garbage. Hard-fail rather than guess. Names the instruction + lane.
     UndefinedInternal { index: usize, byte_offset: usize, lane: u8, raw: u64 },
+    /// A source read a SPECIAL/GLOBAL hardware register whose contents have not been
+    /// established. Names the GLOBAL index so the next one to appear says what to go and
+    /// establish, rather than reading as a generic unmapped-bank failure.
+    UnmodeledGlobal { index: usize, byte_offset: usize, global: u8, raw: u64 },
 }
 
 impl core::fmt::Display for EmitError {
@@ -68,12 +72,79 @@ impl core::fmt::Display for EmitError {
                  iterator/PDS pre-load of internal registers is not modeled; wire that before \
                  emitting this shader",
             ),
+            EmitError::UnmodeledGlobal { index, byte_offset, global, raw } => write!(
+                f,
+                "USSE instruction #{index} at code byte {byte_offset:#x} (raw {raw:#018x}) reads \
+                 SPECIAL/GLOBAL hardware register {global} - its contents are not established; \
+                 establish what GLOBAL[{global}] holds and wire it, do not substitute a value",
+            ),
         }
     }
 }
 
 /// Number of internal-register scalar lanes the pipeline exposes: i0..i3, four lanes each.
 const INTERNAL_LANES: usize = 16;
+
+/// The WGSL name the fragment module binds `@builtin(front_facing)` to. The emitter
+/// references it whenever it translates the established `GLOBAL[16]` facing test, so a module
+/// builder that emits such a body MUST declare this (see [`FRONT_FACING_DECL`]).
+pub const FRONT_FACING_VAR: &str = "gxp_front_facing";
+
+/// The declaration a fragment module emits to bind [`FRONT_FACING_VAR`] from its entry point.
+pub const FRONT_FACING_DECL: &str = "  let gxp_front_facing: bool = in.front_facing;\n";
+
+/// The GLOBAL (SPECIAL hardware register) index whose meaning is established: the per-fragment
+/// facing flag, read as `GLOBAL[16] & 1`.
+const GLOBAL_FACING: u8 = 16;
+
+/// The WGSL `u32` expression for a read of an established GLOBAL hardware register, or `None`
+/// when this register's contents are not established (the caller then hard-fails naming it).
+///
+/// **`GLOBAL[16]` bit 0 is the per-fragment FACING flag.** No clean source names the GLOBAL
+/// registers, so this is an inference from the corpus; here is the whole argument, and the
+/// scope is deliberately narrow enough that it cannot quietly apply to anything it was not
+/// derived from:
+///
+/// * The decode is a fact, confirmed field by field against the TEST-group layout: the
+///   instruction is `p0 = ((GLOBAL[16] & 1) != 0)`.
+/// * There are exactly THREE GLOBAL reads in the whole captured corpus. All three are
+///   `GLOBAL[16]`, all three are this same test, and all three are in FRAGMENT programs
+///   (`global_special_register_reads` in the oracle prints them).
+/// * In all three, `p0` selects between two SA registers that the program's own SECONDARY
+///   program sets, by byte-identical instruction pairs, to exactly `+1.0` and `-1.0`
+///   (`mov SA[a] <- FPCONSTANT 1.0`, then `mul SA[b] <- -SA[a] * 1.0`). `p0` set picks `-1.0`.
+/// * That selected value is packed to F16 and run through two complementary conditional moves
+///   (`LteZero` / `LtZero`) and a subtract, which is exactly `sign(x)` - so the shader has
+///   computed `+1` or `-1` from the predicate and nothing else.
+/// * It multiplies an interpolated 3-vector which is then normalized and used as a cube-map
+///   sampling direction and as the operand of dot products with the directional light
+///   direction. That vector is the shading NORMAL.
+///
+/// Flipping the sign of a shading normal per fragment, keyed on one bit of a register no
+/// program writes, is two-sided lighting; the only per-fragment hardware boolean that idiom
+/// keys on is facing.
+///
+/// **The POLARITY is measured, not reasoned**, and it is the one part of this that is tied to
+/// the pipeline rather than to the shader. `select(0u, 1u, front_facing)` is what renders the
+/// car-body liveries correctly; the opposite sense paints those bodies pure black (the flipped
+/// normal drives `saturate(N.L)` to zero on every visible surface), which is how it was
+/// decided. Note WGSL's `front_facing` is defined against the pipeline's `front_face` winding,
+/// which here is wgpu's default (CCW is front) with no culling, because the guest's own
+/// winding/cull state is not yet wired into this path. **If that is ever wired, re-measure this
+/// polarity at the same time** - the two are one setting, not two.
+///
+/// So: bit 0 set selects the flipped normal, and under the current winding configuration that
+/// is `front_facing`. Whether the hardware's own name for that bit is "front" or "back" is not
+/// settled here, and nothing depends on which word is used.
+fn global_u32_expr(op: &Operand, kind: ProgramKind) -> Option<String> {
+    // Fragment-only: `front_facing` exists per fragment and nowhere else. A vertex program
+    // reading GLOBAL[16] would be a different register file and must hard-fail, not inherit
+    // this reading.
+    if op.index != GLOBAL_FACING || kind != ProgramKind::Fragment {
+        return None;
+    }
+    Some(format!("select(0u, 1u, {FRONT_FACING_VAR})"))
+}
 
 /// The WGSL array prefix for a register bank, or `None` for a bank the emitter cannot
 /// express as an indexed array (which is a hard failure at the call site). `Constant` is
@@ -86,7 +157,7 @@ fn bank_prefix(bank: Bank) -> Option<&'static str> {
         Bank::PrimaryAttr => "pa",
         Bank::SecondaryAttr => "sa",
         Bank::Internal => "i",
-        Bank::Constant | Bank::Raw(_) => return None,
+        Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
     })
 }
 
@@ -359,7 +430,7 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         if guard_internal_reads {
             check_internal_reads(instr, index, byte_offset, &internal_written)?;
         }
-        emit_instr(&mut body, instr, index, byte_offset)?;
+        emit_instr(&mut body, instr, index, byte_offset, shader.kind)?;
         record_internal_writes(instr, &mut internal_written);
     }
     Ok(body)
@@ -465,7 +536,10 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding]) -> String {
     // Predicate registers p0..p3, written by the test (VTST) ops and read by predicated
     // instructions. Four booleans, zero-initialised (a predicate is false until a test sets it).
     let _ = writeln!(m, "var<private> p: array<bool, 4>;");
-    let _ = writeln!(m, "\n@fragment\nfn fs_main() -> @location(0) vec4<f32> {{");
+    // `front_facing` is declared unconditionally - see the note in `link::build_linked_module`.
+    let _ = writeln!(m, "\nstruct FsIn {{ @builtin(front_facing) front_facing: bool }};");
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    m.push_str(FRONT_FACING_DECL);
     m.push_str(body);
     let _ = writeln!(
         m,
@@ -514,7 +588,13 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
     m
 }
 
-fn emit_instr(body: &mut String, instr: &Instr, index: usize, byte_offset: usize) -> Result<(), EmitError> {
+fn emit_instr(
+    body: &mut String,
+    instr: &Instr,
+    index: usize,
+    byte_offset: usize,
+    kind: ProgramKind,
+) -> Result<(), EmitError> {
     // Reject an op the emitter has not wired before touching operands, so the error names
     // the op (what to implement next) rather than a missing-operand symptom.
     if !instr.op.is_emittable() {
@@ -530,6 +610,21 @@ fn emit_instr(body: &mut String, instr: &Instr, index: usize, byte_offset: usize
     if matches!(instr.op, Op::Nop) {
         return Ok(());
     }
+    // A GLOBAL (SPECIAL hardware register) operand is decoded structurally but has no value
+    // until its index's meaning is established. Report it by INDEX, ahead of the generic
+    // unmapped-operand path, so the failure says which register to go and establish. The one
+    // established register ([`global_u32_expr`]) is exempt, and only inside the one operation
+    // that reads it as raw bits - a bitwise test. Any other op reading even that register is
+    // outside what the corpus establishes, so it still hard-fails by index.
+    let global_ok = matches!(instr.op, Op::Test { alu: TestAlu::BitAnd, .. });
+    if let Some(g) = instr
+        .srcs
+        .iter()
+        .chain(instr.dest.iter())
+        .find(|o| matches!(o.bank, Bank::Global) && !(global_ok && global_u32_expr(o, kind).is_some()))
+    {
+        return Err(EmitError::UnmodeledGlobal { index, byte_offset, global: g.index, raw: instr.raw });
+    }
     let unmapped = || EmitError::UnmappedOperand { index, raw: instr.raw };
     let mask = instr.write_mask;
 
@@ -541,7 +636,7 @@ fn emit_instr(body: &mut String, instr: &Instr, index: usize, byte_offset: usize
     // The two ops with no mandatory register destination: a predicate-only test writes just
     // `p[n]`, and a discard writes nothing at all.
     if let Op::Test { alu, cmp, reduce, pdst, write_back } = instr.op {
-        emit_test(s, instr, instr.dest.as_ref(), alu, cmp, reduce, pdst, write_back)
+        emit_test(s, instr, instr.dest.as_ref(), alu, cmp, reduce, pdst, write_back, kind)
             .ok_or_else(unmapped)?;
         return finish_predicated(body, instr, &stmts, index);
     }
@@ -754,6 +849,7 @@ fn emit_test(
     reduce: TestReduce,
     pdst: u8,
     write_back: bool,
+    kind: ProgramKind,
 ) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     let p = Prec::of(instr);
@@ -772,26 +868,43 @@ fn emit_test(
         TestReduce::Channel(c) => vec![(c as usize).min(3)],
         _ => (0..4).collect(),
     };
+    // The BITWISE family tests the raw 32-bit lane, so its operands are read as u32 (not
+    // through the float channel reader) and the comparison against zero is integer. Its banks
+    // differ too - an inline immediate and a hardware register only ever appear here - so it
+    // is resolved BEFORE the float path touches the operands.
+    let raw = |o: &Operand| -> Option<String> {
+        if matches!(o.bank, Bank::Constant) {
+            let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
+            return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
+        }
+        // An inline integer literal the group assembled (the flag-bit mask).
+        if matches!(o.bank, Bank::Immediate) {
+            return Some(format!("{}u", o.index as u32));
+        }
+        // A hardware register: only the established ones materialise, and `emit_instr` has
+        // already hard-failed on any other, so `None` here is a belt-and-braces refusal
+        // rather than the reporting path.
+        if matches!(o.bank, Bank::Global) {
+            return global_u32_expr(o, kind);
+        }
+        Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
+    };
     let mut bools = Vec::with_capacity(channels.len());
     for &c in &channels {
+        if matches!(alu, TestAlu::BitAnd) {
+            // The AND must be parenthesised: WGSL binds the equality operators TIGHTER than
+            // `&`, so `a & b != 0u` parses as `a & (b != 0u)` and fails to validate (u32 vs
+            // bool). Do not "simplify" these parentheses away.
+            bools.push(format!("(({} & {}) {op} 0u)", raw(s1)?, raw(s2)?));
+            continue;
+        }
         let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
         let value = match alu {
             TestAlu::Add => format!("({a} + {b})"),
             TestAlu::Sub => format!("({a} - {b})"),
             TestAlu::Mul => format!("({a} * {b})"),
-            // The BITWISE family tests the raw lane, so both operands are read as u32 and the
-            // comparison against zero is integer.
-            TestAlu::BitAnd => {
-                let raw = |o: &Operand| -> Option<String> {
-                    if matches!(o.bank, Bank::Constant) {
-                        let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
-                        return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
-                    }
-                    Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
-                };
-                bools.push(format!("({} & {} {op} 0u)", raw(s1)?, raw(s2)?));
-                continue;
-            }
+            // Resolved above - the raw-lane path never reaches here.
+            TestAlu::BitAnd => unreachable!("bitwise test resolved before the float path"),
         };
         bools.push(format!("({value} {op} 0.0)"));
     }
@@ -1077,6 +1190,65 @@ mod tests {
             other => panic!("expected UnsupportedOp, got {other:?}"),
         }
         assert!(err.to_string().contains("tex"));
+    }
+
+    /// The one established GLOBAL register, on the REAL captured word. The whole instruction
+    /// decodes to `p0 = ((GLOBAL[16] & 1) != 0)` and emits as the per-fragment facing bit, so
+    /// the predicated move after it selects the flipped normal exactly on the faces the guest
+    /// shades two-sided. The polarity here is the one that renders the car liveries; see
+    /// [`global_u32_expr`] for why it is measured rather than reasoned.
+    #[test]
+    fn global16_bit0_is_the_facing_bit() {
+        // frag_82d27fb0 #2 (and byte-identically in frag_82ed89c0); the `skipinv` variant
+        // 0x488b... in frag_82d1bd50 differs only in bit 55 and must translate the same.
+        for raw in [0x480b_0281_600c_2801u64, 0x488b_0281_600c_2801u64] {
+            let ins = crate::usse::decode(raw);
+            assert!(ins.blocked.is_none(), "{raw:#018x} must decode: {:?}", ins.blocked);
+            assert!(
+                matches!(ins.op, Op::Test { alu: TestAlu::BitAnd, cmp: TestCmp::Ne, reduce: crate::ir::TestReduce::Channel(0), pdst: 0, write_back: false }),
+                "{raw:#018x} decoded as {:?}",
+                ins.op
+            );
+            assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::Global, 16));
+            assert_eq!((ins.srcs[1].bank, ins.srcs[1].index), (Bank::Immediate, 1));
+
+            let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
+            assert!(
+                wgsl.contains("p[0] = ((select(0u, 1u, gxp_front_facing) & 1u) != 0u);"),
+                "got:\n{wgsl}"
+            );
+        }
+    }
+
+    /// The facing reading is scoped to the one register it was derived from, in the one stage
+    /// that has a facing bit, read by the one operation that reads it as raw bits. Everything
+    /// else hard-fails naming the GLOBAL index rather than inheriting a value.
+    #[test]
+    fn any_other_global_read_hard_fails_naming_its_index() {
+        let test_of = |global: u8| {
+            instr(
+                Op::Test { alu: TestAlu::BitAnd, cmp: TestCmp::Ne, reduce: crate::ir::TestReduce::Channel(0), pdst: 0, write_back: false },
+                None,
+                vec![Operand::plain(Bank::Global, global, 1), Operand::plain(Bank::Immediate, 1, 2)],
+            )
+        };
+        // A different GLOBAL index, same instruction shape.
+        match emit_fragment(&shader(vec![test_of(17)])).unwrap_err() {
+            EmitError::UnmodeledGlobal { global, .. } => assert_eq!(global, 17),
+            other => panic!("expected UnmodeledGlobal, got {other:?}"),
+        }
+        // GLOBAL[16] in a VERTEX program: there is no per-fragment facing bit there.
+        let vsh = Shader { kind: ProgramKind::Vertex, instrs: vec![test_of(16)] };
+        match emit_body(&vsh).unwrap_err() {
+            EmitError::UnmodeledGlobal { global, .. } => assert_eq!(global, 16),
+            other => panic!("expected UnmodeledGlobal, got {other:?}"),
+        }
+        // GLOBAL[16] read by an ordinary float op rather than a bitwise test.
+        let mov = instr(Op::Mov, Some(Operand::plain(Bank::Temp, 0, 0)), vec![Operand::plain(Bank::Global, 16, 1)]);
+        match emit_fragment(&shader(vec![mov])).unwrap_err() {
+            EmitError::UnmodeledGlobal { global, .. } => assert_eq!(global, 16),
+            other => panic!("expected UnmodeledGlobal, got {other:?}"),
+        }
     }
 
     #[test]

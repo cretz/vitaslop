@@ -719,24 +719,116 @@ fn disasm_one() {
             println!("    interpolant {:?} pa_base={} regs={} span={} half={} prefetch={:?}",
                 it.usage, it.pa_base, it.register_count, it.span, it.half, it.prefetch);
         }
-        for (i, &w) in program.code.iter().enumerate() {
-            let ins = decode(w);
-            let fmt_op = |o: &vitaslop_gxp_shader::ir::Operand| {
-                format!("{:?}[{}]{}{}", o.bank, o.index,
-                    if o.swizzle != [0, 1, 2, 3] { format!(".{:?}", o.swizzle) } else { String::new() },
-                    if o.neg { "(neg)" } else { "" })
-            };
-            let dest = ins.dest.as_ref().map(fmt_op).unwrap_or_else(|| "-".into());
-            let srcs: Vec<String> = ins.srcs.iter().map(fmt_op).collect();
+        let fmt_op = |o: &vitaslop_gxp_shader::ir::Operand| {
+            format!("{:?}[{}]{}{}", o.bank, o.index,
+                if o.swizzle != [0, 1, 2, 3] { format!(".{:?}", o.swizzle) } else { String::new() },
+                if o.neg { "(neg)" } else { "" })
+        };
+        let line = |i: usize, ins: &vitaslop_gxp_shader::ir::Instr, w: u64| {
+            let dest = ins.dest.as_ref().map(&fmt_op).unwrap_or_else(|| "-".into());
+            let srcs: Vec<String> = ins.srcs.iter().map(&fmt_op).collect();
             let mask: String = (0..4).map(|c| if ins.write_mask[c] { "xyzw".as_bytes()[c] as char } else { '.' }).collect();
-            println!("  #{i:<3} {:<10}{} dst={dest} [{mask}] <- {}  {}{}",
+            // The op's full Debug, not just the mnemonic: for the ops that carry a payload
+            // (the compare method of a cmov, the alu/cmp/reduce of a test) that payload IS
+            // the semantics, and reading the idiom around it depends on seeing it.
+            println!("  #{i:<3} {:<10}{} {:<12}dst={dest} [{mask}] <- {}  {:?} {}{}",
                 ins.op.mnemonic(),
                 if ins.half_precision { ".f16" } else { ".f32" },
+                format!("{:?}", ins.pred),
                 srcs.join(", "),
-                if ins.blocked.is_some() { format!("BLOCKED({})", ins.blocked.unwrap()) } else { String::new() },
+                ins.op,
+                if let Some(b) = ins.blocked { format!("BLOCKED({b})") } else { String::new() },
                 format_args!("raw={w:#018x}"));
+        };
+        // The SECONDARY stream runs first on the hardware and exists purely to leave values in
+        // SA registers the primary reads, so a primary `SA[n]` above the uniform buffer is only
+        // readable next to the instruction that produced it.
+        let sec = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
+        println!("  -- secondary program ({} instrs) --", sec.instrs.len());
+        for (i, ins) in sec.instrs.iter().enumerate() {
+            line(i, ins, ins.raw);
+        }
+        println!("  -- primary program ({} instrs) --", program.code.len());
+        for (i, &w) in program.code.iter().enumerate() {
+            line(i, &decode(w), w);
         }
     }
+}
+
+/// Survey every SPECIAL/GLOBAL hardware-register read in the corpus, with the instructions
+/// around it, so what a GLOBAL index holds can be argued from what the shaders DO with it
+/// rather than assumed. Prints, per read: the blob, the program kind, the GLOBAL index, the
+/// instruction, and the following few instructions (the consumers).
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn global_special_register_reads() {
+    let Some(dir) = dump_dir() else {
+        eprintln!("VITASLOP_GXP_DUMPS unset - skipping (expected in CI)");
+        return;
+    };
+    let mut total = 0u32;
+    let mut by_index: std::collections::BTreeMap<u8, u32> = std::collections::BTreeMap::new();
+    let mut by_kind: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        // Both streams: a GLOBAL read in the secondary program would mean something quite
+        // different (it runs once per primitive, not per fragment), so do not conflate them.
+        let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
+        let streams: [(&str, Vec<_>); 2] = [
+            ("secondary", secondary.instrs.clone()),
+            ("primary", program.code.iter().map(|&w| decode(w)).collect()),
+        ];
+        for (stream, instrs) in &streams {
+            for (i, ins) in instrs.iter().enumerate() {
+                let globals: Vec<u8> = ins
+                    .srcs
+                    .iter()
+                    .chain(ins.dest.iter())
+                    .filter(|o| matches!(o.bank, Bank::Global))
+                    .map(|o| o.index)
+                    .collect();
+                if globals.is_empty() {
+                    continue;
+                }
+                total += 1;
+                for g in &globals {
+                    *by_index.entry(*g).or_default() += 1;
+                }
+                *by_kind.entry(format!("{:?}/{stream}", program.kind)).or_default() += 1;
+                println!(
+                    "\n{name} [{stream}] #{i} reads GLOBAL{globals:?}: {} raw={:#018x}",
+                    ins.op.mnemonic(),
+                    ins.raw
+                );
+                // The consumers are the argument: what the shader DOES with the tested bit is
+                // what identifies the register.
+                for (j, follow) in instrs.iter().enumerate().skip(i + 1).take(8) {
+                    let srcs: Vec<String> = follow
+                        .srcs
+                        .iter()
+                        .map(|o| format!("{:?}[{}]", o.bank, o.index))
+                        .collect();
+                    println!(
+                        "    +{:<2} {:<8} {:<10} dst={} <- {}",
+                        j - i,
+                        follow.op.mnemonic(),
+                        format!("{:?}", follow.pred),
+                        follow
+                            .dest
+                            .as_ref()
+                            .map(|d| format!("{:?}[{}]", d.bank, d.index))
+                            .unwrap_or_else(|| "-".into()),
+                        srcs.join(", ")
+                    );
+                }
+            }
+        }
+    }
+    println!("\n=== GLOBAL reads: {total} total ===");
+    println!("  by index: {by_index:?}");
+    println!("  by kind/stream: {by_kind:?}");
 }
 
 /// Verify the SA-bank layout model on every real fragment blob: each `SMP` instruction's

@@ -7,6 +7,33 @@ pub use decode::{decode, field, opcode1, GroupTable, GROUP_TABLES};
 use crate::container::Program;
 use crate::ir::{Op, Shader};
 
+/// Turn SMLSI into a no-op in a program where NOTHING repeats.
+///
+/// SMLSI carries no data effect of its own: it sets the per-operand increment/swizzle state
+/// that a repeated instruction advances its registers by (spec F8.8, "metadata for repeated
+/// instructions; emits nothing directly"). Its danger - and the reason it is blocked by
+/// default - is that ignoring it would silently mis-address the operands of any instruction
+/// that DOES repeat. When no instruction in the program can repeat, that danger cannot
+/// materialise and the instruction is genuinely inert, so retiring it here is a proof, not a
+/// relaxation. Every instruction must be established as single-execution for this to apply;
+/// one instruction whose repeat encoding is unknown leaves every SMLSI blocked.
+///
+/// This is deliberately a whole-program test rather than a per-SMLSI scope analysis: SMLSI
+/// state persists until the next SMLSI, and the ordering rules around branches are not
+/// established, so "nothing in this program repeats at all" is the statement the evidence
+/// actually supports.
+fn retire_inert_repeat_state(code: &[u64], instrs: &mut [crate::ir::Instr]) {
+    if !decode::repeats_nowhere(code) {
+        return;
+    }
+    for instr in instrs.iter_mut() {
+        if matches!(instr.op, Op::Todo("flow smlsi (repeat-state) not modeled")) {
+            instr.op = Op::Nop;
+            instr.blocked = None;
+        }
+    }
+}
+
 /// Decode a parsed program's USSE code stream into the shader IR.
 ///
 /// A `SMP` instruction addresses its sampler by a REGISTER field, not by texture unit: the
@@ -17,6 +44,7 @@ use crate::ir::{Op, Shader};
 /// does not describe blocks the instruction rather than naming an arbitrary unit.
 pub fn decode_shader(program: &Program) -> Shader {
     let mut instrs: Vec<_> = program.code.iter().map(|&w| decode(w)).collect();
+    retire_inert_repeat_state(&program.code, &mut instrs);
     for instr in &mut instrs {
         let Op::Tex { unit: ordinal, coords, coord_half, lod } = instr.op else { continue };
         match program.sampler_unit_at(2 * ordinal as u32) {
@@ -55,6 +83,7 @@ pub fn decode_shader(program: &Program) -> Shader {
 pub fn decode_secondary_shader(program: &Program) -> Shader {
     use crate::ir::Bank;
     let mut instrs: Vec<_> = program.secondary_code.iter().map(|&w| decode(w)).collect();
+    retire_inert_repeat_state(&program.secondary_code, &mut instrs);
     for instr in &mut instrs {
         for op in instr.dest.iter_mut().chain(instr.srcs.iter_mut()) {
             // Everything but an internal register and a constant becomes SA. An inline

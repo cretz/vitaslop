@@ -438,6 +438,95 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 ///   set, the recipe supplies the touches/buttons; when unset, the built-in Tutorial
 ///   tap script runs (the historical title navigation), unless
 ///   `VITASLOP_HEADLESS_NO_TAPS` is set, which runs input-free to the title screen.
+/// - `VITASLOP_HEADLESS_TIMING` - report per-frame GUEST cost (the emulated CPU work
+///   behind one display flip) and the GPU cost of rendering the final captured scene.
+///
+/// NOTE what the timing does and does not measure. The guest advances every frame but the
+/// scene is RENDERED ONCE, at the end - so a wall-clock total over a headless run is CPU
+/// only, and dividing it by the frame count says nothing about the render. The two costs
+/// are reported separately for that reason. Neither is a frame rate on its own: a title
+/// sitting on a menu waiting for input costs almost nothing per frame, so a number
+/// measured there is not a gameplay number.
+/// Print the guest-CPU frame-cost distribution and the one-off render cost.
+///
+/// Reported as PERCENTILES over the whole run and separately over the last 300 frames,
+/// because a headless run is two different workloads glued together: a boot sequence that
+/// does heavy one-off work, then whatever screen it settles on. The median of the tail is
+/// the closest thing here to "what a frame costs on this screen", and it is only a frame
+/// RATE if the title is actually doing work on that screen rather than idling for input.
+fn report_frame_timing(
+    frame_ms: &[f64],
+    cold_render_ms: f64,
+    warm_render_ms: &[f64],
+    split: vitaslop_native::RenderSplit,
+) {
+    if frame_ms.is_empty() {
+        println!("timing: no frames advanced");
+        return;
+    }
+    let pct = |v: &[f64], p: f64| -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[(((s.len() - 1) as f64) * p).round() as usize]
+    };
+    let total: f64 = frame_ms.iter().sum();
+    let tail = &frame_ms[frame_ms.len().saturating_sub(300)..];
+    println!(
+        "timing: guest CPU over {} frames - total {:.0} ms, p50 {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+        frame_ms.len(),
+        total,
+        pct(frame_ms, 0.50),
+        pct(frame_ms, 0.95),
+        pct(frame_ms, 1.0)
+    );
+    println!(
+        "timing: guest CPU over the last {} frames - p50 {:.2} ms ({:.0} fps if CPU-bound), p95 {:.2} ms",
+        tail.len(),
+        pct(tail, 0.50),
+        1000.0 / pct(tail, 0.50).max(1e-6),
+        pct(tail, 0.95)
+    );
+    println!(
+        "timing: GPU render of the final scene - cold {cold_render_ms:.1} ms (builds pipelines, \
+         compiles shaders, uploads textures)"
+    );
+    if !warm_render_ms.is_empty() {
+        let p50 = pct(warm_render_ms, 0.50);
+        println!(
+            "timing: GPU render of the final scene - warm p50 {:.2} ms ({:.0} fps if GPU-bound), \
+             p95 {:.2} ms over {} samples",
+            p50,
+            1000.0 / p50.max(1e-6),
+            pct(warm_render_ms, 0.95),
+            warm_render_ms.len()
+        );
+    }
+    // WHERE the warm render went. A total says the recompiler path is slower than the
+    // fixed-function one; only the split says whether that is per-draw CPU work building GPU
+    // objects or the GPU genuinely shading more, and those call for opposite fixes.
+    let p = split.phases;
+    println!(
+        "timing: warm render split - build {:.2} ms (scene decode, CPU), encode {:.2} ms (CPU), \
+         submit+wait {:.2} ms (contains the GPU)",
+        split.build_ms, split.encode_ms, split.submit_ms
+    );
+    println!(
+        "timing: encode phases - prepare {:.2} ms, upload {:.2} ms, pass {:.2} ms over \
+         {} recompiled + {} fixed-function draws",
+        p.prepare_ms, p.upload_ms, p.pass_ms, p.gxp_draws, p.fixed_draws
+    );
+    // The honest caveat, printed rather than left to the reader: a guest that is waiting for
+    // input does no work, so a low per-frame CPU cost on a menu is not a gameplay figure.
+    println!(
+        "timing: NOTE the CPU figures are whatever the title was doing on this screen - if it \
+         was idling on a menu they are not a gameplay frame rate."
+    );
+}
+
+/// How many extra renders of the captured scene to time for the warm figure. Enough to get a
+/// stable median past the first-render pipeline/upload cost, cheap enough to always run.
+const WARM_RENDER_SAMPLES: usize = 60;
+
 pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
     let recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
@@ -462,6 +551,11 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         (112, 121, 1620, 376),
         (128, 137, 630, 870),
     ];
+    // Per-frame guest cost, in milliseconds, when timing is on. Kept per frame rather than
+    // as a running total so the report can separate the typical frame from the worst one - a
+    // mean over a run that includes boot (or an idle menu) describes neither.
+    let timing = std::env::var_os("VITASLOP_HEADLESS_TIMING").is_some();
+    let mut frame_ms: Vec<f64> = Vec::new();
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
         if use_builtin_taps {
@@ -471,7 +565,13 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
                 .map(|(_, _, x, y)| TouchFrame::single(*x, *y));
             input.lock().unwrap().touch = touch;
         }
-        guest.advance();
+        if timing {
+            let t = std::time::Instant::now();
+            guest.advance();
+            frame_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            guest.advance();
+        }
     }
     if let Some(e) = guest.error() {
         return Err(format!("guest error at frame {}: {e}", guest.frames()));
@@ -479,7 +579,23 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     let scene = guest.current().ok_or("no scene captured")?;
 
     let mut renderer = vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?;
+    let render_t = std::time::Instant::now();
     let fb = renderer.render_scene(scene, GAME_W, GAME_H, CLEAR);
+    let cold_render_ms = render_t.elapsed().as_secs_f64() * 1000.0;
+    if timing {
+        // Re-render the SAME scene to separate one-off cost from per-frame cost. The first
+        // render builds every pipeline, compiles every recompiled shader and uploads every
+        // texture; a steady frame does none of that. Reporting only the cold number would
+        // overstate the per-frame cost by orders of magnitude, and reporting only the warm
+        // one would hide a startup hitch users would actually feel.
+        let mut warm: Vec<f64> = Vec::new();
+        for _ in 0..WARM_RENDER_SAMPLES {
+            let t = std::time::Instant::now();
+            let _ = renderer.render_scene(scene, GAME_W, GAME_H, CLEAR);
+            warm.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split());
+    }
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = shot_dir.join("desktop.png");
     std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
@@ -529,7 +645,9 @@ pub fn run(dir: PathBuf, recipe: Option<String>) -> Result<(), String> {
         last_tick: Instant::now(),
         fps_since: Instant::now(),
         fps_frames: 0,
+        guest_frames_since: 0,
         fps: 0.0,
+        guest_fps: 0.0,
         reported_exit: false,
     };
     event_loop.run_app(&mut app).map_err(|e| format!("run event loop: {e}"))?;
@@ -552,8 +670,18 @@ struct RetailApp {
     acc: Duration,
     last_tick: Instant,
     fps_since: Instant,
+    /// Frames PRESENTED since the meter window opened (redraws), and the guest display
+    /// flips retired in the same window. These are different numbers and the difference is
+    /// the point: the guest is stepped against real time with a catch-up budget, so when
+    /// emulation cannot keep up the window keeps presenting at the display rate while the
+    /// guest falls behind. Reporting only the present rate would show a steady 60 while the
+    /// title ran in slow motion.
     fps_frames: u32,
+    guest_frames_since: u64,
     fps: f64,
+    /// Emulated display flips per second, and that as a fraction of the pace the guest is
+    /// being stepped at (`FRAME_DT`) - i.e. how close to real-time speed it is running.
+    guest_fps: f64,
     reported_exit: bool,
 }
 
@@ -688,14 +816,26 @@ impl RetailApp {
         self.update_title(now);
     }
 
+    /// Publish both rates to the window title, four times a second.
+    ///
+    /// Two numbers, deliberately: `fps` is what the window PRESENTED, `guest` is how many
+    /// emulated display flips actually retired, and `speed` is that against the pace the
+    /// guest is stepped at. On a machine with headroom they agree and speed sits at 100%;
+    /// when emulation cannot keep up, present stays pinned to the display rate and only the
+    /// guest number drops - which is the number a user actually wants when asking "is this
+    /// running full speed?".
     fn update_title(&mut self, now: Instant) {
         self.fps_frames += 1;
         let since = now.duration_since(self.fps_since);
         if since < Duration::from_millis(250) {
             return;
         }
-        self.fps = self.fps_frames as f64 / since.as_secs_f64();
+        let secs = since.as_secs_f64();
+        let guest_now = self.guest.frames();
+        self.fps = self.fps_frames as f64 / secs;
+        self.guest_fps = guest_now.saturating_sub(self.guest_frames_since) as f64 / secs;
         self.fps_frames = 0;
+        self.guest_frames_since = guest_now;
         self.fps_since = now;
         let Some(w) = self.window.as_ref() else { return };
         let state = if self.guest.finished() {
@@ -705,6 +845,18 @@ impl RetailApp {
         } else {
             ""
         };
-        w.set_title(&format!("vitaslop  |  {:.0} fps{}  |  frame {}", self.fps, state, self.guest.frames()));
+        // The step pace is the reference for "full speed": one FRAME_DT per emulated flip.
+        let target = 1.0 / FRAME_DT.as_secs_f64();
+        let speed = if self.paused || self.guest.finished() {
+            String::new()
+        } else {
+            format!("  |  speed {:.0}%", self.guest_fps / target * 100.0)
+        };
+        w.set_title(&format!(
+            "vitaslop  |  {:.0} fps present  |  {:.0} fps guest{speed}{state}  |  frame {}",
+            self.fps,
+            self.guest_fps,
+            guest_now
+        ));
     }
 }

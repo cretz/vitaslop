@@ -735,16 +735,18 @@ fn build_linked_module(
     let _ = writeln!(m, "  return out;\n}}");
 
     // ---- Fragment input struct (the same interface the vertex declares) ----
-    if varying_locations > 0 {
-        let _ = writeln!(m, "\nstruct FsIn {{");
-        for j in 0..varying_locations {
-            let _ = writeln!(m, "  @location({j}) v{j}: vec4<f32>,");
-        }
-        let _ = writeln!(m, "}};");
-        let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
-    } else {
-        let _ = writeln!(m, "\n@fragment\nfn fs_main() -> @location(0) vec4<f32> {{");
+    // `front_facing` is declared unconditionally, even by a fragment stage with no varyings:
+    // it is pipeline state rather than an interpolated value, so it costs no `@location`, and
+    // making it always present keeps the entry signature (and every module builder here) the
+    // same shape whether or not the body happens to read the facing GLOBAL register.
+    let _ = writeln!(m, "\nstruct FsIn {{");
+    for j in 0..varying_locations {
+        let _ = writeln!(m, "  @location({j}) v{j}: vec4<f32>,");
     }
+    let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
+    let _ = writeln!(m, "}};");
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    m.push_str(crate::wgsl::FRONT_FACING_DECL);
     emit_register_banks(&mut m);
     // Rebuild the PA register file from the interpolated components, repacking each F16 pair
     // exactly as the hardware interpolator delivers it (interpolate as floats, then pack). A

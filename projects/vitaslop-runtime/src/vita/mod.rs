@@ -271,12 +271,18 @@ pub fn dispatch(
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
         | gxm_nid::DESTROY_RENDER_TARGET
-        | gxm_nid::SHADER_PATCHER_DESTROY
-        | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
-        | gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
-        | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM
         | gxm_nid::SYNC_OBJECT_DESTROY
         | gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::ok(ctx)),
+        // Nothing to tear down for these, but the guest is now free to reuse the
+        // program's memory, so the reflected constants cached against its header
+        // address must not outlive it.
+        gxm_nid::SHADER_PATCHER_DESTROY
+        | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
+        | gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
+        | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => {
+            st.invalidate_program_reflection();
+            cont!(gxm::ok(ctx))
+        }
         // Record the bound fragment program so a draw can reflect its samplers (albedo
         // selection). The direct-draw path binds it here rather than via a precomputed
         // fragment state.
@@ -433,9 +439,11 @@ pub fn dispatch(
         gxm_nid::DRAW_INSTANCED => cont!(gxm::draw_instanced(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {
             // The frame is complete and queued to flip; on hardware the caller waits
-            // for the flip here, so this is the guest's per-frame yield point.
+            // for the flip here. This is the ONE call that ends a display frame, and
+            // so the only source of `Flip` - everything else that gives up the CPU
+            // yields WITHOUT counting a frame.
             gxm::display_queue_add_entry(ctx, st);
-            SvcOutcome::Yield
+            SvcOutcome::Flip
         }
 
         // --- iofilemgr: file IO -------------------------------------------------
@@ -737,4 +745,72 @@ pub fn dispatch(
         );
     }
     outcome
+}
+
+#[cfg(test)]
+mod frame_boundary_tests {
+    use super::*;
+    use crate::host::VitaState;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    /// Dispatch one NID with the given r0..r3 and report the outcome's kind. The
+    /// distinction under test is coarse (does this count a display frame or not), so
+    /// the outcome is reduced to a name rather than compared structurally.
+    fn outcome_of(nid_lib: u32, nid_fn: u32, args: [u32; 4]) -> &'static str {
+        let mut regs = [0u32; REG_COUNT];
+        regs[..4].copy_from_slice(&args);
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        // The frame/yield distinction only exists under the preemptive scheduler; the
+        // single-worker model has nothing to yield to and returns Continue throughout.
+        st.set_preemptive(true);
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        match dispatch(nid_lib, nid_fn, &mut ctx, &mut st) {
+            SvcOutcome::Flip => "Flip",
+            SvcOutcome::Reschedule => "Reschedule",
+            SvcOutcome::Block => "Block",
+            SvcOutcome::Continue => "Continue",
+            SvcOutcome::Halt => "Halt",
+            SvcOutcome::ThreadExit => "ThreadExit",
+            SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
+        }
+    }
+
+    /// A voluntary yield is NOT a display frame. `sceKernelDelayThread(0)` and
+    /// `sceDisplayWaitVblankStartMulti(0)` both mean "give someone else the CPU"
+    /// and a worker can spin on either thousands of times between two rendered
+    /// frames. Counting them as frames inflates the frame clock by an arbitrary,
+    /// title-dependent factor, which silently desynchronises every frame-keyed
+    /// input script from the game it is driving (a recipe's button press lands in a
+    /// fraction of a game frame and the guest never samples it) and makes every
+    /// per-frame timing figure meaningless. Only `sceGxmDisplayQueueAddEntry` -
+    /// the guest handing a finished frame to scanout - ends a frame.
+    #[test]
+    fn only_a_display_queue_entry_counts_as_a_frame_boundary() {
+        assert_eq!(
+            outcome_of(nid::lib::SCE_THREADMGR, tm_nid::DELAY_THREAD, [0, 0, 0, 0]),
+            "Reschedule",
+            "delayThread(0) is a plain yield, not a frame"
+        );
+        assert_eq!(
+            outcome_of(nid::lib::SCE_DISPLAY_USER, display_nid::WAIT_VBLANK_START_MULTI, [0, 0, 0, 0]),
+            "Reschedule",
+            "waitVblankStartMulti(0) asks for no wait at all, so it is not a frame"
+        );
+        // A real (nonzero) wait still parks the thread on the virtual clock.
+        assert_eq!(
+            outcome_of(nid::lib::SCE_THREADMGR, tm_nid::DELAY_THREAD, [1000, 0, 0, 0]),
+            "Block",
+            "a real delay parks the caller"
+        );
+        assert_eq!(
+            outcome_of(nid::lib::SCE_GXM, gxm_nid::DISPLAY_QUEUE_ADD_ENTRY, [0, 0, 0, 0]),
+            "Flip",
+            "queueing a finished frame for scanout IS the frame boundary"
+        );
+    }
 }

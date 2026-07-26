@@ -18,11 +18,42 @@ publish.workspace = true
 [dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
 vitaslop-native = { path = "../vitaslop-native" }
+# Installs the fmt/EnvFilter subscriber in the `play` and `session` binaries, so the
+# engine's `tracing` diagnostics (RUST_LOG=vitaslop::input=trace, ...) actually reach
+# an agent authoring a recipe. Without a subscriber, RUST_LOG is silently ignored and
+# every diagnostic looks like "the guest never did that".
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
 name = "play"
 path = "src/bin/play.rs"
 
+# The resident session an agent plays a game through, and the client that talks to it.
 [[bin]]
-name = "sweep"
-path = "src/bin/sweep.rs"
+name = "session"
+path = "src/bin/session.rs"
+
+[[bin]]
+name = "ctl"
+path = "src/bin/ctl.rs"
+
+# Parallel variant search: pay the boot prefix once in wall-clock across N workers.
+[[bin]]
+name = "explore"
+path = "src/bin/explore.rs"
+
+# What does a frame COST on this screen, and where did the time go?
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+# Diff two runs' guest memory: what did this input actually touch?
+[[bin]]
+name = "memdiff"
+path = "src/bin/memdiff.rs"
+
+# Montage a run's screenshots into one labelled grid, so a whole run is judged in a
+# single look instead of one file read per shot.
+[[bin]]
+name = "sheet"
+path = "src/bin/sheet.rs"

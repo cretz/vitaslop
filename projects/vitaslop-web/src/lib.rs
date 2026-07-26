@@ -158,6 +158,15 @@ struct FpsMeter {
 /// long enough to average out per-frame jitter.
 const FPS_WINDOW_MS: f64 = 500.0;
 
+/// The console's display rate, and so the reference for "full speed". The live loop
+/// advances the guest exactly one display flip per presented frame, so the presented
+/// rate IS the emulated rate and dividing by this gives the speed the title is running
+/// at. Worth showing next to the raw number: on the main thread the loop is paced by
+/// `requestAnimationFrame`, so the rate is capped at the display refresh and a healthy
+/// run reads a flat 60 whether it has 2x headroom or none - the percentage is what says
+/// "keeping up" and, in a Worker (uncapped), how much room is left.
+const GUEST_DISPLAY_HZ: f64 = 60.0;
+
 /// A sink for the small status/FPS/perf strings the run publishes to the page. On the
 /// main thread it writes DOM elements by id; in a Web Worker (which has no DOM) it
 /// forwards `(id, text)` to a JS callback that turns it into a `postMessage` the page
@@ -211,7 +220,14 @@ impl FpsMeter {
         let dt = now - self.window_start;
         if dt >= FPS_WINDOW_MS {
             self.last_fps = self.window_frames as f64 * 1000.0 / dt;
-            self.report.emit("fps", &format!("fps: {:.0}", self.last_fps));
+            self.report.emit(
+                "fps",
+                &format!(
+                    "fps: {:.0} ({:.0}% speed)",
+                    self.last_fps,
+                    self.last_fps / GUEST_DISPLAY_HZ * 100.0
+                ),
+            );
             self.window_start = now;
             self.window_frames = 0;
         }

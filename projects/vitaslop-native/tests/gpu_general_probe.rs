@@ -62,6 +62,9 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         fprog: Vec::new(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
+        // These probes hand the renderer real triangles, not point-sprite records a
+        // vertex program would expand into quads.
+        shader_expanded: false,
     }
 }
 
@@ -220,6 +223,9 @@ fn mvp_quad(
         fprog: Vec::new(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
+        // These probes hand the renderer real triangles, not point-sprite records a
+        // vertex program would expand into quads.
+        shader_expanded: false,
     }
 }
 
@@ -288,6 +294,8 @@ fn general_renderer_matches_software_oracle() {
         fprog: Vec::new(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
+        // Real triangles, not point-sprite records the vertex program expands.
+        shader_expanded: false,
         };
         assert_parity(&mut gpu, &Scene { color: None, draws: vec![draw] }, "ndc-vertexcolor");
     }
@@ -455,6 +463,8 @@ fn general_renderer_matches_software_oracle() {
         fprog: Vec::new(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
+        // Real triangles, not point-sprite records the vertex program expands.
+        shader_expanded: false,
         };
         let scene = Scene { color: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-untextured");
@@ -497,6 +507,8 @@ fn general_renderer_matches_software_oracle() {
         fprog: Vec::new(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
+        // Real triangles, not point-sprite records the vertex program expands.
+        shader_expanded: false,
             };
             Scene { color: None, draws: vec![draw] }
         };

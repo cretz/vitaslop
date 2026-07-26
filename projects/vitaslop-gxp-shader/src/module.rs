@@ -285,17 +285,16 @@ pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
     }
 
     // Interpolated varyings (PA bank) as @location vec4 inputs.
+    // `front_facing` is declared unconditionally - see the note in `link::build_linked_module`.
     let varyings = plan.varying_count();
-    if varyings > 0 {
-        let _ = writeln!(m, "struct FsIn {{");
-        for i in 0..varyings {
-            let _ = writeln!(m, "  @location({i}) v{i}: vec4<f32>,");
-        }
-        let _ = writeln!(m, "}};");
-        let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
-    } else {
-        let _ = writeln!(m, "\n@fragment\nfn fs_main() -> @location(0) vec4<f32> {{");
+    let _ = writeln!(m, "struct FsIn {{");
+    for i in 0..varyings {
+        let _ = writeln!(m, "  @location({i}) v{i}: vec4<f32>,");
     }
+    let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
+    let _ = writeln!(m, "}};");
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    m.push_str(crate::wgsl::FRONT_FACING_DECL);
 
     // The USSE register-file locals: raw 32-bit registers, matching the emitter.
     for bank in ["r", "o", "i", "pa", "sa"] {

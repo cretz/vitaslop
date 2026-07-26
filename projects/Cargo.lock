@@ -3019,6 +3019,7 @@ dependencies = [
 name = "vitaslop-gamerun-recipes"
 version = "0.0.0"
 dependencies = [
+ "tracing-subscriber",
  "vitaslop-native",
  "vitaslop-runtime",
 ]

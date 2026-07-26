@@ -69,6 +69,11 @@ pub struct LinkedProgram {
     /// `(library_nid, func_nid)` per dense host-import index, for the host
     /// environment's NID dispatch (parallel to [`externs`](Self::externs)).
     pub imports: Vec<(u32, u32)>,
+    /// The subset of [`imports`](Self::imports) whose behaviour is one guest-memory
+    /// read, emitted inline by the transpiler instead of trapping to the host. Derived
+    /// from the import table here, because only the runtime knows what a NID means -
+    /// see [`crate::vita::gxm::inline_op`].
+    pub inline_imports: Vec<vitaslop_transpiler::InlineImport>,
     /// Each module's `module_start` entry, in load order (shared libraries first,
     /// then the eboot): the host runs these before the main entry so a library's
     /// constructors and TLS run before anything calls into it.
@@ -125,6 +130,7 @@ impl LinkedProgram {
             arm_entries: &self.arm_entries,
             externs: &self.externs,
             redirects: &self.redirects,
+            inline_imports: &self.inline_imports,
             noreturn_svc: &[],
             mem_bytes: self.mem_bytes,
             discover_code_pointers: true,
@@ -385,6 +391,18 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     }
 
     let host_import_count = imports.len();
+    // Which host imports the transpiler may emit inline. Derived from the finished
+    // import table so the index a call site uses and the index carrying the inline op
+    // are the same by construction.
+    let inline_imports = imports
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(_, func_nid))| {
+            crate::vita::gxm::inline_op(func_nid)
+                .map(|op| vitaslop_transpiler::InlineImport { import: i as u32, op })
+        })
+        .collect();
+
     Ok(LinkedProgram {
         base: IMAGE_BASE,
         image,
@@ -394,6 +412,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         externs,
         redirects,
         imports,
+        inline_imports,
         module_inits,
         main_entry,
         alloc_base: align_up(image_end, MODULE_ALIGN),

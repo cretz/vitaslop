@@ -36,6 +36,19 @@ pub enum Bank {
     /// constant mode (`alt_opt` set + the constant sub-mode). The emitter materialises the
     /// exact 32-bit value; it carries no swizzle meaning (a scalar broadcast).
     Constant,
+    /// A SPECIAL hardware register ("GLOBAL" bank): pipeline state the shader reads but no
+    /// program writes, selected by the extension row when the raw register field carries the
+    /// `0x40` discriminator (`index` holds the remaining 6-bit selector).
+    ///
+    /// Decoding it is a fact; giving it a VALUE is not. The emitter hard-fails on every index
+    /// whose meaning has not been established, naming the index, so a GLOBAL read can never
+    /// silently become a zero.
+    Global,
+    /// Not a register bank: an inline INTEGER literal assembled by the instruction's own
+    /// group (`index` holds the value). The extension row names IMMEDIATE, but how the
+    /// literal is assembled is group-specific, so only the groups that establish it produce
+    /// this - for the TEST group it is the 7-bit `src2_n`, zero-extended (spec T.5b step 6).
+    Immediate,
     /// A bank selector value not yet mapped to a named bank.
     Raw(u8),
 }

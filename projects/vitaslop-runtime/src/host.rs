@@ -61,6 +61,20 @@ pub trait GuestMemory {
     fn read(&self, off: usize, buf: &mut [u8]);
     /// Write `bytes` at rebased offset `off`.
     fn write(&mut self, off: usize, bytes: &[u8]);
+    /// Borrow `len` bytes at rebased offset `off` directly, without copying, if this
+    /// backing can lend them.
+    ///
+    /// Every in-process host can: guest memory is a byte buffer it owns. The point is
+    /// to COMPARE a large region against a host-side copy without materialising a
+    /// second one - which is how the texture-snapshot cache stays exact (it re-reads
+    /// only what actually changed) instead of re-reading everything every frame.
+    ///
+    /// The default is `None`, so a backing that cannot lend simply loses the
+    /// optimisation rather than the correctness.
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        let _ = (off, len);
+        None
+    }
 }
 
 /// The native/zero-copy backing: guest memory the runtime can borrow directly
@@ -78,6 +92,9 @@ impl GuestMemory for SliceMemory<'_> {
     }
     fn write(&mut self, off: usize, bytes: &[u8]) {
         self.0[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        self.0.get(off..off.checked_add(len)?)
     }
 }
 
@@ -195,13 +212,68 @@ impl<'a> GuestCtx<'a> {
     pub fn read_bytes(&self, addr: u32, len: usize) -> Vec<u8> {
         match self.offset(addr) {
             Some(o) => {
-                let end = (o + len).min(self.mem.len());
-                let mut buf = vec![0u8; end - o];
+                let n = (o + len).min(self.mem.len()) - o;
+                // Borrow-and-clone where the backing allows it: `to_vec` allocates
+                // and copies once, where allocating a zeroed buffer and reading into
+                // it writes every byte TWICE. This path moves megabytes a frame
+                // (vertex, index and texture snapshots), so the second pass is real.
+                if let Some(s) = self.mem.borrow(o, n) {
+                    return s.to_vec();
+                }
+                let mut buf = vec![0u8; n];
                 self.mem.read(o, &mut buf);
                 buf
             }
             None => Vec::new(),
         }
+    }
+
+    /// Read guest memory at `addr` into `buf`, filling the tail with zeros if the
+    /// range runs past the provisioned region. The allocation-free counterpart of
+    /// [`read_bytes`](Self::read_bytes), for a caller with a buffer to reuse - which is
+    /// what a per-draw or per-parameter read must be, since the allocator is otherwise
+    /// the dominant cost of reading a few dozen bytes.
+    pub fn read_into(&self, addr: u32, buf: &mut [u8]) {
+        let n = match self.offset(addr) {
+            Some(o) => {
+                let n = buf.len().min(self.mem.len().saturating_sub(o));
+                self.mem.read(o, &mut buf[..n]);
+                n
+            }
+            None => 0,
+        };
+        // Only the TAIL that guest memory did not cover is zeroed - zeroing the whole
+        // buffer first would write every byte twice on the common in-range path.
+        buf[n..].fill(0);
+    }
+
+    /// Read `count` consecutive little-endian f32s starting at `addr`.
+    ///
+    /// One bounds check and one block copy, rather than `count` calls through the
+    /// `dyn GuestMemory` vtable. A default uniform buffer is hundreds of floats and is
+    /// read on every draw, so the per-element version showed up as a per-draw cost.
+    pub fn read_f32s(&self, addr: u32, count: usize) -> Vec<f32> {
+        // Borrow and convert straight into the result: no staging buffer, and the
+        // result is written once. A default uniform buffer is hundreds of floats and
+        // is read on every draw.
+        if let Some(o) = self.offset(addr) {
+            if let Some(s) = self.mem.borrow(o, count * 4) {
+                return s
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+            }
+        }
+        let mut raw = vec![0u8; count * 4];
+        self.read_into(addr, &mut raw);
+        raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    /// Borrow `len` bytes of guest memory at `addr` in place, without copying.
+    /// `None` when the range is out of bounds or the backing cannot lend
+    /// ([`GuestMemory::borrow`]).
+    pub fn borrow_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
+        self.mem.borrow(self.offset(addr)?, len)
     }
 
     /// Write `bytes` at guest address `addr` (clamped to range).
@@ -792,11 +864,35 @@ impl FileTable {
 /// program handle so a later Draw knows how to snapshot the vertex buffer.
 struct VertexProgramInfo {
     attributes: Vec<crate::capture::VertexAttribute>,
-    stride: u32,
+    /// One entry per `SceGxmVertexStream` the program was created with, in stream order.
+    /// A draw's attributes name a stream each, and only this tells us how wide that
+    /// stream's rows are and whether it is stepped per vertex or per instance.
+    streams: Vec<VertexStreamInfo>,
     /// The `SceGxmProgram*` this vertex program was created from, so a precomputed
     /// vertex state (which references the vertex program) can size its default uniform
     /// buffer from the program header (+0x2C). 0 if it could not be resolved.
     program_header: u32,
+}
+
+impl VertexProgramInfo {
+    /// Stream `i`'s layout, or a zero-stride per-vertex stream if the program declared
+    /// fewer streams than an attribute references (which a well-formed program cannot do,
+    /// and which then contributes no bytes rather than reading somewhere arbitrary).
+    fn stream(&self, i: usize) -> VertexStreamInfo {
+        self.streams.get(i).copied().unwrap_or_default()
+    }
+}
+
+/// One `SceGxmVertexStream`: `{ uint16_t stride; uint16_t indexSource; }`.
+#[derive(Clone, Copy, Default)]
+struct VertexStreamInfo {
+    stride: u32,
+    /// True for `SCE_GXM_INDEX_SOURCE_INSTANCE_{16,32}BIT` (2 and 3): the stream is
+    /// stepped by the INSTANCE number, not the vertex index, so every vertex of one
+    /// instance reads the same row. Getting this wrong feeds per-instance data (a
+    /// particle's world transform, a decal's placement) to the shader indexed by vertex,
+    /// which scatters one object's geometry across whatever the neighbouring rows hold.
+    per_instance: bool,
 }
 
 /// A precomputed vertex- or fragment-state object (`sceGxmPrecomputed{Vertex,Fragment}
@@ -853,7 +949,7 @@ impl Default for TextureExtra {
 #[derive(Clone, Copy, Default)]
 struct PrecomputedDraw {
     vertex_program: u32,
-    stream0: u32,
+    streams: [u32; MAX_VERTEX_STREAMS],
     primitive: u32,
     index_format: u32,
     index_addr: u32,
@@ -866,21 +962,210 @@ struct PrecomputedDraw {
 /// below are ours to define. Word 0 is a tag: a block that does not carry it was never
 /// initialised through our `Init` (or was copied from uninitialised memory), which is a
 /// hard error rather than a silently skipped draw.
-/// Per-scene texture-byte snapshots, keyed by (guest data address, byte length).
-type TextureSnapshots = HashMap<(u32, usize), Arc<[u8]>>;
+/// Snapshots of guest texture bytes, keyed by (guest data address, byte length).
+///
+/// # The problem
+/// The capture renderer needs a texture's PIXELS, and the only place they exist is
+/// guest memory, so a draw that binds a texture has to read them out. Re-reading
+/// every bound texture every frame is ~15 MB of allocate-and-copy per frame on a real
+/// 3D title - measured at a QUARTER of the whole frame budget, the single most
+/// expensive thing the capture did.
+///
+/// Almost none of that is a re-read of something that changed: a title uploads its
+/// textures at load and samples them for the rest of the level.
+///
+/// # Why this compares instead of tracking invalidation
+/// The obvious fix is to keep the snapshot until something invalidates it - a render
+/// into that memory, a `sceGxmTextureInit*` over it, an unmap. That was tried, and a
+/// verifier caught a texture this title writes DIRECTLY with the CPU, through no GXM
+/// call at all. There is no call to hook, so no invalidation list can be complete,
+/// and an incomplete one shows up as a stale texture: a silent visual bug.
+///
+/// So the snapshot is CHECKED rather than trusted. On each first use in a scene the
+/// retained bytes are compared against guest memory borrowed in place
+/// ([`GuestMemory::borrow`]) - no second copy - and only a texture that actually
+/// changed is re-read. That is exactly as correct as re-reading everything, because
+/// the compared bytes are the same bytes the copy would have taken; it just replaces
+/// an allocate-plus-copy with a `memcmp` that early-exits on the first difference.
+///
+/// A backing that cannot lend its bytes (`borrow` returns `None`) falls back to
+/// re-reading every scene - slower, still correct.
+#[derive(Default)]
+struct TextureSnapshots {
+    entries: HashMap<(u32, usize), Arc<[u8]>>,
+    /// Total bytes held, so the cache cannot grow without bound across a long run.
+    bytes: usize,
+    /// Entries already checked this scene, so a texture bound by fifty draws is
+    /// compared once, not fifty times. The cache's claim is "these bytes are
+    /// unchanged since the last frame", and once per scene is what tests it.
+    checked_this_scene: std::collections::HashSet<(u32, usize)>,
+    /// Mean colour of a snapshot, keyed by the identity of the byte buffer itself and
+    /// holding a strong reference to it.
+    ///
+    /// The flat ambient term of every lit draw is the average of the bound irradiance
+    /// map ([`crate::render::texture_mean_rgb`]), which samples a thousand texels and
+    /// decodes each - per DRAW, for a value that is a property of the texture. Keyed
+    /// by the buffer's address rather than the texture's guest address because that is
+    /// what actually determines the answer: a re-read allocates a new buffer, so a
+    /// changed texture cannot hit a stale mean. The strong reference is what makes the
+    /// address a valid key - without it a freed buffer's address could be reused.
+    means: HashMap<usize, ([f32; 3], Arc<[u8]>)>,
+}
+
+/// Byte budget for retained texture snapshots. Past it the cache is cleared whole
+/// (and says so): a level's working set is what it holds, and a title that exceeds
+/// this is telling us something worth seeing rather than something to silently trim.
+const TEXTURE_SNAPSHOT_BUDGET: usize = 192 << 20;
+
+impl TextureSnapshots {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current bytes of the texture of `len` bytes at guest address `addr`,
+    /// reusing the retained snapshot when guest memory still holds the same bytes.
+    fn get_or_read(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
+        if let Some(p) = self.entries.get(&(addr, len)) {
+            // Already compared this scene: the guest cannot have run since (a host
+            // call is not preemptible), so nothing can have changed.
+            if !self.checked_this_scene.insert((addr, len)) {
+                return p.clone();
+            }
+            if let Some(live) = ctx.borrow_bytes(addr, len) {
+                if live == &p[..] {
+                    return p.clone();
+                }
+            }
+        }
+        let bytes: Arc<[u8]> = ctx.read_bytes(addr, len).into();
+        crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
+        self.insert(addr, len, bytes.clone());
+        bytes
+    }
+
+    fn insert(&mut self, addr: u32, len: usize, bytes: Arc<[u8]>) {
+        if self.bytes + bytes.len() > TEXTURE_SNAPSHOT_BUDGET {
+            tracing::info!(
+                target: "vitaslop::gxm",
+                held_mb = self.bytes >> 20,
+                entries = self.entries.len(),
+                "texture snapshot cache over budget - cleared"
+            );
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        if let Some(old) = self.entries.insert((addr, len), bytes.clone()) {
+            self.bytes -= old.len();
+        }
+        self.bytes += bytes.len();
+    }
+
+    /// Start a new scene: every retained entry becomes due for one comparison again.
+    fn begin_scene(&mut self) {
+        self.checked_this_scene.clear();
+    }
+
+    /// The mean colour of `t`'s pixels, computed once per distinct byte buffer.
+    /// `None` for a texture whose format cannot be sampled, exactly as
+    /// [`crate::render::texture_mean_rgb`] reports it.
+    fn mean_rgb(&mut self, t: &crate::capture::BoundTexture) -> Option<[f32; 3]> {
+        let key = Arc::as_ptr(&t.pixels) as *const u8 as usize;
+        if let Some((m, _)) = self.means.get(&key) {
+            return Some(*m);
+        }
+        let m = crate::render::texture_mean_rgb(t)?;
+        // Bounded by the snapshot cache it shadows: a buffer that is dropped there
+        // would keep its entry alive here, so drop entries whose buffer this cache is
+        // now the only owner of.
+        self.means.retain(|_, (_, buf)| Arc::strong_count(buf) > 1);
+        self.means.insert(key, (m, t.pixels.clone()));
+        Some(m)
+    }
+
+    /// Drop every snapshot overlapping `[addr, addr+len)`, for memory the guest has
+    /// released. Not needed for correctness (the comparison covers content changes),
+    /// but a snapshot of freed memory is dead weight the cache should not hold.
+    fn invalidate_range(&mut self, addr: u32, len: usize) {
+        let end = addr as u64 + len as u64;
+        let mut freed = 0usize;
+        self.entries.retain(|&(a, l), bytes| {
+            let overlaps = (a as u64) < end && (addr as u64) < (a as u64 + l as u64);
+            if overlaps {
+                freed += bytes.len();
+            }
+            !overlaps
+        });
+        self.bytes -= freed;
+    }
+}
 
 mod pdraw {
     /// "PDRW" - the initialised-block tag in word 0.
     pub const MAGIC: u32 = 0x5744_5250;
     pub const OFF_MAGIC: u32 = 0;
     pub const OFF_VERTEX_PROGRAM: u32 = 4;
-    pub const OFF_STREAM0: u32 = 8;
+    /// Stream `i`'s buffer pointer, one word each: words 2, 7, 8, 9. Stream 0 keeps word 2
+    /// (where it has always been) and the rest use the words that were spare.
+    pub const OFF_STREAM: [u32; super::MAX_VERTEX_STREAMS] = [8, 28, 32, 36];
     pub const OFF_PRIMITIVE: u32 = 12;
     pub const OFF_INDEX_FORMAT: u32 = 16;
     pub const OFF_INDEX_ADDR: u32 = 20;
     pub const OFF_INDEX_COUNT: u32 = 24;
-    /// Words 7..10 are unused; kept so the block is exactly the reported size.
+    /// Word 10 is unused; kept so the block is exactly the reported size.
     pub const WORDS: u32 = 11;
+}
+
+/// `SCE_GXM_MAX_VERTEX_STREAMS`. A vertex program may source its attributes from up to
+/// this many separate guest buffers.
+pub(crate) const MAX_VERTEX_STREAMS: usize = 4;
+
+/// One reflected uniform parameter: where its components sit in the program's default
+/// uniform buffer and how they are packed. `res` is a 4-byte-register offset; each of
+/// the `comp` components is an F16 (2 bytes) when `f16`, else an F32.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParamRef {
+    res: u32,
+    comp: u8,
+    f16: bool,
+}
+
+/// Everything the capture needs to know about ONE `SceGxmProgram`, reflected out of
+/// its parameter table.
+///
+/// # Why this is cached
+/// A program's parameter table is immutable for the life of the registration: it is
+/// part of the compiled shader blob the guest hands to the shader patcher. Every field
+/// here is therefore a constant of the program, while the VALUES at these offsets
+/// change every draw.
+///
+/// Reflecting per draw meant five independent walks of the table (world/projection,
+/// exposure, shader-expansion, albedo sampler, material) each allocating a `String`
+/// per parameter to lowercase and substring-match its name. At a couple of hundred
+/// draws a frame that was tens of thousands of allocations per frame and the single
+/// most expensive thing a `sceGxmDraw` did. One walk, once per program, replaces it.
+///
+/// Every field is `Copy`, so a draw takes the whole reflection out of the cache
+/// without touching the allocator.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ProgramReflection {
+    /// Float offset of the model->world 4x4 (`vsModelToWorldMatrix`).
+    world_off: Option<u32>,
+    /// Float offset of the world->projection 4x4.
+    proj_off: Option<u32>,
+    /// Float offset of the scene exposure scalar (`vsCoarseExposureReg`).
+    exposure_off: Option<u32>,
+    /// Does this vertex program SYNTHESIZE its primitive (point sprite / billboard)?
+    shader_expanded: bool,
+    /// Texture unit of the sampler that reads as the albedo / base-colour map.
+    albedo_unit: Option<u32>,
+    /// The base-colour tint multiplying the sampled albedo.
+    tint: Option<ParamRef>,
+    /// Direction and colour of the single directional light the material model uses.
+    light_dir: Option<ParamRef>,
+    light_col: Option<ParamRef>,
+    /// Size of the program's default uniform buffer, from the table's extent in
+    /// floats. See [`VitaState::reflected_uniform_size_bytes`].
+    uniform_size_bytes: u32,
 }
 
 /// All host state for one run: the guest allocator, handle tables, the capture
@@ -892,7 +1177,14 @@ pub struct VitaState {
     next_handle: u32,
     next_uid: i32,
     memblocks: Vec<MemBlock>,
-    vertex_programs: Vec<(u32, VertexProgramInfo)>,
+    /// Vertex program handle -> its attribute layout. A map, not a list: every draw
+    /// resolves the bound handle several times, and a title registers hundreds of
+    /// programs, so a linear scan here was per-draw cost that grew with the level.
+    vertex_programs: std::collections::HashMap<u32, VertexProgramInfo>,
+    /// Reflected constants of each `SceGxmProgram`, keyed by its header address. See
+    /// [`ProgramReflection`]; cleared whenever a program is registered or unregistered,
+    /// which is the only moment a header address can come to mean a different program.
+    program_reflection: std::collections::HashMap<u32, ProgramReflection>,
     color_surfaces: Vec<(u32, crate::capture::ColorSurface)>,
     /// Guest address of the displayQueue callback from sceGxmInitialize, and its
     /// data size. Recorded for faithfulness; the present address is captured from
@@ -907,7 +1199,11 @@ pub struct VitaState {
     // colour) and prefer it over a normal/spec/env map when picking the one texture
     // the capture renderer samples. 0 when no fragment program is bound.
     bound_fragment_program_header: u32,
-    bound_stream0: u32,
+    /// The guest vertex buffer bound to each stream index by `sceGxmSetVertexStream`.
+    /// GXM allows up to [`MAX_VERTEX_STREAMS`]; a mesh that splits per-vertex data from
+    /// per-instance data (particles, decals, instanced props) uses more than one, and
+    /// capturing only stream 0 decodes those attributes out of the wrong buffer.
+    bound_streams: [u32; MAX_VERTEX_STREAMS],
     pending_uniforms: Vec<f32>,
     // Threads the program created, and any pending synchronous thread run raised
     // by sceKernelStartThread (drained by the engine host after the call).
@@ -1029,16 +1325,20 @@ pub struct VitaState {
     /// channel swizzle (only a 3-bit field survives), so we keep the full 32-bit
     /// format the guest passed for an exact decode; a texture the guest fills
     /// directly (a `.gxt` blob) is absent here and falls back to control-word parse.
-    texture_formats: Vec<(u32, u32)>,
+    ///
+    /// Maps, not lists: these three are looked up once per BOUND TEXTURE UNIT per
+    /// DRAW, while they grow with every distinct texture the title has ever touched.
+    /// A linear scan made the capture cost of a frame grow with the size of the level.
+    texture_formats: std::collections::HashMap<u32, u32>,
     /// Sampler wrap/LOD state per guest `SceGxmTexture*`, as `(addr, (u_addr_mode,
     /// v_addr_mode, lod_bias))`, set by `sceGxmTextureSet{U,V}AddrMode[Safe]` /
     /// `SetLodBias`. Kept beside `texture_formats` (rather than mutated into the
     /// guest control words) so recording the state never risks corrupting a struct
     /// the guest re-reads. Absent = GXM defaults (REPEAT/REPEAT/0).
-    texture_samplers: Vec<(u32, (u32, u32, u32))>,
+    texture_samplers: std::collections::HashMap<u32, (u32, u32, u32)>,
     /// Extra sticky per-texture state (`mipCount`, byte stride, min/mag/mip filter,
     /// gamma) the `sceGxmTextureGet*` getters read back, keyed by `SceGxmTexture*`.
-    texture_extra: Vec<(u32, TextureExtra)>,
+    texture_extra: std::collections::HashMap<u32, TextureExtra>,
     /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`,
     /// keyed by `SceGxmColorSurface*`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
     color_surface_gamma: Vec<(u32, u32)>,
@@ -1056,12 +1356,30 @@ pub struct VitaState {
     /// `SceGxmFragmentProgram*` handle -> its `SceGxmProgram*`, recorded at
     /// `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed fragment state can
     /// size its default uniform buffer. (Vertex programs carry this in `VertexProgramInfo`.)
-    fragment_programs: Vec<(u32, u32)>,
+    fragment_programs: std::collections::HashMap<u32, u32>,
+    /// The recycled arena the default uniform buffers are handed out of (guest ptr,
+    /// byte size, and the bump offset within it). See
+    /// [`Self::alloc_default_uniform_buffer`].
+    uniform_ring: u32,
+    uniform_ring_size: u32,
+    uniform_ring_cursor: u32,
+    /// Set once, when a single scene has asked for more default-uniform bytes than the
+    /// ring holds, so the wrap is reported exactly once instead of every frame.
+    uniform_ring_wrapped: bool,
     /// The vertex default uniform buffer bound for the next draw (guest ptr, byte size),
     /// from `sceGxmSetPrecomputedVertexState`. Read into the draw's uniforms at record
     /// time; 0 = fall back to the `sceGxmSetUniformDataF` path (`pending_uniforms`).
     bound_vertex_uniform_buf: u32,
     bound_vertex_uniform_size: u32,
+    /// The `SceGxmProgram*` the bound vertex uniform buffer was sized and filled FOR.
+    /// A default uniform buffer belongs to one program: its contents are that program's
+    /// SA bank, laid out by that program's parameter table. GXM invalidates the
+    /// reservation when the vertex program changes, so a draw whose program no longer
+    /// matches this must NOT read the buffer - doing so hands one object's uniforms
+    /// (typically its model matrix) to a completely different object, which on screen
+    /// looks like a piece of geometry welded to whatever was drawn before it.
+    /// See [`Self::stale_vertex_uniforms`].
+    vertex_uniform_header: u32,
     /// The FRAGMENT default uniform buffer bound for the next draw (guest ptr, byte size),
     /// from `sceGxmSetPrecomputedFragmentState` or `sceGxmReserveFragmentDefaultUniformBuffer`.
     /// Holds the per-material fragment uniforms - base-colour tint (`AlbedoColour`/
@@ -1072,6 +1390,13 @@ pub struct VitaState {
     /// by a dark `AlbedoColour`, is why unlit wheels rendered as white rings). 0 = unbound.
     bound_fragment_uniform_buf: u32,
     bound_fragment_uniform_size: u32,
+    /// The `SceGxmProgram*` the bound fragment uniform buffer was sized and filled for,
+    /// the fragment-stage counterpart of [`Self::vertex_uniform_header`].
+    fragment_uniform_header: u32,
+    /// `(stage, bound-for program, drawing program)` triples already reported by
+    /// [`Self::stale_uniforms`], so the warning fires once per pair instead of once per
+    /// draw (hundreds a frame).
+    reported_stale_uniforms: std::collections::HashSet<(&'static str, u32, u32)>,
     /// The GPU notification region: a guest buffer of `SCE_GXM_NOTIFICATION_COUNT`
     /// u32 slots handed out by `sceGxmGetNotificationRegion`, lazily allocated on
     /// first use (0 = not yet allocated). Scenes complete synchronously here, so a
@@ -1125,14 +1450,15 @@ impl VitaState {
             next_handle: HANDLE_BASE + 1,
             next_uid: 0x100,
             memblocks: Vec::new(),
-            vertex_programs: Vec::new(),
+            vertex_programs: std::collections::HashMap::new(),
+            program_reflection: std::collections::HashMap::new(),
             color_surfaces: Vec::new(),
             display_queue_cb: 0,
             display_queue_cb_data_size: 0,
             scene: None,
             bound_vertex_program: 0,
             bound_fragment_program_header: 0,
-            bound_stream0: 0,
+            bound_streams: [0; MAX_VERTEX_STREAMS],
             pending_uniforms: Vec::new(),
             threads: Vec::new(),
             pending_reentry: None,
@@ -1174,18 +1500,25 @@ impl VitaState {
             tls_bases: Vec::new(),
             shader_programs: Vec::new(),
             bound_textures: Vec::new(),
-            texture_formats: Vec::new(),
-            texture_samplers: Vec::new(),
-            texture_extra: Vec::new(),
+            texture_formats: std::collections::HashMap::new(),
+            texture_samplers: std::collections::HashMap::new(),
+            texture_extra: std::collections::HashMap::new(),
             color_surface_gamma: Vec::new(),
             texture_snapshots: TextureSnapshots::new(),
             precomputed_vertex_states: std::collections::HashMap::new(),
             precomputed_fragment_states: std::collections::HashMap::new(),
-            fragment_programs: Vec::new(),
+            fragment_programs: std::collections::HashMap::new(),
+            uniform_ring: 0,
+            uniform_ring_size: 0,
+            uniform_ring_cursor: 0,
+            uniform_ring_wrapped: false,
             bound_vertex_uniform_buf: 0,
             bound_vertex_uniform_size: 0,
+            vertex_uniform_header: 0,
             bound_fragment_uniform_buf: 0,
             bound_fragment_uniform_size: 0,
+            fragment_uniform_header: 0,
+            reported_stale_uniforms: std::collections::HashSet::new(),
             notification_region: 0,
             render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
@@ -1214,6 +1547,10 @@ impl VitaState {
     pub fn register_shader_program(&mut self, program_header: u32) -> u32 {
         let handle = self.new_handle();
         self.shader_programs.push((handle, program_header));
+        // A registration is the one moment a header address can begin to mean a
+        // different program (the guest may have freed and reallocated the blob), so
+        // nothing reflected earlier may be trusted past it.
+        self.invalidate_program_reflection();
         handle
     }
 
@@ -2395,21 +2732,51 @@ impl VitaState {
         self.event_flags.iter().find(|(u, _)| *u == uid).map(|(_, p)| *p).unwrap_or(0)
     }
 
+    /// Guest-region bytes reserved at the top for the MAIN THREAD'S STACK, which the
+    /// heap may never hand out.
+    ///
+    /// The main thread's stack pointer starts near the top of the region and grows
+    /// DOWN, while this bump allocator grows UP; nothing but this reservation keeps
+    /// them apart. Capping only at the region ceiling is not enough, and the failure is
+    /// vicious: the heap marches into live stack frames and the next perfectly ordinary
+    /// guest write - a `memcpy` into a buffer we just handed out - silently overwrites a
+    /// caller's saved registers. The crash then lands in an innocent function, frames
+    /// and often minutes later, with a callee-saved register holding a float.
+    ///
+    /// The reserve covers the host's startup headroom above the initial SP plus room
+    /// for real stack depth beneath it.
+    const MAIN_STACK_RESERVE_BYTES: u32 = 5 * 1024 * 1024;
+
     /// Allocate `size` bytes of real guest memory aligned to `align`, returning
     /// the guest address (0 on exhaustion). Deterministic: a pure function of the
-    /// allocation order. The bump cursor is capped at the guest region ceiling
-    /// (`base + mem_bytes`): the indirect-dispatch address table lives immediately
-    /// above that, so an unbounded heap must never be handed an address that reaches
-    /// it (a stray guest/host write there would corrupt the table and fault every
-    /// later indirect call). An allocation past the ceiling is a real
-    /// out-of-memory: return 0 rather than a colliding pointer.
+    /// allocation order. The bump cursor is capped below the guest region ceiling
+    /// (`base + mem_bytes`) by [`Self::MAIN_STACK_RESERVE_BYTES`), for two reasons: the
+    /// indirect-dispatch address table lives immediately above the ceiling (a stray
+    /// write there corrupts the table and faults every later indirect call), and the
+    /// main thread's stack descends through the top of the region itself. An allocation
+    /// that would reach either is a real out-of-memory: return 0 - loudly - rather than
+    /// a pointer that aliases something live.
     pub fn galloc(&mut self, size: u32, align: u32) -> u32 {
         let a = align.max(4);
         let p = (self.alloc_cursor + a - 1) & !(a - 1);
-        let ceiling = self.base.wrapping_add(self.mem_bytes);
+        let ceiling = self
+            .base
+            .wrapping_add(self.mem_bytes)
+            .wrapping_sub(Self::MAIN_STACK_RESERVE_BYTES);
         let end = p.wrapping_add(size.max(4));
         if end > ceiling || end < p {
-            return 0; // heap exhausted; do not encroach on the dispatch table
+            // Silence here is what turns a leak into memory corruption somewhere else
+            // entirely, so an exhausted heap always says so.
+            tracing::error!(
+                target: "vitaslop::err",
+                size,
+                align,
+                cursor = format_args!("{:#x}", self.alloc_cursor),
+                ceiling = format_args!("{ceiling:#x}"),
+                "guest heap EXHAUSTED - returning a null allocation rather than encroaching \
+                 on the main thread stack or the dispatch table"
+            );
+            return 0;
         }
         self.alloc_cursor = end;
         p
@@ -2436,29 +2803,31 @@ impl VitaState {
         self.memblocks.iter().find(|b| b.uid == uid).map(|b| b.base)
     }
 
-    /// Record a vertex program's attribute layout and stream stride.
+    /// Record a vertex program's attribute layout and per-stream strides.
     pub fn set_vertex_program(
         &mut self,
         handle: u32,
         attributes: Vec<crate::capture::VertexAttribute>,
-        stride: u32,
+        streams: Vec<(u32, bool)>,
         program_header: u32,
     ) {
-        self.vertex_programs.push((handle, VertexProgramInfo { attributes, stride, program_header }));
+        let streams =
+            streams.into_iter().map(|(stride, per_instance)| VertexStreamInfo { stride, per_instance }).collect();
+        self.vertex_programs.insert(handle, VertexProgramInfo { attributes, streams, program_header });
     }
 
     /// The `SceGxmProgram*` a vertex program handle was created from, if recorded.
     fn vertex_program_header(&self, handle: u32) -> u32 {
-        self.vertex_programs.iter().find(|(h, _)| *h == handle).map(|(_, i)| i.program_header).unwrap_or(0)
+        self.vertex_programs.get(&handle).map(|i| i.program_header).unwrap_or(0)
     }
 
     /// Record `sceGxmShaderPatcherCreateFragmentProgram`'s handle -> `SceGxmProgram*`.
     pub fn set_fragment_program(&mut self, handle: u32, program_header: u32) {
-        self.fragment_programs.push((handle, program_header));
+        self.fragment_programs.insert(handle, program_header);
     }
 
     fn fragment_program_header(&self, handle: u32) -> u32 {
-        self.fragment_programs.iter().find(|(h, _)| *h == handle).map(|(_, p)| *p).unwrap_or(0)
+        self.fragment_programs.get(&handle).copied().unwrap_or(0)
     }
 
     /// Record a color surface, keyed by its guest struct address.
@@ -2469,7 +2838,14 @@ impl VitaState {
     // --- scene assembly (used by the gxm handlers) ---
 
     pub fn begin_scene(&mut self, color_surface_addr: u32) {
-        self.texture_snapshots.clear();
+        // Texture snapshots deliberately SURVIVE the scene - see `TextureSnapshots`
+        // for what invalidates them instead. Only the verifier is re-armed here.
+        self.texture_snapshots.begin_scene();
+        // Recycle the default-uniform arena for the new scene. Every draw's uniforms
+        // are snapshotted into the draw at record time, so last scene's buffers are
+        // dead by now; see [`Self::alloc_default_uniform_buffer`] for what happens
+        // when this is NOT recycled.
+        self.uniform_ring_cursor = 0;
         let color = self
             .color_surfaces
             .iter()
@@ -2490,16 +2866,40 @@ impl VitaState {
         self.bound_fragment_program_header = self.fragment_program_header(handle);
     }
 
-    pub fn bind_stream0(&mut self, addr: u32) {
-        self.bound_stream0 = addr;
+    /// `sceGxmSetVertexStream(context, streamIndex, data)`. A stream index beyond
+    /// [`MAX_VERTEX_STREAMS`] is not a thing GXM can produce, so it is reported rather
+    /// than silently dropped.
+    pub fn bind_stream(&mut self, index: u32, addr: u32) {
+        match self.bound_streams.get_mut(index as usize) {
+            Some(slot) => *slot = addr,
+            None => tracing::warn!(
+                target: "vitaslop::gxm",
+                index,
+                data = format_args!("{addr:#x}"),
+                "setVertexStream on a stream index beyond SCE_GXM_MAX_VERTEX_STREAMS - DROPPED"
+            ),
+        }
     }
 
     /// Record `sceGxmSetFragmentTexture(unit, texture)`: remember which guest
     /// `SceGxmTexture*` is bound to sampler `unit`. A zero address unbinds it.
+    /// Kept SORTED by unit: every draw reads this list and needs unit 0 first, so
+    /// maintaining the order at bind time (a handful of units, a handful of times per
+    /// draw) replaces cloning and re-sorting it inside every draw.
     pub fn bind_fragment_texture(&mut self, unit: u32, texture_addr: u32) {
-        self.bound_textures.retain(|(u, _)| *u != unit);
-        if texture_addr != 0 {
-            self.bound_textures.push((unit, texture_addr));
+        match self.bound_textures.binary_search_by_key(&unit, |(u, _)| *u) {
+            Ok(i) => {
+                if texture_addr == 0 {
+                    self.bound_textures.remove(i);
+                } else {
+                    self.bound_textures[i].1 = texture_addr;
+                }
+            }
+            Err(i) => {
+                if texture_addr != 0 {
+                    self.bound_textures.insert(i, (unit, texture_addr));
+                }
+            }
         }
     }
 
@@ -2507,15 +2907,12 @@ impl VitaState {
     /// `sceGxmTextureInit*`/`SetFormat`), so a later decode recovers the exact
     /// channel swizzle rather than the lossy 3-bit control-word field.
     pub fn set_texture_format(&mut self, texture_addr: u32, format: u32) {
-        self.texture_formats.retain(|(a, _)| *a != texture_addr);
-        self.texture_formats.push((texture_addr, format));
+        self.texture_formats.insert(texture_addr, format);
     }
 
+
     pub fn texture_format(&self, texture_addr: u32) -> Option<u32> {
-        self.texture_formats
-            .iter()
-            .find(|(a, _)| *a == texture_addr)
-            .map(|(_, f)| *f)
+        self.texture_formats.get(&texture_addr).copied()
     }
 
     /// Mutable access to the live GXM fixed-function state, so a `sceGxmSet*` setter
@@ -2527,23 +2924,13 @@ impl VitaState {
     /// The recorded sampler wrap/LOD state for a `SceGxmTexture*`, defaulting to the
     /// GXM defaults (REPEAT/REPEAT/0) when the guest never set it.
     fn texture_sampler(&self, texture_addr: u32) -> (u32, u32, u32) {
-        self.texture_samplers
-            .iter()
-            .find(|(a, _)| *a == texture_addr)
-            .map(|(_, s)| *s)
-            .unwrap_or((0, 0, 0))
+        self.texture_samplers.get(&texture_addr).copied().unwrap_or((0, 0, 0))
     }
 
     /// Update one component of a texture's sampler state, keyed by its guest address.
     /// `which`: 0 = U addr mode, 1 = V addr mode, 2 = LOD bias.
     pub fn set_texture_sampler(&mut self, texture_addr: u32, which: u8, value: u32) {
-        let slot = match self.texture_samplers.iter_mut().find(|(a, _)| *a == texture_addr) {
-            Some((_, s)) => s,
-            None => {
-                self.texture_samplers.push((texture_addr, (0, 0, 0)));
-                &mut self.texture_samplers.last_mut().unwrap().1
-            }
-        };
+        let slot = self.texture_samplers.entry(texture_addr).or_insert((0, 0, 0));
         match which {
             0 => slot.0 = value,
             1 => slot.1 = value,
@@ -2559,21 +2946,12 @@ impl VitaState {
 
     /// The sticky extra state for a `SceGxmTexture*`, or GXM defaults if never set.
     fn texture_extra(&self, texture_addr: u32) -> TextureExtra {
-        self.texture_extra
-            .iter()
-            .find(|(a, _)| *a == texture_addr)
-            .map(|(_, e)| *e)
-            .unwrap_or_default()
+        self.texture_extra.get(&texture_addr).copied().unwrap_or_default()
     }
 
     /// Mutable slot for a texture's extra state, inserting GXM defaults on first touch.
     fn texture_extra_mut(&mut self, texture_addr: u32) -> &mut TextureExtra {
-        if let Some(i) = self.texture_extra.iter().position(|(a, _)| *a == texture_addr) {
-            &mut self.texture_extra[i].1
-        } else {
-            self.texture_extra.push((texture_addr, TextureExtra::default()));
-            &mut self.texture_extra.last_mut().unwrap().1
-        }
+        self.texture_extra.entry(texture_addr).or_default()
     }
 
     /// Record the mip count / explicit byte stride a `sceGxmTextureInit*` established
@@ -2692,8 +3070,14 @@ impl VitaState {
         stream_index: u32,
         data: u32,
     ) {
-        if stream_index == 0 {
-            ctx.write_u32(precomputed + pdraw::OFF_STREAM0, data);
+        match pdraw::OFF_STREAM.get(stream_index as usize) {
+            Some(&off) => ctx.write_u32(precomputed + off, data),
+            None => tracing::warn!(
+                target: "vitaslop::gxm",
+                stream_index,
+                data = format_args!("{data:#x}"),
+                "precomputedDrawSetVertexStream beyond SCE_GXM_MAX_VERTEX_STREAMS - DROPPED"
+            ),
         }
     }
 
@@ -2722,7 +3106,7 @@ impl VitaState {
         }
         Some(PrecomputedDraw {
             vertex_program: ctx.read_u32(precomputed + pdraw::OFF_VERTEX_PROGRAM),
-            stream0: ctx.read_u32(precomputed + pdraw::OFF_STREAM0),
+            streams: std::array::from_fn(|i| ctx.read_u32(precomputed + pdraw::OFF_STREAM[i])),
             primitive: ctx.read_u32(precomputed + pdraw::OFF_PRIMITIVE),
             index_format: ctx.read_u32(precomputed + pdraw::OFF_INDEX_FORMAT),
             index_addr: ctx.read_u32(precomputed + pdraw::OFF_INDEX_ADDR),
@@ -2746,7 +3130,7 @@ impl VitaState {
             return;
         };
         self.bound_vertex_program = d.vertex_program;
-        self.bound_stream0 = d.stream0;
+        self.bound_streams = d.streams;
         self.record_draw(ctx, d.primitive, d.index_format, d.index_addr, d.index_count);
     }
 
@@ -2817,23 +3201,31 @@ impl VitaState {
     /// the next `record_draw` reads its uniforms from guest memory. A state that was never
     /// built (or a null bind) clears the binding, restoring the direct uniform path.
     pub fn bind_precomputed_vertex_state(&mut self, ctx: &GuestCtx, state: u32) {
-        match self.precomputed_vertex_states.get(&state) {
-            Some(s) => {
-                self.bound_vertex_uniform_buf = s.default_uniform_buffer;
+        // The fields are copied out before the reflection lookup below, which needs
+        // `&mut self` to fill its cache.
+        let bound = self
+            .precomputed_vertex_states
+            .get(&state)
+            .map(|s| (s.default_uniform_buffer, s.program_header));
+        match bound {
+            Some((default_uniform_buffer, program_header)) => {
+                self.bound_vertex_uniform_buf = default_uniform_buffer;
+                self.vertex_uniform_header = program_header;
                 self.bound_vertex_uniform_size = self
-                    .reflected_uniform_size_bytes(ctx, s.program_header)
-                    .max(default_uniform_buffer_bytes(ctx, s.program_header));
+                    .reflected_uniform_size_bytes(ctx, program_header)
+                    .max(default_uniform_buffer_bytes(ctx, program_header));
                 tracing::trace!(
                     target: "vitaslop::gxm",
                     buffer = format_args!("{:#x}", self.bound_vertex_uniform_buf),
                     size = self.bound_vertex_uniform_size,
-                    header = format_args!("{:#x}", s.program_header),
+                    header = format_args!("{program_header:#x}"),
                     "bindPrecomputedVertexState"
                 );
             }
             None => {
                 self.bound_vertex_uniform_buf = 0;
                 self.bound_vertex_uniform_size = 0;
+                self.vertex_uniform_header = 0;
             }
         }
     }
@@ -2852,6 +3244,7 @@ impl VitaState {
         // reads the per-material fragment uniforms (tint / light / fog) from guest memory,
         // exactly as the precomputed vertex path binds the vertex uniform buffer.
         self.bound_fragment_uniform_buf = uniform_buf;
+        self.fragment_uniform_header = header;
         self.bound_fragment_uniform_size = self
             .reflected_uniform_size_bytes(ctx, header)
             .max(default_uniform_buffer_bytes(ctx, header))
@@ -2867,14 +3260,68 @@ impl VitaState {
     /// size is read from the program header (+0x2C) and clamped so an unresolved header
     /// cannot request an absurd allocation; a program with no default uniforms yields
     /// size 0, and the draw falls back to the `sceGxmSetUniformDataF` capture.
+    /// Hand out `size` bytes of default-uniform space from a RECYCLED per-scene arena.
+    ///
+    /// A title reserves a default uniform buffer once per draw per stage - hundreds of
+    /// times a frame, tens of thousands of times a second. Bump-allocating a fresh
+    /// block for each (which is what this did until 2026-07-25) leaks the whole arena
+    /// in minutes: the cursor marches up through guest memory until it reaches the
+    /// region the MAIN THREAD'S STACK descends through, and then the guest's own
+    /// `memcpy` of its uniforms into "its" buffer quietly overwrites live stack frames.
+    /// The damage surfaces far away and much later - as a callee-saved register that
+    /// comes back from a `POP` holding a float, and a crash in a function that did
+    /// nothing wrong. On real hardware the default uniform buffer IS a ring the driver
+    /// recycles, so recycling is also the faithful behaviour.
+    ///
+    /// The cursor resets per scene ([`Self::begin_scene`]), so within one frame every
+    /// reserve still gets a distinct address exactly as before - only the growth across
+    /// frames is gone.
+    fn alloc_default_uniform_buffer(&mut self, size: u32) -> u32 {
+        let size = size.max(256);
+        if self.uniform_ring == 0 {
+            self.uniform_ring = self.galloc(Self::UNIFORM_RING_BYTES, 16);
+            self.uniform_ring_size = if self.uniform_ring == 0 { 0 } else { Self::UNIFORM_RING_BYTES };
+        }
+        if self.uniform_ring == 0 {
+            // The arena could not supply a ring at all; fall back to a direct
+            // allocation so the call still returns something usable.
+            return self.galloc(size, 16);
+        }
+        let off = (self.uniform_ring_cursor + 15) & !15;
+        if off + size > self.uniform_ring_size {
+            // One scene wanted more than the ring holds. Wrapping aliases two live
+            // buffers, which is a real (if rare) fidelity loss, so say so once rather
+            // than silently returning overlapping memory.
+            if !self.uniform_ring_wrapped {
+                self.uniform_ring_wrapped = true;
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    ring = Self::UNIFORM_RING_BYTES,
+                    wanted = off + size,
+                    "default-uniform ring wrapped WITHIN one scene - buffers now alias; raise UNIFORM_RING_BYTES"
+                );
+            }
+            self.uniform_ring_cursor = size;
+            return self.uniform_ring;
+        }
+        self.uniform_ring_cursor = off + size;
+        self.uniform_ring + off
+    }
+
+    /// Bytes of recycled default-uniform space. One scene of this title's main screen
+    /// uses ~340 draws x 2 stages x <=4 KiB worst case; 8 MiB leaves generous headroom
+    /// while staying a rounding error against the guest region.
+    const UNIFORM_RING_BYTES: u32 = 8 * 1024 * 1024;
+
     pub fn reserve_vertex_uniform_buffer(&mut self, ctx: &mut GuestCtx) -> u32 {
         let header = self.vertex_program_header(self.bound_vertex_program);
         let header_size = default_uniform_buffer_bytes(ctx, header);
         let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
-        let buf = self.galloc(size.max(256), 16);
+        let buf = self.alloc_default_uniform_buffer(size);
         poison_uniform_buffer(ctx, buf, size);
         self.bound_vertex_uniform_buf = buf;
         self.bound_vertex_uniform_size = size;
+        self.vertex_uniform_header = header;
         tracing::trace!(
             target: "vitaslop::gxm",
             program = format_args!("{:#x}", self.bound_vertex_program),
@@ -2896,9 +3343,10 @@ impl VitaState {
         let header = self.bound_fragment_program_header;
         let header_size = default_uniform_buffer_bytes(ctx, header);
         let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
-        let buf = self.galloc(size.max(256), 16);
+        let buf = self.alloc_default_uniform_buffer(size);
         self.bound_fragment_uniform_buf = buf;
         self.bound_fragment_uniform_size = size;
+        self.fragment_uniform_header = header;
         buf
     }
 
@@ -2908,9 +3356,15 @@ impl VitaState {
     /// later `sceKernelGetMemBlockBase(uid)` no longer resolves it, matching the guest-
     /// visible contract that the id is now invalid.
     pub fn free_memblock(&mut self, uid: i32) -> bool {
-        let before = self.memblocks.len();
-        self.memblocks.retain(|b| b.uid != uid);
-        self.memblocks.len() != before
+        let Some(i) = self.memblocks.iter().position(|b| b.uid == uid) else { return false };
+        let b = self.memblocks.remove(i);
+        // Drop any texture snapshot over the released memory. The bump arena never
+        // reuses an address, so nothing can be mistaken for this block's contents
+        // later - but a snapshot is only ever as valid as the memory behind it, and
+        // tying its lifetime to that memory is what keeps the cache's invalidation
+        // list complete rather than merely sufficient today.
+        self.texture_snapshots.invalidate_range(b.base, b.size as usize);
+        true
     }
 
     pub fn set_uniforms(&mut self, values: Vec<f32>) {
@@ -2961,22 +3415,57 @@ impl VitaState {
 
     /// The bound vertex program's layout, if recorded.
     fn bound_layout(&self) -> Option<&VertexProgramInfo> {
-        self.vertex_programs
-            .iter()
-            .find(|(h, _)| *h == self.bound_vertex_program)
-            .map(|(_, info)| info)
+        self.vertex_programs.get(&self.bound_vertex_program)
+    }
+
+    /// Is the bound default uniform buffer for `stage` left over from a DIFFERENT program
+    /// than the one about to draw?
+    ///
+    /// A default uniform buffer is one program's SA bank: its size and its every offset
+    /// come from that program's parameter table, and GXM invalidates the reservation when
+    /// the program changes (the app reserves again after each `sceGxmSetVertexProgram`).
+    /// A draw that arrives with the previous program's buffer still bound therefore reads
+    /// another object's uniforms through this program's layout. When lane 0 is a model
+    /// matrix - which it is for every 3D vertex program in this title - the result is a
+    /// mesh rendered at some other object's position, following it around the world.
+    ///
+    /// Reported unconditionally (once per program pair): a draw silently transformed by
+    /// the wrong matrix is indistinguishable from a faithful render except by eye, and
+    /// that is exactly how this class of bug survives.
+    fn stale_uniforms(&mut self, stage: &'static str, bound_for: u32, drawing: u32) -> bool {
+        // `drawing == 0` means the program header was never recorded (an unknown handle),
+        // so there is nothing to compare against and no evidence of staleness.
+        if bound_for == drawing || drawing == 0 {
+            return false;
+        }
+        if self.reported_stale_uniforms.insert((stage, bound_for, drawing)) {
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                stage,
+                bound_for = format_args!("{bound_for:#x}"),
+                drawing = format_args!("{drawing:#x}"),
+                "STALE default uniform buffer: bound for another program, DROPPED for this draw"
+            );
+        }
+        true
     }
 
     /// The vertex uniforms in effect for the next draw. On the precomputed path
     /// (`bound_vertex_uniform_buf` set by `sceGxmSetPrecomputedVertexState`) read the
     /// default uniform buffer straight from guest memory, sized by the program's default
     /// uniform buffer size. Otherwise use the `sceGxmSetUniformDataF` capture.
-    fn current_vertex_uniforms(&self, ctx: &GuestCtx) -> Vec<f32> {
+    ///
+    /// A buffer bound for a different vertex program is NOT this draw's SA bank - see
+    /// [`Self::stale_uniforms`] - so it is dropped rather than misread.
+    fn current_vertex_uniforms(&mut self, ctx: &GuestCtx) -> Vec<f32> {
+        let drawing = self.vertex_program_header(self.bound_vertex_program);
+        let bound_for = self.vertex_uniform_header;
+        if self.stale_uniforms("vertex", bound_for, drawing) {
+            return self.pending_uniforms.clone();
+        }
         if self.bound_vertex_uniform_buf != 0 && self.bound_vertex_uniform_size >= 4 {
             let count = (self.bound_vertex_uniform_size / 4) as usize;
-            (0..count)
-                .map(|i| ctx.read_f32(self.bound_vertex_uniform_buf + (i as u32) * 4))
-                .collect()
+            ctx.read_f32s(self.bound_vertex_uniform_buf, count)
         } else {
             self.pending_uniforms.clone()
         }
@@ -2991,13 +3480,39 @@ impl VitaState {
         index_addr: u32,
         index_count: u32,
     ) {
-        let (attributes, stride) = match self.bound_layout() {
-            Some(info) => (info.attributes.clone(), info.stride),
-            None => (Vec::new(), 0),
+        // Drop a default uniform buffer still bound for a DIFFERENT program before anything
+        // below reads it (see [`Self::stale_uniforms`]). The vertex stage is handled inside
+        // `current_vertex_uniforms`; the fragment stage has several independent readers
+        // (material reflection, the recompiler's `frag_sa`, the draw dump), so clear it once
+        // here and they all see the same truth.
+        if self.bound_fragment_uniform_buf != 0 {
+            let drawing = self.bound_fragment_program_header;
+            if self.stale_uniforms("fragment", self.fragment_uniform_header, drawing) {
+                self.bound_fragment_uniform_buf = 0;
+                self.bound_fragment_uniform_size = 0;
+            }
+        }
+        // Reflect both bound programs ONCE, here. Every name-based lookup below reads
+        // these instead of re-walking a parameter table (see `ProgramReflection`).
+        let vheader = self.vertex_program_header(self.bound_vertex_program);
+        let vref = self.reflect_program(ctx, vheader);
+        let fref = self.reflect_program(ctx, self.bound_fragment_program_header);
+        // The bound program's attributes, and the layout of each stream they name. The
+        // attributes are rewritten below onto the single interleaved buffer this draw is
+        // captured into, so what goes into the `Draw` is the REPACKED layout, not the
+        // guest's.
+        let (mut attributes, streams) = match self.bound_layout() {
+            Some(info) => {
+                let used = info.attributes.iter().map(|a| a.stream_index as usize).max().map(|m| m + 1).unwrap_or(0);
+                (info.attributes.clone(), (0..used).map(|i| info.stream(i)).collect::<Vec<_>>())
+            }
+            None => (Vec::new(), Vec::new()),
         };
         // Index element size: U16 (0) is 2 bytes, U32 is 4.
         let index_elem = if index_format == 0 { 2 } else { 4 };
-        let mut indices = ctx.read_bytes(index_addr, index_count as usize * index_elem);
+        let mut indices = crate::perf::time(crate::perf::Phase::DrawIndices, || {
+            ctx.read_bytes(index_addr, index_count as usize * index_elem)
+        });
         let index_of = |c: &[u8]| match index_elem {
             2 => u16::from_le_bytes([c[0], c[1]]) as u32,
             _ => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
@@ -3007,35 +3522,106 @@ impl VitaState {
         // tens of thousands, so copying `0..=max_index` per draw costs hundreds of megabytes a
         // frame (and reads far past what the draw can touch). Take the `min..=max` window and
         // rebase the indices onto it, which leaves every consumer's indexing unchanged.
-        let (min_index, max_index) = indices.chunks(index_elem).fold((u32::MAX, 0u32), |(lo, hi), c| {
-            let i = index_of(c);
-            (lo.min(i), hi.max(i))
-        });
-        let (first_vertex, vertex_count) = if min_index > max_index {
-            (0, 0) // no indices at all
-        } else {
-            (min_index, max_index - min_index + 1)
-        };
-        if first_vertex > 0 {
-            for c in indices.chunks_mut(index_elem) {
-                let rebased = index_of(c) - first_vertex;
-                match index_elem {
-                    2 => c[..2].copy_from_slice(&(rebased as u16).to_le_bytes()),
-                    _ => c[..4].copy_from_slice(&rebased.to_le_bytes()),
+        let (first_vertex, vertex_count) =
+            crate::perf::time(crate::perf::Phase::DrawIndexScan, || {
+                let (min_index, max_index) =
+                    indices.chunks(index_elem).fold((u32::MAX, 0u32), |(lo, hi), c| {
+                        let i = index_of(c);
+                        (lo.min(i), hi.max(i))
+                    });
+                let (first_vertex, vertex_count) = if min_index > max_index {
+                    (0, 0) // no indices at all
+                } else {
+                    (min_index, max_index - min_index + 1)
+                };
+                if first_vertex > 0 {
+                    for c in indices.chunks_mut(index_elem) {
+                        let rebased = index_of(c) - first_vertex;
+                        match index_elem {
+                            2 => c[..2].copy_from_slice(&(rebased as u16).to_le_bytes()),
+                            _ => c[..4].copy_from_slice(&rebased.to_le_bytes()),
+                        }
+                    }
+                }
+                (first_vertex, vertex_count)
+            });
+        // Interleave every stream this draw's attributes name into ONE buffer, and rewrite
+        // the attributes onto it. A vertex here is the concatenation of its row from each
+        // used stream, so the result is a plain single-stream mesh that indexes exactly as
+        // the guest's did - every consumer (software raster, fixed-function GPU path, the
+        // recompiler's repack) keeps working unchanged and now sees the data it was
+        // previously decoding out of stream 0 by mistake.
+        //
+        // `instance` is 0: only the first instance of an instanced draw is captured (see
+        // `sceGxmDrawInstanced`), so a per-instance stream contributes its row 0 to every
+        // vertex, which is what instance 0 reads.
+        let mut base = Vec::with_capacity(streams.len());
+        let mut stride = 0u32;
+        for s in &streams {
+            base.push(stride);
+            stride += s.stride;
+        }
+        let single_stream = matches!(streams.as_slice(), [s] if !s.per_instance);
+        let bound_streams = self.bound_streams;
+        let vertices = crate::perf::time(crate::perf::Phase::DrawVertices, || {
+            if single_stream {
+                // The overwhelmingly common case is one per-vertex stream, whose rows are
+                // already contiguous: take them in one read rather than one per vertex (this
+                // path runs for every draw of every frame, over meshes of thousands of
+                // vertices).
+                let v = ctx.read_bytes(
+                    bound_streams[0].wrapping_add(first_vertex * stride),
+                    (vertex_count * stride) as usize,
+                );
+                crate::perf::note_bytes(crate::perf::Phase::DrawVertices, v.len());
+                return v;
+            }
+            let mut vertices = vec![0u8; (vertex_count * stride) as usize];
+            for (si, s) in streams.iter().enumerate() {
+                if s.stride == 0 {
+                    continue;
+                }
+                let buf = bound_streams.get(si).copied().unwrap_or(0);
+                // A per-instance stream is stepped by instance, not by vertex, so instance 0
+                // reads row 0 for every vertex; a per-vertex stream's rows are contiguous.
+                // Either way this is ONE guest read, then a scatter into the interleaved
+                // buffer.
+                let (src, repeat) = if s.per_instance {
+                    (ctx.read_bytes(buf, s.stride as usize), true)
+                } else {
+                    let start = buf.wrapping_add(first_vertex * s.stride);
+                    (ctx.read_bytes(start, (vertex_count * s.stride) as usize), false)
+                };
+                let row_len = s.stride as usize;
+                for v in 0..vertex_count as usize {
+                    let from = if repeat { 0 } else { v * row_len };
+                    let Some(row) = src.get(from..from + row_len) else {
+                        break; // the guest buffer ended short of the indices; keep what we have
+                    };
+                    let dst = v * stride as usize + base[si] as usize;
+                    vertices[dst..dst + row_len].copy_from_slice(row);
                 }
             }
+            vertices
+        });
+        for a in &mut attributes {
+            a.offset += base.get(a.stream_index as usize).copied().unwrap_or(0) as u16;
+            a.stream_index = 0;
         }
-        let vertices = ctx.read_bytes(
-            self.bound_stream0.wrapping_add(first_vertex * stride),
-            (vertex_count * stride) as usize,
-        );
         // Snapshot every bound fragment texture (decoded from its control words),
-        // sorted by unit so unit 0 is first.
-        let mut units: Vec<(u32, u32)> = self.bound_textures.clone();
-        units.sort_by_key(|(u, _)| *u);
+        // sorted by unit so unit 0 is first. `bound_textures` is already kept sorted by
+        // unit as it is bound, so this reads it in place rather than cloning and
+        // re-sorting a fresh Vec for every draw.
+        let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
+        debug_assert!(
+            self.bound_textures.windows(2).all(|w| w[0].0 <= w[1].0),
+            "bound_textures must stay sorted by unit - see bind_fragment_texture and \
+             bind_precomputed_fragment_state"
+        );
         // Read the per-unit control state first, so the snapshot cache can be borrowed
         // mutably for the decode loop without also holding a shared borrow of `self`.
-        let unit_state: Vec<(u32, u32, Option<u32>, (u32, u32, u32), (u32, u32))> = units
+        let unit_state: Vec<(u32, u32, Option<u32>, (u32, u32, u32), (u32, u32))> = self
+            .bound_textures
             .iter()
             .map(|&(unit, addr)| {
                 let e = self.texture_extra(addr);
@@ -3049,6 +3635,7 @@ impl VitaState {
                 decode_texture(ctx, snapshots, unit, addr, format, sampler, filters)
             })
             .collect();
+        drop(texture_phase);
         // The capture renderer samples a single texture (`textures.first()`). This title
         // binds the NORMAL map at unit 0, so pick the albedo sampler by fragment-program
         // reflection and move it to the front; without this every surface is tinted by a
@@ -3063,19 +3650,19 @@ impl VitaState {
         {
             textures[..=pos].rotate_right(1);
         }
-        if let Some(unit) = self.fragment_albedo_unit(ctx) {
+        if let Some(unit) = Self::fragment_albedo_unit(&fref) {
             if let Some(pos) = textures.iter().position(|t| t.unit == unit) {
                 textures[..=pos].rotate_right(1);
             }
         }
-        if std::env::var("VITASLOP_DUMP_FPROG").is_ok() {
+        if dump_fprog() {
             self.dump_fragment_program_samplers(ctx);
         }
-        self.dump_draw_gxp(ctx, &textures, &attributes, primitive, index_count, stride);
         // Vertex uniforms: on the precomputed path the game wrote them into a default
         // uniform buffer bound by `sceGxmSetPrecomputedVertexState`, so read that guest
         // buffer now (its contents are current at draw time). On the direct path the
         // buffer is 0 and we fall back to the `sceGxmSetUniformDataF` capture.
+        let uniform_phase = crate::perf::scope(crate::perf::Phase::DrawUniforms);
         let mut uniforms = self.current_vertex_uniforms(ctx);
         // The RAW vertex default-uniform (SA bank) as the guest wrote it, BEFORE the composed
         // MVP is stamped over lanes 0..16 below. This is what the recompiled vertex shader
@@ -3090,7 +3677,7 @@ impl VitaState {
         // The model-to-world matrix (for bringing the vertex normal into world space for
         // lighting). Read from the ORIGINAL uniforms, before `composed_mvp` below overwrites
         // uniforms[0..16] (which is exactly where `vsModelToWorldMatrix` usually sits).
-        let world = self.reflected_world_matrix(ctx, &uniforms);
+        let world = self.reflected_world_matrix(&vref, &uniforms);
         // Recover the true clip-space transform from the vertex program's reflected
         // uniforms. A 3D shader keeps a per-object model->world matrix and a shared
         // world->projection matrix as separate uniforms (named e.g. `vsModelToWorldMatrix`
@@ -3099,18 +3686,24 @@ impl VitaState {
         // first 16 floats, which the software/GPU paths read as the MVP. A shader with a
         // single combined transform (2D UI: `vsPrimRenderTransform` at offset 0) has no
         // projection matrix, so this leaves its MVP untouched.
-        if let Some(mvp) = self.composed_mvp(ctx, &uniforms) {
+        if let Some(mvp) = self.composed_mvp(&vref, &uniforms) {
             if uniforms.len() >= 16 {
                 uniforms[..16].copy_from_slice(&mvp);
             }
         }
-        if std::env::var("VITASLOP_DUMP_VPROG").is_ok() {
+        if dump_vprog() {
             self.dump_vertex_program_params(ctx);
         }
-        let exposure = self.reflected_exposure(ctx, &uniforms);
+        let exposure = Self::reflected_exposure(&vref, &uniforms);
         // The per-material fragment inputs (tint / directional light / ambient), reflected
         // from the fragment program's uniforms so the renderer reproduces the LIT colour.
-        let material = self.reflect_fragment_material(ctx, &textures);
+        let material = self.reflect_fragment_material(ctx, &fref, &textures);
+        drop(uniform_phase);
+        // The per-draw diagnostic dump, after everything it reports has been computed
+        // (it prints the reflected transform and material rather than recomputing them).
+        self.dump_draw_gxp(
+            ctx, &vref, &material, &textures, &attributes, primitive, index_count, stride,
+        );
         // Snapshot the raw shader blobs + SA uniform bytes for the GXP->WGSL recompiler
         // path, but only when it is enabled (the reads + per-draw clones are pure cost on
         // the default fixed-function path). The blob size is the container total-length
@@ -3155,6 +3748,7 @@ impl VitaState {
             fprog,
             vert_sa,
             frag_sa,
+            shader_expanded: Self::reflected_shader_expanded(&vref),
         };
         match self.scene.as_mut() {
             Some(scene) => scene.draws.push(draw),
@@ -3171,25 +3765,38 @@ impl VitaState {
     /// large uniform block (e.g. a world matrix at float 0 plus a world-to-projection
     /// matrix at float 16 plus lighting/fog), truncating the captured buffer and
     /// dropping the view-projection - so the reflected extent is the reliable size.
-    fn reflected_uniform_size_bytes(&self, ctx: &GuestCtx, header: u32) -> u32 {
+    fn reflected_uniform_size_bytes(&mut self, ctx: &GuestCtx, header: u32) -> u32 {
+        self.reflect_program(ctx, header).uniform_size_bytes
+    }
+
+    /// Drop every cached [`ProgramReflection`]. Called when the guest registers or
+    /// unregisters a program with the shader patcher - the only points at which a
+    /// header address can start meaning a different program - so a reused address can
+    /// never be read through the old program's layout.
+    ///
+    /// A whole-table clear rather than a targeted eviction: registration happens a few
+    /// hundred times over a run, at load, and the next draw simply re-reflects. Being
+    /// obviously correct is worth more here than evicting one entry.
+    pub fn invalidate_program_reflection(&mut self) {
+        self.program_reflection.clear();
+    }
+
+    /// The reflected constants of the program at `header`, walking its parameter table
+    /// on the first ask and returning the cached answer afterwards. See
+    /// [`ProgramReflection`] for why this is one walk instead of five.
+    ///
+    /// A zero header (no program bound, or a handle never recorded) reflects to the
+    /// default: no matrices, no material, identity behaviour at every call site.
+    fn reflect_program(&mut self, ctx: &GuestCtx, header: u32) -> ProgramReflection {
         if header == 0 {
-            return 0;
+            return ProgramReflection::default();
         }
-        let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-        let mut max_floats = 0u32;
-        for i in 0..count.min(256) {
-            let p = base.wrapping_add(i.wrapping_mul(16));
-            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
-            if word & 0xf != 1 {
-                continue; // category 1 == uniform (0 is a vertex attribute)
-            }
-            let comp = ((word >> 8) & 0xf).max(1);
-            let array = ctx.read_u32(p.wrapping_add(8)).max(1);
-            let res = ctx.read_u32(p.wrapping_add(0xc));
-            max_floats = max_floats.max(res.wrapping_add(comp.wrapping_mul(array)));
+        if let Some(r) = self.program_reflection.get(&header) {
+            return *r;
         }
-        max_floats.wrapping_mul(4)
+        let r = reflect_program_uncached(ctx, header);
+        self.program_reflection.insert(header, r);
+        r
     }
 
     /// Compose the model->projection MVP for the bound vertex program from its captured
@@ -3198,8 +3805,8 @@ impl VitaState {
     /// projection matrix (a single-transform 2D/UI shader), so the caller keeps the
     /// offset-0 matrix as-is. Both matrices are column-major 4x4 float blocks at their
     /// reflected `resource_index` (in floats); the result is `projection * world`.
-    fn composed_mvp(&self, ctx: &GuestCtx, uniforms: &[f32]) -> Option<[f32; 16]> {
-        let (world, proj) = self.reflected_world_proj(ctx, uniforms)?;
+    fn composed_mvp(&self, r: &ProgramReflection, uniforms: &[f32]) -> Option<[f32; 16]> {
+        let (world, proj) = Self::reflected_world_proj(r, uniforms)?;
         // Column-major 4x4 multiply: out = proj * world.
         let mut out = [0f32; 16];
         for col in 0..4 {
@@ -3217,41 +3824,21 @@ impl VitaState {
     /// The model-to-world matrix reflected from the vertex program's `vsModelToWorldMatrix`
     /// (column-major 4x4), or identity if the shader declares no world matrix. Used to bring
     /// the object-space vertex normal into world space for lighting.
-    fn reflected_world_matrix(&self, ctx: &GuestCtx, uniforms: &[f32]) -> [f32; 16] {
+    fn reflected_world_matrix(&self, r: &ProgramReflection, uniforms: &[f32]) -> [f32; 16] {
         const IDENTITY: [f32; 16] =
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        self.reflected_world_proj(ctx, uniforms).map(|(w, _)| w).unwrap_or(IDENTITY)
+        Self::reflected_world_proj(r, uniforms).map(|(w, _)| w).unwrap_or(IDENTITY)
     }
 
-    /// Reflect the vertex program's model->world and world->projection 4x4 matrices from its
-    /// captured `uniforms`, located by their declared names. Returns `(world, proj)` or `None`
-    /// when the shader has no separate projection matrix (a single-transform 2D/UI shader).
-    fn reflected_world_proj(&self, ctx: &GuestCtx, uniforms: &[f32]) -> Option<([f32; 16], [f32; 16])> {
-        let header = self.vertex_program_header(self.bound_vertex_program);
-        if header == 0 {
-            return None;
-        }
-        let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-        let (mut world_off, mut proj_off) = (None, None);
-        for i in 0..count.min(256) {
-            let p = base.wrapping_add(i.wrapping_mul(16));
-            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
-            // Category 1 (uniform), a 4x4 matrix: component_count 4 and array_size 4.
-            if word & 0xf != 1 || (word >> 8) & 0xf != 4 || ctx.read_u32(p.wrapping_add(8)) != 4 {
-                continue;
-            }
-            let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
-            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
-            let raw = ctx.read_bytes(name_addr, 48);
-            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
-            if name.contains("toprojection") || name.contains("worldtoclip") || name.contains("viewprojection") {
-                proj_off = Some(res);
-            } else if name.contains("modeltoworld") {
-                world_off = Some(res);
-            }
-        }
-        let (wo, po) = (world_off?, proj_off?);
+    /// Pull the vertex program's model->world and world->projection 4x4 matrices out of
+    /// this draw's `uniforms`, at the offsets [`ProgramReflection`] located by name.
+    /// Returns `(world, proj)` or `None` when the shader has no separate projection
+    /// matrix (a single-transform 2D/UI shader) or the buffer is short of either.
+    fn reflected_world_proj(
+        r: &ProgramReflection,
+        uniforms: &[f32],
+    ) -> Option<([f32; 16], [f32; 16])> {
+        let (wo, po) = (r.world_off? as usize, r.proj_off? as usize);
         let read4x4 = |off: usize| -> Option<[f32; 16]> {
             let mut m = [0f32; 16];
             m.copy_from_slice(uniforms.get(off..off + 16)?);
@@ -3260,38 +3847,34 @@ impl VitaState {
         Some((read4x4(wo)?, read4x4(po)?))
     }
 
+    /// Does the bound vertex program SYNTHESIZE its primitive instead of reading it?
+    ///
+    /// A point-sprite/billboard shader is handed one record per sprite - a centre position
+    /// plus the basis it expands into corners with - and builds the quad itself. The
+    /// declared ATTRIBUTE names are what say so, and they are the guest's own reflection
+    /// data, not a guess: an expansion basis is a `scale_rotation`, or an explicit
+    /// right/up axis pair. Ordinary geometry declares none of these (across this title's
+    /// whole shader corpus the per-vertex names are position/normal/tangent/uv/colour).
+    ///
+    /// Consumed by [`crate::capture::Draw::shader_expanded`]. This costs one parameter-table
+    /// scan per draw, the same scan the world/projection and exposure reflection already do.
+    /// Reflected once per program (category-0 attribute names only, so a UNIFORM named
+    /// "rotation" cannot trip it) - see [`ProgramReflection::shader_expanded`].
+    fn reflected_shader_expanded(r: &ProgramReflection) -> bool {
+        r.shader_expanded
+    }
+
     /// Recover the scene exposure from the bound vertex program's reflected
     /// `vsCoarseExposureReg` uniform (a float4 whose first component is the linear
     /// exposure scale the shaders multiply lit albedo by before tone-mapping). Returns
     /// `1.0` when the shader declares no exposure uniform (2D/UI shaders), or when the
     /// value is not a sane positive number, so it is a safe no-op there.
-    fn reflected_exposure(&self, ctx: &GuestCtx, uniforms: &[f32]) -> f32 {
-        let header = self.vertex_program_header(self.bound_vertex_program);
-        if header == 0 {
-            return 1.0;
+    fn reflected_exposure(r: &ProgramReflection, uniforms: &[f32]) -> f32 {
+        let Some(off) = r.exposure_off else { return 1.0 };
+        match uniforms.get(off as usize) {
+            Some(&e) if e.is_finite() && e > 0.0 => e,
+            _ => 1.0,
         }
-        let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-        for i in 0..count.min(256) {
-            let p = base.wrapping_add(i.wrapping_mul(16));
-            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
-            if word & 0xf != 1 {
-                continue; // category 1 == uniform
-            }
-            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
-            let raw = ctx.read_bytes(name_addr, 48);
-            let name: String =
-                raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
-            if name.contains("coarseexposure") {
-                let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
-                if let Some(&e) = uniforms.get(res) {
-                    if e.is_finite() && e > 0.0 {
-                        return e;
-                    }
-                }
-            }
-        }
-        1.0
     }
 
     /// Diagnostic (VITASLOP_DUMP_VPROG): reflect the bound vertex program's parameter
@@ -3342,31 +3925,8 @@ impl VitaState {
     /// cube, reflection, gloss, light, shadow, detail, bump, height, mask, ao) are
     /// rejected. Returns `None` when there is no fragment program or no sampler reads as
     /// an albedo, leaving the caller on its default unit-0 pick.
-    fn fragment_albedo_unit(&self, ctx: &GuestCtx) -> Option<u32> {
-        let header = self.bound_fragment_program_header;
-        if header == 0 {
-            return None;
-        }
-        let count = ctx.read_u32(header.wrapping_add(0x24));
-        let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-        let mut best: Option<(i32, u32)> = None; // (score, unit)
-        for i in 0..count.min(256) {
-            let p = base.wrapping_add(i.wrapping_mul(16));
-            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
-            if word & 0xf != 2 {
-                continue; // category 2 == sampler
-            }
-            let unit = ctx.read_u32(p.wrapping_add(0xc));
-            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
-            let raw = ctx.read_bytes(name_addr, 64);
-            let name: String =
-                raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
-            let score = albedo_name_score(&name);
-            if score > 0 && best.map(|(s, _)| score > s).unwrap_or(true) {
-                best = Some((score, unit));
-            }
-        }
-        best.map(|(_, u)| u)
+    fn fragment_albedo_unit(r: &ProgramReflection) -> Option<u32> {
+        r.albedo_unit
     }
 
     /// Reflect the bound fragment program's per-material inputs (base-colour tint, the
@@ -3380,65 +3940,46 @@ impl VitaState {
     /// its `component_count` components is an F16 (`type == 1`, 2 bytes) or an F32 (`type ==
     /// 0`, 4 bytes). `textures` is the draw's bound textures (albedo reordered to the front),
     /// used to resolve the ambient colour from the tiny `diffuseAmbientMap` irradiance map.
-    fn reflect_fragment_material(&self, ctx: &GuestCtx, textures: &[crate::capture::BoundTexture]) -> crate::capture::FragmentMaterial {
+    fn reflect_fragment_material(
+        &mut self,
+        ctx: &GuestCtx,
+        r: &ProgramReflection,
+        textures: &[crate::capture::BoundTexture],
+    ) -> crate::capture::FragmentMaterial {
         let mut m = crate::capture::FragmentMaterial::default();
-        let header = self.bound_fragment_program_header;
         let buf = self.bound_fragment_uniform_buf;
-        if header != 0 && buf != 0 {
-            let count = ctx.read_u32(header.wrapping_add(0x24));
-            let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-            // Read `comp` scalar components of a uniform parameter from the fragment default
-            // uniform buffer at its register offset, honouring the F16/F32 component type.
-            let read_vals = |res_index: u32, comp: usize, is_f16: bool| -> Vec<f32> {
-                let byte_off = buf.wrapping_add(res_index.wrapping_mul(4));
-                (0..comp)
-                    .map(|i| {
-                        if is_f16 {
-                            crate::render::half_to_f32(ctx.read_u16(byte_off.wrapping_add((i as u32) * 2)))
-                        } else {
-                            ctx.read_f32(byte_off.wrapping_add((i as u32) * 4))
-                        }
-                    })
-                    .collect()
+        if buf != 0 {
+            // Read the first three scalar components of a reflected parameter from the
+            // fragment default uniform buffer at its register offset, honouring the
+            // F16/F32 component type.
+            let read3 = |p: ParamRef| -> [f32; 3] {
+                let byte_off = buf.wrapping_add(p.res.wrapping_mul(4));
+                std::array::from_fn(|i| {
+                    if p.f16 {
+                        crate::render::half_to_f32(ctx.read_u16(byte_off.wrapping_add(i as u32 * 2)))
+                    } else {
+                        ctx.read_f32(byte_off.wrapping_add(i as u32 * 4))
+                    }
+                })
             };
-            for i in 0..count.min(256) {
-                let p = base.wrapping_add(i.wrapping_mul(16));
-                let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
-                if word & 0xf != 1 {
-                    continue; // category 1 == uniform
+            // The base-colour tint: the primary layer's tint (or a wheel's AlbedoColour).
+            if let Some(p) = r.tint {
+                let t = read3(p);
+                if t.iter().all(|c| c.is_finite() && *c >= 0.0 && *c <= 8.0) {
+                    m.tint = t;
                 }
-                let ptype = (word >> 4) & 0xf;
-                let comp = ((word >> 8) & 0xf).max(1) as usize;
-                let res = ctx.read_u32(p.wrapping_add(0xc));
-                let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
-                let raw = ctx.read_bytes(name_addr, 64);
-                let name: String =
-                    raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()).collect();
-                let is_f16 = ptype == 1;
-                let take3 = |v: &[f32]| [*v.first().unwrap_or(&0.0), *v.get(1).unwrap_or(&0.0), *v.get(2).unwrap_or(&0.0)];
-                // The base-colour tint: the primary layer's tint (or a wheel's AlbedoColour).
-                // A "secondary" tint belongs to a second material layer we do not composite,
-                // so only the primary/albedo tint drives the base colour.
-                if (name.contains("albedocolour") || name.contains("albedocolor") || name.contains("primarytint"))
-                    && comp >= 3
-                {
-                    let t = take3(&read_vals(res, 3, is_f16));
-                    if t.iter().all(|c| c.is_finite() && *c >= 0.0 && *c <= 8.0) {
-                        m.tint = t;
-                    }
-                } else if name.contains("light0direction") && comp >= 3 {
-                    let d = take3(&read_vals(res, 3, is_f16));
-                    if d.iter().all(|c| c.is_finite()) && d.iter().any(|c| *c != 0.0) {
-                        m.light_dir = d;
-                        m.has_light = true;
-                    }
-                } else if name.contains("light0colour") || name.contains("light0color") {
-                    if comp >= 3 {
-                        let c = take3(&read_vals(res, 3, is_f16));
-                        if c.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 16.0) {
-                            m.light_col = c;
-                        }
-                    }
+            }
+            if let Some(p) = r.light_dir {
+                let d = read3(p);
+                if d.iter().all(|c| c.is_finite()) && d.iter().any(|c| *c != 0.0) {
+                    m.light_dir = d;
+                    m.has_light = true;
+                }
+            }
+            if let Some(p) = r.light_col {
+                let c = read3(p);
+                if c.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 16.0) {
+                    m.light_col = c;
                 }
             }
         }
@@ -3447,7 +3988,7 @@ impl VitaState {
         // flat ambient for a renderer that does not sample it per-normal. Leaves the default
         // grey ambient when no such map is present.
         if let Some(amb) = textures.iter().find(|t| t.unit == 15) {
-            if let Some(mean) = crate::render::texture_mean_rgb(amb) {
+            if let Some(mean) = self.texture_snapshots.mean_rgb(amb) {
                 m.ambient = mean;
             }
         }
@@ -3497,9 +4038,13 @@ impl VitaState {
     /// name at each unit. This is the empirical instrument for the wheel-ring artifact: it
     /// shows whether a draw feeds one UV set to several samplers (a composite we must
     /// reproduce) or picks the wrong UV set for a sampler (a binding we can correct).
-    fn dump_draw_gxp(&self, ctx: &GuestCtx, textures: &[crate::capture::BoundTexture], attributes: &[crate::capture::VertexAttribute], primitive: u32, index_count: u32, stride: u32) {
-        let want = match std::env::var("VITASLOP_DUMP_DRAW_GXP").ok() {
-            Some(s) => s,
+    #[allow(clippy::too_many_arguments)]
+    fn dump_draw_gxp(&self, ctx: &GuestCtx, vref: &ProgramReflection, material: &crate::capture::FragmentMaterial, textures: &[crate::capture::BoundTexture], attributes: &[crate::capture::VertexAttribute], primitive: u32, index_count: u32, stride: u32) {
+        // Cached: this runs per draw, and reading an unset environment variable on
+        // Windows is not free (see `dump_vprog`).
+        static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let want = match WANT.get_or_init(|| std::env::var("VITASLOP_DUMP_DRAW_GXP").ok()) {
+            Some(s) => s.clone(),
             None => return,
         };
         // The frame the dump keys on is the scheduler frame (`cur_frame`, the display-flip /
@@ -3533,10 +4078,48 @@ impl VitaState {
         let seq = self.scene.as_ref().map(|s| s.draws.len()).unwrap_or(0);
         let vh = self.vertex_program_header(self.bound_vertex_program);
         let fh = self.bound_fragment_program_header;
-        let mat = self.reflect_fragment_material(ctx, textures);
+        // The caller has already reflected it - recomputing here would be a second
+        // (and, with the ambient-mean cache, a differently-warmed) evaluation of the
+        // same thing.
+        let mat = material;
         eprintln!(
             "DRAW frame={disp} seq={seq} prim={primitive:#010x} idx={index_count} stride={stride} vprog={vh:#x} fprog={fh:#x} fubuf={:#x}",
             self.bound_fragment_uniform_buf
+        );
+        // Where this draw's transform comes from, and what it is. A mesh rendered in the
+        // wrong place is always one of three things: the wrong default uniform buffer still
+        // bound (`STALE-ubuf`), no reflected projection matrix so offset 0 is used raw and
+        // may not be an MVP at all (`composed=no`), or a leftover `sceGxmSetUniformDataF`
+        // capture (`setUniformDataF` with a buffer of 0). This line separates them, and
+        // prints the MVP's translation column - the clip-space position of the object's
+        // origin, which is what "it is drawn at the wrong place" actually means.
+        let vbuf = self.bound_vertex_uniform_buf;
+        let usable = vbuf != 0 && self.bound_vertex_uniform_size >= 4 && self.vertex_uniform_header == vh;
+        let source = match (vbuf != 0, self.vertex_uniform_header == vh) {
+            (true, true) => "ubuf",
+            (true, false) => "STALE-ubuf",
+            (false, _) => "setUniformDataF",
+        };
+        let raw: Vec<f32> = if usable {
+            (0..(self.bound_vertex_uniform_size / 4) as usize)
+                .map(|i| ctx.read_f32(vbuf.wrapping_add(i as u32 * 4)))
+                .collect()
+        } else {
+            self.pending_uniforms.clone()
+        };
+        let composed = self.composed_mvp(vref, &raw);
+        let eff = composed.unwrap_or_else(|| {
+            let mut m = [0f32; 16];
+            for (i, s) in m.iter_mut().zip(raw.iter()) {
+                *i = *s;
+            }
+            m
+        });
+        eprintln!(
+            "  TRANSFORM source={source} ubuf={vbuf:#x} lanes={} composed={} origin_clip=[{:.3},{:.3},{:.3},{:.3}]",
+            raw.len(),
+            if composed.is_some() { "yes" } else { "no" },
+            eff[12], eff[13], eff[14], eff[15],
         );
         eprintln!(
             "  MATERIAL tint=[{:.3},{:.3},{:.3}] has_light={} light_dir=[{:.3},{:.3},{:.3}] light_col=[{:.3},{:.3},{:.3}] ambient=[{:.3},{:.3},{:.3}]",
@@ -3756,7 +4339,9 @@ impl VitaState {
 
     pub fn end_scene(&mut self) {
         if let Some(scene) = self.scene.take() {
-            self.capture.scenes.push(scene);
+            // Goes through `push_scene`, not a bare push, so a bounded-retention run
+            // still folds every scene into the determinism signature.
+            self.capture.push_scene(scene);
         }
     }
 
@@ -3768,6 +4353,126 @@ impl VitaState {
     pub fn write_stdout(&mut self, bytes: &[u8]) {
         self.capture.stdout.extend_from_slice(bytes);
     }
+}
+
+/// Walk one `SceGxmProgram`'s parameter table and reflect every constant the capture
+/// path needs from it. This is the uncached body behind
+/// [`VitaState::reflect_program`] - see [`ProgramReflection`] for the caching rationale
+/// and why it must stay a pure function of the program blob.
+///
+/// Table layout (from the guest's own reflection API, the same offsets
+/// `sceGxmProgramGetParameter` and friends use): `header+0x24` is the parameter count,
+/// `header+0x28` holds the offset to the table, and each 16-byte entry is
+/// `{ +0x0 name offset (signed, relative to the entry), +0x4 packed word, +0x8 array
+/// size, +0xc resource index }`. The packed word's low nibble is the category (0
+/// attribute, 1 uniform, 2 sampler), the next the component type (1 = F16), the next
+/// the component count.
+fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
+    let mut r = ProgramReflection::default();
+    let count = ctx.read_u32(header.wrapping_add(0x24));
+    let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
+    let mut max_floats = 0u32;
+    let mut best_albedo: Option<(i32, u32)> = None;
+    // One scratch buffer for every name in the table: names are short and this walk is
+    // the whole reason the per-draw version allocated.
+    let mut name = String::with_capacity(64);
+    for i in 0..count.min(256) {
+        let p = base.wrapping_add(i.wrapping_mul(16));
+        let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+        let category = word & 0xf;
+        let ptype = (word >> 4) & 0xf;
+        let comp = (word >> 8) & 0xf;
+        let res = ctx.read_u32(p.wrapping_add(0xc));
+        let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+        read_lowercase_name(ctx, name_addr, &mut name);
+        match category {
+            // A per-vertex attribute. Only its NAME matters: an expansion basis
+            // (`scale_rotation`, or an explicit right/up axis pair) says the vertex
+            // program synthesizes its own primitive rather than reading triangles.
+            0 => {
+                if name.contains("scale_rotation")
+                    || name.contains("rightvector")
+                    || name.contains("upvector")
+                {
+                    r.shader_expanded = true;
+                }
+            }
+            1 => {
+                let array = ctx.read_u32(p.wrapping_add(8)).max(1);
+                max_floats = max_floats.max(res.wrapping_add(comp.max(1).wrapping_mul(array)));
+                let is_f16 = ptype == 1;
+                let pref = ParamRef { res, comp: comp.max(1) as u8, f16: is_f16 };
+                // A 4x4 matrix is declared as component_count 4, array_size 4.
+                let is_matrix = comp == 4 && array == 4;
+                if is_matrix
+                    && (name.contains("toprojection")
+                        || name.contains("worldtoclip")
+                        || name.contains("viewprojection"))
+                {
+                    r.proj_off = Some(res);
+                } else if is_matrix && name.contains("modeltoworld") {
+                    r.world_off = Some(res);
+                } else if name.contains("coarseexposure") {
+                    r.exposure_off = Some(res);
+                } else if (name.contains("albedocolour")
+                    || name.contains("albedocolor")
+                    || name.contains("primarytint"))
+                    && comp >= 3
+                {
+                    // The primary layer's tint only: a "secondary" tint belongs to a
+                    // second material layer the capture renderer does not composite.
+                    r.tint = Some(pref);
+                } else if name.contains("light0direction") && comp >= 3 {
+                    r.light_dir = Some(pref);
+                } else if (name.contains("light0colour") || name.contains("light0color"))
+                    && comp >= 3
+                {
+                    r.light_col = Some(pref);
+                }
+            }
+            2 => {
+                let score = albedo_name_score(&name);
+                if score > 0 && best_albedo.map(|(s, _)| score > s).unwrap_or(true) {
+                    best_albedo = Some((score, res));
+                }
+            }
+            _ => {}
+        }
+    }
+    r.albedo_unit = best_albedo.map(|(_, u)| u);
+    r.uniform_size_bytes = max_floats.wrapping_mul(4);
+    r
+}
+
+/// Diagnostic (`VITASLOP_DUMP_VPROG`): dump each vertex program's parameter table.
+///
+/// Read once and cached. These two are tested ONCE PER DRAW, and on Windows
+/// `std::env::var` copies and re-encodes the whole environment block before it can
+/// answer - so an unset diagnostic knob was costing more per frame than several draws.
+fn dump_vprog() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITASLOP_DUMP_VPROG").is_some())
+}
+
+/// Diagnostic (`VITASLOP_DUMP_FPROG`): dump each fragment program's samplers. See
+/// [`dump_vprog`] for why this is cached.
+fn dump_fprog() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITASLOP_DUMP_FPROG").is_some())
+}
+
+/// Longest parameter name read while reflecting. The previous per-call code read 48 or
+/// 64 bytes depending on the call site; 64 is the larger of the two, so nothing that
+/// used to match stops matching.
+const MAX_PARAM_NAME: usize = 64;
+
+/// Read the NUL-terminated parameter name at `addr` into `out`, lowercased. Reuses the
+/// caller's buffer so a whole parameter table costs one allocation, not one per name.
+fn read_lowercase_name(ctx: &GuestCtx, addr: u32, out: &mut String) {
+    let mut raw = [0u8; MAX_PARAM_NAME];
+    ctx.read_into(addr, &mut raw);
+    out.clear();
+    out.extend(raw.iter().take_while(|&&b| b != 0).map(|&b| (b as char).to_ascii_lowercase()));
 }
 
 /// Round `v` up to the next multiple of `align` (a power of two).
@@ -3869,6 +4574,7 @@ fn gxp_live_capture() -> bool {
 /// format whose byte size we do not know yet. The layout is the public GXM texture
 /// control-word format (vitasdk `gxm.h` `struct SceGxmTexture`): word 1 holds
 /// width/height (stored as size-1) and the base format, word 2 the data address.
+#[allow(clippy::too_many_arguments)]
 fn decode_texture(
     ctx: &GuestCtx,
     cache: &mut TextureSnapshots,
@@ -3940,14 +4646,7 @@ fn decode_texture(
     // later one - within a single scene the guest cannot rewrite a texture the GPU is
     // consuming, so the snapshot cannot go stale.
     let len = (total * faces) as usize;
-    let pixels = match cache.get(&(data_addr, len)) {
-        Some(p) => p.clone(),
-        None => {
-            let bytes: Arc<[u8]> = ctx.read_bytes(data_addr, len).into();
-            cache.insert((data_addr, len), bytes.clone());
-            bytes
-        }
-    };
+    let pixels = cache.get_or_read(ctx, data_addr, len);
     if pixels.is_empty() {
         return None;
     }
@@ -3995,6 +4694,13 @@ impl VitaEnv {
     /// Convenience constructor with the default deterministic world.
     pub fn with_default_world(imports: Vec<(u32, u32)>, base: u32, mem_bytes: u32) -> Self {
         VitaEnv::new(imports, base, mem_bytes, Box::new(DeterministicWorld::default()))
+    }
+
+    /// The `(library_nid, func_nid)` pair a dense import index dispatches to, or
+    /// `None` past the end of the table. A profiler counts host calls by the index
+    /// the emitted wasm passes, so this is what turns those counts back into names.
+    pub fn import_at(&self, index: u32) -> Option<(u32, u32)> {
+        self.imports.get(index as usize).copied()
     }
 }
 

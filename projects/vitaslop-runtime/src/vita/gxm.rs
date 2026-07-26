@@ -5,7 +5,7 @@
 //! no pixel is drawn here; that is the renderer's job over this capture.
 
 use crate::capture::{ColorSurface, VertexAttribute};
-use crate::host::{GuestCtx, VitaState};
+use crate::host::{GuestCtx, VitaState, MAX_VERTEX_STREAMS};
 use crate::hostcall;
 
 /// SceGxmInitializeParams: displayQueueCallback at offset 8, its data size at 12.
@@ -86,6 +86,64 @@ fn params_base(ctx: &GuestCtx, program: u32) -> u32 {
 /// The packed u16 attribute word (`category`/`type`/`component_count`/`container_index`).
 fn param_word(ctx: &GuestCtx, param: u32) -> u32 {
     ctx.read_u32(param.wrapping_add(4)) & 0xffff
+}
+
+/// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
+/// ones the transpiler could emit inline.
+///
+/// This is the A/B switch for the inline mechanism, and it earns its keep because
+/// inlining changes how much wasm the guest executes, which changes fuel consumption,
+/// which changes WHERE the preemptive scheduler switches threads - so an inlined build
+/// legitimately reports a different determinism signature without computing anything
+/// differently. Turning inlining off is how a signature is compared against a
+/// pre-inlining run, which is the only way to tell a real behaviour change from that
+/// re-interleaving. Read at LINK time, so it must be set for the whole run.
+fn no_inline_imports() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITASLOP_NO_INLINE_IMPORTS").is_some())
+}
+
+/// Byte offset of the packed attribute word within a `SceGxmProgramParameter`.
+const GXM_PARAM_WORD_OFF: u32 = 4;
+/// Byte offset of a parameter's `array_size`.
+const GXM_PARAM_ARRAY_SIZE_OFF: u32 = 8;
+/// Byte offset of a parameter's `resource_index`.
+const GXM_PARAM_RESOURCE_INDEX_OFF: u32 = 0xC;
+
+/// The inline form of a host import, for the pure GXM reflection getters - or `None`
+/// for every NID that has real behaviour and must stay a host call.
+///
+/// These four getters are, together, the majority of every host call a gameplay frame
+/// makes: a title re-reflects its shader parameter tables per material, per frame. Each
+/// is one word load plus a shift and a mask over a guest structure, with no host state
+/// involved at all, so the transpiler can emit it straight into the guest code and skip
+/// the boundary entirely. See [`vitaslop_transpiler::InlineImport`].
+///
+/// **Every entry here duplicates a handler above, and the two must agree.** The
+/// `inline_ops_match_their_handlers` test holds them to that; add nothing here without
+/// extending it.
+pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::nid::gxm as g;
+    use vitaslop_transpiler::InlineOp::LoadShiftMask;
+    // The packed word's fields; `param_word` masks the word to 16 bits first, which
+    // the 4-bit field masks below make redundant.
+    let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf };
+    if no_inline_imports() {
+        return None;
+    }
+    Some(match func_nid {
+        g::PROGRAM_PARAMETER_GET_CATEGORY => word(0),
+        g::PROGRAM_PARAMETER_GET_TYPE => word(4),
+        g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => word(8),
+        g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => word(12),
+        g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => {
+            LoadShiftMask { offset: GXM_PARAM_ARRAY_SIZE_OFF, shift: 0, mask: u32::MAX }
+        }
+        g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => {
+            LoadShiftMask { offset: GXM_PARAM_RESOURCE_INDEX_OFF, shift: 0, mask: u32::MAX }
+        }
+        _ => return None,
+    })
 }
 
 /// unsigned int sceGxmProgramGetParameterCount(const SceGxmProgram *program)
@@ -190,6 +248,7 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     let attributes_addr = ctx.arg(2);
     let attribute_count = ctx.arg(3);
     let streams_addr = ctx.arg(4);
+    let stream_count = ctx.arg(5);
     let out = ctx.arg(6);
 
     let mut attributes = Vec::new();
@@ -207,12 +266,20 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
             reg_index: u16::from_le_bytes([raw[6], raw[7]]),
         });
     }
-    // SceGxmVertexStream: u16 stride at offset 0 of streams[0].
-    let stride = (ctx.read_u32(streams_addr) & 0xFFFF) as u32;
+    // SceGxmVertexStream is `{ uint16_t stride; uint16_t indexSource; }` - one per stream.
+    // `indexSource` 2 and 3 are the INSTANCE variants (16- and 32-bit), which step the
+    // stream by instance rather than by vertex.
+    let streams: Vec<(u32, bool)> = (0..stream_count.min(MAX_VERTEX_STREAMS as u32))
+        .map(|i| {
+            let w = ctx.read_u32(streams_addr + i * 4);
+            (w & 0xFFFF, ((w >> 16) & 0xFFFF) >= 2)
+        })
+        .collect();
+    let stride = streams.first().map(|s| s.0).unwrap_or(0);
 
     tracing::debug!(
         target: "vitaslop::gxm",
-        attribute_count, stride, attrs = attributes.len(),
+        attribute_count, stream_count, stride, attrs = attributes.len(),
         attrs_addr = format_args!("{attributes_addr:#x}"),
         streams_addr = format_args!("{streams_addr:#x}"),
         "createVertexProgram"
@@ -222,7 +289,7 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // vertex state built from this vertex program can size its default uniform buffer.
     let program_header = st.shader_program(program_id);
     let handle = st.new_handle();
-    st.set_vertex_program(handle, attributes, stride, program_header);
+    st.set_vertex_program(handle, attributes, streams, program_header);
     ctx.write_u32(out, handle);
     ctx.ret(0);
 }
@@ -328,13 +395,7 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
 pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, st: &mut VitaState) {
     let stream_index = ctx.arg(1);
     let data = ctx.arg(2);
-    if stream_index == 0 {
-        st.bind_stream0(data);
-    } else {
-        // Only stream 0 is captured. An attribute declared on a higher stream would then be
-        // decoded out of stream 0's bytes, so log the binding rather than lose it silently.
-        tracing::debug!(target: "vitaslop::gxm", stream_index, data = format_args!("{data:#x}"), "setVertexStream (uncaptured stream)");
-    }
+    st.bind_stream(stream_index, data);
     ctx.ret(0);
 }
 
@@ -1039,4 +1100,113 @@ pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaStat
 pub(super) fn set_precomputed_fragment_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
     st.bind_precomputed_fragment_state(ctx, state);
     0
+}
+
+#[cfg(test)]
+mod inline_op_tests {
+    use super::*;
+    use crate::host::VitaState;
+    use crate::nid::gxm as g;
+    use crate::world::DeterministicWorld;
+    use crate::{SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    /// Guest address the synthetic `SceGxmProgramParameter` sits at. Word-aligned and
+    /// away from 0 so a bug that reads the wrong base shows up as a mismatch.
+    const PARAM: u32 = 0x40;
+
+    /// The parameter record: name offset, the packed word, array size, resource index.
+    /// The packed word's nibbles are all DIFFERENT so a getter that reads the wrong
+    /// field, or shifts by the wrong amount, cannot accidentally agree.
+    fn param_record() -> [u32; 4] {
+        [0x1234_5678, 0x0000_9CB6, 0x0000_002A, 0x0000_0007]
+    }
+
+    /// Run a NID through the real dispatch over a synthetic parameter record and
+    /// return the r0 the guest would see.
+    fn handler_result(func_nid: u32) -> u32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = PARAM;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        for (i, w) in param_record().iter().enumerate() {
+            let off = PARAM as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        regs[0]
+    }
+
+    /// The word an inline op reads, out of the same synthetic record.
+    fn word_at(offset: u32) -> u32 {
+        param_record()[(offset / 4) as usize]
+    }
+
+    /// EVERY NID with an inline form must compute exactly what its host handler
+    /// computes. The inline form is a SECOND implementation of the same call - the
+    /// transpiler emits it into guest code and the host handler never runs - so
+    /// nothing else in the system would notice them drifting apart: the render would
+    /// simply be wrong, in a way that looks like a shader bug.
+    ///
+    /// Every NID this project inlines is listed here explicitly rather than iterated
+    /// from the table, so adding an entry to `inline_op` without a case here leaves
+    /// `every_inlined_nid_is_covered` failing.
+    #[test]
+    fn inline_ops_match_their_handlers() {
+        for func_nid in COVERED {
+            let op = inline_op(func_nid).expect("listed NID has an inline form");
+            assert_eq!(
+                op.eval(word_at(op.offset())),
+                handler_result(func_nid),
+                "inline form of {} disagrees with its handler",
+                crate::nid::name(func_nid)
+            );
+        }
+    }
+
+    /// The NIDs the test above checks.
+    const COVERED: [u32; 6] = [
+        g::PROGRAM_PARAMETER_GET_CATEGORY,
+        g::PROGRAM_PARAMETER_GET_TYPE,
+        g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT,
+        g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX,
+        g::PROGRAM_PARAMETER_GET_ARRAY_SIZE,
+        g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX,
+    ];
+
+    /// Only a call with NO host behaviour may be inlined. Inlining is invisible to
+    /// the host - the handler simply never runs - so inlining a NID that touches
+    /// `VitaState` would silently drop that state change, and the symptom would appear
+    /// somewhere else entirely.
+    ///
+    /// The two directions are checked separately: every NID this test claims to cover
+    /// really does have an inline form (so `COVERED` cannot silently go stale against
+    /// `inline_op`), and a sample of NIDs with real behaviour do not.
+    #[test]
+    fn only_pure_getters_are_inlined() {
+        for &nid in &COVERED {
+            assert!(
+                inline_op(nid).is_some(),
+                "{} is listed as covered but has no inline form",
+                crate::nid::name(nid)
+            );
+        }
+        for nid in [
+            g::DRAW,                          // records a whole draw into the scene
+            g::END_SCENE,                     // completes and folds a frame
+            g::SET_VERTEX_PROGRAM,            // updates the bound program
+            g::PROGRAM_PARAMETER_GET_NAME,    // returns a pointer, not a bitfield
+            g::PROGRAM_GET_PARAMETER,         // computes an address from two reads
+            g::PROGRAM_GET_PARAMETER_COUNT,   // reads the PROGRAM, not a parameter
+        ] {
+            assert!(
+                inline_op(nid).is_none(),
+                "{} does more than one bitfield read and must not be inlined",
+                crate::nid::name(nid)
+            );
+        }
+    }
 }
