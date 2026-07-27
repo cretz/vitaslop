@@ -16,6 +16,7 @@
 
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
+use crate::Ptr;
 use crate::vita::cfmt;
 use crate::SvcOutcome;
 
@@ -102,6 +103,7 @@ pub(super) fn create_thread(
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let nm = String::from_utf8_lossy(&raw[..end]);
         tracing::debug!(target: "vitaslop::thread", thid, entry = format_args!("{:#010x}", entry.addr()), prio, name = %nm, "createThread");
+        st.set_thread_name(thid, &nm);
     }
     thid
 }
@@ -341,6 +343,163 @@ pub(super) fn clib_strcmp(ctx: &mut GuestCtx, a: Ptr, b: Ptr) -> i32 {
         }
     }
     result
+}
+
+/// char *sceClibStrrchr(const char *s, int c)
+/// The LAST occurrence of `c` in `s`, or NULL. Expression-bodied (no early `return`):
+/// `#[hostcall]` inlines the body into a `()` wrapper.
+#[hostcall]
+pub(super) fn clib_strrchr(ctx: &mut GuestCtx, s: Ptr, c: i32) -> Ptr {
+    let bytes = read_cstr_bytes(ctx, s.addr());
+    let needle = c as u8;
+    match needle {
+        // Searching for the terminator finds it, as C specifies.
+        0 => Ptr(s.addr() + bytes.len() as u32),
+        _ => match bytes.iter().rposition(|&b| b == needle) {
+            Some(i) => Ptr(s.addr() + i as u32),
+            None => Ptr(0),
+        },
+    }
+}
+
+/// int sceClibStrncasecmp(const char *a, const char *b, SceSize n)
+/// Compare at most `n` bytes, case-insensitively for ASCII. Like the other clib compares
+/// the result is the difference of the first differing (folded) bytes.
+#[hostcall]
+pub(super) fn clib_strncasecmp(ctx: &mut GuestCtx, a: Ptr, b: Ptr, n: u32) -> i32 {
+    let x = read_cstr_bytes(ctx, a.addr());
+    let y = read_cstr_bytes(ctx, b.addr());
+    let mut result = 0;
+    for i in 0..n as usize {
+        let p = x.get(i).copied().unwrap_or(0).to_ascii_lowercase();
+        let q = y.get(i).copied().unwrap_or(0).to_ascii_lowercase();
+        if p != q {
+            result = p as i32 - q as i32;
+            break;
+        }
+        if p == 0 {
+            break;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// sceClibMspace*: a general allocator over a block of the title's OWN memory.
+//
+// A title that manages its own heap hands the system a block and asks for an allocator
+// over it. The allocator is real (see [`crate::mspace`]) and lives entirely inside the
+// block the guest provided, so nothing here can collide with anything else in the guest
+// address space - the failure mode `vitaslop-galloc-vs-main-stack` records.
+// ---------------------------------------------------------------------------
+
+/// void *sceClibMspaceCreate(void *base, SceSize capacity, SceUInt32 flag)
+/// Create a memory space over the caller's block and return its handle. The handle is
+/// the block's own base address, exactly as hardware's returns it, so a title that
+/// stores and passes the handle around always resolves to the same space.
+///
+/// A degenerate request (null base, or a capacity too small to allocate anything from)
+/// returns NULL, which is what a caller checks for.
+#[hostcall]
+pub(super) fn clib_mspace_create(_ctx: &mut GuestCtx, st: &mut VitaState, base: Ptr, capacity: u32, _flag: u32) -> Ptr {
+    match st.mspaces.create(base.addr(), capacity) {
+        Some(handle) => {
+            tracing::debug!(
+                target: "vitaslop::cb",
+                base = format_args!("{:#x}", base.addr()),
+                capacity,
+                "sceClibMspaceCreate"
+            );
+            Ptr(handle)
+        }
+        None => {
+            tracing::warn!(
+                target: "vitaslop::err",
+                base = format_args!("{:#x}", base.addr()),
+                capacity,
+                "sceClibMspaceCreate: degenerate space -> NULL"
+            );
+            Ptr(0)
+        }
+    }
+}
+
+/// void sceClibMspaceDestroy(void *msp)
+/// Drop a space. The guest owns the memory it was built over and reclaims it itself, so
+/// there is nothing to release here beyond the bookkeeping.
+#[hostcall]
+pub(super) fn clib_mspace_destroy(_ctx: &mut GuestCtx, st: &mut VitaState, msp: Ptr) {
+    if !st.mspaces.destroy(msp.addr()) {
+        tracing::warn!(
+            target: "vitaslop::err",
+            msp = format_args!("{:#x}", msp.addr()),
+            "sceClibMspaceDestroy: no such memory space"
+        );
+    }
+}
+
+/// void *sceClibMspaceMalloc(void *msp, SceSize size)
+/// Allocate from a space. Returns NULL when the space is exhausted - the honest result,
+/// and one the caller is written to handle. An unknown space is reported: it means a
+/// handle the guest holds is not one we created, which is a bug worth seeing rather than
+/// an allocation to invent.
+#[hostcall]
+pub(super) fn clib_mspace_malloc(_ctx: &mut GuestCtx, st: &mut VitaState, msp: Ptr, size: u32) -> Ptr {
+    Ptr(mspace_alloc(st, msp, size, 0, "sceClibMspaceMalloc"))
+}
+
+/// void *sceClibMspaceMemalign(void *msp, SceSize alignment, SceSize size)
+#[hostcall]
+pub(super) fn clib_mspace_memalign(_ctx: &mut GuestCtx, st: &mut VitaState, msp: Ptr, alignment: u32, size: u32) -> Ptr {
+    Ptr(mspace_alloc(st, msp, size, alignment, "sceClibMspaceMemalign"))
+}
+
+fn mspace_alloc(st: &mut VitaState, msp: Ptr, size: u32, align: u32, what: &str) -> u32 {
+    let Some(space) = st.mspaces.get_mut(msp.addr()) else {
+        tracing::warn!(
+            target: "vitaslop::err",
+            msp = format_args!("{:#x}", msp.addr()),
+            "{what}: no such memory space -> NULL"
+        );
+        return 0;
+    };
+    match space.alloc(size, align) {
+        Some(p) => p,
+        None => {
+            let (used, capacity) = (space.used_bytes(), space.capacity());
+            tracing::warn!(
+                target: "vitaslop::err",
+                msp = format_args!("{:#x}", msp.addr()),
+                size,
+                align,
+                used,
+                capacity,
+                "{what}: memory space exhausted -> NULL"
+            );
+            0
+        }
+    }
+}
+
+/// void sceClibMspaceFree(void *msp, void *ptr)
+/// Free a pointer back to its space. Freeing NULL is a no-op, as it is in C; freeing
+/// anything the space did not hand out is reported rather than absorbed, because a double
+/// free or a foreign pointer is a real defect that silence would hide until the heap
+/// misbehaves somewhere unrelated.
+#[hostcall]
+pub(super) fn clib_mspace_free(_ctx: &mut GuestCtx, st: &mut VitaState, msp: Ptr, ptr: Ptr) {
+    if ptr.is_null() {
+        return;
+    }
+    let freed = st.mspaces.get_mut(msp.addr()).is_some_and(|s| s.free(ptr.addr()));
+    if !freed {
+        tracing::warn!(
+            target: "vitaslop::err",
+            msp = format_args!("{:#x}", msp.addr()),
+            ptr = format_args!("{:#x}", ptr.addr()),
+            "sceClibMspaceFree: pointer is not a live allocation of this space"
+        );
+    }
 }
 
 /// Read a bounded NUL-terminated byte string from guest memory.

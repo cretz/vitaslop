@@ -1,0 +1,114 @@
+@title First-run setup, then the main menu and TIME ATTACK SELECTION
+@game  PCSE00001
+
+# The whole first-run wizard is mandatory (the team choice is one-time and offline), and
+# every screen in it is TOUCH driven - the buttons are not pad-selectable. Panel
+# coordinates are screen*2. Verified end to end with
+#   VITASLOP_GXP_LIVE=1 VITASLOP_HEADLESS_RECIPE=<this> VITASLOP_HEADLESS_FRAMES=11000 \
+#   VITASLOP_HEADLESS_SHOT_EVERY=200 vitaslop-desktop --game <app> --headless <dir>
+# `play` renders in SOFTWARE and shows this title as black - judge it only through the
+# headless GPU path.
+
+0: @section boot
+
+# PLAY on the title screen (screen 480,420 -> panel 960,840)
+1500: touch=960,840
+1520:
+1560: touch=960,840
+1580:
+
+# PLANETARY LEAGUE -> SIGN ON (screen 480,437 -> panel 960,874). Despite the name this
+# is NOT a PlayStation Network sign-in; it proceeds with no account and no network.
+1700: touch=960,874
+1720:
+1780: touch=960,874
+1800:
+
+# TEAMS: "Touch the ticket to sign the contract" - ticket centre screen (200,270).
+2000: touch=400,540
+2020:
+2100: touch=400,540
+2120:
+
+# TEAM CONFIRMATION: "touch and HOLD the team icon". A tap does nothing.
+2400: touch=960,556
+2600:
+
+# The hold issues a TEAM ID card. The cyan "OK" box on the card is NOT the control - the
+# ticker says "touch the arrow on the right", and an `explore` sweep at f2700 proved it:
+# the OK box and the card body both bucket as NO EFFECT, while the right-edge arrow at
+# panel (1870,516) produces a distinct signature. Do not re-try the OK box.
+2700: touch=1870,516
+2740:
+2820: touch=1870,516
+2860:
+
+# SIGNING COMPLETE -> NEXT (screen 480,437 -> panel 960,874).
+3200: touch=960,874
+3240:
+
+# From here the setup screens (LOCATION INFO, ...) advance on the RIGHT-EDGE ARROW at
+# screen (935,270) -> panel (1870,540), not on any centre button. Walk them.
+3500: touch=1870,540
+3540:
+3700: touch=1870,540
+3740:
+# "Now creating your ID Card..." offers USE LOCATION TRACKER (screen 480,362) or FIND
+# LOCATION ON MAP (screen 480,439). The right arrow does NOT advance this one - it needs a
+# choice. Take the map, which is the offline path: the tracker wants a real position fix.
+3900: touch=960,878
+3940:
+4000: touch=960,878
+4040:
+
+# Then place the marker on the world map and confirm with the right-edge arrow.
+4200: touch=960,540
+4240:
+4400: touch=1870,540
+4440:
+4600: touch=1870,540
+4640:
+4800: touch=960,874
+4840:
+5000: touch=960,874
+5040:
+
+# COUNTRY/REGION list, "Other" -> the single entry "RID / Ridge State" at screen (480,157).
+5200: touch=960,314
+5240:
+5350: touch=960,314
+5390:
+
+# Confirm out of the region list and on through whatever the wizard has left.
+5550: touch=1870,540
+5590:
+5750: touch=960,874
+5790:
+5950: touch=1870,540
+5990:
+6150: touch=960,874
+6190:
+
+# SETTINGS COMPLETE - "Touch READY on the right side to begin." The READY button is the
+# big arrow panel at screen (826,276) -> panel (1652,552).
+6400: touch=1652,552
+6440:
+6600: touch=1652,552
+6640:
+
+# Team trophy + RCTV PLANET NEWS ticker; the right-edge arrow dismisses it to the MAIN MENU.
+7000: touch=1870,540
+7040:
+7300: touch=1870,540
+7340:
+# MAIN MENU: GARAGE | WORLD RACE | SPOT... | TIME ... - take the TIME card (screen 930,415).
+7600: touch=1860,830
+7640:
+7900: touch=1860,830
+7940:
+8300: touch=960,540
+8340:
+8700: touch=960,874
+8740:
+9100: touch=1870,540
+9140:

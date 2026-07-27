@@ -15,8 +15,25 @@ use crate::hostcall;
 pub(super) fn alloc_mem_block(st: &mut VitaState, _name: Ptr, _ty: u32, size: u32, _opt: Ptr) -> i32 {
     // CDRAM aligns to 256 KiB, other blocks to 4 KiB. The guest already rounds
     // size; align the base to match hardware granularity.
-    st.alloc_memblock(size, 256 * 1024)
+    match st.alloc_memblock(size, 256 * 1024) {
+        0 => {
+            // An exhausted arena must be an error the guest can act on. Reporting a live
+            // SceUID whose base is 0 is a hollow success: the caller's null check passes,
+            // `sceKernelGetMemBlockBase` hands it 0, and the failure surfaces much later
+            // as a write through a null pointer with nothing left pointing at the cause.
+            tracing::error!(
+                target: "vitaslop::err",
+                size,
+                "sceKernelAllocMemBlock: no guest memory left - reporting NO_MEMORY"
+            );
+            SCE_KERNEL_ERROR_NO_MEMORY
+        }
+        uid => uid,
+    }
 }
+
+/// `SCE_KERNEL_ERROR_NO_MEMORY`: the allocation could not be satisfied.
+const SCE_KERNEL_ERROR_NO_MEMORY: i32 = 0x8002_0003u32 as i32;
 
 /// int sceKernelGetMemBlockBase(SceUID uid, void **base)
 #[hostcall]

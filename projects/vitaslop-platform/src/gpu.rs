@@ -97,6 +97,13 @@ pub enum DrawSpace {
 #[derive(Clone, Debug)]
 pub struct GxmTexture {
     pub key: u64,
+    /// Guest address of the texture's pixel data. Identity, not content: a title that
+    /// renders a pass into an offscreen buffer and samples it in a later pass binds a
+    /// texture whose data pointer IS that pass's colour surface, and the guest bytes
+    /// behind it are stale (the GPU wrote the real pixels, not the guest). The renderer
+    /// matches this against the render targets it has drawn this frame and binds the
+    /// rendered texture instead - see `GxmRenderer::encode_chain`.
+    pub data_addr: u32,
     pub width: u32,
     pub height: u32,
     /// Number of `width x height` RGBA8 images `rgba` holds back to back: 1 normally, 6 for a
@@ -170,6 +177,43 @@ pub struct GxmDraw {
     /// (`VITASLOP_GXP_LIVE`); the renderer links + caches a pipeline and ALWAYS falls back
     /// to the fixed-function fields above on any link/format error. See [`GxpRecompile`].
     pub gxp: Option<GxpRecompile>,
+    /// This draw has NO valid fixed-function representation: its geometry carries neither a
+    /// texcoord nor a per-vertex colour, so the fixed-function fields above have no colour
+    /// source and would paint opaque white. Its real colour lives in the guest's fragment
+    /// shader (typically a uniform), so it can only be drawn through `gxp`.
+    ///
+    /// The scene builder used to DISCARD such a draw outright, silently. That is what made a
+    /// retail title's solid-colour UI fills - a button's interior, a panel backing - simply
+    /// absent, indistinguishable from the guest never drawing them, and it survived being
+    /// stared at in screenshots. Keeping the draw and marking it lets the recompiler render it
+    /// exactly; if no recompiled pipeline is available the renderer skips it and SAYS SO,
+    /// rather than either dropping it quietly or painting a white rectangle.
+    pub shader_only: bool,
+}
+
+/// Report, once per run, that a draw with no fixed-function representation could not be drawn
+/// by the recompiler either - so it is missing from the frame. Suppressed after the first so a
+/// per-frame occurrence cannot flood the log; the first one carries what matters.
+pub(crate) fn report_shader_only_skip(d: &GxmDraw, gxp_enabled: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "render: a draw with NO fixed-function representation (position-only geometry, its \
+         colour lives in the guest fragment shader) is MISSING from the frame - {}. \
+         {} indices, {} vertex bytes.",
+        if !gxp_enabled {
+            "the GXP recompiler is not enabled (set VITASLOP_GXP_LIVE)"
+        } else if d.gxp.is_none() {
+            "the runtime captured no shader payload for it"
+        } else {
+            "its shader pair did not link (the fallback above names the reason)"
+        },
+        d.index_count,
+        d.vertices.len(),
+    );
 }
 
 /// Everything the GXP->WGSL recompiler needs to draw one call with the guest's real
@@ -243,11 +287,26 @@ pub struct GxpTex {
 /// Stride of the canonical [`GxmDraw`] vertex: pos(12) + uv(8) + color(4) + world-normal(12).
 pub const GXM_VERTEX_STRIDE: u64 = 36;
 
+/// Where a scene's pixels land: the guest address of its colour surface and that
+/// surface's size. A frame is usually several scenes - offscreen passes that render
+/// shadow maps, reflections, the 3D world - followed by one that composites them onto
+/// the display buffer, and the composite samples the earlier ones as TEXTURES. Matching
+/// a sampled texture's data pointer against these is what lets the renderer bind what it
+/// actually drew instead of the guest bytes, which the GPU never wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RttTarget {
+    pub data_addr: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A whole scene reduced to general draws, in submission order. The runtime builds
 /// it from a captured [`Scene`](vitaslop_runtime-side); [`GxmRenderer`] draws it.
 #[derive(Clone, Debug, Default)]
 pub struct RenderScene {
     pub draws: Vec<GxmDraw>,
+    /// This scene's render target, when the guest's colour surface was resolvable.
+    pub target: Option<RttTarget>,
     /// Linear depth-normalization for the opaque (Mvp) draws: the shader maps each
     /// fragment's post-divide depth `d = c.z/c.w` to `clamp((d - depth_min) * depth_scale,
     /// 0, 1)` before the depth test. The guest's captured matrices produce `d` in an
@@ -678,6 +737,11 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     enum BindKey {
         White,
         Tex(u64, bool),
+        /// A texture whose pixels this frame's earlier pass rendered, named by the guest
+        /// address of that pass's colour surface rather than by content - the guest bytes
+        /// at that address are stale, so a content key would name the wrong image. The
+        /// last field selects the pre-pass snapshot over the live target.
+        Rtt(u32, bool, bool),
     }
 
     /// One draw resolved against the per-frame arena: byte ranges into the shared
@@ -752,6 +816,36 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// The lazily-(re)created offscreen supersample target (colour + depth + resolve bind
         /// group), sized to `ss_scale * surf`. Rebuilt when the scale or target size changes.
         ss_target: Option<SsTarget>,
+        /// Offscreen render targets, keyed by the guest address of the colour surface the
+        /// pass that fills them writes. Persistent across frames (a title reuses the same
+        /// few targets every frame), rebuilt when a target's size changes.
+        rtt: HashMap<u32, RttSurface>,
+        /// Views of the targets already rendered in the CURRENT frame's chain, by guest
+        /// address. A later pass only substitutes a rendered target for a sampled texture
+        /// when THIS frame drew it; otherwise it would sample last frame's image, which is
+        /// worse than the guest's own bytes because it looks plausible.
+        rtt_rendered: HashMap<u32, wgpu::TextureView>,
+        /// Fixed-function bind groups over a rendered target, keyed by (address, linear,
+        /// reading-the-snapshot). The snapshot flag is part of the key because the two
+        /// views are different textures - binding the live one where the snapshot is meant
+        /// would make the target its own input.
+        rtt_binds: HashMap<(u32, bool, bool), wgpu::BindGroup>,
+        /// Addresses whose entry in `rtt_rendered` is currently the snapshot rather than
+        /// the live target (the pass being encoded draws into that address).
+        rtt_reads_snapshot: HashSet<u32>,
+        /// Draws in the current chain that sampled a target this frame rendered. Zero over
+        /// a frame with several passes means the composite is NOT reading them, which is a
+        /// different problem from the passes not being drawn - and the two look identical
+        /// on screen.
+        rtt_hits: usize,
+        /// Last reported chain shape, so the report prints on a change rather than every
+        /// frame. See the `gxm chain:` line.
+        last_chain_shape: Option<String>,
+        /// Guest addresses of every texture the pass being encoded sampled. Reported for
+        /// the frame's LAST pass: a composite that shows none of the world is either not
+        /// sampling the world target or sampling an address nothing rendered, and those
+        /// need opposite fixes.
+        sampled_addrs: HashSet<u32>,
         /// The live GXP->WGSL recompiler: a per-shader-pair pipeline cache. When enabled
         /// (`VITASLOP_GXP_LIVE`) a draw carrying [`super::GxpRecompile`] is rendered with the
         /// guest's real shaders; a pair that fails to link falls back to the fixed-function
@@ -797,6 +891,36 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         color_view: wgpu::TextureView,
         depth_view: wgpu::TextureView,
         resolve_bind: wgpu::BindGroup,
+    }
+
+    /// A scene whose colour surface could not be resolved has nowhere to be drawn, and
+    /// whatever it drew is missing from the frame. Reported the first time it happens (a
+    /// per-frame pass would otherwise flood the log), unconditionally - a pass silently
+    /// vanishing is indistinguishable from the guest never submitting it, and that
+    /// ambiguity has cost this project whole sessions.
+    fn report_unplaced_scene(draws: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "gxm: a scene with {draws} draws has no resolvable colour surface - it renders \
+                 nowhere, and any later pass that samples its target gets stale guest memory"
+            );
+        }
+    }
+
+    /// One offscreen render target: the colour buffer a pass draws into and a matching
+    /// depth buffer. Held by the guest address of the colour surface, so the pass that
+    /// samples it later can be matched to it by the texture's data pointer.
+    struct RttSurface {
+        width: u32,
+        height: u32,
+        color: wgpu::Texture,
+        color_view: wgpu::TextureView,
+        depth_view: wgpu::TextureView,
+        /// A copy of `color` as it stood before the pass now drawing into it, made only
+        /// when that pass also SAMPLES the buffer - see `GxmRenderer::snapshot_rtt`.
+        shadow: Option<(wgpu::Texture, wgpu::TextureView)>,
     }
 
     /// Round `v` up to a multiple of `align` (a power of two).
@@ -900,6 +1024,8 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// back. Rendering one pair at a time is how a visual artifact is attributed to the
         /// shader that produced it. Empty = no filter (recompile every linkable pair).
         keys: Vec<u64>,
+        /// Pairs forced down the fixed-function path (`VITASLOP_GXP_EXCLUDE`).
+        exclude: Vec<u64>,
         /// `key -> Some(pipeline)` for a linkable pair, `key -> None` for one that failed to
         /// link (cached so we never retry it and always fall back).
         pipelines: HashMap<u64, Option<GxpPipeline>>,
@@ -949,6 +1075,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                exclude: std::env::var("VITASLOP_GXP_EXCLUDE")
+                    .ok()
+                    .map(|v| {
+                        v.split(',')
+                            .filter_map(|k| u64::from_str_radix(k.trim().trim_start_matches("0x"), 16).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 pipelines: HashMap::new(),
                 views: HashMap::new(),
                 sampler_point: None,
@@ -976,12 +1110,23 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             color_format: wgpu::TextureFormat,
             gxp: &GxpRecompile,
             depth_range: [f32; 2],
+            // `rendered`: views of the render targets this frame has already drawn, by
+            // guest address. A sampler whose bound texture points at one of these binds
+            // the render rather than the guest's (stale) bytes.
+            rendered: &HashMap<u32, wgpu::TextureView>,
         ) -> Option<GxpPrepared> {
             if gxp.index_count == 0 || gxp.vertices.is_empty() {
                 return None;
             }
             let key = Self::key(gxp);
             if !self.keys.is_empty() && !self.keys.contains(&key) {
+                return None;
+            }
+            // `VITASLOP_GXP_EXCLUDE=<key>,...`: send these pairs down the fixed-function
+            // path instead. The complement of `VITASLOP_GXP_KEYS`, and the useful one when
+            // a frame is almost right: it answers "is this ONE draw the recompiler's fault"
+            // without also un-recompiling the hundreds of draws that are already correct.
+            if self.exclude.contains(&key) {
                 return None;
             }
             if !self.pipelines.contains_key(&key) {
@@ -1033,6 +1178,26 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     "gxp draw key {:x}: vsa_lanes={} vert_sa_lanes={} fsa_lanes={} frag_sa_lanes={} samplers={:?} stride={} idx={} nverts={nverts} max_index={max_index} vbytes={} attrs(reg,off,fmt,comp)={:?}\n  vsa={:?}\n  fsa={:?}",
                     key, pipe.vsa_lanes, f.len(), pipe.fsa_lanes, ff.len(), pipe.samplers, gxp.vertex_stride, gxp.index_count, gxp.vertices.len(), attrs, f, ff
                 );
+                // For a small mesh, the attribute VALUES as fetched. A quad landing in the
+                // wrong place on screen is either its positions or its transform, and those
+                // are indistinguishable from the picture; this shows the positions.
+                if nverts <= 8 {
+                    let stride = gxp.vertex_stride.max(1) as usize;
+                    for v in 0..nverts {
+                        let vals: Vec<String> = gxp
+                            .attributes
+                            .iter()
+                            .map(|a| {
+                                let base = v * stride + a.offset as usize;
+                                let c: Vec<String> = (0..a.components as usize)
+                                    .map(|i| format!("{:.3}", read_attr_component(&gxp.vertices, base, a.gxm_format, i)))
+                                    .collect();
+                                format!("r{}=[{}]", a.reg_index, c.join(","))
+                            })
+                            .collect();
+                        eprintln!("    v{v}: {}", vals.join(" "));
+                    }
+                }
             }
 
             // Repack the guest vertex stream into the tightly-packed f32 layout the pipeline
@@ -1055,6 +1220,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let bg2 = Self::make_sampler_bg(
                 device, queue, &pipe.layouts[2], &pipe.samplers, gxp, key,
                 view_cache, sampler_point.as_ref().unwrap(), sampler_linear.as_ref().unwrap(), *force,
+                rendered,
             )?;
             // group3: the scene depth range the injected clip fixup maps through, as one vec4
             // (min, scale, unused, unused) - the same values the fixed-function path uses, so
@@ -1099,6 +1265,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             sampler_point: &wgpu::Sampler,
             sampler_linear: &wgpu::Sampler,
             force: bool,
+            rendered: &HashMap<u32, wgpu::TextureView>,
         ) -> Option<wgpu::BindGroup> {
             if samplers.is_empty() {
                 return Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1122,6 +1289,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     SamplerDim::Three => false,
                 });
                 match usable {
+                    // Sampling a buffer an earlier pass in THIS frame rendered: bind that
+                    // render. Only 2D targets - a cube face is never a GXM render target.
+                    Some(gt) if want == SamplerDim::Two && rendered.contains_key(&gt.tex.data_addr) => {
+                        views.push(rendered[&gt.tex.data_addr].clone());
+                        linears.push(gt.tex.filter_linear);
+                    }
                     Some(gt) => {
                         let cache_key = (gt.tex.key, want);
                         if !view_cache.contains_key(&cache_key) {
@@ -1442,6 +1615,38 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// Report, once per pair, every USSE control-flow branch either program contains: the
+    /// branch's instruction index, its signed word delta, the target that resolves to, and the
+    /// program's instruction count.
+    ///
+    /// This is a MEASUREMENT, not a debug aid, and that is why it is unconditional like
+    /// [`report_fallback`] rather than behind a flag. Branch translation rests on one fact the
+    /// distilled ISA reference states but the captured shader corpus cannot corroborate (it
+    /// contains no branches at all): that a target is `index + rel` rather than `index + 1 +
+    /// rel`. Those differ by exactly one instruction, so the wrong reading leaves the last
+    /// instruction of every conditional block running unconditionally - a plausible wrong
+    /// picture with no error anywhere. A branch whose target lands exactly on `total` (one past
+    /// the end, the shape a trailing `if` compiles to) confirms the implemented reading;
+    /// targets that cluster one short of it, with none ever reaching `total`, would refute it.
+    fn report_branches(key: u64, gxp: &GxpRecompile) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.insert(key) {
+            return;
+        }
+        for (kind, bytes) in [("vertex", &gxp.vprog), ("fragment", &gxp.fprog)] {
+            let Ok((total, sites)) = vitaslop_gxp_shader::branch_sites(bytes) else { continue };
+            for s in sites {
+                eprintln!(
+                    "gxp pair {key:016x}: {kind} BR #{} rel={} -> target {} of {total} instrs",
+                    s.index, s.rel, s.target
+                );
+            }
+        }
+    }
+
     /// Link a guest shader pair and build its two pipeline variants + bind-group layouts.
     /// `None` (fall back) on any link error or an unmappable vertex format.
     ///
@@ -1459,6 +1664,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         solid: bool,
     ) -> Option<GxpPipeline> {
         let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
+        report_branches(key, gxp);
         let linked = match vitaslop_gxp_shader::link_programs(&gxp.vprog, &gxp.fprog) {
             Ok(l) => l,
             Err(e) => {
@@ -1993,6 +2199,13 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 resolve_layout,
                 resolve_scale_buf,
                 ss_target: None,
+                rtt: HashMap::new(),
+                rtt_rendered: HashMap::new(),
+                rtt_binds: HashMap::new(),
+                rtt_reads_snapshot: HashSet::new(),
+                rtt_hits: 0,
+                last_chain_shape: None,
+                sampled_addrs: HashSet::new(),
                 gxp: GxpLive::from_env(),
             }
         }
@@ -2151,6 +2364,260 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             match key {
                 BindKey::White => &self.white_bind,
                 BindKey::Tex(k, l) => &self.tex_binds[&(k, l)],
+                BindKey::Rtt(a, l, s) => &self.rtt_binds[&(a, l, s)],
+            }
+        }
+
+        /// The offscreen target for the colour surface at guest address `addr`, created (or
+        /// re-created at a new size) on demand.
+        fn ensure_rtt(&mut self, device: &wgpu::Device, addr: u32, width: u32, height: u32) {
+            let stale = match self.rtt.get(&addr) {
+                Some(t) => t.width != width || t.height != height,
+                None => true,
+            };
+            if !stale {
+                return;
+            }
+            let size = wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 };
+            let color = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gxm-rtt-color"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.color_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gxm-rtt-depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let color_view = color.create_view(&Default::default());
+            let depth_view = depth.create_view(&Default::default());
+            // A bind group over the new view is stale by construction; drop any cached ones.
+            self.rtt_binds.retain(|&(a, _, _), _| a != addr);
+            self.rtt.insert(addr, RttSurface { width, height, color, color_view, depth_view, shadow: None });
+        }
+
+        /// Copy the rendered target at `addr` into a side texture and return a view of it.
+        ///
+        /// A pass is entitled to render into a buffer it also samples - a post-process
+        /// stage reading the previous stage in place is the common shape - but a texture
+        /// cannot be a colour target and a sampled resource in the same pass (wgpu rejects
+        /// it, and the hardware read would be undefined). The snapshot is the buffer as it
+        /// stood BEFORE this pass, which is exactly what such a pass means to read.
+        fn snapshot_rtt(
+            &mut self,
+            device: &wgpu::Device,
+            encoder: &mut wgpu::CommandEncoder,
+            addr: u32,
+        ) -> Option<wgpu::TextureView> {
+            let color_format = self.color_format;
+            let t = self.rtt.get_mut(&addr)?;
+            let size = wgpu::Extent3d { width: t.width.max(1), height: t.height.max(1), depth_or_array_layers: 1 };
+            if t.shadow.is_none() {
+                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gxm-rtt-shadow"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: color_format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&Default::default());
+                t.shadow = Some((tex, view));
+            }
+            let (shadow_tex, shadow_view) = t.shadow.as_ref()?;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &t.color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: shadow_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                size,
+            );
+            Some(shadow_view.clone())
+        }
+
+        /// Ensure a fixed-function bind group exists for sampling `view` - the rendered
+        /// target at `addr`, or its snapshot - with the given filter.
+        fn ensure_rtt_bind(
+            &mut self,
+            device: &wgpu::Device,
+            addr: u32,
+            linear: bool,
+            snapshot: bool,
+            view: &wgpu::TextureView,
+        ) {
+            if self.rtt_binds.contains_key(&(addr, linear, snapshot)) {
+                return;
+            }
+            let samp = if linear { &self.sampler_linear } else { &self.sampler_point };
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gxm-rtt-bind"),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(samp) },
+                ],
+            });
+            self.rtt_binds.insert((addr, linear, snapshot), bind);
+        }
+
+        /// Encode a whole FRAME - every GXM scene the guest submitted, in order - so that a
+        /// pass which renders into an offscreen buffer is actually drawn, and a later pass
+        /// that samples that buffer gets what was drawn.
+        ///
+        /// This is the difference between a HUD and a game. A 3D title does not build its
+        /// frame in one pass: it renders the world (and its shadow maps, reflections,
+        /// post-process chain) into offscreen colour surfaces and then composites them onto
+        /// the display buffer. Rendering only the last scene - which is all a single-scene
+        /// `encode` can do - draws only that composite, and every texture it samples comes
+        /// from guest memory that the guest never wrote, because on hardware the GPU wrote
+        /// it. PCSE00001's race is exactly this: fourteen offscreen passes carrying the
+        /// entire world, then a 24-draw composite. The result was a correct, live HUD over a
+        /// black screen.
+        ///
+        /// Scenes are encoded in submission order (a pass may sample an EARLIER pass's
+        /// target, so order is load-bearing). A scene whose target is the same buffer the
+        /// final scene draws to goes straight into the caller's view, clearing only on the
+        /// first such pass so later ones compose onto it; every other scene goes into an
+        /// offscreen target held by its surface's guest address. A scene with no resolvable
+        /// target cannot be placed at all and is reported rather than silently dropped.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_chain(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            encoder: &mut wgpu::CommandEncoder,
+            color_view: &wgpu::TextureView,
+            depth_view: &wgpu::TextureView,
+            scenes: &[RenderScene],
+            surf_w: u32,
+            surf_h: u32,
+            clear: [u8; 4],
+        ) {
+            self.rtt_rendered.clear();
+            self.rtt_hits = 0;
+            let Some(last) = scenes.last() else { return };
+            // The display buffer is whatever the final scene draws to. Any earlier scene
+            // naming the same address is part of the same image, not an offscreen pass.
+            let display = last.target.map(|t| t.data_addr);
+            let ss = self.ss_scale > 1;
+            if ss {
+                self.ensure_ss_target(device, queue, surf_w, surf_h);
+            }
+            let mut display_pass_done = false;
+            let n = scenes.len();
+            for (i, scene) in scenes.iter().enumerate() {
+                let to_display = i + 1 == n || (scene.target.map(|t| t.data_addr) == display && display.is_some());
+                if to_display {
+                    let (cv, dv) = match (ss, self.ss_target.as_ref()) {
+                        (true, Some(t)) => (t.color_view.clone(), t.depth_view.clone()),
+                        _ => (color_view.clone(), depth_view.clone()),
+                    };
+                    let first = !display_pass_done;
+                    display_pass_done = true;
+                    self.rtt_reads_snapshot.clear();
+                    self.encode_pass(device, queue, encoder, &cv, &dv, scene, surf_w, surf_h, first.then_some(clear));
+                    continue;
+                }
+                let Some(t) = scene.target else {
+                    report_unplaced_scene(scene.draws.len());
+                    continue;
+                };
+                self.ensure_rtt(device, t.data_addr, t.width, t.height);
+                // Drawing into a buffer this frame already filled, which this pass may also
+                // sample: hand it a snapshot to read so the live buffer is a target only.
+                self.rtt_reads_snapshot.clear();
+                // Clear a target the FIRST time this frame draws into it, and compose onto
+                // it after that - the same rule the display buffer follows. A later pass
+                // into a buffer an earlier pass filled is a post-process step, and it is
+                // entitled to leave most of the image alone: PCSE00001's race ends with a
+                // five-draw pass over the world target, and clearing for it wiped the whole
+                // world, leaving a correct HUD over black.
+                let first_pass_here = !self.rtt_rendered.contains_key(&t.data_addr);
+                if !first_pass_here {
+                    if let Some(before) = self.snapshot_rtt(device, encoder, t.data_addr) {
+                        self.rtt_rendered.insert(t.data_addr, before);
+                        self.rtt_reads_snapshot.insert(t.data_addr);
+                    }
+                }
+                let (cv, dv) = {
+                    let s = &self.rtt[&t.data_addr];
+                    (s.color_view.clone(), s.depth_view.clone())
+                };
+                // A first pass is cleared to transparent black, not to the display's clear
+                // colour: it is an intermediate image, and a composite that blends it must
+                // see nothing where the pass drew nothing.
+                let clear = first_pass_here.then_some([0, 0, 0, 0]);
+                self.encode_pass(device, queue, encoder, &cv, &dv, scene, t.width, t.height, clear);
+                self.rtt_rendered.insert(t.data_addr, cv);
+            }
+            // Report the frame's pass structure whenever it CHANGES: how many scenes, where
+            // each one draws, and - the load-bearing number - how many draws sampled a
+            // target this frame rendered. A chain of passes with zero samples of them means
+            // the composite never reads the world, which looks exactly like the passes not
+            // being drawn at all but is a different bug.
+            if scenes.len() > 1 || self.rtt_hits > 0 {
+                let shape = scenes
+                    .iter()
+                    .map(|s| match s.target {
+                        Some(t) => format!("{:#x}:{}x{}/{}", t.data_addr, t.width, t.height, s.draws.len()),
+                        None => format!("?/{}", s.draws.len()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut sampled: Vec<String> =
+                    self.sampled_addrs.iter().map(|a| format!("{a:#x}")).collect();
+                sampled.sort();
+                let line = format!(
+                    "gxm chain: {} scenes [{shape}] rtt-samples={} final-pass-sampled=[{}]",
+                    scenes.len(),
+                    self.rtt_hits,
+                    sampled.join(" ")
+                );
+                if self.last_chain_shape.as_deref() != Some(line.as_str()) {
+                    eprintln!("{line}");
+                    self.last_chain_shape = Some(line);
+                }
+            }
+            // Resolve the supersampled display buffer once, after the last pass into it.
+            if let (true, Some(t)) = (ss, self.ss_target.as_ref()) {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("gxm-resolve"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rpass.set_pipeline(&self.resolve_pipeline);
+                rpass.set_bind_group(0, &t.resolve_bind, &[]);
+                rpass.draw(0..3, 0..1);
             }
         }
 
@@ -2177,6 +2644,36 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             surf_h: u32,
             clear: [u8; 4],
         ) {
+            self.encode_chain(
+                device,
+                queue,
+                encoder,
+                color_view,
+                depth_view,
+                std::slice::from_ref(scene),
+                surf_w,
+                surf_h,
+                clear,
+            );
+        }
+
+        /// One scene into one target. `clear` is `Some(colour)` for the first pass into a
+        /// target and `None` to compose onto what is already there. Supersampling is the
+        /// caller's business ([`encode_chain`](Self::encode_chain) picks the views and
+        /// resolves once), so this is a plain pass.
+        #[allow(clippy::too_many_arguments)]
+        fn encode_pass(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            encoder: &mut wgpu::CommandEncoder,
+            color_view: &wgpu::TextureView,
+            depth_view: &wgpu::TextureView,
+            scene: &RenderScene,
+            surf_w: u32,
+            surf_h: u32,
+            clear: Option<[u8; 4]>,
+        ) {
             // 1. Walk the scene once: pack vertex/index/uniform bytes into per-frame
             //    arenas and ensure each draw's texture upload + bind group exist.
             let t_prepare = Stopwatch::start();
@@ -2192,13 +2689,62 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let color_format = self.color_format;
             let mut gxp_prepared: Vec<GxpPrepared> = Vec::new();
             let mut order: Vec<Enc> = Vec::with_capacity(scene.draws.len());
-            for d in &scene.draws {
+            // Taken out for the walk so the render-target views can be read while the
+            // texture caches next to them are written; restored below.
+            let rendered = std::mem::take(&mut self.rtt_rendered);
+            self.sampled_addrs.clear();
+            // `VITASLOP_CHAIN_DRAWS=1`: describe every draw in this pass that samples a
+            // target the frame rendered. A composite that shows none of the world has
+            // either no such draw, or one whose blend/space/geometry throws it away, and
+            // the finished (black) frame cannot tell those apart.
+            let trace_draws = std::env::var_os("VITASLOP_CHAIN_DRAWS").is_some();
+            // `=all` describes EVERY draw of the pass, not only the ones sampling a
+            // rendered target - what is needed when the question is "which draw was
+            // supposed to put the world on screen" rather than "did this one bind right".
+            let trace_all = std::env::var("VITASLOP_CHAIN_DRAWS").map(|v| v == "all").unwrap_or(false);
+            for (di, d) in scene.draws.iter().enumerate() {
+                if trace_draws {
+                    // The sampled texture's own dimensions matter as much as its address: a
+                    // title may bind a render target through a texture describing a
+                    // different extent, and the UVs the shader computes are for THAT extent.
+                    let hits: Vec<String> = d
+                        .texture
+                        .iter()
+                        .map(|t| (t.data_addr, t.width, t.height))
+                        .chain(d.gxp.iter().flat_map(|g| g.textures.iter().map(|t| (t.tex.data_addr, t.tex.width, t.tex.height))))
+                        .filter(|(a, _, _)| trace_all || rendered.contains_key(a))
+                        .map(|(a, w, h)| {
+                            format!("{a:#x}({w}x{h}){}", if rendered.contains_key(&a) { "*" } else { "" })
+                        })
+                        .collect();
+                    if !hits.is_empty() || trace_all {
+                        eprintln!(
+                            "chain draw #{di}: samples {:?} key={:?} recompiled={} blend={:?} opaque={} space={:?} idx={}",
+                            hits,
+                            d.gxp.as_ref().map(|g| format!("{:x}", GxpLive::key(g))),
+                            d.gxp.is_some(),
+                            d.gxp.as_ref().map(|g| g.blend),
+                            d.opaque,
+                            d.space,
+                            d.index_count
+                        );
+                    }
+                }
+                if let Some(t) = &d.texture {
+                    self.sampled_addrs.insert(t.data_addr);
+                }
+                if let Some(g) = &d.gxp {
+                    self.sampled_addrs.extend(g.textures.iter().map(|t| t.tex.data_addr));
+                }
                 // Live GXP path: draw with the guest's real shaders when the pair links. On a
                 // link/format failure fall through to the fixed-function packing below (unless
                 // isolate mode, which renders only the recompiled draws).
                 if gxp_enabled {
                     if let Some(g) = &d.gxp {
-                        if let Some(mut prep) = self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale]) {
+                        self.rtt_hits += g.textures.iter().filter(|t| rendered.contains_key(&t.tex.data_addr)).count();
+                        if let Some(mut prep) =
+                            self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale], &rendered)
+                        {
                             if self.gxp.solid {
                                 prep.blend = false; // REPLACE + depth-Always variant (see make)
                             }
@@ -2213,11 +2759,28 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         continue;
                     }
                 }
+                // A shader-only draw has no colour source the fixed-function packing can
+                // honour, so reaching here means the recompiler could not draw it and the
+                // alternative would be an opaque white rectangle. Skip it - but never
+                // silently: this is a draw the guest asked for that the frame will not show.
+                if d.shader_only {
+                    crate::gpu::report_shader_only_skip(d, gxp_enabled);
+                    continue;
+                }
                 if d.index_count == 0 || d.vertices.is_empty() {
                     continue;
                 }
                 let bind = match &d.texture {
                     None => BindKey::White,
+                    // A texture whose data pointer is a target THIS frame already rendered
+                    // is that render, not the guest bytes behind the pointer (which the GPU,
+                    // not the guest, was supposed to have written).
+                    Some(t) if rendered.contains_key(&t.data_addr) => {
+                        self.rtt_hits += 1;
+                        let snapshot = self.rtt_reads_snapshot.contains(&t.data_addr);
+                        self.ensure_rtt_bind(device, t.data_addr, t.filter_linear, snapshot, &rendered[&t.data_addr]);
+                        BindKey::Rtt(t.data_addr, t.filter_linear, snapshot)
+                    }
                     Some(t) => {
                         self.ensure_texture(device, queue, t);
                         BindKey::Tex(t.key, t.filter_linear)
@@ -2272,6 +2835,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 });
                 order.push(Enc::Fixed(items.len() - 1));
             }
+            self.rtt_rendered = rendered;
             if gxp_enabled {
                 let with_payload = scene.draws.iter().filter(|d| d.gxp.is_some()).count();
                 let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
@@ -2325,35 +2889,28 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             //    into the offscreen `scale x` target (built here) and a resolve pass below
             //    box-downsamples it into the caller's view; otherwise it is drawn straight in.
             let t_pass = Stopwatch::start();
-            let ss = self.ss_scale > 1;
-            if ss {
-                self.ensure_ss_target(device, queue, surf_w, surf_h);
-            }
-            // The pass target (colour + depth) is the offscreen SS buffer when supersampling,
-            // else the caller's views. Bound in a narrow scope so the resolve pass can follow.
             {
-                let (cv, dv) = match (ss, self.ss_target.as_ref()) {
-                    (true, Some(t)) => (&t.color_view, &t.depth_view),
-                    _ => (color_view, depth_view),
-                };
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("gxm-scene"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: cv,
+                        view: color_view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: clear[0] as f64 / 255.0,
-                                g: clear[1] as f64 / 255.0,
-                                b: clear[2] as f64 / 255.0,
-                                a: clear[3] as f64 / 255.0,
-                            }),
+                            load: match clear {
+                                Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: c[0] as f64 / 255.0,
+                                    g: c[1] as f64 / 255.0,
+                                    b: c[2] as f64 / 255.0,
+                                    a: c[3] as f64 / 255.0,
+                                }),
+                                None => wgpu::LoadOp::Load,
+                            },
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: dv,
+                        view: depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(1.0),
                             store: wgpu::StoreOp::Discard,
@@ -2364,10 +2921,10 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                if order.is_empty() && !ss {
-                    // Clear-only frame; the pass above already cleared the target. The
-                    // phase timing is still closed out, so a caller reading it never sees
-                    // a stale value from an earlier, busier frame.
+                if order.is_empty() {
+                    // Clear-only pass; the descriptor above already did the work. The phase
+                    // timing is still closed out, so a caller reading it never sees a stale
+                    // value from an earlier, busier frame.
                     self.last_phases.pass_ms = t_pass.ms();
                     return;
                 }
@@ -2403,26 +2960,6 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                     }
                 }
-            }
-
-            // 4. Resolve: box-downsample the offscreen SS target into the caller's view.
-            if let (true, Some(t)) = (ss, self.ss_target.as_ref()) {
-                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("gxm-resolve"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: color_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rpass.set_pipeline(&self.resolve_pipeline);
-                rpass.set_bind_group(0, &t.resolve_bind, &[]);
-                rpass.draw(0..3, 0..1);
             }
             self.last_phases.pass_ms = t_pass.ms();
         }

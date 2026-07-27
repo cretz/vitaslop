@@ -13,29 +13,32 @@
 # accept once and it is saved, so later boots skip straight to the sandbox; we
 # have no saved acceptance, so this recipe scripts the accept every run.
 #
-# FRAME NUMBERS ARE POST-2026-07-25. Before that date a plain cooperative yield
-# (sceKernelDelayThread(0), sceDisplayWaitVblankStartMulti(0)) was counted as a
-# display frame, so this title's frame clock ran roughly 80x fast while a worker
-# spun. Every landmark below was re-measured against the corrected clock, where
-# one frame is one sceGxmDisplayQueueAddEntry. Old recipes' frame numbers are
-# meaningless; do not port them.
+# FRAME NUMBERS ARE POST-2026-07-27. Two clock corrections have moved them:
+#  - 2026-07-25: a plain cooperative yield (sceKernelDelayThread(0),
+#    sceDisplayWaitVblankStartMulti(0)) used to count as a display frame, so this
+#    title's frame clock ran roughly 80x fast while a worker spun.
+#  - 2026-07-27: file reads take modelled STORAGE TIME instead of completing
+#    instantly, so a load now occupies the frames it would occupy on hardware.
+#    That moved this title's whole boot later by ~500 frames - the terms panel
+#    was live at ~f800 and is live at ~f1300.
+# Old recipes' frame numbers are meaningless; do not port them.
 # ============================================================================
 
 0: @section boot
-# (no input) - legal splash to ~f450, then a "Communicating with server" spinner
-# (~f600), then the ONLINE TERMS panel fades in and is live and scrolling by f800.
+# (no input) - studio logos to ~f1050, then the ONLINE TERMS panel fades in and is
+# live and scrolling by f1300.
 
 # --- accept the terms with a single brief Cross press ---
-820: @section accept-terms
-820: cross          # ACCEPT. Held 12 frames: the guest samples the pad once per
-832:                 # display frame, so a press must span several frames to be seen.
+1350: @section accept-terms
+1350: cross          # ACCEPT. Held 12 frames: the guest samples the pad once per
+1362:                 # display frame, so a press must span several frames to be seen.
 
 # --- the sandbox loads in behind a tutorial dialog ---
-850: @section post-accept
-900:  @shot post-accept-0900
-1000: @shot post-accept-1000
-1100: @shot post-accept-1100
-1200: @shot main-screen-1200   # sandbox fully up: skatepark, both RC cars, the
+1380: @section post-accept
+1500: @shot post-accept-1500
+1700: @shot post-accept-1700
+1900: @shot post-accept-1900
+2100: @shot main-screen-2100   # sandbox fully up: skatepark, both RC cars, the
                                # "Welcome to the MotorStorm RC tutorial" dialog.
-1200: @note This recipe stops at the main screen on purpose - it is the render target.
-1200: @note To play the tutorial, use tutorial-drive.recipe, which continues from here.
+2100: @note This recipe stops at the main screen on purpose - it is the render target.
+2100: @note To play the tutorial, use tutorial-drive.recipe, which continues from here.

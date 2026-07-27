@@ -187,10 +187,11 @@ fn read_dir_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 /// The retail guest, stepped live on the preemptive scheduler. Owns the scheduler and
-/// tracks the newest presented scene and whether the run has ended.
+/// tracks the newest presented frame and whether the run has ended.
 pub struct RetailGuest {
     sched: ThreadedScheduler<VitaEnv>,
-    scene: Option<Scene>,
+    /// Every scene of the newest presented frame, in submission order.
+    scenes: Vec<Scene>,
     finished: bool,
     err: Option<String>,
     /// Decrypt + link + transpile + instantiate time, measured once at construction.
@@ -240,7 +241,7 @@ impl RetailGuest {
         let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
             .map_err(|e| format!("scheduler: {e:?}"))?;
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(RetailGuest { sched, scene: None, finished: false, err: None, build_ms })
+        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, build_ms })
     }
 
     /// Step the guest one display frame. Keeps the newest captured scene and drops the
@@ -269,8 +270,14 @@ impl RetailGuest {
                     .collect();
                 eprintln!("SCENES frame={}: [{}]", self.sched.frames(), shape.join(", "));
             }
-            if let Some(scene) = cap.scenes.pop() {
-                self.scene = Some(scene);
+            // Keep the WHOLE frame, not just its last scene. A 3D title renders its world
+            // (and shadow maps, reflections, post chains) into offscreen surfaces and then
+            // composites them; keeping only the last scene keeps only the composite, and
+            // the world never gets drawn at all - PCSE00001's race was a live HUD over
+            // black for exactly this reason. An empty list means the guest submitted no
+            // scene this frame, in which case the previous frame's stays on screen.
+            if !cap.scenes.is_empty() {
+                self.scenes = std::mem::take(&mut cap.scenes);
             }
             cap.scenes.clear();
             cap.trace.clear();
@@ -287,8 +294,31 @@ impl RetailGuest {
         }
     }
 
-    pub fn current(&self) -> Option<&Scene> {
-        self.scene.as_ref()
+    /// The guest's OWN diagnostic output: everything it has written to fd 1/2 this run.
+    ///
+    /// Retail titles ship a lot of their own logging, and it is the developer's account of
+    /// what the game thinks is happening - which beats reverse-engineering the answer, and
+    /// has already identified a hang on another title in one line. The engine has been
+    /// capturing this all along with nothing in the headless path to read it.
+    /// The guest's virtual clock, in microseconds.
+    ///
+    /// Worth reporting next to the frame count: a title that paces its simulation off the
+    /// wall clock but caps how far it will step per frame goes WRONG QUIETLY when this
+    /// runs fast - the race timer counts up several times too quickly while the car
+    /// crawls, and neither symptom names the clock. One frame is 1/60 s, so the ratio of
+    /// this to `frames / 60` should be 1.
+    pub fn clock_us(&mut self) -> u64 {
+        self.sched.host().state.now_us()
+    }
+
+    pub fn guest_stdout(&mut self) -> Vec<u8> {
+        self.sched.host().state.capture.stdout.clone()
+    }
+
+    /// The newest presented frame's scenes, in submission order; empty until the guest
+    /// has flipped once.
+    pub fn current(&self) -> &[Scene] {
+        &self.scenes
     }
     pub fn finished(&self) -> bool {
         self.finished
@@ -389,8 +419,8 @@ impl RetailGfx {
         self.depth = make_depth(&self.device, w, h);
     }
 
-    fn present(&mut self, scene: &Scene) {
-        let render_scene = self.builder.build(scene);
+    fn present(&mut self, scenes: &[Scene]) {
+        let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => return,
@@ -403,7 +433,7 @@ impl RetailGfx {
         // Project against the 960x544 GAME resolution (not the window size), so pixel-
         // space 2D coords map correctly; the window-sized framebuffer stretches the
         // resolution-independent clip output to fill the window.
-        self.gxm.encode(&self.device, &self.queue, &mut encoder, &view, &self.depth, &render_scene, GAME_W, GAME_H, CLEAR);
+        self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, GAME_W, GAME_H, CLEAR);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
     }
@@ -440,6 +470,8 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 ///   `VITASLOP_HEADLESS_NO_TAPS` is set, which runs input-free to the title screen.
 /// - `VITASLOP_HEADLESS_TIMING` - report per-frame GUEST cost (the emulated CPU work
 ///   behind one display flip) and the GPU cost of rendering the final captured scene.
+/// - `VITASLOP_HEADLESS_SHOT_EVERY` - also write `<shot_dir>/fNNNNNN.png` every N display
+///   flips, so one run shows the whole boot SEQUENCE rather than only its last frame.
 ///
 /// NOTE what the timing does and does not measure. The guest advances every frame but the
 /// scene is RENDERED ONCE, at the end - so a wall-clock total over a headless run is CPU
@@ -555,9 +587,42 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     // as a running total so the report can separate the typical frame from the worst one - a
     // mean over a run that includes boot (or an idle menu) describes neither.
     let timing = std::env::var_os("VITASLOP_HEADLESS_TIMING").is_some();
+    // Periodic GPU shots (`VITASLOP_HEADLESS_SHOT_EVERY=N`). Without this the headless path
+    // renders exactly one frame - the last - which answers "what is on screen at frame N"
+    // and nothing else. A title being brought up moves through a SEQUENCE (legal notice,
+    // attract, title, menu), and finding the frame a given screen lives on by bisecting on
+    // one final shot per run costs a whole boot per guess. The renderer is built once and
+    // reused, so the extra cost is one render per sampled frame.
+    //
+    // Note this renders through `GeneralRenderer`, the same GPU path as the final shot, so
+    // a sampled frame is directly comparable to it - and to the browser, which shares the
+    // renderer. The software rasterizer is NOT used here and could not show a title whose
+    // draws are fragment-shader passes.
+    let shot_every: u64 = std::env::var("VITASLOP_HEADLESS_SHOT_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut periodic: Option<vitaslop_native::GeneralRenderer> = None;
+    if shot_every > 0 {
+        std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
+        periodic = Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
+    }
     let mut frame_ms: Vec<f64> = Vec::new();
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
+        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && f % shot_every == 0) {
+            let scenes = guest.current();
+            if !scenes.is_empty() {
+                let fb = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+                let path = shot_dir.join(format!("f{f:06}.png"));
+                std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
+            }
+            // The guest clock beside the frame, so its LOCAL rate is visible. A run-total
+            // ratio of 1.00x hides a stretch that ran five times fast against a stretch
+            // that stalled, and a title paced off the clock behaves very differently in
+            // the two.
+            println!("shot f{f:06}: guest clock {:.3}s", guest.clock_us() as f64 / 1e6);
+        }
         if use_builtin_taps {
             let touch = taps
                 .iter()
@@ -573,14 +638,34 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
             guest.advance();
         }
     }
+    // Block-visit histogram (`VITASLOP_BLOCK_HIST=<top>`, with `VITASLOP_TRACE_BLOCKS=lo-hi`
+    // emitting the hooks). It was only reachable from the boot-probe test, which cannot
+    // replay a recipe - so the one case it is built for, "the title reached screen N and
+    // stopped", could not be measured at all. Restrict the hook range to the suspect
+    // functions and the tail of the recorded sequence IS the stuck loop.
+    if let Ok(top) = std::env::var("VITASLOP_BLOCK_HIST") {
+        vitaslop_native::dump_block_hist(top.trim().parse().unwrap_or(40));
+    }
+    // VITASLOP_DUMP_STDOUT=<path>: write everything the GUEST logged to fd 1/2 this run.
+    // Written before the error check, because a run that ended in a trap or a hang is exactly
+    // the one whose log matters most.
+    if let Ok(path) = std::env::var("VITASLOP_DUMP_STDOUT") {
+        let bytes = guest.guest_stdout();
+        let len = bytes.len();
+        std::fs::write(&path, bytes).map_err(|e| format!("write guest stdout: {e}"))?;
+        println!("headless: wrote {len} bytes of GUEST log to {path}");
+    }
     if let Some(e) = guest.error() {
         return Err(format!("guest error at frame {}: {e}", guest.frames()));
     }
-    let scene = guest.current().ok_or("no scene captured")?;
+    let scenes = guest.current().to_vec();
+    if scenes.is_empty() {
+        return Err("no scene captured".into());
+    }
 
     let mut renderer = vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?;
     let render_t = std::time::Instant::now();
-    let fb = renderer.render_scene(scene, GAME_W, GAME_H, CLEAR);
+    let fb = renderer.render_frame(&scenes, GAME_W, GAME_H, CLEAR);
     let cold_render_ms = render_t.elapsed().as_secs_f64() * 1000.0;
     if timing {
         // Re-render the SAME scene to separate one-off cost from per-frame cost. The first
@@ -591,7 +676,7 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         let mut warm: Vec<f64> = Vec::new();
         for _ in 0..WARM_RENDER_SAMPLES {
             let t = std::time::Instant::now();
-            let _ = renderer.render_scene(scene, GAME_W, GAME_H, CLEAR);
+            let _ = renderer.render_frame(&scenes, GAME_W, GAME_H, CLEAR);
             warm.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split());
@@ -599,18 +684,26 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = shot_dir.join("desktop.png");
     std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
-    // Diagnostic (VITASLOP_SOFTWARE=1): also render the SAME captured scene through the
+    // Diagnostic (VITASLOP_SOFTWARE=1): also render the frame's FINAL scene through the
     // software rasterizer and write it beside the GPU shot. The two paths share the scene
     // but nothing else, so a defect present in both is upstream of rendering (geometry,
     // capture, uniforms) rather than a shading bug - and the software path is the one that
-    // reports per-draw `DSTAT` coverage under VITASLOP_DRAW_STATS.
+    // reports per-draw `DSTAT` coverage under VITASLOP_DRAW_STATS. It renders one scene, so
+    // on a title that composites offscreen passes it shows the composite only.
     if std::env::var_os("VITASLOP_SOFTWARE").is_some() {
-        let sw = vitaslop_runtime::render::render_scene(scene, GAME_W, GAME_H, CLEAR);
+        let sw = vitaslop_runtime::render::render_scene(scenes.last().unwrap(), GAME_W, GAME_H, CLEAR);
         let sw_path = shot_dir.join("software.png");
         std::fs::write(&sw_path, sw.to_png()).map_err(|e| format!("write png: {e}"))?;
         println!("headless: wrote {}", sw_path.display());
     }
-    println!("headless: reached frame {}, wrote {}", guest.frames(), path.display());
+    let frames = guest.frames();
+    let clock_s = guest.clock_us() as f64 / 1e6;
+    println!(
+        "headless: reached frame {frames}, wrote {} (guest clock {clock_s:.1}s = {:.2}x the {:.1}s those frames are worth)",
+        path.display(),
+        clock_s / (frames.max(1) as f64 / 60.0),
+        frames as f64 / 60.0,
+    );
     Ok(())
 }
 
@@ -785,7 +878,7 @@ impl RetailApp {
         if self.paused {
             self.acc = Duration::ZERO;
         } else {
-            if self.guest.current().is_none() {
+            if self.guest.current().is_empty() {
                 self.guest.advance(); // bootstrap the first frame (runs the whole boot)
             }
             // Cap catch-up so a long boot frame does not spiral.
@@ -809,8 +902,9 @@ impl RetailApp {
         }
 
         if let Some(gfx) = self.gfx.as_mut() {
-            if let Some(scene) = self.guest.current() {
-                gfx.present(scene);
+            let scenes = self.guest.current();
+            if !scenes.is_empty() {
+                gfx.present(scenes);
             }
         }
         self.update_title(now);

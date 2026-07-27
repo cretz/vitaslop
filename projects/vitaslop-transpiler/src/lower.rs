@@ -377,6 +377,54 @@ fn const_operand(op: &Operand, regs: &RegConsts) -> Option<u32> {
     regnum(op).and_then(|r| regs[r as usize])
 }
 
+/// Whether control can reach `target` from `from` by walking the decoded stream:
+/// fall-through, unconditional branches, and BOTH sides of a conditional one. Calls are
+/// not followed (they come back), and a table branch stops the walk (where it goes is the
+/// very thing being recovered).
+///
+/// This is what tells a range check's in-range side from its out-of-range side. Position
+/// cannot: a guard's taken target routinely lands between the guard and the table branch
+/// while leading somewhere else entirely - a chain of `cmp`/`b` guards selecting among
+/// SEVERAL tables is exactly that shape, and reading the wrong side either loses the
+/// bound or, worse, sizes the table wrong.
+fn reaches(
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    from: u32,
+    target: u32,
+) -> bool {
+    // Bounded so recovery stays linear-ish on a pathological CFG. A range check sits
+    // within a few blocks of the table it guards.
+    const BUDGET: usize = 256;
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![from];
+    let mut steps = 0;
+    while let Some(mut pc) = stack.pop() {
+        loop {
+            if pc == target {
+                return true;
+            }
+            steps += 1;
+            if steps > BUDGET || !seen.insert(pc) {
+                break;
+            }
+            let Some((ins, len, cond, _)) = decoded.get(&pc) else { break };
+            if matches!(ins.opcode, Opcode::TBB | Opcode::TBH) {
+                break;
+            }
+            if ins.opcode == Opcode::B {
+                let Some(t) = branch_target(ins, pc, true) else { break };
+                if ins.condition == ConditionCode::AL && *cond == ConditionCode::AL {
+                    pc = t;
+                    continue;
+                }
+                stack.push(t);
+            }
+            pc = pc.wrapping_add(*len);
+        }
+    }
+    false
+}
+
 /// Recover the entry count and out-of-range default of a `tbb`/`tbh` switch from
 /// the compiler's range check.
 ///
@@ -480,9 +528,17 @@ fn recover_switch_bound(
             continue;
         }
         let Some(gt) = branch_target(br, br_addr, true) else { continue };
-        // In-range is the side that steers toward the table branch. The taken branch
-        // does so when its target lands in the setup between the guard and the table.
-        let in_range_taken = gt > br_addr && gt <= tb_addr;
+        // In-range is the side that actually steers toward the table branch, decided by
+        // walking the CFG from each side. When exactly one side reaches the table that
+        // settles it; when the walk is inconclusive (a diamond that rejoins, or a budget
+        // cut-off) fall back to position - the taken branch steers toward the table when
+        // its target lands in the setup between the guard and the table.
+        let fall = br_addr.wrapping_add(br_len);
+        let in_range_taken = match (reaches(decoded, gt, tb_addr), reaches(decoded, fall, tb_addr)) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => gt > br_addr && gt <= tb_addr,
+        };
         let effective = if in_range_taken { br.condition } else { negate_cond(br.condition) };
         // Only an upper bound on the switch value fixes the entry count.
         let max_index = match effective {
@@ -522,6 +578,7 @@ fn resolve_switch(
     tb_addr: u32,
     inst: &Instruction,
     decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    leaders: &BTreeSet<u32>,
 ) -> Option<SwitchInfo> {
     let index = switch_index_reg(inst)?;
     let is_tbh = inst.opcode == Opcode::TBH;
@@ -538,7 +595,46 @@ fn resolve_switch(
     };
 
     let (cmp_count, default) = recover_switch_bound(decoded, tb_addr, index);
-    let count = match cmp_count {
+    // The table ABUTS the next code leader: a jump table is inline data, so the first
+    // known instruction address after it ends it exactly. This is the bound for a switch
+    // whose range check is NOT local - a compiler lowering a large sparse switch as a
+    // binary search over sub-tables establishes the bound in an enclosing comparison many
+    // instructions earlier, so `recover_switch_bound` finds nothing, and the table-extent
+    // heuristic below fails too because it assumes the nearest case body follows the table
+    // (here the bodies are kilobytes away, so the smallest entry bounds nothing and the
+    // scan runs to its runaway guard).
+    //
+    // The abutment is self-checking, which is what makes it safe to trust: the leader must
+    // land on an exact entry boundary from the table base. A leader inside the table (which
+    // would mean we mistook table data for code) almost never satisfies that, and a count
+    // that is wrong anyway still has to pass the per-target validation below.
+    let abut_count = leaders
+        .range(pc.wrapping_add(1)..)
+        .next()
+        .map(|&l| l.wrapping_sub(pc))
+        .filter(|span| *span % esize == 0)
+        .map(|span| span / esize)
+        .filter(|c| *c > 0 && *c <= 1024)
+        // CONSISTENCY, and this is load-bearing: a leader that merely happens to follow the
+        // table does not prove the table reaches it. The table's own entries have to agree.
+        // Every entry is a forward offset to a case body, so the table cannot contain more
+        // entries than the smallest offset allows - entry `min` would otherwise sit at or
+        // past the first case body. Reading code or unrelated data as entries almost always
+        // violates that, so this rejects an over-long count instead of seeding far-flung
+        // garbage leaders into the function. Without it, resolving tables that had
+        // previously been left alone broke a title at frame 0.
+        .filter(|&c| {
+            let mut min_entry = u32::MAX;
+            for i in 0..c {
+                match read(i) {
+                    Some(v) => min_entry = min_entry.min(v),
+                    None => return false,
+                }
+            }
+            let limit = if is_tbh { min_entry } else { 2 * min_entry };
+            c <= limit
+        });
+    let count = match cmp_count.or(abut_count) {
         Some(c) => c,
         None => {
             // Infer from the table extent: grow the entry list until the next index
@@ -642,6 +738,9 @@ pub fn discover(
     let init: RegConsts = [None; 16];
     let mut work: Vec<(u32, u8, RegConsts)> = vec![(entry, 0, init)];
     leaders.insert(entry);
+    // Table branches whose extent could not be bounded on first sight; retried after the
+    // walk settles, when `leaders` is complete (see the retry loop below).
+    let mut pending_switches: BTreeSet<u32> = BTreeSet::new();
 
     // A guest address is decodable only if it lies within the code image.
     let in_bounds = |addr: u32| {
@@ -649,6 +748,10 @@ pub fn discover(
         off < code.len()
     };
 
+    // The walk runs to a fixpoint with the table-branch retry below: resolving a table
+    // reveals new case bodies to decode, and decoding them can supply the leader that
+    // bounds the NEXT table.
+    loop {
     while let Some((addr, itstate, regs)) = work.pop() {
         if !in_bounds(addr) {
             continue;
@@ -753,16 +856,25 @@ pub fn discover(
         // through - resolved or not. An unresolved table is reported per-function in
         // pass 2 rather than marching the decoder into table data.
         if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
-            if let Some(info) = resolve_switch(code, base, addr, &inst, &decoded) {
-                for &t in &info.targets {
-                    leaders.insert(t);
-                    work.push((t, 0, init));
+            match resolve_switch(code, base, addr, &inst, &decoded, &leaders) {
+                Some(info) => {
+                    for &t in &info.targets {
+                        leaders.insert(t);
+                        work.push((t, 0, init));
+                    }
+                    if let Some(d) = info.default {
+                        leaders.insert(d);
+                        work.push((d, 0, init));
+                    }
+                    switches.insert(addr, info);
                 }
-                if let Some(d) = info.default {
-                    leaders.insert(d);
-                    work.push((d, 0, init));
+                // Not resolvable YET. The abutment bound needs the leader that follows
+                // the table, which a sibling branch may not have contributed at this
+                // point in the walk - so remember it and retry once the walk settles,
+                // rather than giving up on an order-dependent snapshot.
+                None => {
+                    pending_switches.insert(addr);
                 }
-                switches.insert(addr, info);
             }
             continue;
         }
@@ -792,6 +904,44 @@ pub fn discover(
                 work.push((next, next_it, next_regs));
             }
             Flow::Return | Flow::Halt => {}
+        }
+    }
+
+        // Retry the table branches that could not be bounded on first sight.
+        //
+        // The abutment bound reads the leader that FOLLOWS the table, and that leader is
+        // often contributed by a sibling comparison the walk had not reached yet: a large
+        // sparse switch compiles to a binary search whose sub-tables are interleaved with
+        // the compare chain that targets the code after each one. Retrying once the walk
+        // settles removes that order dependence. Each round either resolves a pending table
+        // (and loops to decode its case bodies) or stops, so this terminates.
+        if pending_switches.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for addr in core::mem::take(&mut pending_switches) {
+            let Some((inst, _, _, _)) = decoded.get(&addr) else { continue };
+            let inst = inst.clone();
+            match resolve_switch(code, base, addr, &inst, &decoded, &leaders) {
+                Some(info) => {
+                    for &t in &info.targets {
+                        leaders.insert(t);
+                        work.push((t, 0, init));
+                    }
+                    if let Some(d) = info.default {
+                        leaders.insert(d);
+                        work.push((d, 0, init));
+                    }
+                    switches.insert(addr, info);
+                    progressed = true;
+                }
+                None => {
+                    pending_switches.insert(addr);
+                }
+            }
+        }
+        if !progressed {
+            break; // Nothing further is resolvable; pass 2 reports these exactly as before.
         }
     }
 
@@ -859,6 +1009,50 @@ pub fn discover(
         blocks.push(Block { addr, stmts, term });
     }
     blocks.sort_by_key(|b| b.addr);
+
+    // Repair, rather than reject, a function with an intra-function branch to an address
+    // that never became a block (a leader pass 1 could not decode to). Every such target
+    // gets a trapping block of its own, which makes the function well-formed by
+    // construction: the paths that DID lift run, and only the one that reaches the gap
+    // faults, at the exact instruction.
+    //
+    // The lenient build does this because the alternative is worse than it looks:
+    // dropping the function leaves nothing at its address, so every DYNAMIC dispatch to
+    // it becomes a miss - and a real function reached only through a function pointer
+    // (a C++ virtual, a registered callback) then takes the whole title down over a gap
+    // it may never have executed. Strict callers keep the old behaviour: the caller sees
+    // a malformed tentative function and drops it.
+    //
+    // This runs BEFORE the runaway guard below, so a repaired block that lands far away -
+    // which means the branch target was garbage, not a gap - widens the span and gets the
+    // whole discovery rejected, exactly as an over-read switch table does.
+    if isolate {
+        let mut missing: BTreeSet<u32> = BTreeSet::new();
+        let is_block = |a: u32, bs: &[Block]| bs.iter().any(|b| b.addr == a);
+        for b in &blocks {
+            match &b.term {
+                Term::Jump(t) | Term::Branch { taken: t, .. } | Term::BranchZero { taken: t, .. } => {
+                    if !is_block(*t, &blocks) {
+                        missing.insert(*t);
+                    }
+                }
+                Term::Switch { targets, default, .. } => {
+                    for t in targets.iter().chain(default.iter()) {
+                        if !is_block(*t, &blocks) {
+                            missing.insert(*t);
+                        }
+                    }
+                }
+                Term::Fallthrough | Term::Return | Term::Halt | Term::Unreachable => {}
+            }
+        }
+        if !missing.is_empty() {
+            blocks.extend(
+                missing.iter().map(|&addr| Block { addr, stmts: Vec::new(), term: Term::Unreachable }),
+            );
+            blocks.sort_by_key(|b| b.addr);
+        }
+    }
 
     // Runaway guard: a real function's blocks cluster tightly, but a mis-recovered
     // computed jump (a `tbh` whose bound we could not read from the range check, so

@@ -75,6 +75,46 @@ pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// SceInt32 sceNgsVoiceInit(SceNgsHVoice voice, const SceNgsVoicePreset *preset,
+///                           SceUInt32 initFlags)
+/// Reset a voice to its initial state, optionally from a preset. Whatever the flags
+/// select, a reset voice is not playing - so the one part of this the engine DOES model,
+/// the source player, is stopped. The preset itself configures module parameters that
+/// only a real synthesizer would consume; there is nothing here to apply it to, and
+/// pretending otherwise would put state in the mixer that no sample ever passes through.
+pub(super) fn voice_init(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let voice = ctx.arg(0);
+    st.audio_state.at9.stop(voice);
+    ctx.ret(0);
+}
+
+/// `SceNgsVoiceInfo.uVoiceState` at offset 0: the voice's lifecycle state, a BITFIELD
+/// (available 0, active 1, finalizing 2, unloading 4). Only offset 0 is written - see
+/// [`voice_get_info`].
+const NGS_VOICE_INFO_STATE_OFF: u32 = 0;
+
+/// `SCE_NGS_VOICE_STATE_AVAILABLE`: the voice is idle and holds nothing.
+const NGS_VOICE_STATE_AVAILABLE: u32 = 0;
+
+/// SceInt32 sceNgsVoiceGetInfo(SceNgsHVoice voice, SceNgsVoiceInfo *info)
+///
+/// Reports the voice as AVAILABLE, which is the truth for this engine: no synthesis runs,
+/// so no voice is ever active. That is also what unblocks a title waiting for a sound to
+/// finish - the observed caller polls this and treats `state & (ACTIVE | UNLOADING)` as
+/// "still playing", releasing its voice slot only once that clears.
+///
+/// Writes ONLY the state word. The rest of `SceNgsVoiceInfo` has no layout in any source
+/// available here, and zeroing a struct whose length is a guess would scribble over
+/// whatever the caller put after it - a stack frame, in the observed call. A field this
+/// function does not know is a field it leaves alone.
+#[hostcall]
+pub(super) fn voice_get_info(ctx: &mut GuestCtx, _st: &mut VitaState, _voice: u32, info: Ptr) -> i32 {
+    if info.addr() != 0 {
+        ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, NGS_VOICE_STATE_AVAILABLE);
+    }
+    0
+}
+
 /// Voice key-off / kill / pause - stop producing audio from this voice.
 pub(super) fn voice_stop(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);

@@ -422,18 +422,154 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
     // lane); the guard would wrongly reject those, so it applies to fragment programs only.
     let guard_internal_reads = shader.kind == ProgramKind::Fragment;
     let mut internal_written = [false; INTERNAL_LANES];
-    for (index, instr) in shader.instrs.iter().enumerate() {
+    emit_range(
+        &mut body,
+        shader,
+        0,
+        shader.instrs.len(),
+        guard_internal_reads,
+        &mut internal_written,
+        1,
+    )?;
+    Ok(body)
+}
+
+/// Emit instructions `[start, end)`, turning USSE branches into structured WGSL.
+///
+/// A USSE branch is taken when its predicate holds, so the words it jumps OVER are exactly the
+/// ones that execute when the predicate does not - which is a WGSL `if` on the negated
+/// condition around the range `[branch+1, target)`. Ranges nest, so this recurses, and `end`
+/// bounds how far a nested branch may jump: a target past the enclosing range is a jump out of
+/// a block, which no `if` can express.
+///
+/// Everything that is NOT a properly nested forward skip hard-fails naming itself. A BACKWARD
+/// branch is a loop, and a loop cannot be reconstructed by skipping ranges - emitting its body
+/// straight-line would run it exactly once, which is a plausible-looking wrong picture rather
+/// than a failure. That is the class of silent error this recompiler refuses to make.
+///
+/// `internal_written` is carried through a conditional block as a UNION rather than being
+/// discarded at its end. The guard it feeds asks "does this program ever write the lane it is
+/// reading", because an internal lane no instruction writes is a PDS/iterator preload this model
+/// does not carry; it is not a path-sensitive definite-assignment analysis. A write under a
+/// branch answers that question, so intersecting at the join would reject shaders that are fine.
+///
+/// `depth` is only the indentation of the generated WGSL.
+#[allow(clippy::too_many_arguments)]
+fn emit_range(
+    body: &mut String,
+    shader: &Shader,
+    start: usize,
+    end: usize,
+    guard_internal_reads: bool,
+    internal_written: &mut [bool; INTERNAL_LANES],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let mut index = start;
+    while index < end {
+        let instr = &shader.instrs[index];
         let byte_offset = index * 8;
         if let Some(reason) = instr.blocked {
             return Err(EmitError::Blocked { index, byte_offset, reason, raw: instr.raw });
         }
-        if guard_internal_reads {
-            check_internal_reads(instr, index, byte_offset, &internal_written)?;
+        let Op::Branch { rel } = instr.op else {
+            if guard_internal_reads {
+                check_internal_reads(instr, index, byte_offset, internal_written)?;
+            }
+            emit_instr(body, instr, index, byte_offset, shader.kind)?;
+            record_internal_writes(instr, internal_written);
+            index += 1;
+            continue;
+        };
+        let blocked = |reason| Err(EmitError::Blocked { index, byte_offset, reason, raw: instr.raw });
+        let target = index as i64 + rel as i64;
+        if target <= index as i64 {
+            return blocked("0xF8 BR jumps backward - a USSE loop is not reconstructed");
         }
-        emit_instr(&mut body, instr, index, byte_offset, shader.kind)?;
-        record_internal_writes(instr, &mut internal_written);
+        if target > end as i64 {
+            return blocked("0xF8 BR jumps out of its enclosing block - not structurable");
+        }
+        let target = target as usize;
+        // The skipped range is what runs when the branch is NOT taken. An UNCONDITIONAL branch
+        // therefore always skips it: the range is unreachable and emitting nothing for it is
+        // exact. (This is the shape a compiler emits for the `else` arm's jump over the `then`
+        // arm's tail, so it is not an oddity.)
+        let cond = match instr.pred {
+            Predicate::Always => None,
+            Predicate::IfP(n) => Some(format!("!p[{n}]")),
+            Predicate::IfNotP(n) => Some(format!("p[{n}]")),
+            Predicate::Raw(_) => {
+                return blocked("0xF8 BR carries an unresolved predicate encoding")
+            }
+        };
+        let conditional = cond.is_some();
+        let pad = "  ".repeat(depth);
+        // IF/ELSE. When the last word of the skipped range is itself an UNCONDITIONAL forward
+        // branch past `target`, that word is not part of the guarded body - it is the `then`
+        // arm's jump over the `else` arm, which is exactly how a compiler lays an if/else out:
+        //
+        //   i:   br cond -> T        (skip the then-arm)
+        //   i+1..T-2:                the then-arm
+        //   T-1: br       -> E       (jump over the else-arm)
+        //   T..E-1:                  the else-arm
+        //   E:                       the merge point
+        //
+        // Recovering it matters beyond tidiness: without it the inner branch reads as a jump out
+        // of its enclosing block and the whole pair falls back to fixed-function. Both of a
+        // retail title's menu fragment programs are this shape.
+        let else_arm = (target > index + 1)
+            .then(|| &shader.instrs[target - 1])
+            .and_then(|last| match (last.op, last.pred) {
+                (Op::Branch { rel: r }, Predicate::Always) => {
+                    let e = (target - 1) as i64 + r as i64;
+                    (e > target as i64 && e <= end as i64 && last.blocked.is_none())
+                        .then_some(e as usize)
+                }
+                _ => None,
+            });
+        match cond {
+            // An unconditional branch always skips its range: that range is unreachable and
+            // emitting nothing for it is exact, not a dropped instruction.
+            None => {}
+            Some(c) => {
+                let then_end = if else_arm.is_some() { target - 1 } else { target };
+                let _ = writeln!(body, "{pad}if ({c}) {{");
+                emit_range(
+                    body,
+                    shader,
+                    index + 1,
+                    then_end,
+                    guard_internal_reads,
+                    internal_written,
+                    depth + 1,
+                )?;
+                match else_arm {
+                    None => {
+                        let _ = writeln!(body, "{pad}}}");
+                    }
+                    Some(e) => {
+                        let _ = writeln!(body, "{pad}}} else {{");
+                        emit_range(
+                            body,
+                            shader,
+                            target,
+                            e,
+                            guard_internal_reads,
+                            internal_written,
+                            depth + 1,
+                        )?;
+                        let _ = writeln!(body, "{pad}}}");
+                    }
+                }
+            }
+        }
+        // An unconditional branch consumes only its own skip; a conditional one that recovered
+        // an else-arm has emitted through to the merge point.
+        index = match (conditional, else_arm) {
+            (true, Some(e)) => e,
+            _ => target,
+        };
     }
-    Ok(body)
+    Ok(())
 }
 
 /// The source channels an instruction actually reads: a dot sums channels `0..components`
@@ -609,6 +745,17 @@ fn emit_instr(
     // A no-op (phase declaration / NOP) has no destination and produces no statement.
     if matches!(instr.op, Op::Nop) {
         return Ok(());
+    }
+    // A branch is consumed by [`emit_range`]'s structuring, never emitted per-instruction.
+    // Reaching here means that pass has a hole, and translating the branch as nothing would
+    // silently run a skipped range - so say so instead.
+    if matches!(instr.op, Op::Branch { .. }) {
+        return Err(EmitError::Blocked {
+            index,
+            byte_offset,
+            reason: "0xF8 BR reached the per-instruction emitter (branch structuring missed it)",
+            raw: instr.raw,
+        });
     }
     // A GLOBAL (SPECIAL hardware register) operand is decoded structurally but has no value
     // until its index's meaning is established. Report it by INDEX, ahead of the generic
@@ -1424,5 +1571,134 @@ mod tests {
     #[test]
     fn empty_declines() {
         assert_eq!(emit_fragment(&shader(vec![])).unwrap_err(), EmitError::Empty);
+    }
+
+    /// A branch that is TAKEN when its predicate holds skips the words after it, so the range
+    /// it skips runs when the predicate does NOT hold - the emitted `if` must carry the NEGATED
+    /// condition. Getting this backwards runs exactly the wrong arm, which is why it is pinned.
+    fn mov(dest: u8) -> Instr {
+        instr(Op::Mov, Some(Operand::plain(Bank::Temp, dest, 0)), vec![Operand::plain(Bank::Temp, 100, 0)])
+    }
+
+    fn branch(rel: i32, pred: Predicate) -> Instr {
+        let mut b = instr(Op::Branch { rel }, None, vec![]);
+        b.pred = pred;
+        b.write_mask = [false; 4];
+        b
+    }
+
+    #[test]
+    fn forward_branch_becomes_an_if_on_the_negated_condition() {
+        // 0: br if p0 -> 3      (skips instructions 1..2)
+        // 1: mov r0
+        // 2: mov r2
+        // 3: mov r4
+        // Destination bases are 4 apart so each `mov`'s four written lanes are disjoint and a
+        // lane names exactly one instruction.
+        let wgsl = emit_fragment(&shader(vec![branch(3, Predicate::IfP(0)), mov(0), mov(4), mov(8)]))
+            .unwrap();
+        assert!(wgsl.contains("if (!p[0]) {"), "got:\n{wgsl}");
+        let inside = wgsl.split("if (!p[0]) {").nth(1).unwrap();
+        let (guarded, after) = inside.split_once("}").unwrap();
+        assert!(guarded.contains("r[0] ="), "the skipped range is the guarded body:\n{wgsl}");
+        assert!(guarded.contains("r[4] ="), "the skipped range is the guarded body:\n{wgsl}");
+        assert!(!guarded.contains("r[8] ="), "the branch target is NOT guarded:\n{wgsl}");
+        assert!(after.contains("r[8] ="), "the branch target is emitted after:\n{wgsl}");
+    }
+
+    /// A branch predicated on p0 being CLEAR guards its range on p0 being SET.
+    #[test]
+    fn negated_predicate_branch_inverts_the_same_way() {
+        let wgsl =
+            emit_fragment(&shader(vec![branch(2, Predicate::IfNotP(1)), mov(0), mov(2)])).unwrap();
+        assert!(wgsl.contains("if (p[1]) {"), "got:\n{wgsl}");
+    }
+
+    /// An UNCONDITIONAL forward branch always skips its range, so that range is unreachable and
+    /// emitting nothing for it is exact - not a dropped instruction.
+    #[test]
+    fn unconditional_forward_branch_drops_the_unreachable_range() {
+        let wgsl =
+            emit_fragment(&shader(vec![branch(2, Predicate::Always), mov(0), mov(2)])).unwrap();
+        assert!(!wgsl.contains("r[0] ="), "skipped range must not be emitted:\n{wgsl}");
+        assert!(wgsl.contains("r[2] ="), "the target must be emitted:\n{wgsl}");
+    }
+
+    /// A BACKWARD branch is a loop. Emitting its body once would look plausible and be wrong,
+    /// so it hard-fails naming itself.
+    #[test]
+    fn backward_branch_hard_fails_as_a_loop() {
+        let err = emit_fragment(&shader(vec![mov(0), mov(2), branch(-2, Predicate::IfP(0))]))
+            .unwrap_err();
+        match err {
+            EmitError::Blocked { reason, index, .. } => {
+                assert_eq!(index, 2);
+                assert!(reason.contains("backward"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// A branch whose target leaves the block an enclosing branch opened is irreducible - no
+    /// nest of `if`s expresses it - so it blocks rather than being silently clamped.
+    #[test]
+    fn branch_out_of_an_enclosing_block_hard_fails() {
+        // 0: br if p0 -> 3 (opens the block [1,3))
+        // 1: br if p1 -> 4 (would leave it)
+        let err = emit_fragment(&shader(vec![
+            branch(3, Predicate::IfP(0)),
+            branch(3, Predicate::IfP(1)),
+            mov(0),
+            mov(2),
+        ]))
+        .unwrap_err();
+        match err {
+            EmitError::Blocked { reason, index, .. } => {
+                assert_eq!(index, 1);
+                assert!(reason.contains("out of its enclosing block"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// A conditional skip whose range ENDS in an unconditional jump past the target is an
+    /// if/else: the trailing jump is the then-arm's hop over the else-arm, not part of the
+    /// guarded body. Without recovering it the inner branch reads as a jump out of its
+    /// enclosing block and the whole pair falls back - this is the exact shape of both of a
+    /// retail title's menu fragment programs (`br #6 -> 10`, `br #9 -> 13 of 13`).
+    #[test]
+    fn conditional_skip_ending_in_an_unconditional_jump_is_an_if_else() {
+        // 0: br if p0 -> 4 ; 1: mov r0 ; 2: mov r4 ; 3: br -> 6 ; 4: mov r8 ; 5: mov r12
+        let wgsl = emit_fragment(&shader(vec![
+            branch(4, Predicate::IfP(0)),
+            mov(0),
+            mov(4),
+            branch(3, Predicate::Always),
+            mov(8),
+            mov(12),
+        ]))
+        .unwrap();
+        assert!(wgsl.contains("} else {"), "an else arm must be emitted:\n{wgsl}");
+        let (then_arm, rest) = wgsl.split_once("} else {").unwrap();
+        assert!(then_arm.contains("r[0] =") && then_arm.contains("r[4] ="), "then arm:\n{wgsl}");
+        assert!(!then_arm.contains("r[8] ="), "else arm must not be in the then arm:\n{wgsl}");
+        assert!(rest.contains("r[8] =") && rest.contains("r[12] ="), "else arm:\n{wgsl}");
+    }
+
+    /// Nested skips nest as blocks, and the inner one's range stays inside the outer one's.
+    #[test]
+    fn nested_forward_branches_nest() {
+        // 0: br if p0 -> 4 ; 1: br if p1 -> 3 ; 2: mov r0 ; 3: mov r2 ; 4: mov r4
+        let wgsl = emit_fragment(&shader(vec![
+            branch(4, Predicate::IfP(0)),
+            branch(2, Predicate::IfP(1)),
+            mov(0),
+            mov(2),
+            mov(4),
+        ]))
+        .unwrap();
+        let outer = wgsl.split("if (!p[0]) {").nth(1).unwrap();
+        let inner = outer.split("if (!p[1]) {").nth(1).unwrap();
+        assert!(inner.starts_with(|_c: char| true) && inner.contains("r[0] ="), "got:\n{wgsl}");
     }
 }

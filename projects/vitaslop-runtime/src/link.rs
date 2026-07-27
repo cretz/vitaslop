@@ -294,6 +294,37 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         }
     }
 
+    // Which host imports we have no NAME for. A function import that no handler covers
+    // becomes a stub that hard-fails when CALLED, which is correct but serialises the work:
+    // each run reveals exactly one missing NID, so bringing up a title costs one boot per
+    // call. The imports are all known HERE, at link time, so the whole list can be reported
+    // at once and implemented in one pass.
+    //
+    // `nid::name` is the test because a NID gets its name in the same change that gives it
+    // a handler, so an unnamed import is an unimplemented one. It is a HINT, not a
+    // guarantee: a named NID with no dispatch arm still hard-fails at the call, which is
+    // why the call-time failure stays exactly as loud as it was.
+    let unnamed: Vec<(u32, u32)> = {
+        let mut v: Vec<(u32, u32)> = imports
+            .iter()
+            .copied()
+            .filter(|(_, func)| crate::nid::name(*func) == crate::nid::UNKNOWN_NAME)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    if !unnamed.is_empty() {
+        eprintln!(
+            "link: {} imported function NID(s) have no handler - the title will hard-fail if it \
+             CALLS one. Look each up in the vitasdk NID db (db/360/*.yml) and implement it:",
+            unnamed.len()
+        );
+        for (lib, func) in &unnamed {
+            eprintln!("  unhandled import: library_nid={lib:#010x} func_nid={func:#010x}");
+        }
+    }
+
     // 5. Discovery roots: every module entry and constructor. The entry addresses
     //    are even (SCE stores module_start without the Thumb bit); decoding is
     //    Thumb regardless.

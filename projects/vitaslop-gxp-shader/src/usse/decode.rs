@@ -1759,15 +1759,42 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// zero it is at its default, and the default repeat count is "execute once".
 fn executes_once(word: u64) -> Option<bool> {
     match opcode1(word) {
-        // Established repeat_count fields.
-        0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44) == 0), // 0x30, 0x40, 0x50 family
-        0x07 | 0x09 | 0x0f => Some(bits(word, 45, 44) == 0),        // 0x38 VMOV, 0x48 VTST
-        // No repeat_count field exists in these layouts.
-        0x01 | 0x02 => Some(true), // 0x08/0x10 V32NMAD/V16NMAD - 47:44 is src2_swiz
-        0x1c => Some(true),        // 0xE0 SMP
-        0x1f => Some(true),        // 0xF8 complex flow
-        // Vector MAD/DP: qualifies only with every unknown bit at its default.
+        // Vector MAD/DP: for the SMLSI question specifically, qualifies only with every
+        // unknown bit at its default. This is deliberately STRICTER than
+        // [`repeat_extra_iterations`], and the two answer different questions. Unrolling asks
+        // "how many times does THIS instruction run", which its own grammar settles. Retiring
+        // an SMLSI asks "can any instruction ANYWHERE in this program consult the state it
+        // sets", where being wrong silently mis-addresses an unrelated instruction's operands -
+        // so there, an undocumented bit at a non-default value is reason enough to decline.
         0x00 | 0x03 => Some(grp_mad_unknown_bits_are_zero(word)),
+        _ => repeat_extra_iterations(word).map(|extra| extra == 0),
+    }
+}
+
+/// How many EXTRA times `word` re-executes after its first execution (0 = runs once), or
+/// `None` when this group's repeat encoding is not established and the answer therefore cannot
+/// be stated. A caller that cannot handle `None` must block the instruction rather than assume
+/// zero: assuming zero is what silently drops the later iterations of a repeating instruction.
+///
+/// The field map is the one [`executes_once`] documents, kept here as the single place the
+/// per-group repeat encoding is written down so the two can never disagree.
+pub(crate) fn repeat_extra_iterations(word: u64) -> Option<u32> {
+    match opcode1(word) {
+        // Established repeat_count fields.
+        0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44) as u32), // 0x30, 0x40, 0x50 family
+        0x07 | 0x09 | 0x0f => Some(bits(word, 45, 44) as u32),        // 0x38 VMOV, 0x48 VTST
+        // No repeat_count field exists in these layouts.
+        0x01 | 0x02 => Some(0), // 0x08/0x10 V32NMAD/V16NMAD - 47:44 is src2_swiz
+        0x1c => Some(0),        // 0xE0 SMP
+        0x1f => Some(0),        // 0xF8 complex flow
+        // 0x00/0x18 vector MAD/DP: no repeat_count field either. Every group whose grammar is
+        // documented places `repeat_count` at bits 47:44, and in this group's own field table
+        // those four bits are `abs_op2` plus the `op0_strange`/`swz_en_strange` pair - named
+        // operand-modifier bits the decoder already reads, and already blocks on where their
+        // effect is undocumented. A repeat count cannot also live there. The remaining `unk`
+        // bits in this group are scattered singles, not a contiguous field at any position a
+        // repeat count occupies elsewhere.
+        0x00 | 0x03 => Some(0),
         _ => None,
     }
 }
@@ -1821,23 +1848,46 @@ fn decode_grp_flow(word: u64) -> Instr {
     } else if op2 == 0b011 && opcat == 0b11 {
         (Op::Todo("flow depthf depth-write"), Some("0xF8 DEPTHF (fragment depth write) not yet wired"))
     } else if opcat_extra == 0 && opcat == 0 {
-        // BR (branch) family. A branch with a ZERO displacement (offset field [19:0] == 0)
-        // and no predicate (unconditional) cannot move the program counter across any
-        // instruction - it neither skips forward over code nor loops backward over it - so a
-        // linear decode is semantically unaffected and it is a structural no-op. This is the
-        // exact word EVERY captured vertex program emits at instruction #1
-        // (0xf800094000000000, immediately after the PHAS prologue): unconditional, offset 0,
-        // with the real transform math following and executing (validated across 13 vertex
-        // blobs - they compute o0..o3 clip position + varyings, and the title renders). A
-        // branch with a NONZERO displacement is genuine control flow (a forward skip or a
-        // backward loop) and stays hard-blocked; structured-control-flow reconstruction is a
-        // separate, unwired effort. `op2` here is the ExtPredicate field (bits[58:56]);
-        // 0 = unconditional.
+        // BR (branch) family. `br_op` (bits[40:39]) selects the member within it: 0 is a plain
+        // branch, and the reference's return shape carries 2. The word EVERY captured vertex
+        // program emits at instruction #1 (0xf800094000000000, immediately after the PHAS
+        // prologue) carries br_op = 2 with a ZERO displacement and no predicate, so under either
+        // reading it cannot move the program counter across any instruction - it neither skips
+        // forward over code nor loops backward over it - and a linear decode is semantically
+        // unaffected. That is validated across 13 vertex blobs: they compute o0..o3 clip
+        // position + varyings after it, and the title renders. It stays a structural no-op.
+        //
+        // br_op == 0 with a displacement is genuine control flow, which
+        // [`crate::wgsl::emit_body`] reconstructs as structured WGSL. `save_link` (bit 41) marks
+        // a branch-with-link (a call), whose matching return is not modelled, so it blocks.
         let br_off = bits(word, 19, 0);
-        if op2 == 0 && br_off == 0 {
+        let br_op = bits(word, 40, 39);
+        let save_link = bits(word, 41, 41) == 1;
+        if br_off == 0 && op2 == 0 {
             (Op::Nop, None)
+        } else if br_op != 0 {
+            (Op::Todo("flow branch (non-branch br_op)"), Some("0xF8 BR with a displacement and a non-branch br_op is not modelled"))
+        } else if save_link {
+            (Op::Todo("flow branch-with-link"), Some("0xF8 BR save_link (branch-with-link / call) not modelled"))
         } else {
-            (Op::Todo("flow branch"), Some("0xF8 BR (branch/control-flow) not yet wired"))
+            // The offset is a 20-bit count of 64-bit instruction words relative to the branch's
+            // own program offset. It is two's-complement signed only when `br_type` (bit 38) is
+            // set AND the field's own sign bit (bit 19) is set; otherwise it is the raw
+            // non-negative value (spec F8.2).
+            let br_type = bits(word, 38, 38) == 1;
+            let signed = br_type && (br_off & (1 << 19)) != 0;
+            let rel = if signed { (br_off as i32) - (1 << 20) } else { br_off as i32 };
+            if rel == 0 {
+                // A PREDICATED zero-displacement branch: under the offset convention above its
+                // target is the branch itself, i.e. an infinite loop whenever the predicate
+                // holds, which no shader compiler emits. That makes the word evidence that the
+                // convention is wrong for it rather than a case to translate, so it blocks.
+                // (The UNCONDITIONAL zero-displacement word is handled above: it is the
+                // universal prologue, and is a no-op under either convention.)
+                (Op::Todo("flow branch (zero displacement)"), Some("0xF8 BR with a zero displacement and a predicate is not a structurable skip"))
+            } else {
+                (Op::Branch { rel }, None)
+            }
         }
     } else {
         // SPEC catch-all (its discriminant fixes only the top 5 bits; op2/opcat are
@@ -1863,6 +1913,12 @@ fn decode_grp_flow(word: u64) -> Instr {
             2 => Predicate::IfNotP(1),
             _ => Predicate::IfP(0),
         }
+    } else if matches!(op, Op::Branch { .. }) {
+        // A branch reads the group's normal ExtPredicate slot (bits[58:56]) as its CONDITION,
+        // and unlike an ALU op it cannot be treated as unpredicated: the predicate IS the
+        // control flow, so an unresolved encoding (PN) must reach the emitter as `Raw` and
+        // block there rather than silently becoming "always taken".
+        ext_predicate(op2 as u32)
     } else {
         Predicate::Always
     };
@@ -2390,9 +2446,18 @@ mod tests {
         let smlsi = word_bits(&[(0x1f, 63, 59), (0b010, 58, 56), (0b01, 53, 52)]);
         let ins = decode(smlsi);
         assert!(ins.blocked.is_some() && ins.blocked.unwrap().contains("SMLSI"));
-        // A branch (opcat_extra=0, opcat=00, not the NOP pattern) blocks naming branch.
-        let br = word_bits(&[(0x1f, 63, 59), (0b100, 58, 56), (0, 54, 54), (0b00, 53, 52)]);
-        assert!(decode(br).blocked.is_some());
+        // A branch-with-link (save_link, bit 41) is a CALL: its matching return is not
+        // modelled, so it blocks naming itself rather than translating as a plain skip.
+        let call = word_bits(&[
+            (0x1f, 63, 59),
+            (0b001, 58, 56),
+            (0, 54, 54),
+            (0b00, 53, 52),
+            (1, 41, 41),
+            (4, 19, 0),
+        ]);
+        let ins = decode(call);
+        assert!(ins.blocked.is_some_and(|r| r.contains("save_link")), "{:?}", ins.blocked);
     }
 
     #[test]
@@ -2404,13 +2469,56 @@ mod tests {
         assert_eq!(ins.op, Op::Nop);
         assert!(ins.blocked.is_none(), "zero-offset unconditional branch must not block");
 
-        // A branch with a NONZERO displacement is genuine control flow and stays blocked.
+        // A branch with a NONZERO displacement is genuine control flow: it decodes to a
+        // BRANCH carrying its instruction-word delta, and the emitter's structuring pass
+        // decides whether that delta is expressible.
         let taken = word_bits(&[(0x1f, 63, 59), (0, 58, 56), (0, 54, 54), (0b00, 53, 52), (5, 19, 0)]);
         let ti = decode(taken);
-        assert!(ti.blocked.is_some(), "nonzero-offset branch must block");
-        // A CONDITIONAL zero-offset branch also stays blocked (its predicate could matter).
+        assert_eq!(ti.op, Op::Branch { rel: 5 });
+        assert_eq!(ti.pred, Predicate::Always);
+        assert!(ti.blocked.is_none(), "a plain forward branch must not block: {:?}", ti.blocked);
+        // A CONDITIONAL zero-offset branch stays blocked: its target is the branch itself.
         let cond = word_bits(&[(0x1f, 63, 59), (0b001, 58, 56), (0, 54, 54), (0b00, 53, 52)]);
-        assert!(decode(cond).blocked.is_some(), "conditional branch must block");
+        assert!(decode(cond).blocked.is_some(), "conditional zero-offset branch must block");
+    }
+
+    /// The offset is signed ONLY when `br_type` (bit 38) is set AND the field's own sign bit
+    /// (bit 19) is set (spec F8.2). Both halves matter: without br_type a large offset is a
+    /// legitimate long forward jump, and reading it as negative would turn a forward skip into
+    /// a backward loop.
+    #[test]
+    fn branch_offset_is_signed_only_with_br_type_and_sign_bit() {
+        let neg = word_bits(&[
+            (0x1f, 63, 59), (0b101, 58, 56), (0, 54, 54), (0b00, 53, 52), (1, 38, 38),
+            ((1 << 20) - 6, 19, 0),
+        ]);
+        let ins = decode(neg);
+        assert_eq!(ins.op, Op::Branch { rel: -6 });
+        assert_eq!(ins.pred, Predicate::IfNotP(0));
+        // Same bit pattern in the offset, br_type CLEAR: a raw non-negative long jump.
+        let far = word_bits(&[
+            (0x1f, 63, 59), (0b101, 58, 56), (0, 54, 54), (0b00, 53, 52),
+            ((1 << 20) - 6, 19, 0),
+        ]);
+        assert_eq!(decode(far).op, Op::Branch { rel: (1 << 20) - 6 });
+    }
+
+    /// The two branch words a retail title's menu shaders actually encode, decoded end to end:
+    /// a fragment `if p0` skipping 3 words and a vertex `if !p0` skipping 7. Both carry
+    /// br_type, a zero `br_op` and no link, so both are plain forward conditional skips.
+    #[test]
+    fn corpus_branch_words_decode_as_forward_conditional_skips() {
+        let frag = decode(0xf900004000000003);
+        assert_eq!(frag.op, Op::Branch { rel: 3 });
+        assert_eq!(frag.pred, Predicate::IfP(0));
+        assert!(frag.blocked.is_none());
+        let vert = decode(0xfd00004000000007);
+        assert_eq!(vert.op, Op::Branch { rel: 7 });
+        assert_eq!(vert.pred, Predicate::IfNotP(0));
+        assert!(vert.blocked.is_none());
+        // The universal prologue word carries br_op = 2, not 0, and no displacement: still a
+        // structural no-op, and specifically NOT reclassified as a branch by this work.
+        assert_eq!(decode(0xf800094000000000).op, Op::Nop);
     }
 
     #[test]

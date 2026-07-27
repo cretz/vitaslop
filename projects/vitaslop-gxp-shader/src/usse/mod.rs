@@ -34,6 +34,110 @@ fn retire_inert_repeat_state(code: &[u64], instrs: &mut [crate::ir::Instr]) {
     }
 }
 
+/// Words a single operand of the given precision occupies per execution, which is also the
+/// stride a REPEATED instruction advances that operand by between iterations.
+///
+/// The register banks are addressed in 32-bit words. An F16 operand packs its channels two per
+/// word and so occupies ONE word; an F32 operand can only address the low two channels of a
+/// packed register (spec A.6 - "F32 into these banks can only address the low two channels"),
+/// so it occupies TWO. The width is a property of the operand's precision, not of how many
+/// channels the write mask happens to enable.
+fn operand_words(half_precision: bool) -> u32 {
+    if half_precision {
+        1
+    } else {
+        2
+    }
+}
+
+/// Expand every repeating instruction into the sequence of single executions it stands for.
+///
+/// A USSE instruction carries a `repeat_count`: it re-executes that many extra times, and
+/// between iterations each operand's register advances by that operand's own width
+/// ([`operand_words`]). Nothing downstream of the IR models repetition, so unrolling here is
+/// what makes the rest of the recompiler - the emitter, the written-output-lane check, the PA
+/// read/write maps that decide the varying interface - see the instruction stream the hardware
+/// actually executes.
+///
+/// MEASURED, on the two vertex programs that draw a retail title's entire front-end. Each
+/// writes its colour varying with ONE `mov` to `Output[4]` under a two-channel mask, yet its
+/// container declares 8 and 10 total output lanes respectively. The repeat counts are 1 and 2,
+/// and unrolling at a stride of two words closes both statements exactly:
+///
+/// * 8 lanes: `Output[4] <- SA[0]`, `Output[6] <- SA[2]` - the 4-component `color` uniform
+///   filling COLOR0's lanes 4..7 after clip position's 0..3;
+/// * 10 lanes: `Output[4] <- PA[4]`, `Output[6] <- PA[6]`, `Output[8] <- PA[8]` - where the
+///   parameter table places `In.Color` at PA[4] (4 components) and `In.TexCoord` at PA[8]. The
+///   third iteration is the ONLY write of the texture coordinate anywhere in that program.
+///
+/// That last point is why this is not cosmetic: without unrolling, a textured program's UV
+/// varying is never written at all, so every sample lands at (0,0). The stride also reproduces
+/// the spec's own per-group repeat multipliers for group 0x40, which are stated as
+/// `(dest,src1,src2) = (1,2,2)` for a float source - an F16 destination (one word) fed by F32
+/// sources (two words each) - and `all 1` otherwise, where every operand is a single word.
+///
+/// An instruction whose group's repeat encoding is NOT established is BLOCKED rather than
+/// emitted once: emitting once is a silent guess that it does not repeat, and a dropped
+/// iteration is exactly the invisible failure this recompiler refuses to make.
+/// Returns the unrolled stream and, alongside it, where each ORIGINAL code word landed in it:
+/// `starts[i]` is the index of code word `i`'s first copy, and `starts[code.len()]` is the
+/// stream length, so a branch target of "one past the end" maps too. Unrolling renumbers the
+/// stream, and a branch offset is a count of code WORDS, so every branch has to be rewritten
+/// through this map or it would silently point at the wrong instruction.
+fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir::Instr>, Vec<usize>) {
+    let mut out = Vec::with_capacity(instrs.len());
+    let mut starts = Vec::with_capacity(code.len() + 1);
+    for (instr, &word) in instrs.into_iter().zip(code) {
+        starts.push(out.len());
+        let Some(extra) = decode::repeat_extra_iterations(word) else {
+            out.push(crate::ir::Instr {
+                blocked: Some("repeat_count encoding not established for this opcode group"),
+                ..instr
+            });
+            continue;
+        };
+        if extra == 0 {
+            out.push(instr);
+            continue;
+        }
+        let dest_step = operand_words(instr.half_precision);
+        let src_step = operand_words(instr.source_half_precision());
+        for i in 0..=extra {
+            let mut it = instr.clone();
+            if let Some(d) = it.dest.as_mut() {
+                d.index = d.index.saturating_add((i * dest_step).min(u8::MAX as u32) as u8);
+            }
+            for s in it.srcs.iter_mut() {
+                s.index = s.index.saturating_add((i * src_step).min(u8::MAX as u32) as u8);
+            }
+            out.push(it);
+        }
+    }
+    starts.push(out.len());
+    (out, starts)
+}
+
+/// Rewrite every [`Op::Branch`] delta from the ORIGINAL code-word numbering into the unrolled
+/// stream's numbering, using the map [`unroll_repeats`] produced.
+///
+/// A target that falls outside the program (before the first word, or past one-past-the-end) is
+/// not expressible in the current stream and cannot be reconstructed, so the instruction is
+/// BLOCKED naming that rather than clamped to something plausible.
+fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
+    // `starts` is indexed by ORIGINAL code word, and a branch never repeats (group 0xF8 carries
+    // no repeat count), so word `w` is the single instruction at `starts[w]`.
+    for (word, &at) in starts.iter().take(starts.len().saturating_sub(1)).enumerate() {
+        let Op::Branch { rel } = instrs[at].op else { continue };
+        let target = word as i64 + rel as i64;
+        if target < 0 || target as usize >= starts.len() {
+            instrs[at].blocked = Some("0xF8 BR target falls outside the program");
+            continue;
+        }
+        let new_rel = starts[target as usize] as i64 - at as i64;
+        instrs[at].op = Op::Branch { rel: new_rel as i32 };
+    }
+}
+
 /// Decode a parsed program's USSE code stream into the shader IR.
 ///
 /// A `SMP` instruction addresses its sampler by a REGISTER field, not by texture unit: the
@@ -57,6 +161,9 @@ pub fn decode_shader(program: &Program) -> Shader {
             }
         }
     }
+    // Last, so every pass above still sees one instruction per code word.
+    let (mut instrs, starts) = unroll_repeats(&program.code, instrs);
+    remap_branch_targets(&mut instrs, &starts);
     Shader { kind: program.kind, instrs }
 }
 
@@ -94,5 +201,7 @@ pub fn decode_secondary_shader(program: &Program) -> Shader {
             }
         }
     }
+    let (mut instrs, starts) = unroll_repeats(&program.secondary_code, instrs);
+    remap_branch_targets(&mut instrs, &starts);
     Shader { kind: program.kind, instrs }
 }

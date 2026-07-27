@@ -32,6 +32,24 @@ pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) ->
     SvcOutcome::Block
 }
 
+/// int sceDisplayWaitVblankStart(void)
+///
+/// Wait for exactly one vblank - the no-argument form of
+/// [`wait_vblank_start_multi`], and identical to it with a `vcount` of 1. Kept as a
+/// separate entry point rather than folded in because it is a DIFFERENT NID and a title
+/// that links only this one must not hard-fail; the behaviour is shared so the two cannot
+/// diverge. Note this is a wait, NOT a frame boundary: only the display-queue flip counts
+/// a frame (see [`SvcOutcome::Flip`]), and letting a vblank wait advance the frame count
+/// runs the clock at the rate of the pacing loop rather than the rate of presentation.
+pub(super) fn wait_vblank_start(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    ctx.ret(0);
+    if !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    st.sleep_park(VBLANK_US);
+    SvcOutcome::Block
+}
+
 /// int sceDisplayWaitSetFrameBuf(void)
 ///
 /// Block until the framebuffer queued by the most recent `sceDisplaySetFrameBuf` has

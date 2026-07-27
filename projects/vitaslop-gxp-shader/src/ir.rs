@@ -242,6 +242,20 @@ pub enum Op {
     /// Fragment discard (group 0xF8 KILL). Ends the fragment with no colour written; the
     /// emitter maps it to WGSL `discard`.
     Kill,
+    /// Conditional or unconditional BRANCH (group 0xF8 BR). `rel` is the target expressed as a
+    /// signed instruction-word delta from the branch's OWN index, so `target = index + rel`
+    /// (spec F8.2 - the offset is a count of 64-bit words relative to the branch's own program
+    /// offset). The instruction's [`Instr::pred`] is the branch CONDITION: the branch is taken
+    /// when it holds, so the words it jumps over execute when it does NOT.
+    ///
+    /// This op never reaches the per-instruction emitter. [`crate::wgsl::emit_body`] consumes it
+    /// structurally, turning a forward branch into a WGSL `if` around the range it skips, and
+    /// hard-fails on any shape that is not a properly nested forward skip (a backward branch is a
+    /// loop, a branch out of an enclosing range is irreducible, and a branch-with-link is a call
+    /// - none are reconstructed yet). `rel` is rewritten by
+    /// [`crate::usse::decode_shader`] when repeat-unrolling renumbers the instruction stream, so
+    /// it is always a delta in the CURRENT stream.
+    Branch { rel: i32 },
     /// A documented operation that is not yet wired for WGSL emit (tex, pack, the u32
     /// bitwise ops, fx8/u8 integer ops, loads/stores, complex flow). Carries a static
     /// mnemonic so an emit attempt hard-fails naming exactly what to implement next. This
@@ -268,6 +282,10 @@ impl Op {
                 | Op::Nop | Op::Tex { .. }
                 | Op::Pack { .. } | Op::Bitwise { .. }
                 | Op::Test { .. } | Op::Kill
+                // A branch is translated by the emitter's STRUCTURING pass rather than by
+                // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
+                // bug in that pass and hard-fails there, naming itself.
+                | Op::Branch { .. }
         )
     }
 
@@ -301,6 +319,7 @@ impl Op {
             Op::Bitwise { .. } => "bitwise",
             Op::Test { .. } => "vtst",
             Op::Kill => "kill",
+            Op::Branch { .. } => "br",
             Op::Todo(name) => name,
             Op::Illegal => "illegal",
             Op::Unsupported { .. } => "unsupported",

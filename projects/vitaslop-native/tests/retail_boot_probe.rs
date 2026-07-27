@@ -60,6 +60,10 @@ const CLEAR: [u8; 4] = [0, 0, 0, 255];
 const QUANTUM_FUEL: u64 = 5_000_000;
 /// Frame flips (display queue entries) to capture before stopping the run.
 const MAX_FRAMES: u64 = 3;
+/// The span `VITASLOP_FIND_WORD` searches: from the image base up through the guest heap.
+/// Wide enough to cover both the loaded modules and everything allocated above them.
+const IMAGE_SCAN_BASE: u32 = vitaslop_runtime::link::IMAGE_BASE;
+const IMAGE_SCAN_LEN: usize = 0x1000_0000;
 /// Fiber-poll backstop so a busy-waiting guest cannot run unbounded.
 const MAX_ROUNDS: u64 = 200_000;
 
@@ -862,6 +866,37 @@ fn retail_boot_probe() {
                         None => eprintln!("  backtrace wasm[{widx}] = <dispatcher or out of range>"),
                     }
                 }
+            }
+        }
+    }
+
+    // Post-mortem word search: VITASLOP_FIND_WORD=0xVALUE[,0xVALUE...] reports every
+    // 4-byte-aligned guest address holding that word. Written for "who holds this
+    // function pointer?" after a dispatch miss - the answer separates a pointer the
+    // linker wrote into a static table (which static discovery could find) from one the
+    // guest computed at runtime (which it cannot), and those need different fixes.
+    if let Ok(spec) = std::env::var("VITASLOP_FIND_WORD") {
+        let wants: Vec<u32> = spec
+            .split(',')
+            .filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        // The whole guest region in one borrow; a chunked read would miss a word
+        // straddling the boundary and costs another copy.
+        let image = sched.read_guest(IMAGE_SCAN_BASE, IMAGE_SCAN_LEN);
+        for want in wants {
+            let mut hits = 0;
+            for (i, w) in image.chunks_exact(4).enumerate() {
+                if u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == want {
+                    eprintln!("  find {want:#010x}: at {:#010x}", IMAGE_SCAN_BASE + 4 * i as u32);
+                    hits += 1;
+                    if hits >= 64 {
+                        eprintln!("  find {want:#010x}: ... (more than 64 hits)");
+                        break;
+                    }
+                }
+            }
+            if hits == 0 {
+                eprintln!("  find {want:#010x}: not present in guest memory");
             }
         }
     }

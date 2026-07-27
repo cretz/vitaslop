@@ -224,6 +224,54 @@ pub(super) fn find_parameter(ctx: &mut GuestCtx, _st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// Marks a `SceGxmColorSurface` this implementation initialised, in the first of the
+/// eight opaque words hardware GXM fills with PBE state (`pbeSidebandWord` +
+/// `pbeEmitWords[6]` + `outputRegisterSize` = 32 bytes, ahead of `backgroundTex`).
+///
+/// The surface's identity has to live IN the guest struct, not only in a host table
+/// keyed by the struct's address, because a title is entitled to COPY the struct - and
+/// PCSE00001 does: it initialises its nine render targets into a static array and then
+/// assigns each into a per-pass command object, so every `sceGxmBeginScene` in a race
+/// frame names an address `sceGxmColorSurfaceInit` was never called with. Address-keyed
+/// lookup then reports "no surface" for exactly the render-to-texture passes that draw
+/// the world, and only the final composite (the HUD) survives to be rendered.
+const COLOR_SURFACE_MAGIC: u32 = 0x5343_5356;
+
+/// Byte offsets of our fields within the surface's opaque word block.
+const CS_FORMAT: u32 = 4;
+const CS_TYPE: u32 = 8;
+const CS_WIDTH: u32 = 12;
+const CS_HEIGHT: u32 = 16;
+const CS_STRIDE: u32 = 20;
+const CS_DATA: u32 = 24;
+
+/// Write `surface`'s fields into the guest struct so a copy of it stays resolvable.
+fn write_color_surface(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
+    ctx.write_u32(addr, COLOR_SURFACE_MAGIC);
+    ctx.write_u32(addr + CS_FORMAT, s.format);
+    ctx.write_u32(addr + CS_TYPE, s.surface_type);
+    ctx.write_u32(addr + CS_WIDTH, s.width);
+    ctx.write_u32(addr + CS_HEIGHT, s.height);
+    ctx.write_u32(addr + CS_STRIDE, s.stride_pixels);
+    ctx.write_u32(addr + CS_DATA, s.data_addr);
+}
+
+/// Read back a surface written by [`write_color_surface`], or `None` if this address
+/// does not hold one.
+pub(super) fn read_color_surface(ctx: &mut GuestCtx, addr: u32) -> Option<ColorSurface> {
+    if addr == 0 || ctx.read_u32(addr) != COLOR_SURFACE_MAGIC {
+        return None;
+    }
+    Some(ColorSurface {
+        format: ctx.read_u32(addr + CS_FORMAT),
+        surface_type: ctx.read_u32(addr + CS_TYPE),
+        width: ctx.read_u32(addr + CS_WIDTH),
+        height: ctx.read_u32(addr + CS_HEIGHT),
+        stride_pixels: ctx.read_u32(addr + CS_STRIDE),
+        data_addr: ctx.read_u32(addr + CS_DATA),
+    })
+}
+
 /// int sceGxmColorSurfaceInit(surface, format, type, scale, outputRegisterSize,
 ///     width, height, strideInPixels, data)  -- 9 args (5 on the stack).
 pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
@@ -234,10 +282,17 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     let height = ctx.arg(6);
     let stride_pixels = ctx.arg(7);
     let data_addr = ctx.arg(8);
-    st.set_color_surface(
-        surface,
-        ColorSurface { format, surface_type, width, height, stride_pixels, data_addr },
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        surface = format_args!("{surface:#x}"),
+        data = format_args!("{data_addr:#x}"),
+        width, height, stride_pixels,
+        format = format_args!("{format:#x}"),
+        "colorSurfaceInit"
     );
+    let s = ColorSurface { format, surface_type, width, height, stride_pixels, data_addr };
+    write_color_surface(ctx, surface, &s);
+    st.set_color_surface(surface, s);
     ctx.ret(0);
 }
 
@@ -284,6 +339,23 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         streams_addr = format_args!("{streams_addr:#x}"),
         "createVertexProgram"
     );
+    // A vertex program with NO attributes over a stream that has a real stride cannot
+    // fetch anything: every draw through it arrives with geometry the renderer has no
+    // layout for, and the frame comes out empty. That is almost always a HOST bug (the
+    // title built its attribute array by reflecting the shader, and some reflection call
+    // told it there was nothing to bind), so it is reported unconditionally rather than
+    // accepted quietly - the empty frame it produces is otherwise indistinguishable from
+    // a title that simply drew nothing.
+    if attributes.is_empty() && stride > 0 {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            stride,
+            attribute_count,
+            program = format_args!("{program_id:#x}"),
+            "vertex program created with ZERO attributes over a stride-{stride} stream - \
+             every draw through it will have no fetchable geometry"
+        );
+    }
 
     // Resolve the shader-patcher id back to its `SceGxmProgram*` so a precomputed
     // vertex state built from this vertex program can size its default uniform buffer.
@@ -313,7 +385,18 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
 ///     vertexSyncObject, fragmentSyncObject, colorSurface, depthStencil) -- 8 args.
 pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     let color_surface = ctx.arg(6);
-    st.begin_scene(color_surface);
+    // Resolve from the struct's own contents first (survives a copy), then from the
+    // address table (covers a surface whose bytes a title has since overwritten).
+    let color = read_color_surface(ctx, color_surface).or_else(|| st.color_surface(color_surface));
+    if color.is_none() {
+        tracing::debug!(
+            target: "vitaslop::gxm",
+            surface = format_args!("{color_surface:#x}"),
+            "beginScene with an unrecognised colour surface - this scene's render target is \
+             unknown, so a later pass sampling it cannot be chained to it"
+        );
+    }
+    st.begin_scene(color);
     ctx.ret(0);
 }
 
@@ -699,16 +782,22 @@ pub(super) fn set_region_clip(
 /// Returns the exact format the guest set on this surface (recorded at
 /// `sceGxmColorSurfaceInit`), or 0 if the surface was never initialized here.
 #[hostcall]
-pub(super) fn color_surface_get_format(st: &mut VitaState, surface: u32) -> u32 {
-    st.color_surface(surface).map(|s| s.format).unwrap_or(0)
+pub(super) fn color_surface_get_format(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.format).unwrap_or(0)
+}
+
+/// The live surface at `addr`: from the guest struct's own contents if it holds one
+/// (so a COPY of an initialised surface still answers), else from the address table.
+fn resolve_color_surface(ctx: &mut GuestCtx, st: &VitaState, addr: u32) -> Option<ColorSurface> {
+    read_color_surface(ctx, addr).or_else(|| st.color_surface(addr))
 }
 
 /// SceGxmColorSurfaceType sceGxmColorSurfaceGetType(const SceGxmColorSurface *surface)
 /// Returns the surface layout type (LINEAR/TILED/SWIZZLED) the guest set at
 /// `sceGxmColorSurfaceInit`, or 0 (LINEAR, the enum default) if never initialized here.
 #[hostcall]
-pub(super) fn color_surface_get_type(st: &mut VitaState, surface: u32) -> u32 {
-    st.color_surface(surface).map(|s| s.surface_type).unwrap_or(0)
+pub(super) fn color_surface_get_type(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.surface_type).unwrap_or(0)
 }
 
 /// void sceGxmColorSurfaceSetClip(SceGxmColorSurface *surface, unsigned int xMin,
@@ -732,27 +821,44 @@ pub(super) fn texture_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, texture:
 
 /// The `semantic` u16 packed into a `SceGxmProgramParameter` at record offset +6
 /// (following the +4 category/type/component/container word verified against the
-/// real shaders in the image). Per the public gxp layout the field carries both the
-/// `SceGxmParameterSemantic` (high 4 bits) and its index (low 12 bits), e.g.
-/// TEXCOORD3 -> semantic TEXCOORD, index 3. The exact bit-split is the documented
-/// encoding but not yet cross-checked against a decoded attribute here; it feeds the
-/// render frontier (attribute->semantic mapping), not the boot path, so a title that
-/// only reflects on it during setup is unaffected either way. Validate the split when
-/// the renderer consumes semantics.
+/// real shaders in the image). It carries the `SceGxmParameterSemantic` in the LOW
+/// byte and the semantic INDEX in the high byte - see [`param_get_semantic`] for the
+/// measurement that pins that, and why the split matters.
 fn param_semantic_word(ctx: &GuestCtx, param: u32) -> u32 {
     (ctx.read_u32(param.wrapping_add(4)) >> 16) & 0xffff
 }
 
+/// Byte mask of the `SceGxmParameterSemantic` within [`param_semantic_word`].
+const GXM_SEMANTIC_MASK: u32 = 0xff;
+/// Bit position of the semantic INDEX within [`param_semantic_word`].
+const GXM_SEMANTIC_INDEX_SHIFT: u32 = 8;
+
 /// SceGxmParameterSemantic sceGxmProgramParameterGetSemantic(const SceGxmProgramParameter *param)
+///
+/// # The split, and how it was pinned
+/// A title that builds its `SceGxmVertexAttribute` array by matching shader semantics -
+/// rather than by hard-coding offsets - gets ZERO attributes when this returns the wrong
+/// field, and an empty attribute array is silent: `sceGxmShaderPatcherCreateVertexProgram`
+/// accepts it, every draw then arrives with real geometry and no way to fetch it, and the
+/// frame renders as a bare clear colour that looks exactly like a title drawing nothing.
+///
+/// So the split is measured, not assumed. Over the captured shader corpus of two retail
+/// titles, the attribute parameters' raw words are: `position` 0x000b, `normal` 0x0009,
+/// `VertexColour1` 0x0006, `Uv1` 0x000e, `Uv2` 0x010e, `rightVector` 0x020e, `upVector`
+/// 0x030e, `tangent` 0x060e, `lightColour` 0x0106. The low byte matches
+/// `SceGxmParameterSemantic` exactly (POSITION 11, NORMAL 9, COLOR 6, TEXCOORD 14 -
+/// vitasdk `gxm.h`), and the high byte counts 0,1,2,3,6 across names that differ only by
+/// their index. A 4/12 split would instead read those indices as 16/32/48/96, which no
+/// enumerated semantic index takes.
 #[hostcall]
 pub(super) fn param_get_semantic(ctx: &mut GuestCtx, _st: &mut VitaState, param: Ptr) -> u32 {
-    (param_semantic_word(ctx, param.addr()) >> 12) & 0xf
+    param_semantic_word(ctx, param.addr()) & GXM_SEMANTIC_MASK
 }
 
 /// unsigned int sceGxmProgramParameterGetSemanticIndex(const SceGxmProgramParameter *param)
 #[hostcall]
 pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, param: Ptr) -> u32 {
-    param_semantic_word(ctx, param.addr()) & 0xfff
+    param_semantic_word(ctx, param.addr()) >> GXM_SEMANTIC_INDEX_SHIFT
 }
 
 // --- Sampler state ----------------------------------------------------------
@@ -804,6 +910,34 @@ pub(super) fn texture_set_mip_filter(st: &mut VitaState, texture: u32, filter: u
 pub(super) fn texture_set_gamma_mode(st: &mut VitaState, texture: u32, gamma: u32) -> i32 {
     st.set_texture_gamma(texture, gamma);
     0
+}
+
+/// void sceGxmSetVertexUniformBuffer / sceGxmSetFragmentUniformBuffer
+///     (SceGxmContext *context, unsigned int bufferIndex, const void *bufferData)
+///
+/// Binds a NON-default uniform buffer for the given stage.
+///
+/// The capture carries only the DEFAULT uniform buffer (the SA bank) with each draw, so
+/// this buffer's CONTENTS do not reach the scene: a recompiled shader that reads uniform
+/// buffer `bufferIndex` reads nothing. That is a real gap rather than a no-op, so it says
+/// so once - an unreported approximation is indistinguishable on screen from a faithful
+/// render, which is exactly how a wrong "it renders correctly" claim gets made. Once per
+/// run rather than per call, because it is a property of the title's shaders, not an event.
+pub(super) fn set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let index = ctx.arg(1);
+    let data = ctx.arg(2);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            stage,
+            index,
+            data = format_args!("{data:#x}"),
+            "a non-default uniform buffer was bound; the capture records only the DEFAULT \
+             uniform buffer, so a recompiled shader reading this buffer index gets nothing"
+        );
+    }
+    ctx.ret(0);
 }
 
 // --- Texture getters (read back the sticky sampler/format state) -------------
@@ -861,14 +995,14 @@ pub(super) fn texture_get_stride(ctx: &mut GuestCtx, st: &mut VitaState) {
 
 /// void *sceGxmColorSurfaceGetData(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_data(st: &mut VitaState, surface: u32) -> u32 {
-    st.color_surface(surface).map(|s| s.data_addr).unwrap_or(0)
+pub(super) fn color_surface_get_data(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.data_addr).unwrap_or(0)
 }
 
 /// unsigned int sceGxmColorSurfaceGetStrideInPixels(const SceGxmColorSurface *surface)
 #[hostcall]
-pub(super) fn color_surface_get_stride_in_pixels(st: &mut VitaState, surface: u32) -> u32 {
-    st.color_surface(surface).map(|s| s.stride_pixels).unwrap_or(0)
+pub(super) fn color_surface_get_stride_in_pixels(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.stride_pixels).unwrap_or(0)
 }
 
 /// int sceGxmColorSurfaceSetGammaMode(SceGxmColorSurface *surface, SceGxmColorSurfaceGammaMode gammaMode)
@@ -1103,7 +1237,7 @@ pub(super) fn set_precomputed_fragment_state(ctx: &mut GuestCtx, st: &mut VitaSt
 }
 
 #[cfg(test)]
-mod inline_op_tests {
+pub(crate) mod inline_op_tests {
     use super::*;
     use crate::host::VitaState;
     use crate::nid::gxm as g;
@@ -1125,11 +1259,16 @@ mod inline_op_tests {
     /// Run a NID through the real dispatch over a synthetic parameter record and
     /// return the r0 the guest would see.
     fn handler_result(func_nid: u32) -> u32 {
+        handler_result_over(func_nid, param_record())
+    }
+
+    /// As [`handler_result`], over a caller-supplied record.
+    pub(crate) fn handler_result_over(func_nid: u32, record: [u32; 4]) -> u32 {
         let mut regs = [0u32; REG_COUNT];
         regs[0] = PARAM;
         let mut vfp = [0u32; VFP_ARG_COUNT];
         let mut bytes = vec![0u8; 4096];
-        for (i, w) in param_record().iter().enumerate() {
+        for (i, w) in record.iter().enumerate() {
             let off = PARAM as usize + i * 4;
             bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
         }
@@ -1208,5 +1347,72 @@ mod inline_op_tests {
                 crate::nid::name(nid)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    //! How `sceGxmProgramParameterGetSemantic` / `GetSemanticIndex` split the `semantic`
+    //! u16 in a `SceGxmProgramParameter`.
+    //!
+    //! Content-free: the words below are the encoding, not game data. They are the values
+    //! measured over a captured shader corpus (see the doc comment on
+    //! [`super::param_get_semantic`]), reproduced here as the specification this code is
+    //! held to. A title that builds its vertex-attribute array by matching semantics
+    //! renders NOTHING when this split is wrong, and does so silently, so the encoding is
+    //! pinned by a test rather than left to a comment.
+    use super::inline_op_tests::handler_result_over;
+    use crate::nid::gxm as g;
+
+    /// A parameter record carrying `semantic_word` in the upper half of the +4 word.
+    /// The lower half is a plausible attribute descriptor (category 0 = ATTRIBUTE,
+    /// float, 4 components) so nothing about the record is degenerate.
+    fn record(semantic_word: u16) -> [u32; 4] {
+        [0x1234_5678, ((semantic_word as u32) << 16) | 0x0400, 1, 0]
+    }
+
+    /// vitasdk `gxm.h` `SceGxmParameterSemantic` ordinals.
+    const COLOR: u32 = 6;
+    const NORMAL: u32 = 9;
+    const POSITION: u32 = 11;
+    const TEXCOORD: u32 = 14;
+
+    #[test]
+    fn semantic_is_the_low_byte_and_the_index_is_the_high_byte() {
+        // (raw word, semantic, index) - each row an attribute name observed in the corpus:
+        // position, normal, VertexColour1, Uv1, Uv2, rightVector, upVector, tangent.
+        for (word, semantic, index) in [
+            (0x000bu16, POSITION, 0),
+            (0x0009, NORMAL, 0),
+            (0x0006, COLOR, 0),
+            (0x000e, TEXCOORD, 0),
+            (0x010e, TEXCOORD, 1),
+            (0x020e, TEXCOORD, 2),
+            (0x030e, TEXCOORD, 3),
+            (0x060e, TEXCOORD, 6),
+            (0x0106, COLOR, 1),
+        ] {
+            assert_eq!(
+                handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC, record(word)),
+                semantic,
+                "semantic of {word:#06x}"
+            );
+            assert_eq!(
+                handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX, record(word)),
+                index,
+                "semantic index of {word:#06x}"
+            );
+        }
+    }
+
+    /// The two fields must not overlap: reading the whole u16 as either one is the exact
+    /// mistake this encoding invites, and it is invisible for index-0 attributes (the
+    /// common case) while breaking every indexed one.
+    #[test]
+    fn the_two_fields_are_disjoint() {
+        let word = 0x060e;
+        let semantic = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC, record(word));
+        let index = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX, record(word));
+        assert_eq!(semantic | (index << 8), word as u32, "the two fields reassemble the word");
     }
 }

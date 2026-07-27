@@ -212,9 +212,25 @@ impl GeneralRenderer {
     }
 
     /// Render one captured scene to an RGBA framebuffer on the GPU via the general path.
-    pub fn render_scene(
+    ///
+    /// A frame that is really several passes must go through
+    /// [`render_frame`](Self::render_frame) instead - see its doc comment for why one
+    /// scene is not a frame.
+    pub fn render_scene(&mut self, scene: &Scene, width: u32, height: u32, clear: [u8; 4]) -> Framebuffer {
+        self.render_frame(std::slice::from_ref(scene), width, height, clear)
+    }
+
+    /// Render a whole captured FRAME - every scene the guest submitted between flips, in
+    /// order - to an RGBA framebuffer.
+    ///
+    /// A 3D title's frame is a chain: offscreen passes render the world and its
+    /// intermediates, and a final pass composites them onto the display buffer by SAMPLING
+    /// them. Rendering only the last scene therefore draws only the composite, over
+    /// textures whose guest bytes the GPU (not the guest) was supposed to fill. See
+    /// [`GxmRenderer::encode_chain`].
+    pub fn render_frame(
         &mut self,
-        scene: &Scene,
+        scenes: &[Scene],
         width: u32,
         height: u32,
         clear: [u8; 4],
@@ -242,20 +258,43 @@ impl GeneralRenderer {
         });
         let depth_view = depth_tex.create_view(&Default::default());
 
+        // `VITASLOP_CHAIN_LIMIT=N` renders only the frame's first N scenes, which makes the
+        // Nth one the image. A frame is a chain of offscreen passes feeding a composite, and
+        // when the composite comes out black the question is WHICH pass is empty - a
+        // question the finished frame cannot answer, because every failure mode looks like
+        // black. This shows any single pass on its own.
+        let limit = std::env::var("VITASLOP_CHAIN_LIMIT").ok().and_then(|s| s.trim().parse::<usize>().ok());
+        let scenes = match limit {
+            Some(n) if n > 0 && n < scenes.len() => &scenes[..n],
+            _ => scenes,
+        };
+        // `VITASLOP_CHAIN_SKIP=i,j` leaves those passes out of the frame. A pass that draws
+        // over a target an earlier pass filled correctly is indistinguishable, in the
+        // finished frame, from the earlier pass never having drawn - removing the suspect
+        // and seeing the image come back separates the two in one run.
+        let skip: Vec<usize> = std::env::var("VITASLOP_CHAIN_SKIP")
+            .ok()
+            .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+            .unwrap_or_default();
         let t_build = std::time::Instant::now();
-        let render_scene = self.builder.build(scene);
+        let built: Vec<_> = scenes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !skip.contains(i))
+            .map(|(_, s)| self.builder.build(s))
+            .collect();
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let t_encode = std::time::Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.gxm.encode(
+        self.gxm.encode_chain(
             &self.device,
             &self.queue,
             &mut encoder,
             &color_view,
             &depth_view,
-            &render_scene,
+            &built,
             width,
             height,
             clear,

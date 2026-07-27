@@ -288,6 +288,11 @@ fn trace_funcs() -> &'static std::collections::BTreeSet<u32> {
 /// target address plus the live argument registers r0..r3 and lr = the caller's return).
 /// This reveals the runtime vtable dispatch graph that static call-graph analysis cannot
 /// follow. Zero cost / byte-identical when unset.
+///
+/// Honours [`arm_at_frame`], which is what makes it usable on a live title: a virtual call
+/// in an engine's refcount or resource path runs millions of times during boot, so an
+/// ungated trace of one is gigabytes of the wrong window. Gated, the same knob answers "who
+/// called addRef/release on this object, in the 60 frames around the trap".
 fn trace_indirect_range() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
@@ -369,6 +374,26 @@ fn watch_store_arm_mode() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
     *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_ARM").is_ok())
+}
+
+/// `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing
+/// function's address plus the live register file, through the `svc` trace path) and
+/// carry on, instead of trapping on the (skip+1)-th.
+///
+/// The trapping form answers "who wrote this" one writer at a time: each additional
+/// writer costs another whole run with `VITASLOP_WATCH_STORE_SKIP` bumped, and it can
+/// never say how many writers there are in total - the run just stops trapping, which
+/// is indistinguishable from having mis-set the skip. Logging enumerates the complete
+/// write history in ONE run, which is what a refcount question needs: "how many times
+/// was this incremented, by whom, before the decrement that freed it" is a question
+/// about the whole sequence, not about any single writer.
+///
+/// Pairs with [`arm_at_frame`] (the address of a heap object only exists late) and with
+/// `VITASLOP_WATCH_STORE_NZ`.
+fn watch_store_log() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_LOG").is_ok())
 }
 
 // Scratch locals used by flag computation. Local 0 is `$bb`.
@@ -737,6 +762,7 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
         f.instruction(&W::I32Const(hi as i32));
         f.instruction(&W::I32LeU);
         f.instruction(&W::I32And);
+        and_armed(&mut f);
         f.instruction(&W::If(BlockType::Empty));
         f.instruction(&W::LocalGet(P_TARGET));
         f.instruction(&W::Call(SVC_FUNC));
@@ -808,9 +834,16 @@ fn emit_func(
     // Diagnostic entry tracer (opt-in): announce this function's entry to the host
     // `svc` handler, which logs the address and incoming argument registers. Emitted
     // before any block so it fires exactly once per call, on entry (see `trace_funcs`).
+    // Honours `arm_at_frame`: a function on an engine's hot path (a resource request, an
+    // allocator) is entered thousands of times during boot, so an ungated trace of one
+    // buries the frames actually being asked about.
     if trace_funcs().contains(&func.addr) {
+        f.instruction(&W::I32Const(1));
+        and_armed(&mut f);
+        f.instruction(&W::If(BlockType::Empty));
         f.instruction(&W::I32Const(func.addr as i32));
         f.instruction(&W::Call(SVC_FUNC));
+        f.instruction(&W::End);
     }
 
     // Diagnostic forced return (opt-in): set r0 to the configured value and return before
@@ -887,7 +920,20 @@ fn emit_block(
 fn goto(f: &mut Function, func: &Func, target: u32, loop_depth: u32, extra: u32) {
     let idx = func
         .block_index(target)
-        .unwrap_or_else(|| panic!("branch target {target:#x} is not a block in f_{:x}", func.addr))
+        .unwrap_or_else(|| {
+            // Name the blocks that DO exist. Without them this says only that something
+            // does not fit, and the first question - "is the target just outside this
+            // function, or is the function nonsense?" - needs the answer inline.
+            let blocks: Vec<String> =
+                func.blocks.iter().take(12).map(|b| format!("{:#x}", b.addr)).collect();
+            panic!(
+                "branch target {target:#x} is not a block in f_{:x} ({} block(s): {}{})",
+                func.addr,
+                func.blocks.len(),
+                blocks.join(" "),
+                if func.blocks.len() > 12 { " ..." } else { "" }
+            )
+        })
         as i32;
     f.instruction(&W::I32Const(idx));
     f.instruction(&W::LocalSet(L_BB));
@@ -1153,17 +1199,24 @@ fn emit_stmt(
                     }
                     and_armed(f);
                     f.instruction(&W::If(BlockType::Empty));
-                    // Matched: bump the counter and trap once past the skip window.
-                    f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
-                    f.instruction(&W::I32Const(1));
-                    f.instruction(&W::I32Add);
-                    f.instruction(&W::GlobalSet(WATCH_STORE_COUNT_GLOBAL));
-                    f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
-                    f.instruction(&W::I32Const(watch_store_skip() as i32));
-                    f.instruction(&W::I32GtU);
-                    f.instruction(&W::If(BlockType::Empty));
-                    f.instruction(&W::Unreachable);
-                    f.instruction(&W::End);
+                    if watch_store_log() {
+                        // Log the writer (its own address, through the `svc` trace
+                        // marker path) and carry on, so one run enumerates them all.
+                        f.instruction(&W::I32Const(func_addr as i32));
+                        f.instruction(&W::Call(SVC_FUNC));
+                    } else {
+                        // Matched: bump the counter and trap once past the skip window.
+                        f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
+                        f.instruction(&W::I32Const(1));
+                        f.instruction(&W::I32Add);
+                        f.instruction(&W::GlobalSet(WATCH_STORE_COUNT_GLOBAL));
+                        f.instruction(&W::GlobalGet(WATCH_STORE_COUNT_GLOBAL));
+                        f.instruction(&W::I32Const(watch_store_skip() as i32));
+                        f.instruction(&W::I32GtU);
+                        f.instruction(&W::If(BlockType::Empty));
+                        f.instruction(&W::Unreachable);
+                        f.instruction(&W::End);
+                    }
                     f.instruction(&W::End);
                 }
                 f.instruction(&W::LocalGet(L_T0));

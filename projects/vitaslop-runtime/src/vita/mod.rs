@@ -19,6 +19,7 @@ pub mod sync;
 pub mod sysmem;
 pub mod threadmgr;
 pub mod touch;
+pub mod video;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
@@ -55,14 +56,54 @@ static CALLSITE_CODE_RANGE: LazyLock<(u32, u32)> = LazyLock::new(|| {
 });
 static CALLSITE_HIST: Mutex<BTreeMap<(u32, u32), u64>> = Mutex::new(BTreeMap::new());
 
+/// Print the guest call chain the first time a chosen NID is called from each thread
+/// (env `VITASLOP_BACKTRACE=<func-nid-hex>[@LO-HI]`, the frame window optional). The
+/// scan range is [`CALLSITE_CODE_RANGE`], so `VITASLOP_CODE_RANGE` widens it to a
+/// title whose own code sits outside the default window.
+static BACKTRACE_AT: LazyLock<Option<(u32, u64, u64)>> = LazyLock::new(|| {
+    let s = std::env::var("VITASLOP_BACKTRACE").ok()?;
+    let (nid_s, win) = match s.split_once('@') {
+        Some((n, w)) => (n, parse_frame_window(w)),
+        None => (s.as_str(), (0, u64::MAX)),
+    };
+    let nid_ = u32::from_str_radix(nid_s.trim().trim_start_matches("0x"), 16).ok()?;
+    Some((nid_, win.0, win.1))
+});
+/// (nid, thread) pairs already reported, so the backtrace prints once per thread
+/// instead of every frame.
+static BACKTRACE_DONE: Mutex<std::collections::BTreeSet<(u32, i32)>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
 /// Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful*
 /// host call live, in global order, with a monotonic index and thread id. Unlike
 /// the counting profiler this shows the boot NARRATIVE and the exact point it
-/// flatlines into a pure lock/poll spin. The high-frequency lock/unlock and shader-
-/// reflection calls are filtered so the interesting sequence is not drowned out.
-static TRACE_ORDER: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("VITASLOP_TRACE_ORDER").is_ok());
+/// flatlines into a pure lock/poll spin. The high-frequency lock/unlock, shader-
+/// reflection and per-draw GXM state calls are filtered so the interesting sequence
+/// is not drowned out (a single front-end frame issues thousands of `sceGxmSet*`).
+///
+/// The value is a DISPLAY-FRAME WINDOW, because the interesting moment is usually
+/// thousands of frames into a boot and tracing from frame 0 costs hundreds of
+/// megabytes and minutes of wall time to reach it: `1`/`all` traces everything,
+/// `LO-HI` traces an inclusive range, `LO-` traces from `LO` to the end. Anything
+/// outside the window costs one integer compare.
+static TRACE_ORDER: LazyLock<Option<(u64, u64)>> =
+    LazyLock::new(|| std::env::var("VITASLOP_TRACE_ORDER").ok().map(|s| parse_frame_window(&s)));
 static TRACE_ORDER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Parse a diagnostic's display-frame window: `LO-HI` inclusive, `LO-` open-ended,
+/// and anything else (including `1` and `all`) the whole run. A malformed bound is
+/// the whole run rather than silently a different window.
+fn parse_frame_window(spec: &str) -> (u64, u64) {
+    let spec = spec.trim();
+    match spec.split_once('-') {
+        Some((lo, hi)) => {
+            let lo = lo.trim().parse::<u64>().unwrap_or(0);
+            let hi = if hi.trim().is_empty() { u64::MAX } else { hi.trim().parse::<u64>().unwrap_or(u64::MAX) };
+            (lo, hi)
+        }
+        None => (0, u64::MAX),
+    }
+}
 
 /// Print the hottest call sites (by count) gathered when `VITASLOP_DBG_CALLSITES` is
 /// set. Call from a probe after the run to localize a spin.
@@ -120,15 +161,48 @@ pub fn dispatch(
         *CALLSITE_HIST.lock().unwrap().entry((func_nid, caller)).or_insert(0u64) += 1;
     }
 
+    // Diagnostic (env `VITASLOP_BACKTRACE`): the guest CALL CHAIN at a chosen host
+    // call, once. "Which NID is being called" answers what a thread is doing; only the
+    // chain answers WHERE in the game that thread is, and a stalled title's stuck
+    // state machine is usually several frames up from the innermost call it makes.
+    // The chain is a stack SCAN (every word in the code range, innermost first), not a
+    // frame-pointer walk - ARM leaf frames often keep no frame pointer at all - so it
+    // may contain stale slots; it is a set of candidates ordered by depth, not proof.
+    if let Some((want_nid, lo_f, hi_f)) = *BACKTRACE_AT {
+        if func_nid == want_nid && (lo_f..=hi_f).contains(&st.cur_frame()) {
+            let key = (want_nid, st.current_thread());
+            if BACKTRACE_DONE.lock().unwrap().insert(key) {
+                let (lo, hi) = *CALLSITE_CODE_RANGE;
+                let sp = ctx.regs[13];
+                let mut chain = vec![format!("{:#010x}", ctx.regs[14])];
+                for i in 0..256u32 {
+                    let v = ctx.read_u32(sp.wrapping_add(i * 4));
+                    if (lo..hi).contains(&v) {
+                        chain.push(format!("{v:#010x}"));
+                    }
+                }
+                eprintln!(
+                    "backtrace f{} t{} {}: lr+stack candidates [{}]",
+                    st.cur_frame(),
+                    st.current_thread(),
+                    nid::name(func_nid),
+                    chain.join(" ")
+                );
+            }
+        }
+    }
+
     // Diagnostic (env `VITASLOP_TRACE_ORDER`): live, globally-ordered timeline of
     // meaningful calls. Filters the lock/unlock and shader-reflection storm so the
     // boot sequence and its flatline-into-spin are legible. Zero cost when unset.
-    if *TRACE_ORDER {
+    if TRACE_ORDER.is_some_and(|(lo, hi)| (lo..=hi).contains(&st.cur_frame())) {
         let nm = nid::name(func_nid);
         let noise = nm.contains("LwMutex")
             || nm.contains("LockMutex")
             || nm.contains("UnlockMutex")
             || nm.starts_with("sceGxmProgram")
+            || nm.starts_with("sceGxmSet")
+            || nm == "sceGxmDraw"
             || nm == "sceKernelGetTLSAddr";
         if !noise {
             let seq = TRACE_ORDER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -138,7 +212,8 @@ pub fn dispatch(
                 nm.to_string()
             };
             eprintln!(
-                "[ord {seq:>7} t{:<3}] {label}({:#x}, {:#x}, {:#x}, {:#x}) lr={:#010x}",
+                "[ord {seq:>7} f{:<6} t{:<3}] {label}({:#x}, {:#x}, {:#x}, {:#x}) lr={:#010x}",
+                st.cur_frame(),
                 st.current_thread(),
                 ctx.arg(0),
                 ctx.arg(1),
@@ -197,6 +272,7 @@ pub fn dispatch(
         sync_nid::TRY_LOCK_MUTEX => sync::lock_mutex(ctx, st, true),
         sync_nid::UNLOCK_MUTEX => cont!(sync::unlock_mutex(ctx, st)),
         sync_nid::DELETE_MUTEX => cont!(sync::delete_object(ctx, st)),
+        sync_nid::CLOSE_MUTEX => cont!(sync::delete_object(ctx, st)),
         sync_nid::CREATE_SEMA | sync_nid::CREATE_SEMA_16XX => cont!(sync::create_sema(ctx, st)),
         sync_nid::WAIT_SEMA => sync::wait_sema(ctx, st),
         sync_nid::SIGNAL_SEMA => cont!(sync::signal_sema(ctx, st)),
@@ -226,6 +302,13 @@ pub fn dispatch(
         lk_nid::CLIB_STRNCPY => cont!(libkernel::clib_strncpy(ctx, st)),
         lk_nid::CLIB_STRNCMP => cont!(libkernel::clib_strncmp(ctx, st)),
         lk_nid::CLIB_STRCMP => cont!(libkernel::clib_strcmp(ctx, st)),
+        lk_nid::CLIB_STRRCHR => cont!(libkernel::clib_strrchr(ctx, st)),
+        lk_nid::CLIB_STRNCASECMP => cont!(libkernel::clib_strncasecmp(ctx, st)),
+        lk_nid::CLIB_MSPACE_CREATE => cont!(libkernel::clib_mspace_create(ctx, st)),
+        lk_nid::CLIB_MSPACE_DESTROY => cont!(libkernel::clib_mspace_destroy(ctx, st)),
+        lk_nid::CLIB_MSPACE_MALLOC => cont!(libkernel::clib_mspace_malloc(ctx, st)),
+        lk_nid::CLIB_MSPACE_MEMALIGN => cont!(libkernel::clib_mspace_memalign(ctx, st)),
+        lk_nid::CLIB_MSPACE_FREE => cont!(libkernel::clib_mspace_free(ctx, st)),
         lk_nid::CREATE_THREAD => cont!(libkernel::create_thread(ctx, st)),
         lk_nid::START_THREAD => libkernel::start_thread(ctx, st),
         // Join can block under the preemptive scheduler.
@@ -254,6 +337,7 @@ pub fn dispatch(
                 SvcOutcome::Halt
             }
         }
+        tm_nid::DELETE_THREAD => cont!(threadmgr::delete_thread(ctx, st)),
         tm_nid::GET_PROCESS_ID => cont!(threadmgr::get_process_id(ctx, st)),
         tm_nid::GET_THREAD_CURRENT_PRIORITY => {
             cont!(threadmgr::get_thread_current_priority(ctx, st))
@@ -346,9 +430,12 @@ pub fn dispatch(
         gxm_nid::TEXTURE_SET_MAG_FILTER => cont!(gxm::texture_set_mag_filter(ctx, st)),
         gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx, st)),
         gxm_nid::TEXTURE_SET_GAMMA_MODE => cont!(gxm::texture_set_gamma_mode(ctx, st)),
-        gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::ok(ctx)),
+        gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "fragment")),
+        gxm_nid::SET_VERTEX_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "vertex")),
         // Texture getters: read back the sticky sampler/format state a setter stored.
-        gxm_nid::TEXTURE_GET_MIPMAP_COUNT_UNSAFE => cont!(gxm::texture_get_mipmap_count(ctx, st)),
+        gxm_nid::TEXTURE_GET_MIPMAP_COUNT_UNSAFE | gxm_nid::TEXTURE_GET_MIPMAP_COUNT => {
+            cont!(gxm::texture_get_mipmap_count(ctx, st))
+        }
         gxm_nid::TEXTURE_GET_STRIDE => cont!(gxm::texture_get_stride(ctx, st)),
         gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx, st)),
         gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx, st)),
@@ -449,11 +536,13 @@ pub fn dispatch(
         // --- iofilemgr: file IO -------------------------------------------------
         io_nid::IO_OPEN => cont!(iofilemgr::io_open(ctx, st)),
         io_nid::IO_CLOSE => cont!(iofilemgr::io_close(ctx, st)),
-        io_nid::IO_READ => cont!(iofilemgr::io_read(ctx, st)),
+        // Reads park the caller for their modelled transfer time, so these two arms
+        // return the outcome directly instead of forcing `Continue`.
+        io_nid::IO_READ => iofilemgr::io_read(ctx, st),
         io_nid::IO_WRITE => cont!(iofilemgr::io_write(ctx, st)),
         io_nid::IO_LSEEK32 => cont!(iofilemgr::io_lseek32(ctx, st)),
         io_nid::IO_LSEEK => cont!(iofilemgr::io_lseek(ctx, st)),
-        io_nid::IO_PREAD => cont!(iofilemgr::io_pread(ctx, st)),
+        io_nid::IO_PREAD => iofilemgr::io_pread(ctx, st),
         io_nid::IO_PWRITE => cont!(iofilemgr::io_pwrite(ctx, st)),
         io_nid::IO_GETSTAT => cont!(iofilemgr::io_getstat(ctx, st)),
         io_nid::IO_GETSTAT_BY_FD => cont!(iofilemgr::io_getstat_by_fd(ctx, st)),
@@ -472,6 +561,7 @@ pub fn dispatch(
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
         // A real timed vblank wait (parks under the preemptive scheduler).
         display_nid::WAIT_VBLANK_START_MULTI => display::wait_vblank_start_multi(ctx, st),
+        display_nid::WAIT_VBLANK_START => display::wait_vblank_start(ctx, st),
         display_nid::WAIT_SET_FRAME_BUF => display::wait_set_frame_buf(ctx, st),
 
         // --- ctrl: input --------------------------------------------------------
@@ -494,7 +584,10 @@ pub fn dispatch(
         | ngs_nid::VOICE_DEF_GET_REVERB_BUSS
         | ngs_nid::VOICE_DEF_GET_EQ_BUSS
         | ngs_nid::VOICE_DEF_GET_SIMPLE_VOICE
-        | ngs_nid::VOICE_DEF_GET_MIXER_BUSS => cont!(ngs::voice_def_get(ctx, st)),
+        | ngs_nid::VOICE_DEF_GET_MIXER_BUSS
+        | ngs_nid::VOICE_DEF_GET_COMPRESSOR_BUSS
+        | ngs_nid::VOICE_DEF_GET_DELAY_BUSS
+        | ngs_nid::VOICE_DEF_GET_DISTORTION_BUSS => cont!(ngs::voice_def_get(ctx, st)),
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
@@ -504,6 +597,7 @@ pub fn dispatch(
         ngs_nid::VOICE_UNLOCK_PARAMS => cont!(ngs::voice_unlock_params(ctx, st)),
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::SYSTEM_RELEASE
+        | ngs_nid::RACK_RELEASE
         | ngs_nid::VOICE_RESUME
         | ngs_nid::VOICE_SET_FINISHED_CALLBACK
         | ngs_nid::VOICE_SET_MODULE_CALLBACK
@@ -522,6 +616,8 @@ pub fn dispatch(
         ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL | ngs_nid::VOICE_PAUSE => {
             cont!(ngs::voice_stop(ctx, st))
         }
+        ngs_nid::VOICE_INIT => cont!(ngs::voice_init(ctx, st)),
+        ngs_nid::VOICE_GET_INFO => cont!(ngs::voice_get_info(ctx, st)),
         audio_nid::OUT_OPEN_PORT => cont!(audio::out_open_port(ctx, st)),
         audio_nid::OUT_OUTPUT => audio::out_output(ctx, st),
         audio_nid::OUT_SET_VOLUME => cont!(audio::out_set_volume(ctx, st)),
@@ -557,6 +653,7 @@ pub fn dispatch(
         // --- services: sysmodule / net / http / np / rtc / apputil / touch -----
         sv_nid::SYSMODULE_IS_LOADED => cont!(services::sysmodule_is_loaded(ctx, st)),
         sv_nid::NET_CTL_INET_GET_STATE => cont!(services::netctl_inet_get_state(ctx, st)),
+        sv_nid::NET_CTL_INET_GET_INFO => cont!(services::netctl_inet_get_info(ctx, st)),
         sv_nid::NET_CTL_INET_REGISTER_CALLBACK => cont!(services::netctl_register_callback(ctx, st)),
         sv_nid::NET_CTL_CHECK_CALLBACK => cont!(services::net_check_callback(ctx, st)),
         sv_nid::NP_REGISTER_SERVICE_STATE_CALLBACK => {
@@ -571,7 +668,30 @@ pub fn dispatch(
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::RTC_CONVERT_UTC_TO_LOCAL_TIME | sv_nid::RTC_CONVERT_LOCAL_TIME_TO_UTC => {
+            cont!(services::rtc_convert_time_zone(ctx, st))
+        }
         sv_nid::RTC_GET_TICK => cont!(services::rtc_get_tick(ctx, st)),
+        sv_nid::RTC_GET_TIME64_T => cont!(services::rtc_get_time64_t(ctx, st)),
+        sv_nid::RTC_GET_CURRENT_NETWORK_TICK => {
+            cont!(services::rtc_get_current_network_tick(ctx, st))
+        }
+        sv_nid::RTC_SET_TICK => cont!(services::rtc_set_tick(ctx, st)),
+        // The sceRtcTickAdd* family, by unit. `true` marks the forms whose count is a
+        // 64-bit SceLong64 (an aligned register pair), `false` a plain int.
+        sv_nid::RTC_TICK_ADD_TICKS => cont!(services::rtc_tick_add_fixed(ctx, 1, true)),
+        sv_nid::RTC_TICK_ADD_MICROSECONDS => cont!(services::rtc_tick_add_fixed(ctx, 1, true)),
+        sv_nid::RTC_TICK_ADD_SECONDS => cont!(services::rtc_tick_add_fixed(ctx, 1_000_000, true)),
+        sv_nid::RTC_TICK_ADD_MINUTES => cont!(services::rtc_tick_add_fixed(ctx, 60_000_000, true)),
+        sv_nid::RTC_TICK_ADD_HOURS => cont!(services::rtc_tick_add_fixed(ctx, 3_600_000_000, false)),
+        sv_nid::RTC_TICK_ADD_DAYS => {
+            cont!(services::rtc_tick_add_fixed(ctx, 86_400_000_000, false))
+        }
+        sv_nid::RTC_TICK_ADD_WEEKS => {
+            cont!(services::rtc_tick_add_fixed(ctx, 7 * 86_400_000_000, false))
+        }
+        sv_nid::RTC_TICK_ADD_MONTHS => cont!(services::rtc_tick_add_calendar(ctx, 1)),
+        sv_nid::RTC_TICK_ADD_YEARS => cont!(services::rtc_tick_add_calendar(ctx, 12)),
         sv_nid::MOTION_GET_STATE => cont!(services::motion_get_state(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
@@ -585,18 +705,39 @@ pub fn dispatch(
         sv_nid::APPUTIL_SAVEDATA_SLOT_CREATE => {
             cont!(services::apputil_savedata_slot_create(ctx, st))
         }
+        sv_nid::APPUTIL_SAVEDATA_SLOT_SET_PARAM => {
+            cont!(services::apputil_savedata_slot_set_param(ctx, st))
+        }
         sv_nid::APPUTIL_SAVEDATA_DATA_SAVE => {
             cont!(services::apputil_savedata_data_save(ctx, st))
         }
         sv_nid::APP_MGR_GET_APP_STATE => cont!(services::app_mgr_get_app_state(ctx, st)),
+        sv_nid::APP_MGR_IS_GAME_PROGRAM => cont!(services::app_mgr_is_game_program(ctx, st)),
+        sv_nid::FIOS_OVERLAY_GET_RECOMMENDED_SCHEDULER => {
+            cont!(services::fios_overlay_get_recommended_scheduler(ctx, st))
+        }
         // Offline services with an out-param handle to hand back.
         sv_nid::NETCTL_ADHOC_REGISTER_CALLBACK => {
             cont!(services::netctl_adhoc_register_callback(ctx, st))
         }
+        sv_nid::NETCTL_ADHOC_GET_IN_ADDR => cont!(services::netctl_adhoc_get_in_addr(ctx, st)),
+        sv_nid::NETCTL_ADHOC_GET_STATE => cont!(services::netctl_adhoc_get_state(ctx, st)),
+        sv_nid::NETCTL_ADHOC_DISCONNECT => cont!(services::netctl_adhoc_disconnect(ctx, st)),
+        sv_nid::MP4_OPEN_FILE => cont!(video::mp4_open_file(ctx, st)),
+        sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
+        sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
+        sv_nid::MP4_RELEASE_BUFFER_7B4832FE => cont!(video::mp4_release_buffer(ctx, st)),
         sv_nid::NP_TROPHY_CREATE_CONTEXT => cont!(services::np_trophy_create_context(ctx, st)),
+        sv_nid::NP_TROPHY_DESTROY_CONTEXT => cont!(services::np_trophy_destroy_context(ctx, st)),
         sv_nid::NP_TROPHY_CREATE_HANDLE => cont!(services::np_trophy_create_handle(ctx, st)),
         sv_nid::NP_TROPHY_GET_GAME_INFO => cont!(services::np_trophy_get_game_info(ctx, st)),
+        sv_nid::NP_TROPHY_GET_GAME_ICON => cont!(services::np_trophy_get_game_icon(ctx, st)),
+        sv_nid::NP_TROPHY_GET_GROUP_INFO => cont!(services::np_trophy_get_group_info(ctx, st)),
+        sv_nid::NP_TROPHY_GET_GROUP_ICON => cont!(services::np_trophy_get_group_icon(ctx, st)),
+        sv_nid::NP_TROPHY_GET_TROPHY_INFO => cont!(services::np_trophy_get_trophy_info(ctx, st)),
+        sv_nid::NP_TROPHY_GET_TROPHY_ICON => cont!(services::np_trophy_get_trophy_icon(ctx, st)),
         sv_nid::NP_TROPHY_GET_TROPHY_UNLOCK_STATE => cont!(services::np_trophy_get_trophy_unlock_state(ctx, st)),
+        sv_nid::NP_TROPHY_UNLOCK_TROPHY => cont!(services::np_trophy_unlock_trophy(ctx, st)),
         // The trophy-setup dialog's result read (zeroed result = OK), like the other
         // dialog GetResult calls.
         sv_nid::NP_TROPHY_SETUP_DIALOG_GET_RESULT => cont!(services::dialog_ok(ctx, st)),
@@ -631,9 +772,16 @@ pub fn dispatch(
         // NpBasic per-frame pump: no presence/friend events exist off-console.
         | sv_nid::NP_BASIC_CHECK_CALLBACK
         | sv_nid::FIOS_OVERLAY_GET_LIST
+        // Enabling/disabling FIOS overlay resolution for a thread: there are no overlays
+        // mounted off-console (the list above is empty), so there is nothing to switch.
+        | sv_nid::FIOS_OVERLAY_THREAD_SET_DISABLED
         | sv_nid::ULOBJ_REGISTER_PROTOCOL_REVISION
         | sv_nid::APPUTIL_INIT
         | sv_nid::NP_SCORE_INIT
+        // Tearing down the ranking library: there is nothing behind it off-console, so a
+        // term has nothing to fail at. Titles reach this from their own no-network cleanup
+        // path (which is where `sceNetCtlInetGetInfo` reporting NOT_CONNECTED sends them).
+        | sv_nid::NP_SCORE_TERM
         // The requested module is already linked into the image, so a load succeeds.
         | sv_nid::SYSMODULE_LOAD_MODULE
         | sv_nid::TOUCH_SET_SAMPLING_STATE
@@ -643,14 +791,42 @@ pub fn dispatch(
         | sv_nid::SCREENSHOT_ENABLE
         | sv_nid::SCREENSHOT_SET_PARAM
         | sv_nid::SCREENSHOT_SET_OVERLAY_IMAGE
-        // SceNpTrophy init + the Np subsystem inits: offline success.
+        // SceNpTrophy init/term and handle lifetime: a handle only scopes an async
+        // operation, and every query here completes synchronously, so there is nothing
+        // for destroy/abort to cancel.
         | sv_nid::NP_TROPHY_INIT
+        | sv_nid::NP_TROPHY_TERM
+        | sv_nid::NP_TROPHY_DESTROY_HANDLE
+        | sv_nid::NP_TROPHY_ABORT_HANDLE
         | sv_nid::NP_ACTIVITY_INIT
         | sv_nid::NP_AUTH_INIT
         | sv_nid::NP_LOOKUP_INIT
         | sv_nid::NP_TUS_INIT
         | sv_nid::NP_MESSAGE_INIT_WITH_PARAM
         | sv_nid::NP_MESSAGE_TERM
+        | sv_nid::NP_MATCHING2_INIT
+        // Online-stack TEARDOWN. A title that finds itself offline unwinds the whole
+        // stack it brought up; terminating a subsystem with no backing service, and
+        // unregistering a callback that never fired, genuinely succeed.
+        | sv_nid::NP_TERM
+        | sv_nid::NP_UNREGISTER_SERVICE_STATE_CALLBACK
+        | sv_nid::NP_BASIC_TERM
+        | sv_nid::NP_ACTIVITY_TERM
+        | sv_nid::NP_AUTH_TERM
+        | sv_nid::NP_LOOKUP_TERM
+        | sv_nid::NP_LOOKUP_DELETE_TITLE_CTX
+        | sv_nid::NP_TUS_TERM
+        | sv_nid::NP_TUS_DELETE_TITLE_CTX
+        | sv_nid::NP_SCORE_DELETE_TITLE_CTX
+        | sv_nid::NP_MATCHING2_TERM
+        | sv_nid::HTTP_TERM
+        | sv_nid::SSL_TERM
+        | sv_nid::NET_TERM
+        | sv_nid::NET_CTL_TERM
+        | sv_nid::NET_CTL_INET_UNREGISTER_CALLBACK
+        | sv_nid::NETCTL_ADHOC_UNREGISTER_CALLBACK
+        | sv_nid::SYSMODULE_UNLOAD_MODULE
+        | sv_nid::APPUTIL_SHUTDOWN
         | sv_nid::NP_COMMERCE2_INIT
         // SceNpCommerce2 context/request creation: local handle setup that succeeds; the
         // actual store fetch has no server to reach off-console and returns no content.

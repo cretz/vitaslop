@@ -1,0 +1,37 @@
+@title Ridge Racer - boot to the title screen and press PLAY
+@game  PCSE00001
+@shot-every 100
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Boots the title through its logo sequence to the RIDGE RACER title screen and
+# presses PLAY, which is the entry to the front-end menus.
+#
+# HOW IT WAS AUTHORED (lessons for the next agent)
+# - Judge this title ONLY through `vitaslop-desktop --headless`. Its draws are
+#   fragment-shader passes, and the software rasterizer `play` uses cannot show
+#   them - its shots come out blank and prove nothing. Use
+#   VITASLOP_HEADLESS_SHOT_EVERY to see the sequence rather than one last frame.
+# - Boot landmarks on the display-flip clock, measured: legal notice to ~f350,
+#   BANDAI NAMCO Games ~f400-550, namco ~f600-750, CELLIUS ~f800-1050, a
+#   save-data spinner ~f1050, then the title movie is attempted and skipped
+#   (there is no H.264 decoder) and the RIDGE RACER title screen with its
+#   pulsing PLAY button is up from ~f1400 and stays up waiting for input.
+# - The movie matters: the title IGNORES a failed sceMp4OpenFile and calls
+#   sceMp4StartFileStreaming anyway, so the skip needs BOTH to fail honestly.
+#   Behind the title screen there should be a movie playing; this run has a
+#   plain dark background there instead, and the engine says so on stderr.
+# ============================================================================
+
+# --- press PLAY on the title screen ---
+# The button's centre is MEASURED off a title-screen shot at screen (480, 420);
+# the front touch panel is screen*2, so that is panel (960, 840). The first
+# attempt tapped panel y=560..640 - screen y=280..320 - which is empty space
+# above the button, and nothing happened for 1100 frames. Measure the button in
+# a shot before assuming where a front-end control is.
+0: @section boot
+
+1500: touch=960,840
+1520:
+1560: touch=960,840
+1580:

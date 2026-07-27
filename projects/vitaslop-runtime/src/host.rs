@@ -332,8 +332,21 @@ pub struct MemBlock {
 /// its return value once it has run.
 struct ThreadRec {
     uid: i32,
+    /// The name the guest passed to `sceKernelCreateThread`, if any. A worker's own
+    /// name ("threadFile", "NU::File::RequestManager", "auto_save") is the fastest
+    /// way to read a stalled thread dump, so it is kept rather than only logged.
+    name: String,
     entry: u32,
     stack_top: u32,
+    /// The stack allocation this thread owns: `(base, size)`. Kept so
+    /// [`VitaState::delete_thread`] can hand it back for reuse - the guest allocator here
+    /// is a bump allocator with no free, so a title that churns threads would otherwise
+    /// march through the arena until it collided with something else.
+    stack: (u32, u32),
+    /// Whether the thread has ever been started. A created-but-never-started thread is
+    /// DORMANT and may be deleted; a running one may not, and both have no exit code, so
+    /// the exit code alone cannot tell them apart.
+    started: bool,
     exit_code: Option<u32>,
     /// SceKernel thread priority (lower number = higher priority). The scheduler
     /// runs the highest-priority runnable thread, matching the real kernel.
@@ -358,6 +371,18 @@ pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
 /// to the woken thread's `r0` through the resume-code channel (see
 /// [`VitaState::take_resume_code`]); a wait satisfied by a signal returns 0 instead.
 pub const SCE_KERNEL_ERROR_WAIT_TIMEOUT: u32 = 0x8002_8005;
+
+/// `SCE_KERNEL_ERROR_NOT_DORMANT` - a thread operation that requires the thread to be
+/// stopped was asked of a running one.
+///
+/// From vitasdk `psp2/kernel/error.h`, NOT the psdevwiki error-code table: that table
+/// disagrees with the header on this whole block (it lists NOT_DORMANT at 0x80028002 and
+/// WAIT_TIMEOUT at 0x80028008, where the header has 0x80028028 and 0x80028005). The header
+/// is the one that matches the value this engine already returns for a timed-out wait, so
+/// the table's rows appear to be shifted. Prefer the header for SceKernel error numbers.
+pub const SCE_KERNEL_ERROR_NOT_DORMANT: u32 = 0x8002_8028;
+/// `SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID` - no thread has that SceUID (same header).
+pub const SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID: u32 = 0x8002_8021;
 
 /// Resolve a `sceKernelCreateThread` priority argument to a concrete scheduler
 /// priority. Absolute user priorities (small numbers, ~0x40..0xBF) pass through;
@@ -1177,6 +1202,27 @@ pub struct VitaState {
     next_handle: u32,
     next_uid: i32,
     memblocks: Vec<MemBlock>,
+    /// Accrued modelled storage-transfer time not yet paid by parking a thread.
+    io_debt_us: u64,
+    /// The modelled storage device's own clock, in microseconds. Deliberately NOT the
+    /// game clock (`virtual_us`): a park charged against `virtual_us` livelocks, because
+    /// that clock only advances on a display flip or on the scheduler's
+    /// nothing-is-runnable idle path, and a title waiting for a load produces neither.
+    /// This clock instead advances on any evidence that time passed at all - see
+    /// [`VitaState::advance_io_by`] - so a modelled transfer always completes.
+    io_us: u64,
+    /// `(thid, io_us deadline)` for each thread parked paying its storage-latency debt.
+    io_waiters: Vec<(i32, u64)>,
+    /// Storage-clock time already charged by quantum boundaries since the last display
+    /// flip, so the per-flip advance can top up to exactly one frame rather than
+    /// double-count. See [`VitaState::advance_io_frame`].
+    io_charged_since_flip: u64,
+    /// `(base, size)` of every released memory block, in release order, available for
+    /// reuse by [`VitaState::alloc_memblock`]. Not coalesced: adjacency in the arena is
+    /// not adjacency in usefulness here (blocks are whole buffers a title allocates and
+    /// releases as units), and leaving the list in release order keeps the choice of hole
+    /// a pure function of the guest's own allocation sequence.
+    freed_memblocks: Vec<(u32, u32)>,
     /// Vertex program handle -> its attribute layout. A map, not a list: every draw
     /// resolves the bound handle several times, and a title registers hundreds of
     /// programs, so a linear scan here was per-draw cost that grew with the level.
@@ -1208,6 +1254,16 @@ pub struct VitaState {
     // Threads the program created, and any pending synchronous thread run raised
     // by sceKernelStartThread (drained by the engine host after the call).
     threads: Vec<ThreadRec>,
+    /// Stacks belonging to deleted threads, as `(base, size)`. NOT a free list - see
+    /// [`VitaState::create_thread`] for why they are not recycled. Kept so the leak a
+    /// thread-churning title causes is a number someone can look at rather than an
+    /// invisible drift toward an allocator collision.
+    free_stacks: Vec<(u32, u32)>,
+    /// Whether the runaway-thread-creation warning has been emitted (once per run).
+    runaway_threads_reported: bool,
+    /// Whether "video playback is not implemented" has been reported (once per run).
+    /// See `vita::video`.
+    pub(crate) reported_no_video: bool,
     pending_reentry: Option<Reentry>,
     // Synchronization objects. Bring-up model: one thread of control (workers run
     // synchronously to completion), so nothing ever actually blocks; a semaphore's
@@ -1276,6 +1332,11 @@ pub struct VitaState {
     fs: FileTable,
     // In-memory savedata slot metadata (SceAppUtil), so a created slot round-trips on get.
     savedata: SaveDataStore,
+    /// SceNpTrophy: the sets read out of the title's own TRP plus this run's unlock
+    /// ledger. Public to the NID handlers in `vita/services.rs`.
+    pub(crate) trophies: crate::trophy::TrophyStore,
+    /// `sceClibMspace*`: general allocators over blocks of the title's own memory.
+    pub(crate) mspaces: crate::mspace::MspaceStore,
     /// ScePvf font engine: open lib/font handles, size config, glyph cache. Public so
     /// the ScePvf NID handlers in `vita/pvf.rs` can drive it.
     pub fonts: crate::font::FontLibrary,
@@ -1450,6 +1511,11 @@ impl VitaState {
             next_handle: HANDLE_BASE + 1,
             next_uid: 0x100,
             memblocks: Vec::new(),
+            io_debt_us: 0,
+            io_us: 0,
+            io_waiters: Vec::new(),
+            io_charged_since_flip: 0,
+            freed_memblocks: Vec::new(),
             vertex_programs: std::collections::HashMap::new(),
             program_reflection: std::collections::HashMap::new(),
             color_surfaces: Vec::new(),
@@ -1461,6 +1527,9 @@ impl VitaState {
             bound_streams: [0; MAX_VERTEX_STREAMS],
             pending_uniforms: Vec::new(),
             threads: Vec::new(),
+            free_stacks: Vec::new(),
+            runaway_threads_reported: false,
+            reported_no_video: false,
             pending_reentry: None,
             semaphores: Vec::new(),
             event_flags: Vec::new(),
@@ -1488,6 +1557,8 @@ impl VitaState {
             pending_resume_codes: Vec::new(),
             fs: FileTable::new(),
             savedata: SaveDataStore::default(),
+            trophies: crate::trophy::TrophyStore::default(),
+            mspaces: crate::mspace::MspaceStore::default(),
             fonts: crate::font::FontLibrary::default(),
             capture: Capture::new(),
             world,
@@ -1759,6 +1830,23 @@ impl VitaState {
         self.fs.read_all(path)
     }
 
+    /// The entries directly under `path`, for a host call that must DISCOVER a name
+    /// rather than being handed one - a system service resolving the running title's
+    /// own data, where the console knows the name from the installed package and we
+    /// only have the package's layout. Empty if the directory does not exist.
+    pub fn list_dir(&mut self, path: &str) -> Vec<DirEntry> {
+        let fd = self.fs.dopen(path);
+        if fd < 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        while let Some(Some(e)) = self.fs.dread(fd) {
+            out.push(e);
+        }
+        self.fs.dclose(fd);
+        out
+    }
+
     /// Whether a savedata slot exists (SceAppUtil metadata layer).
     pub fn savedata_slot_exists(&self, mount: &str, slot_id: u32) -> bool {
         self.savedata.contains(mount, slot_id)
@@ -1815,10 +1903,55 @@ impl VitaState {
         std::mem::take(&mut self.pending_wakes)
     }
 
+    /// How many live thread records is so many that the guest must be in a retry loop.
+    ///
+    /// No real title holds thousands of threads at once; a title that reaches this is
+    /// creating and abandoning them. Left unchecked, each one takes a stack off a bump
+    /// allocator that cannot free, so the run ends in a heap exhaustion whose crash site is
+    /// unrelated to the cause - an out-of-bounds access with a stack pointer near zero, in
+    /// whichever thread happened to start last. Naming the entry point that is repeating
+    /// turns that into a one-line diagnosis. Measured against a real case: a trophy-info
+    /// thread respawning on an error it could not act on reached ~74,000.
+    const RUNAWAY_THREAD_LIMIT: usize = 2048;
+
     /// Create a thread: allocate its own stack and record it, returning its
     /// SceUID. The entry's Thumb bit is cleared so it names the transpiled export.
     pub fn create_thread(&mut self, entry: u32, stack_size: u32, priority: i32) -> i32 {
+        if self.threads.len() >= Self::RUNAWAY_THREAD_LIMIT {
+            // Report ONCE, with the entry that dominates, then keep going: the heap
+            // exhaustion below will stop the run loudly anyway, and this is the line that
+            // explains it.
+            if !self.runaway_threads_reported {
+                self.runaway_threads_reported = true;
+                let mut counts: std::collections::HashMap<u32, usize> =
+                    std::collections::HashMap::new();
+                for t in &self.threads {
+                    *counts.entry(t.entry).or_insert(0) += 1;
+                }
+                let worst = counts.iter().max_by_key(|(_, n)| **n);
+                tracing::error!(
+                    target: "vitaslop::err",
+                    live = self.threads.len(),
+                    entry = format_args!("{entry:#x}"),
+                    repeated_entry = format_args!("{:#x}", worst.map(|(e, _)| *e).unwrap_or(0)),
+                    repeated_count = worst.map(|(_, n)| *n).unwrap_or(0),
+                    "RUNAWAY thread creation - the guest is spawning threads it never \
+                     reaps, which will exhaust the guest heap and crash somewhere \
+                     unrelated. Almost always a host call returning something the guest \
+                     treats as retryable: look at what the repeated entry point calls."
+                );
+            }
+        }
         let size = stack_size.max(0x1000);
+        // A deleted thread's stack is deliberately NOT recycled here. It looks like free
+        // memory - the guest allocator is a bump allocator with no free, so recycling is
+        // tempting - but "the guest deleted the thread" and "the host has finished with
+        // that fiber" are different events: an exited thread's stack can still be live
+        // under the scheduler when the guest deletes its record. Handing it to a new
+        // thread then corrupts two threads' stacks at once, which surfaces as an
+        // out-of-bounds access with a nonsense stack pointer nowhere near the cause.
+        // Leaking it is the safe direction; `free_stacks` records the leak so it is
+        // measurable rather than invisible.
         let stack = self.galloc(size, 16);
         // The stack grows down from an 8-byte-aligned top (AAPCS at a public call).
         let stack_top = stack.wrapping_add(size) & !0xF;
@@ -1836,8 +1969,45 @@ impl VitaState {
             main_priority = format_args!("{DEFAULT_THREAD_PRIORITY:#x}"),
             "create"
         );
-        self.threads.push(ThreadRec { uid, entry: entry & !1, stack_top, exit_code: None, priority });
+        self.threads.push(ThreadRec {
+            uid,
+            name: String::new(),
+            entry: entry & !1,
+            stack_top,
+            stack: (stack, size),
+            started: false,
+            exit_code: None,
+            priority,
+        });
         uid
+    }
+
+    /// Record the guest's own name for a thread (from `sceKernelCreateThread`).
+    pub fn set_thread_name(&mut self, thid: i32, name: &str) {
+        if let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) {
+            t.name = name.to_string();
+        }
+    }
+
+    /// int sceKernelDeleteThread(SceUID thid): drop a DORMANT thread's record and hand its
+    /// stack back for reuse.
+    ///
+    /// Deleting a thread that is still running is refused with `SCE_KERNEL_ERROR_NOT_DORMANT`,
+    /// as the kernel does - accepting it would invalidate the id of a thread the scheduler
+    /// is about to resume. A thread that was created and never started is dormant too, which
+    /// is why [`ThreadRec::started`] exists: neither it nor a running thread has an exit code.
+    pub fn delete_thread(&mut self, thid: i32) -> Result<(), u32> {
+        let Some(i) = self.threads.iter().position(|t| t.uid == thid) else {
+            return Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+        };
+        let t = &self.threads[i];
+        if t.started && t.exit_code.is_none() {
+            return Err(SCE_KERNEL_ERROR_NOT_DORMANT);
+        }
+        let rec = self.threads.swap_remove(i);
+        self.free_stacks.push(rec.stack);
+        tracing::trace!(target: "vitaslop::thread", uid = thid, "delete");
+        Ok(())
     }
 
     /// The priority the current thread is running at (lower = higher priority).
@@ -1859,7 +2029,8 @@ impl VitaState {
     /// ordering guarantee titles rely on when a worker must initialize (e.g. create
     /// and store a semaphore the starter then waits on) before the starter proceeds.
     pub fn start_thread(&mut self, thid: i32, arg_len: u32, arg_ptr: u32) -> bool {
-        let Some(t) = self.threads.iter().find(|t| t.uid == thid) else { return false };
+        let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) else { return false };
+        t.started = true;
         let new_priority = t.priority;
         let req = Reentry {
             entry: t.entry,
@@ -2355,6 +2526,86 @@ impl VitaState {
 
     /// Park the current thread until `now + us` on the virtual clock, woken only by
     /// time. Used for `sceKernelDelayThread` and `sceAudioOutOutput` grain pacing.
+    /// Add `us` to the accrued storage-latency debt and return the new total. See
+    /// `vita::iofilemgr::charge_read`: the debt exists so the modelled transfer time is
+    /// charged in full without a scheduler round trip per read.
+    pub fn add_io_debt_us(&mut self, us: u64) -> u64 {
+        self.io_debt_us = self.io_debt_us.saturating_add(us);
+        self.io_debt_us
+    }
+
+    /// Clear the accrued storage-latency debt (the caller is about to park for it).
+    pub fn take_io_debt_us(&mut self) -> u64 {
+        core::mem::take(&mut self.io_debt_us)
+    }
+
+    /// Park the current thread on the STORAGE clock for `us` of modelled transfer time.
+    ///
+    /// Not [`sleep_park`](Self::sleep_park): a sleep's deadline is in `virtual_us`, which
+    /// only moves on a display flip or on the scheduler's idle path. A title blocked
+    /// waiting for the load produces no flips, and a sibling thread polling with a
+    /// zero-length delay keeps the idle path finding a deadline that buys no time, so the
+    /// game clock stands still and the load can never finish - the measured livelock. The
+    /// storage clock has no such dependency.
+    pub fn io_park(&mut self, us: u64) {
+        let deadline = self.io_us.saturating_add(us);
+        self.io_waiters.push((self.current, deadline));
+    }
+
+    /// Advance the storage clock by `us` and wake every transfer that has now completed.
+    fn advance_io_by(&mut self, us: u64) {
+        self.io_us = self.io_us.saturating_add(us);
+        let now = self.io_us;
+        let mut woken: Vec<i32> = Vec::new();
+        self.io_waiters.retain(|&(thid, deadline)| {
+            if deadline <= now {
+                woken.push(thid);
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_wakes.extend(woken);
+    }
+
+    /// One display flip happened: bring the storage clock up to one full frame of
+    /// progress, minus whatever the quantum charges already contributed since the last
+    /// flip. While a title renders, this is the whole model - the device streams one
+    /// frame's worth of bytes per rendered frame, which is what a loading screen's
+    /// spinner is telling the player.
+    pub fn advance_io_frame(&mut self, frame_us: u64) {
+        let owed = frame_us.saturating_sub(core::mem::take(&mut self.io_charged_since_flip));
+        self.advance_io_by(owed);
+    }
+
+    /// A thread burned a whole scheduler quantum (or yielded) without a flip. Time
+    /// passed on the device too. This is what keeps a title that spins in guest code
+    /// waiting for a load - never blocking, never flipping - from waiting forever;
+    /// [`advance_io_frame`](Self::advance_io_frame) nets these out so a normally
+    /// rendering title still advances exactly one frame of storage time per frame.
+    pub fn charge_io_quantum(&mut self, us: u64) {
+        self.io_charged_since_flip = self.io_charged_since_flip.saturating_add(us);
+        self.advance_io_by(us);
+    }
+
+    /// Nothing is runnable and the game clock cannot buy any progress: complete the
+    /// earliest outstanding transfer. Returns whether anything was released. No ordering
+    /// the guest can observe is lost - by construction no guest code can run until
+    /// something completes, so this is the storage device being the only thing left with
+    /// work to do, not a shortcut.
+    pub fn release_earliest_io(&mut self) -> bool {
+        let Some(deadline) = self.io_waiters.iter().map(|&(_, d)| d).min() else {
+            return false;
+        };
+        self.advance_io_by(deadline.saturating_sub(self.io_us));
+        true
+    }
+
+    /// Whether any thread is parked paying storage latency.
+    pub fn has_io_waiters(&self) -> bool {
+        !self.io_waiters.is_empty()
+    }
+
     pub fn sleep_park(&mut self, us: u64) {
         self.sleep_waiters.push((self.current, self.virtual_us.wrapping_add(us)));
     }
@@ -2789,9 +3040,44 @@ impl VitaState {
         h
     }
 
-    /// Allocate a memory block of `size` and record it, returning its SceUID.
+    /// Allocate a memory block of `size` and record it, returning its SceUID, or 0 when
+    /// the arena cannot satisfy it.
+    ///
+    /// A freed block is reused before the bump cursor moves (first fit over the
+    /// release-ordered free list, so the choice is deterministic). Without that, a title
+    /// that cycles screens - freeing one screen's buffers and allocating the next one's -
+    /// grows the arena forever and eventually gets a null allocation for a request the
+    /// console would have satisfied from the memory it just handed back.
+    ///
+    /// Returning 0 on exhaustion matters as much as the reuse: the caller turns it into a
+    /// real `sceKernelAllocMemBlock` error, where handing back a live SceUID whose base is
+    /// 0 is a hollow success the guest cannot detect until it writes through the pointer.
     pub fn alloc_memblock(&mut self, size: u32, align: u32) -> i32 {
-        let base = self.galloc(size, align);
+        let want = size.max(4);
+        let a = align.max(4);
+        let reused = self.freed_memblocks.iter().position(|&(base, sz)| {
+            sz >= want && base & (a - 1) == 0
+        });
+        let base = match reused {
+            Some(i) => {
+                let (base, sz) = self.freed_memblocks.remove(i);
+                // Keep the remainder available rather than rounding the whole hole up to
+                // this request; a 4 KiB reuse of a 2 MiB hole must not lose 2 MiB.
+                let rest = sz - want;
+                if rest >= a {
+                    let split = base + want;
+                    let aligned = (split + a - 1) & !(a - 1);
+                    if aligned < base + sz {
+                        self.freed_memblocks.push((aligned, base + sz - aligned));
+                    }
+                }
+                base
+            }
+            None => self.galloc(size, align),
+        };
+        if base == 0 {
+            return 0;
+        }
         let uid = self.next_uid;
         self.next_uid += 1;
         self.memblocks.push(MemBlock { uid, base, size });
@@ -2837,7 +3123,7 @@ impl VitaState {
 
     // --- scene assembly (used by the gxm handlers) ---
 
-    pub fn begin_scene(&mut self, color_surface_addr: u32) {
+    pub fn begin_scene(&mut self, color: Option<crate::capture::ColorSurface>) {
         // Texture snapshots deliberately SURVIVE the scene - see `TextureSnapshots`
         // for what invalidates them instead. Only the verifier is re-armed here.
         self.texture_snapshots.begin_scene();
@@ -2846,11 +3132,6 @@ impl VitaState {
         // dead by now; see [`Self::alloc_default_uniform_buffer`] for what happens
         // when this is NOT recycled.
         self.uniform_ring_cursor = 0;
-        let color = self
-            .color_surfaces
-            .iter()
-            .find(|(a, _)| *a == color_surface_addr)
-            .map(|(_, s)| *s);
         self.scene = Some(crate::capture::Scene { color, draws: Vec::new() });
         self.pending_uniforms.clear();
     }
@@ -3358,17 +3639,72 @@ impl VitaState {
     pub fn free_memblock(&mut self, uid: i32) -> bool {
         let Some(i) = self.memblocks.iter().position(|b| b.uid == uid) else { return false };
         let b = self.memblocks.remove(i);
-        // Drop any texture snapshot over the released memory. The bump arena never
-        // reuses an address, so nothing can be mistaken for this block's contents
-        // later - but a snapshot is only ever as valid as the memory behind it, and
-        // tying its lifetime to that memory is what keeps the cache's invalidation
-        // list complete rather than merely sufficient today.
+        // Drop any texture snapshot over the released memory. Now that the block's
+        // address CAN come back from [`Self::alloc_memblock`], this invalidation is
+        // load-bearing rather than merely tidy: a stale snapshot over reused memory
+        // would render the previous screen's pixels into the next one's texture.
         self.texture_snapshots.invalidate_range(b.base, b.size as usize);
+        if b.base != 0 {
+            self.freed_memblocks.push((b.base, b.size.max(4)));
+        }
         true
     }
 
     pub fn set_uniforms(&mut self, values: Vec<f32>) {
         self.pending_uniforms = values;
+    }
+
+    /// What thread `thid` is parked on, as one line, or `RUNNABLE` if it appears in no
+    /// waiter list at all. "Runnable" is the interesting answer as often as the blocked
+    /// ones are: a title that renders but never progresses has one thread spinning on a
+    /// flag in pure guest compute, and that thread is exactly the one nothing here
+    /// mentions.
+    fn thread_wait_state(&self, thid: i32) -> String {
+        for m in &self.lwmutexes {
+            if m.waiters.contains(&thid) {
+                return format!("blocked on lwmutex work={:#010x} (owner={:?})", m.work, m.owner);
+            }
+        }
+        for m in &self.mutexes {
+            if m.waiters.contains(&thid) {
+                return format!("blocked on mutex uid={:#x} (owner={:?})", m.uid, m.owner);
+            }
+        }
+        if let Some(w) = self.sema_waiters.iter().find(|w| w.thid == thid) {
+            return format!("blocked on sema uid={:#x} need={}", w.uid, w.need);
+        }
+        if let Some(w) = self.evf_waiters.iter().find(|w| w.thid == thid) {
+            let pattern = self.event_flags.iter().find(|(u, _)| *u == w.uid).map(|(_, p)| *p).unwrap_or(0);
+            return format!(
+                "blocked on eventflag uid={:#x} want={:#x} mode={:#x} have={:#x}{}",
+                w.uid,
+                w.bits,
+                w.mode,
+                pattern,
+                match w.deadline {
+                    Some(d) => format!(" deadline_us={d}"),
+                    None => String::new(),
+                }
+            );
+        }
+        for c in &self.conds {
+            if c.waiters.iter().any(|w| w.thid == thid) {
+                return format!("blocked on cond uid={:#x} (mutex uid={:#x})", c.uid, c.mutex);
+            }
+        }
+        if let Some((_, work, deadline)) = self.lwcond_waiters.iter().find(|(t, _, _)| *t == thid) {
+            return format!("blocked on lwcond work={work:#010x} deadline={deadline:?}");
+        }
+        if let Some((_, deadline)) = self.io_waiters.iter().find(|(t, _)| *t == thid) {
+            return format!("awaiting storage io_us={deadline} (now {})", self.io_us);
+        }
+        if let Some((_, deadline)) = self.sleep_waiters.iter().find(|(t, _)| *t == thid) {
+            return format!("sleeping until_us={deadline} (now {})", self.virtual_us);
+        }
+        if let Some((_, target, _)) = self.join_waiters.iter().find(|(t, _, _)| *t == thid) {
+            return format!("joining thid={target:#x}");
+        }
+        "RUNNABLE".to_string()
     }
 
     /// Human-readable dump of every preemptive sync primitive's ownership/waiter state
@@ -3380,6 +3716,28 @@ impl VitaState {
         use std::fmt::Write;
         let mut s = String::new();
         let _ = writeln!(s, "current thread = {:#x}, virtual_us = {}", self.current, self.virtual_us);
+        // The threads themselves come first: the primitive lists below say who is
+        // waiting on each object, but only this says, for every live thread, whether
+        // it is parked at all - and a thread absent from every waiter list is the
+        // one actually running. A stall dump without it forces the reader to
+        // cross-reference by hand and silently omits any thread blocked on a
+        // primitive whose list is not printed.
+        let _ = writeln!(s, "threads ({} live):", self.threads.iter().filter(|t| t.exit_code.is_none()).count());
+        for t in &self.threads {
+            if t.exit_code.is_some() {
+                continue;
+            }
+            let name = if t.name.is_empty() { "-".to_string() } else { format!("{:?}", t.name) };
+            let _ = writeln!(
+                s,
+                "  thid={:#x} {name} entry={:#010x} prio={:#x} {}{}",
+                t.uid,
+                t.entry,
+                t.priority,
+                if t.started { "" } else { "DORMANT " },
+                self.thread_wait_state(t.uid),
+            );
+        }
         let _ = writeln!(s, "lwmutexes ({}):", self.lwmutexes.len());
         for m in &self.lwmutexes {
             let _ = writeln!(
@@ -3399,6 +3757,17 @@ impl VitaState {
             let waiters: Vec<(i32, i32)> =
                 self.sema_waiters.iter().filter(|w| w.uid == *uid).map(|w| (w.thid, w.need)).collect();
             let _ = writeln!(s, "  uid={uid:#x} count={count} waiters(thid,need)={waiters:x?}");
+        }
+        // Event flags were missing from this dump entirely, and they are what a title's
+        // own worker threads actually park on - so a stall could show every printed
+        // list empty while several threads were blocked.
+        let _ = writeln!(s, "event flags ({}):", self.event_flags.len());
+        for (uid, pattern) in &self.event_flags {
+            let waiters: Vec<(i32, u32)> =
+                self.evf_waiters.iter().filter(|w| w.uid == *uid).map(|w| (w.thid, w.bits)).collect();
+            if !waiters.is_empty() {
+                let _ = writeln!(s, "  uid={uid:#x} pattern={pattern:#x} waiters(thid,want)={waiters:x?}");
+            }
         }
         let _ = writeln!(s, "cond waiters:");
         for c in &self.conds {
@@ -3907,8 +4276,16 @@ impl VitaState {
             let name_addr = (p as i64 + name_off as i64) as u32;
             let raw = ctx.read_bytes(name_addr, 48);
             let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            // The upper half of the +4 word is the `semantic` u16 that
+            // `sceGxmProgramParameterGetSemantic`/`GetSemanticIndex` split. Printed RAW as
+            // well as split, because a title that builds its `SceGxmVertexAttribute` array
+            // by matching semantics produces ZERO attributes when the split is wrong - and
+            // an empty attribute array is silent: the draw arrives with real geometry and
+            // no way to fetch it.
+            let semantic = ctx.read_u32(p.wrapping_add(4)) >> 16;
             eprintln!(
-                "  param[{i}] name={name:?} cat={} type={} comp={} container={} array={array_size} res_index={res_index}",
+                "  param[{i}] name={name:?} cat={} type={} comp={} container={} array={array_size} \
+                 res_index={res_index} semantic_word={semantic:#06x}",
                 word & 0xf, (word >> 4) & 0xf, (word >> 8) & 0xf, (word >> 12) & 0xf,
             );
         }
@@ -4818,6 +5195,25 @@ pub trait ImportDispatch {
     /// woken thread ids then surface through [`take_wakes`](Self::take_wakes).
     fn advance_time_to(&mut self, _to_us: u64) {}
 
+    /// The virtual clock now, in microseconds. The scheduler compares it against
+    /// [`earliest_deadline`](Self::earliest_deadline) to tell a wait that will buy time
+    /// from one that will not (a zero-length delay re-armed every iteration).
+    fn clock_us(&self) -> u64 {
+        0
+    }
+
+    /// Nothing is runnable and the virtual clock cannot advance: complete the earliest
+    /// outstanding modelled storage transfer, waking its reader. Returns whether anything
+    /// was released. See [`VitaState::release_earliest_io`].
+    fn release_earliest_io(&mut self) -> bool {
+        false
+    }
+
+    /// A thread used a whole scheduler quantum (or yielded without flipping). Lets the
+    /// host charge clocks that track executed work rather than rendered frames - today,
+    /// the modelled storage clock. The default ignores it.
+    fn on_quantum(&mut self) {}
+
     /// The `r0` value owed to thread `thid` as it resumes from a block (a timed wait
     /// that expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT`), if any. The engine
     /// calls this at the point the woken thread resumes and, on `Some`, overwrites its
@@ -4889,6 +5285,20 @@ impl ImportDispatch for VitaEnv {
         self.state.advance_time_to(to_us);
     }
 
+    fn clock_us(&self) -> u64 {
+        self.state.now_us()
+    }
+
+    fn release_earliest_io(&mut self) -> bool {
+        self.state.release_earliest_io()
+    }
+
+    fn on_quantum(&mut self) {
+        if self.state.has_io_waiters() {
+            self.state.charge_io_quantum(QUANTUM_IO_US);
+        }
+    }
+
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
         self.state.take_resume_code(thid)
     }
@@ -4913,8 +5323,18 @@ impl ImportDispatch for VitaEnv {
         const FRAME_US: u64 = 1_000_000 / 60;
         let target = self.state.now_us() + FRAME_US;
         self.state.advance_time_to(target);
+        // The modelled storage device gets one frame of progress per rendered frame,
+        // net of anything the quantum charges already contributed.
+        self.state.advance_io_frame(FRAME_US);
     }
 }
+
+/// Storage-clock time charged for one scheduler quantum, in microseconds. The default
+/// preemption quantum is 5,000,000 units of engine fuel, which is a few milliseconds of
+/// guest execution; the exact figure only matters when a title spins in guest code
+/// waiting for a load instead of rendering, since a rendering title's storage progress is
+/// pinned to its frames by [`VitaState::advance_io_frame`].
+const QUANTUM_IO_US: u64 = 2_000;
 
 /// A shared handle to a `VitaEnv`: attach one clone as the engine's import
 /// environment and keep another to read the capture back after the run. Single
@@ -4965,6 +5385,18 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
 
     fn advance_time_to(&mut self, to_us: u64) {
         self.borrow_mut().advance_time_to(to_us);
+    }
+
+    fn clock_us(&self) -> u64 {
+        self.borrow().clock_us()
+    }
+
+    fn release_earliest_io(&mut self) -> bool {
+        self.borrow_mut().release_earliest_io()
+    }
+
+    fn on_quantum(&mut self) {
+        self.borrow_mut().on_quantum();
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
@@ -5124,6 +5556,62 @@ mod preemptive_tests {
         let mut st = VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()));
         st.set_preemptive(true);
         st
+    }
+
+    #[test]
+    fn storage_park_is_paid_by_frames_not_by_the_game_clock() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        // Thread 1 pays for a transfer worth two and a bit frames.
+        st.set_current(1);
+        st.io_park(2 * FRAME_US + 10);
+        assert!(st.take_wakes().is_empty());
+        // The game clock running does NOT pay for it: a transfer is the device's time,
+        // and coupling the two is what livelocked (the clock only moves on flips, and
+        // the title is waiting on this very load).
+        st.advance_time_to(st.now_us() + 10_000_000);
+        assert!(st.take_wakes().is_empty());
+        // Rendered frames do. Two are not enough; the third completes it.
+        st.advance_io_frame(FRAME_US);
+        st.advance_io_frame(FRAME_US);
+        assert!(st.take_wakes().is_empty());
+        st.advance_io_frame(FRAME_US);
+        assert_eq!(st.take_wakes(), vec![1]);
+    }
+
+    #[test]
+    fn quantum_charges_are_netted_out_of_the_next_frame() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        st.set_current(1);
+        st.io_park(FRAME_US);
+        // A whole frame's worth of storage time charged by quanta must not be charged
+        // AGAIN by the flip that follows - a rendering title advances exactly one frame
+        // of storage time per frame however its quanta fell.
+        st.charge_io_quantum(FRAME_US / 2);
+        st.charge_io_quantum(FRAME_US / 2);
+        assert_eq!(st.take_wakes(), vec![1]);
+        st.set_current(2);
+        st.io_park(1);
+        st.advance_io_frame(FRAME_US);
+        assert!(st.take_wakes().is_empty(), "the flip owed nothing, so nothing completed");
+    }
+
+    #[test]
+    fn the_idle_path_completes_the_earliest_transfer() {
+        let mut st = state();
+        st.set_current(1);
+        st.io_park(5_000);
+        st.set_current(2);
+        st.io_park(1_000);
+        // Nothing else can run, so the device is the only thing with work left: the
+        // earliest transfer completes, and only that one.
+        assert!(st.release_earliest_io());
+        assert_eq!(st.take_wakes(), vec![2]);
+        assert!(st.has_io_waiters());
+        assert!(st.release_earliest_io());
+        assert_eq!(st.take_wakes(), vec![1]);
+        assert!(!st.release_earliest_io(), "nothing outstanding");
     }
 
     #[test]

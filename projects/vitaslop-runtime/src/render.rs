@@ -554,6 +554,11 @@ const SCE_GXM_CULL_CCW: u32 = 0x0000_0002;
 /// SCE_GXM_DEPTH_WRITE_DISABLED - depth writes off (a 2D alpha overlay, not opaque 3D).
 const SCE_GXM_DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
 
+/// SCE_GXM_DEPTH_FUNC_LESS_EQUAL - GXM's default depth test, and what [`render_map`]
+/// asks for explicitly: its depth buffer holds negated world height rather than a
+/// projected z, so the draw's own recorded func does not apply.
+const SCE_GXM_DEPTH_FUNC_LESS_EQUAL: u32 = 0x00C0_0000;
+
 /// The number of triangles a draw's topology emits from its index count.
 fn triangle_count(d: &Draw) -> usize {
     match d.primitive {
@@ -902,7 +907,21 @@ fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
         let swizzle = (t.swizzle >> 12) & 0x7;
         return swizzle4(rgba[0], rgba[1], rgba[2], rgba[3], swizzle);
     }
-    let off = face_base + (y * t.stride + x * block_bytes) as usize;
+    // Uncompressed. A SWIZZLED texture is Morton-addressed over a power-of-two-padded grid
+    // exactly like the block-compressed case above - the only difference is that the "block"
+    // is one texel, so the interleave runs over texel coordinates directly. Reading one
+    // row-major instead scrambles it into blocky noise that still carries the right COLOURS,
+    // which is what made this look like intentional "data readout" art rather than a bug: a
+    // retail title's small cyan-on-black UI panels came out as static while every other
+    // texture on the same screen was fine, because the others were LINEAR (type 3), solid
+    // 8x8 fills (where a permutation is invisible), or block-compressed (already handled).
+    let off = if swizzled_type(t.tex_type) {
+        let pw = t.width.next_power_of_two();
+        let ph = t.height.next_power_of_two();
+        face_base + (morton_index(x, y, pw, ph) * block_bytes) as usize
+    } else {
+        face_base + (y * t.stride + x * block_bytes) as usize
+    };
     let px = &t.pixels;
     let byte = |i: usize| -> u8 { *px.get(off + i).unwrap_or(&0) };
     // Channel swizzle field (bits 12..14 of the full SceGxmTextureFormat).
@@ -1266,6 +1285,908 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
     // stays stable frame to frame - which is what makes two `locate`s comparable.
     out.sort_by_key(|o| o.draws.first().copied().unwrap_or(usize::MAX));
     out
+}
+
+/// How much a scene's coordinate ORIGIN moved between two [`locate_scene`] reports, and
+/// how much of the scene agreed about it.
+///
+/// # Why this is not optional
+/// The matrix a title calls "model to world" need not be measured from a fixed origin. On
+/// PCSA00027 it is measured from a frame that travels with the camera - so while the
+/// player drives, EVERY static object's reported position changes by the same vector, and
+/// the player's own barely changes at all. Read naively that says the scenery is flying
+/// past a stationary car, which inverts the one question a navigator asks. Worse, it is
+/// not visibly wrong: the numbers are smooth, plausible, and self-consistent.
+///
+/// The scene itself supplies the correction. Most of what is in view is bolted down, so
+/// the MODAL displacement across id-matched objects is the origin's own motion, and
+/// subtracting it leaves true world motion. It is a mode rather than a mean because a
+/// mean is dragged by the very objects being measured against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OriginDrift {
+    /// The displacement of the coordinate origin, in the later report's units.
+    pub delta: [f32; 3],
+    /// How many matched objects agreed with `delta` (within `tol`).
+    pub agreed: usize,
+    /// How many objects were matched between the two reports at all.
+    pub matched: usize,
+}
+
+impl OriginDrift {
+    /// Whether the estimate can be trusted: a clear majority of a non-trivial sample
+    /// agreed. A scene cut, or a frame in which almost everything genuinely moves, gives
+    /// no majority - and then the honest answer is "unknown", not a plausible vector.
+    pub fn reliable(&self) -> bool {
+        self.matched >= 8 && self.agreed * 2 > self.matched
+    }
+}
+
+/// The most common displacement in a set, and how many agreed with it.
+///
+/// A MODE rather than a mean, because a mean is dragged by the very objects being measured
+/// against it. Found by taking the member with the most neighbours within `tol` and then
+/// averaging that cluster - O(n^2) over a few hundred items, which is nothing, and it needs
+/// no bin alignment (a histogram splits one cluster across two bins whenever it straddles
+/// an edge).
+fn modal_shift(deltas: &[[f32; 3]], tol: f32) -> Option<([f32; 3], usize)> {
+    if deltas.is_empty() {
+        return None;
+    }
+    let near = |a: &[f32; 3], b: &[f32; 3]| {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= tol
+    };
+    let mut best = (0usize, 0usize);
+    for (i, a) in deltas.iter().enumerate() {
+        let n = deltas.iter().filter(|b| near(a, b)).count();
+        if n > best.1 {
+            best = (i, n);
+        }
+    }
+    let centre = deltas[best.0];
+    let mut sum = [0f64; 3];
+    let mut n = 0usize;
+    for b in deltas.iter().filter(|b| near(&centre, b)) {
+        for k in 0..3 {
+            sum[k] += b[k] as f64;
+        }
+        n += 1;
+    }
+    Some((
+        [(sum[0] / n as f64) as f32, (sum[1] / n as f64) as f32, (sum[2] / n as f64) as f32],
+        n,
+    ))
+}
+
+/// Estimate the coordinate-origin displacement between two [`locate_scene`] reports.
+/// `tol` is the world distance within which two displacements count as the same.
+/// Returns `None` when nothing could be matched.
+pub fn origin_drift(prev: &[ObjectLoc], now: &[ObjectLoc], tol: f32) -> Option<OriginDrift> {
+    // Match by GEOMETRY id, and among same-id candidates (a row of identical cones) take
+    // the nearest - over a short span nothing outruns its own spacing.
+    let mut deltas: Vec<[f32; 3]> = Vec::new();
+    for o in now {
+        let best = prev
+            .iter()
+            .filter(|p| p.id == o.id)
+            .map(|p| {
+                let d = [o.world[0] - p.world[0], o.world[1] - p.world[1], o.world[2] - p.world[2]];
+                (d, d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((d, _)) = best {
+            deltas.push(d);
+        }
+    }
+    let (delta, agreed) = modal_shift(&deltas, tol)?;
+    Some(OriginDrift { delta, agreed, matched: deltas.len() })
+}
+
+/// One 2D drawn thing in a captured scene: where it is ON SCREEN, and an identity that
+/// survives it moving.
+///
+/// # Why 3D locating cannot cover this
+/// [`locate_scene`] needs a model-to-world matrix, and a 2D title has none: a sprite's
+/// POSITION lives in its vertex data, in screen pixels. That breaks both halves of the 3D
+/// approach at once - there is no placement to group by, and the geometry hash that gives a
+/// 3D mesh its stable identity changes every single time a sprite moves, because the
+/// geometry IS the position.
+///
+/// So identity comes from what does not change: the bound texture, the REGION of it this
+/// quad samples, and the quad's size. That is exactly what makes one sprite in an atlas
+/// distinguishable from another - two draws sampling different parts of the same sheet are
+/// different sprites, and the same sprite drawn a hundred pixels along is the same sprite.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpriteLoc {
+    pub id: u64,
+    /// The draw this came from. One entry per draw: a 2D pass is normally one quad or one
+    /// batch, and merging batches would throw away the positions that are the point.
+    pub draw: usize,
+    /// Screen bounding box `[min_x, min_y, max_x, max_y]` in the requested raster size.
+    pub bbox: [f32; 4],
+    pub centroid: [f32; 2],
+    pub size: [f32; 2],
+    pub triangles: usize,
+    /// Whether the draw sampled a texture at all (an untextured 2D fill - a bar, a fade -
+    /// has no atlas region, so its identity rests on shape alone and is weaker).
+    pub textured: bool,
+}
+
+/// Where every 2D drawn thing in a captured scene is on screen. See [`SpriteLoc`].
+///
+/// `width`/`height` are the raster size the coordinates are expressed in.
+pub fn locate_sprites(scene: &Scene, width: u32, height: u32) -> Vec<SpriteLoc> {
+    let mut out = Vec::new();
+    for (di, d) in scene.draws.iter().enumerate() {
+        if triangle_count(d) == 0 {
+            continue;
+        }
+        let interp = interpret_draw(d);
+        // 3D draws belong to `locate_scene`; a shader-expanded stream has no primitive here.
+        if matches!(interp.space, Space::Mvp(_)) || interp.skip {
+            continue;
+        }
+        let stride = d.vertex_stride.max(1) as usize;
+        let nverts = d.vertices.len() / stride;
+        if nverts == 0 {
+            continue;
+        }
+        let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut uv = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut seen = 0usize;
+        for i in 0..nverts {
+            let v = decode_vertex(d, &interp.layout, i);
+            if let Some(p) = project(&v, &interp.space, width, height, 1.0) {
+                bbox[0] = bbox[0].min(p[0]);
+                bbox[1] = bbox[1].min(p[1]);
+                bbox[2] = bbox[2].max(p[0]);
+                bbox[3] = bbox[3].max(p[1]);
+                seen += 1;
+            }
+            if interp.layout.uv_off.is_some() {
+                uv[0] = uv[0].min(v.uv[0]);
+                uv[1] = uv[1].min(v.uv[1]);
+                uv[2] = uv[2].max(v.uv[0]);
+                uv[3] = uv[3].max(v.uv[1]);
+            }
+        }
+        if seen == 0 {
+            continue;
+        }
+        let size = [bbox[2] - bbox[0], bbox[3] - bbox[1]];
+        // Identity: the texture, the atlas region, and the shape - all of which are
+        // properties of the sprite rather than of where it currently is. Quantized so
+        // sub-pixel jitter in a scrolling layer does not split one sprite into two.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let textured = d.albedo().is_some() && interp.layout.uv_off.is_some();
+        mix(d.albedo().map(tex_key).unwrap_or(0));
+        for c in uv {
+            mix(if c.is_finite() { (c * 4096.0).round() as i64 as u64 } else { 0 });
+        }
+        mix((size[0].round() as i64 as u64) << 32 | size[1].round() as i64 as u64);
+        mix(d.index_count as u64);
+        out.push(SpriteLoc {
+            id: h,
+            draw: di,
+            bbox,
+            centroid: [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5],
+            size,
+            triangles: triangle_count(d),
+            textured,
+        });
+    }
+    out
+}
+
+/// How much a 2D scene SCROLLED between two [`locate_sprites`] reports.
+///
+/// The same problem the 3D path has, in screen space: when the camera pans, every
+/// background sprite moves and the player - which the camera is following - appears not to.
+/// Reported in pixels, from the modal displacement of id-matched sprites.
+pub fn scroll_drift(prev: &[SpriteLoc], now: &[SpriteLoc], tol: f32) -> Option<OriginDrift> {
+    let mut deltas: Vec<[f32; 3]> = Vec::new();
+    for s in now {
+        let best = prev
+            .iter()
+            .filter(|p| p.id == s.id)
+            .map(|p| {
+                let d = [s.centroid[0] - p.centroid[0], s.centroid[1] - p.centroid[1], 0.0];
+                (d, d[0] * d[0] + d[1] * d[1])
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((d, _)) = best {
+            deltas.push(d);
+        }
+    }
+    let (delta, agreed) = modal_shift(&deltas, tol)?;
+    Some(OriginDrift { delta, agreed, matched: deltas.len() })
+}
+
+/// A sprite's motion on screen with the scene's scroll removed, and its magnitude.
+/// Matched against the scroll-corrected expected position, for the same reason
+/// [`world_motion`] is.
+pub fn sprite_motion(
+    prev: &[SpriteLoc],
+    now: &SpriteLoc,
+    scroll: [f32; 3],
+) -> Option<([f32; 2], f32)> {
+    let expect = [now.centroid[0] - scroll[0], now.centroid[1] - scroll[1]];
+    prev.iter()
+        .filter(|p| p.id == now.id)
+        .map(|p| {
+            let d = [expect[0] - p.centroid[0], expect[1] - p.centroid[1]];
+            (d, (d[0] * d[0] + d[1] * d[1]).sqrt())
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// One object's motion through the WORLD between two [`locate_scene`] reports: the
+/// displacement with the origin's own drift removed, and its magnitude. `None` when the
+/// object was not in the earlier report.
+///
+/// Matching is done against the DRIFT-CORRECTED expected position, which matters as soon
+/// as a title repeats a mesh. A row of identical fence posts shares one geometry id, so
+/// candidates can only be told apart by position - and if the origin drifted 23 units
+/// while the posts stand 20 apart, matching on raw proximity pairs each post with its
+/// NEIGHBOUR and reports the whole fence as moving. Removing the drift first puts every
+/// static object back on top of its own previous position, where the nearest candidate is
+/// itself.
+pub fn world_motion(
+    prev: &[ObjectLoc],
+    now: &ObjectLoc,
+    drift: [f32; 3],
+) -> Option<([f32; 3], f32)> {
+    let expect = [now.world[0] - drift[0], now.world[1] - drift[1], now.world[2] - drift[2]];
+    prev.iter()
+        .filter(|p| p.id == now.id)
+        .map(|p| {
+            let d = [expect[0] - p.world[0], expect[1] - p.world[1], expect[2] - p.world[2]];
+            (d, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// The orthographic top-down window a [`WorldMap`] covers, and the transform between
+/// world XZ and map pixels.
+///
+/// Screen convention: +X is right, world -Z is UP the image. That is the same frame the
+/// pad's polar stick directive and [`ObjectLoc::heading`] use (bearing 0 along world +X,
+/// increasing toward world -Z), so a bearing read off the map is directly a bearing to
+/// command - no per-title sign to rediscover.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapView {
+    /// World-space window in the XZ plane: `[min_x, min_z, max_x, max_z]`.
+    pub extent: [f32; 4],
+    pub width: u32,
+    pub height: u32,
+}
+
+impl MapView {
+    /// World units per pixel, `[x, z]`.
+    pub fn scale(&self) -> [f32; 2] {
+        [
+            (self.extent[2] - self.extent[0]) / self.width.max(1) as f32,
+            (self.extent[3] - self.extent[1]) / self.height.max(1) as f32,
+        ]
+    }
+
+    /// Map pixel (may be fractional or outside the image) for a world XZ position.
+    /// Image Y grows DOWNWARD, so the most negative Z is at the top of the image.
+    pub fn pixel_of(&self, wx: f32, wz: f32) -> [f32; 2] {
+        let s = self.scale();
+        [(wx - self.extent[0]) / s[0], (wz - self.extent[1]) / s[1]]
+    }
+
+    /// The world XZ position at a map pixel centre - the inverse of [`Self::pixel_of`].
+    /// This is what makes the map a measuring instrument: a feature spotted at pixel
+    /// (px, py) has an exact world coordinate to steer toward.
+    pub fn world_of(&self, px: f32, py: f32) -> [f32; 2] {
+        let s = self.scale();
+        [self.extent[0] + px * s[0], self.extent[1] + py * s[1]]
+    }
+}
+
+/// A top-down orthographic render of a captured scene's world geometry, with the height
+/// of the topmost surface at every pixel.
+///
+/// # Why this exists
+/// [`locate_scene`] answers "where is each OBJECT", which is enough to steer a vehicle
+/// and to tell a moving thing from scenery. It cannot answer the two questions that
+/// actually block a playthrough of a driving tutorial:
+///
+/// - **Where is the route?** On this title the trail the tutorial asks you to follow is
+///   painted into the GROUND TEXTURE. It is not an object, has no placement matrix, and
+///   so does not appear in a `locate` report at all. It does appear in a top-down render,
+///   at a pixel this view converts straight back to a world coordinate.
+/// - **What will I hit?** Internal railings and benches are what a hand-guessed waypoint
+///   ring catches on. They are a metre of extra height over the ground, which
+///   [`Self::top_y`] measures per pixel, so an obstacle is a reading rather than a
+///   surprise.
+///
+/// The projection needs no reverse engineering: [`Draw::world`] is the reflected
+/// model-to-world matrix, so transforming the object-space vertices by it gives true
+/// world positions, and the ortho projection is ours to choose. Only 3D (`Mvp`) draws
+/// take part - a 2D overlay has no world position to place.
+pub struct WorldMap {
+    pub view: MapView,
+    /// The rendered image (same shading as the ordinary software render, so the ground
+    /// markings look as they do in-game).
+    pub fb: Framebuffer,
+    /// World Y of the topmost surface at each pixel, row-major, `f32::NAN` where no
+    /// geometry covered the pixel. A bird's-eye view keeps the HIGHEST surface, so this
+    /// is a height field: ground where the pixel is open, higher where something stands
+    /// on it.
+    pub top_y: Vec<f32>,
+}
+
+impl WorldMap {
+    /// The topmost surface height at a world XZ position, or `None` when that position is
+    /// outside the view or no geometry covered it.
+    pub fn height_at(&self, wx: f32, wz: f32) -> Option<f32> {
+        let p = self.view.pixel_of(wx, wz);
+        if p[0] < 0.0 || p[1] < 0.0 {
+            return None;
+        }
+        let (x, y) = (p[0] as u32, p[1] as u32);
+        if x >= self.fb.width || y >= self.fb.height {
+            return None;
+        }
+        let h = self.top_y[(y * self.fb.width + x) as usize];
+        if h.is_nan() { None } else { Some(h) }
+    }
+
+    /// The most common covered height, quantized to `bucket` world units - the ground
+    /// level of the mapped area. Taken as a mode rather than a mean or a minimum because
+    /// a scene contains both a large flat drivable surface and a few tall things, and it
+    /// is the flat surface that defines "ground".
+    pub fn ground_level(&self, bucket: f32) -> Option<f32> {
+        let bucket = if bucket > 0.0 { bucket } else { 1.0 };
+        let mut hist: HashMap<i64, u32> = HashMap::new();
+        for h in self.top_y.iter().filter(|h| !h.is_nan()) {
+            *hist.entry((h / bucket).round() as i64).or_insert(0) += 1;
+        }
+        hist.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k as f32 * bucket)
+    }
+
+    /// An ASCII height field over `cols` x `rows` cells: a machine-readable obstacle map
+    /// to plan a route against, in the same orientation as the image.
+    ///
+    /// A cell reports the MAXIMUM height in it, because for navigation the worst case in
+    /// a cell is what matters. Legend, relative to `ground` (see [`Self::ground_level`]):
+    /// `' '` nothing mapped, `'.'` at ground, `':'` up to `step`, `'+'` up to `4*step`,
+    /// `'#'` higher. `step` is the height a vehicle can be expected to ignore - a kerb -
+    /// so `.` and `:` are drivable and `+`/`#` are things to go around.
+    pub fn height_grid(&self, cols: u32, rows: u32, ground: f32, step: f32) -> String {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        let step = if step > 0.0 { step } else { 1.0 };
+        let mut out = String::with_capacity(((cols + 1) * rows) as usize);
+        for r in 0..rows {
+            for c in 0..cols {
+                // Cell -> pixel span. Integer division deliberately: every pixel belongs
+                // to exactly one cell, so nothing is sampled twice or missed.
+                let x0 = c * self.fb.width / cols;
+                let x1 = ((c + 1) * self.fb.width / cols).max(x0 + 1).min(self.fb.width);
+                let y0 = r * self.fb.height / rows;
+                let y1 = ((r + 1) * self.fb.height / rows).max(y0 + 1).min(self.fb.height);
+                let mut peak = f32::NEG_INFINITY;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let h = self.top_y[(y * self.fb.width + x) as usize];
+                        if !h.is_nan() && h > peak {
+                            peak = h;
+                        }
+                    }
+                }
+                out.push(if peak == f32::NEG_INFINITY {
+                    ' '
+                } else {
+                    let d = peak - ground;
+                    if d <= step * 0.5 {
+                        '.'
+                    } else if d <= step {
+                        ':'
+                    } else if d <= step * 4.0 {
+                        '+'
+                    } else {
+                        '#'
+                    }
+                });
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// How the mapped surface heights are distributed, as `(height, pixel_count)` bins of
+    /// `bucket` world units, tallest first.
+    ///
+    /// This is the instrument that turns "pick a ceiling" from a guess into a reading. A
+    /// scene with a drivable floor and a roof over part of it shows as two dense bands
+    /// with a gap; a scene whose sky writes depth shows one enormous band far above
+    /// everything else. Without it, a map that came out wrong looks exactly like a map of
+    /// somewhere uninteresting.
+    pub fn height_bins(&self, bucket: f32) -> Vec<(f32, u32)> {
+        let bucket = if bucket > 0.0 { bucket } else { 1.0 };
+        let mut hist: HashMap<i64, u32> = HashMap::new();
+        for h in self.top_y.iter().filter(|h| !h.is_nan()) {
+            *hist.entry((h / bucket).floor() as i64).or_insert(0) += 1;
+        }
+        let mut v: Vec<(f32, u32)> = hist.into_iter().map(|(k, n)| (k as f32 * bucket, n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// Stamp a hollow square marker into the image at a world position, so a rendered map
+    /// carries the player's own location and the waypoints being steered to. `size` is the
+    /// marker's half-extent in pixels.
+    pub fn mark(&mut self, wx: f32, wz: f32, size: i32, rgb: [u8; 3]) {
+        let p = self.view.pixel_of(wx, wz);
+        let (cx, cy) = (p[0] as i32, p[1] as i32);
+        let (w, h) = (self.fb.width as i32, self.fb.height as i32);
+        for dy in -size..=size {
+            for dx in -size..=size {
+                // Outline only: a filled marker hides the very thing it points at.
+                if dx.abs() != size && dy.abs() != size {
+                    continue;
+                }
+                let (x, y) = (cx + dx, cy + dy);
+                if x < 0 || y < 0 || x >= w || y >= h {
+                    continue;
+                }
+                let i = ((y * w + x) * 4) as usize;
+                self.fb.rgba[i..i + 3].copy_from_slice(&rgb);
+                self.fb.rgba[i + 3] = 255;
+            }
+        }
+    }
+}
+
+/// The world XZ extent of a scene's 3D geometry, robust to a skybox.
+///
+/// `keep` is the central fraction of vertices to cover (e.g. 0.98). A skydome or a
+/// distant backdrop is a handful of vertices spanning kilometres, so a strict min/max
+/// puts the playable area in four pixels; taking a percentile instead lets vertex DENSITY
+/// decide, and the surface a game tessellates most is the one it is played on. Returns
+/// `None` for a scene with no 3D draws.
+pub fn world_extent(scene: &Scene, keep: f32) -> Option<[f32; 4]> {
+    let mut xs: Vec<f32> = Vec::new();
+    let mut zs: Vec<f32> = Vec::new();
+    for d in &scene.draws {
+        if !is_map_surface(d) {
+            continue;
+        }
+        let interp = interpret_draw(d);
+        let stride = d.vertex_stride.max(1) as usize;
+        let nverts = d.vertices.len() / stride;
+        for i in 0..nverts {
+            let v = decode_vertex(d, &interp.layout, i);
+            let w = transform(&d.world, v.pos[0], v.pos[1], v.pos[2]);
+            if w[0].is_finite() && w[2].is_finite() {
+                xs.push(w[0]);
+                zs.push(w[2]);
+            }
+        }
+    }
+    if xs.is_empty() {
+        return None;
+    }
+    let keep = keep.clamp(0.01, 1.0);
+    let cut = ((1.0 - keep) * 0.5 * xs.len() as f32) as usize;
+    let pick = |mut v: Vec<f32>| -> (f32, f32) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (v[cut.min(v.len() - 1)], v[(v.len() - 1 - cut).min(v.len() - 1)])
+    };
+    let (x0, x1) = pick(xs);
+    let (z0, z1) = pick(zs);
+    // A degenerate axis (everything at one X) would divide by zero in the transform.
+    let pad = |a: f32, b: f32| if (b - a).abs() < 1e-3 { (a - 1.0, b + 1.0) } else { (a, b) };
+    let (x0, x1) = pad(x0, x1);
+    let (z0, z1) = pad(z0, z1);
+    Some([x0, z0, x1, z1])
+}
+
+/// A traversability mask over a [`WorldMap`]: which pixels a ground vehicle could stand
+/// on, with room to spare.
+///
+/// Derived from the map's height field by SLOPE rather than by absolute height, because
+/// absolute height cannot tell a ramp from a wall - a driveable slope and a kerb differ in
+/// how fast the surface rises, not in where it ends up. Anything unmapped is impassable:
+/// a hole in the map is a place nothing is known about, and routing through it would be
+/// routing through a guess.
+pub struct Traversable {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, `true` where a vehicle of the requested clearance fits.
+    pub open: Vec<bool>,
+}
+
+impl Traversable {
+    /// Build the mask. `rise` is the largest height difference between neighbouring
+    /// pixels that still counts as drivable ground - a slope limit in world units per
+    /// map pixel. `clearance` erodes the result by that many pixels, so a route planned
+    /// on it keeps a body's width away from what it must not touch; 0 hugs the walls.
+    pub fn from_map(map: &WorldMap, rise: f32, clearance: u32) -> Traversable {
+        let (w, h) = (map.fb.width, map.fb.height);
+        let at = |x: u32, y: u32| -> f32 { map.top_y[(y * w + x) as usize] };
+        let mut open = vec![false; (w * h) as usize];
+        for y in 1..h.saturating_sub(1) {
+            for x in 1..w.saturating_sub(1) {
+                let c = at(x, y);
+                if c.is_nan() {
+                    continue;
+                }
+                // A rise to ANY 4-neighbour that exceeds the limit makes this a lip, a
+                // kerb or the foot of a wall - all of which stop a vehicle.
+                let ok = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)].iter().all(|&(nx, ny)| {
+                    let n = at(nx, ny);
+                    !n.is_nan() && (n - c).abs() <= rise
+                });
+                open[(y * w + x) as usize] = ok;
+            }
+        }
+        // Erode. Done as `clearance` single-pixel passes: a Chebyshev erosion by N, which
+        // is what "keep N pixels away from anything blocked" means.
+        for _ in 0..clearance {
+            let prev = open.clone();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) as usize;
+                    if !prev[i] {
+                        continue;
+                    }
+                    let edge = x == 0 || y == 0 || x + 1 >= w || y + 1 >= h;
+                    let blocked_neighbour = !edge
+                        && [
+                            (x - 1, y - 1), (x, y - 1), (x + 1, y - 1),
+                            (x - 1, y), (x + 1, y),
+                            (x - 1, y + 1), (x, y + 1), (x + 1, y + 1),
+                        ]
+                        .iter()
+                        .any(|&(nx, ny)| !prev[(ny * w + nx) as usize]);
+                    if edge || blocked_neighbour {
+                        open[i] = false;
+                    }
+                }
+            }
+        }
+        Traversable { width: w, height: h, open }
+    }
+
+    /// The mask as an RGBA image: open ground pale, blocked dark.
+    ///
+    /// A planner whose input cannot be looked at is a planner whose failures are all
+    /// mysterious. "No route" and "a route straight through a fence" have the same cause -
+    /// the mask disagreeing with the world - and one glance at this settles which.
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.open.len() * 4);
+        for o in &self.open {
+            let v = if *o { 220u8 } else { 25u8 };
+            out.extend_from_slice(&[v, v, v, 255]);
+        }
+        out
+    }
+
+    pub fn is_open(&self, x: i64, y: i64) -> bool {
+        x >= 0
+            && y >= 0
+            && (x as u32) < self.width
+            && (y as u32) < self.height
+            && self.open[(y as u32 * self.width + x as u32) as usize]
+    }
+
+    /// How much of the mask is open, as a fraction - a sanity reading for the caller. A
+    /// mask that came out at 0.01 means the slope limit or clearance is wrong, and a route
+    /// failure is then a configuration problem rather than a walled-off destination.
+    pub fn open_fraction(&self) -> f32 {
+        if self.open.is_empty() {
+            return 0.0;
+        }
+        self.open.iter().filter(|o| **o).count() as f32 / self.open.len() as f32
+    }
+
+    /// The nearest pixel to `(x, y)` within `radius` that satisfies `ok`, or `None`.
+    ///
+    /// Endpoints need this: a vehicle's own centre often sits on a pixel the mask calls
+    /// blocked (it is pressed against a kerb, or the clearance erosion clipped it), and
+    /// refusing to plan from where the player actually is would make the planner useless
+    /// exactly when it is needed. Callers pass an `ok` stricter than "open" - see
+    /// [`plan_route`], which requires the pixel to be REACHABLE, because the flat top of a
+    /// wall is open ground that happens to be an island.
+    pub fn nearest(&self, x: i64, y: i64, radius: u32, ok: impl Fn(i64, i64) -> bool) -> Option<(i64, i64)> {
+        if ok(x, y) {
+            return Some((x, y));
+        }
+        for r in 1..=radius as i64 {
+            let mut best: Option<((i64, i64), i64)> = None;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // The ring at Chebyshev distance r.
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
+                    if ok(x + dx, y + dy) {
+                        let d2 = dx * dx + dy * dy;
+                        if best.is_none_or(|(_, bd)| d2 < bd) {
+                            best = Some(((x + dx, y + dy), d2));
+                        }
+                    }
+                }
+            }
+            if let Some((p, _)) = best {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
+
+/// A route through a [`Traversable`] mask from `from` to `to`, in WORLD coordinates, or
+/// `None` when the two are not connected through open ground.
+///
+/// # Why a planner and not a list of waypoints
+/// Waypoints picked by eye off a map encode only what the eye noticed. Every railing,
+/// bench and kerb between two of them is an obstacle the route knows nothing about, and
+/// the vehicle finds it by driving into it - which is exactly how a hand-guessed ring of
+/// waypoints wedges a car six times in one run. The height field already contains those
+/// obstacles, so the route should be computed from it.
+///
+/// The cost field is flooded from the GOAL over the whole mask, and only then is the start
+/// chosen - as the nearest pixel that flood actually reached. Snapping first and searching
+/// afterwards looks equivalent and is not: a slope test cannot tell the flat top of a wall
+/// from the floor, so "nearest open pixel" to a vehicle pressed against a railing can be
+/// the top of the railing, and a search from there correctly finds no route at all.
+///
+/// The path is then simplified by line of sight: a point is dropped while the straight run
+/// past it stays on open ground, so the result is the handful of turns the route actually
+/// makes rather than one waypoint per pixel.
+pub fn plan_route(
+    map: &WorldMap,
+    mask: &Traversable,
+    from: [f32; 2],
+    to: [f32; 2],
+    snap_radius: u32,
+) -> Option<Vec<[f32; 2]>> {
+    let w = mask.width as i64;
+    let px = |p: [f32; 2]| -> (i64, i64) {
+        let q = map.view.pixel_of(p[0], p[1]);
+        (q[0].round() as i64, q[1].round() as i64)
+    };
+    let gp = px(to);
+    let goal = mask.nearest(gp.0, gp.1, snap_radius, |x, y| mask.is_open(x, y))?;
+
+    // Dijkstra from the goal over open ground. Costs in thousandths of a pixel so the
+    // diagonal step is exact enough as an integer.
+    let n = (mask.width * mask.height) as usize;
+    let idx = |x: i64, y: i64| -> usize { (y * w + x) as usize };
+    let mut dist = vec![u32::MAX; n];
+    let mut heap: std::collections::BinaryHeap<(std::cmp::Reverse<u32>, i64, i64)> =
+        std::collections::BinaryHeap::new();
+    dist[idx(goal.0, goal.1)] = 0;
+    heap.push((std::cmp::Reverse(0), goal.0, goal.1));
+    while let Some((std::cmp::Reverse(d), x, y)) = heap.pop() {
+        if d > dist[idx(x, y)] {
+            continue;
+        }
+        for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let (nx, ny) = (x + dx, y + dy);
+            if !mask.is_open(nx, ny) {
+                continue;
+            }
+            // No corner-cutting: a diagonal step is legal only when both orthogonal
+            // neighbours are open, or the route squeezes through a gap a body cannot.
+            if dx != 0 && dy != 0 && !(mask.is_open(x + dx, y) && mask.is_open(x, y + dy)) {
+                continue;
+            }
+            let step = if dx != 0 && dy != 0 { 1414 } else { 1000 };
+            let nd = d.saturating_add(step);
+            if nd < dist[idx(nx, ny)] {
+                dist[idx(nx, ny)] = nd;
+                heap.push((std::cmp::Reverse(nd), nx, ny));
+            }
+        }
+    }
+
+    let sp = px(from);
+    let reached = |x: i64, y: i64| -> bool {
+        mask.is_open(x, y) && dist[idx(x, y)] != u32::MAX
+    };
+    let start = mask.nearest(sp.0, sp.1, snap_radius, reached)?;
+
+    // Walk downhill on the cost field. Guaranteed to terminate at the goal: every open
+    // reached pixel except the goal has a neighbour with strictly smaller cost.
+    let mut path: Vec<(i64, i64)> = vec![start];
+    let mut cur = start;
+    while cur != goal {
+        let mut best: Option<((i64, i64), u32)> = None;
+        for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let (nx, ny) = (cur.0 + dx, cur.1 + dy);
+            if !reached(nx, ny) {
+                continue;
+            }
+            if dx != 0 && dy != 0 && !(mask.is_open(cur.0 + dx, cur.1) && mask.is_open(cur.0, cur.1 + dy)) {
+                continue;
+            }
+            let d = dist[idx(nx, ny)];
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some(((nx, ny), d));
+            }
+        }
+        match best {
+            Some((p, d)) if d < dist[idx(cur.0, cur.1)] => {
+                cur = p;
+                path.push(cur);
+            }
+            // Cannot happen for a reached pixel, but a silent infinite loop here would be
+            // far worse than an honest `None`.
+            _ => return None,
+        }
+    }
+
+    // Line of sight, sampled with the SAME rounding a caller walking the route would use.
+    // Truncating integer division instead (the first version) samples a line up to a pixel
+    // off the real one, which passes a leg that grazes blocked ground.
+    let clear = |a: (i64, i64), b: (i64, i64)| -> bool {
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        (0..=steps).all(|s| {
+            let t = s as f64 / steps as f64;
+            let x = (a.0 as f64 + (b.0 - a.0) as f64 * t).round() as i64;
+            let y = (a.1 as f64 + (b.1 - a.1) as f64 * t).round() as i64;
+            mask.is_open(x, y)
+        })
+    };
+    let mut keep: Vec<(i64, i64)> = vec![path[0]];
+    let mut i = 0usize;
+    while i + 1 < path.len() {
+        // The furthest point still in line of sight from the current one.
+        let mut j = i + 1;
+        let mut best = i + 1;
+        while j < path.len() {
+            if clear(path[i], path[j]) {
+                best = j;
+            }
+            j += 1;
+        }
+        keep.push(path[best]);
+        i = best;
+    }
+    Some(
+        keep.iter()
+            .map(|&(x, y)| {
+                let wpt = map.view.world_of(x as f32, y as f32);
+                [wpt[0], wpt[1]]
+            })
+            .collect(),
+    )
+}
+
+/// Whether a draw is world SURFACE - something a top-down map should show and a vehicle
+/// could stand on - rather than an overlay.
+///
+/// Two exclusions, both of which cost a map its meaning if skipped:
+/// - Not 3D (`Mvp`), or a shader-expanded sprite stream: no world placement, or no
+///   triangles in the stream to place.
+/// - Depth writes disabled. A skydome is the highest geometry in the scene at every
+///   single pixel, so a bird's-eye view that includes it is a picture of the inside of
+///   the sky and its height field is the sky's. GXM titles draw the sky and other
+///   backdrop/overlay passes with `SCE_GXM_DEPTH_WRITE_DISABLED` precisely because they
+///   are not surfaces, which makes the guest's own render state the filter - no height
+///   threshold to guess, no per-title constant.
+fn is_map_surface(d: &Draw) -> bool {
+    let interp = interpret_draw(d);
+    matches!(interp.space, Space::Mvp(_))
+        && !interp.skip
+        && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED
+}
+
+/// Render a scene's 3D geometry as a top-down map. See [`WorldMap`] for why.
+///
+/// Only surfaces take part ([`is_map_surface`]). `ceiling`, when given, additionally
+/// drops any triangle lying entirely above that Y - the escape hatch for a title whose
+/// sky or roof DOES write depth, and the way to see the floor of a covered area.
+///
+/// `origin` is subtracted from every world position, so `view.extent`, the height field
+/// and `ceiling` are all measured from it. Passing a static object's placement (see
+/// [`origin_drift`] for why one is needed) makes the map's coordinates stable from frame
+/// to frame on a title whose own origin travels with the camera; `[0.0; 3]` maps raw
+/// coordinates.
+///
+/// `ssaa` supersamples as [`render_scene_supersampled`] does; the height field is
+/// downsampled by MAXIMUM (an obstacle must not be averaged away by the ground beside
+/// it), while the image is box-averaged as usual.
+pub fn render_map(
+    scene: &Scene,
+    view: MapView,
+    clear: [u8; 4],
+    ssaa: u32,
+    ceiling: Option<f32>,
+    origin: [f32; 3],
+) -> WorldMap {
+    let s = ssaa.clamp(1, 8);
+    let (rw, rh) = (view.width.max(1) * s, view.height.max(1) * s);
+    let raster = MapView { extent: view.extent, width: rw, height: rh };
+    let mut fb = Framebuffer::new(rw, rh, clear);
+    // The depth buffer holds NEGATED world Y, so the rasterizer's existing "smaller
+    // wins" test keeps the HIGHEST surface - which is what looking down from above
+    // means. Reusing the real triangle rasterizer (rather than a second one written for
+    // maps) is what makes the map show the same textures and shading the game does.
+    let mut depth = vec![f32::INFINITY; (rw * rh) as usize];
+    for d in &scene.draws {
+        let tri_count = triangle_count(d);
+        if tri_count == 0 {
+            continue;
+        }
+        if !is_map_surface(d) {
+            continue;
+        }
+        let DrawInterp { layout, textured, uv_div, .. } = interpret_draw(d);
+        let texture = if textured { d.albedo() } else { None };
+        for t in 0..tri_count {
+            let vs = tri_indices(d, t);
+            let verts: Vec<Vertex> = vs.iter().map(|&i| decode_vertex(d, &layout, i)).collect();
+            let mut screen = [[0f32; 4]; 3];
+            let mut low = f32::INFINITY;
+            for (k, v) in verts.iter().enumerate() {
+                let mut w = transform(&d.world, v.pos[0], v.pos[1], v.pos[2]);
+                if !w[0].is_finite() || !w[1].is_finite() || !w[2].is_finite() {
+                    screen[k][3] = f32::NAN;
+                    break;
+                }
+                for c in 0..3 {
+                    w[c] -= origin[c];
+                }
+                let p = raster.pixel_of(w[0], w[2]);
+                low = low.min(w[1]);
+                // 1/w of exactly 1: an ortho projection has no perspective, and the
+                // rasterizer's perspective-correct interpolation degenerates to the
+                // correct affine one when every weight is equal.
+                screen[k] = [p[0], p[1], -w[1], 1.0];
+            }
+            if screen.iter().any(|s| s[3].is_nan()) {
+                continue;
+            }
+            // Entirely above the ceiling. Tested on the LOWEST vertex so a wall that
+            // rises through the ceiling still contributes the part below it.
+            if ceiling.is_some_and(|c| low > c) {
+                continue;
+            }
+            // No back-face cull: the map wants whatever surface is on top, and culling by
+            // the guest's winding here would punch holes in single-sided ground panels
+            // seen from a direction the game never views them from.
+            raster_triangle(
+                &mut fb, &mut depth, &screen, &verts, texture, uv_div, true,
+                SCE_GXM_DEPTH_FUNC_LESS_EQUAL, d.exposure, &d.material, &d.world, None, 0, false,
+            );
+        }
+    }
+    // Resolve: average the image, take the MAX height per output cell.
+    let top_y: Vec<f32> = if s == 1 {
+        depth.iter().map(|z| if z.is_finite() { -z } else { f32::NAN }).collect()
+    } else {
+        let (ow, oh) = (rw / s, rh / s);
+        let mut out = Vec::with_capacity((ow * oh) as usize);
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut peak = f32::NEG_INFINITY;
+                for sy in 0..s {
+                    for sx in 0..s {
+                        let z = depth[(((oy * s + sy) * rw) + ox * s + sx) as usize];
+                        if z.is_finite() && -z > peak {
+                            peak = -z;
+                        }
+                    }
+                }
+                out.push(if peak == f32::NEG_INFINITY { f32::NAN } else { peak });
+            }
+        }
+        out
+    };
+    WorldMap { view: MapView { extent: view.extent, width: rw / s, height: rh / s }, fb: fb.downsampled(s), top_y }
 }
 
 /// Rasterize one scene into a fresh framebuffer at native resolution. `clear` is the
@@ -1731,6 +2652,133 @@ fn tex_key(t: &BoundTexture) -> u64 {
 /// cache warm.
 pub struct RenderSceneBuilder {
     decode_cache: HashMap<u64, GxmTexture>,
+    /// The last reported "the whole scene was dropped" tally, so [`DropTally::report`]
+    /// prints when the shape CHANGES rather than sixty times a second.
+    last_empty: Option<DropTally>,
+}
+
+/// Why [`RenderSceneBuilder::build`] discarded draws from a captured scene.
+///
+/// # Why this is reported rather than silent
+/// `build` is allowed to drop a captured draw - a line/point topology has no triangles,
+/// and a position-only stream has no colour source the fixed-function path can honour.
+/// Each drop is individually correct, but the SUM of them is not: a scene where every
+/// draw is dropped renders a bare clear colour, which on screen is indistinguishable from
+/// "the guest submitted nothing". That ambiguity cost a whole session on one title, where
+/// the capture reported `5draws@960x544` every frame and the renderer reported `0 draws`
+/// and the two facts sat side by side without either being wrong.
+///
+/// So a drop reports itself unconditionally, naming the reason - the same rule the
+/// recompiler's fixed-function fallback follows.
+///
+/// # Every drop reports, not just a total one
+/// Reporting only the all-dropped case was itself a silent failure: a single discarded draw
+/// among hundreds is a missing button fill, a missing decal, a missing glyph - invisible in a
+/// summary that says nothing, and indistinguishable from the guest not drawing it. The FIRST
+/// drop of each kind now prints regardless of how many survive; a repeat of the same kind is
+/// suppressed so a per-frame drop cannot flood the log. `VITASLOP_STRICT_DRAWS` turns any
+/// drop into a hard failure, which is the mode to run when a frame looks wrong.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct DropTally {
+    /// Draws in the captured scene.
+    total: usize,
+    /// Dropped: not a triangle topology (lines/points emit no triangles).
+    topology: usize,
+    /// Dropped: the vertex stream holds shader-expanded sprite RECORDS, not vertices.
+    expanded: usize,
+    /// Dropped: position-only geometry - no texcoord and no vertex colour, so the
+    /// fixed-function path has no colour source and would paint opaque white.
+    colorless: usize,
+    /// Of the dropped draws, how many carried the guest's real shaders. These are the
+    /// expensive ones to lose: the recompiler could have drawn them exactly.
+    with_shaders: usize,
+}
+
+impl DropTally {
+    fn dropped(&self) -> usize {
+        self.topology + self.expanded + self.colorless
+    }
+
+    /// Report a scene that produced no drawable geometry at all. Returns whether this
+    /// tally differs from `last`, so the caller can print on change only.
+    fn report_if_total(&self, last: &mut Option<DropTally>) {
+        if self.total == 0 || self.dropped() < self.total || *last == Some(*self) {
+            return;
+        }
+        *last = Some(*self);
+        eprintln!(
+            "render: ALL {} captured draws were dropped - {} non-triangle topology, {} \
+             shader-expanded sprite records, {} position-only (no texcoord, no vertex colour); \
+             {} of them carried the guest's real shaders. This frame renders as a bare clear \
+             colour, which is NOT the same as the guest drawing nothing.",
+            self.total, self.topology, self.expanded, self.colorless, self.with_shaders,
+        );
+    }
+}
+
+/// Why one captured draw was discarded, for [`report_drop`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DropKind {
+    Topology,
+    Expanded,
+    Colorless,
+}
+
+impl DropKind {
+    fn describe(self) -> &'static str {
+        match self {
+            DropKind::Topology => {
+                "not a triangle topology (a line/point list emits no triangles)"
+            }
+            DropKind::Expanded => {
+                "the vertex stream holds shader-expanded sprite RECORDS, not vertices"
+            }
+            DropKind::Colorless => {
+                "position-only geometry: no texcoord and no vertex colour, so the \
+                 fixed-function path has no colour source"
+            }
+        }
+    }
+}
+
+/// `VITASLOP_STRICT_DRAWS`: turn any dropped draw into a hard failure instead of a report.
+/// Off by default because several drops are legitimate on titles that render correctly (a
+/// point-list topology genuinely has no triangles), but a frame that looks wrong should be
+/// re-run under this so the FIRST missing draw stops the run at its own draw index rather
+/// than being reasoned about from a screenshot.
+fn strict_draws() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| std::env::var_os("VITASLOP_STRICT_DRAWS").is_some())
+}
+
+/// Report one dropped draw the first time a drop of that kind happens, and panic instead
+/// when `VITASLOP_STRICT_DRAWS` is set.
+///
+/// Suppressing repeats is what keeps this usable: a draw dropped every frame would otherwise
+/// print sixty times a second. The first one carries the information that matters - which
+/// draw, why, and whether it had the guest's real shaders attached (a drop that did is one
+/// the recompiler could have drawn exactly, so it is the expensive kind to lose).
+fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
+    let detail = format!(
+        "render: DROPPED draw {di} - {}. tris={tri_count}, stride={}, {} attributes, \
+         shaders={}. This draw is MISSING from the frame; the guest asked for it.",
+        kind.describe(),
+        d.vertex_stride,
+        d.attributes.len(),
+        if d.vprog.is_empty() { "none" } else { "yes (the recompiler could draw this)" },
+    );
+    if strict_draws() {
+        panic!("{detail}\n(VITASLOP_STRICT_DRAWS is set, so a dropped draw is fatal)");
+    }
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<DropKind>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if seen.contains(&kind) {
+        return;
+    }
+    seen.push(kind);
+    eprintln!("{detail}");
 }
 
 /// Cap on the decode cache; cleared wholesale if exceeded (a title's working texture
@@ -1746,7 +2794,7 @@ impl Default for RenderSceneBuilder {
 
 impl RenderSceneBuilder {
     pub fn new() -> Self {
-        RenderSceneBuilder { decode_cache: HashMap::new() }
+        RenderSceneBuilder { decode_cache: HashMap::new(), last_empty: None }
     }
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
@@ -1763,8 +2811,15 @@ impl RenderSceneBuilder {
         // bilinear, as the software `sample_texture_bilinear` does). SceGxmTextureFilter:
         // 1 = LINEAR, 0 = POINT.
         let filter_linear = t.mag_filter == 1;
-        let g =
-            GxmTexture { key, width, height, faces: t.faces.max(1), rgba: Arc::new(rgba), filter_linear };
+        let g = GxmTexture {
+            key,
+            data_addr: t.data_addr,
+            width,
+            height,
+            faces: t.faces.max(1),
+            rgba: Arc::new(rgba),
+            filter_linear,
+        };
         self.decode_cache.insert(key, g.clone());
         g
     }
@@ -1787,15 +2842,58 @@ impl RenderSceneBuilder {
         // Diagnostic: VITASLOP_DRAW_STATS also reports each opaque draw's own visible depth
         // span, which is what the GPU's normalization has to keep separable.
         let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+        let mut tally = DropTally { total: scene.draws.len(), ..Default::default() };
         for (di, d) in scene.draws.iter().enumerate() {
             // A list emits idx/3 triangles; a strip or fan emits idx-2. Any other topology
             // (lines/points) emits none and is skipped.
             let tri_count = triangle_count(d);
             if tri_count == 0 {
+                tally.topology += 1;
+                tally.with_shaders += !d.vprog.is_empty() as usize;
+                report_drop(DropKind::Topology, di, d, tri_count);
+                if stats {
+                    println!(
+                        "draw {di:>3}: DROPPED - primitive {:#x} is not a triangle topology \
+                         ({} indices)",
+                        d.primitive, d.index_count
+                    );
+                }
                 continue;
             }
             let interp = interpret_draw(d);
-            if interp.skip {
+            // A position-only draw whose colour lives in the guest's shader is NOT dropped
+            // when the recompiler can have it: the fixed-function packing has no colour
+            // source, but the recompiled pair does. It is carried through marked
+            // `shader_only`, and the renderer draws it with the real shaders or reports it
+            // missing. Dropping it here is what silently erased a title's solid-colour UI
+            // fills. A shader-expanded draw is still dropped: its stream holds sprite
+            // RECORDS, so there is no primitive to draw by any path.
+            let shader_only = interp.skip && !d.shader_expanded && !d.vprog.is_empty();
+            if interp.skip && !shader_only {
+                let kind = if d.shader_expanded {
+                    tally.expanded += 1;
+                    DropKind::Expanded
+                } else {
+                    tally.colorless += 1;
+                    DropKind::Colorless
+                };
+                tally.with_shaders += !d.vprog.is_empty() as usize;
+                report_drop(kind, di, d, tri_count);
+                if stats {
+                    println!(
+                        "draw {di:>3}: DROPPED - {} (tris={tri_count}, stride={}, {} attributes, \
+                         {} uniform floats, shaders={})",
+                        if d.shader_expanded {
+                            "shader-expanded sprite records"
+                        } else {
+                            "position-only: no texcoord and no vertex colour"
+                        },
+                        d.vertex_stride,
+                        d.attributes.len(),
+                        d.uniforms.len(),
+                        if d.vprog.is_empty() { "none" } else { "captured" },
+                    );
+                }
                 continue;
             }
             let layout = &interp.layout;
@@ -1982,6 +3080,7 @@ impl RenderSceneBuilder {
                     ambient: d.material.ambient,
                 },
                 gxp,
+                shader_only,
             });
         }
         // Linear depth-normalization params: map the visible opaque depth range to [0,1].
@@ -1993,7 +3092,15 @@ impl RenderSceneBuilder {
         } else {
             (0.0, 0.0)
         };
-        RenderScene { draws, depth_min, depth_scale }
+        tally.report_if_total(&mut self.last_empty);
+        // Carry where this scene draws to, so a renderer can keep the result addressable
+        // for a later pass that samples it (see `RttTarget`).
+        let target = scene.color.map(|c| vitaslop_platform::gpu::RttTarget {
+            data_addr: c.data_addr,
+            width: c.width,
+            height: c.height,
+        });
+        RenderScene { draws, target, depth_min, depth_scale }
     }
 }
 
@@ -2303,6 +3410,565 @@ mod geometry_tests {
         let half = 0.5 * (1.0 / 10.0 + 1.0 / 20.0);
         assert!((mid[3] - 1.0 / 15.0).abs() < 1e-6);
         assert!((-half - (near[2] + far[2]) / 2.0).abs() < 1e-6);
+    }
+
+    // --- the top-down map, and the travelling-origin correction ---------------------
+
+    /// An axis-aligned quad on the XZ plane at height `y`, spanning `[x0,x1] x [z0,z1]`,
+    /// as a two-triangle list whose vertices are already in world space (identity world
+    /// matrix). `depth_write` off marks it an overlay - a skydome, in the case that
+    /// matters.
+    fn ground_quad(y: f32, x0: f32, z0: f32, x1: f32, z1: f32, depth_write: bool) -> Draw {
+        let mut d = located_draw(
+            [0.0, 0.0, 0.0],
+            &[[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]],
+            {
+                let mut m = [0f32; 16];
+                m[0] = 1.0;
+                m[5] = 1.0;
+                m[10] = 1.0;
+                m[11] = 1.0;
+                m
+            },
+        );
+        d.primitive = PRIM_TRIANGLES;
+        d.index_count = 6;
+        d.indices = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
+        // The REAL GXM attribute format codes, so `layout_of` recognizes the position and
+        // the colour and `interpret_draw` therefore does not skip the draw as having no
+        // colour source. (`located_draw` predates the map and gets away with placeholder
+        // codes because `locate_scene` never consults `DrawInterp::skip`.)
+        d.attributes[0].format = FORMAT_F32;
+        d.attributes[1].format = FORMAT_U8N;
+        if !depth_write {
+            d.render_state.front_depth_write = SCE_GXM_DEPTH_WRITE_DISABLED;
+        }
+        d
+    }
+
+    fn square_view(extent: [f32; 4], n: u32) -> MapView {
+        MapView { extent, width: n, height: n }
+    }
+
+    #[test]
+    fn map_view_round_trips_and_puts_minus_z_up_the_image() {
+        let v = square_view([-100.0, -50.0, 100.0, 150.0], 200);
+        // Round trip: a pixel centre maps to a world position and back.
+        for (px, py) in [(0.0, 0.0), (57.0, 133.0), (199.0, 199.0)] {
+            let w = v.world_of(px, py);
+            let back = v.pixel_of(w[0], w[1]);
+            assert!((back[0] - px).abs() < 1e-3 && (back[1] - py).abs() < 1e-3, "{px},{py}");
+        }
+        // Orientation, which is the part a caller cannot check by eye without a title in
+        // front of it: +X is right, and world -Z is UP the image (smaller y).
+        let origin = v.pixel_of(0.0, 0.0);
+        assert!(v.pixel_of(50.0, 0.0)[0] > origin[0], "+X goes right");
+        assert!(v.pixel_of(0.0, -40.0)[1] < origin[1], "-Z goes up the image");
+        // Scale is world units per pixel on each axis, independently.
+        assert!((v.scale()[0] - 1.0).abs() < 1e-6 && (v.scale()[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// The whole point of [`origin_drift`]: a frame in which the coordinate origin moved
+    /// must not be read as a frame in which the scenery moved.
+    #[test]
+    fn origin_drift_finds_the_shared_shift_and_leaves_the_real_mover() {
+        let obj = |id: u64, w: [f32; 3]| ObjectLoc {
+            id,
+            draws: vec![0],
+            world: w,
+            heading: None,
+            screen: None,
+            centroid: None,
+            distance: None,
+            triangles: 1,
+            sprites: false,
+        };
+        let shift = [-11.7, -0.66, -19.92];
+        let mut prev = Vec::new();
+        let mut now = Vec::new();
+        for i in 0..20u64 {
+            let p = [i as f32 * 3.0, 0.0, i as f32 * 7.0];
+            prev.push(obj(i, p));
+            // Bolted down: its coordinates change by the origin's displacement alone.
+            now.push(obj(i, [p[0] + shift[0], p[1] + shift[1], p[2] + shift[2]]));
+        }
+        // One object that genuinely moved, by a completely different vector.
+        let car = [500.0, -50.0, 300.0];
+        prev.push(obj(999, car));
+        now.push(obj(999, [car[0] + shift[0] + 12.0, car[1] + shift[1], car[2] + shift[2] + 8.0]));
+
+        let d = origin_drift(&prev, &now, 0.05).expect("a match");
+        assert!(d.reliable(), "a scene that is 20/21 static must yield a majority");
+        for k in 0..3 {
+            assert!((d.delta[k] - shift[k]).abs() < 1e-3, "axis {k}: {:?}", d.delta);
+        }
+        assert_eq!(d.agreed, 20, "the mover must not be counted in the cluster");
+        assert_eq!(d.matched, 21);
+
+        // And with the drift removed, the mover's residual is its TRUE motion while every
+        // static object reads zero - the property navigation depends on.
+        for (p, n) in prev.iter().zip(now.iter()) {
+            let resid: Vec<f32> = (0..3).map(|k| n.world[k] - p.world[k] - d.delta[k]).collect();
+            let mag = (resid[0] * resid[0] + resid[1] * resid[1] + resid[2] * resid[2]).sqrt();
+            if n.id == 999 {
+                assert!((mag - (12.0f32 * 12.0 + 8.0 * 8.0).sqrt()).abs() < 1e-2, "mover {mag}");
+            } else {
+                assert!(mag < 1e-3, "static object read as moving: {mag}");
+            }
+        }
+    }
+
+    #[test]
+    fn origin_drift_refuses_to_guess_when_nothing_agrees() {
+        let obj = |id: u64, w: [f32; 3]| ObjectLoc {
+            id,
+            draws: vec![0],
+            world: w,
+            heading: None,
+            screen: None,
+            centroid: None,
+            distance: None,
+            triangles: 1,
+            sprites: false,
+        };
+        // Every object moved by a different amount: there is no origin displacement to
+        // find, and inventing one would silently corrupt every delta in the report.
+        let prev: Vec<ObjectLoc> = (0..12u64).map(|i| obj(i, [0.0, 0.0, 0.0])).collect();
+        let now: Vec<ObjectLoc> =
+            (0..12u64).map(|i| obj(i, [i as f32 * 5.0, 0.0, i as f32 * -3.0])).collect();
+        let d = origin_drift(&prev, &now, 0.05).expect("objects did match");
+        assert!(!d.reliable(), "no majority must be reported as unreliable, not as a vector");
+        // Too small a sample is also not a majority worth trusting.
+        let d2 = origin_drift(&prev[..3], &now[..3], 0.05).unwrap();
+        assert!(!d2.reliable());
+    }
+
+    /// A row of identical fence posts drifting further than their own spacing. Matching on
+    /// raw proximity pairs each post with its NEIGHBOUR and reports the fence as moving;
+    /// matching against the drift-corrected expectation pairs each post with itself.
+    #[test]
+    fn world_motion_matches_a_repeated_mesh_to_itself_not_its_neighbour() {
+        let post = |w: [f32; 3]| ObjectLoc {
+            id: 0xfeed_face,
+            draws: vec![0],
+            world: w,
+            heading: None,
+            screen: None,
+            centroid: None,
+            distance: None,
+            triangles: 143,
+            sprites: false,
+        };
+        let spacing = 20.0;
+        let drift = [-23.0, 0.0, 0.0];
+        let prev: Vec<ObjectLoc> = (0..8).map(|i| post([i as f32 * spacing, 0.0, 0.0])).collect();
+        let now: Vec<ObjectLoc> =
+            (0..8).map(|i| post([i as f32 * spacing + drift[0], 0.0, 0.0])).collect();
+        for o in &now {
+            let (_, mag) = world_motion(&prev, o, drift).expect("matched");
+            assert!(mag < 1e-3, "a static post must read 0, got {mag} at {:?}", o.world);
+        }
+        // The naive version this replaced: nearest RAW candidate, i.e. drift of zero.
+        // Kept as a test so the bug cannot come back quietly.
+        let naive: Vec<f32> =
+            now.iter().filter_map(|o| world_motion(&prev, o, [0.0; 3]).map(|(_, m)| m)).collect();
+        assert!(
+            naive.iter().any(|m| *m > 1.0),
+            "the uncorrected match should mis-pair posts - if it no longer does, this \
+             fixture stopped exercising the bug: {naive:?}"
+        );
+    }
+
+    #[test]
+    fn map_keeps_the_higher_surface_and_measures_its_height() {
+        // A wide floor with a small block standing on it.
+        let scene = Scene {
+            color: None,
+            draws: vec![
+                ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
+                ground_quad(8.0, 0.0, 0.0, 20.0, 20.0, true),
+            ],
+        };
+        let view = square_view([-50.0, -50.0, 50.0, 50.0], 100);
+        let map = render_map(&scene, view, [0, 0, 0, 255], 1, None, [0.0; 3]);
+        // Looking down keeps the block, not the floor beneath it.
+        assert_eq!(map.height_at(10.0, 10.0), Some(8.0), "the block is on top");
+        assert_eq!(map.height_at(-25.0, -25.0), Some(0.0), "open floor reads the floor");
+        // The floor is the bulk of the covered area, so it is the ground level.
+        assert_eq!(map.ground_level(0.25), Some(0.0));
+        // Densest band first: the floor, then the block.
+        let bins = map.height_bins(2.0);
+        assert_eq!(bins[0].0, 0.0);
+        assert!(bins.iter().any(|(h, _)| *h == 8.0), "the block has its own band: {bins:?}");
+        // In the grid the block is an obstacle and the open floor is drivable.
+        let grid = map.height_grid(10, 10, 0.0, 1.0);
+        let g: Vec<&str> = grid.lines().collect();
+        // Grid row 0 is the TOP of the image, which is the most negative Z; the block
+        // occupies world x 0..20, z 0..20, so it lands below and right of centre.
+        assert_eq!(g[0].chars().next(), Some('.'), "a corner of open floor");
+        assert!(g.iter().any(|row| row.contains('#')), "the block reads as an obstacle");
+        let blocked = g.iter().map(|r| r.chars().filter(|c| *c == '#').count()).sum::<usize>();
+        assert_eq!(blocked, 4, "a 20x20 block over a 100x100 map is 2x2 of a 10x10 grid");
+    }
+
+    /// The failure that made the first map of this title a picture of the inside of the
+    /// sky: a skydome is above everything at every pixel, so it wins the whole height
+    /// field. The guest's own depth-write state is the filter.
+    #[test]
+    fn map_excludes_geometry_that_does_not_write_depth() {
+        let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
+        let scene = Scene { color: None, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
+        assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
+        assert_eq!(map.ground_level(0.25), Some(0.0));
+    }
+
+    #[test]
+    fn map_ceiling_drops_geometry_above_it_and_reveals_the_floor_below() {
+        // A depth-WRITING roof over half the floor: the ceiling option is the only way to
+        // see what is under it.
+        let scene = Scene {
+            color: None,
+            draws: vec![
+                ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
+                ground_quad(30.0, -50.0, -50.0, 0.0, 50.0, true),
+            ],
+        };
+        let view = square_view([-50.0, -50.0, 50.0, 50.0], 40);
+        let roofed = render_map(&scene, view, [0, 0, 0, 255], 1, None, [0.0; 3]);
+        assert_eq!(roofed.height_at(-25.0, 0.0), Some(30.0), "without a ceiling, the roof wins");
+        let under = render_map(&scene, view, [0, 0, 0, 255], 1, Some(10.0), [0.0; 3]);
+        assert_eq!(under.height_at(-25.0, 0.0), Some(0.0), "with a ceiling, the floor shows");
+        assert_eq!(under.height_at(25.0, 0.0), Some(0.0), "the open half is unaffected");
+    }
+
+    #[test]
+    fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
+        let scene = Scene { color: None, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let origin = [100.0, 4.0, -200.0];
+        // The same geometry, asked for in a frame measured from `origin`: the quad now
+        // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
+        let view = square_view([-160.0, 140.0, -40.0, 260.0], 120);
+        let map = render_map(&scene, view, [0, 0, 0, 255], 1, None, origin);
+        assert_eq!(map.height_at(-100.0, 200.0), Some(0.0), "shifted in x, z AND y");
+        assert_eq!(map.height_at(0.0, 0.0), None, "nothing at the raw position any more");
+    }
+
+    // --- 2D sprite locating -----------------------------------------------------------
+
+    /// A textured screen-space quad: the shape a 2D title draws everything with. `Pixel`
+    /// space (a texcoord present and no MVP uniform) is what `interpret_draw` infers for it.
+    fn sprite_quad(x0: f32, y0: f32, x1: f32, y1: f32, u0: f32, v0: f32, tex_byte: u8) -> Draw {
+        let mut d = located_draw([0.0, 0.0, 0.0], &[], [0f32; 16]);
+        d.primitive = PRIM_TRIANGLES;
+        d.index_count = 6;
+        d.indices = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
+        // pos.xy at 0, uv.xy at 8, colour at 16.
+        d.vertex_stride = 20;
+        let corners = [(x0, y0, u0, v0), (x1, y0, u0 + 0.1, v0), (x1, y1, u0 + 0.1, v0 + 0.1), (x0, y1, u0, v0 + 0.1)];
+        d.vertices = corners
+            .iter()
+            .flat_map(|(x, y, u, v)| {
+                let mut b: Vec<u8> = Vec::new();
+                for f in [x, y, &0.0, u, v] {
+                    b.extend_from_slice(&f.to_le_bytes());
+                }
+                b.truncate(16);
+                b.extend_from_slice(&[255, 255, 255, 255]);
+                b
+            })
+            .collect();
+        d.attributes = vec![
+            crate::capture::VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 3, reg_index: 0 },
+            crate::capture::VertexAttribute { stream_index: 0, offset: 12, format: FORMAT_F32, component_count: 2, reg_index: 1 },
+            crate::capture::VertexAttribute { stream_index: 0, offset: 16, format: FORMAT_U8N, component_count: 4, reg_index: 2 },
+        ];
+        // No uniforms: that is what makes this 2D rather than MVP, which is the whole point.
+        d.uniforms = vec![];
+        d.textures = vec![BoundTexture {
+            unit: 0,
+            base_format: 0x0c,
+            swizzle: 0,
+            tex_type: 0,
+            width: 4,
+            height: 4,
+            stride: 16,
+            faces: 1,
+            face_bytes: 64,
+            data_addr: 0x1000,
+            pixels: vec![tex_byte; 64].into(),
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
+            min_filter: 0,
+            mag_filter: 0,
+        }];
+        d
+    }
+
+    #[test]
+    fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
+        let scene = Scene {
+            color: None,
+            draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.0, 0.0, 7)],
+        };
+        let found = locate_sprites(&scene, 960, 544);
+        assert_eq!(found.len(), 1, "one 2D quad is one sprite: {found:?}");
+        let s = &found[0];
+        assert_eq!(s.centroid, [140.0, 240.0]);
+        assert_eq!(s.size, [80.0, 80.0]);
+        assert!(s.textured);
+
+        // The SAME sprite 300 pixels along keeps its id - which a 3D geometry hash could
+        // not do, because a 2D sprite's position IS its vertex data.
+        let moved = Scene {
+            color: None,
+            draws: vec![sprite_quad(400.0, 200.0, 480.0, 280.0, 0.0, 0.0, 7)],
+        };
+        let after = locate_sprites(&moved, 960, 544);
+        assert_eq!(after[0].id, s.id, "identity must survive motion");
+        // A different region of the same sheet is a DIFFERENT sprite.
+        let other = Scene {
+            color: None,
+            draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.5, 0.5, 7)],
+        };
+        assert_ne!(locate_sprites(&other, 960, 544)[0].id, s.id, "another atlas region");
+    }
+
+    #[test]
+    fn sprite_motion_removes_the_scene_scroll() {
+        // A backdrop of many sprites panning left by 6px, and one that moves against it.
+        let build = |shift: f32, hero_extra: f32| Scene {
+            color: None,
+            draws: (0..12)
+                .map(|i| {
+                    let x = 40.0 * i as f32 + shift;
+                    sprite_quad(x, 100.0, x + 30.0, 130.0, 0.05 * i as f32, 0.0, i as u8)
+                })
+                .chain(std::iter::once(sprite_quad(
+                    500.0 + shift + hero_extra,
+                    300.0,
+                    540.0 + shift + hero_extra,
+                    340.0,
+                    0.9,
+                    0.9,
+                    99,
+                )))
+                .collect(),
+        };
+        let before = locate_sprites(&build(0.0, 0.0), 960, 544);
+        let after = locate_sprites(&build(-6.0, 20.0), 960, 544);
+        let drift = scroll_drift(&before, &after, 0.75).expect("matched");
+        assert!(drift.reliable(), "12 of 13 sprites agree, so this is a majority");
+        assert!((drift.delta[0] + 6.0).abs() < 1e-3, "the pan is -6px: {:?}", drift.delta);
+
+        for s in &after {
+            let (_, mag) = sprite_motion(&before, s, drift.delta).expect("matched");
+            if s.size[0] == 40.0 {
+                // The hero moved 20px through the world on top of the scroll.
+                assert!((mag - 20.0).abs() < 1e-2, "hero motion {mag}");
+            } else {
+                assert!(mag < 1e-2, "a backdrop sprite must read as still, got {mag}");
+            }
+        }
+    }
+
+    #[test]
+    fn sprites_ignore_3d_draws_and_locate_ignores_2d_ones() {
+        // The two locators must partition the scene, or an object gets counted twice - or,
+        // worse, a title gets an empty report from the one that does not apply to it.
+        let scene = Scene {
+            color: None,
+            draws: vec![
+                sprite_quad(10.0, 10.0, 50.0, 50.0, 0.0, 0.0, 1),
+                ground_quad(0.0, -10.0, -10.0, 10.0, 10.0, true),
+            ],
+        };
+        let two_d = locate_sprites(&scene, 960, 544);
+        let three_d = locate_scene(&scene, 960, 544);
+        assert_eq!(two_d.len(), 1, "only the quad with no MVP is a sprite");
+        assert_eq!(two_d[0].draw, 0);
+        assert_eq!(three_d.len(), 1, "only the MVP draw is a placed object");
+        assert_eq!(three_d[0].draws, vec![1]);
+    }
+
+    // --- traversability and route planning ------------------------------------------
+
+    /// A 200x200 floor with a wall across it at z = 0, with a gap. The wall is a tall thin
+    /// quad, so on the height field it is a fast rise, which is what stops a vehicle.
+    fn walled_scene(gap: Option<(f32, f32)>) -> Scene {
+        let mut draws = vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)];
+        match gap {
+            None => draws.push(ground_quad(20.0, -100.0, -4.0, 100.0, 4.0, true)),
+            Some((g0, g1)) => {
+                draws.push(ground_quad(20.0, -100.0, -4.0, g0, 4.0, true));
+                draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
+            }
+        }
+        Scene { color: None, draws }
+    }
+
+    fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
+        render_map(
+            &walled_scene(gap),
+            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            [0, 0, 0, 255],
+            1,
+            None,
+            [0.0; 3],
+        )
+    }
+
+    #[test]
+    fn traversable_blocks_a_wall_and_keeps_the_open_floor() {
+        let map = walled_map(Some((10.0, 30.0)));
+        let mask = Traversable::from_map(&map, 1.0, 0);
+        let open_at = |wx: f32, wz: f32| {
+            let p = map.view.pixel_of(wx, wz);
+            mask.is_open(p[0] as i64, p[1] as i64)
+        };
+        assert!(open_at(-50.0, -50.0), "open floor is drivable");
+        assert!(open_at(20.0, 0.0), "the gap in the wall is drivable");
+        // The wall's FOOT is blocked, which is the property that stops a vehicle crossing
+        // it. Its flat top is not distinguishable from floor by slope alone - so it stays
+        // "open" here, as an island nothing can reach. `plan_route` is what must not be
+        // fooled by that, and it flood-fills from the goal rather than trusting a snap.
+        assert!(!open_at(-50.0, -4.5), "the foot of the wall is blocked");
+        assert!(!open_at(-50.0, 4.5), "and so is the far foot");
+        // A mask that came out almost entirely closed means the slope limit is wrong, and
+        // the caller needs to be able to see that rather than just get "no route".
+        let f = mask.open_fraction();
+        assert!(f > 0.5 && f < 1.0, "most of a mostly-open floor should be open, got {f}");
+    }
+
+    #[test]
+    fn traversable_calls_a_ramp_drivable_and_a_step_not() {
+        // Two surfaces rising the same total height: one over 60 world units, one abruptly.
+        let mut draws = vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)];
+        for i in 0..60 {
+            let x = -80.0 + i as f32;
+            draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
+        }
+        draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
+        let scene = Scene { color: None, draws };
+        let map = render_map(
+            &scene,
+            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            [0, 0, 0, 255],
+            1,
+            None,
+            [0.0; 3],
+        );
+        let mask = Traversable::from_map(&map, 0.5, 0);
+        let open_at = |wx: f32, wz: f32| {
+            let p = map.view.pixel_of(wx, wz);
+            mask.is_open(p[0] as i64, p[1] as i64)
+        };
+        assert!(open_at(-50.0, -35.0), "a gentle ramp is drivable ground");
+        // The abrupt slab's own top is flat, but its EDGE is not passable - which is the
+        // property that matters, since a route has to cross the edge to get on it.
+        let p = map.view.pixel_of(20.0, -35.0);
+        assert!(!mask.is_open(p[0] as i64, p[1] as i64), "the foot of a step is blocked");
+    }
+
+    #[test]
+    fn plan_route_goes_through_the_gap_and_stays_on_open_ground() {
+        let map = walled_map(Some((10.0, 30.0)));
+        let mask = Traversable::from_map(&map, 1.0, 2);
+        let route = plan_route(&map, &mask, [-60.0, -60.0], [-60.0, 60.0], 20)
+            .expect("a gap exists, so a route must be found");
+        assert!(route.len() >= 3, "a route around a wall has turns in it: {route:?}");
+        // Every straight leg must stay on open ground - the property that makes a route
+        // followable rather than a set of suggestions.
+        for pair in route.windows(2) {
+            let (a, b) = (map.view.pixel_of(pair[0][0], pair[0][1]), map.view.pixel_of(pair[1][0], pair[1][1]));
+            let steps = ((b[0] - a[0]).abs().max((b[1] - a[1]).abs()).max(1.0)) as i64;
+            for s in 0..=steps {
+                let t = s as f32 / steps as f32;
+                let x = (a[0] + (b[0] - a[0]) * t).round() as i64;
+                let y = (a[1] + (b[1] - a[1]) * t).round() as i64;
+                assert!(mask.is_open(x, y), "leg {pair:?} crosses blocked ground at ({x},{y})");
+            }
+        }
+        // And it must actually pass through the gap, not teleport across the wall.
+        assert!(
+            route.iter().any(|p| p[0] > 5.0 && p[0] < 35.0 && p[1].abs() < 20.0),
+            "the route should thread the gap at x 10..30: {route:?}"
+        );
+    }
+
+    #[test]
+    fn plan_route_admits_when_the_goal_is_walled_off() {
+        let map = walled_map(None);
+        let mask = Traversable::from_map(&map, 1.0, 1);
+        // A solid wall: the honest answer is that there is no route, not a path through it.
+        assert!(plan_route(&map, &mask, [-60.0, -60.0], [-60.0, 60.0], 10).is_none());
+        // The same two points on the SAME side are still connected.
+        assert!(plan_route(&map, &mask, [-60.0, -60.0], [60.0, -60.0], 10).is_some());
+    }
+
+    #[test]
+    fn plan_route_simplifies_open_ground_to_two_points() {
+        let scene = Scene { color: None, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let map = render_map(
+            &scene,
+            MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
+            [0, 0, 0, 255],
+            1,
+            None,
+            [0.0; 3],
+        );
+        let mask = Traversable::from_map(&map, 1.0, 0);
+        let route = plan_route(&map, &mask, [-60.0, -60.0], [60.0, 60.0], 10).expect("open ground");
+        assert_eq!(route.len(), 2, "nothing in the way means start and finish: {route:?}");
+        assert!((route[1][0] - 60.0).abs() < 3.0 && (route[1][1] - 60.0).abs() < 3.0);
+    }
+
+    #[test]
+    fn plan_route_snaps_an_endpoint_that_sits_on_blocked_ground() {
+        let map = walled_map(Some((10.0, 30.0)));
+        let mask = Traversable::from_map(&map, 1.0, 2);
+        // Start pressed against the wall's foot, where the clearance erosion has blocked
+        // the vehicle's own pixel. Refusing to plan from there would fail exactly when the
+        // planner is needed.
+        let route = plan_route(&map, &mask, [-50.0, -5.0], [-60.0, 60.0], 30)
+            .expect("a start beside an obstacle must snap to open ground");
+        assert!(route.len() >= 2);
+        // Snapping must land on ground the goal can actually be reached from. The flat top
+        // of the wall is open, is nearer to a point on the wall than the floor is, and is
+        // an island - so a planner that snapped first and searched afterwards would either
+        // fail here or route along the wall.
+        let on_wall = plan_route(&map, &mask, [-50.0, 0.0], [-60.0, 60.0], 30);
+        if let Some(r) = &on_wall {
+            for p in r {
+                let q = map.view.pixel_of(p[0], p[1]);
+                assert!(
+                    map.height_at(p[0], p[1]).is_some_and(|h| h < 10.0),
+                    "route point {p:?} (pixel {q:?}) is on top of the wall"
+                );
+            }
+        }
+        // And a snap radius of zero must not silently invent a start position.
+        assert!(plan_route(&map, &mask, [-50.0, -5.0], [-60.0, 60.0], 0).is_none());
+    }
+
+    #[test]
+    fn world_extent_lets_vertex_density_decide_and_ignores_a_sparse_shell() {
+        // A densely tessellated small floor, plus a distant 4-vertex backdrop. A strict
+        // min/max would size the map to the backdrop and leave the floor sub-pixel.
+        let mut draws = vec![ground_quad(1000.0, -9000.0, -9000.0, 9000.0, 9000.0, true)];
+        for i in 0..60 {
+            let x = -30.0 + i as f32;
+            draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
+        }
+        let scene = Scene { color: None, draws };
+        let strict = world_extent(&scene, 1.0).unwrap();
+        assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
+        let dense = world_extent(&scene, 0.90).unwrap();
+        assert!(
+            dense[0] > -200.0 && dense[2] < 200.0,
+            "the tessellated floor should set the extent, got {dense:?}"
+        );
     }
 }
 
@@ -2661,6 +4327,40 @@ mod texture_tests {
         assert_eq!(sample_texture(&t, u_of(8, 16), u_of(4, 16))[3], 0);
         // A neighboring block (texel (0,0), block (0,0)) stays opaque.
         assert_eq!(sample_texture(&t, u_of(0, 16), u_of(0, 16))[3], 255);
+    }
+
+    /// UNCOMPRESSED textures are Morton-addressed when swizzled too, which the decoder once
+    /// applied only to the block-compressed path. The failure it caused is worth naming: a
+    /// retail title's small cyan-on-black UI panels rendered as blocky two-colour static,
+    /// which reads as deliberate "data readout" art rather than a bug, because a permutation
+    /// preserves every colour and only moves it. Nothing else on those screens showed it -
+    /// the rest were LINEAR, solid 8x8 fills, or block-compressed.
+    #[test]
+    fn u8x4_swizzled_texel_addressing() {
+        // An 8x8 U8U8U8U8 swizzled texture. Texel (2,1) sits at Morton index 9 but linear
+        // index 1*8+2 = 10, so the two readings disagree and the test can tell them apart.
+        let (w, h) = (8u32, 8u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let target = morton_index(2, 1, w, h) as usize;
+        assert_eq!(target, 9);
+        assert_ne!(target, (1 * w + 2) as usize, "row-major and Morton must differ here");
+        px[target * 4] = 0xFF; // mark that texel's first channel
+        let t = tex_typed(0x0c, 0, w, h, w * 4, px);
+        assert_eq!(sample_texture(&t, u_of(2, 8), u_of(1, 8))[0], 0xFF);
+        // The texel a row-major reader would have returned instead must stay clear, so a
+        // regression cannot pass by marking everything.
+        assert_eq!(sample_texture(&t, u_of(1, 8), u_of(1, 8))[0], 0x00);
+    }
+
+    /// The LINEAR path must stay row-major - the swizzle fix above applies only to swizzled
+    /// types, and most correctly-rendering UI textures are LINEAR.
+    #[test]
+    fn u8x4_linear_texel_addressing_is_row_major() {
+        let (w, h) = (8u32, 8u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        px[((1 * w + 2) * 4) as usize] = 0xFF;
+        let t = tex_typed(0x0c, 3, w, h, w * 4, px); // LINEAR
+        assert_eq!(sample_texture(&t, u_of(2, 8), u_of(1, 8))[0], 0xFF);
     }
 }
 

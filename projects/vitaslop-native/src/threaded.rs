@@ -1392,10 +1392,29 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
 }
 
 fn trap_detail(e: &wasmtime::Error) -> String {
-    match e.downcast_ref::<wasmtime::Trap>() {
+    let mut s = match e.downcast_ref::<wasmtime::Trap>() {
         Some(t) => format!("{t:?}: {e}"),
         None => e.to_string(),
+    };
+    // Walk the CAUSE CHAIN. Without this the report is the wrapper alone - "error while
+    // executing at wasm backtrace: ..." - which names the frames and not the reason, and
+    // the reason is the whole point. A host import that fails, or a panic caught at the
+    // boundary, carries its explanation one or more levels down.
+    let mut src = std::error::Error::source(e.as_ref() as &dyn std::error::Error);
+    let mut depth = 0;
+    while let Some(c) = src {
+        // A wasm backtrace repeated at every level would bury the causes.
+        let text = c.to_string();
+        if !s.contains(&text) {
+            s.push_str(&format!("\ncaused by: {text}"));
+        }
+        src = c.source();
+        depth += 1;
+        if depth > 8 {
+            break;
+        }
     }
+    s
 }
 
 // --- register/vfp accessors (Caller during a call, Store during setup) --------

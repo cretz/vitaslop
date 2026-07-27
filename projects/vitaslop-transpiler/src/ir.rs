@@ -555,6 +555,36 @@ impl Func {
         Func { addr, thumb: true, blocks: Vec::new(), stub: true }
     }
 
+    /// A one-statement function that performs host import `idx` and returns.
+    ///
+    /// This is what an import STUB's address is lowered to when the guest reaches it
+    /// through a function POINTER. A direct call to a stub is resolved to the import at
+    /// lift time and never lands here; a dynamic one (a vtable slot or a registered
+    /// callback holding an imported function) has only the address, and the stub's own
+    /// bytes are the loader's unresolved placeholder (`mvn r0,#0; bx lr`) - lifting those
+    /// would make the call a silent no-op returning -1. The thunk performs the real host
+    /// call instead, without lifting the placeholder.
+    pub fn new_import_thunk(addr: u32, thumb: bool, idx: u32) -> Self {
+        Func::new_thunk(addr, thumb, Stmt::Import(idx))
+    }
+
+    /// The inter-module counterpart of [`Self::new_import_thunk`]: a one-statement
+    /// function that calls the guest function a REDIRECT stub resolves to and returns.
+    /// `lr` is untouched, so the callee's own return unwinds through here to the
+    /// original caller.
+    pub fn new_redirect_thunk(addr: u32, thumb: bool, target: u32) -> Self {
+        Func::new_thunk(addr, thumb, Stmt::Call { target })
+    }
+
+    fn new_thunk(addr: u32, thumb: bool, stmt: Stmt) -> Self {
+        Func {
+            addr,
+            thumb,
+            blocks: vec![Block { addr, stmts: vec![stmt], term: Term::Return }],
+            stub: false,
+        }
+    }
+
     /// True if every intra-function branch target resolves to a block in this
     /// function. A tentatively-discovered function (a guessed code pointer) can
     /// decode into nonsense whose terminator branches to an address that is not a

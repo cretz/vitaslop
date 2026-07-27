@@ -227,6 +227,158 @@ fn scan_veneers(code: &[u8], base: u32, imports: &BTreeMap<u32, u32>) -> Vec<(u3
     out
 }
 
+/// Whether the halfword at `off` opens a Thumb function: one of the `push` encodings a
+/// non-leaf function starts with (`push {..}` / `push {.., lr}` / the wide
+/// `stmdb sp!, {..}`). Used to filter GUESSED function pointers - everything that passes
+/// is still only seeded tentatively.
+fn looks_like_thumb_entry(code: &[u8], base: u32, target: u32) -> bool {
+    let Some(off) = target.checked_sub(base).map(|d| d as usize) else { return false };
+    if target & 1 != 0 || off + 2 > code.len() {
+        return false;
+    }
+    let first = u16::from_le_bytes([code[off], code[off + 1]]);
+    (first & 0xFE00) == 0xB400 || first == 0xE92D
+}
+
+/// Scan the whole image's CODE for `movw`/`movt` pairs that materialize a Thumb function
+/// pointer, and return the targets.
+///
+/// This is the companion to [`scan_stored_code_pointers`], and it exists because a
+/// function pointer is not always in a table: a callback registered at runtime, a C++
+/// lambda captured into a heap object, a `std::function` - all of these BUILD the address
+/// in code with `movw`/`movt` and store it somewhere no static scan can see.
+/// `Program::discover_code_pointers` already picks those up, but only inside functions
+/// that were themselves discovered, so a chain of pointer-reached code stays invisible:
+/// the producer is only called through a pointer, so it is never discovered, so the
+/// pointer it produces is never seen, and the trail goes cold at the first link.
+/// Scanning the image linearly does not care how the producer is reached.
+///
+/// Both `movw`/`movt` are the Thumb-2 T3/T1 encodings:
+/// `movw`: `11110 i 100100 imm4 | 0 imm3 Rd imm8`, `movt` the same with bit 7 of the
+/// first halfword set, and the value is `imm4:i:imm3:imm8`.
+fn scan_materialized_code_pointers(code: &[u8], base: u32) -> Vec<u32> {
+    /// How far after a `movw` its `movt` may sit. A compiler emits them adjacent or with
+    /// a couple of instructions between; a wide window only adds false pairings.
+    const PAIR_WINDOW: usize = 16;
+    let rd16 = |o: usize| u16::from_le_bytes([code[o], code[o + 1]]);
+    // (Rd, imm16) of a movw/movt at `o`, if it is one.
+    let parts = |o: usize, movt: bool| -> Option<(u8, u32)> {
+        if o + 4 > code.len() {
+            return None;
+        }
+        let hw1 = rd16(o);
+        let want = if movt { 0xF2C0 } else { 0xF240 };
+        if hw1 & 0xFBF0 != want {
+            return None;
+        }
+        let hw2 = rd16(o + 2);
+        if hw2 & 0x8000 != 0 {
+            return None; // not the second halfword of a 32-bit data-processing op
+        }
+        let i = ((hw1 >> 10) & 1) as u32;
+        let imm4 = (hw1 & 0xF) as u32;
+        let imm3 = ((hw2 >> 12) & 7) as u32;
+        let imm8 = (hw2 & 0xFF) as u32;
+        Some((((hw2 >> 8) & 0xF) as u8, (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8))
+    };
+
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 4 <= code.len() {
+        if let Some((rd, lo)) = parts(o, false) {
+            let mut p = o + 4;
+            while p + 4 <= code.len() && p < o + 4 + PAIR_WINDOW * 2 {
+                if let Some((rd2, hi)) = parts(p, true) {
+                    if rd2 == rd {
+                        let value = (hi << 16) | lo;
+                        if value & 1 == 1 && looks_like_thumb_entry(code, base, value & !1) {
+                            out.push(value & !1);
+                        }
+                        break;
+                    }
+                }
+                p += 2;
+            }
+        }
+        o += 2;
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `(entry, last block address)` for every discovered function, so a sweep candidate that
+/// lands inside one already-understood function can be skipped. Approximate on purpose:
+/// the last block's own length is not counted, which keeps the test to two comparisons
+/// and can only ever admit a candidate, never wrongly reject one.
+fn discovered_spans(funcs: &BTreeMap<u32, ir::Func>) -> Vec<(u32, u32)> {
+    funcs
+        .values()
+        .filter_map(|f| Some((f.addr, f.blocks.last()?.addr)))
+        .collect()
+}
+
+/// Every address in the image that opens like a Thumb function, in ascending order.
+///
+/// The last resort for finding code nothing points at *that we can see*. A title's
+/// pointer-reached code forms chains - a handler registered by a function that is itself
+/// only registered - and the call graph, the image's pointer tables and its `movw`/`movt`
+/// materializations between them still do not always reach the far end. A linear sweep
+/// does not care how code is reached.
+///
+/// Everything here is a guess, so callers seed it TENTATIVELY (a candidate that fails to
+/// decode, or decodes into something malformed, is dropped) and skip anything already
+/// inside a discovered function - a `push` in the middle of a real function is not a
+/// second function, and emitting it as one would put a bogus entry in the dispatch table.
+fn sweep_thumb_entries(code: &[u8], base: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 2 <= code.len() {
+        let addr = base.wrapping_add(o as u32);
+        if looks_like_thumb_entry(code, base, addr) {
+            out.push(addr);
+        }
+        o += 2;
+    }
+    out
+}
+
+/// Scan the whole image for stored Thumb function POINTERS and return their targets.
+///
+/// A C++ vtable, a table of state handlers, a registered callback saved into a struct
+/// initializer - all of these put a function's address in DATA, and a dispatch through
+/// one is the single thing a call-graph walk cannot follow. `discover_code_pointers`
+/// finds the pointers a function MATERIALIZES with `movw`/`movt`; this finds the ones the
+/// linker wrote into the image.
+///
+/// The filter is deliberately narrow, because everything found here is guessed: a
+/// candidate must be a 4-byte-aligned word, odd (a Thumb pointer), in bounds, and land on
+/// a plausible function prologue - one of the `push` encodings that opens a non-leaf
+/// function. Everything that survives is seeded as TENTATIVE, so a guess that fails to
+/// decode, or decodes into something malformed, is dropped rather than emitted.
+///
+/// A leaf function whose address is only ever stored in data and which does not open with
+/// a `push` is still missed. That is the honest trade: a wider filter guesses more, and a
+/// dispatch to an address we did not discover already fails loudly rather than silently.
+fn scan_stored_code_pointers(code: &[u8], base: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut o = 0usize;
+    while o + 4 <= code.len() {
+        let w = u32::from_le_bytes([code[o], code[o + 1], code[o + 2], code[o + 3]]);
+        o += 4;
+        if w & 1 == 0 {
+            continue;
+        }
+        let target = w & !1;
+        if looks_like_thumb_entry(code, base, target) {
+            out.push(target);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Transpile `program` into a WASM module and its dispatch map.
 /// One pending discovery target: its address, whether it is `tentative` (a guessed
 /// code pointer that is dropped on a decode failure rather than erroring), and which
@@ -378,50 +530,98 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
     let mut stubbed = Vec::new();
     let mut work = seed_worklist(program);
-    while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
-        if funcs.contains_key(&addr) {
+    // A redirect's target is an ordinary guest function, and it is reachable even when no
+    // direct call to its stub exists - a vtable slot can hold the stub's address alone.
+    // Seed the targets so the thunks added below always have something to call.
+    work.extend(program.redirects.iter().map(|r| WorkItem::tentative(r.target, program.thumb)));
+    // Function pointers the call graph cannot reach: the ones the linker wrote into the
+    // image (vtables, handler tables) and the ones code materializes with `movw`/`movt`
+    // anywhere in the image, discovered or not. Both are guesses, so both are tentative.
+    if program.discover_code_pointers {
+        let guessed = scan_stored_code_pointers(program.code, program.base)
+            .into_iter()
+            .chain(scan_materialized_code_pointers(program.code, program.base));
+        work.extend(guessed.map(|a| WorkItem::tentative(a, true)));
+    }
+    // Two rounds: the call graph and everything pointed at, then - only over what is
+    // still unaccounted for - the linear prologue sweep. The sweep runs second because it
+    // is the weakest evidence there is, and running it last means it only ever proposes
+    // code that no stronger route already claimed.
+    for round in 0..2 {
+        if round == 1 {
+            if !program.discover_code_pointers {
+                break;
+            }
+            let claimed = discovered_spans(&funcs);
+            work.extend(
+                sweep_thumb_entries(program.code, program.base)
+                    .into_iter()
+                    .filter(|a| !claimed.iter().any(|&(lo, hi)| (lo..=hi).contains(a)))
+                    .map(|a| WorkItem::tentative(a, true)),
+            );
+        }
+        while let Some(WorkItem { addr, tentative, thumb }) = work.pop() {
+            if funcs.contains_key(&addr) {
+                continue;
+            }
+            // Never lift an import or redirect stub's unresolved placeholder (`mvn r0,#0;
+            // bx lr`) as a function - that would make a dispatch to it a silent no-op
+            // returning -1 (e.g. a `memset` reached through a function pointer doing
+            // nothing). Direct calls to a stub are already resolved to the import/callee,
+            // and register-indirect calls with a tracked target are too (see
+            // `lower::discover`). Stubs get real thunks after discovery instead.
+            if import_map.contains_key(&addr) || redirect_map.contains_key(&addr) {
+                continue;
+            }
+            match lower::discover(
+                program.code,
+                program.base,
+                addr,
+                thumb,
+                &imports,
+                program.noreturn_svc,
+                program.discover_code_pointers,
+                true,
+            ) {
+                // A tentative guess that decoded into a malformed function (a branch to
+                // a non-block) was never real; drop it before it can be emitted.
+                Ok(found) if tentative && !found.func.well_formed() => {}
+                Ok(found) => {
+                    let callee: fn(u32, bool) -> WorkItem =
+                        if tentative { WorkItem::tentative } else { WorkItem::hard };
+                    work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+                    work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
+                    work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
+                    funcs.insert(addr, found.func);
+                }
+                // A tentative code pointer that does not decode was never a function.
+                Err(_) if tentative => {}
+                // A hard callee we cannot lower becomes a trapping stub, so the rest of
+                // the program still builds and runs.
+                Err(_) => {
+                    stubbed.push(addr);
+                    funcs.insert(addr, ir::Func::new_stub(addr));
+                }
+            }
+        }
+    }
+
+    // Give every import and redirect stub a callable thunk. A DYNAMIC pointer to one - a
+    // vtable slot, a registered callback - reaches the stub's address with nothing for
+    // the indirect dispatcher to land on, because a direct call was resolved at lift time
+    // and the placeholder bytes were deliberately not lifted (above). Thunks are one
+    // statement each and are emitted for every stub rather than only the reachable ones,
+    // because which stubs a title takes the address of is exactly what static discovery
+    // cannot know. A redirect whose target did not survive discovery gets no thunk, so a
+    // dispatch to it stays a loud miss rather than a call into nothing.
+    for (&addr, &import) in &import_map {
+        funcs.insert(addr, ir::Func::new_import_thunk(addr, true, import));
+    }
+    for (&addr, &target) in &redirect_map {
+        if import_map.contains_key(&addr) || !funcs.contains_key(&target) {
             continue;
         }
-        // Never lift an import/redirect stub's unresolved placeholder (`mvn r0,#0;
-        // bx lr`) as a function. Direct calls to a stub are already resolved to the
-        // import/callee, and register-indirect calls with a tracked target are too
-        // (see `lower::discover`). Lifting the placeholder would make an unresolved
-        // indirect dispatch land on a silent no-op returning -1 (e.g. a `memset`
-        // reached through a function pointer doing nothing). Leaving it unlifted makes
-        // that dispatch a loud `dispatch_miss` trap instead.
-        if import_map.contains_key(&addr) || redirect_map.contains_key(&addr) {
-            continue;
-        }
-        match lower::discover(
-            program.code,
-            program.base,
-            addr,
-            thumb,
-            &imports,
-            program.noreturn_svc,
-            program.discover_code_pointers,
-            true,
-        ) {
-            // A tentative guess that decoded into a malformed function (a branch to
-            // a non-block) was never real; drop it before it can be emitted.
-            Ok(found) if tentative && !found.func.well_formed() => {}
-            Ok(found) => {
-                let callee: fn(u32, bool) -> WorkItem =
-                    if tentative { WorkItem::tentative } else { WorkItem::hard };
-                work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
-                work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
-                work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
-                funcs.insert(addr, found.func);
-            }
-            // A tentative code pointer that does not decode was never a function.
-            Err(_) if tentative => {}
-            // A hard callee we cannot lower becomes a trapping stub, so the rest of
-            // the program still builds and runs.
-            Err(_) => {
-                stubbed.push(addr);
-                funcs.insert(addr, ir::Func::new_stub(addr));
-            }
-        }
+        funcs.insert(addr, ir::Func::new_redirect_thunk(addr, true, target));
     }
 
     let ordered: Vec<ir::Func> = funcs.into_values().collect();

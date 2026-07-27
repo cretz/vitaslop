@@ -786,7 +786,11 @@ fn build_linked_module(
     // Replay the samples the PDS took before the shader started. Each leaves four components in
     // two PA registers as packed F16 halves, which is how the code reads them - the instruction
     // stream contains no SMP for these, so without this the shader would read zeros.
-    for pf in &iface.prefetches {
+    // The temporary is named by the prefetch's ORDINAL, not by its texture unit: one unit can be
+    // prefetched more than once (the same texture sampled at two different interpolants), and
+    // naming by unit emits two `let pf1` in one scope, which is a WGSL redefinition error that
+    // fails the whole module - taking a pair that recompiled correctly straight to a hard stop.
+    for (i, pf) in iface.prefetches.iter().enumerate() {
         let coord = pf
             .coords
             .iter()
@@ -796,11 +800,11 @@ fn build_linked_module(
         let n = pf.coords.len();
         let _ = writeln!(
             m,
-            "  let pf{0} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
+            "  let pf{i} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
             pf.unit
         );
-        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{}.xy);", pf.pa_base, pf.unit);
-        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{}.zw);", pf.pa_base + 1, pf.unit);
+        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.xy);", pf.pa_base);
+        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.zw);", pf.pa_base + 1);
     }
     emit_secondary_attrs(&mut m, "fs_sa", fsa_regs, fliterals);
     m.push_str(fbody);

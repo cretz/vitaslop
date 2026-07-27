@@ -13,9 +13,98 @@
 
 use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
+use crate::SvcOutcome;
 
 /// Bound on a path string read from guest memory.
 const MAX_PATH: usize = 1024;
+
+/// Modelled sequential read bandwidth, in KiB per second
+/// (`VITASLOP_IO_BANDWIDTH_KIBPS`; `0` disables the model entirely).
+///
+/// Our reads are served from a host `path -> bytes` map, so without this they complete in
+/// zero guest time - and that is not a harmless speed-up, it changes ORDER. A title that
+/// posts an asynchronous load job and then touches the thing being loaded expects the job
+/// to still be in flight; with instant reads the job finishes in the frame it was posted,
+/// its resource is released, and the consumer reads a dangling handle. That is the exact
+/// shape of the PCSE00001 race-load crash: 4 MB of car + course data that takes about a
+/// second off a real game card completed inside two frames here.
+///
+/// 10 MiB/s is a defensible PS Vita game-card figure. Deterministic: the delay is a pure
+/// function of the byte count, so a run is as reproducible as it was with instant reads.
+///
+/// A first attempt at this parked the reader on the GAME clock (`sleep_park`) and
+/// livelocked: `virtual_us` advances a frame per display FLIP and otherwise only on the
+/// scheduler's nothing-is-runnable idle path, so a title waiting for its load produced no
+/// flips, a sibling polling with a zero-length delay kept the idle path finding a deadline
+/// that bought no time, and the clock stood still at ANY bandwidth including 1 GiB/s. The
+/// park is now charged against a separate storage clock (`VitaState::io_park`) that
+/// advances on flips, on scheduler quanta and on the idle path, so it cannot depend on the
+/// thing it is blocking.
+const DEFAULT_BANDWIDTH_KIBPS: u64 = 10 * 1024;
+
+/// Fixed per-request cost in microseconds (`VITASLOP_IO_REQUEST_US`): the command
+/// round-trip a read pays whatever its size, so a stream of small reads is not free either.
+const DEFAULT_REQUEST_US: u64 = 200;
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+}
+
+/// The modelled time a read of `bytes` bytes takes, in microseconds, or `None` when the
+/// model is switched off (bandwidth 0) or the transfer is empty.
+fn read_latency_us(bytes: usize) -> Option<u64> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<(u64, u64)> = OnceLock::new();
+    let &(kibps, request_us) = CFG.get_or_init(|| {
+        (
+            env_u64("VITASLOP_IO_BANDWIDTH_KIBPS", DEFAULT_BANDWIDTH_KIBPS),
+            env_u64("VITASLOP_IO_REQUEST_US", DEFAULT_REQUEST_US),
+        )
+    });
+    if kibps == 0 || bytes == 0 {
+        return None;
+    }
+    // bytes / (kibps * 1024) seconds, in microseconds, rounded up so a sub-microsecond
+    // read still costs something.
+    let transfer_us = (bytes as u64 * 1_000_000).div_ceil(kibps * 1024);
+    Some(request_us + transfer_us)
+}
+
+/// Smallest debt worth a context switch, in microseconds
+/// (`VITASLOP_IO_PARK_THRESHOLD_US`). See [`charge_read`].
+const DEFAULT_PARK_THRESHOLD_US: u64 = 2_000;
+
+/// Charge the modelled cost of having transferred `bytes` to the calling thread, parking it
+/// once the accrued debt is worth a context switch.
+///
+/// Parking on EVERY read is what a first attempt did, and it was unusable: a title's boot
+/// issues an enormous number of small reads (a text parser reading a few bytes at a time),
+/// and each park costs a full block/idle/clock-advance/resume round trip through the
+/// scheduler. Booting stopped making progress at ANY bandwidth, including 1 GiB/s - which is
+/// the measurement that shows the cost is the park COUNT, not the delay size.
+///
+/// Accumulating instead keeps the aggregate rate exactly as modelled (no time is discarded -
+/// the debt is only deferred, then paid in full) while making the number of parks
+/// proportional to bytes moved rather than to reads issued.
+fn charge_read(st: &mut VitaState, bytes: usize) -> SvcOutcome {
+    let Some(us) = read_latency_us(bytes) else { return SvcOutcome::Continue };
+    if !st.is_preemptive() {
+        // Cooperative hosts cannot park a thread at all; keep instant reads there.
+        return SvcOutcome::Continue;
+    }
+    let debt = st.add_io_debt_us(us);
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    let threshold =
+        *THRESHOLD.get_or_init(|| env_u64("VITASLOP_IO_PARK_THRESHOLD_US", DEFAULT_PARK_THRESHOLD_US));
+    if debt < threshold {
+        return SvcOutcome::Continue;
+    }
+    st.take_io_debt_us();
+    tracing::debug!(target: "vitaslop::io", thid = st.current_thread(), debt_us = debt, "storage park");
+    st.io_park(debt);
+    SvcOutcome::Block
+}
 
 /// Offset of `st_size` (SceOff, 64-bit) within SceIoStat: after `st_mode` (u32)
 /// and `st_attr` (u32).
@@ -53,15 +142,23 @@ pub(super) fn io_open(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, flags: 
 
 /// int sceIoRead(SceUID fd, void *buf, SceSize size)
 /// Returns the number of bytes read, or a negative errno on a bad descriptor.
-#[hostcall]
-pub(super) fn io_read(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, buf: Ptr, size: u32) -> i32 {
-    match st.io_read(fd, size as usize) {
+///
+/// Marshalled by hand rather than through `#[hostcall]` because a read PARKS the calling
+/// thread for the transfer's modelled duration (see [`read_latency_us`]), so it has to be
+/// able to return [`SvcOutcome::Block`].
+pub(super) fn io_read(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let fd = ctx.arg(0) as i32;
+    let buf = ctx.arg(1);
+    let size = ctx.arg(2);
+    let (ret, got) = match st.io_read(fd, size as usize) {
         Some(data) => {
-            ctx.write_bytes(buf.addr(), &data);
-            data.len() as i32
+            ctx.write_bytes(buf, &data);
+            (data.len() as i32, data.len())
         }
-        None => EBADF,
-    }
+        None => (EBADF, 0),
+    };
+    ctx.ret(ret as u32);
+    charge_read(st, got)
 }
 
 /// int sceIoWrite(SceUID fd, const void *buf, SceSize size)
@@ -103,20 +200,21 @@ pub(super) fn io_lseek(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// 64-bit offset spills to the even-aligned first stack slot (`arg(4):arg(5)`), like
 /// `sceIoLseek`. This is the path an AT9 music streamer uses to read the
 /// file header and successive chunks from a shared descriptor.
-pub(super) fn io_pread(ctx: &mut GuestCtx, st: &mut VitaState) {
+pub(super) fn io_pread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let fd = ctx.arg(0) as i32;
     let buf = ctx.arg(1);
     let size = ctx.arg(2);
     let offset = ctx.arg(4) as u64 | (ctx.arg(5) as u64) << 32;
-    let ret = match st.io_pread(fd, offset, size as usize) {
+    let (ret, got) = match st.io_pread(fd, offset, size as usize) {
         Some(data) => {
             ctx.write_bytes(buf, &data);
-            data.len() as i32
+            (data.len() as i32, data.len())
         }
-        None => EBADF,
+        None => (EBADF, 0),
     };
     tracing::trace!(target: "vitaslop::io", fd, offset, size, ret, "pread");
     ctx.ret(ret as u32);
+    charge_read(st, got)
 }
 
 /// int sceIoPwrite(SceUID fd, const void *data, SceSize size, SceOff offset)

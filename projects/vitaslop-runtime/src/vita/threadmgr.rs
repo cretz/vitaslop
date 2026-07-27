@@ -22,6 +22,19 @@ pub(super) fn get_thread_current_priority(st: &mut VitaState) -> i32 {
     st.current_priority()
 }
 
+/// int sceKernelDeleteThread(SceUID thid)
+/// Delete a DORMANT thread: drop its record so its SceUID stops resolving, and give its
+/// stack back for reuse. A running thread cannot be deleted (`NOT_DORMANT`) - accepting
+/// that would invalidate the id of a thread the scheduler is about to resume, which is a
+/// corruption rather than an error. See [`VitaState::delete_thread`].
+#[hostcall]
+pub(super) fn delete_thread(st: &mut VitaState, thid: i32) -> i32 {
+    match st.delete_thread(thid) {
+        Ok(()) => 0,
+        Err(e) => e as i32,
+    }
+}
+
 /// int sceKernelChangeThreadVfpException(int clearMask, int setMask)
 ///
 /// Selects which VFP/NEON floating-point exceptions (invalid, div-by-zero, overflow,

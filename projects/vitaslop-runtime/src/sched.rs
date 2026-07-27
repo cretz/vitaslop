@@ -286,6 +286,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             // [`Slot::cooled`]).
             Stop::Quantum => {
                 self.threads[idx].cooled = true;
+                // Guest work happened without a frame ending. Clocks that track executed
+                // work rather than rendered frames advance here (the modelled storage
+                // clock), so a title that spins in guest code waiting for a load still
+                // sees the load complete.
+                self.host.lock().unwrap().on_quantum();
                 None
             }
         }
@@ -334,6 +339,20 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             return IdleStep::Done(RunReport::Finished(self.main_exit_code()));
         }
         let deadline = self.host.lock().unwrap().earliest_deadline();
+        // An outstanding storage transfer comes FIRST, before any timed wait. Nothing is
+        // runnable, so the modelled device is the only thing left with work to do, and
+        // completing it is the next thing that happens - no game time passes while it
+        // does. Jumping the clock to a pending timeout instead is wrong twice over: it
+        // makes a thread waiting on a zero-length delay spin forever without the clock
+        // moving (the livelock that kept the I/O model switched off), and, worse, when the
+        // nearest timeout is far away it LEAPS the game clock over a load. A title that
+        // paces its simulation off the wall clock but caps how far it will step per frame
+        // then runs its clock fast and its world slow - which showed up as a car crawling
+        // at 16 mph while its race timer counted five times too quickly.
+        if self.host.lock().unwrap().release_earliest_io() {
+            self.drain();
+            return IdleStep::Continue;
+        }
         match deadline {
             Some(t) => {
                 self.host.lock().unwrap().advance_time_to(t);

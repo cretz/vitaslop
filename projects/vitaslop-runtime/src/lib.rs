@@ -24,10 +24,13 @@ pub mod ingest;
 pub mod link;
 pub mod nid;
 pub mod knobs;
+pub mod mp4;
+pub mod mspace;
 pub mod perf;
 pub mod recipe;
 pub mod sched;
 pub mod render;
+pub mod trophy;
 pub mod vita;
 pub mod world;
 

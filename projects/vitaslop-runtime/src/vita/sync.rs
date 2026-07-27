@@ -258,7 +258,8 @@ pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
 
 // --- delete (shared: no teardown needed for these lightweight handles) ---
 
-/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id) - all succeed.
+/// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelCloseMutex - all
+/// succeed. See `nid::sync::CLOSE_MUTEX` for why close and delete share this.
 #[hostcall]
 pub(super) fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
     0

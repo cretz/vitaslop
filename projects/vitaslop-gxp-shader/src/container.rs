@@ -180,8 +180,11 @@ pub enum VaryingUsage {
     Fog,
     /// TEXCOORD0..[`MAX_TEXCOORD`].
     TexCoord(u8),
-    /// A usage the decode did not recognise (carries the raw `attribute_info` high nibble).
-    Unknown(u16),
+    /// A usage the decode did not recognise. Carries the WHOLE raw `attribute_info` word,
+    /// not just the semantic nibble: the nibble alone cannot say whether the input is one
+    /// the rasteriser generates (bit 0x40000000) or a vertex output under a semantic we do
+    /// not map, and those want opposite treatment - synthesise it, or refuse to link.
+    Unknown(u32),
 }
 
 /// A texture sample the PDS performs BEFORE the fragment program runs, leaving its result in
@@ -622,8 +625,21 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         else {
             return Vec::new(); // ran off the blob -> layout mismatch for this blob; bind nothing
         };
-        let register_count = ((size >> 4) & 0x3) as u8 + 1;
         let usage = varying_usage_from_attribute_info(attribute_info);
+        // A descriptor whose semantic nibble is 0xF interpolates NOTHING: it exists only to
+        // carry a PDS-prefetched sample. Its size field's register-count bits are 0 and its
+        // precision bits are clear, because there is no iterated data for them to describe.
+        //
+        // Measured, on the closure the whole PA layout rests on (the descriptor spans must
+        // sum to the program's own `primary_reg_count`): reading these as one data register
+        // plus the prefetch pair closes on 11 of PCSE00001's 18 race fragment programs;
+        // reading them as prefetch-only closes on 15, and the three that still fall short
+        // are short because the program allocates PA registers no descriptor covers, which
+        // is allowed. The 40-blob corpus is unaffected either way - it contains no 0xF
+        // descriptor at all, which is why this went unnoticed until a title composited its
+        // world through one.
+        let prefetch_only = matches!(usage, VaryingUsage::Unknown(info) if (info >> 12) & 0xf == 0xf);
+        let register_count = if prefetch_only { 0 } else { ((size >> 4) & 0x3) as u8 + 1 };
         // Precision field (`attribute_info & 0x30100000`): observed as 0x20000000 on every F16
         // interpolant across the captured blobs and 0 on the F32 ones. Cross-checked by span:
         // an F16 varying packs two components per PA register, so a 4-register interpolant is
@@ -637,7 +653,11 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         let flags = [
             size & SIZE_PREFETCH != 0,
             attribute_info & INFO_PREFETCH != 0,
-            component_info == COMPONENT_INFO_PREFETCH,
+            // A BIT test, not equality: PCSE00001 has a descriptor carrying 0x30 here, and
+            // rejecting it threw away that whole program's interpolant list (the parse is
+            // all-or-nothing) over a bit that is not the prefetch flag. Across the corpus
+            // this field is only ever 0x00 or 0x20, so the flag itself is unambiguous.
+            component_info & COMPONENT_INFO_PREFETCH != 0,
         ];
         let prefetch = match flags {
             [false, false, false] => {
@@ -683,6 +703,10 @@ const VERTEX_POSITION_LANES: u32 = 4;
 /// See [`parse_vertex_output_varyings`].
 const FOG_RESERVED_LANES: u32 = 2;
 
+/// The reserved-slot width, in output lanes, for which COLOR0's position is established: a
+/// full vec4 filling the region. See [`parse_vertex_output_varyings`].
+const COLOR0_RESERVED_LANES: u32 = 4;
+
 /// Decode a VERTEX program's interpolated outputs from its varyings block.
 ///
 /// The block (header +0x2C, self-relative) carries two words the vertex side needs:
@@ -705,8 +729,29 @@ const FOG_RESERVED_LANES: u32 = 2;
 /// vertex program with that region ends in a byte-identical F16->F32 pack whose destination is
 /// output lane 4, computing `clamp(-depth * fogScale, 0, fogMax)` from the lane its own
 /// projection wrote - and the fragments that consume it declare Fog as exactly one F32
-/// component. Wider reserved regions are left undeclared (a fragment reading Fog against one of
-/// those falls back) because no captured program pins what else shares them.
+/// component.
+///
+/// COLOR0 fills a [`COLOR0_RESERVED_LANES`]-wide reserved region as a vec4 from the first
+/// reserved lane, established the same way FOG's placement is - by reading what the programs
+/// with that region actually write. One moves `Output[4] <- PrimaryAttr[4]`, whose parameter
+/// table names PA register 4 as a 4-component ATTRIBUTE with the COLOR semantic; another moves
+/// `Output[4] <- SecondaryAttr[0]`, a 4-component `color` UNIFORM. Both are paired with a
+/// fragment declaring Color0, and region width, source component count and consumer
+/// declaration all agree at 4.
+///
+/// HISTORY, because declaring this was once tried and reverted: on its own it made every draw
+/// of a title recompile and the screen render BLACK, where the fixed-function approximation had
+/// been legible. The missing piece was not the placement - it was that each of those `mov`s
+/// carries a REPEAT COUNT, so a single instruction under a two-channel mask writes two or three
+/// lane PAIRS, and the recompiler was executing it once. Lanes 6..7 (COLOR0's z/w) and, in the
+/// textured program, lanes 8..9 (the only write of the texture coordinate anywhere in it) were
+/// simply never written, so every glyph sampled the atlas at (0,0) and multiplied by a colour
+/// with zero alpha. See [`crate::usse::unroll_repeats`]; with repetition modelled, the written
+/// lanes reproduce the container's own total exactly and this declaration is safe.
+///
+/// The same rule still covers every other width: a fragment reading a varying we did not place
+/// falls back rather than sample an uninterpolated register. The corpus also has one 8-lane
+/// region, and nothing in it pins what shares those eight lanes.
 fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
     let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else { return Vec::new() };
     if rel == 0 {
@@ -723,10 +768,10 @@ fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
             (v != 0).then(|| (k as u8, (v & 1) * 2 + ((v >> 1) & 1) + ((v >> 2) & 1)))
         })
         .collect();
-    if widths.is_empty() {
-        return Vec::new();
-    }
-
+    // No texcoords is a real layout, not a decode failure: a program can forward only COLOR0
+    // (one of the two that draw a retail title's whole front-end does exactly that, declaring
+    // 8 total lanes = clip position + a 4-lane reserved region). The lane accounting below is
+    // what validates the result, so it does not need a texcoord to be trustworthy.
     let total_lanes = vo1 >> 24;
     let texcoord_lanes: u32 = widths.iter().map(|&(_, n)| n).sum();
     let Some(base_lane) = total_lanes.checked_sub(texcoord_lanes) else { return Vec::new() };
@@ -738,6 +783,13 @@ fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
             usage: VaryingUsage::Fog,
             base_lane: VERTEX_POSITION_LANES,
             components: 1,
+        });
+    }
+    if reserved == COLOR0_RESERVED_LANES {
+        out.push(OutputVarying {
+            usage: VaryingUsage::Color0,
+            base_lane: VERTEX_POSITION_LANES,
+            components: COLOR0_RESERVED_LANES,
         });
     }
     let mut lane = base_lane;
@@ -754,7 +806,7 @@ fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
 /// fragment-generated sprite/point coordinate (no vertex output feeds it) -> `Unknown`.
 fn varying_usage_from_attribute_info(info: u32) -> VaryingUsage {
     if info & 0x4000_0000 != 0 {
-        return VaryingUsage::Unknown((info & 0xf000) as u16);
+        return VaryingUsage::Unknown(info);
     }
     match info & 0xf000 {
         v @ 0x0000..=0x9000 => VaryingUsage::TexCoord((v >> 12) as u8),
@@ -762,7 +814,7 @@ fn varying_usage_from_attribute_info(info: u32) -> VaryingUsage {
         0xb000 => VaryingUsage::Color1,
         0xc000 => VaryingUsage::Fog,
         0xd000 => VaryingUsage::Position,
-        other => VaryingUsage::Unknown(other as u16),
+        _ => VaryingUsage::Unknown(info),
     }
 }
 
@@ -1074,7 +1126,7 @@ mod tests {
         assert_eq!(varying_usage_from_attribute_info(0x0000_c000), VaryingUsage::Fog);
         assert_eq!(varying_usage_from_attribute_info(0x0000_d000), VaryingUsage::Position);
         // A sprite/point coordinate (bit 0x40000000) is fragment-generated, not a vertex output.
-        assert_eq!(varying_usage_from_attribute_info(0x4000_1000), VaryingUsage::Unknown(0x1000));
+        assert_eq!(varying_usage_from_attribute_info(0x4000_1000), VaryingUsage::Unknown(0x4000_1000));
     }
 
     /// Build a minimal but structurally valid FRAGMENT blob whose varyings block carries a

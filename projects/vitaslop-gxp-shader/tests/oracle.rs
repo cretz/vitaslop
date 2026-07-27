@@ -1144,3 +1144,140 @@ fn half_to_f32(h: u16) -> f32 {
     };
     f32::from_bits(bits)
 }
+
+/// The REPEAT-COUNT closure test: after unrolling, a vertex program's written OUTPUT lanes must
+/// be exactly the set its own container declares, `0..(vertex_outputs1 >> 24)`.
+///
+/// This is the independent check on the repeat stride (`crate::usse::unroll_repeats`). The two
+/// statements come from opposite ends of the container - one from the varyings-block header,
+/// the other from executing the instruction stream - and nothing makes them agree except a
+/// correct model of how a repeated instruction advances its destination. Before repetition was
+/// modelled, programs whose colour varying is written by one repeating `mov` fell short by two
+/// or four lanes, and the missing lanes were COLOR0's z/w and, in a textured program, the whole
+/// texture coordinate.
+///
+/// Programs whose stream still contains a blocked instruction are skipped, not failed: an
+/// instruction the decoder refuses to translate may be the one that writes the missing lane, so
+/// requiring closure there would assert on a stream we have not claimed to decode.
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn vertex_written_lanes_close_against_declared_total() {
+    let Some(dir) = dump_dir() else {
+        eprintln!("VITASLOP_GXP_DUMPS unset - skipping repeat closure test");
+        return;
+    };
+    let (mut checked, mut skipped) = (0u32, 0u32);
+    let mut failures: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut single_lane_short: Vec<String> = Vec::new();
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        if program.kind != ProgramKind::Vertex {
+            continue;
+        }
+        let var_rel = u32(&bytes, 0x2c);
+        if var_rel == 0 {
+            continue;
+        }
+        let total = u32(&bytes, 0x2c + var_rel as usize + 0x10) >> 24;
+        if total == 0 {
+            continue;
+        }
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        if shader.instrs.iter().any(|i| i.blocked.is_some()) {
+            skipped += 1;
+            for i in shader.instrs.iter().filter(|i| i.blocked.is_some()) {
+                reasons.push(format!("{} (group {:#04x})", i.blocked.unwrap(), i.group));
+            }
+            continue;
+        }
+        let mut written = vec![false; 256];
+        for instr in &shader.instrs {
+            let Some(d) = instr.dest.as_ref() else { continue };
+            if d.bank != Bank::Output {
+                continue;
+            }
+            for c in 0..4 {
+                if instr.write_mask[c] {
+                    let lane = d.index as usize + c;
+                    if lane < written.len() {
+                        written[lane] = true;
+                    }
+                }
+            }
+        }
+        // The lanes the recompiler actually ROUTES: clip position, plus every varying the
+        // container declares. This is the set correctness depends on, and it is the right
+        // comparison rather than a dense `0..total` - a reserved region can legitimately hold
+        // a lane no varying claims and the program therefore never writes (every fog-carrying
+        // program in the corpus declares a 2-lane region whose second lane is exactly that).
+        let mut routed = vec![false; written.len()];
+        for l in 0..4usize {
+            routed[l] = true;
+        }
+        for v in &program.output_varyings {
+            for c in 0..v.components as usize {
+                let lane = v.base_lane as usize + c;
+                if lane < routed.len() {
+                    routed[lane] = true;
+                }
+            }
+        }
+        let got: Vec<usize> = (0..written.len()).filter(|&l| written[l]).collect();
+        let expect: Vec<usize> = (0..routed.len()).filter(|&l| routed[l]).collect();
+        checked += 1;
+        // Two distinct failures, and the direction matters when reading a regression: a
+        // SHORTFALL means an iteration was dropped (the pre-repeat bug, which silently left a
+        // varying uninterpolated), an OVERRUN means the stride is too large and the program is
+        // writing over a lane that belongs to something else.
+        let over: Vec<usize> = got.iter().copied().filter(|l| !routed[*l]).collect();
+        let under: Vec<usize> = expect.iter().copied().filter(|l| !written[*l]).collect();
+        // An OVERRUN is unambiguously a wrong stride: the program wrote a lane no declared
+        // varying claims. A SHORTFALL of a single lane is not - a program may simply not fill a
+        // component its consumer never reads, and the container declares the interface width
+        // rather than promising every lane is written. What separates the two readings is the
+        // SIZE of the shortfall: a wrong repeat stride drops whole iterations, so it comes up
+        // short by two or four lanes at a time (before repetition was modelled the two
+        // front-end programs were short by exactly 2 and 4). One lane cannot be a dropped
+        // iteration, so it is bounded here rather than ignored.
+        if !over.is_empty() || under.len() > 1 {
+            failures.push(format!(
+                "  {name}: declares {total} total lanes; routed {expect:?}; wrote {got:?}\
+                 \n      unwritten routed lanes {under:?}, writes outside the routed set {over:?}"
+            ));
+        } else if !under.is_empty() {
+            single_lane_short.push(format!("{name} lane {}", under[0]));
+        }
+    }
+    println!("\n=== repeat closure: {checked} vertex programs checked, {skipped} skipped (blocked) ===");
+    // What is actually blocking the skipped programs, so a skip count can never quietly stand
+    // in for a decode gap nobody has looked at.
+    reasons.sort();
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    for r in reasons {
+        match tally.last_mut() {
+            Some((k, n)) if *k == r => *n += 1,
+            _ => tally.push((r, 1)),
+        }
+    }
+    tally.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (r, n) in &tally {
+        println!("  {n:5}  {r}");
+    }
+    if !single_lane_short.is_empty() {
+        println!(
+            "  {} program(s) leave exactly one routed lane unwritten (an unread component, not a\n\
+             \x20 dropped iteration - see the test's doc comment): {}",
+            single_lane_short.len(),
+            single_lane_short.join(", ")
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} vertex programs do not write exactly their declared output lanes:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

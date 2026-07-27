@@ -143,6 +143,43 @@ pub fn analyze(bytes: &[u8]) -> Result<Coverage, container::ParseError> {
     })
 }
 
+/// One control-flow branch in a decoded program: its instruction index, its signed
+/// instruction-word delta, and the target index that delta resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchSite {
+    pub index: usize,
+    pub rel: i32,
+    pub target: i64,
+}
+
+/// Every [`Op::Branch`] in a blob, with the program's instruction count.
+///
+/// This exists to make the ONE unsettled fact about USSE control flow measurable on real
+/// shaders rather than argued from the spec: whether a branch target is `index + rel` (what
+/// [`usse::decode_shader`] produces, per the distilled ISA reference's "relative to the branch
+/// instruction's own program offset") or `index + 1 + rel`. The two differ by exactly one
+/// instruction, so the wrong one leaves the last instruction of every conditional block
+/// running unconditionally - a wrong picture with no error, which is the failure mode this
+/// recompiler exists to avoid. A branch whose target lands exactly on `total` (one past the
+/// end) settles it: under the other reading that same branch would run off the end.
+///
+/// The captured corpus contains no branches at all, so the only source of this evidence is a
+/// live title - hence a reporting hook rather than a test fixture.
+pub fn branch_sites(bytes: &[u8]) -> Result<(usize, Vec<BranchSite>), container::ParseError> {
+    let program = Program::parse(bytes)?;
+    let shader = usse::decode_shader(&program);
+    let sites = shader
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, i)| match i.op {
+            Op::Branch { rel } => Some(BranchSite { index, rel, target: index as i64 + rel as i64 }),
+            _ => None,
+        })
+        .collect();
+    Ok((shader.instrs.len(), sites))
+}
+
 /// Recompile a fragment shader blob to WGSL, or return why it could not be (which sends
 /// the caller to its fixed-function fallback).
 pub fn recompile_fragment(bytes: &[u8]) -> Result<RecompiledFragment, RecompileError> {
