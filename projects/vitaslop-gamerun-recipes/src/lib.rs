@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 /// One registry entry: a title id and its friendly name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameEntry {
-    /// The title id, e.g. `"PCSE00341"` - also the recipes subdir name.
+    /// The title id, e.g. `"ABCD00001"` - also the recipes subdir name.
     pub id: String,
-    /// A human name, e.g. `"OlliOlli"`.
+    /// A human name, e.g. `"Example"`.
     pub name: String,
     /// Region tag, if given (e.g. `"PAL"`).
     pub region: Option<String>,
@@ -120,18 +120,18 @@ mod tests {
         let text = "\
 # a comment
 [[game]]
-id = \"PCSE00341\"
-name = \"OlliOlli\"
+id = \"ABCD00001\"
+name = \"Example\"
 region = \"PAL\"
 
 [[game]]
-id = \"ABCD00001\"
-name = \"Example\"
+id = \"ABCD00002\"
+name = \"Second\"
 ";
         let games = parse_registry(text);
         assert_eq!(games.len(), 2);
-        assert_eq!(games[0], GameEntry { id: "PCSE00341".into(), name: "OlliOlli".into(), region: Some("PAL".into()) });
-        assert_eq!(games[1].id, "ABCD00001");
+        assert_eq!(games[0], GameEntry { id: "ABCD00001".into(), name: "Example".into(), region: Some("PAL".into()) });
+        assert_eq!(games[1].id, "ABCD00002");
         assert_eq!(games[1].region, None);
     }
 

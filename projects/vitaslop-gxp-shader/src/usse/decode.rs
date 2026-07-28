@@ -1132,12 +1132,29 @@ fn decode_grp_18_mad(word: u64, hi: u32, lo: u32) -> Instr {
     let dest = Some(Operand::plain(dbank, didx, op0_sel));
 
     // op1: R6/RS2 register, swizzle from the shared table (idx = swz_alt_op1<<2 | op1_swz).
+    //
+    // With `alt_opt1` set the operand is on the bank-EXTENSION row - the SAME row the shared
+    // operand decode resolves through [`ext_source`], so this is the established reading and
+    // not a new guess: SPECIAL yields a hardware constant (FPCONSTANT) or a GLOBAL register,
+    // and the two INDEXED rows plus IMMEDIATE stay unmodeled and block by name.
+    //
+    // It must NOT go through [`r6_source_bank_index`]: an extension-row operand is never
+    // double-register scaled, so that path would report constant 1 as register 2 - a wrong
+    // operand that decodes cleanly and reads like an ordinary register.
     let op1_sel = field(lo, low, "opt1") as u8;
-    if field(hi, high, "alt_opt1") != 0 {
-        blocked = blocked.or(Some("op1 in index/exotic mode"));
-    }
-    let (b1, i1) = r6_source_bank_index(op1_sel, field(lo, low, "op1"));
-    let mut s1 = Operand::plain(b1, i1, op1_sel);
+    let op1_field = field(lo, low, "op1");
+    let mut s1 = if field(hi, high, "alt_opt1") != 0 {
+        match ext_source(op1_sel, op1_field) {
+            Ok(o) => o,
+            Err(why) => {
+                blocked = blocked.or(Some(why));
+                Operand::plain(Bank::Temp, 0, op1_sel)
+            }
+        }
+    } else {
+        let (b1, i1) = r6_source_bank_index(op1_sel, op1_field);
+        Operand::plain(b1, i1, op1_sel)
+    };
     s1.swizzle = MAD18_SWZ[(((field(lo, low, "swz_alt_op1") & 7) << 2) | (field(lo, low, "op1_swz") & 3)) as usize];
     s1.abs = field(hi, high, "abs_op1") != 0;
     s1.neg = field(hi, high, "neg_op1") != 0;
@@ -1739,36 +1756,28 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// load) not yet plumbed. Each is wired as it becomes needed by a real shader.
 /// Whether `word` provably executes EXACTLY ONCE, i.e. carries no repeat.
 ///
-/// This is what decides whether an SMLSI ahead of it can be ignored: SMLSI only sets the
+/// This is what decides whether an SMLSI ahead of it can reach anything: SMLSI only sets the
 /// per-operand increment/swizzle state that a REPEATED instruction steps its registers by
 /// (spec F8.8 - "metadata for repeated instructions; emits nothing directly"). An instruction
-/// that runs once never consults it, so a program in which nothing repeats is one where SMLSI
-/// has no observable effect at all. See [`repeats_nowhere`].
+/// that runs once never consults it. See [`slots_repeats_consult`].
 ///
 /// `None` means "cannot be established for this group" and must be treated as "might repeat".
-/// The two ways a group qualifies:
+/// This is [`repeat_extra_iterations`] asked as a yes/no - deliberately the SAME answer, since
+/// both questions turn on the single fact of where (or whether) a group encodes a repeat count,
+/// and two readings of that could only disagree by one of them being wrong.
 ///
-///  * its `repeat_count` field position is established (spec: 4-bit at 47:44 for 0x30/0x40/
-///    0x50, 2-bit at 45:44 for 0x38/0x48), so it is simply read; or
-///  * its field table accounts for every bit and names no repeat count at all (0x08/0x10,
-///    whose 47:44 is `src2_swiz`; 0xE0 SMP; 0xF8 flow) - those forms cannot encode one.
-///
-/// The 0x00/0x18 vector-MAD groups are the awkward case: the operand grammar names all 32
-/// high bits but several are `unk*`, so a repeat count could hide among them. They qualify
-/// only when every one of those unknown bits is ZERO - whatever an unknown field means, at
-/// zero it is at its default, and the default repeat count is "execute once".
+/// It once answered the 0x00/0x18 vector-MAD groups more strictly, demanding every `unk*` bit
+/// of the operand grammar be zero on the reasoning that a repeat count might hide among them.
+/// The corpus refutes that: those groups' `unk` bits are set all over the captured programs
+/// (bit 55 - the position the ISA gives `sync` in every group that documents it - is set on
+/// essentially every MAD), while the whole corpus's vertex programs write EXACTLY their
+/// declared output interface under the reading that a MAD executes once. Had those bits been a
+/// repeat count, a matrix-transform MAD would re-execute five or nine times and stomp lanes far
+/// outside the declared interface, which is precisely what
+/// `vertex_written_lanes_close_against_declared_total` would report. The strictness was
+/// therefore not buying safety - it was only refusing SMLSIs whose repeats are elsewhere.
 fn executes_once(word: u64) -> Option<bool> {
-    match opcode1(word) {
-        // Vector MAD/DP: for the SMLSI question specifically, qualifies only with every
-        // unknown bit at its default. This is deliberately STRICTER than
-        // [`repeat_extra_iterations`], and the two answer different questions. Unrolling asks
-        // "how many times does THIS instruction run", which its own grammar settles. Retiring
-        // an SMLSI asks "can any instruction ANYWHERE in this program consult the state it
-        // sets", where being wrong silently mis-addresses an unrelated instruction's operands -
-        // so there, an undocumented bit at a non-default value is reason enough to decline.
-        0x00 | 0x03 => Some(grp_mad_unknown_bits_are_zero(word)),
-        _ => repeat_extra_iterations(word).map(|extra| extra == 0),
-    }
+    repeat_extra_iterations(word).map(|extra| extra == 0)
 }
 
 /// How many EXTRA times `word` re-executes after its first execution (0 = runs once), or
@@ -1778,7 +1787,7 @@ fn executes_once(word: u64) -> Option<bool> {
 ///
 /// The field map is the one [`executes_once`] documents, kept here as the single place the
 /// per-group repeat encoding is written down so the two can never disagree.
-pub(crate) fn repeat_extra_iterations(word: u64) -> Option<u32> {
+pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
     match opcode1(word) {
         // Established repeat_count fields.
         0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44) as u32), // 0x30, 0x40, 0x50 family
@@ -1799,31 +1808,103 @@ pub(crate) fn repeat_extra_iterations(word: u64) -> Option<u32> {
     }
 }
 
-/// True when every `unk*` bit of a 0x00/0x18 word is zero (see [`executes_once`]). The names
-/// come from the operand grammar's own field table, so this asks exactly "is every bit whose
-/// purpose is undocumented at its default?".
-fn grp_mad_unknown_bits_are_zero(word: u64) -> bool {
-    let (hi, _) = halves(word);
-    let table = if opcode1(word) == 0x00 {
-        // 0x00 VMAD2 is decoded through the shared MAD path; use the same table the decoder
-        // reads so this can never disagree with what was actually decoded.
-        G18_MAD_HIGH
-    } else if field(hi, G18_DOT_HIGH, "opcode2") == 0 {
-        G18_DOT_HIGH
-    } else {
-        G18_MAD_HIGH
-    };
-    table
-        .iter()
-        .filter(|(name, _)| name.starts_with("unk"))
-        .all(|(name, _)| field(hi, table, name) == 0)
+/// True when `word` is a group-0xF8 SMLSI (the discriminant [`decode_grp_flow`] matches on).
+pub(crate) fn is_smlsi(word: u64) -> bool {
+    opcode1(word) == 0x1f && bits(word, 58, 56) == 0b010 && bits(word, 53, 52) == 0b01
 }
 
-/// True when NO instruction in `code` can repeat, so any SMLSI among them is inert. A single
-/// instruction whose repeat state cannot be established makes the whole answer `false` - the
-/// point is to be sure, not to be optimistic.
-pub(crate) fn repeats_nowhere(code: &[u64]) -> bool {
-    code.iter().all(|&w| executes_once(w) == Some(true))
+/// What one SMLSI leaves for a single hardware operand slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmlsiSlot {
+    /// The operand advances by `n` of its OWN widths per repeat iteration - the unit is the
+    /// operand width, not the register word, which is what the corpus measurement below shows.
+    Increment(u8),
+    /// The operand does not advance by a register count; the byte selects the channels each
+    /// iteration reads instead. Not modeled.
+    Swizzle(u8),
+}
+
+/// Decode an SMLSI word into the per-operand repeat state it sets, indexed by hardware operand
+/// slot: `[dest, src0, src1, src2]` - the operand order every group's own field table uses.
+///
+/// The layout is four 8-bit values in bits[31:0] (slot `k` at bits `8k+7 : 8k`) and four mode
+/// bits at bits[35:32] (slot `k` at bit `32+k`), which is the spec's "four inc-mode bits, four
+/// 8-bit increments in the low 32 bits" read as the 36-bit field [35:0] it must be - the
+/// sentence describes 36 bits and the increments alone are 32 of them.
+///
+/// MEASURED against the corpus, on both ends of the only idiom that uses it. Across two
+/// unrelated titles, eight vertex programs open with `SMLSI; VMOV(repeat N)` copying vertex
+/// attributes straight to the output bank, and in every one of them the DEFAULT stepping (one
+/// operand width per iteration) is what closes:
+///
+///  * on the destination side, one program's three iterations of `Output[8] <- PA[4]` land its
+///    last write exactly on the `TexCoord(0)` varying the container declares at output lane 12,
+///    and the program's writes then fill lanes 0..13 of a declared 14-lane interface with no
+///    gap. A stride of one word would never reach lane 12 (the varying would go uninterpolated);
+///    a stride of four would run two lanes past the declared interface.
+///  * on the source side, another program's four iterations of `Output[4] <- PA[4]` consume
+///    exactly `PA[4..11]` - its `in_texCoord` and `in_colour` attributes, the whole declared
+///    12-register attribute set with nothing left over. Under a non-advancing source every
+///    iteration would re-read `in_texCoord.xy` and `in_colour` would be dead, yet the container
+///    declares it as a fed vertex attribute and no other instruction in that program reads it.
+///
+/// In all four distinct SMLSI words the corpus contains, the dest / src1 / src2 slots carry
+/// increment 1 - the default - and only the src0 slot varies (0x01, 0x0e, 0x4e, 0xf6, with its
+/// mode bit set in two of them). Every repeat those words govern is an UNCONDITIONAL VMOV,
+/// which reads src1 alone and never src0, so that byte is a don't-care the compiler left
+/// uninitialised. That is why [`slots_repeats_consult`] asks which slots are actually read
+/// rather than demanding the whole word be default.
+///
+/// Bit 50 also varies (set on the words that restore the default, clear on the ones that open
+/// the attribute copy). It sits where group 0x38 documents `end`, and it is not part of either
+/// field above; the register-addressing model does not read it.
+pub(crate) fn decode_smlsi(word: u64) -> [SmlsiSlot; 4] {
+    std::array::from_fn(|k| {
+        let value = ((word >> (8 * k)) & 0xff) as u8;
+        if (word >> (32 + k)) & 1 == 0 {
+            SmlsiSlot::Increment(value)
+        } else {
+            SmlsiSlot::Swizzle(value)
+        }
+    })
+}
+
+/// The hardware operand slots `word` READS or WRITES, indexed as [`decode_smlsi`] indexes them,
+/// or `None` when that is not established for this opcode group.
+///
+/// Only a repeating instruction consults SMLSI state at all, and it consults it only for the
+/// slots it actually uses - so this is what decides whether a non-default byte in an SMLSI can
+/// reach anything. `None` must be read as "every slot", never as "no slot".
+fn slots_used(word: u64) -> Option<[bool; 4]> {
+    match opcode1(word) {
+        // 0x38 VMOV. `move_type` (47:46) 0 is the unconditional form, `dest = src1` - it has no
+        // src0 and no src2 operand at all (see `decode_grp_38`, where those fields are decoded
+        // only under the conditional form). Any other move_type is a conditional select reading
+        // all three sources.
+        0x07 if bits(word, 47, 46) == 0 => Some([true, false, true, false]),
+        0x07 => Some([true, true, true, true]),
+        _ => None,
+    }
+}
+
+/// The union of hardware operand slots that any instruction in `code` which CAN repeat will
+/// consult - i.e. exactly the slots an SMLSI's state can still reach.
+///
+/// An instruction established as single-execution never advances anything, so it contributes
+/// nothing. One whose repeat encoding (or operand grammar) is not established contributes every
+/// slot, because being wrong here silently mis-addresses an operand.
+pub(crate) fn slots_repeats_consult(code: &[u64]) -> [bool; 4] {
+    let mut needed = [false; 4];
+    for &w in code {
+        if executes_once(w) == Some(true) {
+            continue;
+        }
+        let used = slots_used(w).unwrap_or([true; 4]);
+        for (n, u) in needed.iter_mut().zip(used) {
+            *n |= u;
+        }
+    }
+    needed
 }
 
 fn decode_grp_flow(word: u64) -> Instr {
@@ -2782,43 +2863,71 @@ mod tests {
         assert_eq!(ins.dest.as_ref().map(|d| (d.bank, d.index)), Some((Bank::PrimaryAttr, 8)));
     }
 
+    /// The SMLSI decode and the slots-a-repeat-consults rule, pinned in BOTH directions on the
+    /// real corpus.
+    ///
+    /// The captured vertex program that carries SMLSI genuinely REPEATS: its `mov` (group 0x38)
+    /// encodes `repeat_count = 3` in bits 45:44, so that one instruction executes four times
+    /// with the stepping SMLSI configures. Reading the disassembly as though every instruction
+    /// ran once - which is how the surrounding code looks - gets this wrong. What makes that
+    /// program's SMLSI inert anyway is narrower and is the fact pinned here: the repeat is an
+    /// UNCONDITIONAL VMOV, which reads src1 and nothing else, and every slot other than src0
+    /// carries increment 1.
+    #[test]
+    fn smlsi_slots_a_repeat_consults_decide_whether_it_is_inert() {
+        // vert_82c14da0's prologue: SMLSI, then a VMOV with repeat_count 3.
+        const SMLSI: u64 = 0xfa10000201014e01;
+        const MOV_REPEAT_3: u64 = 0x3880352183080080;
+        assert_eq!(bits(MOV_REPEAT_3, 45, 44), 3, "the VMOV really does encode a repeat");
+        assert_eq!(
+            decode_smlsi(SMLSI),
+            [
+                SmlsiSlot::Increment(1),  // dest
+                SmlsiSlot::Swizzle(0x4e), // src0 - the one slot that varies across the corpus
+                SmlsiSlot::Increment(1),  // src1
+                SmlsiSlot::Increment(1),  // src2
+            ]
+        );
+        // An unconditional VMOV is `dest = src1`: it has no src0 and no src2 operand, so the
+        // one non-default byte in that word cannot reach anything it does.
+        assert_eq!(slots_repeats_consult(&[SMLSI, MOV_REPEAT_3]), [true, false, true, false]);
+
+        // Turn the same repeat into the CONDITIONAL form (move_type 1, bits 47:46), which reads
+        // src0 as its test - now the swizzle-mode byte is live and the program must stay blocked.
+        const MOV_COND_REPEAT: u64 = MOV_REPEAT_3 | (1 << 46);
+        assert_eq!(bits(MOV_COND_REPEAT, 45, 44), 3, "still a repeat");
+        assert_eq!(slots_repeats_consult(&[SMLSI, MOV_COND_REPEAT]), [true; 4]);
+
+        // The same SMLSI with only non-repeating instructions after it consults nothing at all
+        // (real word, instruction #12 of the same program).
+        const MOV_ONCE: u64 = 0x38800d0902000f40;
+        assert_eq!(bits(MOV_ONCE, 45, 44), 0);
+        assert_eq!(slots_repeats_consult(&[SMLSI, MOV_ONCE]), [false; 4]);
+
+        // A group whose repeat encoding is not established leaves the answer unknown, which
+        // must read as "might repeat, through every operand" rather than as "safe".
+        const UNESTABLISHED_GROUP: u64 = 0xa000_0000_0000_0000; // opcode1 = 0x14, no table
+        assert_eq!(opcode1(UNESTABLISHED_GROUP), 0x14);
+        assert_eq!(slots_repeats_consult(&[SMLSI, UNESTABLISHED_GROUP]), [true; 4]);
+
+        // The other three distinct SMLSI words the corpus contains, all default on every slot a
+        // VMOV repeat reads. The src0 byte is the only one that ever differs.
+        for w in [0xfa10000201010e01u64, 0xfa14000001010101, 0xfa1400000101f601] {
+            assert!(is_smlsi(w));
+            let state = decode_smlsi(w);
+            assert_eq!(
+                [state[0], state[2], state[3]],
+                [SmlsiSlot::Increment(1); 3],
+                "{w:#018x} must be the default step on dest/src1/src2"
+            );
+        }
+    }
+
     /// The SPECIAL row's GLOBAL half DECODES (which register it names is as structural as
     /// which constant its FPCONSTANT half names); what a GLOBAL register CONTAINS is settled
     /// per index by the emitter, so decode leaves `blocked` clear here and the emitter
     /// hard-fails on any index it has not established. The indexed modes still block at
     /// decode - they need RIO6 addressing, so their operand cannot even be named.
-    #[test]
-    /// The SMLSI-is-inert test, pinned in BOTH directions on the real corpus.
-    ///
-    /// The captured vertex program that carries SMLSI genuinely REPEATS: its `mov` (group 0x38)
-    /// encodes `repeat_count = 3` in bits 45:44, so that one instruction executes four times
-    /// with the stepping SMLSI configures. Reading the disassembly as though every instruction
-    /// ran once - which is how the surrounding code looks - gets this wrong, so it is pinned
-    /// here: the guard must refuse this program, and only retire SMLSI where nothing repeats.
-    #[test]
-    fn smlsi_is_retired_only_where_no_instruction_repeats() {
-        // vert_82c14da0's prologue: SMLSI, then a VMOV with repeat_count 3.
-        const SMLSI: u64 = 0xfa10000201014e01;
-        const MOV_REPEAT_3: u64 = 0x3880352183080080;
-        assert_eq!(bits(MOV_REPEAT_3, 45, 44), 3, "the VMOV really does encode a repeat");
-        assert!(
-            !repeats_nowhere(&[SMLSI, MOV_REPEAT_3]),
-            "a program containing a repeating instruction must keep SMLSI blocked"
-        );
-
-        // The same SMLSI with only non-repeating instructions after it: a VMOV whose
-        // repeat_count is 0 (real word, instruction #12 of the same program).
-        const MOV_ONCE: u64 = 0x38800d0902000f40;
-        assert_eq!(bits(MOV_ONCE, 45, 44), 0);
-        assert!(repeats_nowhere(&[SMLSI, MOV_ONCE]));
-
-        // A group whose repeat encoding is not established leaves the answer unknown, which
-        // must read as "might repeat" rather than as "safe".
-        const UNESTABLISHED_GROUP: u64 = 0xa000_0000_0000_0000; // opcode1 = 0x14, no table
-        assert_eq!(opcode1(UNESTABLISHED_GROUP), 0x14);
-        assert!(!repeats_nowhere(&[SMLSI, UNESTABLISHED_GROUP]));
-    }
-
     #[test]
     fn group_50_extended_src1_names_the_global_register_and_blocks_indexed_banks() {
         // Same word with the src1 field's 0x40 bit set (field 4 -> 68): SPECIAL -> GLOBAL.

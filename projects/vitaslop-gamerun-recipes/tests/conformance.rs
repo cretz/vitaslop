@@ -8,7 +8,7 @@
 //! private dump. Point it at the extracted app dir for the title whose recipes you
 //! want to run:
 //!
-//!   VITASLOP_GAME_DIR=/path/to/app/PCSE00341 \
+//!   VITASLOP_GAME_DIR=/path/to/app/<TITLE_ID> \
 //!   cargo test --release -p vitaslop-gamerun-recipes --test conformance -- --ignored --nocapture
 //!
 //! Only recipes whose `@game` matches the dumped title are run (the dir holds one

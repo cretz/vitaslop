@@ -355,6 +355,25 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         }
         match deadline {
             Some(t) => {
+                // Diagnostic (VITASLOP_CLOCK_TRACE=<us>): report every idle jump at least
+                // that large. A title derives its own timers from this clock, so a jump
+                // bigger than a frame is game time passing that the rendered frames never
+                // accounted for - the game's race clock runs ahead of its own simulation,
+                // and the symptom is a rule (a race that always times out), not anything
+                // that looks like a clock bug. The size and frequency of these jumps is the
+                // only thing that says whether the leap is the cause or a bystander.
+                if let Ok(min) = std::env::var("VITASLOP_CLOCK_TRACE") {
+                    let min: u64 = min.parse().unwrap_or(16_667);
+                    let now = self.host.lock().unwrap().clock_us();
+                    if t.saturating_sub(now) >= min {
+                        eprintln!(
+                            "CLOCKJUMP +{}us (now {}us, {} blocked)",
+                            t - now,
+                            now,
+                            blocked.len()
+                        );
+                    }
+                }
                 self.host.lock().unwrap().advance_time_to(t);
                 self.drain();
                 IdleStep::Continue

@@ -1499,6 +1499,11 @@ pub struct VitaState {
     cur_frame: u64,
 }
 
+/// The ceiling on a default uniform buffer, in 4-byte registers. A program header or parameter
+/// record that asks for more than this is one we are misreading, and the clamp keeps a bad read
+/// from turning into an allocation.
+const MAX_DEFAULT_UNIFORM_REGS: u32 = 4096;
+
 impl VitaState {
     /// New state for a run over `[base, base + mem_bytes)`. Allocations start
     /// above the image (at base + 1 MiB) and grow up, well below the stack that
@@ -3529,7 +3534,7 @@ impl VitaState {
         self.bound_fragment_uniform_size = self
             .reflected_uniform_size_bytes(ctx, header)
             .max(default_uniform_buffer_bytes(ctx, header))
-            .min(4096);
+            .min(MAX_DEFAULT_UNIFORM_REGS);
     }
 
     /// `sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)`: hand
@@ -3597,7 +3602,7 @@ impl VitaState {
     pub fn reserve_vertex_uniform_buffer(&mut self, ctx: &mut GuestCtx) -> u32 {
         let header = self.vertex_program_header(self.bound_vertex_program);
         let header_size = default_uniform_buffer_bytes(ctx, header);
-        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
+        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(MAX_DEFAULT_UNIFORM_REGS);
         let buf = self.alloc_default_uniform_buffer(size);
         poison_uniform_buffer(ctx, buf, size);
         self.bound_vertex_uniform_buf = buf;
@@ -3623,7 +3628,7 @@ impl VitaState {
     pub fn reserve_fragment_uniform_buffer(&mut self, ctx: &GuestCtx) -> u32 {
         let header = self.bound_fragment_program_header;
         let header_size = default_uniform_buffer_bytes(ctx, header);
-        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(4096);
+        let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(MAX_DEFAULT_UNIFORM_REGS);
         let buf = self.alloc_default_uniform_buffer(size);
         self.bound_fragment_uniform_buf = buf;
         self.bound_fragment_uniform_size = size;
@@ -3650,8 +3655,30 @@ impl VitaState {
         true
     }
 
-    pub fn set_uniforms(&mut self, values: Vec<f32>) {
-        self.pending_uniforms = values;
+    /// Record a `sceGxmSetUniformDataF` write into the fallback SA bank - the one a draw uses
+    /// when no default uniform buffer is bound.
+    ///
+    /// `at` is the register the write STARTS at: the parameter's own `resource_index` plus the
+    /// call's `componentOffset`. Placing the values there rather than at the top is the same
+    /// fact the buffer copy in `vita::gxm::set_uniform_data_f` rests on, and the two must agree
+    /// - a program that sets two uniforms would otherwise have the second land on the first here
+    /// while landing correctly in the buffer, so which of the two a draw read would depend on
+    /// whether the title happened to reserve a buffer.
+    ///
+    /// Writes ACCUMULATE within a scene (the bank is cleared in `begin_scene`), because that is
+    /// what the guest's own buffer does: two calls setting different uniforms leave both set.
+    pub fn set_uniforms(&mut self, at: u32, values: Vec<f32>) {
+        let end = at as usize + values.len();
+        // Same ceiling the reserved buffers are clamped to: a register offset past it is a
+        // record we misread, not a uniform, and growing the bank to match it would turn a bad
+        // read into an allocation.
+        if end > MAX_DEFAULT_UNIFORM_REGS as usize {
+            return;
+        }
+        if self.pending_uniforms.len() < end {
+            self.pending_uniforms.resize(end, 0.0);
+        }
+        self.pending_uniforms[at as usize..end].copy_from_slice(&values);
     }
 
     /// What thread `thid` is parked on, as one line, or `RUNNABLE` if it appears in no
@@ -4070,6 +4097,11 @@ impl VitaState {
         drop(uniform_phase);
         // The per-draw diagnostic dump, after everything it reports has been computed
         // (it prints the reflected transform and material rather than recomputing them).
+        self.dump_gxp_blobs(
+            ctx,
+            self.bound_fragment_program_header,
+            self.vertex_program_header(self.bound_vertex_program),
+        );
         self.dump_draw_gxp(
             ctx, &vref, &material, &textures, &attributes, primitive, index_count, stride,
         );
@@ -4416,6 +4448,48 @@ impl VitaState {
     /// shows whether a draw feeds one UV set to several samplers (a composite we must
     /// reproduce) or picks the wrong UV set for a sampler (a binding we can correct).
     #[allow(clippy::too_many_arguments)]
+    /// `VITASLOP_DUMP_GXP_BIN=<dir>`: write the raw `SceGxmProgram` blobs (the whole container -
+    /// header + parameter table + USSE bytecode) for the bound fragment and vertex programs,
+    /// named `<type>_<header-addr>.gxp`, deduped by header address. These are the durable
+    /// artifacts the clean-room GXP->WGSL recompiler decodes, and the corpus every ISA question
+    /// is settled against. `SceGxmProgram.size` is the u32 at header+0x08 (the container's total
+    /// byte length; clamped defensively).
+    ///
+    /// This has its OWN gate rather than living inside [`Self::dump_draw_gxp`]. Capturing the
+    /// corpus and reading a per-draw trace are different jobs: the trace is frame-keyed and
+    /// capped because it is gigabytes of text, while a corpus wants every program the whole run
+    /// ever binds. Coupling them meant the shaders reachable only late in a level could not be
+    /// captured at all without also emitting the trace for every draw before them.
+    fn dump_gxp_blobs(&self, ctx: &GuestCtx, fh: u32, vh: u32) {
+        // Cached: this runs per draw, and reading an unset environment variable on Windows is
+        // not free (see `dump_vprog`).
+        static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(dir) = WANT.get_or_init(|| std::env::var("VITASLOP_DUMP_GXP_BIN").ok()) else {
+            return;
+        };
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        for (kind, header) in [("frag", fh), ("vert", vh)] {
+            if header == 0 {
+                continue;
+            }
+            {
+                let mut seen = SEEN.lock().unwrap();
+                if seen.contains(&header) {
+                    continue;
+                }
+                if seen.is_empty() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                seen.push(header);
+            }
+            let size = ctx.read_u32(header.wrapping_add(0x08)).clamp(0x40, 0x40000);
+            let bytes = ctx.read_bytes(header, size as usize);
+            let path = std::path::Path::new(dir).join(format!("{kind}_{header:08x}.gxp"));
+            let _ = std::fs::write(path, &bytes);
+        }
+    }
+
     fn dump_draw_gxp(&self, ctx: &GuestCtx, vref: &ProgramReflection, material: &crate::capture::FragmentMaterial, textures: &[crate::capture::BoundTexture], attributes: &[crate::capture::VertexAttribute], primitive: u32, index_count: u32, stride: u32) {
         // Cached: this runs per draw, and reading an unset environment variable on
         // Windows is not free (see `dump_vprog`).
@@ -4571,33 +4645,6 @@ impl VitaState {
                 let _ = std::fs::write(path, crate::render::rgba_to_png(w, h, &rgba));
             }
         }
-        // VITASLOP_DUMP_GXP_BIN=<dir>: write the raw SceGxmProgram blobs (the whole container -
-        // header + parameter table + USSE bytecode) for the bound fragment and vertex programs,
-        // named `<type>_<header-addr>.gxp`, deduped by address. These are the durable artifacts
-        // the clean-room GXP->WGSL shader recompiler decodes. `SceGxmProgram.size` is the u32 at
-        // header+0x08 (the container's total byte length; clamped defensively).
-        if let Ok(dir) = std::env::var("VITASLOP_DUMP_GXP_BIN") {
-            use std::sync::Mutex;
-            static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-            let _ = std::fs::create_dir_all(&dir);
-            for (kind, header) in [("frag", fh), ("vert", vh)] {
-                if header == 0 {
-                    continue;
-                }
-                {
-                    let mut seen = SEEN.lock().unwrap();
-                    if seen.contains(&header) {
-                        continue;
-                    }
-                    seen.push(header);
-                }
-                let size = ctx.read_u32(header.wrapping_add(0x08)).clamp(0x40, 0x40000);
-                let bytes = ctx.read_bytes(header, size as usize);
-                let path = std::path::Path::new(&dir).join(format!("{kind}_{header:08x}.gxp"));
-                let _ = std::fs::write(path, &bytes);
-            }
-        }
-
         // VITASLOP_GXP_RECOMPILE=1: the explicit clean-room shader-recompiler GRIND mode.
         // For each unique bound fragment AND vertex program, read its container from guest
         // memory and recompile the guest USSE to a complete, bindable WGSL module. This is NOT
@@ -5306,6 +5353,10 @@ impl ImportDispatch for VitaEnv {
     fn on_frame_boundary(&mut self, frame: u64) {
         self.state.world.set_frame(frame);
         self.state.set_cur_frame(frame);
+        // Close the capture's frame so an observer can ask for the scenes THIS frame was
+        // built from rather than for the last scene submitted, which on a multi-pass
+        // title is the composite and holds no world geometry at all.
+        self.state.capture.end_frame();
         // Advance the virtual clock by one full 60 Hz frame per display flip: a
         // rendered frame represents ~16.6 ms of wall time passing, so the game's
         // animation and dialog timers progress at the right rate. `advance_time_to`

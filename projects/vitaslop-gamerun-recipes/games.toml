@@ -15,3 +15,8 @@ region = "PAL"
 id = "PCSA00027"
 name = "MotorStorm RC"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00001"
+name = "Ridge Racer"
+region = "NTSC"

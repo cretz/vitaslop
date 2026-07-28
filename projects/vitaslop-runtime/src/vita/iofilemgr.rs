@@ -26,7 +26,7 @@ const MAX_PATH: usize = 1024;
 /// posts an asynchronous load job and then touches the thing being loaded expects the job
 /// to still be in flight; with instant reads the job finishes in the frame it was posted,
 /// its resource is released, and the consumer reads a dangling handle. That is the exact
-/// shape of the PCSE00001 race-load crash: 4 MB of car + course data that takes about a
+/// shape of a retail racer's race-load crash: 4 MB of car + course data that takes about a
 /// second off a real game card completed inside two frames here.
 ///
 /// 10 MiB/s is a defensible PS Vita game-card figure. Deterministic: the delay is a pure

@@ -1,0 +1,854 @@
+@title Time Attack - drive two complete laps of the circuit
+@game  PCSE00001
+@shot-every 200
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Walks the mandatory first-run wizard, enters Lap Time Attack, and then DRIVES
+# the circuit: two complete laps, confirmed by the game's own HUD reading
+# `LAP 3/30` with two finished lap times listed at the end of the run.
+#
+# HOW IT WAS AUTHORED (lessons for the next agent)
+# - Judge this title ONLY through `vitaslop-desktop --headless`. The session's
+#   software renderer does draw the race (HUD included), but the GPU path is the
+#   one a player sees and the two do NOT agree - see the render note below.
+# - The driving line is not hand-authored. It is the recorded response of a
+#   closed-loop controller that steered at the far end of the ROAD MATERIAL
+#   ahead, re-measured every 10 frames, with a LAP DIRECTION carried across the
+#   whole run so a spin cannot turn the lap around. Every value here is a
+#   response the car actually gave.
+# - WHY LAP DIRECTION MATTERS, because it cost two earlier attempts: "the far
+#   end of the road ahead" is just as true of the road already driven. Once the
+#   car is pointing backwards, a direction-agnostic controller aims at the start
+#   straight and drives a fast lap the WRONG WAY, which looks like progress to
+#   every measurement except the game's own lap counter.
+# - A COUNTED FRAME IS NOT 1/60 s OF GAME TIME here: the guest advances about
+#   5.3 frames of simulation per frame this recipe counts. Frame-keyed timings
+#   below are on the counted clock; do not convert them to seconds.
+#
+# WHAT IS NOT ASSERTED, and why
+# There is no @assert, because the lap counter's address is not yet found. Do
+# NOT re-try these - they are measured dead ends:
+#   * scanning u32 for the displayed lap value across a lap boundary: the
+#     survivors are noise, and none of 67 candidates moved the HUD when poked.
+#   * 0x81536714 / 0x815367d4 (+0x18 in the two racer records whose +0x00 holds
+#     the lap TOTAL 30): they read 3 and 2 at a frame where the HUD reads LAP 1,
+#     so they are constants, not counters.
+#   * poking as a test at all: the HUD caches the lap number and only re-reads
+#     it on a lap event, so a poke that does not move the display proves
+#     nothing either way.
+# The reliable next move is `@watch` on a candidate plus a driven lap boundary,
+# reading the HUD from a shot at the same frame.
+#
+# KNOWN RENDER DEFECTS visible in this run (all shader-recompiler gaps, all
+# reported by name at run time - grep the run for "FALLS BACK"):
+#   * the player's car draws as saturated red/black blobs
+#   * large trackside objects draw as untextured white boxes
+#   * RGB fringing over the whole frame when the camera is close to geometry,
+#     on the GPU path only - the software path renders the same moment clean
+# ============================================================================
+
+0: @section boot
+1500: touch=960,840
+1520: 
+1560: touch=960,840
+1580: 
+1700: touch=960,874
+1720: 
+1780: touch=960,874
+1800: 
+2000: touch=400,540
+2020: 
+2100: touch=400,540
+2120: 
+2400: touch=960,556
+2600: 
+2700: touch=1870,516
+2740: 
+2820: touch=1870,516
+2860: 
+3200: touch=960,874
+3240: 
+3500: touch=1870,540
+3540: 
+3700: touch=1870,540
+3740: 
+3900: touch=960,878
+3940: 
+4000: touch=960,878
+4040: 
+4200: touch=960,540
+4240: 
+4400: touch=1870,540
+4440: 
+4600: touch=1870,540
+4640: 
+4800: touch=960,874
+4840: 
+5000: touch=960,874
+5040: 
+5200: touch=960,314
+5240: 
+5350: touch=960,314
+5390: 
+5550: touch=1870,540
+5590: 
+5750: touch=960,874
+5790: 
+5950: touch=1870,540
+5990: 
+6150: touch=960,874
+6190: 
+6400: touch=1652,552
+6440: 
+6600: touch=1652,552
+6640: 
+7000: touch=1870,540
+7040: 
+7300: touch=1870,540
+7340: 
+7600: touch=1860,830
+7640: 
+7900: touch=1860,830
+7940: 
+8300: touch=960,540
+8340: 
+8700: touch=960,874
+8740: 
+9100: touch=1870,540
+9140: 
+9400: touch=476,550
+9440: 
+9600: touch=476,550
+9640: 
+10000: touch=960,540
+10040: 
+10200: touch=960,540
+10240: 
+10500: touch=1870,544
+10540: 
+10800: touch=1850,550
+10840: 
+11000: touch=1850,550
+11040: 
+11800: cross
+11810: cross
+11820: cross
+11830: cross
+11840: cross
+11850: cross lx=127
+11860: cross lx=127
+11870: cross lx=127
+11880: cross lx=127
+11890: cross lx=130
+11900: cross lx=162
+11910: cross lx=192
+11920: cross lx=197
+11930: lx=203
+11940: lx=203
+11950: cross lx=125
+11960: cross lx=87
+11970: cross lx=138
+11980: cross lx=151
+11990: cross lx=115
+12000: cross lx=140
+12010: cross lx=133
+12020: cross lx=134
+12030: cross lx=137
+12040: cross lx=142
+12050: cross lx=143
+12060: cross lx=135
+12070: cross lx=126
+12080: cross lx=110
+12090: cross lx=160
+12100: cross lx=107
+12110: cross lx=126
+12120: cross lx=142
+12130: cross lx=172
+12140: cross lx=125
+12150: cross lx=93
+12160: cross lx=53
+12170: cross lx=69
+12180: cross lx=53
+12190: cross lx=105
+12200: cross lx=123
+12210: cross lx=91
+12220: cross lx=140
+12230: cross lx=165
+12240: lx=203
+12250: cross lx=176
+12260: cross lx=125
+12270: cross lx=174
+12280: cross lx=203
+12290: cross lx=203
+12300: cross lx=189
+12310: cross lx=165
+12320: cross lx=158
+12330: cross lx=158
+12340: cross lx=168
+12350: cross lx=158
+12360: cross lx=186
+12370: cross lx=174
+12380: lx=53
+12390: cross lx=98
+12400: cross lx=104
+12410: cross lx=101
+12420: cross lx=75
+12430: cross lx=104
+12440: cross lx=123
+12450: cross lx=146
+12460: cross lx=188
+12470: cross lx=203
+12480: cross lx=139
+12490: cross lx=77
+12500: cross lx=118
+12510: cross lx=130
+12520: cross lx=182
+12530: cross lx=182
+12540: cross lx=115
+12550: cross lx=115
+12560: cross lx=75
+12570: cross lx=176
+12580: cross lx=76
+12590: cross lx=132
+12600: cross lx=62
+12610: cross lx=203
+12620: cross lx=202
+12630: cross lx=57
+12640: cross lx=107
+12650: cross lx=117
+12660: cross lx=53
+12670: cross lx=53
+12680: cross lx=53
+12690: cross lx=203
+12700: cross lx=53
+12710: cross lx=105
+12720: cross lx=166
+12730: cross lx=167
+12740: cross lx=122
+12750: cross lx=132
+12760: cross lx=133
+12770: cross lx=203
+12780: cross lx=53
+12790: cross lx=53
+12800: cross lx=53
+12810: cross lx=53
+12820: cross lx=203
+12830: cross lx=130
+12840: cross lx=74
+12850: cross lx=53
+12860: cross lx=53
+12870: cross lx=186
+12880: cross lx=203
+12890: cross lx=178
+12900: cross lx=158
+12910: cross lx=156
+12920: cross lx=172
+12930: cross lx=164
+12940: cross lx=157
+12950: cross lx=179
+12960: cross lx=183
+12970: lx=203
+12980: cross lx=203
+12990: cross lx=133
+13000: cross lx=156
+13010: cross lx=203
+13020: lx=203
+13030: cross lx=203
+13040: cross lx=183
+13050: cross lx=151
+13060: cross lx=147
+13070: cross lx=147
+13080: cross lx=137
+13090: cross lx=125
+13100: cross lx=113
+13110: cross lx=85
+13120: cross lx=75
+13130: cross lx=90
+13140: cross lx=95
+13150: cross lx=94
+13160: cross lx=117
+13170: cross lx=124
+13180: cross lx=106
+13190: cross lx=125
+13200: cross lx=110
+13210: cross lx=143
+13220: cross lx=157
+13230: cross lx=158
+13240: cross lx=175
+13250: cross lx=138
+13260: lx=203
+13270: cross lx=126
+13280: cross lx=108
+13290: cross lx=134
+13300: cross lx=142
+13310: cross lx=142
+13320: cross lx=199
+13330: cross lx=114
+13340: cross lx=122
+13350: cross lx=138
+13360: cross lx=129
+13370: cross lx=165
+13380: cross lx=169
+13390: cross lx=112
+13400: cross lx=111
+13410: lx=53
+13420: cross lx=134
+13430: cross lx=174
+13440: cross lx=159
+13450: cross lx=133
+13460: cross lx=138
+13470: cross lx=65
+13480: cross lx=97
+13490: cross lx=99
+13500: cross lx=109
+13510: cross lx=133
+13520: lx=203
+13530: cross lx=178
+13540: cross lx=176
+13550: cross lx=192
+13560: cross lx=197
+13570: cross lx=178
+13580: cross lx=151
+13590: cross lx=148
+13600: cross lx=151
+13610: cross lx=159
+13620: cross lx=152
+13630: cross lx=172
+13640: cross lx=147
+13650: cross lx=144
+13660: cross lx=122
+13670: cross lx=126
+13680: cross lx=122
+13690: cross lx=95
+13700: cross lx=104
+13710: cross lx=99
+13720: cross lx=187
+13730: cross lx=140
+13740: cross lx=130
+13750: cross lx=203
+13760: cross lx=53
+13770: cross lx=53
+13780: cross lx=203
+13790: cross lx=203
+13800: cross lx=53
+13810: cross lx=53
+13820: cross lx=203
+13830: cross lx=203
+13840: cross lx=203
+13850: cross lx=203
+13860: cross lx=203
+13870: cross lx=155
+13880: cross lx=126
+13890: cross lx=147
+13900: cross lx=126
+13910: cross lx=151
+13920: cross lx=151
+13930: cross lx=148
+13940: cross lx=140
+13950: cross lx=142
+13960: cross lx=151
+13970: cross lx=142
+13980: cross lx=140
+13990: cross lx=151
+14000: cross lx=163
+14010: cross lx=187
+14020: lx=203
+14030: cross lx=109
+14040: cross lx=83
+14050: cross lx=138
+14060: cross lx=170
+14070: cross lx=152
+14080: cross lx=189
+14090: cross lx=156
+14100: cross lx=99
+14110: cross lx=146
+14120: cross lx=140
+14130: cross lx=132
+14140: cross lx=156
+14150: cross lx=190
+14160: cross lx=169
+14170: cross lx=142
+14180: cross lx=126
+14190: cross lx=91
+14200: cross
+14210: cross lx=131
+14220: cross lx=203
+14230: cross lx=53
+14240: cross lx=53
+14250: cross lx=53
+14260: cross lx=53
+14270: cross lx=114
+14280: cross lx=203
+14290: cross lx=99
+14300: cross lx=68
+14310: cross lx=103
+14320: cross lx=132
+14330: cross lx=135
+14340: cross lx=203
+14350: cross lx=53
+14360: cross lx=203
+14370: cross lx=53
+14380: cross lx=203
+14390: cross lx=53
+14400: cross lx=53
+14410: cross lx=203
+14420: cross lx=80
+14430: cross lx=53
+14440: cross lx=53
+14450: cross lx=129
+14460: cross lx=177
+14470: cross lx=158
+14480: cross lx=149
+14490: cross lx=156
+14500: cross lx=144
+14510: cross lx=183
+14520: cross lx=175
+14530: cross lx=138
+14540: lx=203
+14550: cross lx=186
+14560: cross lx=166
+14570: cross lx=159
+14580: cross lx=165
+14590: cross lx=134
+14600: cross lx=167
+14610: cross lx=198
+14620: cross lx=132
+14630: cross lx=99
+14640: cross lx=96
+14650: cross lx=89
+14660: cross lx=91
+14670: cross lx=109
+14680: cross lx=112
+14690: cross lx=57
+14700: cross lx=118
+14710: cross lx=151
+14720: cross lx=159
+14730: cross lx=158
+14740: cross lx=143
+14750: cross lx=140
+14760: cross lx=151
+14770: cross lx=187
+14780: lx=203
+14790: cross lx=175
+14800: cross lx=105
+14810: cross lx=122
+14820: cross lx=150
+14830: cross lx=168
+14840: cross lx=180
+14850: cross lx=180
+14860: cross lx=177
+14870: cross lx=162
+14880: cross lx=152
+14890: cross lx=147
+14900: cross lx=144
+14910: cross lx=141
+14920: cross lx=150
+14930: cross lx=153
+14940: cross lx=161
+14950: cross lx=147
+14960: cross lx=141
+14970: cross lx=134
+14980: cross lx=115
+14990: cross lx=112
+15000: cross lx=96
+15010: cross lx=168
+15020: cross lx=112
+15030: cross lx=133
+15040: lx=203
+15050: cross lx=123
+15060: cross lx=53
+15070: cross lx=62
+15080: cross lx=94
+15090: cross lx=119
+15100: cross lx=114
+15110: cross lx=87
+15120: cross lx=94
+15130: cross lx=53
+15140: cross lx=118
+15150: cross lx=101
+15160: cross lx=103
+15170: cross lx=123
+15180: cross lx=189
+15190: lx=203
+15200: lx=203
+15210: cross lx=179
+15220: cross lx=55
+15230: cross lx=93
+15240: cross lx=150
+15250: cross lx=200
+15260: cross lx=189
+15270: cross lx=136
+15280: cross lx=133
+15290: cross lx=140
+15300: cross lx=154
+15310: cross lx=181
+15320: cross lx=170
+15330: cross lx=155
+15340: cross lx=155
+15350: cross lx=161
+15360: cross lx=175
+15370: cross lx=175
+15380: cross lx=181
+15390: cross lx=167
+15400: lx=53
+15410: lx=53
+15420: cross lx=100
+15430: cross lx=123
+15440: cross lx=149
+15450: cross lx=149
+15460: cross lx=175
+15470: cross lx=159
+15480: cross lx=203
+15490: cross lx=164
+15500: cross lx=103
+15510: cross lx=70
+15520: cross lx=62
+15530: cross lx=77
+15540: cross lx=149
+15550: cross lx=173
+15560: cross lx=159
+15570: lx=203
+15580: cross lx=53
+15590: cross lx=80
+15600: cross lx=105
+15610: cross lx=96
+15620: cross lx=131
+15630: cross lx=203
+15640: cross lx=54
+15650: cross lx=101
+15660: cross lx=113
+15670: cross lx=53
+15680: cross lx=203
+15690: cross lx=53
+15700: cross lx=53
+15710: cross lx=53
+15720: cross lx=53
+15730: cross lx=53
+15740: cross lx=203
+15750: cross lx=127
+15760: cross lx=115
+15770: cross lx=136
+15780: cross lx=139
+15790: cross lx=139
+15800: 
+15800: cross
+15810: cross
+15820: cross
+15830: cross
+15840: cross
+15850: cross lx=131
+15860: cross lx=131
+15870: cross lx=131
+15880: cross lx=203
+15890: cross lx=203
+15900: cross lx=53
+15910: cross lx=53
+15920: cross lx=203
+15930: cross lx=53
+15940: cross lx=203
+15950: cross lx=53
+15960: cross lx=53
+15970: cross lx=53
+15980: cross lx=53
+15990: cross lx=107
+16000: cross lx=100
+16010: cross lx=85
+16020: cross lx=137
+16030: cross lx=173
+16040: cross lx=153
+16050: cross lx=194
+16060: cross lx=180
+16070: cross lx=150
+16080: cross lx=158
+16090: cross lx=159
+16100: cross lx=142
+16110: cross lx=177
+16120: lx=203
+16130: cross lx=166
+16140: cross lx=102
+16150: cross lx=132
+16160: cross lx=161
+16170: cross lx=199
+16180: cross lx=203
+16190: cross lx=203
+16200: cross lx=203
+16210: lx=203
+16220: cross lx=133
+16230: cross lx=110
+16240: cross lx=110
+16250: cross lx=110
+16260: cross lx=106
+16270: cross lx=103
+16280: cross lx=99
+16290: lx=200
+16300: cross lx=180
+16310: cross lx=115
+16320: cross lx=151
+16330: cross lx=53
+16340: cross lx=53
+16350: cross lx=60
+16360: cross lx=99
+16370: cross lx=126
+16380: cross lx=127
+16390: cross lx=117
+16400: cross lx=125
+16410: cross lx=133
+16420: cross lx=130
+16430: cross lx=127
+16440: cross lx=144
+16450: cross lx=162
+16460: cross lx=145
+16470: cross lx=127
+16480: cross lx=131
+16490: cross lx=158
+16500: cross lx=137
+16510: cross lx=152
+16520: lx=203
+16530: lx=203
+16540: cross lx=58
+16550: cross lx=76
+16560: cross lx=133
+16570: cross lx=157
+16580: lx=203
+16590: cross lx=134
+16600: cross lx=132
+16610: cross lx=111
+16620: lx=53
+16630: cross lx=120
+16640: cross lx=91
+16650: cross lx=190
+16660: cross lx=192
+16670: cross lx=161
+16680: cross lx=136
+16690: cross lx=158
+16700: cross lx=108
+16710: cross lx=63
+16720: cross lx=101
+16730: cross lx=106
+16740: cross lx=88
+16750: cross lx=84
+16760: cross lx=104
+16770: cross lx=86
+16780: cross lx=71
+16790: cross lx=81
+16800: cross lx=95
+16810: cross lx=115
+16820: cross lx=132
+16830: cross lx=143
+16840: lx=203
+16850: cross lx=155
+16860: cross lx=150
+16870: cross lx=199
+16880: cross lx=169
+16890: cross lx=175
+16900: cross lx=151
+16910: cross lx=138
+16920: cross lx=141
+16930: cross lx=135
+16940: cross lx=143
+16950: cross lx=146
+16960: cross lx=175
+16970: cross lx=159
+16980: cross lx=144
+16990: cross lx=146
+17000: cross lx=131
+17010: cross lx=135
+17020: cross lx=77
+17030: cross lx=107
+17040: cross lx=97
+17050: cross lx=191
+17060: cross lx=165
+17070: cross lx=143
+17080: cross lx=203
+17090: cross lx=53
+17100: cross lx=203
+17110: cross lx=203
+17120: cross lx=203
+17130: cross lx=203
+17140: cross lx=191
+17150: cross lx=110
+17160: cross lx=59
+17170: cross lx=125
+17180: cross lx=125
+17190: cross lx=129
+17200: cross lx=132
+17210: cross lx=129
+17220: cross lx=146
+17230: cross lx=169
+17240: cross lx=181
+17250: cross lx=187
+17260: cross lx=169
+17270: cross lx=157
+17280: cross lx=169
+17290: cross lx=167
+17300: cross lx=179
+17310: cross lx=164
+17320: cross lx=80
+17330: cross lx=103
+17340: cross lx=138
+17350: cross lx=147
+17360: cross lx=158
+17370: cross lx=193
+17380: cross lx=174
+17390: cross lx=129
+17400: cross lx=91
+17410: cross lx=132
+17420: cross lx=157
+17430: cross lx=133
+17440: cross lx=203
+17450: cross lx=53
+17460: cross lx=53
+17470: cross lx=203
+17480: cross lx=53
+17490: cross lx=53
+17500: cross lx=53
+17510: cross lx=203
+17520: cross lx=165
+17530: cross lx=62
+17540: cross lx=132
+17550: cross lx=147
+17560: cross lx=143
+17570: cross lx=159
+17580: cross lx=53
+17590: cross lx=53
+17600: cross lx=53
+17610: cross lx=53
+17620: cross lx=138
+17630: cross lx=176
+17640: cross lx=161
+17650: cross lx=151
+17660: cross lx=153
+17670: cross lx=152
+17680: cross lx=163
+17690: cross lx=172
+17700: cross lx=164
+17710: cross lx=140
+17720: lx=203
+17730: cross lx=53
+17740: cross lx=87
+17750: cross lx=53
+17760: cross lx=109
+17770: cross lx=53
+17780: cross lx=201
+17790: cross lx=150
+17800: cross lx=203
+17810: cross lx=53
+17820: cross lx=203
+17830: cross lx=203
+17840: cross lx=203
+17850: cross lx=203
+17860: cross lx=203
+17870: cross lx=114
+17880: cross lx=159
+17890: cross lx=154
+17900: cross lx=106
+17910: cross lx=81
+17920: cross lx=89
+17930: cross lx=103
+17940: cross lx=93
+17950: cross lx=104
+17960: cross lx=106
+17970: cross lx=106
+17980: cross lx=59
+17990: cross lx=103
+18000: cross lx=139
+18010: cross lx=162
+18020: cross lx=162
+18030: cross lx=146
+18040: cross lx=145
+18050: cross lx=148
+18060: cross lx=162
+18070: cross lx=171
+18080: cross lx=188
+18090: lx=203
+18100: cross lx=183
+18110: cross lx=154
+18120: cross lx=168
+18130: cross lx=194
+18140: cross lx=163
+18150: cross lx=188
+18160: cross lx=167
+18170: cross lx=153
+18180: cross lx=149
+18190: cross lx=145
+18200: cross lx=165
+18210: cross lx=69
+18220: lx=53
+18230: cross lx=187
+18240: lx=53
+18250: lx=53
+18260: cross lx=102
+18270: cross lx=121
+18280: cross lx=119
+18290: cross lx=119
+18300: cross lx=53
+18310: cross lx=203
+18320: cross lx=203
+18330: cross lx=203
+18340: cross lx=203
+18350: cross lx=182
+18360: cross lx=121
+18370: cross lx=147
+18380: cross lx=142
+18390: cross lx=131
+18400: cross lx=123
+18410: cross lx=111
+18420: cross lx=95
+18430: cross lx=168
+18440: cross lx=175
+18450: cross lx=115
+18460: lx=203
+18470: cross lx=115
+18480: cross lx=53
+18490: cross lx=93
+18500: cross lx=168
+18510: cross lx=53
+18520: cross lx=203
+18530: cross lx=203
+18540: cross lx=53
+18550: cross lx=53
+18560: cross lx=53
+18570: cross lx=53
+18580: cross lx=71
+18590: cross lx=118
+18600: cross lx=115
+18610: cross lx=114
+18620: cross lx=129
+18630: cross lx=142
+18640: lx=203
+18650: lx=203
+18660: cross lx=132
+18670: cross lx=91
+18680: cross
+18690: cross lx=173
+18700: cross lx=176
+18710: cross lx=144
+18720: cross lx=148
+18730: cross lx=148
+18740: cross lx=161
+18750: cross lx=189
+18760: cross lx=160
+18770: cross lx=160
+18780: cross lx=167
+18790: cross lx=163
+18800: cross lx=152
+18810: cross lx=166
+18820: cross lx=165
+18830: cross lx=182
+18840: cross lx=186
+18850: cross lx=171
+18860: lx=53
+18870: lx=53
+18880: cross lx=203
+18890: cross lx=184
+18900: cross lx=97
+18910: cross lx=54
+18920: cross lx=179
+18930: lx=53
+18940: lx=203
+18950: cross lx=96
+18960: cross lx=76
+18970: cross lx=116
+18980: cross lx=161
+18990: cross lx=153

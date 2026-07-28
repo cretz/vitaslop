@@ -427,6 +427,7 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         shader,
         0,
         shader.instrs.len(),
+        shader.instrs.len(),
         guard_internal_reads,
         &mut internal_written,
         1,
@@ -441,6 +442,22 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
 /// condition around the range `[branch+1, target)`. Ranges nest, so this recurses, and `end`
 /// bounds how far a nested branch may jump: a target past the enclosing range is a jump out of
 /// a block, which no `if` can express.
+///
+/// `exit` is the instruction index control reaches when THIS range simply runs off its end -
+/// which for a then-arm is the if/else MERGE point, not `end`. It is what makes an early exit
+/// expressible. A compiler emits
+///
+///   i:   br c        -> M      (skip the rest of this arm)
+///   ...                        the rest of the arm
+///   end:                       (the arm's last word, the jump over the else-arm)
+///   ...                        the else-arm
+///   M:                         the merge
+///
+/// and a branch to `M` from inside the arm is a jump out of the enclosing block by index, yet
+/// it means exactly "stop executing this arm" - because running off the arm's end arrives at
+/// `M` anyway. So a target equal to `exit` is rewritten to `end` and structures as an ordinary
+/// skip. Anything else past `end` is a genuine jump out and still hard-fails: this rewrite is
+/// an identity on the control flow, not a guess about where a branch meant to go.
 ///
 /// Everything that is NOT a properly nested forward skip hard-fails naming itself. A BACKWARD
 /// branch is a loop, and a loop cannot be reconstructed by skipping ranges - emitting its body
@@ -460,6 +477,7 @@ fn emit_range(
     shader: &Shader,
     start: usize,
     end: usize,
+    exit: usize,
     guard_internal_reads: bool,
     internal_written: &mut [bool; INTERNAL_LANES],
     depth: usize,
@@ -485,10 +503,14 @@ fn emit_range(
         if target <= index as i64 {
             return blocked("0xF8 BR jumps backward - a USSE loop is not reconstructed");
         }
-        if target > end as i64 {
+        // A branch to this range's own exit point stops the range, which `end` already is.
+        // See the `exit` note above: this is a re-indexing of the same control flow, not a
+        // reinterpretation of it.
+        let early_exit = target > end as i64 && target == exit as i64;
+        if target > end as i64 && !early_exit {
             return blocked("0xF8 BR jumps out of its enclosing block - not structurable");
         }
-        let target = target as usize;
+        let target = if early_exit { end } else { target as usize };
         // The skipped range is what runs when the branch is NOT taken. An UNCONDITIONAL branch
         // therefore always skips it: the range is unreachable and emitting nothing for it is
         // exact. (This is the shape a compiler emits for the `else` arm's jump over the `then`
@@ -516,7 +538,9 @@ fn emit_range(
         // Recovering it matters beyond tidiness: without it the inner branch reads as a jump out
         // of its enclosing block and the whole pair falls back to fixed-function. Both of a
         // retail title's menu fragment programs are this shape.
-        let else_arm = (target > index + 1)
+        // An early exit has no else-arm to recover: its `target - 1` is just the last word of
+        // the arm being cut short, not a compiler's jump over an alternative.
+        let else_arm = (!early_exit && target > index + 1)
             .then(|| &shader.instrs[target - 1])
             .and_then(|last| match (last.op, last.pred) {
                 (Op::Branch { rel: r }, Predicate::Always) => {
@@ -532,12 +556,18 @@ fn emit_range(
             None => {}
             Some(c) => {
                 let then_end = if else_arm.is_some() { target - 1 } else { target };
+                // Where the then-arm arrives when it runs off its end: the merge if this is an
+                // if/else, otherwise the branch target - and, when the target was clamped as an
+                // early exit, this whole range's own exit.
+                let then_exit =
+                    else_arm.unwrap_or(if early_exit { exit } else { target });
                 let _ = writeln!(body, "{pad}if ({c}) {{");
                 emit_range(
                     body,
                     shader,
                     index + 1,
                     then_end,
+                    then_exit,
                     guard_internal_reads,
                     internal_written,
                     depth + 1,
@@ -552,6 +582,7 @@ fn emit_range(
                             body,
                             shader,
                             target,
+                            e,
                             e,
                             guard_internal_reads,
                             internal_written,

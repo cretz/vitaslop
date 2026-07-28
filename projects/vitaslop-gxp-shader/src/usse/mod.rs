@@ -2,28 +2,44 @@
 
 pub mod decode;
 
-pub use decode::{decode, field, opcode1, GroupTable, GROUP_TABLES};
+pub use decode::{decode, field, opcode1, repeat_extra_iterations, GroupTable, GROUP_TABLES};
 
 use crate::container::Program;
 use crate::ir::{Op, Shader};
 
-/// Turn SMLSI into a no-op in a program where NOTHING repeats.
+/// Turn SMLSI into a no-op in a program where every SMLSI provably sets the DEFAULT stepping on
+/// every operand slot a repeat can still consult.
 ///
 /// SMLSI carries no data effect of its own: it sets the per-operand increment/swizzle state
 /// that a repeated instruction advances its registers by (spec F8.8, "metadata for repeated
 /// instructions; emits nothing directly"). Its danger - and the reason it is blocked by
 /// default - is that ignoring it would silently mis-address the operands of any instruction
-/// that DOES repeat. When no instruction in the program can repeat, that danger cannot
-/// materialise and the instruction is genuinely inert, so retiring it here is a proof, not a
-/// relaxation. Every instruction must be established as single-execution for this to apply;
-/// one instruction whose repeat encoding is unknown leaves every SMLSI blocked.
+/// that DOES repeat. [`unroll_repeats`] advances every operand by one of its own widths per
+/// iteration, so an SMLSI that asks for exactly that is describing what the unroller already
+/// does and is genuinely inert. Two ways that happens, and both are proofs rather than
+/// relaxations:
+///
+///  * nothing in the program can repeat, so no instruction ever reads the state; or
+///  * every slot that a repeat CAN read (`slots_repeats_consult`) is set to increment 1, the
+///    default width step ([`decode::decode_smlsi`] documents how that unit was measured).
+///
+/// Anything else - an increment this recompiler has no evidence for, a swizzle-mode operand, an
+/// instruction whose repeat encoding or operand grammar is not established - leaves every SMLSI
+/// in the program blocked.
 ///
 /// This is deliberately a whole-program test rather than a per-SMLSI scope analysis: SMLSI
 /// state persists until the next SMLSI, and the ordering rules around branches are not
-/// established, so "nothing in this program repeats at all" is the statement the evidence
-/// actually supports.
+/// established, so "every SMLSI here is the default" is the statement the evidence supports.
 fn retire_inert_repeat_state(code: &[u64], instrs: &mut [crate::ir::Instr]) {
-    if !decode::repeats_nowhere(code) {
+    let needed = decode::slots_repeats_consult(code);
+    let every_smlsi_is_the_default = code.iter().filter(|&&w| decode::is_smlsi(w)).all(|&w| {
+        let state = decode::decode_smlsi(w);
+        needed
+            .iter()
+            .zip(state)
+            .all(|(&read, slot)| !read || slot == decode::SmlsiSlot::Increment(1))
+    });
+    if !every_smlsi_is_the_default {
         return;
     }
     for instr in instrs.iter_mut() {

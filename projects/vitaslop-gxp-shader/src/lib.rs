@@ -51,6 +51,10 @@ pub enum RecompileError {
     WrongKind,
     /// WGSL emission hard-failed (unsupported op named, empty, or unmapped operand).
     Emit(wgsl::EmitError),
+    /// The fragment writes NEITHER colour register, so which one carries its result is not
+    /// established for this program - see [`module::writes_no_color_register`]. Emitting it
+    /// would paint a zero-initialised register file; the caller falls back instead.
+    ColorRegisterNeverWritten,
     /// A vertex program declared more `@location` varying outputs than the pipeline supports.
     /// Names the count and the limit so the caller knows the shader exceeded the interface,
     /// not that translation failed - it falls back to fixed-function rather than mis-bind.
@@ -63,6 +67,10 @@ impl core::fmt::Display for RecompileError {
             RecompileError::Parse(e) => write!(f, "GXP container parse error: {e:?}"),
             RecompileError::WrongKind => write!(f, "program kind mismatch (expected a fragment shader)"),
             RecompileError::Emit(e) => write!(f, "{e}"),
+            RecompileError::ColorRegisterNeverWritten => write!(
+                f,
+                "fragment writes neither OUTPUT nor PRIMATTR register 0, so the register carrying                  its colour is not established (a pass-through of an interpolated varying)"
+            ),
             RecompileError::TooManyVaryings { needed, limit } => write!(
                 f,
                 "vertex program needs {needed} varying @location outputs but the pipeline supports only {limit}",
@@ -200,6 +208,9 @@ pub fn recompile_fragment(bytes: &[u8]) -> Result<RecompiledFragment, RecompileE
 /// silent degrade.
 pub fn recompile_fragment_module(bytes: &[u8]) -> Result<(RecompiledFragment, FragmentModule), RecompileError> {
     let rc = recompile_fragment(bytes)?;
+    if module::writes_no_color_register(&rc.shader) {
+        return Err(RecompileError::ColorRegisterNeverWritten);
+    }
     let plan = module::plan_bindings(&rc.shader, rc.program.default_uniform_regs, |o| {
         rc.program.sampler_is_cube(o as u32)
     });

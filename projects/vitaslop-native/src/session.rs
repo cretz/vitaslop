@@ -57,13 +57,23 @@ pub struct SessionOpts {
     /// How many completed scenes the capture keeps
     /// ([`Capture::scene_limit`](vitaslop_runtime::capture::Capture::scene_limit)).
     ///
-    /// ONE, because that is all anything reads: a screenshot renders the latest
-    /// scene, `scene` digests the latest scene, and the determinism signature folds
-    /// each scene as it is evicted. Holding more is pure waste, and it is expensive
-    /// waste - a scene carries a snapshot of every draw's vertex window, several
-    /// megabytes a frame on a real 3D title.
+    /// ONE FRAME's worth, because a frame is not one scene. A racing title's race
+    /// frame is fifteen scenes and only ONE of them holds the world; the last one
+    /// submitted is the composite, so a session that kept a single scene could not see
+    /// that title's racetrack at all and `locate` reported nothing while the whole
+    /// course was on screen. [`Capture::world_scene`](vitaslop_runtime::capture::Capture::world_scene)
+    /// picks the right one out of the retained frame, and this is what leaves it a
+    /// frame to pick from.
+    ///
+    /// Retention is a RING, not growth - the cost is a fixed multiple of one frame's
+    /// draws, not a per-frame leak - and eviction still folds each dropped scene into
+    /// the determinism signature, so a bounded session and an unbounded one agree.
     pub scene_limit: Option<usize>,
 }
+
+/// Scenes retained by default: enough for the deepest multi-pass frame observed on a
+/// retail title (fifteen), with headroom, so no title silently loses its world pass.
+pub const DEFAULT_SCENE_LIMIT: usize = 24;
 
 impl Default for SessionOpts {
     fn default() -> Self {
@@ -72,7 +82,7 @@ impl Default for SessionOpts {
             max_rounds: 400_000_000,
             per_frame_rounds: 4_000_000,
             shot_dir: None,
-            scene_limit: Some(1),
+            scene_limit: Some(DEFAULT_SCENE_LIMIT),
         }
     }
 }
@@ -320,9 +330,14 @@ impl Session {
                 Ok(format!("{cmd} recorded at f{}", self.frame()))
             }
             "threads" => Ok(self.sched.host().state.debug_sync_dump()),
-            "scene" => Ok(self.cmd_scene()),
+            "scene" => Ok(self.cmd_scene(args)),
             "locate" => Ok(self.cmd_locate(args)),
             "map" => self.cmd_map(args),
+            "surface" => self.cmd_surface(args),
+            "camera" => Ok(self.cmd_camera(args)),
+            "calls" => Ok(vitaslop_runtime::vita::call_sites_report(
+                args.trim().parse().unwrap_or(30),
+            )),
             "sprites" => Ok(self.cmd_sprites(args)),
             "navigate" => self.cmd_navigate(args),
             "route" => self.cmd_route(args),
@@ -1023,10 +1038,42 @@ impl Session {
     /// the per-scene digest across a few frames separates "nothing responds to my
     /// input" from "nothing is happening at all", and those have completely different
     /// causes.
-    fn cmd_scene(&self) -> String {
+    fn cmd_scene(&self, args: &str) -> String {
         let host = self.sched.host();
         let cap = &host.state.capture;
-        let Some(scene) = cap.scenes.last() else { return "no scene captured yet".into() };
+        // `--passes` reports the frame's whole pass structure and, per pass, the vertex
+        // FORMATS its draws use. A title whose world will not map is the case this is for:
+        // the observers here decode a vertex through its declared attribute list, so a
+        // format that list describes and the decoder does not shows up as geometry at an
+        // absurd coordinate rather than as an error, and nothing else in the session says
+        // which format it was.
+        if args.split_whitespace().any(|a| a == "--passes") {
+            let mut out = vec![format!("frame={} retained={}", self.frame(), cap.scenes.len())];
+            for (i, s) in cap.frame_scenes().iter().enumerate() {
+                let mut fmts: Vec<String> = Vec::new();
+                for d in &s.draws {
+                    for a in &d.attributes {
+                        let f = format!("fmt{}x{}@{}", a.format, a.component_count, a.offset);
+                        if !fmts.contains(&f) {
+                            fmts.push(f);
+                        }
+                    }
+                }
+                fmts.sort();
+                out.push(format!(
+                    "  pass{i:<2} draws={:<4} world-tris={:<7} target={} attrs=[{}]",
+                    s.draws.len(),
+                    s.world_triangles(),
+                    s.color
+                        .as_ref()
+                        .map(|c| format!("{:#x}:{}x{}", c.data_addr, c.width, c.height))
+                        .unwrap_or_else(|| "-".into()),
+                    fmts.join(" ")
+                ));
+            }
+            return out.join("\n");
+        }
+        let Some(scene) = cap.world_scene() else { return "no scene captured yet".into() };
         // A digest over just this scene's draws, so successive frames are comparable
         // (the run signature is cumulative and always differs).
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1067,7 +1114,7 @@ impl Session {
     > {
         let objects = {
             let host = self.sched.host();
-            let scene = host.state.capture.scenes.last().ok_or("no scene captured yet")?;
+            let scene = host.state.capture.world_scene().ok_or("no scene captured yet")?;
             render::locate_scene(scene, observe::WIDTH, observe::HEIGHT)
         };
         let previous = std::mem::replace(&mut self.last_locate, Some(objects.clone()));
@@ -1363,7 +1410,7 @@ impl Session {
 
         let scene = {
             let host = self.sched.host();
-            host.state.capture.scenes.last().cloned().ok_or("no scene captured yet")?
+            host.state.capture.world_scene().cloned().ok_or("no scene captured yet")?
         };
         // The frame every coordinate in this report is measured from - see `locate_frame`,
         // which is the single place that knows how a travelling origin is handled.
@@ -1595,6 +1642,186 @@ impl Session {
         format!("{header}{}", lines.join("\n"))
     }
 
+    /// `camera` - where the view is and which way it looks, this frame.
+    ///
+    /// Reconstructed from the world-to-clip matrix the guest drew with, so unlike an
+    /// address found by memory diffing it cannot go stale: a title's per-frame matrix
+    /// pool moves the vehicle between slots, and the reading from a slot it has left
+    /// freezes at a value that looks exactly like a car stopped against a wall.
+    /// `--passes` reports EVERY pass of the frame with its own recovered camera, marking
+    /// the one `world_scene` selected. This is the instrument that distinguishes a car
+    /// that is spinning from a reading that is jumping between two passes: a race frame
+    /// carries a rear-view MIRROR pass, whose camera is a legitimate reconstruction of a
+    /// view pointing the other way, so a selection that flips between it and the main view
+    /// reports a heading that flips 180 degrees while the car drives dead straight.
+    fn cmd_camera(&self, args: &str) -> String {
+        let host = self.sched.host();
+        let fmt = |e: &render::Eye| {
+            format!(
+                "eye=({:.2},{:.2},{:.2}) dir=({:.4},{:.4},{:.4}) bearing={:.2}",
+                e.pos[0], e.pos[1], e.pos[2], e.dir[0], e.dir[1], e.dir[2], e.bearing
+            )
+        };
+        if args.split_whitespace().any(|a| a == "--passes") {
+            let frame = host.state.capture.frame_scenes();
+            let chosen = host.state.capture.world_scene().map(|s| s as *const _);
+            let mut out = vec![format!("frame={} passes={}", self.frame(), frame.len())];
+            for (i, s) in frame.iter().enumerate() {
+                let mark = if Some(s as *const _) == chosen { "<- world_scene" } else { "" };
+                let target = match &s.color {
+                    Some(c) => format!("{:#x}:{}x{}", c.data_addr, c.width, c.height),
+                    None => "none".into(),
+                };
+                let cam = match render::scene_eye(s) {
+                    Some(e) => fmt(&e),
+                    None => "no world-to-clip matrix".into(),
+                };
+                out.push(format!(
+                    "  pass{i:<3} tris={:<7} target={target:<22} {cam} {mark}",
+                    s.world_triangles()
+                ));
+            }
+            return out.join("\n");
+        }
+        let Some(scene) = host.state.capture.world_scene() else {
+            return "no scene captured yet".into();
+        };
+        match render::scene_eye(scene) {
+            Some(e) => format!("frame={} {}", self.frame(), fmt(&e)),
+            None => format!("frame={} no world-to-clip matrix in this frame", self.frame()),
+        }
+    }
+
+    /// `surface --at <x>,<z> [--ceiling Y]` - what surface is under that world point.
+    /// `surface --tex <hex> --from <x>,<z> --bearing <deg> [--fov F] [--range R] [--top N]`
+    ///     - how far that surface reaches in front of you, and where its far edge is.
+    ///
+    /// # Why
+    /// Steering along a ROAD needs to know where the road is, and a height field cannot
+    /// say: tarmac and the grass beside it are the same height, so a slope-derived
+    /// traversable mask calls the whole valley drivable. The distinction is the MATERIAL,
+    /// which the capture already carries per draw. `--at` reads the material the vehicle
+    /// is standing on (ask it where the vehicle is certainly legal - on the grid), and
+    /// `--tex` then measures that same material ahead, which is an aim point.
+    fn cmd_surface(&mut self, args: &str) -> Result<String, String> {
+        let mut at: Option<[f32; 2]> = None;
+        let mut from: Option<[f32; 2]> = None;
+        // A SET, because one surface is rarely one material: a circuit changes tarmac
+        // texture between sectors, and a controller that re-identified the road every tick
+        // would follow whatever it happened to be standing on the moment it ran wide.
+        let mut tex: Vec<u32> = Vec::new();
+        let mut bearing = 0f32;
+        let mut fov = 100f32;
+        let mut range = 400f32;
+        let mut top = 8usize;
+        let mut ceiling: Option<f32> = None;
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        let pair = |s: &str| -> Result<[f32; 2], String> {
+            let (a, b) = s.split_once(',').ok_or_else(|| format!("expected x,z not {s:?}"))?;
+            Ok([a.trim().parse().map_err(|_| "bad x")?, b.trim().parse().map_err(|_| "bad z")?])
+        };
+        let mut i = 0;
+        while i < parts.len() {
+            let v = parts.get(i + 1).copied().unwrap_or("");
+            match parts[i] {
+                "--at" => at = Some(pair(v)?),
+                "--from" => from = Some(pair(v)?),
+                "--tex" => {
+                    for t in v.split(',').filter(|s| !s.is_empty()) {
+                        tex.push(
+                            u32::from_str_radix(t.trim().trim_start_matches("0x"), 16)
+                                .map_err(|_| "bad --tex")?,
+                        );
+                    }
+                }
+                "--bearing" => bearing = v.parse().map_err(|_| "bad --bearing")?,
+                "--fov" => fov = v.parse().map_err(|_| "bad --fov")?,
+                "--range" => range = v.parse().map_err(|_| "bad --range")?,
+                "--top" => top = v.parse().map_err(|_| "bad --top")?,
+                "--ceiling" => ceiling = Some(v.parse().map_err(|_| "bad --ceiling")?),
+                _ => {}
+            }
+            i += 2;
+        }
+        let scene = {
+            let host = self.sched.host();
+            host.state.capture.world_scene().cloned().ok_or("no scene captured yet")?
+        };
+        let tris = render::surface_tris(&scene);
+        if let Some(p) = at {
+            let Some((hit, y)) = render::surface_at(&tris, p[0], p[1], ceiling) else {
+                return Ok(format!(
+                    "frame={} no surface covers ({:.2},{:.2}) among {} triangles",
+                    self.frame(),
+                    p[0],
+                    p[1],
+                    tris.len()
+                ));
+            };
+            let same = tris.iter().filter(|t| t.tex == hit.tex).count();
+            return Ok(format!(
+                "frame={} at=({:.2},{:.2}) y={y:.2} draw={} tex={:#010x} tris_of_tex={same} scene_tris={}",
+                self.frame(),
+                p[0],
+                p[1],
+                hit.draw,
+                hit.tex,
+                tris.len()
+            ));
+        }
+        let Some(from) = from.filter(|_| !tex.is_empty()) else {
+            return Err("surface needs --at <x>,<z>, or --tex <hex>[,<hex>...] --from <x>,<z>".into());
+        };
+        // Forward reach: every triangle of that material whose centroid is inside the cone,
+        // ranked by how far ahead it is. The FARTHEST is the aim point - "drive as far along
+        // this surface as you can see" needs no track model and no waypoints authored by eye.
+        let (sb, cb) = (bearing.to_radians().sin(), bearing.to_radians().cos());
+        let mut hits: Vec<(f32, f32, [f32; 3])> = Vec::new();
+        for t in tris.iter().filter(|t| tex.contains(&t.tex)) {
+            let c = t.centroid();
+            // Bearing convention matches `locate` and `lang=`: 0 is world +X, increasing
+            // toward world -Z.
+            let (dx, dz) = (c[0] - from[0], c[2] - from[1]);
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > range || dist < 1e-3 {
+                continue;
+            }
+            let ahead = (dx * cb + (-dz) * sb) / dist;
+            let off = ahead.clamp(-1.0, 1.0).acos().to_degrees();
+            if off > fov * 0.5 {
+                continue;
+            }
+            hits.push((dist, off, c));
+        }
+        if hits.is_empty() {
+            return Ok(format!(
+                "frame={} tex={tex:02x?} no surface within {range:.0} ahead of ({:.2},{:.2}) bearing {bearing:.1}",
+                self.frame(),
+                from[0],
+                from[1]
+            ));
+        }
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out = vec![format!(
+            "frame={} tex={tex:02x?} from=({:.2},{:.2}) bearing={bearing:.1} fov={fov:.0} reach={} tris",
+            self.frame(),
+            from[0],
+            from[1],
+            hits.len()
+        )];
+        for (dist, off, c) in hits.iter().take(top) {
+            let b = (-(c[2] - from[1])).atan2(c[0] - from[0]).to_degrees();
+            out.push(format!(
+                "  at=({:.2},{:.2}) y={:.2} dist={dist:.1} bearing={:.1} off={off:.1}",
+                c[0],
+                c[2],
+                c[1],
+                if b < 0.0 { b + 360.0 } else { b }
+            ));
+        }
+        Ok(out.join("\n"))
+    }
+
     /// Build a navigation mesh for the current frame: the top-down map, and a
     /// traversability mask over it.
     ///
@@ -1613,7 +1840,7 @@ impl Session {
     ) -> Result<(render::WorldMap, render::Traversable, [f32; 3]), String> {
         let scene = {
             let host = self.sched.host();
-            host.state.capture.scenes.last().cloned().ok_or("no scene captured yet")?
+            host.state.capture.world_scene().cloned().ok_or("no scene captured yet")?
         };
         let (_, origin, _, _) = self.locate_frame(want)?;
         let raw = render::world_extent(&scene, 0.98).ok_or("scene has no 3D geometry to map")?;
@@ -2240,8 +2467,18 @@ impl Session {
             None => "none".into(),
         };
         let (input, touch) = self.timeline.lock().unwrap().at(self.frame());
+        // The guest clock beside the frame count, with the RATE it has been running at.
+        // A title derives its own timers from this clock, so if it advances faster than
+        // the frames are worth then everything the game times - a race clock, a countdown,
+        // a timed event - runs fast, and the failure shows up as a game rule (a race that
+        // always runs out of time) rather than as anything that looks like a clock bug.
+        // A run TOTAL can average out to 1.00x while a stretch inside it runs at 5x, which
+        // is why this is reported live rather than only at the end of a run.
+        let clock_us = self.sched.host().state.now_us();
+        let worth_us = self.frame() * 1_000_000 / 60;
+        let rate = if worth_us > 0 { clock_us as f64 / worth_us as f64 } else { 0.0 };
         format!(
-            "frame      {}\nrun        {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan       {scan}\nshots      {}\nsig        {:#018x}",
+            "frame      {}\nrun        {:?}\nguest mem  {base:#010x}+{len:#x}\nheld input buttons={:#06x} lx={} ly={} rx={} ry={} touch={}\nwatches    {}\nscan       {scan}\nshots      {}\nclock      {:.3}s = {rate:.2}x the {:.1}s these frames are worth\nsig        {:#018x}",
             self.frame(),
             self.last,
             input.buttons,
@@ -2256,6 +2493,8 @@ impl Session {
                 self.watch_values()
             },
             self.opts.shot_dir.as_ref().map(|p| p.display().to_string()).unwrap_or("(none)".into()),
+            clock_us as f64 / 1e6,
+            worth_us as f64 / 1e6,
             self.signature(),
         )
     }
@@ -2487,9 +2726,11 @@ OUTPUT
   shot [name]                render the current frame to a PNG
   shot-every <N>             auto-shot every N stepped frames (0 disables)
   section <name> | note <text> | todo <text>
-  scene                      draw count + a digest of THIS frame's draws, so you
+  scene [--passes]           draw count + a digest of THIS frame's draws, so you
                              can tell a world that is simulating from one that is
-                             only redrawing
+                             only redrawing. --passes lists every pass of the frame
+                             with its render target, its world-triangle count and
+                             the vertex attribute FORMATS its draws declare
   locate [--min-tris N] [--top N] [--moving] [--id <hex>] [--stable|--anchor <hex>]
                              every object in this frame: its world position, its
                              screen box, and how far it moved since the last
@@ -2528,6 +2769,19 @@ OUTPUT
                              railings a guessed route would catch on. Auto extent
                              covers 98% of vertices, so a skydome cannot squash
                              the playable area into four pixels.
+  camera                     where the view is and which way it looks, recovered
+                             from the frame's own world-to-clip matrix. Use this
+                             rather than a position address found by memory
+                             diffing: a per-frame matrix pool moves the vehicle
+                             between slots, and a stale slot reads exactly like a
+                             car stopped against a wall.
+  surface --at <x>,<z> [--ceiling Y]
+  surface --tex <hex> --from <x>,<z> --bearing <deg> [--fov F] [--range R] [--top N]
+                             which MATERIAL is under a world point, and how far that
+                             same material reaches ahead of you. Height cannot tell a
+                             road from the grass beside it (same height); the texture
+                             can. Ask --at where the vehicle is certainly legal, then
+                             --tex that answer to get an aim point every tick.
   route --to <x>,<z> [--to ...] [--from <x>,<z>|--id <hex>] [--slope R]
         [--clearance W] [--size WxH] [--ceiling Y] [--snap N] [--out <name>]
                              a DRIVEABLE route to each destination, computed from

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use vitaslop_gxp_shader::container::{ParamCategory, ProgramKind};
 use vitaslop_gxp_shader::ir::Bank;
-use vitaslop_gxp_shader::usse::{decode, field, opcode1, GROUP_TABLES};
+use vitaslop_gxp_shader::usse::{decode, field, opcode1, repeat_extra_iterations, GROUP_TABLES};
 use vitaslop_gxp_shader::{
     analyze, container::Program, recompile_fragment, recompile_fragment_module,
     recompile_vertex_module, RecompileError,
@@ -197,7 +197,17 @@ fn oracle_parse_decode_all_blobs() {
         assert_eq!(program.size as usize, bytes.len(), "{name}: size != len");
 
         let cov = analyze(&bytes).unwrap();
-        assert_eq!(cov.total, program.code.len(), "{name}: instr count mismatch");
+        // Coverage counts the stream the hardware EXECUTES, not the code words, and those
+        // differ by exactly the repeat counts: one word carrying `repeat_count = n` stands for
+        // n+1 executions (see `usse::unroll_repeats`). Asserting equality with the word count
+        // was an invariant from before repetition was modelled, and it fails on every program
+        // that repeats - which is a property of the fixture, not a decode error.
+        let unrolled: usize = program
+            .code
+            .iter()
+            .map(|&w| 1 + repeat_extra_iterations(w).unwrap_or(0) as usize)
+            .sum();
+        assert_eq!(cov.total, unrolled, "{name}: instr count mismatch vs the unrolled stream");
 
         // Every instruction re-decodes to exactly the same word we read (losslessness).
         for &w in &program.code {
@@ -252,8 +262,17 @@ fn oracle_parse_decode_all_blobs() {
                 n_recompiled += 1;
                 // Go the whole way to a complete, bindable module and prove it validates as
                 // real WGSL with a sound binding interface (the artifact the renderer binds).
-                let (_, module) = recompile_fragment_module(&bytes)
-                    .unwrap_or_else(|e| panic!("{name}: module assembly failed: {e}"));
+                // A pass-through fragment (writes neither colour register) recompiles to an
+                // empty body but cannot be given a colour register, so it is REPORTED here
+                // rather than asserted away - see `module::writes_no_color_register`.
+                let (_, module) = match recompile_fragment_module(&bytes) {
+                    Ok(v) => v,
+                    Err(RecompileError::ColorRegisterNeverWritten) => {
+                        println!("  {name:<24} PASS-THROUGH - writes no colour register, falls back");
+                        continue;
+                    }
+                    Err(e) => panic!("{name}: module assembly failed: {e}"),
+                };
                 validate_module_wgsl(&name, &module.wgsl);
                 let b = &module.bindings;
                 println!(
@@ -528,6 +547,106 @@ fn vertex_output_layout_analysis() {
         println!("    pa-lanes read:   {pa_lanes:?}");
         println!("    attributes: [{}]", attrs.join(" "));
         println!("    varyings hdr: vo1={vo1:#010x} vo2={vo2:#010x} texpack={texpack:#010x}");
+    }
+}
+
+/// PER-LANE PROVENANCE of every vertex output: for each output lane the program writes,
+/// which register (and therefore which NAMED attribute, uniform or literal) supplies it.
+///
+/// The reserved region between the clip position and the texcoord block is argued about in
+/// terms of what it CONTAINS, and until now the evidence for that was the region's WIDTH plus
+/// the partner fragment's declared usage. Width cannot distinguish two layouts of the same
+/// total, which is exactly why both readings of an 8-lane region were tried and refuted
+/// against pixels. Provenance can: a lane fed from an attribute the parameter table calls a
+/// colour is a colour, and a lane fed from a literal is not, whatever its position.
+///
+/// Printed AFTER unrolling, because a repeating `mov` is the instruction that fills a whole
+/// varying and the un-unrolled stream shows only its first lane pair.
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn vertex_output_lane_provenance() {
+    let Some(dir) = dump_dir() else { return };
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        if program.kind != ProgramKind::Vertex {
+            continue;
+        }
+        let var_rel = u32(&bytes, 0x2c);
+        if var_rel == 0 {
+            continue;
+        }
+        let blk = 0x2c + var_rel as usize;
+        let (vo1, vo2) = (u32(&bytes, blk + 0x10), u32(&bytes, blk + 0x14));
+        // A register index is only readable next to the table that names it: an attribute
+        // occupies `component_count` registers from its `resource_index`, and a uniform the
+        // same in the SA bank.
+        let name_of = |bank: Bank, index: u8| -> String {
+            let want = match bank {
+                Bank::PrimaryAttr => ParamCategory::Attribute,
+                Bank::SecondaryAttr => ParamCategory::Uniform,
+                _ => return String::new(),
+            };
+            for p in &program.parameters {
+                if p.category != want {
+                    continue;
+                }
+                let base = p.resource_index as i64;
+                let span = (p.component_count as i64 * p.array_size as i64).max(1);
+                if (index as i64) >= base && (index as i64) < base + span {
+                    return format!("{}[{}]", p.name, index as i64 - base);
+                }
+            }
+            if bank == Bank::SecondaryAttr {
+                if let Some(&(_, w)) = program.literals.iter().find(|&&(sa, _)| sa == index as u32) {
+                    return format!("literal({})", f32::from_bits(w));
+                }
+            }
+            String::new()
+        };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        let mut lanes: Vec<String> = Vec::new();
+        for ins in &shader.instrs {
+            let Some(d) = &ins.dest else { continue };
+            if d.bank != Bank::Output {
+                continue;
+            }
+            for c in 0..4 {
+                if !ins.write_mask[c] {
+                    continue;
+                }
+                let lane = d.index as usize + c;
+                if lanes.len() <= lane {
+                    lanes.resize(lane + 1, "-".into());
+                }
+                // The source lane the destination channel takes: the mask selects channels
+                // of one operand, so channel `c` of the destination comes from source
+                // register `index` channel `c` unless a swizzle says otherwise.
+                let src = ins
+                    .srcs
+                    .first()
+                    .map(|s| {
+                        let n = name_of(s.bank, s.index);
+                        if n.is_empty() {
+                            format!("{:?}[{}].{c}", s.bank, s.index)
+                        } else {
+                            format!("{n}.{c}")
+                        }
+                    })
+                    .unwrap_or_else(|| format!("{:?}", ins.op));
+                lanes[lane] = format!("{}={src}", ins.op.mnemonic());
+            }
+        }
+        println!(
+            "\n  {name}: vo1={vo1:#010x} total={} vo1lo={:#06x} vo2={vo2:#010x} declared={:?}",
+            vo1 >> 24,
+            vo1 & 0xffff,
+            program.output_varyings
+        );
+        for (lane, src) in lanes.iter().enumerate() {
+            println!("    o[{lane:>2}] <- {src}");
+        }
     }
 }
 
@@ -1232,7 +1351,16 @@ fn vertex_written_lanes_close_against_declared_total() {
         // SHORTFALL means an iteration was dropped (the pre-repeat bug, which silently left a
         // varying uninterpolated), an OVERRUN means the stride is too large and the program is
         // writing over a lane that belongs to something else.
-        let over: Vec<usize> = got.iter().copied().filter(|l| !routed[*l]).collect();
+        // An overrun is a write past the DECLARED INTERFACE, not merely past the lanes some
+        // varying claims. The two differ, and the programs that carry SMLSI are what showed it:
+        // they open by copying whole vertex attributes straight through with one repeated move,
+        // filling every lane of a 14- or 16-lane declared interface, while the varying table
+        // claims only position and one texture coordinate. The unclaimed middle is the same
+        // reserved region this test already tolerates a program for NOT writing - it cannot also
+        // be an error to write it. What a wrong stride does is leave the interface entirely
+        // (stepping by four instead of two puts the last iteration two lanes past `total`), and
+        // that is what is caught here.
+        let over: Vec<usize> = got.iter().copied().filter(|&l| l >= total as usize).collect();
         let under: Vec<usize> = expect.iter().copied().filter(|l| !written[*l]).collect();
         // An OVERRUN is unambiguously a wrong stride: the program wrote a lane no declared
         // varying claims. A SHORTFALL of a single lane is not - a program may simply not fill a
@@ -1280,4 +1408,208 @@ fn vertex_written_lanes_close_against_declared_total() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// Survey every SMLSI in the corpus with the instructions it governs, so its encoding can be
+/// argued from what the programs around it DO rather than from a spec line that describes 36
+/// bits of a 32-bit field.
+///
+/// SMLSI sets the per-operand increment/swizzle state a REPEATED instruction steps its registers
+/// by. The decoder blocks it, which is why two of a racing title's shader pairs still fall back
+/// to fixed function. What this prints, per SMLSI: the raw word split into the candidate fields,
+/// and then every instruction it governs (up to the next SMLSI) with its repeat count and
+/// operands - because an SMLSI followed by nothing that repeats is inert, and one followed by a
+/// repeating instruction is measurable against that program's declared output lanes.
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn smlsi_corpus_survey() {
+    let Some(dir) = dump_dir() else {
+        eprintln!("VITASLOP_GXP_DUMPS unset - skipping SMLSI survey");
+        return;
+    };
+    let mut total = 0u32;
+    let mut distinct: Vec<(u64, u32)> = Vec::new();
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        for (stream, code) in [("primary", &program.code), ("secondary", &program.secondary_code)] {
+            if !code.iter().any(|&w| is_smlsi(w)) {
+                continue;
+            }
+            println!("\n== {name} [{stream}] {:?} {} instrs ==", program.kind, code.len());
+            if program.kind == ProgramKind::Vertex {
+                let routed: Vec<String> = program
+                    .output_varyings
+                    .iter()
+                    .map(|v| format!("{:?}@{}x{}", v.usage, v.base_lane, v.components))
+                    .collect();
+                println!("   output varyings: {}", routed.join(" "));
+            }
+            for (i, &w) in code.iter().enumerate() {
+                let ins = decode(w);
+                if is_smlsi(w) {
+                    total += 1;
+                    match distinct.iter_mut().find(|(d, _)| *d == w) {
+                        Some((_, n)) => *n += 1,
+                        None => distinct.push((w, 1)),
+                    }
+                    println!("  #{i:<3} SMLSI raw={w:#018x}  {}", smlsi_fields(w));
+                    continue;
+                }
+                let rpt = repeat_extra_iterations(w).map_or("?".to_string(), |n| n.to_string());
+                let fmt = |o: &vitaslop_gxp_shader::ir::Operand| format!("{:?}[{}]", o.bank, o.index);
+                let dest = ins.dest.as_ref().map(&fmt).unwrap_or_else(|| "-".into());
+                let srcs: Vec<String> = ins.srcs.iter().map(&fmt).collect();
+                let mask: String = (0..4)
+                    .map(|c| if ins.write_mask[c] { "xyzw".as_bytes()[c] as char } else { '.' })
+                    .collect();
+                println!(
+                    "  #{i:<3} {:<8} g={:#04x} rpt={rpt:<6} {:<4} dst={dest} [{mask}] <- {}",
+                    ins.op.mnemonic(),
+                    ins.group,
+                    if ins.half_precision { "f16" } else { "f32" },
+                    srcs.join(", ")
+                );
+            }
+        }
+    }
+    println!("\n=== {total} SMLSI words, {} distinct ===", distinct.len());
+    distinct.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (w, n) in &distinct {
+        println!("  {n:4}x {w:#018x}  {}", smlsi_fields(*w));
+    }
+}
+
+fn is_smlsi(w: u64) -> bool {
+    (w >> 59) & 0x1f == 0x1f && (w >> 56) & 0b111 == 0b010 && (w >> 52) & 0b11 == 0b01
+}
+
+/// The candidate field split of an SMLSI word, printed side by side so the survey can settle
+/// which one the corpus supports.
+fn smlsi_fields(w: u64) -> String {
+    let byte = |i: u32| (w >> (8 * i)) & 0xff;
+    format!(
+        "hi[58:52]={:#05b}_{:02b} limits[51:36]={:#06x} b[35:32]={:04b} bytes=[{:02x} {:02x} {:02x} {:02x}]",
+        (w >> 55) & 0b1111,
+        (w >> 52) & 0b11,
+        (w >> 36) & 0xffff,
+        (w >> 32) & 0xf,
+        byte(0),
+        byte(1),
+        byte(2),
+        byte(3)
+    )
+}
+
+
+/// For every program whose SMLSI is still BLOCKED, print what is keeping it blocked: the
+/// instructions that are not established as single-execution, and therefore force the
+/// conservative "every operand slot is live" reading of the repeat state.
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn smlsi_blockers() {
+    let Some(dir) = dump_dir() else { return };
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        for (stream, code) in [("primary", &program.code), ("secondary", &program.secondary_code)] {
+            if !code.iter().any(|&w| is_smlsi(w)) {
+                continue;
+            }
+            let shader = if stream == "primary" {
+                vitaslop_gxp_shader::usse::decode_shader(&program)
+            } else {
+                vitaslop_gxp_shader::usse::decode_secondary_shader(&program)
+            };
+            let still = shader.instrs.iter().filter(|i| i.blocked == Some(
+                "0xF8 SMLSI repeat/swizzle state not modeled - would mis-address later instructions",
+            )).count();
+            if still == 0 {
+                continue;
+            }
+            println!("\n== {name} [{stream}]: {still} SMLSI still blocked ==");
+            for (i, &w) in code.iter().enumerate() {
+                let g = opcode1(w);
+                // The same question `executes_once` asks, restated here so the survey can name
+                // the instruction rather than only report that something failed it.
+                let established_once = match g {
+                    0x06 | 0x08 | 0x0a..=0x0d => Some((w >> 44) & 0xf == 0),
+                    0x07 | 0x09 | 0x0f => Some((w >> 44) & 0x3 == 0),
+                    0x01 | 0x02 | 0x1c | 0x1f => Some(true),
+                    0x00 | 0x03 => None, // decided by the group's unknown bits
+                    _ => Some(false),
+                };
+                if established_once == Some(true) {
+                    continue;
+                }
+                let ins = decode(w);
+                println!(
+                    "  #{i:<3} {:<8} g={g:#04x} raw={w:#018x} once={established_once:?} {}",
+                    ins.op.mnemonic(),
+                    ins.blocked.unwrap_or("")
+                );
+            }
+        }
+    }
+}
+
+/// The vertex-side lane accounting next to the fragment-side interpolant declarations, which is
+/// what settles what a RESERVED region between the clip position and the texcoords contains.
+///
+/// `parse_vertex_output_varyings` derives the texcoord base lane from the block's own total, and
+/// whatever sits between output lane 4 and that base is the reserved region. Its 2-lane form is
+/// established as FOG and its 4-lane form as COLOR0; this prints every width the corpus actually
+/// contains alongside the non-texcoord varyings the fragments declare, so a wider region can be
+/// argued from the pairing rather than guessed.
+#[test]
+#[ignore = "requires the private VITASLOP_GXP_DUMPS fixture; run explicitly"]
+fn reserved_output_region_widths_against_fragment_declarations() {
+    let Some(dir) = dump_dir() else { return };
+    let mut vertex_rows: Vec<String> = Vec::new();
+    let mut frag_rows: Vec<String> = Vec::new();
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        if program.kind == ProgramKind::Vertex {
+            let var_rel = u32(&bytes, 0x2c);
+            if var_rel == 0 {
+                continue;
+            }
+            let total = u32(&bytes, 0x2c + var_rel as usize + 0x10) >> 24;
+            let tex: u32 = program
+                .output_varyings
+                .iter()
+                .filter(|v| matches!(v.usage, vitaslop_gxp_shader::container::VaryingUsage::TexCoord(_)))
+                .map(|v| v.components)
+                .sum();
+            if total < 4 + tex {
+                continue;
+            }
+            vertex_rows.push(format!(
+                "  {name}: total={total} texcoord_lanes={tex} reserved={} declared={:?}",
+                total - 4 - tex,
+                program.output_varyings
+            ));
+        } else {
+            let non_tex: Vec<String> = program
+                .interpolants
+                .iter()
+                .map(|i| format!("{:?}(regs={} span={} half={})", i.usage, i.register_count, i.span, i.half))
+                .collect();
+            frag_rows.push(format!("  {name}: {}", non_tex.join(" ")));
+        }
+    }
+    vertex_rows.sort();
+    frag_rows.sort();
+    println!("\n=== vertex output lane accounting ({}) ===", vertex_rows.len());
+    for r in &vertex_rows {
+        println!("{r}");
+    }
+    println!("\n=== fragment interpolant declarations ({}) ===", frag_rows.len());
+    for r in &frag_rows {
+        println!("{r}");
+    }
 }

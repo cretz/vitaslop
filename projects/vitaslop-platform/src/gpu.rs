@@ -1019,6 +1019,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// the depth test disabled, to answer "does the geometry rasterize on-screen at all?"
         /// independent of fragment shading and depth. Magenta visible -> vertex/clip is right.
         solid: bool,
+        /// Diagnostic (`VITASLOP_GXP_NODEPTH`): every recompiled draw keeps its real shading and
+        /// blending but stops testing depth. `solid` answers "does this geometry rasterize"
+        /// while changing BOTH the shading and the depth test, so a surface that comes out
+        /// black under it is still ambiguous - the fragment could be painting black, or it
+        /// could be losing the depth test. This changes only the depth test, which separates
+        /// the two: a surface that appears here and not in an ordinary run is depth-rejected,
+        /// one that stays black is shaded black.
+        nodepth: bool,
         /// Diagnostic (`VITASLOP_GXP_KEYS=<hex>,<hex>`): recompile ONLY these shader-pair keys
         /// (the `gxp draw key` value `VITASLOP_GXP_DUMP` prints), letting every other draw fall
         /// back. Rendering one pair at a time is how a visual artifact is attributed to the
@@ -1067,6 +1075,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 yflip: std::env::var("VITASLOP_GXP_YFLIP").map(|v| v != "0").unwrap_or(false),
                 force: flag("VITASLOP_GXP_FORCE"),
                 solid: flag("VITASLOP_GXP_SOLID"),
+                nodepth: flag("VITASLOP_GXP_NODEPTH"),
                 keys: std::env::var("VITASLOP_GXP_KEYS")
                     .ok()
                     .map(|v| {
@@ -1130,7 +1139,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 return None;
             }
             if !self.pipelines.contains_key(&key) {
-                let built = build_gxp_pipeline(device, color_format, gxp, key, self.zfix, self.yflip, self.solid);
+                let built = build_gxp_pipeline(device, color_format, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth);
                 self.pipelines.insert(key, built);
             }
             if self.sampler_point.is_none() {
@@ -1662,6 +1671,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         zfix: bool,
         yflip: bool,
         solid: bool,
+        nodepth: bool,
     ) -> Option<GxpPipeline> {
         let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
         report_branches(key, gxp);
@@ -1843,6 +1853,10 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // Diagnostic: REPLACE (ignore alpha) + depth Always, so a magenta triangle shows
                 // unconditionally wherever geometry lands.
                 blend = Some(wgpu::BlendState::REPLACE);
+            }
+            if solid || nodepth {
+                // Both diagnostics drop the depth test; `solid` additionally replaces the
+                // shading, which is exactly the difference between them.
                 depth_write = false;
                 depth_compare = wgpu::CompareFunction::Always;
             }
@@ -2492,9 +2506,9 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// the display buffer. Rendering only the last scene - which is all a single-scene
         /// `encode` can do - draws only that composite, and every texture it samples comes
         /// from guest memory that the guest never wrote, because on hardware the GPU wrote
-        /// it. PCSE00001's race is exactly this: fourteen offscreen passes carrying the
-        /// entire world, then a 24-draw composite. The result was a correct, live HUD over a
-        /// black screen.
+        /// it. One of the retail racers is exactly this: fourteen offscreen passes carrying
+        /// the entire world, then a 24-draw composite. The result was a correct, live HUD
+        /// over a black screen.
         ///
         /// Scenes are encoded in submission order (a pass may sample an EARLIER pass's
         /// target, so order is load-bearing). A scene whose target is the same buffer the
@@ -2551,9 +2565,9 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // Clear a target the FIRST time this frame draws into it, and compose onto
                 // it after that - the same rule the display buffer follows. A later pass
                 // into a buffer an earlier pass filled is a post-process step, and it is
-                // entitled to leave most of the image alone: PCSE00001's race ends with a
-                // five-draw pass over the world target, and clearing for it wiped the whole
-                // world, leaving a correct HUD over black.
+                // entitled to leave most of the image alone: a retail racer's race frame ends
+                // with a five-draw pass over the world target, and clearing for it wiped the
+                // whole world, leaving a correct HUD over black.
                 let first_pass_here = !self.rtt_rendered.contains_key(&t.data_addr);
                 if !first_pass_here {
                     if let Some(before) = self.snapshot_rtt(device, encoder, t.data_addr) {

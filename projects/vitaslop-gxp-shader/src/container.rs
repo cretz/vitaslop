@@ -632,7 +632,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         //
         // Measured, on the closure the whole PA layout rests on (the descriptor spans must
         // sum to the program's own `primary_reg_count`): reading these as one data register
-        // plus the prefetch pair closes on 11 of PCSE00001's 18 race fragment programs;
+        // plus the prefetch pair closes on 11 of a retail racer's 18 race fragment programs;
         // reading them as prefetch-only closes on 15, and the three that still fall short
         // are short because the program allocates PA registers no descriptor covers, which
         // is allowed. The 40-blob corpus is unaffected either way - it contains no 0xF
@@ -653,7 +653,7 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         let flags = [
             size & SIZE_PREFETCH != 0,
             attribute_info & INFO_PREFETCH != 0,
-            // A BIT test, not equality: PCSE00001 has a descriptor carrying 0x30 here, and
+            // A BIT test, not equality: a retail title has a descriptor carrying 0x30 here, and
             // rejecting it threw away that whole program's interpolant list (the parse is
             // all-or-nothing) over a bit that is not the prefetch flag. Across the corpus
             // this field is only ever 0x00 or 0x20, so the flag itself is unambiguous.
@@ -749,9 +749,27 @@ const COLOR0_RESERVED_LANES: u32 = 4;
 /// with zero alpha. See [`crate::usse::unroll_repeats`]; with repetition modelled, the written
 /// lanes reproduce the container's own total exactly and this declaration is safe.
 ///
+/// The 8-lane region is NOT placed, and that is a measured decision rather than a gap nobody
+/// looked at. What the corpus does establish is its CONTENT: a racing title's race frame has
+/// seven vertex programs with an 8-lane region, and the fragment each is drawn with declares
+/// **Color1** - a usage that appears next to no 4-lane region anywhere in the corpus, where every
+/// fragment declares Color0 alone. Three of the seven read both colours and four read only
+/// Color1.
+///
+/// What it does NOT establish is the LAYOUT, and both readings were tried and refuted against
+/// PIXELS. Declaring COLOR0 at lane 4 and COLOR1 at lane 8 makes the Color1-only fragments read
+/// the lanes their vertex fills from `In.UV1` - texture coordinates used as a colour - and they
+/// paint saturated yellow over the track. Swapping them makes those fragments read a lane pair
+/// the vertex fills from the literal `(0, 1, -0.01, 0)`, and they paint pure green. Neither is a
+/// colour, so neither placement is right, and a third arrangement is not something to guess at:
+/// the region may not be two vec4s at all.
+///
+/// So these pairs FALL BACK, visibly and by name, and the renderer draws its approximation -
+/// which looks like scenery - instead of a recompiled shader sampling a register the vertex
+/// filled with something else. Settling it needs evidence from the varyings block itself.
+///
 /// The same rule still covers every other width: a fragment reading a varying we did not place
-/// falls back rather than sample an uninterpolated register. The corpus also has one 8-lane
-/// region, and nothing in it pins what shares those eight lanes.
+/// falls back rather than sample an uninterpolated register.
 fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
     let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else { return Vec::new() };
     if rel == 0 {

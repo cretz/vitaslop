@@ -1057,6 +1057,13 @@ struct DrawInterp {
 /// Latch for the once-per-run notice that shader-expanded draws are being skipped.
 static SKIPPED_EXPANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Latch for the once-per-run notice that a frame held a scene with no colour surface,
+/// so [`render_frame_chain`] could not place it in the chain.
+static UNPLACED_SCENE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Latch for the once-per-run notice that post-process passes are being skipped.
+static SKIPPED_POST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Print `msg` the first time this latch is raised. Used for "the renderer cannot
 /// reproduce this class of draw" notices, which are properties of the title's shaders and
 /// so would otherwise repeat every frame forever.
@@ -1067,6 +1074,43 @@ fn report_once(latch: &std::sync::atomic::AtomicBool, msg: &str) {
 }
 
 /// Recover a draw's [`DrawInterp`] the same way for both render paths.
+/// Whether a non-MVP draw's positions are already in NORMALIZED DEVICE coordinates: the
+/// whole position bounding box lies inside [-1, 1] and spans a real area.
+///
+/// # Why this is not a refinement
+/// "A texcoord means a pixel-space sprite" is a guess about what a 2D draw is for, and a
+/// composite's fullscreen blit breaks it: it reads a texcoord (it is sampling the world
+/// that earlier passes rendered) while its positions are the NDC corners `+-1`. Read as
+/// PIXEL coordinates those corners are a FOUR-PIXEL quad in the top-left of the screen -
+/// so the entire 3D view composited into a dot, and the finished frame was a correct HUD
+/// over black. Which is indistinguishable, by eye, from the world never having been drawn.
+///
+/// The positions themselves settle it and no guess is needed: nothing measured in pixels
+/// on a 960x544 panel fits inside a two-unit box, and a fullscreen NDC quad fills it
+/// exactly. The area requirement keeps a genuinely sub-pixel 2D element (which would be
+/// invisible either way) from being stretched across the screen.
+fn positions_are_ndc(d: &Draw, layout: &Layout) -> bool {
+    let stride = d.vertex_stride.max(1) as usize;
+    let nverts = d.vertices.len() / stride.max(1);
+    if nverts == 0 {
+        return false;
+    }
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for i in 0..nverts {
+        let v = decode_vertex(d, layout, i);
+        for k in 0..2 {
+            if !v.pos[k].is_finite() {
+                return false;
+            }
+            lo[k] = lo[k].min(v.pos[k]);
+            hi[k] = hi[k].max(v.pos[k]);
+        }
+    }
+    let inside = lo.iter().chain(hi.iter()).all(|c| c.abs() <= 1.001);
+    let spans = (hi[0] - lo[0]) >= 0.5 || (hi[1] - lo[1]) >= 0.5;
+    inside && spans
+}
+
 fn interpret_draw(d: &Draw) -> DrawInterp {
     let layout = layout_of(d);
     // Recover the draw's coordinate space (see `Space`). A 4x4 MVP uniform is the 3D
@@ -1076,7 +1120,7 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
         let mut m = [0f32; 16];
         m.copy_from_slice(&d.uniforms[..16]);
         Space::Mvp(m)
-    } else if layout.uv_off.is_some() {
+    } else if layout.uv_off.is_some() && !positions_are_ndc(d, &layout) {
         Space::Pixel
     } else {
         Space::Ndc
@@ -1190,6 +1234,24 @@ pub struct ObjectLoc {
 /// title-specific fact, and the way to establish it is behavioural: hold the throttle,
 /// see which world position moves. That belongs in a recipe, not in the engine.
 ///
+impl Scene {
+    /// Triangles this scene draws through a model-to-world matrix, i.e. how much WORLD
+    /// it contains. Zero for a composite, a HUD pass or a fullscreen post pass, whose
+    /// geometry is emitted straight in clip or pixel space.
+    ///
+    /// This is what lets [`Capture::world_scene`](crate::capture::Capture::world_scene)
+    /// pick the world pass out of a multi-pass frame by content rather than by order.
+    /// The same [`interpret_draw`] classification every observer here uses decides it,
+    /// so "the scene `locate` reports on" and "the scene selected" can never disagree.
+    pub fn world_triangles(&self) -> usize {
+        self.draws
+            .iter()
+            .filter(|d| matches!(interpret_draw(d).space, Space::Mvp(_)))
+            .map(triangle_count)
+            .sum()
+    }
+}
+
 /// `width`/`height` are the raster size the screen coordinates are expressed in.
 pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
     // Group by quantized world translation. Millimetre buckets: fine enough that two
@@ -1292,7 +1354,7 @@ pub fn locate_scene(scene: &Scene, width: u32, height: u32) -> Vec<ObjectLoc> {
 ///
 /// # Why this is not optional
 /// The matrix a title calls "model to world" need not be measured from a fixed origin. On
-/// PCSA00027 it is measured from a frame that travels with the camera - so while the
+/// one retail racer it is measured from a frame that travels with the camera - so while the
 /// player drives, EVERY static object's reported position changes by the same vector, and
 /// the player's own barely changes at all. Read naively that says the scenery is flying
 /// past a stationary car, which inverts the one question a navigator asks. Worse, it is
@@ -2084,6 +2146,230 @@ fn is_map_surface(d: &Draw) -> bool {
         && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED
 }
 
+/// Where the camera is and which way it looks, recovered from a draw's own
+/// world-to-clip matrix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Eye {
+    /// Camera position in world coordinates.
+    pub pos: [f32; 3],
+    /// Unit view direction in world coordinates.
+    pub dir: [f32; 3],
+    /// Compass bearing of `dir` in the `lang=`/`locate` convention (0 = world +X,
+    /// increasing toward world -Z).
+    pub bearing: f32,
+}
+
+/// Invert a column-major 4x4. `None` when singular.
+fn invert4(m: &[f32; 16]) -> Option<[f32; 16]> {
+    // Cofactor expansion, written out: a general inverse of a projection*view product,
+    // which is not affine (its last row is a perspective divide), so the cheap
+    // transpose-and-negate trick for rigid transforms does not apply here.
+    let mut inv = [0f32; 16];
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if !det.is_finite() || det.abs() < 1e-20 {
+        return None;
+    }
+    for v in inv.iter_mut() {
+        *v /= det;
+    }
+    Some(inv)
+}
+
+/// Recover the camera from a scene's world-to-clip matrix.
+///
+/// # Why this exists
+/// Steering needs to know where the vehicle is and which way it points, and the obvious
+/// source - an address in guest memory found by diffing two runs - is not dependable:
+/// on a real title those matrices live in a per-frame scratch pool, so the slot that
+/// tracked the car for two thousand frames silently stops updating and the reading
+/// freezes at a plausible value. A controller cannot tell that apart from a car against
+/// a wall, and both of this project's driving controllers were fooled by it.
+///
+/// The camera cannot go stale, because it is reconstructed from the matrix the guest
+/// used to draw THIS frame. A chase camera sits behind the vehicle and looks where it is
+/// going, so its position and bearing are the vehicle's, to within a car length - which
+/// is well inside the width of a road.
+///
+/// The maths: the matrix `M` maps world to clip, and the eye is the view-space origin,
+/// which a perspective projection sends to `(0, 0, c, 0)`. So `[eye; 1]` is parallel to
+/// `M^-1 * (0, 0, 1, 0)`, and dehomogenizing that gives the world position exactly. The
+/// direction is then the difference between the eye and any unprojected point on the
+/// central view ray.
+pub fn scene_eye(scene: &Scene) -> Option<Eye> {
+    // The most common world-to-clip matrix among world draws. A frame contains reflection
+    // and shadow passes with cameras of their own; the one that draws most of the world is
+    // the player's.
+    let mut tally: Vec<([f32; 16], usize)> = Vec::new();
+    for d in &scene.draws {
+        let Space::Mvp(m) = interpret_draw(d).space else { continue };
+        let n = triangle_count(d);
+        match tally.iter_mut().find(|(k, _)| k == &m) {
+            Some((_, c)) => *c += n,
+            None => tally.push((m, n)),
+        }
+    }
+    let (m, _) = tally.into_iter().max_by_key(|&(_, c)| c)?;
+    let inv = invert4(&m)?;
+    let mul = |v: [f32; 4]| -> [f32; 4] {
+        [
+            inv[0] * v[0] + inv[4] * v[1] + inv[8] * v[2] + inv[12] * v[3],
+            inv[1] * v[0] + inv[5] * v[1] + inv[9] * v[2] + inv[13] * v[3],
+            inv[2] * v[0] + inv[6] * v[1] + inv[10] * v[2] + inv[14] * v[3],
+            inv[3] * v[0] + inv[7] * v[1] + inv[11] * v[2] + inv[15] * v[3],
+        ]
+    };
+    let e = mul([0.0, 0.0, 1.0, 0.0]);
+    if e[3].abs() < 1e-12 {
+        return None;
+    }
+    let pos = [e[0] / e[3], e[1] / e[3], e[2] / e[3]];
+    // A point on the central view ray, part way into the scene. Which clip depth is
+    // immaterial - every one of them is on the same ray - so this only has to be a depth
+    // the projection actually maps.
+    let f = mul([0.0, 0.0, 0.5, 1.0]);
+    if f[3].abs() < 1e-12 {
+        return None;
+    }
+    let mut dir = [f[0] / f[3] - pos[0], f[1] / f[3] - pos[1], f[2] / f[3] - pos[2]];
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if !len.is_finite() || len < 1e-9 {
+        return None;
+    }
+    for c in dir.iter_mut() {
+        *c /= len;
+    }
+    if !pos.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+    let bearing = (-dir[2]).atan2(dir[0]).to_degrees();
+    Some(Eye { pos, dir, bearing })
+}
+
+/// One world-surface triangle, in world coordinates, tagged with what drew it.
+///
+/// See [`surface_at`] for why the tag is the important half.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceTri {
+    /// Index into [`Scene::draws`].
+    pub draw: usize,
+    /// Guest address of the draw's albedo texture - a stable identity for the MATERIAL
+    /// across draws and frames. 0 when the draw is untextured.
+    pub tex: u32,
+    /// The triangle's world-space vertices.
+    pub v: [[f32; 3]; 3],
+}
+
+impl SurfaceTri {
+    pub fn centroid(&self) -> [f32; 3] {
+        [
+            (self.v[0][0] + self.v[1][0] + self.v[2][0]) / 3.0,
+            (self.v[0][1] + self.v[1][1] + self.v[2][1]) / 3.0,
+            (self.v[0][2] + self.v[1][2] + self.v[2][2]) / 3.0,
+        ]
+    }
+
+    /// Height of the triangle's plane at `(x, z)`, if `(x, z)` is inside it seen from
+    /// above. Barycentric, so a point on an edge belongs to both neighbours - which is
+    /// what a surface query wants.
+    pub fn height_at(&self, x: f32, z: f32) -> Option<f32> {
+        let (a, b, c) = (self.v[0], self.v[1], self.v[2]);
+        let det = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let l0 = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / det;
+        let l1 = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / det;
+        let l2 = 1.0 - l0 - l1;
+        let eps = -1e-4;
+        (l0 >= eps && l1 >= eps && l2 >= eps).then(|| l0 * a[1] + l1 * b[1] + l2 * c[1])
+    }
+}
+
+/// Every world-surface triangle in a scene, in world coordinates.
+///
+/// # Why this exists
+/// A height field says how high the ground is, and that is enough to route around a wall.
+/// It is NOT enough to stay on a ROAD: a racing circuit and the grass beside it are the
+/// same height, so a slope-based traversable mask calls the whole valley drivable and a
+/// route through it drives straight across the infield. What separates them is the
+/// MATERIAL - the road is a different surface drawn with a different texture - and that
+/// is already in the capture, one field away from the geometry.
+///
+/// So this returns the triangles WITH their material tag, and [`surface_at`] turns "which
+/// surface is the car standing on" into a reading rather than a guess: put the vehicle
+/// somewhere it is certainly legal (a starting grid), ask what is underneath it, and every
+/// later query for that tag is the drivable surface itself, at full extent, with no
+/// threshold to tune.
+pub fn surface_tris(scene: &Scene) -> Vec<SurfaceTri> {
+    let mut out = Vec::new();
+    for (di, d) in scene.draws.iter().enumerate() {
+        if !is_map_surface(d) {
+            continue;
+        }
+        let interp = interpret_draw(d);
+        let tex = d.albedo().map(|t| t.data_addr).unwrap_or(0);
+        let stride = d.vertex_stride.max(1) as usize;
+        let nverts = d.vertices.len() / stride;
+        if nverts == 0 {
+            continue;
+        }
+        for t in 0..triangle_count(d) {
+            let idx = tri_indices(d, t);
+            if idx.iter().any(|&i| i >= nverts) {
+                continue;
+            }
+            let mut v = [[0f32; 3]; 3];
+            for (k, &i) in idx.iter().enumerate() {
+                let vert = decode_vertex(d, &interp.layout, i);
+                let w = transform(&d.world, vert.pos[0], vert.pos[1], vert.pos[2]);
+                v[k] = [w[0], w[1], w[2]];
+            }
+            if v.iter().any(|p| p.iter().any(|c| !c.is_finite())) {
+                continue;
+            }
+            out.push(SurfaceTri { draw: di, tex, v });
+        }
+    }
+    out
+}
+
+/// The surface directly under a world XZ position: the HIGHEST triangle covering it that
+/// is not above `ceiling`.
+///
+/// Highest-under-a-ceiling rather than simply highest, because a title that draws a roof
+/// or a banner gantry with depth writes would otherwise answer with that. The ceiling is
+/// the caller's statement of "the thing I am standing on is below this", which for a
+/// vehicle is just above its own roof.
+pub fn surface_at(tris: &[SurfaceTri], x: f32, z: f32, ceiling: Option<f32>) -> Option<(SurfaceTri, f32)> {
+    let mut best: Option<(SurfaceTri, f32)> = None;
+    for t in tris {
+        let Some(y) = t.height_at(x, z) else { continue };
+        if ceiling.is_some_and(|c| y > c) {
+            continue;
+        }
+        if best.is_none_or(|(_, by)| y > by) {
+            best = Some((*t, y));
+        }
+    }
+    best
+}
+
 /// Render a scene's 3D geometry as a top-down map. See [`WorldMap`] for why.
 ///
 /// Only surfaces take part ([`is_map_surface`]). `ceiling`, when given, additionally
@@ -2210,13 +2496,266 @@ pub fn render_scene_supersampled(scene: &Scene, width: u32, height: u32, clear: 
     render_scene_raster(scene, width * s, height * s, clear, s).downsampled(s)
 }
 
+/// Rasterize a whole FRAME - every scene the guest submitted between two display flips,
+/// in submission order - into one image. This is the software twin of
+/// `GxmRenderer::encode_chain`, and without it a 3D title's shot is a lie.
+///
+/// A frame is not a scene. A 3D title renders its world (plus shadow maps, reflections
+/// and a post-process chain) into OFFSCREEN colour surfaces and then composites those
+/// onto the display buffer. Rendering only the last scene - which is all
+/// [`render_scene`] can do - draws only that composite, and every texture the composite
+/// samples comes from guest memory the guest never wrote, because on hardware the GPU
+/// wrote it. One of the retail racers is exactly this shape: fourteen offscreen passes
+/// carrying the entire world, then a 24-draw composite. Rendering the last scene alone
+/// gave a correct, live HUD over pure black, and that is worse than no picture at all - it
+/// looks like a title that renders nothing rather than one whose passes were dropped.
+///
+/// The two rules that make the chain come out right, both learned on the GPU side:
+///   * a target is CLEARED the first time this frame draws into it and COMPOSED onto
+///     after that. A later pass into a buffer an earlier pass filled is a post-process
+///     step and is entitled to leave most of the image alone; clearing for it wipes the
+///     world the pass before it drew.
+///   * a draw that samples a texture whose guest address is a target this frame has
+///     already rendered samples THAT RENDER, not the guest bytes - which are stale by
+///     construction, since on hardware nothing but the GPU ever writes them.
+pub fn render_frame_chain(
+    scenes: &[Scene],
+    width: u32,
+    height: u32,
+    clear: [u8; 4],
+    ssaa: u32,
+) -> Framebuffer {
+    let s = ssaa.max(1);
+    let (rw, rh) = (width * s, height * s);
+    let Some(last) = scenes.last() else {
+        return Framebuffer::new(width, height, clear);
+    };
+    if scenes.len() == 1 {
+        return render_scene_supersampled(last, width, height, clear, s);
+    }
+    // The display buffer is whatever the FINAL scene draws to; any earlier scene naming
+    // the same address is part of the same image rather than an offscreen pass.
+    let display = last.color.as_ref().map(|c| c.data_addr);
+
+    let mut fb = Framebuffer::new(rw, rh, clear);
+    let mut depth = vec![f32::INFINITY; (rw * rh) as usize];
+    // Each offscreen target's rendered image, at its NATIVE size (that is the size a
+    // later pass samples it at), keyed by the colour surface's guest address.
+    let mut rendered: HashMap<u32, Framebuffer> = HashMap::new();
+    // Live offscreen framebuffers plus their depth buffers, so a second pass into the
+    // same target composes onto the first instead of starting from nothing.
+    let mut targets: HashMap<u32, (Framebuffer, Vec<f32>)> = HashMap::new();
+
+    // Diagnostic (VITASLOP_SW_CHAIN=1): per pass, what it drew into and how many pixels it
+    // actually wrote, plus - the load-bearing part - which draws sampled a target this
+    // frame rendered. A composite that samples NONE of them produces a picture that is
+    // indistinguishable from the passes never having run, and those are different bugs.
+    let debug = std::env::var("VITASLOP_SW_CHAIN").is_ok();
+
+    let n = scenes.len();
+    for (i, scene) in scenes.iter().enumerate() {
+        let addr = scene.color.as_ref().map(|c| c.data_addr);
+        if debug {
+            let sampled: Vec<String> = scene
+                .draws
+                .iter()
+                .filter_map(|d| d.albedo())
+                .map(|t| {
+                    let hit = if rendered.contains_key(&t.data_addr) { "*" } else { "" };
+                    format!("{:#x}{hit}", t.data_addr)
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            // Exposure and material tint are the two fixed-function inputs that can turn a
+            // pass that draws every pixel into a pass that draws every pixel BLACK, so they
+            // are reported next to the pass rather than left to be guessed at afterwards.
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for d in &scene.draws {
+                lo = lo.min(d.exposure);
+                hi = hi.max(d.exposure);
+            }
+            eprintln!(
+                "SWCHAIN pass{i} target={} draws={} exposure={lo:.3}..{hi:.3} samples=[{}]",
+                addr.map(|a| format!("{a:#x}")).unwrap_or_else(|| "none".into()),
+                scene.draws.len(),
+                sampled.join(" ")
+            );
+        }
+        if i + 1 == n || (addr.is_some() && addr == display) {
+            render_scene_onto(&mut fb, &mut depth, scene, s as f32, clear, &rendered);
+            if debug {
+                let px = &fb.rgba;
+                let cnt = (px.len() / 4).max(1) as u64;
+                let mut acc = [0u64; 4];
+                for p in px.chunks_exact(4) {
+                    for (a, v) in acc.iter_mut().zip(p) {
+                        *a += *v as u64;
+                    }
+                }
+                eprintln!(
+                    "SWCHAIN   -> DISPLAY after pass{i} mean=({},{},{},{})",
+                    acc[0] / cnt, acc[1] / cnt, acc[2] / cnt, acc[3] / cnt
+                );
+                if let Some(dir) = std::env::var_os("VITASLOP_SW_CHAIN_DIR") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        dir.join(format!("pass{i:02}_display.png")),
+                        fb.downsampled(s).to_png(),
+                    );
+                }
+            }
+            continue;
+        }
+        let Some(c) = scene.color.as_ref() else {
+            // A scene with no resolvable target cannot be placed at all. Say so rather
+            // than dropping it: an unplaced pass and a pass that drew nothing look
+            // identical in the finished frame and are completely different bugs.
+            report_once(
+                &UNPLACED_SCENE,
+                "software render: a scene of this frame has NO colour surface, so its \
+                 draws cannot be placed in the chain and are not rendered. The finished \
+                 frame is missing whatever that pass carried.",
+            );
+            continue;
+        };
+        if c.width == 0 || c.height == 0 {
+            continue;
+        }
+        // A SECOND pass into a target this frame already filled is a post-process step -
+        // depth of field, bloom, a radial blur - and post-process is pure SHADER work. The
+        // fixed-function approximation has no shader to run, so it paints the pass's mask
+        // and blur textures as if they were surface albedo: this title's DOF pass covers
+        // the whole frame in the flat white of its lens mask and leaves a porthole of world
+        // in the middle. Dropping the pass keeps the sharp world the pass before it drew,
+        // which is far closer to what the title puts on screen than the mask is.
+        //
+        // Reported unconditionally, because an approximation that silently discards a pass
+        // is indistinguishable from one that reproduces it. `VITASLOP_SW_POST=keep` renders
+        // them anyway, which is how you look at what a post pass is actually doing.
+        if targets.contains_key(&c.data_addr)
+            && std::env::var("VITASLOP_SW_POST").as_deref() != Ok("keep")
+        {
+            report_once(
+                &SKIPPED_POST,
+                "software render: SKIPPING post-process passes (a second pass into a target \
+                 already rendered this frame). They are shader work - blur, depth of field, \
+                 bloom - and the fixed-function approximation would paint their mask and \
+                 blur textures as flat surface colour over the finished image. The GXP \
+                 recompiler renders them properly; set VITASLOP_SW_POST=keep to see them.",
+            );
+            if debug {
+                eprintln!("SWCHAIN   -> SKIPPED post pass{i} into {:#x}", c.data_addr);
+            }
+            continue;
+        }
+        let (tw, th) = (c.width * s, c.height * s);
+        let entry = targets.entry(c.data_addr).or_insert_with(|| {
+            // An intermediate image clears to TRANSPARENT black, not to the display's
+            // clear colour: a composite that blends it must see nothing where the pass
+            // drew nothing.
+            (Framebuffer::new(tw, th, [0, 0, 0, 0]), vec![f32::INFINITY; (tw * th) as usize])
+        });
+        render_scene_onto(&mut entry.0, &mut entry.1, scene, s as f32, [0, 0, 0, 0], &rendered);
+        if debug {
+            // The MEAN colour, not just a drawn-pixel count. "Drawn" only means "not the
+            // transparent clear", which opaque black satisfies - so a pass that rendered
+            // every one of its pixels black reports as fully drawn and reads like a
+            // success. The mean is what separates "this pass did not run" from "this pass
+            // ran and produced black", and those have nothing in common as bugs.
+            let px = &entry.0.rgba;
+            let n = (px.len() / 4).max(1) as u64;
+            let mut acc = [0u64; 4];
+            for p in px.chunks_exact(4) {
+                for (a, v) in acc.iter_mut().zip(p) {
+                    *a += *v as u64;
+                }
+            }
+            eprintln!(
+                "SWCHAIN   -> rendered {:#x} {}x{} drawn={} of {} px mean=({},{},{},{})",
+                c.data_addr,
+                entry.0.width,
+                entry.0.height,
+                entry.0.drawn_pixels([0, 0, 0, 0]),
+                entry.0.width * entry.0.height,
+                acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n
+            );
+            // VITASLOP_SW_CHAIN_DIR=<dir> writes each pass's own image. This is the software
+            // twin of VITASLOP_CHAIN_LIMIT: when a composite comes out wrong the question is
+            // always WHICH pass is wrong, and the finished frame cannot answer it because
+            // every failure mode looks the same once composited.
+            if let Some(dir) = std::env::var_os("VITASLOP_SW_CHAIN_DIR") {
+                let dir = std::path::PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    dir.join(format!("pass{i:02}_{:08x}.png", c.data_addr)),
+                    entry.0.downsampled(s).to_png(),
+                );
+            }
+        }
+        rendered.insert(c.data_addr, entry.0.downsampled(s));
+    }
+    fb.downsampled(s)
+}
+
+/// Build the substitute texture a draw sampling a render target reads: the image this
+/// frame rendered into that target, as a plain linear RGBA8 texture. Everything about
+/// HOW the draw samples (unit, filters, wrap modes) is kept from the guest's binding -
+/// only the pixels and their layout change.
+fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
+    BoundTexture {
+        unit: proto.unit,
+        // 0x0c is the 32-bit four-channel family and swizzle 0 (ABGR) is the identity
+        // permutation over memory bytes, so `b0,b1,b2,b3` decode as `R,G,B,A` - exactly
+        // the order a `Framebuffer` stores. `tex_type` 3 is LINEAR: a rendered image is
+        // row-major, not Morton-swizzled.
+        base_format: 0x0c,
+        swizzle: 0,
+        tex_type: 3,
+        width: image.width,
+        height: image.height,
+        stride: image.width * 4,
+        faces: 1,
+        face_bytes: image.width * image.height * 4,
+        data_addr: proto.data_addr,
+        pixels: Arc::from(image.rgba.as_slice()),
+        u_addr_mode: proto.u_addr_mode,
+        v_addr_mode: proto.v_addr_mode,
+        lod_bias: proto.lod_bias,
+        min_filter: proto.min_filter,
+        mag_filter: proto.mag_filter,
+    }
+}
+
 /// The rasterizer core. `width`/`height` are the RASTER dimensions and `ssaa` the supersample
 /// factor those already fold in (so Pixel-space draws scale by it - see [`project`]); the
 /// caller downsamples the result. `clear` is the background color.
 fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], ssaa: u32) -> Framebuffer {
-    let ssaa = ssaa.max(1) as f32;
     let mut fb = Framebuffer::new(width, height, clear);
     let mut depth = vec![f32::INFINITY; (width * height) as usize];
+    render_scene_onto(&mut fb, &mut depth, scene, ssaa.max(1) as f32, clear, &HashMap::new());
+    fb
+}
+
+/// Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever
+/// is already there. Split out of [`render_scene_raster`] so that
+/// [`render_frame_chain`] can render a frame's passes into their own targets and let a
+/// later pass compose onto an earlier one's image.
+///
+/// `rtt` maps a colour surface's guest address to the image this frame already rendered
+/// into it: a draw sampling one of those addresses samples that image instead of the
+/// guest bytes, which is the whole reason a composite can show a world at all.
+/// `clear` is only the colour the per-draw statistics count "drawn" pixels against.
+fn render_scene_onto(
+    fb: &mut Framebuffer,
+    depth: &mut [f32],
+    scene: &Scene,
+    ssaa: f32,
+    clear: [u8; 4],
+    rtt: &HashMap<u32, Framebuffer>,
+) {
+    let (width, height) = (fb.width, fb.height);
 
     // Diagnostic: VITASLOP_PIXEL_TRACE=x,y logs every draw that writes that pixel (index,
     // whether textured/depth-tested, the source RGBA) - the definitive "which draw painted
@@ -2305,7 +2844,21 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
         } else {
             SCE_GXM_CULL_NONE
         };
-        let texture = if textured { d.albedo() } else { None };
+        // A draw sampling a colour surface this frame already rendered reads THAT image.
+        // The guest bytes at that address are stale by construction - on hardware nothing
+        // but the GPU ever writes a render target - so sampling them is what turns a
+        // composite of a finished world into a composite of whatever was last left there.
+        let substitute;
+        let texture = match (textured, d.albedo()) {
+            (true, Some(t)) => match rtt.get(&t.data_addr) {
+                Some(image) => {
+                    substitute = rtt_substitute(image, t);
+                    Some(&substitute)
+                }
+                None => Some(t),
+            },
+            _ => None,
+        };
         let (mut n_behind, mut n_off, mut n_on, mut n_culled) = (0u32, 0u32, 0u32, 0u32);
         let (mut bb_lo, mut bb_hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
 
@@ -2352,7 +2905,7 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
                 n_culled += 1;
                 continue;
             }
-            raster_triangle(&mut fb, &mut depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug);
+            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug);
         }
         if stats {
             let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
@@ -2364,7 +2917,6 @@ fn render_scene_raster(scene: &Scene, width: u32, height: u32, clear: [u8; 4], s
             );
         }
     }
-    fb
 }
 
 /// Rasterize one screen-space triangle with perspective-correct interpolation of

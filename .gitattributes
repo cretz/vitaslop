@@ -1,0 +1,17 @@
+# Line endings are normalised to LF in the index, so a file's committed bytes do not
+# depend on which OS committed it.
+#
+# This matters beyond tidiness: CI regenerates the ARM conformance goldens and fails on
+# any git diff. `regen` writes LF. If a case file were ever committed with CRLF from a
+# Windows checkout, the Linux runner would regenerate it to LF and the diff check would
+# fail on line endings alone - a red build reporting nothing about the corpus.
+* text=auto
+
+# The committed binary fixtures: guest executables, their reference ELFs, and the
+# permissively-licensed conformance font. Marked explicitly rather than left to the
+# text/binary heuristic, because a false "text" call would corrupt them on checkout.
+*.velf binary
+*.elf  binary
+*.bin  binary
+*.ttf  binary
+*.png  binary

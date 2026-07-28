@@ -395,6 +395,17 @@ pub struct Capture {
     /// How many scenes have been evicted (so `scenes.len() + retired_scenes` is the
     /// true count for a report).
     pub retired_scenes: u64,
+    /// Scenes pushed since the last display flip - the frame under construction.
+    frame_scenes: usize,
+    /// Scenes the PREVIOUS display frame was made of, latched at the flip.
+    ///
+    /// A title is not one scene per frame. A racing title's race frame is fifteen: six
+    /// small reflection/shadow passes, a 720x408 world pass, a post pass over it, and a
+    /// composite that blits the world and draws the HUD. Every observer that wants "the
+    /// scene" wants a specific one of those, and which one is a question about CONTENT,
+    /// not about order - so [`Capture::frame_scenes`] hands out the whole frame and
+    /// [`Capture::world_scene`] picks by what the scene contains.
+    prev_frame_scenes: usize,
 }
 
 /// Upper bound on retained trace entries. When the trace reaches this, the oldest
@@ -493,6 +504,7 @@ impl Capture {
     /// is.
     pub fn push_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+        self.frame_scenes += 1;
         let Some(limit) = self.scene_limit else { return };
         let limit = limit.max(1);
         while self.scenes.len() > limit {
@@ -528,6 +540,74 @@ impl Capture {
             fnv(&mut h, format!("{:?}", ev.kind).as_bytes());
         }
         h
+    }
+
+    /// Latch the scene count of the frame that just finished. Called once per display
+    /// flip, so [`frame_scenes`](Self::frame_scenes) can hand back exactly the scenes
+    /// the last completed frame was built from.
+    pub fn end_frame(&mut self) {
+        self.prev_frame_scenes = self.frame_scenes;
+        self.frame_scenes = 0;
+    }
+
+    /// The scenes of the most recently COMPLETED display frame, oldest first.
+    ///
+    /// Bounded by what `scene_limit` actually retained: a run that keeps one scene gets
+    /// one back, which is the old behaviour and still correct for a single-pass title.
+    /// Between flips (a partially built frame) this reports the previous frame's tail
+    /// rather than a mixture, because an observer asking about "this frame" during
+    /// construction has no complete frame to be given.
+    pub fn frame_scenes(&self) -> &[Scene] {
+        let n = self.prev_frame_scenes.max(1).min(self.scenes.len());
+        &self.scenes[self.scenes.len() - n..]
+    }
+
+    /// The scene of the last completed frame that holds the PLAYER'S VIEW - the pass an
+    /// observer means when it asks where things are or which way the vehicle points.
+    ///
+    /// Never by order: the last scene of a multi-pass frame is the composite, a handful of
+    /// full-screen quads and a HUD, which is why a racing title reported nothing at all
+    /// from `locate` while rendering a whole racetrack.
+    ///
+    /// # Why triangle count is the WRONG selector, measured
+    /// It was the selector, and it silently chose a different pass from frame to frame.
+    /// A race frame carries a rear-view MIRROR pass, and a mirror draws the same world
+    /// through a camera pointing the other way - so its triangle count sits within a few
+    /// percent of the main view's and crosses over depending on what happens to be behind
+    /// the car. Every crossover flipped the reported heading by 180 degrees. That is
+    /// indistinguishable from a car that has spun, and it was read as one: a controller
+    /// steering on it fought an imaginary spin and abandoned the lap, three times, at
+    /// three different corners. The position stayed smooth throughout, which is the
+    /// contradiction that gives the bug away - a car cannot swap ends and hold a straight
+    /// line.
+    ///
+    /// # The rule
+    /// Among scenes with a RECOVERABLE CAMERA, the largest render target wins (ties on
+    /// world triangles). The player's view is by construction the biggest thing drawn:
+    /// a mirror, a reflection and an environment-probe face are all smaller. Requiring a
+    /// camera is what excludes the rest for free - a shadow pass is drawn through an
+    /// ORTHOGRAPHIC matrix, which is affine, so it has no eye to recover
+    /// ([`scene_eye`](crate::render::scene_eye) returns `None`), and the composite has no
+    /// world-to-clip matrix at all.
+    ///
+    /// A title whose frame is one scene selects that scene, unchanged, and a frame with no
+    /// camera anywhere falls back to the old most-world-geometry reading.
+    pub fn world_scene(&self) -> Option<&Scene> {
+        let frame = self.frame_scenes();
+        frame
+            .iter()
+            .filter(|s| crate::render::scene_eye(s).is_some())
+            .max_by_key(|s| {
+                let area = s.color.as_ref().map_or(0u64, |c| c.width as u64 * c.height as u64);
+                (area, s.world_triangles())
+            })
+            .or_else(|| {
+                frame
+                    .iter()
+                    .filter(|s| s.world_triangles() > 0)
+                    .max_by_key(|s| s.world_triangles())
+            })
+            .or_else(|| frame.last())
     }
 
     /// Scenes the run has completed, including any evicted by `scene_limit`.

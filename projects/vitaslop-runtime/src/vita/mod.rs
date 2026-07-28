@@ -108,13 +108,39 @@ fn parse_frame_window(spec: &str) -> (u64, u64) {
 /// Print the hottest call sites (by count) gathered when `VITASLOP_DBG_CALLSITES` is
 /// set. Call from a probe after the run to localize a spin.
 pub fn dump_call_sites(top: usize) {
+    eprintln!("{}", call_sites_report(top));
+}
+
+/// The hottest call sites as text, so a live session can print them too rather than only
+/// an after-the-run probe. Counts are CUMULATIVE from boot, which is what makes them
+/// useful: sample twice around a known number of display frames and the difference is
+/// calls-per-frame, which is how you tell a title pacing itself off the display from one
+/// running its own loop at a rate we are not presenting at.
+pub fn call_sites_report(top: usize) -> String {
+    use std::fmt::Write;
     let h = CALLSITE_HIST.lock().unwrap();
+    if h.is_empty() {
+        return "no call sites recorded - set VITASLOP_DBG_CALLSITES=1 on the run".into();
+    }
+    // Aggregate per NID as well as per call site: "how often does this title ask for the
+    // time" is a question about the NID, not about which of its call sites asked.
+    let mut per_nid: BTreeMap<u32, u64> = BTreeMap::new();
+    for ((nid_, _), n) in h.iter() {
+        *per_nid.entry(*nid_).or_default() += n;
+    }
     let mut v: Vec<_> = h.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1));
-    eprintln!("--- hottest call sites (nid, caller lr): count ---");
-    for ((nid_, lr), n) in v.into_iter().take(top) {
-        eprintln!("  {n:>12}  {} @ lr={lr:#010x}", nid::name(*nid_));
+    let mut byn: Vec<_> = per_nid.iter().collect();
+    byn.sort_by(|a, b| b.1.cmp(a.1));
+    let mut s = String::from("--- calls by NID: count ---\n");
+    for (nid_, n) in byn.into_iter().take(top) {
+        let _ = writeln!(s, "  {n:>12}  {}", nid::name(*nid_));
     }
+    let _ = writeln!(s, "--- hottest call sites (nid, caller lr): count ---");
+    for ((nid_, lr), n) in v.into_iter().take(top) {
+        let _ = writeln!(s, "  {n:>12}  {} @ lr={lr:#010x}", nid::name(*nid_));
+    }
+    s
 }
 
 /// Route a NID call straight to its handler. Function NIDs are globally unique, so

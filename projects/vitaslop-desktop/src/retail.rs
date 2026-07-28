@@ -273,7 +273,7 @@ impl RetailGuest {
             // Keep the WHOLE frame, not just its last scene. A 3D title renders its world
             // (and shadow maps, reflections, post chains) into offscreen surfaces and then
             // composites them; keeping only the last scene keeps only the composite, and
-            // the world never gets drawn at all - PCSE00001's race was a live HUD over
+            // the world never gets drawn at all - a retail racer's race was a live HUD over
             // black for exactly this reason. An empty list means the guest submitted no
             // scene this frame, in which case the previous frame's stays on screen.
             if !cap.scenes.is_empty() {

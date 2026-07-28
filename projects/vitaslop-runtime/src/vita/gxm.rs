@@ -230,7 +230,7 @@ pub(super) fn find_parameter(ctx: &mut GuestCtx, _st: &mut VitaState) {
 ///
 /// The surface's identity has to live IN the guest struct, not only in a host table
 /// keyed by the struct's address, because a title is entitled to COPY the struct - and
-/// PCSE00001 does: it initialises its nine render targets into a static array and then
+/// a retail racer does: it initialises its nine render targets into a static array and then
 /// assigns each into a per-pass command object, so every `sceGxmBeginScene` in a race
 /// frame names an address `sceGxmColorSurfaceInit` was never called with. Address-keyed
 /// lookup then reports "no surface" for exactly the render-to-texture passes that draw
@@ -451,26 +451,43 @@ pub(super) fn reserve_fragment_uniforms(ctx: &mut GuestCtx, st: &mut VitaState) 
 ///     const float *sourceData)  -- 5 args (1 on the stack).
 pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
     let uniform_buffer = ctx.arg(0);
+    let parameter = ctx.arg(1);
     let component_offset = ctx.arg(2);
     let component_count = ctx.arg(3);
     let source = ctx.arg(4);
 
+    // `componentOffset` is relative to the PARAMETER, not to the buffer: where the parameter
+    // itself starts is its `resource_index`, which for a UNIFORM is its 4-byte-register offset
+    // into the default uniform buffer. Ignoring the parameter argument (as this once did) writes
+    // every uniform at the top of the buffer, so any program whose second uniform is not at
+    // register 0 reads a value the guest never put there - and the shader that multiplies by it
+    // paints black without any error. The record layout is the parameter table's own (16 bytes:
+    // name_rel, packed, array_size, resource_index), so the index is at +12.
+    // The field is signed on disk, and only a non-negative register offset can name a slot in
+    // this buffer - anything else is a record we are not reading correctly, so fall back to the
+    // top of the buffer rather than write at a wild offset.
+    let base = match parameter {
+        0 => 0,
+        p => (ctx.read_u32(p + 12) as i32).max(0) as u32,
+    };
     let mut values = Vec::with_capacity(component_count as usize);
     for i in 0..component_count {
         values.push(ctx.read_f32(source + i * 4));
     }
     // Faithful copy into the reserved buffer (in case the guest reads it back).
     for (i, v) in values.iter().enumerate() {
-        ctx.write_u32(uniform_buffer + (component_offset + i as u32) * 4, v.to_bits());
+        ctx.write_u32(uniform_buffer + (base + component_offset + i as u32) * 4, v.to_bits());
     }
     tracing::trace!(
         target: "vitaslop::gxm",
         buffer = format_args!("{uniform_buffer:#x}"),
+        parameter = format_args!("{parameter:#x}"),
+        base,
         component_offset,
         component_count,
         "setUniformDataF"
     );
-    st.set_uniforms(values);
+    st.set_uniforms(base + component_offset, values);
     ctx.ret(0);
 }
 

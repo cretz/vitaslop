@@ -31,18 +31,28 @@ pub fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &WatchDecl) -> Option
     w.ty.decode(&buf[..width])
 }
 
-/// Render the last captured scene to `<dir>/<name>.png`. Returns the written path,
-/// or `None` if there is no scene yet or the write failed.
+/// Render the current frame to `<dir>/<name>.png`. Returns the written path, or `None`
+/// if there is no scene yet or the write failed.
+///
+/// The WHOLE frame, not its last scene. A 3D title builds a frame from several passes -
+/// the world and its shadow/reflection/post targets offscreen, then a composite - and
+/// rendering only the last one draws only the composite, whose sampled world target the
+/// software path never filled. That is a live HUD over black: a shot that is not merely
+/// imperfect but actively misleading, because it looks like a title that renders nothing.
+/// See [`render::render_frame_chain`].
 pub fn write_shot(
     sched: &ThreadedScheduler<VitaEnv>,
     shot_dir: Option<&Path>,
     name: &str,
 ) -> Option<PathBuf> {
     let dir = shot_dir?;
-    let scene = {
+    let scenes: Vec<_> = {
         let host = sched.host();
-        host.state.capture.scenes.last().cloned()
-    }?;
+        host.state.capture.frame_scenes().to_vec()
+    };
+    if scenes.is_empty() {
+        return None;
+    }
     std::fs::create_dir_all(dir).ok()?;
     // Supersample the software shot (VITASLOP_SSAA=N): rasterize at N x native and
     // box-downsample. Antialiases the geometric aliasing of the heavily-tessellated
@@ -56,7 +66,7 @@ pub fn write_shot(
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(2);
-    let fb = render::render_scene_supersampled(&scene, WIDTH, HEIGHT, CLEAR, ssaa);
+    let fb = render::render_frame_chain(&scenes, WIDTH, HEIGHT, CLEAR, ssaa);
     let path = dir.join(format!("{name}.png"));
     std::fs::write(&path, fb.to_png()).ok()?;
     Some(path)

@@ -327,17 +327,23 @@ Timeline lines `<frame>: ...`:
   `0..127` (default full). `lang=0` is exactly `lx=128 ly=1`. See below for why this
   is not sugar.
 
-### Aim a stick with `lang=`, not with `lx=`
+### Measure what a stick axis MEANS before writing recipes against it
 
 A stick is often not two independent axes, and assuming it is produces a title that
-looks broken. PCSA00027's left stick is an ABSOLUTE, camera-relative heading: it
-points where the car should FACE, so `lx` and `ly` are one vector and must be set
-together. Setting only `lx` - which every early recipe here did - can aim the car
-exactly screen-left or exactly screen-right and at NO diagonal, so "steer a little
-toward the trail" is not expressible at all and the car drives into a wall instead.
-That cost two sessions across two different depths of investigation.
+looks broken - but the opposite assumption is just as expensive. One retail racer's
+left stick was written up here as an ABSOLUTE, camera-relative heading (`lx`/`ly` as
+one vector pointing where the car should FACE), and that was WRONG: `lx` is a TURN
+RATE and `ly` is not read at all, proven by two runs whose determinism signatures were
+identical with `ly` set and unset. A recipe built on the absolute-heading reading
+steers into every correction.
 
-`lang=<bearing>` says the thing the control legend says. It also makes the search
+Establish the axis empirically, and prefer a measurement whose signal is bigger than
+its noise: hold one axis at full deflection for enough frames to move the vehicle a
+long way, and compare against a run with the axis neutral. A calibration taken over a
+few frames while the vehicle is still settling measures drift, not steering.
+
+`lang=<bearing>` remains available for a title whose stick really is an absolute
+heading; do not reach for it until that has been measured. It also makes the search
 over headings a one-liner, which is the form navigation actually takes:
 
 ```

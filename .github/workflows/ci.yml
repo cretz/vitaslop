@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build and test the whole workspace on all three desktop hosts, and check that nothing
+  # generated has gone stale. The engine targets the browser, but the browser is not where
+  # it gets debugged - the native path is the same code, so a difference between hosts is a
+  # portability bug worth catching here rather than in a wasm build.
+  #
+  # `cargo test --workspace` is much more than unit tests. It runs BOTH conformance
+  # corpora: the 40-case ARM corpus, pushed through the native engine and diffed against
+  # its committed goldens, and the Vita suite - the committed clean-room cube plus the
+  # kernel/GXM/threading/VFP/NEON cases - end to end through load -> transpile -> run ->
+  # capture. That is the real coverage here; the per-crate unit tests are the smaller half.
+  #
+  # Nothing needs a GPU or a game dump. The cube's pixel test is a SOFTWARE rasterizer, and
+  # the wgpu one skips itself when no adapter is present. Everything else that needs a
+  # private fixture is `#[ignore]`d - the game dumps and the captured shader-blob corpus are
+  # game-derived bytes that cannot live in a public runner - so a plain
+  # `cargo test --workspace` is green for everyone, which is what this job asserts.
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+
+      # The desktop frontend links a window/input stack. These are its Linux build
+      # dependencies only - the crate is cross-platform and macOS/Windows ship the
+      # equivalents in their SDKs.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
+
+      # `--locked` throughout: CI must build the dependency set the committed lockfile
+      # pins, which is the set a shipped artifact is built from. Letting cargo re-resolve
+      # would test something nobody runs, and lockfile drift would never surface.
+      - name: Build
+        working-directory: projects
+        run: cargo build --workspace --locked
+
+      - name: Test
+        working-directory: projects
+        run: cargo test --workspace --locked
+
+      # --- generated artifacts must be identical after regeneration --------------------
+      # A stale golden is worse than no golden: it keeps passing while describing code
+      # that no longer exists.
+      #
+      # `KNOBS.md` (the env-knob index) needs no step here - a normal unit test fails when
+      # it goes stale, so the `Test` step above already covers it.
+      #
+      # The ARM corpus is the one case needing real tools. Its per-case `[bin]` and `[out]`
+      # blocks are produced by assembling each case and running it under qemu, deliberately,
+      # so no expected value is ever authored by hand (see that crate's README). qemu is a
+      # strict black-box oracle: executed and observed, never read, linked or derived from.
+      #
+      # Note what this adds over the `Test` step, which is narrower than it looks: the ARM
+      # cases running natively prove `[out]` still matches `[bin]`, because the engine runs
+      # the committed BYTES. They cannot notice that the committed bytes no longer match the
+      # committed `asm` - edit a case's assembly, forget to regenerate, and every test still
+      # passes against the old program. Re-assembling is the only thing that catches it.
+      #
+      # Linux only: one leg is enough to prove the corpus is current, and it is where the
+      # toolchain is a package rather than a download.
+      - name: Install the ARM toolchain and qemu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends binutils-arm-none-eabi qemu-user
+
+      # `regen` takes these from PATH as arm-none-eabi-{as,objcopy,ld} and qemu-arm
+      # (overridable with ARM_AS / ARM_OBJCOPY / ARM_LD / QEMU). It rewrites only the
+      # generated half of each case, deterministically, so an unchanged corpus produces no
+      # diff at all - any diff means a committed golden is not what the oracle produces.
+      - name: Regenerate the ARM conformance goldens and fail on any diff
+        if: runner.os == 'Linux'
+        working-directory: projects
+        run: |
+          cargo run --locked -p vitaslop-conformance-suite-arm --bin regen
+          git diff --exit-code

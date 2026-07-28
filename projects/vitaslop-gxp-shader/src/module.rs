@@ -158,6 +158,24 @@ fn read_lane_mask(instr: &crate::ir::Instr) -> [bool; 4] {
     }
 }
 
+/// True when the fragment writes NEITHER colour register, so nothing in the stream says what it
+/// emits and [`color_output`]'s inference has no evidence to work from.
+///
+/// Such a program is not broken - it is a PASS-THROUGH, and on hardware the register its header
+/// names is already full: the rasteriser wrote the interpolated varying there before the first
+/// instruction ran, and a shader with nothing to do just lets it stand. A racing title's race
+/// frame contains one (a single PHAS word, a declared `Color0` interpolant, and no other
+/// instruction) - a flat vertex-coloured polygon.
+///
+/// Emitting it anyway would return a zero-initialised register file, i.e. paint transparent
+/// black over whatever it covers, with no error anywhere - exactly the silent-approximation
+/// failure this recompiler exists to avoid. Reproducing it instead needs the header's
+/// `is_native_color` bit, which is not established, so the honest answer is to report the pair
+/// and let the renderer draw its fixed-function approximation.
+pub fn writes_no_color_register(shader: &Shader) -> bool {
+    !writes_bank(shader, Bank::Output) && !writes_bank(shader, Bank::PrimaryAttr)
+}
+
 /// Whether the shader writes any lane of a bank (used to decide native vs non-native colour).
 fn writes_bank(shader: &Shader, bank: Bank) -> bool {
     shader.instrs.iter().any(|i| {
@@ -169,8 +187,12 @@ fn writes_bank(shader: &Shader, bank: Bank) -> bool {
 
 /// Decide where the fragment colour ends up: a shader that writes the OUTPUT bank is native
 /// (`o0`); one that never writes OUTPUT but writes PRIMATTR reg 0 is non-native (`pa0`).
-/// Defaults to native `o0` (the common case) when neither is written - the module then
-/// returns whatever `o0` holds, which is the SGX default-colour register.
+///
+/// Which of the two applies is a header fact (spec F8.9 - `is_native_color`), and this infers it
+/// from what the stream WRITES instead, which is exact for every shader that writes its colour
+/// at all. A shader that writes NEITHER is the one case the inference cannot answer: see
+/// [`writes_no_color_register`], which makes the caller fall back rather than let this default
+/// pick a register the program never filled.
 fn color_output(shader: &Shader) -> ColorOutput {
     if writes_bank(shader, Bank::Output) {
         return ColorOutput::NativeO0;
