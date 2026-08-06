@@ -2,83 +2,55 @@
 
 pub mod decode;
 
-pub use decode::{decode, field, opcode1, repeat_extra_iterations, GroupTable, GROUP_TABLES};
+pub use decode::{
+    decode, decode_smlsi, field, is_smlsi, opcode1, repeat_extra_iterations, GroupTable, SmlsiSlot,
+    GROUP_TABLES,
+};
 
 use crate::container::Program;
 use crate::ir::{Op, Shader};
 
-/// Turn SMLSI into a no-op in a program where every SMLSI provably sets the DEFAULT stepping on
-/// every operand slot a repeat can still consult.
+/// Whether the per-instruction SMLSI state can be read off the code stream LINEARLY, i.e. no
+/// branch can carry control across an SMLSI.
 ///
-/// SMLSI carries no data effect of its own: it sets the per-operand increment/swizzle state
-/// that a repeated instruction advances its registers by (spec F8.8, "metadata for repeated
-/// instructions; emits nothing directly"). Its danger - and the reason it is blocked by
-/// default - is that ignoring it would silently mis-address the operands of any instruction
-/// that DOES repeat. [`unroll_repeats`] advances every operand by one of its own widths per
-/// iteration, so an SMLSI that asks for exactly that is describing what the unroller already
-/// does and is genuinely inert. Two ways that happens, and both are proofs rather than
-/// relaxations:
+/// SMLSI sets state that persists until the next SMLSI, so what a repeating instruction consults
+/// is simply the last SMLSI before it - provided control actually reached it that way. A branch
+/// that jumps over an SMLSI (or into the middle of its scope) makes the state at a later
+/// instruction path-dependent, and this decoder has no dataflow to resolve that. In that case
+/// every SMLSI stays BLOCKED, which is where the model was for every program before this.
 ///
-///  * nothing in the program can repeat, so no instruction ever reads the state; or
-///  * every slot that a repeat CAN read (`slots_repeats_consult`) is set to increment 1, the
-///    default width step ([`decode::decode_smlsi`] documents how that unit was measured).
-///
-/// Anything else - an increment this recompiler has no evidence for, a swizzle-mode operand, an
-/// instruction whose repeat encoding or operand grammar is not established - leaves every SMLSI
-/// in the program blocked.
-///
-/// This is deliberately a whole-program test rather than a per-SMLSI scope analysis: SMLSI
-/// state persists until the next SMLSI, and the ordering rules around branches are not
-/// established, so "every SMLSI here is the default" is the statement the evidence supports.
-fn retire_inert_repeat_state(code: &[u64], instrs: &mut [crate::ir::Instr]) {
-    let needed = decode::slots_repeats_consult(code);
-    let every_smlsi_is_the_default = code.iter().filter(|&&w| decode::is_smlsi(w)).all(|&w| {
-        let state = decode::decode_smlsi(w);
-        needed
-            .iter()
-            .zip(state)
-            .all(|(&read, slot)| !read || slot == decode::SmlsiSlot::Increment(1))
-    });
-    if !every_smlsi_is_the_default {
-        return;
-    }
-    for instr in instrs.iter_mut() {
-        if matches!(instr.op, Op::Todo("flow smlsi (repeat-state) not modeled")) {
-            instr.op = Op::Nop;
-            instr.blocked = None;
-        }
-    }
+/// The span is taken as the whole open interval between the branch and its target, in both
+/// directions. A backward branch that re-executes its own SMLSI would in fact be safe, but the
+/// corpus contains no such program, and a rule that has to reason about re-execution order is
+/// not one worth having on no evidence.
+fn smlsi_state_is_linear(code: &[u64], instrs: &[crate::ir::Instr]) -> bool {
+    let smlsi_at = |lo: i64, hi: i64| {
+        code.iter().enumerate().any(|(i, &w)| (i as i64) > lo && (i as i64) < hi && decode::is_smlsi(w))
+    };
+    !instrs.iter().enumerate().any(|(at, instr)| {
+        let Op::Branch { rel } = instr.op else { return false };
+        let (at, target) = (at as i64, at as i64 + i64::from(rel));
+        smlsi_at(at.min(target), at.max(target))
+    })
 }
 
-/// Words a single operand of the given precision occupies per execution, which is also the
-/// stride a REPEATED instruction advances that operand by between iterations.
-///
-/// The register banks are addressed in 32-bit words. An F16 operand packs its channels two per
-/// word and so occupies ONE word; an F32 operand can only address the low two channels of a
-/// packed register (spec A.6 - "F32 into these banks can only address the low two channels"),
-/// so it occupies TWO. The width is a property of the operand's precision, not of how many
-/// channels the write mask happens to enable.
-fn operand_words(half_precision: bool) -> u32 {
-    if half_precision {
-        1
-    } else {
-        2
-    }
-}
-
-/// Expand every repeating instruction into the sequence of single executions it stands for.
+/// Expand every repeating instruction into the sequence of single executions it stands for,
+/// stepping each operand by the amount the SMLSI state in force asks for.
 ///
 /// A USSE instruction carries a `repeat_count`: it re-executes that many extra times, and
-/// between iterations each operand's register advances by that operand's own width
-/// ([`operand_words`]). Nothing downstream of the IR models repetition, so unrolling here is
-/// what makes the rest of the recompiler - the emitter, the written-output-lane check, the PA
-/// read/write maps that decide the varying interface - see the instruction stream the hardware
-/// actually executes.
+/// between iterations each operand's ENCODED REGISTER FIELD advances by the per-slot increment
+/// the last SMLSI set (default 1 - see [`decode::DEFAULT_REPEAT_STATE`]). What that does to the
+/// register INDEX depends on the field's own scaling, which is the whole content of
+/// [`decode::repeat_operands`]: a six-bit field is doubled by the hardware, a seven-bit field is
+/// not. Nothing downstream of the IR models repetition, so unrolling here is what makes the rest
+/// of the recompiler - the emitter, the written-output-lane check, the PA read/write maps that
+/// decide the varying interface - see the instruction stream the hardware actually executes.
 ///
-/// MEASURED, on the two vertex programs that draw a retail title's entire front-end. Each
-/// writes its colour varying with ONE `mov` to `Output[4]` under a two-channel mask, yet its
-/// container declares 8 and 10 total output lanes respectively. The repeat counts are 1 and 2,
-/// and unrolling at a stride of two words closes both statements exactly:
+/// That the default stepping is right is MEASURED on the two vertex programs that draw a retail
+/// title's entire front-end. Each writes its colour varying with ONE `mov` to `Output[4]` under a
+/// two-channel mask, yet its container declares 8 and 10 total output lanes respectively. The
+/// repeat counts are 1 and 2, and unrolling at increment 1 over a six-bit (doubled) field closes
+/// both statements exactly:
 ///
 /// * 8 lanes: `Output[4] <- SA[0]`, `Output[6] <- SA[2]` - the 4-component `color` uniform
 ///   filling COLOR0's lanes 4..7 after clip position's 0..3;
@@ -87,24 +59,40 @@ fn operand_words(half_precision: bool) -> u32 {
 ///   third iteration is the ONLY write of the texture coordinate anywhere in that program.
 ///
 /// That last point is why this is not cosmetic: without unrolling, a textured program's UV
-/// varying is never written at all, so every sample lands at (0,0). The stride also reproduces
-/// the spec's own per-group repeat multipliers for group 0x40, which are stated as
-/// `(dest,src1,src2) = (1,2,2)` for a float source - an F16 destination (one word) fed by F32
-/// sources (two words each) - and `all 1` otherwise, where every operand is a single word.
+/// varying is never written at all, so every sample lands at (0,0).
 ///
-/// An instruction whose group's repeat encoding is NOT established is BLOCKED rather than
-/// emitted once: emitting once is a silent guess that it does not repeat, and a dropped
-/// iteration is exactly the invisible failure this recompiler refuses to make.
+/// Anything the model cannot state is BLOCKED rather than emitted: a group whose repeat encoding
+/// or operand grammar is not established, a slot the SMLSI puts in swizzle mode, or a stepped
+/// index that leaves the register file. Emitting once is a silent guess that an instruction does
+/// not repeat, and a dropped iteration is exactly the invisible failure this recompiler refuses
+/// to make.
+///
 /// Returns the unrolled stream and, alongside it, where each ORIGINAL code word landed in it:
 /// `starts[i]` is the index of code word `i`'s first copy, and `starts[code.len()]` is the
 /// stream length, so a branch target of "one past the end" maps too. Unrolling renumbers the
 /// stream, and a branch offset is a count of code WORDS, so every branch has to be rewritten
 /// through this map or it would silently point at the wrong instruction.
 fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir::Instr>, Vec<usize>) {
+    let linear = smlsi_state_is_linear(code, &instrs);
+    let mut state = decode::DEFAULT_REPEAT_STATE;
     let mut out = Vec::with_capacity(instrs.len());
     let mut starts = Vec::with_capacity(code.len() + 1);
     for (instr, &word) in instrs.into_iter().zip(code) {
         starts.push(out.len());
+
+        // SMLSI itself emits nothing - its entire effect is the state the repeats below read.
+        if decode::is_smlsi(word) {
+            state = decode::decode_smlsi(word);
+            out.push(crate::ir::Instr {
+                op: Op::Nop,
+                blocked: (!linear).then_some(
+                    "0xF8 SMLSI state is not linearly readable - a branch crosses its scope",
+                ),
+                ..instr
+            });
+            continue;
+        }
+
         let Some(extra) = decode::repeat_extra_iterations(word) else {
             out.push(crate::ir::Instr {
                 blocked: Some("repeat_count encoding not established for this opcode group"),
@@ -116,17 +104,77 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
             out.push(instr);
             continue;
         }
-        let dest_step = operand_words(instr.half_precision);
-        let src_step = operand_words(instr.source_half_precision());
+        // From here the instruction really repeats, so the operand grammar has to be known
+        // exactly: which SMLSI byte governs each operand, and what one unit of it moves.
+        let Some(operands) = decode::repeat_operands(word) else {
+            out.push(crate::ir::Instr {
+                blocked: Some("repeat operand slots not established for this opcode group"),
+                ..instr
+            });
+            continue;
+        };
+        let steps: Result<Vec<i32>, &'static str> = operands
+            .iter()
+            .map(|o| match state[o.slot] {
+                decode::SmlsiSlot::Increment(n) => Ok(i32::from(n) * o.stride as i32),
+                decode::SmlsiSlot::Swizzle(_) => {
+                    Err("0xF8 SMLSI per-iteration SWIZZLE stepping not modeled")
+                }
+            })
+            .collect();
+        let steps = match steps {
+            Ok(s) if s.len() > instr.srcs.len() => s,
+            // More IR sources than the grammar describes means the two disagree about the
+            // instruction, which is a decoder bug rather than a shader feature.
+            Ok(_) => {
+                out.push(crate::ir::Instr {
+                    blocked: Some("repeat operand list is shorter than the decoded sources"),
+                    ..instr
+                });
+                continue;
+            }
+            Err(why) => {
+                out.push(crate::ir::Instr { blocked: Some(why), ..instr });
+                continue;
+            }
+        };
+        // A stepped index that leaves the 8-bit register file is not a register, and clamping it
+        // would read or write the wrong one silently.
+        let advance = |index: u8, step: i32, i: u32| -> Option<u8> {
+            u8::try_from(i32::from(index) + step * i as i32).ok()
+        };
+        let mut escaped = false;
         for i in 0..=extra {
             let mut it = instr.clone();
             if let Some(d) = it.dest.as_mut() {
-                d.index = d.index.saturating_add((i * dest_step).min(u8::MAX as u32) as u8);
+                match advance(d.index, steps[0], i) {
+                    Some(index) => d.index = index,
+                    None => escaped = true,
+                }
             }
-            for s in it.srcs.iter_mut() {
-                s.index = s.index.saturating_add((i * src_step).min(u8::MAX as u32) as u8);
+            for (s, &step) in it.srcs.iter_mut().zip(&steps[1..]) {
+                match advance(s.index, step, i) {
+                    // A register-INDIRECT operand's number is not a register index: its top two
+                    // bits select the sub-bank and only the low five are the offset. Stepping it
+                    // past 31 would carry into the bank selector and silently read a different
+                    // bank, so a repeat that walks off the offset field is not a register step.
+                    Some(index)
+                        if matches!(s.bank, crate::ir::Bank::Indexed)
+                            && index >> 5 != s.index >> 5 =>
+                    {
+                        escaped = true
+                    }
+                    Some(index) => s.index = index,
+                    None => escaped = true,
+                }
             }
             out.push(it);
+        }
+        if escaped {
+            let from = starts[starts.len() - 1];
+            for it in &mut out[from..] {
+                it.blocked = Some("a repeated operand steps outside the register file");
+            }
         }
     }
     starts.push(out.len());
@@ -164,7 +212,6 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
 /// does not describe blocks the instruction rather than naming an arbitrary unit.
 pub fn decode_shader(program: &Program) -> Shader {
     let mut instrs: Vec<_> = program.code.iter().map(|&w| decode(w)).collect();
-    retire_inert_repeat_state(&program.code, &mut instrs);
     for instr in &mut instrs {
         let Op::Tex { unit: ordinal, coords, coord_half, lod } = instr.op else { continue };
         match program.sampler_unit_at(2 * ordinal as u32) {
@@ -206,7 +253,6 @@ pub fn decode_shader(program: &Program) -> Shader {
 pub fn decode_secondary_shader(program: &Program) -> Shader {
     use crate::ir::Bank;
     let mut instrs: Vec<_> = program.secondary_code.iter().map(|&w| decode(w)).collect();
-    retire_inert_repeat_state(&program.secondary_code, &mut instrs);
     for instr in &mut instrs {
         for op in instr.dest.iter_mut().chain(instr.srcs.iter_mut()) {
             // Everything but an internal register and a constant becomes SA. An inline

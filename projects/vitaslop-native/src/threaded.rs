@@ -197,6 +197,10 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     /// transpiled with `VITASLOP_ARM_AT_FRAME` (see
     /// [`vitaslop_transpiler::arm_at_frame`]). `None` in an ordinary build.
     arm_word_off: Option<u64>,
+    /// Linear-memory offset of the host-mirror block, when this build inlined any read
+    /// of it (see `vitaslop_transpiler::InlineOp::LoadMirror`). The scheduler refreshes
+    /// it before every resume.
+    mirror_off: Option<u64>,
 }
 
 impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
@@ -235,6 +239,12 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
         write_shared(&self.shared_mem, off as usize, &1u32.to_le_bytes());
         DIAG_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[diag] armed at frame {frames} (VITASLOP_ARM_AT_FRAME)");
+    }
+
+    fn mirror_base(&self) -> Option<u32> {
+        // The block sits above the guest region, so its guest address is the rebase
+        // origin plus the offset - the same convention `write_mem` undoes.
+        self.mirror_off.map(|off| self.base.wrapping_add(off as u32))
     }
 }
 
@@ -343,6 +353,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             base,
             quantum_fuel,
             arm_word_off: artifact.arm_word_off,
+            mirror_off: artifact.mirror_off,
         };
 
         // The main thread: sp near the top of the region (with startup headroom), no
@@ -414,6 +425,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             base: linked.base,
             quantum_fuel,
             arm_word_off: built.artifact.arm_word_off,
+            mirror_off: built.artifact.mirror_off,
         };
 
         // The main thread runs every module_start in load order, then (as the last
@@ -480,6 +492,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// to separate the guest's work from the cost of switching between guest threads.
     pub fn rounds_total(&self) -> u64 {
         self.inner.rounds_total()
+    }
+
+    /// Who actually got the CPU - see
+    /// [`vitaslop_runtime::sched::SchedCore::cpu_share_report`].
+    pub fn cpu_share_report(&self) -> String {
+        self.inner.cpu_share_report()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run

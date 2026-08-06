@@ -1060,14 +1060,37 @@ impl Session {
                     }
                 }
                 fmts.sort();
+                // The VIEWPORT the pass's draws were issued under, as the pixel extent it
+                // implies (GXM's viewport is offset/scale in pixels, so the width is
+                // 2*|xScale|). This is the second, independent statement of how big a pass
+                // is, and it is the one to believe when it disagrees with the target: a
+                // title may hand `sceGxmBeginScene` a colour surface whose width/height
+                // fields are meaningless, and then the surface says 1x1 while the pass
+                // really rasterizes the whole screen.
+                // Both the implied extent AND the raw offset/scale: a viewport that is the
+                // right SIZE but not centred on the target places the pass's image somewhere
+                // other than the origin, and a later pass sampling that buffer then needs a
+                // bias to find it. Printing only the size hides exactly that case.
+                let vp = s.draws.first().map(|d| d.render_state.viewport).map(|v| {
+                    format!(
+                        "viewport={}x{}@(off {},{} scale {},{})",
+                        (2.0 * v[1].abs()) as i64,
+                        (2.0 * v[3].abs()) as i64,
+                        v[0],
+                        v[2],
+                        v[1],
+                        v[3]
+                    )
+                });
                 out.push(format!(
-                    "  pass{i:<2} draws={:<4} world-tris={:<7} target={} attrs=[{}]",
+                    "  pass{i:<2} draws={:<4} world-tris={:<7} target={} {} attrs=[{}]",
                     s.draws.len(),
                     s.world_triangles(),
                     s.color
                         .as_ref()
                         .map(|c| format!("{:#x}:{}x{}", c.data_addr, c.width, c.height))
                         .unwrap_or_else(|| "-".into()),
+                    vp.unwrap_or_else(|| "viewport=-".into()),
                     fmts.join(" ")
                 ));
             }

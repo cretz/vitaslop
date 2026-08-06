@@ -113,7 +113,7 @@ pub enum LinkError {
     /// would silently read a zero-initialised register, which is how a shader that links
     /// "successfully" can paint black. The interpolant layout decode is incomplete for this
     /// program. Fall back.
-    PaReadUnfed { register: u32 },
+    PaReadUnfed { register: u32, varyings_error: Option<&'static str> },
     /// The linked varying count exceeds what WebGPU guarantees (16 inter-stage vec4s). Fall back.
     TooManyVaryings { needed: u32, limit: u32 },
     /// A stage reads an SA register that is neither in its default uniform buffer nor a
@@ -156,10 +156,16 @@ impl core::fmt::Display for LinkError {
                 f,
                 "fragment reads PA register {register} before writing it, beyond its {primary_regs} allocated PA registers"
             ),
-            LinkError::PaReadUnfed { register } => write!(
+            LinkError::PaReadUnfed { register, varyings_error } => write!(
                 f,
                 "fragment reads PA register {register} before writing it but no declared interpolant \
-                 covers it, so no vertex output feeds it"
+                 covers it, so no vertex output feeds it{}",
+                match varyings_error {
+                    // The interpolant list is empty because the block would not DECODE, which
+                    // is the actual defect - without this the message blames the pairing.
+                    Some(why) => format!(" (its varyings block did not decode: {why})"),
+                    None => String::new(),
+                }
             ),
             LinkError::TooManyVaryings { needed, limit } => write!(
                 f,
@@ -186,6 +192,8 @@ impl core::fmt::Display for LinkError {
 
 /// PA registers a prefetched sample's result occupies: two, holding its four components as
 /// packed F16 halves. See [`crate::container::SamplePrefetch`].
+/// The widest a prefetched sample can be, in PA registers. The per-descriptor width is
+/// [`crate::container::Interpolant::prefetch_regs`]; this is only the upper bound.
 const PREFETCH_REGS: u32 = 2;
 
 impl std::error::Error for LinkError {}
@@ -215,9 +223,16 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
         plan_bindings(&frc.shader, fprog.default_uniform_regs, |u| fprog.sampler_is_cube(u as u32));
 
     // The vertex must place clip POSITION in o0..o3 (what the rasteriser consumes) and its
-    // varyings block must have validated - otherwise its varying placement is unknown.
+    // varyings block must have VALIDATED - otherwise its varying placement is unknown.
+    //
+    // "Validated" is `varyings_error`, not "produced at least one varying". An empty output list
+    // used to stand for both "the block did not decode" and "this program outputs clip position
+    // and nothing else", and those are opposite situations: the first must fall back, the second
+    // is a perfectly linkable DEPTH-ONLY program. Conflating them cost this title its whole
+    // 1024x1024 shadow pass - 13 of its 16 draws fell back with a message naming a layout
+    // problem that did not exist.
     let written = output_written_lanes(&vrc.shader);
-    if !(0..4).all(|l| written.get(l).copied().unwrap_or(false)) || vprog.output_varyings.is_empty() {
+    if !(0..4).all(|l| written.get(l).copied().unwrap_or(false)) || vprog.varyings_error.is_some() {
         return Err(LinkError::UnsupportedVertexLayout);
     }
 
@@ -411,8 +426,16 @@ enum ComponentDest {
 struct PlannedPrefetch {
     /// GXM texture unit sampled.
     unit: u8,
-    /// First of the two PA registers the four F16 result components land in.
+    /// First PA register the packed F16 result components land in.
     pa_base: u32,
+    /// How many PA registers the result occupies: 2 (four components) or 1 (two). See
+    /// [`crate::container::Interpolant::prefetch_regs`].
+    ///
+    /// Writing two unconditionally is not a harmless over-write: the register after a
+    /// one-register prefetch belongs to the NEXT interpolant, so it clobbers a varying the
+    /// vertex stage fed correctly. That is invisible in the WGSL and shows up only as a
+    /// surface shading black.
+    regs: u32,
     /// Interface component indices of the sample coordinates, in order.
     coords: Vec<usize>,
     /// The sampler is a cube map, so the coordinate is a three-component direction.
@@ -433,6 +456,13 @@ impl PlannedPrefetch {
 struct Interface {
     components: Vec<VaryingComponent>,
     prefetches: Vec<PlannedPrefetch>,
+    /// First PA register of a `Position` interpolant the fragment reads, if it declares one.
+    ///
+    /// This is NOT an interpolated varying: it is the rasteriser's own WINDOW coordinate -
+    /// pixels in x/y, the depth-buffer value in z, and `1/w` in w - which is what Sony's Cg
+    /// front end gives a fragment program's `POSITION`/`WPOS` semantic. See
+    /// [`plan_interface`] for the corpus measurement that settles it.
+    window_position: Option<u32>,
 }
 
 /// Match the vertex's declared varying outputs to the fragment's declared interpolants BY
@@ -462,6 +492,22 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     let reads = |range: core::ops::Range<u32>| {
         range.into_iter().any(|r| inputs.get(r as usize).copied().unwrap_or(false))
     };
+    // The POSITION a fragment can declare as an interpolant is the rasteriser's WINDOW
+    // coordinate, not an interpolated copy of the vertex's clip position: pixels in x and y,
+    // the value written to the depth buffer in z, and `1/w` in w. That is Cg's `WPOS`, and
+    // Sony's shader front end for this hardware is Cg - but it is not assumed from provenance,
+    // it is MEASURED on the corpus (`fragment_position_interpolant_usage`):
+    //
+    //   `frag_8151b0bc` computes `kDepthBias + Position.z` and writes the result as the
+    //   FRAGMENT DEPTH (`0xF8 DEPTHF`). A depth write only type-checks against a value already
+    //   in depth-buffer space, which the raw clip `z` is not - it still needs its `w` divide.
+    //
+    // The previous reading (route lanes 0..3 as an ordinary varying) differs from this one by
+    // a perspective divide and a viewport scale, so it silently changed the arithmetic of
+    // every shader that reprojects - soft particles, screen-space fades, depth fog.
+    //
+    // It is never a prefetch coordinate source (those are named by TEXCOORD index), so it only
+    // has to be handled where an interpolant's own data registers are read.
     let vertex_output = |usage| {
         vprog
             .output_varyings
@@ -470,11 +516,29 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             .ok_or(LinkError::UnfedVarying { usage })
     };
 
-    let mut iface = Interface { components: Vec::new(), prefetches: Vec::new() };
+    let mut iface =
+        Interface { components: Vec::new(), prefetches: Vec::new(), window_position: None };
     let mut fed = vec![false; inputs.len()];
     for it in &fprog.interpolants {
         let data_base = it.pa_base as u32;
-        if reads(data_base..data_base + it.register_count as u32) {
+        if it.usage == VaryingUsage::Position && reads(data_base..data_base + it.register_count as u32)
+        {
+            // Four full-precision registers is the only shape the window coordinate has; a
+            // half-precision or narrower declaration would mean the descriptor means something
+            // else here, and guessing a routing for it would feed the shader silent zeros.
+            if it.half || it.register_count != 4 {
+                return Err(LinkError::VaryingSizeMismatch {
+                    usage: it.usage,
+                    fragment_registers: it.register_count as u32,
+                    vertex_components: 4,
+                    half: it.half,
+                });
+            }
+            iface.window_position = Some(data_base);
+            for r in data_base..data_base + 4 {
+                fed[r as usize] = true;
+            }
+        } else if reads(data_base..data_base + it.register_count as u32) {
             let vertex = vertex_output(it.usage)?;
             let n = vertex.components;
             let expected = if it.half { n.div_ceil(2) } else { n };
@@ -499,11 +563,13 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             }
         }
 
-        // The prefetched sample's four F16 components sit in the two registers after the data.
+        // The prefetched sample's packed F16 components sit in the register(s) after the data -
+        // one or two, as the descriptor says (see `Interpolant::prefetch_regs`).
         let (Some(pf), Some(pa_base)) = (it.prefetch, it.prefetch_base().map(u32::from)) else {
             continue;
         };
-        if !reads(pa_base..pa_base + PREFETCH_REGS) {
+        let prefetch_regs = u32::from(it.prefetch_regs);
+        if !reads(pa_base..pa_base + prefetch_regs) {
             continue; // the PDS fetched it, but this shader never looks at the result
         }
         // The unit must be one the program itself declares, or the renderer would bind a
@@ -536,10 +602,11 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
         iface.prefetches.push(PlannedPrefetch {
             unit: pf.unit,
             pa_base,
+            regs: prefetch_regs,
             coords: (first..first + coords as usize).collect(),
             cube,
         });
-        for r in pa_base..pa_base + PREFETCH_REGS {
+        for r in pa_base..pa_base + prefetch_regs {
             fed[r as usize] = true;
         }
     }
@@ -548,7 +615,7 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     // emit as a read of a zero-initialised register - a silently wrong picture rather than a
     // fallback - so it is a hard error, not a gap to paper over.
     if let Some(reg) = (0..inputs.len()).find(|&r| inputs[r] && !fed[r]) {
-        return Err(LinkError::PaReadUnfed { register: reg as u32 });
+        return Err(LinkError::PaReadUnfed { register: reg as u32, varyings_error: fprog.varyings_error });
     }
     Ok(iface)
 }
@@ -571,6 +638,15 @@ fn emit_secondary_body(program: &Program) -> Result<String, EmitError> {
 /// written by the program's own secondary code, or a container literal, and return the literal
 /// initialisers to emit. An SA read anywhere else lands in the texture-control-word region,
 /// which is GPU state rather than shader data.
+///
+/// BOTH streams are scanned for reads, and that is not a detail. The secondary program is where
+/// a container literal is most likely to be consumed - its whole job is to fold constants into
+/// the SA registers the primary then reads - so scanning only the primary makes exactly the
+/// literals that matter invisible, emits no initialiser for them, and the secondary reads zero.
+/// MEASURED: a title's separable-blur vertex program declares `sa[3] = 3.0h`, `sa[4] = 5.0h` -
+/// the tap distances of a 6-tap kernel at +-1, +-3, +-5 texels - and reads them ONLY in its
+/// secondary program. With them zeroed, all six taps collapse onto +-1 and the blur silently
+/// stops blurring, with nothing in the log to say so.
 fn secondary_attr_init(
     shader: &Shader,
     program: &Program,
@@ -593,11 +669,20 @@ fn secondary_attr_init(
         }
     }
     let mut needed = std::collections::BTreeSet::new();
-    for instr in &shader.instrs {
+    for instr in shader.instrs.iter().chain(secondary.instrs.iter()) {
         let half = instr.source_half_precision();
         let read = read_channels(instr);
-        for src in &instr.srcs {
+        for (i, src) in instr.srcs.iter().enumerate() {
             if src.bank != Bank::SecondaryAttr {
+                continue;
+            }
+            // A texture sample's SECOND source is the SAMPLER, not data: it names the four
+            // texture-control words describing the texture, which live above the default
+            // uniform buffer by construction. The unit is resolved from the container's own
+            // texture-control table at decode, so those registers are never read as uniforms -
+            // counting them makes a shader look like it reads past its buffer, and the read
+            // channels here are the COORDINATE's count, which says nothing about the sampler.
+            if matches!(instr.op, Op::Tex { .. }) && i == 1 {
                 continue;
             }
             for c in 0..4 {
@@ -636,6 +721,38 @@ fn comp(c: u32) -> char {
 /// interface, with the non-colliding binding namespace documented on the module. `vbody`/
 /// `fbody` are the verbatim [`emit_body`] statements for each stage.
 #[allow(clippy::too_many_arguments)]
+/// The pipeline-supplied depth state, and the two helpers that read it. See the call site in
+/// [`build_linked_module`] for what each lane holds.
+///
+/// `gxp_guest_depth` is the single definition of "what a GXM depth surface holds", and it is
+/// deliberately shared: the renderer's depth-conversion pass writes that value into a sampleable
+/// texture, and a fragment reading its own POSITION.z reads it here. If those two ever disagree
+/// the comparison a soft particle makes is between two different quantities - which renders as a
+/// fade that is stuck at 0 or 1 with nothing to point at.
+pub(crate) const GXP_DEPTH_DECL: &str = r#"struct GxpDepth { range: vec4<f32>, fit: vec4<f32> };
+@group(3) @binding(0) var<uniform> gxp_depth: GxpDepth;
+
+// The value the GUEST's depth buffer holds for a fragment at clip `w`. A projection makes clip
+// `z` affine in clip `w` (`z = a*w + c`), so the window depth `z/w` is `a + c/w` - and `a`, `c`
+// are MEASURED per pass by interpreting its own vertex programs, not guessed. Both `a` and `c`
+// matter and for different reasons: a soft-particle fade takes a DIFFERENCE of two depths, where
+// `a` cancels and `c` sets the scale, while a near-plane fade reads one depth on its own, where
+// `a` is the whole answer.
+fn gxp_guest_depth(w: f32) -> f32 {
+  return select(gxp_depth.fit.x + gxp_depth.fit.y / w, 0.0, w == 0.0);
+}
+
+fn gxp_window_position(fc: vec4<f32>) -> vec4<f32> {
+  // `fc` is WebGPU's fragment builtin: pixels in xy, OUR remapped depth in z, and 1/w of the
+  // position this pipeline actually rasterised - which is the guest's clip position after
+  // `gxp_clipfix`. Recover the guest's own clip w by undoing that fixup's sign correction
+  // (both correcting modes negate w; only the value of w matters here, not x/y/z).
+  var w = 1.0 / fc.w;
+  if (gxp_depth.range.z != 1.0) { w = -w; }
+  return vec4<f32>(fc.x, fc.y, gxp_guest_depth(w), 1.0 / w);
+}
+"#;
+
 fn build_linked_module(
     vbody: &str,
     vplan: &VertexBindingPlan,
@@ -650,6 +767,15 @@ fn build_linked_module(
 ) -> String {
     let varyings = &iface.components;
     let mut m = String::new();
+
+    // ---- Pipeline-supplied depth state at group 3 ----
+    // Declared by the LINKER rather than injected by the renderer, because both stages depend
+    // on it and a module that mentions it has to be independently compilable (the oracle
+    // naga-validates linked modules with no renderer in the picture). The renderer fills it:
+    //   x = depth_min, y = depth_scale  - the affine remap `gxp_clipfix` puts clip depth through
+    //   z = the clip-`w` sign correction that same fixup applied (1 none, -1 negate, 2 flip w)
+    //   w = which value the guest's own depth buffer holds (see `gxp_guest_depth`)
+    m.push_str(GXP_DEPTH_DECL);
 
     // ---- Vertex default-uniform buffer (SA bank) at group 0 ----
     // The buffer is the guest's raw default-uniform-buffer bytes: a run of 32-bit registers,
@@ -676,6 +802,21 @@ fn build_linked_module(
         let ty = b.wgsl_type();
         let _ = writeln!(m, "@group(2) @binding({tb}) var t{}: {ty};", b.unit);
         let _ = writeln!(m, "@group(2) @binding({sb}) var s{}: sampler;", b.unit);
+    }
+
+    // ---- Vertex sampled textures + samplers, AFTER the fragment ones in group 2 ----
+    // They share the group because the device guarantees only four bind groups and the other
+    // three are taken; they keep their own NAMES (`vt{u}`/`vs{u}`) because the two stages number
+    // their sampler units independently, so a linked module can carry a vertex unit 0 and a
+    // fragment unit 0 that are different textures. A vertex fetch builds GEOMETRY from what it
+    // reads, so conflating them would not shade a surface wrongly, it would draw the wrong mesh.
+    let vsampler_base = fplan.samplers.len() as u32 * 2;
+    for (i, b) in vplan.samplers.iter().enumerate() {
+        let (tb, sb) = (vsampler_base + i as u32 * 2, vsampler_base + i as u32 * 2 + 1);
+        let ty = b.wgsl_type();
+        let (tex, samp) = crate::wgsl::sampler_names(ProgramKind::Vertex, b.unit);
+        let _ = writeln!(m, "@group(2) @binding({tb}) var {tex}: {ty};");
+        let _ = writeln!(m, "@group(2) @binding({sb}) var {samp}: sampler;");
     }
 
     // ---- Vertex input attributes ----
@@ -743,11 +884,27 @@ fn build_linked_module(
     for j in 0..varying_locations {
         let _ = writeln!(m, "  @location({j}) v{j}: vec4<f32>,");
     }
+    // Both builtins are declared unconditionally, even by a fragment stage with no varyings:
+    // they are rasteriser state rather than interpolated values, so they cost no `@location`,
+    // and making them always present keeps the entry signature (and every module builder here)
+    // the same shape whether or not the body happens to read them.
+    let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
     let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
     let _ = writeln!(m, "}};");
     let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
     m.push_str(crate::wgsl::FRONT_FACING_DECL);
     emit_register_banks(&mut m);
+    // The WINDOW coordinate a fragment's POSITION interpolant reads (see `plan_interface`).
+    // `gxp_window_position` undoes what the pipeline did to the guest's clip position on the
+    // way here - the clip-`w` sign correction and the depth remap - and re-encodes the depth
+    // the way the guest's own depth buffer holds it, so that a shader comparing its own
+    // POSITION against a sampled depth surface compares two values in ONE space.
+    if let Some(base) = iface.window_position {
+        let _ = writeln!(m, "  let gxp_wpos = gxp_window_position(in.frag_coord);");
+        for c in 0..4u32 {
+            let _ = writeln!(m, "  pa[{}] = bitcast<u32>(gxp_wpos.{});", base + c, comp(c));
+        }
+    }
     // Rebuild the PA register file from the interpolated components, repacking each F16 pair
     // exactly as the hardware interpolator delivers it (interpolate as floats, then pack). A
     // register carrying only one half of a pair (an odd-width varying) keeps 0 in the other.
@@ -803,8 +960,22 @@ fn build_linked_module(
             "  let pf{i} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
             pf.unit
         );
-        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.xy);", pf.pa_base);
-        let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.zw);", pf.pa_base + 1);
+        if pf.regs > 1 {
+            // Two registers: four F16 components, packed two per register.
+            let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.xy);", pf.pa_base);
+            let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.zw);", pf.pa_base + 1);
+        } else {
+            // One register: a single FULL-PRECISION component, not a packed pair.
+            //
+            // MEASURED on the corpus's own reads. A title's track material prefetches four
+            // samples: its `DiffuseAlphaMap`, `lightmap` and `occlusionMap` descriptors each
+            // span two registers and the code reads them with `unpack2x16float`, while its
+            // one-register `shadowMap` descriptor is read with a full-precision `bitcast` -
+            // the correlation is exact across the corpus. Packing halves into that register
+            // instead makes the shadow compare read a denormal, every fragment tests as
+            // shadowed, and the whole track surface shades black.
+            let _ = writeln!(m, "  pa[{}] = bitcast<u32>(pf{i}.x);", pf.pa_base);
+        }
     }
     emit_secondary_attrs(&mut m, "fs_sa", fsa_regs, fliterals);
     m.push_str(fbody);
@@ -815,7 +986,7 @@ fn build_linked_module(
     let _ = writeln!(
         m,
         "  return {};\n}}",
-        crate::module::color_return_expr(ret, fplan.color_precision)
+        crate::module::color_return_expr(ret, fplan.color_precision, varying_locations)
     );
 
     m
@@ -844,6 +1015,9 @@ fn emit_register_banks(m: &mut String) {
         let _ = writeln!(m, "  var {bank}: array<u32, {BANK_REGS}>;");
     }
     let _ = writeln!(m, "  var p: array<bool, 4>;");
+    // The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    let _ = writeln!(m, "  var idx: array<i32, 2>;");
 }
 
 #[cfg(test)]
@@ -905,6 +1079,7 @@ mod tests {
     /// A minimal vertex `Program` carrying only the fields the linker reads.
     fn vertex_program(secondary_reg_count: u16, attrs: Vec<Parameter>, hash: u64) -> Program {
         Program {
+            varyings_error: None,
             default_uniform_regs: 0,
             secondary_code: Vec::new(),
             literals: Vec::new(),
@@ -936,6 +1111,7 @@ mod tests {
             span: register_count,
             half,
             prefetch: None,
+            prefetch_regs: 2,
         }
     }
 
@@ -951,6 +1127,7 @@ mod tests {
         Interpolant {
             span: register_count + PREFETCH_REGS as u8,
             prefetch: Some(SamplePrefetch { unit, source_texcoord: source, last: true }),
+            prefetch_regs: 2,
             ..texcoord_in(index, pa_base, register_count, true)
         }
     }
@@ -1080,6 +1257,7 @@ mod tests {
                     span: 1,
                     half: false,
                     prefetch: None,
+                    prefetch_regs: 2,
                 },
             ],
             4,
@@ -1111,7 +1289,7 @@ mod tests {
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, true)], 8);
         assert_eq!(
             plan_interface(&vprog, &fprog, &fragment_reading(&[0, 4])).unwrap_err(),
-            LinkError::PaReadUnfed { register: 4 }
+            LinkError::PaReadUnfed { register: 4, varyings_error: None }
         );
     }
 
@@ -1162,7 +1340,7 @@ mod tests {
         let iface = plan_interface(&vprog, &fprog, &fragment_reading(&[0, 2])).unwrap();
         assert_eq!(
             iface.prefetches,
-            vec![PlannedPrefetch { unit: 13, pa_base: 2, coords: vec![4, 5], cube: false }]
+            vec![PlannedPrefetch { unit: 13, pa_base: 2, regs: 2, coords: vec![4, 5], cube: false }]
         );
         // The interface carries TEXCOORD1's four components, then the two sample coordinates
         // taken from TEXCOORD0 - which is NOT itself an interpolant of this fragment.

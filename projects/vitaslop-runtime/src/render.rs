@@ -388,6 +388,42 @@ pub fn half_to_f32(h: u16) -> f32 {
     if sign == 1 { -v } else { v }
 }
 
+/// Encode an f32 as an IEEE-754 half-float (F16), round-to-nearest-even, with overflow
+/// saturating to infinity and underflow going through the subnormal range.
+///
+/// The inverse of [`half_to_f32`], and needed wherever the GUEST hands over a float that the
+/// hardware stores at half width - `sceGxmSetUniformDataF` writing an F16-declared uniform is
+/// the case that matters: the shader reads that register back as two packed halves.
+pub fn f32_to_half(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf/NaN. A NaN must stay a NaN, so keep a non-zero mantissa.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflows the half range
+    }
+    if e <= 0 {
+        // Subnormal (or zero): shift the implicit leading 1 into the mantissa.
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        // Round to nearest, ties to even, on the bit shifted out.
+        let round = u32::from((m >> (shift - 1)) & 1 == 1 && (m & ((1 << (shift - 1)) - 1) != 0 || half & 1 == 1));
+        return sign | (half + round) as u16;
+    }
+    let half = ((e as u32) << 10) | (mant >> 13);
+    let round = u32::from(mant & 0x1000 != 0 && (mant & 0x0fff != 0 || half & 1 == 1));
+    sign | (half + round) as u16
+}
+
 /// Multiply column-major 4x4 `m` by the column vector `(x, y, z, 1)`.
 fn transform(m: &[f32; 16], x: f32, y: f32, z: f32) -> [f32; 4] {
     [
@@ -630,10 +666,20 @@ pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
         0x02..=0x0b => (1, 1, 2),
         // 24-bit three-channel (U8U8U8, S8S8S8).
         0x98 | 0x99 => (1, 1, 3),
+        // U2F10F10F10: a 32-bit packed HDR format, numbered up with the odd-sized formats
+        // rather than with the other 32-bit ones. One retail racer renders its whole world
+        // pass into a colour surface of this format, so the texture it reads that pass back
+        // through is exactly this - and an unsized format is DROPPED, not approximated.
+        0x9a => (1, 1, 4),
         // 32-bit (U8U8U8U8, ..., F32) and 32-bit single (U32/S32).
         0x0c..=0x1a => (1, 1, 4),
         // 64-bit four/two-channel: F16F16F16F16, U16U16U16U16, S16S16S16S16, F32F32, U32U32.
         0x1b..=0x1f => (1, 1, 8),
+        // PVRTC (PVRTC1 and PVRTC2): 8-byte blocks covering 4x4 texels at 4bpp and 8x4 at
+        // 2bpp. Unlike BC, a block is not decodable on its own - see `crate::pvrtc` - but its
+        // GEOMETRY is what sizing and addressing need, and that is all this reports.
+        0x80 | 0x82 => (8, 4, 8),
+        0x81 | 0x83 => (4, 4, 8),
         // BC1 (DXT1) and BC4 (both signs): 8-byte 4x4 blocks.
         0x85 | 0x88 | 0x89 => (4, 4, 8),
         // BC2 (DXT3), BC3 (DXT5), BC5 (both signs): 16-byte 4x4 blocks.
@@ -660,7 +706,7 @@ pub fn cube_type(tex_type: u32) -> bool {
 /// formed by the smaller dimension, then append the remaining high bits of the
 /// larger dimension linearly. This is the GXM swizzle for a power-of-two-padded
 /// block grid `pw x ph`, matching how the GPU addresses a SWIZZLED texture.
-fn morton_index(mut x: u32, mut y: u32, pw: u32, ph: u32) -> u32 {
+pub(crate) fn morton_index(mut x: u32, mut y: u32, pw: u32, ph: u32) -> u32 {
     let min_log = pw.min(ph).trailing_zeros();
     let mut index = 0u32;
     for i in 0..min_log {
@@ -886,9 +932,16 @@ fn texel_rgba(t: &BoundTexture, x: u32, y: u32) -> [u8; 4] {
 /// so a face is just a byte offset applied to every fetch.
 fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
     let Some((block_w, block_h, block_bytes)) = block_layout(t.base_format) else {
+        report_undecodable_texture_format(t.base_format, t.tex_type);
         return [255, 0, 255, 255];
     };
     let face_base = (face * t.face_bytes) as usize;
+    // PVRTC is block-based but NOT block-local: a texel needs the four blocks whose centres
+    // surround it, so it cannot go through the single-block path below.
+    if let Some(variant) = crate::pvrtc::Variant::from_base_format(t.base_format) {
+        let face = t.pixels.get(face_base..).unwrap_or(&[]);
+        return crate::pvrtc::texel(face, t.width, t.height, x, y, variant, swizzled_type(t.tex_type));
+    }
     // Block-compressed (BC/DXT): locate the 4x4 block (Morton-addressed when the
     // texture is swizzled, else row-major), decode it, and apply the channel
     // swizzle to the decoded RGBA (ABGR/field 0 is the identity).
@@ -936,8 +989,157 @@ fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
                 _ => [b0, b1, b2, 255], // BGR
             }
         }
+        // Two-channel 16-bit lanes (U16U16 / S16S16 / F16F16), 32 bits total. These sit
+        // inside the byte-wise 8888 range below but are NOT four 8-bit lanes: decoding them
+        // as bytes splits each 16-bit value in half and produces noise, so they are pulled
+        // out ahead of it. SWIZZLE2, low lane first.
+        0x0f | 0x10 | 0x11 => {
+            let lane = |i: usize| -> u8 {
+                let raw = u16::from_le_bytes([byte(i * 2), byte(i * 2 + 1)]);
+                let v = match t.base_format {
+                    0x0f => raw as f32 / 65535.0,
+                    0x10 => ((raw as i16) as f32 / 32767.0).max(0.0),
+                    _ => half_to_f32(raw),
+                };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            swizzle2(lane(0), lane(1), swizzle)
+        }
+        // Single-channel 32-bit (F32 / F32M / U32 / S32). One value, routed by SWIZZLE1.
+        // F32M is F32 with the sign bit used as a flag; the magnitude is what a colour
+        // read wants, so it decodes as the absolute value.
+        0x12 | 0x13 | 0x17 | 0x18 => {
+            let raw = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let v = match t.base_format {
+                0x12 => f32::from_bits(raw),
+                0x13 => f32::from_bits(raw).abs(),
+                0x17 => raw as f32 / u32::MAX as f32,
+                _ => ((raw as i32) as f32 / i32::MAX as f32).max(0.0),
+            };
+            swizzle1((v.clamp(0.0, 1.0) * 255.0).round() as u8, swizzle)
+        }
+        // X8U24: an 8-bit stencil byte over a 24-bit unsigned depth. SWIZZLE2 names the two
+        // (SD / DS); the depth is the value a colour read means, normalized over 24 bits.
+        0x15 => {
+            let raw = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let d = ((raw & 0x00ff_ffff) as f32 / 16_777_215.0 * 255.0).round() as u8;
+            let s = (raw >> 24) as u8;
+            match swizzle {
+                1 => [d, s, 0, 255], // DS
+                _ => [s, d, 0, 255], // SD
+            }
+        }
+        // U2U10U10U10: three 10-bit lanes under a 2-bit alpha, permuted by SWIZZLE4 with the
+        // 2-bit lane in the alpha role (as U1U5U5U5 does with its 1-bit lane).
+        0x0e => {
+            let w = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let ten = |sh: u32| ((((w >> sh) & 0x3ff) as f32 / 1023.0) * 255.0).round() as u8;
+            let a = (((w >> 30) & 0x3) as f32 / 3.0 * 255.0).round() as u8;
+            match swizzle {
+                1 => [ten(20), ten(10), ten(0), a], // ARGB
+                _ => [ten(0), ten(10), ten(20), a], // ABGR
+            }
+        }
+        // F11F11F10: three unsigned packed floats (no sign bit) - 11/11/10 bits from the
+        // low end, exponent bias 15, exactly the half-float layout minus the sign and with
+        // a shorter mantissa. SWIZZLE3 BGR/RGB.
+        0x1a => {
+            let w = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let small = |bits: u32, mant_bits: u32| -> f32 {
+                let exp = bits >> mant_bits;
+                let mant = bits & ((1 << mant_bits) - 1);
+                let scale = (1u32 << mant_bits) as f32;
+                if exp == 0 {
+                    // Denormal: no implicit leading one.
+                    mant as f32 / scale * 2f32.powi(-14)
+                } else {
+                    (1.0 + mant as f32 / scale) * 2f32.powi(exp as i32 - 15)
+                }
+            };
+            let c0 = small(w & 0x7ff, 6);
+            let c1 = small((w >> 11) & 0x7ff, 6);
+            let c2 = small((w >> 22) & 0x3ff, 5);
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            match swizzle {
+                1 => [q(c2), q(c1), q(c0), 255], // RGB
+                _ => [q(c0), q(c1), q(c2), 255], // BGR
+            }
+        }
+        // SE5M9M9M9: three 9-bit mantissas sharing one 5-bit exponent (bias 15, no implicit
+        // leading one - the RGB9E5 layout). SWIZZLE3 BGR/RGB.
+        0x19 => {
+            let w = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let scale = 2f32.powi((w >> 27) as i32 - 15 - 9);
+            let m = |sh: u32| (((w >> sh) & 0x1ff) as f32 * scale).clamp(0.0, 1.0);
+            let q = |v: f32| (v * 255.0).round() as u8;
+            match swizzle {
+                1 => [q(m(18)), q(m(9)), q(m(0)), 255], // RGB
+                _ => [q(m(0)), q(m(9)), q(m(18)), 255], // BGR
+            }
+        }
         // 32-bit four-channel (U8U8U8U8 et al). SWIZZLE4 permutes the memory bytes.
         0x0c..=0x1a => swizzle4(byte(0), byte(1), byte(2), byte(3), swizzle),
+        // U8U3U3U2: one 16-bit word, lanes MSB->LSB 8 / 3 / 3 / 2, so the same SWIZZLE4
+        // selector applies with the 8-bit lane in the b3 role.
+        0x03 => {
+            let w = u16::from_le_bytes([byte(0), byte(1)]);
+            let b3 = (w >> 8) as u8;
+            let b2 = ((((w >> 5) & 0x7) as u32 * 255) / 7) as u8;
+            let b1 = ((((w >> 2) & 0x7) as u32 * 255) / 7) as u8;
+            let b0 = (((w & 0x3) as u32 * 255) / 3) as u8;
+            swizzle4(b0, b1, b2, b3, swizzle)
+        }
+        // S5S5U6: opaque 16-bit three-channel, lanes MSB->LSB 5 / 5 / 6 with the two 5-bit
+        // lanes SIGNED. SWIZZLE3 names them BGR(0)/RGB(1) as U5U6U5 does.
+        0x06 => {
+            let w = u16::from_le_bytes([byte(0), byte(1)]);
+            let s5 = |v: u32| -> u8 {
+                // Sign-extend a 5-bit two's-complement lane, then map [-1,1] -> [0,255].
+                let s = if v & 0x10 != 0 { v as i32 - 32 } else { v as i32 };
+                (((s as f32 / 15.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * 255.0).round() as u8
+            };
+            let hi = s5((w >> 11) as u32 & 0x1f);
+            let mid = s5((w >> 6) as u32 & 0x1f);
+            let lo = (((w & 0x3f) as u32 * 255) / 63) as u8;
+            match swizzle {
+                1 => [hi, mid, lo, 255], // RGB
+                _ => [lo, mid, hi, 255], // BGR
+            }
+        }
+        // Two-channel 8-bit (U8U8 / S8S8): SWIZZLE2 over (low byte, high byte).
+        0x07 | 0x08 => {
+            let lane = |b: u8| -> u8 {
+                if t.base_format == 0x08 {
+                    (((b as i8) as f32 / 127.0).max(0.0) * 255.0).round() as u8
+                } else {
+                    b
+                }
+            };
+            swizzle2(lane(byte(0)), lane(byte(1)), swizzle)
+        }
+        // Single-channel 16-bit (U16 / S16 / F16), reduced to 8 bits for the shared RGBA8
+        // seam and routed by SWIZZLE1 exactly as the 8-bit single-channel case below.
+        0x09 | 0x0a | 0x0b => {
+            let raw = u16::from_le_bytes([byte(0), byte(1)]);
+            let v = match t.base_format {
+                0x09 => raw as f32 / 65535.0,
+                0x0a => ((raw as i16) as f32 / 32767.0).max(0.0),
+                _ => half_to_f32(raw),
+            };
+            swizzle1((v.clamp(0.0, 1.0) * 255.0).round() as u8, swizzle)
+        }
+        // Two-channel 32-bit lanes (F32F32 / U32U32), 64 bits total. SWIZZLE2.
+        0x1e | 0x1f => {
+            let lane = |i: usize| -> u8 {
+                let raw = u32::from_le_bytes([byte(i * 4), byte(i * 4 + 1), byte(i * 4 + 2), byte(i * 4 + 3)]);
+                let v = match t.base_format {
+                    0x1e => f32::from_bits(raw),
+                    _ => raw as f32 / u32::MAX as f32,
+                };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            swizzle2(lane(0), lane(1), swizzle)
+        }
         // U1U5U5U5: little-endian 16-bit, MSB->LSB lanes = [1-bit A, 5, 5, 5]. The
         // 1-bit lane is the alpha; the three 5-bit lanes permute by swizzle.
         0x04 => {
@@ -992,8 +1194,35 @@ fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
         // forcing alpha to 255 would turn the transparent inter-glyph gaps into opaque
         // boxes that overwrite neighbouring glyphs.
         0x00 | 0x01 => swizzle1(byte(0), swizzle),
-        _ => [255, 0, 255, 255], // unknown format: opaque magenta
+        // Unknown format: opaque magenta, and it says so. Magenta on screen is only useful
+        // if it can be traced back to a format number, and a texel decoder is far too hot to
+        // report per call - so the report is deduped by format and printed once.
+        _ => {
+            report_undecodable_texture_format(t.base_format, t.tex_type);
+            [255, 0, 255, 255]
+        }
     }
+}
+
+/// Report - once per distinct base format, unconditionally - that a texture's format has no
+/// texel decode, so every draw sampling it is painted magenta.
+///
+/// The counterpart of the capture side's unsized-format report: that one covers a format
+/// whose SIZE is unknown (the unit ends up unbound), this one a format that is sized but not
+/// decodable (the unit binds a magenta image). Both are silent failures otherwise, and they
+/// look nothing alike on screen.
+pub(crate) fn report_undecodable_texture_format(base_format: u32, tex_type: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(base_format) {
+        return;
+    }
+    eprintln!(
+        "gxm texture: base format {base_format:#04x} (type {tex_type}) has no texel decode - \
+         every draw sampling it is painted MAGENTA"
+    );
 }
 
 /// Route a single-channel (U8/S8) texel to straight RGBA per its GXM `SWIZZLE1`
@@ -1012,6 +1241,23 @@ fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
         5 => [255, r, r, r],     // 1RRR
         6 => [r, 0, 0, 0],       // R000
         _ => [r, 255, 255, 255], // R111 (7)
+    }
+}
+
+/// Route a two-channel texel to straight RGBA per its GXM `SWIZZLE2` selector, with `r`
+/// the low (first) lane and `g` the high (second) lane.
+///
+/// The selector names the output channels left to right, the same reading `swizzle1` uses,
+/// and a channel the name does not mention is 0 - except alpha, which is opaque so a
+/// two-channel texture does not render invisible.
+fn swizzle2(r: u8, g: u8, swizzle: u32) -> [u8; 4] {
+    match swizzle {
+        1 => [0, 0, g, r],       // 00GR
+        2 => [g, r, r, r],       // GRRR
+        3 => [r, g, g, g],       // RGGG
+        4 => [g, r, g, r],       // GRGR
+        5 => [0, 0, r, g],       // 00RG
+        _ => [g, r, 0, 255],     // GR
     }
 }
 
@@ -1063,6 +1309,10 @@ static UNPLACED_SCENE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// Latch for the once-per-run notice that post-process passes are being skipped.
 static SKIPPED_POST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Latch for the once-per-run notice that a pass was dropped for having a zero-sized
+/// target.
+static ZERO_SIZED_TARGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Print `msg` the first time this latch is raised. Used for "the renderer cannot
 /// reproduce this class of draw" notices, which are properties of the title's shaders and
@@ -2621,6 +2871,18 @@ pub fn render_frame_chain(
             continue;
         };
         if c.width == 0 || c.height == 0 {
+            // Nothing can be rasterized into a zero-sized target, but dropping the
+            // pass in silence is how a whole pass goes missing without a trace: a
+            // frame whose world pass was dropped looks exactly like a title that
+            // drew no world. If this fires, the extent is almost certainly wrong
+            // rather than the title's - `sceGxmBeginScene` takes it from the RENDER
+            // TARGET, and only falls back to the colour surface for a target this
+            // implementation never saw created.
+            report_once(
+                &ZERO_SIZED_TARGET,
+                "software render: DROPPING a pass whose colour target has a zero extent. \
+                 Whatever that pass carried is missing from the finished frame.",
+            );
             continue;
         }
         // A SECOND pass into a target this frame already filled is a post-process step -
@@ -2725,6 +2987,10 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
         lod_bias: proto.lod_bias,
         min_filter: proto.min_filter,
         mag_filter: proto.mag_filter,
+        // The substitute holds the pixels this frame RENDERED, which are already linear in
+        // whatever space the pass wrote them - there is no gamma-encoded memory here for a
+        // sampler to decode, so the mode does not carry over from the prototype binding.
+        gamma: 0,
     }
 }
 
@@ -3181,6 +3447,15 @@ fn tex_key(t: &BoundTexture) -> u64 {
     mix(t.tex_type as u64);
     mix(((t.width as u64) << 32) | t.height as u64);
     mix(((t.stride as u64) << 32) | t.pixels.len() as u64);
+    // The SAMPLER state belongs in the key too. It does not change the decoded pixels, but the
+    // cached `GxmTexture` carries it to the renderer, so leaving it out hands the second binding
+    // of the same image the FIRST binding's filter and wrap modes.
+    mix((t.mag_filter as u64) << 32 | t.min_filter as u64);
+    mix((t.u_addr_mode as u64) << 32 | t.v_addr_mode as u64);
+    // GAMMA belongs here for the same reason: it does not change the decoded bytes, but it
+    // changes the FORMAT they are uploaded through (sRGB decodes on fetch), so two bindings of
+    // one image differing only in gamma must not share a cache entry.
+    mix(t.gamma as u64);
     // Sample at most ~256 bytes spread across the buffer so a content change is seen
     // cheaply regardless of texture size.
     let n = t.pixels.len();
@@ -3371,6 +3646,9 @@ impl RenderSceneBuilder {
             faces: t.faces.max(1),
             rgba: Arc::new(rgba),
             filter_linear,
+            addr_mode_u: t.u_addr_mode,
+            addr_mode_v: t.v_addr_mode,
+            gamma: t.gamma != 0,
         };
         self.decode_cache.insert(key, g.clone());
         g
@@ -3583,6 +3861,14 @@ impl RenderSceneBuilder {
                     .iter()
                     .map(|t| vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t) })
                     .collect();
+                // The VERTEX stage's own bindings, uploaded the same way. A vertex program that
+                // samples builds its geometry from the fetch, so these decide whether the draw
+                // has a mesh at all.
+                let vertex_textures = d
+                    .vertex_textures
+                    .iter()
+                    .map(|t| vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t) })
+                    .collect();
                 // Expand the guest topology into a flat, winding-normalized triangle-LIST u32
                 // index buffer (NO CPU cull - the recompiled pipeline culls on the GPU via the
                 // guest cull mode, using its own real-shader projection). Indexes into the RAW
@@ -3607,10 +3893,20 @@ impl RenderSceneBuilder {
                     index_u32: true,
                     primitive: d.primitive,
                     textures,
+                    vertex_textures,
                     depth_write: d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED,
                     depth_func: d.render_state.front_depth_func,
                     cull_mode: d.render_state.cull_mode,
                     blend: !opaque,
+                    blend_state: [
+                        d.blend.color_mask,
+                        d.blend.color_func,
+                        d.blend.alpha_func,
+                        d.blend.color_src,
+                        d.blend.color_dst,
+                        d.blend.alpha_src,
+                        d.blend.alpha_dst,
+                    ],
                     viewport: d.render_state.viewport,
                 })
             } else {
@@ -3651,8 +3947,12 @@ impl RenderSceneBuilder {
             data_addr: c.data_addr,
             width: c.width,
             height: c.height,
+            gamma: c.gamma != 0,
         });
-        RenderScene { draws, target, depth_min, depth_scale }
+        // Where this scene's DEPTH lands, for the same reason as `target` above: a later pass
+        // that samples this depth names exactly this address.
+        let depth_addr = scene.depth.map(|d| d.depth_addr).unwrap_or(0);
+        RenderScene { draws, target, depth_min, depth_scale, depth_addr }
     }
 }
 
@@ -3677,7 +3977,9 @@ mod geometry_tests {
             indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![],
             textures: vec![],
+            vertex_textures: vec![],
             render_state: RenderState::default(),
+            blend: crate::capture::BlendState::default(),
             exposure: 1.0,
             material: crate::capture::FragmentMaterial::default(),
             world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
@@ -3738,6 +4040,7 @@ mod geometry_tests {
         let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 located_draw([10.0, 0.0, 5.0], &tri, mvp),
                 // Same placement as the first: one object drawn in two passes.
@@ -3771,7 +4074,7 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { color: None, draws: vec![d.clone()] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![d.clone()] }, 100, 100);
         let h = found[0].heading.expect("an identity rotation has a heading");
         assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
         assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
@@ -3782,7 +4085,7 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { color: None, draws: vec![turned] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![turned] }, 100, 100);
         let h = found[0].heading.unwrap();
         assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
 
@@ -3791,7 +4094,7 @@ mod geometry_tests {
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { color: None, draws: vec![flat] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![flat] }, 100, 100);
         assert_eq!(found[0].heading, None);
     }
 
@@ -3808,10 +4111,11 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { color: None, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene { color: None, depth: None, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
         // Next frame: something new is submitted first, and the car has moved.
         let after = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 located_draw([99.0, 0.0, 0.0], &other, mvp),
                 located_draw([1.0, 0.0, 0.0], &car, mvp),
@@ -4136,6 +4440,7 @@ mod geometry_tests {
         // A wide floor with a small block standing on it.
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(8.0, 0.0, 0.0, 20.0, 20.0, true),
@@ -4169,7 +4474,7 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { color: None, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
         let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
@@ -4181,6 +4486,7 @@ mod geometry_tests {
         // see what is under it.
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(30.0, -50.0, -50.0, 0.0, 50.0, true),
@@ -4196,7 +4502,7 @@ mod geometry_tests {
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { color: None, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
@@ -4254,6 +4560,7 @@ mod geometry_tests {
             lod_bias: 0,
             min_filter: 0,
             mag_filter: 0,
+            gamma: 0,
         }];
         d
     }
@@ -4262,6 +4569,7 @@ mod geometry_tests {
     fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.0, 0.0, 7)],
         };
         let found = locate_sprites(&scene, 960, 544);
@@ -4275,6 +4583,7 @@ mod geometry_tests {
         // not do, because a 2D sprite's position IS its vertex data.
         let moved = Scene {
             color: None,
+            depth: None,
             draws: vec![sprite_quad(400.0, 200.0, 480.0, 280.0, 0.0, 0.0, 7)],
         };
         let after = locate_sprites(&moved, 960, 544);
@@ -4282,6 +4591,7 @@ mod geometry_tests {
         // A different region of the same sheet is a DIFFERENT sprite.
         let other = Scene {
             color: None,
+            depth: None,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.5, 0.5, 7)],
         };
         assert_ne!(locate_sprites(&other, 960, 544)[0].id, s.id, "another atlas region");
@@ -4292,6 +4602,7 @@ mod geometry_tests {
         // A backdrop of many sprites panning left by 6px, and one that moves against it.
         let build = |shift: f32, hero_extra: f32| Scene {
             color: None,
+            depth: None,
             draws: (0..12)
                 .map(|i| {
                     let x = 40.0 * i as f32 + shift;
@@ -4331,6 +4642,7 @@ mod geometry_tests {
         // worse, a title gets an empty report from the one that does not apply to it.
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 sprite_quad(10.0, 10.0, 50.0, 50.0, 0.0, 0.0, 1),
                 ground_quad(0.0, -10.0, -10.0, 10.0, 10.0, true),
@@ -4357,7 +4669,7 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { color: None, draws }
+        Scene { color: None, depth: None, draws }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
@@ -4402,7 +4714,7 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { color: None, draws };
+        let scene = Scene { color: None, depth: None, draws };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -4461,7 +4773,7 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { color: None, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -4513,7 +4825,7 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { color: None, draws };
+        let scene = Scene { color: None, depth: None, draws };
         let strict = world_extent(&scene, 1.0).unwrap();
         assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
         let dense = world_extent(&scene, 0.90).unwrap();
@@ -4573,7 +4885,7 @@ mod supersample_tests {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
             faces: 1, face_bytes: 4,
             pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
-            lod_bias: 0, min_filter: 0, mag_filter: 0,
+            lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0,
         };
         let draw = Draw {
             primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
@@ -4583,11 +4895,12 @@ mod supersample_tests {
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
             ],
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
+            uniforms: vec![], textures: vec![tex], vertex_textures: vec![], render_state: RenderState::default(),
+            blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
-        let scene = Scene { color: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -4618,7 +4931,7 @@ mod supersample_tests {
         let tex = BoundTexture {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
             faces: 1, face_bytes: tw * th * 4,
-            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0,
+            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0,
         };
         // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
         // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
@@ -4637,11 +4950,12 @@ mod supersample_tests {
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
             ],
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex], render_state: RenderState::default(),
+            uniforms: vec![], textures: vec![tex], vertex_textures: vec![], render_state: RenderState::default(),
+            blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
-        let s = Scene { color: None, draws: vec![draw] };
+        let s = Scene { color: None, depth: None, draws: vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;
@@ -4688,6 +5002,7 @@ mod texture_tests {
             lod_bias: 0,
             min_filter: 0,
             mag_filter: 0,
+            gamma: 0,
         }
     }
 
@@ -4813,7 +5128,7 @@ mod texture_tests {
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         let face_bytes = pixels.len() as u32;
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0 }
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0 }
     }
 
     #[test]
@@ -4941,6 +5256,40 @@ mod png_tests {
         let (dw, dh, out) = png_to_rgba(&rgba_to_png(w, h, &rgba)).expect("decode");
         assert_eq!((dw, dh), (w, h));
         assert_eq!(out, rgba);
+    }
+
+    /// The F16 encoder against the decoder that already reads real guest data, over EVERY
+    /// finite half - so the round trip is exhaustive rather than sampled.
+    ///
+    /// Exhaustive matters here because the interesting cases are the ones a hand-picked list
+    /// misses: the subnormal range below 2^-14 (where the implicit leading one has to be
+    /// shifted back in) and the rounding ties, which is where a plausible-looking encoder
+    /// quietly loses a bit.
+    #[test]
+    fn every_finite_half_survives_a_round_trip_through_f32() {
+        for h in 0u16..=0xffff {
+            if (h >> 10) & 0x1f == 0x1f {
+                continue; // Inf/NaN: not a value equality holds for
+            }
+            let back = f32_to_half(half_to_f32(h));
+            assert_eq!(back, h, "half {h:#06x} -> {} -> {back:#06x}", half_to_f32(h));
+        }
+    }
+
+    /// The encoder's edges, stated as values rather than as bit patterns.
+    #[test]
+    fn f32_to_half_saturates_and_rounds() {
+        assert_eq!(f32_to_half(1.0), 0x3c00);
+        assert_eq!(f32_to_half(0.25), 0x3400);
+        assert_eq!(f32_to_half(-0.25), 0xb400);
+        // Past the half range, in both directions.
+        assert_eq!(f32_to_half(1.0e6), 0x7c00);
+        assert_eq!(f32_to_half(-1.0e6), 0xfc00);
+        // Below the smallest subnormal: flushes to a signed zero, not to a wrong tiny value.
+        assert_eq!(f32_to_half(1.0e-12), 0x0000);
+        assert_eq!(f32_to_half(-1.0e-12), 0x8000);
+        // Round to nearest, ties to even, on the first bit the half cannot hold.
+        assert_eq!(half_to_f32(f32_to_half(0.3)), half_to_f32(0x34cd));
     }
 
     /// Anything outside the narrow supported shape must NAME what it found rather

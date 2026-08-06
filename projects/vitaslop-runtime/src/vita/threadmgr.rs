@@ -48,6 +48,22 @@ pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i
     0
 }
 
+/// int sceKernelChangeThreadPriority(SceUID thid, int priority)
+///
+/// Retarget a thread's scheduler priority; `thid` 0 is the calling thread. Returns
+/// the PREVIOUS priority, which is what a title saves so it can restore after a
+/// temporary boost. This genuinely moves the thread in the run order - the scheduler
+/// picks the highest-priority runnable thread - so a title raising a loader above the
+/// main thread gets the ordering it asked for rather than a value it can read back
+/// and no change in behaviour.
+#[hostcall]
+pub(super) fn change_thread_priority(st: &mut VitaState, thid: i32, priority: i32) -> i32 {
+    match st.change_thread_priority(thid, priority) {
+        Ok(previous) => previous,
+        Err(e) => e as i32,
+    }
+}
+
 /// int sceKernelDelayThread(SceUInt delay)
 ///
 /// Preemptive: a REAL timed sleep - park the caller until the virtual clock

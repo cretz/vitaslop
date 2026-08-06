@@ -72,10 +72,74 @@ pub(super) fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
 /// SceUID sceKernelCreateSema(const char *name, SceUInt attr, int initVal,
 ///     int maxVal, SceKernelSemaOptParam *option)
 #[hostcall]
-pub(super) fn create_sema(st: &mut VitaState, _name: Ptr, _attr: u32, init: i32, _max: i32, _opt: Ptr) -> i32 {
-    let id = st.create_sema(init);
-    tracing::trace!(target: "vitaslop::sema", id, init, thread = st.current_thread(), "create");
+pub(super) fn create_sema(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    attr: u32,
+    init: i32,
+    max: i32,
+    _opt: Ptr,
+) -> i32 {
+    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let id = st.create_sema(&name, attr, init, max);
+    tracing::trace!(target: "vitaslop::sema", id, init, max, name, thread = st.current_thread(), "create");
     id
+}
+
+/// SceUID sceKernelOpenSema(const char *name)
+///
+/// Resolve an existing openable semaphore by name; it does NOT create one. Two
+/// modules sharing a semaphore do it this way - one creates it named, the other opens
+/// it - so returning a fresh object here would hand them two independent counters that
+/// look right and synchronize nothing. A name that names nothing is an error.
+#[hostcall]
+pub(super) fn open_sema(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr) -> i32 {
+    let name = if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    match st.sema_by_name(&name) {
+        Some(uid) => uid,
+        None => SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID as i32,
+    }
+}
+
+/// Byte size of a guest `SceKernelSemaInfo`, and the offset of each field after the
+/// 32-byte `name` array. Layout (vitasdk `psp2common/kernel/threadmgr.h`, asserted
+/// there at 0x3C): size, semaId, name[32], attr, initCount, currentCount, maxCount,
+/// numWaitThreads.
+const SEMA_INFO_SIZE: u32 = 0x3C;
+const SEMA_INFO_NAME: u32 = 8;
+const SEMA_INFO_ATTR: u32 = 40;
+
+/// int sceKernelGetSemaInfo(SceUID semaId, SceKernelSemaInfo *info)
+///
+/// The caller sets `info->size` before the call and the kernel fills the rest. Every
+/// field is real state here (the name and attr from create, the count from the live
+/// primitive, the waiter count from the park queue), so a title that reports or asserts
+/// on a semaphore sees what the semaphore is actually doing.
+#[hostcall]
+pub(super) fn get_sema_info(ctx: &mut GuestCtx, st: &mut VitaState, sema_id: i32, info: Ptr) -> i32 {
+    // Expression-bodied throughout: `#[hostcall]` inlines this into a `()` wrapper, so
+    // an early `return` would leave the wrapper rather than this handler.
+    match st.sema_info(sema_id) {
+        Some((name, attr, init, current, max, waiting)) if info.addr() != 0 => {
+            let addr = info.addr();
+            let mut name_buf = [0u8; 32];
+            let bytes = name.as_bytes();
+            let n = bytes.len().min(31); // keep the terminating NUL
+            name_buf[..n].copy_from_slice(&bytes[..n]);
+
+            ctx.write_u32(addr, SEMA_INFO_SIZE);
+            ctx.write_u32(addr + 4, sema_id as u32);
+            ctx.write_bytes(addr + SEMA_INFO_NAME, &name_buf);
+            ctx.write_u32(addr + SEMA_INFO_ATTR, attr);
+            ctx.write_u32(addr + SEMA_INFO_ATTR + 4, init as u32);
+            ctx.write_u32(addr + SEMA_INFO_ATTR + 8, current as u32);
+            ctx.write_u32(addr + SEMA_INFO_ATTR + 12, max as u32);
+            ctx.write_u32(addr + SEMA_INFO_ATTR + 16, waiting as u32);
+            0
+        }
+        _ => SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID as i32,
+    }
 }
 
 /// int sceKernelWaitSema(SceUID semaid, int signal, unsigned int *timeout)

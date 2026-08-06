@@ -242,6 +242,10 @@ pub struct BrowserEngine {
     svc_fn: JsValue,
     _dispatch_miss: Closure<dyn FnMut(i32, i32)>,
     dispatch_miss_fn: JsValue,
+    /// Linear-memory offset of the host-mirror block, when this build inlined any read
+    /// of it (`vitaslop_transpiler::Artifact::mirror_off`). The scheduler refreshes it
+    /// before every resume.
+    mirror_off: Option<u64>,
 }
 
 impl BrowserEngine {
@@ -400,6 +404,12 @@ impl GuestEngine for BrowserEngine {
         if off + bytes.len() <= view.length() as usize {
             view.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
         }
+    }
+
+    fn mirror_base(&self) -> Option<u32> {
+        // The block sits above the guest region, so its guest address is the rebase
+        // origin plus the offset - the same convention `write_mem` undoes.
+        self.mirror_off.map(|off| self.base.wrapping_add(off as u32))
     }
 }
 
@@ -573,11 +583,12 @@ impl BrowserSched {
         image: &[u8],
         base: u32,
         mem_pages: u32,
+        mirror_off: Option<u64>,
         entry: u32,
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
-        let (engine, host) = build_engine(module, image, base, mem_pages, env)?;
+        let (engine, host) = build_engine(module, image, base, mem_pages, mirror_off, env)?;
         let main = engine.make_thread(
             0,
             &[entry & !1],
@@ -601,11 +612,12 @@ impl BrowserSched {
         image: &[u8],
         base: u32,
         mem_pages: u32,
+        mirror_off: Option<u64>,
         entries: &[u32],
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
-        let (engine, host) = build_engine(module, image, base, mem_pages, env)?;
+        let (engine, host) = build_engine(module, image, base, mem_pages, mirror_off, env)?;
         let main = engine.make_thread(
             0,
             entries,
@@ -627,6 +639,7 @@ fn build_engine(
     image: &[u8],
     base: u32,
     mem_pages: u32,
+    mirror_off: Option<u64>,
     env: VitaEnv,
 ) -> Result<(BrowserEngine, Host), JsValue> {
     {
@@ -677,6 +690,7 @@ fn build_engine(
             svc_fn,
             _dispatch_miss: dispatch_miss,
             dispatch_miss_fn,
+            mirror_off,
         };
 
         Ok((engine, host))

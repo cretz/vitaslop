@@ -90,11 +90,11 @@ pub(super) fn create_thread(
     entry: Ptr,
     prio: i32,
     stack_size: u32,
-    _attr: u32,
-    _cpu: i32,
+    attr: u32,
+    cpu: i32,
     _opt: Ptr,
 ) -> i32 {
-    let thid = st.create_thread(entry.addr(), stack_size, prio);
+    let thid = st.create_thread(entry.addr(), stack_size, prio, attr, cpu);
     // Thread names are the fastest way to identify a worker's purpose when diagnosing
     // a boot stall (RUST_LOG=vitaslop::thread=debug): a pure-poll thread's name
     // ("Online", "Sync", ...) names the subsystem the title is waiting on.
@@ -102,7 +102,7 @@ pub(super) fn create_thread(
         let raw = ctx.read_bytes(name.addr(), 32);
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let nm = String::from_utf8_lossy(&raw[..end]);
-        tracing::debug!(target: "vitaslop::thread", thid, entry = format_args!("{:#010x}", entry.addr()), prio, name = %nm, "createThread");
+        tracing::debug!(target: "vitaslop::thread", thid, entry = format_args!("{:#010x}", entry.addr()), prio, name = %nm, flip = st.flip_count(), "createThread");
         st.set_thread_name(thid, &nm);
     }
     thid
@@ -173,7 +173,10 @@ pub(super) fn wait_thread_end(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
 #[hostcall]
 pub(super) fn get_thread_id(st: &mut VitaState) -> i32 {
     if st.is_preemptive() {
-        st.current_thread()
+        // A fiber reports the thread that ran it, because on hardware it executes on
+        // that thread - only its stack differs. A job system that keys per-worker state
+        // off the thread id would otherwise see a new worker at every switch.
+        st.logical_thread(st.current_thread())
     } else {
         MAIN_THREAD_ID
     }
@@ -213,6 +216,241 @@ pub(super) fn get_process_time_wide(ctx: &mut GuestCtx, st: &mut VitaState) -> S
     let t = st.now_us();
     ctx.regs[0] = t as u32;
     ctx.regs[1] = (t >> 32) as u32;
+    SvcOutcome::Continue
+}
+
+/// Byte size of a guest `SceKernelThreadInfo` and the offsets past its 32-byte
+/// `name` array. Layout from vitasdk `psp2common/kernel/threadmgr.h`, which asserts
+/// the total at 0x80: size, processId, name[32], attr, status, entry, stack,
+/// stackSize, initPriority, currentPriority, initCpuAffinityMask,
+/// currentCpuAffinityMask, currentCpuId, lastExecutedCpuId, waitType, waitId,
+/// exitStatus, runClocks (64-bit), intrPreemptCount, threadPreemptCount,
+/// threadReleaseCount, changeCpuCount, ...
+const THREAD_INFO_SIZE: u32 = 0x80;
+const THREAD_INFO_NAME: u32 = 8;
+const THREAD_INFO_ATTR: u32 = 40;
+
+/// The one CPU this scheduler runs guest threads on. Reported for both `currentCpuId`
+/// and `lastExecutedCpuId`: there is a single baton, so a thread has only ever run
+/// here, and saying so is more truthful than leaving the fields at a value that names
+/// a core the thread never touched.
+const ONLY_CPU_ID: u32 = 0;
+
+/// int sceKernelGetThreadInfo(SceUID thid, SceKernelThreadInfo *info)
+///
+/// Fill the guest's thread-info struct. `thid` 0 is the calling thread. Everything
+/// this kernel actually models is real (name, attributes, run status, entry, stack,
+/// both priorities, affinity, exit status); the counters it does not model
+/// (preemption/release tallies, wait type/id, accumulated run clocks) are written as
+/// zero rather than left holding whatever the guest buffer had, so a title reading
+/// them sees a defined value.
+#[hostcall]
+pub(super) fn get_thread_info(ctx: &mut GuestCtx, st: &mut VitaState, thid: i32, info: Ptr) -> i32 {
+    match st.thread_info(thid) {
+        Some(t) if info.addr() != 0 => {
+            let addr = info.addr();
+            let mut name = [0u8; 32];
+            let bytes = t.name.as_bytes();
+            let n = bytes.len().min(31); // keep the terminating NUL
+            name[..n].copy_from_slice(&bytes[..n]);
+
+            ctx.write_u32(addr, THREAD_INFO_SIZE);
+            ctx.write_u32(addr + 4, PROCESS_ID as u32);
+            ctx.write_bytes(addr + THREAD_INFO_NAME, &name);
+            let f = |i: u32| addr + THREAD_INFO_ATTR + i * 4;
+            ctx.write_u32(f(0), t.attr);
+            ctx.write_u32(f(1), t.status);
+            ctx.write_u32(f(2), t.entry);
+            ctx.write_u32(f(3), t.stack_base);
+            ctx.write_u32(f(4), t.stack_size as u32);
+            ctx.write_u32(f(5), t.init_priority as u32);
+            ctx.write_u32(f(6), t.current_priority as u32);
+            ctx.write_u32(f(7), t.cpu_affinity as u32);
+            ctx.write_u32(f(8), t.cpu_affinity as u32);
+            ctx.write_u32(f(9), ONLY_CPU_ID); // currentCpuId
+            ctx.write_u32(f(10), ONLY_CPU_ID); // lastExecutedCpuId
+            ctx.write_u32(f(11), 0); // waitType
+            ctx.write_u32(f(12), 0); // waitId
+            ctx.write_u32(f(13), t.exit_status as u32);
+            // runClocks (64-bit) then the four preempt/release/changeCpu counters and
+            // the trailing notify-callback fields: not modelled, defined as zero.
+            for i in 14..(THREAD_INFO_SIZE - THREAD_INFO_ATTR) / 4 {
+                ctx.write_u32(f(i), 0);
+            }
+            0
+        }
+        _ => SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID as i32,
+    }
+}
+
+/// The single process this kernel runs, matching `sceKernelGetProcessId`.
+const PROCESS_ID: i32 = 0x1000;
+
+/// `SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID`.
+const SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID: u32 = 0x8002_8021;
+
+/// int sceKernelSendSignal(SceUID threadId)
+///
+/// Deliver one signal to a thread. Counted rather than latched, so a producer that
+/// signals twice before the consumer runs does not lose one - a lost signal here is
+/// exactly the hazard the primitive exists to avoid.
+#[hostcall]
+pub(super) fn send_signal(st: &mut VitaState, thid: i32) -> i32 {
+    match st.send_signal(thid) {
+        Ok(()) => 0,
+        Err(e) => e as i32,
+    }
+}
+
+/// int sceKernelWaitSignal(SceUInt32 unk0, SceUInt32 delay, SceUInt32 *timeout)
+///
+/// Consume one signal sent to the calling thread, parking until one arrives. The
+/// first argument is unused by the kernel's own callers and the delay/timeout pair
+/// arms a deadline exactly as the other timed waits do.
+///
+/// Under the single-thread bring-up there is no sibling to signal us, so an
+/// unsatisfied wait cannot be made to succeed by waiting; it returns at once, which
+/// is the same choice the other primitives make there.
+pub(super) fn wait_signal(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    ctx.ret(0);
+    let thid = st.current_thread();
+    if st.take_signal(thid) || !st.is_preemptive() {
+        SvcOutcome::Continue
+    } else {
+        st.signal_block();
+        SvcOutcome::Block
+    }
+}
+
+/// SceUInt32 sceKernelGetProcessTimeLow(void)
+///
+/// The low 32 bits of the same microsecond process clock the wide form returns. It is
+/// a separate export rather than a convenience wrapper because callers use it for
+/// cheap interval timing, and it must come off the SAME clock as the wide one or two
+/// timings of the same interval disagree.
+#[hostcall]
+pub(super) fn get_process_time_low(st: &mut VitaState) -> u32 {
+    st.now_us() as u32
+}
+
+/// The 16-byte OpenPSID this console reports. It is a per-console identifier, so
+/// there is no "correct" value to reproduce - what matters is that it is STABLE
+/// (a title keying save data or a local profile on it must see the same bytes on
+/// every boot) and constant across runs, which determinism requires anyway. Titles
+/// also reject an all-zero id as "not provisioned", so it is not zero.
+const OPEN_PS_ID: [u8; 16] = [
+    0x76, 0x69, 0x74, 0x61, 0x73, 0x6C, 0x6F, 0x70, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+];
+
+/// int sceKernelGetOpenPsId(SceKernelOpenPsId *id)
+#[hostcall]
+pub(super) fn get_open_ps_id(ctx: &mut GuestCtx, out: Ptr) -> i32 {
+    if out.is_null() {
+        SCE_KERNEL_ERROR_INVALID_ARGUMENT as i32
+    } else {
+        ctx.write_bytes(out.addr(), &OPEN_PS_ID);
+        0
+    }
+}
+
+/// `SCE_KERNEL_ERROR_INVALID_ARGUMENT`.
+const SCE_KERNEL_ERROR_INVALID_ARGUMENT: u32 = 0x8002_0005;
+/// `SCE_KERNEL_ERROR_MODULEMGR_NOENT`: no loaded module covers the address.
+const SCE_KERNEL_ERROR_MODULEMGR_NOENT: u32 = 0x8002_D082;
+
+/// Guest `SceKernelModuleInfo` layout (vitasdk `psp2common/kernel/modulemgr.h`,
+/// asserted there at 0x1B8): size, modid, modattr(u16), modver[2], module_name[28],
+/// unk28, start/stop/exit entries, exidx/extab bounds, tlsInit + two sizes,
+/// path[256], segments[4] (0x18 each), state.
+const MODULE_INFO_SIZE: u32 = 0x1B8;
+const MODULE_INFO_NAME: u32 = 12;
+const MODULE_INFO_START_ENTRY: u32 = 44;
+const MODULE_INFO_PATH: u32 = 76;
+const MODULE_INFO_SEGMENTS: u32 = MODULE_INFO_PATH + 256;
+const SEGMENT_INFO_SIZE: u32 = 0x18;
+/// `SceKernelModuleInfo::segments` is a fixed array of four.
+const MODULE_INFO_MAX_SEGMENTS: usize = 4;
+/// `SCE_KERNEL_MODULE_STATE_STARTED`: every module in the image was started before
+/// the guest's main entry ran, which is the only state one can be observed in here.
+const MODULE_STATE_STARTED: u32 = 1 | 4 | 8;
+
+/// int sceKernelGetModuleInfoByAddr(const void *addr, SceKernelModuleInfo *info)
+///
+/// Identify the module a code or data address belongs to and describe it. This is how
+/// a title turns a return address into "which module faulted" for its own crash
+/// reporting, so the answer has to be the real module and the real segment bounds -
+/// the linker records where each one was actually placed (see
+/// [`crate::link::LoadedModule`]).
+///
+/// An address in no module (the heap, a thread stack, a memory block) is not an error
+/// case to paper over: the kernel reports NOENT and so do we.
+#[hostcall]
+pub(super) fn get_module_info_by_addr(ctx: &mut GuestCtx, st: &mut VitaState, addr: Ptr, info: Ptr) -> i32 {
+    match st.module_by_addr(addr.addr()) {
+        Some((uid, m)) if info.addr() != 0 => {
+            let base = info.addr();
+            // The name field is 28 bytes and the path 256; both are NUL-terminated, and
+            // the whole struct is written (not just the fields we know) so the guest
+            // never reads its own stale buffer back as module state.
+            let mut buf = vec![0u8; MODULE_INFO_SIZE as usize];
+            let put = |buf: &mut [u8], off: u32, v: u32| {
+                buf[off as usize..off as usize + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            let put_str = |buf: &mut [u8], off: u32, cap: usize, s: &str| {
+                let b = s.as_bytes();
+                let n = b.len().min(cap - 1); // keep the terminating NUL
+                buf[off as usize..off as usize + n].copy_from_slice(&b[..n]);
+            };
+            put(&mut buf, 0, MODULE_INFO_SIZE);
+            put(&mut buf, 4, uid as u32);
+            put_str(&mut buf, MODULE_INFO_NAME, 28, &m.name);
+            put(&mut buf, MODULE_INFO_START_ENTRY, m.entry);
+            // The module was loaded from the title's own directory; report the name as
+            // its path, which is what a module loaded by the process shows.
+            put_str(&mut buf, MODULE_INFO_PATH, 256, &m.name);
+            for (i, &(vaddr, mem_size, file_size, exec, write)) in
+                m.segments.iter().take(MODULE_INFO_MAX_SEGMENTS).enumerate()
+            {
+                let seg = MODULE_INFO_SEGMENTS + i as u32 * SEGMENT_INFO_SIZE;
+                // `perms` is rwx in the low bits, in the usual ELF order.
+                let perms = 4 | u32::from(write) << 1 | u32::from(exec);
+                put(&mut buf, seg, SEGMENT_INFO_SIZE);
+                put(&mut buf, seg + 4, perms);
+                put(&mut buf, seg + 8, vaddr);
+                put(&mut buf, seg + 12, mem_size);
+                put(&mut buf, seg + 16, file_size);
+            }
+            put(&mut buf, MODULE_INFO_SIZE - 4, MODULE_STATE_STARTED);
+            ctx.write_bytes(base, &buf);
+            0
+        }
+        Some(_) => SCE_KERNEL_ERROR_INVALID_ARGUMENT as i32,
+        None => SCE_KERNEL_ERROR_MODULEMGR_NOENT as i32,
+    }
+}
+
+/// int sceKernelCallModuleExit(...)
+///
+/// Run the process's registered module-exit handlers. On hardware this is part of
+/// shutting the process down: the kernel walks the loaded modules calling each
+/// `module_stop`, and the process is torn down afterwards. Ending the run is exactly
+/// what this engine's process teardown does, so it is reported as a clean halt rather
+/// than allowed to return to a guest that expects never to be resumed.
+pub(super) fn call_module_exit(ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+    ctx.ret(0);
+    tracing::info!(target: "vitaslop::exit", "sceKernelCallModuleExit - process teardown");
+    SvcOutcome::Halt
+}
+
+/// void __sce_aeabi_idiv0(int return_value) / long long __sce_aeabi_ldiv0(long long)
+///
+/// The ARM EABI division-by-zero hook: the compiler's `__aeabi_idiv`/`__aeabi_ldiv`
+/// call it when the divisor is zero, passing the value the division will yield, and
+/// the default implementation RETURNS THAT VALUE UNCHANGED (a hook exists so a program
+/// can raise SIGFPE instead; the SCE runtime's does not). The value is already in
+/// r0 (and r0:r1 for the long form) on entry, so returning is the whole behaviour -
+/// and it must not be clobbered, which is why this writes no return value at all.
+pub(super) fn aeabi_div0(_ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
     SvcOutcome::Continue
 }
 

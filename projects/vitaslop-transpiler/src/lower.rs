@@ -32,13 +32,17 @@ use crate::ir::{
 /// is a plain guest-to-guest call with no host round-trip. Redirection is applied
 /// to a branch target before the host-import lookup, so a redirected stub is
 /// never also treated as a host import.
+/// A redirect also carries the exporting function's instruction set, because the
+/// stub in between is not what runs: a Thumb caller reaches an ARM veneer that the
+/// linker has already resolved away, so neither the caller's mode nor the branch
+/// that got there says anything about the callee's.
 pub struct Imports<'a> {
     map: &'a BTreeMap<u32, u32>,
-    redirects: &'a BTreeMap<u32, u32>,
+    redirects: &'a BTreeMap<u32, (u32, bool)>,
 }
 
 impl<'a> Imports<'a> {
-    pub fn new(map: &'a BTreeMap<u32, u32>, redirects: &'a BTreeMap<u32, u32>) -> Self {
+    pub fn new(map: &'a BTreeMap<u32, u32>, redirects: &'a BTreeMap<u32, (u32, bool)>) -> Self {
         Imports { map, redirects }
     }
     fn get(&self, addr: u32) -> Option<u32> {
@@ -47,7 +51,14 @@ impl<'a> Imports<'a> {
     /// Rewrite an inter-module import stub address to the real callee address it
     /// resolves to; a non-redirected address is returned unchanged.
     fn resolve(&self, addr: u32) -> u32 {
-        self.redirects.get(&addr).copied().unwrap_or(addr)
+        self.redirects.get(&addr).map(|&(t, _)| t).unwrap_or(addr)
+    }
+    /// Resolve a call target AND the mode to decode it in. `mode` is what the branch
+    /// itself selects (the caller's mode for `bl`, the other one for `blx`); it is
+    /// used only when the target is not a redirect, since a redirect's callee mode
+    /// comes from the export, not from the call site.
+    fn resolve_call(&self, addr: u32, mode: bool) -> (u32, bool) {
+        self.redirects.get(&addr).copied().unwrap_or((addr, mode))
     }
 }
 
@@ -57,7 +68,9 @@ impl<'a> Imports<'a> {
 /// direct-call closure alone would never reach).
 pub struct Discovered {
     pub func: Func,
-    pub callees: Vec<u32>,
+    /// Direct callees as `(address, thumb)`: the mode to decode each in. A `blx
+    /// <label>` interworks, so a callee's mode is NOT always the caller's.
+    pub callees: Vec<(u32, bool)>,
     /// Thumb code pointers this function materializes (odd `movw`/`movt`
     /// constants, and odd targets of a register-indirect `blx`/`bx`).
     pub code_pointers: Vec<u32>,
@@ -104,8 +117,12 @@ enum Flow {
     /// Continue to `addr + len` only.
     Seq,
     /// A call: continue to `addr + len` (the callee returns). `guest` is the
-    /// callee address if it is translated code, else it is a host import.
-    Call { guest: Option<u32> },
+    /// callee address and the instruction-set mode to decode it in (true = Thumb)
+    /// if it is translated code, else it is a host import. The mode is carried
+    /// because `blx <label>` INTERWORKS - the callee is decoded in the opposite
+    /// mode to the caller - and a callee decoded in the wrong mode does not fail,
+    /// it silently becomes different instructions.
+    Call { guest: Option<(u32, bool)> },
     /// Unconditional branch: successor is `target` only.
     Jump(u32),
     /// An unconditional branch that leaves this function to another translated
@@ -113,7 +130,9 @@ enum Flow {
     /// own callee, run as a call, then this function returns to its caller (lr is
     /// unchanged, so the callee's return unwinds past us). It is NOT pulled into
     /// this body. Distinguished from [`Jump`] (a local branch) by [`is_tail_call`].
-    TailCall(u32),
+    /// Carries the callee's mode like [`Call`]; a plain `b` never interworks, so it
+    /// is always the caller's own mode.
+    TailCall(u32, bool),
     /// Conditional/zero branch: successors are `target` and `addr + len`.
     Fork(u32),
     /// Returns to caller; no successors.
@@ -145,15 +164,17 @@ fn is_tail_call(target: u32, entry: u32) -> bool {
 /// the offset from the instruction address (already folding in the pipeline pc bias),
 /// so the target is `addr + 2*off` for a Thumb branch (halfwords) and `addr + 4*off`
 /// for an ARM branch (words) - NOT `pc + off`; adding the `pc+4`/`pc+8` bias again
-/// would land the target 4/8 bytes past the real callee. `blx` switches to ARM and
-/// word-aligns the pc (`Align(PC,4)`), so from a non-word-aligned address its target
-/// is rounded down to the next word - otherwise it lands 2 bytes past the callee.
-fn branch_target(inst: &Instruction, addr: u32, _thumb: bool) -> Option<u32> {
+/// would land the target 4/8 bytes past the real callee. `blx <label>` INTERWORKS: from
+/// Thumb it switches to ARM and word-aligns the pc (`Align(PC,4)`), so from a
+/// non-word-aligned address its target is rounded down to the next word - otherwise it
+/// lands 2 bytes past the callee. From ARM it switches to Thumb, whose targets are
+/// halfword granular, so the same rounding there would land 2 bytes BEFORE the callee.
+fn branch_target(inst: &Instruction, addr: u32, thumb: bool) -> Option<u32> {
     for op in &inst.operands {
         match op {
             Operand::BranchThumbOffset(off) => {
                 let t = addr.wrapping_add((2 * off) as u32);
-                return Some(if inst.opcode == Opcode::BLX { t & !3 } else { t });
+                return Some(if inst.opcode == Opcode::BLX && thumb { t & !3 } else { t });
             }
             Operand::BranchOffset(off) => {
                 // ARM branch: yaxpeax's `off` is in words from `addr`, pipeline bias
@@ -186,15 +207,17 @@ fn flow(
     noreturn_svc: &[u32],
 ) -> Flow {
     match inst.opcode {
-        Opcode::B => match branch_target(inst, addr, thumb).map(|t| imports.resolve(t)) {
+        // A plain `b` never interworks, so the mode it selects is the caller's own -
+        // unless the target resolves through a redirect, whose export names its own.
+        Opcode::B => match branch_target(inst, addr, thumb).map(|t| imports.resolve_call(t, thumb)) {
             // `b .` (branch to self) is an idle spin: treat as Halt so we do not
             // emit an infinite wasm loop the host cannot leave.
-            Some(t) if t == addr => Flow::Halt,
+            Some((t, _)) if t == addr => Flow::Halt,
             // An unconditional branch to an import stub/veneer is a tail call
             // (`return memset(...)`): it transfers out of the function, so it has
             // no in-function successor and adds no callee - lowering runs the
             // import then returns.
-            Some(t) if inst.condition == ConditionCode::AL && imports.get(t).is_some() => {
+            Some((t, _)) if inst.condition == ConditionCode::AL && imports.get(t).is_some() => {
                 Flow::Return
             }
             // An unconditional branch out of this function to another translated
@@ -202,20 +225,28 @@ fn flow(
             // inlining the callee (and its own tail-call chain) into this body -
             // which is what makes statically-linked `b.w library_fn` explode the
             // function span. A near forward branch is a local label - inline it.
-            Some(t) if inst.condition == ConditionCode::AL && is_tail_call(t, entry) => {
-                Flow::TailCall(t)
+            Some((t, t_thumb)) if inst.condition == ConditionCode::AL && is_tail_call(t, entry) => {
+                Flow::TailCall(t, t_thumb)
             }
-            Some(t) if inst.condition == ConditionCode::AL => Flow::Jump(t),
-            Some(t) => Flow::Fork(t),
+            Some((t, _)) if inst.condition == ConditionCode::AL => Flow::Jump(t),
+            Some((t, _)) => Flow::Fork(t),
             None => Flow::Halt,
         },
         Opcode::CBZ | Opcode::CBNZ => match branch_target(inst, addr, thumb) {
             Some(t) => Flow::Fork(t),
             None => Flow::Halt,
         },
-        Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb).map(|t| imports.resolve(t)) {
-            Some(t) if imports.get(t).is_some() => Flow::Call { guest: None },
-            Some(t) => Flow::Call { guest: Some(t) },
+        // `bl <label>` stays in the caller's instruction set; `blx <label>` switches to
+        // the other one. Decoding an ARM callee as Thumb does not fail - it decodes into
+        // an entirely different, plausible-looking function - so the mode has to travel
+        // with the callee address rather than being inherited from the caller. A target
+        // that resolves through an inter-module redirect takes the EXPORT's mode instead:
+        // the veneer the branch actually names has been resolved away.
+        Opcode::BL | Opcode::BLX => match branch_target(inst, addr, thumb)
+            .map(|t| imports.resolve_call(t, if inst.opcode == Opcode::BLX { !thumb } else { thumb }))
+        {
+            Some((t, _)) if imports.get(t).is_some() => Flow::Call { guest: None },
+            Some((t, t_thumb)) => Flow::Call { guest: Some((t, t_thumb)) },
             // A register-target `blx rN` is an indirect call through a function
             // pointer: it returns here, so continue to the fall-through, but the
             // target is not a statically-known callee (the dispatcher resolves it
@@ -264,6 +295,7 @@ fn flow(
 /// operand (matching the old r7 rule, so r7's noreturn behavior is unchanged).
 fn track_regs(
     inst: &Instruction,
+    addr: u32,
     mut regs: RegConsts,
     in_code: &impl Fn(u32) -> bool,
     discover_pointers: bool,
@@ -271,6 +303,61 @@ fn track_regs(
 ) -> RegConsts {
     let dst = inst.operands.first().and_then(regnum);
     match inst.opcode {
+        // Constant arithmetic, which is how HAND-WRITTEN assembly forms a computed jump
+        // target: there is no literal pool and no relocation to notice, just `add rd,
+        // pc, #imm` to get a code address and then `add rd, rd, #stride` to step it,
+        // with a `blx`/`bx rd` at the end. An assembly MD5 in this title's libc walks
+        // its round blocks exactly so:
+        //
+        // ```text
+        //   add r12, pc, #77       ; r12 = the first round helper
+        //   ...  blx r12           ; call it
+        //   add r12, r12, #16      ; step to the next block
+        //   bx  r12                ; and enter that
+        // ```
+        //
+        // Neither target is reachable by any direct branch, so without following the
+        // arithmetic they are never discovered and the run dies on an indirect dispatch
+        // to an address that is perfectly correct but has no entry. Tracking the step
+        // makes discovery cascade: each block entered this way contains the `add` that
+        // reveals the next.
+        //
+        // Bit 0 is the Thumb bit, as for a `movw`/`movt` pointer: the assembler folds
+        // it into the constant, so `pc + 77` = `...349` addresses the code at `...348`.
+        Opcode::ADD => {
+            if let Some(rd) = dst {
+                let pc =
+                    if inst.thumb { addr.wrapping_add(4) & !3 } else { addr.wrapping_add(8) };
+                // The addend's constant value: pc itself when the operand is r15,
+                // otherwise whatever that register is tracked as holding.
+                let tracked = |op: Option<&Operand>| -> Option<u32> {
+                    match op {
+                        Some(Operand::Reg(r)) if r.number() == 15 => Some(pc),
+                        Some(Operand::Reg(r)) => regs[r.number() as usize],
+                        _ => None,
+                    }
+                };
+                let v = match (&inst.operands[1], &inst.operands[2]) {
+                    // add rd, rn, #imm - including `rn == pc`.
+                    (_, op2 @ (Operand::Imm32(_) | Operand::Imm(_) | Operand::Imm12(_))) => {
+                        tracked(Some(&inst.operands[1]))
+                            .zip(imm(op2))
+                            .map(|(a, k)| a.wrapping_add(k))
+                    }
+                    // add rd, #imm (two-operand form: rd is also the source).
+                    (op1 @ (Operand::Imm32(_) | Operand::Imm(_) | Operand::Imm12(_)), _) => {
+                        regs[rd as usize].zip(imm(op1)).map(|(a, k)| a.wrapping_add(k))
+                    }
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    if discover_pointers && v & 1 == 1 && in_code(v & !1) {
+                        code_pointers.insert(v & !1);
+                    }
+                }
+                regs[rd as usize] = v;
+            }
+        }
         // movw / mov rd, #imm: rd becomes the immediate (or unknown if not one).
         // A register source (`mov rd, rn`) yields None, clearing rd.
         Opcode::MOV => {
@@ -292,6 +379,27 @@ fn track_regs(
                 });
             }
         }
+        // Opcodes whose FIRST operand is a SOURCE, not a destination. They write no
+        // register, so the blanket clear below would throw away a constant that is
+        // still live afterwards.
+        //
+        // `blx rN` is the one that matters: a computed jump CALLS THROUGH the very
+        // register it is stepping, so clearing it at the call broke the chain between
+        // `add r12, pc, #imm` and the `add r12, r12, #16` that walks to the next block.
+        // (A call may of course clobber a caller-saved register for real; this tracker
+        // does not model calls at all, and a wrong constant can only ever produce a
+        // tentative code pointer, which is bounds-checked and dropped if it does not
+        // decode.) The compares and stores are the same mistake, just less costly.
+        Opcode::BX
+        | Opcode::BLX
+        | Opcode::CMP
+        | Opcode::CMN
+        | Opcode::TST
+        | Opcode::TEQ
+        | Opcode::STR
+        | Opcode::STRB
+        | Opcode::STRH
+        | Opcode::PUSH => {}
         // Anything else that writes a register clears its tracked constant.
         _ => {
             if let Some(rd) = dst {
@@ -425,6 +533,50 @@ fn reaches(
     false
 }
 
+/// One step of the `idx = switch + k` chain: given an instruction that DEFINES
+/// `reg`, report which register it derived that value from and the constant it
+/// added.
+///
+/// Returns `(reg, 0)` - the register unchanged, no step - when the definition is not
+/// a constant adjustment or a register copy. That is the chain's terminator: the
+/// value being indexed by IS the switch variable at that point, and walking further
+/// back would attribute unrelated arithmetic to the rebase.
+fn adjustment_step(ins: &Instruction, reg: u8, before: &RegConsts) -> (u8, u32) {
+    match ins.opcode {
+        // `idx = a +/- b`, where the label base folds into `k`. Both the two-operand
+        // (`add rd,#imm` == `rd = rd +/- imm`) and three-operand (`add rd,rn,rm`)
+        // forms appear; a source register carrying a tracked constant is the base,
+        // the other is the switch variable.
+        Opcode::ADD | Opcode::SUB => {
+            let neg = ins.opcode == Opcode::SUB;
+            let signed = |kk: u32| if neg { kk.wrapping_neg() } else { kk };
+            let o1 = &ins.operands[1];
+            let o2 = &ins.operands[2];
+            if matches!(o2, Operand::Nothing) {
+                // Two-operand: `rd = rd (op) o1`. The switch value is the destination
+                // (also the implicit first source), so the chain continues on `reg`.
+                if let Some(kk) = imm(o1) {
+                    (reg, signed(kk))
+                } else if let Some(kk) = regnum(o1).and_then(|r| before[r as usize]) {
+                    (reg, signed(kk))
+                } else {
+                    (reg, 0)
+                }
+            } else if let (Some(rs), Some(kk)) = (regnum(o1), const_operand(o2, before)) {
+                (rs, signed(kk))
+            } else if let (Some(kk), Some(rs)) = (const_operand(o1, before), regnum(o2)) {
+                // `rd = imm (op) rs`: only `imm + rs` keeps `rs` a straight index;
+                // `imm - rs` negates the index, which we do not model.
+                if neg { (reg, 0) } else { (rs, kk) }
+            } else {
+                (reg, 0)
+            }
+        }
+        Opcode::MOV => regnum(&ins.operands[1]).map_or((reg, 0), |rs| (rs, 0)),
+        _ => (reg, 0),
+    }
+}
+
 /// Recover the entry count and out-of-range default of a `tbb`/`tbh` switch from
 /// the compiler's range check.
 ///
@@ -460,53 +612,49 @@ fn recover_switch_bound(
     let mut snaps: Vec<(u32, &Instruction, u32, RegConsts)> = Vec::new();
     for (&a, (ins, len, _, _)) in decoded.range(tb_addr.wrapping_sub(WINDOW)..tb_addr) {
         snaps.push((a, ins, *len, regs));
-        regs = track_regs(ins, regs, &|_| false, false, &mut throwaway);
+        regs = track_regs(ins, a, regs, &|_| false, false, &mut throwaway);
     }
 
     // How the index register was produced from the switch variable: `idx = switch + k`.
-    // The nearest writer of the index register wins; an `add`/`sub` folds the label
-    // base into `k`, a `mov` copies (k = 0), and anything else (a load, arithmetic we
-    // do not model) means the index *is* the switch variable (k = 0).
+    //
+    // This is a CHAIN, not a single step, and following only one step is an
+    // off-by-`k` waiting to happen. A compiler normalising a switch whose labels do
+    // not start at zero emits the rebase in as many instructions as the constants
+    // need - a real title has `subs r0,#1 ; sub.w r0,r0,#0x1000 ; tbh`, two
+    // adjustments in a row - and taking only the nearest one recovers `k = -0x1000`
+    // instead of `-0x1001`. The count then comes out exactly one too high, the extra
+    // "entry" is whatever instruction follows the table, and the switch is rejected
+    // as unresolvable (its bogus last target lands far outside the function). The
+    // whole function then fails to lift, which is how this surfaced: a trapping stub
+    // reached during boot.
+    //
+    // So walk back through consecutive definitions, accumulating `k`, until a
+    // definition is reached that is not a constant adjustment or a register copy.
+    // The walk is bounded by the snapshot window, and each step must define the
+    // register the previous step read, so it cannot loop.
     let (switch_reg, k) = {
-        let def = snaps.iter().rev().find(|(_, ins, _, _)| {
-            ins.operands.first().and_then(regnum) == Some(index_reg)
-        });
-        match def {
-            Some((_, ins, _, before)) => match ins.opcode {
-                // `idx = a +/- b`, where the label base folds into `k`. Both the
-                // two-operand (`add rd,#imm` == `rd = rd +/- imm`) and three-operand
-                // (`add rd,rn,rm`) forms appear; a source register carrying a tracked
-                // constant is the base, the other is the switch variable.
-                Opcode::ADD | Opcode::SUB => {
-                    let neg = ins.opcode == Opcode::SUB;
-                    let signed = |kk: u32| if neg { kk.wrapping_neg() } else { kk };
-                    let o1 = &ins.operands[1];
-                    let o2 = &ins.operands[2];
-                    if matches!(o2, Operand::Nothing) {
-                        // Two-operand: `rd = rd (op) o1`. The switch value is the
-                        // destination (also the implicit first source).
-                        if let Some(kk) = imm(o1) {
-                            (index_reg, signed(kk))
-                        } else if let Some(kk) = regnum(o1).and_then(|r| before[r as usize]) {
-                            (index_reg, signed(kk))
-                        } else {
-                            (index_reg, 0)
-                        }
-                    } else if let (Some(rs), Some(kk)) = (regnum(o1), const_operand(o2, before)) {
-                        (rs, signed(kk))
-                    } else if let (Some(kk), Some(rs)) = (const_operand(o1, before), regnum(o2)) {
-                        // `rd = imm (op) rs`: only `imm + rs` keeps `rs` a straight
-                        // index; `imm - rs` negates the index, which we do not model.
-                        if neg { (index_reg, 0) } else { (rs, kk) }
-                    } else {
-                        (index_reg, 0)
-                    }
-                }
-                Opcode::MOV => regnum(&ins.operands[1]).map_or((index_reg, 0), |rs| (rs, 0)),
-                _ => (index_reg, 0),
-            },
-            None => (index_reg, 0),
+        let mut reg = index_reg;
+        let mut k: u32 = 0;
+        let mut from = snaps.len();
+        loop {
+            let Some(i) = snaps[..from]
+                .iter()
+                .rposition(|(_, ins, _, _)| ins.operands.first().and_then(regnum) == Some(reg))
+            else {
+                break;
+            };
+            let (_, ins, _, before) = &snaps[i];
+            let (next_reg, step) = adjustment_step(ins, reg, before);
+            k = k.wrapping_add(step);
+            // A definition that is not an adjustment reports itself as the same
+            // register with no step, which is where the chain ends.
+            if next_reg == reg && step == 0 {
+                break;
+            }
+            reg = next_reg;
+            from = i;
         }
+        (reg, k)
     };
 
     // Pick the range check closest to the table branch whose in-range side is an
@@ -553,6 +701,14 @@ fn recover_switch_bound(
         let default = if in_range_taken { br_addr.wrapping_add(br_len) } else { gt };
         // Closest compare to the table branch wins (the innermost cluster's guard).
         if best.is_none_or(|(a, _, _)| *cmp_addr > a) {
+            if switch_why(tb_addr) {
+                eprintln!(
+                    "  guard @{cmp_addr:#x}: cmp r{switch_reg}, {bound:#x}  br @{br_addr:#x} \
+                     cond={:?} target={gt:#x} fall={fall:#x} in_range_taken={in_range_taken} \
+                     effective={effective:?} k={k:#x} -> count={count} default={default:#x}",
+                    br.condition
+                );
+            }
             best = Some((*cmp_addr, count, Some(default)));
         }
     }
@@ -580,7 +736,25 @@ fn resolve_switch(
     decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
     leaders: &BTreeSet<u32>,
 ) -> Option<SwitchInfo> {
-    let index = switch_index_reg(inst)?;
+    // Diagnostic (`VITASLOP_SWITCH_WHY=<hex tb address>`, or `all`): explain why a
+    // table branch did or did not resolve. An unresolved `tbb`/`tbh` fails its whole
+    // function, and the report only says "Unsupported TBH" - which names the
+    // instruction but not which of the three independent bounds recoveries gave up,
+    // so the next step is a guess. This prints the actual count each one produced.
+    let why = switch_why(tb_addr);
+    let index = match switch_index_reg(inst) {
+        Some(i) => i,
+        None => {
+            if why {
+                eprintln!(
+                    "switch @{tb_addr:#x}: UNRESOLVED - operand form is not a pc-relative \
+                     table ({:?}), so the table address is only known at runtime",
+                    inst.operands[0]
+                );
+            }
+            return None;
+        }
+    };
     let is_tbh = inst.opcode == Opcode::TBH;
     let pc = tb_addr.wrapping_add(4);
     let esize = if is_tbh { 2u32 } else { 1 };
@@ -634,6 +808,15 @@ fn resolve_switch(
             let limit = if is_tbh { min_entry } else { 2 * min_entry };
             c <= limit
         });
+    if why {
+        eprintln!(
+            "switch @{tb_addr:#x}: {} index=r{index} table={:#x} cmp_count={cmp_count:?} \
+             abut_count={abut_count:?} default={default:?} next_leader={:?}",
+            if is_tbh { "tbh" } else { "tbb" },
+            pc,
+            leaders.range(pc.wrapping_add(1)..).next().map(|l| format!("{l:#x}")),
+        );
+    }
     let count = match cmp_count.or(abut_count) {
         Some(c) => c,
         None => {
@@ -660,6 +843,9 @@ fn resolve_switch(
         }
     };
     if count == 0 || count > 1024 {
+        if why {
+            eprintln!("switch @{tb_addr:#x}: UNRESOLVED - entry count {count} is out of range");
+        }
         return None;
     }
 
@@ -672,16 +858,58 @@ fn resolve_switch(
     const MAX_REACH: u32 = 0x1_0000; // 64 KiB, matches the discovery span guard
     let mut targets = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let target = pc.wrapping_add(2 * read(i)?);
+        let Some(entry) = read(i) else {
+            if why {
+                eprintln!("switch @{tb_addr:#x}: UNRESOLVED - entry {i} of {count} is off the image");
+            }
+            return None;
+        };
+        let target = pc.wrapping_add(2 * entry);
         if target.wrapping_sub(base) as usize >= code.len() {
+            if why {
+                eprintln!(
+                    "switch @{tb_addr:#x}: UNRESOLVED - entry {i} ({entry:#x}) targets \
+                     {target:#x}, outside the image: the entry count is wrong"
+                );
+            }
             return None; // target outside the image: bound is wrong, bail cleanly
         }
         if target.wrapping_sub(tb_addr).min(tb_addr.wrapping_sub(target)) > MAX_REACH {
+            if why {
+                eprintln!(
+                    "switch @{tb_addr:#x}: UNRESOLVED - entry {i} ({entry:#x}) targets \
+                     {target:#x}, more than {MAX_REACH:#x} from the table: the count is wrong"
+                );
+            }
             return None; // implausibly far from the table: bound is wrong, bail cleanly
         }
         targets.push(target);
     }
+    if why {
+        eprintln!("switch @{tb_addr:#x}: RESOLVED {count} targets, default={default:?}");
+    }
     Some(SwitchInfo { index, targets, default })
+}
+
+/// Whether the table-branch diagnostic is on for this address
+/// (`VITASLOP_SWITCH_WHY=<hex address>` or `all`). Parsed once.
+fn switch_why(tb_addr: u32) -> bool {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<Option<u32>>> = OnceLock::new();
+    match SPEC.get_or_init(|| {
+        std::env::var("VITASLOP_SWITCH_WHY").ok().map(|s| {
+            let s = s.trim();
+            if s.eq_ignore_ascii_case("all") {
+                None
+            } else {
+                u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+            }
+        })
+    }) {
+        None => false,
+        Some(None) => true,
+        Some(Some(a)) => *a == tb_addr,
+    }
 }
 
 /// Discover and lower the function at `entry`.
@@ -704,7 +932,9 @@ pub fn discover(
     // and whether it sits inside an IT block (where flag-setting is suppressed).
     let mut decoded: BTreeMap<u32, (Instruction, u32, ConditionCode, bool)> = BTreeMap::new();
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
-    let mut callees: BTreeSet<u32> = BTreeSet::new();
+    // Direct callees as (address, Thumb-mode-to-decode-in). The mode is per callee, not
+    // per caller: `blx <label>` interworks.
+    let mut callees: BTreeSet<(u32, bool)> = BTreeSet::new();
     // Address-taken code pointers materialized in this function (thread entries,
     // callbacks). Collected via `movw`/`movt` tracking; processed as tentative
     // entries by the caller.
@@ -810,7 +1040,8 @@ pub fn discover(
         } else {
             0
         };
-        let next_regs = track_regs(&inst, regs, &in_bounds, discover_pointers, &mut code_pointers);
+        let next_regs =
+            track_regs(&inst, addr, regs, &in_bounds, discover_pointers, &mut code_pointers);
         let next = addr.wrapping_add(len);
 
         // A register-indirect `blx`/`bx` whose target register holds a tracked
@@ -829,7 +1060,7 @@ pub fn discover(
                 // silently returns -1 and skips the call's effect (e.g. a hash table
                 // never gets its 0xffffffff sentinels, so a probe loops forever).
                 let s = v & !1;
-                let resolved = imports.resolve(s);
+                let (resolved, resolved_thumb) = imports.resolve_call(s, v & 1 == 1);
                 if let Some(idx) = imports.get(s) {
                     // Host import reached through a function pointer.
                     indirect_imports.insert(addr, idx);
@@ -838,7 +1069,10 @@ pub fn discover(
                     // real routine directly and seed it for discovery, instead of
                     // dispatching to the stub's placeholder.
                     indirect_redirects.insert(addr, resolved);
-                    callees.insert(resolved);
+                    // The mode is the EXPORT's, not the tracked pointer's: the pointer
+                    // names the ARM import stub, whose Thumb bit says nothing about the
+                    // function the linker resolved it to.
+                    callees.insert((resolved, resolved_thumb));
                 } else if in_bounds(s) {
                     if v & 1 == 1 {
                         code_pointers.insert(s);
@@ -882,16 +1116,16 @@ pub fn discover(
         match flow(&inst, addr, len, thumb, entry, imports, regs[7], noreturn_svc) {
             Flow::Seq => work.push((next, next_it, next_regs)),
             Flow::Call { guest } => {
-                if let Some(t) = guest {
-                    callees.insert(t);
+                if let Some((t, t_thumb)) = guest {
+                    callees.insert((t, t_thumb));
                 }
                 work.push((next, next_it, next_regs));
             }
             // A tail call records the callee (a separate function to discover) and
             // terminates this path: no fall-through, and the target is not a leader
             // in this function's body.
-            Flow::TailCall(t) => {
-                callees.insert(t);
+            Flow::TailCall(t, t_thumb) => {
+                callees.insert((t, t_thumb));
             }
             Flow::Jump(t) => {
                 leaders.insert(t);
@@ -942,6 +1176,120 @@ pub fn discover(
         }
         if !progressed {
             break; // Nothing further is resolvable; pass 2 reports these exactly as before.
+        }
+    }
+
+    // Pass 1b: constant propagation ACROSS branches, whose only output is more tentative
+    // code pointers.
+    //
+    // Pass 1 deliberately restarts constant tracking at every branch target, because a
+    // target can have several predecessors and it uses those constants for decisions
+    // that must not be wrong (resolving an indirect call to an import, spotting a
+    // noreturn `svc`). That is the right rule there and it stays.
+    //
+    // But it also breaks a chain this title needs: a hand-written assembly MD5 steps a
+    // code pointer with `add r12, r12, #16` and enters it with `bx r12`, and the loop
+    // that does the stepping is re-entered BY A BRANCH from each block it reaches. So
+    // every block after the first arrives with r12 forgotten, and the walk finds one
+    // more round block per pass instead of all of them.
+    //
+    // This pass propagates the same tracking to a fixpoint WITH A PROPER MERGE at joins
+    // (a register keeps a value only where every path into a block agrees on it), so it
+    // cannot invent a constant that some path contradicts. It feeds nothing but
+    // `code_pointers`, which are TENTATIVE - bounds-checked, decoded speculatively, and
+    // dropped if they do not lift - so even a wrong one costs nothing but the attempt.
+    if discover_pointers {
+        // Meet: keep only the values both sides agree on.
+        let meet = |a: &RegConsts, b: &RegConsts| -> RegConsts {
+            let mut out = [None; 16];
+            for i in 0..16 {
+                if a[i] == b[i] {
+                    out[i] = a[i];
+                }
+            }
+            out
+        };
+        let mut at: BTreeMap<u32, RegConsts> = BTreeMap::new();
+        at.insert(entry, init);
+        let work: Vec<u32> = vec![entry];
+        // Instructions decoded by this pass alone, for addresses pass 1 did not put in
+        // `decoded`. A computed-jump chain runs THROUGH a shared loop that pass 1 leaves
+        // by an outside branch, which it lowers as a tail call - correct for execution,
+        // but it ends the walk, and with it the chain. Following it here costs nothing
+        // at run time because this pass produces only tentative entries.
+        let mut extra: BTreeMap<u32, (Instruction, u32)> = BTreeMap::new();
+        // How far outside the function this pass will follow such a branch. A computed
+        // jump chain is one hand-written routine's internal structure, so it is local;
+        // the window keeps a stray branch from walking the pass across the image.
+        const CHAIN_WINDOW: u32 = 0x1000;
+        let near = |a: u32| a.wrapping_sub(entry) <= CHAIN_WINDOW
+            || entry.wrapping_sub(a) <= CHAIN_WINDOW;
+        let mut work: Vec<u32> = work;
+        // Each register can only lose its value, so a block's state can change at most
+        // 16 times and the fixpoint terminates; the cap is a belt-and-braces guard.
+        let mut steps = 0usize;
+        while let Some(addr) = work.pop() {
+            steps += 1;
+            if steps > MAX_FUNC_INSNS * 4 {
+                break;
+            }
+            if !decoded.contains_key(&addr) && !extra.contains_key(&addr) {
+                match decode_at(&decoder, code, base, addr, thumb) {
+                    Ok(v) => {
+                        extra.insert(addr, v);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let (inst, len) = match decoded.get(&addr) {
+                Some((i, l, _, _)) => (i.clone(), *l),
+                None => extra[&addr].clone(),
+            };
+            let (inst, len) = (&inst, &len);
+            let regs = at[&addr];
+            let next_regs =
+                track_regs(inst, addr, regs, &in_bounds, true, &mut code_pointers);
+            // A register-indirect call/branch through a tracked constant is an entry,
+            // exactly as in pass 1 - but here the constant may have come from across a
+            // branch.
+            if matches!(inst.opcode, Opcode::BLX | Opcode::BX) {
+                if let Some(v) =
+                    inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize])
+                {
+                    let s = v & !1;
+                    if imports.get(s).is_none() && in_bounds(s) {
+                        if v & 1 == 1 {
+                            code_pointers.insert(s);
+                        } else {
+                            arm_code_pointers.insert(v);
+                        }
+                    }
+                }
+            }
+            let mut go = |t: u32, r: RegConsts, work: &mut Vec<u32>| {
+                if !decoded.contains_key(&t) && !(in_bounds(t) && near(t)) {
+                    return;
+                }
+                let merged = match at.get(&t) {
+                    Some(prev) => meet(prev, &r),
+                    None => r,
+                };
+                if at.get(&t) != Some(&merged) {
+                    at.insert(t, merged);
+                    work.push(t);
+                }
+            };
+            let next = addr.wrapping_add(*len);
+            match flow(inst, addr, *len, thumb, entry, imports, regs[7], noreturn_svc) {
+                Flow::Seq | Flow::Call { .. } => go(next, next_regs, &mut work),
+                Flow::Jump(t) => go(t, next_regs, &mut work),
+                Flow::Fork(t) => {
+                    go(t, next_regs, &mut work);
+                    go(next, next_regs, &mut work);
+                }
+                Flow::TailCall(t, _) => go(t, next_regs, &mut work),
+                Flow::Return | Flow::Halt => {}
+            }
         }
     }
 
@@ -1133,8 +1481,15 @@ fn imm(op: &Operand) -> Option<u32> {
 /// A data-processing operand: a register read, an immediate, or a shifted
 /// register (the Thumb-2 wide `add.w`/`mov.w`/... forms carry an explicit shift,
 /// often `lsl #0`).
-fn operand_value(op: &Operand) -> Option<Value> {
+fn operand_value(op: &Operand, pc: u32) -> Option<Value> {
     match op {
+        // Reading r15 as a data-processing SOURCE yields the ISA's pc constant, not the
+        // register file's r15 (which the transpiler does not maintain per-instruction -
+        // it would read 0). `lower_addr` already folds it this way for a memory operand
+        // and `ADR` for its own form; a hand-written `add r12, pc, #imm` followed by
+        // `blx r12` - the computed-jump idiom in an assembly MD5 - reaches it HERE, and
+        // without this fold it dispatched to the bare immediate.
+        Operand::Reg(r) if r.number() == 15 => Some(Value::Imm(pc)),
         Operand::Reg(r) => Some(Value::Reg(r.number())),
         Operand::Imm32(v) | Operand::Imm(v) => Some(Value::Imm(*v)),
         Operand::Imm12(v) => Some(Value::Imm(*v as u32)),
@@ -1201,14 +1556,14 @@ fn shift_operand(rs: &RegShift) -> Option<Value> {
 
 /// Decode a data-processing instruction's `(rd, rn, op2)`. Handles the 3-operand
 /// form `op rd, rn, op2` and the 2-operand form `op rd, op2` (where rd is rn).
-fn dataproc(inst: &Instruction) -> Option<(u8, Value, Value)> {
+fn dataproc(inst: &Instruction, pc: u32) -> Option<(u8, Value, Value)> {
     let rd = regnum(&inst.operands[0])?;
     if matches!(inst.operands[2], Operand::Nothing) {
-        let op2 = operand_value(&inst.operands[1])?;
+        let op2 = operand_value(&inst.operands[1], pc)?;
         Some((rd, Value::Reg(rd), op2))
     } else {
-        let rn = operand_value(&inst.operands[1])?;
-        let op2 = operand_value(&inst.operands[2])?;
+        let rn = operand_value(&inst.operands[1], pc)?;
+        let op2 = operand_value(&inst.operands[2], pc)?;
         Some((rd, rn, op2))
     }
 }
@@ -1469,6 +1824,9 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
     let err = || Error::Operand { addr };
     let ops = &inst.operands;
     let sets_flags = inst.s && !in_it;
+    // The value an instruction reads when it uses r15 as a source: `Align(addr+4, 4)` in
+    // Thumb, `addr+8` in ARM. Const per instruction, so it folds; see `operand_value`.
+    let pc_const = if inst.thumb { addr.wrapping_add(4) & !3 } else { addr.wrapping_add(8) };
 
     let mut out = Vec::new();
     match inst.opcode {
@@ -1517,7 +1875,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
 
         MOV => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let src = operand_value(&ops[1]).ok_or_else(err)?;
+            let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // Flags before the write: the value expression reads original regs.
             if sets_flags {
                 let carry = match src {
@@ -1541,7 +1899,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         MVN => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let src = operand_value(&ops[1]).ok_or_else(err)?;
+            let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // MVN's carry-out comes from the raw immediate expansion, not the ~value.
             let carry = match src {
                 Value::Imm(v) => modified_imm_carry(v, inst.thumb),
@@ -1572,14 +1930,14 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
 
         ADD => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
                 out.push(Stmt::FlagsAdd { a: rn.clone(), b: op2.clone(), cin: Value::Imm(0) });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, op2)));
         }
         SUB => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
                 out.push(Stmt::FlagsAdd {
                     a: rn.clone(),
@@ -1595,7 +1953,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // than re-adding `Flag(C)` - which would now be the carry-out, not the
         // carry-in (and `rd` may alias `rn`, so there is no re-reading it either).
         ADC => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
                 out.push(Stmt::FlagsAdd { a: rn, b: op2, cin: Value::Flag(crate::abi::Flag::C) });
                 out.push(Stmt::SetReg(rd, Value::CarryAddResult));
@@ -1607,7 +1965,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         // sbc rd, rn, op2 => rd = rn - op2 - NOT(C) = rn + ~op2 + C.
         SBC => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             let not_op2 = Value::Not(Box::new(op2));
             if sets_flags {
                 out.push(Stmt::FlagsAdd { a: rn, b: not_op2, cin: Value::Flag(crate::abi::Flag::C) });
@@ -1623,7 +1981,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         RSB => {
             // rsb rd, rn, op2 => rd = op2 - rn.
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
                 out.push(Stmt::FlagsAdd {
                     a: op2.clone(),
@@ -1634,18 +1992,18 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, op2, rn)));
         }
         CMP => {
-            let a = operand_value(&ops[0]).ok_or_else(err)?;
-            let b = operand_value(&ops[1]).ok_or_else(err)?;
+            let a = operand_value(&ops[0], pc_const).ok_or_else(err)?;
+            let b = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::FlagsAdd { a, b: Value::Not(Box::new(b)), cin: Value::Imm(1) });
         }
         CMN => {
-            let a = operand_value(&ops[0]).ok_or_else(err)?;
-            let b = operand_value(&ops[1]).ok_or_else(err)?;
+            let a = operand_value(&ops[0], pc_const).ok_or_else(err)?;
+            let b = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0) });
         }
 
         AND | BIC | ORR | ORN | EOR | TST => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             // A flag-setting logical op with a rotate-form immediate updates C from the
             // immediate expansion (ThumbExpandImm_C). Read it from the *raw* immediate,
             // before BIC/ORN complement the operand below.
@@ -1676,7 +2034,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
 
         LSL | LSR | ASR => {
-            let (rd, rn, sh) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, sh) = dataproc(inst, pc_const).ok_or_else(err)?;
             if let Value::Imm(_) = sh {
                 // Immediate-amount shift: the amount is known at lowering, so wasm's
                 // masked shift and the constant-folded `shift_carry` are already exact.
@@ -1708,7 +2066,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // matching ARM's register-rotate masking); ROR's carry-out is bit 31 of
         // the result when it sets flags.
         ROR => {
-            let (rd, rn, sh) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, sh) = dataproc(inst, pc_const).ok_or_else(err)?;
             let result = bin(BinOp::Ror, rn, sh);
             if sets_flags {
                 let carry = bin(BinOp::And, bin(BinOp::Lsr, result.clone(), Value::Imm(31)), Value::Imm(1));
@@ -1720,7 +2078,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // bit `lsb`, leaving the rest of rd unchanged.
         BFI => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             let lsb = imm(&ops[2]).ok_or_else(err)?;
             let width = imm(&ops[3]).ok_or_else(err)?;
             let field = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
@@ -1744,7 +2102,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
 
         MUL => {
-            let (rd, rn, op2) = dataproc(inst).ok_or_else(err)?;
+            let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             let result = bin(BinOp::Mul, rn, op2);
             if sets_flags {
                 out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
@@ -1757,28 +2115,28 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         UMULL | SMULL => {
             let rdlo = regnum(&ops[0]).ok_or_else(err)?;
             let rdhi = regnum(&ops[1]).ok_or_else(err)?;
-            let rn = operand_value(&ops[2]).ok_or_else(err)?;
-            let rm = operand_value(&ops[3]).ok_or_else(err)?;
+            let rn = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[3], pc_const).ok_or_else(err)?;
             out.push(Stmt::MulLong { rdlo, rdhi, rn, rm, signed: inst.opcode == SMULL });
         }
         // clz rd, rm.
         CLZ => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::SetReg(rd, Value::Clz(Box::new(rm))));
         }
         // rbit rd, rm: reverse the 32 bits of rm.
         RBIT => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::Rbit { rd, rm });
         }
         // mla rd, rn, rm, ra => rd = rn*rm + ra; mls => rd = ra - rn*rm.
         MLA | MLS => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rn = operand_value(&ops[1]).ok_or_else(err)?;
-            let rm = operand_value(&ops[2]).ok_or_else(err)?;
-            let ra = operand_value(&ops[3]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let ra = operand_value(&ops[3], pc_const).ok_or_else(err)?;
             let prod = bin(BinOp::Mul, rn, rm);
             let result = if inst.opcode == MLS {
                 bin(BinOp::Sub, ra, prod)
@@ -1790,13 +2148,13 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // rev rd, rm: reverse all four bytes.
         REV => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::SetReg(rd, byte_reverse(rm)));
         }
         // rev16 rd, rm: reverse the bytes within each halfword.
         REV16 => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // ((rm >> 8) & 0x00FF00FF) | ((rm << 8) & 0xFF00FF00)
             let hi = bin(BinOp::And, bin(BinOp::Lsr, rm.clone(), Value::Imm(8)), Value::Imm(0x00FF_00FF));
             let lo = bin(BinOp::And, bin(BinOp::Shl, rm, Value::Imm(8)), Value::Imm(0xFF00_FF00));
@@ -1810,7 +2168,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // value), so honour it here.
         SXTB | UXTB | SXTH | UXTH => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let mut rm = operand_value(&ops[1]).ok_or_else(err)?;
+            let mut rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             if let Some(rot) = imm(&ops[2]).filter(|&r| r != 0) {
                 rm = bin(BinOp::Ror, rm, Value::Imm(rot));
             }
@@ -1829,8 +2187,8 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // ops[3]).
         SXTAB | UXTAB | SXTAH | UXTAH => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rn = operand_value(&ops[1]).ok_or_else(err)?;
-            let mut rm = operand_value(&ops[2]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let mut rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
             if let Some(rot) = imm(&ops[3]).filter(|&r| r != 0) {
                 rm = bin(BinOp::Ror, rm, Value::Imm(rot));
             }
@@ -1846,7 +2204,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // (sign-extended).
         UBFX | SBFX => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
-            let rn = operand_value(&ops[1]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             let lsb = imm(&ops[2]).ok_or_else(err)?;
             let width = imm(&ops[3]).ok_or_else(err)?;
             let result = if inst.opcode == UBFX {
@@ -3163,5 +3521,45 @@ mod block_transfer_tests {
             })
             .collect();
         assert_eq!(loads, vec![(-8i32) as u32, (-4i32) as u32], "ldmdb reads below the base");
+    }
+}
+
+#[cfg(test)]
+mod pc_source_operand_tests {
+    use super::*;
+
+    /// Lower one Thumb instruction (given as its raw little-endian bytes) at `addr`.
+    fn lower_thumb(bytes: &[u8], addr: u32) -> Vec<Stmt> {
+        let decoder = InstDecoder::default().with_thumb_mode(true);
+        let mut reader = U8Reader::new(bytes);
+        let inst = decoder.decode(&mut reader).expect("decodes");
+        lower_effects(&inst, addr, false).expect("lowers")
+    }
+
+    /// Reading `r15` as a data-processing SOURCE has to produce the ISA's pc constant.
+    /// The transpiler keeps no live r15 in the register file, so an unfolded read yields
+    /// 0 and the instruction computes a small integer instead of a code address.
+    ///
+    /// The encoding here is the real one this was found on: `f2 0f 4d 0c`
+    /// (`add r12, pc, #77`) at `0x813432fa`, the head of a hand-written assembly MD5
+    /// that builds a jump target with it and then does `blx r12`. Unfolded, r12 became
+    /// `0x4d` and the run died on "indirect dispatch to unknown target 0x4c" - far from
+    /// anything that looked like an addressing bug.
+    #[test]
+    fn reading_pc_as_a_source_operand_folds_to_the_isa_pc() {
+        let stmts = lower_thumb(&[0x0f, 0xf2, 0x4d, 0x0c], 0x8134_32fa);
+        // Thumb pc is Align(addr + 4, 4) = 0x813432fc, so r12 = 0x813432fc + 77.
+        let want = ((0x8134_32fau32.wrapping_add(4)) & !3).wrapping_add(77);
+        let got = stmts.iter().find_map(|s| match s {
+            // add rd, pc, #imm folds to a single constant, or to Imm + Imm.
+            Stmt::SetReg(12, Value::Imm(v)) => Some(*v),
+            Stmt::SetReg(12, Value::Bin(BinOp::Add, a, b)) => match (&**a, &**b) {
+                (Value::Imm(x), Value::Imm(y)) => Some(x.wrapping_add(*y)),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(got, Some(want), "add r12, pc, #77 must compute {want:#x}, not a bare 77");
+        assert_ne!(got, Some(77), "an unfolded pc read gives the immediate alone");
     }
 }

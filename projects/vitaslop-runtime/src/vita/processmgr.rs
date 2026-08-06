@@ -7,8 +7,9 @@
 //! image ([`crate::link::LinkedProgram::process_param`]); the host holds its address
 //! and hands it back here. Returning 0 would make the crt dereference NULL.
 
-use crate::host::{FD_STDERR, FD_STDOUT};
+use crate::host::{GuestCtx, VitaState, FD_STDERR, FD_STDOUT};
 use crate::hostcall;
+use crate::SvcOutcome;
 
 /// The fd reported for stdin. Reads from it hit the empty console input.
 const FD_STDIN: i32 = 0;
@@ -47,6 +48,42 @@ pub(super) fn libc_time(ctx: &mut GuestCtx, st: &mut VitaState, tloc: Ptr) -> i3
         ctx.write_u32(tloc.addr(), secs as u32);
     }
     secs
+}
+
+/// int sceKernelLibcGettimeofday(struct timeval *tv, struct timezone *tz)
+///
+/// Wall-clock time as a `{ time_t tv_sec; suseconds_t tv_usec; }` pair, both 32-bit
+/// here. Taken from the SAME world wall clock `sceKernelLibcTime` reads, so the two
+/// cannot disagree about what time it is. `tz` is filled with zeroes when asked for:
+/// the console reports UTC with no DST rule, and leaving the caller's struct
+/// untouched would let it read its own stack as a timezone offset.
+#[hostcall]
+pub(super) fn libc_gettimeofday(ctx: &mut GuestCtx, st: &mut VitaState, tv: Ptr, tz: Ptr) -> i32 {
+    let now_us = st.world.wall_us();
+    if !tv.is_null() {
+        ctx.write_u32(tv.addr(), (now_us / 1_000_000) as u32);
+        ctx.write_u32(tv.addr() + 4, (now_us % 1_000_000) as u32);
+    }
+    if !tz.is_null() {
+        ctx.write_u32(tz.addr(), 0); // tz_minuteswest
+        ctx.write_u32(tz.addr() + 4, 0); // tz_dsttime
+    }
+    0
+}
+
+/// int sceKernelCallAbortHandler(...)
+///
+/// Invoke the process's registered abort handler - the path libc's `abort()` takes
+/// after flushing, and the last thing that runs before the process is killed. It does
+/// not return on hardware, so it must not return here either: the run ends loudly with
+/// the abort named, rather than the guest carrying on past its own abort() and
+/// crashing later somewhere unrelated.
+pub(super) fn call_abort_handler(_ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+    SvcOutcome::Fatal(
+        "sceKernelCallAbortHandler: the guest called abort() - the title itself decided \
+         it cannot continue. Look at what it printed or asserted just before this."
+            .into(),
+    )
 }
 
 /// clock_t sceKernelLibcClock(void)

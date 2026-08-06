@@ -91,6 +91,12 @@ pub struct Extern {
 pub struct Redirect {
     pub addr: u32,
     pub target: u32,
+    /// The instruction set `target` is written in, taken from the Thumb bit of the
+    /// exported address (which `target` itself has cleared). It cannot be inferred
+    /// from the call site: the caller reaches an ARM veneer, and the veneer is not
+    /// what runs. A wrongly-moded callee decodes into a different function without
+    /// erroring, so this has to travel with the redirect.
+    pub thumb: bool,
 }
 
 /// A host import whose whole behaviour is one guest-memory read, emitted INLINE
@@ -131,15 +137,33 @@ pub struct InlineImport {
 
 /// What an [`InlineImport`] computes.
 ///
-/// Deliberately ONE shape rather than a general expression language: every operation
-/// admitted here has to be proven equivalent to its host handler, and a closed, tiny
-/// set is what makes that provable. Widen it only with a matching test.
+/// Deliberately a tiny closed set rather than a general expression language: every
+/// operation admitted here has to be proven equivalent to its host handler, and a
+/// small set is what makes that provable. Widen it only with a matching test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineOp {
     /// `r0 = (u32_at(r0 + offset) >> shift) & mask` - read a word at a fixed offset
     /// from the pointer argument and extract a bitfield. `mask` is applied after the
     /// shift, so `mask = u32::MAX` means "the whole word".
     LoadShiftMask { offset: u32, shift: u32, mask: u32 },
+    /// `r0 = u32_at(mirror_base + slot * 4)` - read slot `slot` of the HOST MIRROR
+    /// block, a small run of words the host keeps up to date in linear memory (see
+    /// [`Artifact::mirror_off`]). Takes no guest argument and reads nothing the guest
+    /// owns.
+    ///
+    /// This covers the other shape of pure accessor: one that returns a value of the
+    /// SYSTEM rather than of a guest structure. `sceDisplayGetVcount` is the case that
+    /// motivated it - a vblank spin calls it tens of thousands of times a frame, and
+    /// its answer is a pure function of the virtual clock, which can only change while
+    /// no guest code is running. So a word the host refreshes at every such point is
+    /// not an approximation of the call, it is the call's answer.
+    ///
+    /// The host side of that contract is the whole correctness argument, and it is not
+    /// optional: a module emitted with any `LoadMirror` op must be run on a host that
+    /// refreshes the block before it resumes guest code. A host that does not is a
+    /// configuration error, and callers are expected to reject it outright rather than
+    /// let the guest read a stale word.
+    LoadMirror { slot: u32 },
 }
 
 impl InlineOp {
@@ -148,13 +172,25 @@ impl InlineOp {
     pub fn eval(self, word: u32) -> u32 {
         match self {
             InlineOp::LoadShiftMask { shift, mask, .. } => (word >> shift) & mask,
+            // The mirror word IS the answer; the host computed it.
+            InlineOp::LoadMirror { .. } => word,
         }
     }
 
-    /// Byte offset from the pointer argument at which the word is read.
-    pub fn offset(self) -> u32 {
+    /// Byte offset from the pointer argument at which the word is read, for the forms
+    /// that read through a guest pointer. `None` for a form that does not take one.
+    pub fn offset(self) -> Option<u32> {
         match self {
-            InlineOp::LoadShiftMask { offset, .. } => offset,
+            InlineOp::LoadShiftMask { offset, .. } => Some(offset),
+            InlineOp::LoadMirror { .. } => None,
+        }
+    }
+
+    /// The host-mirror slot this op reads, if it reads one.
+    pub fn mirror_slot(self) -> Option<u32> {
+        match self {
+            InlineOp::LoadShiftMask { .. } => None,
+            InlineOp::LoadMirror { slot } => Some(slot),
         }
     }
 }
@@ -174,6 +210,15 @@ pub struct Artifact {
     /// Linear-memory offset of the "diagnostics armed" word, present only when this
     /// build was emitted with `VITASLOP_ARM_AT_FRAME` (see [`emit::arm_at_frame`]).
     pub arm_word_off: Option<u64>,
+    /// Linear-memory byte offset of the HOST MIRROR block, present only when some
+    /// inline import reads it ([`InlineOp::LoadMirror`]). Slot `n` is the word at
+    /// `mirror_off + n * 4`.
+    ///
+    /// A host running this module MUST keep those words current - see
+    /// [`InlineOp::LoadMirror`]. `Some` here is therefore a REQUIREMENT on the host,
+    /// not an optional extra: a host that cannot refresh the block must refuse to run
+    /// the module rather than let the guest read a word that never changes.
+    pub mirror_off: Option<u64>,
 }
 
 /// A transpiled function: the guest address it starts at and its wasm export.
@@ -416,8 +461,8 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
     for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
         import_map.insert(veneer, idx);
     }
-    let redirect_map: BTreeMap<u32, u32> =
-        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let redirect_map: BTreeMap<u32, (u32, bool)> =
+        program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
     let imports = Imports::new(&import_map, &redirect_map);
 
     // Discover the transitive closure from the entries: direct callees are hard
@@ -458,11 +503,13 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         if tentative && !found.func.well_formed() {
             continue;
         }
-        // Direct callees inherit this function's mode and its tentativeness (a
-        // callee reached only from a guess is itself a guess); discovered code
-        // pointers are tentative Thumb (materialized with the Thumb bit set).
+        // Direct callees inherit this function's tentativeness (a callee reached only
+        // from a guess is itself a guess) but NOT its mode: `discover` reports the mode
+        // per callee, because `blx <label>` interworks and an ARM callee decoded as
+        // Thumb silently becomes a different function rather than failing. Discovered
+        // code pointers are tentative Thumb (materialized with the Thumb bit set).
         let callee: fn(u32, bool) -> WorkItem = if tentative { WorkItem::tentative } else { WorkItem::hard };
-        work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+        work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
         work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
         work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
         funcs.insert(addr, found.func);
@@ -477,7 +524,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off } =
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off } =
         emit::emit_module(
             &ordered,
             &func_index,
@@ -493,7 +540,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off })
+    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off })
 }
 
 /// The output of a lenient whole-program build ([`transpile_lenient`]): the module
@@ -523,8 +570,8 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
         import_map.insert(veneer, idx);
     }
-    let redirect_map: BTreeMap<u32, u32> =
-        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let redirect_map: BTreeMap<u32, (u32, bool)> =
+        program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
     let imports = Imports::new(&import_map, &redirect_map);
 
     let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
@@ -533,7 +580,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     // A redirect's target is an ordinary guest function, and it is reachable even when no
     // direct call to its stub exists - a vtable slot can hold the stub's address alone.
     // Seed the targets so the thunks added below always have something to call.
-    work.extend(program.redirects.iter().map(|r| WorkItem::tentative(r.target, program.thumb)));
+    work.extend(program.redirects.iter().map(|r| WorkItem::tentative(r.target, r.thumb)));
     // Function pointers the call graph cannot reach: the ones the linker wrote into the
     // image (vtables, handler tables) and the ones code materializes with `movw`/`movt`
     // anywhere in the image, discovered or not. Both are guesses, so both are tentative.
@@ -589,7 +636,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
                 Ok(found) => {
                     let callee: fn(u32, bool) -> WorkItem =
                         if tentative { WorkItem::tentative } else { WorkItem::hard };
-                    work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+                    work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
                     work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
                     work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
                     funcs.insert(addr, found.func);
@@ -617,7 +664,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     for (&addr, &import) in &import_map {
         funcs.insert(addr, ir::Func::new_import_thunk(addr, true, import));
     }
-    for (&addr, &target) in &redirect_map {
+    for (&addr, &(target, _)) in &redirect_map {
         if import_map.contains_key(&addr) || !funcs.contains_key(&target) {
             continue;
         }
@@ -630,7 +677,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         .enumerate()
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off } = emit::emit_module(
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off } = emit::emit_module(
         &ordered,
         &func_index,
         program.base,
@@ -645,7 +692,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
-        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off },
+        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off },
         stubbed,
         stub_wasm_indices,
     }
@@ -666,8 +713,8 @@ pub fn dump_func(program: &Program, addr: u32) -> Option<String> {
     for (veneer, idx) in scan_veneers(program.code, program.base, &import_map) {
         import_map.insert(veneer, idx);
     }
-    let redirect_map: BTreeMap<u32, u32> =
-        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let redirect_map: BTreeMap<u32, (u32, bool)> =
+        program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
     let imports = Imports::new(&import_map, &redirect_map);
     let seeded_thumb = !program.arm_entries.contains(&addr);
     let disc = |thumb: bool| {
@@ -744,8 +791,8 @@ pub struct Report {
 pub fn transpile_report(program: &Program) -> Report {
     let import_map: BTreeMap<u32, u32> =
         program.externs.iter().map(|e| (e.addr, e.import)).collect();
-    let redirect_map: BTreeMap<u32, u32> =
-        program.redirects.iter().map(|r| (r.addr, r.target)).collect();
+    let redirect_map: BTreeMap<u32, (u32, bool)> =
+        program.redirects.iter().map(|r| (r.addr, (r.target, r.thumb))).collect();
     let imports = Imports::new(&import_map, &redirect_map);
 
     let mut done: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -770,7 +817,7 @@ pub fn transpile_report(program: &Program) -> Report {
             Ok(found) => {
                 let callee: fn(u32, bool) -> WorkItem =
                     if tentative { WorkItem::tentative } else { WorkItem::hard };
-                work.extend(found.callees.into_iter().map(|a| callee(a, thumb)));
+                work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
                 work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
                 work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
                 ok.push(addr);
@@ -817,6 +864,109 @@ mod tests {
         assert_eq!(artifact.funcs[0].export, "f_10000");
         // The module must validate.
         wasmparser::validate(&artifact.wasm).expect("valid wasm");
+    }
+
+    /// A mirror-reading import must lower to a plain load of the reserved block, with
+    /// NO host call left behind - and the block must be a page the module actually
+    /// declares, above everything the guest can reach.
+    ///
+    /// Worth pinning here because the failure is silent and remote: a load of the wrong
+    /// address reads a word nobody writes, which for the clock is a vblank spin that can
+    /// never be satisfied - the title simply stops, thousands of frames from the cause.
+    #[test]
+    fn a_mirror_import_lowers_to_a_load_of_the_reserved_block() {
+        // Thumb `bl` to the import stub at 0x10010, then `bx lr`.
+        let code: [u8; 8] = [
+            0x00, 0xf0, 0x06, 0xf8, // bl 0x10010
+            0x70, 0x47, // bx lr
+            0x00, 0x00,
+        ];
+        const SLOT: u32 = 3;
+        let program = |inline: &[InlineImport]| -> Artifact {
+            transpile(&Program {
+                code: &code,
+                base: 0x10000,
+                thumb: true,
+                entries: &[0x10000],
+                arm_entries: &[],
+                externs: &[Extern { addr: 0x10010, import: 0 }],
+                redirects: &[],
+                inline_imports: inline,
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory: false,
+            })
+            .expect("transpile")
+        };
+
+        let plain = program(&[]);
+        assert_eq!(plain.mirror_off, None, "no mirror op means no block and no layout change");
+
+        let mirrored =
+            program(&[InlineImport { import: 0, op: InlineOp::LoadMirror { slot: SLOT } }]);
+        wasmparser::validate(&mirrored.wasm).expect("valid wasm");
+        let off = mirrored.mirror_off.expect("a mirror op reserves the block");
+        assert_eq!(
+            mirrored.mem_pages,
+            plain.mem_pages + 1,
+            "the block is one more declared page"
+        );
+        assert!(
+            off >= u64::from(0x20000u32),
+            "the block must sit above the guest region, not inside it"
+        );
+
+        // The emitted body must contain the load of slot SLOT, and no call to the
+        // import it replaced. The un-inlined build is checked to DO make that call, so
+        // the negative assertion below cannot pass by looking at the wrong thing.
+        assert!(
+            scan_body(&plain.wasm).1,
+            "without an inline form the import must be a host call",
+        );
+        let (loads, calls) = scan_body(&mirrored.wasm);
+        assert!(
+            loads.contains(&(off + u64::from(SLOT) * 4)),
+            "expected an i32.load of the slot at {:#x}; found loads at {loads:?}",
+            off + u64::from(SLOT) * 4
+        );
+        assert!(!calls, "the inlined import must not also emit a host call");
+    }
+
+    /// Byte offsets of every `i32.load` in the module's guest functions, and whether
+    /// any of them calls the host-import trap.
+    fn scan_body(wasm: &[u8]) -> (Vec<u64>, bool) {
+        use wasmparser::{Chunk, Parser, Payload};
+        let mut loads = Vec::new();
+        let mut calls = false;
+        let mut parser = Parser::new(0);
+        let mut input = wasm;
+        loop {
+            let (payload, consumed) = match parser.parse(input, true).expect("parse") {
+                Chunk::Parsed { payload, consumed } => (payload, consumed),
+                Chunk::NeedMoreData(_) => panic!("truncated module"),
+            };
+            if let Payload::CodeSectionEntry(body) = &payload {
+                let mut ops = body.get_operators_reader().expect("ops");
+                while !ops.eof() {
+                    match ops.read().expect("op") {
+                        wasmparser::Operator::I32Load { memarg } => loads.push(memarg.offset),
+                        // The host-call trap the inline form replaces.
+                        wasmparser::Operator::Call { function_index }
+                            if function_index == crate::emit::IMPORT_FUNC =>
+                        {
+                            calls = true
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Payload::End(_) = payload {
+                break;
+            }
+            input = &input[consumed..];
+        }
+        (loads, calls)
     }
 
     #[test]

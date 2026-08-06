@@ -4,13 +4,22 @@
 
 pub mod at9;
 pub mod audio;
+pub mod camera;
 pub mod cfmt;
 pub mod ctrl;
+pub mod dbg;
 pub mod display;
+pub mod fiber;
+pub mod gesture;
+pub mod net;
+pub mod fios2;
 pub mod gxm;
 pub mod iofilemgr;
+pub mod jpeg;
+pub mod jpegenc;
 pub mod libkernel;
 pub mod lwsync;
+pub mod mirror;
 pub mod ngs;
 pub mod processmgr;
 pub mod pvf;
@@ -23,8 +32,9 @@ pub mod video;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
-    audio as audio_nid, ctrl as ctrl_nid, display as display_nid, gxm as gxm_nid,
-    iofilemgr as io_nid, libkernel as lk_nid, lwsync as lw_nid, ngs as ngs_nid,
+    audio as audio_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
+    fiber as fiber_nid, fios2 as fios2_nid, gxm as gxm_nid,
+    iofilemgr as io_nid, libkernel as lk_nid, lwsync as lw_nid, net as net_nid, ngs as ngs_nid,
     processmgr as pm_nid, pvf as pvf_nid, services as sv_nid, sync as sync_nid,
     sysmem as sm_nid, threadmgr as tm_nid,
 };
@@ -32,6 +42,36 @@ use crate::{nid, SvcOutcome};
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
+
+/// The inline form of host import `func_nid` - the code the transpiler emits straight
+/// into the guest instead of trapping to the host - or `None` for every NID with real
+/// behaviour, which is nearly all of them.
+///
+/// The one place that decides what may be inlined, because only this crate knows what
+/// a NID means. Two shapes qualify and no others: a pure read through a guest pointer
+/// (the GXM reflection getters) and a read of a host value that cannot change while
+/// guest code runs (the mirror block - see [`mirror`]).
+pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    if no_inline_imports() {
+        return None;
+    }
+    gxm::inline_op(func_nid).or_else(|| display::inline_op(func_nid))
+}
+
+/// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
+/// ones the transpiler could emit inline.
+///
+/// This is the A/B switch for the inline mechanism, and it earns its keep because
+/// inlining changes how much wasm the guest executes, which changes fuel consumption,
+/// which changes WHERE the preemptive scheduler switches threads - so an inlined build
+/// legitimately reports a different determinism signature without computing anything
+/// differently. Turning inlining off is how a signature is compared against a
+/// pre-inlining run, which is the only way to tell a real behaviour change from that
+/// re-interleaving. Read at LINK time, so it must be set for the whole run.
+fn no_inline_imports() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VITASLOP_NO_INLINE_IMPORTS").is_some())
+}
 
 /// Diagnostic call-site profiler (env `VITASLOP_DBG_CALLSITES`): counts host calls
 /// keyed by (function NID, guest return address). A busy-wait spin shows up as one
@@ -90,6 +130,28 @@ static TRACE_ORDER: LazyLock<Option<(u64, u64)>> =
     LazyLock::new(|| std::env::var("VITASLOP_TRACE_ORDER").ok().map(|s| parse_frame_window(&s)));
 static TRACE_ORDER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `VITASLOP_HOSTCALL_WATCH=<hex addr>[,<hex addr>...]` - print every host call that passes one
+/// of these guest addresses in any of its first four arguments.
+///
+/// This is the "what was ever done to this object" watch, and it is the one of the three that
+/// can see an ABSENCE. A `SceGxmTexture` that reads as sixteen zero bytes at bind time was
+/// either never initialised or initialised somewhere else, and no watchpoint on WRITES can tell
+/// those apart - neither fires. A complete list of the calls that did name the struct settles
+/// it: if `sceGxmTextureInitLinear` is not in it, the guest never called it.
+static HOSTCALL_WATCH: LazyLock<Option<std::collections::HashSet<u32>>> = LazyLock::new(|| {
+    let spec = std::env::var("VITASLOP_HOSTCALL_WATCH").ok()?;
+    let set: std::collections::HashSet<u32> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            u32::from_str_radix(s.trim_start_matches("0x"), 16)
+                .unwrap_or_else(|e| panic!("VITASLOP_HOSTCALL_WATCH: {s:?} is not a hex address: {e}"))
+        })
+        .collect();
+    (!set.is_empty()).then_some(set)
+});
+
 /// Parse a diagnostic's display-frame window: `LO-HI` inclusive, `LO-` open-ended,
 /// and anything else (including `1` and `all`) the whole run. A malformed bound is
 /// the whole run rather than silently a different window.
@@ -103,6 +165,44 @@ fn parse_frame_window(spec: &str) -> (u64, u64) {
         }
         None => (0, u64::MAX),
     }
+}
+
+/// Describe a host call exactly as the guest made it: `r0`-`r3`, `lr`/`sp`, the first
+/// few stack words (arguments five and up, under AAPCS), and a short dump of whatever
+/// each pointer-looking argument points at.
+///
+/// This is the RE tool for a library with NO PUBLISHED PROTOTYPE. The NID database gives
+/// a name and nothing else, and the title's own call is then the only evidence for the
+/// signature: which arguments are pointers, how big a work area is, what a descriptor's
+/// leading fields hold. Printed by the unimplemented-NID hard-fail, which is the moment
+/// that evidence is on the wire.
+///
+/// A "pointer" here is any value inside the guest address space; that over-selects (a
+/// large integer looks like one), so the dump is EVIDENCE, never a decoded signature.
+fn describe_call_args(ctx: &mut crate::host::GuestCtx) -> String {
+    use core::fmt::Write;
+    let base = ctx.base;
+    let lo = base;
+    let hi = base.saturating_add(0x2000_0000);
+    let sp = ctx.regs[13];
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "  call: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={sp:#010x}",
+        ctx.regs[0], ctx.regs[1], ctx.regs[2], ctx.regs[3], ctx.regs[14],
+    );
+    let stack: Vec<String> =
+        (0..4).map(|i| format!("{:#010x}", ctx.read_u32(sp.wrapping_add(i * 4)))).collect();
+    let _ = writeln!(s, "  stack args (sp+0..12): [{}]", stack.join(" "));
+    for (i, &v) in [ctx.regs[0], ctx.regs[1], ctx.regs[2], ctx.regs[3]].iter().enumerate() {
+        if !(lo..hi).contains(&v) {
+            continue;
+        }
+        let words: Vec<String> =
+            (0..8).map(|k| format!("{:#010x}", ctx.read_u32(v.wrapping_add(k * 4)))).collect();
+        let _ = writeln!(s, "  *r{i} ({v:#010x}): [{}]", words.join(" "));
+    }
+    s
 }
 
 /// Print the hottest call sites (by count) gathered when `VITASLOP_DBG_CALLSITES` is
@@ -218,6 +318,32 @@ pub fn dispatch(
         }
     }
 
+    // Diagnostic (env `VITASLOP_HOSTCALL_WATCH`): every host call that names a watched guest
+    // ADDRESS in any of its first four arguments, with the call, its arguments and the site.
+    //
+    // The question this answers is "what did the guest ever DO to this object", and neither of
+    // the two watchpoints can answer it. `VITASLOP_WATCH_STORE` sees guest stores, so it is
+    // blind to a host call writing the struct on the guest's behalf; `VITASLOP_HOST_WRITE_WATCH`
+    // sees host writes, so it is blind to a call that should have written and did not - which is
+    // exactly the interesting case for a struct that is all zeros. Watching the ARGUMENT catches
+    // the call either way, including the one that was never made looking absent from a complete
+    // list of the ones that were.
+    if let Some(watch) = HOSTCALL_WATCH.as_ref() {
+        if let Some(hit) = (0..4).map(|i| ctx.arg(i)).find(|a| watch.contains(a)) {
+            eprintln!(
+                "hostcall watch {hit:#x}: f{} t{} {}({:#x}, {:#x}, {:#x}, {:#x}) lr={:#010x}",
+                st.cur_frame(),
+                st.current_thread(),
+                nid::name(func_nid),
+                ctx.arg(0),
+                ctx.arg(1),
+                ctx.arg(2),
+                ctx.arg(3),
+                ctx.regs[14],
+            );
+        }
+    }
+
     // Diagnostic (env `VITASLOP_TRACE_ORDER`): live, globally-ordered timeline of
     // meaningful calls. Filters the lock/unlock and shader-reflection storm so the
     // boot sequence and its flatline-into-spin are legible. Zero cost when unset.
@@ -300,7 +426,13 @@ pub fn dispatch(
         sync_nid::DELETE_MUTEX => cont!(sync::delete_object(ctx, st)),
         sync_nid::CLOSE_MUTEX => cont!(sync::delete_object(ctx, st)),
         sync_nid::CREATE_SEMA | sync_nid::CREATE_SEMA_16XX => cont!(sync::create_sema(ctx, st)),
-        sync_nid::WAIT_SEMA => sync::wait_sema(ctx, st),
+        // `sceKernelWaitSemaCB` is the same wait, at which the kernel also delivers
+        // the calling thread's pending async callbacks. Callback delivery here is
+        // driven by the scheduler (the display queue runs its callbacks on its own
+        // serialized path), so there is no separate pump to run at this point - but
+        // the WAIT itself is the load-bearing behaviour and must be identical, which
+        // is why it shares the handler rather than getting a weaker one.
+        sync_nid::WAIT_SEMA | lk_nid::WAIT_SEMA_CB => sync::wait_sema(ctx, st),
         sync_nid::SIGNAL_SEMA => cont!(sync::signal_sema(ctx, st)),
         sync_nid::DELETE_SEMA => cont!(sync::delete_object(ctx, st)),
         sync_nid::CREATE_COND => cont!(sync::create_cond(ctx, st)),
@@ -338,7 +470,8 @@ pub fn dispatch(
         lk_nid::CREATE_THREAD => cont!(libkernel::create_thread(ctx, st)),
         lk_nid::START_THREAD => libkernel::start_thread(ctx, st),
         // Join can block under the preemptive scheduler.
-        lk_nid::WAIT_THREAD_END => libkernel::wait_thread_end(ctx, st),
+        // ...CB is the same join with callback delivery; see `WAIT_SEMA_CB` above.
+        lk_nid::WAIT_THREAD_END | lk_nid::WAIT_THREAD_END_CB => libkernel::wait_thread_end(ctx, st),
         lk_nid::GET_THREAD_ID => cont!(libkernel::get_thread_id(ctx, st)),
         lk_nid::GET_THREAD_EXIT_STATUS => cont!(libkernel::get_thread_exit_status(ctx, st)),
         lk_nid::GET_TLS_ADDR => cont!(libkernel::get_tls_addr(ctx, st)),
@@ -352,7 +485,8 @@ pub fn dispatch(
 
         // --- threadmgr: delay, exit, process id --------------------------------
         // A real timed sleep: parks under the preemptive scheduler (see the handler).
-        tm_nid::DELAY_THREAD => threadmgr::delay_thread(ctx, st),
+        // ...CB is the same sleep with callback delivery; see `WAIT_SEMA_CB` above.
+        tm_nid::DELAY_THREAD | tm_nid::DELAY_THREAD_CB => threadmgr::delay_thread(ctx, st),
         // A thread ending itself: just this thread under the preemptive scheduler;
         // a whole-run stop in single-thread-of-control bring-up (only main reaches
         // here there - workers return normally instead).
@@ -372,17 +506,64 @@ pub fn dispatch(
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
 
+        // --- net: BSD sockets, modelled OFFLINE (see `vita::net`) ---------------
+        net_nid::SOCKET => cont!(net::socket(ctx, st)),
+        net_nid::SOCKET_CLOSE => cont!(net::socket_close(ctx, st)),
+        net_nid::BIND => cont!(net::bind(ctx, st)),
+        net_nid::LISTEN => cont!(net::listen(ctx, st)),
+        net_nid::ACCEPT => cont!(net::accept(ctx, st)),
+        net_nid::CONNECT => cont!(net::connect(ctx, st)),
+        net_nid::SEND | net_nid::SENDTO | net_nid::SENDMSG => cont!(net::send(ctx, st)),
+        net_nid::RECV | net_nid::RECVFROM => cont!(net::recv(ctx, st)),
+        net_nid::SHUTDOWN => cont!(net::shutdown(ctx, st)),
+        net_nid::GETSOCKNAME => cont!(net::getsockname(ctx, st)),
+        net_nid::GETPEERNAME => cont!(net::getpeername(ctx, st)),
+        net_nid::SETSOCKOPT => cont!(net::setsockopt(ctx, st)),
+        net_nid::GETSOCKOPT => cont!(net::getsockopt(ctx, st)),
+        net_nid::GET_SOCK_INFO => cont!(net::get_sock_info(ctx, st)),
+        net_nid::SHOW_NETSTAT => cont!(net::show_netstat(ctx, st)),
+        net_nid::HTONL | net_nid::NTOHL => cont!(net::swap32(ctx, st)),
+        net_nid::HTONS | net_nid::NTOHS => cont!(net::swap16(ctx, st)),
+        net_nid::INET_PTON => cont!(net::inet_pton(ctx, st)),
+        net_nid::INET_NTOP => cont!(net::inet_ntop(ctx, st)),
+        net_nid::ERRNO_LOC => cont!(net::errno_loc(ctx, st)),
+        net_nid::RESOLVER_CREATE => cont!(net::resolver_create(ctx, st)),
+        net_nid::RESOLVER_DESTROY => cont!(net::resolver_destroy(ctx, st)),
+        net_nid::RESOLVER_START_NTOA | net_nid::RESOLVER_START_ATON => {
+            cont!(net::resolver_start(ctx, st))
+        }
+        net_nid::RESOLVER_GET_ERROR => cont!(net::resolver_get_error(ctx, st)),
+        net_nid::EPOLL_CREATE => cont!(net::epoll_create(ctx, st)),
+        net_nid::EPOLL_DESTROY => cont!(net::epoll_destroy(ctx, st)),
+        net_nid::EPOLL_CONTROL => cont!(net::epoll_control(ctx, st)),
+        net_nid::EPOLL_WAIT => cont!(net::epoll_wait(ctx, st)),
+
+        // --- fiber: cooperative user-level threads -------------------------------
+        // Run/Switch/ReturnToThread hand the baton over and PARK the caller, so these
+        // return their own outcome rather than going through `cont!`.
+        fiber_nid::INITIALIZE_IMPL => cont!(fiber::initialize(ctx, st)),
+        fiber_nid::INITIALIZE_WITH_INTERNAL_OPTION_IMPL => {
+            cont!(fiber::initialize_with_internal_option(ctx, st))
+        }
+        fiber_nid::RUN => fiber::run(ctx, st),
+        fiber_nid::SWITCH => fiber::switch(ctx, st),
+        fiber_nid::ATTACH_CONTEXT_AND_SWITCH => fiber::attach_context_and_switch(ctx, st),
+        fiber_nid::RETURN_TO_THREAD => fiber::return_to_thread(ctx, st),
+        fiber_nid::GET_SELF => cont!(fiber::get_self(ctx, st)),
+        fiber_nid::FINALIZE => cont!(fiber::finalize(ctx, st)),
+        fiber_nid::GET_INFO => cont!(fiber::get_info(ctx, st)),
+
         // --- gxm: graphics ------------------------------------------------------
         gxm_nid::INITIALIZE => cont!(gxm::initialize(ctx, st)),
-        gxm_nid::MAP_MEMORY
-        | gxm_nid::FINISH
+        gxm_nid::FINISH
         | gxm_nid::PAD_HEARTBEAT
         | gxm_nid::DISPLAY_QUEUE_FINISH
         | gxm_nid::PROGRAM_CHECK
         | gxm_nid::DESTROY_CONTEXT
         | gxm_nid::DESTROY_RENDER_TARGET
-        | gxm_nid::SYNC_OBJECT_DESTROY
-        | gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::ok(ctx)),
+        | gxm_nid::SYNC_OBJECT_DESTROY => cont!(gxm::ok(ctx)),
+        gxm_nid::MAP_MEMORY => cont!(gxm::map_memory(ctx, st)),
+        gxm_nid::DEPTH_STENCIL_SURFACE_INIT => cont!(gxm::depth_stencil_surface_init(ctx, st)),
         // Nothing to tear down for these, but the guest is now free to reuse the
         // program's memory, so the reflected constants cached against its header
         // address must not outlive it.
@@ -406,11 +587,12 @@ pub fn dispatch(
             }
         }
         gxm_nid::MAP_VERTEX_USSE_MEMORY | gxm_nid::MAP_FRAGMENT_USSE_MEMORY => {
-            cont!(gxm::map_usse(ctx))
+            cont!(gxm::map_usse(ctx, st))
         }
-        gxm_nid::CREATE_CONTEXT | gxm_nid::CREATE_RENDER_TARGET | gxm_nid::SHADER_PATCHER_CREATE => {
+        gxm_nid::CREATE_CONTEXT | gxm_nid::SHADER_PATCHER_CREATE => {
             cont!(gxm::out_handle(ctx, st, 1))
         }
+        gxm_nid::CREATE_RENDER_TARGET => cont!(gxm::create_render_target(ctx, st)),
         gxm_nid::SYNC_OBJECT_CREATE => cont!(gxm::out_handle(ctx, st, 0)),
         gxm_nid::SHADER_PATCHER_REGISTER_PROGRAM => cont!(gxm::register_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_GET_PROGRAM_FROM_ID => cont!(gxm::get_program_from_id(ctx, st)),
@@ -511,6 +693,63 @@ pub fn dispatch(
         gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE => cont!(gxm::precomputed_fragment_state_set_texture(ctx, st)),
         gxm_nid::SET_PRECOMPUTED_VERTEX_STATE => cont!(gxm::set_precomputed_vertex_state(ctx, st)),
         gxm_nid::SET_PRECOMPUTED_FRAGMENT_STATE => cont!(gxm::set_precomputed_fragment_state(ctx, st)),
+        gxm_nid::PRECOMPUTED_DRAW_SET_ALL_VERTEX_STREAMS => {
+            cont!(gxm::precomputed_draw_set_all_vertex_streams(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES => {
+            cont!(gxm::precomputed_fragment_state_set_all_textures(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES => {
+            cont!(gxm::precomputed_vertex_state_set_all_textures(ctx, st))
+        }
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "vertex", false))
+        }
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER => {
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "fragment", false))
+        }
+        gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "vertex", true))
+        }
+        gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => {
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "fragment", true))
+        }
+        // Depth/stencil surface: the published struct is written in place, so a copy of
+        // it carries its own state (no address-keyed side table).
+        gxm_nid::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_DEPTH => {
+            cont!(gxm::depth_stencil_surface_set_background_depth(ctx, st))
+        }
+        gxm_nid::DEPTH_STENCIL_SURFACE_SET_BACKGROUND_STENCIL => {
+            cont!(gxm::depth_stencil_surface_set_background_stencil(ctx, st))
+        }
+        gxm_nid::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE => {
+            cont!(gxm::depth_stencil_surface_set_force_load_mode(ctx, st))
+        }
+        gxm_nid::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE => {
+            cont!(gxm::depth_stencil_surface_set_force_store_mode(ctx, st))
+        }
+        gxm_nid::SET_BACK_DEPTH_WRITE_ENABLE => cont!(gxm::set_back_depth_write_enable(ctx, st)),
+        gxm_nid::SET_BACK_POLYGON_MODE => cont!(gxm::set_back_polygon_mode(ctx, st)),
+        gxm_nid::SET_VISIBILITY_BUFFER => cont!(gxm::set_visibility_buffer(ctx, st)),
+        gxm_nid::SET_FRONT_VISIBILITY_TEST_ENABLE => cont!(gxm::set_front_visibility_test_enable(ctx, st)),
+        gxm_nid::SET_FRONT_VISIBILITY_TEST_INDEX => cont!(gxm::set_front_visibility_test_index(ctx, st)),
+        gxm_nid::SET_FRONT_VISIBILITY_TEST_OP => cont!(gxm::set_front_visibility_test_op(ctx, st)),
+        gxm_nid::UNMAP_MEMORY
+        | gxm_nid::UNMAP_VERTEX_USSE_MEMORY
+        | gxm_nid::UNMAP_FRAGMENT_USSE_MEMORY => cont!(gxm::unmap_memory(ctx, st)),
+        gxm_nid::COLOR_SURFACE_GET_SCALE_MODE => cont!(gxm::color_surface_get_scale_mode(ctx, st)),
+        gxm_nid::COLOR_SURFACE_SET_DATA => cont!(gxm::color_surface_set_data(ctx, st)),
+        gxm_nid::PROGRAM_GET_TYPE => cont!(gxm::program_get_type(ctx, st)),
+        gxm_nid::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => cont!(gxm::find_parameter_by_semantic(ctx, st)),
+        gxm_nid::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => {
+            cont!(gxm::render_target_get_driver_mem_block(ctx, st))
+        }
+        gxm_nid::NOTIFICATION_WAIT => cont!(gxm::notification_wait(ctx, st)),
+        gxm_nid::SET_VERTEX_TEXTURE => cont!(gxm::set_vertex_texture(ctx, st)),
+        gxm_nid::TEXTURE_INIT_CUBE_ARBITRARY => {
+            cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE_ARBITRARY))
+        }
+        gxm_nid::TEXTURE_SET_PALETTE => cont!(gxm::texture_set_palette(ctx, st)),
         // Fixed-function pipeline state: record into the sticky render state that is
         // snapshotted per draw (see `capture::RenderState`).
         gxm_nid::SET_CULL_MODE => cont!(gxm::set_cull_mode(ctx, st)),
@@ -577,11 +816,73 @@ pub fn dispatch(
         io_nid::IO_DOPEN => cont!(iofilemgr::io_dopen(ctx, st)),
         io_nid::IO_DREAD => cont!(iofilemgr::io_dread(ctx, st)),
         io_nid::IO_DCLOSE => cont!(iofilemgr::io_dclose(ctx, st)),
+        io_nid::IO_SYNC_BY_FD => cont!(iofilemgr::io_sync_by_fd(ctx, st)),
+        // The same file operations, re-exported by SceLibKernel under its own NIDs.
+        lk_nid::IO_RMDIR => cont!(iofilemgr::io_rmdir(ctx, st)),
+        lk_nid::IO_RENAME => cont!(iofilemgr::io_rename(ctx, st)),
+        lk_nid::IO_CHSTAT => cont!(iofilemgr::io_chstat(ctx, st)),
+        lk_nid::IO_SYNC => cont!(iofilemgr::io_sync(ctx, st)),
+        // Device control: a real per-command dispatch that stops the run on a command
+        // it does not implement rather than inventing an answer.
+        lk_nid::IO_DEVCTL => iofilemgr::io_devctl(ctx, st),
+        lk_nid::IO_IOCTL => iofilemgr::io_ioctl(ctx, st),
+
+        // --- thread and semaphore introspection, signals, module queries ---------
+        lk_nid::GET_THREAD_INFO => cont!(libkernel::get_thread_info(ctx, st)),
+        lk_nid::GET_SEMA_INFO => cont!(sync::get_sema_info(ctx, st)),
+        sync_nid::OPEN_SEMA => cont!(sync::open_sema(ctx, st)),
+        tm_nid::CHANGE_THREAD_PRIORITY => cont!(threadmgr::change_thread_priority(ctx, st)),
+        tm_nid::SEND_SIGNAL => cont!(libkernel::send_signal(ctx, st)),
+        lk_nid::WAIT_SIGNAL => libkernel::wait_signal(ctx, st),
+        lk_nid::GET_PROCESS_TIME_LOW => cont!(libkernel::get_process_time_low(ctx, st)),
+        lk_nid::GET_OPEN_PS_ID => cont!(libkernel::get_open_ps_id(ctx, st)),
+        lk_nid::GET_MODULE_INFO_BY_ADDR => cont!(libkernel::get_module_info_by_addr(ctx, st)),
+        lk_nid::CALL_MODULE_EXIT => libkernel::call_module_exit(ctx, st),
+        // The ARM EABI divide-by-zero hooks. The value the division yields is already
+        // in r0 (r0:r1 for the long form) and the default handler returns it unchanged,
+        // so these must not write a return value at all.
+        lk_nid::AEABI_IDIV0 | lk_nid::AEABI_LDIV0 => libkernel::aeabi_div0(ctx, st),
+
+        // --- SceFios2Kernel: the path overlay layer under FIOS2 ------------------
+        fios2_nid::OVERLAY_ADD => cont!(fios2::overlay_add(ctx, st)),
+        fios2_nid::OVERLAY_ADD_FOR_PROCESS => cont!(fios2::overlay_add_for_process(ctx, st)),
+        fios2_nid::OVERLAY_MODIFY => cont!(fios2::overlay_modify(ctx, st)),
+        fios2_nid::OVERLAY_MODIFY_FOR_PROCESS => cont!(fios2::overlay_modify_for_process(ctx, st)),
+        fios2_nid::OVERLAY_REMOVE => cont!(fios2::overlay_remove(ctx, st)),
+        fios2_nid::OVERLAY_REMOVE_FOR_PROCESS => cont!(fios2::overlay_remove_for_process(ctx, st)),
+        fios2_nid::OVERLAY_GET_INFO => cont!(fios2::overlay_get_info(ctx, st)),
+        fios2_nid::OVERLAY_GET_INFO_FOR_PROCESS => cont!(fios2::overlay_get_info_for_process(ctx, st)),
+        fios2_nid::OVERLAY_GET_LIST => cont!(fios2::overlay_get_list(ctx, st)),
+        fios2_nid::OVERLAY_RESOLVE_SYNC => cont!(fios2::overlay_resolve_sync(ctx, st)),
+        fios2_nid::OVERLAY_RESOLVE_WITH_RANGE_SYNC => {
+            cont!(fios2::overlay_resolve_with_range_sync(ctx, st))
+        }
+        fios2_nid::OVERLAY_GET_RECOMMENDED_SCHEDULER => {
+            cont!(fios2::overlay_get_recommended_scheduler(ctx, st))
+        }
+        fios2_nid::OVERLAY_THREAD_IS_DISABLED => cont!(fios2::overlay_thread_is_disabled(ctx, st)),
+        fios2_nid::OVERLAY_THREAD_SET_DISABLED => cont!(fios2::overlay_thread_set_disabled(ctx, st)),
+        fios2_nid::DH_OPEN_SYNC => cont!(fios2::dh_open_sync(ctx, st)),
+        fios2_nid::DH_READ_SYNC => cont!(fios2::dh_read_sync(ctx, st)),
+        fios2_nid::DH_STAT_SYNC => cont!(fios2::dh_stat_sync(ctx, st)),
+        fios2_nid::DH_CHSTAT_SYNC => cont!(fios2::dh_chstat_sync(ctx, st)),
+        fios2_nid::DH_SYNC_SYNC => cont!(fios2::dh_sync_sync(ctx, st)),
+        fios2_nid::DH_CLOSE_SYNC => cont!(fios2::dh_close_sync(ctx, st)),
+
+        // --- SceLibDbg: the title's own assertions and log lines -----------------
+        dbg_nid::ASSERTION_HANDLER => cont!(dbg::assertion_handler(ctx, st)),
+        dbg_nid::LOGGING_HANDLER => cont!(dbg::logging_handler(ctx, st)),
+
+        // --- process ------------------------------------------------------------
+        pm_nid::LIBC_GETTIMEOFDAY => cont!(processmgr::libc_gettimeofday(ctx, st)),
+        pm_nid::CALL_ABORT_HANDLER => processmgr::call_abort_handler(ctx, st),
 
         // --- sysmem: memory blocks ---------------------------------------------
         sm_nid::ALLOC_MEM_BLOCK => cont!(sysmem::alloc_mem_block(ctx, st)),
         sm_nid::GET_MEM_BLOCK_BASE => cont!(sysmem::get_mem_block_base(ctx, st)),
         sm_nid::FREE_MEM_BLOCK => cont!(sysmem::free_mem_block(ctx, st)),
+        sm_nid::SET_GPO => cont!(sysmem::set_gpo(ctx, st)),
+        sm_nid::FIND_MEM_BLOCK_BY_ADDR => cont!(sysmem::find_mem_block_by_addr(ctx, st)),
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
@@ -589,6 +890,7 @@ pub fn dispatch(
         display_nid::WAIT_VBLANK_START_MULTI => display::wait_vblank_start_multi(ctx, st),
         display_nid::WAIT_VBLANK_START => display::wait_vblank_start(ctx, st),
         display_nid::WAIT_SET_FRAME_BUF => display::wait_set_frame_buf(ctx, st),
+        display_nid::GET_VCOUNT => cont!(display::get_vcount(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
@@ -613,7 +915,10 @@ pub fn dispatch(
         | ngs_nid::VOICE_DEF_GET_MIXER_BUSS
         | ngs_nid::VOICE_DEF_GET_COMPRESSOR_BUSS
         | ngs_nid::VOICE_DEF_GET_DELAY_BUSS
-        | ngs_nid::VOICE_DEF_GET_DISTORTION_BUSS => cont!(ngs::voice_def_get(ctx, st)),
+        | ngs_nid::VOICE_DEF_GET_DISTORTION_BUSS
+        | ngs_nid::VOICE_DEF_GET_COMPRESSOR_SIDE_CHAIN_BUSS
+        | ngs_nid::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE
+        | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE => cont!(ngs::voice_def_get(ctx, st)),
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
@@ -621,6 +926,7 @@ pub fn dispatch(
         // out-of-range query (0 = in range).
         ngs_nid::SYSTEM_UPDATE => cont!(ngs::system_update(ctx, st)),
         ngs_nid::VOICE_UNLOCK_PARAMS => cont!(ngs::voice_unlock_params(ctx, st)),
+        ngs_nid::VOICE_SET_PARAMS_BLOCK => cont!(ngs::voice_set_params_block(ctx, st)),
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::SYSTEM_RELEASE
         | ngs_nid::RACK_RELEASE
@@ -690,6 +996,49 @@ pub fn dispatch(
             cont!(services::np_basic_get_friend_list_entry_count(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_CLOCK => cont!(services::rtc_get_current_clock(ctx, st)),
+        sv_nid::RTC_SET_TIME64_T => cont!(services::rtc_set_time64_t(ctx, st)),
+        // SceAppUtil: the app-event queue (permanently empty offline) and the savedata
+        // remove/quota pair, both of which act on the real guest filesystem.
+        sv_nid::APPUTIL_RECEIVE_APP_EVENT => cont!(services::apputil_receive_app_event(ctx, st)),
+        sv_nid::APPUTIL_APP_EVENT_PARSE_NEAR_GIFT
+        | sv_nid::APPUTIL_APP_EVENT_PARSE_NP_BASIC_JOINABLE_PRESENCE
+        | sv_nid::APPUTIL_APP_EVENT_PARSE_NP_INVITE_MESSAGE => {
+            cont!(services::apputil_app_event_parse(ctx, st))
+        }
+        sv_nid::APPUTIL_SAVEDATA_DATA_REMOVE => cont!(services::apputil_savedata_data_remove(ctx, st)),
+        sv_nid::APPUTIL_SAVEDATA_GET_QUOTA => cont!(services::apputil_savedata_get_quota(ctx, st)),
+        sv_nid::NET_CTL_INET_GET_RESULT | sv_nid::NET_CTL_ADHOC_GET_RESULT => {
+            cont!(services::net_ctl_get_result(ctx, st))
+        }
+        sv_nid::APPMGR_RECEIVE_SYSTEM_EVENT => cont!(services::appmgr_receive_system_event(ctx, st)),
+        // Ends the run rather than returning: the title asked to be replaced.
+        sv_nid::APPMGR_LOAD_EXEC => services::appmgr_load_exec(ctx, st),
+        sv_nid::SHUTTER_SOUND_PLAY => cont!(services::shutter_sound_play(ctx, st)),
+        sv_nid::PHOTO_EXPORT_FROM_DATA => cont!(services::photo_export_from_data(ctx, st)),
+        // SceNp, offline: see the module's own section for why each of these reports
+        // signed-out rather than fabricating an account, a ticket or a friend list.
+        sv_nid::NP_GET_SERVICE_STATE => cont!(services::np_get_service_state(ctx, st)),
+        sv_nid::NP_BASIC_GET_FRIEND_LIST_ENTRIES => {
+            cont!(services::np_basic_get_friend_list_entries(ctx, st))
+        }
+        sv_nid::NP_BASIC_GET_GAME_JOINING_PRESENCE => {
+            cont!(services::np_basic_get_game_joining_presence(ctx, st))
+        }
+        sv_nid::NP_BASIC_SET_IN_GAME_PRESENCE | sv_nid::NP_BASIC_UNREGISTER_HANDLER => {
+            cont!(services::np_basic_presence_ok(ctx, st))
+        }
+        sv_nid::NP_LOOKUP_CREATE_TITLE_CTX => cont!(services::np_lookup_create_title_ctx(ctx, st)),
+        sv_nid::NP_LOOKUP_DELETE_REQUEST => cont!(services::np_lookup_delete_request(ctx, st)),
+        sv_nid::NP_LOOKUP_USER_PROFILE_ASYNC | sv_nid::NP_LOOKUP_POLL_ASYNC => {
+            cont!(services::np_lookup_async(ctx, st))
+        }
+        sv_nid::NP_AUTH_DESTROY_REQUEST => cont!(services::np_lookup_delete_request(ctx, st)),
+        sv_nid::NP_AUTH_CREATE_START_REQUEST
+        | sv_nid::NP_AUTH_GET_TICKET
+        | sv_nid::NP_AUTH_GET_TICKET_PARAM
+        | sv_nid::NP_AUTH_GET_ENTITLEMENT_BY_ID
+        | sv_nid::NP_AUTH_GET_ENTITLEMENT_ID_LIST => cont!(services::np_auth_signed_out(ctx, st)),
+        sv_nid::NP_ACTIVITY_POST_STATUS => cont!(services::np_activity_post_status(ctx, st)),
         sv_nid::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => {
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
@@ -719,6 +1068,11 @@ pub fn dispatch(
         sv_nid::RTC_TICK_ADD_MONTHS => cont!(services::rtc_tick_add_calendar(ctx, 1)),
         sv_nid::RTC_TICK_ADD_YEARS => cont!(services::rtc_tick_add_calendar(ctx, 12)),
         sv_nid::MOTION_GET_STATE => cont!(services::motion_get_state(ctx, st)),
+        // Motion tuning knobs. The modelled device is perfectly still and perfectly
+        // level, so a deadband and a tilt correction change nothing about what
+        // `sceMotionGetState` reports - but they are accepted, because refusing them
+        // would fail a title's sensor setup for a setting that cannot matter here.
+        sv_nid::MOTION_SET_DEADBAND | sv_nid::MOTION_SET_TILT_CORRECTION => cont!(gxm::ok(ctx)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
         sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
@@ -767,6 +1121,48 @@ pub fn dispatch(
         // The trophy-setup dialog's result read (zeroed result = OK), like the other
         // dialog GetResult calls.
         sv_nid::NP_TROPHY_SETUP_DIALOG_GET_RESULT => cont!(services::dialog_ok(ctx, st)),
+        // SceSystemGesture. No published prototype anywhere - see `vita::gesture` for
+        // where each argument shape comes from. The rest of the family is deliberately
+        // left to the hard-fail below until its call is observed.
+        sv_nid::SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER => {
+            cont!(gesture::init_primitive_touch_recognizer(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_CREATE_TOUCH_RECOGNIZER => {
+            cont!(gesture::create_touch_recognizer(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_UPDATE_PRIMITIVE_TOUCH_RECOGNIZER => {
+            cont!(gesture::update_primitive_touch_recognizer(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER => {
+            cont!(gesture::update_touch_recognizer(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT => {
+            cont!(gesture::get_touch_events_count(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => {
+            cont!(gesture::get_touch_event_by_index(ctx, st))
+        }
+        // SceCamera: no camera is attached to this host, and every entry point says so
+        // with the API's own SCE_CAMERA_ERROR_NOT_MOUNTED / _NOT_OPEN. See `vita::camera`.
+        // SceJpegEnc: context setup is real; Encode/Csc are left to the hard-fail
+        // because there is no honest way to hand back a JPEG that was never encoded.
+        sv_nid::JPEG_INIT_MJPEG => cont!(jpeg::init_mjpeg(ctx, st)),
+        sv_nid::JPEG_FINISH_MJPEG => cont!(jpeg::finish_mjpeg(ctx, st)),
+        sv_nid::JPEGENC_GET_CONTEXT_SIZE => cont!(jpegenc::get_context_size(ctx, st)),
+        sv_nid::JPEGENC_INIT => cont!(jpegenc::init(ctx, st)),
+        sv_nid::JPEGENC_END => cont!(jpegenc::end(ctx, st)),
+        sv_nid::JPEGENC_SET_OUTPUT_ADDR => cont!(jpegenc::set_output_addr(ctx, st)),
+        sv_nid::JPEGENC_SET_COMPRESSION_RATIO => cont!(jpegenc::set_compression_ratio(ctx, st)),
+        sv_nid::JPEGENC_SET_VALID_REGION => cont!(jpegenc::set_valid_region(ctx, st)),
+        sv_nid::CAMERA_OPEN => cont!(camera::open(ctx, st)),
+        sv_nid::CAMERA_CLOSE => cont!(camera::close(ctx, st)),
+        sv_nid::CAMERA_START => cont!(camera::start(ctx, st)),
+        sv_nid::CAMERA_STOP => cont!(camera::stop(ctx, st)),
+        sv_nid::CAMERA_READ => cont!(camera::read(ctx, st)),
+        sv_nid::CAMERA_GET_REVERSE => cont!(camera::get_reverse(ctx, st)),
+        sv_nid::CAMERA_SET_REVERSE => cont!(camera::set_reverse(ctx, st)),
+        sv_nid::CAMERA_SET_BACKLIGHT => cont!(camera::set_backlight(ctx, st)),
+        sv_nid::CAMERA_SET_WHITE_BALANCE => cont!(camera::set_white_balance(ctx, st)),
         sv_nid::TOUCH_READ => cont!(touch::read(ctx, st)),
         sv_nid::TOUCH_PEEK => cont!(touch::peek(ctx, st)),
         sv_nid::TOUCH_GET_PANEL_INFO => cont!(touch::get_panel_info(ctx, st)),
@@ -900,6 +1296,16 @@ pub fn dispatch(
         sv_nid::STORE_CHECKOUT_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::StoreCheckout)),
         sv_nid::NP_SNS_FACEBOOK_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::NpSnsFacebook)),
         sv_nid::NP_SNS_FACEBOOK_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpSnsFacebook)),
+        sv_nid::IME_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Ime)),
+        sv_nid::IME_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Ime)),
+        sv_nid::IME_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Ime)),
+        // An abort closes the dialog: it must stop reporting FINISHED, or a title that
+        // aborts and re-polls sees a completion it cancelled.
+        sv_nid::IME_DIALOG_ABORT => cont!(services::dialog_term(ctx, st, services::DialogFamily::Ime)),
+        sv_nid::MSG_DIALOG_ABORT => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
+        // The text-entry dialog is the one family whose result is not "zeroed reads as
+        // OK": it reports the CLOSE button, because off-console nobody typed anything.
+        sv_nid::IME_DIALOG_GET_RESULT => cont!(services::ime_dialog_get_result(ctx, st)),
         // Result reads and per-frame pumping succeed with the caller's (zeroed)
         // result struct untouched; the update pump has no system UI to animate.
         sv_nid::MSG_DIALOG_GET_RESULT => cont!(services::msg_dialog_get_result(ctx, st)),
@@ -925,9 +1331,17 @@ pub fn dispatch(
             // reaching here means the NID is genuinely unhandled.
             st.capture.note_unimplemented(library_nid, func_nid, nid::name(func_nid));
             let name = nid::name(func_nid);
+            // Report the CALL, not just its name. For a library with no published
+            // prototype the only source for the signature is the title's own use of
+            // it, and this is the one moment that evidence exists: r0-r3 as the guest
+            // passed them, the first stack words in case the call takes more than four
+            // arguments, and a short dump of whatever each pointer-looking argument
+            // points at (a work-area size, a struct's leading fields). Cheap - it runs
+            // once, on the way to stopping the run.
+            let arg_dump = describe_call_args(ctx);
             return SvcOutcome::Fatal(format!(
                 "unimplemented NID {name} (lib={library_nid:#010x} nid={func_nid:#010x}) \
-                 called by thread {:#x}; implement it (no silent stub)",
+                 called by thread {:#x}; implement it (no silent stub)\n{arg_dump}",
                 st.current_thread(),
             ));
         }

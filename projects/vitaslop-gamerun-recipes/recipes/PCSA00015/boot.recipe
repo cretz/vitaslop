@@ -1,0 +1,71 @@
+@title PCSA00015 boot - splash, autosave notice, title screen, loading
+@game  PCSA00015
+@shot-every 10000
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Boots the title and records how far it gets, with no input at all. It is the
+# baseline every deeper PCSA00015 recipe builds on, and it deliberately sends
+# NOTHING - see "input" below for why that is not an oversight.
+#
+# WHAT IS MEASURED (2026-07-28, all of it from runs, none of it assumed)
+# - The title reaches `main`, renders, and hits ZERO unimplemented NIDs over
+#   100,000 display flips.
+# - Screen order, all rendering correctly:
+#     the SCE publisher splash
+#     -> "THIS GAME SAVES DATA AUTOMATICALLY AT CERTAIN POINTS" + autosave icon
+#     -> the WIPEOUT logo with the copyright line
+#     -> a LOADING screen with a real percentage and progress bar (94% at
+#        f60000)
+# - It plays audio from the title screen on (SceNgs voices are set up and the
+#   AT9 path is fed).
+#
+# INPUT: THE TITLE IS TOUCH-DRIVEN, NOT BUTTON-DRIVEN.
+# Measured with `explore` against a no-input control at the autosave notice:
+# `cross`, `circle` and `start` produced determinism signatures BIT-IDENTICAL to
+# doing nothing; a touch did not. Do not waste a session mapping buttons here.
+#
+# AND BEFORE TRYING TO DISMISS A SCREEN WITH INPUT AT ALL: this title sat on the
+# autosave notice for 42 minutes of game time and it was NOT waiting for input.
+# `sceAppUtilSaveDataDataSave` was writing its autosave where the title's own
+# `sceIoGetstat` could not read it back, so it saved, looked, failed and saved
+# again forever. A screen that does not advance is a SAVE or a LOAD before it is
+# an input problem - `RUST_LOG=vitaslop::err=debug` then `vitaslop::io=trace`
+# names it in two runs.
+#
+# CAVEAT that decides how to read a stall on a touch-driven screen:
+# `vita::gesture` reports POSITION-ONLY gesture events and cannot tell a tap
+# from a drag from a pinch (SceSystemGesture has no published struct layout, so
+# the type values are known but their meanings are not). If a menu ignores a
+# scripted tap, suspect that before suspecting the tap coordinates.
+# ============================================================================
+
+# >>> THIS RECIPE IS THE BOOT LADDER ONLY. To reach the front end, use
+# >>> front-end.recipe, and read its header first - it needs
+# >>> `VITASLOP_FRAME_TOPUP=0`, and so does anything that wants this title to
+# >>> finish loading at all.
+#
+# WITH THE DEFAULT CLOCK (top-up on) THIS TITLE NEVER FINISHES LOADING.
+# Measured: a 300,000-frame run ends still on the loading screen. A displayed
+# frame carries about a TENTH of the guest work a console frame carries, because
+# a display flip tops the game clock up to a full frame however little guest
+# code actually ran (3120 fps, barely one whole scheduler quantum per frame).
+# With `VITASLOP_FRAME_TOPUP=0` the same boot reaches "PRESS ANY BUTTON TO
+# START" by f30000. See `VitaState::advance_time_frame`.
+#
+# AND THE LOADING IS NOT I/O-BOUND - the 28a note that said so is REFUTED. With
+# the storage model switched OFF entirely (`VITASLOP_IO_BANDWIDTH_KIBPS=0`),
+# f30000 reaches the same 94% that 50 MiB/s reaches; 10 MiB/s reaches 87%. An
+# io trace over 90,000 frames reads 291 MiB in total, which is 29 seconds of
+# modelled storage time against 25 minutes of game time.
+
+0: @section boot
+# No input. The whole point of this recipe is the unattended boot ladder.
+
+# @todo No @assert yet: there is no progress value pinned down to assert on.
+# The loading percentage on screen is the obvious candidate. NOTE a scan for it
+# was tried and produced a FALSE POSITIVE that survived two observations
+# (0x9697aa28 read 56 then 94 at the right frames, then read 99 while the screen
+# read 75) - so whatever is found this way must be checked against the SCREEN at
+# the same instant before it is trusted.
+100000: @section loaded

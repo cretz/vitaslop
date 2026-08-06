@@ -27,10 +27,46 @@ const MAX_PATH: usize = 1024;
 /// to still be in flight; with instant reads the job finishes in the frame it was posted,
 /// its resource is released, and the consumer reads a dangling handle. That is the exact
 /// shape of a retail racer's race-load crash: 4 MB of car + course data that takes about a
-/// second off a real game card completed inside two frames here.
+/// second off a real game card completed inside two frames here. That failure is the
+/// thing this constant is chosen against - see the table below.
 ///
-/// 10 MiB/s is a defensible PS Vita game-card figure. Deterministic: the delay is a pure
-/// function of the byte count, so a run is as reproducible as it was with instant reads.
+/// # Why this is 50 MiB/s, which is FASTER than the hardware
+/// The model exists for ORDERING, not for fidelity to a particular device, and the
+/// hardware is not the target: measured retail PS Vita memory cards read at about
+/// 6-8 MB/s, so even the 10 MiB/s this defaulted to first was already faster than a
+/// real console. Being slower than we need to be costs real time on every run - a title
+/// whose front-end streams tens of megabytes spends tens of thousands of frames on a
+/// loading screen - and buys nothing, because nothing here is trying to reproduce a
+/// console's loading times.
+///
+/// So the figure is chosen as the FASTEST rate that still preserves ordering, and that
+/// boundary is measured rather than guessed. Sweeping a retail racer's gameplay recipe
+/// (2500 frames, the title whose race-load crash this model was built for):
+///
+/// | `VITASLOP_IO_BANDWIDTH_KIBPS` | determinism signature |
+/// |---|---|
+/// | 10240 (10 MiB/s) | `0x24440860369ae8c9` |
+/// | **25600, 51200 (25, 50 MiB/s)** | **`0xe5686dc22877ba86` - one plateau** |
+/// | 102400 (100 MiB/s) | `0xc0182fa9dba87ebd` |
+/// | 204800 (200 MiB/s) | `0xa061166e6b3304bb` |
+/// | 0 (model OFF, instant reads) | `0xa061166e6b3304bb` - **the same** |
+///
+/// The last row is the finding that fixes the number: at 200 MiB/s the title behaves
+/// EXACTLY as it does with no model at all, so by then the model has stopped doing its
+/// job. 25 and 50 MiB/s produce bit-identical behaviour, so 50 is the top of a plateau
+/// where the title cannot tell the difference from the conservative setting - with a 4x
+/// margin below the point where the model stops mattering.
+///
+/// A second title (a retail skater with a real `@assert`) was swept the same way and is
+/// bit-identical at EVERY value including `0` - it is small enough not to be I/O-bound
+/// at all. That is a no-regression check, not a second boundary measurement, and it is
+/// recorded as such: only a title that streams can locate this number.
+///
+/// Raise this further only with the same measurement, on a title that streams: a value
+/// that reproduces the `0` row is not a fast model, it is no model.
+///
+/// Deterministic: the delay is a pure function of the byte count, so a run is as
+/// reproducible as it was with instant reads.
 ///
 /// A first attempt at this parked the reader on the GAME clock (`sleep_park`) and
 /// livelocked: `virtual_us` advances a frame per display FLIP and otherwise only on the
@@ -40,7 +76,7 @@ const MAX_PATH: usize = 1024;
 /// park is now charged against a separate storage clock (`VitaState::io_park`) that
 /// advances on flips, on scheduler quanta and on the idle path, so it cannot depend on the
 /// thing it is blocking.
-const DEFAULT_BANDWIDTH_KIBPS: u64 = 10 * 1024;
+const DEFAULT_BANDWIDTH_KIBPS: u64 = 50 * 1024;
 
 /// Fixed per-request cost in microseconds (`VITASLOP_IO_REQUEST_US`): the command
 /// round-trip a read pays whatever its size, so a stream of small reads is not free either.
@@ -241,12 +277,46 @@ pub(super) fn io_close(st: &mut VitaState, fd: i32) -> i32 {
 /// int sceIoGetstat(const char *file, SceIoStat *stat)
 /// Fills what a size query needs: the regular-file mode/attr and the 64-bit size
 /// (see [`write_file_stat`]). Returns a negative errno if the path does not exist.
+/// Apply any `sceIoChstat` overrides recorded for `path` on top of the synthesized
+/// stat already written at `stat_addr`. Read-after-write on file status is the whole
+/// point of chstat, so what was set has to come back out here.
+fn apply_stat_override(ctx: &mut GuestCtx, st: &VitaState, path: &str, stat_addr: u32) {
+    let Some(over) = st.io_stat_override(path) else { return };
+    let (mode, attr, times) = (over.mode, over.attr, over.times);
+    if let Some(mode) = mode {
+        ctx.write_u32(stat_addr, mode);
+    }
+    if let Some(attr) = attr {
+        ctx.write_u32(stat_addr + 4, attr);
+    }
+    for (i, t) in times.iter().enumerate() {
+        if let Some(t) = t {
+            ctx.write_bytes(stat_addr + STAT_CTIME_OFFSET + i as u32 * 16, t);
+        }
+    }
+}
+
 #[hostcall]
 pub(super) fn io_getstat(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr, stat: Ptr) -> i32 {
     let path = read_cstr(ctx, file.addr());
     match st.io_size(&path) {
         Some(size) => {
             write_file_stat(ctx, stat.addr(), size);
+            apply_stat_override(ctx, st, &path, stat.addr());
+            0
+        }
+        // Not a file - but a DIRECTORY still stats, and a title checking whether its
+        // save directory exists asks exactly this way. Reporting ENOENT for a real
+        // directory sends it down the "create everything" path every boot.
+        None if st.io_is_dir(&path) => {
+            let addr = stat.addr();
+            if addr != 0 {
+                ctx.write_u32(addr, STAT_MODE_DIR);
+                ctx.write_u32(addr + 4, STAT_ATTR_DIR);
+                ctx.write_u32(addr + STAT_SIZE_OFFSET, 0);
+                ctx.write_u32(addr + STAT_SIZE_OFFSET + 4, 0);
+                apply_stat_override(ctx, st, &path, addr);
+            }
             0
         }
         None => ENOENT,
@@ -294,6 +364,16 @@ pub(super) fn io_dopen(ctx: &mut GuestCtx, st: &mut VitaState, dirname: Ptr) -> 
 /// title reading name or stat fields sees no stale guest memory.
 #[hostcall]
 pub(super) fn io_dread(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, dirent: Ptr) -> i32 {
+    write_dirent(ctx, st, fd, dirent.addr())
+}
+
+/// Read the next entry of directory descriptor `fd` into the guest `SceIoDirent` at
+/// `dirent`. Shared with `SceFios2Kernel`'s directory-handle family, whose
+/// `SceFiosNativeDirEntry` is this same native structure (see `vita::fios2`).
+///
+/// Takes a raw guest address rather than a `Ptr` because `Ptr` exists only inside a
+/// `#[hostcall]` body.
+pub(super) fn write_dirent(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, dirent: u32) -> i32 {
     match st.io_dread(fd) {
         Some(Some(entry)) => {
             let mut buf = [0u8; DIRENT_SIZE];
@@ -308,12 +388,42 @@ pub(super) fn io_dread(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, dirent: 
             let name = entry.name.as_bytes();
             let n = name.len().min(255); // keep the trailing NUL
             buf[STAT_SIZE..STAT_SIZE + n].copy_from_slice(&name[..n]);
-            ctx.write_bytes(dirent.addr(), &buf);
+            ctx.write_bytes(dirent, &buf);
             1
         }
         Some(None) => 0,
         None => EBADF,
     }
+}
+
+/// Write a directory's `SceIoStat` (mode/attr plus a zero size) at `addr`. Shared
+/// with `SceFios2Kernel`'s `SceFiosNativeStat`, which is this same structure.
+pub(super) fn write_dir_stat(ctx: &mut GuestCtx, addr: u32) {
+    ctx.write_u32(addr, STAT_MODE_DIR);
+    ctx.write_u32(addr + 4, STAT_ATTR_DIR);
+    ctx.write_u32(addr + STAT_SIZE_OFFSET, 0);
+    ctx.write_u32(addr + STAT_SIZE_OFFSET + 4, 0);
+}
+
+/// Read the `bits`-selected fields of a guest `SceIoStat` at `addr` into the override
+/// record the filesystem stores. Shared with `SceFios2Kernel`'s DH chstat.
+pub(super) fn read_stat_override(ctx: &GuestCtx, addr: u32, bits: i32) -> crate::host::FileStatOverride {
+    let mut over = crate::host::FileStatOverride::default();
+    if bits & SCE_CST_MODE != 0 {
+        over.mode = Some(ctx.read_u32(addr));
+    }
+    if bits & SCE_CST_ATTR != 0 {
+        over.attr = Some(ctx.read_u32(addr + 4));
+    }
+    for (i, sel) in [SCE_CST_CT, SCE_CST_AT, SCE_CST_MT].into_iter().enumerate() {
+        if bits & sel != 0 {
+            let raw = ctx.read_bytes(addr + STAT_CTIME_OFFSET + i as u32 * 16, 16);
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&raw);
+            over.times[i] = Some(t);
+        }
+    }
+    over
 }
 
 /// int sceIoDclose(SceUID fd)
@@ -323,18 +433,134 @@ pub(super) fn io_dclose(st: &mut VitaState, fd: i32) -> i32 {
 }
 
 /// int sceIoMkdir(const char *dir, SceMode mode)
-/// The vfs is flat (paths are opaque keys), so directories are a no-op success.
+/// Really creates the directory, so a title can list, stat and remove what it made.
+/// Reports EEXIST when something already occupies the path.
 #[hostcall]
-pub(super) fn io_mkdir(_st: &mut VitaState, _dir: Ptr, _mode: u32) -> i32 {
-    0
+pub(super) fn io_mkdir(ctx: &mut GuestCtx, st: &mut VitaState, dir: Ptr, _mode: u32) -> i32 {
+    let path = read_cstr(ctx, dir.addr());
+    st.io_mkdir(&path)
+}
+
+/// int sceIoRmdir(const char *path)
+/// Removes an EMPTY directory; a non-empty one is refused with ENOTEMPTY, as the
+/// kernel refuses it.
+#[hostcall]
+pub(super) fn io_rmdir(ctx: &mut GuestCtx, st: &mut VitaState, path: Ptr) -> i32 {
+    let path = read_cstr(ctx, path.addr());
+    st.io_rmdir(&path)
 }
 
 /// int sceIoRemove(const char *file)
-/// No-op success: the vfs does not track a deleted state (a rewrite goes through
-/// SCE_O_TRUNC on open instead). Faithful enough for bring-up.
+/// Really deletes the file: a later open without SCE_O_CREAT reports ENOENT and a
+/// listing no longer shows it. A directory is refused (that is `sceIoRmdir`'s job).
 #[hostcall]
-pub(super) fn io_remove(_st: &mut VitaState, _file: Ptr) -> i32 {
+pub(super) fn io_remove(ctx: &mut GuestCtx, st: &mut VitaState, file: Ptr) -> i32 {
+    let path = read_cstr(ctx, file.addr());
+    st.io_remove(&path)
+}
+
+/// int sceIoRename(const char *oldname, const char *newname)
+/// Moves a file, or a whole directory subtree with its contents. Refuses to
+/// overwrite an existing destination.
+#[hostcall]
+pub(super) fn io_rename(ctx: &mut GuestCtx, st: &mut VitaState, old: Ptr, new: Ptr) -> i32 {
+    let (old, new) = (read_cstr(ctx, old.addr()), read_cstr(ctx, new.addr()));
+    st.io_rename(&old, &new)
+}
+
+/// `SceIoStat` field offsets past the 8-byte size: the three `SceDateTime`s
+/// (st_ctime, st_atime, st_mtime), 16 bytes each.
+const STAT_CTIME_OFFSET: u32 = 16;
+
+/// `sceIoChstat` `bits` selectors (SCE_CST_*), from the vitasdk io/stat header.
+const SCE_CST_MODE: i32 = 0x0001;
+const SCE_CST_AT: i32 = 0x0008;
+const SCE_CST_MT: i32 = 0x0010;
+const SCE_CST_CT: i32 = 0x0020;
+/// SCE_CST_ATTR - the Vita-specific attribute word beside the POSIX mode.
+const SCE_CST_ATTR: i32 = 0x0002;
+
+/// int sceIoChstat(const char *name, SceIoStat *stat, int bits)
+///
+/// Apply the selected fields of `stat` to a path. `bits` says WHICH fields, so a call
+/// that sets only the modification time must not also overwrite the mode - each field
+/// is recorded independently and read back by `sceIoGetstat`. A chstat whose effect is
+/// invisible is worse than an error: the title believes the change took.
+#[hostcall]
+pub(super) fn io_chstat(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, stat: Ptr, bits: i32) -> i32 {
+    let path = read_cstr(ctx, name.addr());
+    if stat.addr() == 0 {
+        ENOENT
+    } else {
+        let over = read_stat_override(ctx, stat.addr(), bits);
+        st.io_chstat(&path, over)
+    }
+}
+
+/// int sceIoDevctl(const char *devname, int cmd, void *arg, SceSize arglen,
+///                 void *bufp, SceSize buflen)
+///
+/// Send a device-specific control command to a mounted device. Unlike the rest of
+/// this module there is no single behaviour to implement: `cmd` selects among a
+/// per-device command set, and the user-mode command numbers are not published in
+/// vita-headers or the wiki.
+///
+/// So this is a real dispatch with no commands in it yet, and an unknown command
+/// STOPS THE RUN naming the device and command rather than returning a plausible
+/// success. That is the same rule the unimplemented-NID path follows and for the same
+/// reason: a fabricated answer to "how much space is free" or "is a card inserted"
+/// sends the title down a branch on a false premise, and the failure then surfaces
+/// somewhere with no connection to this call.
+pub(super) fn io_devctl(ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+    let dev = read_cstr(ctx, ctx.arg(0));
+    let cmd = ctx.arg(1);
+    SvcOutcome::Fatal(format!(
+        "sceIoDevctl: device {dev:?} command {cmd:#x} is not implemented - no user-mode \
+         devctl command set is published, so implement this command against what the \
+         title does with the result (no silent stub)"
+    ))
+}
+
+/// int sceIoIoctl(SceUID fd, int cmd, void *argp, SceSize arglen, void *bufp,
+///                SceSize buflen)
+///
+/// The by-descriptor counterpart of [`io_devctl`], with the same reasoning: a real
+/// dispatch, no commands published, and an unknown one stops the run naming the
+/// descriptor's file and the command.
+pub(super) fn io_ioctl(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let fd = ctx.arg(0) as i32;
+    let cmd = ctx.arg(1);
+    let known = st.io_size_fd(fd).is_some();
+    SvcOutcome::Fatal(format!(
+        "sceIoIoctl: fd {fd} ({}) command {cmd:#x} is not implemented - implement this \
+         command against what the title does with the result (no silent stub)",
+        if known { "open" } else { "not open" }
+    ))
+}
+
+/// int sceIoSync(const char *devname, unsigned int flag)
+/// int sceIoSyncByFd(SceUID fd, int flag)
+///
+/// Flush a device's (or a descriptor's) pending writes to storage. This vfs holds
+/// file bytes directly with no write-back cache in front of them, so every write is
+/// already durable at the instant it is made and there is genuinely nothing queued to
+/// push - the sync is complete when it is asked for. That is a property of the
+/// backing store, not a shortcut: were a cache ever added, this is the call that
+/// would have to drain it.
+#[hostcall]
+pub(super) fn io_sync(_st: &mut VitaState, _devname: Ptr, _flag: u32) -> i32 {
     0
+}
+
+/// int sceIoSyncByFd(SceUID fd, int flag) - see [`io_sync`]. Validates the
+/// descriptor, because syncing a closed fd is an error the caller should hear about.
+#[hostcall]
+pub(super) fn io_sync_by_fd(st: &mut VitaState, fd: i32, _flag: i32) -> i32 {
+    if st.io_size_fd(fd).is_some() {
+        0
+    } else {
+        EBADF
+    }
 }
 
 /// Bad file descriptor / no such file, as SCE returns negative on IO failure.

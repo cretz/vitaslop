@@ -795,6 +795,73 @@ fn link_pairs_validate() {
     println!("  => {n_linked} pairs linked to a validated WGSL module");
 }
 
+/// Every raw instruction word of one opcode GROUP across the whole corpus, plus a per-bit
+/// tally of which bits ever vary - the microscope for an encoding the spec does not carry.
+///
+/// `VITASLOP_GXP_GROUP=<hex group>` selects the group by its `[63:59]` value (e.g. `14` for
+/// I16MAD). A bit that is CONSTANT over every occurrence in three titles is not a field this
+/// corpus can tell you anything about; a bit that varies is, and the values it takes are the
+/// whole evidence. This is the closure argument that settled the semantic bitfield and the F16
+/// write masks, applied to a group rather than to one instruction.
+#[test]
+#[ignore = "requires VITASLOP_GXP_DUMPS + VITASLOP_GXP_GROUP; run explicitly"]
+fn group_microscope() {
+    let Some(dir) = dump_dir() else { return };
+    let Ok(want) = std::env::var("VITASLOP_GXP_GROUP") else {
+        eprintln!("set VITASLOP_GXP_GROUP=<hex opcode group, bits 63:59>");
+        return;
+    };
+    let want = u32::from_str_radix(want.trim().trim_start_matches("0x"), 16).unwrap();
+    let mut words: Vec<(String, usize, u64)> = Vec::new();
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = fs::read(&path).unwrap();
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        for (i, w) in program.code.iter().enumerate() {
+            if ((w >> 59) & 0x1f) as u32 == want {
+                words.push((name.clone(), i, *w));
+            }
+        }
+    }
+    println!("\n== group {want:#04x}: {} occurrences ==", words.len());
+    for (name, i, w) in &words {
+        println!("  {name:<24} #{i:<3} {w:#018x}");
+    }
+    if words.is_empty() {
+        return;
+    }
+    // Which bits are constant across every occurrence, and which vary. A run of varying bits
+    // is a field; the values it takes bound what that field can mean.
+    let (mut ones, mut zeros) = (0u64, 0u64);
+    for (_, _, w) in &words {
+        ones |= *w;
+        zeros |= !*w;
+    }
+    let varying = ones & zeros;
+    println!("  constant-1 bits: {:#018x}", ones & !varying);
+    println!("  constant-0 bits: {:#018x}", !ones & !zeros & u64::MAX);
+    println!("  VARYING bits:    {:#018x}", varying);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut bit = 0;
+    while bit < 64 {
+        if varying >> bit & 1 == 1 {
+            let lo = bit;
+            while bit < 64 && varying >> bit & 1 == 1 {
+                bit += 1;
+            }
+            runs.push((bit - 1, lo));
+        } else {
+            bit += 1;
+        }
+    }
+    for (hi, lo) in runs {
+        let mut vals: Vec<u64> = words.iter().map(|(_, _, w)| (w >> lo) & ((1 << (hi - lo + 1)) - 1)).collect();
+        vals.sort_unstable();
+        vals.dedup();
+        println!("    field [{hi}:{lo}] takes {} distinct values: {vals:?}", vals.len());
+    }
+}
+
 /// Compact disassembly of one blob (named by `VITASLOP_GXP_DISASM`, matched as a filename
 /// substring), printing each instruction's op / destination / sources - the microscope for
 /// understanding a specific decode (e.g. where an internal register is written vs read).
@@ -837,6 +904,13 @@ fn disasm_one() {
         for it in &program.interpolants {
             println!("    interpolant {:?} pa_base={} regs={} span={} half={} prefetch={:?}",
                 it.usage, it.pa_base, it.register_count, it.span, it.half, it.prefetch);
+        }
+        // The vertex side of the same interface. A fragment prefetch names its coordinate by
+        // TEXCOORD INDEX, so the only way to read "which of these lanes feeds that sample" is
+        // to see the producer's own usage list next to the consumer's.
+        for ov in &program.output_varyings {
+            println!("    output varying {:?} base_lane={} components={}",
+                ov.usage, ov.base_lane, ov.components);
         }
         let fmt_op = |o: &vitaslop_gxp_shader::ir::Operand| {
             format!("{:?}[{}]{}{}", o.bank, o.index,
@@ -1612,4 +1686,82 @@ fn reserved_output_region_widths_against_fragment_declarations() {
     for r in &frag_rows {
         println!("{r}");
     }
+}
+
+/// What IS the fragment `Position` interpolant - the interpolated CLIP position its vertex
+/// wrote, or the WINDOW coordinate the rasteriser hands a fragment (Cg's `WPOS`: pixels in
+/// x/y, the depth-buffer value in z, and `1/w` in w)?
+///
+/// The two readings differ by a perspective divide and a viewport scale, so every shader that
+/// reprojects - soft particles, screen-space fades, depth fog - computes a different number
+/// under each. The linker currently routes it as an ordinary varying carrying vertex output
+/// lanes 0..3, and that choice was made structurally, never measured.
+///
+/// This is the measurement, and the corpus is the oracle: print every fragment program that
+/// declares a Position interpolant next to the instructions that first READ each of its four
+/// lanes. The tell is what the code multiplies the x/y lanes by. A WINDOW coordinate is in
+/// pixels and has to be scaled by roughly 1/960 or 1/544 to become anything else; a CLIP
+/// coordinate is in units of `w` and has to be DIVIDED by the w lane. One of those shapes
+/// appears in the corpus and the other does not.
+#[test]
+#[ignore = "requires VITASLOP_GXP_DUMPS; run explicitly"]
+fn fragment_position_interpolant_usage() {
+    let Some(dir) = dump_dir() else { return };
+    println!("\n=== fragment Position interpolant: how the code reads its four lanes ===");
+    let (mut with_pos, mut total) = (0usize, 0usize);
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        if program.kind != ProgramKind::Fragment {
+            continue;
+        }
+        total += 1;
+        let Some(pos) = program
+            .interpolants
+            .iter()
+            .find(|i| i.usage == vitaslop_gxp_shader::container::VaryingUsage::Position)
+        else {
+            continue;
+        };
+        with_pos += 1;
+        let base = pos.pa_base as u32;
+        let lanes = base..base + pos.register_count as u32;
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        println!(
+            "\n-- {name}: Position pa_base={base} regs={} span={} half={} (sa={}, literals={})",
+            pos.register_count,
+            pos.span,
+            pos.half,
+            program.secondary_reg_count,
+            program.literals.len()
+        );
+        for &(sa, w) in &program.literals {
+            println!("     literal SA[{sa}] = {w:#010x} f32={} f16=({}, {})",
+                f32::from_bits(w), half_to_f32(w as u16), half_to_f32((w >> 16) as u16));
+        }
+        let fmt_op = |o: &vitaslop_gxp_shader::ir::Operand| {
+            format!("{:?}[{}]{}{}", o.bank, o.index,
+                if o.swizzle != [0, 1, 2, 3] { format!(".{:?}", o.swizzle) } else { String::new() },
+                if o.neg { "(neg)" } else { "" })
+        };
+        for (i, ins) in shader.instrs.iter().enumerate() {
+            let touches = ins.srcs.iter().any(|s| {
+                s.bank == Bank::PrimaryAttr && lanes.contains(&(s.index as u32))
+            });
+            if !touches {
+                continue;
+            }
+            let dest = ins.dest.as_ref().map(&fmt_op).unwrap_or_else(|| "-".into());
+            let srcs: Vec<String> = ins.srcs.iter().map(&fmt_op).collect();
+            let mask: String =
+                (0..4).map(|c| if ins.write_mask[c] { "xyzw".as_bytes()[c] as char } else { '.' }).collect();
+            println!("   #{i:<3} {:<8}{} dst={dest} [{mask}] <- {}  {:?}",
+                ins.op.mnemonic(),
+                if ins.half_precision { ".f16" } else { ".f32" },
+                srcs.join(", "),
+                ins.op);
+        }
+    }
+    println!("\n{with_pos} of {total} fragment programs declare a Position interpolant");
 }

@@ -47,6 +47,18 @@ pub(super) fn get_mem_block_base(ctx: &mut GuestCtx, st: &mut VitaState, uid: i3
 /// allocation. The real kernel rejects the id rather than pretending it freed.
 const SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID: i32 = 0x8002_0064u32 as i32;
 
+/// void sceKernelSetGPO(SceUInt32 gpo)
+///
+/// The debug GPIO output register, exported to user mode by SceDebugLed. On a
+/// development unit its low bits light the board's diagnostic LEDs; retail hardware
+/// wires none of them, so the write has no observable effect there either. The value
+/// is held (it is a register, and a title using it as a boot progress marker leaves
+/// its last marker behind) and the call returns nothing - void, so no return write.
+#[hostcall]
+pub(super) fn set_gpo(st: &mut VitaState, gpo: u32) {
+    st.gpo = gpo;
+}
+
 /// int sceKernelFreeMemBlock(SceUID uid)
 /// Release a memory block. The registry entry is removed so a later
 /// `sceKernelGetMemBlockBase(uid)` no longer resolves it; the deterministic arena
@@ -58,5 +70,20 @@ pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
         0
     } else {
         SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID
+    }
+}
+
+/// SceUID sceKernelFindMemBlockByAddr(const void *addr, SceSize size)
+///
+/// Resolve an address back to the block it lives in - what a title does when it is
+/// handed a pointer and needs the UID to free or query it. The block must CONTAIN the
+/// whole `[addr, addr+size)` range, since a caller asking about a span that straddles
+/// two blocks has no single answer. An address in no block reports
+/// `SCE_KERNEL_ERROR_BLOCK_ERROR` rather than a plausible-looking UID.
+#[hostcall]
+pub(super) fn find_mem_block_by_addr(st: &mut VitaState, addr: u32, size: u32) -> i32 {
+    match st.memblock_containing(addr, size) {
+        Some(uid) => uid,
+        None => 0x8002_D082u32 as i32,
     }
 }

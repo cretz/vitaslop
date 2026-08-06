@@ -45,7 +45,7 @@ fn validate_src(module_src: &str) {
 }
 
 fn validate_with(body: &str, units: &[TexBinding]) {
-    let module_src = wrap_module(body, units);
+    let module_src = wrap_module(body, units, ProgramKind::Fragment);
     let module = naga::front::wgsl::parse_str(&module_src)
         .unwrap_or_else(|e| panic!("emitted WGSL failed to parse:\n{module_src}\n\nerror: {e:?}"));
     let mut validator = naga::valid::Validator::new(
@@ -88,9 +88,9 @@ fn every_emittable_op_produces_valid_wgsl() {
             i
         }] }),
         ("pack", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Pack { src_half: false }, d(0), vec![r(4)], full)] }),
-        ("and-imm", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::And, imm: Some(0xFF) }, d(0), vec![r(4)], [true, false, false, false])] }),
-        ("shr-reg", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::Shr, imm: None }, d(0), vec![r(4), r(8)], [true, false, false, false])] }),
-        ("asr-reg", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::Asr, imm: None }, d(0), vec![r(4), r(8)], [true, false, false, false])] }),
+        ("and-imm", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::And, imm: Some(0xFF), lane_bits: 32 }, d(0), vec![r(4)], [true, false, false, false])] }),
+        ("shr-reg", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::Shr, imm: None, lane_bits: 32 }, d(0), vec![r(4), r(8)], [true, false, false, false])] }),
+        ("asr-reg", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Bitwise { kind: BitwiseKind::Asr, imm: None, lane_bits: 32 }, d(0), vec![r(4), r(8)], [true, false, false, false])] }),
         ("const", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Mul, d(0), vec![r(4), k(2)], full)] }),
         // The NaN constant table entries must also materialise as valid WGSL (via bitcast).
         ("const-nan", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(Op::Mul, d(0), vec![r(4), k(0x38)], full)] }),

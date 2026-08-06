@@ -106,6 +106,9 @@ pub struct RecipeReport {
     pub shots: Vec<ShotOutcome>,
     /// The per-frame watch log as CSV (empty when no watches were declared).
     pub watch_csv: String,
+    /// Who actually got the CPU over the run, when `VITASLOP_CPU_SHARE` is set - see
+    /// [`vitaslop_runtime::sched::SchedCore::cpu_share_report`]. Empty otherwise.
+    pub cpu_share: String,
     /// The egress ledger, formatted one event per line.
     pub egress: Vec<String>,
 }
@@ -141,7 +144,30 @@ impl RecipeReport {
             s.push_str(&format!("EGRESS {e}\n"));
         }
         s.push_str(&format!("RESULT {passed}/{} asserts passed\n", self.asserts.len()));
+        // Under `VITASLOP_DBG_CALLSITES`, end with the hottest `(nid, caller)` pairs.
+        // A recipe run is often the ONLY way to reach the code being investigated - a
+        // call that needs a touch on screen cannot be provoked by a headless boot probe
+        // at all - so the call-site profile has to be readable from here too, not only
+        // from the probe and the resident session.
+        if std::env::var("VITASLOP_DBG_CALLSITES").is_ok() {
+            s.push_str(&vitaslop_runtime::vita::call_sites_report(60));
+            s.push('\n');
+        }
+        // Under `VITASLOP_CPU_SHARE`, who actually got the single baton.
+        s.push_str(&self.cpu_share);
         s
+    }
+
+    /// Dump the per-PC block-entry histogram gathered under `VITASLOP_BLOCK_HIST`, for
+    /// the same reason the call-site report is printed here: once host calls are no
+    /// longer the hot path, the only thing that names where guest time goes is this
+    /// histogram, and a recipe run is often the only way to reach the code in question.
+    /// It goes to stderr (the histogram can be hundreds of lines) rather than into the
+    /// report string, and is a no-op when the knob is unset.
+    pub fn dump_block_hist(&self) {
+        if let Ok(top) = std::env::var("VITASLOP_BLOCK_HIST") {
+            crate::dump_block_hist(top.trim().parse().unwrap_or(40));
+        }
     }
 }
 
@@ -162,6 +188,7 @@ pub fn boot_retail(
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_modules(linked.loaded_modules.clone());
     // The TLS template seeds each thread's thread-local block; without it an early
     // thread-local access reads uninitialized memory and traps (MemoryOutOfBounds at
     // boot). The boot probe sets this too - keep the shared helper in parity.
@@ -329,6 +356,15 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
         shots: shots_out,
         watch_csv: csv,
         egress,
+        // `VITASLOP_CPU_SHARE`: which threads got the single baton. A title whose
+        // background worker runs at a low priority can be starved by a high-priority
+        // thread that never blocks, and from outside that is indistinguishable from
+        // the title simply being busy.
+        cpu_share: if std::env::var("VITASLOP_CPU_SHARE").is_ok() {
+            sched.cpu_share_report()
+        } else {
+            String::new()
+        },
     })
 }
 

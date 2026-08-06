@@ -49,8 +49,36 @@ pub enum Bank {
     /// literal is assembled is group-specific, so only the groups that establish it produce
     /// this - for the TEST group it is the 7-bit `src2_n`, zero-extended (spec T.5b step 6).
     Immediate,
+    /// Register-INDIRECT addressing (the extension row's INDEXED1 / INDEXED2 banks): the
+    /// element read is `bank[index_register + offset]`, where the bank and the offset come
+    /// from the operand's own 7-bit number (bits[6:5] select TEMP/OUTPUT/PRIMATTR/SECATTR,
+    /// bits[4:0] are the offset) and the index register is `i0` for INDEXED1, `i1` for
+    /// INDEXED2. [`Operand::index`] holds the raw 7-bit number; [`Operand::bank_sel`] holds
+    /// which index register, so both halves survive to the emitter.
+    ///
+    /// This is what a shader that indexes a uniform ARRAY by a value it computed compiles to,
+    /// and it is the only operand form whose address is not known until the shader runs.
+    Indexed,
+    /// The INDEX register file (`i0`, `i1`) itself, as a DESTINATION. Only the integer-MAD
+    /// groups write it; nothing reads it except [`Bank::Indexed`] addressing.
+    Index,
     /// A bank selector value not yet mapped to a named bank.
     Raw(u8),
+}
+
+/// Which sub-bank an [`Bank::Indexed`] operand's 7-bit number names (bits [6:5]).
+pub fn indexed_sub_bank(number: u8) -> Bank {
+    match (number >> 5) & 3 {
+        0 => Bank::Temp,
+        1 => Bank::Output,
+        2 => Bank::PrimaryAttr,
+        _ => Bank::SecondaryAttr,
+    }
+}
+
+/// The additive offset an [`Bank::Indexed`] operand's 7-bit number carries (bits [4:0]).
+pub fn indexed_offset(number: u8) -> u32 {
+    (number & 0x1f) as u32
 }
 
 /// One decoded source or destination operand.
@@ -214,7 +242,7 @@ pub enum Op {
     /// 32-bit lane bit patterns. `imm` is the assembled inline source-2 constant when source
     /// 2 is an immediate (already rotated/inverted at decode); otherwise source 2 is a
     /// register (`srcs[1]`). Emitted via `bitcast<u32>`.
-    Bitwise { kind: BitwiseKind, imm: Option<u32> },
+    Bitwise { kind: BitwiseKind, imm: Option<u32>, lane_bits: u8 },
     /// Format pack/convert (group 0x40, VPCK). A float<->float repack (F16<->F32) preserves
     /// the NUMBER while changing its STORAGE width, so it is emitted like a move - but the
     /// source and destination are read and written at their own precisions, which is the whole
@@ -223,6 +251,23 @@ pub enum Op {
     /// normalized conversions and the C10/O8 packed formats change the numeric value and are
     /// decoded but blocked (their exact layout is not established).
     Pack { src_half: bool },
+    /// VPCK converting a FLOAT source to an INTEGER destination with `scale` clear - a
+    /// truncating numeric cast, not a normalize. `bits` is the destination width (8, 16 or 32)
+    /// and `signed` its signedness; the result is stored as the integer's two's-complement bit
+    /// pattern in the destination lane, which is the same representation the integer groups
+    /// (VBW, the integer MADs) read and write. The normalized (`scale` set) and C10/O8 forms
+    /// stay blocked - they change the value by a factor this does not model.
+    PackToInt { bits: u8, signed: bool, src_half: bool },
+    /// Load an INDEX register (group 0x14, I16MAD, in the one encoding the corpus establishes):
+    /// `i[dest] = src + addend`, as a 16-bit integer.
+    ///
+    /// The corpus is the whole authority for this and it is narrow: group 0x14 occurs in ONE
+    /// program across three titles, six times, and the only bits that ever vary are [17:14],
+    /// the source register number. Every other bit is constant, so the encoding establishes a
+    /// register and nothing else. `addend` is fixed instead by ARITHMETIC CLOSURE against the
+    /// container's own parameter table - see the decoder - and any group-0x14 word that is not
+    /// this exact encoding must hard-fail rather than inherit that assumption.
+    LoadIndex { addend: i32 },
     /// Texture sample (group 0xE0). `unit` is the GXM texture unit, which
     /// [`crate::usse::decode_shader`] resolves from the instruction's raw sampler-register
     /// field through the container's texture-control table; `coords` is the number of
@@ -280,7 +325,8 @@ impl Op {
                 | Op::Dot { .. }
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. }
-                | Op::Pack { .. } | Op::Bitwise { .. }
+                | Op::Pack { .. } | Op::PackToInt { .. } | Op::Bitwise { .. }
+                | Op::LoadIndex { .. }
                 | Op::Test { .. } | Op::Kill
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
@@ -316,6 +362,8 @@ impl Op {
             Op::Nop => "nop",
             Op::Tex { .. } => "tex",
             Op::Pack { .. } => "pack",
+            Op::PackToInt { .. } => "pack.int",
+            Op::LoadIndex { .. } => "loadidx",
             Op::Bitwise { .. } => "bitwise",
             Op::Test { .. } => "vtst",
             Op::Kill => "kill",
@@ -369,6 +417,10 @@ impl Instr {
     pub fn source_half_precision(&self) -> bool {
         match self.op {
             Op::Pack { src_half } => src_half,
+            // A float->integer convert reads its source at the SOURCE format's precision,
+            // exactly like the float->float form - the instruction's own `half_precision`
+            // describes the destination, which here is not a float at all.
+            Op::PackToInt { src_half, .. } => src_half,
             _ => self.half_precision,
         }
     }

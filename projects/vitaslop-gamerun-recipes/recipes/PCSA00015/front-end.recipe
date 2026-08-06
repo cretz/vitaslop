@@ -1,0 +1,82 @@
+@title PCSA00015 front end - title screen, GAME MODE, campaign intro, campaign map
+@game  PCSA00015
+# (no cadence shots - every shot below is explicit)
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Boots the title and drives its TOUCH front end as far as it currently goes:
+#
+#   loading -> PRESS ANY BUTTON TO START -> GAME MODE (4 tiles)
+#     -> SINGLE PLAYER CAMPAIGN -> the campaign intro text -> the campaign MAP
+#
+# Every input here was found in a resident session and is reproducible; the
+# shots below are the evidence for each screen.
+#
+# >>> IT NEEDS `VITASLOP_FRAME_TOPUP=0`, AND THAT IS NOT OPTIONAL.
+# With the default per-flip clock top-up, a displayed frame carries about a
+# TENTH of the guest work a console frame carries (measured: 3120 fps with
+# barely one whole scheduler quantum per frame), so this title never finishes
+# loading at all - a 300,000-frame run ends still on the loading screen. With
+# the top-up off it reaches PRESS ANY BUTTON by f30000. See
+# `VitaState::advance_time_frame` for the mechanism and why it is a knob rather
+# than the default.
+#
+#   VITASLOP_FRAME_TOPUP=0 play --game <dir> --recipe <this> --max-frames 40000
+#
+# THE TITLE IS TOUCH-DRIVEN, and this recipe is the proof: the four GAME MODE
+# tiles, the confirm checkmark and the map's own back button all respond to a
+# `touch=`, and `cross` works on the two screens that say "press any button".
+# `touch=X,Y` is in PANEL coordinates, which are screen*2.
+#
+# >>> WHERE IT STOPS, AND WHY - read this before extending it
+# The campaign MAP renders its HUD and nothing else, and it is FROZEN: the
+# scene digest is bit-identical over 25,000 frames, and a 4x4 grid of taps
+# across the whole map body produces the SAME digest as no input at all. The
+# nodes the intro text tells you to touch are not there to be touched.
+#
+# Two measured facts about that, so the next session does not re-derive them:
+#   1. The map's geometry IS being submitted - one pass carries 20,160 world
+#      triangles - but its render target is a 1x1 colour surface (the title
+#      really does init it 1x1 with stride 8, which is GXM's legal minimum), so
+#      nothing of it reaches the display. Only the 27-draw HUD pass targets the
+#      960x544 surface.
+#   2. There is NO game-logic thread left. `threads` at the map lists the
+#      render thread, audio, the FIOS workers and one "NEW THREAD" blocked on a
+#      semaphore that nothing signals. The main thread is gone.
+# So the map is a STALL to diagnose, not a screen to find the right tap for.
+# ============================================================================
+
+0: @section boot
+# No input while it loads. This is the boot ladder of boot.recipe, unchanged.
+
+28000: cross
+28000: @shot title-screen
+28020:
+# "PRESS ANY BUTTON TO START" -> GAME MODE
+
+28620: touch=472,524
+28620: @shot game-mode
+28640:
+# The SINGLE PLAYER CAMPAIGN tile (screen 236,262). The two greyed tiles are
+# ONLINE CAMPAIGN and CROSS-PLAY - this build is signed out, so they are
+# correctly unavailable.
+
+29040: cross
+29040: @shot campaign-intro
+29060:
+# The intro text ("Touch the nodes to play events"). `cross` brings up its
+# confirm checkmark rather than dismissing it.
+
+29460: touch=1760,952
+29460: @shot campaign-intro-confirm
+29480:
+# The checkmark, bottom right (screen 880,476).
+
+33000: @section campaign-map
+33000: @shot campaign-map
+
+# @todo The map is frozen - see the header. Next: find who should signal the
+# semaphore "NEW THREAD" waits on, and why the map pass targets a 1x1 surface.
+# @todo No @assert yet: the map has no progress value, and the screens above
+# are only evidenced by their shots. The first assertable thing here would be a
+# watch on whatever the front end advances when a node is selected.

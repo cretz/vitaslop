@@ -20,3 +20,8 @@ region = "NTSC"
 id = "PCSE00001"
 name = "Ridge Racer"
 region = "NTSC"
+
+[[game]]
+id = "PCSA00015"
+name = "WipEout 2048"
+region = "NTSC"

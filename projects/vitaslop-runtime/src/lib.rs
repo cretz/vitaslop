@@ -27,6 +27,7 @@ pub mod knobs;
 pub mod mp4;
 pub mod mspace;
 pub mod perf;
+pub mod pvrtc;
 pub mod recipe;
 pub mod sched;
 pub mod render;

@@ -164,7 +164,7 @@ fn track_pc() -> bool {
 /// Function indices of the host imports (imports occupy the low function-index
 /// space, in declaration order).
 const SVC_FUNC: u32 = 0;
-const IMPORT_FUNC: u32 = 1;
+pub(crate) const IMPORT_FUNC: u32 = 1;
 /// `env.dispatch_miss(target, caller)`: the indirect-call dispatcher calls this
 /// when a runtime function-pointer matches no translated function, so an unmapped
 /// target becomes a reported, debuggable trap instead of an opaque `unreachable`.
@@ -441,7 +441,17 @@ pub struct EmitOutput {
     /// writes 1 there once the run reaches the armed frame; until then every
     /// trapping diagnostic is inert. `None` in an ordinary build.
     pub arm_word_off: Option<u64>,
+    /// Linear-memory byte offset of the host-mirror block, when some inline import
+    /// reads it ([`crate::InlineOp::LoadMirror`]). `None` when none does, which
+    /// leaves the memory layout exactly as it was.
+    pub mirror_off: Option<u64>,
 }
+
+/// Host-mirror slots per page. The block is one page, which is far more than the
+/// handful of system values that can ever qualify (a value only belongs here if it
+/// cannot change while guest code runs), so overflowing it means the rule was
+/// abandoned rather than that the block wants growing.
+const MIRROR_SLOTS_PER_PAGE: u32 = abi::PAGE_SIZE / 4;
 
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the guest linear memory;
@@ -465,7 +475,6 @@ pub fn emit_module(
     inline_imports: &[crate::InlineImport],
     import_memory: bool,
 ) -> EmitOutput {
-    let inline = InlineImports::new(inline_imports, mem_bytes);
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
     let host_ty = 0;
@@ -488,10 +497,31 @@ pub fn emit_module(
     // (see `arm_at_frame`), and only when that knob is set - an ordinary build's
     // memory layout is unchanged. Its own page, so no guest allocation or dispatch
     // entry can ever share a cache line with it.
-    let arm_word_off =
-        arm_at_frame().map(|_| (guest_pages + addr_table_pages) * abi::PAGE_SIZE as u64);
+    //
+    // Above those, and only when something actually reads it, one page holds the
+    // HOST MIRROR block (see `crate::InlineOp::LoadMirror`). It is placed here for
+    // the same reason as the armed word: outside the guest region, so no guest
+    // allocation can reach it and no guest store can corrupt it.
+    let mirror_slots = inline_imports.iter().filter_map(|i| i.op.mirror_slot()).max();
+    if let Some(top) = mirror_slots {
+        assert!(
+            top < MIRROR_SLOTS_PER_PAGE,
+            "host-mirror slot {top} does not fit the one-page block ({MIRROR_SLOTS_PER_PAGE} slots)",
+        );
+    }
+    let mirror_off =
+        mirror_slots.map(|_| (guest_pages + addr_table_pages) * abi::PAGE_SIZE as u64);
+    let arm_word_off = arm_at_frame().map(|_| {
+        (guest_pages + addr_table_pages + u64::from(mirror_off.is_some())) * abi::PAGE_SIZE as u64
+    });
     ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
-    let total_pages = guest_pages + addr_table_pages + u64::from(arm_word_off.is_some());
+    let total_pages = guest_pages
+        + addr_table_pages
+        + u64::from(mirror_off.is_some())
+        + u64::from(arm_word_off.is_some());
+    // Built here rather than at the top of the function because an inline mirror read
+    // needs the block's address, which is part of the layout just computed.
+    let inline = InlineImports::new(inline_imports, mem_bytes, mirror_off);
 
     // Preemptive multithreading (the native `ThreadedScheduler`) runs each guest
     // thread as its own instance so their register globals stay independent, but
@@ -682,7 +712,7 @@ pub fn emit_module(
         name_section.functions(&names);
         module.section(&name_section);
     }
-    EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32, arm_word_off }
+    EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32, arm_word_off, mirror_off }
 }
 
 /// Emit the indirect-call dispatcher: `(target: i32, caller: i32) -> ()`. It masks
@@ -3361,46 +3391,83 @@ pub struct InlineImports {
     ops: BTreeMap<u32, crate::InlineOp>,
     /// Guest region size in bytes - the bound an inline load must stay inside.
     mem_bytes: u32,
+    /// Linear-memory offset of the host-mirror block, when the layout reserved one.
+    mirror_off: Option<u64>,
+}
+
+/// How a given import lowers inline, with the operand the emitter needs.
+enum InlineLowering {
+    /// Read through the pointer in r0, falling back to the host call unless the
+    /// rebased pointer is `<= limit`.
+    Guest { offset: u32, shift: u32, mask: u32, limit: u32 },
+    /// Read the host-mirror word at this fixed linear-memory offset. No guard: the
+    /// address is a constant inside the module's own reserved page, so there is no
+    /// out-of-range case to fall back for.
+    Mirror { off: u64 },
 }
 
 impl InlineImports {
-    fn new(list: &[crate::InlineImport], mem_bytes: u32) -> Self {
+    fn new(list: &[crate::InlineImport], mem_bytes: u32, mirror_off: Option<u64>) -> Self {
         InlineImports {
             ops: list.iter().map(|i| (i.import, i.op)).collect(),
             mem_bytes,
+            mirror_off,
         }
     }
 
-    /// The inline form of import `index`, together with the highest REBASED address
-    /// at which it may be used. `None` when the import has no inline form, or when
-    /// guest memory is too small for the load to ever be in range (in which case the
-    /// host call is not merely correct but the only option).
-    fn lower(&self, index: u32) -> Option<(crate::InlineOp, u32)> {
-        let op = *self.ops.get(&index)?;
-        // The load reads 4 bytes at `offset + op.offset()`, so the last rebased
-        // address it may start from is `mem_bytes - 4 - op.offset()`.
-        let limit = self.mem_bytes.checked_sub(4)?.checked_sub(op.offset())?;
-        Some((op, limit))
+    /// How import `index` lowers inline. `None` when the import has no inline form, or
+    /// when guest memory is too small for the load to ever be in range (in which case
+    /// the host call is not merely correct but the only option).
+    fn lower(&self, index: u32) -> Option<InlineLowering> {
+        match *self.ops.get(&index)? {
+            crate::InlineOp::LoadShiftMask { offset, shift, mask } => {
+                // The load reads 4 bytes at `r0 - base + offset`, so the last rebased
+                // address it may start from is `mem_bytes - 4 - offset`.
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
+                Some(InlineLowering::Guest { offset, shift, mask, limit })
+            }
+            crate::InlineOp::LoadMirror { slot } => {
+                // The block is reserved by the same layout pass that fills `mirror_off`
+                // from these very ops, so a mirror op without a block is a bug here, not
+                // a condition to paper over with a host call.
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                Some(InlineLowering::Mirror { off: base + slot as u64 * 4 })
+            }
+        }
     }
 }
 
 /// Emit a host-import call: either the real trap, or - for an import with an inline
-/// form - the guest-memory read it amounts to.
+/// form - the memory read it amounts to.
 ///
-/// The inline form is guarded so it is EXACTLY equivalent to the host call, never
-/// merely equivalent in the expected case. `r0 - base` is compared unsigned against
-/// the highest address the load may start from, which rejects both a pointer below
-/// the image base (the subtraction wraps to a huge value - this is the null-pointer
-/// case) and one too near the end of guest memory, in a single comparison. Either way
-/// the real host call runs, so the handler stays the definition of the behaviour and
-/// the odd cases keep their exact old semantics.
+/// A pointer-reading inline form is guarded so it is EXACTLY equivalent to the host
+/// call, never merely equivalent in the expected case. `r0 - base` is compared
+/// unsigned against the highest address the load may start from, which rejects both a
+/// pointer below the image base (the subtraction wraps to a huge value - this is the
+/// null-pointer case) and one too near the end of guest memory, in a single
+/// comparison. Either way the real host call runs, so the handler stays the definition
+/// of the behaviour and the odd cases keep their exact old semantics.
+///
+/// A host-mirror read takes no pointer and needs no guard: its address is a constant
+/// inside a page this module reserved, so it is always in range. What makes IT exact
+/// is the host-side contract in [`crate::InlineOp::LoadMirror`], not a guard here.
 fn emit_import(f: &mut Function, index: u32, base: u32, inline: &InlineImports) {
-    let Some((op, limit)) = inline.lower(index) else {
-        f.instruction(&W::I32Const(index as i32));
-        f.instruction(&W::Call(IMPORT_FUNC));
-        return;
+    let (offset, shift, mask, limit) = match inline.lower(index) {
+        None => {
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            return;
+        }
+        Some(InlineLowering::Mirror { off }) => {
+            // r0 = the mirror word. Address zero plus a constant `offset`, so the whole
+            // read is one `i32.load` against a literal.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off, align: 0, memory_index: 0 }));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            return;
+        }
+        Some(InlineLowering::Guest { offset, shift, mask, limit }) => (offset, shift, mask, limit),
     };
-    let crate::InlineOp::LoadShiftMask { offset, shift, mask } = op;
     // t0 = r0 - base, the rebased address of the pointer argument.
     f.instruction(&W::GlobalGet(abi::reg_global(0)));
     f.instruction(&W::I32Const(base as i32));

@@ -73,7 +73,12 @@ pub enum ParamType {
 }
 
 impl ParamType {
-    fn from_bits(v: u8) -> Self {
+    /// Decode the parameter record's type nibble. Public because the runtime decodes the SAME
+    /// nibble straight out of guest memory: `sceGxmSetUniformDataF` is handed a pointer to one
+    /// of these records and must know how wide a component is before it can write one - an F16
+    /// uniform packs two components per register, and assuming four bytes each puts every
+    /// component after the first at the wrong offset.
+    pub fn from_bits(v: u8) -> Self {
         match v {
             0 => ParamType::F32,
             1 => ParamType::F16,
@@ -119,16 +124,29 @@ const SAMPLER_CUBE_BIT: u32 = 0x1000_0000;
 /// plain interpolated texcoord - the PDS can fetch it before the shader starts and leave the
 /// result sitting in the primary-attribute bank, which is why such samples never appear as SMP
 /// instructions in the instruction stream. See [`SamplePrefetch`] for the fields that describe
-/// one, and [`INFO_PREFETCH`] / [`INFO_PREFETCH_LAST`] for the two redundant flags that confirm
-/// the decode.
-const SIZE_PREFETCH: u32 = 0x40;
+/// one, and [`INFO_PREFETCH`] / [`INFO_PREFETCH_LAST`] for the flags that confirm the decode.
+///
+/// `size` bit 6 is NOT one of them, and used to be treated as one. MEASURED over a 314-blob
+/// corpus, tabulating every descriptor by these bits: `attribute_info & 0x100` and
+/// `component_info & 0x20` are equal on EVERY descriptor - all thirty distinct combinations -
+/// while `size & 0x40` differs from them on fourteen, every one of which is a genuine prefetch
+/// (it names a texture unit and a source texcoord). Requiring all three to agree therefore
+/// threw away those fourteen programs' entire interpolant lists, and with them a title's whole
+/// post-process chain: sixteen of its seventeen draws fell back to fixed-function and its
+/// bloom/tonemap targets came out black.
+///
+/// What `size` bit 6 does mean is NOT established. It co-occurs exactly with
+/// `component_info == 0x70` (rather than `0x20`), so the two are one fact seen twice, but
+/// nothing here depends on knowing which fact - so it is read as an independent field and left
+/// alone rather than given a meaning it has not earned.
+const _SIZE_BIT6_NOT_A_PREFETCH_FLAG: u32 = 0x40;
 
-/// `component_info` value a fragment varying descriptor carries exactly when it declares a
-/// prefetched sample - the third, redundant statement of [`SIZE_PREFETCH`]. All three are
-/// cross-checked on parse; a program where they disagree is not decoded at all.
+/// `component_info` bit a fragment varying descriptor carries exactly when it declares a
+/// prefetched sample - the redundant statement of [`INFO_PREFETCH`]. The two are cross-checked
+/// on parse; a program where they disagree is not decoded at all.
 const COMPONENT_INFO_PREFETCH: u32 = 0x20;
 
-/// `attribute_info` bit that repeats [`SIZE_PREFETCH`].
+/// `attribute_info` bit marking a descriptor that declares a prefetched sample.
 const INFO_PREFETCH: u32 = 0x0000_0100;
 
 /// `attribute_info` bit marking the LAST prefetched sample in the program's descriptor array
@@ -232,9 +250,20 @@ pub struct Interpolant {
     /// PA register) rather than one F32 per register - the `attribute_info` precision field.
     /// This decides how many interpolated components the vertex stage must supply for it.
     pub half: bool,
-    /// A texture sample the PDS leaves in the two registers at `pa_base + register_count`,
-    /// as four packed F16 components.
+    /// A texture sample the PDS leaves in the registers at `pa_base + register_count`, as
+    /// packed F16 components - [`Interpolant::prefetch_regs`] of them.
     pub prefetch: Option<SamplePrefetch>,
+    /// How many PA registers this descriptor's prefetched sample occupies: 2 (four packed F16
+    /// components) or 1 (two).
+    ///
+    /// This is what `size` bit 6 means. MEASURED by the closure the whole PA layout rests on -
+    /// the descriptor spans must sum to the program's own `primary_reg_count`. Reading every
+    /// prefetch as two registers makes fourteen of a title's fragment programs overrun their
+    /// declared count by EXACTLY ONE each, and every one of those fourteen is a descriptor
+    /// with `size` bit 6 clear; reading those as one register closes all fourteen exactly.
+    /// No other assignment closes them, because the miss is a constant one register per
+    /// program and each has exactly one such descriptor.
+    pub prefetch_regs: u8,
 }
 
 impl Interpolant {
@@ -291,6 +320,14 @@ pub struct Program {
     /// position) lands in, which is how the recompiled fragment's `pa[]` is fed from the
     /// vertex stage (positional-by-usage linkage).
     pub interpolants: Vec<Interpolant>,
+    /// Why [`Program::interpolants`] is empty, when it is empty because the varyings block
+    /// could not be decoded rather than because the program declares none.
+    ///
+    /// The two are completely different situations and used to be the same value. A fragment
+    /// that genuinely has no interpolants is fine; one whose block failed to decode reads PA
+    /// registers nothing feeds, and the link then fails with "no declared interpolant covers
+    /// it" - a message that describes the SYMPTOM and hides the cause, which is here.
+    pub varyings_error: Option<&'static str>,
     /// Vertex interpolated OUTPUTS (the varyings this vertex program produces), decoded from
     /// the varyings block. Empty for a fragment program, and empty for a vertex program whose
     /// decoded placement does not reproduce the block's own total output-lane count - the
@@ -495,10 +532,16 @@ impl Program {
         let temp_reg_count = temp1.max(temp2);
 
         let parameters = parse_parameters(bytes)?;
-        let (interpolants, output_varyings) = if kind == ProgramKind::Fragment {
-            (parse_fragment_interpolants(bytes), Vec::new())
+        let (interpolants, varyings_error, output_varyings) = if kind == ProgramKind::Fragment {
+            match parse_fragment_interpolants(bytes) {
+                Ok(v) => (v, None, Vec::new()),
+                Err(why) => (Vec::new(), Some(why), Vec::new()),
+            }
         } else {
-            (Vec::new(), parse_vertex_output_varyings(bytes))
+            match parse_vertex_output_varyings(bytes) {
+                Ok(v) => (Vec::new(), None, v),
+                Err(why) => (Vec::new(), Some(why), Vec::new()),
+            }
         };
 
         // USSE code region: [asm_abs .. min(literal_abs, params_abs)]. Self-relative
@@ -557,6 +600,7 @@ impl Program {
             code,
             secondary_code,
             interpolants,
+            varyings_error,
             output_varyings,
             hash: fnv1a64(bytes),
         })
@@ -596,25 +640,69 @@ impl Program {
 /// Best-effort and never fails the whole parse: any out-of-range read yields an empty list
 /// (the renderer then falls back to the fixed-function path, never a wrong binding). The
 /// oracle harness cross-checks the decoded texcoord PA spans against the SMP coordinate reads.
-fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
+/// The RAW varying descriptors of a fragment program, as
+/// `[attribute_info, resource_index, size, component_info]` per entry.
+///
+/// For reverse engineering the varyings block: when [`parse_fragment_interpolants`] refuses a
+/// blob, the only way forward is to look at the words it refused, and reconstructing the block
+/// address by hand from a hex dump is exactly the kind of step that gets done wrong. Returns
+/// an empty list when the block itself cannot be located.
+pub fn raw_varying_descriptors(bytes: &[u8]) -> Vec<[u32; 4]> {
+    const DESCRIPTOR_LEN: usize = 16;
+    let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET).filter(|r| *r != 0) else { return Vec::new() };
+    let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else { return Vec::new() };
+    let Some(count) = rd_u16(bytes, block + 0x0c).map(usize::from).filter(|c| *c <= 32) else {
+        return Vec::new();
+    };
+    let arr_field = block + 0x10;
+    let Some(arr) = rd_u32(bytes, arr_field).and_then(|r| arr_field.checked_add(r as usize)) else {
+        return Vec::new();
+    };
+    (0..count)
+        .filter_map(|i| {
+            let d = arr + i * DESCRIPTOR_LEN;
+            Some([
+                rd_u32(bytes, d)?,
+                rd_u32(bytes, d + 4)?,
+                rd_u32(bytes, d + 8)?,
+                rd_u32(bytes, d + 12)?,
+            ])
+        })
+        .collect()
+}
+
+fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'static str> {
     const DESCRIPTOR_LEN: usize = 16;
 
-    let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else { return Vec::new() };
+    let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else {
+        return Err("the varyings-block offset field is outside the blob");
+    };
     if rel == 0 {
-        return Vec::new();
+        return Err("the program declares no varyings block (offset 0)");
     }
-    let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else { return Vec::new() };
-    let Some(count) = rd_u16(bytes, block + 0x0c) else { return Vec::new() };
+    let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else {
+        return Err("the varyings-block offset overflows");
+    };
+    let Some(count) = rd_u16(bytes, block + 0x0c) else {
+        return Err("the varyings count is outside the blob");
+    };
     let count = count as usize;
     // A sane fragment program has a handful of varyings; reject an absurd count rather than
     // walk off the blob (a sign the block offset is wrong for this blob).
-    if count == 0 || count > 32 {
-        return Vec::new();
+    if count == 0 {
+        return Err("the varyings block declares a count of 0");
+    }
+    if count > 32 {
+        return Err("the varyings count is absurd (>32), so the block offset is wrong here");
     }
     // The descriptor array is at a self-relative offset stored at block + 0x10.
     let arr_field = block + 0x10;
-    let Some(arr_rel) = rd_u32(bytes, arr_field) else { return Vec::new() };
-    let Some(arr) = arr_field.checked_add(arr_rel as usize) else { return Vec::new() };
+    let Some(arr_rel) = rd_u32(bytes, arr_field) else {
+        return Err("the descriptor-array offset field is outside the blob");
+    };
+    let Some(arr) = arr_field.checked_add(arr_rel as usize) else {
+        return Err("the descriptor-array offset overflows");
+    };
 
     let mut out = Vec::with_capacity(count);
     let mut pa_base: u32 = 0;
@@ -623,7 +711,8 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         let (Some(attribute_info), Some(resource_index), Some(size), Some(component_info)) =
             (rd_u32(bytes, d), rd_u32(bytes, d + 4), rd_u32(bytes, d + 8), rd_u32(bytes, d + 12))
         else {
-            return Vec::new(); // ran off the blob -> layout mismatch for this blob; bind nothing
+            // Ran off the blob -> layout mismatch for this blob; bind nothing.
+            return Err("a varying descriptor lies outside the blob");
         };
         let usage = varying_usage_from_attribute_info(attribute_info);
         // A descriptor whose semantic nibble is 0xF interpolates NOTHING: it exists only to
@@ -646,30 +735,30 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
         // always F32 (four components is a texcoord's maximum).
         let half = attribute_info & 0x2000_0000 != 0;
 
-        // Three independent fields state whether a prefetched sample rides along. They agree on
-        // every captured blob, so a disagreement means this program's varyings block is not the
-        // layout decoded here - bind nothing rather than a wrong PA register map.
+        // TWO independent fields state whether a prefetched sample rides along, and they agree
+        // on every descriptor of every captured blob, so a disagreement means this program's
+        // varyings block is not the layout decoded here - bind nothing rather than a wrong PA
+        // register map. (`size` bit 6 was once a third; see
+        // `_SIZE_BIT6_NOT_A_PREFETCH_FLAG` for the measurement that removed it.)
         let source = attribute_info & INFO_PREFETCH_SOURCE;
         let flags = [
-            size & SIZE_PREFETCH != 0,
             attribute_info & INFO_PREFETCH != 0,
             // A BIT test, not equality: a retail title has a descriptor carrying 0x30 here, and
             // rejecting it threw away that whole program's interpolant list (the parse is
-            // all-or-nothing) over a bit that is not the prefetch flag. Across the corpus
-            // this field is only ever 0x00 or 0x20, so the flag itself is unambiguous.
+            // all-or-nothing) over a bit that is not the prefetch flag.
             component_info & COMPONENT_INFO_PREFETCH != 0,
         ];
         let prefetch = match flags {
-            [false, false, false] => {
+            [false, false] => {
                 // A descriptor with no prefetch names no unit and no source.
                 if source != PREFETCH_SOURCE_NONE || resource_index != 0 {
-                    return Vec::new();
+                    return Err("a descriptor carries no prefetch flag yet names a unit or source");
                 }
                 None
             }
-            [true, true, true] => {
+            [true, true] => {
                 if source > MAX_TEXCOORD as u32 || resource_index > u8::MAX as u32 {
-                    return Vec::new();
+                    return Err("a prefetch descriptor names an out-of-range texcoord or unit");
                 }
                 Some(SamplePrefetch {
                     unit: resource_index as u8,
@@ -677,10 +766,18 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
                     last: attribute_info & INFO_PREFETCH_LAST != 0,
                 })
             }
-            _ => return Vec::new(),
+            _ => {
+                return Err(
+                    "the two prefetch flags of a descriptor disagree, so this program's \
+                     varyings block is not the layout decoded here",
+                )
+            }
         };
 
-        let span = register_count + if prefetch.is_some() { 2 } else { 0 };
+        // `size` bit 6 says the prefetched sample occupies TWO PA registers (four packed F16
+        // components) rather than one - see `Interpolant::prefetch_regs`.
+        let prefetch_regs = if size & 0x40 != 0 { 2 } else { 1 };
+        let span = register_count + if prefetch.is_some() { prefetch_regs } else { 0 };
         out.push(Interpolant {
             usage,
             pa_base: pa_base.min(u8::MAX as u32) as u8,
@@ -688,10 +785,11 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Vec<Interpolant> {
             span,
             half,
             prefetch,
+            prefetch_regs,
         });
         pa_base += span as u32;
     }
-    out
+    Ok(out)
 }
 
 /// The OUTPUT lanes a vertex program's clip POSITION occupies. The rasteriser consumes these;
@@ -770,14 +868,20 @@ const COLOR0_RESERVED_LANES: u32 = 4;
 ///
 /// The same rule still covers every other width: a fragment reading a varying we did not place
 /// falls back rather than sample an uninterpolated register.
-fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
-    let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else { return Vec::new() };
+fn parse_vertex_output_varyings(bytes: &[u8]) -> Result<Vec<OutputVarying>, &'static str> {
+    let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else {
+        return Err("the varyings-block offset field is outside the blob");
+    };
     if rel == 0 {
-        return Vec::new();
+        // No block at all. A program with no varyings block outputs clip position and nothing
+        // else, which is exactly what a depth-only (shadow/z-prepass) vertex program is.
+        return Ok(Vec::new());
     }
-    let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else { return Vec::new() };
+    let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else {
+        return Err("the varyings-block offset overflowed");
+    };
     let (Some(vo1), Some(vo2)) = (rd_u32(bytes, block + 0x10), rd_u32(bytes, block + 0x14)) else {
-        return Vec::new();
+        return Err("the varyings block's two output words lie outside the blob");
     };
 
     let widths: Vec<(u8, u32)> = (0..=MAX_TEXCOORD as u32)
@@ -792,8 +896,12 @@ fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
     // what validates the result, so it does not need a texcoord to be trustworthy.
     let total_lanes = vo1 >> 24;
     let texcoord_lanes: u32 = widths.iter().map(|&(_, n)| n).sum();
-    let Some(base_lane) = total_lanes.checked_sub(texcoord_lanes) else { return Vec::new() };
-    let Some(reserved) = base_lane.checked_sub(VERTEX_POSITION_LANES) else { return Vec::new() };
+    let Some(base_lane) = total_lanes.checked_sub(texcoord_lanes) else {
+        return Err("the decoded texcoord widths exceed the block's own total output-lane count");
+    };
+    let Some(reserved) = base_lane.checked_sub(VERTEX_POSITION_LANES) else {
+        return Err("the block declares fewer output lanes than the clip position occupies");
+    };
 
     let mut out = Vec::new();
     if reserved == FOG_RESERVED_LANES {
@@ -815,7 +923,7 @@ fn parse_vertex_output_varyings(bytes: &[u8]) -> Vec<OutputVarying> {
         out.push(OutputVarying { usage: VaryingUsage::TexCoord(k), base_lane: lane, components });
         lane += components;
     }
-    out
+    Ok(out)
 }
 
 /// Decode a fragment interpolant descriptor's usage from its `attribute_info` semantic nibble
@@ -1217,6 +1325,7 @@ mod tests {
                     span: 4,
                     half: true,
                     prefetch: Some(SamplePrefetch { unit: 13, source_texcoord: 0, last: false }),
+                    prefetch_regs: 2,
                 },
                 Interpolant {
                     usage: VaryingUsage::TexCoord(2),
@@ -1225,6 +1334,7 @@ mod tests {
                     span: 4,
                     half: true,
                     prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 3, last: true }),
+                    prefetch_regs: 2,
                 },
                 Interpolant {
                     usage: VaryingUsage::TexCoord(3),
@@ -1233,6 +1343,8 @@ mod tests {
                     span: 4,
                     half: false,
                     prefetch: None,
+                    // No prefetch rides along, so this only reflects `size` bit 6 (clear here).
+                    prefetch_regs: 1,
                 },
             ]
         );
@@ -1244,20 +1356,33 @@ mod tests {
 
     #[test]
     fn descriptors_whose_prefetch_flags_disagree_are_not_decoded() {
-        // Three independent fields state whether a prefetched sample rides along, and they agree
-        // on every captured blob. A descriptor where they do not is not the layout decoded here,
-        // so the whole block yields nothing and the renderer falls back - rather than shift every
-        // later interpolant's PA base by two and silently feed the shader the wrong registers.
+        // TWO independent fields state whether a prefetched sample rides along, and they agree
+        // on every descriptor of every captured blob. A descriptor where they do not is not the
+        // layout decoded here, so the whole block yields nothing and the renderer falls back -
+        // rather than shift every later interpolant's PA base by two and silently feed the
+        // shader the wrong registers.
+        //
+        // `size` bit 6 is deliberately NOT one of them: it disagrees with the other two on
+        // fourteen real descriptors that are unambiguously prefetches, and demanding it agree
+        // discarded those programs entirely. The third case below pins that - the same
+        // descriptor that used to be rejected for lacking bit 6 must now decode.
         for bad in [
-            (0x2cc0_1100u32, 13u32, 0x50u32, 0x00u32), // size + attribute_info, no component_info
-            (0x2cc0_1000, 13, 0x50, 0x20),             // size + component_info, no attribute_info
-            (0x2cc0_1100, 13, 0x10, 0x20),             // attribute_info + component_info, no size
+            (0x2cc0_1100u32, 13u32, 0x50u32, 0x00u32), // attribute_info, no component_info
+            (0x2cc0_1000, 13, 0x50, 0x20),             // component_info, no attribute_info
         ] {
             assert!(
                 Program::parse(&build_frag_with_varyings(&[bad])).unwrap().interpolants.is_empty(),
                 "{bad:x?} should not decode"
             );
         }
+        // A prefetch descriptor WITHOUT `size` bit 6 decodes - it is a real prefetch, and the
+        // corpus has fourteen of them. This is the regression guard for the class of program
+        // that was being thrown away whole.
+        let no_size_bit6 = build_frag_with_varyings(&[(0x2cc0_1100, 13, 0x10, 0x20)]);
+        let decoded = Program::parse(&no_size_bit6).unwrap();
+        assert_eq!(decoded.interpolants.len(), 1, "a prefetch without size bit 6 must decode");
+        assert!(decoded.interpolants[0].prefetch.is_some());
+
         // A descriptor with no prefetch names neither a source texcoord nor a texture unit.
         let unit_without_prefetch = build_frag_with_varyings(&[(0x0cc0_300f, 13, 0x30, 0x00)]);
         assert!(Program::parse(&unit_without_prefetch).unwrap().interpolants.is_empty());

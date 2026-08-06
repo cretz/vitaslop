@@ -6,6 +6,8 @@
 
 use crate::capture::{ColorSurface, VertexAttribute};
 use crate::host::{GuestCtx, VitaState, MAX_VERTEX_STREAMS};
+use crate::render::f32_to_half;
+use vitaslop_gxp_shader::ParamType;
 use crate::hostcall;
 
 /// SceGxmInitializeParams: displayQueueCallback at offset 8, its data size at 12.
@@ -17,11 +19,145 @@ pub(super) fn ok(ctx: &mut GuestCtx) {
     ctx.ret(0);
 }
 
+/// int sceGxmMapMemory(void *base, SceSize size, SceGxmMemoryAttribFlags attr)
+///
+/// The guest's pages already ARE the memory the capture reads, so nothing is mapped -
+/// but the RANGE is remembered, because `sceGxmUnmapMemory` is given only a base and
+/// has to be able to invalidate what was cached from it.
+pub(super) fn map_memory(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let base = ctx.arg(0);
+    let size = ctx.arg(1);
+    st.gxm_map(base, size);
+    ctx.ret(0);
+}
+
 /// Map*UsseMemory(base, size, unsigned int *usseOffset): return offset 0.
-pub(super) fn map_usse(ctx: &mut GuestCtx) {
+pub(super) fn map_usse(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let base = ctx.arg(0);
+    let size = ctx.arg(1);
     let out = ctx.arg(2);
+    st.gxm_map(base, size);
     ctx.write_u32(out, 0);
     ctx.ret(0);
+}
+
+/// int sceGxmCreateRenderTarget(const SceGxmRenderTargetParams *params,
+///     SceGxmRenderTarget **renderTarget)
+///
+/// Hands back an opaque handle like any other create call, and remembers two things
+/// from the params block: the `driverMemBlock` UID at +0x10, so
+/// `sceGxmRenderTargetGetDriverMemBlock` returns the block the guest actually
+/// supplied rather than a guess, and the `width`/`height` at +0x04/+0x06, which are
+/// the EXTENT every scene begun on this target rasterizes into (see
+/// [`VitaState::render_target_extent`]).
+///
+/// `SceGxmRenderTargetParams` (vitasdk `gxm.h`, asserted 0x14 bytes): `uint32 flags`,
+/// `uint16 width`, `uint16 height`, `uint16 scenesPerFrame`, `uint16 multisampleMode`,
+/// `uint32 multisampleLocations`, `SceUID driverMemBlock`.
+pub(super) fn create_render_target(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let params = ctx.arg(0);
+    let out = ctx.arg(1);
+    let handle = st.new_handle();
+    let dims = ctx.read_u32(params + 0x04);
+    let (width, height) = (dims & 0xFFFF, dims >> 16);
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        target_handle = format_args!("{handle:#x}"),
+        width, height,
+        params = format_args!("{params:#x}"),
+        raw = format_args!(
+            "{:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+            ctx.read_u32(params),
+            ctx.read_u32(params + 4),
+            ctx.read_u32(params + 8),
+            ctx.read_u32(params + 12),
+            ctx.read_u32(params + 16),
+        ),
+        caller = format_args!("{:#010x}", ctx.regs[14]),
+        "createRenderTarget"
+    );
+    st.set_render_target_extent(handle, width, height);
+    st.set_render_target_mem_block(handle, ctx.read_u32(params + 0x10));
+    report_multisample_mode(handle, width, height, (ctx.read_u32(params + 0x08) >> 16) & 0xFFFF);
+    // A render target whose extent decodes DEGENERATE is either a title creating a real 1x1
+    // probe or this reader looking at the wrong bytes, and those need opposite responses. The
+    // 20-byte params block is the only thing that tells them apart, so print it unconditionally
+    // rather than behind a log level: on one retail title the world pass comes through a target
+    // that decodes 1x1 while every draw in it sets a 960x544 viewport, and a 1x1 target with a
+    // 1x1 valid region would clip that pass away entirely on hardware.
+    {
+        eprintln!(
+            "gxm render target {handle:#x} extent {width}x{height}{} - raw \
+             SceGxmRenderTargetParams at {params:#x}: {:#010x} {:#010x} {:#010x} {:#010x} \
+             {:#010x} (flags, width|height<<16, scenesPerFrame|multisample<<16, \
+             multisampleLocations, driverMemBlock), caller lr={:#010x}",
+            if width <= 1 || height <= 1 { " DEGENERATE" } else { "" },
+            ctx.read_u32(params),
+            ctx.read_u32(params + 4),
+            ctx.read_u32(params + 8),
+            ctx.read_u32(params + 12),
+            ctx.read_u32(params + 16),
+            ctx.regs[14],
+        );
+        // Every render target here is created through ONE thin wrapper, so the immediate `lr`
+        // is the same for the good sizes and the degenerate ones and says nothing. The chain
+        // above it is what differs: the caller that computed 1x1 is the bug, and it is several
+        // frames up. A stack SCAN, not a frame-pointer walk - ARM leaf frames often keep none -
+        // so these are candidates ordered by depth, not proof.
+        let sp = ctx.regs[13];
+        let chain: Vec<String> = (0..192u32)
+            .map(|i| ctx.read_u32(sp.wrapping_add(i * 4)))
+            .filter(|v| (0x8100_0000..0x8200_0000).contains(v))
+            .map(|v| format!("{v:#010x}"))
+            .collect();
+        eprintln!("gxm render target {handle:#x}: caller candidates [{}]", chain.join(" "));
+    }
+    ctx.write_u32(out, handle);
+    ctx.ret(0);
+}
+
+/// Report - once per (target, mode) - the MULTISAMPLE mode a render target was created with,
+/// and that we rasterize it at one sample regardless.
+///
+/// `SceGxmMultisampleMode` is `NONE`/`2X`/`4X`, and 4X means the hardware keeps 2x2 samples per
+/// pixel - which is why a 960x544 colour surface on this hardware carries a **1920x1088** depth
+/// surface, a pairing that otherwise reads as a decode error. Rendering it at one sample is an
+/// approximation (the title is aliased relative to hardware), and an approximation says so.
+/// The multisample mode a render target was created with, by handle. Recorded here rather than
+/// in `VitaState` because the only consumer is diagnostic - but it has to be a RECORD and not a
+/// re-read of the params struct, which is a caller stack frame that is gone by `beginScene`.
+static MULTISAMPLE_BY_TARGET: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> =
+    std::sync::Mutex::new(None);
+
+fn multisample_mode_of(handle: u32) -> u32 {
+    let g = MULTISAMPLE_BY_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(&handle).copied()).unwrap_or(0)
+}
+
+fn report_multisample_mode(handle: u32, width: u32, height: u32, mode: u32) {
+    {
+        let mut g = MULTISAMPLE_BY_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(std::collections::HashMap::new).insert(handle, mode);
+    }
+    if mode == 0 {
+        return;
+    }
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert((handle, mode)) {
+        let (name, dw, dh) = match mode {
+            1 => ("2X", width * 2, height),
+            2 => ("4X", width * 2, height * 2),
+            _ => ("an unrecognised mode", width, height),
+        };
+        eprintln!(
+            "gxm render target {handle:#x} ({width}x{height}) was created MULTISAMPLED ({name}), \
+             so on hardware its depth surface is {dw}x{dh} samples - we rasterize it at ONE \
+             sample, which is more aliased than the title intends"
+        );
+    }
 }
 
 /// A create-call that writes a fresh opaque handle to its out-pointer at
@@ -88,21 +224,6 @@ fn param_word(ctx: &GuestCtx, param: u32) -> u32 {
     ctx.read_u32(param.wrapping_add(4)) & 0xffff
 }
 
-/// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
-/// ones the transpiler could emit inline.
-///
-/// This is the A/B switch for the inline mechanism, and it earns its keep because
-/// inlining changes how much wasm the guest executes, which changes fuel consumption,
-/// which changes WHERE the preemptive scheduler switches threads - so an inlined build
-/// legitimately reports a different determinism signature without computing anything
-/// differently. Turning inlining off is how a signature is compared against a
-/// pre-inlining run, which is the only way to tell a real behaviour change from that
-/// re-interleaving. Read at LINK time, so it must be set for the whole run.
-fn no_inline_imports() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VITASLOP_NO_INLINE_IMPORTS").is_some())
-}
-
 /// Byte offset of the packed attribute word within a `SceGxmProgramParameter`.
 const GXM_PARAM_WORD_OFF: u32 = 4;
 /// Byte offset of a parameter's `array_size`.
@@ -110,8 +231,9 @@ const GXM_PARAM_ARRAY_SIZE_OFF: u32 = 8;
 /// Byte offset of a parameter's `resource_index`.
 const GXM_PARAM_RESOURCE_INDEX_OFF: u32 = 0xC;
 
-/// The inline form of a host import, for the pure GXM reflection getters - or `None`
-/// for every NID that has real behaviour and must stay a host call.
+/// The inline form of a GXM host import, for the pure reflection getters - or `None`
+/// for every NID that has real behaviour and must stay a host call. Reached through
+/// [`crate::vita::inline_op`], which owns the global on/off switch.
 ///
 /// These four getters are, together, the majority of every host call a gameplay frame
 /// makes: a title re-reflects its shader parameter tables per material, per frame. Each
@@ -128,9 +250,6 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
     // The packed word's fields; `param_word` masks the word to 16 bits first, which
     // the 4-bit field masks below make redundant.
     let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf };
-    if no_inline_imports() {
-        return None;
-    }
     Some(match func_nid {
         g::PROGRAM_PARAMETER_GET_CATEGORY => word(0),
         g::PROGRAM_PARAMETER_GET_TYPE => word(4),
@@ -244,8 +363,32 @@ const CS_WIDTH: u32 = 12;
 const CS_HEIGHT: u32 = 16;
 const CS_STRIDE: u32 = 20;
 const CS_DATA: u32 = 24;
+const CS_SCALE: u32 = 28;
 
-/// Write `surface`'s fields into the guest struct so a copy of it stays resolvable.
+/// Byte offset of the `SceGxmTexture backgroundTex` a `SceGxmColorSurface` ends with.
+///
+/// `SceGxmColorSurface` is **0x30 bytes**, not 0x20: `pbeSidebandWord` + `pbeEmitWords[6]` +
+/// `outputRegisterSize` fill the first 32, and a whole 16-byte `SceGxmTexture` follows
+/// (vitasdk `gxm.h`, `VITASDK_BUILD_ASSERT_EQ(0x30, SceGxmColorSurface)`).
+const CS_BACKGROUND_TEX: u32 = 32;
+
+/// Write `surface`'s fields into the guest struct so a copy of it stays resolvable, INCLUDING
+/// the `backgroundTex` a real `sceGxmColorSurfaceInit` leaves at the end of it.
+///
+/// # Why `backgroundTex` is load-bearing and not an optional extra
+/// It is how a title reads its own render target back - both its SIZE and its pixels. Leaving
+/// it zeroed is not a missing convenience; it is a wrong ANSWER, because
+/// `sceGxmTextureGetWidth` on sixteen zero bytes returns 1 (the control words store size-1).
+/// MEASURED on one retail racer: it sizes every screen-sized render target from
+/// `sceGxmTextureGetWidth(&surface->backgroundTex)`, so it created its world, glow and bloom
+/// targets **1x1**, and derived every colour surface and valid region from that. The frame only
+/// looked right because the renderer fell back to guessing each pass's extent from its
+/// viewport. The same gap left twelve texture handles all-zero at bind time - the ones the
+/// title builds from a colour surface - which is what made its whole bloom chain black.
+///
+/// An earlier reading of the same evidence from the other side is recorded above: writing a
+/// ninth word here "corrupted whatever the guest had placed after the struct" and cost a
+/// sampler binding. That was this texture, being overwritten with our field rather than filled.
 fn write_color_surface(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
     ctx.write_u32(addr, COLOR_SURFACE_MAGIC);
     ctx.write_u32(addr + CS_FORMAT, s.format);
@@ -254,6 +397,166 @@ fn write_color_surface(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
     ctx.write_u32(addr + CS_HEIGHT, s.height);
     ctx.write_u32(addr + CS_STRIDE, s.stride_pixels);
     ctx.write_u32(addr + CS_DATA, s.data_addr);
+    ctx.write_u32(addr + CS_SCALE, s.scale_mode);
+    write_background_tex(ctx, addr + CS_BACKGROUND_TEX, s);
+}
+
+/// Fill the 16-byte `SceGxmTexture` that describes `s` itself, at `addr`.
+///
+/// The layout is [`texture_init`]'s, so a title that binds this texture and one that binds a
+/// texture it built by hand over the same memory go down exactly the same path. A surface whose
+/// stride differs from its width is LINEAR_STRIDED (that is what the layout means); otherwise
+/// plain LINEAR.
+fn write_background_tex(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
+    report_background_tex_had_data(ctx, addr);
+    let tex_format = color_format_to_texture_format(s.format);
+    let base_format = (tex_format >> 24) & 0xff;
+    let swizzle = (tex_format >> 12) & 0x7;
+    let type_field =
+        if s.stride_pixels != 0 && s.stride_pixels != s.width { TYPE_LINEAR_STRIDED } else { TYPE_LINEAR };
+    write_texture_control_words(
+        ctx,
+        addr,
+        type_field,
+        base_format,
+        swizzle,
+        s.width,
+        s.height,
+        s.data_addr,
+    );
+}
+
+/// Report - once - that a colour surface's `backgroundTex` slot held data before we filled it.
+///
+/// It should not: `sceGxmColorSurfaceInit` owns those sixteen bytes, so anything already there
+/// is either a title re-initialising a live surface (harmless, the contents are ours) or this
+/// implementation writing over something the title put there, which is the failure the surface
+/// size comment above records a previous session mis-diagnosing. Saying so makes the difference
+/// between the two visible in any run rather than after a pixel diff.
+fn report_background_tex_had_data(ctx: &mut GuestCtx, addr: u32) {
+    let words = [
+        ctx.read_u32(addr),
+        ctx.read_u32(addr + 4),
+        ctx.read_u32(addr + 8),
+        ctx.read_u32(addr + 12),
+    ];
+    if words.iter().all(|w| *w == 0) {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if SEEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "gxm surface: the backgroundTex slot at {addr:#x} already held {:#010x} {:#010x} \
+         {:#010x} {:#010x} before sceGxmColorSurfaceInit filled it",
+        words[0], words[1], words[2], words[3]
+    );
+}
+
+/// Write the four `SceGxmTexture` control words for a texture of this geometry.
+///
+/// Shared by `sceGxmTextureInit*` and by the `backgroundTex` a colour surface carries, so the
+/// two can never drift. Note bit 31 of word 0: a base format above 0x7f does not fit the 5-bit
+/// field in word 1 and its top bit lives there - without it a texture read back from its control
+/// words alone (which is what happens once a title COPIES the struct) silently becomes a
+/// different format, and every compressed format plus `U2F10F10F10` is above 0x7f.
+fn write_texture_control_words(
+    ctx: &mut GuestCtx,
+    addr: u32,
+    type_field: u32,
+    base_format: u32,
+    swizzle: u32,
+    width: u32,
+    height: u32,
+    data: u32,
+) {
+    let w0 = ((base_format >> 7) & 1) << 31;
+    let w1 = (height.saturating_sub(1) & 0xfff)
+        | ((width.saturating_sub(1) & 0xfff) << 12)
+        | ((base_format & 0x1f) << 24)
+        | (type_field << 29);
+    ctx.write_u32(addr, w0);
+    ctx.write_u32(addr + 4, w1);
+    ctx.write_u32(addr + 8, data & 0xffff_fffc);
+    ctx.write_u32(addr + 12, (swizzle & 0x7) << 29);
+}
+
+/// Map a `SceGxmColorFormat` to the `SceGxmTextureFormat` naming the same pixels.
+///
+/// The two enums are separate numberings of the same set, so this is a table, not arithmetic:
+/// a colour format's BASE occupies bits 31:28 plus bits 24 and 23 (mask `0xF1800000`) and its
+/// SWIZZLE bits 21:20, while a texture format's base is bits 31:24 and its swizzle bits 14:12.
+/// Within the four- and three-component families the swizzle enumerations agree name for name,
+/// so those shift straight across; the one- and two-component families do not, and a nonzero
+/// swizzle there is REPORTED rather than translated into a channel order it might not be.
+/// Both tables are from vitasdk `gxm.h`.
+fn color_format_to_texture_format(color_format: u32) -> u32 {
+    let base = color_format & 0xF180_0000;
+    let swizzle = color_format & 0x0030_0000;
+    // (colour base, texture base, does the swizzle enumeration carry across?)
+    const TABLE: [(u32, u32, bool); 25] = [
+        (0x0000_0000, 0x0C00_0000, true),  // U8U8U8U8
+        (0x1000_0000, 0x9800_0000, true),  // U8U8U8
+        (0x3000_0000, 0x0500_0000, true),  // U5U6U5
+        (0x4000_0000, 0x0400_0000, true),  // U1U5U5U5
+        (0x5000_0000, 0x0200_0000, true),  // U4U4U4U4
+        (0x6000_0000, 0x0300_0000, true),  // U8U3U3U2
+        (0xF000_0000, 0x0B00_0000, false), // F16
+        (0x0080_0000, 0x1100_0000, false), // F16F16
+        (0x1080_0000, 0x1200_0000, false), // F32
+        (0x2080_0000, 0x0A00_0000, false), // S16
+        (0x3080_0000, 0x1000_0000, false), // S16S16
+        (0x4080_0000, 0x0900_0000, false), // U16
+        (0x5080_0000, 0x0F00_0000, false), // U16U16
+        (0x6080_0000, 0x0E00_0000, true),  // U2U10U10U10
+        (0x8080_0000, 0x0000_0000, false), // U8
+        (0x9080_0000, 0x0100_0000, false), // S8
+        (0xA080_0000, 0x0600_0000, true),  // S5S5U6
+        (0xB080_0000, 0x0700_0000, false), // U8U8
+        (0xC080_0000, 0x0800_0000, false), // S8S8
+        (0xD080_0000, 0x1400_0000, true),  // U8S8S8U8 -> X8S8S8U8
+        (0xE080_0000, 0x0D00_0000, true),  // S8S8S8S8
+        (0x0100_0000, 0x1B00_0000, true),  // F16F16F16F16
+        (0x1100_0000, 0x1E00_0000, false), // F32F32
+        (0x2100_0000, 0x1A00_0000, true),  // F11F11F10
+        (0x3100_0000, 0x1900_0000, true),  // SE5M9M9M9
+    ];
+    // U2F10F10F10 is last so the table above stays one screen; kept separate only to keep the
+    // array length honest with its declared size.
+    if base == 0x4100_0000 {
+        return 0x9A00_0000 | (swizzle >> 8);
+    }
+    let Some(&(_, tex_base, swizzle_carries)) = TABLE.iter().find(|(c, _, _)| *c == base) else {
+        report_unmapped_color_format(color_format);
+        // The geometry still has to be right: a title sizes its render targets from this
+        // texture's width and height, and getting those wrong is a far larger error than a
+        // wrong channel order. U8U8U8U8 is the only format every consumer here can size.
+        return 0x0C00_0000;
+    };
+    if !swizzle_carries && swizzle != 0 {
+        report_unmapped_color_format(color_format);
+        return tex_base;
+    }
+    tex_base | (swizzle >> 8)
+}
+
+/// Report - once per format - a colour format whose texture equivalent is not established.
+fn report_unmapped_color_format(color_format: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(color_format) {
+        return;
+    }
+    eprintln!(
+        "gxm surface: colour format {color_format:#010x} has no established SceGxmTextureFormat \
+         equivalent, so the backgroundTex this surface carries names the right PIXELS at the \
+         right size but may name the wrong channel order. A title sampling its own render \
+         target through it will get its colours permuted."
+    );
 }
 
 /// Read back a surface written by [`write_color_surface`], or `None` if this address
@@ -269,6 +572,13 @@ pub(super) fn read_color_surface(ctx: &mut GuestCtx, addr: u32) -> Option<ColorS
         height: ctx.read_u32(addr + CS_HEIGHT),
         stride_pixels: ctx.read_u32(addr + CS_STRIDE),
         data_addr: ctx.read_u32(addr + CS_DATA),
+        scale_mode: ctx.read_u32(addr + CS_SCALE),
+        // NOT read from guest memory: a `SceGxmColorSurface` is 32 bytes (eight control words)
+        // and there is no ninth to keep this in. Writing one corrupted whatever the guest had
+        // placed after the struct - measured, and it cost this title a sampler binding, which
+        // surfaced as a shader falling back for a texture unit the guest had definitely bound.
+        // The mode lives in the host-side table and is merged in by `resolve_color_surface`.
+        gamma: 0,
     })
 }
 
@@ -278,6 +588,7 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     let surface = ctx.arg(0);
     let format = ctx.arg(1);
     let surface_type = ctx.arg(2);
+    let scale_mode = ctx.arg(3);
     let width = ctx.arg(5);
     let height = ctx.arg(6);
     let stride_pixels = ctx.arg(7);
@@ -288,12 +599,58 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
         data = format_args!("{data_addr:#x}"),
         width, height, stride_pixels,
         format = format_args!("{format:#x}"),
+        // The four stack arguments and the caller, because a surface that arrives
+        // with a zero extent is either a title doing something unusual or this
+        // handler reading the wrong stack slots, and only the raw words plus the
+        // call site tell those apart.
+        out_reg_size = ctx.arg(4),
+        caller = format_args!("{:#010x}", ctx.regs[14]),
         "colorSurfaceInit"
     );
-    let s = ColorSurface { format, surface_type, width, height, stride_pixels, data_addr };
+    let s = ColorSurface { format, surface_type, width, height, stride_pixels, data_addr, scale_mode, gamma: 0 };
+    report_color_surface_scale_mode(data_addr, scale_mode);
     write_color_surface(ctx, surface, &s);
     st.set_color_surface(surface, s);
     ctx.ret(0);
+}
+
+/// Report - once per (surface data address, mode) - a colour surface created with a SCALE MODE
+/// we do not honour.
+///
+/// `SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE` (1) means the pass RASTERISES at twice the
+/// surface's resolution in each axis and the hardware resolves 2x2 samples into each stored
+/// pixel. We rasterise at the surface's own resolution and store that, which is not a rounding
+/// difference: everything the guest derives from the two resolutions - a post-process pass's
+/// texel size, a screen-space scale/bias, a depth surface it then samples - is computed for a
+/// buffer twice the size of the one we produced.
+///
+/// It is a report rather than a fix because honouring it means rasterising a pass at 2x and
+/// resolving, which is a real piece of work; and an approximation that says nothing is
+/// indistinguishable on screen from a faithful render, which is exactly how a wrong frame
+/// survives being stared at. MEASURED on one retail racer: its world colour surface asks for
+/// MSAA_DOWNSCALE and the depth surface the guest then samples is described as exactly 2x2 the
+/// colour resolution - the two facts agree, and both disagree with what we render.
+fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
+    if scale_mode == 0 {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((data_addr, scale_mode)) {
+        return;
+    }
+    let name = match scale_mode {
+        1 => "MSAA_DOWNSCALE (the guest rasterises this pass at 2x2 the stored resolution and \
+              resolves into it)",
+        _ => "an unrecognised scale mode",
+    };
+    eprintln!(
+        "gxm surface: colour surface at {data_addr:#x} was created with {name} - we rasterise it \
+         at the stored resolution and IGNORE the mode, so anything the guest derives from the \
+         two resolutions is computed for a buffer twice the size of the one we produce"
+    );
 }
 
 /// int sceGxmShaderPatcherCreateVertexProgram(patcher, programId, attributes,
@@ -371,12 +728,53 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// Hand back a fresh handle (as the generic `out_handle` did) and additionally record
 /// the handle -> `SceGxmProgram*` mapping, so a precomputed fragment state built from
 /// this fragment program can size its default uniform buffer.
+/// Report each DISTINCT `SceGxmBlendInfo` a title creates a fragment program with.
+///
+/// The blend equation is baked in here and never mentioned again, so this is the only place
+/// it can be observed - and it decides whether a shader that outputs alpha 0 is invisible or
+/// perfectly fine. A handful of distinct values covers a whole title, so printing each once is
+/// cheap and says exactly what the renderer has to reproduce.
+fn report_blend_info(blend_info: u32, blend: crate::capture::BlendState) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<crate::capture::BlendState>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(blend) {
+        return;
+    }
+    eprintln!(
+        "gxm blend: fragment program created with {} - mask={:#x} colorFunc={} alphaFunc={} \
+         colorSrc={} colorDst={} alphaSrc={} alphaDst={} (blends={})",
+        if blend_info == 0 { "a NULL blendInfo" } else { "a blendInfo" },
+        blend.color_mask,
+        blend.color_func,
+        blend.alpha_func,
+        blend.color_src,
+        blend.color_dst,
+        blend.alpha_src,
+        blend.alpha_dst,
+        blend.blends(),
+    );
+}
+
 pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     let program_id = ctx.arg(1);
+    let blend_info = ctx.arg(4);
     let out = ctx.arg(6);
     let program_header = st.shader_program(program_id);
     let handle = st.new_handle();
-    st.set_fragment_program(handle, program_header);
+    // The BLEND EQUATION arrives here and nowhere else - GXM has no runtime blend setter, so
+    // a program created with a NULL `blendInfo` never blends and one created with an additive
+    // info always does. Dropping this argument is what forced every renderer downstream to
+    // guess the mode from the geometry, and a guess is wrong for whole classes of draw.
+    let blend = match ctx.read_bytes(blend_info, 4) {
+        b if blend_info != 0 && b.len() == 4 => {
+            crate::capture::BlendState::from_bytes([b[0], b[1], b[2], b[3]])
+        }
+        _ => crate::capture::BlendState::default(),
+    };
+    report_blend_info(blend_info, blend);
+    st.set_fragment_program(handle, program_header, blend);
     ctx.write_u32(out, handle);
     ctx.ret(0);
 }
@@ -384,10 +782,37 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// int sceGxmBeginScene(context, flags, renderTarget, validRegion,
 ///     vertexSyncObject, fragmentSyncObject, colorSurface, depthStencil) -- 8 args.
 pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let render_target = ctx.arg(2);
+    let valid_region = ctx.arg(3);
     let color_surface = ctx.arg(6);
+    let depth_stencil = ctx.arg(7);
     // Resolve from the struct's own contents first (survives a copy), then from the
     // address table (covers a surface whose bytes a title has since overwritten).
-    let color = read_color_surface(ctx, color_surface).or_else(|| st.color_surface(color_surface));
+    // `resolve_color_surface` also merges in the sticky gamma mode, which the 32-byte guest
+    // struct cannot carry - and the scene's target is exactly where it has to arrive.
+    let mut color = resolve_color_surface(ctx, st, color_surface);
+    let surface_extent = color.as_ref().map(|c| (c.width, c.height));
+    // The RENDER TARGET carries the extent this scene rasterizes into; the colour
+    // surface only says where the pixels land. Taking the extent from the surface
+    // works for the display buffers (a title initialises those with the real size)
+    // and fails silently for render-to-texture, where a title may fill the surface
+    // struct from a template: this one begins a 20,160-triangle pass on a 1024x1024
+    // target through a colour surface initialised 1x1, and reading the surface made
+    // that whole pass a single pixel. Where both are known the render target wins.
+    if let (Some(c), Some((w, h))) = (color.as_mut(), st.render_target_extent(render_target)) {
+        if w != 0 && h != 0 && (c.width, c.height) != (w, h) {
+            tracing::debug!(
+                target: "vitaslop::gxm",
+                surface = format_args!("{color_surface:#x}"),
+                surface_extent = format_args!("{}x{}", c.width, c.height),
+                target_extent = format_args!("{w}x{h}"),
+                "beginScene: taking the scene extent from the render target, not the \
+                 colour surface"
+            );
+            c.width = w;
+            c.height = h;
+        }
+    }
     if color.is_none() {
         tracing::debug!(
             target: "vitaslop::gxm",
@@ -396,13 +821,236 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
              unknown, so a later pass sampling it cannot be chained to it"
         );
     }
-    st.begin_scene(color);
+    // Which RENDER TARGET this scene rasterises through, next to the SCALE MODE its colour
+    // surface asks for. The two are one setting, not two: MSAA_DOWNSCALE means "rasterise at
+    // 2x2 the stored resolution", which only makes sense against a multisampled target, and a
+    // title that copies one surface template into several passes can pair them wrongly. Neither
+    // fact is visible in the frame, and reading either alone has already produced a wrong
+    // conclusion here.
+    report_scene_target(
+        color.as_ref().map(|c| c.data_addr).unwrap_or(0),
+        render_target,
+        st.render_target_extent(render_target),
+        color.as_ref().map(|c| c.scale_mode).unwrap_or(0),
+    );
+    report_scene_extent_sources(
+        color.as_ref().map(|c| c.data_addr).unwrap_or(0),
+        surface_extent,
+        st.render_target_extent(render_target),
+        read_valid_region(ctx, valid_region),
+        color.as_ref().map(|c| (c.width, c.height)),
+    );
+    let depth = read_depth_stencil_surface(ctx, depth_stencil);
+    report_scene_depth(
+        color.as_ref().map(|c| c.data_addr).unwrap_or(0),
+        color_surface,
+        depth_stencil,
+        depth,
+    );
+    st.begin_scene(color, depth);
     ctx.ret(0);
 }
 
-/// int sceGxmEndScene(context, notification, notification2)
+/// Read a `SceGxmDepthStencilSurface` out of guest memory, or `None` for a null pointer.
+///
+/// The struct's layout IS published (see the constants above), so this reads the guest's own
+/// fields rather than consulting a side table - which also means it survives the guest copying
+/// the struct, exactly as the setters above assume.
+fn read_depth_stencil_surface(
+    ctx: &mut GuestCtx,
+    surface: u32,
+) -> Option<crate::capture::DepthSurface> {
+    if surface == 0 {
+        return None;
+    }
+    Some(crate::capture::DepthSurface {
+        zls_control: ctx.read_u32(surface + DS_ZLS_CONTROL),
+        depth_addr: ctx.read_u32(surface + DS_DEPTH_DATA),
+        stencil_addr: ctx.read_u32(surface + DS_STENCIL_DATA),
+        background_depth: ctx.read_u32(surface + DS_BACKGROUND_DEPTH),
+    })
+}
+
+/// Report - once per distinct (colour target, render target) pairing - which render target a
+/// scene rasterises through, its extent and multisample mode, and the scale mode the colour
+/// surface asks for. See the call site for why those belong on one line.
+fn report_scene_target(
+    color_addr: u32,
+    render_target: u32,
+    extent: Option<(u32, u32)>,
+    scale_mode: u32,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    // The EXTENT is in the key as well as the pairing: the same colour buffer goes through the
+    // same render target at two different sizes over a run (a 1x1 dummy while a title is
+    // loading, its real size in play), and a pairing-only dedup prints the boot one and hides
+    // the one the frame is actually built from.
+    static SEEN: Mutex<Option<HashSet<(u32, u32, u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (w, h) = extent.unwrap_or((0, 0));
+    if !g.get_or_insert_with(HashSet::new).insert((color_addr, render_target, w, h)) {
+        return;
+    }
+    eprintln!(
+        "gxm scene target: colour {color_addr:#x} rasterises through render target \
+         {render_target:#x} ({w}x{h}, multisample {}) with colour scale mode {scale_mode}{}",
+        multisample_mode_of(render_target),
+        if scale_mode == 1 && multisample_mode_of(render_target) == 0 {
+            "  <-- MSAA_DOWNSCALE on a target we read as NOT multisampled: one of those two \
+             readings is wrong, and until it is settled the resolution this pass really \
+             rasterises at is UNKNOWN"
+        } else {
+            ""
+        }
+    );
+}
+
+/// `SceGxmValidRegion { unsigned int xMax; unsigned int yMax; }` - `sceGxmBeginScene`'s
+/// argument 3, the sub-rectangle of the render target this scene is allowed to touch.
+/// `None` for the null pointer, which is what a title passes to mean "the whole target".
+fn read_valid_region(ctx: &mut GuestCtx, valid_region: u32) -> Option<(u32, u32)> {
+    if valid_region == 0 {
+        return None;
+    }
+    Some((ctx.read_u32(valid_region), ctx.read_u32(valid_region + 4)))
+}
+
+/// Report - once per colour target - every INDEPENDENT statement of this scene's extent next to
+/// the one we ended up rasterising at.
+///
+/// Three sources describe it and they can disagree: the colour surface's own width/height, the
+/// render target's, and `sceGxmBeginScene`'s `validRegion`. Reading any one alone has already
+/// produced a wrong answer here (a 1024x1024 pass came through a surface initialised 1x1), and
+/// the current open question on one retail title is a world pass that lands at 960x544 while
+/// BOTH the surface and the target read 1x1 - which no single-source reading can explain. Only
+/// printing all of them together says which one the frame is actually built from.
+fn report_scene_extent_sources(
+    color_addr: u32,
+    surface: Option<(u32, u32)>,
+    target: Option<(u32, u32)>,
+    valid_region: Option<(u32, u32)>,
+    used: Option<(u32, u32)>,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    // Keyed on the VALUES, not just the address. A title reuses one colour buffer for a 1x1
+    // dummy pass during boot and for its 960x544 world pass in play, and a per-address dedup
+    // reports only the first - which reads as "that pass is 1x1" for the whole run and sent a
+    // session hunting an extent bug that does not exist.
+    #[allow(clippy::type_complexity)]
+    static SEEN: Mutex<
+        Option<HashSet<(u32, Option<(u32, u32)>, Option<(u32, u32)>, Option<(u32, u32)>)>>,
+    > = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((color_addr, surface, target, valid_region)) {
+        return;
+    }
+    let fmt = |e: Option<(u32, u32)>| match e {
+        Some((w, h)) => format!("{w}x{h}"),
+        None => "(none)".to_string(),
+    };
+    eprintln!(
+        "gxm scene extent: colour {color_addr:#x} surface={} target={} validRegion={} -> \
+         RASTERISED AT {}",
+        fmt(surface),
+        fmt(target),
+        fmt(valid_region),
+        fmt(used)
+    );
+}
+
+/// Report - once per distinct (colour target, depth surface) pairing - where a scene puts its
+/// depth.
+///
+/// This is the fact that tells a later pass sampling a depth buffer apart from one sampling a
+/// colour buffer, and the two are allocated close enough together that an address-range match
+/// silently resolves the wrong one. Printing the pairing makes that visible in any run.
+fn report_scene_depth(
+    color_addr: u32,
+    color_surface: u32,
+    depth_stencil: u32,
+    depth: Option<crate::capture::DepthSurface>,
+) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, u32, u32)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    let d = depth.unwrap_or_default();
+    if seen.insert((color_addr, d.depth_addr, d.stencil_addr)) {
+        // The STRUCT addresses too, not just the pixel addresses they hold. On one retail racer
+        // a scene reports its colour at `0x89204aa0` and its depth 256 bytes later, for buffers
+        // that are two megabytes each - so they cannot both be where they say they are, and the
+        // next question is always "were those pointers read out of the right structs". Only the
+        // struct addresses let a `VITASLOP_PEEK` answer it. (A well-formed pass in the same
+        // frame puts its depth just PAST its colour buffer, which is what the anomaly is
+        // measured against.)
+        eprintln!(
+            "gxm scene depth: colour {color_addr:#x} (surface struct {color_surface:#x}) renders \
+             depth into {:#x} (stencil {:#x}, zlsControl {:#010x}, background {}, depthStencil \
+             struct {depth_stencil:#x})",
+            d.depth_addr,
+            d.stencil_addr,
+            d.zls_control,
+            f32::from_bits(d.background_depth)
+        );
+    }
+}
+
+/// int sceGxmEndScene(context, const SceGxmNotification *vertexNotification,
+///     const SceGxmNotification *fragmentNotification)
+///
+/// Ending the scene is where the GPU's work for it finishes, so it is also where the
+/// two optional notifications are signalled and where an occlusion query's counts land
+/// in the guest's visibility buffer. All of that is synchronous here, which is why
+/// `sceGxmNotificationWait` never actually has to wait.
 pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     st.end_scene();
+    st.flush_visibility(ctx);
+    let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
+    signal_notification(ctx, vertex_notification);
+    signal_notification(ctx, fragment_notification);
+    ctx.ret(0);
+}
+
+/// Write a `SceGxmNotification`'s `value` through its `address`, which is what the GPU
+/// does when the work the notification was attached to completes. `{ volatile unsigned
+/// int *address; unsigned int value; }`, per vitasdk `gxm.h`.
+fn signal_notification(ctx: &mut GuestCtx, notification: u32) {
+    if notification == 0 {
+        return;
+    }
+    let address = ctx.read_u32(notification);
+    let value = ctx.read_u32(notification + 4);
+    if address != 0 {
+        ctx.write_u32(address, value);
+    }
+}
+
+/// int sceGxmNotificationWait(const SceGxmNotification *notification)
+///
+/// Block until `*notification->address == notification->value`. Every scene completes
+/// synchronously here and signals its notifications at `sceGxmEndScene`, so by the time
+/// a title waits the value is already there and this returns at once.
+///
+/// A notification that is NOT already signalled means it was never attached to a scene
+/// that ended - waiting for it would hang forever, so it is signalled here instead, and
+/// reported, because a wait that silently returns without its condition holding is the
+/// kind of thing that surfaces thousands of frames away.
+pub(super) fn notification_wait(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let notification = ctx.arg(0);
+    let address = ctx.read_u32(notification);
+    let value = ctx.read_u32(notification + 4);
+    if address != 0 && ctx.read_u32(address) != value {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            address = format_args!("{address:#x}"),
+            value,
+            "notificationWait on a notification no ended scene signalled - signalling it \
+             here rather than waiting forever"
+        );
+        ctx.write_u32(address, value);
+    }
     ctx.ret(0);
 }
 
@@ -470,14 +1118,37 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
         0 => 0,
         p => (ctx.read_u32(p + 12) as i32).max(0) as u32,
     };
+    // The parameter's own declared TYPE decides how wide a component is in the buffer. A
+    // half-float uniform packs TWO components per 4-byte register, and the shader reads it
+    // back that way - so writing one 4-byte float per component both puts every component at
+    // the wrong offset AND stores a bit pattern the shader will unpack as two halves. That
+    // is a silent corruption of every uniform after the first, which is why the width comes
+    // from the record rather than being assumed. The record layout is the parameter table's
+    // own 16 bytes (name_rel, packed, array_size, resource_index), and the type is the second
+    // nibble of `packed` - the same field `SceGxmProgramParameter` reflection reads.
+    let half = parameter != 0
+        && matches!(ParamType::from_bits(((ctx.read_u32(parameter + 4) >> 4) & 0xf) as u8), ParamType::F16);
     let mut values = Vec::with_capacity(component_count as usize);
     for i in 0..component_count {
         values.push(ctx.read_f32(source + i * 4));
     }
-    // Faithful copy into the reserved buffer (in case the guest reads it back).
+    // Faithful copy into the reserved buffer (in case the guest reads it back, and because a
+    // recompiled shader reads this buffer verbatim).
     for (i, v) in values.iter().enumerate() {
-        ctx.write_u32(uniform_buffer + (base + component_offset + i as u32) * 4, v.to_bits());
+        let component = base * if half { 2 } else { 1 } + component_offset + i as u32;
+        if half {
+            // Two halves per register: read-modify-write the other half so a partial update
+            // (the common `componentOffset` case) does not clear its neighbour.
+            let addr = uniform_buffer + (component / 2) * 4;
+            let word = ctx.read_u32(addr);
+            let h = u32::from(f32_to_half(*v));
+            let merged = if component % 2 == 0 { (word & 0xffff_0000) | h } else { (word & 0x0000_ffff) | (h << 16) };
+            ctx.write_u32(addr, merged);
+        } else {
+            ctx.write_u32(uniform_buffer + component * 4, v.to_bits());
+        }
     }
+    report_uniform_write(ctx, uniform_buffer, parameter, base, component_offset, half, &values);
     tracing::trace!(
         target: "vitaslop::gxm",
         buffer = format_args!("{uniform_buffer:#x}"),
@@ -485,10 +1156,89 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
         base,
         component_offset,
         component_count,
+        half,
         "setUniformDataF"
     );
-    st.set_uniforms(base + component_offset, values);
+    if half {
+        st.set_uniform_halves(base * 2 + component_offset, &values);
+    } else {
+        st.set_uniforms(base + component_offset, values);
+    }
     ctx.ret(0);
+}
+
+/// `VITASLOP_UNIFORM_WATCH=<hex address>|<parameter name substring>[,...]`: report every
+/// `sceGxmSetUniformDataF` that lands on one of those addresses OR writes a parameter whose
+/// name matches, with the values the guest passed and the word left behind.
+///
+/// A name is usually the right handle. The uniform block a title bakes a material into is
+/// heap, so its address moves between runs, and by the time a wrong value is noticed - in a
+/// frame - the address is all that is left of it; the NAME is stable and is what the question
+/// was actually about.
+///
+/// A guest-store watchpoint cannot see this. `sceGxmSetUniformDataF` takes an arbitrary buffer
+/// pointer - a title bakes a material's uniform block once with it and memcpys the block per
+/// draw - so the bytes a shader ends up reading may have been written by US, on the guest's
+/// behalf, with no guest store anywhere near them. "No guest store ever writes that address"
+/// then reads as "it must be static data" when the real answer is "a host call put it there"
+/// (memory `vitaslop-host-call-reference-semantics`).
+fn report_uniform_write(
+    ctx: &GuestCtx,
+    buffer: u32,
+    parameter: u32,
+    base: u32,
+    component_offset: u32,
+    half: bool,
+    values: &[f32],
+) {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<(Vec<u32>, Vec<String>)> = OnceLock::new();
+    let (addrs, names) = WATCH.get_or_init(|| {
+        let (mut a, mut n) = (Vec::new(), Vec::new());
+        for t in std::env::var("VITASLOP_UNIFORM_WATCH").unwrap_or_default().split(',') {
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            match u32::from_str_radix(t.trim_start_matches("0x"), 16) {
+                Ok(v) => a.push(v),
+                Err(_) => n.push(t.to_string()),
+            }
+        }
+        (a, n)
+    });
+    if (addrs.is_empty() && names.is_empty()) || values.is_empty() {
+        return;
+    }
+    // The byte range this call touched, in the buffer's own addressing.
+    let first = base * if half { 2 } else { 1 } + component_offset;
+    let last = first + values.len() as u32 - 1;
+    let (lo, hi) = match half {
+        true => (buffer + (first / 2) * 4, buffer + (last / 2) * 4 + 3),
+        false => (buffer + first * 4, buffer + last * 4 + 3),
+    };
+    // The parameter's name, which is what makes the line readable AND is the other way to
+    // select one: an offset says where the write went, the name says what the guest thought it
+    // was writing.
+    let name = (parameter != 0)
+        .then(|| {
+            let rel = ctx.read_u32(parameter);
+            ctx.read_cstr(parameter.wrapping_add(rel), 64)
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<unnamed>".into());
+    if !addrs.iter().any(|&a| a >= lo && a <= hi) && !names.iter().any(|n| name.contains(n.as_str()))
+    {
+        return;
+    }
+    eprintln!(
+        "gxm uniform watch: sceGxmSetUniformDataF wrote {name} ({}) into {lo:#x}..={hi:#x} of \
+         buffer {buffer:#x} - reg {base}, component offset {component_offset}, values {values:?}, \
+         leaving {:08x} at {lo:#x}, from lr={:#010x}",
+        if half { "F16" } else { "F32" },
+        ctx.read_u32(lo),
+        ctx.regs[14]
+    );
 }
 
 /// void sceGxmSetVertexStream(context, unsigned int streamIndex, const void *data)
@@ -543,13 +1293,43 @@ pub(super) const TYPE_LINEAR: u32 = 3; // 0x6000_0000 >> 29
 pub(super) const TYPE_TILED: u32 = 4; // 0x8000_0000 >> 29
 pub(super) const TYPE_SWIZZLED_ARBITRARY: u32 = 5; // 0xA000_0000 >> 29
 pub(super) const TYPE_LINEAR_STRIDED: u32 = 6; // 0xC000_0000 >> 29
+pub(super) const TYPE_CUBE_ARBITRARY: u32 = 7; // 0xE000_0000 >> 29
 
 /// void sceGxmSetFragmentTexture(context, unsigned int textureIndex, const
 ///     SceGxmTexture *texture)
 pub(super) fn set_fragment_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
     let unit = ctx.arg(1);
     let texture = ctx.arg(2);
-    st.bind_fragment_texture(unit, texture);
+    // Whether the control words are already zero AT BIND TIME. A texture that is live here and
+    // zero at draw time is a LIFETIME problem (the guest reused or cleared the struct, or the
+    // binding went stale); one that is zero here was never a texture at this address at all,
+    // and the address itself is what is wrong. The two need opposite investigations.
+    let live_at_bind = texture != 0
+        && (ctx.read_u32(texture)
+            | ctx.read_u32(texture + 4)
+            | ctx.read_u32(texture + 8)
+            | ctx.read_u32(texture + 12))
+            != 0;
+    // A non-null handle whose control words are all zero is the guest handing GXM a texture it
+    // never initialised. Name the CALL SITE the first time each address does it: the binding
+    // itself says nothing about why, and the caller is the only thing that can (see
+    // `vitaslop-re-undocumented-nid-from-callsite`).
+    if texture != 0 && !live_at_bind {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if g.get_or_insert_with(HashSet::new).insert(texture) {
+            eprintln!(
+                "gxm texture: sceGxmSetFragmentTexture(unit {unit}, {texture:#x}) with ALL-ZERO \
+                 control words, called from lr={:#010x}",
+                ctx.regs[14]
+            );
+        }
+    }
+    st.bind_fragment_texture(ctx, unit, texture);
+    st.note_direct_texture_bind();
+    st.note_texture_live_at_bind(texture, live_at_bind);
     ctx.ret(0);
 }
 
@@ -575,15 +1355,16 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
         st.set_texture_init_extra(texture, mip_or_stride, 0);
     }
 
-    let base_format = (tex_format >> 24) & 0x1f;
-    let w1 = (height.saturating_sub(1) & 0xfff)
-        | ((width.saturating_sub(1) & 0xfff) << 12)
-        | (base_format << 24)
-        | (type_field << 29);
-    ctx.write_u32(texture, 0);
-    ctx.write_u32(texture + 4, w1);
-    ctx.write_u32(texture + 8, data & 0xffff_fffc);
-    ctx.write_u32(texture + 12, 0);
+    write_texture_control_words(
+        ctx,
+        texture,
+        type_field,
+        (tex_format >> 24) & 0xff,
+        (tex_format >> 12) & 0x7,
+        width,
+        height,
+        data,
+    );
     st.set_texture_format(texture, tex_format);
     ctx.ret(0);
 }
@@ -806,7 +1587,12 @@ pub(super) fn color_surface_get_format(ctx: &mut GuestCtx, st: &mut VitaState, s
 /// The live surface at `addr`: from the guest struct's own contents if it holds one
 /// (so a COPY of an initialised surface still answers), else from the address table.
 fn resolve_color_surface(ctx: &mut GuestCtx, st: &VitaState, addr: u32) -> Option<ColorSurface> {
-    read_color_surface(ctx, addr).or_else(|| st.color_surface(addr))
+    let mut s = read_color_surface(ctx, addr).or_else(|| st.color_surface(addr))?;
+    // The gamma mode is sticky host-side state keyed by the SURFACE address, because the
+    // 32-byte guest struct has nowhere to hold it. Merge it back in here so every consumer -
+    // the getter, and the scene's render target - sees a complete surface.
+    s.gamma = st.color_surface_gamma_mode(addr);
+    Some(s)
 }
 
 /// SceGxmColorSurfaceType sceGxmColorSurfaceGetType(const SceGxmColorSurface *surface)
@@ -1013,7 +1799,25 @@ pub(super) fn texture_get_stride(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// void *sceGxmColorSurfaceGetData(const SceGxmColorSurface *surface)
 #[hostcall]
 pub(super) fn color_surface_get_data(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
-    resolve_color_surface(ctx, st, surface).map(|s| s.data_addr).unwrap_or(0)
+    let data = resolve_color_surface(ctx, st, surface).map(|s| s.data_addr).unwrap_or(0);
+    // A getter that answers zero for a surface the title is about to build a texture from makes
+    // the title skip the build and bind an uninitialised `SceGxmTexture` - which then samples
+    // as a 1x1 zero texel and blacks out whatever pass reads it, a long way from here. Say it
+    // once per surface, because "the guest bound a null texture" and "we told the guest its
+    // render target has no pixels" are the same event seen from two ends.
+    if data == 0 {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if g.get_or_insert_with(HashSet::new).insert(surface) {
+            eprintln!(
+                "gxm surface: sceGxmColorSurfaceGetData({surface:#x}) answered NULL - no colour                  surface is recorded at that address, called from lr={:#010x}",
+                ctx.regs[14]
+            );
+        }
+    }
+    data
 }
 
 /// unsigned int sceGxmColorSurfaceGetStrideInPixels(const SceGxmColorSurface *surface)
@@ -1024,8 +1828,29 @@ pub(super) fn color_surface_get_stride_in_pixels(ctx: &mut GuestCtx, st: &mut Vi
 
 /// int sceGxmColorSurfaceSetGammaMode(SceGxmColorSurface *surface, SceGxmColorSurfaceGammaMode gammaMode)
 #[hostcall]
-pub(super) fn color_surface_set_gamma_mode(st: &mut VitaState, surface: u32, gamma: u32) -> i32 {
+pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, gamma: u32) -> i32 {
     st.set_color_surface_gamma(surface, gamma);
+    // Write it into the guest-visible surface struct too, so a scene that resolves its target
+    // through `read_color_surface` carries the mode with it. Keeping the mode only in a side
+    // table keyed by the SURFACE address loses it the moment the scene is described by its
+    // colour surface's CONTENTS - which is how the renderer sees it.
+    if let Some(s) = read_color_surface(ctx, surface) {
+        // Name the DATA address, not the surface struct: the renderer, the chain dump and every
+        // diagnostic downstream identify a pass by where its pixels land.
+        tracing::debug!(
+            target: "vitaslop::gxm",
+            surface = format_args!("{surface:#x}"),
+            data = format_args!("{:#x}", s.data_addr),
+            gamma = format_args!("{gamma:#x}"),
+            size = format_args!("{}x{}", s.width, s.height),
+            "colorSurfaceSetGammaMode"
+        );
+        eprintln!(
+            "gxm surface: GAMMA-CORRECT writes on the surface at data {:#x} ({}x{}), mode              {gamma:#x}",
+            s.data_addr, s.width, s.height
+        );
+        st.set_color_surface(surface, s);
+    }
     0
 }
 
@@ -1224,16 +2049,16 @@ pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(st: &mut Vit
 /// int sceGxmPrecomputedVertexStateSetTexture(state, unsigned int textureIndex,
 ///     const SceGxmTexture *texture)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_set_texture(st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
-    st.precomputed_vertex_state_set_texture(state, index, texture);
+pub(super) fn precomputed_vertex_state_set_texture(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+    st.precomputed_vertex_state_set_texture(ctx, state, index, texture);
     0
 }
 
 /// int sceGxmPrecomputedFragmentStateSetTexture(state, unsigned int textureIndex,
 ///     const SceGxmTexture *texture)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_set_texture(st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
-    st.precomputed_fragment_state_set_texture(state, index, texture);
+pub(super) fn precomputed_fragment_state_set_texture(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, index: u32, texture: u32) -> i32 {
+    st.precomputed_fragment_state_set_texture(ctx, state, index, texture);
     0
 }
 
@@ -1251,6 +2076,383 @@ pub(super) fn set_precomputed_vertex_state(ctx: &mut GuestCtx, st: &mut VitaStat
 pub(super) fn set_precomputed_fragment_state(ctx: &mut GuestCtx, st: &mut VitaState, _context: u32, state: u32) -> i32 {
     st.bind_precomputed_fragment_state(ctx, state);
     0
+}
+
+// --- Depth/stencil surface ---------------------------------------------------
+//
+// Unlike a colour surface (whose emit words are opaque hardware state, so we keep our
+// own tagged mirror), `SceGxmDepthStencilSurface`'s layout IS published in vitasdk
+// `gxm.h`: `{ +0x00 zlsControl, +0x04 depthData, +0x08 stencilData, +0x0c
+// backgroundDepth (float), +0x10 backgroundControl }`, 0x14 bytes. So these calls write
+// the real fields, and a copy of the struct carries its own state with no side table.
+//
+// Only `zlsControl`'s bit layout is unpublished, and the two force-mode enums give us
+// exactly the bits we need: GXM's enums are the raw register bits throughout (a depth
+// func is 0x00C00000, a texture type is 0x60000000), and FORCE_LOAD_ENABLED is 0x2 with
+// FORCE_STORE_ENABLED 0x4 - adjacent single bits, in the word that controls the Z Load
+// Store unit. They are therefore written and read back in place.
+
+const DS_ZLS_CONTROL: u32 = 0x00;
+const DS_DEPTH_DATA: u32 = 0x04;
+const DS_STENCIL_DATA: u32 = 0x08;
+const DS_BACKGROUND_DEPTH: u32 = 0x0c;
+const DS_BACKGROUND_CONTROL: u32 = 0x10;
+/// `SceGxmDepthStencilForceLoadMode` / `ForceStoreMode` occupy these bits of `zlsControl`.
+const DS_FORCE_LOAD_MASK: u32 = 0x0000_0002;
+const DS_FORCE_STORE_MASK: u32 = 0x0000_0004;
+
+/// int sceGxmDepthStencilSurfaceInit(SceGxmDepthStencilSurface *surface,
+///     SceGxmDepthStencilFormat depthStencilFormat, SceGxmDepthStencilSurfaceType
+///     surfaceType, unsigned int strideInSamples, void *depthData, void *stencilData)
+///
+/// Fills the published fields, with the GXM defaults for the two background values (a
+/// depth clear of 1.0 - the far plane - and no background stencil). `format`,
+/// `surfaceType` and `strideInSamples` belong to `zlsControl`, whose packing is not
+/// published; they are folded in as the enum words they already are, which keeps the
+/// force bits (the part that IS specified) exact. Nothing here reads that word back, and
+/// every `Get` that would expose the packing is an unimplemented NID that hard-fails, so
+/// a wrong guess cannot be observed as a wrong ANSWER - only as a loud missing call.
+pub(super) fn depth_stencil_surface_init(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let surface = ctx.arg(0);
+    let format = ctx.arg(1);
+    let surface_type = ctx.arg(2);
+    let stride_in_samples = ctx.arg(3);
+    let depth_data = ctx.arg(4);
+    let stencil_data = ctx.arg(5);
+    let zls = format | surface_type | (stride_in_samples & !(DS_FORCE_LOAD_MASK | DS_FORCE_STORE_MASK));
+    ctx.write_u32(surface + DS_ZLS_CONTROL, zls);
+    ctx.write_u32(surface + DS_DEPTH_DATA, depth_data);
+    ctx.write_u32(surface + DS_STENCIL_DATA, stencil_data);
+    ctx.write_u32(surface + DS_BACKGROUND_DEPTH, 1.0f32.to_bits());
+    ctx.write_u32(surface + DS_BACKGROUND_CONTROL, 0);
+    ctx.ret(0);
+}
+
+/// void sceGxmDepthStencilSurfaceSetBackgroundDepth(SceGxmDepthStencilSurface *surface,
+///     float backgroundDepth)
+#[hostcall]
+pub(super) fn depth_stencil_surface_set_background_depth(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    surface: u32,
+    background_depth: f32,
+) -> i32 {
+    ctx.write_u32(surface + DS_BACKGROUND_DEPTH, background_depth.to_bits());
+    0
+}
+
+/// void sceGxmDepthStencilSurfaceSetBackgroundStencil(SceGxmDepthStencilSurface
+///     *surface, unsigned char backgroundStencil)
+///
+/// The value lands in the low byte of `backgroundControl`. That byte position is an
+/// inference (the struct field is published, its bit layout is not), but a stencil value
+/// is eight bits wide and this word exists to carry it; the matching getter reads the
+/// same byte, so a title that sets and reads back sees exactly what it wrote.
+#[hostcall]
+pub(super) fn depth_stencil_surface_set_background_stencil(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    surface: u32,
+    background_stencil: u32,
+) -> i32 {
+    let w = ctx.read_u32(surface + DS_BACKGROUND_CONTROL);
+    ctx.write_u32(surface + DS_BACKGROUND_CONTROL, (w & !0xff) | (background_stencil & 0xff));
+    0
+}
+
+/// void sceGxmDepthStencilSurfaceSetForceLoadMode(SceGxmDepthStencilSurface *surface,
+///     SceGxmDepthStencilForceLoadMode forceLoad)
+#[hostcall]
+pub(super) fn depth_stencil_surface_set_force_load_mode(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    surface: u32,
+    force_load: u32,
+) -> i32 {
+    let w = ctx.read_u32(surface + DS_ZLS_CONTROL);
+    ctx.write_u32(surface + DS_ZLS_CONTROL, (w & !DS_FORCE_LOAD_MASK) | (force_load & DS_FORCE_LOAD_MASK));
+    0
+}
+
+/// void sceGxmDepthStencilSurfaceSetForceStoreMode(SceGxmDepthStencilSurface *surface,
+///     SceGxmDepthStencilForceStoreMode forceStore)
+#[hostcall]
+pub(super) fn depth_stencil_surface_set_force_store_mode(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    surface: u32,
+    force_store: u32,
+) -> i32 {
+    let w = ctx.read_u32(surface + DS_ZLS_CONTROL);
+    ctx.write_u32(surface + DS_ZLS_CONTROL, (w & !DS_FORCE_STORE_MASK) | (force_store & DS_FORCE_STORE_MASK));
+    0
+}
+
+// --- Back-face render state --------------------------------------------------
+
+/// void sceGxmSetBackDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
+#[hostcall]
+pub(super) fn set_back_depth_write_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().back_depth_write = enable;
+    0
+}
+
+/// void sceGxmSetBackPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
+#[hostcall]
+pub(super) fn set_back_polygon_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
+    st.render_state_mut().back_polygon_mode = mode;
+    0
+}
+
+// --- Occlusion queries -------------------------------------------------------
+
+/// int sceGxmSetVisibilityBuffer(SceGxmContext *context, void *bufferBase,
+///     unsigned int stridePerCore)
+#[hostcall]
+pub(super) fn set_visibility_buffer(st: &mut VitaState, _context: u32, base: u32, stride_per_core: u32) -> i32 {
+    st.set_visibility_buffer(base, stride_per_core);
+    0
+}
+
+/// void sceGxmSetFrontVisibilityTestEnable(SceGxmContext *context,
+///     SceGxmVisibilityTestMode enable)
+#[hostcall]
+pub(super) fn set_front_visibility_test_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
+    st.render_state_mut().front_visibility_test_enable = enable;
+    0
+}
+
+/// void sceGxmSetFrontVisibilityTestIndex(SceGxmContext *context, unsigned int index)
+#[hostcall]
+pub(super) fn set_front_visibility_test_index(st: &mut VitaState, _context: u32, index: u32) -> i32 {
+    st.render_state_mut().front_visibility_test_index = index;
+    0
+}
+
+/// void sceGxmSetFrontVisibilityTestOp(SceGxmContext *context, SceGxmVisibilityTestOp op)
+#[hostcall]
+pub(super) fn set_front_visibility_test_op(st: &mut VitaState, _context: u32, op: u32) -> i32 {
+    st.render_state_mut().front_visibility_test_op = op;
+    0
+}
+
+// --- Unmapping ---------------------------------------------------------------
+
+/// int sceGxmUnmapMemory(void *base) / sceGxmUnmapVertexUsseMemory(void *base) /
+/// sceGxmUnmapFragmentUsseMemory(void *base)
+///
+/// The guest's pages already ARE the memory the capture reads, so mapping is a no-op -
+/// but unmapping is not, because the guest may now reuse those pages for anything, and a
+/// texture snapshot cached against them would be sampled as if it were still a texture.
+#[hostcall]
+pub(super) fn unmap_memory(st: &mut VitaState, base: u32) -> i32 {
+    st.gxm_unmap(base)
+}
+
+// --- Colour surface: scale mode + data rebind --------------------------------
+
+/// SceGxmColorSurfaceScaleMode sceGxmColorSurfaceGetScaleMode(const SceGxmColorSurface *surface)
+#[hostcall]
+pub(super) fn color_surface_get_scale_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32) -> u32 {
+    resolve_color_surface(ctx, st, surface).map(|s| s.scale_mode).unwrap_or(0)
+}
+
+/// int sceGxmColorSurfaceSetData(SceGxmColorSurface *surface, void *data)
+///
+/// Rebinds where the surface renders to. Written into BOTH the guest struct (so a copy
+/// of the surface resolves to the new address) and the address table, because a scene
+/// begun after this must be captured against the new buffer - a title double-buffers by
+/// calling exactly this between frames, and missing it renders every frame into one.
+#[hostcall]
+pub(super) fn color_surface_set_data(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, data: u32) -> i32 {
+    match resolve_color_surface(ctx, st, surface) {
+        Some(mut s) => {
+            s.data_addr = data;
+            write_color_surface(ctx, surface, &s);
+            st.set_color_surface(surface, s);
+            0
+        }
+        None => {
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                surface = format_args!("{surface:#x}"),
+                data = format_args!("{data:#x}"),
+                "colorSurfaceSetData on a surface never initialised here - the new render \
+                 target is NOT recorded"
+            );
+            // SCE_GXM_ERROR_INVALID_VALUE.
+            0x8021_0000u32 as i32
+        }
+    }
+}
+
+// --- Program reflection: type + find-by-semantic ------------------------------
+
+/// SceGxmProgramType sceGxmProgramGetType(const SceGxmProgram *program)
+///
+/// Bit 0 of the byte at header +0x14 selects the stage (set = fragment). This is the
+/// same field, at the same offset, that the clean-room GXP container parser keys its
+/// own vertex/fragment decision off, so the two cannot disagree.
+#[hostcall]
+pub(super) fn program_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, program: u32) -> u32 {
+    // SCE_GXM_VERTEX_PROGRAM = 0, SCE_GXM_FRAGMENT_PROGRAM = 1.
+    (ctx.read_u32(program.wrapping_add(0x14)) & 1) as u32
+}
+
+/// const SceGxmProgramParameter *_sceGxmProgramFindParameterBySemantic(
+///     const SceGxmProgram *program, SceGxmParameterSemantic semantic, unsigned int index)
+///
+/// The counterpart of `sceGxmProgramFindParameterByName` for a title that builds its
+/// vertex-attribute array from semantics rather than names. Walks the same parameter
+/// table and returns the first entry whose packed semantic word matches - the semantic
+/// in the LOW byte, its index in the high one (see [`param_get_semantic`]). Null when
+/// nothing matches, which is what the API returns and what a caller tests for.
+#[hostcall]
+pub(super) fn find_parameter_by_semantic(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    program: u32,
+    semantic: u32,
+    index: u32,
+) -> u32 {
+    let count = ctx.read_u32(program.wrapping_add(0x24));
+    let base = program.wrapping_add(0x28).wrapping_add(ctx.read_u32(program.wrapping_add(0x28)));
+    let want = (semantic & 0xff) | ((index & 0xff) << 8);
+    (0..count)
+        .map(|i| base.wrapping_add(i.wrapping_mul(16)))
+        .find(|&p| (ctx.read_u32(p.wrapping_add(4)) >> 16) & 0xffff == want)
+        .unwrap_or(0)
+}
+
+/// int sceGxmRenderTargetGetDriverMemBlock(const SceGxmRenderTarget *renderTarget,
+///     SceUID *driverMemBlock)
+///
+/// Hands back the UID the guest supplied in `SceGxmRenderTargetParams::driverMemBlock`
+/// (+0x10 of that struct), so a title that frees the block it allocated frees the right
+/// one. A target created with `SCE_UID_INVALID_UID` (sceGxm allocates its own) reads
+/// back exactly that, which is the signal not to free anything.
+#[hostcall]
+pub(super) fn render_target_get_driver_mem_block(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    render_target: u32,
+    out: Ptr,
+) -> i32 {
+    if out.is_null() {
+        // SCE_GXM_ERROR_INVALID_POINTER.
+        0x8021_0004u32 as i32
+    } else {
+        ctx.write_u32(out.addr(), st.render_target_mem_block(render_target));
+        0
+    }
+}
+
+// --- Vertex-stage textures, cube-arbitrary init, palettes ---------------------
+
+/// int _sceGxmSetVertexTexture(SceGxmContext *context, unsigned int textureIndex,
+///     const SceGxmTexture *texture)
+///
+/// Binds a texture to a VERTEX-stage sampler (vertex texture fetch: displacement maps,
+/// per-instance data tables). The capture carries fragment-stage textures with each
+/// draw; a vertex sampler has no slot in it, so a vertex program that samples renders as
+/// if the fetch returned nothing. The binding is deliberately NOT stored - nothing would
+/// read it - but the gap is stated once, because it is a property of the title's shaders
+/// rather than an event, and an unreported approximation looks exactly like a faithful
+/// render on screen.
+pub(super) fn set_vertex_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let unit = ctx.arg(1);
+    let texture = ctx.arg(2);
+    st.bind_vertex_texture(ctx, unit, texture);
+    ctx.ret(0);
+}
+
+/// int sceGxmTextureSetPalette(SceGxmTexture *texture, const void *paletteData)
+///
+/// Points a paletted (P8/P4) texture at its colour table. The palette's position within
+/// the 16-byte control words is not published, so it is kept beside them rather than
+/// packed into a field whose neighbours ARE understood - guessing the packing would
+/// corrupt the format and dimension fields that decode correctly today.
+///
+/// The capture's sampler does not expand palette indices to colours, so a paletted
+/// texture still samples its INDEX as if it were a value. That is a real gap, and it
+/// says so once rather than rendering wrong quietly.
+#[hostcall]
+pub(super) fn texture_set_palette(st: &mut VitaState, texture: u32, palette: u32) -> i32 {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            texture = format_args!("{texture:#x}"),
+            palette = format_args!("{palette:#x}"),
+            "a texture palette was bound; the capture samples paletted formats as raw \
+             indices, so this texture's colours are wrong until palette expansion lands"
+        );
+    }
+    st.set_texture_palette(texture, palette);
+    0
+}
+
+// --- Precomputed: whole-array setters and non-default uniform buffers ---------
+
+/// int sceGxmPrecomputedDrawSetAllVertexStreams(SceGxmPrecomputedDraw *precomputedDraw,
+///     const void *const *streamDataArray)
+pub(super) fn precomputed_draw_set_all_vertex_streams(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let precomputed = ctx.arg(0);
+    let array = ctx.arg(1);
+    st.precomputed_draw_set_all_streams(ctx, precomputed, array);
+    ctx.ret(0);
+}
+
+/// int sceGxmPrecomputedFragmentStateSetAllTextures(SceGxmPrecomputedFragmentState
+///     *precomputedState, const SceGxmTexture *textureArray)
+#[hostcall]
+pub(super) fn precomputed_fragment_state_set_all_textures(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    array: u32,
+) -> i32 {
+    st.precomputed_fragment_state_set_all_textures(ctx, state, array);
+    0
+}
+
+/// int sceGxmPrecomputedVertexStateSetAllTextures(SceGxmPrecomputedVertexState
+///     *precomputedState, const SceGxmTexture *textures)
+#[hostcall]
+pub(super) fn precomputed_vertex_state_set_all_textures(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: u32,
+    array: u32,
+) -> i32 {
+    st.precomputed_vertex_state_set_all_textures(ctx, state, array);
+    0
+}
+
+/// int sceGxmPrecomputed{Vertex,Fragment}StateSetUniformBuffer(state,
+///     unsigned int bufferIndex, const void *bufferData)
+/// int sceGxmPrecomputed{Vertex,Fragment}StateSetAllUniformBuffers(state,
+///     const void *const *bufferDataArray)
+///
+/// These bind NON-default uniform buffers into a precomputed state - the same thing
+/// `sceGxmSetVertexUniformBuffer` does on the direct path, and with the same limit: a
+/// draw carries only the DEFAULT uniform buffer, so a shader reading buffer index N
+/// reads nothing. Recording the pointer would not change that, so what matters is that
+/// the gap is stated rather than the call quietly succeeding.
+pub(super) fn precomputed_state_set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str, all: bool) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            stage,
+            all,
+            state = format_args!("{:#x}", ctx.arg(0)),
+            "a precomputed state bound a non-default uniform buffer; the capture records \
+             only the DEFAULT uniform buffer, so a shader reading that buffer index gets \
+             nothing"
+        );
+    }
+    ctx.ret(0);
 }
 
 #[cfg(test)]
@@ -1314,8 +2516,9 @@ pub(crate) mod inline_op_tests {
     fn inline_ops_match_their_handlers() {
         for func_nid in COVERED {
             let op = inline_op(func_nid).expect("listed NID has an inline form");
+            let offset = op.offset().expect("a GXM getter reads through its pointer argument");
             assert_eq!(
-                op.eval(word_at(op.offset())),
+                op.eval(word_at(offset)),
                 handler_result(func_nid),
                 "inline form of {} disagrees with its handler",
                 crate::nid::name(func_nid)

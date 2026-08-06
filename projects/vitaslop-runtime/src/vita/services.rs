@@ -11,6 +11,7 @@
 
 use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
+use crate::SvcOutcome;
 
 /// SceNetCtl connection state: disconnected (no link).
 const SCE_NETCTL_STATE_DISCONNECTED: u32 = 0;
@@ -259,6 +260,32 @@ pub(super) enum DialogFamily {
     NpTrophySetup = 4,
     StoreCheckout = 5,
     NpSnsFacebook = 6,
+    Ime = 7,
+}
+
+/// `SceImeDialogButton`: which button dismissed the text-entry dialog.
+const SCE_IME_DIALOG_BUTTON_CLOSE: u32 = 1;
+/// `SceImeDialogResult` field offsets: `{ +0x00 result, +0x04 button }`.
+const IME_DIALOG_RESULT_RESULT: u32 = 0;
+const IME_DIALOG_RESULT_BUTTON: u32 = 4;
+
+/// SceInt32 sceImeDialogGetResult(SceImeDialogResult *result)
+///
+/// The IME is the on-screen keyboard: it exists to collect text a PERSON types. There
+/// is no person here, and inventing text would be worse than admitting that - a title
+/// that reads back a name it never received would carry it into a save or a profile.
+///
+/// So the dialog reports CLOSE (dismissed without entering anything), which is exactly
+/// what a user pressing the close button produces and a path every title handles: it
+/// keeps whatever value it already had. The `inputTextBuffer` the title supplied at
+/// `Init` is deliberately left as the title prepared it, which is what a CLOSE means.
+pub(super) fn ime_dialog_get_result(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let result = ctx.arg(0);
+    if result != 0 {
+        ctx.write_u32(result + IME_DIALOG_RESULT_RESULT, 0);
+        ctx.write_u32(result + IME_DIALOG_RESULT_BUTTON, SCE_IME_DIALOG_BUTTON_CLOSE);
+    }
+    ctx.ret(0);
 }
 
 /// `*DialogInit`: mark the family open; the dialog will report finished on the
@@ -711,18 +738,41 @@ const SCE_APPUTIL_ERROR_SAVEDATA_SLOT_EXISTS: i32 = 0x8010_0640u32 as i32;
 /// title/subtitle/detail plus icon path, user param, size, modified time, reserved.
 const SAVEDATA_SLOT_PARAM_SIZE: usize = 0x34C;
 
-/// Read the mount-point name (SceAppUtilSaveDataMountPoint, 16 opaque bytes) from a
-/// guest pointer as a NUL-trimmed string, used as the savedata-store namespace so a
-/// title with more than one mount keeps its slots distinct. A null pointer maps to the
-/// empty mount (a title that always passes the same - possibly null - handle stays
-/// self-consistent, which is all read-after-write needs).
+/// The savedata mount every title gets without asking for one. A save API call with no
+/// mount point names THIS mount, which is also the path prefix the title's own
+/// `sceIoOpen`/`sceIoGetstat` use to read the same files back.
+const DEFAULT_SAVEDATA_MOUNT: &str = "savedata0:";
+
+/// Read the mount-point name (SceAppUtilSaveDataMountPoint, 16 opaque bytes) from a guest
+/// pointer as a NUL-trimmed string, used both as the savedata-store namespace (so a title
+/// with more than one mount keeps its slots distinct) and as the PATH PREFIX a saved file
+/// lands under.
+///
+/// A null or empty mount point is [`DEFAULT_SAVEDATA_MOUNT`], not the empty string, and
+/// that distinction is not cosmetic. It used to map to `""`, on the reasoning that a title
+/// which always passes the same handle stays self-consistent - **and that reasoning was
+/// wrong, because a title does NOT only use this API to reach its own saves.** This
+/// title's autosave writes `-AUTO-/DATA.BIN` through `sceAppUtilSaveDataDataSave` with a
+/// null mount, so the file landed at `/-AUTO-/DATA.BIN`, and then reads it back with an
+/// ordinary `sceIoGetstat("savedata0:/-AUTO-/DATA.BIN")`, which found nothing. It saved,
+/// looked, failed and saved again - forever, on a "THIS GAME SAVES DATA AUTOMATICALLY"
+/// screen it never left.
+///
+/// The title's own reads are the evidence for which mount the default is: it writes with
+/// no mount and reads with `savedata0:`, so on hardware those two must name the same file.
 fn read_mount_name(ctx: &GuestCtx, mount: Ptr) -> String {
-    if mount.is_null() {
-        return String::new();
+    let name = if mount.is_null() {
+        String::new()
+    } else {
+        let raw = ctx.read_bytes(mount.addr(), 16);
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    };
+    if name.is_empty() {
+        DEFAULT_SAVEDATA_MOUNT.to_string()
+    } else {
+        name
     }
-    let raw = ctx.read_bytes(mount.addr(), 16);
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
 /// int sceAppUtilSaveDataSlotGetParam(unsigned int slotId,
@@ -1615,6 +1665,386 @@ pub(super) fn rtc_get_current_clock(ctx: &mut GuestCtx, _st: &mut VitaState, tim
 pub(super) fn rtc_get_current_clock_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr) -> i32 {
     write_fixed_date_time(ctx, time);
     0
+}
+
+/// int sceRtcSetTime64_t(SceDateTime *time, time_t iTime)
+///
+/// The inverse of `sceRtcGetTime64_t`: break a UNIX second count down into the
+/// `SceDateTime` fields, over the same proleptic-Gregorian conversion the rest of this
+/// module's RTC surface uses, so a Set/Get round-trips exactly.
+/// The 64-bit `time_t` arrives in the r2:r3 register pair (AAPCS aligns a 64-bit
+/// argument to an even register), which the two `u32` halves below name directly.
+#[hostcall]
+pub(super) fn rtc_set_time64_t(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    time: Ptr,
+    _pad: u32,
+    seconds_lo: u32,
+    seconds_hi: u32,
+) -> i32 {
+    if time.is_null() {
+        SCE_RTC_ERROR_INVALID_POINTER
+    } else {
+        let seconds = ((seconds_hi as u64) << 32) | seconds_lo as u64;
+        let days = (seconds / 86_400) as i64;
+        let sod = (seconds % 86_400) as i64;
+        let (y, m, d) = civil_from_days(days);
+        let mut buf = [0u8; 16];
+        buf[0..2].copy_from_slice(&(y as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&(m as u16).to_le_bytes());
+        buf[4..6].copy_from_slice(&(d as u16).to_le_bytes());
+        buf[6..8].copy_from_slice(&((sod / 3600) as u16).to_le_bytes());
+        buf[8..10].copy_from_slice(&(((sod / 60) % 60) as u16).to_le_bytes());
+        buf[10..12].copy_from_slice(&((sod % 60) as u16).to_le_bytes());
+        // Microseconds stay zero: a whole-second input carries none.
+        ctx.write_bytes(time.addr(), &buf);
+        0
+    }
+}
+
+/// Byte size of `SceAppUtilAppEventParam` (`{ SceUInt32 type; uint8_t dat[1024]; }`).
+const APP_EVENT_PARAM_SIZE: usize = 0x404;
+
+/// int sceAppUtilReceiveAppEvent(SceAppUtilAppEventParam *eventParam)
+///
+/// The LiveArea / system event queue: an invite accepted from a message, a gift from
+/// Near, a "resume this save" tile. None of those exist off-console, so the queue is
+/// permanently empty - but the WHOLE param is zeroed rather than left alone, because
+/// the type field is what the title switches on and a caller's uninitialised stack
+/// would otherwise read as an event that never happened.
+#[hostcall]
+pub(super) fn apputil_receive_app_event(ctx: &mut GuestCtx, _st: &mut VitaState, event: Ptr) -> i32 {
+    if event.is_null() {
+        SCE_APPUTIL_ERROR_PARAMETER
+    } else {
+        ctx.write_bytes(event.addr(), &vec![0u8; APP_EVENT_PARAM_SIZE]);
+        0
+    }
+}
+
+/// int sceAppUtilAppEventParse{NearGift,NpInviteMessage,NpBasicJoinablePresence}(
+///     const SceAppUtilAppEventParam *eventParam, ...)
+///
+/// Decode a received app event of one specific type. `sceAppUtilReceiveAppEvent` never
+/// delivers one here (there is no LiveArea and no message inbox off-console), so there
+/// is never an event of the right type to parse, and the honest answer is the parameter
+/// error the kernel gives for a mismatched event - NOT a zero-filled success, which
+/// would hand the title a phantom invite or gift that it would then act on.
+#[hostcall]
+pub(super) fn apputil_app_event_parse(_st: &mut VitaState) -> i32 {
+    SCE_APPUTIL_ERROR_PARAMETER
+}
+
+/// `SceAppUtilSaveDataRemoveItem` (vitasdk `apputil.h`, 0x2C bytes):
+/// `{ +0x00 const char *dataPath, +0x04 int mode, +0x08 reserved[36] }`.
+const SAVEDATA_REMOVE_STRIDE: u32 = 0x2C;
+
+/// int sceAppUtilSaveDataDataRemove(SceAppUtilSaveDataFileSlot *slot,
+///     SceAppUtilSaveDataRemoveItem *files, unsigned int fileNum,
+///     SceAppUtilSaveDataMountPoint *mountPoint)
+///
+/// The counterpart of `sceAppUtilSaveDataDataSave`, and it really deletes: the paths go
+/// out of the same guest filesystem the save wrote them into, so a title that deletes a
+/// slot and re-reads it sees the deletion. Removing a path that is not there is not an
+/// error - the file is absent either way, which is what the caller asked for.
+#[hostcall]
+pub(super) fn apputil_savedata_data_remove(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _slot: Ptr,
+    files: Ptr,
+    file_num: u32,
+    mount: Ptr,
+) -> i32 {
+    let mount_name = read_mount_name(ctx, mount);
+    for i in 0..file_num {
+        let entry = files.addr() + i * SAVEDATA_REMOVE_STRIDE;
+        let path_ptr = ctx.read_u32(entry);
+        if path_ptr == 0 {
+            continue;
+        }
+        let rel = ctx.read_cstr(path_ptr, 512);
+        let full = if rel.contains(':') {
+            rel.clone()
+        } else {
+            format!("{}/{}", mount_name.trim_end_matches('/'), rel.trim_start_matches('/'))
+        };
+        let removed = st.remove_file(&full);
+        tracing::debug!(target: "vitaslop::io", path = %full, removed, "sceAppUtilSaveDataDataRemove");
+    }
+    0
+}
+
+/// Modelled savedata quota, in KiB. A title compares its save against this before
+/// writing; the console's per-title allocation is on the order of a few MiB, and the
+/// figure here is deliberately generous so a legitimate save is never refused.
+const SAVEDATA_QUOTA_KIB: u32 = 8 * 1024;
+
+/// int sceAppUtilSaveDataGetQuota(SceSize *quotaSizeKiB, SceSize *usedSizeKiB,
+///     SceAppUtilSaveDataMountPoint *mountPoint)
+///
+/// UNPUBLISHED PROTOTYPE - vitasdk carries the NID but no signature. The argument order
+/// above is the one every reference to this call uses, and the `used` figure is REAL:
+/// the summed size of everything the guest filesystem holds under the mount, so a title
+/// that writes and re-queries sees its own save accounted for.
+///
+/// The inference is reported once, because swapping the two out-pointers would make a
+/// title believe the card is full - which looks like a save bug, not a wrong prototype.
+#[hostcall]
+pub(super) fn apputil_savedata_get_quota(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    quota: Ptr,
+    used: Ptr,
+    mount: Ptr,
+) -> i32 {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "vitaslop::io",
+            "sceAppUtilSaveDataGetQuota has no published prototype; assuming \
+             (quotaKiB*, usedKiB*, mountPoint*)"
+        );
+    }
+    let mount_name = read_mount_name(ctx, mount);
+    let prefix = if mount_name.is_empty() { "savedata0:".to_string() } else { mount_name };
+    let used_kib = st.mount_used_bytes(&prefix).div_ceil(1024) as u32;
+    if !quota.is_null() {
+        ctx.write_u32(quota.addr(), SAVEDATA_QUOTA_KIB);
+    }
+    if !used.is_null() {
+        ctx.write_u32(used.addr(), used_kib);
+    }
+    0
+}
+
+/// int sceNetCtlInetGetResult(int eventType, int *errorCode) /
+/// int sceNetCtlAdhocGetResult(int eventType, int *errorCode)
+///
+/// The error code of the last asynchronous NetCtl operation of `eventType`. Nothing
+/// here ever starts one - the network is modelled offline and every NetCtl call
+/// completes synchronously - so there is no failure to report and the code is 0.
+#[hostcall]
+pub(super) fn net_ctl_get_result(ctx: &mut GuestCtx, _st: &mut VitaState, _event_type: i32, error_code: Ptr) -> i32 {
+    if !error_code.is_null() {
+        ctx.write_u32(error_code.addr(), 0);
+    }
+    0
+}
+
+/// int sceAppMgrReceiveSystemEvent(SceAppMgrSystemEvent *event)
+///
+/// The system-event queue: the app being suspended, resumed, or asked to quit. The
+/// emulator never suspends the title, so the queue is empty - and the struct is zeroed
+/// for the same reason `sceAppUtilReceiveAppEvent` zeroes its own.
+#[hostcall]
+pub(super) fn appmgr_receive_system_event(ctx: &mut GuestCtx, _st: &mut VitaState, event: Ptr) -> i32 {
+    if !event.is_null() {
+        // `SceAppMgrSystemEvent` is `{ int systemEvent; uint8_t reserved[60]; }`.
+        ctx.write_bytes(event.addr(), &[0u8; 64]);
+    }
+    0
+}
+
+/// int sceAppMgrLoadExec(const char *appPath, char *const argv[],
+///     const SceAppMgrExecOptParam *optParam)
+///
+/// Replace the running process with another application. There is no second
+/// application here, and there is no honest way to continue: the title has decided it
+/// is done, and everything after this call in its own code is unreachable. So the run
+/// ENDS, named, rather than returning a success the guest then runs on past its own
+/// point of no return - or a failure it never expects and does not handle.
+pub(super) fn appmgr_load_exec(ctx: &mut GuestCtx, _st: &mut VitaState) -> SvcOutcome {
+    let path_ptr = ctx.arg(0);
+    let path = if path_ptr == 0 { String::new() } else { ctx.read_cstr(path_ptr, 256) };
+    SvcOutcome::Fatal(format!(
+        "sceAppMgrLoadExec(\"{path}\"): the title asked to launch another application and \
+         end itself; there is no second application to launch here"
+    ))
+}
+
+/// int sceShutterSoundPlay(int type)
+///
+/// Plays the console's built-in camera shutter sound - a SYSTEM sound, mandated so a
+/// photo cannot be taken silently, and not part of the title's own audio. There is no
+/// camera here and no system sound bank, so nothing plays and the call succeeds, which
+/// is what it does on a console too. Said once, so the silence is accounted for.
+#[hostcall]
+pub(super) fn shutter_sound_play(_st: &mut VitaState, _kind: i32) -> i32 {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(target: "vitaslop::cb", "sceShutterSoundPlay: no system sound bank offline");
+    }
+    0
+}
+
+/// int scePhotoExportFromData(const void *photodata, SceSize photodataSize,
+///     const ScePhotoExportParam *param, void *workMemory, void *cancelCb,
+///     void *userdata, char *outPath, SceSize outPathSize)
+///
+/// Export an image into the console's photo library. There is no photo library, but
+/// there IS a filesystem, so the bytes are written to a `photo0:` path and that path is
+/// handed back: the title's own "saved to your photos" flow works, and what it exported
+/// is inspectable afterwards rather than discarded.
+#[hostcall]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn photo_export_from_data(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    photodata: Ptr,
+    photodata_size: u32,
+    _param: Ptr,
+    _work_memory: Ptr,
+    _cancel_cb: Ptr,
+    _userdata: Ptr,
+    out_path: Ptr,
+    out_path_size: u32,
+) -> i32 {
+    if photodata.is_null() || photodata_size == 0 {
+        SCE_APPUTIL_ERROR_PARAMETER
+    } else {
+        let bytes = ctx.read_bytes(photodata.addr(), photodata_size as usize);
+        // Numbered per export, so a second one does not silently replace the first.
+        let path = format!("photo0:/export{:04}.jpg", st.next_photo_export_index());
+        st.add_file(&path, bytes);
+        if !out_path.is_null() && out_path_size > 1 {
+            let mut buf = path.into_bytes();
+            buf.truncate(out_path_size as usize - 1);
+            buf.push(0);
+            ctx.write_bytes(out_path.addr(), &buf);
+        }
+        0
+    }
+}
+
+// --- SceNp: the offline account surface ---------------------------------------
+//
+// There is no PSN account and no network here, and the ONE thing every call below has
+// in common is that pretending otherwise is worse than refusing: a title handed a
+// fabricated ticket, friend list or entitlement acts on it - it unlocks content, or it
+// waits for a session that will never arrive. Every call therefore reports the same
+// truth the console reports to a signed-out user, which is a path titles do handle.
+
+/// int sceNpGetServiceState(SceNpServiceState *state)
+///
+/// The account sign-in state, as an out-parameter rather than through the callback
+/// `sceNpCheckCallback` pumps. Same answer as that callback carries: SIGNED_OUT.
+#[hostcall]
+pub(super) fn np_get_service_state(ctx: &mut GuestCtx, _st: &mut VitaState, state: Ptr) -> i32 {
+    if !state.is_null() {
+        ctx.write_u32(state.addr(), SCE_NP_SERVICE_STATE_SIGNED_OUT);
+    }
+    0
+}
+
+/// int sceNpBasicGetFriendListEntries(SceUInt32 startIndex, SceNpId *npIds,
+///     SceUInt32 numEntries, SceUInt32 *retrieved)
+///
+/// Retrieve friends from the local NpBasic cache. Signed out there is no cache and no
+/// friends, so ZERO entries are retrieved - and `retrieved` is written, because it is
+/// the loop bound the caller then walks `npIds` with.
+#[hostcall]
+pub(super) fn np_basic_get_friend_list_entries(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _start: u32,
+    _np_ids: Ptr,
+    _num: u32,
+    retrieved: Ptr,
+) -> i32 {
+    if !retrieved.is_null() {
+        ctx.write_u32(retrieved.addr(), 0);
+    }
+    0
+}
+
+/// int sceNpBasicGetGameJoinablePresence(const SceNpCommunicationId *commId,
+///     SceNpBasicJoinablePresence *presence)
+///
+/// Whether this title's session is joinable by a friend. There is no session, so the
+/// presence struct is zeroed (not joinable) rather than left as the caller's stack.
+#[hostcall]
+pub(super) fn np_basic_get_game_joining_presence(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _comm_id: Ptr,
+    presence: Ptr,
+) -> i32 {
+    if !presence.is_null() {
+        // `SceNpBasicJoinablePresence` is a status word plus a 0x80-byte session blob.
+        ctx.write_bytes(presence.addr(), &[0u8; 0x84]);
+    }
+    0
+}
+
+/// int sceNpBasicSetInGamePresence(const SceNpBasicInGamePresence *presence)
+/// int sceNpBasicUnregisterHandler(void)
+///
+/// Publishing "what I am doing right now" to friends, and tearing the handler down.
+/// Signed out, presence goes nowhere - and it is not an error to set it: the console
+/// accepts it and simply has no one to show it to.
+#[hostcall]
+pub(super) fn np_basic_presence_ok(_st: &mut VitaState) -> i32 {
+    0
+}
+
+/// int sceNpLookupCreateTitleCtx(const SceNpCommunicationId *titleId,
+///     const SceNpId *selfNpId)
+///
+/// A lookup context is a handle onto the PSN profile service. Signed out there is no
+/// service to look anything up in, so the context cannot be created and the call says
+/// so - a title that treats the failure as "no profile data" is on the path the console
+/// puts it on, whereas a phantom context leads it to poll a request that never lands.
+#[hostcall]
+pub(super) fn np_lookup_create_title_ctx(_st: &mut VitaState) -> i32 {
+    SCE_NP_ERROR_SIGNED_OUT
+}
+
+/// int sceNpLookupDeleteRequest(int reqId)
+/// Deleting a request that was never created is harmless and succeeds.
+#[hostcall]
+pub(super) fn np_lookup_delete_request(_st: &mut VitaState) -> i32 {
+    0
+}
+
+/// int sceNpLookupUserProfileAsync(...) / int sceNpLookupPollAsync(int reqId, int *result)
+///
+/// Start a profile fetch, and poll it. No context can exist (see above), so any request
+/// id is invalid; the poll reports the same, and writes its `result` out-parameter so a
+/// caller reading it does not read its own stack as a server reply.
+#[hostcall]
+pub(super) fn np_lookup_async(ctx: &mut GuestCtx, _st: &mut VitaState, _req: i32, result: Ptr) -> i32 {
+    if !result.is_null() {
+        ctx.write_u32(result.addr(), SCE_NP_ERROR_SIGNED_OUT as u32);
+    }
+    SCE_NP_ERROR_SIGNED_OUT
+}
+
+/// The SceNpAuth surface: `CreateStartRequest`, `DestroyRequest`, `GetTicket`,
+/// `GetTicketParam`, `GetEntitlementById`, `GetEntitlementIdList`.
+///
+/// A ticket is a SIGNED assertion from Sony's authentication service that a particular
+/// account owns a particular entitlement, and a title hands it to its own server. There
+/// is no account, no service and no signing key here - a fabricated ticket would be
+/// both a forgery and useless - so every call reports signed-out. That is the same
+/// answer the console gives a user who is not logged in, and titles handle it.
+///
+/// `DestroyRequest` is the exception: tearing down a request that was never created is
+/// harmless, and refusing it would leave a title looping on cleanup.
+#[hostcall]
+pub(super) fn np_auth_signed_out(_st: &mut VitaState) -> i32 {
+    SCE_NP_ERROR_SIGNED_OUT
+}
+
+/// int sceNpActivityPostStatus(...)
+///
+/// Post an entry to the account's activity feed. Posting requires an account, and there
+/// is none, so this reports signed-out exactly as the console does - nothing leaves the
+/// machine, and nothing is invented on the way back.
+#[hostcall]
+pub(super) fn np_activity_post_status(_st: &mut VitaState) -> i32 {
+    SCE_NP_ERROR_SIGNED_OUT
 }
 
 #[cfg(test)]

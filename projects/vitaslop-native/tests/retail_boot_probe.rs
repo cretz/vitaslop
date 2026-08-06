@@ -406,6 +406,7 @@ fn retail_boot_probe() {
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_modules(linked.loaded_modules.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     let mut preloaded = 0usize;
@@ -433,6 +434,36 @@ fn retail_boot_probe() {
     let (mut sched, stubbed) =
         ThreadedScheduler::from_linked(&linked, env, quantum).expect("scheduler");
     eprintln!("transpiled + instantiated; {} trapping stubs (unlifted funcs)", stubbed.len());
+    // How many completed scenes to KEEP. The probe used to keep every one, which is fine
+    // for a 3-frame bring-up run and ruinous for a long one: this title submits six
+    // scenes a frame, so a 30,000-frame boot retained 180,000 of them - gigabytes of
+    // captured geometry that nothing ever reads, on a run whose whole purpose is to get
+    // further. Eviction folds into the determinism signature, so a limit never changes
+    // `@sig` (see `Capture::record_scene`).
+    //
+    // The default keeps exactly what this run can actually look at: everything when
+    // frames are being written and no window was given, `VITASLOP_SHOT_LAST`'s window
+    // when there is one, and a single scene when nothing is being written at all.
+    // `VITASLOP_SCENE_LIMIT=0` restores unlimited retention.
+    {
+        let shot_last: Option<usize> =
+            std::env::var("VITASLOP_SHOT_LAST").ok().and_then(|s| s.parse().ok());
+        // How many completed GXM scenes the probe KEEPS (0 = unlimited). A long boot
+        // submits hundreds of thousands; keeping them all costs gigabytes and nothing
+        // reads them. Eviction folds into the determinism signature, so this never
+        // changes what a run reports about itself.
+        let requested = std::env::var("VITASLOP_SCENE_LIMIT").ok().and_then(|s| s.parse::<usize>().ok());
+        let limit = match requested {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => match (&shot_dir, shot_last) {
+                (None, _) => Some(1),
+                (Some(_), Some(k)) => Some(k.max(1)),
+                (Some(_), None) => None,
+            },
+        };
+        sched.host().state.capture.scene_limit = limit;
+    }
     // qemu-diff faithfulness (VITASLOP_PATCH_STUBS): the on-disk inter-module import
     // stubs are unresolved placeholders (e.g. `mvn r0,#0; bx lr` = return -1); our
     // transpiler resolves those calls by redirection at transpile time and never writes
@@ -973,7 +1004,15 @@ fn retail_boot_probe() {
     );
     eprintln!("\n== result ==");
     eprintln!("reached executable main: {reached_main}");
-    eprintln!("GXM scenes captured: {}", st.capture.scenes.len());
+    // The TRUE count, not the retained one: `scene_limit` bounds how many are kept,
+    // and reporting the retained figure as "captured" would understate a long run by
+    // orders of magnitude and read as a regression when retention was bounded.
+    eprintln!(
+        "GXM scenes captured: {} ({} retained, {} evicted)",
+        st.capture.scenes.len() as u64 + st.capture.retired_scenes,
+        st.capture.scenes.len(),
+        st.capture.retired_scenes,
+    );
     // The game->OS egress ledger: the human-readable milestones a conformance recipe
     // asserts on (savedata writes, trophies, score submits), each frame-tagged. This
     // is the content-free "the game reached a real state" signal - no pixels needed.
@@ -986,31 +1025,54 @@ fn retail_boot_probe() {
     // egress ledger. Two runs of the same recipe must print the SAME signature - that
     // is what makes a recipe a reproducible test rather than a one-off. Run the probe
     // twice with a recipe and diff this line to prove the run is deterministic.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    for s in &st.capture.scenes {
-        if let Some(c) = &s.color {
-            mix(&c.data_addr.to_le_bytes());
-            mix(&c.format.to_le_bytes());
-        }
-        for d in &s.draws {
-            mix(&d.vertices);
-            mix(&d.indices);
-            for u in &d.uniforms {
-                mix(&u.to_le_bytes());
+    // Use `Capture::signature()` - the ONE authority - rather than folding
+    // `capture.scenes` here. The probe used to hand-roll its own FNV over the retained
+    // scenes, which was a second implementation of the same idea and, worse, was not
+    // invariant under `scene_limit`: once retention is bounded the retained scenes are
+    // only the tail of the run, so the hand-rolled value silently described a few
+    // scenes instead of all of them and compared unequal to an unlimited run of the
+    // very same boot. `Capture::signature` folds `retired_digest` (every evicted scene)
+    // first, so it is identical at any retention setting - verified by running the same
+    // boot at `VITASLOP_SCENE_LIMIT=0` and at the default.
+    //
+    // NOTE this is a different hash from the probe's old hand-rolled one, so probe
+    // signatures recorded before 2026-07-28 are not comparable to these.
+    let h = st.capture.signature();
+    eprintln!(
+        "determinism signature: {h:#018x} (scenes={}, egress={})",
+        st.capture.scenes.len() as u64 + st.capture.retired_scenes,
+        st.capture.egress.len()
+    );
+    // Phase timings (`VITASLOP_PERF=1`). A long boot's wall clock is the thing that
+    // decides how far into a title anything can get, so the probe reports where it went.
+    if vitaslop_runtime::perf::enabled() {
+        eprintln!("--- perf phases (VITASLOP_PERF) ---");
+        for ph in vitaslop_runtime::perf::Phase::all() {
+            let (ns, calls, bytes) = vitaslop_runtime::perf::read(ph);
+            if calls == 0 {
+                continue;
             }
+            eprintln!(
+                "  {:38} {:>9.1} ms  {:>10} calls  {:>12} bytes",
+                ph.label(),
+                ns as f64 / 1e6,
+                calls,
+                bytes
+            );
         }
     }
-    for ev in &st.capture.egress {
-        mix(&ev.frame.to_le_bytes());
-        mix(format!("{:?}", ev.kind).as_bytes());
+    // Clock calibration input: `QUANTUM_CPU_US` is one frame divided by the quanta a
+    // steadily-rendering frame takes, so this ratio is what sets it. It also reads as a
+    // health check - a run whose quanta hugely outnumber its flips is a title spinning
+    // in guest code rather than rendering.
+    {
+        let (quanta, flips) = st.quantum_flip_counts();
+        let per_frame = if flips > 0 { quanta as f64 / flips as f64 } else { f64::NAN };
+        eprintln!(
+            "clock: virtual_us={} quanta={quanta} flips={flips} quanta/flip={per_frame:.2}",
+            st.now_us(),
+        );
     }
-    eprintln!("determinism signature: {h:#018x} (scenes={}, egress={})", st.capture.scenes.len(), st.capture.egress.len());
     // VITASLOP_DUMP_DRAWS dumps every captured scene's draw stream - primitive,
     // vertex stride, index count, the attribute layout (format/components/offset/
     // reg), the uniform vector, any bound fragment textures, and a few decoded

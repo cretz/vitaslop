@@ -306,6 +306,19 @@ impl Vm {
         let built = transpiler::transpile_lenient(&linked.program());
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
+        // This host has no scheduler, so nothing here can honour the host-mirror
+        // contract (`vitaslop_transpiler::InlineOp::LoadMirror`: the block must be
+        // refreshed before guest code resumes). Refuse rather than run: an unrefreshed
+        // mirror is a frozen clock, and a guest's vblank wait on a frozen clock spins
+        // forever with nothing pointing back here.
+        if built.artifact.mirror_off.is_some() {
+            return Err(RunError::Wasm(
+                "this program inlines host-mirror reads, which the single-thread Vm cannot \
+                 refresh; run it on the preemptive scheduler, or set \
+                 VITASLOP_NO_INLINE_IMPORTS=1"
+                    .into(),
+            ));
+        }
 
         let engine = Engine::new(Config::new().consume_fuel(true))
             .map_err(|e| RunError::Wasm(e.to_string()))?;

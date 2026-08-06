@@ -254,3 +254,92 @@ pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, _info
     }
     0
 }
+
+/// Byte size of the `SceNgsModuleParamHeader` that prefixes each entry in a params
+/// BLOCK: `{ SceInt32 moduleId; SceInt32 chan; }`.
+///
+/// EVIDENCE, from the block this title passes: its first two words are `0` and
+/// `0xffffffff` - module 0 (the source player) and "all channels" - and the AT9 params
+/// descriptor id [`crate::vita::at9`] looks for (`0x01015caa`) sits at `+8`, with the
+/// sample-buffer pointer and byte count following it exactly where
+/// `At9Voice::load_params` reads them. So the module params start 8 bytes in, and the
+/// same reader that serves `sceNgsVoiceUnlockParams` serves this untouched.
+const NGS_MODULE_PARAM_HEADER_BYTES: u32 = 8;
+
+/// Offset of `uSize` within the `SceNgsParamsDescriptor` that begins each module's
+/// params (`{ SceUInt32 uId; SceUInt32 uSize; }`), used to step to the next entry.
+const NGS_PARAMS_DESC_SIZE_OFF: u32 = 4;
+
+/// SceInt32 sceNgsVoiceSetParamsBlock(SceNgsHVoice voice, const SceNgsModuleParamHeader
+///     *pParamData, SceUInt32 uSize, SceInt32 *pnErrorCount)
+///
+/// Apply a whole block of module parameters in one call - the batch form of
+/// lock / write / [`voice_unlock_params`], and the form this title's music path uses.
+///
+/// EVIDENCE for the shape, off the calling code: the caller initialises a stack local,
+/// takes its address with `ADD r3, sp, #0`, loads the voice handle and the block pointer
+/// from its own state, puts a byte count in `r2`, and then TESTS the return value. So the
+/// fourth argument is a real out-parameter (not a leftover register) and the return code
+/// is acted on.
+///
+/// The block holds one or more `(header, params)` entries back to back. Each is applied
+/// through the SAME path a single unlocked params buffer takes, so an AT9 source set this
+/// way plays exactly as one set the other way. The walk is self-checking: if the entries
+/// do not tile `uSize` exactly then this reading of the layout is wrong for that block,
+/// and it says so instead of applying whatever it happened to land on.
+#[hostcall]
+pub(super) fn voice_set_params_block(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    block: Ptr,
+    size: u32,
+    error_count: Ptr,
+) -> i32 {
+    let mut applied = 0u32;
+    if !block.is_null() {
+        let mut off = 0u32;
+        while off + NGS_MODULE_PARAM_HEADER_BYTES + 8 <= size {
+            let base = block.addr() + off;
+            let module = ctx.read_u32(base);
+            let params = base + NGS_MODULE_PARAM_HEADER_BYTES;
+            let entry_bytes = ctx.read_u32(params + NGS_PARAMS_DESC_SIZE_OFF);
+            // Module 0 is the source player; its params carry the AT9 buffer + config.
+            // Every other module is a synthesiser stage nothing here runs.
+            if module == 0 {
+                st.audio_state.at9.set_player_params(ctx, voice, params);
+            }
+            applied += 1;
+            // A zero or absurd size cannot be stepped over; stop rather than spin.
+            if entry_bytes == 0 || entry_bytes > size {
+                break;
+            }
+            off += NGS_MODULE_PARAM_HEADER_BYTES + entry_bytes;
+        }
+        if off != size {
+            report_block_layout_mismatch(size, off, applied);
+        }
+    }
+    // The caller reads this back; leaving its initialised local alone would let it act on
+    // whatever it happened to put there.
+    if !error_count.is_null() {
+        ctx.write_u32(error_count.addr(), 0);
+    }
+    0
+}
+
+/// Say so, once, when a params block does not tile exactly - the entry layout above is
+/// REd from one title's music path, and a block that does not fit it is evidence that the
+/// reading is incomplete, not something to apply silently.
+fn report_block_layout_mismatch(size: u32, walked: u32, entries: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "sceNgsVoiceSetParamsBlock: block of {size} bytes did not tile into \
+             (8-byte header + descriptor size) entries - walked {walked} bytes in \
+             {entries} entr(ies). The entry layout is REd from one title; the remainder \
+             was NOT applied."
+        );
+    }
+}

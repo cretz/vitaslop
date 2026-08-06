@@ -66,6 +66,50 @@ pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcO
     SvcOutcome::Block
 }
 
+/// int sceDisplayGetVcount(void)
+///
+/// The scanout's vertical-blank counter: how many vblanks the display has produced
+/// since boot, free-running at 60 Hz whether or not the guest presents. A title uses
+/// it to measure elapsed display time and to detect dropped frames (comparing the
+/// vcount delta across its own frame against 1), so it must be derived from the CLOCK
+/// rather than from the frame count - counting presented frames would report exactly
+/// one vblank per frame no matter how long the frame took, which is precisely the
+/// dropped-frame signal being asked for, inverted.
+///
+/// This NID is also served INLINE, out of a host-mirror word, because a vblank spin
+/// calls it tens of thousands of times a frame; [`vcount`] is the one definition both
+/// forms compute, so they cannot drift.
+#[hostcall]
+pub(super) fn get_vcount(st: &mut VitaState) -> u32 {
+    vcount(st)
+}
+
+/// The vblank counter the display has reached: the virtual clock in units of one
+/// vblank period.
+///
+/// A pure function of the game clock, which is exactly what lets the inline form
+/// exist - the clock changes only at a scheduler quantum boundary, a display flip or
+/// the idle path, none of which can happen while guest code is running.
+pub(crate) fn vcount(st: &VitaState) -> u32 {
+    (st.now_us() / VBLANK_US) as u32
+}
+
+/// The inline form of a SceDisplay host import, or `None` for the ones with real
+/// behaviour. Reached through [`crate::vita::inline_op`], which owns the on/off switch.
+///
+/// Only the vblank counter qualifies, and it qualifies because it is a pure function of
+/// the game clock - see [`crate::vita::mirror`] for the rule and why the two waits
+/// below can never join it (they block, which is behaviour, not a read).
+pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use vitaslop_transpiler::InlineOp::LoadMirror;
+    match func_nid {
+        crate::nid::display::GET_VCOUNT => {
+            Some(LoadMirror { slot: crate::vita::mirror::SLOT_VCOUNT })
+        }
+        _ => None,
+    }
+}
+
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)
 /// SceDisplayFrameBuf: { SceSize size; void *base; uint32 pitch; uint32 fmt;
 ///                       uint32 width; uint32 height; } (0x18 bytes).

@@ -43,6 +43,7 @@ fn pixel_attrs() -> Vec<VertexAttribute> {
 fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTexture>) -> Draw {
     let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
     Draw {
+        vertex_textures: Vec::new(),
         primitive: 0,
         index_format: 0,
         index_count: 6,
@@ -56,6 +57,9 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         exposure: 1.0,
         material: FragmentMaterial::default(),
         world: IDENTITY_MVP,
+        // The guest's blend equation. These probes are fixed-function parity checks, so they
+        // take the default a NULL `blendInfo` gives: write every channel, no blending.
+        blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
         vprog: Vec::new(),
@@ -93,6 +97,7 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         lod_bias: 0,
         min_filter: 0,
         mag_filter: 0,
+        gamma: 0,
     }
 }
 
@@ -204,6 +209,7 @@ fn mvp_quad(
         render_state.front_depth_write = 0x0010_0000; // SCE_GXM_DEPTH_WRITE_DISABLED
     }
     Draw {
+        vertex_textures: Vec::new(),
         primitive: 0,
         index_format: 0,
         index_count: 6,
@@ -217,6 +223,9 @@ fn mvp_quad(
         exposure,
         material,
         world: IDENTITY_MVP,
+        // The guest's blend equation. These probes are fixed-function parity checks, so they
+        // take the default a NULL `blendInfo` gives: write every channel, no blending.
+        blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
         vprog: Vec::new(),
@@ -249,6 +258,7 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut v, 16.0, 48.0, 0.0, 1.0, white);
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![quad(v, pixel_attrs(), vec![solid_texture(4, [220, 40, 40, 255])])],
         };
         assert_parity(&mut gpu, &scene, "pixel-textured");
@@ -283,11 +293,15 @@ fn general_renderer_matches_software_oracle() {
             attributes: attrs,
             indices,
             uniforms: vec![],
-            textures: vec![],
+            vertex_textures: Vec::new(),
+        textures: vec![],
             render_state: Default::default(),
             exposure: 1.0,
             material: FragmentMaterial::default(),
             world: IDENTITY_MVP,
+        // The guest's blend equation. These probes are fixed-function parity checks, so they
+        // take the default a NULL `blendInfo` gives: write every channel, no blending.
+        blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
         vprog: Vec::new(),
@@ -297,7 +311,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
-        assert_parity(&mut gpu, &Scene { color: None, draws: vec![draw] }, "ndc-vertexcolor");
+        assert_parity(&mut gpu, &Scene { color: None, depth: None, draws: vec![draw] }, "ndc-vertexcolor");
     }
 
     // 3. Alpha blend in submission order: an opaque red quad, then a half-alpha blue
@@ -317,6 +331,7 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut front, 24.0, 56.0, 0.0, 0.0, blue_half);
         let scene = Scene {
             color: None,
+            depth: None,
             draws: vec![
                 quad(back, pixel_attrs(), vec![]),
                 quad(front, pixel_attrs(), vec![]),
@@ -337,7 +352,7 @@ fn general_renderer_matches_software_oracle() {
         // = 0.501 -> ~128. This pins the exposure/tonemap curve independent of lighting.
         let dark = solid_texture(4, [64, 64, 64, 255]);
         let draw = mvp_quad([255, 0, 0, 255], vec![dark], 4.0, false, flat_material());
-        let scene = Scene { color: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-exposure");
         let c = center(&sw);
         assert!(c[0] > 100 && c[0] < 155, "exposed dark albedo should be ~mid-grey, got {c:?}");
@@ -362,7 +377,7 @@ fn general_renderer_matches_software_oracle() {
             has_light: true,
         };
         let draw = mvp_quad([255, 0, 255, 255], vec![white], 1.0, false, mat);
-        let scene = Scene { color: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-lit-tint");
         let c = center(&sw);
         // albedo 1.0 * tint 0.05 * (ambient 0 + light 1 * N.L 1) = 0.05; reinhard -> ~12.
@@ -377,7 +392,7 @@ fn general_renderer_matches_software_oracle() {
     {
         let blue = solid_texture(4, [40, 40, 220, 255]);
         let draw = mvp_quad([255, 255, 255, 180], vec![blue], 1.0, true, FragmentMaterial::default());
-        let scene = Scene { color: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-depthdisabled-overlay");
         let c = center(&sw);
         // Blended, not opaque-replaced: alpha 180/255 over the dark clear keeps the blue
@@ -412,6 +427,7 @@ fn general_renderer_matches_software_oracle() {
             lod_bias: 0,
             min_filter: 1,
             mag_filter: 1, // SCE_GXM_TEXTURE_FILTER_LINEAR
+            gamma: 0,
         };
         // Nudge the address so its content key differs from any earlier texture.
         tex.data_addr = 0x2100;
@@ -421,7 +437,7 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut v, 56.0, 8.0, 1.0, 0.0, white);
         pixel_vertex(&mut v, 56.0, 56.0, 1.0, 1.0, white);
         pixel_vertex(&mut v, 8.0, 56.0, 0.0, 1.0, white);
-        let scene = Scene { color: None, draws: vec![quad(v, pixel_attrs(), vec![tex])] };
+        let scene = Scene { color: None, depth: None, draws: vec![quad(v, pixel_attrs(), vec![tex])] };
         assert_parity_tol(&mut gpu, &scene, "linear-filter", 9.0);
     }
 
@@ -451,12 +467,16 @@ fn general_renderer_matches_software_oracle() {
             attributes: attrs,
             indices,
             uniforms: IDENTITY_MVP.to_vec(),
-            textures: vec![],
+            vertex_textures: Vec::new(),
+        textures: vec![],
             render_state: RenderState::default(),
             exposure: 2.0,
             // Flat material (unit ambient, no directional light) isolates the exposure ramp.
             material: flat_material(),
             world: IDENTITY_MVP,
+        // The guest's blend equation. These probes are fixed-function parity checks, so they
+        // take the default a NULL `blendInfo` gives: write every channel, no blending.
+        blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
         vprog: Vec::new(),
@@ -466,7 +486,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
-        let scene = Scene { color: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-untextured");
         let c = center(&sw);
         // R = reinhard(200/255*2) = 1.568/2.568 = 0.611 -> ~156; must be reddish (R>G>B).
@@ -496,11 +516,15 @@ fn general_renderer_matches_software_oracle() {
                 attributes: mvp_attrs(),
                 indices,
                 uniforms: IDENTITY_MVP.to_vec(),
-                textures: vec![],
+                vertex_textures: Vec::new(),
+        textures: vec![],
                 render_state,
                 exposure: 1.0,
                 material: FragmentMaterial::default(),
                 world: IDENTITY_MVP,
+        // The guest's blend equation. These probes are fixed-function parity checks, so they
+        // take the default a NULL `blendInfo` gives: write every channel, no blending.
+        blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
         vprog: Vec::new(),
@@ -510,7 +534,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
             };
-            Scene { color: None, draws: vec![draw] }
+            Scene { color: None, depth: None, draws: vec![draw] }
         };
         let a = cull_tri([0, 1, 2]);
         let b = cull_tri([0, 2, 1]);
@@ -541,7 +565,7 @@ fn general_renderer_matches_software_oracle() {
     {
         let red = mvp_quad([220, 20, 20, 255], vec![], 1.0, false, flat_material());
         let blue = mvp_quad([20, 20, 220, 255], vec![], 1.0, false, flat_material());
-        let scene = Scene { color: None, draws: vec![red, blue] };
+        let scene = Scene { color: None, depth: None, draws: vec![red, blue] };
         let sw = assert_parity(&mut gpu, &scene, "depthfunc-lessequal");
         let c = center(&sw);
         // The winning face is blue: its dominant blue channel survives (Reinhard-compressed
@@ -583,7 +607,7 @@ fn general_renderer_supersample_matches_software() {
         unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 2, height: 2, stride: 8,
         faces: 1, face_bytes: 16,
         pixels: checker.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0,
-        min_filter: 0, mag_filter: 0,
+        min_filter: 0, mag_filter: 0, gamma: 0,
     };
     let mut sprite_v = Vec::new();
     for (x, y, u, v) in [(8.0f32, 8.0, 0.0, 0.0), (56.0, 8.0, 1.0, 0.0), (56.0, 56.0, 1.0, 1.0), (8.0, 56.0, 0.0, 1.0)] {
@@ -591,7 +615,7 @@ fn general_renderer_supersample_matches_software() {
     }
     let sprite = quad(sprite_v, pixel_attrs(), vec![tex]);
     let backdrop = mvp_quad([60, 160, 60, 255], vec![], 1.0, false, flat_material());
-    let scene = Scene { color: None, draws: vec![backdrop, sprite] };
+    let scene = Scene { color: None, depth: None, draws: vec![backdrop, sprite] };
 
     // Factor-1 must still be exactly the non-supersampled path (a sanity anchor).
     gpu.set_supersample(1);

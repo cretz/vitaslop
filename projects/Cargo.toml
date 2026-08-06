@@ -31,6 +31,14 @@ tracing = "0.1"
 wgpu = "30"
 pollster = "1"
 
+# Full debuginfo on MSVC writes a separate .pdb per binary, and this workspace's
+# binaries statically link wgpu plus the generated ARM decoder tables - each one
+# lands at 400-500 MB. Cargo never reclaims the stale hash-suffixed copies, so the
+# debug tree grew past 200 GB. Line tables keep file:line in panics and backtraces,
+# which is all the diagnostics here ever use, at roughly a tenth of the size.
+[profile.dev]
+debug = "line-tables-only"
+
 # Browser wasm blob. Runtime perf first (opt-level 3 from release), size second.
 [profile.wasm-release]
 inherits = "release"

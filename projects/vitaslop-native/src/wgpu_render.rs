@@ -344,11 +344,252 @@ impl GeneralRenderer {
             submit_ms: t_submit.elapsed().as_secs_f64() * 1000.0,
             phases: self.gxm.last_phases(),
         };
+        if let Some(dir) = std::env::var_os("VITASLOP_GPU_CHAIN_DIR") {
+            self.dump_chain_targets(std::path::Path::new(&dir));
+            self.dump_chain_depth_targets(std::path::Path::new(&dir));
+        }
         Framebuffer { width, height, rgba }
+    }
+
+    /// `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just
+    /// rendered to `<dir>/rtt_<addr>_<w>x<h>.png`.
+    ///
+    /// The GPU counterpart of the software rasterizer's `VITASLOP_SW_CHAIN`. Only the
+    /// composite reaches the caller's framebuffer, so a black frame says nothing about
+    /// WHICH pass failed - and on a title whose draws are real recompiled shaders the
+    /// software chain is not an answer either, because it cannot run them. Written after
+    /// submit, so these are the finished images the composite had available to sample.
+    fn dump_chain_targets(&self, dir: &std::path::Path) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("gpu chain dump: mkdir {}: {e}", dir.display());
+            return;
+        }
+        // Row pitch for a texture->buffer copy must be a multiple of 256 bytes, so the
+        // readback is padded and the padding stripped per row on the way out.
+        const ALIGN: u32 = 256;
+        for (addr, tex, w, h) in self.gxm.rtt_targets() {
+            let (w, h) = (w.max(1), h.max(1));
+            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-rtt-readback"),
+                size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.queue.submit([enc.finish()]);
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().is_err() {
+                continue;
+            }
+            let padded_bytes = slice.get_mapped_range().unwrap().to_vec();
+            readback.unmap();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for row in 0..h as usize {
+                let start = row * padded as usize;
+                rgba.extend_from_slice(&padded_bytes[start..start + (w * 4) as usize]);
+            }
+            let path = dir.join(format!("rtt_{addr:08x}_{w}x{h}.png"));
+            let fb = Framebuffer { width: w, height: h, rgba };
+            if let Err(e) = std::fs::write(&path, fb.to_png()) {
+                eprintln!("gpu chain dump: write {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// `VITASLOP_GPU_CHAIN_DIR=<dir>`: alongside the colour targets, report every converted
+    /// guest-DEPTH target numerically and write a normalised grayscale view of it.
+    ///
+    /// The numbers are the point, not the picture. A depth buffer holds view distances in the
+    /// guest's own units - hundreds, and often negative - so a PNG of it says almost nothing,
+    /// while "min -1174, max -3.8" says immediately whether the conversion produced distances
+    /// at all and whether they have the sign the reading shader expects. A pass that samples a
+    /// depth buffer and renders black cannot otherwise be told apart from one that samples a
+    /// depth buffer full of zeroes.
+    fn dump_chain_depth_targets(&self, dir: &std::path::Path) {
+        const ALIGN: u32 = 256;
+        for (addr, tex, w, h) in self.gxm.rtt_depth_targets() {
+            let (w, h) = (w.max(1), h.max(1));
+            // Rgba16Float: four halves, eight bytes a texel.
+            let padded = (w * 8).div_ceil(ALIGN) * ALIGN;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-rtt-depth-readback"),
+                size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.queue.submit([enc.finish()]);
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().is_err() {
+                continue;
+            }
+            let bytes = slice.get_mapped_range().unwrap().to_vec();
+            readback.unmap();
+            let mut vals: Vec<f32> = Vec::with_capacity((w * h) as usize);
+            for row in 0..h as usize {
+                let start = row * padded as usize;
+                for x in 0..w as usize {
+                    let o = start + x * 8;
+                    vals.push(f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])));
+                }
+            }
+            let finite: Vec<f32> =
+                vals.iter().copied().filter(|v| v.is_finite()).collect();
+            let (min, max) = finite
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            let mean =
+                if finite.is_empty() { 0.0 } else { finite.iter().sum::<f32>() / finite.len() as f32 };
+            let nonzero = finite.iter().filter(|v| **v != 0.0).count();
+            eprintln!(
+                "gpu chain depth {addr:#010x} {w}x{h}: min={min} max={max} mean={mean} \
+                 nonzero={nonzero}/{} finite={}",
+                vals.len(),
+                finite.len()
+            );
+            // A coarse grid of actual values. The min/max above say the conversion produced
+            // distances; this says WHERE they are, which is the question when a pass that
+            // reads the depth lights up in some places and not others. Eight columns by six
+            // rows is small enough to read in a log and dense enough to show a horizon.
+            for gy in 0..6 {
+                let y = (h as usize * (2 * gy + 1)) / 12;
+                let row: Vec<String> = (0..8)
+                    .map(|gx| {
+                        let x = (w as usize * (2 * gx + 1)) / 16;
+                        format!("{:>9.1}", vals[y * w as usize + x])
+                    })
+                    .collect();
+                eprintln!("gpu chain depth {addr:#010x}   y={y:<4} {}", row.join(" "));
+            }
+            // A normalised grayscale view, purely so the SHAPE is visible (is that the track,
+            // or noise?). The scale is printed above, because the image cannot carry it.
+            let span = if max > min { max - min } else { 1.0 };
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for v in &vals {
+                let g = if v.is_finite() { (((v - min) / span) * 255.0) as u8 } else { 0 };
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+            let path = dir.join(format!("depth_{addr:08x}_{w}x{h}.png"));
+            let fb = Framebuffer { width: w, height: h, rgba };
+            if let Err(e) = std::fs::write(&path, fb.to_png()) {
+                eprintln!("gpu chain dump: write {}: {e}", path.display());
+            }
+        }
     }
 
     /// Where the last [`GeneralRenderer::render_scene`] went. See [`RenderSplit`].
     pub fn last_split(&self) -> RenderSplit {
         self.last_split
+    }
+}
+
+/// Decode an IEEE binary16 bit pattern to `f32`, including subnormals, infinities and NaN.
+///
+/// Written out rather than pulled from a crate because it is the ONLY place this crate needs
+/// it and a wrong `f16` decode would misreport exactly the values this diagnostic exists to
+/// report - a silently wrong number is worse than no number.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+    let bits = match exp {
+        // Zero or subnormal: normalise by hand.
+        0 if frac == 0 => sign << 31,
+        0 => {
+            // `frac * 2^-24`, renormalised. With `lz` leading zeros in the u32 the top set
+            // bit sits at `31 - lz`, so the value is `2^(7 - lz) * (1 + rest)` and the biased
+            // exponent is `134 - lz`; the mantissa shifts left by `lz - 8` and the implicit
+            // leading one falls off the top under the mask.
+            let lz = frac.leading_zeros();
+            (sign << 31) | ((134 - lz) << 23) | ((frac << (lz - 8)) & 0x7f_ffff)
+        }
+        // Infinity or NaN.
+        0x1f => (sign << 31) | 0x7f80_0000 | (frac << 13),
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13),
+    };
+    f32::from_bits(bits)
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::f16_to_f32;
+
+    /// Every finite half, against the reference conversion. A hand-picked list misses exactly
+    /// the cases that are hard - the subnormals and the exponent boundary.
+    #[test]
+    fn every_finite_half_decodes_exactly() {
+        for bits in 0u32..=0xffff {
+            let h = bits as u16;
+            let exp = (h >> 10) & 0x1f;
+            if exp == 0x1f {
+                continue; // inf/NaN compared separately below
+            }
+            let got = f16_to_f32(h);
+            // Reference: assemble through f32 arithmetic from the fields.
+            let sign = if h >> 15 == 1 { -1.0f32 } else { 1.0 };
+            let frac = (h & 0x3ff) as f32;
+            let want = if exp == 0 {
+                sign * frac * 2.0f32.powi(-24)
+            } else {
+                sign * (1.0 + frac / 1024.0) * 2.0f32.powi(exp as i32 - 15)
+            };
+            assert_eq!(got, want, "half {h:#06x}");
+        }
+    }
+
+    #[test]
+    fn infinities_and_nan_decode() {
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
     }
 }

@@ -153,6 +153,18 @@ pub trait GuestEngine {
     /// (`VITASLOP_ARM_AT_FRAME`) uses it to arm them at the requested frame, which is
     /// what lets a first-hit trap fire deep inside a run instead of during boot.
     fn on_frame(&mut self, _frames: u64) {}
+
+    /// Guest address of the HOST MIRROR block, when this build's inline imports read
+    /// one (`vitaslop_transpiler::InlineOp::LoadMirror`). `None` when the transpiled
+    /// module reserved no block, which is every build that inlines nothing.
+    ///
+    /// An engine that transpiles a module with a mirror block MUST report it here.
+    /// Failing to is not a lost optimisation, it is a guest reading a word nobody ever
+    /// writes - so [`SchedCore::new`] checks that the block is actually being filled
+    /// and refuses to start otherwise.
+    fn mirror_base(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// One entry in the live thread table: the engine's thread plus the policy's state.
@@ -170,6 +182,17 @@ struct Slot<T> {
     /// a host call long before a full quantum) are never cooled and their interleave
     /// is unchanged.
     cooled: bool,
+    /// How many times this thread has been picked to run, and of those how many ended
+    /// by burning a WHOLE quantum rather than blocking or flipping. Together they are
+    /// this thread's share of the single baton - see [`SchedCore::cpu_share_report`].
+    picks: u64,
+    quanta: u64,
+}
+
+impl<T> Slot<T> {
+    fn new(thread: T, state: ThreadState) -> Slot<T> {
+        Slot { thread, state, cooled: false, picks: 0, quanta: 0 }
+    }
 }
 
 /// What to do when no thread is runnable (see [`SchedCore::handle_idle`]).
@@ -200,18 +223,85 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// A core seeded with its `main` thread. `host` is shared with the engine (its
     /// clones ride into each thread), so pass the same `Arc` the engine was built with.
     pub fn new(engine: E, host: Arc<Mutex<H>>, main: E::Thread) -> Self {
-        SchedCore {
+        let mut core = SchedCore {
             engine,
             host,
-            threads: vec![Slot { thread: main, state: ThreadState::Runnable, cooled: false }],
+            threads: vec![Slot::new(main, ThreadState::Runnable)],
             cursor: 0,
             frames: 0,
+        };
+        // If this build inlined any host-mirror read, the host must actually be filling
+        // the block. Check it once, here, while the failure is still one line from its
+        // cause: an unfilled mirror means every inlined read returns a word that never
+        // changes, and for the clock that is a vblank spin that can never be satisfied -
+        // a livelock thousands of frames away with nothing pointing back here.
+        if core.engine.mirror_base().is_some() {
+            let written = core.refresh_mirror();
+            assert!(
+                written > 0,
+                "this build inlines host-mirror reads, but the host writes no mirror slots \
+                 (ImportDispatch::refresh_mirror); the guest would read a word that never \
+                 changes",
+            );
         }
+        core
+    }
+
+    /// Bring the host-mirror block in guest memory up to date, and report how many
+    /// slots the host wrote. A no-op when this build reserved no block.
+    ///
+    /// Called before every resume: that is the whole contract that makes an inlined
+    /// mirror read equal to the host call it replaced (see
+    /// `vitaslop_transpiler::InlineOp::LoadMirror`).
+    fn refresh_mirror(&mut self) -> usize {
+        let Some(base) = self.engine.mirror_base() else {
+            return 0;
+        };
+        // Split borrows: the engine writes memory, the host supplies the values.
+        let engine = &mut self.engine;
+        self.host.lock().unwrap().refresh_mirror(&mut |slot, value| {
+            engine.write_mem(base.wrapping_add(slot * 4), &value.to_le_bytes());
+        })
     }
 
     /// Borrow the engine (e.g. to read guest memory or the shared host after a run).
     pub fn engine(&self) -> &E {
         &self.engine
+    }
+
+    /// Who actually got the CPU: one line per thread, most-scheduled first, with its
+    /// share of all resumes and how many of its turns ended by burning a WHOLE quantum
+    /// (a thread that never blocks) rather than blocking or flipping.
+    ///
+    /// This exists because the console has SEVERAL CPU cores and this scheduler has ONE
+    /// baton. On hardware a high-priority thread that busy-waits occupies one core while
+    /// a low-priority background worker keeps running on another; here the busy-wait
+    /// takes the whole machine, and a title whose loader runs at a low priority can be
+    /// starved into taking tens of thousands of frames to do a few seconds of work. That
+    /// failure looks exactly like "loading is slow" from the outside, and nothing else
+    /// in the system distinguishes it from a title that is genuinely busy - so the share
+    /// has to be measurable.
+    ///
+    /// `quanta/picks` is the tell: a thread whose turns nearly all end in `Quantum` is
+    /// spinning, not working through host calls.
+    pub fn cpu_share_report(&self) -> String {
+        use std::fmt::Write;
+        let total: u64 = self.threads.iter().map(|t| t.picks).sum();
+        let mut rows: Vec<(i32, i32, u64, u64, ThreadState)> = self
+            .threads
+            .iter()
+            .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.state))
+            .collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut s = format!("--- scheduler CPU share: {total} resumes over {} threads ---\n", rows.len());
+        for (thid, prio, picks, quanta, state) in rows {
+            let pct = if total == 0 { 0.0 } else { picks as f64 * 100.0 / total as f64 };
+            let _ = writeln!(
+                s,
+                "  thid={thid:#x} prio={prio:#x} {pct:6.2}%  picks={picks} whole-quanta={quanta} {state:?}"
+            );
+        }
+        s
     }
 
     /// The shared host handle (the browser loop locks it directly to dispatch).
@@ -256,6 +346,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             .map(|k| (self.cursor + k) % n)
             .find(|&i| runnable(&self.threads[i]) && self.threads[i].thread.priority() == best)?;
         self.cursor = idx + 1;
+        self.threads[idx].picks += 1;
+        // Guest code is about to run, so the host-mirror block has to be current. This
+        // is the one place both schedulers (native and browser) pass through on their
+        // way to a resume, which is why the refresh lives here rather than in either
+        // loop - a resume path that skipped it would serve a stale clock.
+        self.refresh_mirror();
         Some(idx)
     }
 
@@ -286,6 +382,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             // [`Slot::cooled`]).
             Stop::Quantum => {
                 self.threads[idx].cooled = true;
+                self.threads[idx].quanta += 1;
                 // Guest work happened without a frame ending. Clocks that track executed
                 // work rather than rendered frames advance here (the modelled storage
                 // clock), so a title that spins in guest code waiting for a load still
@@ -396,8 +493,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             self.engine.write_mem(addr, &value.to_le_bytes());
         }
         for sp in spawns {
-            match self.engine.spawn(&sp) {
-                Ok(thread) => self.threads.push(Slot { thread, state: ThreadState::Runnable, cooled: false }),
+            let spawned = crate::perf::time(crate::perf::Phase::ThreadSpawn, || {
+                self.engine.spawn(&sp)
+            });
+            match spawned {
+                Ok(thread) => self.threads.push(Slot::new(thread, ThreadState::Runnable)),
                 // A spawn whose entry was not translated: record it as finished with
                 // code 0 so a later join does not hang.
                 Err(()) => self.host.lock().unwrap().set_thread_exit(sp.thid, 0),
@@ -485,6 +585,11 @@ where
     /// frame at a time by calling `run_frames(frames() + 1, ..)` each redraw.
     pub fn frames(&self) -> u64 {
         self.core.frames()
+    }
+
+    /// Who actually got the CPU - see [`SchedCore::cpu_share_report`].
+    pub fn cpu_share_report(&self) -> String {
+        self.core.cpu_share_report()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run

@@ -233,12 +233,36 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
 /// The `vec4<f32>` expression that reads the final colour out of register-file array `bank`,
 /// honouring how the shader packed it. Shared by the standalone fragment wrapper and the
 /// linked module so both read the colour identically.
-pub(crate) fn color_return_expr(bank: &str, precision: ColorPrecision) -> String {
+///
+/// `varyings` is how many `v<n>` locations this fragment stage actually declares, so the
+/// varying probe can refuse to name one that does not exist. It used to emit `in.v<n>`
+/// unconditionally, which is a WGSL parse error on any pair with fewer varyings - and since
+/// every pair is compiled, one unlucky pair took the whole run down with it. A diagnostic that
+/// cannot be aimed at one shader has to degrade on the others, not abort.
+pub(crate) fn color_return_expr(bank: &str, precision: ColorPrecision, varyings: u32) -> String {
     // Diagnostic (`VITASLOP_GXP_PROBE=<bank><index>`, e.g. `r6` or `pa0`): return that register
     // pair AS the colour instead of the shader's own result. A recompiled shader that paints a
     // wrong colour is otherwise a black box - this bisects it by making any intermediate
     // visible, which is how a "the whole surface is black" bug is traced to the one term that
     // is zero. Read here so both the standalone and linked module paths honour it.
+    // Diagnostic (`VITASLOP_GXP_VPROBE=<n>`): return interpolated varying `v<n>` AS the colour.
+    // The register probe below can only see values the fragment stores into a register, and a
+    // TEXTURE COORDINATE is usually not one of them - it is consumed straight out of the varying
+    // by a `textureSample`. That leaves the most common "why is this sampling the wrong place"
+    // question with no instrument at all, which is how a composite's UV offset stayed a matter
+    // of argument for a whole session. `<n>.xy` shows as red/green, so an on-screen ramp from
+    // black to yellow is UV 0..1 and anything flat is a coordinate that does not vary.
+    if let Ok(n) = std::env::var("VITASLOP_GXP_VPROBE").map(|s| s.trim().to_string()) {
+        if let Ok(i) = n.parse::<u32>() {
+            if i < varyings {
+                return format!("vec4<f32>(in.v{i}.x, in.v{i}.y, in.v{i}.z, 1.0)");
+            }
+            // This pair has no such varying. Return a flat MAGENTA rather than emitting a
+            // field access that does not compile: the probe is asking a question this shader
+            // cannot answer, and "not applicable" has to be visibly different from "zero".
+            return "vec4<f32>(1.0, 0.0, 1.0, 1.0)".to_string();
+        }
+    }
     if let Ok(spec) = std::env::var("VITASLOP_GXP_PROBE") {
         let split = spec.trim().find(|c: char| c.is_ascii_digit()).unwrap_or(spec.len());
         let (probe_bank, idx) = spec.trim().split_at(split);
@@ -324,6 +348,9 @@ pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
     }
     // Predicate registers p0..p3 (written by test ops, read by predicated instructions).
     let _ = writeln!(m, "  var p: array<bool, 4>;");
+    // The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    let _ = writeln!(m, "  var idx: array<i32, 2>;");
 
     // Feed the PA registers from the varyings. This standalone wrapper carries one register
     // per interpolated component; the real linked module ([`crate::link`]) instead derives each
@@ -345,7 +372,9 @@ pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
         ColorOutput::NativeO0 => "o",
         ColorOutput::NonNativePa0 => "pa",
     };
-    let _ = writeln!(m, "  return {};\n}}", color_return_expr(ret, plan.color_precision));
+    // The standalone fragment wrapper has no inter-stage varyings at all (it is compiled
+    // without a vertex partner), so the varying probe can never apply here.
+    let _ = writeln!(m, "  return {};\n}}", color_return_expr(ret, plan.color_precision, 0));
 
     FragmentModule { wgsl: m, bindings: plan.clone() }
 }
@@ -403,6 +432,10 @@ pub struct VertexBindingPlan {
     /// Number of `@location` vec4 varying OUTPUTS beyond clip position (grouping `o[4..]` four
     /// lanes per location). Zero means the vertex program outputs only position.
     pub varying_vec4s: u32,
+    /// Textures the VERTEX program samples (vertex texture fetch), ascending by unit. A vertex
+    /// program that samples is building its GEOMETRY from the texture, so an unbound one is a
+    /// missing mesh rather than an untextured surface. Empty for the usual vertex program.
+    pub samplers: Vec<crate::wgsl::TexBinding>,
 }
 
 impl VertexBindingPlan {
@@ -464,8 +497,9 @@ pub fn plan_vertex_bindings(program: &Program, shader: &Shader) -> VertexBinding
     let sa_lane_count = program.default_uniform_regs;
     let extent = output_write_extent(shader);
     let varying_vec4s = extent.saturating_sub(4).div_ceil(4);
+    let samplers = crate::wgsl::tex_units(shader, |u| program.sampler_is_cube(u as u32));
 
-    VertexBindingPlan { attributes, sa_lane_count, varying_vec4s }
+    VertexBindingPlan { attributes, sa_lane_count, varying_vec4s, samplers }
 }
 
 /// Assemble a complete, bindable WGSL vertex module from an emitted body + its binding plan.
@@ -513,6 +547,9 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
         let _ = writeln!(m, "  var {bank}: array<u32, {BANK_REGS}>;");
     }
     let _ = writeln!(m, "  var p: array<bool, 4>;");
+    // The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    let _ = writeln!(m, "  var idx: array<i32, 2>;");
 
     // Load PA registers from the vertex attributes (vertex inputs are plain f32 components).
     const COMP: [&str; 4] = ["x", "y", "z", "w"];
@@ -694,6 +731,7 @@ mod tests {
     /// register counts), for testing the vertex binding plan without a real blob.
     fn vertex_program(secondary_reg_count: u16, attrs: Vec<Parameter>) -> Program {
         Program {
+            varyings_error: None,
             default_uniform_regs: 0,
             secondary_code: Vec::new(),
             literals: Vec::new(),

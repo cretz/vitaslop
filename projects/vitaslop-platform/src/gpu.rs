@@ -114,6 +114,20 @@ pub struct GxmTexture {
     /// (`SceGxmTextureFilter` == 1); the renderer then bilinear-samples it, matching
     /// the software rasterizer's `sample_texture_bilinear`. False = POINT/nearest.
     pub filter_linear: bool,
+    /// The guest's `SceGxmTextureAddrMode` for U and V
+    /// (`sceGxmTextureSet{U,V}AddrMode`, 0 = REPEAT). The recompiled path used to hardcode
+    /// REPEAT for every sampler, which is invisible while every coordinate stays inside
+    /// [0,1] and catastrophic the moment one does not: a full-screen pass reading one texel
+    /// past the edge wraps to the OPPOSITE edge instead of clamping, and a title's composite
+    /// showed the world tiled diagonally across the display rather than clipped.
+    pub addr_mode_u: u32,
+    pub addr_mode_v: u32,
+    /// The guest set `sceGxmTextureSetGammaMode` on this texture, so the hardware sampler
+    /// sRGB-DECODES every texel it fetches. Uploading through an sRGB texture format does the
+    /// same decode in the same place, before filtering.
+    ///
+    /// The counterpart of [`RttTarget::gamma`], which is the write half of the same state.
+    pub gamma: bool,
 }
 
 /// The per-material forward-lighting inputs the GPU `fs_opaque` needs to reproduce the
@@ -248,6 +262,11 @@ pub struct GxpRecompile {
     pub primitive: u32,
     /// Decoded textures bound per fragment sampler unit.
     pub textures: Vec<GxpTex>,
+    /// Decoded textures bound per VERTEX sampler unit. Separate list, because the two stages
+    /// number their units independently - and a vertex program that samples is building its
+    /// geometry from what it reads, so binding the fragment's texture here draws a wrong mesh
+    /// rather than shading a surface wrongly.
+    pub vertex_textures: Vec<GxpTex>,
     /// Depth write enabled for this draw (GXM `front_depth_write != DISABLED`).
     pub depth_write: bool,
     /// GXM depth-compare function word (`SceGxmDepthFunc`).
@@ -255,7 +274,17 @@ pub struct GxpRecompile {
     /// GXM cull-mode word (`SceGxmCullMode`).
     pub cull_mode: u32,
     /// Whether this draw is alpha-blended (a 2D/overlay draw, not opaque geometry).
+    ///
+    /// A HEURISTIC read off the geometry, kept only for the fixed-function path. The
+    /// recompiler path uses `blend_state`, which is the guest's own answer.
     pub blend: bool,
+    /// The blend equation the guest baked into this draw's fragment program, as raw GXM enum
+    /// values: `[color_mask, color_func, alpha_func, color_src, color_dst, alpha_src,
+    /// alpha_dst]`.
+    ///
+    /// Carried as a plain array rather than the capture type so this crate stays independent
+    /// of the capture crate, exactly as `depth_func` and `cull_mode` are carried.
+    pub blend_state: [u8; 7],
     /// GXM viewport `[xOffset,xScale,yOffset,yScale,zOffset,zScale]` mapping the guest clip
     /// output to the framebuffer. All-zero means the guest left the default (fullscreen).
     pub viewport: [f32; 6],
@@ -298,6 +327,11 @@ pub struct RttTarget {
     pub data_addr: u32,
     pub width: u32,
     pub height: u32,
+    /// The guest asked for GAMMA-CORRECT writes on this surface
+    /// (`sceGxmColorSurfaceSetGammaMode`), so the hardware sRGB-encodes every value the ROP
+    /// stores. Rendering through an sRGB view of the same texture reproduces that exactly -
+    /// including doing it AFTER blending, which is where the hardware does it too.
+    pub gamma: bool,
 }
 
 /// A whole scene reduced to general draws, in submission order. The runtime builds
@@ -319,6 +353,16 @@ pub struct RenderScene {
     /// opaque geometry (or a single depth plane): every opaque fragment maps to 0.
     pub depth_min: f32,
     pub depth_scale: f32,
+    /// Where the guest's `SceGxmDepthStencilSurface` for this scene puts its depth samples,
+    /// or 0 when the scene had none.
+    ///
+    /// A later pass that reads this scene's depth - a soft-particle fade, fog, SSAO - binds a
+    /// texture at exactly this address. It is the ONLY thing that tells such a sample apart
+    /// from one of the colour target, because a title allocates the two next to each other:
+    /// on one retail racer the world's colour is at `0x89204aa0` and its depth 256 bytes later
+    /// at `0x89204ba0`, so an address-RANGE match against the colour target claims it first
+    /// and the pass reads a colour where it wanted a distance.
+    pub depth_addr: u32,
 }
 
 #[cfg(feature = "gpu")]
@@ -718,6 +762,124 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+    /// Convert one render target's DEPTH attachment into the value the GUEST's depth buffer
+    /// would hold, so a later pass that samples that buffer reads a distance rather than a
+    /// colour.
+    ///
+    /// The recompiled vertex stage does not write the guest's depth: `gxp_clipfix` replaces it
+    /// with `clamp((-1/w - min) * scale, 0, 1)`, a monotonic remap onto the scene's visible
+    /// range that keeps the depth TEST precise (see `RenderScene::depth_min`). That remap is
+    /// affine in `-1/w` and therefore invertible, which is what makes this a small fullscreen
+    /// pass instead of a second colour attachment on every draw of the pass: recover `w`, then
+    /// re-encode it the way the guest expects.
+    ///
+    /// `mode` selects that encoding - see `GxmDepthEncoding`. It is a knob because the value a
+    /// GXM depth surface holds is not something any clean source we hold states outright, and
+    /// the honest thing is to make the choice visible and measurable rather than to bake in a
+    /// guess.
+    const GXM_DEPTH_SHADER: &str = r#"
+struct DU { depth_min: f32, depth_scale: f32, mode: u32, konst: f32, fit_a: f32, fit_c: f32, pad0: f32, pad1: f32 };
+@group(0) @binding(0) var srcDepth: texture_depth_2d;
+@group(0) @binding(1) var<uniform> du: DU;
+
+@vertex
+fn vdep(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // mode 5 is a CAUSALITY test, not an encoding: every texel becomes one known value, so a
+    // pass that reads this depth either responds to it or does not. Reading a value only says
+    // what a shader was fed; substituting one says whether that input is what decides the
+    // picture. It reports itself, like every other substitution here.
+    if (du.mode == 5u) {
+        return vec4<f32>(du.konst, 0.0, 0.0, 1.0);
+    }
+    let d = textureLoad(srcDepth, vec2<i32>(i32(pos.x), i32(pos.y)), 0);
+    // mode 4, and the degenerate scale==0 scene, pass the stored depth straight through:
+    // with no range there is no `w` to recover, and inventing one would be worse than
+    // handing back what is actually in the buffer.
+    if (du.mode == 4u || du.depth_scale == 0.0) {
+        return vec4<f32>(d, 0.0, 0.0, 1.0);
+    }
+    // Undo the clip fixup: q is -1/w, exactly what `gxp_clipfix` mapped onto [0,1].
+    let q = d / du.depth_scale + du.depth_min;
+    let w = select(-1.0 / q, 0.0, q == 0.0);
+    var out = du.fit_a + du.fit_c / w;   // mode 0: the guest's own window depth `a + c/w`
+    if (du.mode == 1u) { out = w; }
+    else if (du.mode == 2u) { out = -w; }
+    else if (du.mode == 3u) { out = q; }                                 // -1/w
+    else if (du.mode == 6u) { out = -q; }                                // 1/w
+    if (w == 0.0) { out = 0.0; }
+    return vec4<f32>(out, 0.0, 0.0, 1.0);
+}
+"#;
+
+    /// The sRGB twin of a linear colour format, when it has one.
+    ///
+    /// A GXM colour surface with `sceGxmColorSurfaceSetGammaMode` set has its writes
+    /// sRGB-ENCODED by the ROP, and a texture with `sceGxmTextureSetGammaMode` has its reads
+    /// sRGB-DECODED by the sampler. Rendering through - and sampling through - an sRGB VIEW of
+    /// the same texture reproduces both exactly, including doing the encode AFTER blending,
+    /// which is where the hardware does it. Nothing else in the pipeline has to change: the
+    /// shader keeps writing linear values.
+    fn srgb_twin(f: wgpu::TextureFormat) -> Option<wgpu::TextureFormat> {
+        use wgpu::TextureFormat as F;
+        match f {
+            F::Rgba8Unorm => Some(F::Rgba8UnormSrgb),
+            F::Bgra8Unorm => Some(F::Bgra8UnormSrgb),
+            // Already sRGB, or a format with no sRGB twin (a float target needs none - it is
+            // not quantised, so there is nothing for a transfer function to buy).
+            _ => None,
+        }
+    }
+
+    /// The format the converted guest-depth texture is stored in.
+    ///
+    /// A GXM `DF32` depth surface holds 32-bit floats, so `R32Float` is the exact match - but
+    /// `R32Float` is NOT filterable in WebGPU core, and the recompiled sampler layout declares
+    /// every unit filterable (it has to: it is one layout serving a shader's texture units,
+    /// and the same unit index carries ordinary colour textures on other pairs). Binding an
+    /// unfilterable format into a filterable slot is a validation error, not a soft failure.
+    ///
+    /// `Rgba16Float` is filterable everywhere and carries ~11 bits of mantissa, which over a
+    /// view distance of a few hundred units is sub-unit precision - far finer than the soft
+    /// fades that read it resolve. The cost is stated rather than assumed: see
+    /// [`report_depth_conversion`], which names the encoding in every run.
+    const GXM_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+    /// Bytes of the depth-conversion uniform block (`DU` above).
+    const GXM_DEPTH_UNIFORM_BYTES: u64 = 32;
+
+    /// Which value a later pass reads out of a render target's depth
+    /// (`VITASLOP_GXM_DEPTH_ENC`), matching the `mode` branch in [`GXM_DEPTH_SHADER`].
+    /// Returns `(mode, constant)`; the constant is used only by mode 5.
+    fn gxm_depth_encoding() -> (u32, f32) {
+        let v = std::env::var("VITASLOP_GXM_DEPTH_ENC").unwrap_or_default();
+        match v.as_str() {
+            // The default is no longer a guess: `fit` writes the guest's own window depth
+            // `a + c/w`, with `a` and `c` measured from the pass's vertex programs. The rest
+            // stay as A/B alternatives, because a title whose depth surface turns out to hold
+            // something else should cost one run to find out, not a code change.
+            "fit" | "" => (0, 0.0),
+            "w" => (1, 0.0),
+            "negw" => (2, 0.0),
+            "negrecipw" => (3, 0.0),
+            "recipw" => (6, 0.0),
+            "unit" => (4, 0.0),
+            other => match other.strip_prefix("const:").map(str::parse::<f32>) {
+                Some(Ok(k)) => (5, k),
+                _ => panic!(
+                    "VITASLOP_GXM_DEPTH_ENC={other} is not one of \
+                     fit|w|negw|negrecipw|recipw|unit|const:<float> - refusing to guess which \
+                     value the guest's depth buffer holds"
+                ),
+            },
+        }
+    }
+
     /// Bytes of the per-draw uniform block (matches the WGSL `U` struct): mat4 (64) +
     /// mode/surf_w/surf_h/textured (16) + exposure/depth_min/depth_scale/pad2 (16) +
     /// tint/light_dir/light_col/ambient (4 x vec4 = 64) = 160. Copies are laid into a
@@ -775,6 +937,9 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     pub struct GxmRenderer {
         opaque: wgpu::RenderPipeline,
         blend: wgpu::RenderPipeline,
+        /// The same two against the sRGB view of the target, for a pass whose colour surface
+        /// the guest put in GAMMA-CORRECT mode. `None` when `color_format` has no sRGB twin.
+        srgb: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
         uniform_layout: wgpu::BindGroupLayout,
         texture_layout: wgpu::BindGroupLayout,
         sampler_point: wgpu::Sampler,
@@ -813,6 +978,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         resolve_pipeline: wgpu::RenderPipeline,
         resolve_layout: wgpu::BindGroupLayout,
         resolve_scale_buf: wgpu::Buffer,
+        /// The depth-conversion pipeline + layout + uniform ([`GXM_DEPTH_SHADER`]), used only
+        /// for a target whose depth a later pass samples. Built once in [`GxmRenderer::new`];
+        /// a frame that samples no depth never runs it.
+        gxm_depth_pipe: wgpu::RenderPipeline,
+        gxm_depth_layout: wgpu::BindGroupLayout,
+        gxm_depth_uniform: wgpu::Buffer,
         /// The lazily-(re)created offscreen supersample target (colour + depth + resolve bind
         /// group), sized to `ss_scale * surf`. Rebuilt when the scale or target size changes.
         ss_target: Option<SsTarget>,
@@ -833,6 +1004,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Addresses whose entry in `rtt_rendered` is currently the snapshot rather than
         /// the live target (the pass being encoded draws into that address).
         rtt_reads_snapshot: HashSet<u32>,
+        /// Views of the guest-encoded DEPTH of the targets already rendered this frame, keyed
+        /// by the guest address of the depth surface (NOT the colour one). A sampler naming
+        /// one of these is asking for a distance, and must be resolved here BEFORE the
+        /// colour-target range match, which would otherwise claim the address first.
+        rtt_depth_rendered: HashMap<u32, wgpu::TextureView>,
+        /// The pass currently being encoded writes into a target whose depth is sampled later,
+        /// so its depth attachment must be STORED rather than discarded.
+        keep_depth: bool,
         /// Draws in the current chain that sampled a target this frame rendered. Zero over
         /// a frame with several passes means the composite is NOT reading them, which is a
         /// different problem from the passes not being drawn - and the two look identical
@@ -917,10 +1096,29 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         height: u32,
         color: wgpu::Texture,
         color_view: wgpu::TextureView,
+        /// An sRGB view of the SAME `color` texture, for a surface the guest put in
+        /// gamma-correct mode. Rendering through it makes the ROP sRGB-encode every store
+        /// after blending, and sampling through it decodes on read - which is what the
+        /// hardware does at both ends. `None` when the colour format has no sRGB twin.
+        color_view_srgb: Option<wgpu::TextureView>,
         depth_view: wgpu::TextureView,
         /// A copy of `color` as it stood before the pass now drawing into it, made only
         /// when that pass also SAMPLES the buffer - see `GxmRenderer::snapshot_rtt`.
         shadow: Option<(wgpu::Texture, wgpu::TextureView)>,
+        /// This target's depth, re-encoded the way the GUEST's depth buffer holds it, for a
+        /// later pass that samples it. Present only when some pass in the frame actually
+        /// names this scene's depth address - see `GxmRenderer::encode_chain`.
+        gxm_depth: Option<GxmDepthTarget>,
+    }
+
+    /// A render target's depth in the guest's own encoding, plus what it takes to produce and
+    /// sample it.
+    struct GxmDepthTarget {
+        /// A sampleable view of the depth ATTACHMENT (the conversion pass's input).
+        src_view: wgpu::TextureView,
+        /// The converted R32Float texture (the output), and the view a draw samples it through.
+        _tex: wgpu::Texture,
+        view: wgpu::TextureView,
     }
 
     /// Round `v` up to a multiple of `align` (a power of two).
@@ -957,6 +1155,8 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         fsa_lanes: u32,
         /// `(sampler unit, is_3d)` per group2 sampler, in binding order.
         samplers: Vec<(u8, SamplerDim)>,
+        /// The VERTEX stage's sampler units, in group-4 binding order.
+        vertex_samplers: Vec<(u8, SamplerDim)>,
         /// How to repack the guest vertex stream into the tightly-packed `Float32xN` buffer
         /// this pipeline's vertex layout expects (one entry per attribute), + the packed
         /// stride. Repacking to f32 on the CPU sidesteps wgpu's vertex-format gaps (no
@@ -984,6 +1184,12 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bg: [wgpu::BindGroup; 4],
         /// True = alpha-blended (2D/overlay), false = opaque geometry.
         blend: bool,
+        /// The guest's GXM viewport for this draw, `[xOffset,xScale,yOffset,yScale,zOffset,
+        /// zScale]`. All-zero means the guest left the default (the whole target).
+        viewport: [f32; 6],
+        /// The attachment format this draw's pipeline was built for - part of the pipeline
+        /// cache key, because a gamma-correct surface renders through an sRGB view.
+        format: wgpu::TextureFormat,
     }
 
     /// One entry in the submission-order draw plan: either a fixed-function [`Item`] (by index
@@ -1004,7 +1210,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         only: bool,
         /// Apply the GXM (GL-style, NDC z in [-1,1]) -> WebGPU (z in [0,1]) clip-depth remap
         /// in the vertex output (`VITASLOP_GXP_ZFIX`, default on). Off passes clip z straight.
-        zfix: bool,
+        zfix: ZFix,
         /// Flip clip Y (`VITASLOP_GXP_YFLIP`, default off). The fixed-function MVP path passes
         /// guest clip X/Y straight to WebGPU and renders upright, so the real shaders should
         /// too; the toggle is here for empirical confirmation.
@@ -1027,6 +1233,11 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// the two: a surface that appears here and not in an ordinary run is depth-rejected,
         /// one that stays black is shaded black.
         nodepth: bool,
+        /// Diagnostic (`VITASLOP_GXP_NOBLEND`): force every recompiled pipeline to REPLACE with
+        /// a full colour write mask, changing NOTHING else. The counterpart of `nodepth` for the
+        /// other way a correctly-shaded draw can leave no mark: a shader that writes alpha 0
+        /// under a src-alpha blend, or a guest colour mask that writes no channels.
+        noblend: bool,
         /// Diagnostic (`VITASLOP_GXP_KEYS=<hex>,<hex>`): recompile ONLY these shader-pair keys
         /// (the `gxp draw key` value `VITASLOP_GXP_DUMP` prints), letting every other draw fall
         /// back. Rendering one pair at a time is how a visual artifact is attributed to the
@@ -1034,16 +1245,40 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         keys: Vec<u64>,
         /// Pairs forced down the fixed-function path (`VITASLOP_GXP_EXCLUDE`).
         exclude: Vec<u64>,
-        /// `key -> Some(pipeline)` for a linkable pair, `key -> None` for one that failed to
-        /// link (cached so we never retry it and always fall back).
-        pipelines: HashMap<u64, Option<GxpPipeline>>,
+        /// `(key, target format) -> Some(pipeline)` for a linkable pair, `-> None` for one that
+        /// failed to link (cached so we never retry it and always fall back).
+        ///
+        /// The FORMAT is part of the key because a render pipeline is bound to the format of
+        /// the attachment it writes, and a surface the guest put in gamma-correct mode is
+        /// rendered through an sRGB view of the same texture. Only a pair that is actually
+        /// drawn onto such a surface ever gets a second entry, so a title using no gamma
+        /// surfaces builds exactly as many pipelines as before.
+        pipelines: HashMap<(u64, wgpu::TextureFormat), Option<GxpPipeline>>,
         /// Uploaded texture views, keyed by the decoded texture's content fingerprint and the
         /// view dimension it is bound as. A scene binds a handful of textures across hundreds
         /// of draws, so uploading per draw (as this path first did) re-sends the same
         /// multi-megabyte shadow map thousands of times a frame and exhausts GPU memory.
         views: HashMap<(u64, SamplerDim), wgpu::TextureView>,
-        sampler_point: Option<wgpu::Sampler>,
-        sampler_linear: Option<wgpu::Sampler>,
+        /// Samplers by `(linear, addr_mode_u, addr_mode_v)`. A handful per title.
+        samplers_by_mode: HashMap<(bool, u32, u32), wgpu::Sampler>,
+        /// How to choose the clip-`w` sign correction (`VITASLOP_GXP_NEGW`).
+        negw: NegW,
+        /// What interpreting each shader pair's vertex program over its own mesh said about the
+        /// projection behind it (see `measure_clip`). Measured ONCE per key, on the first draw
+        /// that uses it. `None` records a pair whose program does not interpret, so it is not
+        /// re-attempted.
+        ///
+        /// The DECISIONS are not per pair - see [`GxpLive::decide_scene_negw`].
+        negw_by_key: HashMap<u64, Option<ClipStats>>,
+        /// Whether THIS pass's projection puts clip `w` negative in front of the camera, as
+        /// decided by [`GxpLive::decide_scene_negw`] before the pass's draws are walked.
+        scene_negw: bool,
+        /// THIS pass's `(a, c)` in `guest window depth = a + c/w` (see [`ClipStats::depth_fit`]).
+        scene_depth_fit: (f32, f32),
+        /// Both verdicts, per render-target address, once a frame's draws produced evidence for
+        /// them. Keeps the measurement off the per-frame path: a projection belongs to the pass,
+        /// and a pass does not change projection convention between frames.
+        negw_by_target: HashMap<u32, (bool, (f32, f32))>,
         /// The `@group(3)` depth-range bind group, keyed by `(pipeline key, the depth
         /// range's bits)`.
         ///
@@ -1053,7 +1288,51 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// same thing each time. Keyed by pipeline as well as by value because each
         /// pipeline owns its own `BindGroupLayout` object; a shared group-3 layout
         /// would collapse this to one entry, and is the right follow-up.
-        depth_bgs: HashMap<(u64, u64), wgpu::BindGroup>,
+        depth_bgs: HashMap<(u64, u64, bool), wgpu::BindGroup>,
+    }
+
+    /// Which depth the recompiled vertex stage writes (`VITASLOP_GXP_ZFIX`).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ZFix {
+        /// The scene's `-1/w` range, normalized onto [0,1] (default): the same quantity and the
+        /// same range the fixed-function path writes, so both kinds of draw share one comparable
+        /// depth buffer. Costs a dependency on the scene depth range, which is measured through
+        /// the software path's own reflected transform.
+        Range,
+        /// The ordinary GL->WebGPU clip-depth remap `(z + w) / 2` (`=gl`), using the guest's own
+        /// clip z and nothing else.
+        Gl,
+        /// Pass the guest's clip z straight through (`=0`).
+        Off,
+    }
+
+    /// How the clip-`w` sign correction is chosen (`VITASLOP_GXP_NEGW`).
+    ///
+    /// A guest projection may put clip `w` NEGATIVE in front of the camera, in which case
+    /// WebGPU clips every world draw away and the pass renders black with correct shaders,
+    /// textures, depth and blend (memory `vitaslop-clip-w-can-be-negative`). The correction
+    /// is to negate the whole clip vector, which names the same point with `w > 0`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    /// MEASURED on one retail racer at a race frame, and this is what settles which correction
+    /// is right: with `w` flipped the HUD reads the right way round and the player's vehicle
+    /// carries readable lettering on its tail; with the WHOLE vector negated the
+    /// identical frame comes out turned 180 degrees, every glyph mirrored. So the guest's
+    /// `x`,`y`,`z` are right and the `w` reaching WebGPU has the wrong SIGN - full negation
+    /// preserves `x/w` exactly, which is precisely why it cannot fix a mirrored picture.
+    enum NegW {
+        /// Never correct (`=0`). The clip position goes to WebGPU as the shader produced it.
+        Off,
+        /// Measure it per PASS (`=auto`, the default) and flip `w` on every pair of a pass
+        /// whose projection is negative. See [`GxpLive::decide_scene_negw`] for why the
+        /// decision cannot be taken per shader pair.
+        Auto,
+        /// Negate the WHOLE clip vector on the pairs `Auto` would correct (`=negate`).
+        ///
+        /// Kept because it is the other reading of the same measurement and the two are one
+        /// experiment apart: negating names the same point with `w > 0` (homogeneous coordinates
+        /// are scale-invariant), so it lifts the clip and changes nothing else. On this title it
+        /// renders the frame upside down - see the note above.
+        Negate,
     }
 
     /// Diagnostic (`VITASLOP_GXP_DUMP`): print each recompiled draw's inputs.
@@ -1071,11 +1350,16 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             GxpLive {
                 enabled: flag("VITASLOP_GXP_LIVE"),
                 only: flag("VITASLOP_GXP_ONLY"),
-                zfix: std::env::var("VITASLOP_GXP_ZFIX").map(|v| v != "0").unwrap_or(true),
+                zfix: match std::env::var("VITASLOP_GXP_ZFIX").ok().as_deref() {
+                    Some("0") | Some("off") => ZFix::Off,
+                    Some("gl") => ZFix::Gl,
+                    _ => ZFix::Range,
+                },
                 yflip: std::env::var("VITASLOP_GXP_YFLIP").map(|v| v != "0").unwrap_or(false),
                 force: flag("VITASLOP_GXP_FORCE"),
                 solid: flag("VITASLOP_GXP_SOLID"),
                 nodepth: flag("VITASLOP_GXP_NODEPTH"),
+                noblend: flag("VITASLOP_GXP_NOBLEND"),
                 keys: std::env::var("VITASLOP_GXP_KEYS")
                     .ok()
                     .map(|v| {
@@ -1094,16 +1378,147 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     .unwrap_or_default(),
                 pipelines: HashMap::new(),
                 views: HashMap::new(),
-                sampler_point: None,
-                sampler_linear: None,
+                samplers_by_mode: HashMap::new(),
+                negw: match std::env::var("VITASLOP_GXP_NEGW").ok().as_deref() {
+                    Some("0") | Some("off") => NegW::Off,
+                    Some("negate") => NegW::Negate,
+                    _ => NegW::Auto,
+                },
+                negw_by_key: HashMap::new(),
+                scene_negw: false,
+                scene_depth_fit: DEPTH_FIT_RECIP_W,
+                negw_by_target: HashMap::new(),
                 depth_bgs: HashMap::new(),
             }
         }
 
-        /// Stable cache key for a shader pair: FNV-1a over the vertex then fragment blob.
+        /// Decide, ONCE PER PASS, whether this pass's projection puts clip `w` NEGATIVE in
+        /// front of the camera - in which case WebGPU clips every draw away and the pass
+        /// renders black with correct shaders, textures, depth and blend (memory
+        /// `vitaslop-clip-w-can-be-negative`).
+        ///
+        /// **It cannot be decided per shader pair, and doing so was a bug.** The sign
+        /// convention is a property of the PROJECTION MATRIX, which every draw of a pass
+        /// shares; "all of this pair's vertices have `w < 0`" is equally the signature of a
+        /// draw that is simply BEHIND THE CAMERA, which WebGPU is then right to clip. Per pair,
+        /// those two are indistinguishable. MEASURED on one retail racer's race pass: of ~60 pairs,
+        /// exactly two came out negative - both engine-trail ribbons ~700 units behind the eye
+        /// - and "correcting" them pulled behind-camera geometry into the frame as a smudge in
+        /// the corner. Across a whole pass the two are easy to tell apart: a negative
+        /// projection makes EVERY draw negative, and one stray draw cannot outvote the rest.
+        ///
+        /// The per-pair MEASUREMENT is still cached per key (interpreting a vertex program over
+        /// its mesh is not cheap); only the verdict is taken over the pass.
+        ///
+        /// The same walk settles the pass's DEPTH ENCODING - `z_clip = a * w_clip + c`, hence a
+        /// window depth of `a + c/w` - because both answers come from the same interpretation
+        /// and neither can be read off the frame afterwards. See [`ClipStats::depth_fit`].
+        fn decide_scene_negw(&mut self, scene: &RenderScene) {
+            if self.negw == NegW::Off || !self.enabled {
+                self.scene_negw = false;
+                self.scene_depth_fit = DEPTH_FIT_RECIP_W;
+                return;
+            }
+            let target = scene.target.as_ref().map(|t| t.data_addr).unwrap_or(0);
+            // Settled passes cost nothing per frame. A pass is only settled once its draws
+            // produced EVIDENCE: a frame in which every draw of a pass happens to cover nothing
+            // says nothing about its projection, and freezing "not negative" from it would make
+            // the answer depend on which frame the pass was first seen in.
+            if let Some(&decided) = self.negw_by_target.get(&target) {
+                self.scene_negw = decided.0;
+                self.scene_depth_fit = decided.1;
+                return;
+            }
+            let (mut in_front, mut behind) = (0usize, 0usize);
+            // The fit is taken from the ONE draw with the widest spread of `w`, not averaged
+            // over the pass: `z = a*w + c` is exact for every draw sharing the projection, so a
+            // wider spread is simply a better-conditioned way of asking the same question, while
+            // an average would let a near-degenerate draw drag the answer.
+            let (mut fit, mut best_spread) = (None, 0.0f32);
+            for d in &scene.draws {
+                let Some(gxp) = d.gxp.as_ref() else { continue };
+                let key = Self::key(gxp);
+                let stats = match self.negw_by_key.get(&key) {
+                    Some(&s) => s,
+                    None => {
+                        let s = measure_clip(gxp, key);
+                        // Only remember an answer the measurement supports: a draw entirely off
+                        // screen decides nothing, and the next draw of the same pair may see the
+                        // geometry that settles it.
+                        let empty = s.is_some_and(|s| s.in_front == 0 && s.behind == 0);
+                        if !empty {
+                            self.negw_by_key.insert(key, s);
+                        }
+                        s
+                    }
+                };
+                let Some(s) = stats else { continue };
+                in_front += s.in_front;
+                behind += s.behind;
+                if let Some(f) = s.depth_fit {
+                    if s.w_spread > best_spread {
+                        best_spread = s.w_spread;
+                        fit = Some(f);
+                    }
+                }
+            }
+            // A negative PROJECTION leaves nothing at all on the positive side. Requiring that
+            // (rather than a mere majority) is what keeps a handful of behind-camera draws from
+            // turning a pass whose projection is perfectly ordinary. One vertex on the positive
+            // side refutes it - which is deliberately strict, and is reported either way.
+            let correct = behind > 0 && in_front == 0;
+            let depth_fit = fit.unwrap_or(DEPTH_FIT_RECIP_W);
+            if in_front + behind > 0 {
+                self.negw_by_target.insert(target, (correct, depth_fit));
+                eprintln!(
+                    "gxp clip: pass into 0x{target:08x}: {in_front} sampled vertices land in the frustum \
+                     with w>0 and {behind} with w<0 -> {}; guest depth = {} + {}/w{}",
+                    if correct {
+                        "the projection is NEGATIVE, CORRECTING the clip w sign for every pair of this pass"
+                    } else {
+                        "clip positions left as the shaders produced them"
+                    },
+                    depth_fit.0,
+                    depth_fit.1,
+                    if fit.is_some() { "" } else { " (NO draw of this pass fits one - assuming -1/w)" }
+                );
+            }
+            self.scene_negw = correct;
+            self.scene_depth_fit = depth_fit;
+        }
+
+        /// The measured `(a, c)` of `guest window depth = a + c/w` for the pass that RENDERS
+        /// into `addr`, for a later pass that wants to sample its depth.
+        ///
+        /// Keyed by the target rather than taken from `scene_depth_fit`, because the pass being
+        /// encoded when a depth surface is converted is not necessarily the pass that wrote it.
+        /// Falls back to `-1/w` for a target no pass has yet produced evidence for - which is
+        /// the honest answer, not a silent zero: it is the encoding with no projection in it.
+        fn depth_fit_for(&self, addr: u32) -> (f32, f32) {
+            self.negw_by_target.get(&addr).map(|v| v.1).unwrap_or(DEPTH_FIT_RECIP_W)
+        }
+
+        /// Stable cache key for a shader pair AND the fixed-function state baked into its
+        /// pipeline: FNV-1a over the vertex blob, the fragment blob, the blend equation and
+        /// the depth state.
+        ///
+        /// Everything the pipeline bakes in has to be in the key, because the cache holds
+        /// compiled PIPELINES, not modules. Two draws sharing a shader pair but differing in
+        /// `SceGxmBlendInfo` or in depth func/write are different pipelines, and leaving
+        /// either out silently gives the second draw the first one's state.
         fn key(gxp: &GxpRecompile) -> u64 {
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in gxp.vprog.iter().chain(gxp.fprog.iter()) {
+            let depth = [
+                gxp.depth_write as u8,
+                (gxp.depth_func >> 22) as u8 & 0x7,
+            ];
+            for b in gxp
+                .vprog
+                .iter()
+                .chain(gxp.fprog.iter())
+                .chain(gxp.blend_state.iter())
+                .chain(depth.iter())
+            {
                 h ^= *b as u64;
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
@@ -1123,6 +1538,9 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // guest address. A sampler whose bound texture points at one of these binds
             // the render rather than the guest's (stale) bytes.
             rendered: &HashMap<u32, wgpu::TextureView>,
+            // The same, for the DEPTH of those targets, keyed by the guest's depth-surface
+            // address. Checked before `rendered` - see `make_sampler_bg`.
+            depth_rendered: &HashMap<u32, wgpu::TextureView>,
         ) -> Option<GxpPrepared> {
             if gxp.index_count == 0 || gxp.vertices.is_empty() {
                 return None;
@@ -1138,27 +1556,42 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if self.exclude.contains(&key) {
                 return None;
             }
-            if !self.pipelines.contains_key(&key) {
-                let built = build_gxp_pipeline(device, color_format, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth);
-                self.pipelines.insert(key, built);
+            report_inputs(key, gxp);
+            let cache_key = (key, color_format);
+            if !self.pipelines.contains_key(&cache_key) {
+                // Name the pair's two containers by their CONTENT hash the moment it is first
+                // seen. `Program::hash` is the same value the offline corpus computes, so this
+                // one line is what turns a draw key from the frame into the two `.gxp` blobs an
+                // offline test can open. Printed once per unique pair (not per draw), and
+                // unconditionally: a diagnostic that needs a knob set is a diagnostic nobody has
+                // when the surprising frame is already in front of them.
+                let ph = |b: &[u8]| {
+                    vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0)
+                };
+                eprintln!(
+                    "gxp pair {key:x}: vprog hash {:016x}, fprog hash {:016x}",
+                    ph(&gxp.vprog),
+                    ph(&gxp.fprog)
+                );
+                let built = build_gxp_pipeline(device, color_format, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth, self.noblend);
+                self.pipelines.insert(cache_key, built);
             }
-            if self.sampler_point.is_none() {
-                self.sampler_point = Some(make_gxp_sampler(device, false));
-                self.sampler_linear = Some(make_gxp_sampler(device, true));
-            }
+
             // Split the borrows: the sampler bind group needs the texture-view cache mutably
             // while the pipeline (its layouts, its sampler plan) stays borrowed.
+            let negw_mode = self.negw;
+            let scene_negw = self.scene_negw;
+            let scene_depth_fit = self.scene_depth_fit;
             let GxpLive {
                 pipelines,
                 views: view_cache,
-                sampler_point,
-                sampler_linear,
+                samplers_by_mode,
                 force,
                 depth_bgs,
                 ..
             } = self;
             // Borrow the cached pipeline; None = link failed -> fall back.
-            let pipe = pipelines.get(&key)?.as_ref()?;
+            let pipe = pipelines.get(&cache_key)?.as_ref()?;
 
             if gxp_dump() {
                 let f: Vec<f32> = gxp
@@ -1224,23 +1657,54 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-            let bg0 = make_uniform_bg(device, &pipe.layouts[0], pipe.vsa_lanes, &gxp.vert_sa);
-            let bg1 = make_uniform_bg(device, &pipe.layouts[1], pipe.fsa_lanes, &gxp.frag_sa);
+            let vert_sa = override_sa(key, 'v', &gxp.vert_sa);
+            let frag_sa = override_sa(key, 'f', &gxp.frag_sa);
+            let bg0 = make_uniform_bg(device, &pipe.layouts[0], pipe.vsa_lanes, &vert_sa);
+            let bg1 = make_uniform_bg(device, &pipe.layouts[1], pipe.fsa_lanes, &frag_sa);
             let bg2 = Self::make_sampler_bg(
-                device, queue, &pipe.layouts[2], &pipe.samplers, gxp, key,
-                view_cache, sampler_point.as_ref().unwrap(), sampler_linear.as_ref().unwrap(), *force,
-                rendered,
+                device, queue, &pipe.layouts[2],
+                &[
+                    (&pipe.samplers[..], &gxp.textures[..]),
+                    (&pipe.vertex_samplers[..], &gxp.vertex_textures[..]),
+                ],
+                gxp, key,
+                view_cache, samplers_by_mode, *force,
+                rendered, depth_rendered,
             )?;
             // group3: the scene depth range the injected clip fixup maps through, as one vec4
             // (min, scale, unused, unused) - the same values the fixed-function path uses, so
             // both kinds of draw write comparable depth. Per SCENE, not per draw, so it is
             // cached (see `GxpLive::depth_bgs`); the bit pattern is the key so a changed
             // range builds a new one rather than reusing a stale buffer.
+            //
+            // Its third lane is the clip-`w` sign correction, which is a property of the DRAW
+            // (its projection), not of the scene - so it joins the cache key.
+            let corrected = scene_negw;
+            let sign: f32 = match (corrected, negw_mode) {
+                (false, _) => 1.0,
+                (true, NegW::Negate) => -1.0,
+                (true, _) => 2.0,
+            };
+            // Lanes 4 and 5 are this pass's guest depth encoding `a + c/w`, and they are the
+            // same numbers the depth-conversion pass writes with: a fragment reading its own
+            // POSITION.z and a fragment sampling a converted depth surface must be looking at
+            // one quantity, or every soft fade between them compares apples to oranges.
+            let (fit_a, fit_c) = scene_depth_fit;
             let depth_key = (depth_range[0].to_bits() as u64) << 32 | depth_range[1].to_bits() as u64;
-            let bg3 = depth_bgs.entry((key, depth_key)).or_insert_with(|| {
+            let bg3 = depth_bgs.entry((key, depth_key, corrected)).or_insert_with(|| {
                 let dbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("gxp-depth"),
-                    contents: &[depth_range[0].to_le_bytes(), depth_range[1].to_le_bytes(), [0; 4], [0; 4]].concat(),
+                    contents: &[
+                        depth_range[0].to_le_bytes(),
+                        depth_range[1].to_le_bytes(),
+                        sign.to_le_bytes(),
+                        [0; 4],
+                        fit_a.to_le_bytes(),
+                        fit_c.to_le_bytes(),
+                        [0; 4],
+                        [0; 4],
+                    ]
+                    .concat(),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1251,12 +1715,24 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             });
             let bg3 = bg3.clone();
 
-            Some(GxpPrepared { key, vbuf, ibuf, index_count: gxp.index_count, bg: [bg0, bg1, bg2, bg3], blend: gxp.blend })
+            Some(GxpPrepared {
+                key,
+                vbuf,
+                ibuf,
+                index_count: gxp.index_count,
+                bg: [bg0, bg1, bg2, bg3],
+                blend: gxp.blend,
+                viewport: gxp.viewport,
+                format: color_format,
+            })
         }
 
         /// The cached pipeline for a prepared draw (only called after `prepare` succeeded).
-        fn pipeline(&self, key: u64) -> &GxpPipeline {
-            self.pipelines.get(&key).and_then(|p| p.as_ref()).expect("prepared key present")
+        fn pipeline(&self, key: u64, format: wgpu::TextureFormat) -> &GxpPipeline {
+            self.pipelines
+                .get(&(key, format))
+                .and_then(|p| p.as_ref())
+                .expect("prepared key present")
         }
 
         /// Build the group2 sampler bind group: for each declared sampler unit, upload the
@@ -1267,16 +1743,20 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             device: &wgpu::Device,
             queue: &wgpu::Queue,
             layout: &wgpu::BindGroupLayout,
-            samplers: &[(u8, SamplerDim)],
+            stages: &[(&[(u8, SamplerDim)], &[crate::gpu::GxpTex])],
             gxp: &GxpRecompile,
             key: u64,
             view_cache: &mut HashMap<(u64, SamplerDim), wgpu::TextureView>,
-            sampler_point: &wgpu::Sampler,
-            sampler_linear: &wgpu::Sampler,
+            samplers_by_mode: &mut HashMap<(bool, u32, u32), wgpu::Sampler>,
             force: bool,
             rendered: &HashMap<u32, wgpu::TextureView>,
+            depth_rendered: &HashMap<u32, wgpu::TextureView>,
         ) -> Option<wgpu::BindGroup> {
-            if samplers.is_empty() {
+            // Both stages' samplers share this group, in declaration order: the fragment's
+            // first, the vertex's after. The layout, the WGSL and this must agree on that order
+            // or a sample reads the wrong texture.
+            let total: usize = stages.iter().map(|(s, _)| s.len()).sum();
+            if total == 0 {
                 return Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("gxp-samplers-empty"),
                     layout,
@@ -1284,11 +1764,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }));
             }
             // Upload every needed texture first so the views outlive the bind-group build.
-            let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(samplers.len());
+            let mut views: Vec<wgpu::TextureView> = Vec::with_capacity(total);
             // Cloning a `TextureView` is a refcount bump, so cached views are shared, not copied.
-            let mut linears: Vec<bool> = Vec::with_capacity(samplers.len());
+            // `(linear, addr_mode_u, addr_mode_v)` per bound view - the sampler state the guest
+            // set on that texture, not a global default.
+            let mut sampler_state: Vec<(bool, u32, u32)> = Vec::with_capacity(total);
+            for &(samplers, textures) in stages {
             for &(unit, want) in samplers {
-                let bound = gxp.textures.iter().find(|t| t.unit == unit);
+                let bound = textures.iter().find(|t| t.unit == unit);
                 // The bound texture must actually supply the dimension the shader declared: a
                 // cube sampler needs the six captured faces, a 2D sampler a single image. A
                 // mismatch means the container and the guest state disagree, so bind nothing.
@@ -1297,14 +1780,49 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     SamplerDim::Two => gt.tex.faces == 1,
                     SamplerDim::Three => false,
                 });
+                // A DEPTH buffer this frame rendered, matched EXACTLY and checked FIRST.
+                //
+                // Order is load-bearing. A title allocates a scene's depth next to its colour
+                // (one racer puts them 256 bytes apart), so `rendered_alias`, which matches by
+                // range, claims the depth address for the colour target and the pass reads a
+                // colour where it asked for a distance - which is why its glow, blur and
+                // soft-particle passes rendered pure black. Exact-matching the depth first is
+                // what tells the two apart, and the address comes from the guest's own
+                // `SceGxmDepthStencilSurface`, not from a guess about the layout.
+                let depth_hit = (want == SamplerDim::Two)
+                    .then(|| usable.and_then(|gt| depth_rendered.get(&gt.tex.data_addr)))
+                    .flatten();
+                let aliased = depth_hit
+                    .is_none()
+                    .then(|| {
+                        (want == SamplerDim::Two)
+                            .then(|| usable.and_then(|gt| rendered_alias(rendered, gt.tex.data_addr, key, unit)))
+                            .flatten()
+                    })
+                    .flatten();
                 match usable {
+                    Some(gt) if depth_hit.is_some() => {
+                        report_depth_sample_bound(key, unit, gt.tex.data_addr);
+                        views.push(depth_hit.unwrap().clone());
+                        sampler_state.push((gt.tex.filter_linear, gt.tex.addr_mode_u, gt.tex.addr_mode_v));
+                    }
                     // Sampling a buffer an earlier pass in THIS frame rendered: bind that
                     // render. Only 2D targets - a cube face is never a GXM render target.
-                    Some(gt) if want == SamplerDim::Two && rendered.contains_key(&gt.tex.data_addr) => {
-                        views.push(rendered[&gt.tex.data_addr].clone());
-                        linears.push(gt.tex.filter_linear);
+                    Some(gt) if aliased.is_some() => {
+                        views.push(rendered[&aliased.unwrap()].clone());
+                        sampler_state.push((gt.tex.filter_linear, gt.tex.addr_mode_u, gt.tex.addr_mode_v));
                     }
                     Some(gt) => {
+                        // A texture whose data pointer is null decodes to a 1x1 ZERO texel. That
+                        // is the faithful substitute (see the runtime's zero-handle report), but
+                        // a recompiled shader sampling it multiplies its whole output by zero,
+                        // and the pass comes out BLACK with nothing in the log tying the two
+                        // together. Name the pair and the unit, once each: this is a draw
+                        // silently losing its content, which is the same class of event as a
+                        // fallback and gets the same unconditional report.
+                        if gt.tex.data_addr == 0 {
+                            report_zero_texel_sample(key, unit);
+                        }
                         let cache_key = (gt.tex.key, want);
                         if !view_cache.contains_key(&cache_key) {
                             // Bound the cache: the keys are content fingerprints, so clearing
@@ -1320,7 +1838,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             view_cache.insert(cache_key, view);
                         }
                         views.push(view_cache[&cache_key].clone());
-                        linears.push(gt.tex.filter_linear);
+                        sampler_state.push((gt.tex.filter_linear, gt.tex.addr_mode_u, gt.tex.addr_mode_v));
                     }
                     // A volume sampler (not yet mapped), or a unit whose real texture we could
                     // not capture/decode: strict mode falls back; force mode binds a neutral
@@ -1340,13 +1858,19 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             return None;
                         }
                         views.push(make_fallback_view(device, queue, want.view_dimension()));
-                        linears.push(false);
+                        sampler_state.push((false, 0, 0));
                     }
                 }
             }
-            let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(samplers.len() * 2);
+            }
+            // Create every sampler this bind group needs FIRST, so the map is not borrowed
+            // mutably while the entries hold shared references into it.
+            for &st in &sampler_state {
+                samplers_by_mode.entry(st).or_insert_with(|| make_gxp_sampler(device, st.0, st.1, st.2));
+            }
+            let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(total * 2);
             for (i, view) in views.iter().enumerate() {
-                let samp = if linears[i] { sampler_linear } else { sampler_point };
+                let samp = &samplers_by_mode[&sampler_state[i]];
                 entries.push(wgpu::BindGroupEntry { binding: i as u32 * 2, resource: wgpu::BindingResource::TextureView(view) });
                 entries.push(wgpu::BindGroupEntry { binding: i as u32 * 2 + 1, resource: wgpu::BindingResource::Sampler(samp) });
             }
@@ -1377,18 +1901,80 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// A REPEAT sampler for the recompiler path (point or linear), mirroring the
     /// fixed-function samplers.
-    fn make_gxp_sampler(device: &wgpu::Device, linear: bool) -> wgpu::Sampler {
+    /// One `SceGxmTextureAddrMode` as a wgpu address mode.
+    ///
+    /// GXM's four "border" variants differ only in what a fetch outside the texture returns
+    /// (a border colour we do not model); their EDGE behaviour is the clamp, which is what
+    /// matters for the coordinates a shader actually produces. Mapping them to clamp is the
+    /// closest available behaviour, and far closer than the repeat they used to get.
+    fn gxm_addr_mode(mode: u32) -> wgpu::AddressMode {
+        match mode {
+            1 | 3 => wgpu::AddressMode::MirrorRepeat, // MIRROR, MIRROR_CLAMP
+            2 | 5..=7 => wgpu::AddressMode::ClampToEdge, // CLAMP + the three border clamps
+            _ => wgpu::AddressMode::Repeat,          // REPEAT, REPEAT_IGNORE_BORDER
+        }
+    }
+
+    fn make_gxp_sampler(device: &wgpu::Device, linear: bool, u: u32, v: u32) -> wgpu::Sampler {
         let f = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
         device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("gxp-sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_u: gxm_addr_mode(u),
+            address_mode_v: gxm_addr_mode(v),
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: f,
             min_filter: f,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            // Trilinear across the generated chain (see `build_mip_chain`). A guest that asked
+            // for point filtering still gets point filtering WITHIN a level; what this changes
+            // is that a minified surface reads a level sized for it instead of aliasing.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         })
+    }
+
+    /// Box-filter a mip chain down from one RGBA8 image, and return it laid out the way
+    /// `TextureDataOrder::LayerMajor` wants (every level of layer 0, then every level of layer 1).
+    ///
+    /// The guest's textures carry their own mip levels and the hardware samples them; we decode
+    /// only level 0, so a minified surface was being point-sampled from the full-size image.
+    /// That is not a subtle difference: the track receding to the horizon covers a 512-texel
+    /// texture in a few dozen pixels, and every pixel lands on an unrelated texel, which reads
+    /// as dense white SPECKLE over the whole distant road rather than as a road.
+    fn build_mip_chain(w: u32, h: u32, layers: u32, level0: &[u8]) -> (Vec<u8>, u32) {
+        let levels = 32 - w.max(h).max(1).leading_zeros();
+        let layer_texels = (w as usize) * (h as usize);
+        let mut out = Vec::with_capacity(level0.len() * 2);
+        for layer in 0..layers as usize {
+            let base = layer * layer_texels * 4;
+            let mut src: Vec<u8> = level0[base..base + layer_texels * 4].to_vec();
+            let (mut sw, mut sh) = (w, h);
+            out.extend_from_slice(&src);
+            for _ in 1..levels {
+                let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
+                let mut dst = vec![0u8; (dw as usize) * (dh as usize) * 4];
+                for y in 0..dh as usize {
+                    for x in 0..dw as usize {
+                        for c in 0..4usize {
+                            // Average the up-to-four source texels this one covers. On an odd
+                            // dimension the second sample repeats the first, which is the
+                            // ordinary way a box filter handles a non-power-of-two level.
+                            let x0 = (2 * x).min(sw as usize - 1);
+                            let x1 = (2 * x + 1).min(sw as usize - 1);
+                            let y0 = (2 * y).min(sh as usize - 1);
+                            let y1 = (2 * y + 1).min(sh as usize - 1);
+                            let at = |xx: usize, yy: usize| src[(yy * sw as usize + xx) * 4 + c] as u32;
+                            dst[(y * dw as usize + x) * 4 + c] =
+                                ((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8;
+                        }
+                    }
+                }
+                out.extend_from_slice(&dst);
+                src = dst;
+                sw = dw;
+                sh = dh;
+            }
+        }
+        (out, levels)
     }
 
     /// Upload a decoded [`GxmTexture`] (linear RGBA8) to a GPU texture for the recompiler path.
@@ -1405,15 +1991,27 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             v.resize(need, 0);
             std::borrow::Cow::Owned(v)
         };
+        let (data, mip_level_count) = if std::env::var("VITASLOP_GXP_MIPS").ok().as_deref() == Some("0") {
+            (data.into_owned(), 1)
+        } else {
+            build_mip_chain(w, h, layers, &data)
+        };
         device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
                 label: Some("gxp-tex"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: layers },
-                mip_level_count: 1,
+                mip_level_count,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                // A GAMMA-CORRECT texture is sRGB-DECODED by the hardware sampler before
+                // filtering. Uploading the same bytes through an sRGB format puts the decode
+                // in exactly that place, so nothing downstream has to know.
+                format: if t.gamma {
+                    wgpu::TextureFormat::Rgba8UnormSrgb
+                } else {
+                    wgpu::TextureFormat::Rgba8Unorm
+                },
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -1483,6 +2081,296 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if sign == 1 { -v } else { v }
     }
 
+    /// Diagnostic (`VITASLOP_GXP_INPUTS=<hex-key>[,<hex-key>]` or `=all`): print, ONCE per
+    /// shader pair, every value the guest actually fed that draw - each declared uniform
+    /// decoded through its own declared type, and the observed range of every vertex
+    /// attribute component over the draw's whole stream.
+    ///
+    /// This exists because the two halves of a wrong picture are indistinguishable from the
+    /// frame: a coordinate that comes out wrong is either a uniform we are reading through the
+    /// wrong layout or an attribute we are decoding wrong, and every other diagnostic here
+    /// (`_PROBE`, `_VPROBE`, `_KEYCOLOR`) observes the shader's OUTPUT, which is downstream of
+    /// both. A uniform printed as its parameter declares it - `mainScaleBias F16[4] = (1, 1,
+    /// 0.25, 0.25)` - settles in one line what a register probe cannot settle at all.
+    fn report_inputs(key: u64, gxp: &GxpRecompile) {
+        let Ok(spec) = std::env::var("VITASLOP_GXP_INPUTS") else { return };
+        let all = spec == "all";
+        if !all && !spec.split(',').any(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16) == Ok(key)) {
+            return;
+        }
+        // Dedupe on the pair AND on the inputs themselves, not on the pair alone: one pair is
+        // submitted many times a frame with DIFFERENT uniforms (that is what a per-draw uniform
+        // buffer is for), and reporting only the first submission is how a diagnostic ends up
+        // describing a draw that is not the one being investigated.
+        use std::hash::{Hash, Hasher};
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        gxp.vert_sa.hash(&mut h);
+        gxp.frag_sa.hash(&mut h);
+        for t in &gxp.textures {
+            (t.unit, t.tex.data_addr, t.tex.width, t.tex.height).hash(&mut h);
+        }
+        let inputs_hash = h.finish();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((key, inputs_hash)) {
+            return;
+        }
+        for (stage, bytes, blob) in
+            [("vertex", &gxp.vert_sa, &gxp.vprog), ("fragment", &gxp.frag_sa, &gxp.fprog)]
+        {
+            let Ok(program) = vitaslop_gxp_shader::Program::parse(blob) else { continue };
+            // The raw words too, not only the decoded parameters. A parameter is decoded through
+            // its declared offset/type, so a value that reads wrong is either the bytes or that
+            // decode - and only the bytes can tell the two apart.
+            eprintln!(
+                "gxp inputs {key:016x} {stage}: default uniform buffer is {} bytes for {} declared registers, raw = {}",
+                bytes.len(),
+                program.default_uniform_regs,
+                bytes
+                    .chunks(4)
+                    .map(|c| {
+                        let mut w = [0u8; 4];
+                        w[..c.len()].copy_from_slice(c);
+                        format!("{:08x}", u32::from_le_bytes(w))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            for p in &program.parameters {
+                use vitaslop_gxp_shader::container::ParamCategory;
+                if p.category != ParamCategory::Uniform {
+                    continue;
+                }
+                let vals = decode_uniform(bytes, p);
+                eprintln!(
+                    "gxp inputs {key:016x} {stage}:   {} {:?}[{}] at reg {} = {}",
+                    p.name, p.ptype, p.component_count, p.resource_index, vals
+                );
+            }
+        }
+        // The guest's VIEWPORT, which is what turns the vertex program's clip output into
+        // target pixels. A post-process pass that samples a source at a scale/bias only lands
+        // right if the source was RENDERED where the pass thinks it was, and the viewport is
+        // the one piece of that which is neither in the shader nor in the uniforms.
+        eprintln!(
+            "gxp inputs {key:016x} viewport: xOffset={} xScale={} yOffset={} yScale={} zOffset={} zScale={}{}",
+            gxp.viewport[0], gxp.viewport[1], gxp.viewport[2],
+            gxp.viewport[3], gxp.viewport[4], gxp.viewport[5],
+            if gxp.viewport.iter().all(|v| *v == 0.0) { "  (all zero = the guest left the default)" } else { "" }
+        );
+        // What each declared sampler is actually bound to. A post-process pass's whole content
+        // is the geometry of the buffer it reads, and "unit 1" in a shader and "unit 1" in the
+        // guest's texture state are only the same thing if the binding says so.
+        if let Ok(fprogram) = vitaslop_gxp_shader::Program::parse(&gxp.fprog) {
+            for p in &fprogram.parameters {
+                if p.category != vitaslop_gxp_shader::container::ParamCategory::Sampler {
+                    continue;
+                }
+                match gxp.textures.iter().find(|t| t.unit as i32 == p.resource_index) {
+                    Some(t) => eprintln!(
+                        "gxp inputs {key:016x} sampler: {} unit {} <- {:#x} {}x{} faces={} \
+                         filter={} wrap=({},{})",
+                        p.name,
+                        p.resource_index,
+                        t.tex.data_addr,
+                        t.tex.width,
+                        t.tex.height,
+                        t.tex.faces,
+                        if t.tex.filter_linear { "linear" } else { "point" },
+                        t.tex.addr_mode_u,
+                        t.tex.addr_mode_v
+                    ),
+                    None => eprintln!(
+                        "gxp inputs {key:016x} sampler: {} unit {} <- NOTHING BOUND",
+                        p.name, p.resource_index
+                    ),
+                }
+            }
+        }
+        // Attribute RANGES, not the first vertex: a scale/bias question is a question about the
+        // span of the coordinate across the mesh, and one vertex cannot answer it.
+        let Ok(vprogram) = vitaslop_gxp_shader::Program::parse(&gxp.vprog) else { return };
+        let stride = gxp.vertex_stride.max(1) as usize;
+        let nverts = gxp.vertices.len() / stride;
+        for a in &gxp.attributes {
+            let name = vprogram
+                .parameters
+                .iter()
+                .find(|p| {
+                    p.category == vitaslop_gxp_shader::container::ParamCategory::Attribute
+                        && p.resource_index == a.reg_index as i32
+                })
+                .map(|p| p.name.as_str())
+                .unwrap_or("<unnamed>");
+            let comps = a.components.clamp(1, 4) as usize;
+            let mut lo = [f32::INFINITY; 4];
+            let mut hi = [f32::NEG_INFINITY; 4];
+            for v in 0..nverts {
+                for c in 0..comps {
+                    let f = read_attr_component(&gxp.vertices, v * stride + a.offset as usize, a.gxm_format, c);
+                    lo[c] = lo[c].min(f);
+                    hi[c] = hi[c].max(f);
+                }
+            }
+            let ranges: Vec<String> =
+                (0..comps).map(|c| format!("[{:.4}, {:.4}]", lo[c], hi[c])).collect();
+            eprintln!(
+                "gxp inputs {key:016x} attribute: {name} lane {} at byte {} of a {}-byte vertex, \
+                 fmt {} x{} over {nverts} vertices = {}",
+                a.reg_index,
+                a.offset,
+                gxp.vertex_stride,
+                a.gxm_format,
+                comps,
+                ranges.join(" ")
+            );
+        }
+        // Per-VERTEX values, when the caller named this pair explicitly rather than asking for
+        // the whole frame. A component RANGE only pins down an attribute if the mesh maps it
+        // affinely onto the screen, and a post-process DISTORTION GRID is exactly the mesh that
+        // does not - so on a small mesh, print the vertices themselves and let the reader see
+        // the mapping instead of assuming one.
+        if all || nverts > MAX_DUMPED_VERTICES {
+            return;
+        }
+        for v in 0..nverts {
+            let cols: Vec<String> = gxp
+                .attributes
+                .iter()
+                .map(|a| {
+                    let comps = a.components.clamp(1, 4) as usize;
+                    let vals: Vec<String> = (0..comps)
+                        .map(|c| {
+                            format!(
+                                "{:.4}",
+                                read_attr_component(&gxp.vertices, v * stride + a.offset as usize, a.gxm_format, c)
+                            )
+                        })
+                        .collect();
+                    format!("lane{}=({})", a.reg_index, vals.join(","))
+                })
+                .collect();
+            // The RAW vertex bytes too. A guest vertex often carries fields no declared attribute
+            // names, and an attribute read at the wrong byte offset produces plausible numbers -
+            // so the only way to tell "this really is the mesh's UV" from "this is some other
+            // field that happens to look like one" is to see the whole record.
+            let raw: String = gxp
+                .vertices
+                .get(v * stride..(v + 1) * stride)
+                .map(|b| b.chunks(4).map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    format!("{}", f32::from_le_bytes(w))
+                }).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            eprintln!("gxp inputs {key:016x} vertex {v}: {}   raw-as-f32 [{raw}]", cols.join(" "));
+        }
+    }
+
+    /// Most vertices `VITASLOP_GXP_INPUTS` will print individually. A post-process grid or a UI
+    /// quad is small enough to read; a world mesh is not, and dumping one would bury the frame's
+    /// other reports in a megabyte of numbers.
+    const MAX_DUMPED_VERTICES: usize = 512;
+
+    /// Diagnostic (`VITASLOP_GXP_SA=<key>:<v|f>:<reg>=<hexword>[,...]`): replace a default-uniform
+    /// register with a chosen 32-bit word before the draw is submitted.
+    ///
+    /// This is the causality half of [`report_inputs`]. Reading a uniform tells you what a shader
+    /// was fed; it does not tell you whether that value is what makes the picture wrong, because
+    /// every downstream stage is a candidate too. Substituting the value and re-rendering is the
+    /// one experiment that separates them, and it takes one run instead of a session of reasoning.
+    /// A substitution is REPORTED, once per (pair, stage, register): a run whose frame came from
+    /// values the guest never wrote must never be mistaken for a run of the real thing.
+    fn override_sa<'a>(key: u64, stage: char, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let Ok(spec) = std::env::var("VITASLOP_GXP_SA") else {
+            return std::borrow::Cow::Borrowed(bytes);
+        };
+        let mut out = std::borrow::Cow::Borrowed(bytes);
+        for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+            let parts: Vec<&str> = item.trim().split(':').collect();
+            let [k, st, assign] = parts[..] else {
+                panic!("VITASLOP_GXP_SA item {item:?} is not <key>:<v|f>:<reg>=<hexword>");
+            };
+            let Ok(want_key) = u64::from_str_radix(k.trim_start_matches("0x"), 16) else {
+                panic!("VITASLOP_GXP_SA item {item:?} has a non-hex pair key");
+            };
+            let want_stage = match st {
+                "v" => 'v',
+                "f" => 'f',
+                other => panic!("VITASLOP_GXP_SA item {item:?} names stage {other:?}, not v or f"),
+            };
+            let Some((reg, word)) = assign.split_once('=') else {
+                panic!("VITASLOP_GXP_SA item {item:?} is missing the =<hexword>");
+            };
+            let (Ok(reg), Ok(word)) = (
+                reg.trim().parse::<usize>(),
+                u32::from_str_radix(word.trim().trim_start_matches("0x"), 16),
+            ) else {
+                panic!("VITASLOP_GXP_SA item {item:?} has a bad register or word");
+            };
+            if want_key != key || want_stage != stage {
+                continue;
+            }
+            let buf = out.to_mut();
+            if buf.len() < (reg + 1) * 4 {
+                buf.resize((reg + 1) * 4, 0);
+            }
+            buf[reg * 4..reg * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            report_sa_override(key, stage, reg, word);
+        }
+        out
+    }
+
+    /// Report - once per (pair, stage, register) - that a uniform register was substituted by
+    /// `VITASLOP_GXP_SA`. See [`override_sa`] for why this is never silent.
+    fn report_sa_override(key: u64, stage: char, reg: usize, word: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, char, usize)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((key, stage, reg)) {
+            eprintln!(
+                "gxp pair {key:016x}: {} uniform register {reg} SUBSTITUTED with {word:#010x} - \
+                 this frame is NOT what the guest asked for",
+                if stage == 'v' { "vertex" } else { "fragment" }
+            );
+        }
+    }
+
+    /// One uniform parameter's values, read out of the raw default-uniform-buffer bytes through
+    /// its OWN declared type. `resource_index` is a 4-byte register offset; the components are
+    /// packed from there at the type's own component width, which is how an F16 float4 fits in
+    /// two registers and an F32 float4 needs four.
+    fn decode_uniform(bytes: &[u8], p: &vitaslop_gxp_shader::container::Parameter) -> String {
+        use vitaslop_gxp_shader::container::ParamType;
+        let Some(width) = p.ptype.component_bytes() else {
+            return format!("<{:?} has no fixed component width>", p.ptype);
+        };
+        let base = (p.resource_index.max(0) as usize) * 4;
+        let n = p.component_count as usize * p.array_size.max(1) as usize;
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = base + i * width as usize;
+            let Some(raw) = bytes.get(o..o + width as usize) else {
+                out.push("<past the end of the buffer>".to_string());
+                break;
+            };
+            out.push(match p.ptype {
+                ParamType::F32 => format!("{}", f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                ParamType::F16 => format!("{}", half_to_f32(u16::from_le_bytes([raw[0], raw[1]]))),
+                ParamType::U32 => format!("{}", u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                ParamType::S32 => format!("{}", i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                ParamType::U16 | ParamType::C10 => format!("{}", u16::from_le_bytes([raw[0], raw[1]])),
+                ParamType::S16 => format!("{}", i16::from_le_bytes([raw[0], raw[1]])),
+                ParamType::U8 => format!("{}", raw[0]),
+                ParamType::S8 => format!("{}", raw[0] as i8),
+                ParamType::Aggregate | ParamType::Unknown(_) => unreachable!("no component width"),
+            });
+        }
+        format!("({})", out.join(", "))
+    }
+
     /// Byte size of one component of a `SceGxmAttributeFormat`.
     fn attr_component_size(gxm_format: u8) -> usize {
         match gxm_format {
@@ -1536,6 +2424,201 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         out
     }
 
+    /// The depth encoding to assume for a pass whose own draws could not produce one: `-1/w`,
+    /// i.e. `a = 0, c = -1`. It is the encoding with no projection in it, so a frame built on
+    /// it is visibly a fallback rather than a plausible-looking guess.
+    const DEPTH_FIT_RECIP_W: (f32, f32) = (0.0, -1.0);
+
+    /// What interpreting a pair's vertex program over its OWN mesh says about the projection
+    /// behind it. See [`count_clip_w_signs`].
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ClipStats {
+        /// Sampled vertices landing inside the frustum with clip `w > 0`, and with `w < 0`.
+        in_front: usize,
+        behind: usize,
+        sampled: usize,
+        /// NDC bounding box under `x/|w|`.
+        bbox: [f32; 4],
+        /// `(a, c)` of `z_clip = a * w_clip + c`, and the spread of `w` the fit was taken over.
+        ///
+        /// A projection matrix makes clip `z` an AFFINE function of clip `w` - both are the same
+        /// dot product against the same point, differing only in which matrix column they use -
+        /// so this holds EXACTLY, per vertex, for every draw sharing one projection. It is what
+        /// gives the guest's own window depth `z/w = a + c/w` without reflecting the matrix, and
+        /// therefore what lets a depth surface be re-encoded the way the guest wrote it rather
+        /// than the way we guessed. `None` when this draw has no two vertices with different
+        /// `w` to fit through.
+        depth_fit: Option<(f32, f32)>,
+        w_spread: f32,
+    }
+
+    /// Interpret a pair's vertex program over its OWN mesh and measure what it says about the
+    /// projection: how many vertices land in front of the eye and how many behind, and how clip
+    /// `z` relates to clip `w`. `None` when the program cannot be interpreted at all.
+    ///
+    /// Sampled with an even STRIDE through the mesh rather than as a prefix: vertex 0 of a
+    /// world mesh is routinely behind the camera, so a prefix answers a different question
+    /// than "does this draw cover anything".
+    fn count_clip_w_signs(gxp: &GxpRecompile, max_samples: usize) -> Option<ClipStats> {
+        let vrc = vitaslop_gxp_shader::recompile_vertex(&gxp.vprog).ok()?;
+        let mut base = vitaslop_gxp_shader::interp::RegFile::with_lanes(512);
+        for (k, c) in gxp.vert_sa.chunks_exact(4).enumerate() {
+            if k < base.sa.len() {
+                base.sa[k] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        // The secondary program (and the container's literals) run first and overwrite SA
+        // registers the primary reads, so skipping them interprets the primary against
+        // uniforms the real module has already replaced.
+        if let Ok(program) = vitaslop_gxp_shader::Program::parse(&gxp.vprog) {
+            for &(reg, value) in &program.literals {
+                if let Some(slot) = base.sa.get_mut(reg as usize) {
+                    *slot = f32::from_bits(value);
+                }
+            }
+            let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
+            if vitaslop_gxp_shader::interp::run(&secondary, &mut base).is_err() {
+                return None;
+            }
+        }
+        let stride = gxp.vertex_stride.max(1) as usize;
+        let nverts = gxp.vertices.len() / stride;
+        if nverts == 0 {
+            return None;
+        }
+        let step = (nverts / max_samples.max(1)).max(1);
+        // Which PA lanes an attribute actually supplies (see the default fill below).
+        let mut claimed = vec![false; base.pa.len()];
+        for a in &gxp.attributes {
+            for c in 0..a.components as usize {
+                if let Some(slot) = claimed.get_mut(a.reg_index as usize + c) {
+                    *slot = true;
+                }
+            }
+        }
+        let (mut in_front, mut behind, mut sampled) = (0usize, 0usize, 0usize);
+        let mut bbox = [f32::MAX, f32::MIN, f32::MAX, f32::MIN];
+        // Least-squares accumulators for `z = a*w + c` over the sampled vertices, in f64: the
+        // fit's `c` is a small difference between two large dot products (on one retail racer,
+        // `z` and `w` agree to four decimal places and `c` is about -1), and in f32 that
+        // subtraction loses most of its significant digits.
+        let (mut sw, mut sz, mut sww, mut swz) = (0f64, 0f64, 0f64, 0f64);
+        let (mut wlo, mut whi) = (f32::MAX, f32::MIN);
+        for v in (0..nverts).step_by(step) {
+            let mut regs = base.clone();
+            for a in &gxp.attributes {
+                let vbase = v * stride + a.offset as usize;
+                // All FOUR lanes of the attribute's register, because that is what the pipeline
+                // feeds the real shader: the linked module reads `in.aN.xyzw`, and WebGPU fills
+                // the components a `Float32x3` vertex format does not supply with (0,0,0,1). An
+                // interpretation that zero-fills instead reads `w = 0` where the GPU reads 1,
+                // which on a 3-component POSITION drops the projection's translation term - i.e.
+                // it measures a different clip `w` than the frame it is supposed to explain.
+                for c in 0..4usize {
+                    let lane = a.reg_index as usize + c;
+                    if lane >= regs.pa.len() {
+                        continue;
+                    }
+                    if c < a.components as usize {
+                        regs.pa[lane] = read_attr_component(&gxp.vertices, vbase, a.gxm_format, c);
+                    } else if !claimed[lane] {
+                        // Only where no OTHER attribute owns the lane - two attributes packed
+                        // two lanes apart would otherwise overwrite each other's components.
+                        regs.pa[lane] = if c == 3 { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+            if vitaslop_gxp_shader::interp::run(&vrc.shader, &mut regs).is_err() {
+                return None;
+            }
+            sampled += 1;
+            // Count the vertices this draw would actually PUT ON SCREEN under each reading of
+            // the sign, rather than the sign alone. A mesh that straddles the camera plane has
+            // both signs in it, and a vote on the sign alone leaves it uncorrected - which
+            // clips away exactly the half that is in view and keeps the half behind the eye.
+            // Inside the frustum means `|x| <= |w|` and `|y| <= |w|` on the side being tested.
+            let (x, y, w) = (regs.o[0], regs.o[1], regs.o[3]);
+            let inside = x.abs() <= w.abs() && y.abs() <= w.abs();
+            if w > 0.0 && inside {
+                in_front += 1;
+            } else if w < 0.0 && inside {
+                behind += 1;
+            }
+            // Where the draw lands once the sign is corrected: `x/|w|`, which is the same NDC
+            // either reading resolves to for the vertices that are actually on screen.
+            if w != 0.0 {
+                let (nx, ny) = (x / w.abs(), y / w.abs());
+                bbox = [bbox[0].min(nx), bbox[1].max(nx), bbox[2].min(ny), bbox[3].max(ny)];
+            }
+            let z = regs.o[2];
+            if w.is_finite() && z.is_finite() {
+                let (wd, zd) = (w as f64, z as f64);
+                sw += wd;
+                sz += zd;
+                sww += wd * wd;
+                swz += wd * zd;
+                wlo = wlo.min(w);
+                whi = whi.max(w);
+            }
+        }
+        let n = sampled as f64;
+        let denom = n * sww - sw * sw;
+        // A mesh whose vertices all share one `w` (a 2D overlay, a billboard) pins no line
+        // through them, and inventing one from a degenerate system would put a wild `c` into
+        // the depth encoding. Requiring a real spread of `w` is what keeps such a draw from
+        // being asked a question it cannot answer.
+        let depth_fit = (sampled >= 2 && denom.abs() > 1e-9 && (whi - wlo).abs() > 1e-3).then(|| {
+            let a = (n * swz - sw * sz) / denom;
+            let c = (sz - a * sw) / n;
+            (a as f32, c as f32)
+        });
+        Some(ClipStats {
+            in_front,
+            behind,
+            sampled,
+            bbox,
+            depth_fit,
+            w_spread: if whi > wlo { whi - wlo } else { 0.0 },
+        })
+    }
+
+    /// Weigh, ONCE per shader pair, how many of that pair's vertices land in the frustum with
+    /// each sign of clip `w`. Reports what it saw unconditionally: a correction this large
+    /// that applied itself silently would be indistinguishable from a faithful projection by
+    /// looking at the frame.
+    ///
+    /// `None` = the pair's vertex program does not interpret at all, so it carries no evidence
+    /// and never will.
+    fn measure_clip(gxp: &GxpRecompile, key: u64) -> Option<ClipStats> {
+        match count_clip_w_signs(gxp, 256) {
+            Some(s) => {
+                eprintln!(
+                    "gxp clip: key {key:x}: of {} sampled vertices, {} land in the frustum with w>0 \
+                     and {} with w<0; ndc x[{:.2},{:.2}] y[{:.2},{:.2}]; z = {}",
+                    s.sampled,
+                    s.in_front,
+                    s.behind,
+                    s.bbox[0],
+                    s.bbox[1],
+                    s.bbox[2],
+                    s.bbox[3],
+                    match s.depth_fit {
+                        Some((a, c)) => format!("{a}*w + {c} over w spread {}", s.w_spread),
+                        None => "(no w spread to fit through)".into(),
+                    }
+                );
+                Some(s)
+            }
+            None => {
+                eprintln!(
+                    "gxp clip: key {key:x}: could not be measured (the vertex program does not \
+                     interpret) - it contributes no evidence about this pass's projection"
+                );
+                None
+            }
+        }
+    }
+
     /// Inject the GXM->WebGPU clip fixup into a linked module: wrap the vertex stage's
     /// `out.position` assignment in a helper that remaps clip Z (and optionally flips Y).
     ///
@@ -1547,23 +2630,48 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// volume, and without it the hardware clips away every triangle whose raw clip z runs past
     /// w (this title's does, by roughly 5x) - which looks like a mesh mysteriously missing its
     /// far half, not like a broken depth buffer.
-    fn inject_clip_fixup(wgsl: &str, zfix: bool, yflip: bool, solid: bool) -> Option<String> {
+    fn inject_clip_fixup(wgsl: &str, zfix: ZFix, yflip: bool, solid: bool, keycolor: Option<u64>) -> Option<String> {
         // Replace the guest's clip z with the SAME depth the fixed-function path writes, so
         // recompiled and fixed-function draws share one comparable depth buffer: the projected
         // view distance through `-1/w`, mapped linearly onto [0,1] over the scene's visible
         // range (see `render::project` for why the guest's own clip z is not a depth here).
         // Keeping xy exact leaves the real shader's projection untouched. w<=0 (behind the eye)
         // is left to wgpu's clip.
-        let z = if zfix {
-            "  if (c.w > 0.0) { let q = -1.0 / c.w;\n    r.z = clamp((q - gxp_depth.range.x) * gxp_depth.range.y, 0.0, 1.0) * c.w; }\n"
-        } else {
-            ""
+        let z = match zfix {
+            ZFix::Range => {
+                "  if (c.w > 0.0) { let q = -1.0 / c.w;\n    r.z = clamp((q - gxp_depth.range.x) * gxp_depth.range.y, 0.0, 1.0) * c.w; }\n"
+            }
+            // The ORDINARY GL->WebGPU depth remap: the guest's own clip z, which GXM reads in
+            // [-w, w], mapped into WebGPU's [0, w]. It needs no scene statistics at all, so it
+            // cannot be thrown off by a depth range measured through a different projection
+            // than the one the recompiled shader actually uses.
+            ZFix::Gl => "  r.z = (c.z + c.w) * 0.5;\n",
+            ZFix::Off => "",
         };
         let y = if yflip { "  r.y = -c.y;\n" } else { "" };
+        // The clip-w SIGN correction (`gxp_depth.range.z`, +1 or -1; see `NegW`). A title whose
+        // projection puts clip `w` NEGATIVE in front of the camera names every visible point on
+        // the half of the homogeneous line WebGPU clips away. Negating all four components names
+        // the SAME point with `w > 0` (homogeneous coordinates are scale-invariant) and moves
+        // behind-camera geometry to `w < 0`, where it belongs. It is one multiply by a UNIFORM,
+        // which is what keeps the decision PER DRAW rather than per vertex - a per-vertex
+        // `if (w < 0) { c = -c; }` would pull the geometry behind the eye into view.
+        //
+        // `gxp_depth.range.z` selects the correction: 1 = none, -1 = negate the whole vector,
+        // 2 = flip the sign of `w` alone. The two are DIFFERENT renders, not two spellings of
+        // one: negating all four components leaves `x/w` exactly as it was (that is what makes
+        // it a rename of the same point), so it fixes the clip and nothing else, while flipping
+        // `w` alone MIRRORS the draw in both axes. Which one a title needs is a measurement.
+        //
+        // The `GxpDepth` block itself is declared by the LINKER (`link::GXP_DEPTH_DECL`), not
+        // here: the fragment stage reads the same block to reconstruct the guest's window
+        // position, and a linked module has to be independently compilable.
         let helper = format!(
-            "struct GxpDepth {{ range: vec4<f32> }};\n\
-             @group(3) @binding(0) var<uniform> gxp_depth: GxpDepth;\n\
-             fn gxp_clipfix(c: vec4<f32>) -> vec4<f32> {{\n  var r = c;\n{z}{y}  return r;\n}}\n"
+            "fn gxp_clipfix(cin: vec4<f32>) -> vec4<f32> {{\n\
+             \x20 var c = cin;\n\
+             \x20 if (gxp_depth.range.z < 0.0) {{ c = -cin; }}\n\
+             \x20 else if (gxp_depth.range.z > 1.5) {{ c = vec4<f32>(cin.x, cin.y, cin.z, -cin.w); }}\n\
+             \x20 var r = c;\n{z}{y}  return r;\n}}\n"
         );
         const ASSIGN: &str = "\n  out.position = ";
         let at = wgsl.find(ASSIGN)?;
@@ -1575,6 +2683,32 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         patched.push_str(&wgsl[rhs_start..rhs_end]);
         patched.push(')');
         patched.push_str(&wgsl[rhs_end..]);
+        // Diagnostic (`VITASLOP_GXP_KEYCOLOR`): shade every pair a flat colour derived from its
+        // own key, keeping its real geometry, depth and blend. One run then answers "WHICH pair
+        // owns this region of the screen" for every region at once - the question that otherwise
+        // costs one `VITASLOP_GXP_KEYS` run per candidate, and the one that has to be answered
+        // before any question about what a surface's shader computes.
+        if let Some(k) = keycolor {
+            let chan = |shift: u32| ((k >> shift) & 0xff) as f32 / 255.0;
+            let (r, g, b) = (0.25 + 0.75 * chan(0), 0.25 + 0.75 * chan(21), 0.25 + 0.75 * chan(42));
+            match patched.rfind("\n  return ") {
+                Some(at) => {
+                    let end = patched[at + 1..].find(";\n").map(|e| at + 1 + e + 1).unwrap_or(patched.len());
+                    patched.replace_range(
+                        at + 1..end,
+                        &format!("  return vec4<f32>({r:.3}, {g:.3}, {b:.3}, 1.0);"),
+                    );
+                    // Print the assignment: reading the colour back OFF the frame means undoing
+                    // whatever transfer function the target applied, and a near-match to the
+                    // wrong key is not distinguishable from a match to the right one.
+                    eprintln!("gxp keycolor: key {k:x} -> linear rgb({r:.3}, {g:.3}, {b:.3})");
+                }
+                None => eprintln!(
+                    "gxp build: VITASLOP_GXP_KEYCOLOR found no fragment return to replace for key \
+                     {k:x} - the module shape changed; this pair is NOT key-coloured"
+                ),
+            }
+        }
         if solid {
             // Diagnostic: force the fragment to solid magenta so any on-screen triangle is
             // visible regardless of shading. The colour expression depends on which register
@@ -1613,6 +2747,258 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     ///
     /// The dedupe is global rather than per-renderer: a pair is submitted hundreds of times a
     /// frame, and nothing is gained by repeating it for a second render target.
+    /// How far past a render target's base address a sampled texture may start and still be
+    /// that target. One 960-pixel row at 4 bytes is 3840, so this covers "the same buffer,
+    /// described from a slightly different origin" and cannot reach the next surface: this
+    /// title's own targets are 16 KiB apart.
+    const RTT_ALIAS_SLACK: u32 = 4096;
+
+    /// The rendered target `addr` refers to, allowing for a small positive offset into it.
+    ///
+    /// A title does not always sample a render target through a texture describing exactly that
+    /// target. This one aliases its 960x544 world buffer as a **1920x1088** texture starting 256
+    /// bytes in - the 2x supersampled view of the same memory - and reads it that way from every
+    /// post-process pass. Matching the data address EXACTLY misses that completely: the sample
+    /// falls through to the guest bytes, which the GPU never wrote, and the light, blur and
+    /// composite passes all render black. Matching by RANGE binds the render they meant.
+    ///
+    /// Reports the first alias it resolves per (pair, unit): substituting a different buffer
+    /// than the one the guest named is exactly the kind of helpfulness that must not be silent.
+    fn rendered_alias(
+        rendered: &HashMap<u32, wgpu::TextureView>,
+        addr: u32,
+        key: u64,
+        unit: u8,
+    ) -> Option<u32> {
+        if addr == 0 {
+            return None;
+        }
+        if rendered.contains_key(&addr) {
+            return Some(addr);
+        }
+        let base = rendered
+            .keys()
+            .copied()
+            .filter(|&b| addr > b && addr - b <= RTT_ALIAS_SLACK)
+            .max_by_key(|&b| b)?;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((key, unit)) {
+            eprintln!(
+                "gxp pair {key:016x}: sampler unit {unit} names {addr:#x}, which is {} bytes into \
+                 the render target at {base:#x} - binding that target's render (the guest is \
+                 describing the same buffer from a different origin)",
+                addr - base
+            );
+        }
+        Some(base)
+    }
+
+    /// Report - once per (pair, unit) - that a recompiled draw is sampling a texture with a NULL
+    /// data pointer, i.e. the 1x1 zero texel the runtime substitutes for an uninitialised
+    /// `SceGxmTexture` handle.
+    ///
+    /// This is not a fallback: the draw runs, with the guest's own shader, and produces a
+    /// perfectly valid picture of nothing. That is exactly why it needs saying out loud - a
+    /// render target that comes out uniformly black looks like a geometry, depth or blend
+    /// problem, and this is none of those.
+    fn report_zero_texel_sample(key: u64, unit: u8) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((key, unit)) {
+            eprintln!(
+                "gxp pair {key:016x}: sampler unit {unit} is bound to a 1x1 ZERO texel (the guest \
+                 handle had null control words) - everything this draw derives from that sample \
+                 is zero"
+            );
+        }
+    }
+
+    /// The wgpu viewport rectangle a GXM viewport asks for, in pixels of a `w` x `h` target,
+    /// or `None` when the guest left the default (all-zero) or is naming exactly the whole
+    /// target - in which case there is nothing to set and nothing to restore.
+    ///
+    /// GXM maps normalised device coordinates to the framebuffer as `screen = offset + scale *
+    /// ndc`, and `yScale` is normally NEGATIVE because ndc `+1` is the top of the screen while
+    /// framebuffer row 0 is the top as well. wgpu's `set_viewport(x, y, w, h)` bakes that same
+    /// flip in, so the two agree exactly whenever `yScale < 0`: the rect is centred on
+    /// `(xOffset, yOffset)` with half-extents `|xScale|` and `|yScale|`.
+    ///
+    /// The DEPTH half (`zOffset`, `zScale`) is deliberately not applied. The recompiled vertex
+    /// stage already writes a depth in whichever convention `VITASLOP_GXP_ZFIX` selects, so
+    /// handing the guest's z mapping to `min_depth`/`max_depth` as well would apply it twice.
+    fn gxm_viewport_rect(vp: &[f32; 6], w: u32, h: u32) -> Option<(f32, f32, f32, f32)> {
+        let [xo, xs, yo, ys, _, _] = *vp;
+        // All-zero is the sentinel for "the guest never called sceGxmSetViewport", not a
+        // request for a zero-area viewport. A zero SCALE with a nonzero offset would be a
+        // degenerate viewport and is reported below rather than silently ignored.
+        if vp.iter().all(|v| *v == 0.0) {
+            return None;
+        }
+        if !vp.iter().all(|v| v.is_finite()) {
+            report_viewport_problem(vp, "it contains a non-finite component");
+            return None;
+        }
+        if ys > 0.0 {
+            // ndc +1 would land at the BOTTOM of the rect. wgpu's viewport cannot express a
+            // vertical flip (it requires a positive height), so the rect below renders this
+            // pass upside down. Saying so is the whole point - a silently mirrored pass is
+            // indistinguishable from a correct one on a symmetric image.
+            report_viewport_problem(vp, "yScale is POSITIVE, which is a vertical flip that a wgpu viewport cannot express - this pass renders mirrored");
+        }
+        let (x, y) = (xo - xs.abs(), yo - ys.abs());
+        let (vw, vh) = (2.0 * xs.abs(), 2.0 * ys.abs());
+        if vw <= 0.0 || vh <= 0.0 {
+            report_viewport_problem(vp, "it has a zero-area rectangle");
+            return None;
+        }
+        // Already the whole target: setting it is a no-op and skipping it keeps the common
+        // fullscreen case free of state changes.
+        if x == 0.0 && y == 0.0 && vw == w as f32 && vh == h as f32 {
+            return None;
+        }
+        // wgpu rejects a viewport that leaves the attachment. Clamp INTO the target and say
+        // so: rendering the pass at the wrong rect is wrong, but dropping the viewport
+        // entirely is wrong in a way that looks like nothing happened.
+        let (cx, cy) = (x.max(0.0), y.max(0.0));
+        let (cw, ch) = ((vw + x.min(0.0)).min(w as f32 - cx), (vh + y.min(0.0)).min(h as f32 - cy));
+        if (cx, cy, cw, ch) != (x, y, vw, vh) {
+            report_viewport_problem(
+                vp,
+                &format!(
+                    "it asks for ({x}, {y}, {vw}, {vh}) which leaves a {w}x{h} target - \
+                     CLAMPED to ({cx}, {cy}, {cw}, {ch})"
+                ),
+            );
+        }
+        if cw <= 0.0 || ch <= 0.0 {
+            return None;
+        }
+        Some((cx, cy, cw, ch))
+    }
+
+    /// Report - once per surface - that a pass is rendering into a GAMMA-CORRECT colour
+    /// surface, and whether that is being honoured.
+    ///
+    /// `honoured == false` means the colour format has no sRGB twin, so the ROP encode the
+    /// hardware performs is not happening and this surface (and everything sampling it) reads
+    /// darker than the title intends. That has to be said out loud - it is precisely the kind
+    /// of uniform darkening that gets chased as a lighting bug.
+    fn report_gamma_surface(addr: u32, honoured: bool) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(addr) {
+            if honoured {
+                eprintln!(
+                    "gxm surface: {addr:#x} is GAMMA-CORRECT - rendering through an sRGB view, \
+                     so writes are sRGB-encoded after blending as the hardware does"
+                );
+            } else {
+                eprintln!(
+                    "gxm surface: {addr:#x} is GAMMA-CORRECT but the render format has no sRGB \
+                     twin - its writes stay LINEAR where the hardware would encode them, so it \
+                     and anything sampling it read darker than the title intends"
+                );
+            }
+        }
+    }
+
+    /// Report - once per (pair, unit) - that a sampler was bound to a render target's DEPTH
+    /// rather than to any colour buffer.
+    ///
+    /// The same class of event as [`rendered_alias`]: the runtime is substituting something
+    /// other than the guest bytes at the address the shader named, and that substitution
+    /// decides what the pass computes.
+    fn report_depth_sample_bound(key: u64, unit: u8, addr: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((key, unit)) {
+            eprintln!(
+                "gxp pair {key:016x}: sampler unit {unit} names {addr:#x}, which is a render \
+                 target's DEPTH surface - binding this frame's converted depth"
+            );
+        }
+    }
+
+    /// Report - once per target - that a render target's depth was converted into the guest's
+    /// encoding for a later pass to sample, and which encoding that was.
+    ///
+    /// Unconditional. Which value a GXM depth surface holds is REVERSE-ENGINEERED, not read
+    /// off a spec we hold, so every frame built on that reading has to say which reading it
+    /// used - otherwise a soft-particle fade that comes out subtly wrong looks like a shading
+    /// bug rather than a choice made here.
+    fn report_depth_conversion(addr: u32, mode: u32, konst: f32, depth_min: f32, depth_scale: f32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((addr, mode)) {
+            if mode == 5 {
+                eprintln!(
+                    "gxm depth: target {addr:#x} depth REPLACED by the constant {konst} - this is \
+                     a causality probe, and any frame built on it is not a real frame"
+                );
+                return;
+            }
+            let name = match mode {
+                0 => "the guest's own window depth (a + c/w, measured from this pass)",
+                1 => "w",
+                2 => "-w",
+                3 => "-1/w",
+                6 => "1/w",
+                _ => "the stored [0,1] depth",
+            };
+            let degenerate = if depth_scale == 0.0 {
+                "  (the scene has NO depth range, so w cannot be recovered and the stored depth \
+                 is passed through unchanged)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "gxm depth: target {addr:#x} depth re-encoded as {name} for a later pass to \
+                 sample (depth_min={depth_min}, depth_scale={depth_scale}){degenerate}"
+            );
+        }
+    }
+
+    /// Report - once per address - that a pass samples a depth buffer the frame did render,
+    /// but through the DISPLAY target rather than an offscreen one, where no converted copy
+    /// exists.
+    fn report_unconverted_depth_sample(addr: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(addr) {
+            eprintln!(
+                "gxm depth: a draw samples the depth at {addr:#x}, which belongs to a scene \
+                 rendered into the DISPLAY target - that pass keeps no depth copy, so this \
+                 sample reads guest bytes the GPU never wrote"
+            );
+        }
+    }
+
+    /// Report - once per distinct viewport and message - that a guest viewport could not be
+    /// reproduced exactly. Unconditional, like every other approximation in this path.
+    fn report_viewport_problem(vp: &[f32; 6], what: &str) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let vps = format!("{vp:?}");
+        if seen.insert((vps.clone(), what.to_string())) {
+            eprintln!("gxp viewport {vps}: {what}");
+        }
+    }
+
     fn report_fallback(key: u64, reason: &str) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
@@ -1622,6 +3008,57 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if seen.insert(key) {
             eprintln!("gxp pair {key:016x}: FALLS BACK to fixed-function - {reason}");
         }
+        drop(seen);
+        fallback_reasons().lock().unwrap_or_else(|e| e.into_inner()).insert(key, reason.to_string());
+        if !allow_fixed_function() {
+            panic!(
+                "gxp pair {key:016x} cannot be recompiled: {reason}\n\
+                 The recompiler is enabled, so this draw would have been drawn by the \
+                 fixed-function APPROXIMATION instead - a different renderer, which does not \
+                 run the guest's shader and cannot be told apart from a faithful render by \
+                 looking at the frame. Refusing. Set VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1 to \
+                 approximate anyway (bring-up only: it is how a title's world silently \
+                 rendered 328 of 388 draws wrong)."
+            );
+        }
+    }
+
+    /// Whether a shader pair the recompiler cannot translate may be drawn by the
+    /// fixed-function approximation instead (`VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1`).
+    ///
+    /// OFF by default, and that default is the point. The approximation reconstructs a draw
+    /// from captured state without running the guest's fragment program, so what it produces
+    /// is plausible and wrong, and indistinguishable on screen from a correct render. It
+    /// remains available for bring-up, where seeing a menu at all is what lets a recipe be
+    /// authored - but a run that does not ask for it now stops at the first pair it cannot
+    /// translate, naming the pair and the reason.
+    fn allow_fixed_function() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VITASLOP_GXP_ALLOW_FIXED_FUNCTION").is_some())
+    }
+
+    /// Why each pair last fell back, keyed by pair.
+    ///
+    /// [`report_fallback`] PRINTS once per pair but RECORDS every time, so a per-scene tally
+    /// can weight reasons by how many DRAWS each cost. That is the number that says what to
+    /// fix next, and the printed list cannot give it: sixty pairs that fall back on one draw
+    /// each and one pair that falls back on three hundred read exactly the same there.
+    fn fallback_reasons() -> &'static std::sync::Mutex<HashMap<u64, String>> {
+        use std::sync::{Mutex, OnceLock};
+        static REASONS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+        REASONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// The recorded fallback reason for `key`, or a placeholder if the pair fell back before
+    /// any reason was recorded (which would itself be a bug worth seeing).
+    fn fallback_reason_of(key: u64) -> String {
+        fallback_reasons()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| "(no reason recorded)".to_string())
     }
 
     /// Report, once per pair, every USSE control-flow branch either program contains: the
@@ -1663,15 +3100,124 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// The translator itself never guesses (an unknown opcode hard-fails naming its raw word),
     /// but the renderer's answer to that hard failure is to draw the fixed-function
     /// approximation, and an unreported approximation reads exactly like a faithful render.
+    /// Map a `SceGxmDepthFunc` to its wgpu equivalent. The enum is a SHIFTED field (vitasdk
+    /// `gxm.h` spaces the values 0x00400000 apart), which is how it is stored in the sticky
+    /// render state, so it is normalised back to 0..7 here.
+    ///
+    /// Not wired into the recompiled pipeline yet - see the note in `build_gxp_pipeline` for
+    /// the measurement that says why. Kept because the mapping itself is right and is what the
+    /// switch-over needs.
+    #[allow(dead_code)]
+    fn gxm_depth_func(f: u32) -> wgpu::CompareFunction {
+        use wgpu::CompareFunction as C;
+        match (f >> 22) & 0x7 {
+            0 => C::Never,
+            1 => C::Less,
+            2 => C::Equal,
+            3 => C::LessEqual,
+            4 => C::Greater,
+            5 => C::NotEqual,
+            6 => C::GreaterEqual,
+            _ => C::Always,
+        }
+    }
+
+    /// Map a `SceGxmBlendFactor` to its wgpu equivalent. The enum order is the vitasdk
+    /// `gxm.h` one; `SRC_ALPHA_SATURATE` has a wgpu counterpart and `DST_ALPHA_SATURATE`
+    /// (which wgpu has no factor for) is reported and treated as `One` rather than silently
+    /// becoming something else.
+    fn gxm_blend_factor(f: u8) -> wgpu::BlendFactor {
+        use wgpu::BlendFactor as F;
+        match f {
+            0 => F::Zero,
+            1 => F::One,
+            2 => F::Src,
+            3 => F::OneMinusSrc,
+            4 => F::SrcAlpha,
+            5 => F::OneMinusSrcAlpha,
+            6 => F::Dst,
+            7 => F::OneMinusDst,
+            8 => F::DstAlpha,
+            9 => F::OneMinusDstAlpha,
+            10 => F::SrcAlphaSaturated,
+            _ => {
+                report_unmapped_blend("DST_ALPHA_SATURATE blend factor");
+                F::One
+            }
+        }
+    }
+
+    /// Map a `SceGxmBlendFunc` pair (func, src, dst) to a wgpu blend component. `MIN`/`MAX`
+    /// ignore the factors, exactly as the hardware does.
+    fn gxm_blend_component(func: u8, src: u8, dst: u8) -> wgpu::BlendComponent {
+        use wgpu::BlendOperation as O;
+        let operation = match func {
+            2 => O::Subtract,
+            3 => O::ReverseSubtract,
+            4 => O::Min,
+            5 => O::Max,
+            _ => O::Add,
+        };
+        // MIN and MAX take the operands unscaled.
+        let (src, dst) = if matches!(func, 4 | 5) { (1, 1) } else { (src, dst) };
+        wgpu::BlendComponent {
+            src_factor: gxm_blend_factor(src),
+            dst_factor: gxm_blend_factor(dst),
+            operation,
+        }
+    }
+
+    /// The wgpu blend state for a draw's captured `SceGxmBlendInfo`, or `None` when the
+    /// program does not blend at all (both funcs `NONE`), which is a REPLACE.
+    fn gxm_blend_state(b: [u8; 7]) -> Option<wgpu::BlendState> {
+        let [_mask, color_func, alpha_func, color_src, color_dst, alpha_src, alpha_dst] = b;
+        if color_func == 0 && alpha_func == 0 {
+            return Some(wgpu::BlendState::REPLACE);
+        }
+        Some(wgpu::BlendState {
+            color: gxm_blend_component(color_func, color_src, color_dst),
+            alpha: gxm_blend_component(alpha_func, alpha_src, alpha_dst),
+        })
+    }
+
+    /// The wgpu write mask for a `SceGxmColorMask` (bit 0 R, 1 G, 2 B, 3 A).
+    fn gxm_color_mask(mask: u8) -> wgpu::ColorWrites {
+        let mut w = wgpu::ColorWrites::empty();
+        for (bit, flag) in [
+            (0, wgpu::ColorWrites::RED),
+            (1, wgpu::ColorWrites::GREEN),
+            (2, wgpu::ColorWrites::BLUE),
+            (3, wgpu::ColorWrites::ALPHA),
+        ] {
+            if mask & (1 << bit) != 0 {
+                w |= flag;
+            }
+        }
+        w
+    }
+
+    /// Report - once per case - a GXM blend value with no exact wgpu equivalent, so the
+    /// substitution is visible rather than silently changing what a draw composites like.
+    fn report_unmapped_blend(what: &str) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(what.to_string()) {
+            eprintln!("gxm blend: {what} has no wgpu equivalent - substituting ONE, which is an approximation");
+        }
+    }
+
     fn build_gxp_pipeline(
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         gxp: &GxpRecompile,
         key: u64,
-        zfix: bool,
+        zfix: ZFix,
         yflip: bool,
         solid: bool,
         nodepth: bool,
+        noblend: bool,
     ) -> Option<GxpPipeline> {
         let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
         report_branches(key, gxp);
@@ -1741,18 +3287,80 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                     }
                 }
-                match vitaslop_gxp_shader::interp::run(&vrc.shader, &mut regs) {
-                    Ok(()) => {
+                // The SECONDARY program runs before the primary and its whole purpose is to
+                // leave values in SA registers the primary reads, so an interpretation that
+                // skips it is reading uniforms the real module has already overwritten. Its
+                // container literals go in too, as raw bit patterns, exactly as the module
+                // emits them.
+                if let Ok(program) = vitaslop_gxp_shader::Program::parse(&gxp.vprog) {
+                    for &(reg, value) in &program.literals {
+                        if let Some(slot) = regs.sa.get_mut(reg as usize) {
+                            *slot = f32::from_bits(value);
+                        }
+                    }
+                    let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
+                    if let Err(e) = vitaslop_gxp_shader::interp::run(&secondary, &mut regs) {
+                        eprintln!("gxp interp: secondary program failed: {e}");
+                    }
+                }
+                // Where the WHOLE mesh lands, not just its first vertex. Vertex 0 of a large
+                // world mesh is routinely behind the camera, so its `w<0` says nothing about
+                // whether the draw covers any pixels - and "this draw is missing" is exactly
+                // the question. Counting the vertices in front of the eye and taking the NDC
+                // bounding box over them answers it outright.
+                let saved_sa = regs.sa.clone();
+                let stride = gxp.vertex_stride.max(1) as usize;
+                let nverts = (gxp.vertices.len() / stride).min(4096);
+                let (mut in_front, mut lo, mut hi) = (0usize, [f32::MAX; 2], [f32::MIN; 2]);
+                for v in 0..nverts {
+                    let mut vregs = regs.clone();
+                    vregs.sa.clone_from(&saved_sa);
+                    for a in &linked.vertex_bindings.attributes {
+                        if let Some(ga) = gxp.attributes.iter().find(|g| g.reg_index as u32 == a.base_lane) {
+                            let base = v * stride + ga.offset as usize;
+                            for c in 0..ga.components as usize {
+                                let lane = a.base_lane as usize + c;
+                                if lane < vregs.pa.len() {
+                                    vregs.pa[lane] = read_attr_component(&gxp.vertices, base, ga.gxm_format, c);
+                                }
+                            }
+                        }
+                    }
+                    if vitaslop_gxp_shader::interp::run(&vrc.shader, &mut vregs).is_err() {
+                        break;
+                    }
+                    let w = vregs.o[3];
+                    if w > 0.0 {
+                        in_front += 1;
+                        lo = [lo[0].min(vregs.o[0] / w), lo[1].min(vregs.o[1] / w)];
+                        hi = [hi[0].max(vregs.o[0] / w), hi[1].max(vregs.o[1] / w)];
+                    }
+                }
+                eprintln!(
+                    "gxp interp: key {key:x} {in_front}/{nverts} vertices have w>0, ndc bbox x[{:.3},{:.3}] y[{:.3},{:.3}]",
+                    lo[0], hi[0], lo[1], hi[1]
+                );
+                match vitaslop_gxp_shader::interp::run_watching_for_nan(&vrc.shader, &mut regs) {
+                    Ok(site) => {
                         let w = regs.o[3];
                         let ndc = if w.abs() > 1e-6 { [regs.o[0] / w, regs.o[1] / w, regs.o[2] / w] } else { [0.0; 3] };
                         eprintln!("gxp interp: o={:?} ndc={:?} viewport(xo,xs,yo,ys,zo,zs)={:?}", &regs.o[0..4], ndc, gxp.viewport);
+                        // A NaN clip position draws NOTHING, which looks exactly like a black
+                        // shader; naming the instruction that produced it is the whole point.
+                        if let Some(s) = site {
+                            eprintln!(
+                                "gxp interp: FIRST non-finite value at instruction #{} {} -> {} channel {} = {}\n  sources: {}",
+                                s.index, s.op, s.dest, s.channel, s.value, s.sources.join("  ")
+                            );
+                        }
                     }
                     Err(e) => eprintln!("gxp interp: run failed: {e}"),
                 }
             }
         }
 
-        let wgsl = match inject_clip_fixup(&linked.wgsl, zfix, yflip, solid) {
+        let keycolor = std::env::var_os("VITASLOP_GXP_KEYCOLOR").map(|_| key);
+        let wgsl = match inject_clip_fixup(&linked.wgsl, zfix, yflip, solid, keycolor) {
             Some(w) => w,
             None => {
                 report_fallback(
@@ -1763,6 +3371,20 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 return None;
             }
         };
+        // `VITASLOP_GXP_WGSL_DIR=<dir>`: write each pair's linked WGSL to `<key>.wgsl`.
+        //
+        // When a recompiled draw comes out wrong, the question is what the guest's shader was
+        // actually translated INTO, and until now the only way to see that was to add a print
+        // and rebuild. The translation is the artefact worth reading - it names the samplers,
+        // the varyings and the clip position in one place.
+        if let Ok(dir) = std::env::var("VITASLOP_GXP_WGSL_DIR") {
+            let dir = std::path::Path::new(&dir);
+            if let Err(e) = std::fs::create_dir_all(dir)
+                .and_then(|()| std::fs::write(dir.join(format!("{key:016x}.wgsl")), &wgsl))
+            {
+                eprintln!("gxp: cannot write WGSL for pair {key:016x}: {e}");
+            }
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gxp-linked"),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -1815,13 +3437,49 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
         // group3 carries the scene depth range the injected clip fixup remaps through - one
         // vec4 the renderer refills per frame, so the pipeline stays cached by shader identity.
+        // BOTH stages read it: the vertex stage to remap clip depth, the fragment stage to
+        // reconstruct the guest's window POSITION (see `link::GXP_DEPTH_DECL`).
+        // The VERTEX stage's samplers go in the SAME group, after the fragment ones: a device
+        // guarantees only four bind groups and the other three are spoken for. A vertex program
+        // that fetches a texture builds its geometry from it, so these are not decoration -
+        // without them the draw has no mesh. Their unit numbering is independent of the fragment
+        // stage's, which is why they keep separate names (`vt{u}`/`vs{u}`).
+        let vsampler_base = g2_entries.len() as u32;
+        let mut vertex_samplers: Vec<(u8, SamplerDim)> = Vec::new();
+        for (i, b) in linked.vertex_bindings.samplers.iter().enumerate() {
+            let dim = match (b.coords >= 3, b.cube) {
+                (true, true) => SamplerDim::Cube,
+                (true, false) => SamplerDim::Three,
+                _ => SamplerDim::Two,
+            };
+            g2_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: vsampler_base + i as u32 * 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: dim.view_dimension(),
+                    multisampled: false,
+                },
+                count: None,
+            });
+            g2_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: vsampler_base + i as u32 * 2 + 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+            if debug {
+                eprintln!("gxp build: VERTEX gxm texture unit {} (coords {}, {dim:?})", b.unit, b.coords);
+            }
+            vertex_samplers.push((b.unit, dim));
+        }
         let layouts = [
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g0"), entries: &g0_entries }),
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g1"), entries: &g1_entries }),
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g2"), entries: &g2_entries }),
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("gxp-g3"),
-                entries: &[uniform_entry(wgpu::ShaderStages::VERTEX)],
+                entries: &[uniform_entry(wgpu::ShaderStages::VERTEX_FRAGMENT)],
             }),
         ];
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1836,24 +3494,41 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             vec![Some(wgpu::VertexBufferLayout { array_stride: packed_stride as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wattrs })]
         };
 
+        // The guest's own blend equation, from the `SceGxmBlendInfo` its fragment program was
+        // created with. This is state, not a guess: GXM has no runtime blend setter, so the
+        // old "opaque draws REPLACE, the rest src-over" reading was the renderer inventing a
+        // mode. It got a title's whole world composite wrong - that draw does NOT blend, and
+        // forcing src-over made it invisible the moment its shader output alpha 0.
+        let guest_blend = gxm_blend_state(gxp.blend_state);
+        let write_mask = gxm_color_mask(gxp.blend_state[0]);
+        // Depth is still the opaque/overlay HEURISTIC, not the guest's captured state, and
+        // that is a known gap rather than an oversight. Driving it from the guest
+        // (`front_depth_func` / `front_depth_write`, both captured) was tried and MEASURED to
+        // be worse: with it, a race's world pass lost its track surface entirely, and only the
+        // ship and a barrier survived - `VITASLOP_GXP_NODEPTH` brought them back, which places
+        // the fault in the depth test rather than the shading. The likely interaction is with
+        // the clip-depth remap `gxp_clipfix` applies (see the scene depth range it reads):
+        // guest depth values and remapped ones cannot both be compared by the guest's own
+        // function. Settle that before switching this over; until then the heuristic is what
+        // the depth remap was built against.
         let make = |opaque: bool| {
             let (mut blend, mut depth_write, mut depth_compare) = if opaque {
-                (Some(wgpu::BlendState::REPLACE), true, wgpu::CompareFunction::LessEqual)
+                (guest_blend, true, wgpu::CompareFunction::LessEqual)
             } else {
-                (
-                    Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-                    }),
-                    false,
-                    wgpu::CompareFunction::Always,
-                )
+                (guest_blend, false, wgpu::CompareFunction::Always)
             };
-            if solid {
-                // Diagnostic: REPLACE (ignore alpha) + depth Always, so a magenta triangle shows
-                // unconditionally wherever geometry lands.
+            if solid || noblend {
+                // Diagnostic: REPLACE, so the fragment's colour reaches the target whatever its
+                // alpha is. `solid` additionally replaces the shading and drops the depth test;
+                // `noblend` changes ONLY the blend, which is what separates "this surface shades
+                // black" from "this surface is composited away". A draw whose shader writes
+                // alpha 0 under a src-alpha blend contributes exactly nothing, and the finished
+                // frame cannot tell that apart from a fragment that computed black.
                 blend = Some(wgpu::BlendState::REPLACE);
             }
+            // A zero write mask is the same invisibility by a different route, so the diagnostic
+            // has to lift it too or it only answers half the question.
+            let write_mask = if solid || noblend { wgpu::ColorWrites::ALL } else { write_mask };
             if solid || nodepth {
                 // Both diagnostics drop the depth test; `solid` additionally replaces the
                 // shading, which is exactly the difference between them.
@@ -1867,7 +3542,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState { format: color_format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format: color_format, blend, write_mask })],
                     compilation_options: Default::default(),
                 }),
                 // No GPU cull yet: guest facing/winding under the recompiled clip is not yet
@@ -1887,7 +3562,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             })
         };
 
-        Some(GxpPipeline { opaque: make(true), blend: make(false), layouts, vsa_lanes, fsa_lanes, samplers, repack, packed_stride })
+        Some(GxpPipeline { opaque: make(true), blend: make(false), layouts, vsa_lanes, fsa_lanes, samplers, vertex_samplers, repack, packed_stride })
     }
 
     impl GxmRenderer {
@@ -1987,7 +3662,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // depth test, straight-alpha src-over blends in submission order, and runs
             // `fs_blend` (vertex_color * texel modulate) - the exact two modes the
             // software rasterizer switches between per draw.
-            let make = |opaque: bool| {
+            let make = |opaque: bool, target_format: wgpu::TextureFormat| {
                 let (blend, depth_write, depth_compare, fs) = if opaque {
                     (
                         Some(wgpu::BlendState::REPLACE),
@@ -2032,7 +3707,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         module: &shader,
                         entry_point: Some(fs),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: color_format,
+                            format: target_format,
                             blend,
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
@@ -2058,8 +3733,15 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 })
             };
 
-            let opaque = make(true);
-            let blend = make(false);
+            let opaque = make(true, color_format);
+            let blend = make(false, color_format);
+            // The same two pipelines against the sRGB view of the same texture, for a pass
+            // whose colour surface the guest put in GAMMA-CORRECT mode. Built eagerly because
+            // it is two pipelines, not a family: the alternative is discovering mid-frame that
+            // a fixed-function draw landed on a gamma surface and having nothing to draw it
+            // with.
+            let srgb = srgb_twin(color_format)
+                .map(|f| (make(true, f), make(false, f)));
 
             let sampler = |linear: bool| {
                 let f = if linear {
@@ -2187,7 +3869,79 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 mapped_at_creation: false,
             });
 
+            // The guest-depth conversion pass. Built unconditionally (it is one small
+            // pipeline) but only ever ENCODED for a target whose depth some pass samples.
+            let gxm_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gxm-depth-convert"),
+                source: wgpu::ShaderSource::Wgsl(GXM_DEPTH_SHADER.into()),
+            });
+            let gxm_depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gxm-depth-convert-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(GXM_DEPTH_UNIFORM_BYTES),
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let gxm_depth_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gxm-depth-convert-pl"),
+                bind_group_layouts: &[Some(&gxm_depth_layout)],
+                immediate_size: 0,
+            });
+            let gxm_depth_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("gxm-depth-convert-pipe"),
+                layout: Some(&gxm_depth_pl),
+                vertex: wgpu::VertexState {
+                    module: &gxm_depth_shader,
+                    entry_point: Some("vdep"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &gxm_depth_shader,
+                    entry_point: Some("fdep"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: GXM_DEPTH_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let gxm_depth_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-depth-convert-uniform"),
+                size: GXM_DEPTH_UNIFORM_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
             GxmRenderer {
+                srgb,
+                gxm_depth_pipe,
+                gxm_depth_layout,
+                gxm_depth_uniform,
                 opaque,
                 blend,
                 uniform_layout,
@@ -2217,6 +3971,8 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 rtt_rendered: HashMap::new(),
                 rtt_binds: HashMap::new(),
                 rtt_reads_snapshot: HashSet::new(),
+                rtt_depth_rendered: HashMap::new(),
+                keep_depth: false,
                 rtt_hits: 0,
                 last_chain_shape: None,
                 sampled_addrs: HashSet::new(),
@@ -2384,15 +4140,37 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
         /// The offscreen target for the colour surface at guest address `addr`, created (or
         /// re-created at a new size) on demand.
-        fn ensure_rtt(&mut self, device: &wgpu::Device, addr: u32, width: u32, height: u32) {
+        ///
+        /// `sample_depth` says some later pass in this frame reads this target's DEPTH, which
+        /// costs the depth texture a `TEXTURE_BINDING` usage and a converted R32Float
+        /// companion. It is off for every target nothing samples, so an ordinary pass pays
+        /// nothing for the feature.
+        fn ensure_rtt(
+            &mut self,
+            device: &wgpu::Device,
+            addr: u32,
+            width: u32,
+            height: u32,
+            sample_depth: bool,
+        ) {
             let stale = match self.rtt.get(&addr) {
-                Some(t) => t.width != width || t.height != height,
+                // Gaining a depth reader is as much a reason to rebuild as a resize: the depth
+                // texture it already has was created without `TEXTURE_BINDING` and cannot be
+                // sampled.
+                Some(t) => t.width != width || t.height != height || (sample_depth && t.gxm_depth.is_none()),
                 None => true,
             };
             if !stale {
                 return;
             }
             let size = wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 };
+            // Declare the sRGB twin as an allowed view format on EVERY target, not only the
+            // ones currently in gamma mode: `sceGxmColorSurfaceSetGammaMode` is sticky state a
+            // title may set at any point, and a texture's view formats are fixed at creation.
+            // Declaring it costs nothing on any backend that matters and removes a whole class
+            // of "the mode arrived after the target existed" bug.
+            let srgb_fmt = srgb_twin(self.color_format);
+            let view_formats: Vec<wgpu::TextureFormat> = srgb_fmt.into_iter().collect();
             let color = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gxm-rtt-color"),
                 size,
@@ -2403,7 +4181,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
+                view_formats: &view_formats,
             });
             let depth = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gxm-rtt-depth"),
@@ -2412,14 +4190,124 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: if sample_depth {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                } else {
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                },
                 view_formats: &[],
             });
             let color_view = color.create_view(&Default::default());
+            let color_view_srgb = srgb_fmt.map(|f| {
+                color.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("gxm-rtt-color-srgb"),
+                    format: Some(f),
+                    ..Default::default()
+                })
+            });
             let depth_view = depth.create_view(&Default::default());
+            let gxm_depth = sample_depth.then(|| {
+                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gxm-rtt-guest-depth"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: GXM_DEPTH_FORMAT,
+                    // COPY_SRC so a host that can read back (the headless chain dump) can
+                    // report what the conversion actually produced. A depth buffer nobody can
+                    // look at is a depth buffer nobody can debug.
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let view = tex.create_view(&Default::default());
+                let src_view = depth.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("gxm-rtt-depth-sampled"),
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    ..Default::default()
+                });
+                GxmDepthTarget { src_view, _tex: tex, view }
+            });
             // A bind group over the new view is stale by construction; drop any cached ones.
             self.rtt_binds.retain(|&(a, _, _), _| a != addr);
-            self.rtt.insert(addr, RttSurface { width, height, color, color_view, depth_view, shadow: None });
+            self.rtt.insert(
+                addr,
+                RttSurface {
+                    width,
+                    height,
+                    color,
+                    color_view,
+                    color_view_srgb,
+                    depth_view,
+                    shadow: None,
+                    gxm_depth,
+                },
+            );
+        }
+
+        /// Run the depth-conversion pass for the target at `addr`: read its depth attachment
+        /// and write the guest's own depth encoding into its R32Float companion.
+        ///
+        /// Called right after the pass that filled the depth, because the next pass into the
+        /// same target clears it again.
+        fn convert_gxm_depth(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            encoder: &mut wgpu::CommandEncoder,
+            addr: u32,
+            depth_min: f32,
+            depth_scale: f32,
+        ) {
+            let Some(t) = self.rtt.get(&addr) else { return };
+            let Some(gd) = t.gxm_depth.as_ref() else { return };
+            let (mode, konst) = gxm_depth_encoding();
+            // The SAME fit the pass's own fragments use for their window POSITION - the two are
+            // one quantity or every comparison between them is meaningless.
+            let (fit_a, fit_c) = self.gxp.depth_fit_for(addr);
+            let mut u = Vec::with_capacity(GXM_DEPTH_UNIFORM_BYTES as usize);
+            u.extend_from_slice(&depth_min.to_le_bytes());
+            u.extend_from_slice(&depth_scale.to_le_bytes());
+            u.extend_from_slice(&mode.to_le_bytes());
+            u.extend_from_slice(&konst.to_le_bytes());
+            u.extend_from_slice(&fit_a.to_le_bytes());
+            u.extend_from_slice(&fit_c.to_le_bytes());
+            u.extend_from_slice(&0f32.to_le_bytes());
+            u.extend_from_slice(&0f32.to_le_bytes());
+            queue.write_buffer(&self.gxm_depth_uniform, 0, &u);
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gxm-depth-convert-bind"),
+                layout: &self.gxm_depth_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gd.src_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.gxm_depth_uniform.as_entire_binding() },
+                ],
+            });
+            let view = gd.view.clone();
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("gxm-depth-convert"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.gxm_depth_pipe);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            report_depth_conversion(addr, mode, konst, depth_min, depth_scale);
         }
 
         /// Copy the rendered target at `addr` into a side texture and return a view of it.
@@ -2530,8 +4418,29 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             clear: [u8; 4],
         ) {
             self.rtt_rendered.clear();
+            self.rtt_depth_rendered.clear();
             self.rtt_hits = 0;
             let Some(last) = scenes.last() else { return };
+            // Which scenes' DEPTH some draw in this frame samples. Scanned up front because
+            // the reader comes AFTER the writer: the pass that fills a depth buffer has to
+            // know, while it is being set up, that something later will read it - a target
+            // built without `TEXTURE_BINDING` cannot be sampled at all, and the extra
+            // conversion is not worth paying on the targets nothing reads.
+            let sampled: HashSet<u32> = scenes
+                .iter()
+                .flat_map(|s| s.draws.iter())
+                .flat_map(|d| {
+                    d.texture
+                        .iter()
+                        .map(|t| t.data_addr)
+                        .chain(d.gxp.iter().flat_map(|g| g.textures.iter().map(|t| t.tex.data_addr)))
+                })
+                .collect();
+            let depth_sampled: HashSet<u32> = scenes
+                .iter()
+                .map(|s| s.depth_addr)
+                .filter(|a| *a != 0 && sampled.contains(a))
+                .collect();
             // The display buffer is whatever the final scene draws to. Any earlier scene
             // naming the same address is part of the same image, not an offscreen pass.
             let display = last.target.map(|t| t.data_addr);
@@ -2551,14 +4460,25 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let first = !display_pass_done;
                     display_pass_done = true;
                     self.rtt_reads_snapshot.clear();
-                    self.encode_pass(device, queue, encoder, &cv, &dv, scene, surf_w, surf_h, first.then_some(clear));
+                    // The display target's format belongs to the surface the host handed us,
+                    // and the host owns whether that is already an sRGB swapchain - so a
+                    // gamma-mode DISPLAY surface is not reinterpreted here.
+                    let fmt = self.color_format;
+                    self.encode_pass(device, queue, encoder, &cv, &dv, fmt, scene, surf_w, surf_h, first.then_some(clear));
+                    // A display pass keeps no depth copy (its depth attachment belongs to the
+                    // caller and is discarded), so if something reads this scene's depth it
+                    // will not find it. Say so rather than let the read fall through silently.
+                    if depth_sampled.contains(&scene.depth_addr) {
+                        report_unconverted_depth_sample(scene.depth_addr);
+                    }
                     continue;
                 }
                 let Some(t) = scene.target else {
                     report_unplaced_scene(scene.draws.len());
                     continue;
                 };
-                self.ensure_rtt(device, t.data_addr, t.width, t.height);
+                let want_depth = depth_sampled.contains(&scene.depth_addr);
+                self.ensure_rtt(device, t.data_addr, t.width, t.height, want_depth);
                 // Drawing into a buffer this frame already filled, which this pass may also
                 // sample: hand it a snapshot to read so the live buffer is a target only.
                 self.rtt_reads_snapshot.clear();
@@ -2575,16 +4495,48 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         self.rtt_reads_snapshot.insert(t.data_addr);
                     }
                 }
-                let (cv, dv) = {
+                // A GAMMA-CORRECT surface is rendered through the sRGB view of the same
+                // texture, so the ROP encodes each store after blending exactly as the
+                // hardware does. The same view goes into `rtt_rendered` below, so a later pass
+                // sampling this target decodes on the way back in.
+                let gamma = t.gamma;
+                let (cv, dv, fmt) = {
                     let s = &self.rtt[&t.data_addr];
-                    (s.color_view.clone(), s.depth_view.clone())
+                    match (gamma, s.color_view_srgb.as_ref()) {
+                        (true, Some(v)) => (
+                            v.clone(),
+                            s.depth_view.clone(),
+                            srgb_twin(self.color_format).unwrap_or(self.color_format),
+                        ),
+                        _ => (s.color_view.clone(), s.depth_view.clone(), self.color_format),
+                    }
                 };
+                if gamma {
+                    report_gamma_surface(t.data_addr, fmt != self.color_format);
+                }
                 // A first pass is cleared to transparent black, not to the display's clear
                 // colour: it is an intermediate image, and a composite that blends it must
                 // see nothing where the pass drew nothing.
                 let clear = first_pass_here.then_some([0, 0, 0, 0]);
-                self.encode_pass(device, queue, encoder, &cv, &dv, scene, t.width, t.height, clear);
+                self.keep_depth = want_depth;
+                self.encode_pass(device, queue, encoder, &cv, &dv, fmt, scene, t.width, t.height, clear);
+                self.keep_depth = false;
                 self.rtt_rendered.insert(t.data_addr, cv);
+                // Convert this pass's depth NOW: the next pass into the same target clears the
+                // depth attachment, so afterwards there is nothing left to convert.
+                if want_depth {
+                    self.convert_gxm_depth(
+                        device,
+                        queue,
+                        encoder,
+                        t.data_addr,
+                        scene.depth_min,
+                        scene.depth_scale,
+                    );
+                    if let Some(v) = self.rtt.get(&t.data_addr).and_then(|s| s.gxm_depth.as_ref()) {
+                        self.rtt_depth_rendered.insert(scene.depth_addr, v.view.clone());
+                    }
+                }
             }
             // Report the frame's pass structure whenever it CHANGES: how many scenes, where
             // each one draws, and - the load-bearing number - how many draws sampled a
@@ -2683,6 +4635,11 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             encoder: &mut wgpu::CommandEncoder,
             color_view: &wgpu::TextureView,
             depth_view: &wgpu::TextureView,
+            // The FORMAT of `color_view`. Usually the renderer's `color_format`, but the sRGB
+            // twin when this pass renders into a gamma-correct surface - and a pipeline is
+            // bound to the format of the attachment it writes, so every pipeline this pass
+            // uses has to be built for this format, not for the renderer's default.
+            target_format: wgpu::TextureFormat,
             scene: &RenderScene,
             surf_w: u32,
             surf_h: u32,
@@ -2690,6 +4647,10 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         ) {
             // 1. Walk the scene once: pack vertex/index/uniform bytes into per-frame
             //    arenas and ensure each draw's texture upload + bind group exist.
+            // Before any draw is prepared: does THIS pass's projection put clip `w` negative in
+            // front of the camera? It is one answer for the whole pass and every draw's
+            // `@group(3)` block carries it, so it has to be settled first.
+            self.gxp.decide_scene_negw(scene);
             let t_prepare = Stopwatch::start();
             let stride = self.uniform_stride as usize;
             let mut vdata: Vec<u8> = Vec::new();
@@ -2700,12 +4661,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // recompiled and fixed-function draws (so they share one depth-tested pass).
             let gxp_enabled = self.gxp.enabled;
             let gxp_only = self.gxp.only;
-            let color_format = self.color_format;
+            // The attachment this pass writes, NOT the renderer's default - see the parameter.
+            let color_format = target_format;
             let mut gxp_prepared: Vec<GxpPrepared> = Vec::new();
             let mut order: Vec<Enc> = Vec::with_capacity(scene.draws.len());
             // Taken out for the walk so the render-target views can be read while the
             // texture caches next to them are written; restored below.
             let rendered = std::mem::take(&mut self.rtt_rendered);
+            let depth_rendered = std::mem::take(&mut self.rtt_depth_rendered);
             self.sampled_addrs.clear();
             // `VITASLOP_CHAIN_DRAWS=1`: describe every draw in this pass that samples a
             // target the frame rendered. A composite that shows none of the world has
@@ -2716,6 +4679,8 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // rendered target - what is needed when the question is "which draw was
             // supposed to put the world on screen" rather than "did this one bind right".
             let trace_all = std::env::var("VITASLOP_CHAIN_DRAWS").map(|v| v == "all").unwrap_or(false);
+            // Fallback draws of THIS pass, by reason - see `fallback_reasons`.
+            let mut fb_reasons: HashMap<String, usize> = HashMap::new();
             for (di, d) in scene.draws.iter().enumerate() {
                 if trace_draws {
                     // The sampled texture's own dimensions matter as much as its address: a
@@ -2733,7 +4698,10 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         .collect();
                     if !hits.is_empty() || trace_all {
                         eprintln!(
-                            "chain draw #{di}: samples {:?} key={:?} recompiled={} blend={:?} opaque={} space={:?} idx={}",
+                            // "carries a payload" is NOT "is recompiled" - a payload that
+                            // fails to link falls back, and labelling that `recompiled=true`
+                            // is how a composite draw got read as working when it was not.
+                            "chain draw #{di}: samples {:?} key={:?} has_payload={} blend={:?} opaque={} space={:?} idx={}",
                             hits,
                             d.gxp.as_ref().map(|g| format!("{:x}", GxpLive::key(g))),
                             d.gxp.is_some(),
@@ -2757,7 +4725,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     if let Some(g) = &d.gxp {
                         self.rtt_hits += g.textures.iter().filter(|t| rendered.contains_key(&t.tex.data_addr)).count();
                         if let Some(mut prep) =
-                            self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale], &rendered)
+                            self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale], &rendered, &depth_rendered)
                         {
                             if self.gxp.solid {
                                 prep.blend = false; // REPLACE + depth-Always variant (see make)
@@ -2766,6 +4734,9 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             gxp_prepared.push(prep);
                             continue;
                         }
+                        // Prepared failed: this draw is one of the pass's fallbacks. Tally it
+                        // against its pair's reason so the summary can rank causes by draws.
+                        *fb_reasons.entry(fallback_reason_of(GxpLive::key(g))).or_insert(0) += 1;
                         if gxp_only {
                             continue;
                         }
@@ -2850,6 +4821,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 order.push(Enc::Fixed(items.len() - 1));
             }
             self.rtt_rendered = rendered;
+            self.rtt_depth_rendered = depth_rendered;
             if gxp_enabled {
                 let with_payload = scene.draws.iter().filter(|d| d.gxp.is_some()).count();
                 let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
@@ -2859,6 +4831,13 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
                         summary.0, summary.1, summary.2, summary.3,
                     );
+                    // Rank the causes by the draws they cost, biggest first. Without this the
+                    // only ranking available is the printed pair list, which counts pairs.
+                    let mut ranked: Vec<_> = fb_reasons.iter().collect();
+                    ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    for (reason, n) in ranked {
+                        eprintln!("gxp:   {n} fallback draws - {reason}");
+                    }
                 }
             }
 
@@ -2927,7 +4906,14 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         view: depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Discard,
+                            // Discarded by default - nothing reads a depth attachment once its
+                            // pass is over. A pass whose depth a LATER pass samples has to keep
+                            // it, and only that pass pays the store.
+                            store: if self.keep_depth {
+                                wgpu::StoreOp::Store
+                            } else {
+                                wgpu::StoreOp::Discard
+                            },
                         }),
                         stencil_ops: None,
                     }),
@@ -2948,12 +4934,38 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let ubo_bind = self.ubo_bind.as_ref();
                 let vbo = self.vbo.as_ref();
                 let ibo = self.ibo.as_ref();
+                // The guest's viewport is per-draw state, and `set_viewport` is sticky, so a
+                // draw that wants the whole target after one that did not must SAY so. The
+                // pass starts at the full rect (wgpu's default), and the tracker below issues
+                // a change only when the requested rect actually differs - which on a title
+                // whose every pass is fullscreen means it never issues one at all.
+                let full = (0.0f32, 0.0f32, surf_w as f32, surf_h as f32);
+                let mut cur_vp = full;
                 for e in &order {
+                    let want = match e {
+                        Enc::Gxp(idx) => {
+                            gxm_viewport_rect(&gxp_prepared[*idx].viewport, surf_w, surf_h).unwrap_or(full)
+                        }
+                        // The fixed-function path packs its own screen-space geometry and has
+                        // never carried a viewport; it means the whole target.
+                        Enc::Fixed(_) => full,
+                    };
+                    if want != cur_vp {
+                        pass.set_viewport(want.0, want.1, want.2, want.3, 0.0, 1.0);
+                        cur_vp = want;
+                    }
                     match e {
                         Enc::Fixed(i) => {
                             let it = &items[*i];
                             let (ubo_bind, vbo, ibo) = (ubo_bind.unwrap(), vbo.unwrap(), ibo.unwrap());
-                            pass.set_pipeline(if it.opaque { &self.opaque } else { &self.blend });
+                            // A fixed-function draw on a gamma-correct surface needs the sRGB
+                            // variant, for the same reason a recompiled one does: a pipeline is
+                            // bound to its attachment's format.
+                            let (op, bl) = match (&self.srgb, target_format == self.color_format) {
+                                (Some((o, b)), false) => (o, b),
+                                _ => (&self.opaque, &self.blend),
+                            };
+                            pass.set_pipeline(if it.opaque { op } else { bl });
                             pass.set_bind_group(0, ubo_bind, &[it.uniform_offset]);
                             pass.set_bind_group(1, self.bind_for(it.bind), &[]);
                             pass.set_vertex_buffer(0, vbo.slice(it.v_off..it.v_off + it.v_len));
@@ -2962,7 +4974,7 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         Enc::Gxp(idx) => {
                             let p = &gxp_prepared[*idx];
-                            let pipe = self.gxp.pipeline(p.key);
+                            let pipe = self.gxp.pipeline(p.key, p.format);
                             pass.set_pipeline(if p.blend { &pipe.blend } else { &pipe.opaque });
                             pass.set_bind_group(0, &p.bg[0], &[]);
                             pass.set_bind_group(1, &p.bg[1], &[]);
@@ -2981,6 +4993,38 @@ fn fres(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// What the last [`GxmRenderer::encode`] spent, phase by phase.
         pub fn last_phases(&self) -> EncodePhases {
             self.last_phases
+        }
+
+        /// Every offscreen target this renderer holds, as `(guest address, texture, w, h)`.
+        ///
+        /// For a host that can read pixels back (the native headless oracle). A frame is a
+        /// CHAIN of passes and only the last one reaches the caller's view, so when the
+        /// finished frame is black the question is which pass is empty - and every failure
+        /// mode looks identical in the composite. `VITASLOP_CHAIN_LIMIT` answers that one
+        /// pass per run; this answers all of them in one, which is the difference between a
+        /// bisect and a look. The colour textures already carry `COPY_SRC` for the snapshot
+        /// path, so exposing them costs nothing.
+        pub fn rtt_targets(&self) -> Vec<(u32, &wgpu::Texture, u32, u32)> {
+            let mut v: Vec<_> =
+                self.rtt.iter().map(|(&a, s)| (a, &s.color, s.width, s.height)).collect();
+            v.sort_by_key(|t| t.0);
+            v
+        }
+
+        /// The guest-encoded DEPTH companions of the targets that have one, as
+        /// `(colour address, texture, w, h)`.
+        ///
+        /// Exposed for the same reason as [`Self::rtt_targets`]: when a pass that reads a
+        /// depth buffer renders black, the first question is whether the depth it read holds
+        /// anything, and a converted buffer nobody can look at is a buffer nobody can debug.
+        pub fn rtt_depth_targets(&self) -> Vec<(u32, &wgpu::Texture, u32, u32)> {
+            let mut v: Vec<_> = self
+                .rtt
+                .iter()
+                .filter_map(|(&a, s)| s.gxm_depth.as_ref().map(|d| (a, &d._tex, s.width, s.height)))
+                .collect();
+            v.sort_by_key(|t| t.0);
+            v
         }
     }
 }

@@ -130,6 +130,11 @@ fn main() -> ExitCode {
     }
 
     print!("{}", report.render_text());
+    // Under `VITASLOP_BLOCK_HIST`, follow the report with the per-PC block-entry
+    // histogram. Once the hot host calls are inlined away, this is the only thing that
+    // says where guest time actually goes, and a recipe run is often the only way to
+    // reach the code in question.
+    report.dump_block_hist();
 
     if report.all_passed() {
         ExitCode::SUCCESS

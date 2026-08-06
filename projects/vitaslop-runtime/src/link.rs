@@ -103,6 +103,34 @@ pub struct LinkedProgram {
     /// pointer/value in the image, so a consumer (probe, front-end) must surface this
     /// list - a non-empty one means some data table the guest reads is unbound.
     pub unresolved_var_imports: Vec<(u32, u32)>,
+    /// Every module in the finished image, in load order, with the placed addresses
+    /// its segments ended up at. The kernel's module queries (`GetModuleInfoByAddr`,
+    /// `GetModuleIdByAddr`) answer from this: a guest address maps to whichever
+    /// module's segments contain it. Held here because only the linker knows where a
+    /// relocatable module was finally placed.
+    pub loaded_modules: Vec<LoadedModule>,
+}
+
+/// One module as it sits in the linked image: what the kernel reports about it.
+#[derive(Clone)]
+pub struct LoadedModule {
+    /// Module name from `SceModuleInfo` (e.g. `"eboot.bin"`, `"SceLibc"`).
+    pub name: String,
+    pub module_nid: u32,
+    /// `SceModuleInfo::module_start`, carrying the Thumb bit as any ARM function
+    /// pointer does.
+    pub entry: u32,
+    /// The placed segments: `(vaddr, mem_size, file_size, executable, writable)`.
+    pub segments: Vec<(u32, u32, u32, bool, bool)>,
+}
+
+impl LoadedModule {
+    /// Whether `addr` falls inside any of this module's placed segments.
+    pub fn contains(&self, addr: u32) -> bool {
+        self.segments.iter().any(|&(vaddr, mem_size, ..)| {
+            addr >= vaddr && addr < vaddr.wrapping_add(mem_size)
+        })
+    }
 }
 
 impl LinkedProgram {
@@ -286,7 +314,11 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             if let Some(&target) = exports.get(&(imp.library_nid, imp.func_nid)) {
                 // The export address carries the Thumb bit (any ARM function
                 // pointer does); the transpiler decodes at the even address.
-                redirects.push(Redirect { addr: imp.stub_addr, target: target & !1 });
+                redirects.push(Redirect {
+                    addr: imp.stub_addr,
+                    target: target & !1,
+                    thumb: target & 1 == 1,
+                });
             } else {
                 externs.push(Extern { addr: imp.stub_addr, import: imports.len() as u32 });
                 imports.push((imp.library_nid, imp.func_nid));
@@ -421,6 +453,23 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         }
     }
 
+    // Snapshot each module's placed identity and segments before the modules are
+    // dropped. Taken here, after rebasing, so the addresses are the ones the guest
+    // will actually run at.
+    let loaded_modules: Vec<LoadedModule> = modules
+        .iter()
+        .map(|m| LoadedModule {
+            name: m.name.clone(),
+            module_nid: m.module_nid,
+            entry: m.entry,
+            segments: m
+                .segments
+                .iter()
+                .map(|s| (s.vaddr, s.mem_size, s.data.len() as u32, s.executable, s.writable))
+                .collect(),
+        })
+        .collect();
+
     let host_import_count = imports.len();
     // Which host imports the transpiler may emit inline. Derived from the finished
     // import table so the index a call site uses and the index carrying the inline op
@@ -429,7 +478,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         .iter()
         .enumerate()
         .filter_map(|(i, &(_, func_nid))| {
-            crate::vita::gxm::inline_op(func_nid)
+            crate::vita::inline_op(func_nid)
                 .map(|op| vitaslop_transpiler::InlineImport { import: i as u32, op })
         })
         .collect();
@@ -451,6 +500,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         process_param,
         tls_template,
         unresolved_var_imports,
+        loaded_modules,
     })
 }
 

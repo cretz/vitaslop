@@ -157,7 +157,12 @@ fn bank_prefix(bank: Bank) -> Option<&'static str> {
         Bank::PrimaryAttr => "pa",
         Bank::SecondaryAttr => "sa",
         Bank::Internal => "i",
-        Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
+        // Constant / Immediate are materialised inline; Global is pipeline state with no
+        // register-file storage; Indexed and Index are ADDRESSING, not a bank - an Indexed
+        // operand resolves through `indexed_sub_bank` to a real bank at use, and the index
+        // register file has its own name. None of them has a plain `bank[n]` spelling.
+        Bank::Constant | Bank::Immediate | Bank::Global | Bank::Indexed | Bank::Index
+        | Bank::Raw(_) => return None,
     })
 }
 
@@ -365,34 +370,123 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
     Some(e)
 }
 
-/// Emit the store of `expr` (an f32 rvalue) into destination channel `c`. An F32 channel
+/// The statement storing `expr` (an f32 rvalue) into destination channel `c`. An F32 channel
 /// overwrites a whole register; an F16 channel is a read-modify-write of one half, so the
 /// paired channel keeps its value - exactly how the hardware packs two halves per register.
-fn store_channel(body: &mut String, op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<()> {
+fn store_stmt(op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<String> {
     let prefix = bank_prefix(op.bank)?;
-    match prec {
+    Some(match prec {
         Prec::F32 => {
-            writeln!(body, "  {prefix}[{}] = bitcast<u32>({expr});", op.index as u32 + c as u32).ok();
+            format!("  {prefix}[{}] = bitcast<u32>({expr});\n", op.index as u32 + c as u32)
         }
         Prec::F16 => {
             let reg = op.index as u32 + (c as u32 >> 1);
             if c & 1 == 0 {
-                writeln!(
-                    body,
-                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | (pack2x16float(vec2<f32>({expr}, 0.0)) & 0x0000ffffu);"
+                format!(
+                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | (pack2x16float(vec2<f32>({expr}, 0.0)) & 0x0000ffffu);\n"
                 )
-                .ok();
             } else {
-                writeln!(
-                    body,
-                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (pack2x16float(vec2<f32>(0.0, {expr})) & 0xffff0000u);"
+                format!(
+                    "  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (pack2x16float(vec2<f32>(0.0, {expr})) & 0xffff0000u);\n"
                 )
-                .ok();
             }
         }
-    }
-    Some(())
+    })
 }
+
+/// The statement sink one instruction emits into.
+///
+/// A USSE instruction reads ALL of its sources before it writes ANY of its destination
+/// channels. The emitter scalarises a vector instruction into one statement per channel, and
+/// those statements run in order - so when the destination register range overlaps a source
+/// register range, a channel written early is visible to a channel emitted later, and the
+/// instruction computes something the hardware never would.
+///
+/// MEASURED, on a title's display composite: `mul pa[2].xyz <- pa[2].zzz, pa[2].xxx` is the
+/// last step of a Reinhard tonemap, `L * (1/(1+L))`. Emitted straight, channel x overwrote
+/// `pa[2].x` (the `1/(1+L)` term) before channels y and z read it, so green and blue came out
+/// multiplied by an extra factor of `L` while red was correct. On screen that is a frame that
+/// is too dark and too RED, with nothing anywhere to say a shader was miscompiled - and red
+/// being exactly right is what makes it read as a colour-space problem rather than a bug.
+///
+/// So when `stage` is set, every store is held back: the value goes into a `let` first, and
+/// the stores are flushed only once the whole instruction has been read. `stage` is off for
+/// the common non-aliasing instruction, where deferring would only make the emitted WGSL
+/// harder to read for no change in meaning.
+struct Dest<'a> {
+    body: &'a mut String,
+    /// Held-back store statements, in channel order. Always empty when `stage` is false.
+    deferred: Vec<String>,
+    stage: bool,
+}
+
+impl std::fmt::Write for Dest<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.body.write_str(s)
+    }
+}
+
+impl Dest<'_> {
+    /// Emit (or stage) the store of `expr` into destination channel `c`.
+    fn store(&mut self, op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<()> {
+        if !self.stage {
+            self.body.push_str(&store_stmt(op, c, expr, prec)?);
+            return Some(());
+        }
+        // Named by the channel, so the four possible temporaries of one instruction cannot
+        // collide - and the whole instruction is wrapped in a block, so they cannot collide
+        // with another instruction's either.
+        let tmp = format!("g{c}");
+        let stmt = store_stmt(op, c, &tmp, prec)?;
+        let _ = writeln!(self.body, "  let {tmp} = {expr};");
+        self.deferred.push(stmt);
+        Some(())
+    }
+
+    /// Store a lane whose expression is already the RAW 32-bit pattern, not a float.
+    ///
+    /// An integer result has no float view to go through: `store` bitcasts an f32 (or packs an
+    /// f16 half), and putting an integer through either would reinterpret its bits. The only
+    /// producer is [`emit_pack_to_int`], whose whole purpose is to leave an integer in the lane
+    /// for the integer groups to read.
+    fn store_raw(&mut self, op: &Operand, c: usize, expr: &str) -> Option<()> {
+        let prefix = bank_prefix(op.bank)?;
+        let stmt = format!("  {prefix}[{}] = {expr};\n", op.index as u32 + c as u32);
+        if !self.stage {
+            self.body.push_str(&stmt);
+            return Some(());
+        }
+        let tmp = format!("g{c}");
+        let _ = writeln!(self.body, "  let {tmp} = {expr};");
+        self.deferred.push(format!("  {prefix}[{}] = {tmp};\n", op.index as u32 + c as u32));
+        Some(())
+    }
+
+    /// Apply every held-back store. Called once the instruction has read everything it reads.
+    fn flush(&mut self) {
+        for stmt in std::mem::take(&mut self.deferred) {
+            self.body.push_str(&stmt);
+        }
+    }
+}
+
+/// Whether this instruction's destination shares a register with any of its sources, so the
+/// emitted statements must read before they write (see [`Dest`]).
+///
+/// Deliberately conservative: it compares BANK and register index within the four-register
+/// span an operand can address, without modelling which channels each end actually touches.
+/// A false positive costs two extra lines of generated WGSL; a false negative is a silent
+/// miscompile, and this is exactly the kind of analysis where being clever is how one gets in.
+fn dest_aliases_source(instr: &Instr) -> bool {
+    let Some(dest) = instr.dest.as_ref() else { return false };
+    instr.srcs.iter().any(|s| {
+        s.bank == dest.bank
+            && (s.index as i32 - dest.index as i32).abs() < OPERAND_REGISTER_SPAN
+    })
+}
+
+/// How many consecutive registers one operand can name: a four-channel F32 vector.
+const OPERAND_REGISTER_SPAN: i32 = 4;
 
 /// Emit a WGSL body from a fully-supported IR - the historical fragment entry point. The
 /// USSE arithmetic core is identical for vertex and fragment programs, so this simply
@@ -685,7 +779,7 @@ pub const BANK_REGS: usize = 512;
 /// the emitter produces is real WGSL (see the naga test), and the skeleton the renderer's
 /// pipeline builder will later bind pa/sa/samplers into. `pa`/`sa` are inputs the real
 /// builder binds; here they are zeroed private storage so the module compiles in isolation.
-pub fn wrap_module(body: &str, tex_units: &[TexBinding]) -> String {
+pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> String {
     let mut m = String::new();
     // Each sampled unit needs a bound texture + sampler (referenced as `t{u}`/`s{u}` by
     // `emit_tex`). Group 0 / running bindings; the real pipeline builder assigns the same
@@ -694,8 +788,9 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding]) -> String {
     for (i, b) in tex_units.iter().enumerate() {
         let (tb, sb) = (i as u32 * 2, i as u32 * 2 + 1);
         let ty = if b.coords >= 3 { "texture_3d<f32>" } else { "texture_2d<f32>" };
-        let _ = writeln!(m, "@group(0) @binding({tb}) var t{}: {ty};", b.unit);
-        let _ = writeln!(m, "@group(0) @binding({sb}) var s{}: sampler;", b.unit);
+        let (tex, samp) = sampler_names(kind, b.unit);
+        let _ = writeln!(m, "@group(0) @binding({tb}) var {tex}: {ty};");
+        let _ = writeln!(m, "@group(0) @binding({sb}) var {samp}: sampler;");
     }
     for bank in ["r", "pa", "sa", "o", "i"] {
         let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
@@ -703,6 +798,9 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding]) -> String {
     // Predicate registers p0..p3, written by the test (VTST) ops and read by predicated
     // instructions. Four booleans, zero-initialised (a predicate is false until a test sets it).
     let _ = writeln!(m, "var<private> p: array<bool, 4>;");
+    // The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
     // `front_facing` is declared unconditionally - see the note in `link::build_linked_module`.
     let _ = writeln!(m, "\nstruct FsIn {{ @builtin(front_facing) front_facing: bool }};");
     let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
@@ -728,6 +826,9 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
         let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
     }
     let _ = writeln!(m, "var<private> p: array<bool, 4>;");
+    // The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
     // Output struct: clip position builtin + one vec4 per varying location.
     let _ = writeln!(m, "\nstruct VsOut {{");
     let _ = writeln!(m, "  @builtin(position) position: vec4<f32>,");
@@ -809,19 +910,23 @@ fn emit_instr(
     // Emit the instruction's statements into a local buffer first, so a predicated
     // instruction can wrap them in an `if` on its predicate register (the writes execute
     // only when the predicate a VTST set holds). Unpredicated instructions append directly.
+    //
+    // The buffer goes through a [`Dest`], which is what enforces the hardware's read-all-then-
+    // write-all ordering when this instruction's destination aliases one of its sources.
     let mut stmts = String::new();
-    let s = &mut stmts;
+    let staged = dest_aliases_source(instr);
+    let mut sink = Dest { body: &mut stmts, deferred: Vec::new(), stage: staged };
+    let s = &mut sink;
     // The two ops with no mandatory register destination: a predicate-only test writes just
     // `p[n]`, and a discard writes nothing at all.
     if let Op::Test { alu, cmp, reduce, pdst, write_back } = instr.op {
         emit_test(s, instr, instr.dest.as_ref(), alu, cmp, reduce, pdst, write_back, kind)
             .ok_or_else(unmapped)?;
-        return finish_predicated(body, instr, &stmts, index);
+        s.flush();
+        return finish_predicated(body, instr, &block(&stmts, staged), index);
     }
     if matches!(instr.op, Op::Kill) {
-        stmts.push_str("  discard;
-");
-        return finish_predicated(body, instr, &stmts, index);
+        return finish_predicated(body, instr, "  discard;\n", index);
     }
     let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
     let r = match instr.op {
@@ -848,9 +953,15 @@ fn emit_instr(
         }
         Op::Cmov { test } => emit_cmov(s, instr, dest, mask, test).ok_or_else(unmapped),
         Op::Tex { unit, coords, coord_half, lod } => {
-            emit_tex(s, instr, dest, unit, coords, coord_half, lod, index).ok_or_else(unmapped)
+            emit_tex(s, instr, dest, unit, coords, coord_half, lod, index, kind).ok_or_else(unmapped)
         }
-        Op::Bitwise { kind, imm } => emit_bitwise(s, instr, dest, kind, imm).ok_or_else(unmapped),
+        Op::Bitwise { kind, imm, lane_bits } => {
+            emit_bitwise(s, instr, dest, kind, imm, lane_bits).ok_or_else(unmapped)
+        }
+        Op::PackToInt { bits, signed, .. } => {
+            emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
+        }
+        Op::LoadIndex { addend } => emit_load_index(s, instr, dest, addend).ok_or_else(unmapped),
         other => Err(EmitError::UnsupportedOp {
             index,
             byte_offset,
@@ -860,11 +971,23 @@ fn emit_instr(
         }),
     };
     r?;
-    finish_predicated(body, instr, &stmts, index)
+    s.flush();
+    finish_predicated(body, instr, &block(&stmts, staged), index)
+}
+
+/// Wrap `stmts` in a WGSL block when the instruction staged its stores, so the `let`
+/// temporaries [`Dest`] introduces are scoped to that one instruction and can never collide
+/// with another's - including across the secondary and primary streams, which are emitted
+/// separately and concatenated into one function.
+fn block(stmts: &str, staged: bool) -> String {
+    if !staged {
+        return stmts.to_string();
+    }
+    format!("  {{\n{stmts}  }}\n")
 }
 
 /// `dest.c = (src1.c OP src2.c)` for each written channel.
-fn emit_binop(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], op: &str, _i: usize) -> Option<()> {
+fn emit_binop(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], op: &str, _i: usize) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     let p = Prec::of(instr);
     for c in 0..4 {
@@ -872,13 +995,13 @@ fn emit_binop(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4],
             continue;
         }
         let e = format!("({} {op} {})", src_channel(s1, c, p)?, src_channel(s2, c, p)?);
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
 
 /// `dest.c = FN(src1.c, src2.c)` for each written channel (min/max).
-fn emit_func2(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], func: &str, _i: usize) -> Option<()> {
+fn emit_func2(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], func: &str, _i: usize) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     let p = Prec::of(instr);
     for c in 0..4 {
@@ -886,13 +1009,13 @@ fn emit_func2(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4],
             continue;
         }
         let e = format!("{func}({}, {})", src_channel(s1, c, p)?, src_channel(s2, c, p)?);
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
 
 /// `dest.c = FN(src1.c)` for each written channel (fract/dpdx/dpdy).
-fn emit_func1(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], func: &str, _i: usize) -> Option<()> {
+fn emit_func1(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], func: &str, _i: usize) -> Option<()> {
     let s1 = instr.srcs.first()?;
     let p = Prec::of(instr);
     for c in 0..4 {
@@ -900,7 +1023,7 @@ fn emit_func1(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4],
             continue;
         }
         let e = format!("{func}({})", src_channel(s1, c, p)?);
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
@@ -909,7 +1032,7 @@ fn emit_func1(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4],
 /// from the source channel expression. Covers the transcendentals (rcp/rsq/log2/exp2) and a
 /// plain move (`wrap` = identity), which do not fit the fixed `FN(x)` shape of `emit_func1`.
 fn emit_unary(
-    body: &mut String,
+    body: &mut Dest,
     instr: &Instr,
     dest: &Operand,
     mask: [bool; 4],
@@ -923,13 +1046,67 @@ fn emit_unary(
             continue;
         }
         let e = wrap(&src_channel(s1, c, sp)?);
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
 
+/// `dest.c = (int)src1.c`, a TRUNCATING float->integer convert (VPCK with `scale` clear).
+///
+/// The result is stored as the integer's two's-complement bit pattern in the destination lane,
+/// which is the representation the integer groups read: the shader that needs this computes an
+/// array index in float, converts it here, doubles it with a 16-bit-lane shift, and hands it to
+/// the index register. Writing a float there instead would make the shift operate on an
+/// exponent.
+fn emit_pack_to_int(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    bits: u8,
+    signed: bool,
+) -> Option<()> {
+    let s1 = instr.srcs.first()?;
+    let sp = Prec::src_of(instr);
+    let lane_mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let f = src_channel(s1, c, sp)?;
+        // `trunc` before the cast, not `i32()` alone: WGSL's float->int conversion truncates
+        // toward zero already, but saying so keeps the rounding explicit next to the mask, and
+        // the clamp keeps a NaN or a huge float from being an undefined conversion.
+        let conv = if signed {
+            format!("bitcast<u32>(i32(clamp(trunc({f}), -2147483000.0, 2147483000.0)))")
+        } else {
+            format!("u32(clamp(trunc({f}), 0.0, 4294967000.0))")
+        };
+        let e = if lane_mask == u32::MAX { conv } else { format!("({conv} & {lane_mask:#x}u)") };
+        body.store_raw(dest, c, &e)?;
+    }
+    Some(())
+}
+
+/// `idx[n] = src + addend` - load an index register for later register-INDIRECT addressing.
+///
+/// The source lane holds an integer bit pattern (it was produced by [`emit_pack_to_int`] and a
+/// 16-bit shift), so it is read raw rather than through a float view.
+fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) -> Option<()> {
+    let s1 = instr.srcs.first()?;
+    let reg = dest.index.min(1) as u32;
+    let bank = bank_prefix(s1.bank)?;
+    writeln!(
+        body,
+        "  idx[{reg}] = i32({bank}[{}] & 0xffffu) + {addend}i;",
+        s1.index as u32
+    )
+    .ok();
+    Some(())
+}
+
 /// `dest.c = src1.c * src2.c + src3.c` (multiply-add).
-fn emit_mad(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4]) -> Option<()> {
+fn emit_mad(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4]) -> Option<()> {
     let (s1, s2, s3) = (instr.srcs.first()?, instr.srcs.get(1)?, instr.srcs.get(2)?);
     let p = Prec::of(instr);
     for c in 0..4 {
@@ -942,7 +1119,7 @@ fn emit_mad(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4]) -
             src_channel(s2, c, p)?,
             src_channel(s3, c, p)?
         );
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
@@ -950,7 +1127,7 @@ fn emit_mad(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4]) -
 /// Conditional move (VMOVC): `dest.c = select(src2.c, src1.c, test(src0.c, 0))` per written
 /// channel. `srcs` is `[src1 (true), src2 (false), src0 (test)]`; the WGSL `select(f, t,
 /// cond)` returns `t` when `cond` is true, matching "src1 when the compare holds".
-fn emit_cmov(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], test: CompareMethod) -> Option<()> {
+fn emit_cmov(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], test: CompareMethod) -> Option<()> {
     let (s1, s2, s0) = (instr.srcs.first()?, instr.srcs.get(1)?, instr.srcs.get(2)?);
     let p = Prec::of(instr);
     for c in 0..4 {
@@ -959,7 +1136,7 @@ fn emit_cmov(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], 
         }
         let cond = compare_zero_expr(&src_channel(s0, c, p)?, test);
         let e = format!("select({}, {}, {cond})", src_channel(s2, c, p)?, src_channel(s1, c, p)?);
-        store_channel(body, dest, c, &e, p)?;
+        body.store(dest, c, &e, p)?;
     }
     Some(())
 }
@@ -1019,7 +1196,7 @@ fn finish_predicated(
 /// `write_back` the raw ALU result is also stored to the destination, exactly as the encoding
 /// says - so the instruction can double as an ALU op rather than silently losing that write.
 fn emit_test(
-    body: &mut String,
+    body: &mut Dest,
     instr: &Instr,
     dest: Option<&Operand>,
     alu: TestAlu,
@@ -1110,7 +1287,7 @@ fn emit_test(
                 // no such instruction, so refusing is exact rather than restrictive.
                 TestAlu::BitAnd => return None,
             };
-            store_channel(body, dest, c, &value, p)?;
+            body.store(dest, c, &value, p)?;
         }
     }
     Some(())
@@ -1118,7 +1295,7 @@ fn emit_test(
 
 /// Dot product: a scalar `src1 . src2` over `components` channels, broadcast to every
 /// written destination channel.
-fn emit_dot(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], components: u8) -> Option<()> {
+fn emit_dot(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], components: u8) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     let p = Prec::of(instr);
     let n = (components as usize).clamp(1, 4);
@@ -1131,7 +1308,7 @@ fn emit_dot(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], c
         if !mask[c] {
             continue;
         }
-        store_channel(body, dest, c, &expr, p)?;
+        body.store(dest, c, &expr, p)?;
     }
     Some(())
 }
@@ -1142,7 +1319,7 @@ fn emit_dot(body: &mut String, instr: &Instr, dest: &Operand, mask: [bool; 4], c
 /// RGBA is written to the destination's four channels.
 #[allow(clippy::too_many_arguments)]
 fn emit_tex(
-    body: &mut String,
+    body: &mut Dest,
     instr: &Instr,
     dest: &Operand,
     unit: u8,
@@ -1150,7 +1327,9 @@ fn emit_tex(
     coord_half: bool,
     lod: TexLod,
     index: usize,
+    kind: ProgramKind,
 ) -> Option<()> {
+    let (tex, samp) = sampler_names(kind, unit);
     let coord = instr.srcs.first()?;
     // The coordinate and the result carry INDEPENDENT precisions (`src0_type` vs
     // `fconv_type`): a shader routinely computes an F16 UV and asks for an F16 result, but
@@ -1171,14 +1350,14 @@ fn emit_tex(
     if coords >= 3 {
         let cy = src_channel(coord, 1, cp)?;
         let cz = src_channel(coord, 2, cp)?;
-        writeln!(body, "  let {tmp} = {func}(t{unit}, s{unit}, vec3<f32>({cx}, {cy}, {cz}){extra});").ok();
+        writeln!(body, "  let {tmp} = {func}({tex}, {samp}, vec3<f32>({cx}, {cy}, {cz}){extra});").ok();
     } else {
         let cy = if coords >= 2 { src_channel(coord, 1, cp)? } else { "0.0".to_string() };
-        writeln!(body, "  let {tmp} = {func}(t{unit}, s{unit}, vec2<f32>({cx}, {cy}){extra});").ok();
+        writeln!(body, "  let {tmp} = {func}({tex}, {samp}, vec2<f32>({cx}, {cy}){extra});").ok();
     }
     const COMP: [&str; 4] = ["x", "y", "z", "w"];
     for c in 0..4 {
-        store_channel(body, dest, c, &format!("{tmp}.{}", COMP[c]), dp)?;
+        body.store(dest, c, &format!("{tmp}.{}", COMP[c]), dp)?;
     }
     Some(())
 }
@@ -1186,8 +1365,21 @@ fn emit_tex(
 /// Integer bitwise / shift on channel 0 only, operating on the 32-bit lane bit pattern:
 /// `dest.x = bitcast<f32>(bitcast<u32>(src1.x) OP b)`, where `b` is the inline immediate or
 /// `bitcast<u32>(src2.x)`. Shift amounts are masked to 31; ASR uses a signed shift.
-fn emit_bitwise(body: &mut String, instr: &Instr, dest: &Operand, kind: BitwiseKind, imm: Option<u32>) -> Option<()> {
+fn emit_bitwise(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    kind: BitwiseKind,
+    imm: Option<u32>,
+    lane_bits: u8,
+) -> Option<()> {
     use BitwiseKind::*;
+    // A 16-bit lane operates on the low half and WRAPS there. The mask is part of the result,
+    // not a tidy-up: a left shift that overflows 16 bits keeps different bits than one that
+    // overflows 32, and this instruction's whole job in the shader that needs it is to double
+    // a small integer index.
+    let mask: u32 = if lane_bits >= 32 { u32::MAX } else { (1u32 << lane_bits) - 1 };
+    let shift_mask = lane_bits as u32 - 1;
     // VBW is an integer op on the 32-bit lane bit pattern, so both operands are read as raw
     // registers rather than through a float precision view.
     let raw = |o: &Operand| -> Option<String> {
@@ -1199,23 +1391,60 @@ fn emit_bitwise(body: &mut String, instr: &Instr, dest: &Operand, kind: BitwiseK
             let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
             return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
         }
+        // A register-INDIRECT source: the element is only known at run time, so it spells out
+        // the address rather than a constant index. See [`indexed_element`].
+        if matches!(o.bank, crate::ir::Bank::Indexed) {
+            return indexed_element(o, 0);
+        }
         Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
     };
-    let a = raw(instr.srcs.first()?)?;
-    let b = match imm {
+    let masked = |e: String| -> String {
+        if mask == u32::MAX { e } else { format!("({e} & {mask:#x}u)") }
+    };
+    let a = masked(raw(instr.srcs.first()?)?);
+    let b = masked(match imm {
         Some(v) => format!("{v}u"),
         None => raw(instr.srcs.get(1)?)?,
-    };
+    });
     let expr = match kind {
         And => format!("({a} & {b})"),
         Or => format!("({a} | {b})"),
         Xor => format!("({a} ^ {b})"),
-        Shl => format!("({a} << ({b} & 31u))"),
-        Shr => format!("({a} >> ({b} & 31u))"),
-        Asr => format!("bitcast<u32>(bitcast<i32>({a}) >> ({b} & 31u))"),
+        Shl => format!("({a} << ({b} & {shift_mask}u))"),
+        Shr => format!("({a} >> ({b} & {shift_mask}u))"),
+        // Arithmetic shift is over the LANE's sign bit, so a narrow lane is sign-extended to
+        // 32 first and re-masked by the write below.
+        Asr if lane_bits >= 32 => format!("bitcast<u32>(bitcast<i32>({a}) >> ({b} & 31u))"),
+        Asr => {
+            let up = 32 - lane_bits as u32;
+            format!("bitcast<u32>((bitcast<i32>({a} << {up}u) >> {up}u) >> ({b} & {shift_mask}u))")
+        }
     };
-    writeln!(body, "  {}[{}] = {expr};", bank_prefix(dest.bank)?, dest.index as u32).ok();
+    writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, masked(expr)).ok();
     Some(())
+}
+
+/// The WGSL expression for one element of a register-INDIRECT ([`Bank::Indexed`]) operand,
+/// `iteration` steps past its base.
+///
+/// The operand's own 7-bit number carries the bank and an additive offset; the index register
+/// supplies the rest and is only known at run time. `iteration` is the repeat step - a repeated
+/// instruction walks consecutive elements, which is how one instruction reads a whole
+/// two-component array entry.
+///
+/// The index is clamped to the bank's size. A dynamic index is the one operand form that can
+/// address outside the register file at all, and WGSL's behaviour for an out-of-bounds dynamic
+/// index is not something to leave to chance in a shader that samples a texture with the result.
+fn indexed_element(o: &Operand, iteration: u32) -> Option<String> {
+    let bank = bank_prefix(crate::ir::indexed_sub_bank(o.index))?;
+    let offset = crate::ir::indexed_offset(o.index) + iteration;
+    // `bank_sel` records which index register the extension row named: INDEXED1 -> i0,
+    // INDEXED2 -> i1.
+    let reg = if o.bank_sel == 0 { 0 } else { 1 };
+    Some(format!(
+        "{bank}[min(u32(max(idx[{reg}] + {offset}i, 0i)), {}u)]",
+        BANK_REGS - 1
+    ))
 }
 
 /// A texture/sampler binding the emitted body references: the sampler `unit` (the SMP
@@ -1242,6 +1471,19 @@ impl TexBinding {
             (true, false) => "texture_3d<f32>",
             _ => "texture_2d<f32>",
         }
+    }
+}
+
+/// The module-scope WGSL names for one stage's texture + sampler at `unit`.
+///
+/// The two stages have INDEPENDENT sampler unit numbering, so a linked module can hold a
+/// vertex `unit 0` and a fragment `unit 0` that are different textures. They must therefore be
+/// different identifiers, or the vertex fetch silently reads the fragment's texture - and a
+/// vertex fetch builds GEOMETRY, so that is not a shading error, it is the wrong mesh.
+pub fn sampler_names(kind: ProgramKind, unit: u8) -> (String, String) {
+    match kind {
+        ProgramKind::Vertex => (format!("vt{unit}"), format!("vs{unit}")),
+        _ => (format!("t{unit}"), format!("s{unit}")),
     }
 }
 
@@ -1318,14 +1560,17 @@ mod tests {
 
     #[test]
     fn honours_partial_write_mask() {
+        // Registers far enough apart that the destination cannot alias a source - this is a
+        // test about the write MASK, and an aliasing destination would also (correctly) stage
+        // the stores through temporaries, which is a different property with its own test.
         let d = Operand::plain(Bank::Temp, 2, 0);
-        let a = Operand::plain(Bank::Temp, 4, 0);
-        let b = Operand::plain(Bank::Temp, 6, 0);
+        let a = Operand::plain(Bank::Temp, 8, 0);
+        let b = Operand::plain(Bank::Temp, 12, 0);
         let mut ins = instr(Op::Add, Some(d), vec![a, b]);
         ins.write_mask = [true, false, true, false];
         let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
-        assert!(wgsl.contains(&st("r", 2, &format!("({} + {})", rd("r", 4), rd("r", 6)))), "got:\n{wgsl}");
-        assert!(wgsl.contains(&st("r", 4, &format!("({} + {})", rd("r", 6), rd("r", 8)))), "got:\n{wgsl}"); // channel 2
+        assert!(wgsl.contains(&st("r", 2, &format!("({} + {})", rd("r", 8), rd("r", 12)))), "got:\n{wgsl}");
+        assert!(wgsl.contains(&st("r", 4, &format!("({} + {})", rd("r", 10), rd("r", 14)))), "got:\n{wgsl}"); // channel 2
         assert!(!wgsl.contains("r[3] ="), "channel 1 masked out:\n{wgsl}");
         assert!(!wgsl.contains("r[5] ="), "channel 3 masked out:\n{wgsl}");
     }
@@ -1346,17 +1591,60 @@ mod tests {
 
     #[test]
     fn emits_min_max_frc_dpdx_and_dot() {
+        // Non-aliasing registers, for the same reason as `honours_partial_write_mask`.
         let d = || Some(Operand::plain(Bank::Temp, 0, 0));
-        let a = Operand::plain(Bank::Temp, 2, 0);
-        let b = Operand::plain(Bank::Temp, 4, 0);
+        let a = Operand::plain(Bank::Temp, 8, 0);
+        let b = Operand::plain(Bank::Temp, 12, 0);
         let mn = emit_fragment(&shader(vec![instr(Op::Min, d(), vec![a, b])])).unwrap();
-        assert!(mn.contains(&st("r", 0, &format!("min({}, {})", rd("r", 2), rd("r", 4)))), "got:\n{mn}");
+        assert!(mn.contains(&st("r", 0, &format!("min({}, {})", rd("r", 8), rd("r", 12)))), "got:\n{mn}");
         let fr = emit_fragment(&shader(vec![instr(Op::Frc, d(), vec![a])])).unwrap();
-        assert!(fr.contains(&st("r", 0, &format!("fract({})", rd("r", 2)))), "got:\n{fr}");
+        assert!(fr.contains(&st("r", 0, &format!("fract({})", rd("r", 8)))), "got:\n{fr}");
         let dx = emit_fragment(&shader(vec![instr(Op::Dsx, d(), vec![a])])).unwrap();
-        assert!(dx.contains(&st("r", 0, &format!("dpdx({})", rd("r", 2)))), "got:\n{dx}");
+        assert!(dx.contains(&st("r", 0, &format!("dpdx({})", rd("r", 8)))), "got:\n{dx}");
         let dt = emit_fragment(&shader(vec![instr(Op::Dot { components: 4 }, d(), vec![a, b])])).unwrap();
-        assert!(dt.contains(&st("r", 0, &format!("({})", (0..4).map(|c| format!("{} * {}", rd("r", 2 + c), rd("r", 4 + c))).collect::<Vec<_>>().join(" + ")))), "got:\n{dt}");
+        assert!(dt.contains(&st("r", 0, &format!("({})", (0..4).map(|c| format!("{} * {}", rd("r", 8 + c), rd("r", 12 + c))).collect::<Vec<_>>().join(" + ")))), "got:\n{dt}");
+    }
+
+    /// An instruction whose destination shares registers with a source must read every source
+    /// BEFORE it writes any channel, because that is what the hardware does.
+    ///
+    /// The shape here is the one that was miscompiling a title's display composite: the last
+    /// step of a Reinhard tonemap, `dest.xyz = src.zzz * src.xxx`, with `dest` and both sources
+    /// the same register pair. Emitted as three independent statements, channel x overwrote the
+    /// `1/(1+L)` term before channels y and z read it, so green and blue picked up an extra
+    /// factor of the luminance while red stayed correct - a frame too dark and too red, with a
+    /// perfectly correct-looking shader.
+    #[test]
+    fn an_instruction_whose_dest_aliases_a_source_reads_before_it_writes() {
+        let d = Operand::plain(Bank::Temp, 2, 0);
+        let mut zzz = Operand::plain(Bank::Temp, 2, 0);
+        zzz.swizzle = [2, 2, 2, 2];
+        let mut xxx = Operand::plain(Bank::Temp, 2, 0);
+        xxx.swizzle = [0, 0, 0, 0];
+        let mut ins = instr(Op::Mul, Some(d), vec![zzz, xxx]);
+        ins.write_mask = [true, true, true, false];
+        let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
+        // Every read is a `let` ahead of every store, so no store can be observed by a later
+        // channel of the same instruction.
+        let first_store = wgsl.find("r[2] = ").expect("a store");
+        for c in 0..3 {
+            let read = wgsl.find(&format!("let g{c} = ")).unwrap_or_else(|| panic!("channel {c} staged:\n{wgsl}"));
+            assert!(read < first_store, "channel {c} is read after a store:\n{wgsl}");
+        }
+        // And the temporaries are block-scoped, so two such instructions cannot collide.
+        assert!(wgsl.contains("  {\n"), "staged stores are wrapped in a block:\n{wgsl}");
+    }
+
+    /// The complement: an ordinary instruction that cannot alias keeps the direct, readable
+    /// one-statement-per-channel form. Staging everything would be correct too, and would make
+    /// every emitted module harder to read for no gain.
+    #[test]
+    fn an_instruction_that_cannot_alias_stores_directly() {
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let a = Operand::plain(Bank::Temp, 8, 0);
+        let b = Operand::plain(Bank::Temp, 12, 0);
+        let wgsl = emit_fragment(&shader(vec![instr(Op::Mul, Some(d), vec![a, b])])).unwrap();
+        assert!(!wgsl.contains("let g0 ="), "no staging needed:\n{wgsl}");
     }
 
     #[test]

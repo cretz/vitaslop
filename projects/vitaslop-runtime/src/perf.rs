@@ -38,10 +38,15 @@ pub enum Phase {
     /// the resume itself: resuming runs the guest, so timing it would measure the
     /// guest. This is the part of a frame that is neither guest code nor a host call.
     SchedOverhead,
+    /// Standing up a new guest thread: with one wasm INSTANCE per thread, a spawn is a
+    /// full module instantiation, not a cheap stack allocation. A title that runs its
+    /// display-queue callback as a guest thread spawns one PER FLIP, so this can be a
+    /// per-frame cost hiding in what looks like guest execution.
+    ThreadSpawn,
 }
 
 impl Phase {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     fn index(self) -> usize {
         match self {
@@ -52,6 +57,7 @@ impl Phase {
             Phase::DrawUniforms => 4,
             Phase::SceneFold => 5,
             Phase::SchedOverhead => 6,
+            Phase::ThreadSpawn => 7,
         }
     }
 
@@ -65,6 +71,7 @@ impl Phase {
             Phase::DrawUniforms,
             Phase::SceneFold,
             Phase::SchedOverhead,
+            Phase::ThreadSpawn,
         ]
     }
 
@@ -78,6 +85,7 @@ impl Phase {
             Phase::DrawUniforms => "draw: uniforms + material",
             Phase::SceneFold => "scene: signature fold",
             Phase::SchedOverhead => "scheduler: pick + drain",
+            Phase::ThreadSpawn => "scheduler: spawn thread (instantiate)",
         }
     }
 }

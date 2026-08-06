@@ -126,6 +126,7 @@ async fn run_cube_scheduled() -> Result<CpuRun, JsValue> {
         &inputs.code,
         inputs.base,
         artifact.mem_pages,
+        artifact.mirror_off,
         m.entry & !1,
         main_sp,
         venv,
@@ -639,6 +640,7 @@ async fn setup_game(
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
+    env.state.set_modules(linked.loaded_modules.clone());
     env.state.set_tls_template(linked.tls_template);
     env.state.set_preemptive(true);
     // Move (not clone) the decrypted assets into the guest filesystem: for a large
@@ -659,6 +661,7 @@ async fn setup_game(
         &linked.image,
         linked.base,
         built.artifact.mem_pages,
+        built.artifact.mirror_off,
         &linked.module_inits,
         main_sp,
         env,

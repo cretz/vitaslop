@@ -58,7 +58,11 @@ impl RegFile {
             Bank::Internal => &mut self.i,
             // Constant is materialised inline; Global is a hardware register the interpreter
             // has no state for (its value is pipeline state, not register-file storage).
-            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
+            // Indexed/Index are register-INDIRECT addressing and the index register file: the
+            // interpreter is a straight-line evaluator with no index state, so an operand that
+            // needs one has no value here rather than a fabricated one.
+            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Indexed | Bank::Index
+            | Bank::Raw(_) => return None,
         })
     }
 
@@ -71,7 +75,11 @@ impl RegFile {
             Bank::Internal => &self.i,
             // Constant is materialised inline; Global is a hardware register the interpreter
             // has no state for (its value is pipeline state, not register-file storage).
-            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Raw(_) => return None,
+            // Indexed/Index are register-INDIRECT addressing and the index register file: the
+            // interpreter is a straight-line evaluator with no index state, so an operand that
+            // needs one has no value here rather than a fabricated one.
+            Bank::Constant | Bank::Immediate | Bank::Global | Bank::Indexed | Bank::Index
+            | Bank::Raw(_) => return None,
         })
     }
 }
@@ -171,23 +179,37 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             if cond { s(0, c)? } else { s(1, c)? }
         }
-        // Integer bitwise/shift on the 32-bit lane bit pattern (channel 0 only).
-        Op::Bitwise { kind, imm } => {
+        // Integer bitwise/shift on the lane bit pattern (channel 0 only). A 16-bit lane
+        // operates on the low half and WRAPS there, so the mask is part of the result and not
+        // a tidy-up: a left shift that overflows 16 bits keeps different bits than one that
+        // overflows 32.
+        Op::Bitwise { kind, imm, lane_bits } => {
             use crate::ir::BitwiseKind::*;
-            let a = s(0, c)?.to_bits();
+            let mask: u32 = if lane_bits >= 32 { u32::MAX } else { (1u32 << lane_bits) - 1 };
+            let shift_mask = lane_bits as u32 - 1;
+            let a = s(0, c)?.to_bits() & mask;
             let b = match imm {
                 Some(v) => v,
                 None => s(1, c)?.to_bits(),
-            };
+            } & mask;
             let r = match kind {
                 And => a & b,
                 Or => a | b,
                 Xor => a ^ b,
-                Shl => a << (b & 31),
-                Shr => a >> (b & 31),
-                Asr => ((a as i32) >> (b & 31)) as u32,
+                Shl => a << (b & shift_mask),
+                Shr => a >> (b & shift_mask),
+                // Arithmetic shift is over the LANE's sign bit, so a narrow lane is sign-
+                // extended to 32 first and re-masked after.
+                Asr => {
+                    let signed = if lane_bits >= 32 {
+                        a as i32
+                    } else {
+                        ((a << (32 - lane_bits)) as i32) >> (32 - lane_bits)
+                    };
+                    (signed >> (b & shift_mask)) as u32
+                }
             };
-            f32::from_bits(r)
+            f32::from_bits(r & mask)
         }
         _ => return Err("unmodeled"),
     })
@@ -197,6 +219,39 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
 /// Hard-fails (leaving `regs` partially updated) on the first op it does not model, naming
 /// it - the reference never fabricates a value for an unestablished op.
 pub fn run(shader: &Shader, regs: &mut RegFile) -> Result<(), InterpError> {
+    run_watching_for_nan(shader, regs).map(|_| ())
+}
+
+/// Where a shader first produced a value that is not finite.
+#[derive(Debug, Clone)]
+pub struct NanSite {
+    /// Index into the shader's (unrolled) instruction stream.
+    pub index: usize,
+    pub op: &'static str,
+    /// The destination the non-finite value landed in, as `bank[index]`.
+    pub dest: String,
+    /// The channel that went bad and the value it took.
+    pub channel: usize,
+    pub value: f32,
+    /// The source register values that produced it, in operand order.
+    pub sources: Vec<String>,
+}
+
+/// Interpret like [`run`], additionally returning the FIRST instruction to write a non-finite
+/// value (NaN or an infinity) into a destination whose inputs were all finite.
+///
+/// A vertex program whose clip position comes out NaN draws nothing at all, and the frame is
+/// then indistinguishable from a shader that painted black, a depth rejection, or a draw that
+/// was never submitted. Every one of those was ruled out by a separate whole-title replay on a
+/// title whose track surface had gone missing; the instruction that actually did it is one
+/// interpreted run away, and only if something reports it. Infinities count as well as NaNs
+/// because the usual route to a NaN is `0 * inf`, and the infinity is the earlier and more
+/// diagnostic event - a reciprocal of a uniform the guest left zero.
+pub fn run_watching_for_nan(
+    shader: &Shader,
+    regs: &mut RegFile,
+) -> Result<Option<NanSite>, InterpError> {
+    let mut site: Option<NanSite> = None;
     for (index, instr) in shader.instrs.iter().enumerate() {
         if let Some(reason) = instr.blocked {
             return Err(InterpError::Blocked { index, reason });
@@ -227,6 +282,33 @@ pub fn run(shader: &Shader, regs: &mut RegFile) -> Result<(), InterpError> {
                 out[c] = eval_channel(regs, instr, c).map_err(|op| InterpError::UnsupportedOp { index, op })?;
             }
         }
+        // Read the sources BEFORE the write, so the report shows what went in - an in-place op
+        // would otherwise print its own result back as its input.
+        if site.is_none() {
+            if let Some(c) = (0..4).find(|&c| instr.write_mask[c] && !out[c].is_finite()) {
+                let sources = instr
+                    .srcs
+                    .iter()
+                    .map(|s| {
+                        let vals: Vec<String> = (0..4)
+                            .map(|k| match regs.bank(s.bank).and_then(|b| b.get(s.index as usize + k)) {
+                                Some(v) => format!("{v}"),
+                                None => "-".to_string(),
+                            })
+                            .collect();
+                        format!("{:?}[{}]={:?}", s.bank, s.index, vals)
+                    })
+                    .collect();
+                site = Some(NanSite {
+                    index,
+                    op: instr.op.mnemonic(),
+                    dest: format!("{:?}[{}]", dest.bank, dest.index),
+                    channel: c,
+                    value: out[c],
+                    sources,
+                });
+            }
+        }
         let base = dest.index as usize;
         let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
         for c in 0..4 {
@@ -235,7 +317,7 @@ pub fn run(shader: &Shader, regs: &mut RegFile) -> Result<(), InterpError> {
             }
         }
     }
-    Ok(())
+    Ok(site)
 }
 
 #[cfg(test)]

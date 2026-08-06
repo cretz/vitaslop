@@ -201,6 +201,7 @@ impl<'a> GuestCtx<'a> {
 
     /// Write a little-endian u32 at guest address `addr` (ignored if out of range).
     pub fn write_u32(&mut self, addr: u32, v: u32) {
+        report_host_write(self, addr, 4, &v.to_le_bytes());
         if let Some(o) = self.offset(addr) {
             if o + 4 <= self.mem.len() {
                 self.mem.write(o, &v.to_le_bytes());
@@ -278,6 +279,7 @@ impl<'a> GuestCtx<'a> {
 
     /// Write `bytes` at guest address `addr` (clamped to range).
     pub fn write_bytes(&mut self, addr: u32, bytes: &[u8]) {
+        report_host_write(self, addr, bytes.len() as u32, bytes);
         if let Some(o) = self.offset(addr) {
             let end = (o + bytes.len()).min(self.mem.len());
             self.mem.write(o, &bytes[..end - o]);
@@ -314,6 +316,65 @@ impl<'a> GuestCtx<'a> {
     }
 }
 
+/// `VITASLOP_HOST_WRITE_WATCH=<hex addr>[,...]`: report every write a HOST CALL makes to one
+/// of those guest addresses, with the bytes and the guest return address that asked for it.
+///
+/// This is the counterpart `VITASLOP_WATCH_STORE` cannot be. That watchpoint traps the guest's
+/// own stores; a host call writing a guest buffer on the guest's behalf - a file read, an
+/// out-parameter, `sceGxmSetUniformDataF` into a game-owned block - leaves no store to trap.
+/// "No guest store ever writes that address" then reads as "it must be static data", and a
+/// whole session can go looking for a file that does not exist. Both watchpoints exist because
+/// each is blind exactly where the other sees (memory `vitaslop-host-call-reference-semantics`).
+/// An entry may also be `v:<hex word>`, which matches on the VALUE written anywhere rather
+/// than on an address. When the question is "where did this number come from" the address is
+/// often the thing you do not have: a material's uniform block is heap, so its address moves
+/// between runs, while the suspicious 32-bit pattern in it is the same every time.
+fn report_host_write(ctx: &GuestCtx, addr: u32, len: u32, bytes: &[u8]) {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<(Vec<u32>, Vec<u32>)> = OnceLock::new();
+    let (addrs, vals) = WATCH.get_or_init(|| {
+        let (mut a, mut v) = (Vec::new(), Vec::new());
+        for t in std::env::var("VITASLOP_HOST_WRITE_WATCH").unwrap_or_default().split(',') {
+            let t = t.trim();
+            let (list, hex) = match t.strip_prefix("v:") {
+                Some(rest) => (&mut v, rest),
+                None => (&mut a, t),
+            };
+            if let Ok(n) = u32::from_str_radix(hex.trim_start_matches("0x"), 16) {
+                list.push(n);
+            }
+        }
+        (a, v)
+    });
+    if addrs.is_empty() && vals.is_empty() {
+        return;
+    }
+    let end = addr.wrapping_add(len.max(1)).wrapping_sub(1);
+    let hit = addrs.iter().copied().find(|&a| a >= addr && a <= end).or_else(|| {
+        (!vals.is_empty())
+            .then(|| {
+                bytes.chunks_exact(4).position(|c| {
+                    vals.contains(&u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                })
+            })
+            .flatten()
+            .map(|i| addr + i as u32 * 4)
+    });
+    let Some(hit) = hit else { return };
+    // The bytes AT the watched word, not the whole (possibly megabyte) write: what the question
+    // is about is the value that ends up there.
+    let off = (hit.wrapping_sub(addr)) as usize & !3;
+    let word = bytes
+        .get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0);
+    eprintln!(
+        "host write watch: a HOST CALL wrote {len} bytes at {addr:#x} covering {hit:#x}, leaving \
+         {word:#010x} there, with the guest at lr={:#010x} pc={:#010x}",
+        ctx.regs[14], ctx.regs[15]
+    );
+}
+
 /// A GXM opaque handle we hand back to the guest. Kept below the guest image base
 /// so it never collides with a real guest address, and nonzero so guest NULL
 /// checks pass. The guest treats these as opaque and never dereferences them.
@@ -330,6 +391,113 @@ pub struct MemBlock {
 /// A guest thread the program created: its SceUID, entry address (Thumb bit
 /// cleared, so it names the transpiled `f_<addr>` export), its own stack top, and
 /// its return value once it has run.
+/// Strip `prefix` from `path` when it is a genuine PATH prefix, returning the rest.
+///
+/// "Genuine" means the prefix ends at a component boundary: `ux0:data` must match
+/// `ux0:data/save` and `ux0:data` itself, but not `ux0:database`. A plain
+/// `starts_with` would redirect the second, which is a silent misdirection of a file
+/// the overlay was never meant to cover. Matching is case-insensitive, as the rest of
+/// this filesystem's lookups are.
+fn strip_path_prefix(path: &str, prefix: &str) -> Option<String> {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return Some(path.to_string());
+    }
+    let (lp, lx) = (path.to_ascii_lowercase(), prefix.to_ascii_lowercase());
+    let rest = lp.strip_prefix(&lx)?;
+    if rest.is_empty() || rest.starts_with('/') {
+        Some(path[prefix.len()..].to_string())
+    } else {
+        None
+    }
+}
+
+/// One registered FIOS2 path overlay: `src` stands in for `dst` under the policy
+/// `kind` selects, at priority `order`. Mirrors the guest's `SceFiosOverlay`.
+///
+/// This is real, observable state - a title adds an overlay and then opens files
+/// through it - so it is held as a decoded record rather than as the raw guest bytes.
+#[derive(Clone)]
+pub struct FiosOverlay {
+    pub id: i32,
+    /// `SceFiosOverlayType`: 0 opaque, 1 translucent, 2 newer, 3 writable.
+    pub kind: u8,
+    /// Resolution priority. Overlays apply lowest `order` first.
+    pub order: u8,
+    pub pid: i32,
+    /// The path prefix being overlaid.
+    pub dst: String,
+    /// The path prefix that stands in for it.
+    pub src: String,
+}
+
+/// `SceFiosOverlayType` values (vitasdk `psp2common/fios2.h`).
+pub const SCE_FIOS_OVERLAY_TYPE_OPAQUE: u8 = 0;
+pub const SCE_FIOS_OVERLAY_TYPE_TRANSLUCENT: u8 = 1;
+pub const SCE_FIOS_OVERLAY_TYPE_NEWER: u8 = 2;
+pub const SCE_FIOS_OVERLAY_TYPE_WRITABLE: u8 = 3;
+
+/// Base of the SceUID range FIOS2 overlay ids come from, kept clear of thread and
+/// sync-object ids for the same reason module ids are.
+const FIOS_OVERLAY_ID_BASE: i32 = 0x0200_0000;
+
+/// Base of the SceUID range module ids come from. Modules are placed once at link
+/// time and never unloaded, so a module's load-order index is a stable identity; the
+/// base keeps those ids clear of the small ones threads and sync objects mint.
+const MODULE_UID_BASE: i32 = 0x0100_0000;
+
+/// What `sceKernelGetThreadInfo` reports about one thread. A borrowed view rather
+/// than a copy: the caller writes it straight into the guest's struct.
+pub struct ThreadInfo<'a> {
+    pub name: &'a str,
+    pub attr: u32,
+    pub status: u32,
+    pub entry: u32,
+    pub stack_base: u32,
+    pub stack_size: i32,
+    pub init_priority: i32,
+    pub current_priority: i32,
+    pub cpu_affinity: i32,
+    pub exit_status: i32,
+}
+
+/// `SceThreadStatus` bits (vitasdk `psp2common/kernel/threadmgr.h`).
+const SCE_THREAD_RUNNING: u32 = 1;
+const SCE_THREAD_READY: u32 = 2;
+const SCE_THREAD_DORMANT: u32 = 16;
+const SCE_THREAD_DEAD: u32 = 32;
+
+/// The `SceThreadStatus` of a thread record. A created-but-never-started thread and a
+/// finished one are distinguished the same way [`VitaState::delete_thread`] does it:
+/// neither has an exit code until it has actually run.
+fn thread_status(t: &ThreadRec, current: i32) -> u32 {
+    if t.exit_code.is_some() {
+        SCE_THREAD_DEAD
+    } else if !t.started {
+        SCE_THREAD_DORMANT
+    } else if t.uid == current {
+        SCE_THREAD_RUNNING
+    } else {
+        SCE_THREAD_READY
+    }
+}
+
+/// A live semaphore. The count is what the primitive runs on; the rest is what
+/// `sceKernelGetSemaInfo` reports and what `sceKernelOpenSema` matches on, so it is
+/// recorded at create time rather than reconstructed. `init`/`max` are the values the
+/// guest asked for, not clamps we apply - the count is floored at 0 by the waiters and
+/// the kernel does not police `max` on signal either.
+struct SemaRec {
+    uid: i32,
+    /// The name passed to `sceKernelCreateSema`. Named semaphores are what
+    /// `sceKernelOpenSema` resolves, so this is a lookup key, not just a label.
+    name: String,
+    attr: u32,
+    init: i32,
+    max: i32,
+    count: i32,
+}
+
 struct ThreadRec {
     uid: i32,
     /// The name the guest passed to `sceKernelCreateThread`, if any. A worker's own
@@ -351,6 +519,96 @@ struct ThreadRec {
     /// SceKernel thread priority (lower number = higher priority). The scheduler
     /// runs the highest-priority runnable thread, matching the real kernel.
     priority: i32,
+    /// The priority the thread was CREATED with, before any
+    /// `sceKernelChangeThreadPriority`. Reported separately from the current one by
+    /// `sceKernelGetThreadInfo`, and the value a title restores when it temporarily
+    /// boosts a worker.
+    init_priority: i32,
+    /// The `attr` and `cpuAffinityMask` from `sceKernelCreateThread`. Neither steers
+    /// this scheduler (one core, and the attribute bits select stack/VFP options we
+    /// always provide), but both are reported verbatim by `sceKernelGetThreadInfo`,
+    /// so they are kept rather than dropped at the seam.
+    attr: u32,
+    cpu_affinity: i32,
+    /// Signals delivered by `sceKernelSendSignal` and not yet consumed by
+    /// `sceKernelWaitSignal`. A counter, not a flag: the kernel counts sends, and a
+    /// producer that signals twice before the consumer runs must not lose one.
+    signals: u32,
+}
+
+/// One socket in the offline SceNet table. Everything recorded here is LOCAL state -
+/// what the guest itself set - because nothing else exists to record.
+struct NetSocket {
+    id: i32,
+    /// The debug name SceNet takes at creation (it names sockets, unlike BSD).
+    name: String,
+    domain: i32,
+    ty: i32,
+    protocol: i32,
+    /// The address `sceNetBind` recorded, as `(network-order ip, host-order port)`.
+    local: (u32, u16),
+    listening: bool,
+    /// `(level, optname, value)` for every option the guest set, so a Get round-trips.
+    options: Vec<(i32, i32, u32)>,
+    closed: bool,
+}
+
+/// Socket, resolver and epoll id ranges. Deliberately disjoint from each other and well
+/// above the file-descriptor range, so an id used with the wrong API is rejected rather
+/// than silently naming somebody else's object.
+const NET_FD_BASE: i32 = 0x1000;
+const NET_RESOLVER_BASE: i32 = 0x2000;
+const NET_EPOLL_BASE: i32 = 0x3000;
+
+/// The stack pointer a fiber starts at: the top of its context buffer, 8-byte aligned
+/// as AAPCS requires at a public call. A fiber with no context yet yields 0, which the
+/// callers refuse to run rather than execute on a null stack.
+fn fiber_stack_top(context_addr: u32, context_size: u32) -> u32 {
+    if context_addr == 0 {
+        0
+    } else {
+        context_addr.wrapping_add(context_size) & !0xF
+    }
+}
+
+/// One `SceFiber` the guest has initialised.
+///
+/// A fiber is cooperative: exactly one member of a fiber chain runs at a time, and a
+/// switch is explicit. That is precisely what the preemptive scheduler already
+/// provides through park/wake, so a fiber is backed by an ordinary guest thread that
+/// is runnable ONLY while it holds the baton. Nothing about the guest's own stack
+/// changes: `Reentry` already carries an explicit `stack_top`, so the fiber's thread
+/// runs on the context buffer the guest supplied, exactly as the hardware does.
+///
+/// Modelling a switched-away fiber by nesting a re-entry cannot work - its stack has
+/// to survive with live frames on it until it is switched back to - and that survival
+/// is exactly what a parked scheduler thread gives for free.
+struct FiberRec {
+    /// The guest `SceFiber*`. This IS the fiber's identity: every API call names it,
+    /// and the guest may hold it anywhere, so nothing about a fiber is keyed on
+    /// anything else.
+    addr: u32,
+    name: String,
+    entry: u32,
+    arg_on_initialize: u32,
+    /// The guest-supplied context (the fiber's stack) as `(base, size)`. Both zero
+    /// until `_sceFiberAttachContextAndSwitch` supplies one - a fiber may be
+    /// initialised without a context and given one at its first switch.
+    context: (u32, u32),
+    /// The scheduler thread backing this fiber. Created at initialize, STARTED only
+    /// on the first run/switch: a fiber that is never run must never execute.
+    thid: i32,
+    started: bool,
+    /// Set by `sceFiberFinalize`; the record is kept so a later call naming a
+    /// finalized fiber is refused rather than silently resurrecting it.
+    finalized: bool,
+    /// The THREAD that ran this fiber's chain - what `sceFiberReturnToThread`
+    /// returns to. 0 when the fiber is not currently running.
+    runner: i32,
+    /// Where to write the value this fiber is handed when it is next resumed: the
+    /// `argOnRun` out-pointer of the `sceFiberSwitch`/`ReturnToThread` it is parked
+    /// in. 0 when it has none (or has not run yet, where the value arrives in r1).
+    resume_out: u32,
 }
 
 /// `SCE_KERNEL_DEFAULT_PRIORITY` - the *sentinel* a title passes to
@@ -364,6 +622,12 @@ pub const SCE_KERNEL_DEFAULT_PRIORITY: i32 = 0x1000_0100;
 /// 0xA0). Absolute user priorities run 0x40 (highest) .. 0xBF (lowest); 0xA0 is the
 /// middle default the initial (main) thread and a defaulted worker resolve to.
 pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
+
+/// The SceUID of the initial ("main") thread. It is the one thread with no
+/// [`ThreadRec`]: `create_thread` records what the GUEST creates, and the loader
+/// starts this one before any guest code runs. Anything that has to name it uses
+/// this rather than a bare 0.
+pub const MAIN_THID: i32 = 0;
 
 /// `SCE_KERNEL_ERROR_WAIT_TIMEOUT` - the value a *timed* blocking wait
 /// (`sceKernelWaitSema`/`WaitCond`/`WaitLwCond`/`WaitEventFlag` with a non-null
@@ -519,6 +783,28 @@ pub struct FileTable {
     open: std::collections::HashMap<i32, OpenFile>,
     open_dirs: std::collections::HashMap<i32, OpenDir>,
     next_fd: i32,
+    /// Directories that exist but hold nothing. The map is flat, so a directory is
+    /// normally IMPLIED by the keys beneath it - which makes an empty one
+    /// unrepresentable, and `sceIoMkdir` followed by `sceIoRmdir` (or by a listing)
+    /// unable to see its own work. Recording explicitly-created directories fixes
+    /// that without giving up the flat map: a directory exists if it is in here OR
+    /// some key lies under it.
+    dirs: std::collections::HashSet<String>,
+    /// Per-path status overrides written by `sceIoChstat`. Absent means "as
+    /// synthesized" (a plain readable regular file); present means the guest set it,
+    /// and a later `sceIoGetstat` must report what was set.
+    stats: std::collections::HashMap<String, FileStatOverride>,
+}
+
+/// The `sceIoChstat`-settable parts of a file's status. Each is `Option` because
+/// chstat takes a bit mask of WHICH fields to apply, so a call that sets only the
+/// times must not also reset the mode.
+#[derive(Clone, Default)]
+pub struct FileStatOverride {
+    pub mode: Option<u32>,
+    pub attr: Option<u32>,
+    /// `(ctime, atime, mtime)`, each the raw 16-byte guest `SceDateTime`.
+    pub times: [Option<[u8; 16]>; 3],
 }
 
 /// In-memory savedata slot store: the metadata layer SceAppUtil exposes on top of a
@@ -572,6 +858,11 @@ pub struct DirEntry {
 struct OpenDir {
     entries: Vec<DirEntry>,
     cursor: usize,
+    /// The (vfs-keyed) path the descriptor was opened on. Kept because a descriptor
+    /// can be the subject of a path operation - `_sceFiosKernelOverlayDHChstatSync`
+    /// changes the status of the directory a HANDLE names - and status is recorded
+    /// per path here.
+    path: String,
 }
 
 // Vita open flags (SCE_O_*), from the MIT vita-headers.
@@ -593,6 +884,12 @@ const SCE_SEEK_END: i32 = 2;
 const SCE_ERROR_ERRNO_ENOENT: i32 = 0x8001_0002u32 as i32;
 /// Bad file descriptor.
 const SCE_ERROR_ERRNO_EBADF: i32 = 0x8001_0009u32 as i32;
+/// The path already exists (mkdir over something, rename onto something).
+const SCE_ERROR_ERRNO_EEXIST: i32 = 0x8001_0011u32 as i32;
+/// A file operation was asked of a directory.
+const SCE_ERROR_ERRNO_EISDIR: i32 = 0x8001_0015u32 as i32;
+/// `sceIoRmdir` on a directory that still holds entries.
+const SCE_ERROR_ERRNO_ENOTEMPTY: i32 = 0x8001_005Au32 as i32;
 
 /// Reserved descriptors: 0 stdin, 1 stdout, 2 stderr. Real fds start at 3.
 const FIRST_FD: i32 = 3;
@@ -836,12 +1133,35 @@ impl FileTable {
                 entry.size = data.len() as u64;
             }
         }
-        if children.is_empty() {
+        // Explicitly-created directories are not implied by any file key, so they have
+        // to be folded in separately or a title cannot see the directory it just made.
+        for d in &self.dirs {
+            let Some(rest) = d.strip_prefix(&prefix) else { continue };
+            if rest.is_empty() {
+                continue;
+            }
+            let comp = rest.split('/').next().unwrap_or(rest);
+            children.entry(comp.to_string()).or_insert_with(|| {
+                let name = self
+                    .originals
+                    .get(d)
+                    .and_then(|orig| orig.split('/').nth(comp_index))
+                    .unwrap_or(comp)
+                    .to_string();
+                DirEntry { name, is_dir: true, size: 0 }
+            });
+        }
+        // An empty listing is only ENOENT when the directory itself does not exist; a
+        // real, explicitly-created empty directory opens fine and reads zero entries.
+        if children.is_empty() && !self.dirs.contains(key) {
             return SCE_ERROR_ERRNO_ENOENT;
         }
         let fd = self.next_fd;
         self.next_fd += 1;
-        self.open_dirs.insert(fd, OpenDir { entries: children.into_values().collect(), cursor: 0 });
+        self.open_dirs.insert(
+            fd,
+            OpenDir { entries: children.into_values().collect(), cursor: 0, path: key.to_string() },
+        );
         fd
     }
 
@@ -855,6 +1175,167 @@ impl FileTable {
             od.cursor += 1;
         }
         Some(entry)
+    }
+
+    /// Whether any stored key lies under `key` (i.e. the directory has content).
+    fn has_children(&self, key: &str) -> bool {
+        let prefix = format!("{key}/");
+        self.files.keys().any(|k| k.starts_with(&prefix))
+            || self.dirs.iter().any(|d| d.starts_with(&prefix))
+    }
+
+    /// Whether `key` names a directory: one explicitly created, or one implied by a
+    /// file stored beneath it.
+    fn is_dir(&self, key: &str) -> bool {
+        self.dirs.contains(key) || self.has_children(key)
+    }
+
+    /// int sceIoMkdir(const char *dir, SceMode mode): create a directory.
+    ///
+    /// Recorded rather than ignored, so the title can see the directory it just made
+    /// (list it, stat it, remove it). The parent is not required to exist - the map is
+    /// flat and the kernel's own mkdir is likewise a single-level operation whose
+    /// failure mode a title checks by return value, which it now gets truthfully.
+    fn mkdir(&mut self, path: &str) -> i32 {
+        let key = vfs_key(path);
+        let key = key.trim_end_matches('/').to_string();
+        if key.is_empty() {
+            return SCE_ERROR_ERRNO_EEXIST;
+        }
+        if self.files.contains_key(&key) || self.is_dir(&key) {
+            return SCE_ERROR_ERRNO_EEXIST;
+        }
+        self.originals.insert(key.clone(), path.trim_end_matches('/').to_string());
+        self.dirs.insert(key);
+        0
+    }
+
+    /// int sceIoRmdir(const char *path): remove an EMPTY directory.
+    ///
+    /// A non-empty one is refused (ENOTEMPTY) exactly as the kernel refuses it -
+    /// silently succeeding would tell the title its tree is gone while every file under
+    /// it is still readable.
+    fn rmdir(&mut self, path: &str) -> i32 {
+        let key = vfs_key(path);
+        let key = key.trim_end_matches('/').to_string();
+        if !self.is_dir(&key) {
+            return SCE_ERROR_ERRNO_ENOENT;
+        }
+        if self.has_children(&key) {
+            return SCE_ERROR_ERRNO_ENOTEMPTY;
+        }
+        self.dirs.remove(&key);
+        self.originals.remove(&key);
+        self.stats.remove(&key);
+        0
+    }
+
+    /// int sceIoRemove(const char *file): delete a file.
+    ///
+    /// Really deletes it: the entry goes, so a later open without SCE_O_CREAT reports
+    /// ENOENT and a listing no longer shows it. Refuses a directory (the kernel has
+    /// `sceIoRmdir` for that) and an unknown path.
+    fn remove(&mut self, path: &str) -> i32 {
+        let key = vfs_key(path);
+        if !self.files.contains_key(&key) {
+            return if self.is_dir(&key) { SCE_ERROR_ERRNO_EISDIR } else { SCE_ERROR_ERRNO_ENOENT };
+        }
+        self.files.remove(&key);
+        self.originals.remove(&key);
+        self.stats.remove(&key);
+        0
+    }
+
+    /// int sceIoRename(const char *oldname, const char *newname): move a file or a
+    /// whole directory subtree.
+    ///
+    /// A directory rename has to carry its contents, and in a flat map that means
+    /// re-keying every entry under the old prefix - which is the entire reason this
+    /// cannot be a two-line map swap. Refuses to overwrite an existing destination,
+    /// as the kernel does.
+    fn rename(&mut self, old: &str, new: &str) -> i32 {
+        let (from, to) = (vfs_key(old), vfs_key(new));
+        let (from, to) = (from.trim_end_matches('/').to_string(), to.trim_end_matches('/').to_string());
+        if from == to {
+            return 0;
+        }
+        if self.files.contains_key(&to) || self.is_dir(&to) {
+            return SCE_ERROR_ERRNO_EEXIST;
+        }
+        let new_orig = new.trim_end_matches('/').to_string();
+
+        if let Some(data) = self.files.remove(&from) {
+            self.files.insert(to.clone(), data);
+            self.originals.remove(&from);
+            self.originals.insert(to.clone(), new_orig);
+            if let Some(s) = self.stats.remove(&from) {
+                self.stats.insert(to, s);
+            }
+            return 0;
+        }
+        if !self.is_dir(&from) {
+            return SCE_ERROR_ERRNO_ENOENT;
+        }
+        // A directory: re-key the directory itself and everything beneath it.
+        let old_prefix = format!("{from}/");
+        let rekey = |k: &str| format!("{to}{}", &k[from.len()..]);
+        let moved: Vec<String> =
+            self.files.keys().filter(|k| k.starts_with(&old_prefix)).cloned().collect();
+        for k in moved {
+            let data = self.files.remove(&k).unwrap_or_default();
+            let nk = rekey(&k);
+            // The original spelling's tail is preserved; only the renamed prefix changes.
+            let orig_tail = self.originals.remove(&k).map(|o| o[from.len().min(o.len())..].to_string());
+            self.files.insert(nk.clone(), data);
+            if let Some(tail) = orig_tail {
+                self.originals.insert(nk.clone(), format!("{new_orig}{tail}"));
+            }
+            if let Some(s) = self.stats.remove(&k) {
+                self.stats.insert(nk, s);
+            }
+        }
+        let moved_dirs: Vec<String> = self
+            .dirs
+            .iter()
+            .filter(|d| **d == from || d.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        for d in moved_dirs {
+            self.dirs.remove(&d);
+            self.dirs.insert(rekey(&d));
+        }
+        self.originals.remove(&from);
+        self.originals.insert(to, new_orig);
+        0
+    }
+
+    /// int sceIoChstat(const char *name, SceIoStat *stat, int bits): apply the
+    /// selected fields of `stat` to a path. Stored so a later `sceIoGetstat` reports
+    /// them back - a chstat whose effect is invisible is worse than an error, because
+    /// the title believes the change took.
+    fn chstat(&mut self, path: &str, over: FileStatOverride) -> i32 {
+        let key = vfs_key(path);
+        if !self.files.contains_key(&key) && !self.is_dir(&key) {
+            return SCE_ERROR_ERRNO_ENOENT;
+        }
+        let e = self.stats.entry(key).or_default();
+        if over.mode.is_some() {
+            e.mode = over.mode;
+        }
+        if over.attr.is_some() {
+            e.attr = over.attr;
+        }
+        for (i, t) in over.times.iter().enumerate() {
+            if t.is_some() {
+                e.times[i] = *t;
+            }
+        }
+        0
+    }
+
+    /// The chstat overrides recorded for a path, if any.
+    fn stat_override(&self, path: &str) -> Option<&FileStatOverride> {
+        self.stats.get(&vfs_key(path))
     }
 
     /// Close a directory descriptor (sceIoDclose); returns 0 or a negative errno.
@@ -926,12 +1407,63 @@ struct VertexStreamInfo {
 /// Keyed by the guest state-struct address, applied to the live bind state when the
 /// guest issues `sceGxmSetPrecomputed{Vertex,Fragment}State`, exactly as the individual
 /// `sceGxmSetUniformDataF`/`sceGxmSetFragmentTexture` calls would be on the direct path.
+/// One sampler unit's bound texture, captured the way the hardware captures it: BY VALUE.
+///
+/// `sceGxmSetFragmentTexture` and `sceGxmPrecomputedFragmentStateSetTexture` both COPY the
+/// 16-byte `SceGxmTexture` into driver-owned memory at the moment of the call - the caller's
+/// struct is `const` and is free to be a stack temporary or a slot in a recycled scratch pool.
+/// Keeping only the POINTER and re-reading it at draw time therefore reads whatever the guest
+/// has since put there, which on this title is zeros: a race frame's post-process chain bound
+/// its three inputs through a precomputed state whose texture array had already been recycled,
+/// every one of them decoded as a null data pointer, and the light, bloom and composite passes
+/// all rendered pure black. The frame still looked like a frame, only far too dark.
+///
+/// The ADDRESS is kept beside the words because the side tables (`texture_formats`,
+/// `texture_samplers`, `texture_extra`) are keyed by it - see
+/// `vitaslop-host-call-reference-semantics` for why identity and value both have to survive.
+#[derive(Clone, Copy, Debug, Default)]
+struct TextureBinding {
+    unit: u32,
+    /// The guest `SceGxmTexture*` the binding came from. Identity only - never re-read for
+    /// control words.
+    addr: u32,
+    /// The four control words as they read AT BIND TIME.
+    words: [u32; 4],
+    /// True when this binding arrived through a precomputed fragment state. Per-binding, not a
+    /// global "last path used" flag: the two paths are live at the same time, and a global one
+    /// mislabels whichever binding did not happen last - which is exactly how a precomputed
+    /// binding spent a session being investigated as a direct one.
+    from_precomputed: bool,
+}
+
+impl TextureBinding {
+    /// Snapshot the 16 control words at `addr` NOW - the moment the guest handed the texture to
+    /// GXM. A null handle yields an all-zero binding, which the caller treats as an unbind.
+    fn read(ctx: &GuestCtx, unit: u32, addr: u32, from_precomputed: bool) -> Self {
+        let words = if addr == 0 {
+            [0; 4]
+        } else {
+            [ctx.read_u32(addr), ctx.read_u32(addr + 4), ctx.read_u32(addr + 8), ctx.read_u32(addr + 12)]
+        };
+        TextureBinding { unit, addr, words, from_precomputed }
+    }
+
+    /// True when the captured control words are all zero - a handle that was never a texture.
+    fn is_null(&self) -> bool {
+        self.words.iter().all(|&w| w == 0)
+    }
+}
+
 #[derive(Clone, Default)]
 struct PrecomputedState {
     program_header: u32,
     default_uniform_buffer: u32,
-    /// (textureIndex, `SceGxmTexture*` addr).
-    textures: Vec<(u32, u32)>,
+    /// (textureIndex, the texture captured BY VALUE - see [`TextureBinding`]).
+    textures: Vec<(u32, TextureBinding)>,
+    /// For a FRAGMENT state, the blend equation of the program it was built from. A draw made
+    /// through a precomputed state never touches `sceGxmSetFragmentProgram`, so without this
+    /// it would inherit whatever the last direct bind left behind.
+    blend: crate::capture::BlendState,
 }
 
 /// Extra sticky per-texture state the `sceGxmTextureGet*` getters read back. The
@@ -1177,6 +1709,10 @@ struct ProgramReflection {
     world_off: Option<u32>,
     /// Float offset of the world->projection 4x4.
     proj_off: Option<u32>,
+    /// Float offset of a SINGLE combined model->clip 4x4 (`worldViewProj`), when the
+    /// shader keeps one instead of a model/projection pair. Takes precedence over
+    /// [`Self::world_off`]/[`Self::proj_off`] because it is already the whole transform.
+    mvp_off: Option<u32>,
     /// Float offset of the scene exposure scalar (`vsCoarseExposureReg`).
     exposure_off: Option<u32>,
     /// Does this vertex program SYNTHESIZE its primitive (point sprite / billboard)?
@@ -1191,6 +1727,10 @@ struct ProgramReflection {
     /// Size of the program's default uniform buffer, from the table's extent in
     /// floats. See [`VitaState::reflected_uniform_size_bytes`].
     uniform_size_bytes: u32,
+    /// Texture units the program's samplers occupy (one past the highest sampler
+    /// resource index). This is the length of the texture array the whole-array
+    /// setter `sceGxmPrecomputed*StateSetAllTextures` is given.
+    texture_unit_count: u32,
 }
 
 /// All host state for one run: the guest allocator, handle tables, the capture
@@ -1217,6 +1757,16 @@ pub struct VitaState {
     /// flip, so the per-flip advance can top up to exactly one frame rather than
     /// double-count. See [`VitaState::advance_io_frame`].
     io_charged_since_flip: u64,
+    /// Game-clock time already charged by quantum boundaries since the last display
+    /// flip, so the per-flip advance can top the clock up to exactly one frame rather
+    /// than double-count. Exactly the role `io_charged_since_flip` plays for the
+    /// storage clock. See [`VitaState::charge_cpu_quantum`].
+    cpu_charged_since_flip: u64,
+    /// Scheduler quanta and display flips observed, for the calibration diagnostic that
+    /// sets `QUANTUM_CPU_US` (a quantum is worth one frame divided by the quanta a
+    /// rendering frame actually takes - see [`VitaState::charge_cpu_quantum`]).
+    quantum_count: u64,
+    flip_count: u64,
     /// `(base, size)` of every released memory block, in release order, available for
     /// reuse by [`VitaState::alloc_memblock`]. Not coalesced: adjacency in the arena is
     /// not adjacency in usefulness here (blocks are whole buffers a title allocates and
@@ -1245,6 +1795,9 @@ pub struct VitaState {
     // colour) and prefer it over a normal/spec/env map when picking the one texture
     // the capture renderer samples. 0 when no fragment program is bound.
     bound_fragment_program_header: u32,
+    /// The blend equation of the currently bound fragment program, snapshotted into every
+    /// draw. See [`crate::capture::BlendState`].
+    bound_fragment_blend: crate::capture::BlendState,
     /// The guest vertex buffer bound to each stream index by `sceGxmSetVertexStream`.
     /// GXM allows up to [`MAX_VERTEX_STREAMS`]; a mesh that splits per-vertex data from
     /// per-instance data (particles, decals, instanced props) uses more than one, and
@@ -1269,12 +1822,27 @@ pub struct VitaState {
     // synchronously to completion), so nothing ever actually blocks; a semaphore's
     // count and an event flag's bit pattern are still tracked so their observable
     // state is faithful for single-thread use (guarding data, wait-then-read).
-    semaphores: Vec<(i32, i32)>,
+    semaphores: Vec<SemaRec>,
     event_flags: Vec<(i32, u32)>,
     /// One bit per open SceCommonDialog family (see `vita::services::DialogFamily`):
     /// set by `*DialogInit`, read by `*DialogGetStatus` (open reports FINISHED -
     /// dialogs complete instantly offline), cleared by `*DialogTerm`.
     pub(crate) open_dialogs: u32,
+    /// Registered FIOS2 path overlays, kept sorted by `order` (see
+    /// [`crate::vita::fios2`]). Path resolution walks them in that order, which is
+    /// what `order` is for, so sorting on insert keeps every resolve a plain scan.
+    fios_overlays: Vec<FiosOverlay>,
+    /// Threads that have switched overlay resolution off for themselves
+    /// (`_sceFiosKernelOverlayThreadSetDisabled`). Per-thread, because that is the
+    /// point of the call: a loader thread turns overlays off to reach the real file
+    /// underneath one it has just overlaid.
+    fios_overlay_disabled: std::collections::HashSet<i32>,
+    /// The debug GPIO output register (`sceKernelSetGPO`). On a development unit its
+    /// low bits drive the board's diagnostic LEDs; retail hardware has none wired, so
+    /// nothing observable comes of a write. It is still a register and the value is
+    /// still held, so it is held here rather than discarded - a title that toggles it
+    /// as a progress marker through boot leaves its last marker readable.
+    pub(crate) gpo: u32,
     // Preemptive-mode state (unused in the single-thread model). When `preemptive`
     // is set, blocking primitives actually park the calling thread (`current`) and
     // are woken by another thread's signal/unlock/thread-end; the scheduler drains
@@ -1288,6 +1856,9 @@ pub struct VitaState {
     conds: Vec<CondRec>,
     sema_waiters: Vec<SemaWaiter>,
     evf_waiters: Vec<EvfWaiter>,
+    /// Threads parked in `sceKernelWaitSignal`. A plain id list: the wait has no
+    /// count or pattern to match, only "a signal arrived for me".
+    signal_waiters: Vec<i32>,
     // Display-queue callback execution (preemptive mode; see
     // [`Self::enqueue_display_callback`]): the dedicated guest stack and
     // callback-data slot ring (lazily allocated), entries waiting to run, and the
@@ -1359,6 +1930,9 @@ pub struct VitaState {
     /// `sceKernelGetProcessParam`. libc's crt reads the `SceLibcParam` it points to
     /// for the heap configuration, so this must be a real address (0 would fault).
     process_param: u32,
+    /// The modules in the linked image (from [`crate::link::LinkedProgram`]), which
+    /// is what the kernel's module queries answer from. Set once before the run.
+    modules: Vec<crate::link::LoadedModule>,
     /// Per-`(thread, key)` thread-local storage slots handed out by
     /// `sceKernelGetTLSAddr`. Each is a distinct zero-initialized guest block whose
     /// address is stable across calls, so a thread stores and reads back its own
@@ -1380,7 +1954,11 @@ pub struct VitaState {
     /// Fragment textures currently bound by `sceGxmSetFragmentTexture`, keyed by
     /// sampler unit -> guest `SceGxmTexture*`. Bindings persist across draws until
     /// rebound (GXM state is sticky), so this is read - not cleared - at each draw.
-    bound_textures: Vec<(u32, u32)>,
+    bound_textures: Vec<TextureBinding>,
+    /// Textures bound to VERTEX-stage sampler units (`_sceGxmSetVertexTexture`). Kept sorted by
+    /// unit, like [`Self::bound_textures`], and separate from it because the two stages number
+    /// their units independently.
+    bound_vertex_textures: Vec<TextureBinding>,
     /// Exact `SceGxmTextureFormat` last set on a guest `SceGxmTexture*` via
     /// `sceGxmTextureInit*`/`SetFormat`. The 16-byte control words alone lose the
     /// channel swizzle (only a 3-bit field survives), so we keep the full 32-bit
@@ -1414,10 +1992,18 @@ pub struct VitaState {
     /// times per frame - so the lookup must be O(1), not a linear scan over every state.
     precomputed_vertex_states: std::collections::HashMap<u32, PrecomputedState>,
     precomputed_fragment_states: std::collections::HashMap<u32, PrecomputedState>,
-    /// `SceGxmFragmentProgram*` handle -> its `SceGxmProgram*`, recorded at
-    /// `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed fragment state can
-    /// size its default uniform buffer. (Vertex programs carry this in `VertexProgramInfo`.)
-    fragment_programs: std::collections::HashMap<u32, u32>,
+    /// Whether the current `bound_textures` came from a precomputed fragment state (true) or
+    /// from direct `sceGxmSetFragmentTexture` calls (false). Diagnostic only - see
+    /// [`VitaState::note_direct_texture_bind`].
+    textures_from_precomputed: bool,
+    /// Texture handles whose control words were non-zero when `sceGxmSetFragmentTexture` bound
+    /// them. Diagnostic - see [`VitaState::note_texture_live_at_bind`].
+    textures_live_at_bind: std::collections::HashSet<u32>,
+    /// `SceGxmFragmentProgram*` handle -> (its `SceGxmProgram*`, the blend equation it was
+    /// created with), recorded at `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed
+    /// fragment state can size its default uniform buffer and every draw can carry its real
+    /// blend mode. (Vertex programs carry their header in `VertexProgramInfo`.)
+    fragment_programs: std::collections::HashMap<u32, (u32, crate::capture::BlendState)>,
     /// The recycled arena the default uniform buffers are handed out of (guest ptr,
     /// byte size, and the bump offset within it). See
     /// [`Self::alloc_default_uniform_buffer`].
@@ -1458,11 +2044,57 @@ pub struct VitaState {
     /// [`Self::stale_uniforms`], so the warning fires once per pair instead of once per
     /// draw (hundreds a frame).
     reported_stale_uniforms: std::collections::HashSet<(&'static str, u32, u32)>,
+    /// Colour-surface pairs already reported as overlapping in guest memory, so the report
+    /// fires once per pair rather than once per `sceGxmColorSurfaceInit`.
+    reported_surface_overlaps: std::collections::HashSet<(u32, u32)>,
     /// The GPU notification region: a guest buffer of `SCE_GXM_NOTIFICATION_COUNT`
     /// u32 slots handed out by `sceGxmGetNotificationRegion`, lazily allocated on
     /// first use (0 = not yet allocated). Scenes complete synchronously here, so a
     /// notification the guest waits on is treated as already signalled.
     notification_region: u32,
+    /// `sceGxmSetVisibilityBuffer(context, bufferBase, stridePerCore)`: where the GPU
+    /// writes occlusion-query results, and the per-core stride. 0 = no buffer bound.
+    visibility_buffer: u32,
+    visibility_stride: u32,
+    /// Per visibility-test index, the sample count accumulated over the current scene
+    /// (see [`Self::accumulate_visibility`]). Flushed into the visibility buffer when
+    /// the scene ends, because that is when the GPU would have written it.
+    visibility_counts: std::collections::BTreeMap<u32, u32>,
+    /// GPU memory mappings from `sceGxmMapMemory(base, size, attr)`, as base -> size.
+    /// Needed only so `sceGxmUnmapMemory(base)` - which is given no size - can drop the
+    /// texture snapshots taken from that range: after an unmap the guest is free to
+    /// reuse the pages, and a snapshot cached against those addresses would then be
+    /// sampled as though it were still the texture that lived there.
+    gxm_mappings: std::collections::BTreeMap<u32, u32>,
+    /// `SceGxmRenderTarget` handle -> the `driverMemBlock` UID its params carried, so
+    /// `sceGxmRenderTargetGetDriverMemBlock` hands back exactly what the guest gave.
+    render_target_mem_blocks: std::collections::HashMap<u32, u32>,
+    /// `SceGxmRenderTarget` handle -> the `(width, height)` its params declared. This
+    /// is the authoritative extent of every scene begun on that target: GXM
+    /// rasterizes the render target's region, and the colour surface only describes
+    /// where the pixels land (its data pointer, format and stride). See
+    /// [`Self::render_target_extent`].
+    render_target_extents: std::collections::HashMap<u32, (u32, u32)>,
+    /// How many images `scePhotoExportFromData` has written, so each export gets its
+    /// own path instead of overwriting the last.
+    photo_exports: u32,
+    /// The offline SceNet socket table, its resolver and epoll handles, and the
+    /// per-thread errno slots. See `vita::net` for the model.
+    net_sockets: Vec<NetSocket>,
+    net_resolvers: Vec<(i32, i32)>,
+    net_epolls: Vec<(i32, Vec<i32>)>,
+    net_errno: Vec<(i32, u32)>,
+    /// Every `SceFiber` the guest has initialised (see [`FiberRec`]).
+    fibers: Vec<FiberRec>,
+    /// Per THREAD that called `sceFiberRun`, the `argOnRun` out-pointer to fill when
+    /// the fiber chain it started returns to it. Keyed by thread id, not by fiber,
+    /// because it belongs to the run call the thread is parked in.
+    fiber_run_out: std::collections::HashMap<i32, u32>,
+    /// `SceGxmTexture*` -> the palette pointer set by `sceGxmTextureSetPalette`.
+    /// Kept beside the control words (rather than packed into word 0) because the
+    /// palette field's bit layout in the control words is not published, and a wrong
+    /// packing would corrupt fields that ARE understood.
+    texture_palettes: std::collections::HashMap<u32, u32>,
     /// The live GXM fixed-function pipeline state (cull/depth/stencil/viewport/...),
     /// mutated by the `sceGxmSet*` setters and snapshotted into each recorded draw.
     /// Sticky across scenes, exactly like the real GXM context.
@@ -1520,6 +2152,9 @@ impl VitaState {
             io_us: 0,
             io_waiters: Vec::new(),
             io_charged_since_flip: 0,
+            cpu_charged_since_flip: 0,
+            quantum_count: 0,
+            flip_count: 0,
             freed_memblocks: Vec::new(),
             vertex_programs: std::collections::HashMap::new(),
             program_reflection: std::collections::HashMap::new(),
@@ -1529,6 +2164,7 @@ impl VitaState {
             scene: None,
             bound_vertex_program: 0,
             bound_fragment_program_header: 0,
+            bound_fragment_blend: crate::capture::BlendState::default(),
             bound_streams: [0; MAX_VERTEX_STREAMS],
             pending_uniforms: Vec::new(),
             threads: Vec::new(),
@@ -1539,12 +2175,16 @@ impl VitaState {
             semaphores: Vec::new(),
             event_flags: Vec::new(),
             open_dialogs: 0,
+            fios_overlays: Vec::new(),
+            fios_overlay_disabled: std::collections::HashSet::new(),
+            gpo: 0,
             preemptive: false,
             current: 0,
             mutexes: Vec::new(),
             lwmutexes: Vec::new(),
             conds: Vec::new(),
             sema_waiters: Vec::new(),
+            signal_waiters: Vec::new(),
             evf_waiters: Vec::new(),
             display_cb_stack: 0,
             display_cb_slots: 0,
@@ -1571,11 +2211,13 @@ impl VitaState {
             audio_state: crate::vita::audio::AudioState::default(),
             halt_on_terminate: false,
             process_param: 0,
+            modules: Vec::new(),
             tls_slots: Vec::new(),
             tls_template: (0, 0, 0),
             tls_bases: Vec::new(),
             shader_programs: Vec::new(),
             bound_textures: Vec::new(),
+            bound_vertex_textures: Vec::new(),
             texture_formats: std::collections::HashMap::new(),
             texture_samplers: std::collections::HashMap::new(),
             texture_extra: std::collections::HashMap::new(),
@@ -1583,6 +2225,8 @@ impl VitaState {
             texture_snapshots: TextureSnapshots::new(),
             precomputed_vertex_states: std::collections::HashMap::new(),
             precomputed_fragment_states: std::collections::HashMap::new(),
+            textures_from_precomputed: false,
+            textures_live_at_bind: std::collections::HashSet::new(),
             fragment_programs: std::collections::HashMap::new(),
             uniform_ring: 0,
             uniform_ring_size: 0,
@@ -1595,7 +2239,22 @@ impl VitaState {
             bound_fragment_uniform_size: 0,
             fragment_uniform_header: 0,
             reported_stale_uniforms: std::collections::HashSet::new(),
+            reported_surface_overlaps: std::collections::HashSet::new(),
             notification_region: 0,
+            visibility_buffer: 0,
+            visibility_stride: 0,
+            visibility_counts: std::collections::BTreeMap::new(),
+            gxm_mappings: std::collections::BTreeMap::new(),
+            render_target_mem_blocks: std::collections::HashMap::new(),
+            render_target_extents: std::collections::HashMap::new(),
+            texture_palettes: std::collections::HashMap::new(),
+            photo_exports: 0,
+            net_sockets: Vec::new(),
+            net_resolvers: Vec::new(),
+            net_epolls: Vec::new(),
+            net_errno: Vec::new(),
+            fibers: Vec::new(),
+            fiber_run_out: std::collections::HashMap::new(),
             render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
             lwcond_mutex: Vec::new(),
@@ -1646,6 +2305,26 @@ impl VitaState {
         self.process_param = addr;
     }
 
+    /// Record the linked image's modules so the kernel's module queries can answer
+    /// from them. Set once before the run, alongside [`Self::set_process_param`].
+    pub fn set_modules(&mut self, modules: Vec<crate::link::LoadedModule>) {
+        self.modules = modules;
+    }
+
+    /// The module whose segments contain `addr`, and its SceUID, or `None` if the
+    /// address is in no loaded module (guest heap, a stack, a memory block).
+    ///
+    /// The UID is the module's index plus a base: modules are placed once at link
+    /// time and never unloaded here, so the index is a stable identity, and offsetting
+    /// it keeps a module id from colliding with the small ids threads and sync objects
+    /// use.
+    pub fn module_by_addr(&self, addr: u32) -> Option<(i32, &crate::link::LoadedModule)> {
+        self.modules
+            .iter()
+            .position(|m| m.contains(addr))
+            .map(|i| (MODULE_UID_BASE + i as i32, &self.modules[i]))
+    }
+
     /// The `SceProcessParam` address (0 if the title carries none).
     pub fn process_param(&self) -> u32 {
         self.process_param
@@ -1689,7 +2368,9 @@ impl VitaState {
     /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
     /// memory starts zeroed, so a never-written slot reads back as NULL.
     pub fn tls_addr(&mut self, key: u32) -> u32 {
-        let thread = self.current;
+        // A fiber shares its runner's thread-local storage: on hardware it runs ON that
+        // thread, so a slot it reads must be the same slot the runner writes.
+        let thread = self.logical_thread(self.current);
         if let Some(&(_, addr)) = self.tls_slots.iter().find(|&&(k, _)| k == (thread, key)) {
             return addr;
         }
@@ -1698,6 +2379,35 @@ impl VitaState {
         let addr = self.galloc(4, 4);
         self.tls_slots.push(((thread, key), addr));
         addr
+    }
+
+    /// Delete a file from the virtual filesystem, reporting whether it was there.
+    /// Used by `sceAppUtilSaveDataDataRemove`, whose whole job is that the deletion is
+    /// real: a title that removes a save slot and re-reads it must see it gone.
+    pub fn remove_file(&mut self, path: &str) -> bool {
+        let key = vfs_key(path);
+        self.fs.originals.remove(&key);
+        self.fs.files.remove(&key).is_some()
+    }
+
+    /// Total bytes the virtual filesystem holds under a mount (e.g. `savedata0:`),
+    /// which is what a quota query has to report as USED.
+    pub fn mount_used_bytes(&self, mount: &str) -> usize {
+        let prefix = vfs_key(mount.trim_end_matches('/'));
+        self.fs
+            .files
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| v.len())
+            .sum()
+    }
+
+    /// A fresh index for the next `scePhotoExportFromData`, so successive exports land
+    /// in distinct files instead of overwriting one another.
+    pub fn next_photo_export_index(&mut self) -> u32 {
+        let i = self.photo_exports;
+        self.photo_exports += 1;
+        i
     }
 
     /// Move the heap allocation cursor to `addr`. A multi-module linked title
@@ -1797,6 +2507,181 @@ impl VitaState {
     }
 
     /// sceIoDopen: open a directory listing; a new fd or a negative errno.
+    // --- FIOS2 path overlays -------------------------------------------------
+
+    /// Register an overlay, returning its id. Insertion keeps the list sorted by
+    /// `order` so resolution is a straight scan in application order.
+    pub fn fios_overlay_add(&mut self, mut overlay: FiosOverlay) -> i32 {
+        let id = FIOS_OVERLAY_ID_BASE + self.fios_overlays.len() as i32;
+        overlay.id = id;
+        let at = self
+            .fios_overlays
+            .iter()
+            .position(|o| o.order > overlay.order)
+            .unwrap_or(self.fios_overlays.len());
+        self.fios_overlays.insert(at, overlay);
+        id
+    }
+
+    /// The overlay with this id, if it is still registered.
+    pub fn fios_overlay(&self, id: i32) -> Option<&FiosOverlay> {
+        self.fios_overlays.iter().find(|o| o.id == id)
+    }
+
+    /// Replace a registered overlay's configuration, keeping its id. Returns whether
+    /// the id resolved. The list is re-sorted because `order` may have changed.
+    pub fn fios_overlay_modify(&mut self, id: i32, mut new_value: FiosOverlay) -> bool {
+        let Some(i) = self.fios_overlays.iter().position(|o| o.id == id) else { return false };
+        new_value.id = id;
+        self.fios_overlays[i] = new_value;
+        self.fios_overlays.sort_by_key(|o| o.order);
+        true
+    }
+
+    /// Unregister an overlay. Returns whether the id resolved.
+    pub fn fios_overlay_remove(&mut self, id: i32) -> bool {
+        let before = self.fios_overlays.len();
+        self.fios_overlays.retain(|o| o.id != id);
+        self.fios_overlays.len() != before
+    }
+
+    /// The ids of every overlay whose `order` falls in `[min_order, max_order]`, in
+    /// application order.
+    pub fn fios_overlay_ids(&self, min_order: u8, max_order: u8) -> Vec<i32> {
+        self.fios_overlays
+            .iter()
+            .filter(|o| o.order >= min_order && o.order <= max_order)
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// Whether the calling thread has switched overlay resolution off for itself.
+    pub fn fios_overlay_disabled(&self) -> bool {
+        self.fios_overlay_disabled.contains(&self.current)
+    }
+
+    /// Switch overlay resolution on or off for the calling thread. Returns the
+    /// previous setting, which is what a caller saves to restore.
+    pub fn fios_overlay_set_disabled(&mut self, disabled: bool) -> bool {
+        let was = self.fios_overlay_disabled.contains(&self.current);
+        if disabled {
+            self.fios_overlay_disabled.insert(self.current);
+        } else {
+            self.fios_overlay_disabled.remove(&self.current);
+        }
+        was
+    }
+
+    /// Resolve `path` through the registered overlays whose `order` is in
+    /// `[min_order, max_order]`, returning the path the filesystem should actually
+    /// see.
+    ///
+    /// Each overlay whose `dst` is a path prefix of the current path can rewrite that
+    /// prefix to its `src`. What decides whether it does is the overlay TYPE:
+    ///
+    /// - `OPAQUE` replaces unconditionally: `src` stands in for `dst` whether or not
+    ///   anything is there, which is what makes it opaque - the original is hidden.
+    /// - `TRANSLUCENT` and `WRITABLE` check `src` first and fall back to `dst`, so the
+    ///   rewrite only takes when the file is really present in the overlay. (They
+    ///   differ in where WRITES land, which is a property of the open, not of the
+    ///   resolve.)
+    /// - `NEWER` picks whichever copy has the later modification time. Nothing in
+    ///   this filesystem carries a modification time unless a title set one with
+    ///   `sceIoChstat`, and the type's own documented tie-break is "if both have the
+    ///   same modification time, dst is used" - which is exactly the untimed case, so
+    ///   an untimed pair resolves to `dst` unless only `src` exists.
+    ///
+    /// Overlays compose: a rewritten path is fed to the next overlay in order, so a
+    /// chain of them behaves as a stack.
+    pub fn fios_resolve(&self, path: &str, min_order: u8, max_order: u8) -> String {
+        if self.fios_overlay_disabled() {
+            return path.to_string();
+        }
+        let mut cur = path.to_string();
+        for o in self.fios_overlays.iter().filter(|o| o.order >= min_order && o.order <= max_order) {
+            let Some(rest) = strip_path_prefix(&cur, &o.dst) else { continue };
+            let candidate = format!("{}{rest}", o.src);
+            let exists = |p: &str| self.io_size(p).is_some() || self.io_is_dir(p);
+            cur = match o.kind {
+                SCE_FIOS_OVERLAY_TYPE_OPAQUE => candidate,
+                SCE_FIOS_OVERLAY_TYPE_TRANSLUCENT | SCE_FIOS_OVERLAY_TYPE_WRITABLE => {
+                    if exists(&candidate) {
+                        candidate
+                    } else {
+                        cur
+                    }
+                }
+                SCE_FIOS_OVERLAY_TYPE_NEWER => {
+                    if exists(&cur) {
+                        cur
+                    } else if exists(&candidate) {
+                        candidate
+                    } else {
+                        cur
+                    }
+                }
+                // An overlay type the console does not define. Leaving the path alone
+                // would silently ignore a registered overlay, so say so once and move
+                // on rather than pretending it applied.
+                other => {
+                    tracing::error!(
+                        target: "vitaslop::err",
+                        kind = other, id = o.id, dst = %o.dst, src = %o.src,
+                        "FIOS2 overlay has an undefined type - it is being ignored, so \
+                         paths under its dst are NOT being redirected"
+                    );
+                    cur
+                }
+            };
+        }
+        cur
+    }
+
+    /// int sceIoMkdir: create a directory (see [`FileTable::mkdir`]).
+    pub fn io_mkdir(&mut self, path: &str) -> i32 {
+        self.fs.mkdir(path)
+    }
+
+    /// int sceIoRmdir: remove an empty directory (see [`FileTable::rmdir`]).
+    pub fn io_rmdir(&mut self, path: &str) -> i32 {
+        self.fs.rmdir(path)
+    }
+
+    /// int sceIoRemove: delete a file (see [`FileTable::remove`]).
+    pub fn io_remove(&mut self, path: &str) -> i32 {
+        self.fs.remove(path)
+    }
+
+    /// int sceIoRename: move a file or directory subtree (see [`FileTable::rename`]).
+    pub fn io_rename(&mut self, old: &str, new: &str) -> i32 {
+        self.fs.rename(old, new)
+    }
+
+    /// int sceIoChstat: apply the selected status fields to a path.
+    pub fn io_chstat(&mut self, path: &str, over: FileStatOverride) -> i32 {
+        self.fs.chstat(path, over)
+    }
+
+    /// The chstat overrides recorded for a path, if any.
+    pub fn io_stat_override(&self, path: &str) -> Option<&FileStatOverride> {
+        self.fs.stat_override(path)
+    }
+
+    /// Whether a path names a directory (explicit or implied by its contents).
+    pub fn io_is_dir(&self, path: &str) -> bool {
+        self.fs.is_dir(&vfs_key(path))
+    }
+
+    /// Whether `fd` is a live DIRECTORY descriptor.
+    pub fn io_dir_is_open(&self, fd: i32) -> bool {
+        self.fs.open_dirs.contains_key(&fd)
+    }
+
+    /// The path a live directory descriptor was opened on.
+    pub fn io_dir_path(&self, fd: i32) -> Option<String> {
+        self.fs.open_dirs.get(&fd).map(|d| d.path.clone())
+    }
+
     pub fn io_dopen(&mut self, path: &str) -> i32 {
         let fd = self.fs.dopen(path);
         tracing::trace!(target: "vitaslop::io", path, fd, "dopen");
@@ -1921,7 +2806,14 @@ impl VitaState {
 
     /// Create a thread: allocate its own stack and record it, returning its
     /// SceUID. The entry's Thumb bit is cleared so it names the transpiled export.
-    pub fn create_thread(&mut self, entry: u32, stack_size: u32, priority: i32) -> i32 {
+    pub fn create_thread(
+        &mut self,
+        entry: u32,
+        stack_size: u32,
+        priority: i32,
+        attr: u32,
+        cpu_affinity: i32,
+    ) -> i32 {
         if self.threads.len() >= Self::RUNAWAY_THREAD_LIMIT {
             // Report ONCE, with the entry that dominates, then keep going: the heap
             // exhaustion below will stop the run loudly anyway, and this is the line that
@@ -1983,8 +2875,338 @@ impl VitaState {
             started: false,
             exit_code: None,
             priority,
+            init_priority: priority,
+            attr,
+            cpu_affinity,
+            signals: 0,
         });
         uid
+    }
+
+    // --- SceFiber -----------------------------------------------------------
+    //
+    // See [`FiberRec`] for why a fiber is backed by a scheduler thread. Everything
+    // below is bookkeeping around one invariant: within a fiber chain exactly ONE of
+    // {the running thread, one fiber} is runnable, and every transition hands the
+    // baton over in a single step (wake the target, park the caller).
+
+    /// `SCE_FIBER_ERROR_*`, from vitasdk `fiber.h`.
+    pub const FIBER_ERROR_NULL: i32 = 0x8059_0001u32 as i32;
+    pub const FIBER_ERROR_INVALID: i32 = 0x8059_0004u32 as i32;
+    pub const FIBER_ERROR_PERMISSION: i32 = 0x8059_0005u32 as i32;
+    pub const FIBER_ERROR_STATE: i32 = 0x8059_0006u32 as i32;
+
+    fn fiber_index(&self, addr: u32) -> Option<usize> {
+        self.fibers.iter().position(|f| f.addr == addr && !f.finalized)
+    }
+
+    /// The fiber the CURRENT thread is executing, if it is executing one.
+    fn current_fiber_index(&self) -> Option<usize> {
+        let cur = self.current;
+        self.fibers.iter().position(|f| f.thid == cur && f.started && !f.finalized)
+    }
+
+    /// The guest `SceFiber*` the current thread is running, or 0 for a plain thread.
+    /// This is `sceFiberGetSelf`.
+    pub fn current_fiber(&self) -> u32 {
+        self.current_fiber_index().map(|i| self.fibers[i].addr).unwrap_or(0)
+    }
+
+    /// The thread a title's own code would call itself: for a fiber's backing thread,
+    /// the THREAD that ran the chain, because on hardware a fiber runs on its runner's
+    /// thread and shares its identity and its thread-local storage. Everything keyed by
+    /// "which thread am I" - `sceKernelGetThreadId`, `sceKernelGetTLSAddr` - has to ask
+    /// this rather than the raw scheduler id, or a fiber-based job system sees a
+    /// different worker identity (and a different TLS block) each time it switches.
+    pub fn logical_thread(&self, thid: i32) -> i32 {
+        match self.fibers.iter().find(|f| f.thid == thid && f.started && !f.finalized) {
+            Some(f) if f.runner != 0 => self.logical_thread(f.runner),
+            _ => thid,
+        }
+    }
+
+    /// `_sceFiberInitializeImpl(fiber, name, entry, argOnInitialize, addrContext,
+    /// sizeContext, params)`: record the fiber and create - but do not start - the
+    /// thread that will run it.
+    ///
+    /// `addrContext` may be null (a fiber initialised without a stack), in which case
+    /// `_sceFiberAttachContextAndSwitch` supplies one before it first runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fiber_initialize(
+        &mut self,
+        addr: u32,
+        name: String,
+        entry: u32,
+        arg_on_initialize: u32,
+        context_addr: u32,
+        context_size: u32,
+    ) -> i32 {
+        if addr == 0 || entry == 0 {
+            return Self::FIBER_ERROR_NULL;
+        }
+        // Re-initialising a live fiber would strand its parked thread on a stack the
+        // guest is about to reuse. That is a guest error the kernel refuses, so refuse
+        // it here rather than leaving a thread parked forever.
+        if let Some(i) = self.fiber_index(addr) {
+            if self.fibers[i].started && self.fibers[i].runner != 0 {
+                return Self::FIBER_ERROR_STATE;
+            }
+            self.fibers.swap_remove(i);
+        }
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        // The fiber runs on the GUEST's context buffer, so this thread record owns no
+        // stack of its own - `stack: (0, 0)` marks that there is nothing to reclaim
+        // when the record goes away.
+        self.threads.push(ThreadRec {
+            uid,
+            name: name.clone(),
+            entry: entry & !1,
+            stack_top: fiber_stack_top(context_addr, context_size),
+            stack: (0, 0),
+            started: false,
+            exit_code: None,
+            priority: DEFAULT_THREAD_PRIORITY,
+            init_priority: DEFAULT_THREAD_PRIORITY,
+            attr: 0,
+            cpu_affinity: 0,
+            signals: 0,
+        });
+        self.fibers.push(FiberRec {
+            addr,
+            name,
+            entry: entry & !1,
+            arg_on_initialize,
+            context: (context_addr, context_size),
+            thid: uid,
+            started: false,
+            finalized: false,
+            runner: 0,
+            resume_out: 0,
+        });
+        0
+    }
+
+    /// Give a fiber the baton: start its thread on first use, or wake it and deliver
+    /// `arg_on_run` through the out-pointer of the call it is parked in.
+    fn fiber_dispatch(&mut self, i: usize, runner: i32, arg_on_run: u32) {
+        self.fibers[i].runner = runner;
+        if self.fibers[i].started {
+            let out = self.fibers[i].resume_out;
+            if out != 0 {
+                self.pending_stat_writes.push((out, arg_on_run));
+            }
+            self.pending_wakes.push(self.fibers[i].thid);
+            return;
+        }
+        self.fibers[i].started = true;
+        let (thid, entry, arg0, stack_top) = {
+            let f = &self.fibers[i];
+            (f.thid, f.entry, f.arg_on_initialize, fiber_stack_top(f.context.0, f.context.1))
+        };
+        // A fiber shares its runner's thread-local storage, because on hardware it IS
+        // that thread. Bind the block before the scheduler instantiates the fiber (it
+        // reads the base then), so a `__thread` variable the fiber touches is the same
+        // storage the runner sees.
+        let runner_tls = self.ensure_tls_block(self.logical_thread(runner));
+        if runner_tls != 0 {
+            self.tls_bases.push((thid, runner_tls));
+        }
+        if let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) {
+            t.started = true;
+            t.stack_top = stack_top;
+        }
+        self.pending_spawns.push(Reentry {
+            entry,
+            // `void entry(SceUInt32 argOnInitialize, SceUInt32 argOnRun)`.
+            arg_len: arg0,
+            arg_ptr: arg_on_run,
+            r2: 0,
+            stack_top,
+            thid,
+            priority: DEFAULT_THREAD_PRIORITY,
+        });
+    }
+
+    /// `sceFiberRun(fiber, argOnRunTo, argOnRun)` called by a plain THREAD: hand the
+    /// fiber the baton and park the caller until the chain returns to it. Returns
+    /// `Ok(())` when the caller must park, or the errno to return instead.
+    pub fn fiber_run(&mut self, addr: u32, arg_on_run_to: u32, arg_on_run_out: u32) -> Result<(), i32> {
+        if self.current_fiber_index().is_some() {
+            // A fiber must Switch, not Run: running nests a second chain on one thread,
+            // which the baton model (and the hardware) does not have.
+            return Err(Self::FIBER_ERROR_PERMISSION);
+        }
+        let Some(i) = self.fiber_index(addr) else { return Err(Self::FIBER_ERROR_INVALID) };
+        if self.fibers[i].runner != 0 {
+            return Err(Self::FIBER_ERROR_STATE);
+        }
+        if self.fibers[i].context.0 == 0 {
+            // No stack: it would run on address 0. Refuse rather than fault later.
+            return Err(Self::FIBER_ERROR_NULL);
+        }
+        let runner = self.current;
+        self.fiber_run_out.insert(runner, arg_on_run_out);
+        self.fiber_dispatch(i, runner, arg_on_run_to);
+        Ok(())
+    }
+
+    /// `sceFiberSwitch(fiber, argOnRunTo, argOnRun)` called by a FIBER: pass the baton
+    /// sideways, keeping the same runner. `context` optionally attaches a stack first
+    /// (`_sceFiberAttachContextAndSwitch`).
+    pub fn fiber_switch(
+        &mut self,
+        addr: u32,
+        arg_on_run_to: u32,
+        arg_on_run_out: u32,
+        context: Option<(u32, u32)>,
+    ) -> Result<(), i32> {
+        let Some(from) = self.current_fiber_index() else { return Err(Self::FIBER_ERROR_PERMISSION) };
+        let Some(to) = self.fiber_index(addr) else { return Err(Self::FIBER_ERROR_INVALID) };
+        if to == from || self.fibers[to].runner != 0 {
+            return Err(Self::FIBER_ERROR_STATE);
+        }
+        if let Some(c) = context {
+            // Attaching a context to a fiber that is already running on one would move
+            // the stack out from under live frames.
+            if self.fibers[to].started {
+                return Err(Self::FIBER_ERROR_STATE);
+            }
+            self.fibers[to].context = c;
+        }
+        if self.fibers[to].context.0 == 0 {
+            return Err(Self::FIBER_ERROR_NULL);
+        }
+        let runner = self.fibers[from].runner;
+        self.fibers[from].runner = 0;
+        self.fibers[from].resume_out = arg_on_run_out;
+        self.fiber_dispatch(to, runner, arg_on_run_to);
+        Ok(())
+    }
+
+    /// `sceFiberReturnToThread(argOnReturn, argOnRun)`: give the baton back to the
+    /// thread that ran this chain and park the fiber where it stands.
+    pub fn fiber_return_to_thread(&mut self, arg_on_return: u32, arg_on_run_out: u32) -> Result<(), i32> {
+        let Some(i) = self.current_fiber_index() else { return Err(Self::FIBER_ERROR_PERMISSION) };
+        let runner = self.fibers[i].runner;
+        if runner == 0 {
+            return Err(Self::FIBER_ERROR_STATE);
+        }
+        self.fibers[i].runner = 0;
+        self.fibers[i].resume_out = arg_on_run_out;
+        if let Some(&out) = self.fiber_run_out.get(&runner) {
+            if out != 0 {
+                self.pending_stat_writes.push((out, arg_on_return));
+            }
+        }
+        self.fiber_run_out.remove(&runner);
+        self.pending_wakes.push(runner);
+        Ok(())
+    }
+
+    /// `sceFiberFinalize(fiber)`: retire a fiber that is not running.
+    pub fn fiber_finalize(&mut self, addr: u32) -> i32 {
+        let Some(i) = self.fiber_index(addr) else { return Self::FIBER_ERROR_INVALID };
+        if self.fibers[i].runner != 0 {
+            return Self::FIBER_ERROR_STATE;
+        }
+        // A started fiber that has not run to completion is parked mid-switch: its
+        // thread would never be resumed again. The kernel calls that a state error, and
+        // saying so is far better than leaking a thread the scheduler still counts.
+        if self.fibers[i].started && !self.thread_finished(self.fibers[i].thid) {
+            tracing::warn!(
+                target: "vitaslop::thread",
+                fiber = format_args!("{addr:#x}"),
+                "sceFiberFinalize on a fiber that is switched away, not finished - its \
+                 backing thread stays parked; the guest is finalizing a live fiber"
+            );
+            return Self::FIBER_ERROR_STATE;
+        }
+        self.fibers[i].finalized = true;
+        0
+    }
+
+    /// `sceFiberGetInfo(fiber, SceFiberInfo *out)`: entry, argOnInitialize, context and
+    /// name, at the offsets vitasdk's `SceFiberInfo` publishes.
+    pub fn fiber_info(&self, addr: u32) -> Option<(u32, u32, u32, u32, &str)> {
+        let i = self.fiber_index(addr)?;
+        let f = &self.fibers[i];
+        Some((f.entry, f.arg_on_initialize, f.context.0, f.context.1, f.name.as_str()))
+    }
+
+    /// int sceKernelChangeThreadPriority(SceUID thid, int priority): retarget a
+    /// thread's scheduler priority. `thid` 0 means the calling thread. Returns the
+    /// PREVIOUS priority on success (what the kernel returns, and what a title saves
+    /// to restore after a temporary boost), or an error for an unknown id.
+    ///
+    /// This genuinely moves the thread in the run order - the scheduler picks the
+    /// highest-priority runnable thread - so a title raising a loader above the main
+    /// thread gets the ordering it asked for.
+    pub fn change_thread_priority(&mut self, thid: i32, priority: i32) -> Result<i32, u32> {
+        let thid = if thid == 0 { self.current } else { thid };
+        let priority = resolve_priority(priority);
+        match self.threads.iter_mut().find(|t| t.uid == thid) {
+            Some(t) => {
+                let previous = t.priority;
+                t.priority = priority;
+                Ok(previous)
+            }
+            None => Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID),
+        }
+    }
+
+    /// Everything `sceKernelGetThreadInfo` reports that this kernel models:
+    /// `(name, attr, status, entry, stack base, stack size, init priority, current
+    /// priority, cpu affinity, exit status)`. `thid` 0 means the calling thread.
+    pub fn thread_info(&self, thid: i32) -> Option<ThreadInfo<'_>> {
+        let thid = if thid == 0 { self.current } else { thid };
+        let t = self.threads.iter().find(|t| t.uid == thid)?;
+        Some(ThreadInfo {
+            name: t.name.as_str(),
+            attr: t.attr,
+            status: thread_status(t, self.current),
+            entry: t.entry,
+            stack_base: t.stack.0,
+            stack_size: t.stack.1 as i32,
+            init_priority: t.init_priority,
+            current_priority: t.priority,
+            cpu_affinity: t.cpu_affinity,
+            exit_status: t.exit_code.unwrap_or(0) as i32,
+        })
+    }
+
+    /// int sceKernelSendSignal(SceUID thid): deliver one signal to a thread, waking it
+    /// if it is parked in `sceKernelWaitSignal`. Counted, so a send that arrives before
+    /// the wait is not lost - that ordering is the whole point of the primitive.
+    pub fn send_signal(&mut self, thid: i32) -> Result<(), u32> {
+        match self.threads.iter_mut().find(|t| t.uid == thid) {
+            Some(t) => {
+                t.signals += 1;
+                if self.preemptive && self.signal_waiters.contains(&thid) {
+                    self.signal_waiters.retain(|w| *w != thid);
+                    self.take_signal(thid);
+                    self.pending_wakes.push(thid);
+                }
+                Ok(())
+            }
+            None => Err(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID),
+        }
+    }
+
+    /// Consume one pending signal from a thread, if it has one.
+    pub fn take_signal(&mut self, thid: i32) -> bool {
+        match self.threads.iter_mut().find(|t| t.uid == thid && t.signals > 0) {
+            Some(t) => {
+                t.signals -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Park the current thread until a signal is sent to it (`sceKernelWaitSignal`).
+    pub fn signal_block(&mut self) {
+        self.signal_waiters.push(self.current);
     }
 
     /// Record the guest's own name for a thread (from `sceKernelCreateThread`).
@@ -2074,7 +3296,21 @@ impl VitaState {
     /// thread ends). In preemptive mode this also wakes any thread parked joining
     /// it (`sceKernelWaitThreadEnd`).
     pub fn set_thread_exit(&mut self, thid: i32, code: u32) {
+        let flip = self.flip_count;
         if let Some(t) = self.threads.iter_mut().find(|t| t.uid == thid) {
+            // A thread ENDING is reported (`RUST_LOG=vitaslop::thread=debug`) for the
+            // same reason its creation is: a title whose game logic has quietly gone
+            // away looks exactly like one that is running and drawing, because the
+            // render thread keeps resubmitting the last command buffer. The only
+            // record of the difference is this line and the frame it happened on.
+            tracing::debug!(
+                target: "vitaslop::thread",
+                thid,
+                name = %t.name,
+                code = format_args!("{code:#x}"),
+                flip,
+                "threadEnded"
+            );
             t.exit_code = Some(code);
         }
         if self.preemptive {
@@ -2132,15 +3368,32 @@ impl VitaState {
 
     /// Whether a semaphore with this uid currently exists.
     pub fn sema_exists(&self, uid: i32) -> bool {
-        self.semaphores.iter().any(|(u, _)| *u == uid)
+        self.semaphores.iter().any(|s| s.uid == uid)
+    }
+
+    /// The SceUID of the live semaphore created with this name, if any.
+    /// `sceKernelOpenSema` resolves a name to the existing object rather than making
+    /// a new one, so this is the lookup behind it. First match wins, which matches a
+    /// kernel that refuses a duplicate openable name.
+    pub fn sema_by_name(&self, name: &str) -> Option<i32> {
+        self.semaphores.iter().find(|s| s.name == name).map(|s| s.uid)
+    }
+
+    /// Everything `sceKernelGetSemaInfo` reports: `(name, attr, init, current, max,
+    /// waiting threads)`. The waiter count is derived from the park queue rather than
+    /// stored, so it cannot drift from the threads actually blocked.
+    pub fn sema_info(&self, uid: i32) -> Option<(&str, u32, i32, i32, i32, i32)> {
+        let s = self.semaphores.iter().find(|s| s.uid == uid)?;
+        let waiting = self.sema_waiters.iter().filter(|w| w.uid == uid).count() as i32;
+        Some((s.name.as_str(), s.attr, s.init, s.count, s.max, waiting))
     }
 
     /// Try to take `need` from semaphore `uid` without blocking. Returns true if
     /// the count was available (and consumed), false otherwise.
     pub fn sema_try_acquire(&mut self, uid: i32, need: i32) -> bool {
-        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
-            if *c >= need {
-                *c -= need;
+        if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid) {
+            if s.count >= need {
+                s.count -= need;
                 return true;
             }
         }
@@ -2165,8 +3418,8 @@ impl VitaState {
             let count = self
                 .semaphores
                 .iter()
-                .find(|(u, _)| *u == uid)
-                .map(|(_, c)| *c)
+                .find(|s| s.uid == uid)
+                .map(|s| s.count)
                 .unwrap_or(0);
             // The first waiter on this semaphore whose need the count can meet.
             let next = self
@@ -2593,6 +3846,79 @@ impl VitaState {
         self.advance_io_by(us);
     }
 
+    /// A thread burned a whole scheduler quantum of guest execution. **Game time passed
+    /// while it did**, and this is the only thing that says so when the title is neither
+    /// blocking nor flipping.
+    ///
+    /// Without this the game clock advances only on a display flip or on the scheduler's
+    /// nothing-is-runnable idle path, so a guest busy-wait ON THE CLOCK ITSELF - the
+    /// `do { v = sceDisplayGetVcount(); } while (v == last);` vblank spin that is
+    /// ordinary, correct guest code - can never be satisfied: the thread never blocks,
+    /// so the scheduler is never idle, and no flip can happen because the flip is what
+    /// the spin is waiting for. Two such threads livelock the whole title. That is not a
+    /// slow boot, it is a stopped clock, and it is what made this title's boot take
+    /// hours while the clock advanced 60 ms.
+    ///
+    /// [`advance_time_frame`](Self::advance_time_frame) nets these charges out, so a
+    /// title that renders normally still advances exactly one frame of game time per
+    /// rendered frame and its own timers keep 60 Hz - the charges only become visible
+    /// when the guest burns more CPU than a frame's worth, which is the honest answer.
+    pub fn charge_cpu_quantum(&mut self, us: u64) {
+        self.quantum_count = self.quantum_count.saturating_add(1);
+        self.cpu_charged_since_flip = self.cpu_charged_since_flip.saturating_add(us);
+        let target = self.virtual_us.saturating_add(us);
+        self.advance_time_to(target);
+    }
+
+    /// One display flip happened: bring the game clock up to one full frame of progress,
+    /// minus whatever [`charge_cpu_quantum`](Self::charge_cpu_quantum) already
+    /// contributed since the last flip. The storage clock's
+    /// [`advance_io_frame`](Self::advance_io_frame) with the game clock's units.
+    ///
+    /// # The top-up hands out time the guest was never given the CPU to use
+    /// `VITASLOP_FRAME_TOPUP=0` switches it off, and that is not a micro-optimisation -
+    /// it changes what a displayed frame MEANS. With the top-up on, a flip advances the
+    /// clock a whole frame however little guest code ran, so the render thread's next
+    /// vblank wait is already satisfied and it flips again at once. Measured on a
+    /// retail title's loading screen: **3120 fps, 8 thread resumes a frame, barely one
+    /// whole scheduler quantum per frame** - the guest gets about a TENTH of the CPU a
+    /// console frame carries, so a load that costs hardware 3,000 frames costs us
+    /// 30,000+, and the wall time goes on per-frame overhead instead of on the loader.
+    ///
+    /// With it off, a flip advances the clock by nothing it did not earn. The render
+    /// thread's vblank wait is then a real wait: its spin burns quanta, every other
+    /// runnable thread is scheduled between them, and the frame ends when a frame's
+    /// worth of guest execution has actually happened. Neither of the two ways the
+    /// clock can stall applies - a spinning thread charges quanta, and a title that
+    /// blocks everything reaches the scheduler's idle path, which advances the clock to
+    /// the earliest deadline.
+    ///
+    /// It is a knob rather than the default because it moves every title's timing and
+    /// every determinism signature.
+    pub fn advance_time_frame(&mut self, frame_us: u64) {
+        self.flip_count = self.flip_count.saturating_add(1);
+        let charged = core::mem::take(&mut self.cpu_charged_since_flip);
+        if !frame_topup() {
+            return;
+        }
+        let owed = frame_us.saturating_sub(charged);
+        let target = self.virtual_us.saturating_add(owed);
+        self.advance_time_to(target);
+    }
+
+    /// Scheduler quanta and display flips seen so far. `QUANTUM_CPU_US` is calibrated
+    /// from their ratio on a title that is rendering steadily: one quantum is worth one
+    /// frame divided by the quanta a frame actually takes.
+    /// Display flips completed so far - the frame number a recipe and a `@shot` count
+    /// in. Diagnostics stamp it so an event can be placed on the timeline.
+    pub fn flip_count(&self) -> u64 {
+        self.flip_count
+    }
+
+    pub fn quantum_flip_counts(&self) -> (u64, u64) {
+        (self.quantum_count, self.flip_count)
+    }
+
     /// Nothing is runnable and the game clock cannot buy any progress: complete the
     /// earliest outstanding transfer. Returns whether anything was released. No ordering
     /// the guest can observe is lost - by construction no guest code can run until
@@ -2875,25 +4201,27 @@ impl VitaState {
         uid
     }
 
-    /// Create a semaphore with an initial count, returning its SceUID.
-    pub fn create_sema(&mut self, init: i32) -> i32 {
+    /// Create a semaphore, returning its SceUID. `name`, `attr` and `max` are kept
+    /// because they are observable: `sceKernelOpenSema` resolves the name and
+    /// `sceKernelGetSemaInfo` reports all three.
+    pub fn create_sema(&mut self, name: &str, attr: u32, init: i32, max: i32) -> i32 {
         let uid = self.new_uid();
-        self.semaphores.push((uid, init));
+        self.semaphores.push(SemaRec { uid, name: name.to_string(), attr, init, max, count: init });
         uid
     }
 
     /// Wait on a semaphore: take `n` from its count (never blocks in the single-
     /// thread model; the count floors at 0).
     pub fn sema_wait(&mut self, uid: i32, n: i32) {
-        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
-            *c = (*c - n).max(0);
+        if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid) {
+            s.count = (s.count - n).max(0);
         }
     }
 
     /// Signal a semaphore: add `n` to its count.
     pub fn sema_signal(&mut self, uid: i32, n: i32) {
-        if let Some((_, c)) = self.semaphores.iter_mut().find(|(u, _)| *u == uid) {
-            *c += n;
+        if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid) {
+            s.count += n;
         }
     }
 
@@ -3038,6 +4366,196 @@ impl VitaState {
         p
     }
 
+    /// The UID of the memory block that fully contains `[addr, addr + size)`, or
+    /// `None`. A zero `size` asks about the single byte at `addr`, which is how a
+    /// caller with only a pointer phrases the question.
+    pub fn memblock_containing(&self, addr: u32, size: u32) -> Option<i32> {
+        let end = addr.wrapping_add(size.max(1));
+        self.memblocks
+            .iter()
+            .find(|b| addr >= b.base && end <= b.base.wrapping_add(b.size))
+            .map(|b| b.uid)
+    }
+
+    // --- SceNet: the offline socket table ------------------------------------
+    //
+    // Real descriptors and real local state, no host sockets. See `vita::net` for what
+    // is modelled and why. Everything here is a pure function of the guest's own call
+    // sequence, so two runs of the same recipe produce identical socket ids.
+
+    /// `sceNetSocket`: allocate a descriptor. Ids start above the file-descriptor range
+    /// so a socket id mistakenly passed to `sceIoClose` cannot close a file.
+    pub fn net_socket(&mut self, name: &str, domain: i32, ty: i32, protocol: i32) -> i32 {
+        let id = NET_FD_BASE + self.net_sockets.len() as i32;
+        self.net_sockets.push(NetSocket {
+            id,
+            name: name.to_string(),
+            domain,
+            ty,
+            protocol,
+            local: (0, 0),
+            listening: false,
+            options: Vec::new(),
+            closed: false,
+        });
+        id
+    }
+
+    fn net_socket_mut(&mut self, id: i32) -> Option<&mut NetSocket> {
+        self.net_sockets.iter_mut().find(|s| s.id == id && !s.closed)
+    }
+
+    pub fn net_socket_exists(&self, id: i32) -> bool {
+        self.net_sockets.iter().any(|s| s.id == id && !s.closed)
+    }
+
+    pub fn net_close(&mut self, id: i32) -> bool {
+        match self.net_socket_mut(id) {
+            Some(s) => {
+                s.closed = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn net_bind(&mut self, id: i32, ip: u32, port: u16) -> bool {
+        match self.net_socket_mut(id) {
+            Some(s) => {
+                s.local = (ip, port);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn net_listen(&mut self, id: i32) -> bool {
+        match self.net_socket_mut(id) {
+            Some(s) => {
+                s.listening = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn net_local_addr(&self, id: i32) -> Option<(u32, u16)> {
+        self.net_sockets.iter().find(|s| s.id == id && !s.closed).map(|s| s.local)
+    }
+
+    pub fn net_set_opt(&mut self, id: i32, level: i32, name: i32, value: u32) -> bool {
+        match self.net_socket_mut(id) {
+            Some(s) => {
+                s.options.retain(|&(l, n, _)| (l, n) != (level, name));
+                s.options.push((level, name, value));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// An option never set reads back as 0, the kernel's default for every option a
+    /// title queries here. `None` means the DESCRIPTOR is bad, which is a different
+    /// answer from "the option is zero" and must not be conflated.
+    pub fn net_get_opt(&self, id: i32, level: i32, name: i32) -> Option<u32> {
+        let s = self.net_sockets.iter().find(|s| s.id == id && !s.closed)?;
+        Some(s.options.iter().find(|&&(l, n, _)| (l, n) == (level, name)).map(|&(_, _, v)| v).unwrap_or(0))
+    }
+
+    /// `sceNetShowNetstat`'s output: the live socket table, one line each.
+    pub fn net_netstat(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::from("netstat: offline model, no host sockets\n");
+        for k in self.net_sockets.iter().filter(|s| !s.closed) {
+            let (ip, port) = k.local;
+            let b = ip.to_le_bytes();
+            let _ = writeln!(
+                s,
+                "  fd={} name={:?} domain={} type={} proto={} local={}.{}.{}.{}:{}{}",
+                k.id, k.name, k.domain, k.ty, k.protocol, b[0], b[1], b[2], b[3], port,
+                if k.listening { " LISTEN" } else { "" }
+            );
+        }
+        s
+    }
+
+    /// The guest address of the CALLING thread's `sceNetErrnoLoc` slot, allocated on
+    /// first use. Per thread, because two workers failing at once must not overwrite
+    /// each other's reason - which is why the API hands back a location, not a value.
+    pub fn net_errno_addr(&mut self) -> u32 {
+        let thid = self.logical_thread(self.current);
+        if let Some(&(_, addr)) = self.net_errno.iter().find(|&&(t, _)| t == thid) {
+            return addr;
+        }
+        let addr = self.galloc(4, 4);
+        self.net_errno.push((thid, addr));
+        addr
+    }
+
+    /// Record why the last SceNet call failed, where `sceNetErrnoLoc` will read it.
+    pub fn net_set_errno(&mut self, code: i32) {
+        let addr = self.net_errno_addr();
+        if addr != 0 {
+            self.pending_stat_writes.push((addr, code as u32));
+        }
+    }
+
+    pub fn net_resolver_create(&mut self) -> i32 {
+        let id = NET_RESOLVER_BASE + self.net_resolvers.len() as i32;
+        self.net_resolvers.push((id, 0));
+        id
+    }
+
+    pub fn net_resolver_destroy(&mut self, rid: i32) -> bool {
+        let before = self.net_resolvers.len();
+        self.net_resolvers.retain(|&(id, _)| id != rid);
+        self.net_resolvers.len() != before
+    }
+
+    pub fn net_resolver_set_error(&mut self, rid: i32, code: i32) {
+        if let Some(e) = self.net_resolvers.iter_mut().find(|(id, _)| *id == rid) {
+            e.1 = code;
+        }
+    }
+
+    pub fn net_resolver_error(&self, rid: i32) -> Option<i32> {
+        self.net_resolvers.iter().find(|(id, _)| *id == rid).map(|&(_, e)| e)
+    }
+
+    pub fn net_epoll_create(&mut self) -> i32 {
+        let id = NET_EPOLL_BASE + self.net_epolls.len() as i32;
+        self.net_epolls.push((id, Vec::new()));
+        id
+    }
+
+    pub fn net_epoll_exists(&self, eid: i32) -> bool {
+        self.net_epolls.iter().any(|(id, _)| *id == eid)
+    }
+
+    pub fn net_epoll_destroy(&mut self, eid: i32) -> bool {
+        let before = self.net_epolls.len();
+        self.net_epolls.retain(|(id, _)| *id != eid);
+        self.net_epolls.len() != before
+    }
+
+    /// `SCE_NET_EPOLL_CTL_ADD` (1) / `MOD` (2) / `DEL` (3) over the registered set.
+    pub fn net_epoll_control(&mut self, eid: i32, op: i32, id: i32) -> bool {
+        match self.net_epolls.iter_mut().find(|(e, _)| *e == eid) {
+            Some((_, set)) => {
+                match op {
+                    3 => set.retain(|&s| s != id),
+                    _ => {
+                        if !set.contains(&id) {
+                            set.push(id);
+                        }
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Mint a fresh opaque GXM handle.
     pub fn new_handle(&mut self) -> u32 {
         let h = self.next_handle;
@@ -3112,23 +4630,83 @@ impl VitaState {
         self.vertex_programs.get(&handle).map(|i| i.program_header).unwrap_or(0)
     }
 
-    /// Record `sceGxmShaderPatcherCreateFragmentProgram`'s handle -> `SceGxmProgram*`.
-    pub fn set_fragment_program(&mut self, handle: u32, program_header: u32) {
-        self.fragment_programs.insert(handle, program_header);
+    /// Record `sceGxmShaderPatcherCreateFragmentProgram`'s handle -> (`SceGxmProgram*`, the
+    /// blend equation it was created with).
+    pub fn set_fragment_program(
+        &mut self,
+        handle: u32,
+        program_header: u32,
+        blend: crate::capture::BlendState,
+    ) {
+        self.fragment_programs.insert(handle, (program_header, blend));
     }
 
     fn fragment_program_header(&self, handle: u32) -> u32 {
-        self.fragment_programs.get(&handle).copied().unwrap_or(0)
+        self.fragment_programs.get(&handle).map(|(h, _)| *h).unwrap_or(0)
+    }
+
+    /// The blend equation a fragment program handle was created with. An unknown handle
+    /// yields the GXM default (no blending), which is what a NULL `blendInfo` means.
+    fn fragment_program_blend(&self, handle: u32) -> crate::capture::BlendState {
+        self.fragment_programs.get(&handle).map(|(_, b)| *b).unwrap_or_default()
     }
 
     /// Record a color surface, keyed by its guest struct address.
     pub fn set_color_surface(&mut self, addr: u32, surface: crate::capture::ColorSurface) {
+        self.report_overlapping_color_surfaces(&surface);
         self.color_surfaces.push((addr, surface));
+    }
+
+    /// Report - once per colliding pair - two colour surfaces whose PIXEL BYTES overlap.
+    ///
+    /// Two render targets cannot both hold their contents in the same bytes, so an overlap is
+    /// one of exactly two things and both matter: the guest is aliasing buffers it knows are
+    /// never live together (legitimate, and it means a later pass sampling the earlier target
+    /// is reading whatever overwrote it), or the data pointer we recorded is not the pixel
+    /// pointer at all. The second is the dangerous one, because every downstream identity -
+    /// which render a sampled texture resolves to, which target a pass draws into - is keyed
+    /// off that address, and a wrong-but-consistent key looks exactly like a right one.
+    ///
+    /// MEASURED on a title whose six targets sit 16 KiB apart while each needs 2 MB.
+    fn report_overlapping_color_surfaces(&mut self, new: &crate::capture::ColorSurface) {
+        // ONE byte per pixel: the smallest any `SceGxmColorFormat` can be. The real formats
+        // here are wider, so this is a hard LOWER bound on the memory a surface occupies and
+        // an overlap it finds is an overlap under every format. A diagnostic that guesses the
+        // width would report pairs that do not really collide, and a report that cries wolf is
+        // worse than none - this one is only allowed to be silent, never wrong.
+        let bytes = |s: &crate::capture::ColorSurface| -> u64 {
+            u64::from(s.stride_pixels.max(s.width)) * u64::from(s.height)
+        };
+        let (lo, hi) = (u64::from(new.data_addr), u64::from(new.data_addr) + bytes(new));
+        if new.data_addr == 0 || hi == lo {
+            return;
+        }
+        for (_, old) in &self.color_surfaces {
+            let (olo, ohi) = (u64::from(old.data_addr), u64::from(old.data_addr) + bytes(old));
+            if old.data_addr == 0 || old.data_addr == new.data_addr || ohi <= lo || hi <= olo {
+                continue;
+            }
+            let key = (old.data_addr.min(new.data_addr), old.data_addr.max(new.data_addr));
+            if self.reported_surface_overlaps.insert(key) {
+                eprintln!(
+                    "gxm surface: colour surfaces {:#x} ({}x{} stride {}, >= {} bytes) and {:#x} \
+                     ({}x{} stride {}, >= {} bytes) OVERLAP in guest memory even at ONE byte per \
+                     pixel - they cannot both hold their pixels, so either the guest aliases them \
+                     or one of these data pointers is not the pixel pointer",
+                    old.data_addr, old.width, old.height, old.stride_pixels, bytes(old),
+                    new.data_addr, new.width, new.height, new.stride_pixels, bytes(new),
+                );
+            }
+        }
     }
 
     // --- scene assembly (used by the gxm handlers) ---
 
-    pub fn begin_scene(&mut self, color: Option<crate::capture::ColorSurface>) {
+    pub fn begin_scene(
+        &mut self,
+        color: Option<crate::capture::ColorSurface>,
+        depth: Option<crate::capture::DepthSurface>,
+    ) {
         // Texture snapshots deliberately SURVIVE the scene - see `TextureSnapshots`
         // for what invalidates them instead. Only the verifier is re-armed here.
         self.texture_snapshots.begin_scene();
@@ -3137,7 +4715,7 @@ impl VitaState {
         // dead by now; see [`Self::alloc_default_uniform_buffer`] for what happens
         // when this is NOT recycled.
         self.uniform_ring_cursor = 0;
-        self.scene = Some(crate::capture::Scene { color, draws: Vec::new() });
+        self.scene = Some(crate::capture::Scene { color, depth, draws: Vec::new() });
         self.pending_uniforms.clear();
     }
 
@@ -3150,6 +4728,7 @@ impl VitaState {
     /// albedo texture. A null/unknown handle clears the binding (header 0).
     pub fn bind_fragment_program(&mut self, handle: u32) {
         self.bound_fragment_program_header = self.fragment_program_header(handle);
+        self.bound_fragment_blend = self.fragment_program_blend(handle);
     }
 
     /// `sceGxmSetVertexStream(context, streamIndex, data)`. A stream index beyond
@@ -3172,18 +4751,102 @@ impl VitaState {
     /// Kept SORTED by unit: every draw reads this list and needs unit 0 first, so
     /// maintaining the order at bind time (a handful of units, a handful of times per
     /// draw) replaces cloning and re-sorting it inside every draw.
-    pub fn bind_fragment_texture(&mut self, unit: u32, texture_addr: u32) {
-        match self.bound_textures.binary_search_by_key(&unit, |(u, _)| *u) {
+    /// A `sceGxmSetFragmentTexture` happened, so the current sampler bindings came down the
+    /// DIRECT path rather than from a precomputed fragment state. Which of the two a missing
+    /// unit came through decides where to look for it, and after the fact they are
+    /// indistinguishable - both end as an address in `bound_textures`.
+    pub fn note_direct_texture_bind(&mut self) {
+        self.textures_from_precomputed = false;
+    }
+
+    /// Record whether a texture handle's control words were non-zero when it was BOUND, so a
+    /// handle that reads as zero at draw time can be classified. Only handles seen as zero at
+    /// draw time are ever looked up, so this keeps just the ones that were live.
+    pub fn note_texture_live_at_bind(&mut self, texture_addr: u32, live: bool) {
+        if live {
+            self.textures_live_at_bind.insert(texture_addr);
+        }
+    }
+
+    /// Decode a list of texture bindings into snapshotted [`crate::capture::BoundTexture`]s.
+    ///
+    /// Shared by the fragment and vertex stages so the two can never decode a texture
+    /// differently: the control words, the recorded exact format, the sampler state and the
+    /// nearby-format search all mean the same thing whichever stage bound it.
+    ///
+    /// Takes the bindings BY VALUE because the per-unit control state has to be read through a
+    /// shared borrow of `self` before the snapshot cache is borrowed mutably for the decode.
+    fn snapshot_bound_textures(
+        &mut self,
+        ctx: &GuestCtx,
+        bindings: Vec<TextureBinding>,
+    ) -> Vec<crate::capture::BoundTexture> {
+        let unit_state: Vec<(
+            TextureBinding,
+            Option<u32>,
+            (u32, u32, u32),
+            (u32, u32, u32),
+            Option<(i64, u32)>,
+        )> = bindings
+            .iter()
+            .map(|&b| {
+                let e = self.texture_extra(b.addr);
+                let format = self.texture_format(b.addr);
+                // Only for a handle with no format of its own: is there an initialised texture
+                // NEARBY? A struct the guest inits at one address and binds at another (off by a
+                // fixed member offset, or copied by value) is a completely different bug from one
+                // it never initialised at all, and the two are indistinguishable from the zero
+                // control words alone. Searching a window answers it in the run that hit it.
+                let nearby =
+                    format.is_none().then(|| self.nearest_recorded_texture(b.addr, 4096)).flatten();
+                (b, format, self.texture_sampler(b.addr), (e.min_filter, e.mag_filter, e.gamma), nearby)
+            })
+            .collect();
+        let snapshots = &mut self.texture_snapshots;
+        unit_state
+            .into_iter()
+            .filter_map(|(binding, format, sampler, filters, nearby)| {
+                decode_texture(ctx, snapshots, &binding, format, sampler, filters, nearby)
+            })
+            .collect()
+    }
+
+    /// `_sceGxmSetVertexTexture`: bind a texture to a VERTEX-stage sampler unit.
+    ///
+    /// Kept in its own list rather than merged with the fragment units, because the two stages
+    /// have independent unit numbering and a shader can sample the same unit number in both
+    /// with different textures.
+    pub fn bind_vertex_texture(&mut self, ctx: &GuestCtx, unit: u32, texture_addr: u32) {
+        let binding = TextureBinding::read(ctx, unit, texture_addr, false);
+        match self.bound_vertex_textures.binary_search_by_key(&unit, |b| b.unit) {
             Ok(i) => {
                 if texture_addr == 0 {
-                    self.bound_textures.remove(i);
+                    self.bound_vertex_textures.remove(i);
                 } else {
-                    self.bound_textures[i].1 = texture_addr;
+                    self.bound_vertex_textures[i] = binding;
                 }
             }
             Err(i) => {
                 if texture_addr != 0 {
-                    self.bound_textures.insert(i, (unit, texture_addr));
+                    self.bound_vertex_textures.insert(i, binding);
+                }
+            }
+        }
+    }
+
+    pub fn bind_fragment_texture(&mut self, ctx: &GuestCtx, unit: u32, texture_addr: u32) {
+        let binding = TextureBinding::read(ctx, unit, texture_addr, false);
+        match self.bound_textures.binary_search_by_key(&unit, |b| b.unit) {
+            Ok(i) => {
+                if texture_addr == 0 {
+                    self.bound_textures.remove(i);
+                } else {
+                    self.bound_textures[i] = binding;
+                }
+            }
+            Err(i) => {
+                if texture_addr != 0 {
+                    self.bound_textures.insert(i, binding);
                 }
             }
         }
@@ -3194,11 +4857,29 @@ impl VitaState {
     /// channel swizzle rather than the lossy 3-bit control-word field.
     pub fn set_texture_format(&mut self, texture_addr: u32, format: u32) {
         self.texture_formats.insert(texture_addr, format);
+        TEXTURE_INITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
 
     pub fn texture_format(&self, texture_addr: u32) -> Option<u32> {
         self.texture_formats.get(&texture_addr).copied()
+    }
+
+    /// The initialised texture nearest `addr` within `+-window` bytes, as `(signed byte delta,
+    /// its format)`. Diagnostic only.
+    ///
+    /// A `sceGxmSetFragmentTexture` of an address we have no format for is ambiguous: the guest
+    /// may never have initialised a texture there, or it may have initialised one a few bytes
+    /// away and bound an interior pointer or a by-value copy. Those need opposite fixes and look
+    /// identical at the binding, so the answer has to come from the neighbourhood.
+    pub fn nearest_recorded_texture(&self, addr: u32, window: u32) -> Option<(i64, u32)> {
+        self.texture_formats
+            .iter()
+            .filter_map(|(&a, &f)| {
+                let d = i64::from(a) - i64::from(addr);
+                (d != 0 && d.unsigned_abs() <= u64::from(window)).then_some((d, f))
+            })
+            .min_by_key(|(d, _)| d.abs())
     }
 
     /// Mutable access to the live GXM fixed-function state, so a `sceGxmSet*` setter
@@ -3260,7 +4941,22 @@ impl VitaState {
     }
 
     /// Record a texture's gamma-correction mode (`sceGxmTextureSetGammaMode`).
+    ///
+    /// The counterpart of [`Self::set_color_surface_gamma`]: a non-`NONE` mode makes the
+    /// hardware sampler sRGB-DECODE each fetched texel before filtering. The mode travels with
+    /// the binding (`BoundTexture::gamma`) and the renderer uploads such a texture through an
+    /// sRGB format, which puts the decode in exactly that place.
     pub fn set_texture_gamma(&mut self, texture_addr: u32, gamma: u32) {
+        if gamma != 0 {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "gxm texture: sceGxmTextureSetGammaMode({texture_addr:#x}, {gamma:#x}) - \
+                     this texture is sampled through an sRGB format, so its texels are decoded \
+                     on fetch as the hardware does"
+                );
+            }
+        }
         self.texture_extra_mut(texture_addr).gamma = gamma;
     }
 
@@ -3323,9 +5019,29 @@ impl VitaState {
     }
 
     /// Record a color surface's gamma-correction mode (`sceGxmColorSurfaceSetGammaMode`).
+    ///
+    /// On hardware a non-`NONE` mode makes the ROP sRGB-ENCODE on write, so a shader writing
+    /// linear values lands gamma-encoded in memory and every later pass reads them that way.
+    /// The mode reaches the renderer through the scene's target (`RttTarget::gamma`), which
+    /// renders such a surface through an sRGB VIEW of the same texture - the encode then
+    /// happens after blending, exactly where the hardware does it.
     pub fn set_color_surface_gamma(&mut self, surface_addr: u32, gamma: u32) {
+        if gamma != 0 && self.color_surface_gamma.iter().all(|(a, _)| *a != surface_addr) {
+            {
+                eprintln!(
+                    "gxm surface: sceGxmColorSurfaceSetGammaMode({surface_addr:#x}, {gamma:#x}) - \
+                     writes to this surface are sRGB-encoded after blending, as the hardware \
+                     does; the renderer reports which view it actually rendered through."
+                );
+            }
+        }
         self.color_surface_gamma.retain(|(a, _)| *a != surface_addr);
         self.color_surface_gamma.push((surface_addr, gamma));
+    }
+
+    /// The `SceGxmColorSurfaceGammaMode` recorded for the surface struct at `addr`, or 0.
+    pub fn color_surface_gamma_mode(&self, addr: u32) -> u32 {
+        self.color_surface_gamma.iter().rev().find(|(a, _)| *a == addr).map(|(_, g)| *g).unwrap_or(0)
     }
 
     /// The GPU notification region, allocating it on first use. Returns a guest
@@ -3335,6 +5051,134 @@ impl VitaState {
             self.notification_region = self.galloc(512 * 4, 16);
         }
         self.notification_region
+    }
+
+    // --- GPU memory mappings ------------------------------------------------
+    //
+    // Mapping is a no-op here (the guest's pages already ARE the memory the capture
+    // reads), but UNmapping is not: after it the guest may hand those pages to its own
+    // allocator, and anything we cached against those addresses is then a snapshot of
+    // somebody else's data. GXM gives the size only on the map call, so the range has to
+    // be remembered to be able to invalidate on the unmap.
+
+    /// `sceGxmMapMemory(base, size, attr)` / `sceGxmMapVertexUsseMemory` /
+    /// `sceGxmMapFragmentUsseMemory`: remember the range.
+    pub fn gxm_map(&mut self, base: u32, size: u32) {
+        if base != 0 && size != 0 {
+            self.gxm_mappings.insert(base, size);
+        }
+    }
+
+    /// `sceGxmUnmapMemory(base)` and the two USSE variants. Drops the mapping and every
+    /// texture snapshot taken from it. An unmap of a base that was never mapped is the
+    /// guest's error, not ours, and is reported rather than ignored.
+    pub fn gxm_unmap(&mut self, base: u32) -> i32 {
+        match self.gxm_mappings.remove(&base) {
+            Some(size) => {
+                self.texture_snapshots.invalidate_range(base, size as usize);
+                0
+            }
+            None => {
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    base = format_args!("{base:#x}"),
+                    "gxmUnmap of an address that was never mapped"
+                );
+                // SCE_GXM_ERROR_INVALID_VALUE.
+                0x8021_0000u32 as i32
+            }
+        }
+    }
+
+    // --- Occlusion queries --------------------------------------------------
+
+    /// `sceGxmSetVisibilityBuffer(context, bufferBase, stridePerCore)`.
+    pub fn set_visibility_buffer(&mut self, base: u32, stride_per_core: u32) {
+        self.visibility_buffer = base;
+        self.visibility_stride = stride_per_core;
+        self.visibility_counts.clear();
+    }
+
+    /// Called once per recorded draw: if the front-face visibility test is enabled,
+    /// add this draw's vertex count to the slot it names.
+    ///
+    /// The real GPU counts SAMPLES THAT PASSED the depth test. Nothing here rasterizes
+    /// at capture time, so the count is the drawn vertex count instead: a real,
+    /// deterministic quantity that rises with the amount of geometry submitted under
+    /// the query, and is nonzero exactly when the guest drew something. What it does NOT
+    /// model is occlusion - geometry behind other geometry still counts - so a title
+    /// using the query to hide a sun flare behind scenery will show the flare. That is
+    /// an approximation, so it says so, once.
+    fn accumulate_visibility(&mut self, index_count: u32) {
+        if self.render_state.front_visibility_test_enable == 0 || self.visibility_buffer == 0 {
+            return;
+        }
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                "an occlusion query is live; the capture does not rasterize, so the visibility \
+                 buffer receives the SUBMITTED vertex count, not the count of samples that \
+                 passed - occluded geometry still reports visible"
+            );
+        }
+        let slot = self.render_state.front_visibility_test_index;
+        *self.visibility_counts.entry(slot).or_insert(0) += index_count;
+    }
+
+    /// Flush the scene's accumulated occlusion counts into the guest's visibility
+    /// buffer, which is when the GPU would have written them (at scene end).
+    pub fn flush_visibility(&mut self, ctx: &mut GuestCtx) {
+        if self.visibility_buffer == 0 {
+            return;
+        }
+        for (&slot, &count) in &self.visibility_counts {
+            ctx.write_u32(self.visibility_buffer.wrapping_add(slot * 4), count);
+        }
+        self.visibility_counts.clear();
+    }
+
+    // --- Render target driver memblock --------------------------------------
+
+    /// Remember the `driverMemBlock` UID from a render target's params so
+    /// `sceGxmRenderTargetGetDriverMemBlock` returns exactly what the guest supplied.
+    pub fn set_render_target_mem_block(&mut self, render_target: u32, mem_block: u32) {
+        self.render_target_mem_blocks.insert(render_target, mem_block);
+    }
+
+    /// The `driverMemBlock` of `render_target`, or `SCE_UID_INVALID_UID` (-1) when the
+    /// target was created asking sceGxm to allocate its own - which is exactly what the
+    /// guest passed in that case.
+    pub fn render_target_mem_block(&self, render_target: u32) -> u32 {
+        self.render_target_mem_blocks.get(&render_target).copied().unwrap_or(0xffff_ffff)
+    }
+
+    /// Remember the extent a render target was created with
+    /// (`SceGxmRenderTargetParams::width`/`height`).
+    pub fn set_render_target_extent(&mut self, render_target: u32, width: u32, height: u32) {
+        self.render_target_extents.insert(render_target, (width, height));
+    }
+
+    /// The `(width, height)` of `render_target`, or `None` if it was never created
+    /// here. This, not the colour surface, is what a scene rasterizes into: a title is
+    /// free to hand `sceGxmBeginScene` a colour surface whose own width/height fields
+    /// are meaningless (a render-to-texture pass that only writes depth, or one whose
+    /// engine fills the struct from a template), and this title does exactly that -
+    /// its map pass carries 20,160 triangles into a surface initialised 1x1.
+    pub fn render_target_extent(&self, render_target: u32) -> Option<(u32, u32)> {
+        self.render_target_extents.get(&render_target).copied()
+    }
+
+    // --- Paletted textures ---------------------------------------------------
+
+    /// `sceGxmTextureSetPalette(texture, paletteData)`.
+    pub fn set_texture_palette(&mut self, texture: u32, palette: u32) {
+        self.texture_palettes.insert(texture, palette);
+    }
+
+    /// The palette bound to `texture`, or 0.
+    pub fn texture_palette(&self, texture: u32) -> u32 {
+        self.texture_palettes.get(&texture).copied().unwrap_or(0)
     }
 
     /// Record `sceGxmPrecomputedDrawInit(precomputedDraw, vertexProgram, memBlock)`:
@@ -3440,8 +5284,9 @@ impl VitaState {
     /// `sceGxmPrecomputedFragmentStateInit(state, fragmentProgram, memBlock)`.
     pub fn precomputed_fragment_state_init(&mut self, state: u32, fragment_program: u32) {
         let program_header = self.fragment_program_header(fragment_program);
+        let blend = self.fragment_program_blend(fragment_program);
         self.precomputed_fragment_states
-            .insert(state, PrecomputedState { program_header, ..PrecomputedState::default() });
+            .insert(state, PrecomputedState { program_header, blend, ..PrecomputedState::default() });
     }
 
     /// `sceGxmPrecomputed{Vertex,Fragment}StateSetDefaultUniformBuffer(state, buffer)`:
@@ -3467,17 +5312,66 @@ impl VitaState {
     /// `SceGxmTexture*` to this stage's sampler `index` (0 unbinds), replacing any prior
     /// binding at that index. Textures are kept sorted by index so the bound order is
     /// stable when the state is applied.
-    pub fn precomputed_vertex_state_set_texture(&mut self, state: u32, index: u32, texture: u32) {
-        Self::state_set_texture(self.precomputed_vertex_states.entry(state).or_default(), index, texture);
+    pub fn precomputed_vertex_state_set_texture(&mut self, ctx: &GuestCtx, state: u32, index: u32, texture: u32) {
+        let b = TextureBinding::read(ctx, index, texture, true);
+        Self::state_set_texture(self.precomputed_vertex_states.entry(state).or_default(), index, b);
     }
-    pub fn precomputed_fragment_state_set_texture(&mut self, state: u32, index: u32, texture: u32) {
-        Self::state_set_texture(self.precomputed_fragment_states.entry(state).or_default(), index, texture);
+    pub fn precomputed_fragment_state_set_texture(&mut self, ctx: &GuestCtx, state: u32, index: u32, texture: u32) {
+        let b = TextureBinding::read(ctx, index, texture, true);
+        Self::state_set_texture(self.precomputed_fragment_states.entry(state).or_default(), index, b);
     }
 
-    fn state_set_texture(s: &mut PrecomputedState, index: u32, texture: u32) {
+    /// `sceGxmPrecomputedDrawSetAllVertexStreams(precomputedDraw, streamDataArray)`:
+    /// the array holds one pointer per `SceGxmVertexStream` the draw's vertex program
+    /// was created with, in stream order. The count comes from the program (a caller
+    /// passes no length), so a draw whose vertex program we never saw sets nothing -
+    /// and says so, because silently binding no streams renders empty geometry.
+    pub fn precomputed_draw_set_all_streams(&mut self, ctx: &mut GuestCtx, precomputed: u32, array: u32) {
+        let handle = ctx.read_u32(precomputed + pdraw::OFF_VERTEX_PROGRAM);
+        let count = match self.vertex_programs.get(&handle) {
+            Some(info) => info.streams.len(),
+            None => {
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    precomputed = format_args!("{precomputed:#x}"),
+                    vertex_program = format_args!("{handle:#x}"),
+                    "precomputedDrawSetAllVertexStreams for an unknown vertex program - \
+                     stream count unknown, NO streams bound"
+                );
+                0
+            }
+        };
+        for i in 0..count as u32 {
+            let data = ctx.read_u32(array.wrapping_add(i * 4));
+            self.precomputed_draw_set_stream(ctx, precomputed, i, data);
+        }
+    }
+
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetAllTextures(state, textureArray)`.
+    ///
+    /// Note the array is of `SceGxmTexture` STRUCTS, not pointers: element `i` lives at
+    /// `textureArray + i*16`, and that address is exactly what the per-index setter takes.
+    /// The length is the program's texture-unit count, since the caller passes none.
+    pub fn precomputed_vertex_state_set_all_textures(&mut self, ctx: &GuestCtx, state: u32, array: u32) {
+        let header = self.precomputed_vertex_states.get(&state).map(|s| s.program_header).unwrap_or(0);
+        let n = self.reflect_program(ctx, header).texture_unit_count;
+        for i in 0..n {
+            self.precomputed_vertex_state_set_texture(ctx, state, i, array.wrapping_add(i * 16));
+        }
+    }
+
+    pub fn precomputed_fragment_state_set_all_textures(&mut self, ctx: &GuestCtx, state: u32, array: u32) {
+        let header = self.precomputed_fragment_states.get(&state).map(|s| s.program_header).unwrap_or(0);
+        let n = self.reflect_program(ctx, header).texture_unit_count;
+        for i in 0..n {
+            self.precomputed_fragment_state_set_texture(ctx, state, i, array.wrapping_add(i * 16));
+        }
+    }
+
+    fn state_set_texture(s: &mut PrecomputedState, index: u32, binding: TextureBinding) {
         s.textures.retain(|(i, _)| *i != index);
-        if texture != 0 {
-            s.textures.push((index, texture));
+        if binding.addr != 0 {
+            s.textures.push((index, binding));
             s.textures.sort_by_key(|(i, _)| *i);
         }
     }
@@ -3520,12 +5414,16 @@ impl VitaState {
     /// textures to the context sampler units, exactly as a sequence of
     /// `sceGxmSetFragmentTexture` calls would, so `record_draw` snapshots them.
     pub fn bind_precomputed_fragment_state(&mut self, ctx: &GuestCtx, state: u32) {
-        let (textures, header, uniform_buf) = match self.precomputed_fragment_states.get(&state) {
-            Some(s) => (s.textures.clone(), s.program_header, s.default_uniform_buffer),
+        let (textures, header, uniform_buf, blend) = match self.precomputed_fragment_states.get(&state) {
+            Some(s) => (s.textures.clone(), s.program_header, s.default_uniform_buffer, s.blend),
             None => return,
         };
-        self.bound_textures = textures;
+        // The precomputed state stores (textureIndex, binding); the live bind list is keyed by
+        // sampler UNIT, and for a fragment state the two are the same number.
+        self.bound_textures = textures.into_iter().map(|(_, b)| b).collect();
+        self.textures_from_precomputed = true;
         self.bound_fragment_program_header = header;
+        self.bound_fragment_blend = blend;
         // Bind this stage's default uniform buffer (pointer + reflected size) so the draw
         // reads the per-material fragment uniforms (tint / light / fog) from guest memory,
         // exactly as the precomputed vertex path binds the vertex uniform buffer.
@@ -3681,6 +5579,37 @@ impl VitaState {
         self.pending_uniforms[at as usize..end].copy_from_slice(&values);
     }
 
+    /// The half-precision counterpart of [`Self::set_uniforms`]: record a
+    /// `sceGxmSetUniformDataF` write to an F16-declared uniform, which packs TWO components
+    /// per register.
+    ///
+    /// `at_half` counts HALVES from the start of the buffer, so register `n` holds halves
+    /// `2n` and `2n+1`. The bank stores raw register words (a lane's f32 bit pattern IS the
+    /// register), so a partial write read-modify-writes the neighbouring half rather than
+    /// clearing it - the same thing the guest's own buffer does, and the same thing
+    /// `vita::gxm::set_uniform_data_f` does to the reserved buffer. The two must agree, or
+    /// which one a draw reads decides what it renders.
+    pub fn set_uniform_halves(&mut self, at_half: u32, values: &[f32]) {
+        let end_reg = (at_half as usize + values.len()).div_ceil(2);
+        if end_reg > MAX_DEFAULT_UNIFORM_REGS as usize {
+            return;
+        }
+        if self.pending_uniforms.len() < end_reg {
+            self.pending_uniforms.resize(end_reg, 0.0);
+        }
+        for (i, v) in values.iter().enumerate() {
+            let component = at_half as usize + i;
+            let slot = &mut self.pending_uniforms[component / 2];
+            let word = slot.to_bits();
+            let h = u32::from(crate::render::f32_to_half(*v));
+            *slot = f32::from_bits(if component % 2 == 0 {
+                (word & 0xffff_0000) | h
+            } else {
+                (word & 0x0000_ffff) | (h << 16)
+            });
+        }
+    }
+
     /// What thread `thid` is parked on, as one line, or `RUNNABLE` if it appears in no
     /// waiter list at all. "Runnable" is the interesting answer as often as the blocked
     /// ones are: a title that renders but never progresses has one thread spinning on a
@@ -3749,7 +5678,23 @@ impl VitaState {
         // one actually running. A stall dump without it forces the reader to
         // cross-reference by hand and silently omits any thread blocked on a
         // primitive whose list is not printed.
-        let _ = writeln!(s, "threads ({} live):", self.threads.iter().filter(|t| t.exit_code.is_none()).count());
+        let _ = writeln!(
+            s,
+            "threads ({} live):",
+            1 + self.threads.iter().filter(|t| t.exit_code.is_none()).count()
+        );
+        // The MAIN thread is listed first and by hand, because it is the one thread
+        // that has no `ThreadRec`: `create_thread` records the threads the GUEST
+        // creates, and the initial thread was created by the loader before any of
+        // that. Omitting it made this dump read as "the game logic thread is gone"
+        // for a title whose main thread was in fact alive and spinning - a wrong
+        // diagnosis that a stall dump exists precisely to prevent. Its thid is 0.
+        let _ = writeln!(
+            s,
+            "  thid={:#x} \"main\" (the initial thread - no create record) {}",
+            MAIN_THID,
+            self.thread_wait_state(MAIN_THID),
+        );
         for t in &self.threads {
             if t.exit_code.is_some() {
                 continue;
@@ -3780,10 +5725,14 @@ impl VitaState {
             );
         }
         let _ = writeln!(s, "semaphores ({}):", self.semaphores.len());
-        for (uid, count) in &self.semaphores {
+        for sem in &self.semaphores {
             let waiters: Vec<(i32, i32)> =
-                self.sema_waiters.iter().filter(|w| w.uid == *uid).map(|w| (w.thid, w.need)).collect();
-            let _ = writeln!(s, "  uid={uid:#x} count={count} waiters(thid,need)={waiters:x?}");
+                self.sema_waiters.iter().filter(|w| w.uid == sem.uid).map(|w| (w.thid, w.need)).collect();
+            let _ = writeln!(
+                s,
+                "  uid={:#x} name={:?} count={} waiters(thid,need)={waiters:x?}",
+                sem.uid, sem.name, sem.count
+            );
         }
         // Event flags were missing from this dump entirely, and they are what a title's
         // own worker threads actually park on - so a stall could show every printed
@@ -3876,6 +5825,9 @@ impl VitaState {
         index_addr: u32,
         index_count: u32,
     ) {
+        // Occlusion query: this draw contributes to whatever slot the front-face
+        // visibility test currently names (no-op when no query is live).
+        self.accumulate_visibility(index_count);
         // Drop a default uniform buffer still bound for a DIFFERENT program before anything
         // below reads it (see [`Self::stale_uniforms`]). The vertex stage is handled inside
         // `current_vertex_uniforms`; the fragment stage has several independent readers
@@ -4010,27 +5962,17 @@ impl VitaState {
         // re-sorting a fresh Vec for every draw.
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
         debug_assert!(
-            self.bound_textures.windows(2).all(|w| w[0].0 <= w[1].0),
+            self.bound_textures.windows(2).all(|w| w[0].unit <= w[1].unit),
             "bound_textures must stay sorted by unit - see bind_fragment_texture and \
              bind_precomputed_fragment_state"
         );
-        // Read the per-unit control state first, so the snapshot cache can be borrowed
-        // mutably for the decode loop without also holding a shared borrow of `self`.
-        let unit_state: Vec<(u32, u32, Option<u32>, (u32, u32, u32), (u32, u32))> = self
-            .bound_textures
-            .iter()
-            .map(|&(unit, addr)| {
-                let e = self.texture_extra(addr);
-                (unit, addr, self.texture_format(addr), self.texture_sampler(addr), (e.min_filter, e.mag_filter))
-            })
-            .collect();
-        let snapshots = &mut self.texture_snapshots;
-        let mut textures: Vec<crate::capture::BoundTexture> = unit_state
-            .into_iter()
-            .filter_map(|(unit, addr, format, sampler, filters)| {
-                decode_texture(ctx, snapshots, unit, addr, format, sampler, filters)
-            })
-            .collect();
+        let mut textures = self.snapshot_bound_textures(ctx, self.bound_textures.clone());
+        // The VERTEX stage's own samplers, decoded exactly the same way. A vertex program that
+        // fetches a texture builds its geometry from it - one retail title draws its whole
+        // campaign map that way - so a draw that carries none of these renders as if the fetch
+        // returned nothing, which is a blank screen rather than a visible error.
+        let vertex_textures =
+            self.snapshot_bound_textures(ctx, self.bound_vertex_textures.clone());
         drop(texture_phase);
         // The capture renderer samples a single texture (`textures.first()`). This title
         // binds the NORMAL map at unit 0, so pick the albedo sampler by fragment-program
@@ -4138,10 +6080,12 @@ impl VitaState {
             vertices,
             vertex_stride: stride,
             attributes,
+            vertex_textures,
             indices,
             uniforms,
             textures,
             render_state: self.render_state,
+            blend: self.bound_fragment_blend,
             exposure,
             material,
             world,
@@ -4207,6 +6151,14 @@ impl VitaState {
     /// offset-0 matrix as-is. Both matrices are column-major 4x4 float blocks at their
     /// reflected `resource_index` (in floats); the result is `projection * world`.
     fn composed_mvp(&self, r: &ProgramReflection, uniforms: &[f32]) -> Option<[f32; 16]> {
+        // A shader that keeps ONE combined matrix needs no composition - but it does
+        // need to be found, because it is not always at offset 0 and the fallback
+        // there would then read whatever else the program put first.
+        if let Some(off) = r.mvp_off.map(|o| o as usize) {
+            let mut m = [0f32; 16];
+            m.copy_from_slice(uniforms.get(off..off + 16)?);
+            return Some(m);
+        }
         let (world, proj) = Self::reflected_world_proj(r, uniforms)?;
         // Column-major 4x4 multiply: out = proj * world.
         let mut out = [0f32; 16];
@@ -4282,6 +6234,41 @@ impl VitaState {
     /// table (name / category / type / component_count / container / array_size /
     /// resource_index) once per unique program, so the uniform-buffer layout (which
     /// slots are the world matrix vs the shared view-projection) is known by name.
+    /// Print every UNIFORM (category 1) the vertex program `ph` declares, with its
+    /// name, its float offset, and the values this draw supplied - a 4x4 laid out as
+    /// four columns.
+    ///
+    /// A capture renderer has no shader, so it can only place geometry with a matrix it
+    /// RECOGNISES; when a title's shader names its transform something the reflection
+    /// does not know, the renderer falls back to "the first sixteen floats" and draws
+    /// the mesh wherever those happen to point. That failure is silent and looks like a
+    /// pass that drew nothing. This is how you find the real transform: read the names.
+    fn dump_named_uniforms(&self, ctx: &GuestCtx, ph: u32, values: &[f32]) {
+        if ph == 0 {
+            return;
+        }
+        let count = ctx.read_u32(ph.wrapping_add(0x24));
+        let base = ph.wrapping_add(0x28).wrapping_add(ctx.read_u32(ph.wrapping_add(0x28)));
+        for i in 0..count.min(64) {
+            let p = base.wrapping_add(i.wrapping_mul(16));
+            let word = ctx.read_u32(p.wrapping_add(4)) & 0xffff;
+            if word & 0xf != 1 {
+                continue; // category 1 = uniform
+            }
+            let comp = ((word >> 8) & 0xf).max(1);
+            let array = ctx.read_u32(p.wrapping_add(8)).max(1);
+            let res = ctx.read_u32(p.wrapping_add(0xc)) as usize;
+            let name_addr = (p as i64 + ctx.read_u32(p) as i32 as i64) as u32;
+            let raw = ctx.read_bytes(name_addr, 48);
+            let name: String = raw.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let n = (comp * array) as usize;
+            let vals: Vec<String> = (0..n.min(16))
+                .map(|k| values.get(res + k).map_or("-".into(), |v| format!("{v:.4}")))
+                .collect();
+            eprintln!("  uniform {name:?} res={res} comp={comp} array={array} = [{}]", vals.join(","));
+        }
+    }
+
     fn dump_vertex_program_params(&self, ctx: &GuestCtx) {
         use std::sync::Mutex;
         static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -4572,6 +6559,22 @@ impl VitaState {
             if composed.is_some() { "yes" } else { "no" },
             eff[12], eff[13], eff[14], eff[15],
         );
+        // The whole transform, column by column. `origin_clip` above is only its last
+        // column, which says WHERE the origin lands and nothing about the scale or the
+        // axes - and a mesh that misses the screen because its scale is wrong looks
+        // exactly like one whose translation is wrong.
+        eprintln!(
+            "  MVP c0=[{:.4},{:.4},{:.4},{:.4}] c1=[{:.4},{:.4},{:.4},{:.4}] \
+             c2=[{:.4},{:.4},{:.4},{:.4}] c3=[{:.4},{:.4},{:.4},{:.4}]",
+            eff[0], eff[1], eff[2], eff[3],
+            eff[4], eff[5], eff[6], eff[7],
+            eff[8], eff[9], eff[10], eff[11],
+            eff[12], eff[13], eff[14], eff[15],
+        );
+        // Every uniform lane the program declares, by NAME, so a transform that is not
+        // in the first sixteen floats can be found rather than guessed at. This is the
+        // dump's whole job on a shader whose transform the reflection does not know.
+        self.dump_named_uniforms(ctx, vh, &raw);
         eprintln!(
             "  MATERIAL tint=[{:.3},{:.3},{:.3}] has_light={} light_dir=[{:.3},{:.3},{:.3}] light_col=[{:.3},{:.3},{:.3}] ambient=[{:.3},{:.3},{:.3}]",
             mat.tint[0], mat.tint[1], mat.tint[2], mat.has_light,
@@ -4762,7 +6765,8 @@ impl VitaState {
     }
 
     pub fn end_scene(&mut self) {
-        if let Some(scene) = self.scene.take() {
+        if let Some(mut scene) = self.scene.take() {
+            scene.adopt_viewport_extent();
             // Goes through `push_scene`, not a bare push, so a bounded-retention run
             // still folds every scene into the determinism signature.
             self.capture.push_scene(scene);
@@ -4828,13 +6832,29 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
                 let pref = ParamRef { res, comp: comp.max(1) as u8, f16: is_f16 };
                 // A 4x4 matrix is declared as component_count 4, array_size 4.
                 let is_matrix = comp == 4 && array == 4;
+                // A single COMBINED model->clip matrix, tested first: its name contains
+                // the projection substring too, and reading it as the projection half of
+                // a pair would compose it with an identity world and place the mesh by a
+                // matrix that is already complete.
                 if is_matrix
+                    && (name.contains("worldviewproj")
+                        || name.contains("modelviewproj")
+                        || name.contains("wvp"))
+                {
+                    r.mvp_off = Some(res);
+                } else if is_matrix
                     && (name.contains("toprojection")
                         || name.contains("worldtoclip")
-                        || name.contains("viewprojection"))
+                        // `viewProjection` and the shorter `viewProj` this title's race
+                        // shaders use. Its model half is named plainly `world` (below);
+                        // between them they are the whole transform, and without both the
+                        // renderer falls back to "the first sixteen floats" - which for
+                        // these programs is the MODEL matrix alone, so the world is drawn
+                        // with no camera at all and no observer can recover the eye.
+                        || name.contains("viewproj"))
                 {
                     r.proj_off = Some(res);
-                } else if is_matrix && name.contains("modeltoworld") {
+                } else if is_matrix && (name.contains("modeltoworld") || name == "world") {
                     r.world_off = Some(res);
                 } else if name.contains("coarseexposure") {
                     r.exposure_off = Some(res);
@@ -4855,6 +6875,10 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
                 }
             }
             2 => {
+                // Sampler. Its resource index IS its texture unit, so the number of units
+                // the program occupies is one past the highest - which is the length of
+                // the array `sceGxmPrecomputed*StateSetAllTextures` is handed.
+                r.texture_unit_count = r.texture_unit_count.max(res.wrapping_add(1));
                 let score = albedo_name_score(&name);
                 if score > 0 && best_albedo.map(|(s, _)| score > s).unwrap_or(true) {
                     best_albedo = Some((score, res));
@@ -4993,6 +7017,209 @@ fn gxp_live_capture() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("VITASLOP_GXP_LIVE").is_some())
 }
 
+/// Report - once per distinct base format, unconditionally - that a bound texture's format
+/// has no known block geometry, so the sampler unit it was bound to is left EMPTY.
+///
+/// This has to be loud rather than a `debug!` behind a filter nobody has on. Downstream the
+/// only evidence is a recompiled shader falling back with "sampler unit N wants Two but the
+/// bound units are [...]", and reading that backwards to a texture format costs a session.
+/// Deduped by format because a title binds the same format on hundreds of draws a frame.
+/// Report - once per (base format, swizzle) - a texture resolved from its CONTROL WORDS rather
+/// than from the exact format recorded at `sceGxmTextureInit*`.
+///
+/// This is the path a texture takes once a title copies the struct it lives in, and it is
+/// lossier than the recorded one: the base format has to be reassembled from a 5-bit field plus
+/// an extension bit, so every format above 0x7f (all of BC/PVRTC, and `U2F10F10F10`) decodes as
+/// a different, smaller format if that bit is not carried. A UI atlas that is really BC3 read as
+/// a 16-bit uncompressed format is not a dropped texture - it renders, subtly wrong.
+fn report_texture_resolved_from_control_words(unit: u32, base_format: u32, swizzle: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((base_format, swizzle)) {
+        return;
+    }
+    eprintln!(
+        "gxm texture: unit {unit} bound a texture with NO recorded format - resolving it from \
+         its control words alone as base format {base_format:#04x}, swizzle {swizzle}. This is a \
+         copy of a texture initialised elsewhere."
+    );
+}
+
+fn report_unsized_texture_format(unit: u32, base_format: u32, tex_type: u32, width: u32, height: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+        return;
+    }
+    eprintln!(
+        "gxm texture: unit {unit} base format {base_format:#04x} (type {tex_type}, \
+         {width}x{height}) has no known block size - EVERY unit bound to this format is left \
+         unbound, and any shader sampling it falls back to fixed-function"
+    );
+}
+
+/// How many sampler-unit bindings each drop cause has cost, over the whole run.
+///
+/// The per-cause REPORTS are deduped so they stay readable, which means they say nothing
+/// about scale - and scale is what decides which cause to fix first. One unsized format on
+/// four units and a zero handle on three read identically in the log while costing wildly
+/// different numbers of draws. Counted here, printed by [`report_texture_drops`].
+static TEXTURE_DROPS: std::sync::Mutex<[u64; 4]> = std::sync::Mutex::new([0; 4]);
+
+/// Drop causes, in [`TEXTURE_DROPS`] order.
+const DROP_CAUSES: [&str; 4] = [
+    "zero control words (null data pointer - bound to a 1x1 zero texel, not dropped)",
+    "unsized format",
+    "pixels not readable",
+    "undecodable base format",
+];
+
+/// How many times a `sceGxmTextureInit*` / `SetFormat` recorded a format for an address. A zero
+/// here alongside a large drop count means the title never goes through the init API at all, and
+/// builds its control words itself - which is a completely different investigation from "it
+/// inits somewhere we are not looking".
+static TEXTURE_INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Distinct `SceGxmTexture*` handles that read as all-zero control words at draw time. See
+/// [`report_zero_texture_handle`].
+static ZERO_TEXTURE_ADDRS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+    std::sync::Mutex::new(None);
+
+fn note_texture_drop(cause: usize) {
+    if let Ok(mut g) = TEXTURE_DROPS.lock() {
+        g[cause] += 1;
+    }
+}
+
+/// Print how many sampler-unit bindings were dropped, by cause, over the run. Call once at
+/// the end of a run; silent when nothing was dropped.
+pub fn report_texture_drops() {
+    let counts = *TEXTURE_DROPS.lock().unwrap_or_else(|e| e.into_inner());
+    if counts.iter().all(|&c| c == 0) {
+        return;
+    }
+    let mut ranked: Vec<_> = DROP_CAUSES.iter().zip(counts).filter(|(_, c)| *c > 0).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("gxm texture: sampler-unit bindings DROPPED over this run, by cause:");
+    for (cause, n) in ranked {
+        eprintln!("gxm texture:   {n} - {cause}");
+    }
+    eprintln!(
+        "gxm texture:   {} texture format(s) were recorded through the init API over the run",
+        TEXTURE_INITS.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    if let Ok(g) = ZERO_TEXTURE_ADDRS.lock() {
+        if let Some(addrs) = g.as_ref().filter(|a| !a.is_empty()) {
+            let mut list: Vec<u32> = addrs.iter().copied().collect();
+            list.sort_unstable();
+            let shown: Vec<String> = list.iter().take(12).map(|a| format!("{a:#x}")).collect();
+            eprintln!(
+                "gxm texture:   the zero control words come from {} DISTINCT handle(s): {}{}",
+                list.len(),
+                shown.join(" "),
+                if list.len() > shown.len() { " ..." } else { "" }
+            );
+        }
+    }
+}
+
+/// Report - once per unit - that a bound `SceGxmTexture` handle reads as all zeros at draw
+/// time, naming which binding path put it there.
+///
+/// `from_precomputed` is the whole point of the message: a zero handle bound through
+/// `sceGxmSetFragmentTexture` means the guest really bound an uninitialised texture, while
+/// one that arrived with a precomputed fragment state means the state record is stale or
+/// keyed wrong on OUR side. Those need opposite investigations and look identical downstream.
+fn report_zero_texture_handle(
+    ctx: &GuestCtx,
+    binding: &TextureBinding,
+    exact_format: Option<u32>,
+    nearby: Option<(i64, u32)>,
+) {
+    let (unit, addr, from_precomputed) = (binding.unit, binding.addr, binding.from_precomputed);
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    // Every distinct zero HANDLE is counted, so the end-of-run summary can say how many
+    // addresses are involved. "2.3 million dropped bindings" reads like a catastrophe and is
+    // consistent with three addresses rebound every frame; the two need different responses.
+    if let Ok(mut a) = ZERO_TEXTURE_ADDRS.lock() {
+        a.get_or_insert_with(HashSet::new).insert(addr);
+    }
+    // Once per (unit, ADDRESS), not per unit: a title binds a different uninitialised handle
+    // to the same unit for each of its post-process steps, and reporting only the first tells
+    // you a chain is broken without telling you how many distinct objects are involved - which
+    // is the difference between one bad pointer and a whole class of them.
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, addr)) {
+        return;
+    }
+    // The memory AROUND the handle, so the two ways this happens can be told apart: memory
+    // that is zero for a long stretch means the struct was never written, while live data
+    // either side of a zero window means the handle address is off by an offset.
+    let window: Vec<String> = (0..32)
+        .map(|i| format!("{:08x}", ctx.read_u32(addr.wrapping_sub(48).wrapping_add(i * 4))))
+        .collect();
+    eprintln!("gxm texture: memory around handle {addr:#x} (from -48): {}", window.join(" "));
+    let via = if from_precomputed {
+        "a PRECOMPUTED fragment state"
+    } else {
+        "sceGxmSetFragmentTexture"
+    };
+    // Whether a `sceGxmTextureInit*`/`SetFormat` was ever seen for THIS address splits the
+    // cause in two: recorded means the guest initialised the texture somewhere else and the
+    // bytes here are a copy that never got them (a by-value problem on our side); not
+    // recorded means the guest never went through an init we implement at all.
+    let init = match (exact_format, nearby) {
+        (Some(f), _) => format!("a format ({f:#010x}) WAS recorded for this address"),
+        // A texture initialised a few bytes away is the whole answer: the guest DID build a
+        // texture and this binding points at the wrong place in it (an interior member, or a
+        // copy that missed the init). Naming the delta turns the fix into arithmetic.
+        (None, Some((d, f))) => format!(
+            "NO format was recorded here, but one ({f:#010x}) WAS recorded {d} bytes away - the \
+             binding is off by that much, or this is an uninitialised COPY of that texture"
+        ),
+        (None, None) => {
+            "NO format was ever recorded for this address, nor within 4 KiB of it".to_string()
+        }
+    };
+    eprintln!(
+        "gxm texture: handle {addr:#x} read as all-zero control words AT BIND TIME (the binding          captures them then, so this is what the guest handed to GXM, not what the memory          happens to hold now)"
+    );
+    eprintln!(
+        "gxm texture: unit {unit} handle {addr:#x} (bound via {via}) reads as ALL ZERO control \
+         words, and {init} - its data pointer is null, so the unit is bound to a 1x1 ZERO \
+         texel (what the hardware would read at address 0)"
+    );
+}
+
+/// Report - once per (unit, format) - that a bound texture's pixel bytes could not be read
+/// from guest memory, so the unit is left EMPTY.
+///
+/// The other half of [`report_unsized_texture_format`]. A unit can go missing because the
+/// format has no size OR because the bytes behind a perfectly-understood format are not
+/// readable, and downstream both look identical: a recompiled shader falling back with
+/// "sampler unit N wants Two but the bound units are [...]". Only the address and length
+/// distinguish them, and only here are they still in hand.
+fn report_unreadable_texture(unit: u32, base_format: u32, addr: u32, len: usize, w: u32, h: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+        return;
+    }
+    eprintln!(
+        "gxm texture: unit {unit} format {base_format:#04x} {w}x{h} at {addr:#x} ({len} bytes) is \
+         NOT READABLE from guest memory - the unit is left unbound, and any shader sampling it \
+         falls back to fixed-function"
+    );
+}
+
 /// Decode a bound `SceGxmTexture` (16 bytes, 4 control words) from guest memory
 /// and snapshot its pixel bytes. Returns `None` for a null/unreadable handle or a
 /// format whose byte size we do not know yet. The layout is the public GXM texture
@@ -5002,19 +7229,61 @@ fn gxp_live_capture() -> bool {
 fn decode_texture(
     ctx: &GuestCtx,
     cache: &mut TextureSnapshots,
-    unit: u32,
-    addr: u32,
+    binding: &TextureBinding,
     exact_format: Option<u32>,
     sampler: (u32, u32, u32),
-    filters: (u32, u32),
+    // `(min filter, mag filter, gamma mode)` - the sampler state that does not live in the
+    // guest's control words, so it has to travel with the binding.
+    filters: (u32, u32, u32),
+    nearby: Option<(i64, u32)>,
 ) -> Option<crate::capture::BoundTexture> {
+    let (unit, addr) = (binding.unit, binding.addr);
     if addr == 0 {
         return None;
     }
-    let w0 = ctx.read_u32(addr);
-    let w1 = ctx.read_u32(addr + 4);
-    let w2 = ctx.read_u32(addr + 8);
-    let w3 = ctx.read_u32(addr + 12);
+    // The control words come from the BINDING, captured when the guest handed the texture to
+    // GXM, not from guest memory now. See `TextureBinding`.
+    let [w0, w1, w2, w3] = binding.words;
+    // All four control words zero is not a texture - it is a handle that was never
+    // initialised, or one whose memory is not readable (an unmapped read yields zero). Either
+    // way the unit ends up unbound, and it is a completely different bug from a format we
+    // cannot size, so it gets its own report rather than being folded into "not readable".
+    if binding.is_null() {
+        note_texture_drop(0);
+        report_zero_texture_handle(ctx, binding, exact_format, nearby);
+        // Bind a 1x1 ZERO texel rather than leaving the unit empty.
+        //
+        // Zero is not a neutral choice, it is the FAITHFUL one: a zeroed handle has a null
+        // data pointer, so the hardware samples address 0 - and the texel it reads there is
+        // zeros in every format. Dropping the unit instead costs the whole draw, because the
+        // recompiled shader then cannot build its bind group at all and falls back to a
+        // fixed-function approximation.
+        //
+        // It was briefly white, on the reasoning that white is the identity for a modulate.
+        // That was wrong twice over: it is not what the hardware reads, and a title's
+        // post-process chain sampled one of these and came out solid white, which then
+        // composited over the entire race. A substitute has to be defensible as a VALUE, not
+        // as a guess about how the shader will use it.
+        return Some(crate::capture::BoundTexture {
+            unit,
+            base_format: 0x0c, // U8U8U8U8
+            swizzle: 0,        // SWIZZLE4_ABGR - the identity permutation
+            tex_type: 3,       // LINEAR
+            width: 1,
+            height: 1,
+            stride: 4,
+            faces: 1,
+            face_bytes: 4,
+            data_addr: 0,
+            pixels: Arc::from([0u8, 0, 0, 0].as_slice()),
+            u_addr_mode: sampler.0,
+            v_addr_mode: sampler.1,
+            lod_bias: sampler.2,
+            min_filter: filters.0,
+            mag_filter: filters.1,
+            gamma: filters.2,
+        });
+    }
 
     let tex_type = (w1 >> 29) & 0x7;
     // generic2 layout (non-swizzled/non-cube): width/height are 12-bit size-1.
@@ -5025,9 +7294,19 @@ fn decode_texture(
     // formats and the channel swizzle intact); otherwise reconstruct the high byte
     // from the 5-bit field plus the format0 extension bit (word 0 bit 31), and take
     // the 3-bit control-word swizzle.
+    // Both arms must produce the swizzle in the FORMAT FIELD's position (bits 14:12), because
+    // that is what every consumer reads it out of (`(swizzle >> 12) & 0x7`). The control words
+    // store it as a bare 3-bit value in word 3, so it has to be shifted back up - without that
+    // every texture resolved from its control words alone silently reads as swizzle 0, and that
+    // is the path a texture takes as soon as a title COPIES the struct it lives in (a colour
+    // surface's `backgroundTex` is copied every time the surface is).
     let (base_format, swizzle) = match exact_format {
         Some(f) => ((f >> 24) & 0xff, f & 0x00ff_ffff),
-        None => (((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7), (w3 >> 29) & 0x7),
+        None => {
+            let base = ((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7);
+            report_texture_resolved_from_control_words(unit, base, (w3 >> 29) & 0x7);
+            (base, ((w3 >> 29) & 0x7) << 12)
+        }
     };
 
     // Block geometry: uncompressed formats are 1x1 texel "blocks"; BC/DXT are 4x4. A format we
@@ -5035,15 +7314,8 @@ fn decode_texture(
     // downstream only as a missing sampler binding, which is far harder to trace back than the
     // format that caused it.
     let Some((block_w, block_h, block_bytes)) = crate::render::block_layout(base_format) else {
-        tracing::debug!(
-            target: "vitaslop::render",
-            unit,
-            base_format = format_args!("{base_format:#04x}"),
-            tex_type,
-            width,
-            height,
-            "texture format not sized - unit left unbound",
-        );
+        note_texture_drop(1);
+        report_unsized_texture_format(unit, base_format, tex_type, width, height);
         return None;
     };
     let blocks_x = width.div_ceil(block_w);
@@ -5072,6 +7344,8 @@ fn decode_texture(
     let len = (total * faces) as usize;
     let pixels = cache.get_or_read(ctx, data_addr, len);
     if pixels.is_empty() {
+        note_texture_drop(2);
+        report_unreadable_texture(unit, base_format, data_addr, len, width, height);
         return None;
     }
     Some(crate::capture::BoundTexture {
@@ -5091,6 +7365,7 @@ fn decode_texture(
         lod_bias: sampler.2,
         min_filter: filters.0,
         mag_filter: filters.1,
+        gamma: filters.2,
     })
 }
 
@@ -5273,6 +7548,18 @@ pub trait ImportDispatch {
     /// source - a scripted TAS recipe - advance in lockstep with the render loop.
     /// The default ignores it.
     fn on_frame_boundary(&mut self, _frame: u64) {}
+
+    /// Write the current value of every HOST MIRROR slot through `write`, which stores
+    /// one word at a slot index. Returns how many slots were written.
+    ///
+    /// Called by the scheduler immediately before guest code resumes, which is what
+    /// makes an inlined read of the block exactly equal to the host call it replaces -
+    /// see [`crate::vita::mirror`] for the rule about what may live there. The default
+    /// writes nothing and returns 0, which is correct for a host with no mirrored
+    /// values and is DETECTED (not tolerated) for one that needs them.
+    fn refresh_mirror(&mut self, _write: &mut dyn FnMut(u32, u32)) -> usize {
+        0
+    }
 }
 
 impl ImportDispatch for VitaEnv {
@@ -5344,10 +7631,19 @@ impl ImportDispatch for VitaEnv {
         if self.state.has_io_waiters() {
             self.state.charge_io_quantum(QUANTUM_IO_US);
         }
+        self.state.charge_cpu_quantum(quantum_cpu_us());
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
         self.state.take_resume_code(thid)
+    }
+
+    fn refresh_mirror(&mut self, write: &mut dyn FnMut(u32, u32)) -> usize {
+        let words = vita::mirror::snapshot(&self.state);
+        for (slot, value) in words.iter().enumerate() {
+            write(slot as u32, *value);
+        }
+        words.len()
     }
 
     fn on_frame_boundary(&mut self, frame: u64) {
@@ -5371,9 +7667,13 @@ impl ImportDispatch for VitaEnv {
         // pin the per-frame advance to ~1 us and freeze the game clock, so every
         // time-based state (a dialog's fade-in / input-enable timer) would never
         // elapse and the title would sit frozen and input-inert.
+        //
+        // It is a TOP-UP, not an unconditional addition: `charge_cpu_quantum` has
+        // already advanced the clock for the guest CPU work this frame took, and adding
+        // a whole frame on top of that would run the game clock fast (the failure mode
+        // in `vitaslop-race-clock-5x`).
         const FRAME_US: u64 = 1_000_000 / 60;
-        let target = self.state.now_us() + FRAME_US;
-        self.state.advance_time_to(target);
+        self.state.advance_time_frame(FRAME_US);
         // The modelled storage device gets one frame of progress per rendered frame,
         // net of anything the quantum charges already contributed.
         self.state.advance_io_frame(FRAME_US);
@@ -5386,6 +7686,50 @@ impl ImportDispatch for VitaEnv {
 /// waiting for a load instead of rendering, since a rendering title's storage progress is
 /// pinned to its frames by [`VitaState::advance_io_frame`].
 const QUANTUM_IO_US: u64 = 2_000;
+
+/// Game-clock time charged for one scheduler quantum of guest execution, in
+/// microseconds. See [`VitaState::charge_cpu_quantum`] for why the game clock must
+/// advance for CPU work at all.
+///
+/// CALIBRATION. The preemption quantum is 5,000,000 units of engine fuel, which is about
+/// that many executed wasm instructions; the transpiler emits several wasm instructions
+/// per guest ARM instruction (register globals, flag computation), so a quantum is order
+/// 0.5-1 M ARM instructions, and the Vita's 444 MHz Cortex-A9 retires that in roughly
+/// 1-2 ms. 2 ms is the middle of that range, and it is the same figure and the same
+/// reasoning as [`QUANTUM_IO_US`] - one quantum of guest execution is one quantum of
+/// guest execution, whichever clock is being charged for it.
+///
+/// Sanity-checked against [`VitaState::quantum_flip_counts`], which the boot probe prints
+/// at the end of every run: a title in its loading phase shows tens of quanta per flip
+/// (its game clock rightly advances faster than 60 Hz, because it really is spending far
+/// more than a frame of CPU between flips), and a steadily rendering one shows few enough
+/// that [`VitaState::advance_time_frame`]'s top-up still pins it to 60 Hz.
+///
+/// Override for an experiment with `VITASLOP_QUANTUM_CPU_US`; 0 restores the old model
+/// (a game clock that moves only on a flip or a scheduler idle) for an A/B.
+const QUANTUM_CPU_US: u64 = 2_000;
+
+/// [`QUANTUM_CPU_US`], overridable per-run by `VITASLOP_QUANTUM_CPU_US` (the knob exists
+/// to take the calibration measurement and to A/B it; 0 restores the pre-calibration
+/// behaviour of a game clock that only moves on a flip or an idle).
+fn quantum_cpu_us() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_QUANTUM_CPU_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(QUANTUM_CPU_US)
+    })
+}
+
+/// `VITASLOP_FRAME_TOPUP=0`: do not top the game clock up to a full frame at a display
+/// flip, so a frame advances the clock only by the guest execution that actually
+/// happened. See [`VitaState::advance_time_frame`] for what that changes and why it is
+/// not the default. Anything other than `0` (or unset) leaves the top-up on.
+fn frame_topup() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_FRAME_TOPUP").as_deref() != Ok("0"))
+}
 
 /// A shared handle to a `VitaEnv`: attach one clone as the engine's import
 /// environment and keep another to read the capture back after the run. Single
@@ -5668,7 +8012,7 @@ mod preemptive_tests {
     #[test]
     fn semaphore_parks_then_a_signal_wakes_and_consumes() {
         let mut st = state();
-        let sem = st.create_sema(0);
+        let sem = st.create_sema("test", 0, 0, i32::MAX);
         // Thread 1 wants 1 but the count is 0: it cannot acquire and parks.
         st.set_current(1);
         assert!(!st.sema_try_acquire(sem, 1));
@@ -5741,7 +8085,7 @@ mod preemptive_tests {
     #[test]
     fn multiple_semaphore_waiters_release_fifo() {
         let mut st = state();
-        let sem = st.create_sema(0);
+        let sem = st.create_sema("test", 0, 0, i32::MAX);
         // Threads 1, 2, 3 park in order, each needing one permit.
         for t in [1, 2, 3] {
             st.set_current(t);
@@ -5759,7 +8103,7 @@ mod preemptive_tests {
     #[test]
     fn semaphore_need_greater_than_one_waits_for_accumulation() {
         let mut st = state();
-        let sem = st.create_sema(0);
+        let sem = st.create_sema("test", 0, 0, i32::MAX);
         st.set_current(1);
         st.sema_block(sem, 3, 0); // needs 3
         st.set_current(2);
@@ -5773,7 +8117,7 @@ mod preemptive_tests {
     #[test]
     fn timed_semaphore_wait_times_out_with_wait_timeout_code() {
         let mut st = state();
-        let sem = st.create_sema(0);
+        let sem = st.create_sema("test", 0, 0, i32::MAX);
         st.set_current(1);
         assert!(!st.sema_try_acquire(sem, 1));
         st.sema_block(sem, 1, 500);
@@ -5793,7 +8137,7 @@ mod preemptive_tests {
     #[test]
     fn timed_semaphore_wait_satisfied_before_deadline_returns_zero() {
         let mut st = state();
-        let sem = st.create_sema(0);
+        let sem = st.create_sema("test", 0, 0, i32::MAX);
         st.set_current(1);
         st.sema_block(sem, 1, 500);
         // A signal before the deadline releases it with NO resume code (r0 stays 0).
@@ -6040,7 +8384,7 @@ mod preemptive_tests {
     #[test]
     fn join_parks_until_the_target_thread_exits() {
         let mut st = state();
-        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY);
+        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY, 0, 0);
         // Main (thread 0) joins the not-yet-finished worker and parks, passing a
         // `stat` out-parameter at guest address 0x5000.
         st.set_current(0);
@@ -6062,7 +8406,7 @@ mod preemptive_tests {
     #[test]
     fn start_thread_queues_a_spawn_not_a_synchronous_reentry() {
         let mut st = state();
-        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY);
+        let worker = st.create_thread(0x2000, 0x1000, DEFAULT_THREAD_PRIORITY, 0, 0);
         st.start_thread(worker, 4, 0x1234);
         assert!(st.take_reentry().is_none(), "preemptive start does not re-enter synchronously");
         let spawns = st.take_spawns();

@@ -230,6 +230,7 @@ impl RetailGuest {
         let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
+        env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
         // Move (not clone) the decrypted assets into the guest filesystem - for a
@@ -328,6 +329,44 @@ impl RetailGuest {
     }
     pub fn error(&self) -> Option<&str> {
         self.err.as_deref()
+    }
+
+    /// Guest memory at `addr`, for `VITASLOP_PEEK`.
+    pub fn peek(&self, addr: u32, len: usize) -> Vec<u8> {
+        self.sched.read_guest(addr, len)
+    }
+}
+
+/// `VITASLOP_PEEK=<hex addr>:<len>[,<hex addr>:<len>]`: hex-dump guest memory at the END of a
+/// headless run, as words with their addresses.
+///
+/// The alternative is a store watchpoint, and the two answer different questions. A watchpoint
+/// says WHO wrote a word; this says WHAT IS THERE, which is what you need when the suspicion is
+/// about the neighbours - "is this a table of records, and does the one next door hold the value
+/// this draw should have had". A watchpoint cannot show you a record nobody wrote.
+fn peek_regions(guest: &RetailGuest) {
+    let Ok(spec) = std::env::var("VITASLOP_PEEK") else { return };
+    for part in spec.split(',') {
+        let Some((a, n)) = part.trim().split_once(':') else { continue };
+        let (Ok(addr), Ok(len)) = (
+            u32::from_str_radix(a.trim().trim_start_matches("0x"), 16),
+            n.trim().parse::<usize>(),
+        ) else {
+            println!("peek: {part:?} is not <hex addr>:<len>");
+            continue;
+        };
+        let bytes = guest.peek(addr, len);
+        for (i, row) in bytes.chunks(32).enumerate() {
+            let words: Vec<String> = row
+                .chunks(4)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    format!("{:08x}", u32::from_le_bytes(w))
+                })
+                .collect();
+            println!("peek {:#010x}: {}", addr + i as u32 * 32, words.join(" "));
+        }
     }
 }
 
@@ -646,6 +685,10 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     if let Ok(top) = std::env::var("VITASLOP_BLOCK_HIST") {
         vitaslop_native::dump_block_hist(top.trim().parse().unwrap_or(40));
     }
+    // Sampler-unit bindings dropped at capture time, ranked by cause. Unconditional: a
+    // dropped unit is why a recompiled shader falls back, and the per-cause reports are
+    // deduped so only this says which cause is worth fixing first.
+    vitaslop_runtime::host::report_texture_drops();
     // VITASLOP_DUMP_STDOUT=<path>: write everything the GUEST logged to fd 1/2 this run.
     // Written before the error check, because a run that ended in a trap or a hang is exactly
     // the one whose log matters most.
@@ -696,6 +739,7 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         std::fs::write(&sw_path, sw.to_png()).map_err(|e| format!("write png: {e}"))?;
         println!("headless: wrote {}", sw_path.display());
     }
+    peek_regions(&guest);
     let frames = guest.frames();
     let clock_s = guest.clock_us() as f64 / 1e6;
     println!(
