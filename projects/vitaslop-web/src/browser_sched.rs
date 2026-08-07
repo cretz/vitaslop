@@ -43,68 +43,603 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+/// Host-call accounting for the live run: how many the guest has made, and how long they
+/// took inside the host.
+///
+/// # Why the browser needs this and native does not
+/// A browser frame is one opaque `await`: while a guest entry runs, nothing on the Rust
+/// side gets control except this import closure, so it is the ONLY place that can say
+/// what a long frame is spending its time on. Without it the two candidate explanations -
+/// translated guest code being slow, and the host-call seam being slow - produce exactly
+/// the same observation (a frame counter that does not move while Chrome burns CPU), and
+/// they need opposite fixes. The counter is a load and an add per call; the clock reads
+/// are two boundary crossings, which is noise beside a call that crosses the boundary
+/// dozens of times anyway.
+/// # Why the TIMING half is opt-in
+/// `performance.now()` is a call out to JS, and the split needs four of them per host
+/// call. At half a million host calls a second that is not a rounding error - measured
+/// here, it was most of what remained after the marshalling fix, so leaving it on would
+/// have made the fix look smaller than it is. Native's `perf` module makes the same
+/// choice for the same reason. The CALL COUNT stays unconditional: it is one add, and it
+/// is what tells a stuck frame from a busy one.
+mod hostcalls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        static MS: Cell<f64> = const { Cell::new(0.0) };
+        /// Of [`MS`], the part spent in the handler rather than around it.
+        static DISPATCH_MS: Cell<f64> = const { Cell::new(0.0) };
+    }
+
+    /// Whether to time each host call (`VITASLOP_PERF`). Read once and cached.
+    pub fn timing_enabled() -> bool {
+        thread_local! {
+            static ON: bool = vitaslop_runtime::knobs::flag("VITASLOP_PERF");
+        }
+        ON.with(|on| *on)
+    }
+
+    /// Host calls one guest thread may make before the browser preempts it
+    /// (`VITASLOP_BROWSER_QUANTUM_CALLS`, 0 disables preemption entirely).
+    ///
+    /// # This is a FAIRNESS backstop, NOT the game clock's driver
+    /// It used to be both, and that was the bug. A preemption advances the virtual game
+    /// clock (`SchedCore::on_quantum` -> `charge_cpu_quantum`), so whichever mechanism
+    /// preempts most sets the rate at which game time passes. Host-call count measures
+    /// host-call DENSITY, which differs by an order of magnitude between a menu and a
+    /// race, so a clock driven by it is calibrated for one screen and wrong on the rest.
+    ///
+    /// The previous default of 1,300 came from matching native's clock over this title's
+    /// LOADER - and the comment here already warned that "a ratio measured on one
+    /// workload does not transfer to another", which is exactly what then happened: on
+    /// the front end the same setting ran the clock 5.1x slow and stranded a frame-keyed
+    /// recipe on a timed screen for 14,000 frames.
+    ///
+    /// The clock is now driven by [`super::fuel_interval`], which counts guest WORK the
+    /// way native's engine fuel does. This stays as a liveness backstop for the one case
+    /// fuel cannot see - a thread that makes host calls in a straight line with no loop
+    /// back edge - so it is set far above the rate at which fuel fires and contributes
+    /// almost nothing to the clock.
+    pub fn quantum_calls() -> u64 {
+        thread_local! {
+            static N: u64 = match vitaslop_runtime::knobs::var("VITASLOP_BROWSER_QUANTUM_CALLS") {
+                // A backstop while fuel drives the clock - but if fuel is switched OFF
+                // this becomes the ONLY preemption again, and a 50,000-call quantum is
+                // far too coarse to schedule or to time with. Fall back to the old
+                // value in that case rather than silently making `FUEL=0` a much worse
+                // run than it used to be.
+                Err(_) if super::fuel_interval() == 0 => 1_300,
+                Err(_) => 50_000,
+                Ok(v) => v.parse().unwrap_or_else(|_| {
+                    panic!("VITASLOP_BROWSER_QUANTUM_CALLS={v} is not a call count")
+                }),
+            };
+        }
+        N.with(|n| *n)
+    }
+
+    thread_local! {
+        static SINCE_YIELD: Cell<u64> = const { Cell::new(0) };
+        /// Preemptions actually taken. Reported, because "I added preemption" and "the
+        /// guest is being preempted" are different claims and only the second is useful.
+        static QUANTA: Cell<u64> = const { Cell::new(0) };
+        /// Calls per import selector, so a runaway frame names the NID it is spinning on
+        /// the way native's `perf` module does. Selectors are dense loader indices.
+        static PER_SELECTOR: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+    }
+
+    /// Highest selector tracked per-NID; a real title imports a few hundred. Calls above
+    /// it still reach the totals, only their attribution is dropped.
+    const MAX_SELECTOR: usize = 4096;
+
+    /// Preemptions taken so far.
+    pub fn quanta() -> u64 {
+        QUANTA.with(|c| c.get())
+    }
+
+    thread_local! {
+        /// Preemptions taken because a thread ran out of SOFTWARE FUEL, as opposed to
+        /// because it made its quota of host calls. Counted separately because the two
+        /// answer different questions: a run whose fuel yields are zero has no guest
+        /// loop spinning without host calls, and a run where they dominate has one.
+        static FUEL_YIELDS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Count one fuel preemption.
+    pub fn note_fuel_yield() {
+        FUEL_YIELDS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fuel preemptions taken so far.
+    pub fn fuel_yields() -> u64 {
+        FUEL_YIELDS.with(|c| c.get())
+    }
+
+    thread_local! {
+        /// Calls per GUEST thread id. Every guest thread runs on this one worker, so
+        /// "which thread is burning the calls" is not answerable from the totals - and
+        /// that is exactly the question when one thread spins while another never runs.
+        static PER_THID: std::cell::RefCell<std::collections::BTreeMap<i32, u64>> =
+            std::cell::RefCell::new(std::collections::BTreeMap::new());
+    }
+
+    /// Count one call against `selector`, made by guest thread `thid`.
+    pub fn note_selector(selector: u32, thid: i32) {
+        PER_SELECTOR.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += 1;
+            }
+        });
+        PER_THID.with(|m| *m.borrow_mut().entry(thid).or_insert(0) += 1);
+    }
+
+    /// Calls per guest thread, descending.
+    pub fn by_thread() -> Vec<(i32, u64)> {
+        PER_THID.with(|m| {
+            let mut all: Vec<(i32, u64)> = m.borrow().iter().map(|(&t, &c)| (t, c)).collect();
+            all.sort_unstable_by_key(|&(_, c)| std::cmp::Reverse(c));
+            all
+        })
+    }
+
+    /// The `n` most-called selectors, descending.
+    pub fn top_selectors(n: usize) -> Vec<(u32, u64)> {
+        PER_SELECTOR.with(|v| {
+            let mut all: Vec<(u32, u64)> = v
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(i, c)| (i as u32, *c))
+                .collect();
+            all.sort_unstable_by_key(|&(_, c)| std::cmp::Reverse(c));
+            all.truncate(n);
+            all
+        })
+    }
+
+    /// Count one host call against the current thread's quantum, and say whether it just
+    /// expired. See [`super::preempt_note`] for why this exists.
+    pub fn quantum_expired() -> bool {
+        let limit = quantum_calls();
+        if limit == 0 {
+            return false;
+        }
+        let n = SINCE_YIELD.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        if n < limit {
+            return false;
+        }
+        reset_quantum();
+        QUANTA.with(|c| c.set(c.get() + 1));
+        true
+    }
+
+    /// Start a fresh quantum - called whenever the guest actually leaves the CPU, so a
+    /// thread that just blocked is not preempted the instant it resumes.
+    pub fn reset_quantum() {
+        SINCE_YIELD.with(|c| c.set(0));
+    }
+
+    /// How many host calls between progress lines. A guest frame makes thousands, so
+    /// this reports a few times a second on a healthy run and is the only sign of life
+    /// during a frame that takes minutes.
+    const REPORT_EVERY: u64 = 250_000;
+
+    thread_local! {
+        static LAST_REPORT_MS: Cell<f64> = const { Cell::new(0.0) };
+        static LAST_REPORT_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Fold one completed host call into the totals, and speak up periodically.
+    /// `ms` is the whole import closure; `dispatch_ms` is the handler within it.
+    /// Returns true when this call completed a reporting window, so the caller - which
+    /// holds the host and can turn a selector into a NID name - emits the breakdown.
+    pub fn record(ms: f64, dispatch_ms: f64) -> bool {
+        let calls = CALLS.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        let total_ms = MS.with(|m| {
+            m.set(m.get() + ms);
+            m.get()
+        });
+        let dispatch_total = DISPATCH_MS.with(|m| {
+            m.set(m.get() + dispatch_ms);
+            m.get()
+        });
+        if calls % REPORT_EVERY != 0 {
+            return false;
+        }
+        if !timing_enabled() {
+            // Untimed: the count and the preemption count are all there is, and they are
+            // still the difference between "this frame is grinding", "this frame is hung"
+            // and "this frame is never being let go of".
+            tracing::info!(
+                target: "vitaslop::perf",
+                "hostcalls: {calls} total, {} preemptions ({} on fuel)",
+                quanta(), fuel_yields()
+            );
+            return true;
+        }
+        let wall = now();
+        let (prev_wall, prev_calls) =
+            (LAST_REPORT_MS.with(|c| c.get()), LAST_REPORT_CALLS.with(|c| c.get()));
+        LAST_REPORT_MS.with(|c| c.set(wall));
+        LAST_REPORT_CALLS.with(|c| c.set(calls));
+        if prev_wall == 0.0 {
+            return true;
+        }
+        let dt = wall - prev_wall;
+        let rate = if dt > 0.0 { (calls - prev_calls) as f64 * 1000.0 / dt } else { 0.0 };
+        let per_call_us = if calls > 0 { total_ms * 1000.0 / calls as f64 } else { 0.0 };
+        let marshal_ms = total_ms - dispatch_total;
+        tracing::info!(
+            target: "vitaslop::perf",
+            "hostcalls: {calls} total, {rate:.0}/s over the last {dt:.0} ms, \
+             {total_ms:.0} ms cumulative ({per_call_us:.2} us/call) = \
+             {dispatch_total:.0} ms handler + {marshal_ms:.0} ms register marshalling, \
+             {} preemptions ({} on fuel)", quanta(), fuel_yields()
+        );
+        true
+    }
+
+    /// Total host calls made and milliseconds spent in them since the run started.
+    pub fn totals() -> (u64, f64) {
+        (CALLS.with(|c| c.get()), MS.with(|m| m.get()))
+    }
+
+    thread_local! {
+        /// JSPI SUSPENSIONS: every time a guest stack parked on a pending Promise.
+        static SUSPENDS: Cell<u64> = const { Cell::new(0) };
+        /// JSPI STACK STARTS: every `WebAssembly.promising` call, each of which makes V8
+        /// allocate a fresh wasm stack.
+        static STACK_STARTS: Cell<u64> = const { Cell::new(0) };
+        /// Stacks parked on a NEVER-resolving Promise. These can never be reclaimed: the
+        /// stack stays suspended and everything it holds stays live, for the rest of the
+        /// run.
+        static ABANDONED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Count one guest-stack suspension.
+    pub fn note_suspend() {
+        SUSPENDS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Count one fresh JSPI stack (a `promising` call).
+    pub fn note_stack_start() {
+        STACK_STARTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Count one stack parked forever on a never-resolving Promise.
+    pub fn note_abandoned_stack() {
+        ABANDONED.with(|c| c.set(c.get() + 1));
+    }
+
+    thread_local! {
+        /// Finished threads whose engine state was handed back.
+        static RELEASED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Count one finished thread whose module instance was released.
+    pub fn note_thread_released() {
+        RELEASED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Finished threads released so far. Reported next to the stack starts, because the
+    /// pair is the whole claim: instances created versus instances given back. One
+    /// number alone cannot show a leak closing.
+    pub fn released() -> u64 {
+        RELEASED.with(|c| c.get())
+    }
+
+    /// `(suspensions, stack starts, abandoned stacks)` so far.
+    ///
+    /// These three are reported per frame because a process that grows by a fixed amount
+    /// every frame is either allocating a fixed NUMBER of something per frame or a fixed
+    /// SIZE per unit of work, and only a count divides the growth into a per-item cost.
+    /// A JSPI stack is the largest single allocation the scheduler can make - megabytes -
+    /// so "how many were started and how many can never be freed" is the first question,
+    /// and it was not answerable at all before these existed.
+    pub fn stack_stats() -> (u64, u64, u64) {
+        (
+            SUSPENDS.with(|c| c.get()),
+            STACK_STARTS.with(|c| c.get()),
+            ABANDONED.with(|c| c.get()),
+        )
+    }
+
+    /// The `performance` clock of whichever global we run in (a Worker has no `window`).
+    pub fn now() -> f64 {
+        thread_local! {
+            static PERF: Option<web_sys::Performance> = js_sys::Reflect::get(
+                &js_sys::global(),
+                &wasm_bindgen::JsValue::from_str("performance"),
+            )
+            .ok()
+            .and_then(|p| wasm_bindgen::JsCast::dyn_into::<web_sys::Performance>(p).ok());
+        }
+        PERF.with(|p| p.as_ref().map(|p| p.now()).unwrap_or(0.0))
+    }
+}
+
+/// Total host calls and milliseconds spent in them since the run started. Published in
+/// the per-frame status so a slow frame names its own cause.
+pub fn host_call_totals() -> (u64, f64) {
+    hostcalls::totals()
+}
+
+/// `(suspensions, JSPI stack starts, abandoned stacks, released threads)` so far. See
+/// [`hostcalls::stack_stats`] for why a per-frame count is what makes a per-frame process
+/// growth attributable.
+pub fn stack_stats() -> (u64, u64, u64, u64) {
+    let (susp, starts, abandoned) = hostcalls::stack_stats();
+    (susp, starts, abandoned, hostcalls::released())
+}
+
+/// `(preemptions, of which on software fuel)` so far.
+///
+/// Reported per frame because these are what ADVANCE THE GAME CLOCK - every preemption
+/// charges `charge_cpu_quantum` a flat `QUANTUM_CPU_US` - so the clock's rate is exactly
+/// their rate, and the split says which trigger set it. A host-call preemption measures
+/// host-call density (which varies by screen) and a fuel preemption measures guest
+/// execution (which does not); a clock driven by the first is calibrated for whatever
+/// screen the calibration was taken on and wrong everywhere else.
+pub fn preemption_stats() -> (u64, u64) {
+    (hostcalls::quanta(), hostcalls::fuel_yields())
+}
+
+/// Announce, once, HOW this run preempts a guest thread - because it is not how native
+/// does it, and the difference is visible in every timing and every determinism
+/// signature.
+///
+/// # The browser has no fuel, and that is not a detail
+/// Native runs the guest on wasmtime with `fuel_async_yield_interval`, so a thread is
+/// interrupted after a fixed amount of EXECUTION whatever it is doing. That interrupt is
+/// also what advances the virtual game clock (`SchedCore::on_quantum` ->
+/// `charge_cpu_quantum`). The browser's WebAssembly engine offers no such thing: a guest
+/// thread here can only leave the CPU at a host call.
+///
+/// Left alone, that is not "slightly less preemptive" - it is a livelock. This title's
+/// loader busy-polls `sceKernelGetProcessTime` waiting for time to pass, and time only
+/// passes when a thread is preempted, so nothing ever ended the poll. Measured: native
+/// spent 107,362 host calls on such a frame; the browser passed 16,700,000 on the same
+/// one and was still going.
+///
+/// So the browser preempts on HOST CALLS, at a count calibrated to the resume rate
+/// native's fuel produces. Every busy-wait that asks the host something is reached by
+/// that.
+///
+/// # A host-call quantum is not enough on its own
+/// What it does NOT reach is a guest loop that makes no host call at all. That was long
+/// assumed not to occur; it does. Measured on this title: the browser reached display
+/// flip 2 and then burned 100% CPU indefinitely with a completely FLAT host-call count
+/// and zero scheduler rounds, while native ran the same boot to flip 45 in 4.3 s. The
+/// loop spins on a word another thread writes, so it can only ever end if the scheduler
+/// is allowed to run something else.
+///
+/// The second mechanism closes that: the transpiler emits a SOFTWARE FUEL counter on
+/// guest loop back edges (`vitaslop_transpiler::emit::set_fuel_interval`), which the
+/// browser turns on and native leaves off because wasmtime gives it real fuel. Both
+/// mechanisms preempt the same way and both advance the clock; they differ only in what
+/// they can see, so a run reports its yields split by cause.
+fn preempt_note() {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let n = hostcalls::quantum_calls();
+        let fuel = fuel_interval();
+        if n == 0 && fuel == 0 {
+            tracing::warn!(
+                target: "vitaslop::sched",
+                "browser preemption is DISABLED on BOTH mechanisms \
+                 (VITASLOP_BROWSER_QUANTUM_CALLS=0, VITASLOP_BROWSER_FUEL=0): a guest thread \
+                 will run until it blocks of its own accord, a busy-wait on the virtual clock \
+                 cannot terminate, and a guest loop that makes no host call will hang the tab"
+            );
+        } else if fuel == 0 {
+            tracing::warn!(
+                target: "vitaslop::sched",
+                "browser preemption: every {n} host calls, and SOFTWARE FUEL IS OFF \
+                 (VITASLOP_BROWSER_FUEL=0) - a guest loop that makes no host call is not \
+                 interruptible in this run and will hang the tab if one is reached"
+            );
+        } else {
+            tracing::info!(
+                target: "vitaslop::sched",
+                "browser preemption: every {fuel} units of software fuel (the engine has \
+                 no fuel counter of its own, so the module counts itself by wasmtime's \
+                 rule - this is native's own quantum in native's own unit), with a {n} \
+                 host-call backstop. Fuel is the clock's driver; the host-call count is \
+                 only a liveness net."
+            );
+        }
+    });
+}
+
+/// Guest work a thread may execute before the browser preempts it, in WASMTIME FUEL UNITS
+/// (`VITASLOP_BROWSER_FUEL`, 0 disables software fuel entirely). Accounted per wasm basic
+/// block as the module is emitted, tested on loop back edges - see
+/// `vitaslop_transpiler::emit::Body` and `emit_fuel_check`.
+///
+/// # This is the browser's GAME CLOCK RATE, and it is THE SAME UNIT AS NATIVE'S
+/// A preemption is what advances the virtual game clock (`SchedCore::on_quantum` ->
+/// `charge_cpu_quantum`, a flat `QUANTUM_CPU_US` each), so the clock's rate is the
+/// preemption rate. Native preempts on 5,000,000 units of wasmtime ENGINE FUEL over this
+/// very module. The transpiler now reproduces wasmtime's own accounting - its operator
+/// cost table and its flush points - so this is native's number in native's unit rather
+/// than a constant fitted to make two different scales agree.
+///
+/// It is deliberately the DOMINANT mechanism: the host-call quantum
+/// ([`hostcalls::quantum_calls`]) measures host-call DENSITY, which varies by an order of
+/// magnitude between a menu and a race, so a clock driven by it is calibrated for
+/// whichever screen the calibration was taken on and wrong on every other. That model
+/// measured 17.37 s of game clock where native had 88.688 s - **5.1x slow** - and it
+/// stranded a frame-keyed recipe on a timed screen for 14,000 frames while native was two
+/// screens further on.
+///
+/// # Why fitting a constant never worked
+/// Every earlier model measured a PROXY for guest work, and a proxy's ratio to the real
+/// thing moves with the workload, so the error moved too and no scalar tracked it:
+///
+/// | IR-statement interval | ~f10,300 | ~f29,300 | ~f40,800 |
+/// |-----------------------|----------|----------|----------|
+/// | 405,000               | **+1%**  | +27%     | +65%     |
+/// | 428,000               | -12%     | -12%     | -12%     |
+/// | 440,000               | -14%     | -15%     | -23%     |
+///
+/// A value perfect at one frame and 65% out at another is worse everywhere it is not
+/// being measured. **That the error moved with the workload rather than scaling is the
+/// evidence that the UNIT was wrong rather than the number** - so the unit was replaced,
+/// twice, rather than the constant being re-fitted again.
+///
+/// # It is not linear, so never tune it by ratio
+/// A faster clock changes how much guest work happens per frame, so this is a feedback
+/// loop: at the old unit, below roughly 400,000 the run BIFURCATED - the title cleared a
+/// load in far fewer frames and ended up AHEAD of native. Re-calibrate by running the
+/// whole curve against native at several frames, never by scaling a single point.
+///
+/// Read once, before the transpile that bakes it into the module - it is an emit-time
+/// property of the code, not something a running thread can be re-tuned with.
+pub fn fuel_interval() -> u32 {
+    thread_local! {
+        static N: u32 = match vitaslop_runtime::knobs::var("VITASLOP_BROWSER_FUEL") {
+            // Native's `fuel_async_yield_interval`, in the unit both now count.
+            Err(_) => 5_000_000,
+            Ok(v) => v.parse().unwrap_or_else(|_| {
+                panic!("VITASLOP_BROWSER_FUEL={v} is not a fuel count")
+            }),
+        };
+    }
+    N.with(|n| *n)
+}
+
 /// The shared host: a single `VitaEnv` behind an `Arc<Mutex>` (single-threaded here,
 /// so the lock never contends - it just satisfies `SchedCore`'s bound, which mirrors
 /// native's `Send` host).
 type Host = Arc<Mutex<VitaEnv>>;
 
 /// A `Uint8Array` view over the shared linear memory, rebased so guest address `A` is
-/// byte `A - base`. Rebuilt per host call because a `memory.grow` would detach the
-/// buffer (the guest never grows the fixed shared memory, but this stays correct).
+/// byte `A - base`.
+///
+/// # The view is built ONCE, and that is a load-bearing property
+/// This used to call `Uint8Array::new(&self.mem.buffer())` inside every `read`, `write`
+/// and `len` - allocating a fresh JS typed array per ACCESS, not per host call. A host
+/// call is made of guest-memory accesses (every pointer argument, every struct field,
+/// every string), so a four-byte `read_u32` cost a `.buffer` getter, a `Uint8Array`
+/// allocation, a `subarray` allocation and a copy. That is what made a browser guest
+/// frame take minutes against 55 ms native.
+///
+/// Caching is sound because this memory CANNOT change identity: it is created with
+/// `initial == maximum` (see `BrowserEngine::new`), so it never grows, and its buffer is
+/// a `SharedArrayBuffer`, which never detaches. A growable memory would need the view
+/// rebuilt on grow - there isn't one, and if one ever appears the fixed size is asserted
+/// at construction rather than silently worked around here.
+#[derive(Clone)]
 struct SharedView {
-    mem: WebAssembly::Memory,
+    bytes: Uint8Array,
 }
 
 impl GuestMemory for SharedView {
     fn len(&self) -> usize {
-        Uint8Array::new(&self.mem.buffer()).length() as usize
+        self.bytes.length() as usize
     }
     fn read(&self, off: usize, buf: &mut [u8]) {
-        Uint8Array::new(&self.mem.buffer())
-            .subarray(off as u32, (off + buf.len()) as u32)
-            .copy_to(buf);
+        self.bytes.subarray(off as u32, (off + buf.len()) as u32).copy_to(buf);
     }
     fn write(&mut self, off: usize, bytes: &[u8]) {
-        Uint8Array::new(&self.mem.buffer())
-            .subarray(off as u32, (off + bytes.len()) as u32)
-            .copy_from(bytes);
+        self.bytes.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
     }
+}
+
+// Batched register marshalling, in JS.
+//
+// # Why a JS helper and not a Rust loop
+// A host call has to move the guest's whole register file out of the instance's wasm
+// globals and back. Done from Rust that is `Global::value()` per register - and each one
+// is a call out to the wasm-bindgen glue, a JS value pushed into the shared heap table,
+// an `as_f64` back across, and a drop: four boundary crossings for four bytes. Times 32
+// registers, times two directions, that is over a hundred crossings per host call, and a
+// retail title makes millions of host calls per loading frame. It measured 3.3 us per
+// call, nearly all of it here.
+//
+// The loop itself is trivial - it is the BOUNDARY that costs. So the loop moves to the
+// side of the boundary where the globals live, and the whole file crosses once, as one
+// `Float64Array`. `inline_js` (rather than `new Function`) so the helper is an ordinary
+// ES module wasm-bindgen emits, and a page with a strict CSP can still run it.
+#[wasm_bindgen(inline_js = "
+export function save_globals(globals, out) {
+  for (let i = 0; i < globals.length; i++) out[i] = globals[i].value;
+}
+export function load_globals(globals, values) {
+  for (let i = 0; i < globals.length; i++) globals[i].value = values[i];
+}
+")]
+extern "C" {
+    /// Copy every global's value into `out`, in order.
+    fn save_globals(globals: &Array, out: &js_sys::Float64Array);
+    /// Write `values` back into every global, in order.
+    fn load_globals(globals: &Array, values: &js_sys::Float64Array);
 }
 
 /// A guest instance's mutable state the host reaches during a call: its 16 ARM
 /// register globals, its VFP single-precision argument globals, and the shared memory.
 struct ThreadRt {
+    /// The ARM register globals, for the few single-register accesses (a park's resume
+    /// code, an entry's seed values). Bulk transfer goes through [`ThreadRt::file`].
     regs: Vec<WebAssembly::Global>,
-    vfp: Vec<WebAssembly::Global>,
-    mem: WebAssembly::Memory,
+    /// The same globals as one JS array - the 16 ARM registers followed by the VFP
+    /// argument registers - so the whole file marshals in a single boundary crossing
+    /// through [`save_globals`] / [`load_globals`].
+    file: Array,
+    /// The staging buffer that array is copied through, allocated once per thread.
+    staging: js_sys::Float64Array,
+    /// The whole shared memory as one typed array, built once. See [`SharedView`] for
+    /// why caching it is both sound and load-bearing.
+    view: SharedView,
     base: u32,
 }
 
+/// Slots in [`ThreadRt::file`]: the ARM registers, then the VFP argument registers.
+const FILE_LEN: usize = abi::REG_COUNT + VFP_ARG_COUNT;
+
 impl ThreadRt {
-    fn read_regs(&self) -> [u32; abi::REG_COUNT] {
-        let mut r = [0u32; abi::REG_COUNT];
-        for (i, g) in self.regs.iter().enumerate() {
-            r[i] = g.value().as_f64().unwrap_or(0.0) as i64 as u32;
+    /// The whole register file, in one crossing each way.
+    ///
+    /// A register value is a `u32` carried as an `f64`, which is exact (an `f64` holds
+    /// every integer up to 2^53), so nothing is lost in the round trip - the per-register
+    /// path this replaced used the same representation.
+    fn read_file(&self) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
+        save_globals(&self.file, &self.staging);
+        let mut buf = [0f64; FILE_LEN];
+        self.staging.copy_to(&mut buf);
+        let mut regs = [0u32; abi::REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = buf[i] as i64 as u32;
         }
-        r
-    }
-    fn write_regs(&self, regs: &[u32; abi::REG_COUNT]) {
-        for (i, g) in self.regs.iter().enumerate() {
-            g.set_value(&JsValue::from_f64(regs[i] as f64));
+        for (i, v) in vfp.iter_mut().enumerate() {
+            *v = buf[abi::REG_COUNT + i] as i64 as u32;
         }
+        (regs, vfp)
     }
-    fn read_vfp(&self) -> [u32; VFP_ARG_COUNT] {
-        let mut v = [0u32; VFP_ARG_COUNT];
-        for (i, g) in self.vfp.iter().enumerate() {
-            v[i] = g.value().as_f64().unwrap_or(0.0) as i64 as u32;
+
+    fn write_file(&self, regs: &[u32; abi::REG_COUNT], vfp: &[u32; VFP_ARG_COUNT]) {
+        let mut buf = [0f64; FILE_LEN];
+        for (i, r) in regs.iter().enumerate() {
+            buf[i] = *r as f64;
         }
-        v
-    }
-    fn write_vfp(&self, vfp: &[u32; VFP_ARG_COUNT]) {
-        for (i, g) in self.vfp.iter().enumerate() {
-            g.set_value(&JsValue::from_f64(vfp[i] as f64));
+        for (i, v) in vfp.iter().enumerate() {
+            buf[abi::REG_COUNT + i] = *v as f64;
         }
+        self.staging.copy_from(&buf);
+        load_globals(&self.file, &self.staging);
     }
+
     fn set_reg(&self, i: usize, v: u32) {
         self.regs[i].set_value(&JsValue::from_f64(v as f64));
     }
@@ -112,7 +647,7 @@ impl ThreadRt {
         self.regs[i].value().as_f64().unwrap_or(0.0) as i64 as u32
     }
     fn view(&self) -> SharedView {
-        SharedView { mem: self.mem.clone() }
+        self.view.clone()
     }
 }
 
@@ -126,7 +661,31 @@ impl ThreadRt {
 pub struct BrowserThread {
     thid: i32,
     priority: i32,
+    /// Everything the ENGINE holds for this thread, dropped by
+    /// [`release`](ThreadHandle::release) the moment the scheduler records the thread as
+    /// finished. `None` afterwards: a finished thread is never picked again, so only its
+    /// identity above is still read.
+    ///
+    /// This is `Option` rather than plain fields precisely so the release is total. A
+    /// guest thread here is one `WebAssembly.Instance` of the ENTIRE transpiled title
+    /// plus a JSPI stack - about 7 MB - and the pieces reference each other (the entry
+    /// functions hold the instance, the import closure holds the register file), so
+    /// clearing them one at a time leaves whichever one was forgotten pinning the rest.
+    engine: Option<ThreadEngine>,
+    /// The shared host, so the un-park path can claim any return code owed to this
+    /// thread (a timed wait that expired -> WAIT_TIMEOUT) and write it into r0 before
+    /// the guest stack resumes. Native does this inside its import closure after the
+    /// block await; the browser has no such re-entry, so it applies it here.
+    host: Host,
+}
+
+/// The per-thread engine state: one module instance and the JSPI machinery that drives
+/// it. Held by [`BrowserThread`] only while the thread is live.
+struct ThreadEngine {
     rt: Rc<ThreadRt>,
+    /// The same `ThreadRt` as the import closure sees it. Cleared on release, so the
+    /// closure stops pinning the instance's register file.
+    rt_cell: Rc<RefCell<Option<Rc<ThreadRt>>>>,
     /// One `promising`-wrapped entry per address, run in order.
     entries: Vec<Function>,
     /// Index of the entry currently running (or about to start).
@@ -145,11 +704,6 @@ pub struct BrowserThread {
     /// The resolver of the Promise a suspended thread is parked on; the scheduler calls
     /// it to un-park (resume) the thread.
     cont: Rc<RefCell<Option<Function>>>,
-    /// The shared host, so the un-park path can claim any return code owed to this
-    /// thread (a timed wait that expired -> WAIT_TIMEOUT) and write it into r0 before
-    /// the guest stack resumes. Native does this inside its import closure after the
-    /// block await; the browser has no such re-entry, so it applies it here.
-    host: Host,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
 }
@@ -160,6 +714,17 @@ impl ThreadHandle for BrowserThread {
     }
     fn priority(&self) -> i32 {
         self.priority
+    }
+
+    fn release(&mut self) {
+        let Some(engine) = self.engine.take() else { return };
+        // Break the closure -> register-file reference before dropping, so nothing the
+        // instance can still be reached through outlives this call.
+        *engine.rt_cell.borrow_mut() = None;
+        engine.signal.borrow_mut().take();
+        engine.cont.borrow_mut().take();
+        hostcalls::note_thread_released();
+        drop(engine);
     }
 }
 
@@ -231,6 +796,9 @@ fn deliver(signal: &Rc<RefCell<Option<Function>>>, ev: &Ev) {
 pub struct BrowserEngine {
     module: WebAssembly::Module,
     shared_mem: WebAssembly::Memory,
+    /// The one cached typed-array view over `shared_mem`, handed to every thread and to
+    /// every host call. See [`SharedView`].
+    view: SharedView,
     host: Host,
     base: u32,
     /// `WebAssembly.promising` (not in the wasm-bindgen bindings; fetched by name).
@@ -275,20 +843,89 @@ impl BrowserEngine {
             let signal = signal.clone();
             let cont = cont.clone();
             Closure::wrap(Box::new(move |selector: i32| -> JsValue {
+                // A software fuel point (see `vitaslop_transpiler::emit::set_fuel_interval`)
+                // is not a host call and must not be billed as one: it carries no
+                // arguments and no return value, so marshalling the register file for it
+                // - which is 91% of what a host call costs here - would be pure waste on
+                // the one path added specifically to make spinning cheap. Counting it
+                // would also put a synthetic entry at the top of every per-NID profile
+                // and reset the host-call quantum, which measures a different thing.
+                if selector as u32 == vitaslop_transpiler::abi::FUEL_SELECTOR {
+                    hostcalls::note_fuel_yield();
+                    // The thread is leaving the CPU, so its host-call quantum starts
+                    // fresh - the same rule every other suspension here follows. Without
+                    // it a thread that fuel-yielded would carry a nearly-spent host-call
+                    // budget back in and preempt again almost immediately, billing the
+                    // clock twice for one switch.
+                    hostcalls::reset_quantum();
+                    return suspend(&signal, &cont, Stop::Quantum);
+                }
+                let timed = hostcalls::timing_enabled();
+                let clock = || if timed { hostcalls::now() } else { 0.0 };
+                let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
-                let mut regs = rt.read_regs();
-                let mut vfp = rt.read_vfp();
+                let (mut regs, mut vfp) = rt.read_file();
+                let d0 = clock();
                 let outcome = {
                     let mut mem = rt.view();
                     let mut host = host.lock().unwrap();
                     host.set_current_thread(thid);
                     host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
                 };
-                rt.write_regs(&regs);
-                rt.write_vfp(&vfp);
+                let d1 = clock();
+                rt.write_file(&regs, &vfp);
+                // Split the call the way native's `perf` module does: the handler versus
+                // everything around it. The difference is register MARSHALLING - work the
+                // guest never asked for - and the two need completely different fixes.
+                hostcalls::note_selector(selector as u32, thid);
+                if hostcalls::record(clock() - t0, d1 - d0) {
+                    // Name the NIDs the guest is spending its calls on. This is the
+                    // browser twin of what native's per-selector `perf` breakdown does,
+                    // and it is the difference between "millions of host calls" and
+                    // "millions of calls to one specific NID", which are different bugs.
+                    let host = host.lock().unwrap();
+                    let top: Vec<String> = hostcalls::top_selectors(5)
+                        .into_iter()
+                        .map(|(sel, n)| match host.import_at(sel) {
+                            Some((_, func_nid)) => {
+                                format!("{} x{n}", vitaslop_runtime::nid::name(func_nid))
+                            }
+                            None => format!("selector {sel} x{n}"),
+                        })
+                        .collect();
+                    tracing::info!(target: "vitaslop::perf", "hostcalls by nid: {}", top.join(", "));
+                    let threads: Vec<String> = hostcalls::by_thread()
+                        .into_iter()
+                        .take(6)
+                        .map(|(t, n)| format!("thid {t:#x} x{n}"))
+                        .collect();
+                    tracing::info!(
+                        target: "vitaslop::perf",
+                        "hostcalls by thread: {}", threads.join(", ")
+                    );
+                    // The decisive question when a frame will not end is whether the
+                    // thread that should finish it is PARKED (and on what) or merely not
+                    // being picked. Only this dump answers it, and a browser run has no
+                    // other way to ask - there is no session command to type here.
+                    tracing::debug!(
+                        target: "vitaslop::sched",
+                        "stall dump:\n{}", host.state.debug_sync_dump()
+                    );
+                }
+                // Anything but a plain return means the guest is leaving the CPU anyway,
+                // so its quantum starts fresh.
+                if !matches!(outcome, SvcOutcome::Continue) {
+                    hostcalls::reset_quantum();
+                }
                 match outcome {
                     // Plain return: the guest continues without suspending (the cheap,
-                    // common path - most host calls just return a value).
+                    // common path - most host calls just return a value)... unless this
+                    // thread has used its quantum, in which case preempt it here. This is
+                    // the browser's stand-in for native's fuel interrupt; see
+                    // [`preempt_note`] for why the run cannot work without one.
+                    SvcOutcome::Continue if hostcalls::quantum_expired() => {
+                        suspend(&signal, &cont, Stop::Quantum)
+                    }
                     SvcOutcome::Continue => JsValue::UNDEFINED,
                     // A switch point: tell the scheduler why we stopped, then return a
                     // pending Promise so the guest stack suspends until it resolves.
@@ -344,7 +981,7 @@ impl BrowserEngine {
         let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
         if tp != 0 {
             if tls_len != 0 {
-                let view = Uint8Array::new(&self.shared_mem.buffer());
+                let view = &self.view.bytes;
                 let src = tls_src.wrapping_sub(self.base);
                 let dst = tp.wrapping_sub(self.base);
                 let head = view.subarray(src, src + tls_len).to_vec();
@@ -357,7 +994,15 @@ impl BrowserEngine {
 
         let regs = read_globals(&exports, |i| abi::reg_export(i), abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
-        let rt = Rc::new(ThreadRt { regs, vfp, mem: self.shared_mem.clone(), base: self.base });
+        // The same globals as one JS array, ARM registers first, so a host call marshals
+        // the whole file in one crossing rather than one per register.
+        let file = Array::new();
+        for g in regs.iter().chain(vfp.iter()) {
+            file.push(g);
+        }
+        let staging = js_sys::Float64Array::new_with_length(FILE_LEN as u32);
+        let rt =
+            Rc::new(ThreadRt { regs, file, staging, view: self.view.clone(), base: self.base });
         *rt_cell.borrow_mut() = Some(rt.clone());
 
         let mut wrapped = Vec::with_capacity(entries.len());
@@ -374,18 +1019,21 @@ impl BrowserEngine {
         Ok(BrowserThread {
             thid,
             priority,
-            rt,
-            entries: wrapped,
-            entry_idx: 0,
-            entry_started: false,
-            sp,
-            r0,
-            r1,
-            r2,
-            signal,
-            cont,
             host: self.host.clone(),
-            _import: import_closure,
+            engine: Some(ThreadEngine {
+                rt,
+                rt_cell,
+                entries: wrapped,
+                entry_idx: 0,
+                entry_started: false,
+                sp,
+                r0,
+                r1,
+                r2,
+                signal,
+                cont,
+                _import: import_closure,
+            }),
         })
     }
 }
@@ -400,10 +1048,20 @@ impl GuestEngine for BrowserEngine {
 
     fn write_mem(&mut self, addr: u32, bytes: &[u8]) {
         let off = addr.wrapping_sub(self.base) as usize;
-        let view = Uint8Array::new(&self.shared_mem.buffer());
+        let view = &self.view.bytes;
         if off + bytes.len() <= view.length() as usize {
             view.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
         }
+    }
+
+    fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool {
+        let off = addr.wrapping_sub(self.base) as usize;
+        let view = &self.view.bytes;
+        if off.checked_add(out.len()).is_none_or(|end| end > view.length() as usize) {
+            return false;
+        }
+        view.subarray(off as u32, (off + out.len()) as u32).copy_to(out);
+        true
     }
 
     fn mirror_base(&self) -> Option<u32> {
@@ -424,6 +1082,7 @@ fn suspend(
     let park = Promise::new(&mut |resolve, _reject| {
         *cont.borrow_mut() = Some(resolve);
     });
+    hostcalls::note_suspend();
     deliver(signal, &Ev::Suspend(stop));
     park.into()
 }
@@ -431,6 +1090,7 @@ fn suspend(
 /// A Promise that never resolves - a finished thread's stack parks here forever (it is
 /// never resumed), the browser analog of a fiber that has returned.
 fn never() -> JsValue {
+    hostcalls::note_abandoned_stack();
     Promise::new(&mut |_resolve, _reject| {}).into()
 }
 
@@ -457,6 +1117,11 @@ fn read_globals(
 /// thread (matching native's `instantiate_thread_seq`). Only a suspend, a halt, a trap,
 /// or the final entry ending yields a [`ThreadStep`].
 async fn resume(t: &mut BrowserThread) -> ThreadStep {
+    let thid = t.thid;
+    let host = t.host.clone();
+    // A released thread is a finished one, and `pick_next` never returns a finished
+    // thread - so reaching here without engine state is a scheduler bug, not an input.
+    let t = t.engine.as_mut().expect("resume of a released (finished) thread");
     loop {
         // A fresh step channel for this turn; the import closure or the entry's
         // completion fills its resolver.
@@ -471,6 +1136,17 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             t.rt.set_reg(0, if t.entry_idx == 0 { t.r0 } else { 0 });
             t.rt.set_reg(1, if t.entry_idx == 0 { t.r1 } else { 0 });
             t.rt.set_reg(2, if t.entry_idx == 0 { t.r2 } else { 0 });
+            hostcalls::note_stack_start();
+            // Which thread started a stack, and which of its entries. A count alone says
+            // stacks are being created; it cannot say whether that is a handful of guest
+            // threads each running a long entry sequence once, or one thread starting
+            // entries over and over - and those are a normal run and a leak respectively.
+            tracing::debug!(
+                target: "vitaslop::sched",
+                "jspi stack start: thid {thid:#x} entry {}/{}",
+                t.entry_idx,
+                t.entries.len()
+            );
             let done: Promise = match t.entries[t.entry_idx].call0(&JsValue::UNDEFINED) {
                 Ok(p) => p.unchecked_into(),
                 Err(e) => return ThreadStep::Finished(FiberEnd::Error(format!("start: {e:?}"))),
@@ -495,7 +1171,7 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             // 0 it parked with (a WAIT_TIMEOUT); write it into r0 before the guest
             // stack resumes. A signal wake has no code and keeps r0 = 0. (Native does
             // the equivalent inside its import closure after the block await.)
-            if let Some(code) = t.host.lock().unwrap().take_resume_code(t.thid) {
+            if let Some(code) = host.lock().unwrap().take_resume_code(thid) {
                 t.rt.set_reg(0, code);
             }
             // Un-park: resolving the parked Promise resumes the suspended guest stack.
@@ -524,13 +1200,31 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
     }
 }
 
+/// How often [`run_frames`] reports its round count.
+///
+/// Sized against the observed round rate, not guessed: with preemption at ~1,300 host
+/// calls a long frame retires a few thousand rounds a second, so a 100,000-round window
+/// would have said nothing for minutes - which is exactly the silence this report exists
+/// to break.
+const PROGRESS_ROUNDS: u64 = 2_000;
+
 /// The browser preemptive run loop: the async twin of native's
 /// `Scheduler::run_frames`, composing the shared [`SchedCore`]. Runs until the process
 /// halts, all threads finish, the run deadlocks, or `max_frames`/`max_rounds` is hit.
+///
+/// `progress` is called every [`PROGRESS_ROUNDS`] scheduler rounds with the count so far.
+/// A single guest frame can be MILLIONS of rounds - the first one runs every
+/// `module_init` and the whole eboot entry before the title's first display flip - and
+/// until this existed such a frame was completely silent: the page reported the frame
+/// number it had last FINISHED, so a healthy run grinding through a heavy frame and a
+/// hung one printed the identical line for minutes. The round count is what tells them
+/// apart, and its rate is the only direct read on how fast the browser executes guest
+/// code at all.
 pub async fn run_frames(
     core: &mut SchedCore<BrowserEngine, VitaEnv>,
     max_frames: u64,
     max_rounds: u64,
+    progress: &mut dyn FnMut(u64),
 ) -> RunReport {
     let mut rounds = 0u64;
     loop {
@@ -538,6 +1232,9 @@ pub async fn run_frames(
             return RunReport::RoundLimit;
         }
         rounds += 1;
+        if rounds % PROGRESS_ROUNDS == 0 {
+            progress(rounds);
+        }
 
         let Some(idx) = core.pick_next() else {
             match core.handle_idle() {
@@ -660,10 +1357,13 @@ fn build_engine(
         Reflect::set(&desc, &JsValue::from_str("maximum"), &JsValue::from_f64(mem_pages as f64))?;
         Reflect::set(&desc, &JsValue::from_str("shared"), &JsValue::TRUE)?;
         let shared_mem = WebAssembly::Memory::new(&desc)?;
+        // The one view over it, for the life of the run. Sound because `initial ==
+        // maximum` above makes this memory non-growable and its SharedArrayBuffer never
+        // detaches - see [`SharedView`] for why rebuilding it per access was the whole
+        // browser performance problem.
+        let view = SharedView { bytes: Uint8Array::new(&shared_mem.buffer()) };
         // Seed the image at offset 0.
-        Uint8Array::new(&shared_mem.buffer())
-            .subarray(0, image.len() as u32)
-            .copy_from(image);
+        view.bytes.subarray(0, image.len() as u32).copy_from(image);
 
         // Shared non-suspending env stubs. svc is unused on the Vita path; a dispatch
         // miss (an indirect call to an untranslated target) throws a clear error.
@@ -678,10 +1378,15 @@ fn build_engine(
         }) as Box<dyn FnMut(i32, i32)>);
         let dispatch_miss_fn: JsValue = dispatch_miss.as_ref().clone();
 
+        // Say how this run preempts before any guest code runs, so the one behavioural
+        // difference from native is on the record rather than inferred from timings.
+        preempt_note();
+
         let host: Host = Arc::new(Mutex::new(env));
         let engine = BrowserEngine {
             module,
             shared_mem,
+            view,
             host: host.clone(),
             base,
             promising,

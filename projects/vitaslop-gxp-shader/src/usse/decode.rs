@@ -1941,11 +1941,22 @@ fn decode_grp_tex(word: u64) -> Instr {
     let dest_pa = bits(word, 39, 39) != 0;
     let dest_bank = if dest_pa { Bank::PrimaryAttr } else { Bank::Temp };
     let dest_n = bits(word, 27, 21);
-    // The SMP destination is NOT double-scaled the way an ALU operand is: an F16 4-component
-    // result lands in the register PAIR `dest_n, dest_n+1`. Established by def-use chains in
-    // real fragment blobs (every albedo/ambient/fog sample resolves only under this rule);
-    // see the SA-bank layout notes distilled alongside the ISA reference.
-    let dest_reg = if result_f16 { dest_n } else { reg_index(dest_n) as u32 };
+    // The SMP destination is NOT double-scaled the way an ALU operand is, at EITHER precision:
+    // `dest_n` is the register the result starts at, and it occupies as many registers as its
+    // width needs - two for an F16 pair, four for F32.
+    //
+    // The F16 half was established by def-use chains in real fragment blobs (every
+    // albedo/ambient/fog sample resolves only under this rule). The F32 half was decoded as
+    // DOUBLED by analogy with the ALU operand rule, and that was wrong; the corpus settles it
+    // (`full_precision_sample_destination_closure`). A title's vector-canvas VERTEX program
+    // samples with `dest_n = 4`: it writes temps {0..3, 8..11} under the doubled reading, then
+    // READS {0..3, 4, 5, 7} - so the sample lands where nothing reads it and three reads name
+    // registers the program never writes. Direct, every read closes against a write. The
+    // shipped compiler does not emit programs that read undefined temporaries.
+    //
+    // Nothing else in three titles' corpora discriminates: every other full-precision sample
+    // uses `dest_n = 0`, where the two readings are the same register.
+    let dest_reg = dest_n;
     let (dbank, didx) = if matches!(dest_bank, Bank::Temp) && (124..=127).contains(&dest_n) {
         (Bank::Internal, internal_base(dest_n - 124))
     } else {
@@ -2197,7 +2208,20 @@ fn decode_grp_flow(word: u64) -> Instr {
     } else if op2 == 0b100 && opcat == 0b10 {
         (Op::Todo("flow limm load-immediate"), Some("0xF8 LIMM (load 32-bit immediate) not yet wired"))
     } else if op2 == 0b011 && opcat == 0b11 {
-        (Op::Todo("flow depthf depth-write"), Some("0xF8 DEPTHF (fragment depth write) not yet wired"))
+        // DEPTHF (spec F8.7): write `src0` - a scalar - into the fragment depth output.
+        //
+        // `two_sided` (bit 39) and `feedback` (bits 38:37) select variants whose extra
+        // behaviour the reference does not resolve, and neither is a detail that can be
+        // ignored: a depth WRITE is what the depth test then compares against, so a variant
+        // silently treated as the plain form would sort the whole surface wrongly. Both are
+        // zero on the only DEPTHF this corpus contains, so anything else blocks.
+        let mut d = None;
+        if bits(word, 39, 39) != 0 {
+            d = Some("0xF8 DEPTHF two-sided variant not modeled");
+        } else if bits(word, 38, 37) != 0 {
+            d = Some("0xF8 DEPTHF feedback mode not modeled");
+        }
+        (Op::DepthF, d)
     } else if opcat_extra == 0 && opcat == 0 {
         // BR (branch) family. `br_op` (bits[40:39]) selects the member within it: 0 is a plain
         // branch, and the reference's return shape carries 2. The word EVERY captured vertex
@@ -2274,12 +2298,39 @@ fn decode_grp_flow(word: u64) -> Instr {
         Predicate::Always
     };
 
+    // DEPTHF is the one member of this group with a data operand: `src0` (bank bit 36 + ext
+    // bit 51, number bits 20:14) holds the depth. The number is read DIRECT, not
+    // double-register scaled: scaling belongs to the float data types (spec A.3), and this
+    // group carries no data-type field at all to select one. The corpus cannot separate the
+    // two readings on its own - its single DEPTHF names register 0, where they agree - so the
+    // argument has to come from the encoding, and it does.
+    let srcs = if matches!(op, Op::DepthF) {
+        let sel = bits(word, 36, 36);
+        let ext = bits(word, 51, 51);
+        // Spec A.2, src0 bank: ext=0 -> 0 TEMP / 1 PRIMATTR; ext=1 -> 0 OUTPUT / 1 SECATTR.
+        let bank = match (ext, sel) {
+            (0, 0) => Bank::Temp,
+            (0, _) => Bank::PrimaryAttr,
+            (_, 0) => Bank::Output,
+            (_, _) => Bank::SecondaryAttr,
+        };
+        let n = bits(word, 20, 14);
+        let (b, i) = if matches!(bank, Bank::Temp) && (124..=127).contains(&n) {
+            (Bank::Internal, internal_base(n - 124))
+        } else {
+            (bank, r7_reg_index(n))
+        };
+        vec![Operand::plain(b, i, sel as u8)]
+    } else {
+        Vec::new()
+    };
+
     Instr {
         op,
         pred,
         dest: None,
         write_mask: [false; 4],
-        srcs: Vec::new(),
+        srcs,
         half_precision: false,
         raw: word,
         group: 0x1f,
@@ -2886,7 +2937,11 @@ mod tests {
     #[test]
     fn tex_decodes_sampler_coord_and_dest() {
         // 0xE0 tex: 2D (dim field 1), implicit LOD, normal sample. coord src0 = pa
-        // (sel=1,ext=0) reg 4 -> pa8; sampler src1 = 5; dest_use_pa=0 -> temp reg 3 -> r6.
+        // (sel=1,ext=0) reg 4 -> pa8; sampler src1 = 5; dest_use_pa=0 -> temp `dest_n` 3 -> r3.
+        //
+        // The DESTINATION is direct at either precision - it is not double-register scaled the
+        // way an ALU operand is (see `decode_grp_tex`, and the corpus closure test that settles
+        // it). This assertion said r6 while that was decoded as `2*dest_n`.
         let w = word_bits(&[
             (0x1c, 63, 59), // opcode1 (tex)
             (1, 43, 42),    // dim = 2D
@@ -2903,7 +2958,7 @@ mod tests {
         assert_eq!(ins.group, 0x1c);
         assert_eq!(ins.op, Op::Tex { unit: 5, coords: 2, coord_half: false, lod: TexLod::Implicit });
         assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::PrimaryAttr, 8));
-        assert_eq!((ins.dest.unwrap().bank, ins.dest.unwrap().index), (Bank::Temp, 6));
+        assert_eq!((ins.dest.unwrap().bank, ins.dest.unwrap().index), (Bank::Temp, 3));
         assert!(ins.blocked.is_none() && ins.is_supported(), "plain 2D tex must emit: {:?}", ins.blocked);
     }
 
@@ -3099,6 +3154,38 @@ mod tests {
             k.pred,
             Predicate::IfNotP(1),
             "kill runs when the alpha test FAILS - the analyzer ordering of bits[42:41]"
+        );
+    }
+
+    /// The one real DEPTHF in the corpus, and the two instructions around it that say what it
+    /// writes:
+    ///
+    /// ```text
+    /// #1  add    r0.x = sa0 (kDepthBias) + pa6 (the POSITION interpolant's z)
+    /// #2  depthf r0
+    /// ```
+    ///
+    /// It is also the instruction that PROVED a fragment's `Position` interpolant is the
+    /// window coordinate rather than the interpolated clip position: a depth write only
+    /// type-checks against a value already in depth-buffer space, and clip `z` is not.
+    #[test]
+    fn real_depthf_writes_the_temp_the_previous_add_filled() {
+        const ADD: u64 = 0x08a40084e0041003;
+        const DEPTHF: u64 = 0xfb300000f0000183;
+
+        let a = decode(ADD);
+        assert!(a.blocked.is_none(), "{:?}", a.blocked);
+        let d = a.dest.expect("the add has a register destination");
+        assert_eq!((d.bank, d.index), (Bank::Temp, 0));
+
+        let f = decode(DEPTHF);
+        assert_eq!(f.op, Op::DepthF);
+        assert!(f.blocked.is_none(), "{:?}", f.blocked);
+        assert!(f.dest.is_none(), "a depth write has no REGISTER destination");
+        assert_eq!(
+            (f.srcs[0].bank, f.srcs[0].index),
+            (Bank::Temp, 0),
+            "src0 (bank bit 36 + ext bit 51, number bits 20:14) names the temp the add wrote"
         );
     }
 

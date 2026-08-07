@@ -287,6 +287,14 @@ pub enum Op {
     /// Fragment discard (group 0xF8 KILL). Ends the fragment with no colour written; the
     /// emitter maps it to WGSL `discard`.
     Kill,
+    /// Fragment DEPTH write (group 0xF8 DEPTHF, spec F8.7): `srcs[0]` is a scalar depth that
+    /// replaces the interpolated one, and the whole shader becomes depth-replacing.
+    ///
+    /// The value is in the GUEST's depth space - the same encoding `gxp_guest_depth` produces
+    /// and a fragment's `POSITION.z` reads - because that is the only space a shader can
+    /// compute one in. Converting it to whatever depth the pipeline actually rasterises is the
+    /// emitter's job, not this decode's.
+    DepthF,
     /// Conditional or unconditional BRANCH (group 0xF8 BR). `rel` is the target expressed as a
     /// signed instruction-word delta from the branch's OWN index, so `target = index + rel`
     /// (spec F8.2 - the offset is a count of 64-bit words relative to the branch's own program
@@ -327,7 +335,7 @@ impl Op {
                 | Op::Nop | Op::Tex { .. }
                 | Op::Pack { .. } | Op::PackToInt { .. } | Op::Bitwise { .. }
                 | Op::LoadIndex { .. }
-                | Op::Test { .. } | Op::Kill
+                | Op::Test { .. } | Op::Kill | Op::DepthF
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
                 // bug in that pass and hard-fails there, naming itself.
@@ -367,6 +375,7 @@ impl Op {
             Op::Bitwise { .. } => "bitwise",
             Op::Test { .. } => "vtst",
             Op::Kill => "kill",
+            Op::DepthF => "depthf",
             Op::Branch { .. } => "br",
             Op::Todo(name) => name,
             Op::Illegal => "illegal",

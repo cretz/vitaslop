@@ -57,9 +57,16 @@ export function startServer(root) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
 
-/// Launch Chrome with WebGPU enabled (and a software fallback so a GPU-less box
-/// still runs). Uses the installed Chrome channel by default - Playwright's cached
-/// Chromium can lag the pkg version, and we want to test real Chrome anyway.
+/// Launch Chrome with WebGPU enabled. Uses the installed Chrome channel by default -
+/// Playwright's cached Chromium can lag the pkg version, and we want to test real Chrome
+/// anyway.
+///
+/// These are the CORRECTNESS tests (the cube render and the ARM conformance corpus), so
+/// they run headless by default: they compare pixels and pass/fail counts, and a software
+/// rasteriser is a legitimate way to produce those. It is not a legitimate way to produce
+/// a frame RATE, which is why `game-boot.mjs` runs headed on a real GPU instead. The
+/// software fallback stays opt-in here too (ALLOW_SOFTWARE=1), so a box that has lost its
+/// GPU says so rather than quietly getting 30x slower.
 export function launchChrome() {
   return chromium.launch({
     channel: process.env.PWCHANNEL || "chrome",
@@ -67,8 +74,8 @@ export function launchChrome() {
     args: [
       "--enable-unsafe-webgpu",
       "--enable-features=Vulkan",
-      "--enable-unsafe-swiftshader",
       "--use-angle=default",
+      ...(process.env.ALLOW_SOFTWARE ? ["--enable-unsafe-swiftshader"] : []),
     ],
   });
 }

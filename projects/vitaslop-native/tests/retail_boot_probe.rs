@@ -217,7 +217,7 @@ fn retail_boot_probe() {
         let work_bytes = std::fs::read(work).expect("read work.bin");
         vitaslop_runtime::ingest::pipeline::decrypt_pkg(&pkg_bytes, &work_bytes).expect("decrypt pkg")
     } else {
-        decrypt_container(&DirVfs::new(dir.as_ref().unwrap())).expect("decrypt container")
+        decrypt_container(&mut DirVfs::new(dir.as_ref().unwrap())).expect("decrypt container")
     };
     let modules: Vec<loader::Module> = game
         .modules

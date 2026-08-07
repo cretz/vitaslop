@@ -768,14 +768,67 @@ struct OpenFile {
     writable: bool,
 }
 
+/// Serves file bytes the host never loaded into memory.
+///
+/// # Why a title's files cannot simply be bytes
+/// The in-memory map below is the right model for a test fixture and for native, where
+/// the host has an address space to spare. It is the wrong model for the browser: a
+/// retail container is over a gigabyte, and the emulator's wasm32 heap tops out at four.
+/// Measured on a 1719 MB title: Chrome peaked at 8.01 GB during ingest and the worker was
+/// killed mid-boot. So the browser stores the title in OPFS and serves reads from there,
+/// and only what a guest actually asks for is ever resident.
+///
+/// # Reads are synchronous, and that is a requirement rather than a preference
+/// A guest file read happens inside a host call, on a suspended guest stack that cannot
+/// await. OPFS is the only browser storage offering synchronous reads
+/// (`FileSystemSyncAccessHandle`, Workers only), which is why it is the backing and
+/// Cache Storage / IndexedDB are not.
+/// # The key an implementation is asked for is NORMALISED
+/// [`keys`](FileBacking::keys) returns paths as the storage spells them, but
+/// [`len`](FileBacking::len) and [`read_at`](FileBacking::read_at) are called with the
+/// result of [`vfs_key`] - collapsed separators, resolved `.`/`..`, and LOWERCASED,
+/// because the Vita filesystem matches case-insensitively. An implementation that maps
+/// the key it receives straight back onto its own storage will therefore miss every
+/// mixed-case path.
+///
+/// That is not a hypothetical: it is how this first shipped. The file OPENED (existence
+/// is checked against the same normalised key, so that matched) and then every read
+/// returned zero bytes, and what surfaced was a guest memory-access trap 31,000 host
+/// calls later with nothing pointing at the filesystem. Build the normalised-to-stored
+/// map with [`vfs_key`] itself, so the two sides cannot drift.
+///
+/// `Send` because the native preemptive scheduler moves the whole host between OS
+/// threads, and that guarantee is real there - it must not be weakened for every backing
+/// just because the browser's cannot honour it. The browser's OPFS backing holds JS
+/// handles, which are `!Send`, and asserts `Send` for itself on the grounds that a wasm
+/// worker is single-threaded by construction; that assertion is stated where it is made,
+/// not hidden here.
+pub trait FileBacking: Send {
+    /// Length of `key`, or `None` if this backing does not serve it.
+    fn len(&self, key: &str) -> Option<usize>;
+    /// Read into `buf` starting at `off`; returns the count, short at end of file.
+    fn read_at(&self, key: &str, off: usize, buf: &mut [u8]) -> usize;
+    /// Every key served, as STORAGE spells them, so existence checks and directory
+    /// listings see them all with their real names.
+    fn keys(&self) -> Vec<String>;
+}
+
 /// A minimal virtual filesystem backing SceIoFilemgr: a path -> bytes map plus a
 /// table of open descriptors. Read files are preloaded by the harness (e.g. a
-/// game's data files); write opens create or truncate entries here. The console
-/// streams (fd 1/2) are handled directly in the IO handlers and are not tracked
-/// here. Deterministic and host-only, so a run touches no real filesystem.
+/// game's data files) or served lazily by a [`FileBacking`]; write opens create or
+/// truncate entries here. The console streams (fd 1/2) are handled directly in the IO
+/// handlers and are not tracked here. Deterministic and host-only, so a run touches no
+/// real filesystem.
 #[derive(Default)]
 pub struct FileTable {
     files: std::collections::HashMap<String, Vec<u8>>,
+    /// Files served on demand by [`backing`](FileTable::backing), as key -> length.
+    /// A key here is NOT in `files` until something writes to it, at which point it is
+    /// faulted in and becomes an ordinary resident file - so a guest write to a game
+    /// asset behaves exactly as it always did, at the cost of materialising that one
+    /// file.
+    backed: std::collections::HashMap<String, usize>,
+    backing: Option<Box<dyn FileBacking>>,
     /// Original (as-added) spelling per lowercased key, so a directory listing can
     /// return real mixed-case names for a title's own glob matching. Lookup stays
     /// case-insensitive through the lowercased `files` key.
@@ -911,7 +964,7 @@ pub const FD_STDERR: i32 = 2;
 /// Without this a title that opens `app0:/settings/foo.ini` or `.../Foo.GXT` would
 /// miss the file stored as `settings/foo.ini` and take its file-missing (often fatal)
 /// path.
-fn vfs_key(path: &str) -> String {
+pub fn vfs_key(path: &str) -> String {
     // Normalize like a real Vita FS before matching: collapse repeated separators,
     // drop `.` and empty segments, and resolve `..`. Titles build paths by joining a
     // directory (often with a trailing `/`) to a subpath (often with a leading `/`),
@@ -962,12 +1015,101 @@ impl FileTable {
         FileTable { next_fd: FIRST_FD, ..Default::default() }
     }
 
+    /// Install the lazy backing and register every key it serves. Called once at setup,
+    /// before the guest runs.
+    ///
+    /// Registering the keys up front (rather than probing the backing on each miss) is
+    /// what keeps existence checks, directory listings and `sceIoGetstat` answering from
+    /// a plain map lookup - so a backed title behaves identically to a resident one
+    /// everywhere except the read itself.
+    pub fn set_backing(&mut self, backing: Box<dyn FileBacking>) {
+        for path in backing.keys() {
+            // NORMALISE FIRST. `len` and `read_at` take the same key the filesystem will
+            // later look up with, not the storage spelling - see `FileBacking`. Asking
+            // with the raw path is how this first shipped, and because a missing length
+            // merely skipped the file, EVERY file was skipped and the title booted with an
+            // empty filesystem. A silent skip is what turned a one-line mistake into a
+            // guest memory trap 30,000 host calls away.
+            let key = vfs_key(&path);
+            let Some(n) = backing.len(&key) else {
+                panic!(
+                    "file backing lists {path:?} but has no length for its normalised key \
+                     {key:?} - the two sides disagree on how a path is spelled, and every \
+                     read of this file would silently return nothing"
+                )
+            };
+            // Keep the as-supplied spelling too: a directory listing hands names back to
+            // the title's own glob matching, and a lowercased name would not match.
+            self.originals
+                .insert(key.clone(), strip_app0(&path).trim_start_matches('/').to_string());
+            self.backed.insert(key, n);
+        }
+        self.backing = Some(backing);
+    }
+
+    /// Whether `key` exists at all - resident or served by the backing.
+    fn has(&self, key: &str) -> bool {
+        self.files.contains_key(key) || self.backed.contains_key(key)
+    }
+
+    /// Length of `key`, wherever it lives.
+    fn byte_len(&self, key: &str) -> Option<usize> {
+        self.files.get(key).map(|d| d.len()).or_else(|| self.backed.get(key).copied())
+    }
+
+    /// Read `[start, start+len)` of `key`, clamped to its end. Serves a resident file
+    /// from the map and a backed one straight from storage, so a backed read never
+    /// materialises anything but the bytes asked for.
+    fn read_range(&self, key: &str, start: usize, len: usize) -> Option<Vec<u8>> {
+        if let Some(data) = self.files.get(key) {
+            let start = start.min(data.len());
+            let end = (start + len).min(data.len());
+            return Some(data[start..end].to_vec());
+        }
+        let size = *self.backed.get(key)?;
+        let backing = self.backing.as_ref()?;
+        let start = start.min(size);
+        let end = (start + len).min(size);
+        let mut out = vec![0u8; end - start];
+        let got = backing.read_at(key, start, &mut out);
+        out.truncate(got);
+        Some(out)
+    }
+
+    /// Backed keys equal to `key` or beneath it as a directory prefix. Used where a key
+    /// is about to MOVE, which the backing cannot follow.
+    fn backed_under(&self, key: &str) -> Vec<String> {
+        let prefix = format!("{key}/");
+        self.backed.keys().filter(|k| *k == key || k.starts_with(&prefix)).cloned().collect()
+    }
+
+    /// Make `key` resident so it can be written, reading it out of the backing first if
+    /// that is where it lives. A no-op for a file that is already resident.
+    ///
+    /// This is the one place a backed file becomes an ordinary one. It is deliberately
+    /// eager and whole-file: a partial write to a lazily-backed file would otherwise need
+    /// a copy-on-write overlay, and the case does not arise in practice (titles write
+    /// savedata, which they create, not the assets they shipped).
+    fn make_resident(&mut self, key: &str) -> &mut Vec<u8> {
+        if !self.files.contains_key(key) {
+            let bytes = if self.backed.contains_key(key) {
+                let n = self.backed[key];
+                self.read_range(key, 0, n).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.backed.remove(key);
+            self.files.insert(key.to_string(), bytes);
+        }
+        self.files.get_mut(key).expect("just inserted")
+    }
+
     /// Open `path` per the SCE_O_* `flags`; returns a new fd or a negative errno.
     fn open(&mut self, path: &str, flags: u32) -> i32 {
         let path = vfs_key(path);
         let readable = flags & SCE_O_RDWR == SCE_O_RDONLY || flags & SCE_O_RDWR == SCE_O_RDWR;
         let writable = flags & SCE_O_WRONLY != 0;
-        let exists = self.files.contains_key(&path);
+        let exists = self.has(&path);
 
         if !exists {
             if flags & SCE_O_CREAT != 0 {
@@ -976,15 +1118,14 @@ impl FileTable {
                 return SCE_ERROR_ERRNO_ENOENT;
             }
         } else if flags & SCE_O_TRUNC != 0 {
+            // Truncation discards the contents, so a backed file needs no fault-in -
+            // just drop the backing's claim on the key and start empty.
+            self.backed.remove(&path);
             self.files.insert(path.clone(), Vec::new());
         }
 
         // Append seeks to end; every other open starts at the beginning.
-        let cursor = if flags & SCE_O_APPEND != 0 {
-            self.files.get(&path).map(|d| d.len()).unwrap_or(0)
-        } else {
-            0
-        };
+        let cursor = if flags & SCE_O_APPEND != 0 { self.byte_len(&path).unwrap_or(0) } else { 0 };
 
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -999,11 +1140,12 @@ impl FileTable {
         if !of.readable {
             return None;
         }
-        let data = self.files.get(&of.path)?;
-        let start = of.cursor.min(data.len());
-        let end = (start + len).min(data.len());
-        let out = data[start..end].to_vec();
-        of.cursor = end;
+        let (path, cursor) = (of.path.clone(), of.cursor);
+        let out = self.read_range(&path, cursor, len)?;
+        // Advance by what was actually delivered, so a short read at end of file leaves
+        // the cursor at the end rather than past it.
+        let end = cursor.min(self.byte_len(&path).unwrap_or(0)) + out.len();
+        self.open.get_mut(&fd)?.cursor = end;
         Some(out)
     }
 
@@ -1016,10 +1158,7 @@ impl FileTable {
         if !of.readable {
             return None;
         }
-        let data = self.files.get(&of.path)?;
-        let start = (offset as usize).min(data.len());
-        let end = (start + len).min(data.len());
-        Some(data[start..end].to_vec())
+        self.read_range(&of.path.clone(), offset as usize, len)
     }
 
     /// Write `bytes` to `fd` at absolute `offset` WITHOUT moving the cursor
@@ -1031,7 +1170,7 @@ impl FileTable {
             return None;
         }
         let path = of.path.clone();
-        let data = self.files.entry(path).or_default();
+        let data = self.make_resident(&path);
         let end = offset as usize + bytes.len();
         if end > data.len() {
             data.resize(end, 0);
@@ -1047,26 +1186,32 @@ impl FileTable {
         if !of.writable {
             return None;
         }
-        let data = self.files.entry(of.path.clone()).or_default();
-        if of.cursor > data.len() {
-            data.resize(of.cursor, 0);
+        let (path, cursor) = (of.path.clone(), of.cursor);
+        let data = self.make_resident(&path);
+        if cursor > data.len() {
+            data.resize(cursor, 0);
         }
-        let end = of.cursor + bytes.len();
+        let end = cursor + bytes.len();
         if end > data.len() {
             data.resize(end, 0);
         }
-        data[of.cursor..end].copy_from_slice(bytes);
-        of.cursor = end;
+        data[cursor..end].copy_from_slice(bytes);
+        self.open.get_mut(&fd)?.cursor = end;
         Some(bytes.len())
     }
 
     /// Seek `fd` to `offset` from `whence`; returns the new absolute position or a
     /// negative errno.
     fn lseek(&mut self, fd: i32, offset: i64, whence: i32) -> i64 {
+        // The size lookup borrows `self`, so read the descriptor's path first and let
+        // that borrow end before taking the mutable one back for the cursor update.
+        let Some(path) = self.open.get(&fd).map(|of| of.path.clone()) else {
+            return SCE_ERROR_ERRNO_EBADF as i64;
+        };
+        let size = self.byte_len(&path).unwrap_or(0) as i64;
         let Some(of) = self.open.get_mut(&fd) else {
             return SCE_ERROR_ERRNO_EBADF as i64;
         };
-        let size = self.files.get(&of.path).map(|d| d.len()).unwrap_or(0) as i64;
         let base = match whence {
             SCE_SEEK_SET => 0,
             SCE_SEEK_CUR => of.cursor as i64,
@@ -1108,7 +1253,18 @@ impl FileTable {
         let comp_index = prefix.matches('/').count();
         let mut children: std::collections::BTreeMap<String, DirEntry> =
             std::collections::BTreeMap::new();
-        for (k, data) in &self.files {
+        // Resident and backed files both appear in a listing: a title that stored its
+        // assets lazily must still see them when it enumerates a directory, and the
+        // sizes have to be right because a title sizes its own read buffers from them.
+        let entries: Vec<(&String, usize)> = self
+            .files
+            .iter()
+            .map(|(k, d)| (k, d.len()))
+            .chain(
+                self.backed.iter().filter(|(k, _)| !self.files.contains_key(*k)).map(|(k, n)| (k, *n)),
+            )
+            .collect();
+        for (k, len) in entries {
             let Some(rest) = k.strip_prefix(&prefix) else { continue };
             if rest.is_empty() {
                 continue;
@@ -1130,7 +1286,7 @@ impl FileTable {
                 DirEntry { name, is_dir, size: 0 }
             });
             if !is_dir {
-                entry.size = data.len() as u64;
+                entry.size = len as u64;
             }
         }
         // Explicitly-created directories are not implied by any file key, so they have
@@ -1181,6 +1337,7 @@ impl FileTable {
     fn has_children(&self, key: &str) -> bool {
         let prefix = format!("{key}/");
         self.files.keys().any(|k| k.starts_with(&prefix))
+            || self.backed.keys().any(|k| k.starts_with(&prefix))
             || self.dirs.iter().any(|d| d.starts_with(&prefix))
     }
 
@@ -1202,7 +1359,7 @@ impl FileTable {
         if key.is_empty() {
             return SCE_ERROR_ERRNO_EEXIST;
         }
-        if self.files.contains_key(&key) || self.is_dir(&key) {
+        if self.has(&key) || self.is_dir(&key) {
             return SCE_ERROR_ERRNO_EEXIST;
         }
         self.originals.insert(key.clone(), path.trim_end_matches('/').to_string());
@@ -1237,10 +1394,14 @@ impl FileTable {
     /// `sceIoRmdir` for that) and an unknown path.
     fn remove(&mut self, path: &str) -> i32 {
         let key = vfs_key(path);
-        if !self.files.contains_key(&key) {
+        if !self.has(&key) {
             return if self.is_dir(&key) { SCE_ERROR_ERRNO_EISDIR } else { SCE_ERROR_ERRNO_ENOENT };
         }
         self.files.remove(&key);
+        // A backed file is deleted by forgetting the key: the bytes stay in storage but
+        // nothing can reach them, which is what the guest asked for. Storage is the
+        // user's installed title and is not ours to erase on a guest unlink.
+        self.backed.remove(&key);
         self.originals.remove(&key);
         self.stats.remove(&key);
         0
@@ -1259,10 +1420,18 @@ impl FileTable {
         if from == to {
             return 0;
         }
-        if self.files.contains_key(&to) || self.is_dir(&to) {
+        if self.has(&to) || self.is_dir(&to) {
             return SCE_ERROR_ERRNO_EEXIST;
         }
         let new_orig = new.trim_end_matches('/').to_string();
+
+        // A rename re-keys the file, and the backing only knows its ORIGINAL key - so a
+        // backed file has to be faulted in first or its new name would read as empty.
+        // Deliberately the expensive path: renaming a shipped asset does not happen in
+        // practice, and a silently unreadable file would be far worse than a copy.
+        for key in self.backed_under(&from) {
+            self.make_resident(&key);
+        }
 
         if let Some(data) = self.files.remove(&from) {
             self.files.insert(to.clone(), data);
@@ -1315,7 +1484,7 @@ impl FileTable {
     /// the title believes the change took.
     fn chstat(&mut self, path: &str, over: FileStatOverride) -> i32 {
         let key = vfs_key(path);
-        if !self.files.contains_key(&key) && !self.is_dir(&key) {
+        if !self.has(&key) && !self.is_dir(&key) {
             return SCE_ERROR_ERRNO_ENOENT;
         }
         let e = self.stats.entry(key).or_default();
@@ -1349,20 +1518,22 @@ impl FileTable {
 
     /// The size of `path` if it exists (for sceIoGetstat).
     fn size_of(&self, path: &str) -> Option<u64> {
-        self.files.get(&vfs_key(path)).map(|d| d.len() as u64)
+        self.byte_len(&vfs_key(path)).map(|n| n as u64)
     }
 
     /// The whole contents of `path` if it exists, cloned. For consumers that need a
     /// file's bytes in one shot without managing a descriptor (e.g. loading a font).
     fn read_all(&self, path: &str) -> Option<Vec<u8>> {
-        self.files.get(&vfs_key(path)).cloned()
+        let key = vfs_key(path);
+        let n = self.byte_len(&key)?;
+        self.read_range(&key, 0, n)
     }
 
     /// The size of the file behind an open descriptor (for sceIoGetstatByFd).
     /// Returns None on a bad descriptor - the path is already the vfs key.
     fn size_of_fd(&self, fd: i32) -> Option<u64> {
         let of = self.open.get(&fd)?;
-        self.files.get(&of.path).map(|d| d.len() as u64)
+        self.byte_len(&of.path).map(|n| n as u64)
     }
 }
 
@@ -1735,6 +1906,19 @@ struct ProgramReflection {
 
 /// All host state for one run: the guest allocator, handle tables, the capture
 /// stream, the world (determinism seam), and the in-progress scene state.
+/// Which path is advancing the virtual game clock, for [`VitaState::clock_sources`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClockSource {
+    /// A scheduler quantum of guest execution ([`VitaState::charge_cpu_quantum`]).
+    Quantum,
+    /// The per-flip top-up ([`VitaState::advance_time_frame`]), off under
+    /// `VITASLOP_FRAME_TOPUP=0`.
+    FrameTopup,
+    /// The scheduler's idle path jumping to the earliest pending deadline - and the
+    /// default, so an advance from an untagged path is attributed rather than lost.
+    Idle,
+}
+
 pub struct VitaState {
     pub base: u32,
     pub mem_bytes: u32,
@@ -1767,6 +1951,16 @@ pub struct VitaState {
     /// rendering frame actually takes - see [`VitaState::charge_cpu_quantum`]).
     quantum_count: u64,
     flip_count: u64,
+    /// Earliest game-clock time the display may latch the NEXT frame - the vsync floor.
+    /// See [`VitaState::pace_flip`].
+    next_flip_us: u64,
+    /// The `sync` argument of the most recent `sceDisplaySetFrameBuf`, which is what
+    /// decides whether a present waits for the scanout. See
+    /// [`VitaState::set_display_sync`].
+    display_sync: u32,
+    /// Whether the guest has called `sceDisplaySetFrameBuf` at all, so the diagnostic can
+    /// tell "asked for the default" from "never asked".
+    display_sync_seen: bool,
     /// `(base, size)` of every released memory block, in release order, available for
     /// reuse by [`VitaState::alloc_memblock`]. Not coalesced: adjacency in the arena is
     /// not adjacency in usefulness here (blocks are whole buffers a title allocates and
@@ -2125,6 +2319,16 @@ pub struct VitaState {
     /// (jumping to the earliest pending deadline when every thread is parked), so a
     /// timed wait costs one round instead of millions of busy-poll iterations.
     virtual_us: u64,
+    /// Which caller is currently advancing the clock, for the [`clock_sources`] split.
+    ///
+    /// `Idle` is the DEFAULT rather than an `Option`, so an advance made from a path
+    /// nobody tagged is attributed to the scheduler's idle jump instead of disappearing.
+    /// A bucket that silently drops time would make the split add up to less than the
+    /// clock and quietly invite the wrong conclusion.
+    clock_source: ClockSource,
+    clock_from_quanta_us: u64,
+    clock_from_topup_us: u64,
+    clock_from_idle_us: u64,
     /// The current display-frame index, updated each flip by the scheduler
     /// (`on_frame_boundary`). Frame-tags egress-ledger events so a recipe can assert
     /// roughly when a milestone occurred, not only that it did.
@@ -2153,6 +2357,9 @@ impl VitaState {
             io_waiters: Vec::new(),
             io_charged_since_flip: 0,
             cpu_charged_since_flip: 0,
+            next_flip_us: 0,
+            display_sync: Self::SETBUF_NEXTFRAME,
+            display_sync_seen: false,
             quantum_count: 0,
             flip_count: 0,
             freed_memblocks: Vec::new(),
@@ -2260,6 +2467,10 @@ impl VitaState {
             lwcond_mutex: Vec::new(),
             sleep_waiters: Vec::new(),
             virtual_us: 0,
+            clock_source: ClockSource::Idle,
+            clock_from_quanta_us: 0,
+            clock_from_topup_us: 0,
+            clock_from_idle_us: 0,
             cur_frame: 0,
         }
     }
@@ -2428,7 +2639,25 @@ impl VitaState {
         self.fs.files.insert(key, bytes);
     }
 
+    /// Serve the guest's read-only files from `backing` instead of loading them.
+    ///
+    /// The browser installs OPFS here: a retail container is over a gigabyte and the
+    /// emulator's wasm32 heap tops out at four, so holding a title's assets in memory is
+    /// what put a browser run over the edge. Native leaves this unset and keeps every
+    /// file resident, which is what an in-process host should do.
+    ///
+    /// Call before the guest runs. Anything already added with [`add_file`](Self::add_file)
+    /// stays resident and wins over a backed key of the same name.
+    pub fn set_file_backing(&mut self, backing: Box<dyn FileBacking>) {
+        self.fs.set_backing(backing);
+    }
+
     /// Read back a file's current bytes (a write target after the run, for tests).
+    ///
+    /// Resident files only, by design: this exists to inspect what a run WROTE, and a
+    /// write always makes its file resident. A borrowed slice cannot be served from a
+    /// backing without materialising the file, and doing that silently on an inspection
+    /// call would hide the very residency this seam exists to avoid.
     pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
         self.fs.files.get(&vfs_key(path)).map(|v| v.as_slice())
     }
@@ -3867,7 +4096,20 @@ impl VitaState {
         self.quantum_count = self.quantum_count.saturating_add(1);
         self.cpu_charged_since_flip = self.cpu_charged_since_flip.saturating_add(us);
         let target = self.virtual_us.saturating_add(us);
+        self.clock_source = ClockSource::Quantum;
         self.advance_time_to(target);
+    }
+
+    /// `(from quanta, from the frame top-up, from idle jumps)` microseconds of game clock
+    /// so far.
+    ///
+    /// The split, not the total. Two engines sharing this scheduler can reach very
+    /// different clocks from the same guest, and the fix depends entirely on which
+    /// bucket differs: a smaller `quanta` bucket means the preemption rate is wrong,
+    /// while a smaller `idle` bucket means the run never goes idle - some thread is
+    /// still runnable - and no amount of re-calibrating the quantum will touch it.
+    pub fn clock_sources(&self) -> (u64, u64, u64) {
+        (self.clock_from_quanta_us, self.clock_from_topup_us, self.clock_from_idle_us)
     }
 
     /// One display flip happened: bring the game clock up to one full frame of progress,
@@ -3903,6 +4145,7 @@ impl VitaState {
         }
         let owed = frame_us.saturating_sub(charged);
         let target = self.virtual_us.saturating_add(owed);
+        self.clock_source = ClockSource::FrameTopup;
         self.advance_time_to(target);
     }
 
@@ -3939,6 +4182,153 @@ impl VitaState {
 
     pub fn sleep_park(&mut self, us: u64) {
         self.sleep_waiters.push((self.current, self.virtual_us.wrapping_add(us)));
+    }
+
+    /// Pace a display flip to the scanout: park the calling thread until the display can
+    /// actually latch the frame it just queued, and reserve the vblank after that for the
+    /// one to come. `frame_us` is one display period.
+    ///
+    /// # Vsync is a FLOOR on when a flip may complete, not a grant of free time
+    /// Neither of the two behaviours this replaces was physical, and they failed in
+    /// opposite directions.
+    ///
+    /// With the per-flip top-up ON, a flip advanced the clock a whole frame however
+    /// little guest code had run. The render thread's next vblank wait was therefore
+    /// already satisfied and it flipped again at once: measured on a retail loading
+    /// screen, **3120 fps and barely one scheduler quantum per frame**, so the guest got
+    /// about a TENTH of the CPU a console frame carries and a load that costs hardware
+    /// 3,000 frames cost 30,000+.
+    ///
+    /// With it OFF, a flip advanced the clock by nothing it had not earned - but nothing
+    /// stopped the guest flipping again immediately either, so the frame rate became
+    /// "however fast the guest can draw". Measured on this title's front end: **4.64 ms
+    /// of game clock per flip, 216 fps**, against a 60 Hz panel. Every wall-clock wait in
+    /// the title then cost 3.6x the flips hardware needs, and since a frame number is
+    /// what a recipe, a screenshot and `--max-frames` are keyed to, the whole timeline
+    /// stretched by that factor. The race was unaffected (33.5 ms/flip, a true 30 fps),
+    /// which is what makes this a pacing bug and not a speed one.
+    ///
+    /// The floor fixes both. A flip may not complete before the next vblank, so a cheap
+    /// frame WAITS - and it waits by blocking, not by being handed time: while this
+    /// thread is parked the scheduler runs every other runnable thread (charging real
+    /// quanta) and only jumps the clock when nothing at all is runnable. The guest
+    /// therefore gets a whole frame's worth of CPU per frame, which is the half the
+    /// top-up never supplied.
+    ///
+    /// # A latch happens ON a vblank, not one period after the request
+    /// The floor above is a duration; the scanout is a GRID. A frame that takes 17 ms
+    /// of a 16.67 ms period does not latch at 17 ms - it misses the vblank and waits
+    /// for the next one, so it costs 33.3 ms and the title runs at 30 Hz. Rounding the
+    /// latch up to the grid is what produces the console's characteristic 60/30/20 Hz
+    /// quantisation instead of a continuum, and it is also what lets a title that
+    /// renders in 5 ms and then waits for vblank stay PHASE-LOCKED rather than drifting
+    /// by its own render time every frame. `sceDisplayGetVcount` is already defined off
+    /// this same grid ([`crate::vita::display::vcount`]), so the two agree by
+    /// construction.
+    ///
+    /// Returns the microseconds parked, for the caller's diagnostics.
+    pub fn pace_flip(&mut self, frame_us: u64) -> u64 {
+        // SCE_DISPLAY_SETBUF_IMMEDIATE: the title asked for the buffer change to take
+        // effect at once rather than at a vblank, which on hardware tears and does NOT
+        // pace. Honouring it means no floor at all - and clearing the reservation too,
+        // or a floor left over from an earlier NEXTFRAME phase would go on pacing a
+        // title that has explicitly asked not to be. See [`Self::set_display_sync`].
+        // A queue depth of one vblank: the caller may not run ahead of the scanout. GXM's
+        // `displayQueueMaxPendingCount` would allow a title to be a frame or two ahead,
+        // which raises throughput but cannot raise the LATCH rate above the panel - and
+        // the latch rate is what the frame count and the game clock are made of.
+        let latch = Self::at_or_after_vblank(self.next_flip_us.max(self.virtual_us), frame_us);
+        self.next_flip_us = latch.saturating_add(frame_us);
+        let park = latch.saturating_sub(self.virtual_us);
+        self.sleep_park(park);
+        park
+    }
+
+    /// `SceDisplaySetBufSync`: the buffer change takes effect immediately (and tears).
+    pub const SETBUF_IMMEDIATE: u32 = 0;
+    /// `SceDisplaySetBufSync`: the buffer change takes effect at the next vblank.
+    pub const SETBUF_NEXTFRAME: u32 = 1;
+
+    /// Record the `sync` argument of a `sceDisplaySetFrameBuf`.
+    ///
+    /// # It is RECORDED and REPORTED, and deliberately not acted on
+    /// `SceDisplaySetBufSync` has exactly two values, IMMEDIATE and NEXTFRAME, and the
+    /// difference between them is WHEN the scanout's framebuffer pointer changes - mid-
+    /// scan, which tears, or at a vblank, which does not. It is not a swap interval, it
+    /// cannot ask for 30 Hz, and it does not change how fast a title can present: the
+    /// panel still scans at 60 Hz and the guest still has to draw each frame. We present
+    /// whole frames, so we do not model tearing, and there is nothing left for the
+    /// argument to change.
+    ///
+    /// Both behaviours it seemed to imply were TRIED and both were wrong, on a retail
+    /// title that really does ask for IMMEDIATE:
+    /// - dropping [`pace_flip`](Self::pace_flip)'s vblank floor for it re-created exactly
+    ///   the bug the floor exists to fix, and
+    /// - letting `sceDisplayWaitSetFrameBuf` return at once (nothing to wait for, if the
+    ///   buffer changed when it was asked for) LIVELOCKED the title: it spins on that
+    ///   call, and the run reached **frame 3** with **34.3 million thread resumes**, one
+    ///   thread taking 25.7 million of them and burning 699 whole quanta. On hardware
+    ///   that call waits for the DISPLAY to update, which is a vblank event whichever
+    ///   sync mode set the buffer.
+    ///
+    /// So it is kept as a diagnostic: it says what the title asked for, which is worth
+    /// knowing and was previously invisible.
+    pub fn set_display_sync(&mut self, sync: u32) {
+        // Report the first call as well as every change, not changes alone. A run that
+        // never logs is otherwise ambiguous between "the title asks for the default" and
+        // "the title never called this at all", and those are different worlds: the
+        // second means the presents are reaching the display down some other path and
+        // the sync mode being honoured here is honouring nothing.
+        if !self.display_sync_seen || self.display_sync != sync {
+            tracing::info!(
+                target: "vitaslop::gxm",
+                sync,
+                first = !self.display_sync_seen,
+                "display: sceDisplaySetFrameBuf sync = {} ({})",
+                sync,
+                if sync == Self::SETBUF_IMMEDIATE {
+                    "IMMEDIATE - the buffer change takes effect at once, so presents do not wait for vblank"
+                } else {
+                    "NEXTFRAME - presents latch at a vblank"
+                },
+            );
+            self.display_sync_seen = true;
+            self.display_sync = sync;
+        }
+    }
+
+    /// The `sync` mode the guest last asked for. See [`Self::set_display_sync`].
+    pub fn display_sync(&self) -> u32 {
+        self.display_sync
+    }
+
+    /// The first vblank edge at or after `t`, on a grid of `period` starting at 0.
+    fn at_or_after_vblank(t: u64, period: u64) -> u64 {
+        if period == 0 {
+            return t;
+        }
+        t.div_ceil(period).saturating_mul(period)
+    }
+
+    /// Park the calling thread until the `n`th vblank edge STRICTLY after now, and
+    /// return the microseconds parked. `n` of 0 parks for nothing.
+    ///
+    /// The distinction from `sleep_park(n * period)` is the whole point: a vblank is a
+    /// scanout heartbeat the guest joins, not a stopwatch it starts. Parking a full
+    /// period from wherever the guest happened to call over-waits by half a period on
+    /// average and can never phase-lock, so a title that renders in 5 ms and waits for
+    /// vblank ran at 5 + 16.67 ms (46 fps) instead of the 60 the hardware gives it.
+    pub fn vblank_park(&mut self, n: u64, period: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        // STRICTLY after: a wait issued exactly on an edge waits for the next one, or a
+        // loop of them would return instantly forever and never advance the clock.
+        let first = Self::at_or_after_vblank(self.virtual_us.saturating_add(1), period);
+        let edge = first.saturating_add((n - 1).saturating_mul(period));
+        let park = edge.saturating_sub(self.virtual_us);
+        self.sleep_park(park);
+        park
     }
 
     /// Guest stack for the display-callback thread. One callback runs at a time,
@@ -4116,6 +4506,22 @@ impl VitaState {
     /// delay elapsing is not a timeout. A timed-out cond wait additionally re-acquires
     /// its mutex before resuming (it may re-block on the mutex first).
     pub fn advance_time_to(&mut self, to_us: u64) {
+        // WHERE the game clock's time came from, cumulatively. See
+        // [`clock_sources`](Self::clock_sources): a total alone cannot say whether one
+        // engine's clock runs slower because it charges less per quantum or because it
+        // never reaches the idle path that JUMPS the clock to the next deadline, and
+        // those have nothing in common as bugs.
+        let gained = to_us.saturating_sub(self.virtual_us);
+        match self.clock_source {
+            ClockSource::Quantum => self.clock_from_quanta_us += gained,
+            ClockSource::FrameTopup => self.clock_from_topup_us += gained,
+            ClockSource::Idle => self.clock_from_idle_us += gained,
+        }
+        // Back to the default immediately: the tag describes THIS call only, and letting
+        // it persist would credit the next untagged advance to whichever path happened to
+        // run last - which is precisely the kind of quiet misattribution this split exists
+        // to prevent.
+        self.clock_source = ClockSource::Idle;
         self.virtual_us = self.virtual_us.max(to_us);
         let now = self.virtual_us;
         // Timed lightweight-cond waits: like the heavyweight cond, a timed-out
@@ -7014,7 +7420,7 @@ fn poison_uniform_buffer(ctx: &mut GuestCtx, buf: u32, size: u32) {
 fn gxp_live_capture() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VITASLOP_GXP_LIVE").is_some())
+    *ENABLED.get_or_init(|| crate::knobs::flag("VITASLOP_GXP_LIVE"))
 }
 
 /// Report - once per distinct base format, unconditionally - that a bound texture's format
@@ -7506,6 +7912,18 @@ pub trait ImportDispatch {
         Vec::new()
     }
 
+    /// Human-readable state of every thread and sync primitive, for a scheduler that
+    /// wants to report a stall from inside its own loop.
+    ///
+    /// It lives on the trait rather than being reached through a concrete host because
+    /// both schedulers are generic over the host, and a stall that happens on one engine
+    /// and not the other can only be diagnosed by comparing the two dumps - which
+    /// requires both to be able to produce one. The default is empty for a host with no
+    /// sync state to report.
+    fn sync_dump(&self) -> String {
+        String::new()
+    }
+
     /// The earliest pending timed-wait deadline (virtual microseconds), if a thread
     /// is parked on a timed wait. When no thread is runnable, the scheduler jumps the
     /// clock to this instead of declaring a deadlock (a busy loop's timed wait).
@@ -7534,7 +7952,12 @@ pub trait ImportDispatch {
     /// A thread used a whole scheduler quantum (or yielded without flipping). Lets the
     /// host charge clocks that track executed work rather than rendered frames - today,
     /// the modelled storage clock. The default ignores it.
-    fn on_quantum(&mut self) {}
+    ///
+    /// `runnable` is how many threads were ready to run at that moment, INCLUDING the
+    /// one that just stopped. The scheduler runs one at a time; the device does not, so
+    /// this is what lets the host divide the quantum's WALL time among the cores that
+    /// would have been executing it in parallel. See [`VitaEnv::on_quantum`].
+    fn on_quantum(&mut self, _runnable: usize) {}
 
     /// The `r0` value owed to thread `thid` as it resumes from a block (a timed wait
     /// that expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT`), if any. The engine
@@ -7571,6 +7994,17 @@ impl ImportDispatch for VitaEnv {
         mem: &mut dyn GuestMemory,
         base: u32,
     ) -> SvcOutcome {
+        // The transpiler's software fuel point, not a NID: this thread has used its
+        // quantum and is asking to be rescheduled. Intercepted before the import table
+        // because it is not IN the import table - it is a reserved selector above every
+        // real index (see `vitaslop_transpiler::abi::FUEL_SELECTOR`).
+        //
+        // Deliberately NOT recorded as a call: it is host bookkeeping the guest never
+        // asked for, and folding it into the per-NID histogram would put a synthetic
+        // entry at the top of every profile.
+        if index == vitaslop_transpiler::abi::FUEL_SELECTOR {
+            return SvcOutcome::Reschedule;
+        }
         let (library_nid, func_nid) = self
             .imports
             .get(index as usize)
@@ -7611,6 +8045,10 @@ impl ImportDispatch for VitaEnv {
         self.state.take_stat_writes()
     }
 
+    fn sync_dump(&self) -> String {
+        self.state.debug_sync_dump()
+    }
+
     fn earliest_deadline(&self) -> Option<u64> {
         self.state.earliest_lwcond_deadline()
     }
@@ -7627,11 +8065,33 @@ impl ImportDispatch for VitaEnv {
         self.state.release_earliest_io()
     }
 
-    fn on_quantum(&mut self) {
+    /// # A quantum of guest EXECUTION is not a quantum of WALL time
+    /// The scheduler has one baton: it resumes a thread, that thread retires a quantum
+    /// of guest code, and the clock is charged for it. The Vita has three CPUs for the
+    /// game, so three threads retire their quanta AT ONCE and only ONE quantum of wall
+    /// time passes while they do. Charging the full quantum per thread makes the game
+    /// clock run at the total rate of every runnable thread, which turns a guest thread
+    /// SPINNING - waiting on nothing, retiring instructions - into game time it never
+    /// costs on hardware.
+    ///
+    /// Measured on this title's event load: the load costs ~230 s of GAME clock against
+    /// **54 s of wall clock** - the frames themselves run at 2.83 ms each - and `bench`
+    /// reports 18 thread resumes a frame, "one per 0 host calls". Threads burning whole
+    /// quanta in guest code, waiting on nothing, and the clock billing every one of them
+    /// as if it had a machine to itself.
+    ///
+    /// So the charge is the quantum divided by the cores that would have been busy:
+    /// `runnable` of them, capped at [`GUEST_CORES`], and never fewer than one (a lone
+    /// runnable thread really does have the machine to itself, and the other two cores
+    /// are idle). The STORAGE clock divides by exactly the same figure and for exactly
+    /// the same reason - it charges for elapsed wall time too, and the device does not
+    /// get three times the bandwidth because three threads are running.
+    fn on_quantum(&mut self, runnable: usize) {
+        let cores = runnable.clamp(1, guest_cores()) as u64;
         if self.state.has_io_waiters() {
-            self.state.charge_io_quantum(QUANTUM_IO_US);
+            self.state.charge_io_quantum(QUANTUM_IO_US / cores);
         }
-        self.state.charge_cpu_quantum(quantum_cpu_us());
+        self.state.charge_cpu_quantum(quantum_cpu_us() / cores);
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
@@ -7722,13 +8182,41 @@ fn quantum_cpu_us() -> u64 {
     })
 }
 
-/// `VITASLOP_FRAME_TOPUP=0`: do not top the game clock up to a full frame at a display
-/// flip, so a frame advances the clock only by the guest execution that actually
-/// happened. See [`VitaState::advance_time_frame`] for what that changes and why it is
-/// not the default. Anything other than `0` (or unset) leaves the top-up on.
+/// CPU cores a Vita gives a GAME. The console has four Cortex-A9 cores; the system
+/// software reserves one, so a title's threads run three at a time. See
+/// [`VitaEnv::on_quantum`], which is the only thing this number means to us: how much
+/// wall time one scheduler quantum of guest execution is worth.
+///
+/// It is a property of the DEVICE, not a tuning constant. Override it with
+/// `VITASLOP_GUEST_CORES` only to A/B the model; 1 restores the one-baton clock.
+const GUEST_CORES: usize = 3;
+
+/// [`GUEST_CORES`], overridable per-run by `VITASLOP_GUEST_CORES` for an A/B.
+pub fn guest_cores() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_GUEST_CORES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(GUEST_CORES)
+    })
+}
+
+/// `VITASLOP_FRAME_TOPUP=1`: top the game clock up to a full frame at a display flip.
+/// **OFF by default, and it should stay off** - see [`VitaState::advance_time_frame`].
+///
+/// It is superseded by [`VitaState::pace_flip`], which parks the flipping thread until
+/// the scanout can latch. The two cannot both be on: the top-up runs at the frame
+/// boundary, AFTER the flip's park, so it would add a second frame of clock on top of
+/// the one the guest just waited out and run the game clock at double rate. Turning it
+/// on also silently disables pacing - the top-up leaves the clock past the vblank floor,
+/// so the next flip never has anything to wait for.
+///
+/// Kept as a knob only so the old behaviour can be measured against the new one.
 fn frame_topup() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_FRAME_TOPUP").as_deref() != Ok("0"))
+    *CELL.get_or_init(|| crate::knobs::var("VITASLOP_FRAME_TOPUP").as_deref() == Ok("1"))
 }
 
 /// A shared handle to a `VitaEnv`: attach one clone as the engine's import
@@ -7790,8 +8278,8 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         self.borrow_mut().release_earliest_io()
     }
 
-    fn on_quantum(&mut self) {
-        self.borrow_mut().on_quantum();
+    fn on_quantum(&mut self, runnable: usize) {
+        self.borrow_mut().on_quantum(runnable);
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
@@ -7951,6 +8439,77 @@ mod preemptive_tests {
         let mut st = VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()));
         st.set_preemptive(true);
         st
+    }
+
+    /// The MOST RECENT park a thread registered, in microseconds from now. The last one,
+    /// not the first: `sleep_waiters` accumulates within a test, and the first entry is
+    /// whatever an earlier step parked on.
+    fn parked_us(st: &VitaState, thid: i32) -> u64 {
+        let (_, deadline) = st
+            .sleep_waiters
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == thid)
+            .copied()
+            .expect("thread is not parked");
+        deadline.saturating_sub(st.now_us())
+    }
+
+    #[test]
+    fn a_flip_latches_on_a_vblank_edge_not_a_period_after_the_request() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        st.set_current(1);
+        // A frame whose work took 5 ms latches at the vblank, 11.67 ms away - NOT a
+        // whole period later. That is what phase-locks a cheap frame to 60 Hz instead
+        // of letting it drift by its own render time every frame.
+        st.advance_time_to(5_000);
+        assert_eq!(st.pace_flip(FRAME_US), FRAME_US - 5_000);
+        assert_eq!(parked_us(&st, 1), FRAME_US - 5_000);
+        // A frame that overruns its period MISSES the vblank and waits for the next
+        // one, so it costs two whole periods - the console's 60/30 quantisation, not a
+        // continuum. Here the guest lands 1 ms past the 2nd edge and latches at the 3rd.
+        st.advance_time_to(2 * FRAME_US + 1_000);
+        assert_eq!(st.pace_flip(FRAME_US), 3 * FRAME_US - (2 * FRAME_US + 1_000));
+    }
+
+    #[test]
+    fn the_setbuf_sync_mode_is_recorded_and_changes_no_pacing() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        st.set_current(1);
+        assert_eq!(st.display_sync(), VitaState::SETBUF_NEXTFRAME, "the safe default");
+        st.advance_time_to(5_000);
+        let paced = st.pace_flip(FRAME_US);
+        assert!(paced > 0);
+        // IMMEDIATE decides whether the scanout's pointer changes MID-SCAN, which tears.
+        // It is not a swap interval and it does not let a title present faster, so the
+        // vblank floor is unchanged by it. Both readings that said otherwise were tried
+        // and both broke the one retail title that asks for it - see `set_display_sync`.
+        st.set_display_sync(VitaState::SETBUF_IMMEDIATE);
+        assert_eq!(st.display_sync(), VitaState::SETBUF_IMMEDIATE, "recorded");
+        // The second flip is reserved for the vblank after the first, and asking for
+        // IMMEDIATE does not release it: the floor is the panel, not the mode.
+        st.advance_time_to(10_000);
+        assert_eq!(st.pace_flip(FRAME_US), 2 * FRAME_US - 10_000);
+        let _ = paced;
+    }
+
+    #[test]
+    fn a_vblank_wait_joins_the_heartbeat_and_never_returns_instantly() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        st.set_current(1);
+        // Called 5 ms into a frame, one vblank away is 11.67 ms - not 16.67.
+        st.advance_time_to(5_000);
+        assert_eq!(st.vblank_park(1, FRAME_US), FRAME_US - 5_000);
+        // n counts EDGES, so two vblanks from the same point is one more period.
+        assert_eq!(st.vblank_park(2, FRAME_US), 2 * FRAME_US - 5_000);
+        // Exactly ON an edge the wait is for the NEXT one. A full period, never zero:
+        // a loop of instantly-returning vblank waits would spin without ever advancing
+        // the clock, which is the shape that livelocks this scheduler.
+        st.advance_time_to(4 * FRAME_US);
+        assert_eq!(st.vblank_park(1, FRAME_US), FRAME_US);
     }
 
     #[test]
@@ -8429,6 +8988,138 @@ mod filesystem_tests {
 
     fn state() -> VitaState {
         VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
+    }
+
+    /// A backing built the way a real one must be: it lists paths in their own spelling
+    /// and resolves lookups through [`vfs_key`], exactly as an OPFS or disk backing has
+    /// to. Keying it by the raw path instead would make every mixed-case test pass
+    /// against a backing that could never work in practice.
+    struct MapBacking {
+        /// Storage spelling -> bytes, in listing order.
+        stored: Vec<(String, Vec<u8>)>,
+        /// Normalised key -> index into `stored`.
+        by_key: std::collections::HashMap<String, usize>,
+    }
+
+    impl MapBacking {
+        fn new(files: &[(&str, Vec<u8>)]) -> Self {
+            let stored: Vec<(String, Vec<u8>)> =
+                files.iter().map(|(p, b)| (p.to_string(), b.clone())).collect();
+            let by_key =
+                stored.iter().enumerate().map(|(i, (p, _))| (vfs_key(p), i)).collect();
+            MapBacking { stored, by_key }
+        }
+        fn get(&self, key: &str) -> Option<&[u8]> {
+            self.by_key.get(key).map(|&i| self.stored[i].1.as_slice())
+        }
+    }
+
+    impl FileBacking for MapBacking {
+        fn len(&self, key: &str) -> Option<usize> {
+            self.get(key).map(|v| v.len())
+        }
+        fn read_at(&self, key: &str, off: usize, buf: &mut [u8]) -> usize {
+            let Some(v) = self.get(key) else { return 0 };
+            let end = (off + buf.len()).min(v.len());
+            let n = end.saturating_sub(off);
+            buf[..n].copy_from_slice(&v[off..end]);
+            n
+        }
+        fn keys(&self) -> Vec<String> {
+            self.stored.iter().map(|(p, _)| p.clone()).collect()
+        }
+    }
+
+    fn backed_state(path: &str, bytes: &[u8]) -> VitaState {
+        let mut st = state();
+        st.set_file_backing(Box::new(MapBacking::new(&[(path, bytes.to_vec())])));
+        st
+    }
+
+    /// A lazily-backed file must be indistinguishable from a resident one through the
+    /// whole SceIo surface. This is the property the browser's memory budget rests on,
+    /// and every way it can go wrong is silent: a title that reads a truncated asset, or
+    /// sizes a buffer from a zero stat, fails somewhere else entirely.
+    #[test]
+    fn a_backed_file_reads_seeks_and_stats_like_a_resident_one() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        let mut st = backed_state("ux0:/data/asset.bin", &data);
+
+        // It exists, and its size is known WITHOUT reading it.
+        assert_eq!(st.io_size("ux0:/data/asset.bin"), Some(256));
+
+        let fd = st.io_open("ux0:/data/asset.bin", SCE_O_RDONLY);
+        assert!(fd >= 0, "a backed file must open for reading");
+
+        // Sequential reads advance the cursor and deliver the real bytes.
+        assert_eq!(st.io_read(fd, 4), Some(vec![0, 1, 2, 3]));
+        assert_eq!(st.io_read(fd, 4), Some(vec![4, 5, 6, 7]));
+
+        // Seek from the end, then read across it: a short read at end of file must be
+        // short, not padded, and must leave the cursor AT the end.
+        assert_eq!(st.io_lseek(fd, -2, SCE_SEEK_END), 254);
+        assert_eq!(st.io_read(fd, 8), Some(vec![254, 255]));
+        assert_eq!(st.io_read(fd, 8), Some(vec![]));
+
+        // Positional reads do not disturb the cursor.
+        assert_eq!(st.io_lseek(fd, 10, SCE_SEEK_SET), 10);
+        assert_eq!(st.io_pread(fd, 100, 3), Some(vec![100, 101, 102]));
+        assert_eq!(st.io_read(fd, 2), Some(vec![10, 11]));
+    }
+
+    /// A write to a backed file faults it in and then behaves exactly as it always did.
+    /// Worth pinning because the fault-in is the one place the two storage models meet,
+    /// and a read-after-write that returned the ORIGINAL bytes would look like a
+    /// corrupted save rather than a filesystem bug.
+    #[test]
+    fn writing_a_backed_file_faults_it_in_and_read_after_write_is_exact() {
+        let mut st = backed_state("ux0:/data/asset.bin", &[9u8; 16]);
+        let fd = st.io_open("ux0:/data/asset.bin", SCE_O_RDWR);
+        assert!(fd >= 0);
+        assert_eq!(st.io_lseek(fd, 4, SCE_SEEK_SET), 4);
+        assert_eq!(st.io_write(fd, &[1, 2, 3]), Some(3));
+        assert_eq!(st.io_lseek(fd, 0, SCE_SEEK_SET), 0);
+        assert_eq!(st.io_read(fd, 8), Some(vec![9, 9, 9, 9, 1, 2, 3, 9]));
+        // Faulted in, so the inspection seam can now see it.
+        assert_eq!(st.file_bytes("ux0:/data/asset.bin").map(|b| b.len()), Some(16));
+    }
+
+    /// A backed file whose stored name has CAPITALS must be reachable by the guest, which
+    /// asks case-insensitively through an `app0:` mount.
+    ///
+    /// This is the exact bug that shipped and cost the most to find. The guest filesystem
+    /// normalises every path (lowercased, `app0:` stripped) before it reaches a backing,
+    /// while storage keeps the name as written. Get the two out of step and the file is
+    /// either missing or reads as nothing - and what surfaces is a guest memory-access
+    /// trap 30,000 host calls later, with nothing anywhere pointing at the filesystem. It
+    /// went wrong twice in a row, in opposite directions, so both ends are pinned here.
+    #[test]
+    fn a_backed_file_is_reachable_through_a_mount_and_a_different_case() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let mut st = state();
+        st.set_file_backing(Box::new(MapBacking::new(&[("PSP2/Data/Blob.BIN", data.clone())])));
+
+        // The spelling the title actually uses: an app0: mount, and whatever case it feels
+        // like. Every one of these is the same file.
+        for path in ["app0:/PSP2/Data/Blob.BIN", "app0:/psp2/data/blob.bin", "PSP2/Data/Blob.BIN"] {
+            assert_eq!(st.io_size(path), Some(64), "size of {path}");
+            let fd = st.io_open(path, SCE_O_RDONLY);
+            assert!(fd >= 0, "{path} must open (got {fd})");
+            assert_eq!(st.io_read(fd, 8), Some(vec![0, 1, 2, 3, 4, 5, 6, 7]), "read of {path}");
+        }
+    }
+
+    /// A backed file has to show up in a directory listing with its real size, because a
+    /// title enumerates its own data directory and sizes read buffers from what it finds.
+    #[test]
+    fn a_backed_file_appears_in_a_listing_with_its_size() {
+        let mut st = backed_state("ux0:/data/Asset.BIN", &[0u8; 42]);
+        let fd = st.io_dopen("ux0:/data");
+        assert!(fd >= 0, "the implied directory of a backed file must open");
+        let e = st.io_dread(fd).expect("a valid dir fd").expect("one entry");
+        assert_eq!(e.name, "Asset.BIN", "the as-supplied spelling must survive");
+        assert_eq!(e.size, 42);
+        assert!(!e.is_dir);
     }
 
     #[test]

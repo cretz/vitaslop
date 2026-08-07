@@ -28,7 +28,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, ExportKind,
+    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, Encode, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
     Instruction as W, MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType,
     TableSection, TableType, TypeSection, ValType,
@@ -36,6 +36,155 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{BinOp, Block, ConditionCode, Func, MemSize, Stmt, Term, Value};
+
+/// Wasmtime's own fuel cost for one operator, from `wasmtime_environ`'s
+/// `default_operator_cost`: an operator that generates no machine code costs nothing,
+/// and everything else costs one.
+///
+/// This is transcribed rather than invented. The browser's software fuel exists to give
+/// the browser the clock signal wasmtime gives native, so the two are only comparable if
+/// they bill the same operators - and the difference is not small. `end` alone is one of
+/// the most common operators in this codegen (every predicated guest instruction lowers
+/// to an `if`/`end` pair), so billing the zero-cost set inflates the browser's idea of
+/// how much work it has done, and its clock with it.
+fn operator_cost(i: &W) -> u32 {
+    match i {
+        // Nop and drop generate no code.
+        W::Nop | W::Drop => 0,
+        // Control flow may create branches, but is generally cheap and free. Note the
+        // absence of `if`, which does pay for its conditional check.
+        W::Block(_) | W::Loop(_) | W::Unreachable | W::Return | W::Else | W::End => 0,
+        _ => 1,
+    }
+}
+
+/// Whether wasmtime flushes its buffered fuel BEFORE emitting this operator, from the
+/// match in `wasmtime_internal_cranelift`'s `fuel_before_op`.
+///
+/// This is what makes fuel a count of the operators actually EXECUTED rather than of the
+/// operators present: a buffered charge is committed at every point control could leave
+/// the current straight line, so the arm of an `if` that is not taken is never billed.
+/// Charging a whole guest block up front instead - the obvious cheap design - bills every
+/// untaken arm in it, and on this codegen that alone ran the browser's clock several
+/// times fast.
+fn operator_flushes(i: &W) -> bool {
+    matches!(
+        i,
+        // Leaving this function, or entering another one: the counter has to be
+        // committed because it may be read while control is elsewhere.
+        W::Unreachable
+            | W::Return
+            | W::Call(_)
+            | W::CallIndirect { .. }
+            | W::ReturnCall(_)
+            | W::ReturnCallIndirect { .. }
+            | W::ReturnCallRef(_)
+            | W::Throw(_)
+            | W::ThrowRef
+            // A loop header, so the code before it is counted once rather than per turn.
+            | W::Loop(_)
+            // A branch whose edge is not known until runtime.
+            | W::If(_)
+            | W::Br(_)
+            | W::BrIf(_)
+            | W::BrTable(..)
+            | W::BrOnNull(_)
+            | W::BrOnNonNull(_)
+            // Leaving a scope: there are several ways out, so this is the only chance.
+            | W::End
+            | W::Else
+    )
+    // `Block` is deliberately absent: entering one is unconditional, so it is
+    // straight-line code and the exit accounts for it.
+}
+
+/// A function body under construction: the encoded instruction bytes, and - when the
+/// build opted into software fuel - wasmtime's fuel accounting emitted inline as they go.
+///
+/// # Why the accounting lives here
+/// Every instruction in a body passes through [`Body::instruction`], which is the only
+/// place that can see both an operator and its position. Wasmtime does its accounting at
+/// exactly this seam (`fuel_before_op`, called per operator as it lowers), so mirroring
+/// it here mirrors it exactly, rather than approximating it from the IR - and no caller
+/// has to remember to charge anything.
+///
+/// Fuel bookkeeping itself emits through [`Body::untolled`] and is never billed: native
+/// meters a module that has none of it, so billing our own instrumentation would charge
+/// the browser for work native never does.
+///
+/// Encoding into a plain `Vec<u8>` rather than straight into a `wasm_encoder::Function`
+/// costs nothing and keeps the locals declaration - which depends on choices made after
+/// the body is under way - out of the picture until [`Body::into_function`].
+struct Body {
+    bytes: Vec<u8>,
+    /// Whether to emit fuel accounting at all. Captured once at construction so a native
+    /// build pays a single branch per instruction and emits byte-identical code.
+    fuelled: bool,
+    /// Fuel charged but not yet committed to the counter - wasmtime's `fuel_consumed`.
+    pending: u32,
+}
+
+impl Body {
+    fn new() -> Self {
+        let fuelled = fuel_interval() != 0;
+        Body {
+            bytes: Vec::new(),
+            fuelled,
+            // Wasmtime starts a function at one, so that even an empty one costs
+            // something. Entering a function is real work: it is a call.
+            pending: u32::from(fuelled),
+        }
+    }
+
+    /// Emit one instruction of translated guest work, billing it as wasmtime would.
+    fn instruction(&mut self, i: &W) -> &mut Self {
+        if self.fuelled {
+            self.pending += operator_cost(i);
+            if operator_flushes(i) {
+                self.flush();
+            }
+        }
+        i.encode(&mut self.bytes);
+        self
+    }
+
+    /// Emit one instruction of fuel bookkeeping, which is not guest work and is neither
+    /// billed nor a flush point.
+    fn untolled(&mut self, i: &W) -> &mut Self {
+        i.encode(&mut self.bytes);
+        self
+    }
+
+    /// Commit the buffered charge to the fuel counter. A no-op when nothing is buffered,
+    /// which is common - a flush point immediately after another one buffers nothing, and
+    /// emitting a `-= 0` for it would be pure code size on the hottest path there is.
+    fn flush(&mut self) {
+        if !self.fuelled || self.pending == 0 {
+            return;
+        }
+        let owed = self.pending as i32;
+        self.pending = 0;
+        self.untolled(&W::GlobalGet(abi::FUEL_GLOBAL));
+        self.untolled(&W::I32Const(owed));
+        self.untolled(&W::I32Sub);
+        self.untolled(&W::GlobalSet(abi::FUEL_GLOBAL));
+    }
+
+    fn into_function<L>(self, locals: L) -> Function
+    where
+        L: IntoIterator<Item = (u32, ValType)>,
+        L::IntoIter: ExactSizeIterator,
+    {
+        debug_assert_eq!(
+            self.pending, 0,
+            "a finished body must have committed its fuel; every body ends in `end`, \
+             which is a flush point"
+        );
+        let mut f = Function::new(locals);
+        f.raw(self.bytes);
+        f
+    }
+}
 
 /// `VITASLOP_ARM_AT_FRAME=<n>` - hold every trapping diagnostic DISARMED until the
 /// run reaches display frame `n`.
@@ -73,7 +222,7 @@ thread_local! {
 /// AND the "diagnostics are armed" condition into the value already on the stack.
 /// A no-op when this build has no frame gate, so an ungated diagnostic keeps its
 /// exact previous shape.
-fn and_armed(f: &mut Function) {
+fn and_armed(f: &mut Body) {
     let off = ARM_WORD_OFF.with(|c| c.get());
     if off == 0 {
         return;
@@ -193,6 +342,134 @@ const WATCH_READ_COUNT_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 2;
 /// Lets `VITASLOP_WATCH_STORE_SKIP` skip the first N matching stores and trap on a later
 /// one - e.g. to catch a map's node-count *decrement* past its earlier increments.
 const WATCH_STORE_COUNT_GLOBAL: u32 = abi::TOTAL_GLOBAL_COUNT + 4;
+
+// Software fuel: how many guest loop iterations a thread may run before it must give
+// the scheduler a turn. 0 (the default) emits no fuel points at all and the module is
+// byte-identical to a build without this feature.
+//
+// # Why this exists, and why only some hosts want it
+// A guest thread can only be taken off the CPU at a point the engine can interrupt.
+// Natively that is free: wasmtime's `fuel_async_yield_interval` interrupts a thread
+// after a fixed amount of EXECUTION, whatever it is doing. The browser's WebAssembly
+// engine has no such counter - there, a guest thread leaves the CPU only when it calls
+// out to the host, which is why browser preemption counts HOST CALLS
+// (`VITASLOP_BROWSER_QUANTUM_CALLS`).
+//
+// That covers a busy-wait that polls the host, and it does NOT cover a guest loop that
+// makes no host call at all. Such a loop was long assumed not to exist in this title;
+// it does. Measured: with host-call preemption alone the browser reached display flip 2
+// and then burned 100% CPU indefinitely with a completely FLAT host-call count, while
+// native ran the same boot to flip 45 in 4.3 s. The loop spins on a word another thread
+// writes, so it can only ever end if something else is allowed to run.
+//
+// So a host with no engine fuel asks for fuel in the CODE. The counter lives in a wasm
+// global (`abi::FUEL_GLOBAL`), which is per-instance - and the preemptive scheduler
+// runs one instance per guest thread, so each thread gets its own quantum for free.
+//
+// # Where the check is emitted, and why that placement is both complete and cheap
+// Only on LOOP BACK EDGES: a re-entry of the dispatch loop whose target block address
+// is at or below the branching block's. That is complete, because every cycle in a
+// control-flow graph contains at least one edge to an address no higher than its
+// source - take the lowest-addressed block in the cycle and look at the edge entering
+// it. And it is cheap, because straight-line code and forward branches emit nothing;
+// only the code that can actually spin pays.
+//
+// Function entry deliberately gets NO check. An unbounded cycle through CALLS cannot
+// spin here: calls are real wasm calls, so a call cycle grows the wasm stack and traps
+// rather than running forever.
+//
+// Thread-local for the same reason as `ARM_WORD_OFF`: emission is single-threaded per
+// module, while a test binary emits several modules at once on several threads. A
+// process-global here would let one test's fuel setting silently change every other
+// test's module.
+thread_local! {
+    static FUEL_INTERVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// Set the fuel interval for modules emitted on this thread after this call (0 disables).
+/// A host with no engine-level fuel calls this before transpiling; one with real fuel
+/// leaves it alone and pays nothing. Overrides `VITASLOP_FUEL`, which is the same knob
+/// for a native experiment (the browser has no environment to read one from).
+pub fn set_fuel_interval(n: u32) {
+    FUEL_INTERVAL.with(|c| c.set(n));
+}
+
+/// The fuel interval this build emits with: an explicit [`set_fuel_interval`] if one was
+/// made on this thread, else `VITASLOP_FUEL`, else 0 (no fuel). `u32::MAX` is the "never
+/// set" sentinel, so a host CAN ask for 0 explicitly and mean it.
+fn fuel_interval() -> u32 {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<u32> = OnceLock::new();
+    match FUEL_INTERVAL.with(|c| c.get()) {
+        u32::MAX => *FROM_ENV.get_or_init(|| {
+            std::env::var("VITASLOP_FUEL").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+        }),
+        n => n,
+    }
+}
+
+/// Emit a fuel point: decrement this thread's quantum and, when it runs out, hand the
+/// scheduler a turn. A no-op unless the build opted into fuel, so an ordinary module is
+/// byte-identical.
+///
+/// The reload lives in the emitted code rather than in the host because the guest stack
+/// resumes exactly where it suspended: a host that forgot to refill would re-yield on
+/// the very next back edge, turning a preemption into a livelock of its own. `i32.le_s`
+/// rather than `i32.eqz` for the same reason - a counter that somehow went negative must
+/// still preempt, not run forever undetected.
+/// Test the fuel counter and, when it has run out, hand the scheduler a turn. Emitted on
+/// LOOP BACK EDGES only; a no-op unless the build opted into fuel, so an ordinary module
+/// is byte-identical.
+///
+/// # The unit is wasmtime's fuel, because that is what native's quantum is measured in
+/// The counter drives the browser's virtual game clock (a preemption charges
+/// `charge_cpu_quantum`), so it has to measure guest EXECUTION the way native's engine
+/// fuel does. It now does so by construction: [`Body`] reproduces wasmtime's own
+/// accounting - its operator cost table and its flush points - so the browser's quantum
+/// and native's `fuel_async_yield_interval` are the same number of the same thing rather
+/// than two scales that have to be fitted to each other.
+///
+/// Four cheaper models were measured against native's clock curve on the same title and
+/// recipe, and every one of them is wrong in a way no constant can absorb:
+///
+/// | model                            | ~f10,300 | ~f29,300 | ~f40,800 |
+/// |----------------------------------|----------|----------|----------|
+/// | flat 1 per back edge             | -1.6%    | -5.0%    | -15.4%   |
+/// | the back-edge block's IR size    | -11.1%   | -5.8%    | -14.6%   |
+/// | every block's IR size, up front  | -12%     | -12%     | -12%     |
+/// | every block's wasm size, up front| about 3.4x FAST                |
+///
+/// Each failure named the next mistake. Weighting the back-edge block alone changed
+/// nothing, because a loop body is usually SEVERAL blocks and only the one carrying the
+/// edge was charged. Charging every block fixed that but left a uniform 12%, because an
+/// IR statement is a PROXY for a wasm instruction whose ratio varies by screen. Counting
+/// wasm instructions instead overshot by 3.4x, for two reasons that only the real
+/// algorithm settles: wasmtime bills NOTHING for `end`/`block`/`loop`/`return`/`drop`,
+/// which are a large share of this codegen, and it bills only the operators actually
+/// EXECUTED, where an up-front block charge bills every untaken `if` arm as well.
+///
+/// The BRANCH stays on back edges only. Straight-line code cannot spin, so only the code
+/// that can actually livelock pays for the test.
+fn emit_fuel_check(f: &mut Body) {
+    let n = fuel_interval();
+    if n == 0 {
+        return;
+    }
+    // Commit anything still buffered first: the test must see what this thread has just
+    // done, not what it had done one basic block ago.
+    f.flush();
+    // The counter is DECREMENTED by `Body`'s own accounting; this only tests it.
+    // Decrementing here as well would double-charge the block carrying the back edge.
+    f.untolled(&W::GlobalGet(abi::FUEL_GLOBAL));
+    f.untolled(&W::I32Const(0));
+    f.untolled(&W::I32LeS);
+    f.untolled(&W::If(BlockType::Empty));
+    f.untolled(&W::I32Const(abi::FUEL_SELECTOR as i32));
+    f.untolled(&W::Call(IMPORT_FUNC));
+    f.untolled(&W::I32Const(n as i32));
+    f.untolled(&W::GlobalSet(abi::FUEL_GLOBAL));
+    f.untolled(&W::End);
+}
 
 /// Number of matching store-watchpoint hits to skip before trapping (`VITASLOP_WATCH_
 /// STORE_SKIP`, default 0 = trap on the first).
@@ -622,6 +899,10 @@ pub fn emit_module(
     // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
     globals.global(i32_global, &ConstExpr::i32_const(0)); // TP_GLOBAL
     globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_STORE_COUNT_GLOBAL
+    // The software fuel counter (see `emit_fuel_check`). Seeded with a full quantum so
+    // the first back edge a fresh thread takes does not immediately yield; zero, unread
+    // and unwritten in a build that did not ask for fuel.
+    globals.global(i32_global, &ConstExpr::i32_const(fuel_interval() as i32)); // FUEL_GLOBAL
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -649,6 +930,10 @@ pub fn emit_module(
     exports.export(abi::GUEST_PC_EXPORT, ExportKind::Global, GUEST_PC_GLOBAL);
     // The per-thread pointer, so the host seeds each thread's TLS base at instantiation.
     exports.export(abi::TP_EXPORT, ExportKind::Global, abi::TP_GLOBAL);
+    // The software fuel counter, so a host can see how much of a thread's quantum is
+    // left. Always exported (like `guest_pc`) so the export list does not depend on a
+    // build option; it reads 0 and never moves unless fuel was asked for.
+    exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::FUEL_GLOBAL);
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -736,7 +1021,7 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
     const L_HI: u32 = 3;
     const L_MID: u32 = 4;
     const L_V: u32 = 5;
-    let mut f = Function::new([(4, ValType::I32)]);
+    let mut f = Body::new();
 
     // target &= ~1  (clear the Thumb bit; function addresses are even).
     f.instruction(&W::LocalGet(P_TARGET));
@@ -827,7 +1112,7 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
     f.instruction(&W::Call(DISPATCH_MISS_FUNC));
     f.instruction(&W::Unreachable);
     f.instruction(&W::End); // function body
-    f
+    f.into_function([(4, ValType::I32)])
 }
 
 /// Emit one guest function as a wasm function: a dispatch loop over its blocks.
@@ -839,26 +1124,27 @@ fn emit_func(
 ) -> Function {
     // Locals: $bb + i32 scratch temps (flag computation), then one i64 scratch
     // (double-register split/merge) and one v128 scratch (NEON quad staging).
-    let mut f = if guard_reg().is_some() {
-        Function::new([
+    let locals: Vec<(u32, ValType)> = if guard_reg().is_some() {
+        vec![
             (L_I32_COUNT, ValType::I32),
             (1, ValType::I64),
             (3, ValType::V128),
             (1, ValType::I32), // L_GUARD: pre-call snapshot for the CSR guard
-        ])
+        ]
     } else {
-        Function::new([
+        vec![
             (L_I32_COUNT, ValType::I32),
             (1, ValType::I64),
             (3, ValType::V128),
-        ])
+        ]
     };
+    let mut f = Body::new();
 
     // A stub for an un-liftable function: trap if ever executed.
     if func.stub {
         f.instruction(&W::Unreachable);
         f.instruction(&W::End);
-        return f;
+        return f.into_function(locals);
     }
 
     // Diagnostic entry tracer (opt-in): announce this function's entry to the host
@@ -890,7 +1176,7 @@ fn emit_func(
     if n == 1 {
         emit_block(&mut f, &func.blocks[0], func, func_index, base, inline, 0);
         f.instruction(&W::End);
-        return f;
+        return f.into_function(locals);
     }
 
     // block $exit ; loop $loop ; block $B{n-1} ... block $B0 ; br_table ...
@@ -911,13 +1197,13 @@ fn emit_func(
     f.instruction(&W::End); // loop
     f.instruction(&W::End); // $exit block
     f.instruction(&W::End); // function body
-    f
+    f.into_function(locals)
 }
 
 /// Emit one basic block's statements and terminator. `loop_depth` is the wasm
 /// branch depth from within this block's code to the enclosing dispatch `loop`.
 fn emit_block(
-    f: &mut Function,
+    f: &mut Body,
     block: &Block,
     func: &Func,
     func_index: &BTreeMap<u32, u32>,
@@ -939,15 +1225,26 @@ fn emit_block(
             f.instruction(&W::Call(SVC_FUNC));
         }
     }
+    // Nothing here charges the software fuel counter: `Body` does it, per operator, as
+    // the block below is emitted (see [`emit_fuel_check`]). The CHECK is what is placed
+    // by hand, and only on back edges.
     for stmt in &block.stmts {
         emit_stmt(f, stmt, func_index, base, inline, func.addr);
     }
-    emit_term(f, &block.term, func, base, loop_depth);
+    emit_term(f, &block.term, func, base, loop_depth, block.addr);
 }
 
 /// Re-dispatch to the block at `target` address: set `$bb`, branch to the loop.
-/// `extra` accounts for any `if`/`block` frames open between here and the loop.
-fn goto(f: &mut Function, func: &Func, target: u32, loop_depth: u32, extra: u32) {
+/// `extra` accounts for any `if`/`block` frames open between here and the loop. `from`
+/// is the address of the block doing the branching, which is what makes a back edge
+/// recognisable (see [`emit_fuel_check`]).
+///
+/// The fuel check goes FIRST and is self-contained (`if`..`end` closes before the
+/// branch), so it cannot disturb `loop_depth + extra`.
+fn goto(f: &mut Body, func: &Func, target: u32, loop_depth: u32, extra: u32, from: u32) {
+    if target <= from {
+        emit_fuel_check(f);
+    }
     let idx = func
         .block_index(target)
         .unwrap_or_else(|| {
@@ -970,7 +1267,7 @@ fn goto(f: &mut Function, func: &Func, target: u32, loop_depth: u32, extra: u32)
     f.instruction(&W::Br(loop_depth + extra));
 }
 
-fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: u32) {
+fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32, from: u32) {
     match term {
         Term::Fallthrough => {} // flow into the next block's code
         Term::Return => {
@@ -993,7 +1290,7 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
             f.instruction(&W::Unreachable);
         }
         Term::Jump(target) => {
-            goto(f, func, *target, loop_depth, 0);
+            goto(f, func, *target, loop_depth, 0, from);
         }
         // Computed jump-table dispatch. A `br_table` on the guest index selects one
         // of `n` landing pads; each sets `$bb` to the target block and re-enters the
@@ -1016,6 +1313,13 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
                 let idx = func.block_index(target).unwrap_or_else(|| {
                     panic!("switch target {target:#x} is not a block in f_{:x}", func.addr)
                 }) as i32;
+                // A switch arm is a dispatch-loop re-entry like any other, so a backward
+                // one is a back edge and needs its fuel point. This pad open-codes what
+                // `goto` does (its branch depth counts the switch frames), so it has to
+                // repeat the check rather than inherit it.
+                if target <= from {
+                    emit_fuel_check(f);
+                }
                 f.instruction(&W::I32Const(idx));
                 f.instruction(&W::LocalSet(L_BB));
                 f.instruction(&W::Br(loop_depth + n - i as u32));
@@ -1024,7 +1328,7 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
             match default {
                 // The range check already routed out-of-range indices away, so this
                 // is faithful when known and unreachable in practice.
-                Some(d) => goto(f, func, *d, loop_depth, 0),
+                Some(d) => goto(f, func, *d, loop_depth, 0, from),
                 None => {
                     f.instruction(&W::Unreachable);
                 }
@@ -1033,7 +1337,7 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
         Term::Branch { cond, taken } => {
             emit_cond(f, *cond);
             f.instruction(&W::If(BlockType::Empty));
-            goto(f, func, *taken, loop_depth, 1); // +1 for the `if` frame
+            goto(f, func, *taken, loop_depth, 1, from); // +1 for the `if` frame
             f.instruction(&W::End);
         }
         Term::BranchZero { reg, nonzero, taken } => {
@@ -1043,19 +1347,19 @@ fn emit_term(f: &mut Function, term: &Term, func: &Func, base: u32, loop_depth: 
                 f.instruction(&W::I32Eqz); // reg != 0
             }
             f.instruction(&W::If(BlockType::Empty));
-            goto(f, func, *taken, loop_depth, 1);
+            goto(f, func, *taken, loop_depth, 1, from);
             f.instruction(&W::End);
         }
     }
 }
 
 /// Push a 0/1 i32 for `cond` computed from the flag globals.
-fn emit_cond(f: &mut Function, cond: ConditionCode) {
+fn emit_cond(f: &mut Body, cond: ConditionCode) {
     use ConditionCode::*;
-    fn get(f: &mut Function, flag: abi::Flag) {
+    fn get(f: &mut Body, flag: abi::Flag) {
         f.instruction(&W::GlobalGet(abi::flag_global(flag)));
     }
-    fn eqz(f: &mut Function) {
+    fn eqz(f: &mut Body) {
         f.instruction(&W::I32Eqz);
     }
     match cond {
@@ -1111,7 +1415,7 @@ fn emit_cond(f: &mut Function, cond: ConditionCode) {
 /// (and, with `VITASLOP_WATCH_READ_NZ`, the value is non-zero) once more than
 /// `VITASLOP_WATCH_READ_SKIP` earlier matches have passed, then leaves the value on the
 /// stack. Shared by the integer and VFP-single load paths.
-fn emit_read_watch_check(f: &mut Function, w: u32, base: u32) {
+fn emit_read_watch_check(f: &mut Body, w: u32, base: u32) {
     f.instruction(&W::LocalSet(L_T1)); // value -> L_T1
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::I32Const(w.wrapping_sub(base) as i32));
@@ -1153,7 +1457,7 @@ fn emit_read_watch_check(f: &mut Function, w: u32, base: u32) {
 
 /// Snapshot the guarded callee-saved register into [`L_GUARD`] just before a call
 /// (no-op unless `VITASLOP_GUARD_REG` is set). See [`guard_reg`].
-fn guard_snapshot(f: &mut Function) {
+fn guard_snapshot(f: &mut Body) {
     if let Some(r) = guard_reg() {
         f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
         f.instruction(&W::LocalSet(L_GUARD));
@@ -1162,7 +1466,7 @@ fn guard_snapshot(f: &mut Function) {
 
 /// After a call returns, trap if the guarded register differs from its pre-call
 /// snapshot - the callee failed to preserve it (no-op unless the guard is set).
-fn guard_check(f: &mut Function) {
+fn guard_check(f: &mut Body) {
     if let Some(r) = guard_reg() {
         f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
         f.instruction(&W::LocalGet(L_GUARD));
@@ -1175,7 +1479,7 @@ fn guard_check(f: &mut Function) {
 }
 
 fn emit_stmt(
-    f: &mut Function,
+    f: &mut Body,
     stmt: &Stmt,
     func_index: &BTreeMap<u32, u32>,
     base: u32,
@@ -1312,7 +1616,7 @@ fn emit_stmt(
             // split the 64-bit product into its low and high 32-bit halves. The
             // full product is computed before either register is written, so an
             // operand that aliases a destination reads its old value first.
-            let extend = |f: &mut Function| {
+            let extend = |f: &mut Body| {
                 if *signed {
                     f.instruction(&W::I64ExtendI32S);
                 } else {
@@ -1405,7 +1709,7 @@ fn emit_stmt(
 }
 
 /// Push byte `i` (0..3) of register `r`, zero-extended: `(r >> 8i) & 0xff`.
-fn push_reg_byte(f: &mut Function, r: u8, i: u32) {
+fn push_reg_byte(f: &mut Body, r: u8, i: u32) {
     f.instruction(&W::GlobalGet(abi::reg_global(r as usize)));
     if i != 0 {
         f.instruction(&W::I32Const((8 * i) as i32));
@@ -1419,7 +1723,7 @@ fn push_reg_byte(f: &mut Function, r: u8, i: u32) {
 /// carry-out into an APSR GE bit (held in `L_GE`) for a later `sel`. The full
 /// result is staged in `L_T2` and the GE mask in `L_GE` before `rd` is written,
 /// so `rd` aliasing `rn`/`rm` (e.g. `uadd8 r2, r2, ip`) is safe.
-fn emit_uadd8(f: &mut Function, rd: u8, rn: u8, rm: u8) {
+fn emit_uadd8(f: &mut Body, rd: u8, rn: u8, rm: u8) {
     f.instruction(&W::I32Const(0));
     f.instruction(&W::LocalSet(L_T2)); // result accumulator
     f.instruction(&W::I32Const(0));
@@ -1460,7 +1764,7 @@ fn emit_uadd8(f: &mut Function, rd: u8, rn: u8, rm: u8) {
 /// `sel rd, rn, rm`: for each byte, pick `rn`'s byte where the GE bit (in `L_GE`)
 /// is set, else `rm`'s. Branchless per byte via a 0x00/0xff mask; staged in
 /// `L_T2` before writing `rd` so aliasing is safe.
-fn emit_sel(f: &mut Function, rd: u8, rn: u8, rm: u8) {
+fn emit_sel(f: &mut Body, rd: u8, rn: u8, rm: u8) {
     f.instruction(&W::I32Const(0));
     f.instruction(&W::LocalSet(L_T2)); // result accumulator
     for i in 0..4u32 {
@@ -1510,7 +1814,7 @@ fn emit_sel(f: &mut Function, rd: u8, rn: u8, rm: u8) {
 /// L_T2=result, L_T3=carry. `value`/`amount` are read before `rd` is written, so a
 /// shift whose amount or source aliases `rd` (e.g. `lsls r0, r3, r0`) is correct.
 fn emit_shift_reg_flags(
-    f: &mut Function,
+    f: &mut Body,
     kind: crate::ir::ShiftKind,
     rd: u8,
     rn: &Value,
@@ -1642,20 +1946,20 @@ fn emit_shift_reg_flags(
 // --- VFP / floating-point emission ---------------------------------------
 
 /// Push S`n` interpreted as an f32.
-fn get_s_f32(f: &mut Function, n: u8) {
+fn get_s_f32(f: &mut Body, n: u8) {
     f.instruction(&W::GlobalGet(abi::vfp_s_global(n)));
     f.instruction(&W::F32ReinterpretI32);
 }
 
 /// Store the f32 on the stack into S`n` (as raw bits).
-fn set_s_f32(f: &mut Function, n: u8) {
+fn set_s_f32(f: &mut Body, n: u8) {
     f.instruction(&W::I32ReinterpretF32);
     f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
 }
 
 /// Push the raw 64 bits of D`n` as an i64. Low bank (n < 16): merge the two S
 /// halves. Upper bank (n >= 16): extract `i64x2` lane `n & 1` of the quad `q(n/2)`.
-fn get_d_bits(f: &mut Function, n: u8) {
+fn get_d_bits(f: &mut Body, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
         let lo = 2 * n;
         let hi = 2 * n + 1;
@@ -1675,7 +1979,7 @@ fn get_d_bits(f: &mut Function, n: u8) {
 /// Store the raw i64 on the stack into D`n`. Low bank (n < 16): split into the two
 /// S halves. Upper bank (n >= 16): replace `i64x2` lane `n & 1` of quad `q(n/2)`,
 /// leaving the sibling D untouched. Uses the i64 scratch local.
-fn set_d_bits(f: &mut Function, n: u8) {
+fn set_d_bits(f: &mut Body, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
         let lo = 2 * n;
         let hi = 2 * n + 1;
@@ -1700,13 +2004,13 @@ fn set_d_bits(f: &mut Function, n: u8) {
 }
 
 /// Push D`n` interpreted as an f64 (its raw 64 bits reinterpreted).
-fn get_d_f64(f: &mut Function, n: u8) {
+fn get_d_f64(f: &mut Body, n: u8) {
     get_d_bits(f, n);
     f.instruction(&W::F64ReinterpretI64);
 }
 
 /// Store the f64 on the stack into D`n` (as raw bits).
-fn set_d_f64(f: &mut Function, n: u8) {
+fn set_d_f64(f: &mut Body, n: u8) {
     f.instruction(&W::I64ReinterpretF64);
     set_d_bits(f, n);
 }
@@ -1731,7 +2035,7 @@ fn fbinop64(op: crate::ir::FBinOp) -> W<'static> {
     }
 }
 
-fn emit_vfp(f: &mut Function, op: &crate::ir::VfpOp) {
+fn emit_vfp(f: &mut Body, op: &crate::ir::VfpOp) {
     use crate::ir::VfpOp::*;
     match op {
         Bin32 { op, rd, rn, rm } => {
@@ -1978,8 +2282,8 @@ fn emit_vfp(f: &mut Function, op: &crate::ir::VfpOp) {
 
 /// Set the FP condition flags from comparing D`rn` against D`rm` (or `+0.0`), the
 /// f64 twin of [`emit_vfp_cmp`]. N=less, Z=equal, C=not-less, V=unordered.
-fn emit_vfp_cmp64(f: &mut Function, rn: u8, rm: Option<u8>) {
-    let push_b = |f: &mut Function| match rm {
+fn emit_vfp_cmp64(f: &mut Body, rn: u8, rm: Option<u8>) {
+    let push_b = |f: &mut Body| match rm {
         Some(m) => get_d_f64(f, m),
         None => {
             f.instruction(&W::F64Const(0.0f64.into()));
@@ -2010,8 +2314,8 @@ fn emit_vfp_cmp64(f: &mut Function, rn: u8, rm: Option<u8>) {
 
 /// Set the FP condition flags (FPSCR N,Z,C,V) from comparing S`rn` against S`rm`
 /// (or +0.0 when `rm` is `None`). N=less, Z=equal, C=not-less, V=unordered.
-fn emit_vfp_cmp(f: &mut Function, rn: u8, rm: Option<u8>) {
-    let push_b = |f: &mut Function| match rm {
+fn emit_vfp_cmp(f: &mut Body, rn: u8, rm: Option<u8>) {
+    let push_b = |f: &mut Body| match rm {
         Some(m) => get_s_f32(f, m),
         None => {
             f.instruction(&W::F32Const(0.0f32.into()));
@@ -2045,7 +2349,7 @@ fn emit_vfp_cmp(f: &mut Function, rn: u8, rm: Option<u8>) {
 }
 
 /// One VFP register <-> memory transfer. S = 4-byte raw i32; D = 8-byte raw i64.
-fn emit_vfp_mem(f: &mut Function, reg: crate::ir::VfpReg, addr: &Value, load: bool, base: u32) {
+fn emit_vfp_mem(f: &mut Body, reg: crate::ir::VfpReg, addr: &Value, load: bool, base: u32) {
     use crate::ir::VfpReg::*;
     match reg {
         S(n) => {
@@ -2092,7 +2396,7 @@ fn emit_vfp_mem(f: &mut Function, reg: crate::ir::VfpReg, addr: &Value, load: bo
 // widen the low 64 bits of a `v128` - exactly the NEON long/wide semantics.
 
 /// Push NEON register `reg` as a `v128` (a `D` lands in the low 64 bits).
-fn neon_get(f: &mut Function, reg: crate::ir::NeonReg) {
+fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
     use crate::ir::NeonReg::*;
     match reg {
         Q(k) => {
@@ -2122,7 +2426,7 @@ fn neon_get(f: &mut Function, reg: crate::ir::NeonReg) {
 /// bits; a `D` writes only the low 64 (leaving the sibling half of an upper-bank
 /// quad intact). Uses the `L_V128A` scratch to fan a low-bank quad out to its S
 /// halves (safe: any staged operands are already consumed by this point).
-fn neon_set(f: &mut Function, reg: crate::ir::NeonReg) {
+fn neon_set(f: &mut Body, reg: crate::ir::NeonReg) {
     use crate::ir::NeonReg::*;
     match reg {
         Q(k) => {
@@ -2385,7 +2689,7 @@ fn splat_lane_mask(bits: u8, val: u64) -> i128 {
 /// is special-cased: a logical one yields zero, an arithmetic one is clamped to `bits-1` (which
 /// already produces the sign broadcast). Left shifts are always in `0..bits-1`.
 fn emit_shift_imm(
-    f: &mut Function,
+    f: &mut Body,
     op: crate::ir::NeonShift,
     ty: crate::ir::NeonType,
     dst: crate::ir::NeonReg,
@@ -2396,7 +2700,7 @@ fn emit_shift_imm(
     let bits = ty.bits;
     let amt = amount as u32;
     // Push `src >> amt` (arithmetic iff `ty.signed`), handling the shift-out-everything case.
-    let push_shifted_src = |f: &mut Function| {
+    let push_shifted_src = |f: &mut Body| {
         if !ty.signed && amt >= bits as u32 {
             f.instruction(&W::V128Const(0)); // logical shift by >= width clears the lane
         } else {
@@ -2457,7 +2761,7 @@ fn emit_shift_imm(
     }
 }
 
-fn emit_neon(f: &mut Function, op: &crate::ir::NeonStmt, base: u32) {
+fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32) {
     use crate::ir::NeonStmt::*;
     match op {
         Bin { op: bop, ty, dst, a, b } => {
@@ -3184,7 +3488,7 @@ fn permute_masks(op: crate::ir::PermuteOp, esize: u8, q: bool) -> ([u8; 16], [u8
 /// element across all `64/esize` lanes (a multiply by the per-lane "1" constant); a
 /// lane store extracts the field and writes `esize` bits out.
 fn emit_elem_mem(
-    f: &mut Function,
+    f: &mut Body,
     d: u8,
     esize: u8,
     lane: crate::ir::ElemLane,
@@ -3258,7 +3562,7 @@ fn emit_elem_mem(
 /// add/sub/cmp, the C flag for adc/sbc. Uses i64 for an always-correct unsigned
 /// carry. `cin` is emitted once into a local, since a flag read must not be
 /// duplicated if it ever had a cost.
-fn emit_flags_add(f: &mut Function, a: &Value, b: &Value, cin: &Value, base: u32) {
+fn emit_flags_add(f: &mut Body, a: &Value, b: &Value, cin: &Value, base: u32) {
     emit_value(f, a, base);
     f.instruction(&W::LocalSet(L_T0)); // a
     emit_value(f, b, base);
@@ -3310,13 +3614,13 @@ fn emit_flags_add(f: &mut Function, a: &Value, b: &Value, cin: &Value, base: u32
 }
 
 /// Emit a guest address as a linear-memory offset (guest addr - base).
-fn emit_addr(f: &mut Function, addr: &Value, base: u32) {
+fn emit_addr(f: &mut Body, addr: &Value, base: u32) {
     emit_value(f, addr, base);
     f.instruction(&W::I32Const(base as i32));
     f.instruction(&W::I32Sub);
 }
 
-fn emit_value(f: &mut Function, v: &Value, base: u32) {
+fn emit_value(f: &mut Body, v: &Value, base: u32) {
     match v {
         Value::Imm(x) => {
             f.instruction(&W::I32Const(*x as i32));
@@ -3451,7 +3755,7 @@ impl InlineImports {
 /// A host-mirror read takes no pointer and needs no guard: its address is a constant
 /// inside a page this module reserved, so it is always in range. What makes IT exact
 /// is the host-side contract in [`crate::InlineOp::LoadMirror`], not a guard here.
-fn emit_import(f: &mut Function, index: u32, base: u32, inline: &InlineImports) {
+fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
     let (offset, shift, mask, limit) = match inline.lower(index) {
         None => {
             f.instruction(&W::I32Const(index as i32));

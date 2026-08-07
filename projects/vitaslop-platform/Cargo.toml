@@ -14,6 +14,11 @@ publish.workspace = true
 gpu = ["dep:wgpu", "dep:vitaslop-gxp-shader"]
 
 [dependencies]
+# Every renderer diagnostic goes through `tracing`, not `eprintln!`. On wasm32 stderr
+# is a no-op sink, so an `eprintln!` here is invisible in the browser - which meant the
+# recompiler's own fallback report, the one thing that says whether a frame was really
+# drawn, was silently discarded on exactly the engine hardest to inspect.
+tracing = { workspace = true }
 wgpu = { workspace = true, optional = true }
 # The clean-room GXP->WGSL recompiler, used only by the GPU `GxmRenderer` to link a
 # guest vertex+fragment shader pair into a live pipeline (falls back to fixed-function

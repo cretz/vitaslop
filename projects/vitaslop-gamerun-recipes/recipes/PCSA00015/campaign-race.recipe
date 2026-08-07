@@ -5,172 +5,138 @@
 # WHAT THIS RECIPE DOES
 #   boot -> PRESS ANY BUTTON -> GAME MODE -> SINGLE PLAYER CAMPAIGN
 #        -> campaign intro -> the campaign MAP -> select the event EMPIRE CLIMB
-#        -> event briefing -> confirm -> SHIP SELECT -> the race is LIVE.
+#        -> event briefing -> START -> SELECT TEAM -> the load -> the pre-race
+#        card -> the race is LIVE at f7300.
 #
-# At the end of this recipe the title is racing: the world pass carries several
-# hundred draws and tens of thousands of triangles, `camera` tracks the ship,
-# and holding `r` (thrust) flies it down the track.
+# At the end of this recipe the title is racing: LAP 1/3, POS 8/8, the world
+# pass carries several hundred draws, `camera` tracks the ship, and holding `r`
+# (thrust) flies it down the track. ZERO shader fallbacks over the whole run.
 #
 # >>> IT NEEDS `VITASLOP_FRAME_TOPUP=0`, AND THAT IS NOT OPTIONAL.
 # With the default per-flip clock top-up a displayed frame carries about a
 # TENTH of the guest work a console frame carries, and this title never
 # finishes loading at all. See `VitaState::advance_time_frame`.
 #
-#   VITASLOP_FRAME_TOPUP=0 play --game <dir> --recipe <this> --max-frames 50000
+#   VITASLOP_FRAME_TOPUP=0 play --game <dir> --recipe <this> --max-frames 12000
 #
-# >>> WHY THE MAP SECTION IS A SWEEP OF 35 TAPS AND NOT ONE TAP
-# The campaign map is a PANNABLE hex grid, and it is drawn by a shader that
-# builds its vertices from a texture fetch - so no fixed-function renderer can
-# show it and there is no picture to read a node's position off. The sweep is
-# how the node was found: it pans the map and taps across it, and the tap at
-# f39800 lands on an event node. That is measured, not guessed - the title
-# spawns its LoadingScreenThread three frames later
-# (`RUST_LOG=vitaslop::thread=debug`), which is the signal this whole sequence
-# was tuned against. Every tap before it is load-bearing: they set the pan the
-# last tap depends on. Do not "tidy" them away.
+# >>> THE MAP NEEDS TWO TAPS IN ONE PLACE, NOT A 35-TAP SWEEP.
+# The version of this recipe before 2026-08-06f swept 35 taps across the map
+# over 6,800 frames and reached the race at f44,600, and its header insisted
+# every tap was load-bearing because the map pans. It does not need to pan. The
+# map opens with a "TOUCH TO START" prompt: the first tap dismisses it and the
+# second selects the node under it. MEASURED - two taps at (1000,550) and the
+# EMPIRE CLIMB briefing is up 100 frames later.
+#
+# >>> EVERY FRAME BELOW IS MEASURED, one headless GPU run per step, shots every
+# 100 frames:
+#   f1100  title, PRESS ANY BUTTON TO START
+#   f1400  GAME MODE
+#   f2100  campaign intro
+#   f3100  campaign MAP
+#   f3900  EMPIRE CLIMB briefing (RACE, NO WEAPONS)
+#  ~f4400  SELECT TEAM (only FEISAR SPEED is unlocked)
+#   f4300-f5600  the CONTROLS/RACER legend with LOADING 0% -> 100%
+#   f5700-f7200  the track flyby behind the RACE card
+#   f7300  THE RACE IS LIVE
+# Judge a live race by the HUD (LAP/POS/TOTAL), never by a world scene: the
+# flyby that plays over the load is a world scene and reads exactly like one.
 #
 # >>> THE GESTURE TYPE MASK MATTERS AND THE DEFAULT IS NOW RIGHT
 # SceSystemGesture recognizers come in types 1/2/4/8 and their meanings are not
 # published. Reporting a touch to ALL of them tells the title a tap and a drag
-# and a pinch happened at once, and the map then only ever PANS - no tap sweep
+# and a pinch happened at once, and the map then only ever PANS - no tap
 # selects anything. Type 1 alone selects. `vita::gesture::type_mask` now
 # defaults to 1 for that reason; `VITASLOP_GESTURE_TYPE_MASK=15` reproduces the
 # old behaviour and this recipe then reaches the map and stops there.
+#
+# >>> THE MAP RENDERS AS A WHITE HEX LATTICE, AND THAT IS A KNOWN DEFECT.
+# The campaign map's body is drawn by a vertex program that fetches `canvasTex`,
+# and it lands in the wrong place - over the whole screen, on every screen from
+# f600 on. That is why a node's position cannot be read off a shot and why the
+# taps here are blind. When it is fixed, these two taps become one aimed one.
 # ============================================================================
 
 0: @section boot
 # No input while it loads - this is boot.recipe's ladder, unchanged.
 
-28000: cross
-28000: @shot title-screen
-28020:
+1300: cross
+1300: @shot title-screen
+1315:
 # "PRESS ANY BUTTON TO START" -> GAME MODE.
 
-28620: touch=472,524
-28620: @shot game-mode
-28640:
+2000: touch=472,524
+2000: @shot game-mode
+2015:
 # The SINGLE PLAYER CAMPAIGN tile (screen 236,262). ONLINE CAMPAIGN and
 # CROSS-PLAY are correctly greyed out (signed out); ADHOC needs a second unit.
 
-29040: cross
-29040: @shot campaign-intro
-29060:
-# The intro text ("Touch the nodes to play events").
+3000: touch=1760,952
+3000: @shot campaign-intro
+3020:
+# The intro text ("Touch the nodes to play events") and its confirm checkmark,
+# bottom right (screen 880,476).
 
-29460: touch=1760,952
-29460: @shot campaign-intro-confirm
-29480:
-# Its confirm checkmark, bottom right (screen 880,476).
+3200: @section campaign-map
+3200: @shot campaign-map
 
-33000: @section campaign-map
-33000: @shot campaign-map
-# The map renders only its HUD - see the header for why. The sweep follows.
-33000: touch=250,250
-33015:
-33200: touch=500,250
-33215:
-33400: touch=750,250
-33415:
-33600: touch=1000,250
-33615:
-33800: touch=1250,250
-33815:
-34000: touch=1500,250
-34015:
-34200: touch=1700,250
-34215:
-34400: touch=250,400
-34415:
-34600: touch=500,400
-34615:
-34800: touch=750,400
-34815:
-35000: touch=1000,400
-35015:
-35200: touch=1250,400
-35215:
-35400: touch=1500,400
-35415:
-35600: touch=1700,400
-35615:
-35800: touch=250,550
-35815:
-36000: touch=500,550
-36015:
-36200: touch=750,550
-36215:
-36400: touch=1000,550
-36415:
-36600: touch=1250,550
-36615:
-36800: touch=1500,550
-36815:
-37000: touch=1700,550
-37015:
-37200: touch=250,700
-37215:
-37400: touch=500,700
-37415:
-37600: touch=750,700
-37615:
-37800: touch=1000,700
-37815:
-38000: touch=1250,700
-38015:
-38200: touch=1500,700
-38215:
-38400: touch=1700,700
-38415:
-38600: touch=250,850
-38615:
-38800: touch=500,850
-38815:
-39000: touch=750,850
-39015:
-39200: touch=1000,850
-39215:
-39400: touch=1250,850
-39415:
-39600: touch=1500,850
-39615:
-39800: touch=1700,850
-39815:
+3400: touch=1000,550
+3415:
+# Dismisses the map's "TOUCH TO START" prompt.
 
-# The tap above at f39800 (touch=1700,850) is the one that lands on an event
-# node: EMPIRE CLIMB, a RACE with NO WEAPONS. The title starts loading it three
-# frames later.
+3800: touch=1000,550
+3815:
+# ...and this one lands on the event node. The title spawns its
+# LoadingScreenThread a few frames later
+# (`RUST_LOG=vitaslop::thread=debug`), which is the machine-readable signal.
 
-40000: @section event-loading
-40000: @shot event-loading
-# The loading screen carries the title's own control legend, which is where the
+4000: @shot event-briefing
+# EMPIRE CLIMB / NO WEAPONS, with the track photo, a ship button, a cancel X
+# and a START triangle along the bottom (screen 622/752/881, 480).
+
+4200: touch=1762,960
+4220:
+# START.
+
+4600: @shot select-team
+# SELECT TEAM. Only FEISAR SPEED is unlocked (SPEED 8 / HANDLING 7 / HEALTH 4 /
+# FIREPOWER 6); every other hull carries a padlock.
+
+5000: touch=1762,960
+5020:
+# Its confirm checkmark, same place.
+
+5400: @section event-loading
+# The CONTROLS/RACER legend with a LOADING percentage. That legend is where the
 # race controls below come from: STEER/PITCH = LEFT STICK, R = THRUST,
 # X = FIRE/USE PICKUP, plus airbrake and absorb.
 
-43600: @shot event-briefing
-# EMPIRE CLIMB / RACE, with a confirm checkmark bottom right.
+6800: @shot pre-race
+# The RACE card over a flyby of the circuit, with a confirm checkmark.
 
-44000: @section confirm-event
-44000: touch=1760,960
-44020:
-44400: @shot after-confirm
+7200: touch=1762,960
+7220:
 
-44600: @section race
-# From here the title is in the event: `start` opens the in-race GAME PAUSED
-# menu (OPTIONS / PHOTO MODE, and quit / restart / resume buttons), and the
-# frame is a race frame - a 1024x1024 shadow pass, reflection and post targets,
-# and a world pass of several hundred draws into an offscreen 960x544 target
-# that the composite samples.
+7600: @section race
+7600: @shot race-start
+# From here the title is in the event: the HUD reads LAP 1/3 POS 8/8, `start`
+# opens the in-race GAME PAUSED menu, and the frame is a race frame - a
+# 1024x1024 shadow pass, reflection and post targets, and a world pass of
+# several hundred draws into an offscreen target that the composite samples.
 #
 # @note The composite CANNOT be reproduced by the software renderer: its
 # fullscreen blit carries no texcoord attribute (the shader derives the UV), so
-# `@shot` here is the HUD over black. The race itself is fine - render the
-# world pass with VITASLOP_SW_CHAIN=1 VITASLOP_SW_CHAIN_DIR=<dir> and look at
-# pass05_89204aa0.png, which shows the ship on the track.
+# `play`'s `@shot` here is the HUD over black - which is exactly what makes it
+# the right oracle for LAP/POS/TOTAL. For the world, render through
+# `vitaslop-desktop --headless` with VITASLOP_GXP_LIVE=1.
 #
-# @todo Drive it. `camera` gives the ship's position and heading every frame and
-# `surface --tex <track>` gives how far the track material reaches ahead, which
-# together close a steering loop (a controller that does this holds ~80 world
-# units per 30 frames along the track). What is NOT solved is finishing: the
-# ship still scrapes walls and is destroyed and respawned, and no lap or
-# progress value has been located yet. There is no @assert here for that reason.
-50000: @section end
+# @todo Drive it, and drive it WELL. The best any controller has managed is one
+# lap's worth of distance without the lap counter ever moving. The controller
+# that gets furthest follows the seven AI SHIPS - they are on the racing line by
+# construction, `locate` reports their world positions directly, and at POS 8/8
+# they are all ahead - and it corners far better than the material-fan one it
+# replaces, but it is stopped by a wall near (1120, 1780) at the top of the
+# first climb, every run, while its aim line passes within 30 units. Render that
+# frame through the GPU path before touching the controller again: the failure
+# is geometric and no amount of log reading will show what the ship is hitting.
+# There is no @assert here until a lap is counted.
+12000: @section end

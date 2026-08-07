@@ -205,6 +205,29 @@ pub const TP_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 3;
 /// writes it per thread with that thread's TLS block base.
 pub const TP_EXPORT: &str = "tp";
 
+/// WASM global index of the software fuel counter, appended after the store-watchpoint
+/// counter. Per-instance, and in this engine an instance IS a guest thread, so each
+/// thread carries its own quantum with no host bookkeeping. Zero and never read unless
+/// the build opted into fuel (see `emit::set_fuel_interval`).
+pub const FUEL_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 5;
+
+/// Exported name of the software fuel counter (see [`FUEL_GLOBAL`]). Exported so a host
+/// can read how much of a thread's quantum is left; nothing needs to WRITE it - the
+/// emitted code reloads it itself after each yield.
+pub const FUEL_EXPORT: &str = "fuel";
+
+/// Reserved [`IMPORT_NAME`] selector meaning "this thread's fuel ran out - reschedule
+/// it". Not a NID: it is above any import index a real title can have, and the host
+/// intercepts it before the import table is consulted.
+///
+/// # Why the fuel yield reuses `env.import` instead of a fourth import
+/// `env.import` is already the one call the host has wrapped for suspension on both
+/// engines - JSPI `Suspending` in the browser, a fiber switch natively. A separate
+/// import would have to be wrapped identically in both hosts to do the same thing, and
+/// would shift [`IMPORT_FUNC_COUNT`], which every wasm-backtrace-to-guest-function
+/// mapping depends on. A reserved selector costs neither.
+pub const FUEL_SELECTOR: u32 = u32::MAX;
+
 /// Import module every host function/memory comes from.
 pub const IMPORT_MODULE: &str = "env";
 /// Import name of the ARM `svc` host trap: `(i32 imm) -> ()`.

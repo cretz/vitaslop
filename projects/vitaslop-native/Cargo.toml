@@ -28,4 +28,7 @@ pollster = { workspace = true }
 # Installs the fmt/EnvFilter subscriber in the probe tests and CLI tools so the
 # runtime's `tracing` diagnostics surface via RUST_LOG (e.g. vitaslop::io=trace).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# This crate emits its own events too - the periodic stall dump in the scheduler,
+# which has to be byte-comparable with the browser's to be worth anything.
+tracing = { workspace = true }
 

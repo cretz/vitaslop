@@ -389,11 +389,28 @@ fn recognizer_events(ctx: &mut GuestCtx, st: &mut VitaState, recognizer: u32) ->
     let (x0, y0) = (x as i32, y as i32);
     let (x1, y1) = (x0 + w as i32, y0 + h as i32);
     let mut out = Vec::new();
-    for p in st.world.poll_touch(port).active() {
+    let frame = st.world.poll_touch(port);
+    let points = frame.active();
+    for p in points.iter() {
         let (px, py) = (p.x as i32, p.y as i32);
         if (x0..=x1).contains(&px) && (y0..=y1).contains(&py) {
             out.push((px as i16, py as i16));
         }
+    }
+    // Diagnostic (`RUST_LOG=vitaslop::input=trace`): the recognizer's rectangle, the
+    // points offered to it, and how many landed inside.
+    //
+    // A tap that is delivered, is inside the right rectangle, and still selects nothing
+    // is a completely different bug from a tap that misses the rectangle or never
+    // arrives - and the screen is identical in all three cases.
+    if !points.is_empty() && tracing::enabled!(target: "vitaslop::input", tracing::Level::TRACE) {
+        tracing::trace!(
+            target: "vitaslop::input",
+            "gesture recognizer kind {kind} rect ({x0},{y0})..({x1},{y1}) port {port}: \
+             {} point(s) offered, {} inside",
+            points.len(),
+            out.len(),
+        );
     }
     out
 }

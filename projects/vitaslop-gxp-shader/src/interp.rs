@@ -34,6 +34,9 @@ pub struct RegFile {
     pub i: Vec<f32>,
     /// Predicate registers p0..p3 (written by test ops, gate predicated instructions).
     pub p: [bool; 4],
+    /// The INDEX register file, for register-INDIRECT operands. Two registers, because the
+    /// extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
+    pub idx: [i32; 2],
 }
 
 impl RegFile {
@@ -46,6 +49,7 @@ impl RegFile {
             o: vec![0.0; lanes],
             i: vec![0.0; lanes],
             p: [false; 4],
+            idx: [0; 2],
         }
     }
 
@@ -115,7 +119,17 @@ impl core::fmt::Display for InterpError {
 /// Read one source channel `c` of `op` from `regs`, applying swizzle + abs/neg (or the
 /// inline constant). `None` on an unmapped bank / out-of-range lane.
 fn read_channel(regs: &RegFile, op: &Operand, c: usize) -> Option<f32> {
-    let mut v = if matches!(op.bank, Bank::Constant) {
+    // A register-INDIRECT operand resolves through the index register file to a real bank,
+    // exactly as the emitter's `indexed_element` does. Modelling it here is what lets the
+    // interpreter run a program that indexes a uniform ARRAY - the idiom a vector-canvas
+    // vertex program is built out of, and the reason such programs used to be unmeasurable.
+    let mut v = if matches!(op.bank, Bank::Indexed) {
+        let bank = regs.bank(crate::ir::indexed_sub_bank(op.index))?;
+        let reg = if op.bank_sel == 0 { 0 } else { 1 };
+        let offset = crate::ir::indexed_offset(op.index) as i32 + c as i32;
+        let e = (regs.idx[reg] + offset).max(0) as usize;
+        *bank.get(e.min(bank.len().saturating_sub(1)))?
+    } else if matches!(op.bank, Bank::Constant) {
         cnst6_value(op.index)
     } else {
         let sel = op.swizzle[c];
@@ -211,6 +225,23 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             f32::from_bits(r & mask)
         }
+        // A truncating float->integer convert whose result is the integer's BIT PATTERN in the
+        // lane - which is what the integer ops above then read. Matching `emit_pack_to_int`,
+        // including its clamp: the source can be a NaN or a huge float, and an unclamped
+        // conversion of either is undefined rather than merely wrong.
+        Op::PackToInt { bits, signed, .. } => {
+            let f = s(0, c)?;
+            let lane_mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            let raw = if signed {
+                f.trunc().clamp(-2_147_483_000.0, 2_147_483_000.0) as i32 as u32
+            } else {
+                f.trunc().clamp(0.0, 4_294_967_000.0) as u32
+            };
+            f32::from_bits(raw & lane_mask)
+        }
+        // A format convert between float widths is value-preserving; this register file holds
+        // one f32 per lane and carries no packing, so it is the identity here.
+        Op::Pack { .. } => s(0, c)?,
         _ => return Err("unmodeled"),
     })
 }
@@ -220,6 +251,19 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
 /// it - the reference never fabricates a value for an unestablished op.
 pub fn run(shader: &Shader, regs: &mut RegFile) -> Result<(), InterpError> {
     run_watching_for_nan(shader, regs).map(|_| ())
+}
+
+/// How the interpreter obtains a texture sample: `(unit, coordinate) -> RGBA`.
+///
+/// `None` from the callback means "this unit is not available", which BLOCKS the run rather
+/// than substituting a value - the interpreter's whole contract is that it never fabricates
+/// one. The default fetcher returns `None` for every unit, so a caller that does not supply
+/// textures behaves exactly as before this existed.
+pub type TexFetch<'a> = &'a dyn Fn(u8, [f32; 4]) -> Option<[f32; 4]>;
+
+/// The fetcher used when a caller supplies none: no unit is available.
+fn no_textures(_unit: u8, _coord: [f32; 4]) -> Option<[f32; 4]> {
+    None
 }
 
 /// Where a shader first produced a value that is not finite.
@@ -251,6 +295,21 @@ pub fn run_watching_for_nan(
     shader: &Shader,
     regs: &mut RegFile,
 ) -> Result<Option<NanSite>, InterpError> {
+    run_watching_for_nan_with_textures(shader, regs, &no_textures)
+}
+
+/// [`run_watching_for_nan`], with texture sampling available.
+///
+/// A vertex program that SAMPLES builds its geometry out of what it reads, so without this the
+/// interpreter cannot run one at all - and everything that depends on interpreting a vertex
+/// program goes blind on exactly those draws: the clip-`w` sign measurement, the depth fit, the
+/// NaN hunt. On this title that blindness is not academic - the campaign map's whole body is
+/// one such draw.
+pub fn run_watching_for_nan_with_textures(
+    shader: &Shader,
+    regs: &mut RegFile,
+    tex: TexFetch<'_>,
+) -> Result<Option<NanSite>, InterpError> {
     let mut site: Option<NanSite> = None;
     for (index, instr) in shader.instrs.iter().enumerate() {
         if let Some(reason) = instr.blocked {
@@ -274,6 +333,45 @@ pub fn run_watching_for_nan(
         let Some(dest) = instr.dest.as_ref() else {
             return Err(InterpError::OutOfRange { index });
         };
+        // Loading an INDEX register is a write to the index file, not to a bank, so it too
+        // sits outside the per-channel evaluator. The source lane holds an integer BIT
+        // PATTERN (a truncating convert followed by a 16-bit shift produced it), and the
+        // interpreter's lanes are f32 - so it is read through the same `& 0xffff` the emitter
+        // applies, over the lane's bits rather than its float value.
+        if let Op::LoadIndex { addend } = instr.op {
+            let s1 = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
+            let bank = regs.bank(s1.bank).ok_or(InterpError::OutOfRange { index })?;
+            let raw = bank.get(s1.index as usize).ok_or(InterpError::OutOfRange { index })?.to_bits();
+            regs.idx[(dest.index & 1) as usize] = (raw & 0xffff) as i32 + addend;
+            continue;
+        }
+        // A texture sample produces four components from ONE fetch, so it cannot go through
+        // the per-channel evaluator below. The result lands in `dest.index + 0..4`, matching
+        // the decoder's direct destination rule.
+        if let Op::Tex { unit, coords, .. } = instr.op {
+            // The result goes to four CONSECUTIVE lanes whatever the precision. On the hardware
+            // an F16 sample lands as two packed pairs, but this register file has no packing
+            // ANYWHERE - `read_channel` reads `index + selector` for every operand regardless
+            // of width - so writing four lanes is the consistent thing rather than a special
+            // case, and a half-precision sample is no less modelled here than a half-precision
+            // multiply already is.
+            let src = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
+            let mut coord = [0.0f32; 4];
+            for k in 0..(coords as usize).clamp(1, 4) {
+                coord[k] = read_channel(regs, src, k).ok_or(InterpError::OutOfRange { index })?;
+            }
+            let rgba = tex(unit, coord)
+                .ok_or(InterpError::UnsupportedOp { index, op: "tex (no texture bound for this unit)" })?;
+            let base = dest.index as usize;
+            let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
+            for (k, v) in rgba.iter().enumerate() {
+                match bank.get_mut(base + k) {
+                    Some(slot) => *slot = *v,
+                    None => return Err(InterpError::OutOfRange { index }),
+                }
+            }
+            continue;
+        }
         // Compute every masked channel from the CURRENT register state first, so an in-place
         // op that reads and writes the same register uses pre-write inputs (USSE semantics).
         let mut out = [0.0f32; 4];

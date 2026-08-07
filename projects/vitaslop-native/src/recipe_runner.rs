@@ -11,15 +11,15 @@
 use std::path::PathBuf;
 
 use vitaslop_loader as loader;
-use vitaslop_runtime::capture::EgressKind;
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
 use vitaslop_runtime::ingest::vfs::{DirVfs, Vfs};
 use vitaslop_runtime::link::link;
-use vitaslop_runtime::recipe::{
-    AssertKind, CmpOp, EgressAssert, FieldMatch, FieldOp, MemAssert, Recipe,
-};
+use vitaslop_runtime::recipe::Recipe;
+// The evaluator itself lives in `vitaslop-runtime` so the browser reaches the same one;
+// see `recipe_eval` for why a wasm32 build could not use this module's own copy.
+use vitaslop_runtime::recipe_eval::{AssertOutcome, RecipeEval};
 
-use crate::observe::{format_f64, sample_watch, signature, write_shot};
+use crate::observe::{signature, write_shot};
 use crate::{RunReport, ThreadedScheduler, VitaEnv};
 
 /// Options controlling one recipe run.
@@ -67,17 +67,6 @@ impl Default for RunOpts {
             scene_limit: Some(1),
         }
     }
-}
-
-/// The outcome of one assertion.
-#[derive(Clone, Debug)]
-pub struct AssertOutcome {
-    pub frame: u64,
-    /// Human-readable statement of what was asserted.
-    pub desc: String,
-    pub passed: bool,
-    /// Actual-vs-expected detail, the feedback an author acts on.
-    pub detail: String,
 }
 
 /// The outcome of one screenshot request.
@@ -178,7 +167,7 @@ pub fn boot_retail(
     world: Box<dyn vitaslop_runtime::World + Send>,
     quantum_fuel: u64,
 ) -> Result<ThreadedScheduler<VitaEnv>, String> {
-    let game = decrypt_container(&DirVfs::new(dir)).map_err(|e| format!("decrypt: {e:?}"))?;
+    let game = decrypt_container(&mut DirVfs::new(dir)).map_err(|e| format!("decrypt: {e:?}"))?;
     let modules: Vec<loader::Module> = game
         .modules
         .iter()
@@ -229,31 +218,18 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     };
     let observe_from = opts.observe_from.unwrap_or(auto_from).min(opts.max_frames);
 
-    // Screenshot cadence: CLI override wins, else the recipe's @shot-every. A cadence
-    // shot is named "<section>-f<frame>" (or "f<frame>" outside any section) so the
-    // frames sort and carry context for human review.
-    let shot_every = opts.shot_every.or(recipe.meta.shot_every).filter(|&n| n > 0);
-
-    // CSV header: frame plus each watch name.
-    let mut csv = String::new();
-    if has_watch {
-        csv.push_str("frame");
-        for w in &recipe.watches {
-            csv.push(',');
-            csv.push_str(&w.name);
-        }
-        csv.push('\n');
-    }
+    // The recipe's observations - watches, assertions, the shot cadence - are evaluated
+    // by the SHARED evaluator in `vitaslop-runtime`, so a browser run of the same recipe
+    // reaches the same verdict. A CLI `--shot-every` overrides the recipe's own cadence.
+    // A cadence shot is named "<section>-f<frame>" (or "f<frame>" outside any section)
+    // so the frames sort and carry context for human review.
+    let mut eval = RecipeEval::new(recipe, opts.shot_every);
 
     let mut last = RunReport::FramesReached(0);
     if observe_from > 0 {
         last = sched.run_frames(observe_from, opts.max_rounds);
     }
 
-    // The freshest sampled value of each watch, by name, for assertion lookup.
-    let mut watch_vals: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
-    let mut asserts_out: Vec<AssertOutcome> = Vec::new();
     let mut shots_out: Vec<ShotOutcome> = Vec::new();
 
     // A guest that trapped or halted DURING the fast-forward prefix is finished, and
@@ -266,49 +242,16 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
         last = sched.run_frames(target, opts.per_frame_rounds);
         let f = sched.frames();
 
-        // Sample every watch this frame.
-        if has_watch {
-            csv.push_str(&f.to_string());
-            for w in &recipe.watches {
-                let v = sample_watch(&sched, w);
-                csv.push(',');
-                match v {
-                    Some(x) => {
-                        csv.push_str(&format_f64(x));
-                        watch_vals.insert(w.name.clone(), x);
-                    }
-                    None => csv.push_str("oob"),
-                }
-            }
-            csv.push('\n');
-        }
-
-        // Assertions due at this frame.
-        for a in recipe.asserts.iter().filter(|a| a.frame == f) {
-            asserts_out.push(eval_assert(&sched, a.frame, &a.kind, &watch_vals));
-        }
-
-        // Screenshots due at this frame: explicit @shot points...
-        for sh in recipe.shots.iter().filter(|s| s.frame == f) {
-            let path = write_shot(&sched, opts.shot_dir.as_deref(), &sh.name);
-            shots_out.push(ShotOutcome { frame: f, name: sh.name.clone(), path });
-        }
-        // ...plus a cadence shot every N frames, named by the active section.
-        if let Some(n) = shot_every {
-            if f % n == 0 {
-                let section = recipe
-                    .sections
-                    .iter()
-                    .rev()
-                    .find(|s| s.frame <= f)
-                    .map(|s| s.name.as_str());
-                let name = match section {
-                    Some(sec) => format!("{sec}-f{f:05}"),
-                    None => format!("f{f:05}"),
-                };
-                let path = write_shot(&sched, opts.shot_dir.as_deref(), &name);
-                shots_out.push(ShotOutcome { frame: f, name, path });
-            }
+        // Sample the watches and evaluate the assertions due at this frame; the returned
+        // names are the screenshots this frame owes. Rendering one is the only part that
+        // stays engine-specific - a PNG on disk here, a canvas in the browser.
+        let shots = {
+            let host = sched.host();
+            eval.on_frame(f, &SchedRead(&sched), &host.state.capture)
+        };
+        for name in shots {
+            let path = write_shot(&sched, opts.shot_dir.as_deref(), &name);
+            shots_out.push(ShotOutcome { frame: f, name, path });
         }
 
         // Stop early if the guest finished or trapped (not just a flip).
@@ -319,17 +262,6 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
 
     let frames = sched.frames();
 
-    // Any assertions/shots past the reached frame never ran: record them as failures
-    // so a run that stalled short is not silently "all passed".
-    for a in recipe.asserts.iter().filter(|a| a.frame > frames) {
-        asserts_out.push(AssertOutcome {
-            frame: a.frame,
-            desc: describe_assert(&a.kind),
-            passed: false,
-            detail: format!("frame {} never reached (run stopped at {frames})", a.frame),
-        });
-    }
-
     // Determinism signature + egress ledger from the captured output.
     let (sig, egress) = {
         let host = sched.host();
@@ -337,24 +269,18 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
         (signature(cap), cap.egress.iter().map(|e| format!("f{:<5} {:?}", e.frame, e.kind)).collect())
     };
 
-    // If the recipe pins an expected signature, that is itself an assertion.
-    if let Some(expected) = recipe.meta.sig {
-        let passed = expected == sig;
-        asserts_out.push(AssertOutcome {
-            frame: frames,
-            desc: "determinism @sig".to_string(),
-            passed,
-            detail: format!("expected {expected:#018x}, got {sig:#018x}"),
-        });
-    }
+    // Close the run: assertions past the frame actually reached are FAILURES (a run that
+    // stalled short has not passed the checks it never ran), and a pinned `@sig` is
+    // itself an assertion.
+    eval.finish(frames, sig);
 
     Ok(RecipeReport {
         frames,
         run: last,
         sig,
-        asserts: asserts_out,
+        asserts: eval.asserts,
         shots: shots_out,
-        watch_csv: csv,
+        watch_csv: eval.watch_csv,
         egress,
         // `VITASLOP_CPU_SHARE`: which threads got the single baton. A title whose
         // background worker runs at a low priority can be starved by a high-priority
@@ -368,145 +294,15 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     })
 }
 
-/// Evaluate one assertion at `frame` and describe the outcome.
-fn eval_assert(
-    sched: &ThreadedScheduler<VitaEnv>,
-    frame: u64,
-    kind: &AssertKind,
-    watch_vals: &std::collections::HashMap<String, f64>,
-) -> AssertOutcome {
-    let desc = describe_assert(kind);
-    match kind {
-        AssertKind::Mem(m) => eval_mem_assert(frame, m, watch_vals, desc),
-        AssertKind::Egress(e) => eval_egress_assert(sched, frame, e, desc),
+/// Reads guest memory for the shared recipe evaluator.
+///
+/// The whole point of the shared evaluator is that a recipe means the same thing on both
+/// engines; this is the one thing each has to supply itself, because "read guest memory"
+/// is a wasmtime store here and a `SharedArrayBuffer` view in the browser.
+struct SchedRead<'a>(&'a ThreadedScheduler<VitaEnv>);
+
+impl vitaslop_runtime::recipe_eval::GuestRead for SchedRead<'_> {
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        self.0.read_guest_into(addr, out)
     }
 }
-
-fn eval_mem_assert(
-    frame: u64,
-    m: &MemAssert,
-    watch_vals: &std::collections::HashMap<String, f64>,
-    desc: String,
-) -> AssertOutcome {
-    match watch_vals.get(&m.watch) {
-        Some(&actual) => {
-            let passed = m.op.eval(actual, m.value, m.tol);
-            AssertOutcome {
-                frame,
-                desc,
-                passed,
-                detail: format!("actual {}={}", m.watch, format_f64(actual)),
-            }
-        }
-        None => AssertOutcome {
-            frame,
-            desc,
-            passed: false,
-            detail: format!("watch {:?} not declared or not sampled", m.watch),
-        },
-    }
-}
-
-fn eval_egress_assert(
-    sched: &ThreadedScheduler<VitaEnv>,
-    frame: u64,
-    e: &EgressAssert,
-    desc: String,
-) -> AssertOutcome {
-    let host = sched.host();
-    // An egress event at or before this frame that matches the kind and every field.
-    let hit = host
-        .state
-        .capture
-        .egress
-        .iter()
-        .filter(|ev| ev.frame <= frame)
-        .any(|ev| egress_matches(&ev.kind, e));
-    AssertOutcome {
-        frame,
-        desc,
-        passed: hit,
-        detail: if hit {
-            "matched an egress event".to_string()
-        } else {
-            "no matching egress event".to_string()
-        },
-    }
-}
-
-/// Does egress event `ev` match assertion `want` (kind plus every field matcher)?
-fn egress_matches(ev: &EgressKind, want: &EgressAssert) -> bool {
-    let kind_ok = match ev {
-        EgressKind::SaveWrite { .. } => want.kind == "SaveWrite",
-        EgressKind::Trophy { .. } => want.kind == "Trophy",
-        EgressKind::ScoreSubmit { .. } => want.kind == "ScoreSubmit",
-    };
-    if !kind_ok {
-        return false;
-    }
-    want.fields.iter().all(|f| field_matches(ev, f))
-}
-
-/// Evaluate one field matcher against an egress event.
-fn field_matches(ev: &EgressKind, f: &FieldMatch) -> bool {
-    // Resolve the field to either a string or a number, then apply the operator.
-    match (ev, f.field.as_str()) {
-        (EgressKind::SaveWrite { path, .. }, "path") => str_match(path, f),
-        (EgressKind::SaveWrite { ascii, .. }, "ascii") => str_match(ascii, f),
-        (EgressKind::SaveWrite { bytes, .. }, "bytes") => num_match(*bytes as f64, f),
-        (EgressKind::Trophy { id }, "id") => num_match(*id as f64, f),
-        (EgressKind::ScoreSubmit { board, .. }, "board") => num_match(*board as f64, f),
-        (EgressKind::ScoreSubmit { score, .. }, "score") => num_match(*score as f64, f),
-        // An unknown field for this kind never matches.
-        _ => false,
-    }
-}
-
-fn str_match(actual: &str, f: &FieldMatch) -> bool {
-    match f.op {
-        FieldOp::Eq => actual == f.value,
-        FieldOp::Contains => actual.contains(&f.value),
-        // Ordering ops are meaningless on strings.
-        _ => false,
-    }
-}
-
-fn num_match(actual: f64, f: &FieldMatch) -> bool {
-    let Ok(want) = f.value.parse::<f64>() else { return false };
-    match f.op {
-        FieldOp::Eq => actual == want,
-        FieldOp::Ge => actual >= want,
-        FieldOp::Le => actual <= want,
-        FieldOp::Gt => actual > want,
-        FieldOp::Lt => actual < want,
-        // Substring on a number is meaningless.
-        FieldOp::Contains => false,
-    }
-}
-
-/// A human statement of what an assertion checks.
-fn describe_assert(kind: &AssertKind) -> String {
-    match kind {
-        AssertKind::Mem(m) => {
-            let op = match m.op {
-                CmpOp::Eq => "==",
-                CmpOp::Ne => "!=",
-                CmpOp::Lt => "<",
-                CmpOp::Le => "<=",
-                CmpOp::Gt => ">",
-                CmpOp::Ge => ">=",
-                CmpOp::Approx => "~",
-            };
-            if m.tol != 0.0 {
-                format!("{} {} {} +-{}", m.watch, op, format_f64(m.value), format_f64(m.tol))
-            } else {
-                format!("{} {} {}", m.watch, op, format_f64(m.value))
-            }
-        }
-        AssertKind::Egress(e) => {
-            let fields: Vec<String> = e.fields.iter().map(|f| format!("{}{:?}{}", f.field, f.op, f.value)).collect();
-            format!("egress {} {}", e.kind, fields.join(" "))
-        }
-    }
-}
-

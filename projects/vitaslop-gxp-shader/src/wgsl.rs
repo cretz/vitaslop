@@ -781,6 +781,11 @@ pub const BANK_REGS: usize = 512;
 /// builder binds; here they are zeroed private storage so the module compiles in isolation.
 pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> String {
     let mut m = String::new();
+    // The pipeline depth state, unconditionally: a body containing a DEPTHF reads it, and this
+    // wrapper exists to validate ANY emittable body in isolation, so leaving it out would make
+    // exactly the ops this file is meant to pin unvalidatable. It costs nothing here - the
+    // wrapper is never a shipped pipeline.
+    m.push_str(crate::link::GXP_DEPTH_DECL);
     // Each sampled unit needs a bound texture + sampler (referenced as `t{u}`/`s{u}` by
     // `emit_tex`). Group 0 / running bindings; the real pipeline builder assigns the same
     // names to the draw's bound textures (and its actual type - cube/3d for 3-coord samples).
@@ -802,13 +807,22 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> S
     // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
     let _ = writeln!(m, "var<private> idx: array<i32, 2>;");
     // `front_facing` is declared unconditionally - see the note in `link::build_linked_module`.
-    let _ = writeln!(m, "\nstruct FsIn {{ @builtin(front_facing) front_facing: bool }};");
-    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    let _ = writeln!(
+        m,
+        "\nstruct FsIn {{ @builtin(front_facing) front_facing: bool, @builtin(position) frag_coord: vec4<f32> }};"
+    );
+    let _ = writeln!(
+        m,
+        "\nstruct FsOut {{\n  @location(0) color: vec4<f32>,\n  @builtin(frag_depth) depth: f32,\n}};"
+    );
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> FsOut {{");
     m.push_str(FRONT_FACING_DECL);
+    let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
+    let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
     m.push_str(body);
     let _ = writeln!(
         m,
-        "  return vec4<f32>(bitcast<f32>(o[0]), bitcast<f32>(o[1]), bitcast<f32>(o[2]), bitcast<f32>(o[3]));\n}}"
+        "  return FsOut(vec4<f32>(bitcast<f32>(o[0]), bitcast<f32>(o[1]), bitcast<f32>(o[2]), bitcast<f32>(o[3])), gxp_frag_depth);\n}}"
     );
     m
 }
@@ -927,6 +941,24 @@ fn emit_instr(
     }
     if matches!(instr.op, Op::Kill) {
         return finish_predicated(body, instr, "  discard;\n", index);
+    }
+    // DEPTHF: replace the fragment's depth with a scalar the shader computed. The value is in
+    // the GUEST's depth encoding (it is built out of `POSITION.z`, which `gxp_window_position`
+    // delivers in exactly that space), so it goes through the inverse of the pipeline's own
+    // clip-depth remap on the way to `@builtin(frag_depth)` - otherwise a written depth and an
+    // interpolated one would be two different quantities in one depth buffer.
+    //
+    // Only a FRAGMENT program has a depth to write; a vertex program carrying this word is
+    // not something the ISA describes, so it hard-fails rather than emitting a store to a
+    // variable that stage does not have.
+    if matches!(instr.op, Op::DepthF) {
+        if !matches!(kind, ProgramKind::Fragment) {
+            return Err(EmitError::UnmappedOperand { index, raw: instr.raw });
+        }
+        let src = instr.srcs.first().ok_or_else(unmapped)?;
+        let e = src_channel(src, 0, Prec::of(instr)).ok_or_else(unmapped)?;
+        let stmt = format!("  gxp_frag_depth = gxp_depth_to_window({e}, gxp_interp_depth);\n");
+        return finish_predicated(body, instr, &stmt, index);
     }
     let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
     let r = match instr.op {

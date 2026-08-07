@@ -90,13 +90,17 @@ impl Game {
 /// A bare velf still returns [`Error::UnknownContainer`] (no fixture exercises a
 /// PFS-less tree). For the common "one `.pkg` plus a standalone `work.bin`" case,
 /// [`decrypt_pkg`] takes the two byte blobs directly.
-pub fn decrypt_container(vfs: &dyn Vfs) -> Result<Game, Error> {
-    match detect(vfs)? {
+pub fn decrypt_container(vfs: &mut dyn Vfs) -> Result<Game, Error> {
+    match detect(&*vfs)? {
         Container::Dump { root } => load_dump(vfs, &root),
-        Container::Pfs { root } => decrypt_pfs(vfs, &root),
+        Container::Pfs { root } => decrypt_pfs(&*vfs, &root),
         Container::Pkg { path } => {
-            let pkg_bytes = vfs.read(&path)?;
-            let work = sibling_work_bin(vfs, &path);
+            // Taken, not read: for an in-memory backing this is the whole pkg (hundreds
+            // of megabytes to over a gigabyte), and holding the source copy alive while
+            // the decrypt allocates its output is what puts a browser run over the
+            // wasm32 ceiling. See `Vfs::take`.
+            let pkg_bytes = vfs.take(&path)?;
+            let work = sibling_work_bin(&*vfs, &path);
             decrypt_pkg_bytes(&pkg_bytes, work.as_deref())
         }
         Container::Velf { .. } => Err(Error::UnknownContainer),
@@ -148,7 +152,60 @@ pub fn dump_entries(game: &Game) -> Vec<(String, Vec<u8>)> {
 /// Mount a decrypted-dump tree rooted at `root` inside `vfs` (the inverse of
 /// [`dump_entries`]): parse the manifest, read the plaintext files and the
 /// unwrapped modules back, preserving the manifest's module load order.
-fn load_dump(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
+/// A decrypted dump mounted WITHOUT reading its data files: the manifest and the
+/// loadable modules only, plus the app-relative paths the caller must serve lazily.
+///
+/// This is the browser's mount. [`decrypt_container`] reads every file into memory,
+/// which for a retail title is over a gigabyte against a wasm32 ceiling of four - and the
+/// data files are exactly the part nothing needs up front. The modules DO have to be read
+/// (link and transpile want the whole image), but they are a few megabytes.
+pub struct LazyDump {
+    pub content_id: String,
+    pub modules: Vec<GameModule>,
+    /// App-relative paths of the data files, and the vfs path each lives at, so the
+    /// caller can wire its own storage to them without re-deriving the layout.
+    pub files: Vec<(String, String)>,
+    /// The vfs path prefix the data files sit under, so a caller mapping stored paths
+    /// back to guest-visible ones strips exactly what this mount added.
+    ///
+    /// Returned rather than left to the caller because it is NOT simply `root + "/files/"`
+    /// - a dump mounted at the vfs root has an empty `root`, and a hand-built prefix then
+    /// carries a leading slash that matches nothing. Every stored path silently fails to
+    /// strip, every guest key comes out wrong, and the title reads garbage.
+    pub files_prefix: String,
+}
+
+/// Mount the decrypted dump at `root` lazily; see [`LazyDump`].
+pub fn mount_dump_lazy(vfs: &dyn Vfs, root: &str) -> Result<LazyDump, Error> {
+    let (content_id, module_paths) = read_manifest(vfs, root)?;
+    // Derived exactly as `load_dump` derives it, via `under`, so the two mounts agree on
+    // the layout by construction rather than by two hand-written strings agreeing.
+    let files_prefix = format!("{}/", under(root, "files"));
+    let files = vfs
+        .list()
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(&files_prefix).map(|rel| (rel.to_string(), p.clone())))
+        .collect();
+    let mut modules = Vec::with_capacity(module_paths.len());
+    for path in module_paths {
+        let elf = vfs.read(&under(root, &format!("modules/{path}")))?;
+        modules.push(GameModule { path, elf });
+    }
+    Ok(LazyDump { content_id, modules, files, files_prefix })
+}
+
+/// Detect the container at the vfs root and return the dump root if it is a decrypted
+/// dump. Exposed so a host that mounts lazily can find the root the same way
+/// [`decrypt_container`] does, rather than hard-coding the layout.
+pub fn dump_root(vfs: &dyn Vfs) -> Option<String> {
+    match detect(vfs) {
+        Ok(Container::Dump { root }) => Some(root),
+        _ => None,
+    }
+}
+
+/// Parse a dump manifest into `(content_id, module paths)`.
+fn read_manifest(vfs: &dyn Vfs, root: &str) -> Result<(String, Vec<String>), Error> {
     let manifest = vfs.read(&under(root, DUMP_MANIFEST))?;
     let manifest = String::from_utf8(manifest).map_err(|_| Error::BadMagic("dump manifest"))?;
     let mut lines = manifest.lines();
@@ -164,19 +221,29 @@ fn load_dump(vfs: &dyn Vfs, root: &str) -> Result<Game, Error> {
             module_paths.push(p.to_string());
         }
     }
+    Ok((content_id, module_paths))
+}
 
+fn load_dump(vfs: &mut dyn Vfs, root: &str) -> Result<Game, Error> {
+    let (content_id, module_paths) = read_manifest(&*vfs, root)?;
+
+    // MOVED out of the source, one file at a time, rather than copied: a dump mount is
+    // the whole title, and copying it means holding a retail container twice at once.
+    // For a backing that owns no copy (a directory, OPFS) `take` is just a read, so this
+    // costs nothing there. See `Vfs::take`.
     let files_root = under(root, "files");
     let files_prefix = format!("{files_root}/");
     let mut files = MemVfs::new();
     for p in vfs.list() {
         if let Some(rel) = p.strip_prefix(&files_prefix) {
-            files.insert(rel, vfs.read(&p)?);
+            let rel = rel.to_string();
+            files.insert(rel, vfs.take(&p)?);
         }
     }
 
     let mut modules = Vec::with_capacity(module_paths.len());
     for path in module_paths {
-        let elf = vfs.read(&under(root, &format!("modules/{path}")))?;
+        let elf = vfs.take(&under(root, &format!("modules/{path}")))?;
         modules.push(GameModule { path, elf });
     }
 
@@ -309,9 +376,9 @@ pub trait Cache {
 /// Decrypt a container, using `cache` to skip the work when a prior decrypt of the
 /// same title is already stored. The content id is read cheaply from the RIF
 /// before any bulk decryption, so a cache hit never touches the ciphertext.
-pub fn ingest_cached(vfs: &dyn Vfs, cache: &dyn Cache) -> Result<Game, Error> {
+pub fn ingest_cached(vfs: &mut dyn Vfs, cache: &dyn Cache) -> Result<Game, Error> {
     // Peek the content id from the RIF without decrypting anything.
-    if let Ok(Container::Pfs { root }) = detect(vfs) {
+    if let Ok(Container::Pfs { root }) = detect(&*vfs) {
         if let Ok(work) = vfs.read(&under(&root, "sce_sys/package/work.bin")) {
             if let Ok(rif) = Rif::parse(&work) {
                 if let Some(game) = cache.load(&rif.content_id) {
@@ -353,7 +420,7 @@ mod tests {
         for (path, bytes) in dump_entries(&game) {
             tree.insert(format!("dumps/T/{path}"), bytes);
         }
-        let back = decrypt_container(&tree).expect("mount dump tree");
+        let back = decrypt_container(&mut tree).expect("mount dump tree");
         assert_eq!(back.content_id, game.content_id);
         assert_eq!(back.file("Disc/Data/a.bin").unwrap(), vec![1, 2, 3]);
         assert_eq!(back.file("eboot.bin").unwrap(), b"SCE\0garbage".to_vec());
@@ -371,8 +438,8 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let vfs = DirVfs::new(dir);
-        let game = decrypt_container(&vfs).expect("decrypt container");
+        let mut vfs = DirVfs::new(dir);
+        let game = decrypt_container(&mut vfs).expect("decrypt container");
 
         // A content id is present (its value is title-specific).
         assert!(!game.content_id.is_empty());
@@ -444,7 +511,7 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         let eboot = game.file("eboot.bin").expect("eboot self bytes");
         eprintln!("eboot SELF head (48 bytes):");
         for row in eboot[..48].chunks(16) {
@@ -677,7 +744,7 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         for m in &game.modules {
             // Raw program headers, including the non-PT_LOAD segments the loader
             // drops (the SCE relocation segment carries the fixups).
@@ -774,7 +841,7 @@ mod tests {
         let files = std::env::var("VITASLOP_DUMP_FILES").unwrap_or_default();
         let out = std::path::PathBuf::from(out);
         std::fs::create_dir_all(&out).expect("create dump dir");
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         for rel in files.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match game.file(rel) {
                 Ok(bytes) => {

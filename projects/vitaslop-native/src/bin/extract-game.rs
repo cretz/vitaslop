@@ -43,7 +43,7 @@ fn main() -> ExitCode {
                 Err(e) => return fail(&format!("decrypt pkg: {e}")),
             }
         }
-        (None, None, Some(dir)) => match decrypt_container(&DirVfs::new(dir)) {
+        (None, None, Some(dir)) => match decrypt_container(&mut DirVfs::new(dir)) {
             Ok(g) => g,
             Err(e) => return fail(&format!("decrypt container: {e}")),
         },

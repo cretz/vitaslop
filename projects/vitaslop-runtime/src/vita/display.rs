@@ -7,18 +7,23 @@ use crate::hostcall;
 use crate::SvcOutcome;
 
 /// The virtual duration of one display vblank interval at 60 Hz, in microseconds.
-const VBLANK_US: u64 = 1_000_000 / 60;
+pub(crate) const VBLANK_US: u64 = 1_000_000 / 60;
 
 /// int sceDisplayWaitVblankStartMulti(unsigned int vcount)
 ///
-/// Block the caller until `vcount` vblank periods have elapsed. Preemptive: a REAL
-/// timed park until the virtual clock reaches `now + vcount * (1/60 s)` - the same
-/// mechanism as `sceKernelDelayThread`, so a frame-pacing loop that waits on vblank
-/// yields the CPU to the threads doing work instead of busy-spinning. A `vcount` of
+/// Block the caller until the `vcount`th vblank EDGE from now. Preemptive: a REAL
+/// timed park until the virtual clock reaches that edge - the same mechanism as
+/// `sceKernelDelayThread`, so a frame-pacing loop that waits on vblank yields the CPU
+/// to the threads doing work instead of busy-spinning. A `vcount` of
 /// 0 is a plain yield - NOT a frame boundary (see [`SvcOutcome::Flip`]); it asks for
 /// no wait at all, so a loop doing it spins as fast as the scheduler allows and must
 /// not be allowed to advance the display frame count. Single-thread model: nothing to
 /// yield to, so it just succeeds (the clock is host-driven). Returns 0.
+///
+/// **An EDGE, not a duration.** The scanout's vblanks are a free-running 60 Hz
+/// heartbeat that this call joins; it does not start a stopwatch. Parking a whole
+/// period from wherever the guest happened to call over-waits by half a period on
+/// average and never phase-locks - see [`VitaState::vblank_park`].
 pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let vcount = ctx.arg(0);
     ctx.ret(0);
@@ -28,7 +33,7 @@ pub(super) fn wait_vblank_start_multi(ctx: &mut GuestCtx, st: &mut VitaState) ->
     if vcount == 0 {
         return SvcOutcome::Reschedule;
     }
-    st.sleep_park(vcount as u64 * VBLANK_US);
+    st.vblank_park(vcount as u64, VBLANK_US);
     SvcOutcome::Block
 }
 
@@ -46,23 +51,30 @@ pub(super) fn wait_vblank_start(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOu
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    st.sleep_park(VBLANK_US);
+    st.vblank_park(1, VBLANK_US);
     SvcOutcome::Block
 }
 
 /// int sceDisplayWaitSetFrameBuf(void)
 ///
 /// Block until the framebuffer queued by the most recent `sceDisplaySetFrameBuf` has
-/// been latched, which hardware does at the next vblank. We apply a set-framebuffer
-/// immediately, so the latch is a single vblank away: park for one vblank period
-/// (preemptive) so a present-then-wait loop paces to 60 Hz and yields the CPU, or a
-/// plain yield in the single-thread model. Returns 0.
+/// been latched, which hardware does at the next vblank. So the wait is until the next
+/// vblank EDGE (preemptive), which paces a present-then-wait loop to 60 Hz and yields
+/// the CPU, or a plain yield in the single-thread model.
+///
+/// **This waits whatever `sync` the buffer was set with**, and the attempt to make
+/// IMMEDIATE return at once - on the reasoning that a buffer already applied has nothing
+/// left to wait for - LIVELOCKED the one retail title that asks for it: it spins on this
+/// call, and the run reached frame 3 with 34.3 million thread resumes. What this call
+/// waits for is the DISPLAY updating, which is a vblank event either way; `sync` only
+/// decides whether the pointer changes mid-scan. See [`VitaState::set_display_sync`].
+/// Returns 0.
 pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     ctx.ret(0);
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    st.sleep_park(VBLANK_US);
+    st.vblank_park(1, VBLANK_US);
     SvcOutcome::Block
 }
 
@@ -113,8 +125,21 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)
 /// SceDisplayFrameBuf: { SceSize size; void *base; uint32 pitch; uint32 fmt;
 ///                       uint32 width; uint32 height; } (0x18 bytes).
+///
+/// `sync` is a `SceDisplaySetBufSync`: `SCE_DISPLAY_SETBUF_NEXTFRAME` (1) asks for the
+/// buffer change to take effect at the next vblank, `SCE_DISPLAY_SETBUF_IMMEDIATE` (0)
+/// for it to take effect at once - which tears, and does not pace. That is the whole of
+/// the argument: it is NOT a swap interval and cannot ask for a 2-vblank one (the enum
+/// has exactly these two values). A title runs at 30 Hz either by taking longer than a
+/// vblank to draw, which [`VitaState::pace_flip`]'s grid now models, or by waiting two
+/// vblanks itself, which [`wait_vblank_start_multi`] models.
+///
+/// The value is recorded rather than acted on here because this call does not present:
+/// under GXM it is the display-queue CALLBACK, and the flip it describes was submitted
+/// by `sceGxmDisplayQueueAddEntry`, which is where the pacing lives.
 #[hostcall]
-pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, _sync: i32) -> i32 {
+pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, sync: i32) -> i32 {
+    st.set_display_sync(sync as u32);
     let base = ctx.read_u32(param.addr() + 4);
     if base != 0 {
         st.present(base);

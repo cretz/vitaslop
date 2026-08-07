@@ -939,7 +939,7 @@ mod tests {
     fn reads_a_real_retail_trophy_set() {
         use crate::ingest::{testfix, vfs::DirVfs};
         let Some(dir) = testfix::game_dir() else { return };
-        let Ok(game) = crate::ingest::pipeline::decrypt_container(&DirVfs::new(dir)) else {
+        let Ok(game) = crate::ingest::pipeline::decrypt_container(&mut DirVfs::new(dir)) else {
             return;
         };
         // The set lives under a directory named for its own NP communication id.

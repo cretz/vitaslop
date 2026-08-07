@@ -27,6 +27,12 @@
 /// without needing the repository on disk.
 pub const INDEX: &str = include_str!("../../KNOBS.md");
 
+// The override table itself lives in `vitaslop-platform`, the crate BELOW this one:
+// the renderer reads `VITASLOP_GXP_LIVE` from there, and it cannot reach a table owned
+// by the runtime. Re-exported here so the name `knobs::set_override` still resolves and
+// this module stays the single place to look for anything knob-shaped.
+pub use vitaslop_platform::knobs::{flag, set_override, var, var_os, OVERRIDABLE};
+
 /// One environment knob: its name, where it is read, and the first line of the doc
 /// comment attached to the code that reads it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,8 +67,12 @@ pub fn scan_sources(root: &std::path::Path) -> Vec<Knob> {
             .replace('\\', "/");
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            // The index describes knobs, not the machinery that indexes them.
-            if rel.ends_with("vitaslop-runtime/src/knobs.rs") {
+            // The index describes knobs, not the machinery that indexes them - and the
+            // override table names every routed knob as a bare literal, which would
+            // otherwise index each one to a line that does not read it.
+            if rel.ends_with("vitaslop-runtime/src/knobs.rs")
+                || rel.ends_with("vitaslop-platform/src/knobs.rs")
+            {
                 continue;
             }
             for name in knob_names(line) {

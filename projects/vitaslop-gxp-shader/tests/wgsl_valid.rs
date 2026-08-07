@@ -108,6 +108,14 @@ fn every_emittable_op_produces_valid_wgsl() {
         ("test-facing", Shader { kind: ProgramKind::Fragment, instrs: vec![instr(
             Op::Test { alu: TestAlu::BitAnd, cmp: TestCmp::Ne, reduce: TestReduce::Channel(0), pdst: 0, write_back: false },
             d(0), vec![Operand::plain(Bank::Global, 16, 1), Operand::plain(Bank::Immediate, 1, 2)], full)] }),
+        // A fragment DEPTH write (0xF8 DEPTHF): no register destination, one scalar source,
+        // and it stores through the entry point's `@builtin(frag_depth)`.
+        ("depthf", Shader { kind: ProgramKind::Fragment, instrs: vec![{
+            let mut i = instr(Op::DepthF, d(0), vec![r(0)], full);
+            i.dest = None;
+            i.write_mask = [false; 4];
+            i
+        }] }),
     ];
 
     for (name, sh) in &cases {

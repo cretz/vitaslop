@@ -14,9 +14,13 @@
     <canvas id="screen" width="960" height="544"></canvas>
     <div id="fps">fps: --</div>
     <div id="perf">perf: --</div>
+    <!-- What the worker's WebGPU adapter actually is; see the note in game.html. -->
+    <div id="adapter">adapter: --</div>
     <pre id="status">loading...</pre>
     <script type="module">
       import { forwardInput } from "./worker-input.js";
+      import { importTitle, isImported } from "./opfs.js";
+      import { startAudio } from "./audio.js";
       const canvas = document.getElementById("screen");
       const status = document.getElementById("status");
 
@@ -24,18 +28,68 @@
       // this origin serves, transfer the on-page canvas + the bytes to a Web Worker, and
       // let the worker run the whole emulator (JSPI scheduler + guest + WebGPU render)
       // there. The worker posts { id, text } metrics back, which we apply to the page.
-      window.__boot = async (recipe, maxFrames, maxRounds) => {
+      // `knobs` is an optional {NAME: value} map, forwarded to the worker (which is its
+      // own wasm instance). The browser has no environment, so this is the only way to
+      // reach a VITASLOP_* knob - and one retail racer needs VITASLOP_FRAME_TOPUP=0 to
+      // finish loading at all.
+      window.__boot = async (recipe, maxFrames, maxRounds, knobs, titleId = "default") => {
         status.textContent = "fetching manifest...";
         const manifest = await (await fetch("/game-manifest.json")).json();
-        const files = {};
-        let bytes = 0;
-        for (let i = 0; i < manifest.length; i++) {
-          const buf = await (await fetch("/game/" + manifest[i])).arrayBuffer();
-          files[manifest[i]] = new Uint8Array(buf);
-          bytes += buf.byteLength;
-          if (i % 40 === 0) status.textContent = `fetched ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
+
+        // Import the title into OPFS ONCE, streaming each file straight from the network
+        // to storage. Nothing accumulates in JS: peak memory here is one chunk, not one
+        // title. Before this the page held every file as an ArrayBuffer and the worker
+        // copied them all into the wasm heap - measured at 8.01 GB peak on a 1719 MB
+        // title, which killed the worker mid-boot against a 4 GB wasm32 ceiling.
+        //
+        // A second run of the same title finds it already stored and skips straight to
+        // the boot, which is also how the product behaves: install once, play many times.
+        if (await isImported(titleId, manifest.length)) {
+          status.textContent = `title already in OPFS (${manifest.length} files); starting worker...`;
+          // Say which path was taken, on the console. The difference between mounting an
+          // installed title and importing a gigabyte of it is the difference between a
+          // twenty-second start and a three-minute one, and it is invisible from the log
+          // otherwise - which is how an ephemeral server port hid the fact that EVERY run
+          // was re-importing, for 29 runs and 49 GB.
+          console.log(`[opfs] REUSED an existing import of ${titleId} (${manifest.length} files)`);
+        } else {
+          const entries = manifest.map((p) => ({
+            path: p,
+            source: async () => (await fetch("/game/" + p)).body,
+          }));
+          await importTitle(titleId, entries, (done, total, bytes) => {
+            if (done % 20 === 0 || done === total) {
+              status.textContent = `importing to OPFS ${done}/${total} (${(bytes / 1e6) | 0} MB)`;
+            }
+          });
+          status.textContent = `imported ${manifest.length} files to OPFS; starting worker...`;
+          console.log(`[opfs] IMPORTED ${manifest.length} files for ${titleId} (one-time)`);
         }
-        status.textContent = `fetched ${manifest.length} files (${(bytes/1e6)|0} MB); starting worker...`;
+
+        // Build the guest module in a THROWAWAY worker, then terminate it.
+        //
+        // The transpile costs ~463 MB of heap that a wasm memory can never give back, so a
+        // worker that transpiles its own guest carries that for the whole run - on top of
+        // the guest's 512 MB and the engine's machine code - and gets killed part-way
+        // through. Doing it here means the peak dies with this worker and only the
+        // compiled module (structured-cloneable) survives.
+        //
+        // It must finish and CLOSE its OPFS handles before the run worker opens its own:
+        // a sync access handle is an exclusive lock.
+        status.textContent = "transpiling (throwaway worker)...";
+        const prebuilt = await new Promise((resolve, reject) => {
+          const tw = new Worker("./transpile-worker.js", { type: "module" });
+          tw.onmessage = (e) => {
+            tw.terminate();
+            e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
+          };
+          tw.onerror = (e) => {
+            tw.terminate();
+            reject(new Error(e.message || "transpile worker failed to start"));
+          };
+          tw.postMessage({ titleId, knobs: knobs || {} });
+        });
+        status.textContent = "transpiled; starting run worker...";
 
         const worker = new Worker("./worker.js", { type: "module" });
         worker.onmessage = (e) => {
@@ -48,15 +102,46 @@
             console.error("[worker]", d.message);
           }
         };
+        // A worker that fails to START, or dies in a way it cannot report itself, would
+        // otherwise leave the page sitting on a stale status line forever.
+        worker.onerror = (e) => {
+          status.textContent = "worker error: " + (e.message || "died");
+          console.error("[worker] onerror:", e.message || e);
+        };
 
         // Forward live pointer/keyboard from the page into the worker.
         forwardInput(worker, canvas);
 
-        // Move canvas render control + the file buffers to the worker (transfer, not
-        // copy - the file ArrayBuffers become owned by the worker).
+        // Audio lives on the MAIN thread (there is no AudioContext in a worker), so the
+        // page owns the context and worklet and the worker only fills a shared ring.
+        // A failure here must not take the run down with it - a silent emulator is worth
+        // far more than no emulator - but it must SAY so rather than look like silence
+        // the guest produced.
+        let audioRing;
+        try {
+          const audio = await startAudio();
+          audioRing = audio.ring;
+          window.__audioStats = audio.stats;
+        } catch (err) {
+          console.warn("[audio] could not start; this run will be SILENT:", err);
+        }
+
+        // Move canvas render control to the worker. The title itself is NOT transferred -
+        // it is in OPFS, and the worker opens its own synchronous handles to it. That is
+        // the whole point: no copy of the container crosses this boundary at all.
         const offscreen = canvas.transferControlToOffscreen();
-        const transfer = [offscreen, ...Object.values(files).map((u) => u.buffer)];
-        worker.postMessage({ offscreen, files, recipe: recipe || "", maxFrames }, transfer);
+        worker.postMessage(
+          {
+            offscreen,
+            titleId,
+            recipe: recipe || "",
+            maxFrames,
+            knobs: knobs || {},
+            prebuilt,
+            audioRing,
+          },
+          [offscreen]
+        );
         return "worker started";
       };
     </script>

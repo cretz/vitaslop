@@ -3478,6 +3478,19 @@ fn tex_key(t: &BoundTexture) -> u64 {
 /// shared `Arc` is handed back; persist one builder across a run's frames to keep the
 /// cache warm.
 pub struct RenderSceneBuilder {
+    /// Whether a draw carrying a shader payload can SKIP its fixed-function representation.
+    ///
+    /// True only when the recompiler is live AND the fixed-function fallback is refused, which
+    /// is the shipped configuration: there, the renderer either draws the guest's real shaders
+    /// or hard-fails, so the canonical vertex buffer, the CPU-culled index buffer, the
+    /// per-vertex screen projection and the albedo decode are provably dead - they are built,
+    /// paid for per vertex, and then skipped by a `continue` in `encode`. Read once here rather
+    /// than per draw.
+    ///
+    /// It is deliberately NOT "the recompiler is live": with the fallback allowed, a pair that
+    /// fails to link still needs all of it, and producing an empty draw instead would lose
+    /// geometry silently.
+    gxp_only: bool,
     decode_cache: HashMap<u64, GxmTexture>,
     /// The last reported "the whole scene was dropped" tally, so [`DropTally::report`]
     /// prints when the shape CHANGES rather than sixty times a second.
@@ -3621,7 +3634,12 @@ impl Default for RenderSceneBuilder {
 
 impl RenderSceneBuilder {
     pub fn new() -> Self {
-        RenderSceneBuilder { decode_cache: HashMap::new(), last_empty: None }
+        RenderSceneBuilder {
+            gxp_only: crate::knobs::flag("VITASLOP_GXP_LIVE")
+                && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"),
+            decode_cache: HashMap::new(),
+            last_empty: None,
+        }
     }
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
@@ -3645,6 +3663,8 @@ impl RenderSceneBuilder {
             height,
             faces: t.faces.max(1),
             rgba: Arc::new(rgba),
+            base_format: t.base_format,
+            swizzle: t.swizzle,
             filter_linear,
             addr_mode_u: t.u_addr_mode,
             addr_mode_v: t.v_addr_mode,
@@ -3758,30 +3778,40 @@ impl RenderSceneBuilder {
             // `project` applies the same Y-flip the software rasterizer uses; only the
             // winding SIGN matters here, so any positive surface size gives the identical
             // cull decision as the real target. `None` = behind the eye (w <= 0).
+            // Whether this draw's FIXED-FUNCTION representation will be used at all. When it
+            // will not (see `gxp_only`), everything below that only feeds it is skipped: on a
+            // race frame that is a few hundred thousand vertices' worth of buffer writes, two
+            // matrix multiplies per vertex and an index expansion, all of which `encode` then
+            // steps over. The depth RANGE is still accumulated, because the recompiled path
+            // maps its clip depth through it.
+            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
             let mut screen_pos: Vec<Option<[f32; 4]>> =
-                if mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
+                if fixed_function && mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
 
             let (mut draw_dmin, mut draw_dmax) = (f32::INFINITY, f32::NEG_INFINITY);
-            let mut vertices = Vec::with_capacity(nverts * GXM_VERTEX_STRIDE as usize);
+            let mut vertices =
+                Vec::with_capacity(if fixed_function { nverts * GXM_VERTEX_STRIDE as usize } else { 0 });
             for i in 0..nverts {
                 let v = decode_vertex(d, layout, i);
-                vertices.extend_from_slice(&v.pos[0].to_le_bytes());
-                vertices.extend_from_slice(&v.pos[1].to_le_bytes());
-                vertices.extend_from_slice(&v.pos[2].to_le_bytes());
-                // Fold the uv divisor in here (constant per draw, so pre-dividing per
-                // vertex is identical to dividing the interpolated coord).
-                vertices.extend_from_slice(&(v.uv[0] / interp.uv_div[0]).to_le_bytes());
-                vertices.extend_from_slice(&(v.uv[1] / interp.uv_div[1]).to_le_bytes());
-                vertices.extend_from_slice(&v.color);
-                // World-space normal for the opaque lighting term, baked here (object normal
-                // through the draw's model-to-world matrix) so the GPU shader uses it directly
-                // and matches the software rasterizer's `world_normal` exactly. A mesh with no
-                // normal yields `[0,1,0]` (up), the same fallback the software path uses.
-                let wn = world_normal(v.normal, &d.world);
-                vertices.extend_from_slice(&wn[0].to_le_bytes());
-                vertices.extend_from_slice(&wn[1].to_le_bytes());
-                vertices.extend_from_slice(&wn[2].to_le_bytes());
-                if mvp.is_some() {
+                if fixed_function {
+                    vertices.extend_from_slice(&v.pos[0].to_le_bytes());
+                    vertices.extend_from_slice(&v.pos[1].to_le_bytes());
+                    vertices.extend_from_slice(&v.pos[2].to_le_bytes());
+                    // Fold the uv divisor in here (constant per draw, so pre-dividing per
+                    // vertex is identical to dividing the interpolated coord).
+                    vertices.extend_from_slice(&(v.uv[0] / interp.uv_div[0]).to_le_bytes());
+                    vertices.extend_from_slice(&(v.uv[1] / interp.uv_div[1]).to_le_bytes());
+                    vertices.extend_from_slice(&v.color);
+                    // World-space normal for the opaque lighting term, baked here (object normal
+                    // through the draw's model-to-world matrix) so the GPU shader uses it directly
+                    // and matches the software rasterizer's `world_normal` exactly. A mesh with no
+                    // normal yields `[0,1,0]` (up), the same fallback the software path uses.
+                    let wn = world_normal(v.normal, &d.world);
+                    vertices.extend_from_slice(&wn[0].to_le_bytes());
+                    vertices.extend_from_slice(&wn[1].to_le_bytes());
+                    vertices.extend_from_slice(&wn[2].to_le_bytes());
+                }
+                if fixed_function && mvp.is_some() {
                     // Cull only needs the winding SIGN, so any uniform scale works; ssaa is 1
                     // here (the GPU applies supersampling itself via an enlarged render target).
                     screen_pos.push(project(&v, &interp.space, 4096, 4096, 1.0));
@@ -3810,8 +3840,11 @@ impl RenderSceneBuilder {
             // faces and dropping behind-eye triangles exactly as the software rasterizer
             // does. Doing the cull here (not via GPU pipeline state) keeps the GPU a
             // pixel-faithful twin with one cull-free pipeline and no per-draw facing state.
-            let mut indices = Vec::with_capacity(tri_count * 3 * 4);
+            let mut indices = Vec::with_capacity(if fixed_function { tri_count * 3 * 4 } else { 0 });
             for t in 0..tri_count {
+                if !fixed_function {
+                    break;
+                }
                 let vs = tri_indices(d, t);
                 if mvp.is_some() {
                     let s: [[f32; 4]; 3] = match [screen_pos[vs[0]], screen_pos[vs[1]], screen_pos[vs[2]]] {
@@ -3836,8 +3869,11 @@ impl RenderSceneBuilder {
                 );
             }
 
-            let texture =
-                if interp.textured { d.albedo().map(|t| self.texture(t)) } else { None };
+            let texture = if interp.textured && fixed_function {
+                d.albedo().map(|t| self.texture(t))
+            } else {
+                None
+            };
 
             // When the runtime captured the raw shader blobs (recompiler path enabled),
             // attach everything the GXP->WGSL recompiler needs to draw this call with the

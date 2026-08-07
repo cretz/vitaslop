@@ -20,15 +20,23 @@ pub const WIDTH: u32 = 960;
 pub const HEIGHT: u32 = 544;
 pub const CLEAR: [u8; 4] = [0, 0, 0, 255];
 
+/// Reads guest memory through a scheduler, for the shared recipe evaluator.
+struct SchedRead<'a>(&'a ThreadedScheduler<VitaEnv>);
+
+impl vitaslop_runtime::recipe_eval::GuestRead for SchedRead<'_> {
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        self.0.read_guest_into(addr, out)
+    }
+}
+
 /// Sample one watched value from current guest memory, widened to `f64`. `None`
 /// when the address is outside guest memory.
+///
+/// Delegates to the SHARED sampler, so a `@watch` means the same thing in a resident
+/// session, in a native recipe run and in the browser. A second copy of four lines of
+/// decode looks harmless right up to the point where one of them is fixed.
 pub fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &WatchDecl) -> Option<f64> {
-    let mut buf = [0u8; 4];
-    let width = w.ty.width();
-    if !sched.read_guest_into(w.addr, &mut buf[..width]) {
-        return None;
-    }
-    w.ty.decode(&buf[..width])
+    vitaslop_runtime::recipe_eval::sample_watch(&SchedRead(sched), w)
 }
 
 /// Render the current frame to `<dir>/<name>.png`. Returns the written path, or `None`
@@ -80,11 +88,8 @@ pub fn signature(cap: &vitaslop_runtime::capture::Capture) -> u64 {
     cap.signature()
 }
 
-/// Format an `f64` compactly: integers without a trailing `.0`.
+/// Format an `f64` compactly: integers without a trailing `.0`. The shared formatter, so
+/// a value reads identically in a session, a recipe report and the browser.
 pub fn format_f64(x: f64) -> String {
-    if x.fract() == 0.0 && x.abs() < 1e15 {
-        format!("{}", x as i64)
-    } else {
-        format!("{x}")
-    }
+    vitaslop_runtime::recipe_eval::format_f64(x)
 }

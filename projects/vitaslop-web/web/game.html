@@ -13,9 +13,13 @@
     <canvas id="screen" width="960" height="544"></canvas>
     <div id="fps">fps: --</div>
     <div id="perf">perf: --</div>
+    <!-- What the page's WebGPU adapter actually is. An fps without this is not a
+         measurement: a software rasteriser produces a number that describes the
+         rasteriser and nothing about the browser. -->
+    <div id="adapter">adapter: --</div>
     <pre id="status">loading wasm...</pre>
     <script type="module">
-      import init, { run_game } from "./pkg/vitaslop_web.js";
+      import init, { run_game, set_knob } from "./pkg/vitaslop_web.js";
       const status = document.getElementById("status");
       const canvas = document.getElementById("screen");
 
@@ -26,8 +30,12 @@
       // run_game returns after setup and spawns the live loop, which then updates
       // #status ("frame N ...") and #fps as it runs. Exposed on window so the harness
       // can await setup and watch the live frame count.
-      window.__boot = async (recipe, maxFrames, maxRounds) => {
+      // `knobs` is an optional {NAME: value} map. The browser has no environment, so this
+      // is the ONLY way to reach a VITASLOP_* knob here - and one retail racer will not
+      // finish loading without VITASLOP_FRAME_TOPUP=0.
+      window.__boot = async (recipe, maxFrames, maxRounds, knobs) => {
         await init();
+        for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
         status.textContent = "fetching manifest...";
         const manifest = await (await fetch("/game-manifest.json")).json();
         const files = {};

@@ -1,4 +1,4 @@
-//! Assemble a recompiled fragment [`Shader`] into a COMPLETE, bindable WGSL fragment
+﻿//! Assemble a recompiled fragment [`Shader`] into a COMPLETE, bindable WGSL fragment
 //! module - the artifact the renderer's pipeline builder consumes - together with an
 //! explicit [`BindingPlan`] describing exactly what the renderer must bind.
 //!
@@ -311,8 +311,15 @@ pub fn plan_bindings(shader: &Shader, uniform_regs: u32, is_cube: impl Fn(u8) ->
 /// plan. The body is the verbatim output of [`crate::wgsl::emit_fragment`]; this wraps it
 /// with the real resource bindings and the register-file locals, initialising `pa` from the
 /// varying inputs and `sa` from the uniform buffer before the body runs.
-pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
+pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> FragmentModule {
     let mut m = String::new();
+
+    // A depth-writing program (0xF8 DEPTHF) reads the pipeline's depth state through the same
+    // group-3 block the linked module declares, so this standalone wrapper has to declare it
+    // too or the module does not compile at all.
+    if writes_depth {
+        m.push_str(crate::link::GXP_DEPTH_DECL);
+    }
 
     // Sampled textures + samplers at group 1 (t{unit} = binding 2*i, s{unit} = 2*i+1).
     for (i, b) in plan.samplers.iter().enumerate() {
@@ -338,9 +345,23 @@ pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
         let _ = writeln!(m, "  @location({i}) v{i}: vec4<f32>,");
     }
     let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
+    if writes_depth {
+        let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
+    }
     let _ = writeln!(m, "}};");
-    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    if writes_depth {
+        let _ = writeln!(
+            m,
+            "\nstruct FsOut {{\n  @location(0) color: vec4<f32>,\n  @builtin(frag_depth) depth: f32,\n}};"
+        );
+    }
+    let ret_ty = if writes_depth { "FsOut" } else { "@location(0) vec4<f32>" };
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> {ret_ty} {{");
     m.push_str(crate::wgsl::FRONT_FACING_DECL);
+    if writes_depth {
+        let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
+        let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
+    }
 
     // The USSE register-file locals: raw 32-bit registers, matching the emitter.
     for bank in ["r", "o", "i", "pa", "sa"] {
@@ -374,7 +395,12 @@ pub fn build_module(body: &str, plan: &BindingPlan) -> FragmentModule {
     };
     // The standalone fragment wrapper has no inter-stage varyings at all (it is compiled
     // without a vertex partner), so the varying probe can never apply here.
-    let _ = writeln!(m, "  return {};\n}}", color_return_expr(ret, plan.color_precision, 0));
+    let color = color_return_expr(ret, plan.color_precision, 0);
+    if writes_depth {
+        let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);\n}}");
+    } else {
+        let _ = writeln!(m, "  return {color};\n}}");
+    }
 
     FragmentModule { wgsl: m, bindings: plan.clone() }
 }
@@ -669,7 +695,7 @@ mod tests {
         let plan = plan_bindings(&shader(vec![half]), 4, |_| false);
         assert_eq!(plan.color, ColorOutput::NonNativePa0);
         assert_eq!(plan.color_precision, ColorPrecision::F16);
-        let wgsl = build_module("", &plan).wgsl;
+        let wgsl = build_module("", &plan, false).wgsl;
         assert!(
             wgsl.contains("return vec4<f32>(unpack2x16float(pa[0]), unpack2x16float(pa[1]));"),
             "{wgsl}"
@@ -713,7 +739,7 @@ mod tests {
         )]);
         let plan = plan_bindings(&sh, 4, |_| false);
         let body = crate::wgsl::emit_fragment(&sh).unwrap();
-        let module = build_module(&body, &plan);
+        let module = build_module(&body, &plan, false);
         assert!(module.wgsl.contains("var<uniform> sa_buf: SaBuf;"), "{}", module.wgsl);
         assert!(module.wgsl.contains("@location(0) v0: vec4<f32>"), "{}", module.wgsl);
         assert!(module.wgsl.contains("pa[0] = bitcast<u32>(in.v0.x);"), "{}", module.wgsl);
@@ -833,3 +859,4 @@ mod tests {
         assert!(!module.wgsl.contains("var<uniform>"), "no SA binding when none read:\n{}", module.wgsl);
     }
 }
+

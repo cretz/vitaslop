@@ -3054,6 +3054,7 @@ name = "vitaslop-native"
 version = "0.0.0"
 dependencies = [
  "pollster",
+ "tracing",
  "tracing-subscriber",
  "vitaslop-loader",
  "vitaslop-platform",
@@ -3068,6 +3069,7 @@ dependencies = [
 name = "vitaslop-platform"
 version = "0.0.0"
 dependencies = [
+ "tracing",
  "vitaslop-gxp-shader",
  "wgpu",
 ]
@@ -3114,6 +3116,8 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "vitaslop-conformance-harness",
  "vitaslop-conformance-suite-arm",
  "vitaslop-loader",

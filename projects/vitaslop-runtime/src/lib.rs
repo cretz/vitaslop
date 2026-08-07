@@ -29,6 +29,7 @@ pub mod mspace;
 pub mod perf;
 pub mod pvrtc;
 pub mod recipe;
+pub mod recipe_eval;
 pub mod sched;
 pub mod render;
 pub mod trophy;

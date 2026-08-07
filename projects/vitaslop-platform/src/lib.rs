@@ -16,3 +16,4 @@
 //! neutral types without pulling in wgpu.
 
 pub mod gpu;
+pub mod knobs;

@@ -15,6 +15,7 @@ mod emit;
 /// trapping diagnostics become live (`VITASLOP_ARM_AT_FRAME`). The host arms them by
 /// writing [`Artifact::arm_word_off`] when the run reaches it.
 pub use emit::arm_at_frame;
+pub use emit::set_fuel_interval;
 mod ir;
 mod lower;
 
@@ -833,6 +834,230 @@ pub fn transpile_report(program: &Program) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Software fuel must land on LOOP BACK EDGES and nowhere else. Both halves matter
+    /// and they fail in opposite directions: a missing fuel point on a back edge is the
+    /// browser livelock this feature exists to fix, and a spurious one on a forward
+    /// branch is a tax on straight-line guest code, which is most of it.
+    ///
+    /// Matched structurally on the emitted call - `i32.const FUEL_SELECTOR` (a one-byte
+    /// signed LEB `-1`) followed by `call $host_import` - and asserted by COUNT, so the
+    /// test fails loudly if the shape ever stops being emitted rather than quietly
+    /// passing on a pattern that no longer matches anything.
+    #[test]
+    fn fuel_is_emitted_on_back_edges_and_only_on_back_edges() {
+        // `i32.const -1` (0x41 0x7f) then `call 1` (0x10 0x01) - see abi::FUEL_SELECTOR
+        // and emit's IMPORT_FUNC.
+        const FUEL_CALL: [u8; 4] = [0x41, 0x7f, 0x10, 0x01];
+        fn fuel_points(wasm: &[u8]) -> usize {
+            wasm.windows(FUEL_CALL.len()).filter(|w| *w == FUEL_CALL).count()
+        }
+        let build = |code: &[u8], fuel: u32| -> Vec<u8> {
+            set_fuel_interval(fuel);
+            let a = transpile(&Program {
+                code,
+                base: 0x10000,
+                thumb: false,
+                entries: &[0x10000],
+                arm_entries: &[],
+                externs: &[],
+                redirects: &[],
+                inline_imports: &[],
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory: false,
+            })
+            .expect("transpile");
+            wasmparser::validate(&a.wasm).expect("valid wasm");
+            set_fuel_interval(u32::MAX); // leave this thread as we found it
+            a.wasm
+        };
+
+        // A loop: mov r1,#0 / subs r0,r0,#1 / bne back to the subs / bx lr.
+        let looping: [u8; 16] = [
+            0x00, 0x10, 0xa0, 0xe3, // mov r1, #0
+            0x01, 0x00, 0x50, 0xe2, // subs r0, r0, #1
+            0xfd, 0xff, 0xff, 0x1a, // bne 0x10004  (backward)
+            0x1e, 0xff, 0x2f, 0xe1, // bx lr
+        ];
+        // No loop: cmp r0,#0 / beq forward over one instruction / mov r1,#1 / bx lr.
+        let straight: [u8; 16] = [
+            0x00, 0x00, 0x50, 0xe3, // cmp r0, #0
+            0x00, 0x00, 0x00, 0x0a, // beq 0x1000c  (forward)
+            0x01, 0x10, 0xa0, 0xe3, // mov r1, #1
+            0x1e, 0xff, 0x2f, 0xe1, // bx lr
+        ];
+
+        assert_eq!(
+            fuel_points(&build(&looping, 1000)),
+            1,
+            "a single guest loop must get exactly one fuel point on its back edge"
+        );
+        assert_eq!(
+            fuel_points(&build(&straight, 1000)),
+            0,
+            "a forward-only branch must cost nothing - fuel is for loops"
+        );
+        // And the whole feature must vanish when not asked for, so a native build is
+        // byte-identical to one from before fuel existed.
+        assert_eq!(
+            fuel_points(&build(&looping, 0)),
+            0,
+            "fuel disabled must emit no fuel points at all"
+        );
+        assert_eq!(
+            build(&looping, 0),
+            build(&looping, u32::MAX),
+            "an unset fuel interval and an explicit 0 must produce the same module"
+        );
+    }
+
+    /// An emitted function must charge itself EXACTLY what wasmtime would charge it.
+    ///
+    /// This is the whole point of the mechanism. The charge drives the browser's virtual
+    /// game clock, and that clock is only comparable with native's because native's
+    /// quantum is wasmtime fuel over the very same module - so any divergence in the rule
+    /// is a divergence in game time, which a frame-keyed recipe then reads as the browser
+    /// being on a different screen from native.
+    ///
+    /// Both halves of wasmtime's rule are load-bearing and each was got wrong in turn:
+    /// billing one per instruction (rather than nothing for `end`/`block`/`loop`/`return`/
+    /// `drop`) and billing a whole guest block up front (rather than only the operators
+    /// actually reached) each ran the clock several times fast.
+    ///
+    /// The cost table below is a deliberate second statement of `emit::operator_cost`,
+    /// over `wasmparser`'s operators rather than `wasm_encoder`'s. A test that imported
+    /// the emitter's own table would agree with it by construction and prove nothing.
+    #[test]
+    fn a_function_charges_itself_exactly_what_wasmtime_would() {
+        use wasmparser::{Operator, Payload};
+
+        // `wasmtime_environ::default_operator_cost`: operators that generate no machine
+        // code are free, everything else is one operation.
+        fn wasmtime_cost(op: &Operator) -> i64 {
+            match op {
+                Operator::Nop | Operator::Drop => 0,
+                Operator::Block { .. }
+                | Operator::Loop { .. }
+                | Operator::Unreachable
+                | Operator::Return
+                | Operator::Else
+                | Operator::End => 0,
+                _ => 1,
+            }
+        }
+
+        const INTERVAL: i32 = 1000;
+        let audit = |code: &[u8], what: &str| {
+            set_fuel_interval(INTERVAL as u32);
+            let wasm = transpile(&Program {
+                code,
+                base: 0x10000,
+                thumb: false,
+                entries: &[0x10000],
+                arm_entries: &[],
+                externs: &[],
+                redirects: &[],
+                inline_imports: &[],
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory: false,
+            })
+            .expect("transpile")
+            .wasm;
+            set_fuel_interval(u32::MAX); // leave this thread as we found it
+            wasmparser::validate(&wasm).expect("valid wasm");
+
+            for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+                let Payload::CodeSectionEntry(body) = payload.expect("parse") else { continue };
+                let ops: Vec<Operator> = body
+                    .get_operators_reader()
+                    .expect("operators")
+                    .into_iter()
+                    .collect::<Result<_, _>>()
+                    .expect("operators");
+
+                // Walk the body, splitting it into the emitter's own bookkeeping (which
+                // native does not have and so must never be billed) and the translated
+                // guest code (which must be billed by wasmtime's rule).
+                //
+                // Wasmtime charges a function one unit for being entered at all, so that
+                // an empty one still costs something; `Body::new` starts at 1 to match.
+                let mut charged: i64 = 0;
+                let mut owed: i64 = 1;
+                let mut i = 0;
+                while i < ops.len() {
+                    // A commit:  global.get $fuel ; i32.const N ; i32.sub ; global.set $fuel
+                    if let [
+                        Operator::GlobalGet { global_index: g },
+                        Operator::I32Const { value },
+                        Operator::I32Sub,
+                        Operator::GlobalSet { global_index: h },
+                    ] = ops[i..(i + 4).min(ops.len())]
+                    {
+                        if g == abi::FUEL_GLOBAL && h == abi::FUEL_GLOBAL {
+                            assert!(value > 0, "{what}: a commit of {value} is dead code");
+                            charged += value as i64;
+                            i += 4;
+                            continue;
+                        }
+                    }
+                    // A back-edge test:  global.get $fuel ; i32.const 0 ; i32.le_s ; if
+                    //   ; i32.const -1 ; call $host ; i32.const INTERVAL ; global.set $fuel ; end
+                    if let [
+                        Operator::GlobalGet { global_index: g },
+                        Operator::I32Const { value: 0 },
+                        Operator::I32LeS,
+                        Operator::If { .. },
+                    ] = ops[i..(i + 4).min(ops.len())]
+                    {
+                        if g == abi::FUEL_GLOBAL {
+                            assert!(
+                                matches!(
+                                    ops[i + 6],
+                                    Operator::I32Const { value } if value == INTERVAL
+                                ),
+                                "{what}: a back-edge test must reload the whole interval"
+                            );
+                            i += 9;
+                            continue;
+                        }
+                    }
+                    owed += wasmtime_cost(&ops[i]);
+                    i += 1;
+                }
+                assert_eq!(
+                    charged, owed,
+                    "{what}: the body commits {charged} fuel where wasmtime bills {owed}"
+                );
+            }
+        };
+
+        // Straight-line only, so every operator in the body is reached and the totals can
+        // be compared as flat sums.
+        audit(
+            &[
+                0x00, 0x10, 0xa0, 0xe3, // mov r1, #0
+                0x01, 0x00, 0x90, 0xe0, // adds r0, r0, r1
+                0x1e, 0xff, 0x2f, 0xe1, // bx lr
+            ],
+            "straight line",
+        );
+        // With real control flow: a dispatch loop, a back edge carrying a fuel test, and
+        // predicated code, which is where an up-front per-block charge went wrong.
+        audit(
+            &[
+                0x00, 0x10, 0xa0, 0xe3, // mov r1, #0
+                0x01, 0x00, 0x50, 0xe2, // subs r0, r0, #1
+                0x01, 0x10, 0x81, 0x12, // addne r1, r1, #1   (predicated)
+                0xfc, 0xff, 0xff, 0x1a, // bne 0x10004        (backward)
+                0x1e, 0xff, 0x2f, 0xe1, // bx lr
+            ],
+            "a loop with predication",
+        );
+    }
 
     #[test]
     fn transpiles_arm_hello() {

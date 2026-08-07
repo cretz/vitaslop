@@ -116,6 +116,21 @@ pub trait ThreadHandle {
     fn thid(&self) -> i32;
     /// SceKernel priority (lower number = higher priority).
     fn priority(&self) -> i32;
+
+    /// Drop everything the ENGINE holds for this thread, keeping only its identity.
+    ///
+    /// Called once the scheduler has recorded the thread as finished. Nothing resumes a
+    /// finished thread - [`SchedCore::pick_next`] skips it - so the instance, its entry
+    /// functions and its stack are dead weight from that moment on. Only `thid` and
+    /// `priority` are still read, by the joins and the sync dumps.
+    ///
+    /// The default is a no-op, which is right for an engine whose per-thread state is
+    /// cheap. It is NOT right for the browser, where a guest thread is a whole
+    /// `WebAssembly.Instance` of the entire transpiled title: measured at about 7 MB
+    /// each, so a title that spawns a few hundred short-lived threads over a few hundred
+    /// frames grows the renderer by a gigabyte and is killed. The slot itself stays -
+    /// indices are stable for the whole run and the exit code has to outlive the thread.
+    fn release(&mut self) {}
 }
 
 /// A guest thread the scheduler can resume *synchronously* to its next switch point.
@@ -147,6 +162,15 @@ pub trait GuestEngine {
     /// writes are dropped. Used to deliver exit codes owed to a woken joiner's `stat`
     /// out-parameter while no thread is live.
     fn write_mem(&mut self, addr: u32, bytes: &[u8]);
+
+    /// Fill `out` from shared guest memory at guest address `addr`. False if the range is
+    /// not mapped.
+    ///
+    /// The symmetric partner of [`write_mem`](Self::write_mem), and what lets a recipe's
+    /// `@watch` be sampled by the SHARED evaluator on either engine. It returns a bool
+    /// rather than zero-filling because "this address is not mapped" and "this address
+    /// holds zero" are different findings and only one of them means the recipe is wrong.
+    fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool;
 
     /// Called once per display frame boundary, with the new frame count. The default
     /// ignores it; an engine that supports frame-armed diagnostics
@@ -217,6 +241,16 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     cursor: usize,
     /// Frame boundaries (display flips) observed so far.
     frames: u64,
+    /// How many threads were RUNNABLE at each quantum boundary, bucketed by count -
+    /// `runnable_hist[n]` is the number of quanta at which `n` threads were ready.
+    /// Index 0 is unused (the thread that just stopped is itself runnable).
+    ///
+    /// This is the measurement behind the core model: the clock divides a quantum's
+    /// wall time by `min(runnable, GUEST_CORES)`, and whether that matters at all is
+    /// entirely a question of this distribution. A run that is almost always at 1 has
+    /// nothing to divide - which is a real answer, and not one to assume either way.
+    /// See [`SchedCore::runnable_report`].
+    runnable_hist: Vec<u64>,
 }
 
 impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
@@ -229,6 +263,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             threads: vec![Slot::new(main, ThreadState::Runnable)],
             cursor: 0,
             frames: 0,
+            runnable_hist: Vec::new(),
         };
         // If this build inlined any host-mirror read, the host must actually be filling
         // the block. Check it once, here, while the failure is still one line from its
@@ -304,6 +339,48 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         s
     }
 
+    /// How many threads were ready to run at each quantum boundary, as a distribution.
+    ///
+    /// The companion to [`cpu_share_report`](Self::cpu_share_report), and the thing that
+    /// says whether the one-baton scheduler is misrepresenting a MULTI-CORE device or
+    /// faithfully representing a single busy thread. `picks` and `resumes` cannot answer
+    /// it: a title can resume eighteen threads a frame and still never have two ready at
+    /// the same instant, and in that case there is no parallelism for the clock to
+    /// divide by. The mean is the number the clock actually divides by, capped at the
+    /// device's core count.
+    pub fn runnable_report(&self, cores: usize) -> String {
+        use std::fmt::Write;
+        let total: u64 = self.runnable_hist.iter().sum();
+        if total == 0 {
+            return "--- runnable at a quantum: no quanta observed ---\n".to_string();
+        }
+        let weighted: u64 =
+            self.runnable_hist.iter().enumerate().map(|(n, c)| n as u64 * c).sum();
+        let capped: u64 = self
+            .runnable_hist
+            .iter()
+            .enumerate()
+            .map(|(n, c)| (n.min(cores)) as u64 * c)
+            .sum();
+        let mut s = format!(
+            "--- runnable threads at a quantum boundary: {total} quanta, mean {:.2}, \
+             mean capped at {cores} cores {:.2} (the clock divisor) ---\n",
+            weighted as f64 / total as f64,
+            capped as f64 / total as f64,
+        );
+        for (n, count) in self.runnable_hist.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                s,
+                "  {n:3} runnable: {count:10} quanta ({:5.2}%)",
+                *count as f64 * 100.0 / total as f64
+            );
+        }
+        s
+    }
+
     /// The shared host handle (the browser loop locks it directly to dispatch).
     pub fn host(&self) -> &Arc<Mutex<H>> {
         &self.host
@@ -312,6 +389,26 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// Frame boundaries observed so far.
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// `(live, finished)` guest threads: how many the title is still running, and how
+    /// many have ended and are held only as a slot with an exit code.
+    ///
+    /// Reported per frame in the browser because "threads created" and "threads still
+    /// alive" are different numbers, and a run whose process grows steadily is asking
+    /// which of the two is climbing. A title that spawns and joins short-lived workers
+    /// looks identical to one that leaks them if only the creation count is visible -
+    /// which is exactly how a per-thread engine allocation went unattributed.
+    pub fn thread_census(&self) -> (usize, usize) {
+        let finished =
+            self.threads.iter().filter(|t| matches!(t.state, ThreadState::Finished(_))).count();
+        (self.threads.len() - finished, finished)
+    }
+
+    /// Read shared guest memory at guest address `addr`; false if it is not mapped.
+    /// The seam a recipe's `@watch` is sampled through on either engine.
+    pub fn read_guest(&self, addr: u32, out: &mut [u8]) -> bool {
+        self.engine.read_mem(addr, out)
     }
 
     /// Mutable access to thread `idx`, for an engine whose resume is driven externally
@@ -365,9 +462,18 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 None
             }
             Stop::Flip => {
-                // A display frame ended: the thread stays runnable, but count the frame
-                // and advance any frame-keyed input (a scripted TAS recipe) in lockstep
-                // with the render loop.
+                // A display frame ended. The thread BLOCKS: on hardware this call waits
+                // for the scanout to latch the frame, and `VitaState::pace_flip` has
+                // already parked it until the next vblank. Leaving it runnable here is
+                // what let a title flip as fast as it could draw - 216 fps on a 60 Hz
+                // panel - which stretched every frame-keyed timeline by that factor.
+                //
+                // The park may be zero (the guest is already late), in which case the
+                // sleep waiter fires on the next scheduler pass and this costs one
+                // reschedule - which is also what hardware does at a frame boundary.
+                self.threads[idx].state = ThreadState::Blocked;
+                // Count the frame and advance any frame-keyed input (a scripted TAS
+                // recipe) in lockstep with the render loop.
                 self.frames += 1;
                 self.host.lock().unwrap().on_frame_boundary(self.frames);
                 // Let the engine arm anything keyed to a frame (see
@@ -387,7 +493,21 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // work rather than rendered frames advance here (the modelled storage
                 // clock), so a title that spins in guest code waiting for a load still
                 // sees the load complete.
-                self.host.lock().unwrap().on_quantum();
+                //
+                // The runnable count goes with it, and it is not bookkeeping: the device
+                // has three CPUs for the game, so up to three of these threads would
+                // have retired their quanta AT ONCE and only one quantum of wall time
+                // would have passed. The host divides by it. `cooled` is an
+                // anti-starvation nudge inside our one-baton rotation and says nothing
+                // about whether a thread could run on hardware, so it is not consulted;
+                // the thread that just stopped is still Runnable and counts itself.
+                let runnable =
+                    self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
+                if self.runnable_hist.len() <= runnable {
+                    self.runnable_hist.resize(runnable + 1, 0);
+                }
+                self.runnable_hist[runnable] += 1;
+                self.host.lock().unwrap().on_quantum(runnable);
                 None
             }
         }
@@ -400,6 +520,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         match end {
             FiberEnd::Returned(code) | FiberEnd::ThreadExit(code) => {
                 self.threads[idx].state = ThreadState::Finished(code);
+                // Hand the engine's per-thread state back the moment the thread is
+                // recorded as finished. See [`ThreadHandle::release`]: on the browser
+                // this is a whole module instance, and holding one per thread for the
+                // rest of the run is a leak measured in gigabytes.
+                self.threads[idx].thread.release();
                 // Tell the host this thread ended, so any sibling waiting on it can be
                 // woken (the wake is drained right after, by the caller).
                 self.host.lock().unwrap().set_thread_exit(thid, code);
@@ -412,6 +537,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                     if let ThreadState::Runnable | ThreadState::Blocked = t.state {
                         t.state = ThreadState::Finished(code);
                     }
+                }
+                // Every thread is finished now, so every engine allocation can go.
+                for t in self.threads.iter_mut() {
+                    t.thread.release();
                 }
                 Some(RunReport::Finished(code))
             }
@@ -590,6 +719,12 @@ where
     /// Who actually got the CPU - see [`SchedCore::cpu_share_report`].
     pub fn cpu_share_report(&self) -> String {
         self.core.cpu_share_report()
+    }
+
+    /// How much of the device's parallelism the run actually used - see
+    /// [`SchedCore::runnable_report`].
+    pub fn runnable_report(&self, cores: usize) -> String {
+        self.core.runnable_report(cores)
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run

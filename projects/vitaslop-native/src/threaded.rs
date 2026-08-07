@@ -226,6 +226,21 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
         }
     }
 
+    fn read_mem(&self, addr: u32, out: &mut [u8]) -> bool {
+        let off = addr.wrapping_sub(self.base) as usize;
+        let data = self.shared_mem.data();
+        if off.checked_add(out.len()).is_none_or(|end| end > data.len()) {
+            return false;
+        }
+        for (i, b) in out.iter_mut().enumerate() {
+            // SAFETY: the same condition `write_shared` relies on - the scheduler calls
+            // this between fiber steps, with one fiber at a time and none running, so
+            // there is no concurrent guest access to this shared memory.
+            *b = unsafe { *data[off + i].get() };
+        }
+        true
+    }
+
     /// Arm the frame-gated diagnostics the instant the run reaches the requested
     /// frame. One word in shared linear memory covers every guest thread at once,
     /// which is the whole reason the gate is not a wasm global.
@@ -498,6 +513,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// [`vitaslop_runtime::sched::SchedCore::cpu_share_report`].
     pub fn cpu_share_report(&self) -> String {
         self.inner.cpu_share_report()
+    }
+
+    /// How much of the device's parallelism the run used - see
+    /// [`vitaslop_runtime::sched::SchedCore::runnable_report`].
+    pub fn runnable_report(&self) -> String {
+        self.inner.runnable_report(vitaslop_runtime::host::guest_cores())
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run
@@ -1163,6 +1184,11 @@ fn bind_dispatch_miss<H: ImportDispatch + Send + 'static>(
 static POLL_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static POLL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Host calls between periodic stall dumps, matching the browser's window so the two
+/// engines' dumps line up call-for-call.
+const STALL_DUMP_EVERY: u64 = 250_000;
+static STALL_DUMP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Guest address to sample after each host call, from `VITASLOP_POLL_ADDR` (hex).
 fn poll_addr() -> Option<u32> {
     use std::sync::OnceLock;
@@ -1220,6 +1246,23 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                             t.elapsed().as_nanos() as u64,
                             dispatch_ns,
                         );
+                    }
+
+                    // Periodic stall dump (`vitaslop::sched=debug`), on the same schedule
+                    // and in the same format as the browser's, so a run that stalls on
+                    // one engine and not the other can be diffed line for line rather
+                    // than argued about. Off unless the target is enabled, and the
+                    // counter is a relaxed add.
+                    {
+                        let n = STALL_DUMP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n % STALL_DUMP_EVERY == 0 && tracing::enabled!(target: "vitaslop::sched", tracing::Level::DEBUG) {
+                            let host = caller.data().host.lock().unwrap();
+                            tracing::debug!(
+                                target: "vitaslop::sched",
+                                "stall dump after {n} host calls:\n{}",
+                                host.sync_dump()
+                            );
+                        }
                     }
 
                     // Diagnostic memory watchpoint (VITASLOP_POLL_ADDR=<hex guest

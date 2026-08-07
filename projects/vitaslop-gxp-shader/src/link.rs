@@ -1,4 +1,4 @@
-//! Cross-stage LINKAGE: pair a recompiled vertex program with a recompiled fragment
+﻿//! Cross-stage LINKAGE: pair a recompiled vertex program with a recompiled fragment
 //! program into a single, bindable WGSL module whose vertex outputs feed the fragment
 //! inputs through matched `@location` varyings.
 //!
@@ -290,6 +290,7 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
         &fliterals,
         &iface,
         fragment_varyings,
+        frc.shader.instrs.iter().any(|i| i.op == Op::DepthF),
     );
 
     Ok(LinkedProgram {
@@ -351,9 +352,30 @@ fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
 /// assigned) and resolves each access to a 32-bit register at the accessing instruction's
 /// precision: an F32 channel reads register `index + selector`, while the four F16 channels
 /// share a register PAIR (`index + selector/2`).
-fn pa_read_before_write(shader: &Shader) -> Vec<bool> {
-    let mut written = vec![false; BANK_REGS];
+///
+/// Returns TWO answers, because the two questions the caller asks are genuinely different.
+///
+/// `.0` is per 16-bit HALF: register `r` is an input if ANY half of it is read before that half
+/// is written. An F16 instruction writes ONE half and the emitter preserves the other (`pa[r] =
+/// (pa[r] & 0xffff0000u) | ...`), so a register whose low half an early instruction fills is NOT
+/// defined - a later read of its high half still needs the interpolated value. Counting the
+/// whole register as written there made a material's interpolant look like scratch, so the
+/// linker routed none of it and the shader read zeros for the components nothing wrote. On this
+/// title's static-world material that component is the FOG FACTOR, so every wall and building
+/// came out flat `fogColour` with correct textures bound and never sampled. This is the answer
+/// that decides whether an interpolant's data has to be routed.
+///
+/// `.1` is per REGISTER: `r` is read at a point where NEITHER half has been written. That is
+/// the strictly-untouched case, and it is what the unfed-varying check must use. A register the
+/// shader itself partially filled and then read another lane of is reading its OWN scratch,
+/// which the hardware leaves undefined too - real programs do it on lanes whose result is dead
+/// (`frag_872e7aa0` computes a 4-channel MAD over a 3-channel product and discards the fourth),
+/// and failing the link over one would refuse a shader that is perfectly translatable.
+fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
+    // Two entries per register: index `2*r + h` is half `h`. An F32 access covers both halves.
+    let mut written = vec![false; BANK_REGS * 2];
     let mut inputs = vec![false; BANK_REGS];
+    let mut untouched = vec![false; BANK_REGS];
     for instr in &shader.instrs {
         // Sources and destination can be at DIFFERENT widths (a format convert), so each side
         // resolves its own registers - see [`crate::ir::Instr::source_half_precision`].
@@ -368,14 +390,23 @@ fn pa_read_before_write(shader: &Shader) -> Vec<bool> {
                 if !read[c] {
                     continue;
                 }
-                let sel = src.swizzle[c];
+                let sel = src.swizzle[c] as usize;
                 if sel > 3 {
                     continue; // a swizzle constant reads no register
                 }
-                let reg =
-                    src.index as usize + if src_half { (sel >> 1) as usize } else { sel as usize };
-                if reg < written.len() && !written[reg] {
+                let (reg, halves) = if src_half {
+                    (src.index as usize + (sel >> 1), (sel & 1)..(sel & 1) + 1)
+                } else {
+                    (src.index as usize + sel, 0..2)
+                };
+                if reg >= BANK_REGS {
+                    continue;
+                }
+                if halves.clone().any(|h| !written[reg * 2 + h]) {
                     inputs[reg] = true;
+                }
+                if !written[reg * 2] && !written[reg * 2 + 1] {
+                    untouched[reg] = true;
                 }
             }
         }
@@ -385,15 +416,19 @@ fn pa_read_before_write(shader: &Shader) -> Vec<bool> {
                     if !instr.write_mask[c] {
                         continue;
                     }
-                    let reg = d.index as usize + if half { c >> 1 } else { c };
-                    if reg < written.len() {
-                        written[reg] = true;
+                    let (reg, halves) =
+                        if half { (d.index as usize + (c >> 1), (c & 1)..(c & 1) + 1) } else { (d.index as usize + c, 0..2) };
+                    if reg >= BANK_REGS {
+                        continue;
+                    }
+                    for h in halves {
+                        written[reg * 2 + h] = true;
                     }
                 }
             }
         }
     }
-    inputs
+    (inputs, untouched)
 }
 
 /// One interpolated scalar component crossing the stage boundary, in interface order. The
@@ -481,7 +516,7 @@ struct Interface {
 /// never reads is skipped: it cannot affect the picture, and skipping it keeps a shader that
 /// merely declares an unmodeled usage linkable.
 fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
-    let inputs = pa_read_before_write(fshader);
+    let (inputs, untouched) = pa_read_before_write(fshader);
     let primary_regs = fprog.primary_reg_count as u32;
 
     // A read of a register the container does not allocate at all means the interpolant spans
@@ -611,10 +646,14 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
         }
     }
 
-    // Every register the fragment reads before writing must now be fed. One that is not would
-    // emit as a read of a zero-initialised register - a silently wrong picture rather than a
-    // fallback - so it is a hard error, not a gap to paper over.
-    if let Some(reg) = (0..inputs.len()).find(|&r| inputs[r] && !fed[r]) {
+    // Every register the fragment reads with NOTHING of it written must now be fed. One that is
+    // not would emit as a read of a zero-initialised register - a silently wrong picture rather
+    // than a fallback - so it is a hard error, not a gap to paper over.
+    //
+    // The strict (`untouched`) half of the analysis is deliberate here: a register the shader
+    // itself half-filled and then read another lane of is its own scratch, undefined on the
+    // hardware too, and never a varying this linker failed to route.
+    if let Some(reg) = (0..untouched.len()).find(|&r| untouched[r] && !fed[r]) {
         return Err(LinkError::PaReadUnfed { register: reg as u32, varyings_error: fprog.varyings_error });
     }
     Ok(iface)
@@ -751,6 +790,28 @@ fn gxp_window_position(fc: vec4<f32>) -> vec4<f32> {
   if (gxp_depth.range.z != 1.0) { w = -w; }
   return vec4<f32>(fc.x, fc.y, gxp_guest_depth(w), 1.0 / w);
 }
+
+// The inverse of the whole chain above, for a fragment that WRITES its own depth (0xF8
+// DEPTHF). A shader can only compute a depth in the GUEST's encoding - it builds one out of
+// its POSITION interpolant, which is that encoding by construction - while the depth buffer
+// holds OURS, so an unconverted write would sort against every interpolated depth at random.
+// `range.w` names which forward map the vertex stage applied, because there is more than one
+// and only the renderer knows which is in force.
+fn gxp_depth_to_window(d: f32, interpolated: f32) -> f32 {
+  // The GL-style remap: the guest's own clip z, read in [-w, w], mapped into [0, w]. The
+  // guest's window depth IS z/w there, so this is just the same affine map on it.
+  if (gxp_depth.range.w > 0.5 && gxp_depth.range.w < 1.5) { return clamp((d + 1.0) * 0.5, 0.0, 1.0); }
+  // No remap at all: the guest's clip z rasterised untouched, so its window depth is `d`.
+  if (gxp_depth.range.w >= 1.5) { return d; }
+  // The default: clip z was REPLACED by the projected view distance `-1/w`, mapped linearly
+  // onto [0,1] over the scene's own range. Recover `w` from `d` by inverting
+  // `gxp_guest_depth`, then apply that same map. `fit.y` is the `c` of `z = a*w + c`; with
+  // c == 0 the guest's depth does not depend on `w` at all, so there is nothing to invert and
+  // the interpolated depth stands.
+  if (gxp_depth.fit.y == 0.0) { return interpolated; }
+  let q = (gxp_depth.fit.x - d) / gxp_depth.fit.y;
+  return clamp((q - gxp_depth.range.x) * gxp_depth.range.y, 0.0, 1.0);
+}
 "#;
 
 fn build_linked_module(
@@ -764,6 +825,8 @@ fn build_linked_module(
     fliterals: &[(u32, u32)],
     iface: &Interface,
     varying_locations: u32,
+    // Whether the fragment program replaces the interpolated depth (0xF8 DEPTHF).
+    writes_depth: bool,
 ) -> String {
     let varyings = &iface.components;
     let mut m = String::new();
@@ -891,9 +954,24 @@ fn build_linked_module(
     let _ = writeln!(m, "  @builtin(position) frag_coord: vec4<f32>,");
     let _ = writeln!(m, "  @builtin(front_facing) front_facing: bool,");
     let _ = writeln!(m, "}};");
-    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> @location(0) vec4<f32> {{");
+    // A fragment that writes its own depth (0xF8 DEPTHF) returns a STRUCT carrying
+    // `@builtin(frag_depth)` next to the colour. The struct is emitted only for such a
+    // program: declaring the builtin unconditionally would defeat early-depth rejection on
+    // every other pair in the title, which is a real cost paid for nothing.
+    if writes_depth {
+        let _ = writeln!(
+            m,
+            "\nstruct FsOut {{\n  @location(0) color: vec4<f32>,\n  @builtin(frag_depth) depth: f32,\n}};"
+        );
+    }
+    let ret_ty = if writes_depth { "FsOut" } else { "@location(0) vec4<f32>" };
+    let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> {ret_ty} {{");
     m.push_str(crate::wgsl::FRONT_FACING_DECL);
     emit_register_banks(&mut m);
+    if writes_depth {
+        let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
+        let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
+    }
     // The WINDOW coordinate a fragment's POSITION interpolant reads (see `plan_interface`).
     // `gxp_window_position` undoes what the pipeline did to the guest's clip position on the
     // way here - the clip-`w` sign correction and the depth remap - and re-encodes the depth
@@ -983,11 +1061,12 @@ fn build_linked_module(
         ColorOutput::NativeO0 => "o",
         ColorOutput::NonNativePa0 => "pa",
     };
-    let _ = writeln!(
-        m,
-        "  return {};\n}}",
-        crate::module::color_return_expr(ret, fplan.color_precision, varying_locations)
-    );
+    let color = crate::module::color_return_expr(ret, fplan.color_precision, varying_locations);
+    if writes_depth {
+        let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);\n}}");
+    } else {
+        let _ = writeln!(m, "  return {color};\n}}");
+    }
 
     m
 }
@@ -1049,7 +1128,7 @@ mod tests {
                 instr(Op::Tex { unit: 1, coords: 2, coord_half: false, lod: crate::ir::TexLod::Implicit }, Some(Operand::plain(Bank::Temp, 4, 0)), vec![Operand::plain(Bank::PrimaryAttr, 10, 1)], [true; 4]),
             ],
         );
-        let inputs = pa_read_before_write(&sh);
+        let (inputs, _) = pa_read_before_write(&sh);
         let regs: Vec<usize> = (0..BANK_REGS).filter(|&r| inputs[r]).collect();
         assert_eq!(regs, vec![4, 5, 10, 11]);
     }
@@ -1066,7 +1145,7 @@ mod tests {
             [true; 4],
         );
         i.half_precision = true;
-        let inputs = pa_read_before_write(&shader(ProgramKind::Fragment, vec![i]));
+        let (inputs, _) = pa_read_before_write(&shader(ProgramKind::Fragment, vec![i]));
         let regs: Vec<usize> = (0..BANK_REGS).filter(|&r| inputs[r]).collect();
         assert_eq!(regs, vec![6, 7]);
     }
@@ -1453,7 +1532,7 @@ mod tests {
         let iface = plan_interface(&uprog, &fprog, &fsh).unwrap();
         let locations = (iface.components.len() as u32).div_ceil(4);
         let wgsl = build_linked_module(
-            &vbody, &vplan, &uprog, &[], &fbody, &fplan, &uprog, &[], &iface, locations,
+            &vbody, &vplan, &uprog, &[], &fbody, &fplan, &uprog, &[], &iface, locations, false,
         );
 
         // Vertex SA is group 0, samplers are group 2, and both stages share @location(0). Every
@@ -1481,3 +1560,5 @@ mod tests {
         assert!(w[6] && w[7] && !w[8]);
     }
 }
+
+

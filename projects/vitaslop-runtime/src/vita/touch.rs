@@ -41,6 +41,25 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
     let ts = st.world.monotonic_us();
     let touch = st.world.poll_touch(port);
     let points = touch.active();
+    // Diagnostic (`RUST_LOG=vitaslop::input=trace`, `VITASLOP_LOG` in the browser): the
+    // touch sample the guest was handed, at the moment it asked for it.
+    //
+    // The twin of the pad's trace in `ctrl.rs`, and the only way to tell "the scripted
+    // tap never reached the guest" from "it reached the guest and the guest ignored it".
+    // Those have nothing in common as bugs, and a front end that simply does not respond
+    // looks exactly the same either way - which is how a browser run replaying the same
+    // recipe as a working native run sat on one menu for fifty thousand frames.
+    if tracing::enabled!(target: "vitaslop::input", tracing::Level::TRACE) {
+        tracing::trace!(
+            target: "vitaslop::input",
+            "touch poll port {port}: {} point(s){} at t={ts}us",
+            points.len(),
+            points
+                .iter()
+                .map(|p| format!(" ({},{}) force {}", p.x, p.y, p.force))
+                .collect::<String>(),
+        );
+    }
     // The panel reports at most report[8]; a world should never exceed that, but clamp
     // defensively so a bad frame cannot overrun the fixed report array.
     let report_count = points.len().min(8);

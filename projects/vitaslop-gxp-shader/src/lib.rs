@@ -214,7 +214,8 @@ pub fn recompile_fragment_module(bytes: &[u8]) -> Result<(RecompiledFragment, Fr
     let plan = module::plan_bindings(&rc.shader, rc.program.default_uniform_regs, |o| {
         rc.program.sampler_is_cube(o as u32)
     });
-    let module = module::build_module(&rc.wgsl_body, &plan);
+    let writes_depth = rc.shader.instrs.iter().any(|i| i.op == ir::Op::DepthF);
+    let module = module::build_module(&rc.wgsl_body, &plan, writes_depth);
     Ok((rc, module))
 }
 

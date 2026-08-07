@@ -210,7 +210,7 @@ impl RetailGuest {
         for (path, bytes) in files {
             vfs.insert(path, bytes);
         }
-        let game = decrypt_container(&vfs).map_err(|e| format!("decrypt: {e:?}"))?;
+        let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
         let modules = game
             .modules
             .iter()
@@ -310,6 +310,20 @@ impl RetailGuest {
     /// this to `frames / 60` should be 1.
     pub fn clock_us(&mut self) -> u64 {
         self.sched.host().state.now_us()
+    }
+
+    /// `(from quanta, from the frame top-up, from idle jumps)` microseconds of game clock.
+    /// Printed next to the clock so a cross-engine comparison can see WHICH source
+    /// differs, not merely that the totals do.
+    pub fn clock_sources(&mut self) -> (u64, u64, u64) {
+        self.sched.host().state.clock_sources()
+    }
+
+    /// Who got the CPU, and how much of the device's parallelism the run used. The two
+    /// belong together: a lopsided share is only a problem if the starved threads were
+    /// READY, and the second report is what says so.
+    pub fn scheduler_report(&self) -> String {
+        format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
 
     pub fn guest_stdout(&mut self) -> Vec<u8> {
@@ -660,7 +674,14 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
             // ratio of 1.00x hides a stretch that ran five times fast against a stretch
             // that stalled, and a title paced off the clock behaves very differently in
             // the two.
-            println!("shot f{f:06}: guest clock {:.3}s", guest.clock_us() as f64 / 1e6);
+            let (clk_q, clk_topup, clk_idle) = guest.clock_sources();
+            println!(
+                "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle)",
+                guest.clock_us() as f64 / 1e6,
+                clk_q as f64 / 1e6,
+                clk_topup as f64 / 1e6,
+                clk_idle as f64 / 1e6,
+            );
         }
         if use_builtin_taps {
             let touch = taps
@@ -689,6 +710,13 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     // dropped unit is why a recompiled shader falls back, and the per-cause reports are
     // deduped so only this says which cause is worth fixing first.
     vitaslop_runtime::host::report_texture_drops();
+    // `VITASLOP_CPU_SHARE=1`: who got the CPU, and how many threads were READY when the
+    // scheduler handed the baton on. The second half is what the game clock divides by
+    // (the device runs three of them at once), so a clock that looks wrong on a loading
+    // screen is answered here or nowhere.
+    if std::env::var_os("VITASLOP_CPU_SHARE").is_some() {
+        print!("{}", guest.scheduler_report());
+    }
     // VITASLOP_DUMP_STDOUT=<path>: write everything the GUEST logged to fd 1/2 this run.
     // Written before the error check, because a run that ended in a trap or a hang is exactly
     // the one whose log matters most.

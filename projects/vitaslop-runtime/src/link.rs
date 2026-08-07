@@ -626,7 +626,7 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         let modules: Vec<Module> = game
             .modules
             .iter()
@@ -676,7 +676,7 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         let modules: Vec<Module> = game
             .modules
             .iter()
@@ -712,7 +712,7 @@ mod tests {
         let Some(dir) = testfix::game_dir() else {
             return;
         };
-        let game = decrypt_container(&DirVfs::new(dir)).expect("decrypt");
+        let game = decrypt_container(&mut DirVfs::new(dir)).expect("decrypt");
         let modules: Vec<Module> = game
             .modules
             .iter()

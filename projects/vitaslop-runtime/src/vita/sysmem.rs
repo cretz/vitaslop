@@ -54,8 +54,20 @@ const SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_ID: i32 = 0x8002_0064u32 as i32;
 /// wires none of them, so the write has no observable effect there either. The value
 /// is held (it is a register, and a title using it as a boot progress marker leaves
 /// its last marker behind) and the call returns nothing - void, so no return write.
+///
+/// The VALUE and the CALLER are traced (`vitaslop::gpo`), because a title that writes
+/// this register in a tight loop is saying something: a boot progress marker changes
+/// monotonically, while a small repeating cycle is a diagnostic BLINK CODE, which means
+/// the title has decided something is wrong. The two look identical in a host-call
+/// tally - only the values tell them apart - and the second is a report about US.
 #[hostcall]
-pub(super) fn set_gpo(st: &mut VitaState, gpo: u32) {
+pub(super) fn set_gpo(ctx: &mut GuestCtx, st: &mut VitaState, gpo: u32) {
+    tracing::debug!(
+        target: "vitaslop::gpo",
+        gpo = format_args!("{gpo:#010x}"),
+        lr = format_args!("{:#010x}", ctx.regs[14]),
+        "setGPO"
+    );
     st.gpo = gpo;
 }
 

@@ -1426,8 +1426,19 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     // game's own buffer bookkeeping lives there, and a double-buffered title
     // spins forever after two frames if it never runs.
     st.enqueue_display_callback(ctx, callback_data);
+    // Pace the caller to the scanout. On hardware this call is where a title waits for
+    // the display, and without the wait the frame rate is "however fast the guest can
+    // draw" - 216 fps on this title's front end against a 60 Hz panel. See
+    // [`VitaState::pace_flip`]. Only in the preemptive model: a run-to-completion host
+    // has no scheduler to park against and treats a flip as a plain continue.
+    if st.is_preemptive() {
+        st.pace_flip(FRAME_US);
+    }
     ctx.ret(0);
 }
+
+/// One display period: the Vita panel is 60 Hz.
+const FRAME_US: u64 = 1_000_000 / 60;
 
 // --- Fixed-function pipeline state setters ----------------------------------
 //
@@ -2353,12 +2364,13 @@ pub(super) fn render_target_get_driver_mem_block(
 ///     const SceGxmTexture *texture)
 ///
 /// Binds a texture to a VERTEX-stage sampler (vertex texture fetch: displacement maps,
-/// per-instance data tables). The capture carries fragment-stage textures with each
-/// draw; a vertex sampler has no slot in it, so a vertex program that samples renders as
-/// if the fetch returned nothing. The binding is deliberately NOT stored - nothing would
-/// read it - but the gap is stated once, because it is a property of the title's shaders
-/// rather than an event, and an unreported approximation looks exactly like a faithful
-/// render on screen.
+/// per-instance data tables, a vector canvas whose control points ARE texels).
+///
+/// The binding is recorded and travels with the draw in its own list, decoded by the same
+/// `snapshot_bound_textures` the fragment stage uses so the two stages can never decode one
+/// texture differently. It is a separate list because the two stages number their sampler
+/// units INDEPENDENTLY - binding the fragment stage's texture here does not shade a surface
+/// wrongly, it draws a different mesh.
 pub(super) fn set_vertex_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
     let unit = ctx.arg(1);
     let texture = ctx.arg(2);

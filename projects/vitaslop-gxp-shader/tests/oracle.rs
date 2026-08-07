@@ -1765,3 +1765,170 @@ fn fragment_position_interpolant_usage() {
     }
     println!("\n{with_pos} of {total} fragment programs declare a Position interpolant");
 }
+
+/// INTERPRET one named program (`VITASLOP_GXP_DISASM`) and say exactly where the interpreter
+/// stops, if it does.
+///
+/// The renderer's clip-`w` / depth-fit measurement runs a vertex program on the CPU, and when
+/// that fails it can only say "the vertex program does not interpret" - which names no
+/// instruction and no reason, and costs a five-minute replay to observe at all. This answers
+/// the same question offline in a second, against the same decoder, and names the instruction.
+///
+/// Inputs are zeros (plus the container's literals): the question here is which OPCODE or
+/// operand form the interpreter cannot model, and that does not depend on the values.
+#[test]
+#[ignore = "requires VITASLOP_GXP_DUMPS + VITASLOP_GXP_DISASM; run explicitly"]
+fn interpret_one() {
+    let Some(dir) = dump_dir() else { return };
+    let Ok(want) = std::env::var("VITASLOP_GXP_DISASM") else {
+        eprintln!("set VITASLOP_GXP_DISASM=<filename substring>");
+        return;
+    };
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.contains(&want) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        let mut regs = vitaslop_gxp_shader::interp::RegFile::with_lanes(512);
+        for &(reg, value) in &program.literals {
+            if let Some(slot) = regs.sa.get_mut(reg as usize) {
+                *slot = f32::from_bits(value);
+            }
+        }
+        let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
+        match vitaslop_gxp_shader::interp::run(&secondary, &mut regs) {
+            Ok(()) => println!("{name}: secondary program interpreted ({} instrs)", secondary.instrs.len()),
+            Err(e) => println!("{name}: SECONDARY stopped: {e}"),
+        }
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        // Every unit returns a mid-grey texel, so a program that samples runs to completion:
+        // the question is which op stops the interpreter, not what the picture looks like.
+        let grey = |_unit: u8, _c: [f32; 4]| Some([0.5f32; 4]);
+        match vitaslop_gxp_shader::interp::run_watching_for_nan_with_textures(&shader, &mut regs, &grey) {
+            Ok(nan) => {
+                println!("{name}: primary interpreted ({} instrs)", shader.instrs.len());
+                if let Some(s) = nan {
+                    println!("  first NON-FINITE value: #{} {} -> {} ch{} = {}", s.index, s.op, s.dest, s.channel, s.value);
+                    for src in &s.sources {
+                        println!("    src {src}");
+                    }
+                }
+                println!("  clip o0..o3 = [{}, {}, {}, {}]", regs.o[0], regs.o[1], regs.o[2], regs.o[3]);
+            }
+            Err(e) => println!("{name}: PRIMARY stopped: {e}"),
+        }
+    }
+}
+
+/// Where a FULL-PRECISION texture sample's four components actually land, decided by def-use
+/// closure over the corpus rather than by analogy with the ALU operand rule.
+///
+/// The two candidate readings of an SMP's 7-bit destination field are DIRECT (`dest_n`, the
+/// result occupying as many registers as its width needs) and DOUBLED (`2*dest_n`, the ALU
+/// operand rule). They are indistinguishable at `dest_n = 0` and differ everywhere else, and
+/// only one of them can be right for both widths at once - the F16 case is already established
+/// as direct, with a 4-component result in the register PAIR.
+///
+/// The test a shipped program has to pass is simple: every register it READS must be one
+/// something WROTE. For each F32 sample this reports whether the reads after it land in the
+/// direct range, the doubled range, or (the disqualifying case) name a register no instruction
+/// in the program ever writes.
+#[test]
+#[ignore = "requires VITASLOP_GXP_DUMPS; run explicitly"]
+fn full_precision_sample_destination_closure() {
+    let Some(dir) = dump_dir() else { return };
+    println!("\n=== where a full-precision SMP result lands: direct vs doubled ===");
+    let (mut direct_only, mut doubled_only, mut both, mut neither) = (0, 0, 0, 0);
+    for path in gxp_files(&dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(program) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        // Registers of the TEMP bank any instruction writes, and the ones read.
+        // EXCLUDING every sample's own write, or the question is circular: whichever range the
+        // current decode picks is written by definition, and the other one looks unwritten.
+        let mut written: Vec<u32> = Vec::new();
+        for ins in &shader.instrs {
+            if matches!(ins.op, vitaslop_gxp_shader::ir::Op::Tex { .. }) {
+                continue;
+            }
+            if let Some(d) = ins.dest.as_ref() {
+                if d.bank == Bank::Temp {
+                    for c in 0..4 {
+                        if ins.write_mask[c] {
+                            written.push(d.index as u32 + if ins.half_precision { (c as u32) >> 1 } else { c as u32 });
+                        }
+                    }
+                }
+            }
+        }
+        // Every TEMP register the program reads, at the reader's own precision and through its
+        // own SWIZZLE. The swizzle is not a detail here: a source written `Temp[7].[1,1,1,1]`
+        // reads register 8 and nothing else, and counting it as 7..10 smears the evidence
+        // across both candidate ranges until neither is refuted.
+        let mut read: Vec<u32> = Vec::new();
+        for ins in &shader.instrs {
+            for s in &ins.srcs {
+                if s.bank != Bank::Temp {
+                    continue;
+                }
+                for c in 0..4usize {
+                    let sel = s.swizzle[c] as u32;
+                    if sel > 3 {
+                        continue; // a swizzle constant reads no register
+                    }
+                    read.push(s.index as u32 + if ins.source_half_precision() { sel >> 1 } else { sel });
+                }
+            }
+        }
+        for (i, ins) in shader.instrs.iter().enumerate() {
+            // Only a full-precision sample discriminates: `dest_n = 0` doubles to itself, and
+            // the F16 case is already settled.
+            let vitaslop_gxp_shader::ir::Op::Tex { .. } = ins.op else { continue };
+            if ins.half_precision {
+                continue;
+            }
+            let raw = ins.raw;
+            let dest_n = ((raw >> 21) & 0x7f) as u32;
+            if dest_n == 0 || ((raw >> 39) & 1) != 0 {
+                continue; // indistinguishable, or a PA destination
+            }
+            let reads_in = |base: u32| {
+                shader.instrs.iter().skip(i + 1).any(|later| {
+                    later.srcs.iter().any(|s| {
+                        s.bank == Bank::Temp
+                            && (0..4).any(|c| {
+                                let r = s.index as u32
+                                    + if later.source_half_precision() { (c as u32) >> 1 } else { c as u32 };
+                                (base..base + 4).contains(&r)
+                            })
+                    })
+                })
+            };
+            let (d, x) = (reads_in(dest_n), reads_in(dest_n * 2));
+            // The disqualifying observation: a range the program READS that no OTHER
+            // instruction writes has to be the one this sample fills.
+            let orphan = |base: u32| {
+                (base..base + 4).filter(|r| read.contains(r) && !written.contains(r)).collect::<Vec<_>>()
+            };
+            let verdict = match (d, x) {
+                (true, false) => { direct_only += 1; "DIRECT only" }
+                (false, true) => { doubled_only += 1; "DOUBLED only" }
+                (true, true) => { both += 1; "both" }
+                (false, false) => { neither += 1; "neither" }
+            };
+            // The readable form of the argument: which ORPHAN reads (registers the program
+            // reads that no other instruction writes) each candidate range would account for.
+            // The right reading is the one that leaves none of them unexplained.
+            println!(
+                "  {name} #{i}: dest_n={dest_n} -> direct [{}..{}] doubled [{}..{}] : {verdict}; \
+                 orphan reads it would explain: direct {:?}, doubled {:?}",
+                dest_n, dest_n + 3, dest_n * 2, dest_n * 2 + 3,
+                orphan(dest_n), orphan(dest_n * 2)
+            );
+        }
+    }
+    println!("\ndirect-only {direct_only}, doubled-only {doubled_only}, both {both}, neither {neither}");
+}

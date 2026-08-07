@@ -29,6 +29,13 @@ wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+# The runtime emits its diagnostics as `tracing` events. On native a subscriber turns
+# them into stderr lines under RUST_LOG; without one here the browser DROPS every one of
+# them, so the same emulator is silent in the one place it is hardest to observe. These
+# two give the browser the same seam, writing to the console and filtered by
+# VITASLOP_LOG (the browser has no environment, so RUST_LOG cannot be the source).
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Serialize the conformance summary the browser returns to the page/Playwright.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

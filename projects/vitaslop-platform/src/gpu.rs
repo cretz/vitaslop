@@ -10,6 +10,31 @@
 //! feature) draws them. Keeping `DrawBatch` free of any wgpu types lets the
 //! engine-agnostic runtime produce it without pulling in a GPU stack.
 
+/// A renderer diagnostic, at `debug` on the `vitaslop::gxm` target.
+///
+/// # Why these are not `eprintln!`
+/// This module is the SHARED render path: the same code draws the native pixel oracle
+/// and the browser canvas. On wasm32 stderr is a no-op sink, so every `eprintln!` here
+/// was discarded in the browser - including the recompiler's own per-scene verdict, the
+/// one line that says whether a frame's draws were really recompiled or quietly fell
+/// back. The engine that is hardest to inspect was the one reporting nothing, and a
+/// black frame there was indistinguishable from a correct one.
+///
+/// Read them with `RUST_LOG=vitaslop::gxm=debug` natively, or
+/// `VITASLOP_LOG=warn,vitaslop::gxm=debug` in the browser. Anything that means the
+/// renderer DEGRADED - a fallback, a dropped draw, an approximated state - goes through
+/// [`report_warn`] instead, so it survives the default `warn` filter on both engines
+/// without anyone having to know to ask for it.
+macro_rules! report {
+    ($($arg:tt)*) => { tracing::debug!(target: "vitaslop::gxm", $($arg)*) };
+}
+
+/// A renderer diagnostic that means the output is WRONG or approximated. Always visible
+/// at the default filter - see [`report`].
+macro_rules! report_warn {
+    ($($arg:tt)*) => { tracing::warn!(target: "vitaslop::gxm", $($arg)*) };
+}
+
 /// One ready-to-draw batch: a model-view-projection matrix and the raw vertex and
 /// index bytes, already snapshotted from guest memory. The vertex layout is the
 /// cube's fixed-function format (see [`CUBE_SHADER`]): position `float32x3` at
@@ -110,6 +135,12 @@ pub struct GxmTexture {
     /// cube map (in +X, -X, +Y, -Y, +Z, -Z order, which is WebGPU's array-layer order).
     pub faces: u32,
     pub rgba: std::sync::Arc<Vec<u8>>,
+    /// The `SceGxmTextureFormat` base format and channel swizzle `rgba` was decoded THROUGH.
+    /// Diagnostic only - the pixels are already RGBA8 by the time the renderer sees them - but
+    /// it is the one fact that separates "this channel is genuinely zero in the asset" from "we
+    /// decoded the asset through the wrong layout", and those need opposite fixes.
+    pub base_format: u32,
+    pub swizzle: u32,
     /// True if the guest set this texture's magnification filter to LINEAR
     /// (`SceGxmTextureFilter` == 1); the renderer then bilinear-samples it, matching
     /// the software rasterizer's `sample_texture_bilinear`. False = POINT/nearest.
@@ -214,7 +245,7 @@ pub(crate) fn report_shader_only_skip(d: &GxmDraw, gxp_enabled: bool) {
     if SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    eprintln!(
+    report!(
         "render: a draw with NO fixed-function representation (position-only geometry, its \
          colour lives in the guest fragment shader) is MISSING from the frame - {}. \
          {} indices, {} vertex bytes.",
@@ -888,9 +919,41 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Upper bound on the cross-frame texture caches before they are cleared wholesale
     /// (a re-upload, never incorrectness - the keys are content fingerprints, so a
-    /// re-decoded atlas still hits). Mirrors the runtime's decode-cache cap; a title's
-    /// working set is far smaller, so this only fires on pathological churn.
-    const TEX_CACHE_CAP: usize = 512;
+    /// re-decoded atlas still hits).
+    ///
+    /// # In BYTES, because a count bounds nothing
+    /// This used to be a cap of 512 ENTRIES. An entry is a texture of any size, so 512 of
+    /// them is anywhere from a few megabytes to well over a gigabyte, and the cap fired at
+    /// the same place either way. Native never noticed - it has an address space to spare.
+    /// The browser did: a worker climbed 0.70 -> 1.81 GB while the emulator's own wasm heap
+    /// stayed FLAT at 487 MB, and was killed with no error, no crash event and nothing in
+    /// any log. A limit that does not track the resource it is limiting is not a limit.
+    ///
+    /// 256 MB is comfortably above this title's working set (so the cache still hits) and
+    /// far below what a browser worker can survive. `VITASLOP_TEX_CACHE_MB` overrides.
+    fn tex_cache_budget_bytes() -> usize {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<usize> = OnceLock::new();
+        *CELL.get_or_init(|| {
+            crate::knobs::var("VITASLOP_TEX_CACHE_MB")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(256)
+                * 1024
+                * 1024
+        })
+    }
+
+    /// Bytes a decoded texture occupies once uploaded, for the cache budget. RGBA8 is what
+    /// every upload path here produces, so this is exact rather than an estimate.
+    fn texture_bytes(width: u32, height: u32) -> usize {
+        (width.max(1) as usize) * (height.max(1) as usize) * 4
+    }
+
+    /// Upper bound on the repacked-geometry cache, in distinct meshes. A frame here submits a
+    /// few hundred; the cap only fires on a title whose geometry genuinely changes every
+    /// frame, where the cache would not have helped anyway.
+    const PACKED_CACHE_CAP: usize = 4096;
 
     /// Which texture bind group a draw uses. `White` is the shared 1x1 opaque-white
     /// fallback for an untextured draw; `Tex` names a cached upload by content key and
@@ -947,6 +1010,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         white_bind: wgpu::BindGroup,
         /// Decoded texture uploads (a view kept alive), keyed by content fingerprint.
         views: HashMap<u64, wgpu::TextureView>,
+        /// Bytes currently held by `views`, against [`tex_cache_budget_bytes`].
+        views_bytes: usize,
         /// Texture bind groups (view + chosen sampler), keyed by (content key, linear).
         tex_binds: HashMap<(u64, bool), wgpu::BindGroup>,
         /// Grow-only per-frame arenas + the uniform bind group over the uniform arena.
@@ -957,6 +1022,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         vbo_cap: u64,
         ibo_cap: u64,
         ubo_cap: u64,
+        /// The recompiled path's own grow-only vertex/index arenas, the counterpart of
+        /// `vbo`/`ibo` above. Separate because the two paths pack different vertex layouts.
+        /// Which PASS of the current chain is being encoded, used to invalidate the bind
+        /// groups over that pass's uniform arena ([`GxpLive::ubo_bgs`]).
+        ///
+        /// The arenas are per PASS and not per frame, and that is not an accident: every pass
+        /// of a chain records into ONE command encoder and the whole encoder is submitted at
+        /// the end, so a shared buffer overwritten between passes would hand every pass the
+        /// LAST pass's geometry. That is exactly what happened when this was first written -
+        /// the race frame came out as sheets of shredded triangles.
+        gxp_pass_gen: u64,
         /// Per-draw uniform spacing: `UNIFORM_BYTES` rounded up to the device's
         /// `min_uniform_buffer_offset_alignment` (256 by default).
         uniform_stride: u64,
@@ -1032,6 +1108,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         gxp: GxpLive,
         /// What the last [`GxmRenderer::encode`] spent, phase by phase. See [`EncodePhases`].
         last_phases: EncodePhases,
+        /// The same, summed over every pass of the last [`GxmRenderer::encode_chain`] - which
+        /// is the frame, and the only figure the caller's `encode` total can be compared with.
+        chain_phases: EncodePhases,
     }
 
     /// Where one `encode` went, in milliseconds of CPU.
@@ -1059,6 +1138,22 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pub fixed_draws: usize,
     }
 
+    impl EncodePhases {
+        /// Fold one PASS's phases into a whole-FRAME total.
+        ///
+        /// A frame is a CHAIN of passes, and reporting only the last one's phases describes
+        /// whichever pass happened to be last - on this title's race frame that is an
+        /// eleven-draw composite, so the split read `prepare 0.25 ms` while the frame was
+        /// spending sixteen milliseconds encoding four hundred draws it never mentioned.
+        fn add(&mut self, pass: EncodePhases) {
+            self.prepare_ms += pass.prepare_ms;
+            self.upload_ms += pass.upload_ms;
+            self.pass_ms += pass.pass_ms;
+            self.gxp_draws += pass.gxp_draws;
+            self.fixed_draws += pass.fixed_draws;
+        }
+    }
+
     /// The offscreen supersample render target: an `ss_scale * surf` colour + depth buffer the
     /// scene is rendered into, plus the bind group the resolve pass samples the colour through.
     /// Kept across frames and rebuilt only when the scale or the target dimensions change.
@@ -1081,7 +1176,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         use std::sync::atomic::{AtomicBool, Ordering};
         static REPORTED: AtomicBool = AtomicBool::new(false);
         if !REPORTED.swap(true, Ordering::Relaxed) {
-            eprintln!(
+            report!(
                 "gxm: a scene with {draws} draws has no resolvable colour surface - it renders \
                  nowhere, and any later pass that samples its target gets stale guest memory"
             );
@@ -1177,11 +1272,26 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     struct GxpPrepared {
         /// Cache key of the pipeline this draw uses (looked up immutably during the pass).
         key: u64,
-        vbuf: wgpu::Buffer,
-        ibuf: wgpu::Buffer,
+        /// Byte range of this draw's repacked vertices and its indices inside the pass's
+        /// grow-only GXP arenas.
+        ///
+        /// NOT per-draw buffers. Creating a vertex and an index buffer per draw is two GPU
+        /// allocations per draw, and a race frame here submits ~470 recompiled draws: measured,
+        /// that per-draw allocation was 14.6 ms of the 15.2 ms `encode`, i.e. the single
+        /// largest item in the whole system. The fixed-function path has always packed into
+        /// shared arenas uploaded once; this is the same thing for the recompiled path.
+        v_off: u64,
+        v_len: u64,
+        i_off: u64,
+        i_len: u64,
         index_count: u32,
-        /// Bind groups for group0/1/2 (empty where the stage declares nothing).
-        bg: [wgpu::BindGroup; 4],
+        /// Byte offsets of this draw's vertex and fragment SA blocks inside the pass's uniform
+        /// arena, for the group0/group1 DYNAMIC offsets. The bind groups themselves belong to
+        /// the shader PAIR, not the draw ([`GxpLive::ubo_bgs`]).
+        u_off: [u32; 2],
+        /// Bind groups for group2 (samplers) and group3 (the pass depth block).
+        bg2: wgpu::BindGroup,
+        bg3: wgpu::BindGroup,
         /// True = alpha-blended (2D/overlay), false = opaque geometry.
         blend: bool,
         /// The guest's GXM viewport for this draw, `[xOffset,xScale,yOffset,yScale,zOffset,
@@ -1259,6 +1369,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// of draws, so uploading per draw (as this path first did) re-sends the same
         /// multi-megabyte shadow map thousands of times a frame and exhausts GPU memory.
         views: HashMap<(u64, SamplerDim), wgpu::TextureView>,
+        /// Bytes currently held by `views`, against [`tex_cache_budget_bytes`]. Tracked
+        /// rather than derived because a `TextureView` cannot be asked its size.
+        views_bytes: usize,
         /// Samplers by `(linear, addr_mode_u, addr_mode_v)`. A handful per title.
         samplers_by_mode: HashMap<(bool, u32, u32), wgpu::Sampler>,
         /// How to choose the clip-`w` sign correction (`VITASLOP_GXP_NEGW`).
@@ -1279,6 +1392,19 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// them. Keeps the measurement off the per-frame path: a projection belongs to the pass,
         /// and a pass does not change projection convention between frames.
         negw_by_target: HashMap<u32, (bool, (f32, f32))>,
+        /// group0/group1 bind groups over the pass's uniform ARENA, one per (shader pair,
+        /// target format, group) rather than one per draw - the draw supplies only a dynamic
+        /// offset. Cleared wholesale when the arena buffer is re-created, because a bind group
+        /// names a specific buffer; `ubo_bgs_gen` is that buffer's generation.
+        ubo_bgs: HashMap<(u64, wgpu::TextureFormat, u8), wgpu::BindGroup>,
+        ubo_bgs_gen: u64,
+        /// Repacked vertex streams, keyed by `(pipeline key, content hash of the guest
+        /// stream)`. The repack walks every component of every vertex, and a world pass here
+        /// submits meshes of ~3800 vertices with eleven components each, EVERY FRAME, from
+        /// byte-identical guest bytes - the static world does not change between frames. The
+        /// key is a content hash rather than the guest address precisely because a title also
+        /// has dynamic geometry at a fixed address, which an address key would serve stale.
+        packed: HashMap<(u64, u64), std::sync::Arc<[u8]>>,
         /// The `@group(3)` depth-range bind group, keyed by `(pipeline key, the depth
         /// range's bits)`.
         ///
@@ -1333,6 +1459,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// are scale-invariant), so it lifts the clip and changes nothing else. On this title it
         /// renders the frame upside down - see the note above.
         Negate,
+        /// Correct EVERY pass, without measuring (`=force`).
+        ///
+        /// A diagnostic, and specifically the one for a pass whose vertex program the CPU
+        /// interpreter cannot run - a program that samples textures, or indexes a uniform
+        /// array. `Auto` then has no evidence and leaves the pass uncorrected, which is
+        /// indistinguishable on screen from a pass that needed no correction: both render
+        /// black. This settles which, in one run.
+        Force,
     }
 
     /// Diagnostic (`VITASLOP_GXP_DUMP`): print each recompiled draw's inputs.
@@ -1341,26 +1475,32 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// variable on Windows copies and re-encodes the whole environment block.
     fn gxp_dump() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VITASLOP_GXP_DUMP").is_some())
+        *ON.get_or_init(|| crate::knobs::flag("VITASLOP_GXP_DUMP"))
     }
 
     impl GxpLive {
+        /// Read the recompiler's configuration.
+        ///
+        /// Through [`crate::knobs`], not `std::env` directly: the browser has no
+        /// environment, so an `std::env` read here silently disables the recompiler
+        /// there and leaves the browser drawing the fixed-function approximation while
+        /// the desktop oracle draws the guest's real shaders.
         fn from_env() -> Self {
-            let flag = |k: &str| std::env::var_os(k).is_some();
+            let flag = crate::knobs::flag;
             GxpLive {
                 enabled: flag("VITASLOP_GXP_LIVE"),
                 only: flag("VITASLOP_GXP_ONLY"),
-                zfix: match std::env::var("VITASLOP_GXP_ZFIX").ok().as_deref() {
+                zfix: match crate::knobs::var("VITASLOP_GXP_ZFIX").ok().as_deref() {
                     Some("0") | Some("off") => ZFix::Off,
                     Some("gl") => ZFix::Gl,
                     _ => ZFix::Range,
                 },
-                yflip: std::env::var("VITASLOP_GXP_YFLIP").map(|v| v != "0").unwrap_or(false),
+                yflip: crate::knobs::var("VITASLOP_GXP_YFLIP").map(|v| v != "0").unwrap_or(false),
                 force: flag("VITASLOP_GXP_FORCE"),
                 solid: flag("VITASLOP_GXP_SOLID"),
                 nodepth: flag("VITASLOP_GXP_NODEPTH"),
                 noblend: flag("VITASLOP_GXP_NOBLEND"),
-                keys: std::env::var("VITASLOP_GXP_KEYS")
+                keys: crate::knobs::var("VITASLOP_GXP_KEYS")
                     .ok()
                     .map(|v| {
                         v.split(',')
@@ -1368,7 +1508,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                exclude: std::env::var("VITASLOP_GXP_EXCLUDE")
+                exclude: crate::knobs::var("VITASLOP_GXP_EXCLUDE")
                     .ok()
                     .map(|v| {
                         v.split(',')
@@ -1378,17 +1518,69 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     .unwrap_or_default(),
                 pipelines: HashMap::new(),
                 views: HashMap::new(),
+                views_bytes: 0,
                 samplers_by_mode: HashMap::new(),
-                negw: match std::env::var("VITASLOP_GXP_NEGW").ok().as_deref() {
+                negw: match crate::knobs::var("VITASLOP_GXP_NEGW").ok().as_deref() {
                     Some("0") | Some("off") => NegW::Off,
                     Some("negate") => NegW::Negate,
+                    Some("force") => NegW::Force,
                     _ => NegW::Auto,
                 },
                 negw_by_key: HashMap::new(),
                 scene_negw: false,
                 scene_depth_fit: DEPTH_FIT_RECIP_W,
                 negw_by_target: HashMap::new(),
+                ubo_bgs: HashMap::new(),
+                ubo_bgs_gen: u64::MAX,
+                packed: HashMap::new(),
                 depth_bgs: HashMap::new(),
+            }
+        }
+
+        /// Ensure a group0/group1 bind group exists over the pass's uniform arena for every
+        /// shader pair the pass uses. Called once per pass, after the arena buffer exists -
+        /// which is why it cannot happen inside `prepare`: the buffer is sized from the arena
+        /// `prepare` fills.
+        fn ensure_ubo_bgs(
+            &mut self,
+            device: &wgpu::Device,
+            buffer: &wgpu::Buffer,
+            generation: u64,
+            used: &[(u64, wgpu::TextureFormat)],
+        ) {
+            if self.ubo_bgs_gen != generation {
+                self.ubo_bgs.clear();
+                self.ubo_bgs_gen = generation;
+            }
+            for &(key, format) in used {
+                let Some(Some(pipe)) = self.pipelines.get(&(key, format)) else { continue };
+                for (group, lanes) in [(0u8, pipe.vsa_lanes), (1u8, pipe.fsa_lanes)] {
+                    if self.ubo_bgs.contains_key(&(key, format, group)) {
+                        continue;
+                    }
+                    let layout = &pipe.layouts[group as usize];
+                    let bg = if lanes == 0 {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("gxp-ubo-empty"),
+                            layout,
+                            entries: &[],
+                        })
+                    } else {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("gxp-ubo-bind"),
+                            layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new((lanes.div_ceil(4) as u64) * 16),
+                                }),
+                            }],
+                        })
+                    };
+                    self.ubo_bgs.insert((key, format, group), bg);
+                }
             }
         }
 
@@ -1416,6 +1608,15 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         fn decide_scene_negw(&mut self, scene: &RenderScene) {
             if self.negw == NegW::Off || !self.enabled {
                 self.scene_negw = false;
+                self.scene_depth_fit = DEPTH_FIT_RECIP_W;
+                return;
+            }
+            // `=force`: correct every pass without measuring, and SAY SO - a frame built on an
+            // assumed projection must never be mistaken for a measured one.
+            if self.negw == NegW::Force {
+                let target = scene.target.as_ref().map(|t| t.data_addr).unwrap_or(0);
+                report_forced_negw(target);
+                self.scene_negw = true;
                 self.scene_depth_fit = DEPTH_FIT_RECIP_W;
                 return;
             }
@@ -1470,7 +1671,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let depth_fit = fit.unwrap_or(DEPTH_FIT_RECIP_W);
             if in_front + behind > 0 {
                 self.negw_by_target.insert(target, (correct, depth_fit));
-                eprintln!(
+                report!(
                     "gxp clip: pass into 0x{target:08x}: {in_front} sampled vertices land in the frustum \
                      with w>0 and {behind} with w<0 -> {}; guest depth = {} + {}/w{}",
                     if correct {
@@ -1506,12 +1707,15 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// compiled PIPELINES, not modules. Two draws sharing a shader pair but differing in
         /// `SceGxmBlendInfo` or in depth func/write are different pipelines, and leaving
         /// either out silently gives the second draw the first one's state.
+        /// Deliberately still the BYTE-at-a-time FNV, and not the word-wise [`fnv64`] used for
+        /// content keys: this value is a published identity. It is what `VITASLOP_GXP_KEYS`,
+        /// `_EXCLUDE`, `_INPUTS` and `_SA` select a pair by, what the fallback and keycolour
+        /// reports name, and what every recorded investigation of this title refers to. Making
+        /// it faster would rename every pair and silently invalidate all of that for a fraction
+        /// of a millisecond.
         fn key(gxp: &GxpRecompile) -> u64 {
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            let depth = [
-                gxp.depth_write as u8,
-                (gxp.depth_func >> 22) as u8 & 0x7,
-            ];
+            let depth = [gxp.depth_write as u8, (gxp.depth_func >> 22) as u8 & 0x7];
             for b in gxp
                 .vprog
                 .iter()
@@ -1541,6 +1745,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // The same, for the DEPTH of those targets, keyed by the guest's depth-surface
             // address. Checked before `rendered` - see `make_sampler_bg`.
             depth_rendered: &HashMap<u32, wgpu::TextureView>,
+            // The pass's grow-only vertex and index arenas, appended to rather than allocated
+            // from per draw. See [`GxpPrepared`].
+            vdata: &mut Vec<u8>,
+            idata: &mut Vec<u8>,
+            // The pass's uniform arena and the device's dynamic-offset alignment.
+            udata: &mut Vec<u8>,
+            ubo_align: u64,
         ) -> Option<GxpPrepared> {
             if gxp.index_count == 0 || gxp.vertices.is_empty() {
                 return None;
@@ -1568,7 +1779,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let ph = |b: &[u8]| {
                     vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0)
                 };
-                eprintln!(
+                report!(
                     "gxp pair {key:x}: vprog hash {:016x}, fprog hash {:016x}",
                     ph(&gxp.vprog),
                     ph(&gxp.fprog)
@@ -1580,14 +1791,24 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // Split the borrows: the sampler bind group needs the texture-view cache mutably
             // while the pipeline (its layouts, its sampler plan) stays borrowed.
             let negw_mode = self.negw;
+            // Which clip-depth remap `inject_clip_fixup` put the vertex stage through. A
+            // fragment that WRITES its own depth has to invert exactly that map, and only the
+            // renderer knows which one is in force, so it travels in the depth block.
+            let zfix_mode: f32 = match self.zfix {
+                ZFix::Range => 0.0,
+                ZFix::Gl => 1.0,
+                ZFix::Off => 2.0,
+            };
             let scene_negw = self.scene_negw;
             let scene_depth_fit = self.scene_depth_fit;
             let GxpLive {
                 pipelines,
                 views: view_cache,
+                views_bytes: view_cache_bytes,
                 samplers_by_mode,
                 force,
                 depth_bgs,
+                packed,
                 ..
             } = self;
             // Borrow the cached pipeline; None = link failed -> fall back.
@@ -1616,7 +1837,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     gxp.indices.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).max()
                 }
                 .unwrap_or(0);
-                eprintln!(
+                report!(
                     "gxp draw key {:x}: vsa_lanes={} vert_sa_lanes={} fsa_lanes={} frag_sa_lanes={} samplers={:?} stride={} idx={} nverts={nverts} max_index={max_index} vbytes={} attrs(reg,off,fmt,comp)={:?}\n  vsa={:?}\n  fsa={:?}",
                     key, pipe.vsa_lanes, f.len(), pipe.fsa_lanes, ff.len(), pipe.samplers, gxp.vertex_stride, gxp.index_count, gxp.vertices.len(), attrs, f, ff
                 );
@@ -1637,30 +1858,55 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                 format!("r{}=[{}]", a.reg_index, c.join(","))
                             })
                             .collect();
-                        eprintln!("    v{v}: {}", vals.join(" "));
+                        report!("    v{v}: {}", vals.join(" "));
                     }
                 }
             }
 
             // Repack the guest vertex stream into the tightly-packed f32 layout the pipeline
-            // expects (per the cached repack plan). Same vertex count/order, so the index
-            // buffer is unchanged.
-            let packed = repack_vertices(&gxp.vertices, gxp.vertex_stride, &pipe.repack, pipe.packed_stride);
-            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gxp-vbo"),
-                contents: &packed,
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gxp-ibo"),
-                contents: &gxp.indices,
-                usage: wgpu::BufferUsages::INDEX,
-            });
+            // expects (per the cached repack plan), straight into the pass's vertex arena.
+            // Same vertex count/order, so the index buffer is unchanged.
+            //
+            // Both arenas stay 4-byte aligned, which `set_vertex_buffer` requires and a u32
+            // index buffer requires: the packed stride is a whole number of f32s and an index
+            // is four bytes, so the padding below never actually fires - it is there so a
+            // future format that is not cannot silently produce an unaligned slice.
+            let v_off = vdata.len() as u64;
+            let pkey = (key, fnv64(0xcbf2_9ce4_8422_2325, &gxp.vertices));
+            match packed.get(&pkey) {
+                Some(bytes) => vdata.extend_from_slice(bytes),
+                None => {
+                    // Bound the cache the way the texture caches are bounded: the key is a
+                    // content hash, so clearing wholesale costs a repack and never correctness.
+                    if packed.len() >= PACKED_CACHE_CAP {
+                        packed.clear();
+                    }
+                    let mut out = Vec::new();
+                    repack_vertices_into(&gxp.vertices, gxp.vertex_stride, &pipe.repack, pipe.packed_stride, &mut out);
+                    vdata.extend_from_slice(&out);
+                    packed.insert(pkey, out.into());
+                }
+            }
+            let v_len = vdata.len() as u64 - v_off;
+            while vdata.len() % 4 != 0 {
+                vdata.push(0);
+            }
+            let i_off = idata.len() as u64;
+            idata.extend_from_slice(&gxp.indices);
+            let i_len = idata.len() as u64 - i_off;
+            while idata.len() % 4 != 0 {
+                idata.push(0);
+            }
 
+            // The two SA blocks go into the pass's uniform ARENA at dynamic-offset alignment;
+            // the bind groups over that arena belong to the shader pair and are built once,
+            // after the arena buffer exists (see `ensure_ubo_bgs`).
             let vert_sa = override_sa(key, 'v', &gxp.vert_sa);
             let frag_sa = override_sa(key, 'f', &gxp.frag_sa);
-            let bg0 = make_uniform_bg(device, &pipe.layouts[0], pipe.vsa_lanes, &vert_sa);
-            let bg1 = make_uniform_bg(device, &pipe.layouts[1], pipe.fsa_lanes, &frag_sa);
+            let u_off = [
+                push_sa(udata, pipe.vsa_lanes, &vert_sa, ubo_align),
+                push_sa(udata, pipe.fsa_lanes, &frag_sa, ubo_align),
+            ];
             let bg2 = Self::make_sampler_bg(
                 device, queue, &pipe.layouts[2],
                 &[
@@ -1668,7 +1914,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     (&pipe.vertex_samplers[..], &gxp.vertex_textures[..]),
                 ],
                 gxp, key,
-                view_cache, samplers_by_mode, *force,
+                view_cache, view_cache_bytes, samplers_by_mode, *force,
                 rendered, depth_rendered,
             )?;
             // group3: the scene depth range the injected clip fixup maps through, as one vec4
@@ -1698,7 +1944,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         depth_range[0].to_le_bytes(),
                         depth_range[1].to_le_bytes(),
                         sign.to_le_bytes(),
-                        [0; 4],
+                        zfix_mode.to_le_bytes(),
                         fit_a.to_le_bytes(),
                         fit_c.to_le_bytes(),
                         [0; 4],
@@ -1717,14 +1963,24 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
             Some(GxpPrepared {
                 key,
-                vbuf,
-                ibuf,
+                v_off,
+                v_len,
+                i_off,
+                i_len,
                 index_count: gxp.index_count,
-                bg: [bg0, bg1, bg2, bg3],
+                u_off,
+                bg2,
+                bg3,
                 blend: gxp.blend,
                 viewport: gxp.viewport,
                 format: color_format,
             })
+        }
+
+        /// The cached group0/group1 bind group for a prepared draw's shader pair (only called
+        /// after `ensure_ubo_bgs` has run for this pass).
+        fn ubo_bg(&self, key: u64, format: wgpu::TextureFormat, group: u8) -> &wgpu::BindGroup {
+            &self.ubo_bgs[&(key, format, group)]
         }
 
         /// The cached pipeline for a prepared draw (only called after `prepare` succeeded).
@@ -1747,6 +2003,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             gxp: &GxpRecompile,
             key: u64,
             view_cache: &mut HashMap<(u64, SamplerDim), wgpu::TextureView>,
+            view_cache_bytes: &mut usize,
             samplers_by_mode: &mut HashMap<(bool, u32, u32), wgpu::Sampler>,
             force: bool,
             rendered: &HashMap<u32, wgpu::TextureView>,
@@ -1825,10 +2082,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         let cache_key = (gt.tex.key, want);
                         if !view_cache.contains_key(&cache_key) {
-                            // Bound the cache: the keys are content fingerprints, so clearing
-                            // wholesale only costs a re-upload, never correctness.
-                            if view_cache.len() >= TEX_CACHE_CAP {
+                            // Bound the cache BY BYTES: the keys are content fingerprints,
+                            // so clearing wholesale only costs a re-upload, never
+                            // correctness. See `tex_cache_budget_bytes` for why counting
+                            // entries did not bound anything.
+                            *view_cache_bytes += texture_bytes(gt.tex.width, gt.tex.height);
+                            if *view_cache_bytes >= tex_cache_budget_bytes() {
                                 view_cache.clear();
+                                *view_cache_bytes = 0;
                             }
                             let tex = upload_gxp_texture(device, queue, &gt.tex);
                             let view = tex.create_view(&wgpu::TextureViewDescriptor {
@@ -2046,6 +2307,27 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Build a group0/group1 uniform bind group from raw guest SA bytes, sized to the WGSL
     /// `array<vec4<f32>, ceil(lanes/4)>` and zero-padded. An empty (0-lane) stage gets an
     /// empty bind group so the pipeline layout's group is still satisfied at draw time.
+    /// Append one stage's SA block to the pass's uniform arena at dynamic-offset alignment,
+    /// zero-padded to the `array<vec4<u32>, ceil(lanes/4)>` the WGSL declares, and return its
+    /// byte offset.
+    ///
+    /// A zero-lane stage still gets an offset (0) because a bind group with no entries takes
+    /// no dynamic offsets at all - the value is simply never used.
+    fn push_sa(udata: &mut Vec<u8>, lanes: u32, guest: &[u8], align: u64) -> u32 {
+        if lanes == 0 {
+            return 0;
+        }
+        while udata.len() as u64 % align != 0 {
+            udata.push(0);
+        }
+        let off = udata.len() as u32;
+        let need = (lanes.div_ceil(4) as usize) * 16;
+        let n = guest.len().min(need);
+        udata.extend_from_slice(&guest[..n]);
+        udata.resize(off as usize + need, 0);
+        off
+    }
+
     fn make_uniform_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, lanes: u32, guest: &[u8]) -> wgpu::BindGroup {
         if lanes == 0 {
             return device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gxp-ubo-empty"), layout, entries: &[] });
@@ -2108,7 +2390,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         gxp.vert_sa.hash(&mut h);
         gxp.frag_sa.hash(&mut h);
-        for t in &gxp.textures {
+        for t in gxp.textures.iter().chain(gxp.vertex_textures.iter()) {
             (t.unit, t.tex.data_addr, t.tex.width, t.tex.height).hash(&mut h);
         }
         let inputs_hash = h.finish();
@@ -2123,7 +2405,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // The raw words too, not only the decoded parameters. A parameter is decoded through
             // its declared offset/type, so a value that reads wrong is either the bytes or that
             // decode - and only the bytes can tell the two apart.
-            eprintln!(
+            report!(
                 "gxp inputs {key:016x} {stage}: default uniform buffer is {} bytes for {} declared registers, raw = {}",
                 bytes.len(),
                 program.default_uniform_regs,
@@ -2143,7 +2425,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     continue;
                 }
                 let vals = decode_uniform(bytes, p);
-                eprintln!(
+                report!(
                     "gxp inputs {key:016x} {stage}:   {} {:?}[{}] at reg {} = {}",
                     p.name, p.ptype, p.component_count, p.resource_index, vals
                 );
@@ -2153,7 +2435,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // target pixels. A post-process pass that samples a source at a scale/bias only lands
         // right if the source was RENDERED where the pass thinks it was, and the viewport is
         // the one piece of that which is neither in the shader nor in the uniforms.
-        eprintln!(
+        report!(
             "gxp inputs {key:016x} viewport: xOffset={} xScale={} yOffset={} yScale={} zOffset={} zScale={}{}",
             gxp.viewport[0], gxp.viewport[1], gxp.viewport[2],
             gxp.viewport[3], gxp.viewport[4], gxp.viewport[5],
@@ -2162,29 +2444,76 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // What each declared sampler is actually bound to. A post-process pass's whole content
         // is the geometry of the buffer it reads, and "unit 1" in a shader and "unit 1" in the
         // guest's texture state are only the same thing if the binding says so.
-        if let Ok(fprogram) = vitaslop_gxp_shader::Program::parse(&gxp.fprog) {
-            for p in &fprogram.parameters {
+        //
+        // BOTH stages, and the vertex one is not a footnote: a vertex program that samples
+        // builds its GEOMETRY from what it reads, so an unbound or empty vertex texture is a
+        // draw with no mesh rather than a surface with the wrong colours. Leaving it out of
+        // this report is what left "the campaign map body is black" a content question nobody
+        // could answer - the fragment side said everything was bound, and it was.
+        for (stage, blob, bound) in [
+            ("sampler", &gxp.fprog, &gxp.textures),
+            ("vertex sampler", &gxp.vprog, &gxp.vertex_textures),
+        ] {
+            let Ok(program) = vitaslop_gxp_shader::Program::parse(blob) else { continue };
+            for p in &program.parameters {
                 if p.category != vitaslop_gxp_shader::container::ParamCategory::Sampler {
                     continue;
                 }
-                match gxp.textures.iter().find(|t| t.unit as i32 == p.resource_index) {
-                    Some(t) => eprintln!(
-                        "gxp inputs {key:016x} sampler: {} unit {} <- {:#x} {}x{} faces={} \
-                         filter={} wrap=({},{})",
+                match bound.iter().find(|t| t.unit as i32 == p.resource_index) {
+                    // The first few DECODED texels, not just the binding. "Which texture" and
+                    // "what is in it" are different questions, and for a texture the shader
+                    // reads as DATA rather than as a picture - a vector canvas, a lookup
+                    // table, an index map - the second one is the whole answer, and the
+                    // binding line alone has already sent one investigation down the wrong
+                    // road. Also says outright when every sampled texel is the same value.
+                    Some(t) => report!(
+                        "gxp inputs {key:016x} {stage}: {} unit {} <- {:#x} {}x{} faces={} \
+                         fmt={:#04x} swz={:#x} filter={} wrap=({},{}) texels[0..4]={:?} {}{}",
                         p.name,
                         p.resource_index,
                         t.tex.data_addr,
                         t.tex.width,
                         t.tex.height,
                         t.tex.faces,
+                        t.tex.base_format,
+                        t.tex.swizzle,
                         if t.tex.filter_linear { "linear" } else { "point" },
                         t.tex.addr_mode_u,
-                        t.tex.addr_mode_v
+                        t.tex.addr_mode_v,
+                        t.tex.rgba.chunks_exact(4).take(4).map(|c| [c[0], c[1], c[2], c[3]]).collect::<Vec<_>>(),
+                        channel_spread(&t.tex.rgba),
+                        match t.tex.rgba.chunks_exact(4).next() {
+                            Some(first) if t.tex.rgba.chunks_exact(4).all(|c| c == first) =>
+                                " (EVERY texel identical - this texture carries no image)",
+                            _ => "",
+                        }
                     ),
-                    None => eprintln!(
-                        "gxp inputs {key:016x} sampler: {} unit {} <- NOTHING BOUND",
+                    None => report!(
+                        "gxp inputs {key:016x} {stage}: {} unit {} <- NOTHING BOUND",
                         p.name, p.resource_index
                     ),
+                }
+                // `VITASLOP_GXP_INPUTS_DIR=<dir>`: the decoded texture itself, as a PNG named by
+                // the parameter. A channel spread says a channel is flat; only the image says
+                // whether the picture in the other three is the one the shader expects, and for
+                // a texture read as DATA (a displacement canvas, a lookup table) that is the
+                // difference between "we decoded it wrong" and "the producer never ran".
+                if let (Ok(dir), Some(t)) =
+                    (std::env::var("VITASLOP_GXP_INPUTS_DIR"), bound.iter().find(|t| t.unit as i32 == p.resource_index))
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let safe: String = p.name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                    // Raw RGBA8 with the dimensions in the NAME, not a PNG: this crate has no
+                    // image encoder and must not grow one for a diagnostic. The size is in the
+                    // filename so the bytes are self-describing.
+                    let path = std::path::Path::new(&dir).join(format!(
+                        "{key:016x}_{}_u{}_{safe}_{}x{}.rgba",
+                        stage.replace(' ', "-"),
+                        p.resource_index,
+                        t.tex.width,
+                        t.tex.height * t.tex.faces
+                    ));
+                    let _ = std::fs::write(path, t.tex.rgba.as_slice());
                 }
             }
         }
@@ -2215,7 +2544,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             let ranges: Vec<String> =
                 (0..comps).map(|c| format!("[{:.4}, {:.4}]", lo[c], hi[c])).collect();
-            eprintln!(
+            report!(
                 "gxp inputs {key:016x} attribute: {name} lane {} at byte {} of a {}-byte vertex, \
                  fmt {} x{} over {nverts} vertices = {}",
                 a.reg_index,
@@ -2264,7 +2593,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     format!("{}", f32::from_le_bytes(w))
                 }).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
-            eprintln!("gxp inputs {key:016x} vertex {v}: {}   raw-as-f32 [{raw}]", cols.join(" "));
+            report!("gxp inputs {key:016x} vertex {v}: {}   raw-as-f32 [{raw}]", cols.join(" "));
         }
     }
 
@@ -2330,7 +2659,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, stage, reg)) {
-            eprintln!(
+            report!(
                 "gxp pair {key:016x}: {} uniform register {reg} SUBSTITUTED with {word:#010x} - \
                  this frame is NOT what the guest asked for",
                 if stage == 'v' { "vertex" } else { "fragment" }
@@ -2371,6 +2700,33 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         format!("({})", out.join(", "))
     }
 
+    /// Per-channel min/max over every texel of a decoded texture.
+    ///
+    /// "The first four texels" answers what a texture looks like at its corner; it does not answer
+    /// whether a channel carries any signal at all, and for a texture a shader reads as DATA that
+    /// is the only question. The map body's vertex program displaces every vertex by this
+    /// texture's ALPHA, so `a[0,0]` and `a[0,255]` are two completely different bugs and the
+    /// corner texel cannot tell them apart.
+    fn channel_spread(rgba: &[u8]) -> String {
+        let mut lo = [255u8; 4];
+        let mut hi = [0u8; 4];
+        let mut texels = 0usize;
+        for c in rgba.chunks_exact(4) {
+            texels += 1;
+            for i in 0..4 {
+                lo[i] = lo[i].min(c[i]);
+                hi[i] = hi[i].max(c[i]);
+            }
+        }
+        if texels == 0 {
+            return "spread=(no texels)".into();
+        }
+        format!(
+            "spread over {texels} texels r[{},{}] g[{},{}] b[{},{}] a[{},{}]",
+            lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]
+        )
+    }
+
     /// Byte size of one component of a `SceGxmAttributeFormat`.
     fn attr_component_size(gxm_format: u8) -> usize {
         match gxm_format {
@@ -2401,13 +2757,45 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// FNV-1a over a byte slice, consuming EIGHT bytes per multiply instead of one.
+    ///
+    /// The distinction matters because this runs over megabytes a frame: every draw hashes its
+    /// shader pair's two container blobs to find its pipeline, and its whole vertex stream to
+    /// find its repacked geometry. A byte-at-a-time FNV over that is milliseconds of a
+    /// twenty-millisecond frame. The trailing bytes are folded in individually so the result
+    /// still depends on the exact length.
+    fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = seed;
+        let (words, tail) = bytes.split_at(bytes.len() & !7);
+        for w in words.chunks_exact(8) {
+            h ^= u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+            h = h.wrapping_mul(PRIME);
+        }
+        for &b in tail {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        h ^ bytes.len() as u64
+    }
+
     /// Repack a guest vertex stream into the tightly-packed `Float32xN` layout the recompiled
     /// pipeline expects. One packed vertex per guest vertex, in order, so the index buffer is
     /// unchanged.
-    fn repack_vertices(vertices: &[u8], guest_stride: u32, repack: &[RepackAttr], packed_stride: u32) -> Vec<u8> {
+    ///
+    /// Appends into a caller-owned arena rather than returning a `Vec`: the arena is uploaded
+    /// once per pass, so a per-draw allocation here would put back exactly the cost the arena
+    /// exists to remove.
+    fn repack_vertices_into(
+        vertices: &[u8],
+        guest_stride: u32,
+        repack: &[RepackAttr],
+        packed_stride: u32,
+        out: &mut Vec<u8>,
+    ) {
         let gstride = guest_stride.max(1) as usize;
         let nverts = vertices.len() / gstride;
-        let mut out = Vec::with_capacity(nverts * packed_stride as usize);
+        out.reserve(nverts * packed_stride as usize);
         for i in 0..nverts {
             let vbase = i * gstride;
             // Zero-fill this packed vertex, then write each attribute at its packed offset.
@@ -2421,7 +2809,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
         }
-        out
     }
 
     /// The depth encoding to assume for a pass whose own draws could not produce one: `-1/w`,
@@ -2487,6 +2874,28 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             return None;
         }
         let step = (nverts / max_samples.max(1)).max(1);
+        // The VERTEX stage's own textures, so a program that builds its geometry from a fetch
+        // can be interpreted at all. Nearest, wrapped, no mip: this is a measurement of where
+        // the geometry LANDS, and a filter would change nothing about that while costing four
+        // texel reads per sample.
+        let fetch = |unit: u8, coord: [f32; 4]| -> Option<[f32; 4]> {
+            let t = &gxp.vertex_textures.iter().find(|t| t.unit == unit)?.tex;
+            let (w, h) = (t.width.max(1), t.height.max(1));
+            let wrap = |v: f32, n: u32| {
+                let n = n as f32;
+                let p = (v * n).floor().rem_euclid(n);
+                p as u32
+            };
+            let (x, y) = (wrap(coord[0], w), wrap(coord[1], h));
+            let o = ((y * w + x) * 4) as usize;
+            let px = t.rgba.get(o..o + 4)?;
+            Some([
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+                px[3] as f32 / 255.0,
+            ])
+        };
         // Which PA lanes an attribute actually supplies (see the default fill below).
         let mut claimed = vec![false; base.pa.len()];
         for a in &gxp.attributes {
@@ -2528,7 +2937,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                 }
             }
-            if vitaslop_gxp_shader::interp::run(&vrc.shader, &mut regs).is_err() {
+            if vitaslop_gxp_shader::interp::run_watching_for_nan_with_textures(
+                &vrc.shader,
+                &mut regs,
+                &fetch,
+            )
+            .is_err()
+            {
                 return None;
             }
             sampled += 1;
@@ -2592,7 +3007,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn measure_clip(gxp: &GxpRecompile, key: u64) -> Option<ClipStats> {
         match count_clip_w_signs(gxp, 256) {
             Some(s) => {
-                eprintln!(
+                report!(
                     "gxp clip: key {key:x}: of {} sampled vertices, {} land in the frustum with w>0 \
                      and {} with w<0; ndc x[{:.2},{:.2}] y[{:.2},{:.2}]; z = {}",
                     s.sampled,
@@ -2610,7 +3025,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 Some(s)
             }
             None => {
-                eprintln!(
+                report!(
                     "gxp clip: key {key:x}: could not be measured (the vertex program does not \
                      interpret) - it contributes no evidence about this pass's projection"
                 );
@@ -2701,9 +3116,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // Print the assignment: reading the colour back OFF the frame means undoing
                     // whatever transfer function the target applied, and a near-match to the
                     // wrong key is not distinguishable from a match to the right one.
-                    eprintln!("gxp keycolor: key {k:x} -> linear rgb({r:.3}, {g:.3}, {b:.3})");
+                    report!("gxp keycolor: key {k:x} -> linear rgb({r:.3}, {g:.3}, {b:.3})");
                 }
-                None => eprintln!(
+                None => report!(
                     "gxp build: VITASLOP_GXP_KEYCOLOR found no fragment return to replace for key \
                      {k:x} - the module shape changed; this pair is NOT key-coloured"
                 ),
@@ -2724,7 +3139,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         .unwrap_or(patched.len());
                     patched.replace_range(at + 1..end, "  return vec4<f32>(1.0, 0.0, 1.0, 1.0);");
                 }
-                None => eprintln!(
+                None => report!(
                     "gxp build: VITASLOP_GXP_SOLID found no fragment return to replace - \
                      the module shape changed; solid-fill is NOT in effect"
                 ),
@@ -2786,7 +3201,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
-            eprintln!(
+            report!(
                 "gxp pair {key:016x}: sampler unit {unit} names {addr:#x}, which is {} bytes into \
                  the render target at {base:#x} - binding that target's render (the guest is \
                  describing the same buffer from a different origin)",
@@ -2810,7 +3225,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
-            eprintln!(
+            report!(
                 "gxp pair {key:016x}: sampler unit {unit} is bound to a 1x1 ZERO texel (the guest \
                  handle had null control words) - everything this draw derives from that sample \
                  is zero"
@@ -2895,12 +3310,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(addr) {
             if honoured {
-                eprintln!(
+                report!(
                     "gxm surface: {addr:#x} is GAMMA-CORRECT - rendering through an sRGB view, \
                      so writes are sRGB-encoded after blending as the hardware does"
                 );
             } else {
-                eprintln!(
+                report!(
                     "gxm surface: {addr:#x} is GAMMA-CORRECT but the render format has no sRGB \
                      twin - its writes stay LINEAR where the hardware would encode them, so it \
                      and anything sampling it read darker than the title intends"
@@ -2921,7 +3336,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
-            eprintln!(
+            report!(
                 "gxp pair {key:016x}: sampler unit {unit} names {addr:#x}, which is a render \
                  target's DEPTH surface - binding this frame's converted depth"
             );
@@ -2942,7 +3357,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((addr, mode)) {
             if mode == 5 {
-                eprintln!(
+                report!(
                     "gxm depth: target {addr:#x} depth REPLACED by the constant {konst} - this is \
                      a causality probe, and any frame built on it is not a real frame"
                 );
@@ -2962,7 +3377,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             } else {
                 ""
             };
-            eprintln!(
+            report!(
                 "gxm depth: target {addr:#x} depth re-encoded as {name} for a later pass to \
                  sample (depth_min={depth_min}, depth_scale={depth_scale}){degenerate}"
             );
@@ -2978,7 +3393,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(addr) {
-            eprintln!(
+            report!(
                 "gxm depth: a draw samples the depth at {addr:#x}, which belongs to a scene \
                  rendered into the DISPLAY target - that pass keeps no depth copy, so this \
                  sample reads guest bytes the GPU never wrote"
@@ -2995,7 +3410,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         let vps = format!("{vp:?}");
         if seen.insert((vps.clone(), what.to_string())) {
-            eprintln!("gxp viewport {vps}: {what}");
+            report!("gxp viewport {vps}: {what}");
         }
     }
 
@@ -3006,7 +3421,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // A poisoned lock must not lose the diagnostic - recover the set and report anyway.
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(key) {
-            eprintln!("gxp pair {key:016x}: FALLS BACK to fixed-function - {reason}");
+            report_warn!("gxp pair {key:016x}: FALLS BACK to fixed-function - {reason}");
         }
         drop(seen);
         fallback_reasons().lock().unwrap_or_else(|e| e.into_inner()).insert(key, reason.to_string());
@@ -3035,7 +3450,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn allow_fixed_function() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VITASLOP_GXP_ALLOW_FIXED_FUNCTION").is_some())
+        *ON.get_or_init(|| crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"))
     }
 
     /// Why each pair last fell back, keyed by pair.
@@ -3085,7 +3500,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         for (kind, bytes) in [("vertex", &gxp.vprog), ("fragment", &gxp.fprog)] {
             let Ok((total, sites)) = vitaslop_gxp_shader::branch_sites(bytes) else { continue };
             for s in sites {
-                eprintln!(
+                report!(
                     "gxp pair {key:016x}: {kind} BR #{} rel={} -> target {} of {total} instrs",
                     s.index, s.rel, s.target
                 );
@@ -3196,6 +3611,42 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         w
     }
 
+    /// Report - once per render target - that `VITASLOP_GXP_NEGW=force` corrected this pass's
+    /// clip `w` without measuring anything.
+    fn report_forced_negw(target: u32) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(target) {
+            report!(
+                "gxp clip: pass into {target:#010x}: VITASLOP_GXP_NEGW=force - correcting the \
+                 clip w sign with NO measurement behind it. This is a diagnostic; the frame it \
+                 produces is not evidence of anything except what the correction does."
+            );
+        }
+    }
+
+    /// Report - once per shader pair - that the guest's own `SceGxmBlendInfo` gives this pair a
+    /// colour write mask of ZERO, so every draw using it writes no colour channel.
+    ///
+    /// This is not a fallback and not an approximation: it is the guest's state, faithfully
+    /// applied, and a depth-only prepass is exactly what it looks like. It is reported because
+    /// the RESULT on screen - a pass that renders nothing - is identical to a draw whose
+    /// geometry, textures or transform we got wrong, and this is the only one of those that is
+    /// correct. Knowing which costs one line here and a whole investigation otherwise.
+    fn report_zero_color_mask(key: u64) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+            report!(
+                "gxp pair {key:016x}: the guest's blend info gives this pair a colour write mask \
+                 of 0 - it writes NO colour channel, so its draws affect depth only. That is the \
+                 guest's own state, not a fallback."
+            );
+        }
+    }
+
     /// Report - once per case - a GXM blend value with no exact wgpu equivalent, so the
     /// substitution is visible rather than silently changing what a draw composites like.
     fn report_unmapped_blend(what: &str) {
@@ -3204,7 +3655,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(what.to_string()) {
-            eprintln!("gxm blend: {what} has no wgpu equivalent - substituting ONE, which is an approximation");
+            report_warn!("gxm blend: {what} has no wgpu equivalent - substituting ONE, which is an approximation");
         }
     }
 
@@ -3300,7 +3751,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&program);
                     if let Err(e) = vitaslop_gxp_shader::interp::run(&secondary, &mut regs) {
-                        eprintln!("gxp interp: secondary program failed: {e}");
+                        report!("gxp interp: secondary program failed: {e}");
                     }
                 }
                 // Where the WHOLE mesh lands, not just its first vertex. Vertex 0 of a large
@@ -3336,7 +3787,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         hi = [hi[0].max(vregs.o[0] / w), hi[1].max(vregs.o[1] / w)];
                     }
                 }
-                eprintln!(
+                report!(
                     "gxp interp: key {key:x} {in_front}/{nverts} vertices have w>0, ndc bbox x[{:.3},{:.3}] y[{:.3},{:.3}]",
                     lo[0], hi[0], lo[1], hi[1]
                 );
@@ -3344,17 +3795,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     Ok(site) => {
                         let w = regs.o[3];
                         let ndc = if w.abs() > 1e-6 { [regs.o[0] / w, regs.o[1] / w, regs.o[2] / w] } else { [0.0; 3] };
-                        eprintln!("gxp interp: o={:?} ndc={:?} viewport(xo,xs,yo,ys,zo,zs)={:?}", &regs.o[0..4], ndc, gxp.viewport);
+                        report!("gxp interp: o={:?} ndc={:?} viewport(xo,xs,yo,ys,zo,zs)={:?}", &regs.o[0..4], ndc, gxp.viewport);
                         // A NaN clip position draws NOTHING, which looks exactly like a black
                         // shader; naming the instruction that produced it is the whole point.
                         if let Some(s) = site {
-                            eprintln!(
+                            report!(
                                 "gxp interp: FIRST non-finite value at instruction #{} {} -> {} channel {} = {}\n  sources: {}",
                                 s.index, s.op, s.dest, s.channel, s.value, s.sources.join("  ")
                             );
                         }
                     }
-                    Err(e) => eprintln!("gxp interp: run failed: {e}"),
+                    Err(e) => report!("gxp interp: run failed: {e}"),
                 }
             }
         }
@@ -3382,7 +3833,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let Err(e) = std::fs::create_dir_all(dir)
                 .and_then(|()| std::fs::write(dir.join(format!("{key:016x}.wgsl")), &wgsl))
             {
-                eprintln!("gxp: cannot write WGSL for pair {key:016x}: {e}");
+                report_warn!("gxp: cannot write WGSL for pair {key:016x}: {e}");
             }
         }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3391,16 +3842,30 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         });
 
         // group0 vertex uniform, group1 fragment uniform, group2 samplers (empty where unused).
-        let uniform_entry = |vis: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+        //
+        // Both are addressed by DYNAMIC OFFSET into one arena per pass, so a pass needs one
+        // bind group per shader pair rather than one per draw - the same shape the
+        // fixed-function path has always used for its per-draw uniform. `min_binding_size`
+        // pins the shader-visible window to exactly this stage's SA block, so the arena's
+        // 256-byte offset alignment cannot let a draw read into the next draw's uniforms.
+        let uniform_entry = |vis: wgpu::ShaderStages, bytes: u64| wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: vis,
-            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(bytes),
+            },
             count: None,
         };
         let vsa_lanes = linked.vertex_bindings.sa_lane_count;
         let fsa_lanes = linked.fragment_bindings.sa_lane_count;
-        let g0_entries: Vec<wgpu::BindGroupLayoutEntry> = if vsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::VERTEX)] } else { vec![] };
-        let g1_entries: Vec<wgpu::BindGroupLayoutEntry> = if fsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::FRAGMENT)] } else { vec![] };
+        let sa_bytes = |lanes: u32| (lanes.div_ceil(4) as u64) * 16;
+        let (vsa_bytes, fsa_bytes) = (sa_bytes(vsa_lanes), sa_bytes(fsa_lanes));
+        let g0_entries: Vec<wgpu::BindGroupLayoutEntry> =
+            if vsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::VERTEX, vsa_bytes)] } else { vec![] };
+        let g1_entries: Vec<wgpu::BindGroupLayoutEntry> =
+            if fsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::FRAGMENT, fsa_bytes)] } else { vec![] };
         let mut g2_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::new();
         let mut samplers: Vec<(u8, SamplerDim)> = Vec::new();
         for (i, b) in linked.fragment_bindings.samplers.iter().enumerate() {
@@ -3431,7 +3896,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 count: None,
             });
             if debug {
-                eprintln!("gxp build: gxm texture unit {gxm_unit} (coords {}, {dim:?})", b.coords);
+                report!("gxp build: gxm texture unit {gxm_unit} (coords {}, {dim:?})", b.coords);
             }
             samplers.push((gxm_unit as u8, dim));
         }
@@ -3469,7 +3934,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 count: None,
             });
             if debug {
-                eprintln!("gxp build: VERTEX gxm texture unit {} (coords {}, {dim:?})", b.unit, b.coords);
+                report!("gxp build: VERTEX gxm texture unit {} (coords {}, {dim:?})", b.unit, b.coords);
             }
             vertex_samplers.push((b.unit, dim));
         }
@@ -3479,7 +3944,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("gxp-g2"), entries: &g2_entries }),
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("gxp-g3"),
-                entries: &[uniform_entry(wgpu::ShaderStages::VERTEX_FRAGMENT)],
+                // The pass depth block is per SCENE, not per draw: one cached bind group, no
+                // dynamic offset.
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
             }),
         ];
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3501,6 +3977,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // forcing src-over made it invisible the moment its shader output alpha 0.
         let guest_blend = gxm_blend_state(gxp.blend_state);
         let write_mask = gxm_color_mask(gxp.blend_state[0]);
+        // A colour mask of ZERO is a legal and meaningful GXM state - a depth-only prepass
+        // writes no colour - but on screen it is indistinguishable from a draw we got wrong,
+        // and it is the one pipeline setting that can make a perfectly recompiled, correctly
+        // bound, correctly transformed draw leave no mark at all. Say it out loud, once.
+        if write_mask.is_empty() {
+            report_zero_color_mask(key);
+        }
         // Depth is still the opaque/overlay HEURISTIC, not the guest's captured state, and
         // that is a known gap rather than an oversight. Driving it from the guest
         // (`front_depth_func` / `front_depth_write`, both captured) was tried and MEASURED to
@@ -3950,6 +4433,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 sampler_linear,
                 white_bind,
                 views: HashMap::new(),
+                views_bytes: 0,
                 tex_binds: HashMap::new(),
                 vbo: None,
                 ibo: None,
@@ -3958,11 +4442,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 vbo_cap: 0,
                 ibo_cap: 0,
                 ubo_cap: 0,
+                gxp_pass_gen: 0,
                 uniform_stride,
                 color_format,
                 ss_scale: 1,
                 last_gxp_summary: None,
                 last_phases: EncodePhases::default(),
+                chain_phases: EncodePhases::default(),
                 resolve_pipeline,
                 resolve_layout,
                 resolve_scale_buf,
@@ -4042,11 +4528,16 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Ensure a decoded texture is uploaded (cached by content key) and that a bind
         /// group exists for it at the requested filter. A cache hit does no GPU work.
         fn ensure_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, t: &super::GxmTexture) {
-            // Bound the caches: on pathological churn, clear wholesale and re-upload
-            // (keys are content fingerprints, so correctness is unaffected).
-            if self.views.len() >= TEX_CACHE_CAP {
-                self.views.clear();
-                self.tex_binds.clear();
+            // Bound the caches BY BYTES: on pathological churn, clear wholesale and
+            // re-upload (keys are content fingerprints, so correctness is unaffected).
+            // See `tex_cache_budget_bytes` for why an entry COUNT bounded nothing.
+            if !self.views.contains_key(&t.key) {
+                self.views_bytes += texture_bytes(t.width, t.height);
+                if self.views_bytes >= tex_cache_budget_bytes() {
+                    self.views.clear();
+                    self.tex_binds.clear();
+                    self.views_bytes = texture_bytes(t.width, t.height);
+                }
             }
             if !self.views.contains_key(&t.key) {
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -4420,6 +4911,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.rtt_rendered.clear();
             self.rtt_depth_rendered.clear();
             self.rtt_hits = 0;
+            self.chain_phases = EncodePhases::default();
             let Some(last) = scenes.last() else { return };
             // Which scenes' DEPTH some draw in this frame samples. Scanned up front because
             // the reader comes AFTER the writer: the pass that fills a depth buffer has to
@@ -4430,10 +4922,19 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 .iter()
                 .flat_map(|s| s.draws.iter())
                 .flat_map(|d| {
-                    d.texture
-                        .iter()
-                        .map(|t| t.data_addr)
-                        .chain(d.gxp.iter().flat_map(|g| g.textures.iter().map(|t| t.tex.data_addr)))
+                    // BOTH stages. A vertex program that samples a depth surface (a
+                    // displacement or reprojection built in the vertex stage) names it exactly
+                    // as a fragment one does, and leaving vertex samplers out of this set makes
+                    // the pass that WROTE that depth skip the conversion - so the reader gets
+                    // raw hardware depth with nothing saying so.
+                    d.texture.iter().map(|t| t.data_addr).chain(
+                        d.gxp.iter().flat_map(|g| {
+                            g.textures
+                                .iter()
+                                .chain(g.vertex_textures.iter())
+                                .map(|t| t.tex.data_addr)
+                        }),
+                    )
                 })
                 .collect();
             let depth_sampled: HashSet<u32> = scenes
@@ -4562,7 +5063,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     sampled.join(" ")
                 );
                 if self.last_chain_shape.as_deref() != Some(line.as_str()) {
-                    eprintln!("{line}");
+                    report!("{line}");
                     self.last_chain_shape = Some(line);
                 }
             }
@@ -4656,6 +5157,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let mut vdata: Vec<u8> = Vec::new();
             let mut idata: Vec<u8> = Vec::new();
             let mut udata: Vec<u8> = Vec::new();
+            // The recompiled path's arenas (see `GxpPrepared`), packed during the same walk.
+            let mut gvdata: Vec<u8> = Vec::new();
+            let mut gidata: Vec<u8> = Vec::new();
+            let mut gudata: Vec<u8> = Vec::new();
+            let ubo_align = device.limits().min_uniform_buffer_offset_alignment as u64;
             let mut items: Vec<Item> = Vec::with_capacity(scene.draws.len());
             // The live recompiler's per-draw resources + a submission-order plan interleaving
             // recompiled and fixed-function draws (so they share one depth-tested pass).
@@ -4690,17 +5196,28 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         .texture
                         .iter()
                         .map(|t| (t.data_addr, t.width, t.height))
-                        .chain(d.gxp.iter().flat_map(|g| g.textures.iter().map(|t| (t.tex.data_addr, t.tex.width, t.tex.height))))
+                        .chain(d.gxp.iter().flat_map(|g| {
+                            g.textures
+                                .iter()
+                                .chain(g.vertex_textures.iter())
+                                .map(|t| (t.tex.data_addr, t.tex.width, t.tex.height))
+                        }))
                         .filter(|(a, _, _)| trace_all || rendered.contains_key(a))
                         .map(|(a, w, h)| {
                             format!("{a:#x}({w}x{h}){}", if rendered.contains_key(&a) { "*" } else { "" })
                         })
                         .collect();
                     if !hits.is_empty() || trace_all {
-                        eprintln!(
+                        report!(
                             // "carries a payload" is NOT "is recompiled" - a payload that
                             // fails to link falls back, and labelling that `recompiled=true`
                             // is how a composite draw got read as working when it was not.
+                            // The index count is the RECOMPILED one when there is a payload.
+                            // The fixed-function count is zero for such a draw by design (the
+                            // builder does not produce a representation the renderer will not
+                            // use), and printing that made every draw of a recompiled pass
+                            // read as empty geometry - a diagnostic saying exactly the wrong
+                            // thing about the question it exists to answer.
                             "chain draw #{di}: samples {:?} key={:?} has_payload={} blend={:?} opaque={} space={:?} idx={}",
                             hits,
                             d.gxp.as_ref().map(|g| format!("{:x}", GxpLive::key(g))),
@@ -4708,7 +5225,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             d.gxp.as_ref().map(|g| g.blend),
                             d.opaque,
                             d.space,
-                            d.index_count
+                            d.gxp.as_ref().map(|g| g.index_count).unwrap_or(d.index_count)
                         );
                     }
                 }
@@ -4716,16 +5233,26 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.sampled_addrs.insert(t.data_addr);
                 }
                 if let Some(g) = &d.gxp {
-                    self.sampled_addrs.extend(g.textures.iter().map(|t| t.tex.data_addr));
+                    // Vertex samplers count too: `final-pass-sampled` is the list a reader
+                    // checks a missing target against, and a target read only by a vertex
+                    // program was invisible in it.
+                    self.sampled_addrs.extend(
+                        g.textures.iter().chain(g.vertex_textures.iter()).map(|t| t.tex.data_addr),
+                    );
                 }
                 // Live GXP path: draw with the guest's real shaders when the pair links. On a
                 // link/format failure fall through to the fixed-function packing below (unless
                 // isolate mode, which renders only the recompiled draws).
                 if gxp_enabled {
                     if let Some(g) = &d.gxp {
-                        self.rtt_hits += g.textures.iter().filter(|t| rendered.contains_key(&t.tex.data_addr)).count();
+                        self.rtt_hits += g
+                            .textures
+                            .iter()
+                            .chain(g.vertex_textures.iter())
+                            .filter(|t| rendered.contains_key(&t.tex.data_addr))
+                            .count();
                         if let Some(mut prep) =
-                            self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale], &rendered, &depth_rendered)
+                            self.gxp.prepare(device, queue, color_format, g, [scene.depth_min, scene.depth_scale], &rendered, &depth_rendered, &mut gvdata, &mut gidata, &mut gudata, ubo_align)
                         {
                             if self.gxp.solid {
                                 prep.blend = false; // REPLACE + depth-Always variant (see make)
@@ -4827,7 +5354,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
                 if self.last_gxp_summary != Some(summary) {
                     self.last_gxp_summary = Some(summary);
-                    eprintln!(
+                    report!(
                         "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
                         summary.0, summary.1, summary.2, summary.3,
                     );
@@ -4836,7 +5363,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let mut ranked: Vec<_> = fb_reasons.iter().collect();
                     ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
                     for (reason, n) in ranked {
-                        eprintln!("gxp:   {n} fallback draws - {reason}");
+                        report_warn!("gxp:   {n} fallback draws - {reason}");
                     }
                 }
             }
@@ -4874,6 +5401,34 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 queue.write_buffer(self.vbo.as_ref().unwrap(), 0, &vdata);
                 queue.write_buffer(self.ibo.as_ref().unwrap(), 0, &idata);
                 queue.write_buffer(self.ubo.as_ref().unwrap(), 0, &udata);
+            }
+            // The recompiled path's arenas: THREE buffers for the whole pass, however many
+            // draws it carries, instead of four per draw. They are created fresh per pass
+            // rather than reused across the chain - see `gxp_pass_gen` for why - and stay
+            // alive through submit because the command encoder holds a reference to every
+            // resource its passes name.
+            let gxp_arena = (!gxp_prepared.is_empty()).then(|| {
+                let mk = |data: &[u8], usage, label| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(label),
+                        // An empty arena is not a legal buffer, and a pass whose every stage
+                        // declares no uniforms produces one.
+                        contents: if data.is_empty() { &[0u8; 4] } else { data },
+                        usage,
+                    })
+                };
+                (
+                    mk(&gvdata, wgpu::BufferUsages::VERTEX, "gxp-vbo"),
+                    mk(&gidata, wgpu::BufferUsages::INDEX, "gxp-ibo"),
+                    mk(&gudata, wgpu::BufferUsages::UNIFORM, "gxp-ubo"),
+                )
+            });
+            if let Some((_, _, ubo)) = &gxp_arena {
+                self.gxp_pass_gen += 1;
+                let pass_gen = self.gxp_pass_gen;
+                let used: Vec<(u64, wgpu::TextureFormat)> =
+                    gxp_prepared.iter().map(|p| (p.key, p.format)).collect();
+                self.gxp.ensure_ubo_bgs(device, ubo, pass_gen, &used);
             }
 
             self.last_phases.upload_ms = t_upload.ms();
@@ -4926,6 +5481,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // timing is still closed out, so a caller reading it never sees a stale
                     // value from an earlier, busier frame.
                     self.last_phases.pass_ms = t_pass.ms();
+                    self.chain_phases.add(self.last_phases);
                     return;
                 }
                 // Draw in submission order, switching between the fixed-function arenas and the
@@ -4934,6 +5490,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let ubo_bind = self.ubo_bind.as_ref();
                 let vbo = self.vbo.as_ref();
                 let ibo = self.ibo.as_ref();
+                // Unwrapped only inside a `Gxp` arm, where `gxp_prepared` is non-empty so the
+                // arenas above were created.
+                let gxp_arena = gxp_arena.as_ref();
                 // The guest's viewport is per-draw state, and `set_viewport` is sticky, so a
                 // draw that wants the whole target after one that did not must SAY so. The
                 // pass starts at the full rect (wgpu's default), and the tracker below issues
@@ -4974,25 +5533,43 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         Enc::Gxp(idx) => {
                             let p = &gxp_prepared[*idx];
+                            let (gxp_vbo, gxp_ibo, _) = gxp_arena.unwrap();
                             let pipe = self.gxp.pipeline(p.key, p.format);
                             pass.set_pipeline(if p.blend { &pipe.blend } else { &pipe.opaque });
-                            pass.set_bind_group(0, &p.bg[0], &[]);
-                            pass.set_bind_group(1, &p.bg[1], &[]);
-                            pass.set_bind_group(2, &p.bg[2], &[]);
-                            pass.set_bind_group(3, &p.bg[3], &[]);
-                            pass.set_vertex_buffer(0, p.vbuf.slice(..));
-                            pass.set_index_buffer(p.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            // group0/group1 belong to the PAIR and take this draw's byte offset
+                            // into the pass's uniform arena; a stage with no uniforms has an
+                            // empty bind group, which takes no dynamic offsets at all.
+                            let dyn_off = |lanes: u32, off: u32| if lanes == 0 { Vec::new() } else { vec![off] };
+                            pass.set_bind_group(
+                                0,
+                                self.gxp.ubo_bg(p.key, p.format, 0),
+                                &dyn_off(pipe.vsa_lanes, p.u_off[0]),
+                            );
+                            pass.set_bind_group(
+                                1,
+                                self.gxp.ubo_bg(p.key, p.format, 1),
+                                &dyn_off(pipe.fsa_lanes, p.u_off[1]),
+                            );
+                            pass.set_bind_group(2, &p.bg2, &[]);
+                            pass.set_bind_group(3, &p.bg3, &[]);
+                            pass.set_vertex_buffer(0, gxp_vbo.slice(p.v_off..p.v_off + p.v_len));
+                            pass.set_index_buffer(
+                                gxp_ibo.slice(p.i_off..p.i_off + p.i_len),
+                                wgpu::IndexFormat::Uint32,
+                            );
                             pass.draw_indexed(0..p.index_count, 0, 0..1);
                         }
                     }
                 }
             }
             self.last_phases.pass_ms = t_pass.ms();
+            self.chain_phases.add(self.last_phases);
         }
 
-        /// What the last [`GxmRenderer::encode`] spent, phase by phase.
+        /// What the last [`GxmRenderer::encode_chain`] spent, phase by phase, over EVERY pass
+        /// of the frame. Reporting one pass instead described the composite and hid the world.
         pub fn last_phases(&self) -> EncodePhases {
-            self.last_phases
+            self.chain_phases
         }
 
         /// Every offscreen target this renderer holds, as `(guest address, texture, w, h)`.

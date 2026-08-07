@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop - OPFS storage test</title>
+  </head>
+  <body>
+    <pre id="out">ready</pre>
+    <script type="module">
+      // The page half of `e2e/opfs.mjs`: it does nothing but hand the work to a worker
+      // and relay the result. All the storage work has to happen in the worker, because
+      // `createSyncAccessHandle` exists only there - which is also why the emulator runs
+      // in one. Driving it from the page would test a different API than the product uses.
+      window.__opfsTest = () =>
+        new Promise((resolve, reject) => {
+          const w = new Worker("./opfs-test-worker.js", { type: "module" });
+          w.onmessage = (e) => {
+            document.getElementById("out").textContent = JSON.stringify(e.data, null, 2);
+            w.terminate();
+            e.data.error ? reject(new Error(e.data.error)) : resolve(e.data);
+          };
+          w.onerror = (e) => reject(new Error(e.message || "worker failed to start"));
+          w.postMessage("go");
+        });
+    </script>
+  </body>
+</html>
