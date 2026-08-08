@@ -279,6 +279,21 @@ impl Default for FragmentMaterial {
     }
 }
 
+/// No shader container: what [`Draw::vprog`] and [`Draw::fprog`] hold off the recompiler path,
+/// and what a synthetic draw (a test, a probe) carries.
+///
+/// A named constructor rather than a `Default` impl on `Draw`: every other field of a draw is a
+/// real capture with no sensible default, and a whole-struct default would make it possible to
+/// build a draw that describes nothing.
+///
+/// One SHARED empty container, so this is a refcount bump rather than an allocation: it is
+/// called twice per draw on the fixed-function path, where the whole point is that the
+/// recompiler payload costs nothing.
+pub fn no_program() -> std::sync::Arc<[u8]> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
+}
+
 /// A single draw call with everything needed to reproduce it, snapshotted from
 /// guest memory at draw time (so later guest writes cannot perturb it).
 #[derive(Clone, Debug, PartialEq)]
@@ -287,11 +302,18 @@ pub struct Draw {
     pub index_format: u32,
     pub index_count: u32,
     /// The bound vertex stream buffer bytes.
-    pub vertices: Vec<u8>,
+    ///
+    /// Shared, not owned: the renderer's scene builder hands these straight to the
+    /// recompiled path, and a `Vec` there meant a full copy of every draw's mesh on every
+    /// frame - MEASURED at 2.4-3.2 MB per frame mid-race on a 500-700 draw title, allocated
+    /// and freed sixty times a second. An `Arc` makes that handoff a refcount bump, and it
+    /// gives the buffer an IDENTITY, which is what lets a consumer cache anything derived
+    /// from it (see the index expansion in `RenderSceneBuilder`).
+    pub vertices: Arc<[u8]>,
     pub vertex_stride: u32,
     pub attributes: Vec<VertexAttribute>,
-    /// The index buffer bytes.
-    pub indices: Vec<u8>,
+    /// The index buffer bytes. `Arc` for the same reason as `vertices` above.
+    pub indices: Arc<[u8]>,
     /// The vertex default uniform buffer contents the guest wrote for this draw
     /// (column-major 4x4 MVP for the cube), if any.
     pub uniforms: Vec<f32>,
@@ -313,6 +335,12 @@ pub struct Draw {
     /// The blend equation baked into the bound fragment program - see [`BlendState`]. This is
     /// state, not a guess: GXM has no runtime blend setter, so this is the only source of it.
     pub blend: BlendState,
+    /// The bound fragment program's `SceGxmProgram*`. Diagnostic, and the one that ties a draw
+    /// to a BLOB: a title can register the SAME fragment shader twice with different blend
+    /// equations, so the shader bytes alone do not identify which `SceGxmFragmentProgram` a
+    /// draw used - and the two render completely differently. It is also the address the shader
+    /// dumps are named by (`frag_<header>.gxp`).
+    pub fragment_program_header: u32,
     /// Scene exposure (linear multiplier) recovered from the vertex program's reflected
     /// `vsCoarseExposureReg` uniform. The shaders scale lit albedo by this before
     /// tone-mapping, so a capture renderer that skips it draws the world ~10x too dark.
@@ -331,9 +359,16 @@ pub struct Draw {
     /// The bound vertex `SceGxmProgram` container bytes, snapshotted for the GXP->WGSL
     /// recompiler (live guest-shader) path. Empty unless recompile-capture is enabled
     /// (env `VITASLOP_GXP_LIVE`), so the default capture pays no read/clone cost.
-    pub vprog: Vec<u8>,
+    ///
+    /// `Arc<[u8]>`, not `Vec<u8>`, because a program container is IMMUTABLE for as long as it
+    /// is registered and every draw bound to it wants the same bytes: a race frame submits
+    /// 400+ draws over a couple of dozen distinct programs, so a per-draw read out of guest
+    /// memory plus a per-draw clone copies the same few kilobytes hundreds of times a frame
+    /// for nothing. The cache that hands these out is `VitaState::program_blobs`, invalidated
+    /// at exactly the moment a header address can come to mean a different program.
+    pub vprog: std::sync::Arc<[u8]>,
     /// The bound fragment `SceGxmProgram` container bytes. Empty off the recompiler path.
-    pub fprog: Vec<u8>,
+    pub fprog: std::sync::Arc<[u8]>,
     /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
     /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
     /// above (which the fixed-function path needs but the real shader recomputes itself).
@@ -483,8 +518,8 @@ impl Scene {
                 mvp.copy_from_slice(&d.uniforms[..16]);
                 vitaslop_platform::gpu::DrawBatch {
                     mvp,
-                    vertices: d.vertices.clone(),
-                    indices: d.indices.clone(),
+                    vertices: d.vertices.to_vec(),
+                    indices: d.indices.to_vec(),
                     index_count: d.index_count,
                     // GXM index format: 0 is U16, anything else U32.
                     index_u32: d.index_format != 0,
@@ -969,14 +1004,15 @@ mod extent_tests {
         render_state.viewport = [vw / 2.0, vw / 2.0, vh / 2.0, -vh / 2.0, 0.5, 0.5];
         render_state.viewport_enable = enable;
         let draw = Draw {
+            fragment_program_header: 0,
             vertex_textures: Vec::new(),
             primitive: 0,
             index_format: 0,
             index_count: 3,
-            vertices: Vec::new(),
+            vertices: Arc::from(&[][..]),
             vertex_stride: 0,
             attributes: Vec::new(),
-            indices: Vec::new(),
+            indices: Arc::from(&[][..]),
             uniforms: Vec::new(),
             textures: Vec::new(),
             render_state,
@@ -984,8 +1020,8 @@ mod extent_tests {
             exposure: 1.0,
             material: FragmentMaterial::default(),
             world: [0.0; 16],
-            vprog: Vec::new(),
-            fprog: Vec::new(),
+            vprog: no_program(),
+            fprog: no_program(),
             vert_sa: Vec::new(),
             frag_sa: Vec::new(),
             shader_expanded: false,

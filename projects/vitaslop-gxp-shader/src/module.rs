@@ -543,6 +543,21 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
         let _ = writeln!(m, "@group(0) @binding(0) var<uniform> sa_buf: SaBuf;");
     }
 
+    // Sampled textures + samplers at group 1, under the VERTEX stage's own names
+    // (`vt{u}`/`vs{u}`, see `crate::wgsl::sampler_names`). A vertex program that fetches a
+    // texture builds GEOMETRY from what it reads, so this is not an optional decoration: a
+    // wrapper that omits the declaration emits a module referring to an undefined identifier,
+    // which cannot be validated at all - and the shaders that need it are exactly the ones
+    // worth validating, the displacement/canvas programs.
+    for (i, b) in plan.samplers.iter().enumerate() {
+        let (tb, sb) = (i as u32 * 2, i as u32 * 2 + 1);
+        let ty = b.wgsl_type();
+        let (tex, samp) =
+            crate::wgsl::sampler_names(crate::container::ProgramKind::Vertex, b.unit);
+        let _ = writeln!(m, "@group(1) @binding({tb}) var {tex}: {ty};");
+        let _ = writeln!(m, "@group(1) @binding({sb}) var {samp}: sampler;");
+    }
+
     // Vertex inputs: one @location per attribute (typed vec4; unused lanes ignored). A vertex
     // program with no attributes takes no input parameter (an empty WGSL struct is invalid).
     let has_inputs = !plan.attributes.is_empty();
@@ -787,6 +802,8 @@ mod tests {
             sampler_cube: false,
             array_size: 1,
             resource_index,
+            semantic: 0,
+            semantic_index: 0,
         }
     }
 

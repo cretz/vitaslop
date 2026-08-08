@@ -216,6 +216,24 @@ pub const FUEL_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 5;
 /// emitted code reloads it itself after each yield.
 pub const FUEL_EXPORT: &str = "fuel";
 
+/// Exported name of the instance RESET function: `() -> ()`. It returns every
+/// per-instance global - the ARM register file and its flags, the whole VFP/NEON file,
+/// the diagnostic latches, `tp`, and the fuel counter - to exactly the value a freshly
+/// instantiated module would have.
+///
+/// # Why the module has to do this, rather than the host writing the globals
+/// A host that reuses an instance for a second guest thread must first make it
+/// indistinguishable from a new one, and from JavaScript that is IMPOSSIBLE: the eight
+/// `v128` quad globals (Q8..Q15) cannot cross the JS boundary at all - reading or
+/// writing `Global.prototype.value` on a `v128` global throws. A host-side reset would
+/// therefore be silently partial, leaving one guest thread's NEON state visible to the
+/// next, which is exactly the class of bug that does not look like a bug.
+///
+/// Inside the module there is no boundary, so the reset is total by construction. It is
+/// also cheaper than the alternative it replaces: one call instead of a hundred
+/// individual global writes across the JS boundary.
+pub const RESET_EXPORT: &str = "reset";
+
 /// Reserved [`IMPORT_NAME`] selector meaning "this thread's fuel ran out - reschedule
 /// it". Not a NID: it is above any import index a real title can have, and the host
 /// intercepts it before the import table is consulted.

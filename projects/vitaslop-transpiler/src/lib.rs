@@ -16,6 +16,16 @@ mod emit;
 /// writing [`Artifact::arm_word_off`] when the run reaches it.
 pub use emit::arm_at_frame;
 pub use emit::set_fuel_interval;
+/// The fuel interval modules emitted on this thread carry, so a HOST can read the
+/// software counter the emitted code maintains: the counter runs DOWN from this and
+/// reloads to it, so only a host that knows the interval can difference it.
+pub use emit::fuel_interval;
+/// The guest-store DIRTY MAP: whether to emit it, and where a host reads it. The map
+/// is one byte per 4 KB page holding the epoch of the last store into that page, laid
+/// out at [`Artifact::dirty_off`] as `[epoch byte][map]` (see [`DIRTY_EPOCH_OFF`] and
+/// [`DIRTY_MAP_OFF`]). A host that stamps its own reads against the epoch can prove a
+/// region of guest memory unchanged without reading it.
+pub use emit::{set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_SHIFT};
 mod ir;
 mod lower;
 
@@ -165,16 +175,63 @@ pub enum InlineOp {
     /// configuration error, and callers are expected to reject it outright rather than
     /// let the guest read a stale word.
     LoadMirror { slot: u32 },
+    /// `r0 = u32_at(r0 + offset) << shl`, but ONLY when the loaded word is `<= max`;
+    /// otherwise the real host call runs.
+    ///
+    /// The value guard is what makes this exact rather than nearly exact. It exists for
+    /// a handler shaped `read(p).min(cap) * k` - a size read out of a structure, scaled,
+    /// and clamped so a header we failed to resolve cannot ask for an absurd allocation.
+    /// The clamp is not expressible as a shift and a mask, so instead of approximating
+    /// it the inline form handles only the unclamped case and hands the other one back
+    /// to the handler, which stays the definition of the answer. Same principle as the
+    /// pointer guard in [`emit`](crate::emit): fall back rather than approximate.
+    LoadScaled { offset: u32, max: u32, shl: u32 },
+    /// `u32_at(r0) = mirror[slot]; u32_at(r0 + 4) = mirror[slot + 1]; r0 = 0` - store a
+    /// 64-bit host-mirror value THROUGH the guest pointer in r0, then return success.
+    ///
+    /// The out-parameter twin of [`InlineOp::LoadMirror`], and it exists because the
+    /// most-called clock reader on a real title does not return its answer in a
+    /// register: `sceKernelGetProcessTime(SceKernelSysClock *)` writes it through a
+    /// pointer. Being an out-parameter is a calling convention, not behaviour - the
+    /// value written is the same pure function of the virtual clock - so the same
+    /// mirror contract covers it.
+    ///
+    /// Guarded like every other pointer form: an out-of-range pointer runs the handler.
+    StoreMirrorPair { slot: u32 },
+    /// `r0 = mirror[slot]; r1 = mirror[slot + 1]` - read a 64-bit host-mirror value into
+    /// the ARM EABI's 64-bit return pair.
+    ///
+    /// The register-returning twin of [`InlineOp::StoreMirrorPair`], for the wide
+    /// spelling of the same clock read. No pointer, so no guard.
+    LoadMirrorPair { slot: u32 },
 }
 
 impl InlineOp {
     /// The operation's meaning, over the word it reads. The single definition of what
     /// the emitted code must compute, so a test can hold a host handler to it.
+    ///
+    /// For the pair forms this is the LOW word only; the high word is `mirror[slot + 1]`
+    /// unchanged, which needs no definition. For [`InlineOp::LoadScaled`] this is
+    /// meaningful only when [`InlineOp::falls_back`] is false - the guarded case has no
+    /// inline answer by construction.
     pub fn eval(self, word: u32) -> u32 {
         match self {
             InlineOp::LoadShiftMask { shift, mask, .. } => (word >> shift) & mask,
             // The mirror word IS the answer; the host computed it.
             InlineOp::LoadMirror { .. } => word,
+            InlineOp::LoadScaled { shl, .. } => word << shl,
+            // The pair forms deliver the mirror words untouched, wherever they land.
+            InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
+        }
+    }
+
+    /// Whether the loaded `word` sends this op to the host call instead of computing an
+    /// answer inline. Only [`InlineOp::LoadScaled`] can, and a test pins the boundary:
+    /// the point of the guard is that the handler, not this, defines the clamped case.
+    pub fn falls_back(self, word: u32) -> bool {
+        match self {
+            InlineOp::LoadScaled { max, .. } => word > max,
+            _ => false,
         }
     }
 
@@ -183,15 +240,34 @@ impl InlineOp {
     pub fn offset(self) -> Option<u32> {
         match self {
             InlineOp::LoadShiftMask { offset, .. } => Some(offset),
-            InlineOp::LoadMirror { .. } => None,
+            InlineOp::LoadScaled { offset, .. } => Some(offset),
+            // Writes through r0 rather than reading through it, so it has no read offset
+            // even though it is a pointer form. `emit_import` guards it on its own terms.
+            InlineOp::StoreMirrorPair { .. } => None,
+            InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorPair { .. } => None,
         }
     }
 
-    /// The host-mirror slot this op reads, if it reads one.
+    /// The host-mirror slot this op reads, if it reads one. For a pair form this is the
+    /// LOW slot; the layout must also reserve `slot + 1`, which
+    /// [`InlineOp::top_mirror_slot`] reports.
     pub fn mirror_slot(self) -> Option<u32> {
         match self {
-            InlineOp::LoadShiftMask { .. } => None,
+            InlineOp::LoadShiftMask { .. } | InlineOp::LoadScaled { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
+            InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
+        }
+    }
+
+    /// The HIGHEST mirror slot this op touches, which is what the memory layout must
+    /// size the block against. A pair form reads two words, so sizing the block from
+    /// [`InlineOp::mirror_slot`] alone would leave its high word off the end of the
+    /// reserved page - a read of whatever follows, which for a clock is a garbage
+    /// timestamp rather than an obvious failure.
+    pub fn top_mirror_slot(self) -> Option<u32> {
+        match self {
+            InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot + 1),
+            other => other.mirror_slot(),
         }
     }
 }
@@ -220,6 +296,14 @@ pub struct Artifact {
     /// not an optional extra: a host that cannot refresh the block must refuse to run
     /// the module rather than let the guest read a word that never changes.
     pub mirror_off: Option<u64>,
+    /// Linear-memory byte offset of the GUEST-STORE DIRTY MAP, present only when this
+    /// build was emitted with store tracking on ([`emit::dirty_tracking`]). One byte
+    /// per 4 KB page of the whole linear memory, set to 1 by every translated store.
+    ///
+    /// A host may read it or ignore it; what it may NOT do is assume a page is clean
+    /// in a build that has no map. `None` means "this module tracks nothing", which is
+    /// why it is an `Option` rather than an offset of zero.
+    pub dirty_off: Option<u64>,
 }
 
 /// A transpiled function: the guest address it starts at and its wasm export.
@@ -525,7 +609,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off } =
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off } =
         emit::emit_module(
             &ordered,
             &func_index,
@@ -541,7 +625,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off })
+    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off })
 }
 
 /// The output of a lenient whole-program build ([`transpile_lenient`]): the module
@@ -678,7 +762,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         .enumerate()
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off } = emit::emit_module(
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off } = emit::emit_module(
         &ordered,
         &func_index,
         program.base,
@@ -693,7 +777,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
-        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off },
+        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off },
         stubbed,
         stub_wasm_indices,
     }
@@ -970,8 +1054,21 @@ mod tests {
             set_fuel_interval(u32::MAX); // leave this thread as we found it
             wasmparser::validate(&wasm).expect("valid wasm");
 
-            for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-                let Payload::CodeSectionEntry(body) = payload.expect("parse") else { continue };
+            // Every body EXCEPT the last, which is `emit_reset` (see `abi::RESET_EXPORT`).
+            // That one is host bookkeeping - it restores an instance's globals so the host
+            // can reuse it - and is emitted deliberately UNBILLED, because native never runs
+            // it and billing it would charge the game clock for work only one engine does.
+            // Auditing it against wasmtime's rule would therefore assert the opposite of
+            // what it is for.
+            let bodies: Vec<_> = wasmparser::Parser::new(0)
+                .parse_all(&wasm)
+                .filter_map(|p| match p.expect("parse") {
+                    Payload::CodeSectionEntry(body) => Some(body),
+                    _ => None,
+                })
+                .collect();
+            let audited = bodies.len() - 1;
+            for body in bodies.into_iter().take(audited) {
                 let ops: Vec<Operator> = body
                     .get_operators_reader()
                     .expect("operators")

@@ -195,6 +195,37 @@ pub(super) fn get_thread_exit_status(ctx: &mut GuestCtx, st: &mut VitaState, thi
     0
 }
 
+/// The inline form of a SceLibKernel host import, or `None` for the overwhelming
+/// majority that have real behaviour. Reached through [`crate::vita::inline_op`], which
+/// owns the global on/off switch.
+///
+/// Only the process-clock family qualifies, and it qualifies for exactly the reason the
+/// [`mirror`](crate::vita::mirror) module doc gives: the value is a pure function of the
+/// virtual clock, and the virtual clock advances only in the scheduler, with no guest
+/// thread live. So a word refreshed before every resume is not an approximation of the
+/// call - it is the answer the call would have given, for as long as the guest can
+/// observe it.
+///
+/// The three spellings differ only in where the answer goes, which is a calling
+/// convention and not behaviour:
+///   - `sceKernelGetProcessTime(SceKernelSysClock *)` writes it through a pointer,
+///   - `...Wide()` returns it in the r0/r1 pair,
+///   - `...Low()` returns its low half in r0.
+///
+/// **Every entry here duplicates a handler below, and the two must agree.** The
+/// `mirror_matches_its_handlers` test holds them to that.
+pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::nid::libkernel as lk;
+    use crate::vita::mirror::SLOT_CLOCK_LO;
+    use vitaslop_transpiler::InlineOp::{LoadMirror, LoadMirrorPair, StoreMirrorPair};
+    Some(match func_nid {
+        lk::GET_PROCESS_TIME => StoreMirrorPair { slot: SLOT_CLOCK_LO },
+        lk::GET_PROCESS_TIME_WIDE => LoadMirrorPair { slot: SLOT_CLOCK_LO },
+        lk::GET_PROCESS_TIME_LOW => LoadMirror { slot: SLOT_CLOCK_LO },
+        _ => return None,
+    })
+}
+
 /// SceUInt64 sceKernelGetProcessTimeWide(void)
 /// The 64-bit process-runtime clock in microseconds. Returned in r0 (low)/r1 (high),
 /// so it is hand-written rather than `#[hostcall]`. Uses the virtual monotonic clock.

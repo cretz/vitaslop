@@ -153,10 +153,106 @@ fn block_offset(bx: u32, by: u32, blocks_x: u32, blocks_y: u32, swizzled: bool) 
     index as usize * 8
 }
 
+/// The sub-block coordinate whose four surrounding block CENTRES bracket texel `(x, y)`.
+///
+/// A block's two colours sit at its centre, so the upscale grid is the block grid shifted by
+/// half a block; this is that shift, and it wraps, because the format wraps at the edges by
+/// construction.
+///
+/// Written as `+ (shift % size)`'s complement rather than the direct `x + size - shift`
+/// because the latter UNDERFLOWS a `u32` when the image is narrower than half a block (a
+/// 3-wide 2bpp mip, say): it panics in debug and, in release, only lands on the right answer
+/// when the size happens to be a power of two. Every real texture takes the same path either
+/// way - this only decides what the degenerate ones do.
+fn shift_coord(v: u32, size: u32, shift: u32) -> u32 {
+    (v + (size - shift % size)) % size
+}
+
+/// Bilinearly upscale the four surrounding blocks' A and B colours at sub-block offset
+/// `(xr, yr)`. Shared by the per-texel decoder and the whole-image one so the two cannot
+/// drift apart; see [`decode_face`].
+fn upscale(
+    n: &[Block; 4],
+    xr: u32,
+    yr: u32,
+    bw: u32,
+    bh: u32,
+) -> ([u8; 4], [u8; 4]) {
+    let w00 = (bw - xr) * (bh - yr);
+    let w10 = xr * (bh - yr);
+    let w01 = (bw - xr) * yr;
+    let w11 = xr * yr;
+    // The block area is 4x4 or 8x4, so it is always a power of two and the divide by it is a
+    // shift. Asserted rather than assumed: a non-power-of-two would round differently.
+    let total = bw * bh;
+    debug_assert!(total.is_power_of_two());
+    let sh = total.trailing_zeros();
+    let lerp = |p: fn(&Block) -> [u8; 4]| -> [u8; 4] {
+        let (c00, c10, c01, c11) = (p(&n[0]), p(&n[1]), p(&n[2]), p(&n[3]));
+        let mut out = [0u8; 4];
+        for (ch, o) in out.iter_mut().enumerate() {
+            let s = c00[ch] as u32 * w00
+                + c10[ch] as u32 * w10
+                + c01[ch] as u32 * w01
+                + c11[ch] as u32 * w11;
+            *o = (s >> sh) as u8;
+        }
+        out
+    };
+    (lerp(|b| b.a), lerp(|b| b.b))
+}
+
+/// How far texel `(tx, ty)` of `own` sits between the two upscaled images, in eighths, and
+/// whether punch-through forces it fully transparent.
+fn modulation(own: &Block, variant: Variant, hard: bool, tx: u32, ty: u32) -> (u32, bool) {
+    if variant.four_bpp {
+        let bit = (ty * 4 + tx) * 2;
+        let v = (own.modulation >> bit) & 0x3;
+        if own.m && !hard {
+            // Punch-through: the middle two codes are a half blend, and one of them forces
+            // the texel fully transparent.
+            match v {
+                0 => (0, false),
+                1 => (4, false),
+                2 => (4, true),
+                _ => (8, false),
+            }
+        } else if own.m && hard {
+            // PVRTC2 M=1,H=1 is the local-palette mode, whose palette construction is not
+            // established here. Report it and fall back to the plain two-colour blend rather
+            // than invent a palette.
+            report_unmodelled(Unmodelled::LocalPalette);
+            ([0, 3, 5, 8][v as usize], false)
+        } else {
+            ([0, 3, 5, 8][v as usize], false)
+        }
+    } else {
+        // 2bpp carries one modulation bit per texel in its base mode.
+        if own.m {
+            report_unmodelled(Unmodelled::SubsampledModulation);
+        }
+        let bit = ty * 8 + tx;
+        (((own.modulation >> bit) & 1) * 8, false)
+    }
+}
+
+/// Blend the two upscaled colours by a modulation `weight` in eighths.
+fn blend(a: [u8; 4], b: [u8; 4], weight: u32) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (ch, o) in out.iter_mut().enumerate() {
+        *o = ((a[ch] as u32 * (8 - weight) + b[ch] as u32 * weight) / 8) as u8;
+    }
+    out
+}
+
 /// Decode the texel at `(x, y)` of a PVRTC image.
 ///
 /// `bytes` is the face's pixel data, `swizzled` whether the block grid is Morton-ordered
 /// (the GXM `SWIZZLED` texture types). `(x, y)` must already be inside `(width, height)`.
+///
+/// This is the ORACLE, not the hot path: [`decode_face`] decodes a whole image and is what
+/// the renderer calls. Both go through the same [`upscale`] / [`modulation`] / [`blend`]
+/// helpers, and `pvrtc_whole_image_matches_per_texel` asserts they agree byte for byte.
 pub fn texel(
     bytes: &[u8],
     width: u32,
@@ -178,12 +274,8 @@ pub fn texel(
         variant,
     );
 
-    // A block's two colours are considered to sit at its CENTRE, so the four blocks whose
-    // centres surround this texel are the ones to interpolate, and they wrap.
-    let shift_x = bw / 2;
-    let shift_y = bh / 2;
-    let sx = (x + width - shift_x) % width;
-    let sy = (y + height - shift_y) % height;
+    let sx = shift_coord(x, width, bw / 2);
+    let sy = shift_coord(y, height, bh / 2);
     let bx0 = sx / bw;
     let by0 = sy / bh;
     let xr = sx % bw;
@@ -197,81 +289,136 @@ pub fn texel(
     let (a, b) = if hard {
         (own.a, own.b)
     } else {
-        let n00 = decode_block(bytes, block_offset(bx0, by0, blocks_x, blocks_y, swizzled), variant);
-        let n10 = decode_block(bytes, block_offset(bx1, by0, blocks_x, blocks_y, swizzled), variant);
-        let n01 = decode_block(bytes, block_offset(bx0, by1, blocks_x, blocks_y, swizzled), variant);
-        let n11 = decode_block(bytes, block_offset(bx1, by1, blocks_x, blocks_y, swizzled), variant);
-        let w00 = (bw - xr) * (bh - yr);
-        let w10 = xr * (bh - yr);
-        let w01 = (bw - xr) * yr;
-        let w11 = xr * yr;
-        let total = bw * bh;
-        let lerp = |p: fn(&Block) -> [u8; 4]| -> [u8; 4] {
-            let (c00, c10, c01, c11) = (p(&n00), p(&n10), p(&n01), p(&n11));
-            let mut out = [0u8; 4];
-            for (ch, o) in out.iter_mut().enumerate() {
-                let s = c00[ch] as u32 * w00
-                    + c10[ch] as u32 * w10
-                    + c01[ch] as u32 * w01
-                    + c11[ch] as u32 * w11;
-                *o = (s / total) as u8;
-            }
-            out
+        let fetch = |bx: u32, by: u32| {
+            decode_block(bytes, block_offset(bx, by, blocks_x, blocks_y, swizzled), variant)
         };
-        (lerp(|b| b.a), lerp(|b| b.b))
+        let n = [fetch(bx0, by0), fetch(bx1, by0), fetch(bx0, by1), fetch(bx1, by1)];
+        upscale(&n, xr, yr, bw, bh)
     };
 
-    // Modulation: how far this texel sits between the two upscaled images, in eighths.
-    let tx = x % bw;
-    let ty = y % bh;
-    let (weight, punched) = if variant.four_bpp {
-        let bit = (ty * 4 + tx) * 2;
-        let v = (own.modulation >> bit) & 0x3;
-        if own.m && !hard {
-            // Punch-through: the middle two codes are a half blend, and one of them forces
-            // the texel fully transparent.
-            match v {
-                0 => (0, false),
-                1 => (4, false),
-                2 => (4, true),
-                _ => (8, false),
-            }
-        } else if own.m && hard {
-            // PVRTC2 M=1,H=1 is the local-palette mode, whose palette construction is not
-            // established here. Report it and fall back to the plain two-colour blend rather
-            // than invent a palette.
-            report_unmodelled("PVRTC2 local-palette mode (M=1, H=1)");
-            ([0, 3, 5, 8][v as usize], false)
-        } else {
-            ([0, 3, 5, 8][v as usize], false)
-        }
-    } else {
-        // 2bpp carries one modulation bit per texel in its base mode.
-        if own.m {
-            report_unmodelled("PVRTC 2bpp sub-sampled modulation (M=1)");
-        }
-        let bit = ty * 8 + tx;
-        (((own.modulation >> bit) & 1) * 8, false)
-    };
-
+    let (weight, punched) = modulation(&own, variant, hard, x % bw, y % bh);
     if punched {
         return [0, 0, 0, 0];
     }
-    let mut out = [0u8; 4];
-    for (ch, o) in out.iter_mut().enumerate() {
-        *o = ((a[ch] as u32 * (8 - weight) + b[ch] as u32 * weight) / 8) as u8;
+    blend(a, b, weight)
+}
+
+/// Decode a WHOLE PVRTC face to tightly-packed RGBA8, `width * height * 4` bytes written at
+/// the front of `out` (which may be longer - a cube map's faces share one buffer).
+///
+/// # Why this exists
+///
+/// PVRTC is the one family [`crate::render::decode_face_fast`]'s block walker cannot cover,
+/// because a PVRTC texel is not block-LOCAL: [`texel`] decodes FIVE blocks for every texel it
+/// answers (its own, plus the four whose centres surround it), and re-derives each of their
+/// Morton addresses while it does. So a 4bpp image decodes every block eighty times.
+///
+/// MEASURED on a mid-race browser frame, PVRTC is 47% of everything this run decodes - the
+/// largest single family, and the one WebGPU cannot be handed compressed, since it has no
+/// PVRTC format at all. So it is the decode that has to get cheaper rather than go away.
+///
+/// This decodes each block ONCE into an array, then walks the upscale grid REGION by region:
+/// inside one region the four surrounding blocks are fixed, so their addressing and expansion
+/// happen once for a whole block of texels instead of once per texel. The per-texel
+/// arithmetic is unchanged - it is the same [`upscale`] / [`modulation`] / [`blend`] - so the
+/// output is byte-for-byte [`texel`]'s, which `pvrtc_whole_image_matches_per_texel` asserts
+/// over both variants, both bit rates, both addressing modes and non-multiple-of-block sizes.
+pub fn decode_face(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    variant: Variant,
+    swizzled: bool,
+    out: &mut [u8],
+) {
+    if width == 0 || height == 0 {
+        return;
     }
-    out
+    let (bw, bh) = variant.block_size();
+    let blocks_x = width.div_ceil(bw).max(1);
+    let blocks_y = height.div_ceil(bh).max(1);
+
+    // Every block, decoded once. This is the whole point: the per-texel path pays five
+    // decodes and five Morton addressings for each texel it answers.
+    let mut blocks = Vec::with_capacity((blocks_x as usize) * (blocks_y as usize));
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            blocks.push(decode_block(
+                bytes,
+                block_offset(bx, by, blocks_x, blocks_y, swizzled),
+                variant,
+            ));
+        }
+    }
+
+    let shift_x = bw / 2;
+    let shift_y = bh / 2;
+
+    // The upscale grid is the block grid shifted by half a block, so a region of the SHIFTED
+    // coordinates `(sx, sy)` has one fixed set of four surrounding blocks. `(sx, sy)` runs
+    // over the whole image exactly once, and the texel it names is `(sx, sy)` shifted back.
+    for by0 in 0..blocks_y {
+        let by1 = (by0 + 1) % blocks_y;
+        for bx0 in 0..blocks_x {
+            let bx1 = (bx0 + 1) % blocks_x;
+            let n = [
+                blocks[(by0 * blocks_x + bx0) as usize],
+                blocks[(by0 * blocks_x + bx1) as usize],
+                blocks[(by1 * blocks_x + bx0) as usize],
+                blocks[(by1 * blocks_x + bx1) as usize],
+            ];
+            for yr in 0..bh {
+                let sy = by0 * bh + yr;
+                if sy >= height {
+                    break;
+                }
+                let y = (sy + shift_y) % height;
+                let own_row = (y / bh) * blocks_x;
+                let ty = y % bh;
+                let row_out = (y * width * 4) as usize;
+                for xr in 0..bw {
+                    let sx = bx0 * bw + xr;
+                    if sx >= width {
+                        break;
+                    }
+                    let x = (sx + shift_x) % width;
+                    let own = &blocks[(own_row + x / bw) as usize];
+                    let hard = variant.two && own.h;
+                    let (a, b) =
+                        if hard { (own.a, own.b) } else { upscale(&n, xr, yr, bw, bh) };
+                    let (weight, punched) = modulation(own, variant, hard, x % bw, ty);
+                    let c = if punched { [0, 0, 0, 0] } else { blend(a, b, weight) };
+                    let o = row_out + (x * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&c);
+                }
+            }
+        }
+    }
+}
+
+/// A PVRTC sub-mode this decoder does not model.
+#[derive(Clone, Copy)]
+enum Unmodelled {
+    /// PVRTC1 2bpp's sub-sampled modulation (`M = 1`).
+    SubsampledModulation,
+    /// PVRTC2's local-palette mode (`M = 1, H = 1`).
+    LocalPalette,
 }
 
 /// Report - once per distinct case - that a PVRTC sub-mode this decoder does not model was
 /// encountered, so the texels it covers are an approximation rather than a decode.
-fn report_unmodelled(what: &str) {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert(what.to_string()) {
+///
+/// Two flags rather than a set of strings because this is called PER TEXEL from the decode
+/// loops: the old version took a mutex and allocated a `String` for every texel of a 2bpp
+/// `M = 1` image, so the report cost more than the decode it was reporting on.
+fn report_unmodelled(what: Unmodelled) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let (slot, what) = match what {
+        Unmodelled::SubsampledModulation => (0, "PVRTC 2bpp sub-sampled modulation (M=1)"),
+        Unmodelled::LocalPalette => (1, "PVRTC2 local-palette mode (M=1, H=1)"),
+    };
+    if SEEN[slot].swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!(

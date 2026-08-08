@@ -33,6 +33,18 @@ pub struct InputState {
     pub buttons: u32,
     /// The live front-panel touch, if a pointer is pressed.
     pub touch: Option<TouchFrame>,
+    /// The live ANALOG sticks as `(x, y)` in the guest's 0..255 encoding, or `None` when
+    /// nothing is driving them.
+    ///
+    /// # Why `Option` and not a centred default
+    /// A centred stick is not "no stick": 128 is a VALUE, and writing it every frame would
+    /// overwrite a scripted recipe's steering with neutral on every poll, which is the same
+    /// mistake as an over-report. `None` means "this run has no live stick, use whatever the
+    /// recipe says" - the identical rule `touch` already follows. It matters because one
+    /// retail racer's whole steering is `lx` (memory `vitaslop-absolute-heading-control`), so a
+    /// browser that can only send buttons cannot drive it at all.
+    pub left_stick: Option<(u8, u8)>,
+    pub right_stick: Option<(u8, u8)>,
 }
 
 /// A shared, thread-safe handle to the live input state.
@@ -100,6 +112,16 @@ impl World for BrowserWorld {
         // Merge live keyboard buttons on top of any scripted state.
         let live = self.live.lock().unwrap();
         f.buttons |= live.buttons;
+        // A live stick OVERRIDES the scripted one, exactly as a live touch does - and only
+        // while something is actually driving it. See `InputState::left_stick`.
+        if let Some((x, y)) = live.left_stick {
+            f.lx = x;
+            f.ly = y;
+        }
+        if let Some((x, y)) = live.right_stick {
+            f.rx = x;
+            f.ry = y;
+        }
         f
     }
     fn poll_touch(&mut self, port: u32) -> TouchFrame {
@@ -255,6 +277,29 @@ pub fn worker_input_key(code: &str, pressed: bool) {
             }
         });
     }
+}
+
+/// Worker input entry point: one analog stick moved, or stopped being driven.
+///
+/// `stick` is 0 for the left stick and 1 for the right. `(x, y)` are the guest's own 0..255
+/// encoding with 128 centred, so the page owns the deadzone and the curve (an on-screen thumb
+/// stick and a real gamepad axis need different ones) and this layer stays a plain conduit.
+/// `active` false releases the stick back to whatever a scripted recipe says, which is not the
+/// same as centring it - see [`InputState::left_stick`].
+///
+/// An unknown `stick` index is IGNORED rather than silently treated as the left one: a caller
+/// that means a stick this build does not have is a bug in the caller, and steering the wrong
+/// axis is worse than steering none.
+#[wasm_bindgen]
+pub fn worker_input_stick(stick: u32, x: u8, y: u8, active: bool) {
+    with_worker_input(|st| {
+        let slot = match stick {
+            0 => &mut st.left_stick,
+            1 => &mut st.right_stick,
+            _ => return,
+        };
+        *slot = active.then_some((x, y));
+    });
 }
 
 /// Worker input entry point: a pointer press/move/release at screen coordinates

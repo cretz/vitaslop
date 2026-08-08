@@ -240,6 +240,22 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     let iface = plan_interface(&vprog, &fprog, &frc.shader)?;
     let varyings = &iface.components;
 
+    // A PASSTHROUGH fragment program emits the PDS-loaded primary attributes verbatim (see
+    // `plan_interface`), so its colour is the primary-attribute bank at register 0 - never the
+    // OUTPUT bank, which nothing in the program ever writes. `plan_bindings` infers the colour
+    // register from what the stream WRITES and cannot answer for a stream that writes nothing;
+    // its default (`NativeO0`) would read four registers the hardware never fills.
+    //
+    // The precision comes from the interpolant that lands there: a HALF descriptor packs four
+    // components into two registers, which is the shape `ColorPrecision::F16` unpacks.
+    if is_passthrough(&frc.shader, &pa_read_before_write(&frc.shader).0) {
+        fplan.color = ColorOutput::NonNativePa0;
+        fplan.color_precision = match fprog.interpolants.iter().find(|it| it.pa_base == 0) {
+            Some(it) if it.half => crate::module::ColorPrecision::F16,
+            _ => crate::module::ColorPrecision::F32,
+        };
+    }
+
     // A prefetched unit is usually sampled ONLY by the PDS, so the instruction walk that built
     // the binding plan never saw it. Merge those units in so the renderer binds them.
     for pf in &iface.prefetches {
@@ -487,10 +503,19 @@ impl PlannedPrefetch {
 
 /// The complete stage interface: the interpolated components plus the samples the PDS performs
 /// from them before the fragment code runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Interface {
     components: Vec<VaryingComponent>,
     prefetches: Vec<PlannedPrefetch>,
+    /// PA registers the fragment reads for a varying the vertex program does not fill, and the
+    /// CONSTANT the iterator supplies for them: `(register, [half0, half1], packed)`.
+    ///
+    /// A GXM iterator programmed for four components off a three-component vertex output does
+    /// not read garbage - it produces the texture-coordinate default, `(0, 0, 0, 1)`, the same
+    /// fill a vertex ATTRIBUTE gets for the components its format does not supply. One title's
+    /// fog fragment declares a four-register `TexCoord(0)` against a three-component vertex
+    /// output and reads all four.
+    defaults: Vec<(u32, [f32; 2], bool)>,
     /// First PA register of a `Position` interpolant the fragment reads, if it declares one.
     ///
     /// This is NOT an interpolated varying: it is the rasteriser's own WINDOW coordinate -
@@ -515,9 +540,85 @@ struct Interface {
 /// would silently read a zero-initialised register. An interpolant (or a prefetch) the code
 /// never reads is skipped: it cannot affect the picture, and skipping it keeps a shader that
 /// merely declares an unmodeled usage linkable.
+/// Say, once per distinct shape, that a fragment allocated more registers to a varying than the
+/// vertex fills, so the surplus was filled with the iterator's texture-coordinate default. That
+/// default is a modelling decision about hardware, not a fact read off the blob, and a shader
+/// that actually depends on the value would go wrong quietly. Naming it is what makes it
+/// findable.
+fn report_unfilled_varying_registers(usage: VaryingUsage, vertex_components: u32, declared: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(VaryingUsage, u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((usage, vertex_components, declared)) {
+        return;
+    }
+    eprintln!(
+        "gxp link: {usage:?} is allocated {declared} fragment registers but the vertex program \
+         fills only {vertex_components} components - the surplus is fed the iterator's default \
+         (0, 0, 0, 1), the same fill a vertex attribute's missing components get"
+    );
+}
+
+/// Report, once per distinct shape, that a fragment consumes only a PREFIX of what the vertex
+/// writes for a varying.
+///
+/// Unconditional and deduplicated, like every other approximation this renderer makes. It used
+/// to be a hard link failure; it is now an accepted reading (see `plan_interface`), and an
+/// accepted reading that turns out to be wrong has to be attributable to something. If a title
+/// ever renders with a texcoord that looks truncated, this line is the first thing to check.
+fn report_varying_read_as_prefix(usage: VaryingUsage, vertex_components: u32, capacity: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(VaryingUsage, u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((usage, vertex_components, capacity)) {
+        return;
+    }
+    eprintln!(
+        "gxp link: the vertex program writes {vertex_components} components of {usage:?} but the \
+         fragment declares room for {capacity} - the fragment reads that PREFIX and the surplus \
+         is not iterated"
+    );
+}
+
+/// Whether this fragment program is a PASSTHROUGH: its stream neither reads a primary-attribute
+/// register nor writes a colour register, so it computes nothing and its result is whatever the
+/// PDS loaded before it ran. In the corpus that is literally a single `Nop`.
+///
+/// BOTH halves matter. "Writes no colour register" alone is the condition
+/// `RecompileError::ColorRegisterNeverWritten` names, and it is also true of a stream that reads
+/// its varyings and leaves the answer in a temporary - a shape no real program has, but one the
+/// unit fixtures use, and treating those as passthrough demands every declared interpolant be
+/// routed whether the shader touches it or not.
+fn is_passthrough(fshader: &Shader, inputs: &[bool]) -> bool {
+    crate::module::writes_no_color_register(fshader) && !inputs.iter().any(|&r| r)
+}
+
 fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
-    let (inputs, untouched) = pa_read_before_write(fshader);
+    let (mut inputs, untouched) = pa_read_before_write(fshader);
     let primary_regs = fprog.primary_reg_count as u32;
+
+    // A PASSTHROUGH fragment program - one whose instruction stream writes NEITHER colour
+    // register (very often a single `Nop`) - does not compute a colour. Its result is whatever
+    // the PDS left in the primary-attribute registers before it ran: the iterated varyings and
+    // any prefetched sample. That is not an inference from provenance, it is what the container
+    // says out loud - such a program still declares its interpolants and a non-zero
+    // `primary_reg_count`, which would be meaningless for a shader that reads nothing.
+    //
+    // Reading the body's own reads here (which are none) routed NO varyings and returned the
+    // zero-initialised register file, so every such draw painted transparent black. On one title
+    // that is the engine's 2D primitive-render path: it draws a fullscreen triangle with
+    // `SCE_GXM_DEPTH_FUNC_ALWAYS` and depth WRITE, and a black one over the finished world is
+    // the whole frame.
+    //
+    // So treat the whole primary-attribute allocation as read. Anything the interpolants then
+    // fail to cover is a hard error below, not a silent zero.
+    let passthrough = is_passthrough(fshader, &inputs);
+    if passthrough {
+        inputs.resize(inputs.len().max(primary_regs as usize), false);
+        inputs[..primary_regs as usize].fill(true);
+    }
 
     // A read of a register the container does not allocate at all means the interpolant spans
     // or the operand decode are wrong - never route varyings on that.
@@ -551,8 +652,12 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             .ok_or(LinkError::UnfedVarying { usage })
     };
 
-    let mut iface =
-        Interface { components: Vec::new(), prefetches: Vec::new(), window_position: None };
+    let mut iface = Interface {
+        components: Vec::new(),
+        prefetches: Vec::new(),
+        defaults: Vec::new(),
+        window_position: None,
+    };
     let mut fed = vec![false; inputs.len()];
     for it in &fprog.interpolants {
         let data_base = it.pa_base as u32;
@@ -577,15 +682,68 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             let vertex = vertex_output(it.usage)?;
             let n = vertex.components;
             let expected = if it.half { n.div_ceil(2) } else { n };
-            if expected != it.register_count as u32 {
-                return Err(LinkError::VaryingSizeMismatch {
-                    usage: it.usage,
-                    fragment_registers: it.register_count as u32,
-                    vertex_components: n,
-                    half: it.half,
-                });
+            let declared = it.register_count as u32;
+            // The fragment may ALLOCATE more registers for a varying than the vertex fills. That
+            // is only a contradiction if the code READS the surplus: the hardware iterates what
+            // the vertex wrote and leaves the rest holding whatever the allocation held, so a
+            // shader that reads it is reading undefined data on the console too. One title's fog
+            // varying is declared four full-precision registers against a three-component vertex
+            // output and never touches the fourth.
+            //
+            // The OPPOSITE case - the vertex writes more than the fragment declared - used to be
+            // a hard failure, on the reasoning that "the surplus would land on the NEXT
+            // interpolant's registers". That is true of THIS PLANNER, which copied all `n`
+            // components into a smaller span, and it is what the clamp below fixes; it is not a
+            // property of the hardware. The fragment reads a PREFIX.
+            //
+            // The evidence is a real draw plus a count. PCSA00027's tutorial pairs a vertex
+            // writing four TexCoord(0) components with a fragment declaring ONE half register
+            // (two components), and that draw is correct on the device - a shipping title's
+            // shaders are. It is not a one-off either: across that title's 47 fragment blobs, 21
+            // of 120 half-precision interpolants declare a single register while their texcoords
+            // are three or four components wide
+            // (`tabulate_interpolant_register_counts_by_precision`). A configuration that common
+            // in a shipping title is one the hardware handles, and the only reading under which
+            // it works is that the iterator fills what the fragment ASKED for.
+            let capacity = if it.half { declared * 2 } else { declared };
+            let n_used = n.min(capacity);
+            if expected > declared {
+                report_varying_read_as_prefix(it.usage, n, capacity);
             }
-            for c in 0..n {
+            // The fragment may allocate MORE registers than the vertex fills. The iterator then
+            // supplies the texture-coordinate default for the trailing components - see
+            // `Interface::defaults` - so those registers are fed with constants, not left zero
+            // and not refused.
+            if expected < declared {
+                report_unfilled_varying_registers(it.usage, n, declared);
+                let total = if it.half { declared * 2 } else { declared };
+                let default_of = |c: u32| if c == 3 { 1.0 } else { 0.0 };
+                let mut r = data_base + expected;
+                while r < data_base + declared {
+                    let c0 = if it.half { (r - data_base) * 2 } else { r - data_base };
+                    let halves = [default_of(c0), default_of(c0 + 1)];
+                    // A half-precision varying whose fill would start MID-register would need the
+                    // register to mix an interpolated half with a default one. No corpus program
+                    // does that, and inventing the packing would be a guess.
+                    if it.half && c0 < n {
+                        return Err(LinkError::VaryingSizeMismatch {
+                            usage: it.usage,
+                            fragment_registers: declared,
+                            vertex_components: n,
+                            half: it.half,
+                        });
+                    }
+                    let _ = total;
+                    iface.defaults.push((r, halves, it.half));
+                    if let Some(slot) = fed.get_mut(r as usize) {
+                        *slot = true;
+                    }
+                    r += 1;
+                }
+            }
+            // `n_used`, not `n`: copying the vertex's surplus components would write PAST this
+            // varying's declared span and into the next interpolant's registers.
+            for c in 0..n_used {
                 let register = data_base + if it.half { c / 2 } else { c };
                 iface.components.push(VaryingComponent {
                     vertex_lane: vertex.base_lane + c,
@@ -655,6 +813,14 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     // hardware too, and never a varying this linker failed to route.
     if let Some(reg) = (0..untouched.len()).find(|&r| untouched[r] && !fed[r]) {
         return Err(LinkError::PaReadUnfed { register: reg as u32, varyings_error: fprog.varyings_error });
+    }
+    // A passthrough program's colour IS its primary-attribute allocation, so a register in that
+    // allocation that no interpolant feeds is a colour channel we would emit as zero. Fail
+    // instead: for these programs the routing is the whole translation.
+    if passthrough {
+        if let Some(reg) = (0..primary_regs).find(|&r| !fed.get(r as usize).copied().unwrap_or(false)) {
+            return Err(LinkError::PaReadUnfed { register: reg, varyings_error: fprog.varyings_error });
+        }
     }
     Ok(iface)
 }
@@ -1018,6 +1184,19 @@ fn build_linked_module(
             }
         }
     }
+    // Registers the iterator fills with the texture-coordinate default because the vertex
+    // program produces fewer components than the fragment allocated (see `Interface::defaults`).
+    for &(register, halves, half) in &iface.defaults {
+        if half {
+            let _ = writeln!(
+                m,
+                "  pa[{register}] = pack2x16float(vec2<f32>({:?}, {:?}));",
+                halves[0], halves[1]
+            );
+        } else {
+            let _ = writeln!(m, "  pa[{register}] = bitcast<u32>({:?}f);", halves[0]);
+        }
+    }
     // Replay the samples the PDS took before the shader started. Each leaves four components in
     // two PA registers as packed F16 halves, which is how the code reads them - the instruction
     // stream contains no SMP for these, so without this the shader would read zeros.
@@ -1221,6 +1400,8 @@ mod tests {
             sampler_cube: cube,
             array_size: 1,
             resource_index: unit,
+            semantic: 0,
+            semantic_index: 0,
         }
     }
 
@@ -1301,21 +1482,39 @@ mod tests {
         );
     }
 
+    /// A fragment that declares LESS room than the vertex writes reads a PREFIX, and the surplus
+    /// is not routed anywhere.
+    ///
+    /// This used to be a hard failure on the reasoning that the surplus would land on the next
+    /// interpolant. It would have - in this planner - which is why the routing is clamped. The
+    /// test that matters is the second assertion: nothing is planned past the declared span.
     #[test]
-    fn size_disagreement_between_the_stages_is_a_hard_failure() {
-        // The vertex produces 4 components but the fragment spans 2 F32 registers: one side is
-        // decoded wrong, so every later varying would be mis-routed. Fall back, never guess.
+    fn a_fragment_narrower_than_its_vertex_reads_a_prefix() {
         let mut vprog = vertex_program(0, Vec::new(), 0);
         vprog.output_varyings = vec![texcoord_out(1, 6, 4)];
         let fprog = fragment_program(vec![texcoord_in(1, 0, 2, false)], 2);
-        assert_eq!(
-            plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap_err(),
-            LinkError::VaryingSizeMismatch {
-                usage: VaryingUsage::TexCoord(1),
-                fragment_registers: 2,
-                vertex_components: 4,
-                half: false,
-            }
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        assert_eq!(plan.len(), 2, "only the two components the fragment declared are routed");
+        assert!(
+            plan.iter().all(|c| matches!(c.dest, ComponentDest::Register(r) if r < 2)),
+            "nothing may be routed past the declared span: {plan:?}"
+        );
+        assert_eq!(plan[0].vertex_lane, 6, "and it is the FIRST components that are taken");
+        assert_eq!(plan[1].vertex_lane, 7);
+    }
+
+    /// The half-precision shape a real draw hits: the vertex writes four texcoord components and
+    /// the fragment declares ONE half register, which holds two.
+    #[test]
+    fn a_half_precision_fragment_narrower_than_its_vertex_reads_two_components() {
+        let mut vprog = vertex_program(0, Vec::new(), 0);
+        vprog.output_varyings = vec![texcoord_out(0, 6, 4)];
+        let fprog = fragment_program(vec![texcoord_in(0, 0, 1, true)], 1);
+        let plan = plan_interface(&vprog, &fprog, &fragment_reading(&[0])).unwrap().components;
+        assert_eq!(plan.len(), 2);
+        assert!(
+            plan.iter().all(|c| matches!(c.dest, ComponentDest::Half { register: 0, .. })),
+            "both components share the one declared register: {plan:?}"
         );
     }
 
@@ -1494,6 +1693,8 @@ mod tests {
             sampler_cube: false,
             array_size: 1,
             resource_index,
+            semantic: 0,
+            semantic_index: 0,
         }
     }
 

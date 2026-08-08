@@ -310,6 +310,7 @@ enum Space {
 /// once per draw from its GXM attribute list. Position is the lowest-offset float
 /// attribute; a second float2 attribute is the texcoord; a normalized-u8 attribute
 /// is the color.
+#[derive(Clone, Copy)]
 struct Layout {
     pos_off: usize,
     pos_comps: usize,
@@ -487,6 +488,38 @@ fn decode_vertex(d: &Draw, layout: &Layout, i: usize) -> Vertex {
     Vertex { pos: [px, py, pz], uv, color, normal }
 }
 
+/// Just the POSITION of vertex `i`, decoded exactly as [`decode_vertex`] decodes it.
+///
+/// For a draw that will be rendered with the guest's recompiled shaders, the canonical
+/// vertex is dead (see `gxp_only`) and the only thing the per-vertex walk still produces
+/// is the opaque depth RANGE - which reads the position and nothing else. Decoding the
+/// uv, colour and normal for it is per-vertex work on a race frame's several hundred
+/// thousand vertices, thrown away immediately.
+fn decode_vertex_pos(d: &Draw, layout: &Layout, i: usize) -> [f32; 3] {
+    let stride = d.vertex_stride.max(1) as usize;
+    let base = i * stride;
+    let lane = |off: usize, fmt: u8| -> f32 {
+        let o = base + off;
+        if fmt == FORMAT_F16 {
+            if o + 2 <= d.vertices.len() {
+                half_to_f32(u16::from_le_bytes([d.vertices[o], d.vertices[o + 1]]))
+            } else {
+                0.0
+            }
+        } else if o + 4 <= d.vertices.len() {
+            f32::from_le_bytes([d.vertices[o], d.vertices[o + 1], d.vertices[o + 2], d.vertices[o + 3]])
+        } else {
+            0.0
+        }
+    };
+    let pstep = if layout.pos_fmt == FORMAT_F16 { 2 } else { 4 };
+    [
+        lane(layout.pos_off, layout.pos_fmt),
+        lane(layout.pos_off + pstep, layout.pos_fmt),
+        if layout.pos_comps >= 3 { lane(layout.pos_off + 2 * pstep, layout.pos_fmt) } else { 0.0 },
+    ]
+}
+
 /// Transform an object-space normal by the model-to-world matrix's upper 3x3 (column-major)
 /// and normalize. Car/world parts use near-uniform scale, so the plain 3x3 (not the
 /// inverse-transpose) is faithful. A zero/degenerate result falls back to `[0,1,0]` (up).
@@ -589,6 +622,10 @@ const SCE_GXM_CULL_CCW: u32 = 0x0000_0002;
 
 /// SCE_GXM_DEPTH_WRITE_DISABLED - depth writes off (a 2D alpha overlay, not opaque 3D).
 const SCE_GXM_DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
+/// `SCE_GXM_FRAGMENT_PROGRAM_DISABLED` (vitasdk `gxm.h`) - the draw rasterises into DEPTH and
+/// STENCIL only and writes no colour. `SCE_GXM_FRAGMENT_PROGRAM_ENABLED` is 0, which is also
+/// the context default, so a title that never calls the setter is enabled throughout.
+const SCE_GXM_FRAGMENT_PROGRAM_DISABLED: u32 = 0x0020_0000;
 
 /// SCE_GXM_DEPTH_FUNC_LESS_EQUAL - GXM's default depth test, and what [`render_map`]
 /// asks for explicitly: its depth buffer holds negated world height rather than a
@@ -902,21 +939,147 @@ fn sample_texture_bilinear(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
 /// result. Returns `(width, height, rgba)`; a zero-sized texture yields a 1x1 opaque
 /// magenta so an unexpected empty binding is visible rather than a GPU error.
 pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
+    decode_texture_rgba8_counted(t, &mut BuildWork::default())
+}
+
+/// [`decode_texture_rgba8`], recording which path decoded it. See [`BuildWork`].
+fn decode_texture_rgba8_counted(t: &BoundTexture, work: &mut BuildWork) -> (u32, u32, Vec<u8>) {
     if t.width == 0 || t.height == 0 {
         return (1, 1, vec![255, 0, 255, 255]);
     }
     // A cube map decodes to its six faces stacked in `BoundTexture::faces` order, which is the
     // layer order the GPU binds them in.
     let faces = t.faces.max(1);
-    let mut rgba = Vec::with_capacity((t.width * t.height * faces * 4) as usize);
+    let mut rgba = vec![0u8; (t.width * t.height * faces * 4) as usize];
     for f in 0..faces {
+        let face_out = (f * t.width * t.height * 4) as usize;
+        let face_len = (t.width * t.height * 4) as u64;
+        DECODE_BY_FORMAT.lock().unwrap()[(t.base_format & 0xff) as usize] += face_len;
+        if decode_face_fast(t, f, &mut rgba[face_out..]) {
+            work.tex_out_blockwise += face_len;
+            continue;
+        }
+        work.tex_out_per_texel += face_len;
+        let mut o = face_out;
         for y in 0..t.height {
             for x in 0..t.width {
-                rgba.extend_from_slice(&texel_rgba_face(t, f, x, y));
+                rgba[o..o + 4].copy_from_slice(&texel_rgba_face(t, f, x, y));
+                o += 4;
             }
         }
     }
     (t.width, t.height, rgba)
+}
+
+/// Decode one face of a BLOCK-COMPRESSED texture a block at a time, into `out`. Returns
+/// false for anything this path does not cover, leaving the caller on the per-texel path.
+///
+/// # Why this exists
+/// [`texel_rgba_face`] answers for ONE texel, and for a block-compressed format answering
+/// for one texel means decoding the whole 4x4 block it belongs to - so the plain loop
+/// decodes every block SIXTEEN TIMES, and recomputes that block's Morton address and
+/// re-dispatches on the format sixteen times with it. That is invisible until a title
+/// streams: MEASURED in the browser mid-race, a single frame that first sees a new stretch
+/// of track decoded 263 textures / 45.6 MB and spent **2,498 ms** inside `build`, while a
+/// frame of 444 draws that decoded nothing built in **1.2 ms**. Build time tracked decoded
+/// megabytes and nothing else.
+///
+/// This walks blocks instead: one decode, one address, one dispatch, sixteen texels
+/// written. It is the same arithmetic per texel, so the output is byte-for-byte what the
+/// per-texel path produces - `blockwise_decode_matches_per_texel` is the test that says so,
+/// and the per-texel function stays as the oracle it checks against.
+fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
+    let Some((block_w, block_h, block_bytes)) = block_layout(t.base_format) else {
+        return false;
+    };
+    // PVRTC is not block-LOCAL (a texel reads the four blocks whose centres surround it), so
+    // it cannot go through the block walker below - it has a whole-IMAGE decode of its own,
+    // which is the same arithmetic with the block decodes and their addressing hoisted out of
+    // the texel loop. It is the largest decoded family measured (47%) and the one WebGPU
+    // cannot be handed compressed, so this path is not optional. The channel swizzle is not
+    // applied here, exactly as `texel_rgba_face` does not apply it to PVRTC.
+    if let Some(variant) = crate::pvrtc::Variant::from_base_format(t.base_format) {
+        if !pvrtc_whole_image() {
+            return false;
+        }
+        let face_base = (face * t.face_bytes) as usize;
+        let face_bytes = t.pixels.get(face_base..).unwrap_or(&[]);
+        crate::pvrtc::decode_face(
+            face_bytes,
+            t.width,
+            t.height,
+            variant,
+            swizzled_type(t.tex_type),
+            out,
+        );
+        return true;
+    }
+    // UNCOMPRESSED: one texel per "block". Same hoist, different inner step - the per-texel
+    // path re-derives the block layout, the PVRTC test, the swizzle mode and the two
+    // power-of-two paddings for EVERY texel, and MEASURED on a mid-race desktop frame this
+    // family is 2.11 MB of the 3.83 MB decoded, i.e. the larger half.
+    if block_w == 1 && block_h == 1 {
+        let face_base = (face * t.face_bytes) as usize;
+        if swizzled_type(t.tex_type) {
+            let (pw, ph) = (t.width.next_power_of_two(), t.height.next_power_of_two());
+            let mut o = 0usize;
+            for y in 0..t.height {
+                for x in 0..t.width {
+                    let off = face_base + (morton_index(x, y, pw, ph) * block_bytes) as usize;
+                    out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off));
+                    o += 4;
+                }
+            }
+        } else {
+            let mut o = 0usize;
+            for y in 0..t.height {
+                let row = face_base + (y * t.stride) as usize;
+                for x in 0..t.width {
+                    let off = row + (x * block_bytes) as usize;
+                    out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off));
+                    o += 4;
+                }
+            }
+        }
+        return true;
+    }
+    if block_w <= 1 {
+        return false;
+    }
+    let face_base = (face * t.face_bytes) as usize;
+    let swizzle = (t.swizzle >> 12) & 0x7;
+    let swizzled = swizzled_type(t.tex_type);
+    let (pw, ph) = if swizzled {
+        (t.width.div_ceil(block_w).next_power_of_two(), t.height.div_ceil(block_h).next_power_of_two())
+    } else {
+        (0, 0)
+    };
+    let blocks_x = t.width.div_ceil(block_w);
+    let blocks_y = t.height.div_ceil(block_h);
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let block_index = if swizzled {
+                morton_index(bx, by, pw, ph)
+            } else {
+                by * (t.stride / block_bytes) + bx
+            };
+            let off = face_base + (block_index * block_bytes) as usize;
+            let block = t.pixels.get(off..off + block_bytes as usize).unwrap_or(&[]);
+            // The trailing blocks of a non-multiple-of-4 texture are partly outside the
+            // image; only the texels inside it are written, exactly as the per-texel loop
+            // (which never asks for the others) would.
+            for py in 0..block_h.min(t.height - by * block_h) {
+                let y = by * block_h + py;
+                for px in 0..block_w.min(t.width - bx * block_w) {
+                    let x = bx * block_w + px;
+                    let c = decode_bc_texel(block, t.base_format, px, py);
+                    let o = ((y * t.width + x) * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&swizzle4(c[0], c[1], c[2], c[3], swizzle));
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Decode the single texel at integer coordinates `(x, y)` (already wrapped/clamped
@@ -975,6 +1138,16 @@ fn texel_rgba_face(t: &BoundTexture, face: u32, x: u32, y: u32) -> [u8; 4] {
     } else {
         face_base + (y * t.stride + x * block_bytes) as usize
     };
+    decode_uncompressed_at(t, off)
+}
+
+/// Decode ONE uncompressed texel, given the byte offset its lanes start at.
+///
+/// Split out of [`texel_rgba_face`] so a whole-face decode can compute that offset in a
+/// tight loop instead of re-deriving the block layout, the PVRTC test, the swizzle mode and
+/// the power-of-two padding for every texel. The arithmetic below is unchanged, so the two
+/// callers cannot disagree.
+fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
     let px = &t.pixels;
     let byte = |i: usize| -> u8 { *px.get(off + i).unwrap_or(&0) };
     // Channel swizzle field (bits 12..14 of the full SceGxmTextureFormat).
@@ -1777,7 +1950,9 @@ pub fn locate_sprites(scene: &Scene, width: u32, height: u32) -> Vec<SpriteLoc> 
             }
         };
         let textured = d.albedo().is_some() && interp.layout.uv_off.is_some();
-        mix(d.albedo().map(tex_key).unwrap_or(0));
+        // The BINDING, not the snapshot: see `tex_binding_key`. A sprite has to match itself
+        // across frames, and every frame snapshots the atlas into a different buffer.
+        mix(d.albedo().map(tex_binding_key).unwrap_or(0));
         for c in uv {
             mix(if c.is_finite() { (c * 4096.0).round() as i64 as u64 } else { 0 });
         }
@@ -2462,16 +2637,38 @@ fn invert4(m: &[f32; 16]) -> Option<[f32; 16]> {
 /// direction is then the difference between the eye and any unprojected point on the
 /// central view ray.
 pub fn scene_eye(scene: &Scene) -> Option<Eye> {
-    // The most common world-to-clip matrix among world draws. A frame contains reflection
-    // and shadow passes with cameras of their own; the one that draws most of the world is
-    // the player's.
-    let mut tally: Vec<([f32; 16], usize)> = Vec::new();
+    // The world-to-clip matrix SHARED BY THE MOST DRAWS, with triangles only as a tiebreak.
+    //
+    // A draw's matrix is MODEL-to-clip, so the world's own matrix is the one that many
+    // separate draws happen to share - static scenery is dozens of draws with an identity
+    // model transform, all carrying the same matrix - while a single articulated MODEL is
+    // one or two draws carrying its own. Ranking by TRIANGLES therefore asks "what is the
+    // biggest mesh on screen", which is not the same question, and on a retail racer the
+    // answer is the player's own ship.
+    //
+    // MEASURED, and it is why a driving controller went blind for a quarter of the circuit:
+    // in enclosed sections less of the track is visible, the player ship's 9,211 triangles
+    // out-weigh what is left of the world, and the eye reconstructed from the SHIP's
+    // model-to-clip matrix lands 11 units from the origin - in the ship's own frame, where
+    // the camera really is 11 units behind it. `camera` then reported (0.70, 3.66, -11.04)
+    // while a smaller pass in the same frame carried the true (1247, 154, 1200), and every
+    // position, heading and sighting downstream was wrong. `camera --passes` shows both.
+    //
+    // Counting draws makes the discriminator structural rather than a threshold on world
+    // scale: there is no "near the origin" constant here, and nothing per title.
+    let mut tally: Vec<([f32; 16], (usize, usize))> = Vec::new();
     for d in &scene.draws {
         let Space::Mvp(m) = interpret_draw(d).space else { continue };
         let n = triangle_count(d);
+        if n == 0 {
+            continue;
+        }
         match tally.iter_mut().find(|(k, _)| k == &m) {
-            Some((_, c)) => *c += n,
-            None => tally.push((m, n)),
+            Some((_, c)) => {
+                c.0 += 1;
+                c.1 += n;
+            }
+            None => tally.push((m, (1, n))),
         }
     }
     let (m, _) = tally.into_iter().max_by_key(|&(_, c)| c)?;
@@ -3428,11 +3625,30 @@ fn to_draw_space(space: &Space) -> DrawSpace {
     }
 }
 
-/// A cheap content/identity fingerprint of a captured texture, used to cache its
-/// decode (here) and its GPU upload (in the renderer). It folds the control words
-/// (address, format, swizzle, type, geometry) and a strided sample of the pixel
-/// bytes - enough to notice a same-address atlas whose contents changed without
-/// hashing every byte every frame. FNV-1a/64.
+/// An EXACT identity fingerprint of a captured texture, used to cache its decode (here)
+/// and its GPU upload (in the renderer). It folds the control words (address, format,
+/// swizzle, type, geometry), the sampler state, and the IDENTITY of the pixel buffer.
+/// FNV-1a/64.
+///
+/// # Why the buffer's identity and not its contents
+/// This used to fold a 256-byte STRIDED SAMPLE of the pixels, on the reasoning that it
+/// would notice a same-address atlas whose contents changed without hashing every byte.
+/// A sample is not a proof: a content change the stride steps over reused a stale DECODE,
+/// however exactly the capture had compared the bytes. So the whole per-scene `memcmp`
+/// upstream ([`TextureSnapshots`], 40% of a race frame) was buying an exactness this key
+/// then threw away - end-to-end detection was sampled either way.
+///
+/// The capture already answers the question exactly, and its answer is the buffer: it hands
+/// back the SAME `Arc` when the bytes are unchanged and a NEW one when they are not
+/// (including on the re-read path, which compares before allocating). So the buffer's
+/// address IS "these are the same pixels" - no sampling, and no hashing of a 4 MB atlas
+/// either. `RenderSceneBuilder::decode_cache` holds a strong reference to the buffer it
+/// keyed on, which is what makes the address valid as a key: without it a freed buffer's
+/// address could be reused by a different texture. `TextureSnapshots::means` is keyed the
+/// same way for the same reason.
+///
+/// Two distinct buffers holding identical bytes get two entries. That is wasteful, never
+/// wrong, and the capture avoids it wherever it can tell.
 fn tex_key(t: &BoundTexture) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |v: u64| {
@@ -3456,17 +3672,38 @@ fn tex_key(t: &BoundTexture) -> u64 {
     // changes the FORMAT they are uploaded through (sRGB decodes on fetch), so two bindings of
     // one image differing only in gamma must not share a cache entry.
     mix(t.gamma as u64);
-    // Sample at most ~256 bytes spread across the buffer so a content change is seen
-    // cheaply regardless of texture size.
-    let n = t.pixels.len();
-    if n > 0 {
-        let step = (n / 256).max(1);
-        let mut i = 0;
-        while i < n {
-            mix(t.pixels[i] as u64);
-            i += step;
+    // The pixel buffer's identity - see this function's own note. The length is already
+    // folded in above (with the stride); the address is what makes this exact.
+    mix(t.pixels.as_ptr() as usize as u64);
+    h
+}
+
+/// A texture's IDENTITY as a bound resource - the guest address, format and shape, WITHOUT
+/// the pixel buffer's address.
+///
+/// [`tex_key`] answers "are these the same decoded bytes", which is what a decode cache
+/// wants and why it folds the buffer's address. Sprite identity is a different question:
+/// two frames of a title showing the same sprite are two different SNAPSHOTS of the same
+/// guest texture, so they hold different buffers by construction, and keying a sprite on
+/// `tex_key` means a sprite never matches itself from one frame to the next. That silently
+/// disabled `scroll_drift` and `sprite_motion` - the two things a 2D title is driven by -
+/// and it is the kind of break that looks like the game moving, not like a bug.
+///
+/// So this is what a SPRITE folds: what the guest bound, not what we copied out of it.
+fn tex_binding_key(t: &BoundTexture) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
         }
-    }
+    };
+    mix(t.data_addr as u64);
+    mix(t.base_format as u64);
+    mix(t.swizzle as u64);
+    mix(t.tex_type as u64);
+    mix(((t.width as u64) << 32) | t.height as u64);
+    mix(((t.stride as u64) << 32) | t.pixels.len() as u64);
     h
 }
 
@@ -3491,10 +3728,240 @@ pub struct RenderSceneBuilder {
     /// fails to link still needs all of it, and producing an empty draw instead would lose
     /// geometry silently.
     gxp_only: bool,
-    decode_cache: HashMap<u64, GxmTexture>,
+    /// Decoded textures by [`tex_key`], each holding a strong reference to the SOURCE pixel
+    /// buffer it was keyed on. The reference is not decoration: the key folds that buffer's
+    /// address, and a freed buffer's address can be reused by an unrelated texture.
+    decode_cache: HashMap<u64, (GxmTexture, Arc<[u8]>)>,
+    /// Decoded RGBA8 bytes held by `decode_cache`, against `decode_cache_budget_bytes`.
+    decode_cache_bytes: usize,
     /// The last reported "the whole scene was dropped" tally, so [`DropTally::report`]
     /// prints when the shape CHANGES rather than sixty times a second.
     last_empty: Option<DropTally>,
+    /// Expanded triangle-LIST `u32` index buffers, keyed by the CONTENT of the guest index
+    /// buffer they were expanded from plus the topology that decides the expansion.
+    ///
+    /// The expansion is a pure function of those inputs, and a title re-submits the same
+    /// indices for its static geometry every frame - MEASURED at 0.74-0.98 MB of freshly
+    /// allocated index bytes per frame mid-race, rebuilt from scratch sixty times a second
+    /// to the same answer.
+    ///
+    /// Keyed by CONTENT, not by the source buffer's identity, and that is not a preference:
+    /// the capture reads a draw's indices out of guest memory into a fresh allocation every
+    /// frame and then REBASES them in place, so the buffer's address is different every
+    /// frame and an identity key would never hit once while growing without bound. Hashing
+    /// the bytes is O(n) but sequential, and it replaces an allocation plus an expansion of
+    /// three times the size.
+    index_cache: HashMap<IndexKey, Arc<[u8]>>,
+}
+
+/// What an expanded index buffer is a function of - see `RenderSceneBuilder::index_cache`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct IndexKey {
+    /// FNV-1a over the guest index bytes AS REBASED, which is what the expansion reads.
+    content: u64,
+    len: usize,
+    index_count: u32,
+    primitive: u32,
+    index_format: u32,
+}
+
+/// What [`RenderSceneBuilder::build`] actually DID, in units neither engine has to have a
+/// clock for.
+///
+/// `build` is the largest item in the browser's render half, and the browser has no
+/// `std::time::Instant` at all - `encode_chain`'s inner split is structurally zero there for
+/// exactly that reason. So the instrument that works on BOTH engines is a count of the work
+/// itself: vertices walked, indices scanned, textures decoded. A count also survives the
+/// comparison a time cannot, since the two engines run on different hardware: 41 us a draw
+/// against 2 us a draw is only a mystery until one of them says it walked forty times as
+/// many vertices.
+///
+/// Bumped once per draw (not per vertex), so the cost of the instrument is a handful of
+/// relaxed adds per draw against the hundreds of thousands of vertices it counts.
+#[derive(Default, Clone, Copy)]
+pub struct BuildWork {
+    /// Vertices decoded and transformed by the MAIN loop - the fixed-function
+    /// representation, or an inline depth-range walk.
+    pub verts_walked: u64,
+    /// Vertices walked by PASS TWO, purely to measure the scene depth range for some other
+    /// draw that reads it. This is the walk the two-pass gate exists to avoid.
+    pub verts_deferred: u64,
+    /// Indices read by the max-index scan that sizes the walk.
+    pub indices_scanned: u64,
+    /// Textures DECODED (a cache miss) and textures served from the decode cache.
+    pub tex_decoded: u64,
+    pub tex_cached: u64,
+    /// Bytes of texture the decoder read, so a small count of huge textures is separable
+    /// from a large count of small ones.
+    pub tex_bytes: u64,
+    /// Decoded OUTPUT bytes, split by which decode path produced them. The block-wise path
+    /// decodes each compressed block once; everything else answers one texel at a time. A
+    /// burst that is expensive despite the fast path is a burst of formats the fast path
+    /// does not cover, and only this split says which.
+    pub tex_out_blockwise: u64,
+    pub tex_out_per_texel: u64,
+    /// Times the decode cache was cleared WHOLESALE on reaching `DECODE_CACHE_CAP`. Any
+    /// nonzero value here mid-run means the working set outgrew the cache and every entry
+    /// is being re-decoded, which is a cliff, not a gradient.
+    pub tex_cache_clears: u64,
+    /// Draws built, and how many of them ran their fixed-function representation.
+    pub draws: u64,
+    pub draws_fixed_function: u64,
+    /// Bytes of RAW guest vertex stream COPIED for the recompiled path (`d.vertices.clone()`,
+    /// once per draw per frame), and bytes of the expanded u32 index buffer built beside it.
+    /// Both are O(mesh) per draw and neither is shared between frames, so they are the two
+    /// candidates for a `build` that scales with geometry rather than with draw count.
+    pub gxp_vertex_bytes: u64,
+    pub gxp_index_bytes: u64,
+    /// Bytes of default-uniform-buffer (SA bank) copied per draw for the two stages.
+    pub gxp_sa_bytes: u64,
+    /// Index buffers EXPANDED from the guest topology, and index buffers served from the
+    /// expansion cache. `gxp_index_bytes` counts only the expanded ones - a cache hit
+    /// allocates nothing.
+    pub index_expanded: u64,
+    pub index_expand_cached: u64,
+    pub index_cache_clears: u64,
+}
+
+impl BuildWork {
+    /// Fold another tally in. Public so a caller can accumulate PER PRESENT and keep the
+    /// worst one apart from the window total.
+    pub fn add_pub(&mut self, o: &BuildWork) {
+        self.add(o);
+    }
+
+    fn add(&mut self, o: &BuildWork) {
+        self.verts_walked += o.verts_walked;
+        self.verts_deferred += o.verts_deferred;
+        self.indices_scanned += o.indices_scanned;
+        self.tex_decoded += o.tex_decoded;
+        self.tex_cached += o.tex_cached;
+        self.tex_bytes += o.tex_bytes;
+        self.tex_out_blockwise += o.tex_out_blockwise;
+        self.tex_out_per_texel += o.tex_out_per_texel;
+        self.tex_cache_clears += o.tex_cache_clears;
+        self.draws += o.draws;
+        self.draws_fixed_function += o.draws_fixed_function;
+        self.gxp_vertex_bytes += o.gxp_vertex_bytes;
+        self.gxp_index_bytes += o.gxp_index_bytes;
+        self.gxp_sa_bytes += o.gxp_sa_bytes;
+        self.index_expanded += o.index_expanded;
+        self.index_expand_cached += o.index_expand_cached;
+        self.index_cache_clears += o.index_cache_clears;
+    }
+
+    /// One line, per FRAME (the caller divides), naming every unit above.
+    pub fn line(&self, frames: u64) -> String {
+        let n = frames.max(1) as f64;
+        format!(
+            "build work/frame: {:.0} draws ({:.0} fixed-function), {:.0} vertices walked \
+             (+{:.0} deferred depth-range), {:.0} indices scanned, textures {:.1} decoded \
+             / {:.1} cached ({:.2} MB decoded: {:.2} MB fast-path + {:.2} MB per-texel), \
+             {:.2} cache clears, indices {:.1} expanded \
+             / {:.1} cached ({:.2} clears), gxp shares {:.2} MB vertices, copies {:.2} MB \
+             indices + {:.2} MB uniforms",
+            self.draws as f64 / n,
+            self.draws_fixed_function as f64 / n,
+            self.verts_walked as f64 / n,
+            self.verts_deferred as f64 / n,
+            self.indices_scanned as f64 / n,
+            self.tex_decoded as f64 / n,
+            self.tex_cached as f64 / n,
+            self.tex_bytes as f64 / n / (1024.0 * 1024.0),
+            self.tex_out_blockwise as f64 / n / (1024.0 * 1024.0),
+            self.tex_out_per_texel as f64 / n / (1024.0 * 1024.0),
+            self.tex_cache_clears as f64 / n,
+            self.index_expanded as f64 / n,
+            self.index_expand_cached as f64 / n,
+            self.index_cache_clears as f64 / n,
+            self.gxp_vertex_bytes as f64 / n / (1024.0 * 1024.0),
+            self.gxp_index_bytes as f64 / n / (1024.0 * 1024.0),
+            self.gxp_sa_bytes as f64 / n / (1024.0 * 1024.0),
+        )
+    }
+}
+
+static BUILD_WORK: std::sync::Mutex<BuildWork> = std::sync::Mutex::new(BuildWork {
+    verts_walked: 0,
+    verts_deferred: 0,
+    indices_scanned: 0,
+    tex_decoded: 0,
+    tex_cached: 0,
+    tex_bytes: 0,
+    tex_out_blockwise: 0,
+    tex_out_per_texel: 0,
+    tex_cache_clears: 0,
+    draws: 0,
+    draws_fixed_function: 0,
+    gxp_vertex_bytes: 0,
+    gxp_index_bytes: 0,
+    gxp_sa_bytes: 0,
+    index_expanded: 0,
+    index_expand_cached: 0,
+    index_cache_clears: 0,
+});
+
+/// Take and RESET the accumulated build work. The caller owns the window it divides by.
+pub fn take_build_work() -> BuildWork {
+    let mut g = BUILD_WORK.lock().unwrap();
+    std::mem::take(&mut *g)
+}
+
+/// Decoded RGBA8 output bytes per guest `base_format`, for the whole run.
+///
+/// # Why the format, and not just the total
+/// The decode volume is the browser's largest single cost, and the obvious next move -
+/// hand WebGPU the guest's COMPRESSED bytes instead of expanding them - is only available
+/// for some formats. WebGPU has `texture-compression-bc`; it has no PVRTC format at all,
+/// and PVRTC is the PowerVR-native family this console's titles are most likely to use.
+/// So "replace the decoder with a compressed upload" is worth a session or worth nothing
+/// depending entirely on this split, and it is not something to guess from the platform.
+///
+/// Indexed by base format (the field is 8 bits), so this is a flat array and costs one
+/// add per decoded face.
+static DECODE_BY_FORMAT: std::sync::Mutex<[u64; 256]> = std::sync::Mutex::new([0; 256]);
+
+/// The formats this run decoded, largest first, as `(base_format, output MB)`.
+/// Only formats that actually decoded something appear.
+pub fn decode_by_format() -> Vec<(u32, f64)> {
+    let g = DECODE_BY_FORMAT.lock().unwrap();
+    let mut v: Vec<(u32, f64)> = g
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b > 0)
+        .map(|(f, b)| (f as u32, *b as f64 / (1024.0 * 1024.0)))
+        .collect();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+/// One line naming what the decoder actually spent its bytes on.
+pub fn decode_by_format_line() -> String {
+    let v = decode_by_format();
+    if v.is_empty() {
+        return "texture decode by format: nothing decoded".to_string();
+    }
+    let total: f64 = v.iter().map(|(_, mb)| mb).sum();
+    let parts: Vec<String> = v
+        .iter()
+        .take(8)
+        .map(|(f, mb)| format!("{:#04x} {} {:.1} MB", f, format_family(*f), mb))
+        .collect();
+    format!("texture decode by format: {total:.1} MB total - {}", parts.join(", "))
+}
+
+/// Which upload family a base format belongs to, which is the question the split exists to
+/// answer: `bc` can be handed to WebGPU compressed, `pvrtc` cannot (no WebGPU format), and
+/// `raw` is already uncompressed so there is nothing to hand over.
+fn format_family(base_format: u32) -> &'static str {
+    if crate::pvrtc::Variant::from_base_format(base_format).is_some() {
+        return "PVRTC(no WebGPU format)";
+    }
+    match block_layout(base_format) {
+        Some((bw, _, _)) if bw > 1 => "BC(uploadable)",
+        Some(_) => "raw",
+        None => "undecodable",
+    }
 }
 
 /// Why [`RenderSceneBuilder::build`] discarded draws from a captured scene.
@@ -3546,7 +4013,8 @@ impl DropTally {
             return;
         }
         *last = Some(*self);
-        eprintln!(
+        tracing::warn!(
+            target: "vitaslop::render",
             "render: ALL {} captured draws were dropped - {} non-triangle topology, {} \
              shader-expanded sprite records, {} position-only (no texcoord, no vertex colour); \
              {} of them carried the guest's real shaders. This frame renders as a bare clear \
@@ -3618,13 +4086,139 @@ fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
         return;
     }
     seen.push(kind);
-    eprintln!("{detail}");
+    tracing::warn!(target: "vitaslop::render", "{detail}");
 }
 
-/// Cap on the decode cache; cleared wholesale if exceeded (a title's working texture
-/// set is far smaller, so this only fires on a pathological churn and just forces a
-/// re-decode, never incorrectness).
-const DECODE_CACHE_CAP: usize = 512;
+/// Does anything in this build CONSUME the scene depth range?
+///
+/// `RenderScene::depth_min`/`depth_scale` are read by exactly two things: the
+/// FIXED-FUNCTION MVP pipeline, and the recompiled path under `VITASLOP_GXP_ZFIX=range`.
+/// The default is `ZFix::Clamp`, which writes the guest's own window depth `z/w` and - as
+/// its own documentation says - needs no scene statistics at all.
+///
+/// Measuring the range costs a position decode and a 4x4 transform for every vertex of
+/// every opaque draw. On a race frame where every draw is recompiled, that is the largest
+/// single item in `build` (measured in the browser: `build` 21.6 ms against 6.6 ms for
+/// every WebGPU call of the frame put together) and NOTHING reads the answer.
+///
+/// Read once, not per scene.
+fn zfix_consumes_scene_depth_range() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::knobs::var("VITASLOP_GXP_ZFIX").map(|v| v.trim() == "range").unwrap_or(false)
+    })
+}
+
+/// Name the first draw that makes a scene measure its depth range, once per run.
+///
+/// The range costs a position decode and a 4x4 transform for every vertex of every opaque
+/// MVP draw in the scene, and exactly one kind of draw reads it: a FIXED-FUNCTION, opaque,
+/// MVP one. On a fully-recompiled frame there is none and the walk never runs - measured,
+/// a race scene of 690 recompiled draws builds in 1.57 ms, and one that walks costs about
+/// eighteen times that per draw.
+///
+/// So "which draw turned it on" is the difference between a legitimate cost and a whole
+/// scene walking for a draw that is dropped or invisible, and it is not something to infer
+/// from a frame time. Reported unconditionally, once, for the same reason a fallback is
+/// [[vitaslop-fallback-must-report]].
+fn report_depth_range_reader(di: usize, d: &Draw) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        // A `tracing` event, not an `eprintln!`: the browser has no stdio, so a report
+        // printed that way is invisible on the one engine whose `build` cost raised the
+        // question. [[vitaslop-fallback-must-report]]
+        tracing::warn!(
+            target: "vitaslop::render",
+            "render: draw {di} is FIXED-FUNCTION, opaque and MVP, so its scene measures the \
+             opaque depth range - a per-vertex walk over every opaque MVP draw in that scene. \
+             tris={}, stride={}, {} attributes, {} uniform floats, primitive {:#x}. Every other \
+             scene of the frame skips the walk.",
+            triangle_count(d),
+            d.vertex_stride,
+            d.attributes.len(),
+            d.uniforms.len(),
+            d.primitive,
+        );
+    });
+}
+
+/// Budget for the decode cache, in BYTES of decoded RGBA8, before it is cleared wholesale.
+///
+/// # In bytes, because a count of entries bounded nothing
+/// This was a cap of 512 ENTRIES, on the reasoning that "a title's working texture set is
+/// far smaller". MEASURED on a mid-race frame of a 705-draw title, it is not: the cache
+/// reached the cap and was dumped roughly once every thirty frames, and each dump cost
+/// about five hundred re-decodes. Averaged over the perf window that read as **15.7
+/// textures decoded per frame against 0.3 on a lighter frame, and it took `build` from
+/// 9.7 ms to 166.8 ms in the browser** - a cliff, not a gradient, which is exactly what a
+/// wholesale clear produces. The same unit error, on the same kind of cache, is written up
+/// in `tex_cache_budget_bytes` in the platform crate; this one was left in the old unit.
+///
+/// An entry is bounded by what it costs to REBUILD (a decode) and by what it holds (the
+/// decoded pixels), and only the second is measurable here, so that is the budget.
+/// `VITASLOP_DECODE_CACHE_MB` overrides. 256 MB matches the view cache it feeds.
+fn decode_cache_budget_bytes() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_DECODE_CACHE_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(256)
+            * 1024
+            * 1024
+    })
+}
+
+/// Whether PVRTC decodes a whole face at a time (the default) or one texel at a time.
+///
+/// # Why the slow path is kept reachable
+/// `VITASLOP_PVRTC_DECODE=per-texel` forces every PVRTC texture through [`crate::pvrtc::texel`],
+/// the oracle the whole-image pass was written against. The two are supposed to be
+/// byte-for-byte identical, so a run that differs only in this knob must render an IDENTICAL
+/// frame - which is a falsifier over the title's REAL textures, in their real sizes,
+/// addressing modes and sub-modes, rather than over the handful a unit test can construct.
+/// That is the same contract, and the same reason, as `VITASLOP_TEXTURE_CHECK=bytes`.
+///
+/// It is a diagnostic, not a tuning knob: the slow path is the one that decodes every block
+/// eighty times. An unrecognised value PANICS rather than silently picking one.
+fn pvrtc_whole_image() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| match crate::knobs::var("VITASLOP_PVRTC_DECODE") {
+        Ok(s) if s.trim() == "per-texel" => {
+            tracing::warn!(
+                target: "vitaslop::render",
+                "VITASLOP_PVRTC_DECODE=per-texel: PVRTC decodes one texel at a time, which \
+                 re-decodes every block eighty times. This is the exactness falsifier, not a \
+                 setting to run in."
+            );
+            false
+        }
+        Ok(s) if s.trim() == "whole-image" || s.trim().is_empty() => true,
+        Ok(s) => panic!(
+            "VITASLOP_PVRTC_DECODE={s:?} is not a mode - use `whole-image` (default) or \
+             `per-texel`"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Cap on the expanded-index cache, in ENTRIES. Same contract as `DECODE_CACHE_CAP`: the key
+/// is a content fingerprint, so clearing wholesale costs a re-expansion and never
+/// correctness. Larger than the decode cap because an entry is one mesh's indices rather
+/// than a decoded image, and a scene can carry hundreds of distinct meshes.
+const INDEX_CACHE_CAP: usize = 4096;
+
+/// FNV-1a over a byte slice. Used to content-address a draw's index buffer; the same
+/// construction the renderer's packed-vertex cache uses, kept local so this file does not
+/// depend on the platform crate for one hash.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 impl Default for RenderSceneBuilder {
     fn default() -> Self {
@@ -3638,20 +4232,28 @@ impl RenderSceneBuilder {
             gxp_only: crate::knobs::flag("VITASLOP_GXP_LIVE")
                 && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"),
             decode_cache: HashMap::new(),
+            decode_cache_bytes: 0,
             last_empty: None,
+            index_cache: HashMap::new(),
         }
     }
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
-    fn texture(&mut self, t: &BoundTexture) -> GxmTexture {
+    fn texture(&mut self, t: &BoundTexture, work: &mut BuildWork) -> GxmTexture {
         let key = tex_key(t);
-        if let Some(g) = self.decode_cache.get(&key) {
+        if let Some((g, _)) = self.decode_cache.get(&key) {
+            work.tex_cached += 1;
             return g.clone();
         }
-        if self.decode_cache.len() >= DECODE_CACHE_CAP {
+        work.tex_decoded += 1;
+        work.tex_bytes += t.pixels.len() as u64;
+        let (width, height, rgba) = decode_texture_rgba8_counted(t, work);
+        self.decode_cache_bytes += rgba.len();
+        if self.decode_cache_bytes >= decode_cache_budget_bytes() {
+            work.tex_cache_clears += 1;
             self.decode_cache.clear();
+            self.decode_cache_bytes = rgba.len();
         }
-        let (width, height, rgba) = decode_texture_rgba8(t);
         // Carry the magnification filter so the GPU picks the matching sampler (LINEAR ->
         // bilinear, as the software `sample_texture_bilinear` does). SceGxmTextureFilter:
         // 1 = LINEAR, 0 = POINT.
@@ -3670,7 +4272,7 @@ impl RenderSceneBuilder {
             addr_mode_v: t.v_addr_mode,
             gamma: t.gamma != 0,
         };
-        self.decode_cache.insert(key, g.clone());
+        self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
         g
     }
 
@@ -3684,6 +4286,10 @@ impl RenderSceneBuilder {
     /// world/vehicle meshes as triangle STRIPS, so dropping them (as an earlier
     /// list-only build did) rendered the whole 3D world black while the 2D UI still showed.
     pub fn build(&mut self, scene: &Scene) -> RenderScene {
+        // What this scene made `build` DO, folded into the process-wide tally at the end.
+        // See [`BuildWork`]: the browser has no clock inside `build`, so the count IS the
+        // measurement.
+        let mut work = BuildWork::default();
         let mut draws = Vec::with_capacity(scene.draws.len());
         // Visible opaque depth range (post-divide c.z/c.w), accumulated across draws for
         // the GPU's linear depth normalization.
@@ -3692,6 +4298,31 @@ impl RenderSceneBuilder {
         // Diagnostic: VITASLOP_DRAW_STATS also reports each opaque draw's own visible depth
         // span, which is what the GPU's normalization has to keep separable.
         let stats = std::env::var("VITASLOP_DRAW_STATS").is_ok();
+        // Will ANY draw of this scene read `depth_min`/`depth_scale`? Only a draw that is
+        // rendered FIXED-FUNCTION *and* opaque *and* MVP does, or - for every draw - the
+        // recompiled path under `ZFix::Range`.
+        //
+        // That question cannot be answered before the draws are interpreted (opaque and MVP
+        // both come out of `interpret_draw`, and calling it twice would cost more than the
+        // walk saves), so the range is measured in TWO passes. The main loop below walks a
+        // draw's vertices only when its own fixed-function representation needs them; every
+        // OTHER opaque MVP draw is remembered in `deferred` and walked afterwards, and only
+        // if a reader actually turned up. The range is still a property of the whole scene -
+        // every opaque MVP draw contributes exactly as before, whatever pass measures it -
+        // and `min`/`max` do not care what order they see their inputs in, so the result is
+        // bit-identical.
+        //
+        // On a frame where every draw is recompiled - which is every frame of every title
+        // now - the second pass never runs at all. The earlier gate asked only whether ANY
+        // draw was fixed-function, and a race scene has TWO draws with no shader payload out
+        // of 461 (2D overlays, which are neither opaque nor MVP and so read nothing), so it
+        // forced the walk on for the whole scene.
+        let zfix_range = zfix_consumes_scene_depth_range();
+        // Opaque MVP draws whose contribution the main loop did NOT measure, as
+        // (draw index, layout, model-view-projection).
+        let mut deferred: Vec<(usize, Layout, [f32; 16])> = Vec::new();
+        // Has a reader turned up? `ZFix::Range` makes every recompiled draw one.
+        let mut range_has_reader = zfix_range;
         let mut tally = DropTally { total: scene.draws.len(), ..Default::default() };
         for (di, d) in scene.draws.iter().enumerate() {
             // A list emits idx/3 triangles; a strip or fan emits idx-2. Any other topology
@@ -3763,28 +4394,61 @@ impl RenderSceneBuilder {
             // winding is submission-defined, so it is never culled (matches `render_scene`).
             let cull_mode = if mvp.is_some() { d.render_state.cull_mode } else { SCE_GXM_CULL_NONE };
 
+            // Whether this draw's FIXED-FUNCTION representation will be used at all - see
+            // `gxp_only`, and the note further down.
+            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
+            // ...and if it will not, the ONLY thing the per-vertex walk still produces is
+            // the opaque depth RANGE, which the recompiled path maps its clip depth
+            // through. When that is not wanted either, the whole walk - and the index scan
+            // that sizes it - is dead. MEASURED in the browser, where this shows up as
+            // `build`: 22.6 ms of a 29.7 ms render, against 6.8 ms for every WebGPU call
+            // of the frame put together.
+            // Only `ZFix::Range` makes a RECOMPILED draw read the range, and that is known
+            // before the scene starts. Everything else is deferred - see the two-pass note
+            // at the top of this function. `VITASLOP_DRAW_STATS` also walks inline, because
+            // it reports each draw's OWN span and the second pass does not keep those
+            // apart; that only affects a diagnostic run.
+            let need_depth_range = opaque && mvp.is_some() && (zfix_range || stats);
+            let walk = fixed_function || need_depth_range;
+            if opaque && mvp.is_some() {
+                if fixed_function {
+                    // This draw's own fixed-function pipeline maps its depth through the
+                    // range, so the scene has a reader. (It also walks, just below, so its
+                    // own contribution is measured inline.)
+                    if !range_has_reader {
+                        report_depth_range_reader(di, d);
+                    }
+                    range_has_reader = true;
+                } else if !need_depth_range {
+                    deferred.push((di, *layout, mvp.expect("checked just above")));
+                }
+            }
+
             // The largest index referenced, so the vertex buffer covers every index
             // (an out-of-range index decodes to a zero vertex, matching the software
             // path's clamped reads, rather than a GPU out-of-bounds fetch).
             let mut max_idx = 0usize;
-            for i in 0..d.index_count as usize {
-                max_idx = max_idx.max(index_at(d, i));
+            if walk {
+                for i in 0..d.index_count as usize {
+                    max_idx = max_idx.max(index_at(d, i));
+                }
+                work.indices_scanned += d.index_count as u64;
             }
             let stride = d.vertex_stride.max(1) as usize;
-            let nverts = (d.vertices.len() / stride).max(max_idx + 1);
+            let nverts = if walk { (d.vertices.len() / stride).max(max_idx + 1) } else { 0 };
+            work.draws += 1;
+            work.draws_fixed_function += fixed_function as u64;
+            work.verts_walked += nverts as u64;
 
             // Screen positions of every vertex for MVP draws, so the cull test and
             // behind-eye drop below reuse one projection per vertex (not per triangle).
             // `project` applies the same Y-flip the software rasterizer uses; only the
             // winding SIGN matters here, so any positive surface size gives the identical
             // cull decision as the real target. `None` = behind the eye (w <= 0).
-            // Whether this draw's FIXED-FUNCTION representation will be used at all. When it
-            // will not (see `gxp_only`), everything below that only feeds it is skipped: on a
-            // race frame that is a few hundred thousand vertices' worth of buffer writes, two
-            // matrix multiplies per vertex and an index expansion, all of which `encode` then
-            // steps over. The depth RANGE is still accumulated, because the recompiled path
-            // maps its clip depth through it.
-            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
+            // Everything below that only feeds the fixed-function representation is skipped
+            // when it is dead: on a race frame that is a few hundred thousand vertices'
+            // worth of buffer writes, two matrix multiplies per vertex and an index
+            // expansion, all of which `encode` then steps over.
             let mut screen_pos: Vec<Option<[f32; 4]>> =
                 if fixed_function && mvp.is_some() { Vec::with_capacity(nverts) } else { Vec::new() };
 
@@ -3792,6 +4456,23 @@ impl RenderSceneBuilder {
             let mut vertices =
                 Vec::with_capacity(if fixed_function { nverts * GXM_VERTEX_STRIDE as usize } else { 0 });
             for i in 0..nverts {
+                if !fixed_function {
+                    // Only the depth range is left, and it reads the position alone. Same
+                    // arithmetic as the general arm below, on the same decoded position.
+                    let p = decode_vertex_pos(d, layout, i);
+                    let m = mvp.expect("need_depth_range implies an MVP");
+                    let c = transform(&m, p[0], p[1], p[2]);
+                    if c[3] > 1e-4 {
+                        let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
+                        if nx.abs() <= 1.0 && ny.abs() <= 1.0 && depth.is_finite() {
+                            dmin = dmin.min(depth);
+                            dmax = dmax.max(depth);
+                            draw_dmin = draw_dmin.min(depth);
+                            draw_dmax = draw_dmax.max(depth);
+                        }
+                    }
+                    continue;
+                }
                 let v = decode_vertex(d, layout, i);
                 if fixed_function {
                     vertices.extend_from_slice(&v.pos[0].to_le_bytes());
@@ -3870,7 +4551,7 @@ impl RenderSceneBuilder {
             }
 
             let texture = if interp.textured && fixed_function {
-                d.albedo().map(|t| self.texture(t))
+                d.albedo().map(|t| self.texture(t, &mut work))
             } else {
                 None
             };
@@ -3895,7 +4576,10 @@ impl RenderSceneBuilder {
                 let textures = d
                     .textures
                     .iter()
-                    .map(|t| vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t) })
+                    .map(|t| vitaslop_platform::gpu::GxpTex {
+                        unit: t.unit as u8,
+                        tex: self.texture(t, &mut work),
+                    })
                     .collect();
                 // The VERTEX stage's own bindings, uploaded the same way. A vertex program that
                 // samples builds its geometry from the fetch, so these decide whether the draw
@@ -3903,19 +4587,48 @@ impl RenderSceneBuilder {
                 let vertex_textures = d
                     .vertex_textures
                     .iter()
-                    .map(|t| vitaslop_platform::gpu::GxpTex { unit: t.unit as u8, tex: self.texture(t) })
+                    .map(|t| vitaslop_platform::gpu::GxpTex {
+                        unit: t.unit as u8,
+                        tex: self.texture(t, &mut work),
+                    })
                     .collect();
                 // Expand the guest topology into a flat, winding-normalized triangle-LIST u32
                 // index buffer (NO CPU cull - the recompiled pipeline culls on the GPU via the
                 // guest cull mode, using its own real-shader projection). Indexes into the RAW
                 // guest vertex stream `d.vertices`.
-                let mut gxp_indices = Vec::with_capacity(tri_count * 3 * 4);
-                for t in 0..tri_count {
-                    for k in tri_indices(d, t) {
-                        gxp_indices.extend_from_slice(&(k as u32).to_le_bytes());
+                let ikey = IndexKey {
+                    content: fnv1a64(&d.indices),
+                    len: d.indices.len(),
+                    index_count: d.index_count,
+                    primitive: d.primitive,
+                    index_format: d.index_format,
+                };
+                let gxp_indices = match self.index_cache.get(&ikey) {
+                    Some(cached) => {
+                        work.index_expand_cached += 1;
+                        cached.clone()
                     }
-                }
+                    None => {
+                        if self.index_cache.len() >= INDEX_CACHE_CAP {
+                            work.index_cache_clears += 1;
+                            self.index_cache.clear();
+                        }
+                        let mut out = Vec::with_capacity(tri_count * 3 * 4);
+                        for t in 0..tri_count {
+                            for k in tri_indices(d, t) {
+                                out.extend_from_slice(&(k as u32).to_le_bytes());
+                            }
+                        }
+                        let out: Arc<[u8]> = out.into();
+                        work.index_expanded += 1;
+                        work.gxp_index_bytes += out.len() as u64;
+                        self.index_cache.insert(ikey, out.clone());
+                        out
+                    }
+                };
                 let gxp_index_count = (gxp_indices.len() / 4) as u32;
+                work.gxp_vertex_bytes += d.vertices.len() as u64;
+                work.gxp_sa_bytes += (d.vert_sa.len() + d.frag_sa.len()) as u64;
                 Some(vitaslop_platform::gpu::GxpRecompile {
                     vprog: d.vprog.clone(),
                     fprog: d.fprog.clone(),
@@ -3933,6 +4646,9 @@ impl RenderSceneBuilder {
                     depth_write: d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED,
                     depth_func: d.render_state.front_depth_func,
                     cull_mode: d.render_state.cull_mode,
+                    fragment_program_enabled: d.render_state.front_fragment_program_enable
+                        != SCE_GXM_FRAGMENT_PROGRAM_DISABLED,
+                    fprog_header: d.fragment_program_header,
                     blend: !opaque,
                     blend_state: [
                         d.blend.color_mask,
@@ -3967,6 +4683,33 @@ impl RenderSceneBuilder {
                 shader_only,
             });
         }
+        // PASS TWO: a reader turned up, so the opaque MVP draws the main loop stepped over
+        // still have to contribute. On a fully-recompiled scene `range_has_reader` is false
+        // and this is skipped entirely, which is the whole point of deferring it.
+        if range_has_reader {
+            for (di, layout, m) in deferred {
+                let d = &scene.draws[di];
+                let mut max_idx = 0usize;
+                for i in 0..d.index_count as usize {
+                    max_idx = max_idx.max(index_at(d, i));
+                }
+                let stride = d.vertex_stride.max(1) as usize;
+                let nverts = (d.vertices.len() / stride).max(max_idx + 1);
+                work.indices_scanned += d.index_count as u64;
+                work.verts_deferred += nverts as u64;
+                for i in 0..nverts {
+                    let p = decode_vertex_pos(d, &layout, i);
+                    let c = transform(&m, p[0], p[1], p[2]);
+                    if c[3] > 1e-4 {
+                        let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
+                        if nx.abs() <= 1.0 && ny.abs() <= 1.0 && depth.is_finite() {
+                            dmin = dmin.min(depth);
+                            dmax = dmax.max(depth);
+                        }
+                    }
+                }
+            }
+        }
         // Linear depth-normalization params: map the visible opaque depth range to [0,1].
         // A degenerate range (no opaque geometry, or a single coplanar depth) yields
         // scale 0, so every opaque fragment maps to depth 0 (submission order decides, as
@@ -3976,6 +4719,7 @@ impl RenderSceneBuilder {
         } else {
             (0.0, 0.0)
         };
+        BUILD_WORK.lock().unwrap().add(&work);
         tally.report_if_total(&mut self.last_empty);
         // Carry where this scene draws to, so a renderer can keep the result addressable
         // for a later pass that samples it (see `RttTarget`).
@@ -4004,13 +4748,14 @@ mod geometry_tests {
 
     fn strip_draw(indices: &[u16]) -> Draw {
         Draw {
+            fragment_program_header: 0,
             primitive: PRIM_TRIANGLE_STRIP,
             index_format: 0,
             index_count: indices.len() as u32,
-            vertices: vec![],
+            vertices: Arc::from(&[][..]),
             vertex_stride: 1,
             attributes: vec![],
-            indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect(),
+            indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>().into(),
             uniforms: vec![],
             textures: vec![],
             vertex_textures: vec![],
@@ -4019,8 +4764,8 @@ mod geometry_tests {
             exposure: 1.0,
             material: crate::capture::FragmentMaterial::default(),
             world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            vprog: vec![],
-            fprog: vec![],
+            vprog: crate::capture::no_program(),
+            fprog: crate::capture::no_program(),
             vert_sa: vec![],
             frag_sa: vec![],
             shader_expanded: false,
@@ -4924,8 +5669,9 @@ mod supersample_tests {
             lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0,
         };
         let draw = Draw {
+            fragment_program_header: 0,
             primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
-            vertices: verts, vertex_stride: 16,
+            vertices: verts.into(), vertex_stride: 16,
             attributes: vec![
                 VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
@@ -4934,7 +5680,8 @@ mod supersample_tests {
             uniforms: vec![], textures: vec![tex], vertex_textures: vec![], render_state: RenderState::default(),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
+            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
+            vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
         let scene = Scene { color: None, depth: None, draws: vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -4979,8 +5726,9 @@ mod supersample_tests {
             }
         }
         let draw = Draw {
+            fragment_program_header: 0,
             primitive: PRIM_TRIANGLES, index_format: 0, index_count: 6,
-            vertices: verts, vertex_stride: 16,
+            vertices: verts.into(), vertex_stride: 16,
             attributes: vec![
                 VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
@@ -4989,7 +5737,8 @@ mod supersample_tests {
             uniforms: vec![], textures: vec![tex], vertex_textures: vec![], render_state: RenderState::default(),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
-            vprog: vec![], fprog: vec![], vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
+            vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
+            vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
         };
         let s = Scene { color: None, depth: None, draws: vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
@@ -5045,6 +5794,139 @@ mod texture_tests {
     // u that lands squarely in texel `i` of a `w`-wide row.
     fn u_of(i: u32, w: u32) -> f32 {
         (i as f32 + 0.5) / w as f32
+    }
+
+    /// The UNCOMPRESSED fast path must produce EXACTLY what the per-texel path produces.
+    ///
+    /// Same contract as the block-compressed case below, over the one-texel-per-block
+    /// formats - which are the LARGER half of what a mid-race frame decodes. Covers every
+    /// lane width the decoder distinguishes (8/16/24/32/64-bit), both addressing modes, and
+    /// non-power-of-two sizes, where a swizzled texture's padding is not the image.
+    #[test]
+    fn uncompressed_fast_path_matches_per_texel() {
+        // One format from each width family the match arms distinguish.
+        let formats = [
+            0x00u32, 0x01, // 8-bit single channel
+            0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // 16-bit
+            0x09, 0x0a, 0x0b, // 16-bit single channel
+            0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x15, 0x17, 0x18, 0x19, 0x1a, // 32-bit
+            0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // 64-bit
+            0x98, 0x99, // 24-bit
+        ];
+        for fmt in formats {
+            let Some((bw, bh, bytes)) = block_layout(fmt) else { continue };
+            assert_eq!((bw, bh), (1, 1), "format {fmt:#x} is not one texel per block");
+            for &(w, h) in &[(4u32, 4u32), (8, 4), (5, 3)] {
+                for &tex_type in &[3u32 /* linear */, 0 /* swizzled */] {
+                    for &chan_swizzle in &[0u32, 1, 2, 3] {
+                        let pw = w.next_power_of_two() as usize;
+                        let ph = h.next_power_of_two() as usize;
+                        let n = (pw * ph + w as usize * h as usize + 8) * bytes as usize;
+                        let pixels: Vec<u8> =
+                            (0..n).map(|i| ((i * 53 + 7) % 251) as u8).collect();
+                        let mut t = tex(fmt, chan_swizzle, w, h, w * bytes, pixels);
+                        t.tex_type = tex_type;
+                        let (_, _, fast) = decode_texture_rgba8(&t);
+                        let mut slow = Vec::with_capacity(fast.len());
+                        for y in 0..h {
+                            for x in 0..w {
+                                slow.extend_from_slice(&texel_rgba_face(&t, 0, x, y));
+                            }
+                        }
+                        assert_eq!(
+                            fast, slow,
+                            "fast path differs from per-texel for format {fmt:#x} {w}x{h} \
+                             tex_type {tex_type} swizzle {chan_swizzle}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The block-wise decode path must produce EXACTLY what the per-texel path produces.
+    ///
+    /// [`decode_face_fast`] exists only to stop re-decoding each 4x4 block sixteen
+    /// times; it is not allowed to be a different decoder. The per-texel function is the
+    /// oracle, so this compares the two over every block-compressed format, both swizzled
+    /// (Morton) and linear addressing, and at sizes that are NOT multiples of the block -
+    /// the partial trailing blocks are where a block walker goes wrong.
+    #[test]
+    fn blockwise_decode_matches_per_texel() {
+        // BC1 (0x85, 8-byte blocks), BC2 (0x86) and BC3 (0x87, 16-byte blocks).
+        for &(fmt, block_bytes) in &[(0x85u32, 8usize), (0x86, 16), (0x87, 16)] {
+            for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 8), (7, 5), (13, 3)] {
+                for &tex_type in &[3u32 /* linear */, 0 /* swizzled */] {
+                    for &chan_swizzle in &[0u32, 1, 3] {
+                        let bx = w.div_ceil(4).next_power_of_two() as usize;
+                        let by = h.div_ceil(4).next_power_of_two() as usize;
+                        // Enough bytes for the padded Morton grid, filled with a pattern
+                        // that varies per byte so every endpoint and index bit differs.
+                        let n = bx * by * block_bytes + block_bytes;
+                        let pixels: Vec<u8> =
+                            (0..n).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+                        let mut t = tex(fmt, chan_swizzle, w, h, w.div_ceil(4) * block_bytes as u32, pixels);
+                        t.tex_type = tex_type;
+                        let (_, _, fast) = decode_texture_rgba8(&t);
+                        let mut slow = Vec::with_capacity(fast.len());
+                        for y in 0..h {
+                            for x in 0..w {
+                                slow.extend_from_slice(&texel_rgba_face(&t, 0, x, y));
+                            }
+                        }
+                        assert_eq!(
+                            fast, slow,
+                            "block-wise decode differs from per-texel for format {fmt:#x} \
+                             {w}x{h} tex_type {tex_type} swizzle {chan_swizzle}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole-image PVRTC decode must produce EXACTLY what the per-texel path produces.
+    ///
+    /// Same contract as the two above, over the family that carries 47% of everything a race
+    /// frame decodes. PVRTC is the awkward one: a texel reads five blocks, the upscale wraps
+    /// at the edges, and the whole-image pass walks the SHIFTED grid rather than the texel
+    /// grid - so an off-by-half-a-block there would still fill every texel, just with its
+    /// neighbour's colours. Only a comparison against the oracle catches that.
+    ///
+    /// Covers both variants (PVRTC1 `0x80`/`0x81`, PVRTC2 `0x82`/`0x83`), both bit rates
+    /// (whose blocks are 4x4 and 8x4), both addressing modes, and sizes that are not
+    /// multiples of the block, including one narrower than a single block.
+    #[test]
+    fn pvrtc_whole_image_matches_per_texel() {
+        for fmt in [0x80u32, 0x81, 0x82, 0x83] {
+            for &(w, h) in &[(8u32, 8u32), (16, 16), (32, 8), (8, 4), (12, 6), (5, 3)] {
+                for &tex_type in &[3u32 /* linear */, 0 /* swizzled */] {
+                    let variant = crate::pvrtc::Variant::from_base_format(fmt).unwrap();
+                    let (bw, bh) = variant.block_size();
+                    // Enough bytes for the padded Morton block grid, filled with a pattern
+                    // that varies per byte so the colours, the flags and every modulation
+                    // code differ block to block.
+                    let bx = w.div_ceil(bw).next_power_of_two() as usize;
+                    let by = h.div_ceil(bh).next_power_of_two() as usize;
+                    let n = (bx * by + 2) * 8;
+                    let pixels: Vec<u8> = (0..n).map(|i| ((i * 41 + 17) % 251) as u8).collect();
+                    let mut t = tex(fmt, 0, w, h, w, pixels);
+                    t.tex_type = tex_type;
+                    let (_, _, fast) = decode_texture_rgba8(&t);
+                    let mut slow = Vec::with_capacity(fast.len());
+                    for y in 0..h {
+                        for x in 0..w {
+                            slow.extend_from_slice(&texel_rgba_face(&t, 0, x, y));
+                        }
+                    }
+                    assert_eq!(
+                        fast, slow,
+                        "whole-image PVRTC decode differs from per-texel for format \
+                         {fmt:#x} {w}x{h} tex_type {tex_type}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

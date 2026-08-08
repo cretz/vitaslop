@@ -37,6 +37,13 @@ pub enum Phase {
     /// spawns/wakes a host call queued, and handling an idle tick. Deliberately NOT
     /// the resume itself: resuming runs the guest, so timing it would measure the
     /// guest. This is the part of a frame that is neither guest code nor a host call.
+    /// The equality COMPARE that decides a retained texture snapshot is still current.
+    /// Split out from [`Phase::DrawTextures`] because it is invisible in that phase's byte
+    /// counter: `note_bytes` there counts bytes RE-READ, and the whole point of the compare
+    /// is that it usually re-reads nothing - so a phase costing 44% of a race frame
+    /// reported "0.0 MB/frame" and read as pure overhead when it is a memcmp of every
+    /// bound texture, once per scene.
+    DrawTextureCompare,
     SchedOverhead,
     /// Standing up a new guest thread: with one wasm INSTANCE per thread, a spawn is a
     /// full module instantiation, not a cheap stack allocation. A title that runs its
@@ -46,7 +53,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     fn index(self) -> usize {
         match self {
@@ -56,8 +63,9 @@ impl Phase {
             Phase::DrawTextures => 3,
             Phase::DrawUniforms => 4,
             Phase::SceneFold => 5,
-            Phase::SchedOverhead => 6,
-            Phase::ThreadSpawn => 7,
+            Phase::DrawTextureCompare => 6,
+            Phase::SchedOverhead => 7,
+            Phase::ThreadSpawn => 8,
         }
     }
 
@@ -70,6 +78,7 @@ impl Phase {
             Phase::DrawTextures,
             Phase::DrawUniforms,
             Phase::SceneFold,
+            Phase::DrawTextureCompare,
             Phase::SchedOverhead,
             Phase::ThreadSpawn,
         ]
@@ -84,6 +93,7 @@ impl Phase {
             Phase::DrawTextures => "draw: snapshot textures",
             Phase::DrawUniforms => "draw: uniforms + material",
             Phase::SceneFold => "scene: signature fold",
+            Phase::DrawTextureCompare => "draw: texture snapshot compare",
             Phase::SchedOverhead => "scheduler: pick + drain",
             Phase::ThreadSpawn => "scheduler: spawn thread (instantiate)",
         }

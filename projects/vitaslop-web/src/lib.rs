@@ -130,6 +130,7 @@ async fn run_cube_scheduled() -> Result<CpuRun, JsValue> {
         inputs.base,
         artifact.mem_pages,
         artifact.mirror_off,
+        artifact.dirty_off,
         m.entry & !1,
         main_sp,
         venv,
@@ -476,6 +477,46 @@ struct LivePlayback {
     depth: wgpu::TextureView,
     render_format: wgpu::TextureFormat,
     fps: FpsMeter,
+    /// The clock `present` times itself with. `FpsMeter` owns one too, but it is behind
+    /// that type's own accounting; the render split needs four reads of its own.
+    perf: Option<web_sys::Performance>,
+    split: RenderSplit,
+}
+
+/// Where a presented frame's render time went. See [`LivePlayback::present`].
+#[derive(Default)]
+struct RenderSplit {
+    build_ms: f64,
+    encode_ms: f64,
+    /// `encode_ms` broken down by `encode_chain`'s own phases, summed over the frame.
+    prepare_ms: f64,
+    upload_ms: f64,
+    pass_ms: f64,
+    gxp_draws: u64,
+    fixed_draws: u64,
+    submit_ms: f64,
+    scenes: u64,
+    draws: u64,
+    presents: u64,
+    /// The WORST single present of the window, and what it did.
+    ///
+    /// A window mean cannot answer this title's question. Its frames range from 276 to 714
+    /// draws depending on what is on screen, so a window averaging 509 draws can be mostly
+    /// cheap frames plus two catastrophic ones - and the mean then reports a per-draw cost
+    /// that no frame in the window actually paid. The worst frame is the one to explain.
+    worst_build_ms: f64,
+    worst_draws: usize,
+    worst_work: vitaslop_runtime::render::BuildWork,
+    /// The same, for the worst present by ENCODE - which is not always the same frame as the
+    /// worst by build, and encode is the larger half now.
+    worst_encode_ms: f64,
+    worst_encode_draws: usize,
+    worst_enc_work: vitaslop_platform::gpu::EncodeWork,
+    /// The window's build work, summed here rather than read globally, so it covers exactly
+    /// the presents this window counted.
+    work: vitaslop_runtime::render::BuildWork,
+    /// What `encode_chain` DID over this window - see `vitaslop_platform::gpu::EncodeWork`.
+    enc_work: vitaslop_platform::gpu::EncodeWork,
 }
 
 /// Supersample factor for the live browser render (`VITASLOP_BROWSER_SUPERSAMPLE`).
@@ -728,6 +769,10 @@ impl LivePlayback {
             },
         );
 
+        // Give the renderer a clock BEFORE it draws anything. See `perf_now`: without this the
+        // encode phase split is zero here and reads as "encode costs nothing", on the one engine
+        // where encode is 84% of the render.
+        vitaslop_platform::gpu::set_wasm_clock(perf_now);
         let mut gxm = GxmRenderer::new(&device, &queue, render_format);
         // 2x supersample: resolve the sub-pixel-triangle / coincident-panel speckle a distant 3D
         // vehicle shows, matching the software review shots and the desktop path. The car content
@@ -736,6 +781,7 @@ impl LivePlayback {
         gxm.set_supersample(supersample());
         let depth = make_depth(&device);
         let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
+        let split_clock = Some(perf.clone());
         let fps = FpsMeter::new(perf, report);
         Ok(LivePlayback {
             surface,
@@ -746,6 +792,8 @@ impl LivePlayback {
             depth,
             render_format,
             fps,
+            perf: split_clock,
+            split: RenderSplit::default(),
         })
     }
 
@@ -766,8 +814,22 @@ impl LivePlayback {
     /// The native oracle has always gone through `encode_chain`
     /// (`vitaslop-desktop::RetailGfx::present`, `WgpuRenderer::render_frame`); this is
     /// the same call over the same renderer, which is what makes the two comparable.
+    /// # Where the time goes, and why it is split HERE
+    /// Mid-race this call costs about as much as the whole guest frame, and "render 32 ms"
+    /// names no cause: BUILD (turning captured GXM scenes into render scenes, pure Rust in
+    /// wasm), ENCODE (`encode_chain` - every pipeline, bind group, buffer write and draw,
+    /// each one a call across the wasm/JS boundary into WebGPU), and SUBMIT/PRESENT (the
+    /// queue and the swapchain) have completely different fixes, and the boundary one is
+    /// the one this project has been caught by before
+    /// [[vitaslop-browser-host-call-cost]]. Timed unconditionally - the clock is already
+    /// read either side of `present` for the perf window, so this is three more reads on a
+    /// path that costs tens of milliseconds.
     fn present(&mut self, scenes: &[Scene]) {
+        let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
+        let t0 = clock(&self.perf);
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+        let draws: usize = built.iter().map(|b| b.draws.len()).sum();
+        let t1 = clock(&self.perf);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => return,
@@ -790,9 +852,50 @@ impl LivePlayback {
             HEIGHT,
             CLEAR,
         );
+        let t2 = clock(&self.perf);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        let t3 = clock(&self.perf);
+        // `encode_chain` already splits itself over every pass of the frame - prepare (the
+        // scene walk, which for a recompiled draw creates its bind groups), upload (the
+        // arena writes) and pass (command encoding). Take that rather than reporting one
+        // opaque encode number: the three have different fixes and only `pass` scales with
+        // the wasm/JS boundary crossings per draw.
+        let ph = self.gxm.last_phases();
+        // Per PRESENT, not per window: the worst frame is the one that needs explaining, and
+        // the counters that explain it have to come from that same frame.
+        let work = vitaslop_runtime::render::take_build_work();
+        let enc_work = vitaslop_platform::gpu::take_encode_work();
+        if t1 - t0 > self.split.worst_build_ms {
+            self.split.worst_build_ms = t1 - t0;
+            self.split.worst_draws = draws;
+            self.split.worst_work = work;
+        }
+        if t2 - t1 > self.split.worst_encode_ms {
+            self.split.worst_encode_ms = t2 - t1;
+            self.split.worst_encode_draws = draws;
+            self.split.worst_enc_work = enc_work;
+        }
+        self.split.work.add_pub(&work);
+        self.split.enc_work.add(&enc_work);
+        self.split.build_ms += t1 - t0;
+        self.split.encode_ms += t2 - t1;
+        self.split.prepare_ms += ph.prepare_ms;
+        self.split.upload_ms += ph.upload_ms;
+        self.split.pass_ms += ph.pass_ms;
+        self.split.gxp_draws += ph.gxp_draws as u64;
+        self.split.fixed_draws += ph.fixed_draws as u64;
+        self.split.submit_ms += t3 - t2;
+        self.split.scenes += scenes.len() as u64;
+        self.split.draws += draws as u64;
+        self.split.presents += 1;
         self.fps.tick();
+    }
+
+    /// The render split accumulated since the last read, and reset. Reported alongside the
+    /// perf window so the two describe the same frames.
+    fn take_split(&mut self) -> RenderSplit {
+        core::mem::take(&mut self.split)
     }
 }
 
@@ -803,6 +906,25 @@ impl LivePlayback {
 fn wasm_heap_mb() -> usize {
     // 64 KiB pages, so pages/16 is megabytes.
     core::arch::wasm32::memory_size(0) / 16
+}
+
+/// `performance.now()`, as a plain `fn` the renderer can hold.
+///
+/// `vitaslop-platform` cannot reach the browser clock itself (it has no `js-sys`, on purpose -
+/// `vitaslop-runtime` depends on it for the neutral seam types), so its own phase Stopwatch
+/// read 0.0 on wasm and the whole `prepare/upload/pass` split was structurally zero here. That
+/// is what "the browser cannot split `encode`" really was: a statement about
+/// `std::time::Instant`, not about the browser. This is installed with
+/// `gpu::set_wasm_clock` and the split is measured on both engines from then on.
+///
+/// The `Performance` object is looked up ONCE and cached: it is a `Reflect::get` off the
+/// global, and this is called four times per pass on a path that runs hundreds of times a
+/// second.
+fn perf_now() -> f64 {
+    thread_local! {
+        static P: Option<web_sys::Performance> = global_performance();
+    }
+    P.with(|p| p.as_ref().map(|p| p.now()).unwrap_or(0.0))
 }
 
 /// The `performance` clock from whichever global we run in - `window.performance` on
@@ -925,6 +1047,7 @@ struct Prebuilt {
     module: js_sys::WebAssembly::Module,
     mem_pages: u32,
     mirror_off: Option<u64>,
+    dirty_off: Option<u64>,
 }
 
 impl Prebuilt {
@@ -948,7 +1071,17 @@ impl Prebuilt {
         } else {
             Some(mirror.as_f64().ok_or_else(|| JsValue::from_str("bad prebuilt.mirrorOff"))? as u64)
         };
-        Ok(Some(Prebuilt { module, mem_pages, mirror_off }))
+        // The guest-store dirty map. Absent is a legitimate answer here (a module built
+        // without tracking has none), so unlike the two above it is not an error - what
+        // would be an error is treating a missing map as "nothing was written", which is
+        // why it travels as an Option all the way to `GuestMemory::dirty_since`.
+        let dirty = get("dirtyOff")?;
+        let dirty_off = if dirty.is_null() || dirty.is_undefined() {
+            None
+        } else {
+            Some(dirty.as_f64().ok_or_else(|| JsValue::from_str("bad prebuilt.dirtyOff"))? as u64)
+        };
+        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off }))
     }
 }
 
@@ -957,6 +1090,7 @@ struct Transpiled {
     wasm: Vec<u8>,
     mem_pages: u32,
     mirror_off: Option<u64>,
+    dirty_off: Option<u64>,
     ms: f64,
 }
 
@@ -972,12 +1106,20 @@ fn transpile_here(
     // Native does not do this: wasmtime interrupts a thread on real fuel, so its module
     // stays free of the counter entirely.
     vitaslop_transpiler::set_fuel_interval(browser_sched::fuel_interval());
+    // And ask it to stamp guest STORES, which lets the capture prove a texture is
+    // unchanged without comparing its bytes (`TextureSnapshots`) - 40% of a race frame
+    // on the desktop, and about half the browser's guest CPU. Emitted unbilled, so the
+    // game clock cannot tell the difference. Native does not do this either: wasmtime
+    // bills every operator it executes, so the stamps would speed its clock up.
+    vitaslop_transpiler::set_dirty_tracking(true);
     let t = perf.now();
     let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
     let ms = perf.now() - t;
     web_sys::console::log_1(&JsValue::from_str(&format!(
-        "[setup] transpiled wasm {} MB, guest memory {} MB, emulator heap {} MB",
+        "[setup] transpiled wasm {} MB, {} functions (the per-instance funcref table), \
+         guest memory {} MB, emulator heap {} MB",
         built.artifact.wasm.len() / (1024 * 1024),
+        built.artifact.funcs.len(),
         linked.mem_bytes / (1024 * 1024),
         wasm_heap_mb(),
     )));
@@ -985,6 +1127,7 @@ fn transpile_here(
         wasm: built.artifact.wasm,
         mem_pages: built.artifact.mem_pages,
         mirror_off: built.artifact.mirror_off,
+        dirty_off: built.artifact.dirty_off,
         ms,
     })
 }
@@ -1010,6 +1153,14 @@ pub async fn transpile_title(source: JsValue) -> Result<JsValue, JsValue> {
         &out,
         &JsValue::from_str("mirrorOff"),
         &match built.mirror_off {
+            Some(v) => JsValue::from_f64(v as f64),
+            None => JsValue::NULL,
+        },
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("dirtyOff"),
+        &match built.dirty_off {
             Some(v) => JsValue::from_f64(v as f64),
             None => JsValue::NULL,
         },
@@ -1194,19 +1345,19 @@ async fn setup_game(
     //
     // Built in a throwaway worker instead, the peak dies with that worker and only the
     // compiled `WebAssembly.Module` crosses over (it is structured-cloneable).
-    let (module, mem_pages, mirror_off, transpile_ms) = match prebuilt {
+    let (module, mem_pages, mirror_off, dirty_off, transpile_ms) = match prebuilt {
         Some(p) => {
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[setup] using a PREBUILT module (transpiled in a throwaway worker); \
                  emulator heap {} MB",
                 wasm_heap_mb()
             )));
-            (p.module, p.mem_pages, p.mirror_off, 0.0)
+            (p.module, p.mem_pages, p.mirror_off, p.dirty_off, 0.0)
         }
         None => {
             let built = transpile_here(&linked, &perf)?;
             let module = browser_sched::compile_module(&built.wasm).await?;
-            (module, built.mem_pages, built.mirror_off, built.ms)
+            (module, built.mem_pages, built.mirror_off, built.dirty_off, built.ms)
         }
     };
 
@@ -1217,6 +1368,7 @@ async fn setup_game(
         linked.base,
         mem_pages,
         mirror_off,
+        dirty_off,
         &linked.module_inits,
         main_sp,
         env,
@@ -1445,6 +1597,28 @@ async fn live_loop(
     let mut acc = 0.0f64;
     let mut last = now();
     let mut last_console = 0.0f64;
+    // What the previous whole ITERATION cost - one guest frame plus the render that followed it.
+    //
+    // The pacing decision needs to know whether this machine is keeping up, and the guest half
+    // alone answers a different question. On the desktop the guest frame is 14.7 ms, inside a
+    // 16.7 ms budget, while the render adds 6.5 - so by the guest figure it is keeping up and by
+    // the real one it is not, and it spent the difference dropping presents that bought it
+    // nothing. Starts at 0 so the first tick is free to catch up: the boot frame is enormous and
+    // would otherwise pin the loop to one frame per tick for the rest of the run.
+    let mut last_iter_ms = 0.0f64;
+    // Whether this run was started with debug capture on (`VITASLOP_DEBUG_CAPTURE`). Read ONCE,
+    // here: it decides whether the expensive instruments record for the whole run, and a run that
+    // changed its own instrumentation part-way would publish two incomparable halves.
+    let debug_capture = vitaslop_runtime::knobs::flag("VITASLOP_DEBUG_CAPTURE");
+    if debug_capture {
+        browser_sched::set_host_call_timing(true);
+        vitaslop_runtime::vita::set_callsite_profiling(true);
+        web_sys::console::log_1(&JsValue::from_str(
+            "[perf] DEBUG CAPTURE is on: host calls are timed and profiled by NID. This costs \
+             roughly a doubling of the guest frame cost - the ratios it reports are valid, the \
+             absolute frame times are not.",
+        ));
+    }
 
     'run: loop {
         next_tick().await;
@@ -1473,9 +1647,34 @@ async fn live_loop(
         // Advance as many whole 60 Hz frames as wall time has accrued (usually one),
         // keeping only the newest scene to present - so the GPU present rate follows the
         // display/tick rate, not the catch-up count.
+        //
+        // # Catch-up is only catch-up when the guest can keep up
+        // Running N frames per tick and presenting once trades visible frame rate for guest
+        // progress, and that trade is only available to a machine that is AHEAD. On one that is
+        // behind, `acc` saturates at `MAX_CATCHUP_MS` every single tick, so the loop
+        // permanently runs the maximum number of frames and permanently discards all but one
+        // present - it never catches up, because there is nothing to catch up to.
+        //
+        // MEASURED on a phone (PowerVR D-series, one title's main screen): 72.8 ms of guest CPU
+        // per frame against a 13.2 ms render. Four frames per tick made that 4 presents/s while
+        // the guest advanced at 14 - so skipping three presents bought 11% of guest speed and
+        // cost three quarters of the frame rate the user could see. One frame per tick shows all
+        // 14. So the catch-up count is capped by whether the last frame FIT in its budget: a
+        // fast machine still catches up after a hitch, a slow one stops paying for a catch-up it
+        // cannot have.
+        //
+        // Fast-forward is exempt: it presents NOTHING by design, so there is no frame rate to
+        // protect and running as many frames per tick as the budget allows is its entire job.
         let mut latest = None;
-        while acc >= FRAME_MS {
+        let mut frames_this_tick = 0u32;
+        // `1` is not a special case - it is what this evaluates to whenever the guest is slower
+        // than real time, which is the whole point. Named `_per_tick` because the run's own
+        // frame LIMIT is also called `max_frames` in this scope, and shadowing it here would
+        // silently end the run at the first tick.
+        let max_frames_per_tick = if fast || last_iter_ms <= FRAME_MS { u32::MAX } else { 1 };
+        while acc >= FRAME_MS && frames_this_tick < max_frames_per_tick {
             acc -= FRAME_MS;
+            frames_this_tick += 1;
             // Run to exactly one more display flip (the frame counter is cumulative
             // across calls, so `frames + 1` advances by a single frame).
             let target = sched.core.frames() + 1;
@@ -1555,6 +1754,8 @@ async fn live_loop(
                     )));
                 }
             }
+            // The guest half now; the render this iteration pays is added after `present` below.
+            last_iter_ms = c1 - c0;
             if frames > WARMUP_FRAMES {
                 cpu_ms += c1 - c0;
                 cpu_frames += 1;
@@ -1623,12 +1824,20 @@ async fn live_loop(
                     (q, f, host.state.now_us(), from_q, from_idle)
                 };
                 let (preempts, on_fuel) = browser_sched::preemption_stats();
+                // Instances INSTANTIATED against instances reused from the pool. A title
+                // that creates a guest thread per frame instantiates the whole transpiled
+                // module per frame without the pool, and each instance is a funcref table
+                // with an entry per translated function - which is what killed the
+                // renderer at frame 22. `created` going flat while `reused` climbs is the
+                // only evidence that the pool is doing its job.
+                let (inst_new, _pooled, inst_reused) = browser_sched::instance_stats();
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[live] {status} | clock {:.2}s over {flips} flips ({quanta} quanta, \
                      {:.1} us/frame; {:.2}s quanta + {:.2}s idle) \
                      | preempt {preempts} ({on_fuel} on fuel) | wasm heap {} MB \
                      | jspi {susp} susp, {starts} stacks, {abandoned} abandoned, \
-                     {released} released | threads {live_threads} live, {finished_threads} finished",
+                     {released} released | instances {inst_new} new, {inst_reused} reused \
+                     | threads {live_threads} live, {finished_threads} finished",
                     clock_us as f64 / 1e6,
                     if flips > 0 { clock_us as f64 / flips as f64 } else { 0.0 },
                     clk_q as f64 / 1e6,
@@ -1700,6 +1909,9 @@ async fn live_loop(
             let r0 = now();
             playback.present(&scene);
             let r1 = now();
+            // A present belongs to the iteration that produced it, so the pacing decision for the
+            // NEXT tick sees the true cost of this one.
+            last_iter_ms += r1 - r0;
             if sched.core.frames() > WARMUP_FRAMES {
                 render_ms += r1 - r0;
                 presents += 1;
@@ -1708,22 +1920,169 @@ async fn live_loop(
                 let cpu_avg = if cpu_frames > 0 { cpu_ms / cpu_frames as f64 } else { 0.0 };
                 let render_avg = render_ms / presents as f64;
                 let cpu_fps = if cpu_avg > 0.0 { 1000.0 / cpu_avg } else { 0.0 };
+                // ...and WHERE the render time went. "render 32 ms" names no cause, and
+                // the three parts have three different fixes: build is Rust in wasm,
+                // encode is one wasm/JS boundary crossing per WebGPU call (so it scales
+                // with the DRAW COUNT, which is printed next to it), and submit is the
+                // queue and swapchain.
+                let s = playback.take_split();
+                let np = s.presents.max(1) as f64;
+                // `encode_chain` splits ITSELF into prepare / upload / pass, and it can do
+                // that here now: the renderer holds `performance.now()` (see `perf_now`),
+                // where it used to hold a `std::time::Instant` that does not exist on wasm32
+                // and so reported zero for every phase. A zero split read as "encode costs
+                // nothing anywhere" on the engine where encode is most of the render, so if
+                // the clock is ever NOT installed this says which case it is rather than
+                // publishing the zeros.
+                let inner = if !vitaslop_platform::gpu::wasm_clock_installed() {
+                    " (no inner split: no wasm clock installed - see gpu::set_wasm_clock)"
+                        .to_string()
+                } else {
+                    format!(
+                        " (prepare {:.1}, upload {:.1}, pass {:.1})",
+                        s.prepare_ms / np,
+                        s.upload_ms / np,
+                        s.pass_ms / np
+                    )
+                };
+                // Guest frames per PRESENT, stated rather than left to be inferred.
+                //
+                // The `fps` meter counts PRESENTS. The cpu figure is per GUEST FRAME. When the
+                // loop runs more than one guest frame per present those are different rates, and
+                // reading one against the other produces a phantom: 72.8 + 13.2 ms of measured
+                // work against a 4 fps display looks like 150 ms a frame going somewhere
+                // unaccounted, when really the loop ran four guest frames and presented once.
+                // This ratio is the whole explanation and it costs one number.
+                let per_present = cpu_frames as f64 / np;
                 let perf_line = format!(
-                    "cpu {cpu_avg:.1} ms/frame ({cpu_fps:.0} fps uncapped) | render {render_avg:.1} ms"
+                    "cpu {cpu_avg:.1} ms/frame ({cpu_fps:.0} fps uncapped, {per_present:.1} \
+                     guest frames per present) | render \
+                     {render_avg:.1} ms = build {:.1} + encode {:.1}{inner} + submit {:.1} \
+                     over {:.0} scenes / {:.0} draws ({:.0} gxp, {:.0} fixed)",
+                    s.build_ms / np,
+                    s.encode_ms / np,
+                    s.submit_ms / np,
+                    s.scenes as f64 / np,
+                    s.draws as f64 / np,
+                    s.gxp_draws as f64 / np,
+                    s.fixed_draws as f64 / np,
                 );
                 report.emit("perf", &perf_line);
-                // Also on the console, with the frame it describes.
+                // Everything below also goes to a `diag` element on the PAGE, not only to the
+                // console.
                 //
-                // The perf element holds only the LATEST window, so a run's rate can only
-                // ever be read at the instant someone looks. A title's cost varies by an
-                // order of magnitude between a menu and a race, so "the browser runs at N
-                // fps" is meaningless without saying which frame N was measured over -
-                // and a single end-of-run reading silently answers for whatever screen
-                // the run happened to stop on.
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "[perf] frame {} | {perf_line}",
-                    sched.core.frames()
-                )));
+                // # Why the console is not enough
+                // The console is unreachable on the device this most needs to be read on. Every
+                // counter in this file was console-only, so a phone - the actual target, and the
+                // only machine whose numbers are not a proxy - could show a frame rate and
+                // nothing that explains it. A run whose diagnostics require a USB cable and
+                // remote debugging is a run nobody profiles.
+                let mut diag = String::new();
+                let frame_no = sched.core.frames();
+                // Emit one diagnostic line to BOTH sinks: the console (which a harness reads and
+                // which keeps the frame number next to every line) and the page's `diag` element
+                // (which is the only one a phone can show).
+                // Each line carries a TAG saying which measurement it is.
+                //
+                // Without one the panel reads as duplicated output, and was reported as such:
+                // `BuildWork::line` and `EncodeWork::line` are reused for the window MEAN and for
+                // the WORST single frame, so their identical `build work/frame:` prefix appears
+                // twice in a row (three times counting the decode tally), and three near-identical
+                // 400-character lines look like the same line printed three times rather than
+                // three different frames.
+                let mut line = |diag: &mut String, tag: &str, text: &str| {
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "[perf] frame {frame_no} | {tag} | {text}"
+                    )));
+                    diag.push_str(tag);
+                    diag.push('\n');
+                    diag.push_str(text);
+                    diag.push_str("\n\n");
+                };
+                line(&mut diag, "RENDER SPLIT", &perf_line);
+                // ...and WHAT `build` did to cost that, in counts rather than milliseconds.
+                // `build` is the largest part of the render half here and there is no
+                // `Instant` inside it on wasm32, so the only portable instrument is the
+                // work itself. See `vitaslop_runtime::render::BuildWork`.
+                let (bg_hit, bg_new) = vitaslop_platform::gpu::take_sampler_bg_counts();
+                line(
+                    &mut diag,
+                    "BUILD, window mean",
+                    &format!(
+                        "{} | sampler bind groups {:.1} reused / {:.1} BUILT",
+                        s.work.line(s.presents.max(1)),
+                        bg_hit as f64 / np,
+                        bg_new as f64 / np,
+                    ),
+                );
+                // ...and WHAT `encode` did, in the same units the desktop prints, for the same
+                // reason: `encode` is the larger half of the render here and its three phases
+                // are timed but not attributed. Bytes and call counts say whether it is upload
+                // volume or per-call boundary overhead, which a millisecond never can.
+                line(&mut diag, "ENCODE, window mean", &s.enc_work.line(s.presents.max(1)));
+                // The single worst present of the window, with ITS OWN counters. A mean over
+                // frames that differ by 2.5x in draw count describes none of them.
+                line(
+                    &mut diag,
+                    "BUILD, the single WORST frame of the window",
+                    &format!(
+                        "{:.1} ms over {} draws | {}",
+                        s.worst_build_ms,
+                        s.worst_draws,
+                        s.worst_work.line(1),
+                    ),
+                );
+                line(
+                    &mut diag,
+                    "ENCODE, the single WORST frame of the window",
+                    &format!(
+                        "{:.1} ms over {} draws | {}",
+                        s.worst_encode_ms,
+                        s.worst_encode_draws,
+                        s.worst_enc_work.line(1),
+                    ),
+                );
+                // What the decoder spent its bytes on, cumulative for the run. This decides
+                // whether a compressed upload path is worth building - see `decode_by_format`.
+                line(
+                    &mut diag,
+                    "TEXTURE DECODE by format, cumulative for the run",
+                    &vitaslop_runtime::render::decode_by_format_line(),
+                );
+                // WHICH host calls, when the profiler is on. The count and the total cost are
+                // already in the status line; neither says which NIDs they are, and the only way
+                // to spend less at the boundary is to cross it fewer times. Cumulative from
+                // boot, so two readings a known number of frames apart give calls per frame.
+                //
+                // LAST, because it is the longest by far - so the shorter lines are readable on a
+                // phone without scrolling past a 25-entry histogram to reach them.
+                // The EXPENSIVE instruments, only when the run was started with debug capture on.
+                //
+                // # Why this is a decision made before the run, and never automatic
+                // Per-call timing and the call-site profiler each roughly double a frame's cost
+                // on a phone: the first reads the clock twice per host call, the second scans the
+                // guest stack once. An earlier version of this sampled them automatically - on
+                // for one window in eight - which is cheaper but is still profiling machinery
+                // running in a production run by default, deciding for the user that a permanent
+                // eighth of their frame budget belongs to diagnostics. It does not. Debug capture
+                // is asked for, or it does not happen.
+                if debug_capture {
+                    let (calls, total, handler, marshal) = browser_sched::host_call_split();
+                    line(
+                        &mut diag,
+                        "HOST CALLS, handler vs marshalling, cumulative",
+                        &format!(
+                            "{calls} timed, {total:.0} ms ({:.2} us/call) = \
+                             {handler:.0} ms handler + {marshal:.0} ms register marshalling \
+                             ({:.0}% marshalling). NOTE debug capture inflates the frame cost; \
+                             the RATIO is the reading, not the total.",
+                            if calls > 0 { total * 1000.0 / calls as f64 } else { 0.0 },
+                            if total > 0.0 { marshal * 100.0 / total } else { 0.0 },
+                        ),
+                    );
+                    line(&mut diag, "HOST CALLS by NID, cumulative", &vitaslop_runtime::vita::call_sites_report(20));
+                }
+                report.emit("diag", &diag);
                 cpu_ms = 0.0;
                 cpu_frames = 0;
                 render_ms = 0.0;

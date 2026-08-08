@@ -154,6 +154,9 @@ pub struct Vm {
     store: Store<Host>,
     instance: Instance,
     base: u32,
+    /// Linear-memory offset of the host-mirror block, when this program inlined any
+    /// read of it. See [`Vm::mirror_off`].
+    mirror_off: Option<u64>,
 }
 
 /// The result of a fuel-bounded guest call ([`Vm::call_bounded`]).
@@ -180,30 +183,54 @@ impl Vm {
         mem_bytes: u32,
         host_abi: &HostAbi,
     ) -> Result<Vm, RunError> {
-        let artifact = transpiler::transpile(&transpiler::Program {
-            code,
-            base,
-            thumb,
-            entries,
-            arm_entries: &[],
-            externs,
-            redirects: &[],
-            // Raw-image entry point: no NID import table, nothing known inlinable.
-            inline_imports: &[],
-            noreturn_svc: host_abi.noreturn_svc,
-            mem_bytes,
-            // Vita modules take function addresses (thread entries, GXM
-            // callbacks); discover them. Safe for the ARM corpus too - those
-            // cases materialize no code pointers, so the closure is unchanged.
-            discover_code_pointers: true,
-            // The single-instance `Vm` defines its own memory.
-            import_memory: false,
-        })?;
+        Vm::from_program(
+            &transpiler::Program {
+                code,
+                base,
+                thumb,
+                entries,
+                arm_entries: &[],
+                externs,
+                redirects: &[],
+                // Raw-image entry point: no NID import table, nothing known inlinable.
+                inline_imports: &[],
+                noreturn_svc: host_abi.noreturn_svc,
+                mem_bytes,
+                // Vita modules take function addresses (thread entries, GXM
+                // callbacks); discover them. Safe for the ARM corpus too - those
+                // cases materialize no code pointers, so the closure is unchanged.
+                discover_code_pointers: true,
+                // The single-instance `Vm` defines its own memory.
+                import_memory: false,
+            },
+            host_abi,
+        )
+    }
+
+    /// Transpile and instantiate an arbitrary [`transpiler::Program`].
+    ///
+    /// The general seam [`Vm::new`] is a preset of. It exists because a `Program`
+    /// field that no constructor can set is a field nothing can test: inline imports
+    /// in particular are emitted as hand-written wasm, and their only other check is
+    /// that the module validates - which proves the code is well formed, not that it
+    /// computes the right answer.
+    ///
+    /// # The host-mirror contract is the CALLER's here
+    /// Unlike [`Vm::from_linked`], this does not refuse a program that inlines mirror
+    /// reads, because a caller that builds its own `Program` is in a position to honour
+    /// the contract itself - [`Vm::mirror_off`] says where to write. A caller that
+    /// neither refreshes the block nor means to is serving the guest a frozen clock.
+    pub fn from_program(
+        program: &transpiler::Program,
+        host_abi: &HostAbi,
+    ) -> Result<Vm, RunError> {
+        let artifact = transpiler::transpile(program)?;
 
         // Validate first for a precise error (wasmtime only names the function).
         wasmparser::validate(&artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
 
+        let base = program.base;
         let engine = Engine::default();
         let module = Module::from_binary(&engine, &artifact.wasm)?;
         let mut store = Store::new(
@@ -226,10 +253,17 @@ impl Vm {
         // Record the instance so an import handler can re-enter guest code.
         store.data_mut().instance = Some(instance);
 
-        let mut vm = Vm { store, instance, base };
-        vm.write_mem(base, code)?;
-        vm.set_reg(abi::SP, base.wrapping_add(mem_bytes));
+        let mut vm = Vm { store, instance, base, mirror_off: artifact.mirror_off };
+        vm.write_mem(base, program.code)?;
+        vm.set_reg(abi::SP, base.wrapping_add(program.mem_bytes));
         Ok(vm)
+    }
+
+    /// Linear-memory offset of the host-mirror block, when this program inlined any
+    /// read of it. Slot `n` is the word at `mirror_off + n * 4`; the GUEST address to
+    /// write it through is `base + mirror_off`.
+    pub fn mirror_off(&self) -> Option<u64> {
+        self.mirror_off
     }
 
     /// Like [`Vm::new`] but transpiles a single module *leniently*: a function
@@ -287,7 +321,7 @@ impl Vm {
         let instance = linker.instantiate(&mut store, &module)?;
         store.data_mut().instance = Some(instance);
 
-        let mut vm = Vm { store, instance, base };
+        let mut vm = Vm { store, instance, base, mirror_off: built.artifact.mirror_off };
         vm.write_mem(base, code)?;
         vm.set_reg(abi::SP, base.wrapping_add(mem_bytes));
         Ok((vm, built.stubbed))
@@ -343,7 +377,11 @@ impl Vm {
         let instance = linker.instantiate(&mut store, &module)?;
         store.data_mut().instance = Some(instance);
 
-        let mut vm = Vm { store, instance, base: linked.base };
+        // `from_linked` refused a mirror-inlining program above, so this is always None
+        // here - carried rather than hardcoded so the refusal stays the single place that
+        // decides it.
+        let mut vm =
+            Vm { store, instance, base: linked.base, mirror_off: built.artifact.mirror_off };
         vm.write_mem(linked.base, &linked.image)?;
         vm.set_reg(abi::SP, linked.base.wrapping_add(linked.mem_bytes));
         // Report stubs as (guest addr, wasm function index) so a trap backtrace can

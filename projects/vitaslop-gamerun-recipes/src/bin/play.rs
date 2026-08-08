@@ -35,9 +35,10 @@ use vitaslop_runtime::Recipe;
 
 fn main() -> ExitCode {
     // Surface the engine's `tracing` diagnostics on stderr (the report goes to stdout,
-    // so the two stay separable). Without this, RUST_LOG is accepted and ignored.
+    // so the two stay separable). Without this the filter is accepted and ignored.
+    // `VITASLOP_LOG` first, `RUST_LOG` as the fallback - see `knobs::log_filter`.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(vitaslop_runtime::knobs::log_filter()))
         .with_writer(std::io::stderr)
         .try_init();
     let args: Vec<String> = std::env::args().collect();

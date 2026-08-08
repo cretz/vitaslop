@@ -42,7 +42,7 @@ use vitaslop_runtime::{nid, Recipe};
 
 fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(vitaslop_runtime::knobs::log_filter()))
         .with_writer(std::io::stderr)
         .try_init();
 
@@ -147,6 +147,14 @@ fn main() -> ExitCode {
     perf::reset();
     vitaslop_runtime::perf::reset();
     let rounds_before = sched.rounds_total();
+    // The GAME CLOCK and the FUEL over the window, not over the run. Both are the numbers
+    // the emulator charges the title for, and both are dominated by boot when read over a
+    // whole run - which is the mistake that made one title look seven times faster than
+    // another when the two were measuring different things
+    // [[vitaslop-compare-like-windows]]. Taken here they describe the screen `--at` names,
+    // which is the only place a "this title costs 4x" claim means anything.
+    let clock_before = sched.host().state.now_us();
+    let (fuel_before, samples_before, _) = sched.fuel_report();
     let mut frame_ms: Vec<f64> = Vec::with_capacity(frames as usize);
     let window = std::time::Instant::now();
     let target = sched.frames() + frames;
@@ -167,8 +175,30 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let rounds = sched.rounds_total() - rounds_before;
-    report(&frame_ms, window_s, rounds, &sched, top, json);
+    let clock_us = sched.host().state.now_us().saturating_sub(clock_before);
+    let (fuel_after, samples_after, fuel_max) = sched.fuel_report();
+    let win = Window {
+        clock_us,
+        fuel: fuel_after - fuel_before,
+        suspends: samples_after - samples_before,
+        fuel_max,
+    };
+    report(&frame_ms, window_s, rounds, &sched, top, json, &win);
     ExitCode::SUCCESS
+}
+
+/// What the emulator CHARGED the guest over the measured window, as opposed to what the
+/// window cost the host. `frame_ms` is the host's cost; these are the device's.
+struct Window {
+    /// Game clock advanced, in microseconds.
+    clock_us: u64,
+    /// Fuel burned - wasm operators executed by translated guest code.
+    fuel: u64,
+    /// Suspends the fuel was sampled over.
+    suspends: u64,
+    /// Largest single burn seen in the RUN. A burn above the preemption interval means the
+    /// reading is broken, not that the title is busy, so it is carried as the falsifier.
+    fuel_max: u64,
 }
 
 /// Percentile of an unsorted sample (nearest rank on the sorted copy).
@@ -186,6 +216,7 @@ fn report(
     sched: &ThreadedScheduler<VitaEnv>,
     top: usize,
     json: bool,
+    win: &Window,
 ) {
     let p50 = pct(frame_ms, 0.50);
     let total_ms = window_s * 1000.0;
@@ -200,6 +231,27 @@ fn report(
         pct(frame_ms, 1.0),
         total_ms / frame_ms.len() as f64
     );
+
+    // What the DEVICE was charged, per frame of the measured window. A console frame is
+    // 16,667 us, so `clock/frame` divided by that IS the title's clock ratio on this
+    // screen - the number every "PCSA00027 costs 4x" claim is about, measured where the
+    // claim applies instead of averaged over a boot.
+    let n = frame_ms.len() as f64;
+    println!(
+        "bench: guest clock - {:.1} ms/frame charged ({:.2}x a 60 Hz console frame), \
+         fuel {:.1} M/frame over {} suspends (mean {}, max {}, interval {})",
+        win.clock_us as f64 / 1000.0 / n,
+        win.clock_us as f64 / n / (1_000_000.0 / 60.0),
+        win.fuel as f64 / 1e6 / n,
+        win.suspends,
+        if win.suspends == 0 { 0 } else { win.fuel / win.suspends },
+        win.fuel_max,
+        vitaslop_runtime::host::QUANTUM_FUEL,
+    );
+
+    // What `RenderSceneBuilder::build` did, in the same units the browser reports, so the
+    // two engines' build cost is comparable without comparing two machines' clocks.
+    println!("bench: {}", vitaslop_runtime::render::take_build_work().line(frame_ms.len() as u64));
 
     println!(
         "bench: scheduler - {rounds} thread resumes ({:.0} per frame, one per {:.0} host calls)",
@@ -308,14 +360,18 @@ fn report(
     if json {
         println!(
             "BENCHJSON {{\"frames\":{},\"p50_ms\":{:.3},\"p95_ms\":{:.3},\"mean_ms\":{:.3},\
-             \"window_s\":{:.3},\"host_calls\":{},\"import_pct\":{:.2}}}",
+             \"window_s\":{:.3},\"host_calls\":{},\"import_pct\":{:.2},\
+             \"clock_ms_per_frame\":{:.3},\"clock_ratio\":{:.3},\"fuel_per_frame\":{}}}",
             frame_ms.len(),
             pct(frame_ms, 0.50),
             pct(frame_ms, 0.95),
             total_ms / frame_ms.len() as f64,
             window_s,
             host_calls,
-            import_pct
+            import_pct,
+            win.clock_us as f64 / 1000.0 / n,
+            win.clock_us as f64 / n / (1_000_000.0 / 60.0),
+            (win.fuel as f64 / n) as u64,
         );
     }
 }

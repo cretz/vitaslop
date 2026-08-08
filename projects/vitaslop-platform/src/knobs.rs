@@ -39,8 +39,27 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_BROWSER_FASTFORWARD",
     "VITASLOP_BROWSER_FUEL",
     "VITASLOP_BROWSER_HEARTBEAT_MS",
+    // Whether a finished guest thread's module instance may be reused. On by default and
+    // overridable because it is the single variable that decides whether a title creating
+    // a thread per frame instantiates the whole module sixty times a second.
+    "VITASLOP_BROWSER_INSTANCE_POOL",
     "VITASLOP_BROWSER_QUANTUM_CALLS",
     "VITASLOP_BROWSER_SUPERSAMPLE",
+    // The per-NID / per-call-site host-call histogram. Reachable from the browser because that
+    // is where the host-call boundary costs the most: a phone spends roughly 16 ms of a 56 ms
+    // guest frame on ~4,950 calls, and the only way to spend less is to make fewer of them -
+    // which needs to know WHICH ones. Read through this seam rather than `std::env` for exactly
+    // that reason; see `vitaslop_runtime::vita::DBG_CALLSITES`.
+    "VITASLOP_DBG_CALLSITES",
+    // ONE switch for every expensive instrument, chosen before a run starts and never turned on
+    // by anything but a human asking for it. The individual knobs above and `VITASLOP_PERF` below
+    // still exist for a harness that wants exactly one of them; this is what a person picks, and
+    // its default of OFF is the point - profiling machinery does not belong in an ordinary run.
+    "VITASLOP_DEBUG_CAPTURE",
+    // Budget for the decoded-texture cache, in MB. Reachable from the browser because that
+    // is where outgrowing it costs the most: a wholesale clear there re-decodes hundreds of
+    // textures inside one frame's `build`.
+    "VITASLOP_DECODE_CACHE_MB",
     "VITASLOP_FRAME_TOPUP",
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
@@ -60,6 +79,18 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_ZFIX",
     "VITASLOP_LOG",
     "VITASLOP_PERF",
+    // Whether PVRTC decodes a whole face at a time or one texel at a time. Reachable from
+    // the browser because that is where PVRTC decode volume costs the most, so that is where
+    // the exactness falsifier has to be runnable.
+    "VITASLOP_PVRTC_DECODE",
+    // Byte budget for retained texture snapshots. Reachable from the browser because
+    // exceeding it there costs a full re-decode of the working set in one frame.
+    "VITASLOP_SNAPSHOT_BUDGET_MB",
+    // How often a retained texture snapshot is re-checked against guest memory: `scene`
+    // (the default, exact) or `frame` (faster, one scene of staleness the first time a
+    // texture changes). Reachable from the browser because that is where the check costs
+    // the most.
+    "VITASLOP_TEXTURE_CHECK",
     "VITASLOP_TEX_CACHE_MB",
 ];
 
@@ -84,6 +115,31 @@ pub fn var_os(name: &str) -> Option<String> {
         return Some(v.clone());
     }
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// The `tracing` filter directive every vitaslop binary installs: `VITASLOP_LOG` if it is set
+/// and non-empty, else `RUST_LOG`, else nothing.
+///
+/// `VITASLOP_LOG` is the primary name because it is the only one that works on BOTH engines:
+/// the browser has no environment to read and takes its knobs through the override table
+/// above, which is keyed by `VITASLOP_*` names. Every note and repro command in this project
+/// is written against it, so a desktop binary answering only to `RUST_LOG` turns a documented
+/// invocation into silence - which is indistinguishable from a diagnostic that never fires,
+/// and that is exactly how it was found. `RUST_LOG` still works, for the ordinary Rust habit.
+pub fn log_filter() -> String {
+    match var("VITASLOP_LOG") {
+        Ok(v) if !v.is_empty() => v,
+        _ => match std::env::var("RUST_LOG") {
+            Ok(v) if !v.is_empty() => v,
+            // WARN by default, not silence. Everything this engine approximates is required
+            // to report itself - a shader pair that falls back to fixed-function, a dropped
+            // draw, an unplaced scene - and those reports are `warn`. With an empty filter
+            // they were all discarded, so the DEFAULT invocation was the one that could not
+            // see them: a run that quietly drew a whole title through the fallback looked
+            // exactly like a run that recompiled it. A knob nobody sets is not a report.
+            _ => "warn".to_string(),
+        },
+    }
 }
 
 /// A presence flag: set (to anything, including the empty string) means on.

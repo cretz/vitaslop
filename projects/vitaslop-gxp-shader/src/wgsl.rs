@@ -351,6 +351,27 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
         }
         return Some(e);
     }
+    // An inline IMMEDIATE is a scalar literal, not a register file: spec A.7 says the operand's
+    // number IS the value, "typed per the operand's DataType", so it is the NUMBER `num` and not
+    // a bit pattern to reinterpret. Every channel whose selector names a lane reads that same
+    // scalar - there are no other lanes to read - and selectors 4..7 are the ordinary swizzle
+    // constants, which is how one operand supplies a mixed vector like `(1, 1, num, num)`.
+    if matches!(op.bank, Bank::Immediate) {
+        let mut e = match op.swizzle[c] {
+            4 => "0.0".to_string(),
+            5 => "1.0".to_string(),
+            6 => "2.0".to_string(),
+            7 => "0.5".to_string(),
+            _ => format!("{:?}", op.index as f32),
+        };
+        if op.abs {
+            e = format!("abs({e})");
+        }
+        if op.neg {
+            e = format!("(-{e})");
+        }
+        return Some(e);
+    }
     let prefix = bank_prefix(op.bank)?;
     let sel = op.swizzle[c];
     let mut e = match sel {
@@ -1378,6 +1399,19 @@ fn emit_tex(
         TexLod::Implicit => ("textureSample", String::new()),
         TexLod::Bias => ("textureSampleBias", format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?)),
         TexLod::Level => ("textureSampleLevel", format!(", {}", src_channel(instr.srcs.get(1)?, 0, Prec::F32)?)),
+        // The gradient form supplies BOTH derivatives from src2, packed one after the other:
+        // for a 2D sample components 0,1 are ddx and 2,3 are ddy (spec E0.4). They are
+        // vectors of the same arity as the coordinate, so a 3D sample would take 3 and 3 -
+        // the decoder blocks that case rather than guess where the second vector starts.
+        TexLod::Gradient => {
+            let g = instr.srcs.get(1)?;
+            let (ddx0, ddx1) = (src_channel(g, 0, Prec::F32)?, src_channel(g, 1, Prec::F32)?);
+            let (ddy0, ddy1) = (src_channel(g, 2, Prec::F32)?, src_channel(g, 3, Prec::F32)?);
+            (
+                "textureSampleGrad",
+                format!(", vec2<f32>({ddx0}, {ddx1}), vec2<f32>({ddy0}, {ddy1})"),
+            )
+        }
     };
     if coords >= 3 {
         let cy = src_channel(coord, 1, cp)?;

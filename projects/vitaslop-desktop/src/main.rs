@@ -37,9 +37,14 @@ const HEIGHT: u32 = 544;
 const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 fn main() {
-    // Surface the runtime's `tracing` diagnostics (RUST_LOG=vitaslop::io=trace, ...).
+    // Surface the runtime's `tracing` diagnostics (`vitaslop::io=trace`, `vitaslop::gxm=debug`,
+    // ...).
+    //
+    // `VITASLOP_LOG` first, `RUST_LOG` as the fallback - see `knobs::log_filter`.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            vitaslop_platform::knobs::log_filter(),
+        ))
         .with_writer(std::io::stderr)
         .try_init();
     // `--game <dir>` plays a real extracted retail title (decrypt -> link -> transpile

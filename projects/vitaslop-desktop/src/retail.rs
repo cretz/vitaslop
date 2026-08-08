@@ -47,7 +47,7 @@ const FRAME_DT: Duration = Duration::from_micros(16_666);
 /// Scheduler quantum + per-frame round cap. The quantum matches the retail boot probe
 /// (a fuel slice large enough that most between-host-call work finishes in one slice);
 /// the per-frame round cap is generous - the first frame runs the whole boot.
-const QUANTUM_FUEL: u64 = 5_000_000;
+const QUANTUM_FUEL: u64 = vitaslop_runtime::host::QUANTUM_FUEL;
 const PER_FRAME_ROUNDS: u64 = 60_000_000;
 
 /// The live input the window writes and the guest's world reads: the merged controller
@@ -341,6 +341,12 @@ impl RetailGuest {
     pub fn frames(&self) -> u64 {
         self.sched.frames()
     }
+
+    /// `(total fuel burned, samples, largest single burn)` - the accounting behind the
+    /// game clock's CPU charge. See [`vitaslop_runtime::sched::SchedCore::fuel_report`].
+    pub fn fuel_report(&self) -> (u64, u64, u64) {
+        self.sched.fuel_report()
+    }
     pub fn error(&self) -> Option<&str> {
         self.err.as_deref()
     }
@@ -600,6 +606,31 @@ fn report_frame_timing(
          {} recompiled + {} fixed-function draws",
         p.prepare_ms, p.upload_ms, p.pass_ms, p.gxp_draws, p.fixed_draws
     );
+    // ...and WHAT `build` did, in counts. The browser prints the same line from the same
+    // counters, so "build costs 21 ms there and 1.6 ms here" can be answered by comparing
+    // work instead of comparing two machines' clocks.
+    let n = warm_render_ms.len().max(1) as u64;
+    println!("timing: {}", vitaslop_runtime::render::take_build_work().line(n));
+    // ...and what `encode` did, in the same units, for the same reason. `encode` is 84% of the
+    // browser's render on a burst frame and the three phase timings do not say what is IN it -
+    // upload volume and per-call boundary overhead live in the same phase and have opposite
+    // fixes. The browser prints this identical line, which is what makes the two comparable.
+    println!("timing: {}", vitaslop_platform::gpu::take_encode_work().line(n));
+    println!("timing: {}", vitaslop_runtime::render::decode_by_format_line());
+    let (bg_hit, bg_new) = vitaslop_platform::gpu::take_sampler_bg_counts();
+    println!(
+        "timing: sampler bind groups - {:.1} reused / {:.1} BUILT per render",
+        bg_hit as f64 / n as f64,
+        bg_new as f64 / n as f64,
+    );
+    // WHICH host calls the run made, when the profiler is on. The browser prints the same report
+    // from the same counters; this path did not print it at all, so the one engine that can be
+    // driven by a recipe in a loop could not answer "which NIDs" without going through the
+    // interactive session. The only way to spend less at the host-call boundary is to cross it
+    // fewer times, and that needs the ranking.
+    if vitaslop_runtime::knobs::flag("VITASLOP_DBG_CALLSITES") {
+        println!("{}", vitaslop_runtime::vita::call_sites_report(25));
+    }
     // The honest caveat, printed rather than left to the reader: a guest that is waiting for
     // input does no work, so a low per-frame CPU cost on a menu is not a gameplay figure.
     println!(
@@ -776,6 +807,28 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         clock_s / (frames.max(1) as f64 / 60.0),
         frames as f64 / 60.0,
     );
+    // The fuel accounting's own totals, next to the clock they price. A mean burn near the
+    // preemption interval means most suspends really are full slices; a mean far below it
+    // with a huge total means the clock is being driven by the NUMBER of suspends, which is
+    // the thing charging per unit of fuel exists to stop. A max above the interval is not a
+    // busy title, it is a broken reading - the engine preempts at the interval.
+    let (fuel, samples, max) = guest.fuel_report();
+    if samples > 0 {
+        println!(
+            "headless: fuel {fuel} over {samples} suspends (mean {}, max {max}, interval {})",
+            fuel / samples,
+            vitaslop_runtime::host::QUANTUM_FUEL,
+        );
+    }
+    // Only on a run that opted into software fuel (`VITASLOP_FUEL`), which is a
+    // comparison run: the browser's clock is driven by that counter and nothing in a
+    // browser run can say whether it agrees with wasmtime's.
+    if let Some((sw, wt, n)) = vitaslop_native::threaded::software_fuel_report() {
+        println!(
+            "headless: software fuel {sw} vs wasmtime {wt} over {n} samples (ratio {:.2}x)",
+            sw as f64 / wt.max(1) as f64,
+        );
+    }
     Ok(())
 }
 

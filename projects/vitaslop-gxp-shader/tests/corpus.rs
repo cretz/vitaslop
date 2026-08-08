@@ -169,6 +169,98 @@ fn describe_fragment_interpolants() {
     }
 }
 
+/// Tabulate every fragment interpolant's `(half, register_count)` against its usage, and every
+/// vertex program's per-usage component width, so the two sides' UNITS can be compared.
+///
+/// # The question this settles
+/// `plan_interface` hard-fails when a vertex produces more components than the fragment's
+/// declaration spans, on the reasoning that the surplus would land on the next interpolant.
+/// One title's `tutorial-drive` hits that on a real pair, and the failure has a suspiciously
+/// uniform shape: every instance reads "the fragment spans **1** PA register at F16", never
+/// any other count. Two readings explain it and they need opposite fixes - the hardware
+/// tolerates a fragment consuming a PREFIX of a wider varying, or `register_count` is being
+/// parsed in the wrong UNIT for a half-precision varying (the trap
+/// `vitaslop-f16-half-granularity-varyings` records once already).
+///
+/// A count is what tells them apart: if EVERY half varying in the corpus declares exactly one
+/// register whatever its width, the field is not a register count.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_interpolant_register_counts_by_precision() {
+    let Some(dir) = corpus_dir() else { return };
+    // (half, register_count) -> how many interpolants declare it.
+    let mut by_shape: BTreeMap<(bool, u8), usize> = BTreeMap::new();
+    // The same, split by usage, so a usage-specific rule would show.
+    let mut by_usage: BTreeMap<(String, bool, u8), usize> = BTreeMap::new();
+    let mut frags = 0usize;
+    for (_, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Fragment {
+            continue;
+        }
+        frags += 1;
+        for it in &p.interpolants {
+            *by_shape.entry((it.half, it.register_count)).or_default() += 1;
+            *by_usage
+                .entry((format!("{:?}", it.usage), it.half, it.register_count))
+                .or_default() += 1;
+        }
+    }
+    println!("{frags} fragment blobs");
+    println!("  (half, register_count) -> count");
+    for ((half, regs), n) in &by_shape {
+        println!("    half={half} registers={regs}: {n}");
+    }
+    println!("  by usage:");
+    for ((usage, half, regs), n) in &by_usage {
+        println!("    {usage:<12} half={half} registers={regs}: {n}");
+    }
+}
+
+/// Tabulate every FRAGMENT program's varying DECLARATION ORDER, and every VERTEX program's
+/// output-lane accounting, so the two can be compared.
+///
+/// The vertex block states WHICH varyings a program outputs and how WIDE each texcoord is; it
+/// does not state the ORDER they occupy the output bank in, and two titles' programs demand
+/// opposite orders for the same declared set. The fragment's descriptor array DOES carry an
+/// order - its entries accumulate a PA base in declaration order - so if the vertex lane order
+/// is the fragment's declaration order, this tabulation shows the two titles' fragments
+/// declaring their varyings in opposite orders, and the contradiction is not one.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_fragment_varying_declaration_order() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let mut by_order: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Fragment {
+            continue;
+        }
+        if p.interpolants.is_empty() {
+            continue;
+        }
+        let order: Vec<String> = p
+            .interpolants
+            .iter()
+            .map(|it| format!("{:?}@{}+{}", it.usage, it.pa_base, it.register_count))
+            .collect();
+        let usages: Vec<String> =
+            p.interpolants.iter().map(|it| format!("{:?}", it.usage)).collect();
+        println!("{name}: primary_reg_count={} {}", p.primary_reg_count, order.join(" "));
+        by_order.entry(usages.join(",")).or_default().push(name);
+    }
+    println!("\n-- declaration orders, by how many fragment programs use them --");
+    for (order, names) in &by_order {
+        println!("  {:<3} [{order}]", names.len());
+        if names.len() <= 6 {
+            println!("        {}", names.join(" "));
+        }
+    }
+}
+
 /// Print one named blob's recompiled WGSL body and its container reflection.
 ///
 /// `VITASLOP_GXP_BLOB=frag_866f5280` selects it. Reading the translation of a SPECIFIC
@@ -205,6 +297,27 @@ fn print_one_blob() {
         }
         for v in &p.output_varyings {
             println!("  OUT {:?} base_lane={} components={}", v.usage, v.base_lane, v.components);
+        }
+        if let Some(w) = vitaslop_gxp_shader::container::raw_varying_block_words(&bytes, 10) {
+            let words: Vec<String> =
+                w.iter().enumerate().map(|(i, v)| format!("+{:#04x}={v:#010x}", i * 4)).collect();
+            println!("  VARYINGS BLOCK {}", words.join(" "));
+        }
+        // The parameter table names each ATTRIBUTE and the register it lands in, which is the
+        // only thing that says WHICH varying a `Output[n] <- PrimaryAttr[n]` copy carries.
+        for prm in &p.parameters {
+            println!(
+                "  PARAM {:<24} category={:?} type={:?} components={} array={} resource_index={} \
+                 semantic={}.{}",
+                prm.name,
+                prm.category,
+                prm.ptype,
+                prm.component_count,
+                prm.array_size,
+                prm.resource_index,
+                prm.semantic,
+                prm.semantic_index
+            );
         }
         for (unit, pname) in p.samplers() {
             println!("  sampler unit {unit} = {pname}");
@@ -864,5 +977,61 @@ fn rank_link_failures_over_all_pairings() {
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     for (reason, n) in ranked.iter().take(20) {
         println!("  {n} pairings - {reason}");
+    }
+}
+
+/// Tabulate every VERTEX program's varyings-block output words against the layout they are
+/// supposed to describe, so the RESERVED region between the clip position and the texcoords can
+/// be settled from the corpus rather than guessed.
+///
+/// `parse_vertex_output_varyings` derives that region by ARITHMETIC - total lanes minus the
+/// texcoord widths minus the four position lanes - and then names it by its width alone (2 lanes
+/// = FOG, 4 = COLOR0). That is a one-item inference, and one title's front-end vertex program
+/// leaves EIGHT reserved lanes, which the arithmetic cannot name: its whole 2D primitive family
+/// then declares no COLOR0 output and every fragment that reads one falls back. This prints the
+/// two words next to the derived region so the bits that name it can be found.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_vertex_varying_output_words() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let mut by_reserved: BTreeMap<u32, usize> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Vertex {
+            continue;
+        }
+        let Some((vo1, vo2)) = vitaslop_gxp_shader::container::raw_vertex_varying_words(&bytes)
+        else {
+            continue;
+        };
+        let total = vo1 >> 24;
+        let widths: Vec<(u32, u32)> = (0..=9u32)
+            .filter_map(|k| {
+                let v = (vo2 >> (k * 3)) & 0x7;
+                (v != 0).then(|| (k, (v & 1) * 2 + ((v >> 1) & 1) + ((v >> 2) & 1)))
+            })
+            .collect();
+        let tex: u32 = widths.iter().map(|&(_, n)| n).sum();
+        let reserved = total.saturating_sub(tex).saturating_sub(4);
+        *by_reserved.entry(reserved).or_default() += 1;
+        let blk = vitaslop_gxp_shader::container::raw_varying_block_words(&bytes, 6)
+            .unwrap_or_default()
+            .iter()
+            .map(|v| format!("{v:#010x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let usages: Vec<String> =
+            p.output_varyings.iter().map(|v| format!("{:?}@{}", v.usage, v.base_lane)).collect();
+        println!(
+            "{name}: blk[{blk}] total={total} tex={tex} RESERVED={reserved} decoded=[{}]",
+            usages.join(" ")
+        );
+    }
+    println!("\n-- reserved-region widths, by how many programs have them --");
+    for (r, n) in &by_reserved {
+        println!("  reserved={r:<3} {n} programs");
     }
 }

@@ -190,9 +190,10 @@ fn sample_watch(sched: &ThreadedScheduler<VitaEnv>, w: &Watch) -> String {
 #[test]
 #[ignore = "boot probe: needs VITASLOP_GAME_DIR or VITASLOP_GAME_PKG+_WORK"]
 fn retail_boot_probe() {
-    // Surface the runtime's `tracing` diagnostics (RUST_LOG=vitaslop::io=trace, ...).
+    // Surface the runtime's `tracing` diagnostics (VITASLOP_LOG=vitaslop::io=trace, ...);
+    // `RUST_LOG` still works as the fallback - see `knobs::log_filter`.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(vitaslop_runtime::knobs::log_filter()))
         .with_writer(std::io::stderr)
         .try_init();
     // Two ingest sources: an extracted PFS dir (VITASLOP_GAME_DIR) or a NoNpDrm

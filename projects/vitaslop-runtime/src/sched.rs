@@ -131,6 +131,21 @@ pub trait ThreadHandle {
     /// frames grows the renderer by a gigabyte and is killed. The slot itself stays -
     /// indices are stable for the whole run and the exit code has to outlive the thread.
     fn release(&mut self) {}
+
+    /// Total engine FUEL this thread has burned since it started, or `None` from an
+    /// engine with no fuel accounting.
+    ///
+    /// Fuel is the only measure of guest work that is exactly proportional to executed
+    /// wasm and identical on both engines, which is what makes it the thing to charge the
+    /// game clock for. Host wall time would be neither - it varies with the machine, so it
+    /// would break determinism.
+    ///
+    /// It must be CUMULATIVE rather than per-resume: the scheduler differences it, and a
+    /// per-resume figure would have to be reset by whoever read it, which is exactly the
+    /// bookkeeping that goes wrong when a resume ends on a path nobody remembered.
+    fn fuel_used(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// A guest thread the scheduler can resume *synchronously* to its next switch point.
@@ -211,11 +226,14 @@ struct Slot<T> {
     /// this thread's share of the single baton - see [`SchedCore::cpu_share_report`].
     picks: u64,
     quanta: u64,
+    /// Cumulative [`GuestThread::fuel_used`] as of this thread's last suspend, so the
+    /// next one can be charged for the DIFFERENCE - the work this resume actually did.
+    fuel_seen: u64,
 }
 
 impl<T> Slot<T> {
     fn new(thread: T, state: ThreadState) -> Slot<T> {
-        Slot { thread, state, cooled: false, picks: 0, quanta: 0 }
+        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0 }
     }
 }
 
@@ -251,6 +269,10 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     /// nothing to divide - which is a real answer, and not one to assume either way.
     /// See [`SchedCore::runnable_report`].
     runnable_hist: Vec<u64>,
+    /// Fuel accounting totals - see [`SchedCore::fuel_report`].
+    fuel_total: u64,
+    fuel_samples: u64,
+    fuel_max: u64,
 }
 
 impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
@@ -264,6 +286,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             cursor: 0,
             frames: 0,
             runnable_hist: Vec::new(),
+            fuel_total: 0,
+            fuel_samples: 0,
+            fuel_max: 0,
         };
         // If this build inlined any host-mirror read, the host must actually be filling
         // the block. Check it once, here, while the failure is still one line from its
@@ -456,6 +481,15 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// a frame flip, counts the frame and advances frame-keyed input; returns
     /// `Some(report)` if the frame budget `max_frames` was reached.
     pub fn on_suspended(&mut self, idx: usize, stop: Stop, max_frames: u64) -> Option<RunReport> {
+        // Charge the game clock for the guest work this resume actually did, WHATEVER it
+        // stopped for. This is the whole correction: `Stop::Quantum` means either "burned a
+        // whole preemption quantum" or "yielded voluntarily after almost nothing" - the
+        // engine sets it as the DEFAULT before polling - and billing both a full quantum
+        // while billing `Stop::Blocked` nothing is two errors in opposite directions, each
+        // workload-dependent. Measured before this: the game clock ran 1.08x on one title
+        // and 4.34x on another, same build, same day. No flat per-quantum constant can fit
+        // both, because a quantum is not a unit of work. Fuel is.
+        self.charge_guest_work(idx);
         match stop {
             Stop::Blocked => {
                 self.threads[idx].state = ThreadState::Blocked;
@@ -489,34 +523,97 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             Stop::Quantum => {
                 self.threads[idx].cooled = true;
                 self.threads[idx].quanta += 1;
-                // Guest work happened without a frame ending. Clocks that track executed
-                // work rather than rendered frames advance here (the modelled storage
-                // clock), so a title that spins in guest code waiting for a load still
-                // sees the load complete.
-                //
-                // The runnable count goes with it, and it is not bookkeeping: the device
-                // has three CPUs for the game, so up to three of these threads would
-                // have retired their quanta AT ONCE and only one quantum of wall time
-                // would have passed. The host divides by it. `cooled` is an
-                // anti-starvation nudge inside our one-baton rotation and says nothing
-                // about whether a thread could run on hardware, so it is not consulted;
-                // the thread that just stopped is still Runnable and counts itself.
-                let runnable =
-                    self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
-                if self.runnable_hist.len() <= runnable {
-                    self.runnable_hist.resize(runnable + 1, 0);
-                }
-                self.runnable_hist[runnable] += 1;
-                self.host.lock().unwrap().on_quantum(runnable);
                 None
             }
         }
+    }
+
+    /// Charge the host's work-tracking clocks for the fuel thread `idx` burned since its
+    /// last suspend.
+    ///
+    /// # Why the clock must advance for guest CPU at all
+    /// Without it the game clock advances only on a display flip or on the scheduler's
+    /// nothing-is-runnable idle path, so a guest busy-wait ON THE CLOCK ITSELF - the
+    /// `do { v = sceDisplayGetVcount(); } while (v == last);` vblank spin that is ordinary,
+    /// correct guest code - can never be satisfied, and two such threads livelock the title.
+    ///
+    /// # Why FUEL and not a per-quantum constant
+    /// Fuel is deterministic and exactly proportional to executed wasm on both engines, so
+    /// the same guest work costs the same game time whichever engine ran it. A per-suspend
+    /// constant instead measures how OFTEN a title suspends, which is a property of its
+    /// host-call density and its blocking pattern, not of its workload.
+    ///
+    /// # Why the runnable count divides it
+    /// The device has three CPUs for the game, so up to three threads would have retired
+    /// this work AT ONCE and only one span of wall time would have passed. `cooled` is an
+    /// anti-starvation nudge inside our one-baton rotation and says nothing about whether a
+    /// thread could run on hardware, so it is not consulted; the thread that just stopped is
+    /// still counted, since it was running.
+    fn charge_guest_work(&mut self, idx: usize) {
+        let Some(total) = self.threads[idx].thread.fuel_used() else { return };
+        // Saturating, not wrapping: an engine that reports a cumulative counter which ever
+        // goes backwards is one whose accounting is wrong, and a huge bogus charge would
+        // jump the game clock by hours rather than showing up as a small drift.
+        let burned = total.saturating_sub(self.threads[idx].fuel_seen);
+        self.threads[idx].fuel_seen = total;
+        if burned == 0 {
+            return;
+        }
+        let runnable = self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
+        if self.runnable_hist.len() <= runnable {
+            self.runnable_hist.resize(runnable + 1, 0);
+        }
+        self.runnable_hist[runnable] += 1;
+        // The fuel accounting's own totals, which are what say whether a clock built on them
+        // is measuring guest work or measuring a bug. A per-suspend burn above the preemption
+        // interval is impossible (the engine preempts AT it), so seeing one means the reading
+        // is wrong rather than the title being busy - and that distinction cannot be made
+        // from the clock alone, because a wrong clock looks exactly like a slow title.
+        self.fuel_total = self.fuel_total.saturating_add(burned);
+        self.fuel_samples += 1;
+        self.fuel_max = self.fuel_max.max(burned);
+        self.host.lock().unwrap().on_guest_work(runnable, burned);
+    }
+
+    /// `(total fuel burned, samples, largest single burn)`.
+    ///
+    /// Reported unconditionally at the end of a headless run, for the same reason every
+    /// approximation here reports itself: the largest single burn is the one number that can
+    /// FALSIFY the clock's calibration, and it is worthless behind a flag nobody sets when the
+    /// surprising timing is already in front of them.
+    pub fn fuel_report(&self) -> (u64, u64, u64) {
+        (self.fuel_total, self.fuel_samples, self.fuel_max)
     }
 
     /// A resumed thread (thread `idx`) finished with `end`; returns `Some(report)` if
     /// the whole run must stop (a process halt or a trap).
     pub fn on_finished(&mut self, idx: usize, end: FiberEnd) -> Option<RunReport> {
         let thid = self.threads[idx].thread.thid();
+        // A thread ending is reported UNCONDITIONALLY, on both engines, in one place.
+        // It used to be silent, and that is how "the browser's threads all finish, one
+        // per frame" could only be seen as a live/finished COUNT in a per-frame telemetry
+        // line - a count says a thread went, never which one or why. The two engines run
+        // the same guest, so a divergence here is only legible if both say the same thing
+        // in the same words.
+        let (kind, code) = match &end {
+            FiberEnd::Returned(c) => ("returned from its entry", *c),
+            FiberEnd::ThreadExit(c) => ("sceKernelExitThread", *c),
+            FiberEnd::ProcessHalt(c) => ("halted the process", *c),
+            FiberEnd::Error(_) => ("TRAPPED", 0),
+        };
+        let finished = self
+            .threads
+            .iter()
+            .filter(|t| matches!(t.state, ThreadState::Finished(_)))
+            .count();
+        tracing::info!(
+            target: "vitaslop::thread",
+            "thread {thid:#x} FINISHED at frame {}: {kind} (code {code:#x}) - {} of {} \
+             threads finished",
+            self.frames,
+            finished + 1,
+            self.threads.len(),
+        );
         match end {
             FiberEnd::Returned(code) | FiberEnd::ThreadExit(code) => {
                 self.threads[idx].state = ThreadState::Finished(code);
@@ -725,6 +822,11 @@ where
     /// [`SchedCore::runnable_report`].
     pub fn runnable_report(&self, cores: usize) -> String {
         self.core.runnable_report(cores)
+    }
+
+    /// The fuel accounting's own totals - see [`SchedCore::fuel_report`].
+    pub fn fuel_report(&self) -> (u64, u64, u64) {
+        self.core.fuel_report()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run

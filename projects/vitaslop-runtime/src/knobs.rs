@@ -31,7 +31,7 @@ pub const INDEX: &str = include_str!("../../KNOBS.md");
 // the renderer reads `VITASLOP_GXP_LIVE` from there, and it cannot reach a table owned
 // by the runtime. Re-exported here so the name `knobs::set_override` still resolves and
 // this module stays the single place to look for anything knob-shaped.
-pub use vitaslop_platform::knobs::{flag, set_override, var, var_os, OVERRIDABLE};
+pub use vitaslop_platform::knobs::{flag, log_filter, set_override, var, var_os, OVERRIDABLE};
 
 /// One environment knob: its name, where it is read, and the first line of the doc
 /// comment attached to the code that reads it.

@@ -1,4 +1,4 @@
-//! Parity probe for the general GXM renderer ([`GeneralRenderer`] over the shared
+﻿//! Parity probe for the general GXM renderer ([`GeneralRenderer`] over the shared
 //! `GxmRenderer`): render synthetic 2D scenes through both the GPU path and the
 //! software rasterizer (`vitaslop_runtime::render::render_scene`, the oracle) and
 //! assert they agree. The two use the same per-draw interpretation and texture
@@ -43,14 +43,15 @@ fn pixel_attrs() -> Vec<VertexAttribute> {
 fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTexture>) -> Draw {
     let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
     Draw {
+        fragment_program_header: 0,
         vertex_textures: Vec::new(),
         primitive: 0,
         index_format: 0,
         index_count: 6,
-        vertices,
+        vertices: vertices.into(),
         vertex_stride: 20,
         attributes: attrs,
-        indices,
+        indices: indices.into(),
         uniforms: vec![],
         textures,
         render_state: Default::default(),
@@ -62,8 +63,8 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
-        vprog: Vec::new(),
-        fprog: Vec::new(),
+        vprog: vitaslop_runtime::capture::no_program(),
+        fprog: vitaslop_runtime::capture::no_program(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
@@ -209,14 +210,15 @@ fn mvp_quad(
         render_state.front_depth_write = 0x0010_0000; // SCE_GXM_DEPTH_WRITE_DISABLED
     }
     Draw {
+        fragment_program_header: 0,
         vertex_textures: Vec::new(),
         primitive: 0,
         index_format: 0,
         index_count: 6,
-        vertices: v,
+        vertices: v.into(),
         vertex_stride: 24,
         attributes: mvp_attrs(),
-        indices,
+        indices: indices.into(),
         uniforms: IDENTITY_MVP.to_vec(),
         textures,
         render_state,
@@ -228,8 +230,8 @@ fn mvp_quad(
         blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
-        vprog: Vec::new(),
-        fprog: Vec::new(),
+        vprog: vitaslop_runtime::capture::no_program(),
+        fprog: vitaslop_runtime::capture::no_program(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
@@ -285,13 +287,14 @@ fn general_renderer_matches_software_oracle() {
         ];
         let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
         let draw = Draw {
+            fragment_program_header: 0,
             primitive: 0,
             index_format: 0,
             index_count: 6,
-            vertices: nv,
+            vertices: nv.into(),
             vertex_stride: 12,
             attributes: attrs,
-            indices,
+            indices: indices.into(),
             uniforms: vec![],
             vertex_textures: Vec::new(),
         textures: vec![],
@@ -304,8 +307,8 @@ fn general_renderer_matches_software_oracle() {
         blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
-        vprog: Vec::new(),
-        fprog: Vec::new(),
+        vprog: vitaslop_runtime::capture::no_program(),
+        fprog: vitaslop_runtime::capture::no_program(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
@@ -459,13 +462,14 @@ fn general_renderer_matches_software_oracle() {
         ];
         let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
         let draw = Draw {
+            fragment_program_header: 0,
             primitive: 0,
             index_format: 0,
             index_count: 6,
-            vertices: v,
+            vertices: v.into(),
             vertex_stride: 16,
             attributes: attrs,
-            indices,
+            indices: indices.into(),
             uniforms: IDENTITY_MVP.to_vec(),
             vertex_textures: Vec::new(),
         textures: vec![],
@@ -479,8 +483,8 @@ fn general_renderer_matches_software_oracle() {
         blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
-        vprog: Vec::new(),
-        fprog: Vec::new(),
+        vprog: vitaslop_runtime::capture::no_program(),
+        fprog: vitaslop_runtime::capture::no_program(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
@@ -508,13 +512,14 @@ fn general_renderer_matches_software_oracle() {
             let mut render_state = RenderState::default();
             render_state.cull_mode = 0x2; // SCE_GXM_CULL_CCW
             let draw = Draw {
+                fragment_program_header: 0,
                 primitive: 0,
                 index_format: 0,
                 index_count: 3,
-                vertices: v,
+                vertices: v.into(),
                 vertex_stride: 24,
                 attributes: mvp_attrs(),
-                indices,
+                indices: indices.into(),
                 uniforms: IDENTITY_MVP.to_vec(),
                 vertex_textures: Vec::new(),
         textures: vec![],
@@ -527,8 +532,8 @@ fn general_renderer_matches_software_oracle() {
         blend: Default::default(),
         // The GXP recompiler payload: empty off that path, which is what these fixed-function
         // probes exercise.
-        vprog: Vec::new(),
-        fprog: Vec::new(),
+        vprog: vitaslop_runtime::capture::no_program(),
+        fprog: vitaslop_runtime::capture::no_program(),
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
@@ -637,3 +642,4 @@ fn general_renderer_supersample_matches_software() {
     assert!(mean_abs_diff(&sw, &one) > 0.0, "supersample must change the frame");
     assert!(drawn(&hw) > 0 && drawn(&sw) > 0, "supersampled frame drew nothing");
 }
+

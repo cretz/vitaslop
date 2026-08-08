@@ -47,7 +47,12 @@
           if (i % 40 === 0) status.textContent = `fetched ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;
         }
         status.textContent = `fetched ${manifest.length} files (${(bytes/1e6)|0} MB); booting...`;
-        const msg = await run_game(canvas, files, recipe || "", maxFrames, maxRounds);
+        // `run_game` takes a TAGGED source, not a bare file map: the product path reads the
+        // title out of OPFS in pieces (a retail container does not fit a wasm32 heap), and the
+        // main thread cannot do that synchronously, so it hands the fetched bytes over as
+        // `memory`. Passing the bare map made this page fail with `game source kind ""` - which
+        // is exactly the error the tag exists to produce rather than guess.
+        const msg = await run_game(canvas, { kind: "memory", payload: files }, recipe || "", maxFrames, maxRounds);
         return msg;
       };
     </script>

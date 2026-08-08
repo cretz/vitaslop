@@ -232,6 +232,123 @@ fn and_armed(f: &mut Body) {
     f.instruction(&W::I32And);
 }
 
+// --- guest-store dirty map ------------------------------------------------
+//
+// One byte per 4 KB page of linear memory, set to 1 by every translated store. The
+// runtime reads it to answer "can this region of guest memory have changed since I
+// last looked?" exactly, without reading the region.
+//
+// # Why it exists
+// A texture lives in guest memory and the capture needs its PIXELS, so it retains a
+// snapshot and compares it against guest memory once per scene to find out whether it
+// is still current (see `TextureSnapshots`). That compare is EXACT and it is
+// enormous: measured on a live race, 116.8 MB a frame, 40% of the whole frame, and it
+// re-reads 0.0 MB - it is paying memory bandwidth to prove nothing changed.
+//
+// The Vita does none of this: GXM hands the GPU a pointer and the SGX reads texture
+// memory through the MMU when it rasterises. The compare is an artefact of decoupling
+// capture from render, and the exact way to remove it is to know which pages the guest
+// wrote - which the guest itself can say, for the cost of a few instructions per store.
+//
+// # Why this is not on by default on every engine
+// The mark is real wasm instructions, and on NATIVE wasmtime bills every operator it
+// executes - so a native build with this on would burn fuel for host bookkeeping and
+// the game clock, which is priced in fuel, would speed up with it. That is fitting a
+// constant to an emulator artefact, which this project does not do. Emitted
+// [`Body::untolled`], so on an engine whose fuel is the transpiler's OWN software
+// counter (the browser) the marks are invisible to the clock, exactly as they should
+// be. So: the browser turns this on and drops the compare; native leaves it off and
+// keeps the compare. Both are exact, by different means.
+thread_local! {
+    /// Whether modules emitted on this thread mark their stores. `u8::MAX` is the
+    /// "never set" sentinel, so a host can ask for OFF explicitly and mean it.
+    static DIRTY_TRACKING: std::cell::Cell<u8> = const { std::cell::Cell::new(u8::MAX) };
+    /// Linear-memory byte offset of the dirty map for the module being emitted on this
+    /// thread, or 0 when this build has none. Thread-local for the same reason as
+    /// [`ARM_WORD_OFF`].
+    static DIRTY_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Turn guest-store dirty tracking on or off for modules emitted on this thread after
+/// this call. A host with a software fuel counter calls this; one billed by the engine
+/// leaves it alone and emits byte-identical code. Overrides `VITASLOP_DIRTY_PAGES`,
+/// which is the same knob for a native experiment (the browser has no environment).
+pub fn set_dirty_tracking(on: bool) {
+    DIRTY_TRACKING.with(|c| c.set(u8::from(on)));
+}
+
+/// Does this build mark guest stores? See [`set_dirty_tracking`].
+pub fn dirty_tracking() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    match DIRTY_TRACKING.with(|c| c.get()) {
+        u8::MAX => *FROM_ENV.get_or_init(|| std::env::var("VITASLOP_DIRTY_PAGES").is_ok()),
+        n => n != 0,
+    }
+}
+
+/// Log2 of the dirty map's granule. 4 KB, the wasm page, so a page index is a plain
+/// `addr >> 12` and the runtime's page arithmetic needs no second unit.
+pub const DIRTY_SHIFT: u32 = 12;
+
+/// Byte offset of the EPOCH within the dirty block. The block leads with it so a host
+/// that knows `dirty_off` knows both.
+pub const DIRTY_EPOCH_OFF: u64 = 0;
+
+/// Byte offset of the page map within the dirty block: page `p`'s stamp is the byte at
+/// `dirty_off + DIRTY_MAP_OFF + p`.
+pub const DIRTY_MAP_OFF: u64 = 4;
+
+/// Mark the page of the rebased address on top of the stack, LEAVING that address on
+/// the stack for the store that follows.
+///
+/// Seven operators, all [`untolled`](Body::untolled) - this is host bookkeeping, not
+/// guest work, and billing it would charge the game clock for something only one
+/// engine does.
+///
+/// # It stamps an EPOCH, not a flag, and that is what makes it exact
+/// A flag would have to be cleared by whoever reads it, and readers here are
+/// per-TEXTURE while the granule is a page: two textures sharing one page would clear
+/// each other's evidence, and the second would serve stale pixels. So the guest writes
+/// the CURRENT EPOCH - a byte the host keeps in linear memory just below the map - and
+/// nothing is ever cleared. A reader asks "was any of my pages stamped at or after the
+/// epoch I recorded when I last read these bytes?", which is a question every reader
+/// can answer independently and none can spoil for another.
+///
+/// The epoch lives in linear MEMORY rather than a global because a guest thread is its
+/// own module instance: a global would be per-thread, and a store on one thread has to
+/// be visible to a reader that ran on another.
+///
+/// # The address is the store's START, and that is exactly enough
+/// A store spanning a page boundary stamps only the page it STARTS in. It is not
+/// widened here, because the widening costs as much again on the hottest path in the
+/// module and the reader can do it for free: the largest translated store is 8 bytes
+/// (`i64.store`, a VFP double), so a store that reaches into page P can only have
+/// started in P or P-1. A reader asking about pages `[first, last]` therefore reads
+/// `[first - 1, last]` and misses nothing. `GuestMemory::take_dirty` does that, and
+/// says so.
+fn emit_dirty_mark(f: &mut Body, addr_local: u32) {
+    let off = DIRTY_OFF.with(|c| c.get());
+    if off == 0 {
+        return;
+    }
+    f.untolled(&W::LocalTee(addr_local));
+    f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+    f.untolled(&W::I32ShrU);
+    f.untolled(&W::I32Const(0));
+    f.untolled(&W::I32Load8U(MemArg {
+        offset: off + DIRTY_EPOCH_OFF,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.untolled(&W::I32Store8(MemArg {
+        offset: off + DIRTY_MAP_OFF,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.untolled(&W::LocalGet(addr_local));
+}
+
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
 /// at transpile time, every word store to that exact guest address is preceded by an
 /// `unreachable`, so the first writer traps with a full wasm backtrace (and the
@@ -397,7 +514,7 @@ pub fn set_fuel_interval(n: u32) {
 /// The fuel interval this build emits with: an explicit [`set_fuel_interval`] if one was
 /// made on this thread, else `VITASLOP_FUEL`, else 0 (no fuel). `u32::MAX` is the "never
 /// set" sentinel, so a host CAN ask for 0 explicitly and mean it.
-fn fuel_interval() -> u32 {
+pub fn fuel_interval() -> u32 {
     use std::sync::OnceLock;
     static FROM_ENV: OnceLock<u32> = OnceLock::new();
     match FUEL_INTERVAL.with(|c| c.get()) {
@@ -687,7 +804,17 @@ const L_T3: u32 = 4;
 /// `uadd8` and the scratches are clobbered in between (the byte-search loop in
 /// `strlen` interleaves loads).
 const L_GE: u32 = 5;
-const L_I32_COUNT: u32 = 6;
+/// The rebased address of a store, held across the guest-store dirty mark
+/// ([`emit_dirty_mark`]) so the mark can index the map and still hand the address to
+/// the store. Its own local, not one of the `L_T*` scratches, because a store's
+/// address is on the stack at points where those are live (the watchpoint path parks
+/// the address in `L_T0` and the value in `L_T1`).
+///
+/// Declared even in a build with tracking off, where nothing reads it: a wasm local is
+/// inert and the engine drops it, and making the declaration conditional would make
+/// every index after it depend on a knob.
+const L_DIRTY: u32 = 6;
+const L_I32_COUNT: u32 = 7;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
@@ -722,6 +849,14 @@ pub struct EmitOutput {
     /// reads it ([`crate::InlineOp::LoadMirror`]). `None` when none does, which
     /// leaves the memory layout exactly as it was.
     pub mirror_off: Option<u64>,
+    /// Linear-memory byte offset of the GUEST-STORE DIRTY MAP, when this build was
+    /// emitted with store tracking on ([`dirty_tracking`]). One byte per 4 KB page of
+    /// the whole linear memory, set to 1 by every translated store. `None` in a build
+    /// without it, which leaves the memory layout exactly as it was.
+    ///
+    /// See [`emit_dirty_mark`] for what the guest writes and why, and
+    /// `TextureSnapshots` in the runtime for what reads it.
+    pub dirty_off: Option<u64>,
 }
 
 /// Host-mirror slots per page. The block is one page, which is far more than the
@@ -779,7 +914,9 @@ pub fn emit_module(
     // HOST MIRROR block (see `crate::InlineOp::LoadMirror`). It is placed here for
     // the same reason as the armed word: outside the guest region, so no guest
     // allocation can reach it and no guest store can corrupt it.
-    let mirror_slots = inline_imports.iter().filter_map(|i| i.op.mirror_slot()).max();
+    // Sized from the TOP slot each op touches, not its base: a pair form reads two words,
+    // and sizing from the base would leave its high word past the end of the page.
+    let mirror_slots = inline_imports.iter().filter_map(|i| i.op.top_mirror_slot()).max();
     if let Some(top) = mirror_slots {
         assert!(
             top < MIRROR_SLOTS_PER_PAGE,
@@ -792,10 +929,39 @@ pub fn emit_module(
         (guest_pages + addr_table_pages + u64::from(mirror_off.is_some())) * abi::PAGE_SIZE as u64
     });
     ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
-    let total_pages = guest_pages
+    let pages_below_dirty = guest_pages
         + addr_table_pages
         + u64::from(mirror_off.is_some())
         + u64::from(arm_word_off.is_some());
+    // The GUEST-STORE DIRTY MAP tops the layout, one byte per 4 KB page - see
+    // `emit_dirty_mark`. It covers the WHOLE linear memory, itself included, rather
+    // than only the guest region: the mark is emitted before its store, so a store to
+    // an address outside the guest region would otherwise index past the map, and
+    // "off the end of the map" must not mean "into the next block". Covering
+    // everything makes any in-memory address a valid index, and an address past the
+    // end of memory traps on the mark exactly as it would have on the store.
+    //
+    // The map's granule is [`DIRTY_SHIFT`] (4 KB), which is NOT the wasm page (64 KB):
+    // one byte per 4 KB of the memory, so an index is a plain `addr >> 12` on the
+    // hottest path in the module. Sizing is self-referential (the map's own pages need
+    // bytes of map), so it is solved by iterating to a fixed point - two rounds at any
+    // real size.
+    let mut dirty_pages = 0u64;
+    if dirty_tracking() {
+        loop {
+            let total_bytes = (pages_below_dirty + dirty_pages) * abi::PAGE_SIZE as u64;
+            let block_bytes = DIRTY_MAP_OFF + (total_bytes >> DIRTY_SHIFT);
+            let next = block_bytes.div_ceil(abi::PAGE_SIZE as u64);
+            if next == dirty_pages {
+                break;
+            }
+            dirty_pages = next;
+        }
+    }
+    let dirty_off =
+        (dirty_pages > 0).then(|| pages_below_dirty * abi::PAGE_SIZE as u64);
+    DIRTY_OFF.with(|c| c.set(dirty_off.unwrap_or(0)));
+    let total_pages = pages_below_dirty + dirty_pages;
     // Built here rather than at the top of the function because an inline mirror read
     // needs the block's address, which is part of the layout just computed.
     let inline = InlineImports::new(inline_imports, mem_bytes, mirror_off);
@@ -839,10 +1005,14 @@ pub fn emit_module(
     for _ in funcs {
         function_section.function(func_ty);
     }
-    // The indirect-call dispatcher (the last defined function): `(target, caller)`.
-    // It binary-searches the address table and `call_indirect`s the match, or reports
-    // an unmapped target to `dispatch_miss` - see `emit_dispatch`.
+    // The indirect-call dispatcher: `(target, caller)`. It binary-searches the address
+    // table and `call_indirect`s the match, or reports an unmapped target to
+    // `dispatch_miss` - see `emit_dispatch`.
     function_section.function(dispatch_ty);
+    // The instance reset (see `abi::RESET_EXPORT` and `emit_reset`), appended AFTER the
+    // dispatcher so no existing function index moves - the funcref table's entries and
+    // every wasm-backtrace-to-guest-function mapping are stated in terms of them.
+    function_section.function(func_ty);
 
     // The dense funcref table the dispatcher's `call_indirect` jumps through:
     // `table[i]` is the i-th translated function in ascending-address order, so the
@@ -952,6 +1122,8 @@ pub fn emit_module(
         code.function(&emit_func(func, func_index, base, &inline));
     }
     code.function(&emit_dispatch(funcs, addr_table_off));
+    code.function(&emit_reset());
+    exports.export(abi::RESET_EXPORT, ExportKind::Func, IMPORT_FUNCS + n + 1);
 
     // The dispatcher's search array: each function's guest address as a little-endian
     // u32, in ascending order (so a binary search finds a target and its dense index
@@ -993,11 +1165,92 @@ pub fn emit_module(
             names.append(IMPORT_FUNCS + i as u32, &format!("g_{:08x}", func.addr));
         }
         names.append(IMPORT_FUNCS + n, "dispatch");
+        names.append(IMPORT_FUNCS + n + 1, "reset");
         let mut name_section = NameSection::new();
         name_section.functions(&names);
         module.section(&name_section);
     }
-    EmitOutput { wasm: module.finish(), mem_pages: total_pages as u32, arm_word_off, mirror_off }
+    EmitOutput {
+        wasm: module.finish(),
+        mem_pages: total_pages as u32,
+        arm_word_off,
+        mirror_off,
+        dirty_off,
+    }
+}
+
+/// Emit the instance RESET function: `() -> ()`, exported as [`abi::RESET_EXPORT`].
+///
+/// It writes every per-instance global back to the value the globals section gives it at
+/// instantiation, IN THE SAME ORDER that section declares them - the whole ARM register
+/// file and flags, the VFP/NEON file (S registers, the Q8..Q15 quads, the FP flags), the
+/// diagnostic latches, `tp`, and the fuel counter. After this call an instance is
+/// indistinguishable from a fresh one, which is what lets a host REUSE it for the next
+/// guest thread instead of instantiating the module again.
+///
+/// # Why that matters here
+/// An instance of a retail title is a funcref table with one entry per translated
+/// function - 106,572 of them on one measured title - and every instantiation allocates
+/// and eagerly initializes the whole table. A guest that creates a thread per frame
+/// therefore hands the browser's GC a fresh copy of that table sixty times a second; the
+/// measured renderer went from 875 MB to 2.19 GB in five seconds and was killed.
+///
+/// # It is emitted UNBILLED
+/// Deliberately built as a raw `Function` rather than through [`Body`]: this is host
+/// bookkeeping, not guest execution, and billing it would charge the game clock for work
+/// the device never does (and would differ between the two engines, since only the
+/// browser reuses instances).
+fn emit_reset() -> Function {
+    let mut f = Function::new([]);
+    let mut g = 0u32;
+    let mut zero_i32 = |f: &mut Function, g: &mut u32| {
+        f.instruction(&W::I32Const(0));
+        f.instruction(&W::GlobalSet(*g));
+        *g += 1;
+    };
+    // 16 registers + the 4 integer flags.
+    for _ in 0..abi::GLOBAL_COUNT {
+        zero_i32(&mut f, &mut g);
+    }
+    // S0..S31, as raw bits.
+    for _ in 0..abi::VFP_S_COUNT {
+        zero_i32(&mut f, &mut g);
+    }
+    // Q8..Q15. These are the reason this function exists: a `v128` global cannot be read
+    // or written from JavaScript at all, so a host-side reset could never clear them.
+    for _ in 0..abi::VFP_Q_HI_COUNT {
+        f.instruction(&W::V128Const(0));
+        f.instruction(&W::GlobalSet(g));
+        g += 1;
+    }
+    // The 4 FP condition flags.
+    for _ in 0..abi::FP_FLAG_COUNT {
+        zero_i32(&mut f, &mut g);
+    }
+    // The diagnostic latches, `tp`, and the store-watchpoint counter, in the order
+    // `emit_module` declares them: WATCH_ARMED, GUEST_PC, WATCH_READ_COUNT, TP,
+    // WATCH_STORE_COUNT. `tp` is among them: it is per-THREAD, so a reused instance that
+    // kept the previous thread's TLS base would reach another thread's `__thread`
+    // variables. The host sets the new thread's value right after this call.
+    for _ in 0..5 {
+        zero_i32(&mut f, &mut g);
+    }
+    // A hard assert, not a debug one: this runs ONCE per emit, and if the globals section
+    // ever grows a field without this walk growing with it, the reset would quietly write
+    // the wrong globals and a reused instance would carry a previous thread's state.
+    assert_eq!(
+        g,
+        abi::FUEL_GLOBAL,
+        "emit_reset must walk the globals section in declaration order; it stopped at {g} \
+         but the fuel counter is global {}",
+        abi::FUEL_GLOBAL,
+    );
+    // The fuel counter, seeded with a full quantum exactly as instantiation does, so a
+    // reused thread's first back edge does not immediately yield.
+    f.instruction(&W::I32Const(fuel_interval() as i32));
+    f.instruction(&W::GlobalSet(abi::FUEL_GLOBAL));
+    f.instruction(&W::End);
+    f
 }
 
 /// Emit the indirect-call dispatcher: `(target: i32, caller: i32) -> ()`. It masks
@@ -1554,10 +1807,12 @@ fn emit_stmt(
                     f.instruction(&W::End);
                 }
                 f.instruction(&W::LocalGet(L_T0));
+                emit_dirty_mark(f, L_DIRTY);
                 f.instruction(&W::LocalGet(L_T1));
                 f.instruction(&store_op(*size));
             } else {
                 emit_addr(f, addr, base);
+                emit_dirty_mark(f, L_DIRTY);
                 emit_value(f, data, base);
                 f.instruction(&store_op(*size));
             }
@@ -2368,6 +2623,7 @@ fn emit_vfp_mem(f: &mut Body, reg: crate::ir::VfpReg, addr: &Value, load: bool, 
                 f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
             } else {
                 emit_addr(f, addr, base);
+                emit_dirty_mark(f, L_DIRTY);
                 f.instruction(&W::GlobalGet(abi::vfp_s_global(n)));
                 f.instruction(&W::I32Store(mem_arg()));
             }
@@ -2379,6 +2635,7 @@ fn emit_vfp_mem(f: &mut Body, reg: crate::ir::VfpReg, addr: &Value, load: bool, 
                 set_d_bits(f, n);
             } else {
                 emit_addr(f, addr, base);
+                emit_dirty_mark(f, L_DIRTY);
                 get_d_bits(f, n);
                 f.instruction(&W::I64Store(mem_arg()));
             }
@@ -3531,6 +3788,7 @@ fn emit_elem_mem(
             // mem = (d >> shift) truncated to esize bits (the store width truncates).
             let shift = (idx as i64) * (esize as i64);
             emit_addr(f, addr, base);
+            emit_dirty_mark(f, L_DIRTY);
             get_d_bits(f, d);
             f.instruction(&W::I64Const(shift));
             f.instruction(&W::I64ShrU);
@@ -3704,10 +3962,22 @@ enum InlineLowering {
     /// Read through the pointer in r0, falling back to the host call unless the
     /// rebased pointer is `<= limit`.
     Guest { offset: u32, shift: u32, mask: u32, limit: u32 },
+    /// Read through the pointer in r0 and shift the whole word LEFT, falling back to
+    /// the host call when the pointer is out of range OR the loaded word exceeds `max`
+    /// (the clamped case, which only the handler defines - see
+    /// [`crate::InlineOp::LoadScaled`]).
+    GuestScaled { offset: u32, max: u32, shl: u32, limit: u32 },
     /// Read the host-mirror word at this fixed linear-memory offset. No guard: the
     /// address is a constant inside the module's own reserved page, so there is no
     /// out-of-range case to fall back for.
     Mirror { off: u64 },
+    /// Read the 64-bit host-mirror value at this offset into r0/r1. No guard, same
+    /// reason as [`InlineLowering::Mirror`].
+    MirrorPair { off: u64 },
+    /// Store the 64-bit host-mirror value at this offset through the guest pointer in
+    /// r0, then set r0 = 0. Guarded on the pointer, which must admit an EIGHT-byte
+    /// store rather than the usual four.
+    MirrorStorePair { off: u64, limit: u32 },
 }
 
 impl InlineImports {
@@ -3730,12 +4000,27 @@ impl InlineImports {
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
                 Some(InlineLowering::Guest { offset, shift, mask, limit })
             }
+            crate::InlineOp::LoadScaled { offset, max, shl } => {
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
+                Some(InlineLowering::GuestScaled { offset, max, shl, limit })
+            }
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
                 // a condition to paper over with a host call.
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
                 Some(InlineLowering::Mirror { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::LoadMirrorPair { slot } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                Some(InlineLowering::MirrorPair { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::StoreMirrorPair { slot } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                // EIGHT bytes are written from the rebased pointer, so the last address
+                // the store may start at is `mem_bytes - 8`, not `- 4`.
+                let limit = self.mem_bytes.checked_sub(8)?;
+                Some(InlineLowering::MirrorStorePair { off: base + slot as u64 * 4, limit })
             }
         }
     }
@@ -3755,6 +4040,28 @@ impl InlineImports {
 /// A host-mirror read takes no pointer and needs no guard: its address is a constant
 /// inside a page this module reserved, so it is always in range. What makes IT exact
 /// is the host-side contract in [`crate::InlineOp::LoadMirror`], not a guard here.
+/// Emit the shared pointer guard for an inline form that touches guest memory through
+/// r0, leaving the emitter positioned inside the IN-RANGE arm (the caller emits its body
+/// and the closing `End`).
+///
+/// `L_T0` holds the rebased address on that arm. The single unsigned compare rejects both
+/// a pointer below the image base (the subtraction wraps to a huge value, which is the
+/// null-pointer case) and one too near the end of guest memory; either way the real host
+/// call runs, so the handler keeps defining those cases.
+fn emit_pointer_guard(f: &mut Body, base: u32, limit: u32, index: u32) {
+    // t0 = r0 - base, the rebased address of the pointer argument.
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Sub);
+    f.instruction(&W::LocalTee(L_T0));
+    f.instruction(&W::I32Const(limit as i32));
+    f.instruction(&W::I32GtU);
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::I32Const(index as i32));
+    f.instruction(&W::Call(IMPORT_FUNC));
+    f.instruction(&W::Else);
+}
+
 fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
     let (offset, shift, mask, limit) = match inline.lower(index) {
         None => {
@@ -3770,19 +4077,61 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::GlobalSet(abi::reg_global(0)));
             return;
         }
+        Some(InlineLowering::MirrorPair { off }) => {
+            // r0 = low word, r1 = high word: the ARM EABI's 64-bit return pair.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off, align: 0, memory_index: 0 }));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off + 4, align: 0, memory_index: 0 }));
+            f.instruction(&W::GlobalSet(abi::reg_global(1)));
+            return;
+        }
+        Some(InlineLowering::MirrorStorePair { off, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // *(u64 *)r0 = the mirror pair. Written as two i32 stores rather than one
+            // i64 store because the guest pointer carries no alignment guarantee, and
+            // the two halves are two separate mirror words in any case.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Store(mem_arg()));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off + 4, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Store(MemArg { offset: 4, align: 0, memory_index: 0 }));
+            // The handler returns 0 on success, and the guarded path is the success path.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::GuestScaled { offset, max, shl, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // In range. Load the word, and hand the CLAMPED case back to the handler:
+            // `word > max` is exactly where `read(p).min(cap) * k` stops being a shift.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            f.instruction(&W::LocalTee(L_T1));
+            f.instruction(&W::I32Const(max as i32));
+            f.instruction(&W::I32GtU);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            f.instruction(&W::LocalGet(L_T1));
+            if shl != 0 {
+                f.instruction(&W::I32Const(shl as i32));
+                f.instruction(&W::I32Shl);
+            }
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
         Some(InlineLowering::Guest { offset, shift, mask, limit }) => (offset, shift, mask, limit),
     };
-    // t0 = r0 - base, the rebased address of the pointer argument.
-    f.instruction(&W::GlobalGet(abi::reg_global(0)));
-    f.instruction(&W::I32Const(base as i32));
-    f.instruction(&W::I32Sub);
-    f.instruction(&W::LocalTee(L_T0));
-    f.instruction(&W::I32Const(limit as i32));
-    f.instruction(&W::I32GtU);
-    f.instruction(&W::If(BlockType::Empty));
-    f.instruction(&W::I32Const(index as i32));
-    f.instruction(&W::Call(IMPORT_FUNC));
-    f.instruction(&W::Else);
+    emit_pointer_guard(f, base, limit, index);
     f.instruction(&W::LocalGet(L_T0));
     f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
     if shift != 0 {

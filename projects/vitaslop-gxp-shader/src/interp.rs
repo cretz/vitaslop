@@ -131,6 +131,16 @@ fn read_channel(regs: &RegFile, op: &Operand, c: usize) -> Option<f32> {
         *bank.get(e.min(bank.len().saturating_sub(1)))?
     } else if matches!(op.bank, Bank::Constant) {
         cnst6_value(op.index)
+    } else if matches!(op.bank, Bank::Immediate) {
+        // A scalar literal (spec A.7): the operand's number IS the value, and the swizzle's
+        // constant selectors still apply, exactly as the emitter reads it.
+        match op.swizzle[c] {
+            4 => 0.0,
+            5 => 1.0,
+            6 => 2.0,
+            7 => 0.5,
+            _ => op.index as f32,
+        }
     } else {
         let sel = op.swizzle[c];
         match sel {

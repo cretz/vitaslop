@@ -129,14 +129,17 @@
 # the right oracle for LAP/POS/TOTAL. For the world, render through
 # `vitaslop-desktop --headless` with VITASLOP_GXP_LIVE=1.
 #
-# @todo Drive it, and drive it WELL. The best any controller has managed is one
-# lap's worth of distance without the lap counter ever moving. The controller
-# that gets furthest follows the seven AI SHIPS - they are on the racing line by
-# construction, `locate` reports their world positions directly, and at POS 8/8
-# they are all ahead - and it corners far better than the material-fan one it
-# replaces, but it is stopped by a wall near (1120, 1780) at the top of the
-# first climb, every run, while its aim line passes within 30 units. Render that
-# frame through the GPU path before touching the controller again: the failure
-# is geometric and no amount of log reading will show what the ship is hitting.
-# There is no @assert here until a lap is counted.
+# @todo Drive it, and drive it WELL. `working-area/drive_ai.py` now gets the ship
+# @todo round the WHOLE circuit with zero wedges - (296,1215) -> (1224,1108) ->
+# @todo (165,643) -> (-414,493) -> (-1291,999) - where every earlier controller
+# @todo died against the wall at (1115,1788) inside forty ticks. Three things did
+# @todo that, all measured: a speed TARGET instead of a brake on/off switch
+# @todo (there are three pedal positions, and it was using two); REFUSING to steer
+# @todo at a breadcrumb line shorter than 8 points, because the pack leaves view
+# @todo in five ticks and a three-point stub aims sideways into the wall; and
+# @todo CARRYING a course, because a heading-holding controller cannot tell a wall
+# @todo bounce from a corner and the HUD read WRONG WAY! at 2.50.18.
+# @todo STILL NOT COUNTED A LAP. Judge it by the HUD - `ctl shot` renders
+# @todo HUD-over-black by design and LAP / POS / TOTAL / shield are all legible -
+# @todo never by distance travelled. There is no @assert here until a lap counts.
 12000: @section end

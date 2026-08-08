@@ -212,6 +212,20 @@ const GXP_PARAM_COUNT_OFF: u32 = 0x24;
 const GXP_PARAMS_OFF_OFF: u32 = 0x28;
 const GXM_PARAM_SIZE: u32 = 16;
 
+/// Byte offset of the header's `default_uniform_buffer_count`, which counts 32-bit SA
+/// registers (so the byte size is four times it).
+pub(crate) const GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF: u32 = 0x64;
+
+/// Largest `default_uniform_buffer_count` taken at face value. Beyond this the header did
+/// not resolve to a real program, and the size is clamped rather than used to size an
+/// allocation.
+///
+/// Shared with the inline form ([`inline_op`]) rather than repeated there: the inline
+/// path treats this as the boundary between "answer inline" and "let the handler decide",
+/// so the two drifting apart would put the clamp in one place and not the other - which
+/// reads as a title occasionally truncating its own uniform upload.
+pub(crate) const DEFAULT_UNIFORM_BUFFER_MAX_WORDS: u32 = 4096;
+
 /// Base guest address of the parameter array for `program`.
 fn params_base(ctx: &GuestCtx, program: u32) -> u32 {
     program
@@ -246,10 +260,18 @@ const GXM_PARAM_RESOURCE_INDEX_OFF: u32 = 0xC;
 /// extending it.
 pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::gxm as g;
-    use vitaslop_transpiler::InlineOp::LoadShiftMask;
+    use vitaslop_transpiler::InlineOp::{LoadScaled, LoadShiftMask};
     // The packed word's fields; `param_word` masks the word to 16 bits first, which
     // the 4-bit field masks below make redundant.
     let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf };
+    // A field of a texture's CONTROL WORD 0, at the pointer itself (offset 0). Every one of
+    // these is now a plain field of the guest's own struct rather than an entry in a host-side
+    // map, which is what makes inlining them possible at all - see [`texword0`].
+    let tex = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift, mask };
+    // ...and for the two enums whose values are already IN control-word position, the answer is
+    // the masked word with no shift, so the mask is the field in place. See
+    // [`texture_get_mip_filter`].
+    let tex_in_place = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift: 0, mask: mask << shift };
     Some(match func_nid {
         g::PROGRAM_PARAMETER_GET_CATEGORY => word(0),
         g::PROGRAM_PARAMETER_GET_TYPE => word(4),
@@ -261,6 +283,40 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => {
             LoadShiftMask { offset: GXM_PARAM_RESOURCE_INDEX_OFF, shift: 0, mask: u32::MAX }
         }
+        // The texture sampler getters. `sceGxmTextureGetLodBias` is the single hottest host call
+        // one title makes - 71,298 in one profile window - and every one of these is one load,
+        // one shift and one mask over a struct the guest already owns.
+        g::TEXTURE_GET_LOD_BIAS => tex(texword0::LOD_BIAS),
+        g::TEXTURE_GET_U_ADDR_MODE_SAFE => tex(texword0::UADDR_MODE),
+        g::TEXTURE_GET_V_ADDR_MODE_SAFE => tex(texword0::VADDR_MODE),
+        g::TEXTURE_GET_MIN_FILTER => tex(texword0::MIN_FILTER),
+        g::TEXTURE_GET_MAG_FILTER => tex(texword0::MAG_FILTER),
+        // Both the checked and unchecked spellings read the same field, exactly as the two
+        // share one handler - see the note on `TEXTURE_GET_MIPMAP_COUNT` in `nid.rs`.
+        g::TEXTURE_GET_MIPMAP_COUNT | g::TEXTURE_GET_MIPMAP_COUNT_UNSAFE => {
+            tex(texword0::MIP_COUNT)
+        }
+        g::TEXTURE_GET_GAMMA_MODE => tex_in_place(texword0::GAMMA_MODE),
+        // The two PROGRAM-pointer reads. Everything above is handed a parameter record;
+        // these are handed the `SceGxmProgram` itself, which changes nothing about the
+        // lowering - an inline form is defined by (pointer argument, offset), and which
+        // structure the pointer names is not the emitter's business.
+        //
+        // Both are called per draw by a title that re-reflects its shader interface every
+        // frame: 21,710 and 24,760 calls in one profile window.
+        g::PROGRAM_GET_PARAMETER_COUNT => {
+            LoadShiftMask { offset: GXP_PARAM_COUNT_OFF, shift: 0, mask: u32::MAX }
+        }
+        // `default_uniform_buffer_bytes` is `read(+0x64).min(4096) * 4`. The scale is a
+        // shift; the CLAMP is not, so the inline form covers values at or below the cap
+        // and hands the rest back - see `InlineOp::LoadScaled`. A program whose header we
+        // failed to resolve is exactly the clamped case, so the handler keeps defining the
+        // answer precisely where the answer is least trustworthy.
+        g::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE => LoadScaled {
+            offset: GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF,
+            max: DEFAULT_UNIFORM_BUFFER_MAX_WORDS,
+            shl: 2,
+        },
         _ => return None,
     })
 }
@@ -327,6 +383,20 @@ pub(super) fn param_get_name(ctx: &mut GuestCtx) {
 /// walk the real parameter table and return the first record whose name matches, or
 /// null. Returning a real record (not an opaque token) lets a title reflect on the
 /// match with the accessors above - the resource index, container, type, etc.
+///
+/// # This was memoized, and the memoization was REVERTED. Do not re-add it.
+/// The obvious optimisation - build a name -> record map per program and hash into it -
+/// was implemented, tested and MEASURED on 2026-08-08e, and it is worth nothing: over a
+/// 2000-frame boot-inclusive window of a real title, 24,760 calls went from 0.58 to 0.57
+/// us each, a saving of 0.2 ms in 19 s.
+///
+/// The reason is that the walk was never the cost. The line below it - reading the
+/// REQUESTED name out of guest memory - happens on every call whatever the lookup does,
+/// and it dominates. Caching removed the cheap half. In exchange it added a per-program
+/// cache keyed by a guest ADDRESS, which a title may reuse for a different shader: two
+/// programs agreeing in parameter count and parameters offset, and sharing a name, would
+/// return the WRONG record - a uniform written to the wrong place, surfacing as a shading
+/// bug nowhere near here. That is a real hazard bought for 0.01 us a call.
 pub(super) fn find_parameter(ctx: &mut GuestCtx, _st: &mut VitaState) {
     let program = ctx.arg(0);
     let want = ctx.read_cstr(ctx.arg(1), 256);
@@ -423,6 +493,9 @@ fn write_background_tex(ctx: &mut GuestCtx, addr: u32, s: &ColorSurface) {
         s.width,
         s.height,
         s.data_addr,
+        // A colour surface's background texture is a single image - a render target has no mip
+        // chain - so one level, and `None` for the strided case where those bits are the stride.
+        (type_field != TYPE_LINEAR_STRIDED).then_some(1),
     );
 }
 
@@ -462,6 +535,7 @@ fn report_background_tex_had_data(ctx: &mut GuestCtx, addr: u32) {
 /// field in word 1 and its top bit lives there - without it a texture read back from its control
 /// words alone (which is what happens once a title COPIES the struct) silently becomes a
 /// different format, and every compressed format plus `U2F10F10F10` is above 0x7f.
+#[allow(clippy::too_many_arguments)]
 fn write_texture_control_words(
     ctx: &mut GuestCtx,
     addr: u32,
@@ -471,8 +545,20 @@ fn write_texture_control_words(
     width: u32,
     height: u32,
     data: u32,
+    // `mipCount` as the guest passed it to `sceGxmTextureInit*`, or `None` for a
+    // `LINEAR_STRIDED` texture, where the same argument is a byte stride and these bits belong
+    // to the stride field instead (see [`texword0`]).
+    mip_count: Option<u32>,
 ) {
-    let w0 = ((base_format >> 7) & 1) << 31;
+    // Word 0's sampler fields are all left ZERO here, which is not a shortcut: GXM's defaults
+    // for every one of them IS zero - REPEAT addressing, POINT filtering, mip filter disabled,
+    // lod bias 0, gamma off - so a freshly initialised texture reads back the documented
+    // defaults from its own control word with nothing else written.
+    let mip = mip_count.map_or(0, |n| {
+        let (shift, mask) = texword0::MIP_COUNT;
+        (n & mask) << shift
+    });
+    let w0 = (((base_format >> 7) & 1) << 31) | mip;
     let w1 = (height.saturating_sub(1) & 0xfff)
         | ((width.saturating_sub(1) & 0xfff) << 12)
         | ((base_format & 0x1f) << 24)
@@ -734,16 +820,21 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// it can be observed - and it decides whether a shader that outputs alpha 0 is invisible or
 /// perfectly fine. A handful of distinct values covers a whole title, so printing each once is
 /// cheap and says exactly what the renderer has to reproduce.
-fn report_blend_info(blend_info: u32, blend: crate::capture::BlendState) {
+///
+/// Keyed by the `SceGxmProgram*` as well as the decoded state, and it PRINTS that address: it is
+/// the same address the shader dumps are named by (`frag_<header>.gxp`), so this line is what
+/// ties "which blend equation" to "which blob" without another run. Deduping on the blend state
+/// alone said a title used four equations and left no way to ask which program had which.
+fn report_blend_info(program_header: u32, blend_info: u32, blend: crate::capture::BlendState) {
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<crate::capture::BlendState>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashSet<(u32, crate::capture::BlendState)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert(blend) {
+    if !g.get_or_insert_with(HashSet::new).insert((program_header, blend)) {
         return;
     }
     eprintln!(
-        "gxm blend: fragment program created with {} - mask={:#x} colorFunc={} alphaFunc={} \
+        "gxm blend: fragment program {program_header:#x} created with {} - mask={:#x} colorFunc={} alphaFunc={} \
          colorSrc={} colorDst={} alphaSrc={} alphaDst={} (blends={})",
         if blend_info == 0 { "a NULL blendInfo" } else { "a blendInfo" },
         blend.color_mask,
@@ -773,7 +864,7 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         }
         _ => crate::capture::BlendState::default(),
     };
-    report_blend_info(blend_info, blend);
+    report_blend_info(program_header, blend_info, blend);
     st.set_fragment_program(handle, program_header, blend);
     ctx.write_u32(out, handle);
     ctx.ret(0);
@@ -1348,11 +1439,16 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
     // The 6th argument is `mipCount` for every layout except LINEAR_STRIDED, where it
     // is the explicit byte stride. Record it so GetMipmapCountUnsafe / GetStride read
     // back the exact value the guest passed.
+    // The BYTE STRIDE stays in the host shadow. It is the one field of word 0 that cannot move
+    // into the guest's words: a `LINEAR_STRIDED` texture spreads its stride over `stride_ext`,
+    // `stride_low` and `stride`, and how those three COMPOSE is not published - the header names
+    // them "stride extension" and "internal stride lower bits" and stops there. Packing it would
+    // mean inventing the composition, so `sceGxmTextureGetStride` still reads what the guest
+    // passed. `mipCount` DOES move, for every layout that has the field.
     let mip_or_stride = ctx.arg(5);
-    if type_field == TYPE_LINEAR_STRIDED {
-        st.set_texture_init_extra(texture, 1, mip_or_stride);
-    } else {
-        st.set_texture_init_extra(texture, mip_or_stride, 0);
+    let strided = type_field == TYPE_LINEAR_STRIDED;
+    if strided {
+        st.set_texture_stride(texture, mip_or_stride);
     }
 
     write_texture_control_words(
@@ -1364,6 +1460,7 @@ pub(super) fn texture_init(ctx: &mut GuestCtx, st: &mut VitaState, type_field: u
         width,
         height,
         data,
+        (!strided).then_some(mip_or_stride),
     );
     st.set_texture_format(texture, tex_format);
     ctx.ret(0);
@@ -1582,7 +1679,41 @@ pub(super) fn set_region_clip(
     let rs = st.render_state_mut();
     rs.region_clip_mode = mode;
     rs.region_clip = [x_min, y_min, x_max, y_max];
+    report_region_clip_ignored(mode, [x_min, y_min, x_max, y_max]);
     0
+}
+
+/// Say so - once per distinct clip, unconditionally - that the guest set a REGION CLIP and no
+/// renderer here consumes it.
+///
+/// `SceGxmRegionClip` is the hardware scissor. It is captured into
+/// [`crate::capture::RenderState`] and then read by nobody: there is no `set_scissor` anywhere
+/// in this project. That is invisible until a title uses the idiom where it matters - draw an
+/// oversized triangle covering the whole viewport and SCISSOR it down to the rectangle you
+/// actually want - at which point ignoring the scissor turns a small rectangle into a
+/// fullscreen one. A black fullscreen triangle drawn that way covers the finished frame, which
+/// is a black screen with the UI on top and no error anywhere.
+///
+/// Mode 0 is `SCE_GXM_REGION_CLIP_NONE` and is not worth reporting; it is the default and it
+/// asks for nothing.
+fn report_region_clip_ignored(mode: u32, rect: [u32; 4]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    if mode == 0 {
+        return;
+    }
+    static SEEN: Mutex<Option<HashSet<(u32, [u32; 4])>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((mode, rect)) {
+        return;
+    }
+    eprintln!(
+        "gxm: sceGxmSetRegionClip(mode={mode}, {},{} .. {},{}) - the guest asked for a SCISSOR \
+         and NO renderer here applies one, so every draw under it rasterises over the whole \
+         target. A title that draws an oversized triangle and scissors it to the rectangle it \
+         wants gets a FULLSCREEN one instead.",
+        rect[0], rect[1], rect[2], rect[3]
+    );
 }
 
 // --- Getters ----------------------------------------------------------------
@@ -1677,53 +1808,157 @@ pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, 
 
 // --- Sampler state ----------------------------------------------------------
 
+/// The fields of `SceGxmTexture` CONTROL WORD 0, as `(byte offset, bit shift, mask)`.
+///
+/// Layout from vitasdk `gxm.h struct SceGxmTexture` (permissive, an approved reference). The
+/// bitfields are declared LSB-first, so the shifts below are the running sum of the widths
+/// above each one:
+///
+/// ```text
+///  bit  0      unk0            bits 14-16  unk1
+///  bits 1-2    stride_ext      bits 17-20  mip_count   (stride, if LINEAR_STRIDED)
+///  bits 3-5    vaddr_mode      bits 21-26  lod_bias    (stride, if LINEAR_STRIDED)
+///  bits 6-8    uaddr_mode      bits 27-28  gamma_mode
+///  bit  9      mip_filter      bits 29-30  unk2        (stride_low, if LINEAR_STRIDED)
+///  bits 10-11  min_filter      bit  31     format0
+///  bits 12-13  mag_filter
+/// ```
+///
+/// # Why these live in the guest's words and not in a host-side shadow
+/// They used to live in a shadow map keyed by the texture struct's ADDRESS, on the stated
+/// reasoning that a setter should not risk corrupting a struct the guest re-reads. That was
+/// wrong in two ways that reinforce each other:
+///
+/// 1. **A `SceGxmTexture` is 16 bytes the guest owns and COPIES.** This codebase already knows
+///    that - `sceGxmSetFragmentTexture` takes the words by value, and one title binds by-value
+///    copies. Address-keyed state does not survive a copy, so a copied texture silently got
+///    GXM defaults for its wrap modes and bias instead of the originals. A wrong wrap mode is
+///    the "colours right, shapes wrong" failure, i.e. visible and hard to attribute.
+/// 2. **A getter whose answer lives in host state cannot be inlined.** These are pure field
+///    reads, which is exactly what [`vitaslop_transpiler::InlineOp::LoadShiftMask`] exists for,
+///    and `sceGxmTextureGetLodBias` is the single hottest host call one title makes - 71,298 in
+///    a profile window, 66,405 of them from one call site. Reading the guest's own word makes
+///    it a load, a shift and a mask emitted straight into the guest code, crossing nothing.
+///
+/// The defaults are why the shadow worked for so long: GXM's defaults for every field here are
+/// zero (REPEAT, POINT, no mip filter, bias 0, gamma off), and `write_texture_control_words`
+/// leaves word 0 zero apart from the format bit - so the word and the shadow agreed on any
+/// texture the guest never copied.
+///
+/// # What is NOT settled, stated rather than guessed
+/// - `mip_count` is four bits and the header says only "Mip count". Whether the driver packs
+///   the count or the count MINUS ONE (as it does for width and height, which this project
+///   established from observed behaviour) is not stated by any clean source. It is also
+///   unobservable through the API: every path that can see it goes through our own writer and
+///   reader, and both choices satisfy `Set(n)` then `Get() == n` and survive a struct copy.
+///   Stored raw, and this comment is the record of the ambiguity.
+/// - `byte_stride` for a `LINEAR_STRIDED` texture is spread over `stride_ext`, `stride_low` and
+///   `stride`, and how those three COMPOSE is not published ("stride extension", "internal
+///   stride lower bits"). That one stays in the host shadow, because packing it would mean
+///   inventing the composition - see [`VitaState::texture_stride`].
+mod texword0 {
+    /// `(shift, mask)` of each field of control word 0.
+    pub const VADDR_MODE: (u32, u32) = (3, 0x7);
+    pub const UADDR_MODE: (u32, u32) = (6, 0x7);
+    pub const MIP_FILTER: (u32, u32) = (9, 0x1);
+    pub const MIN_FILTER: (u32, u32) = (10, 0x3);
+    pub const MAG_FILTER: (u32, u32) = (12, 0x3);
+    pub const MIP_COUNT: (u32, u32) = (17, 0xf);
+    pub const LOD_BIAS: (u32, u32) = (21, 0x3f);
+    pub const GAMMA_MODE: (u32, u32) = (27, 0x3);
+}
+
+/// Read one field of a texture's control word 0.
+fn tex_field(ctx: &GuestCtx, texture: u32, (shift, mask): (u32, u32)) -> u32 {
+    (ctx.read_u32(texture) >> shift) & mask
+}
+
+/// Write one field of a texture's control word 0, leaving every other bit alone.
+///
+/// The value is MASKED, not asserted: the hardware field is this wide, so a caller passing a
+/// wider value gets what the hardware would store. Faithfulness here is "the bits the hardware
+/// keeps", not "reject what the guest asked for".
+fn set_tex_field(ctx: &mut GuestCtx, texture: u32, (shift, mask): (u32, u32), value: u32) {
+    let w0 = ctx.read_u32(texture);
+    ctx.write_u32(texture, (w0 & !(mask << shift)) | ((value & mask) << shift));
+}
+
 /// int sceGxmTextureSetUAddrMode[Safe](SceGxmTexture *texture, SceGxmTextureAddrMode mode)
-#[hostcall]
-pub(super) fn texture_set_u_addr_mode(st: &mut VitaState, texture: u32, mode: u32) -> i32 {
-    st.set_texture_sampler(texture, 0, mode);
-    0
+pub(super) fn texture_set_u_addr_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let mode = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::UADDR_MODE, mode);
+    ctx.ret(0);
 }
 
 /// int sceGxmTextureSetVAddrMode[Safe](SceGxmTexture *texture, SceGxmTextureAddrMode mode)
-#[hostcall]
-pub(super) fn texture_set_v_addr_mode(st: &mut VitaState, texture: u32, mode: u32) -> i32 {
-    st.set_texture_sampler(texture, 1, mode);
-    0
+pub(super) fn texture_set_v_addr_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let mode = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::VADDR_MODE, mode);
+    ctx.ret(0);
 }
 
 /// int sceGxmTextureSetLodBias(SceGxmTexture *texture, unsigned int bias)
-#[hostcall]
-pub(super) fn texture_set_lod_bias(st: &mut VitaState, texture: u32, bias: u32) -> i32 {
-    st.set_texture_sampler(texture, 2, bias);
-    0
+pub(super) fn texture_set_lod_bias(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let bias = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::LOD_BIAS, bias);
+    ctx.ret(0);
 }
 
 /// int sceGxmTextureSetMinFilter(SceGxmTexture *texture, SceGxmTextureFilter minFilter)
-#[hostcall]
-pub(super) fn texture_set_min_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
-    st.set_texture_filter(texture, 0, filter);
-    0
+pub(super) fn texture_set_min_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let filter = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::MIN_FILTER, filter);
+    ctx.ret(0);
 }
 
 /// int sceGxmTextureSetMagFilter(SceGxmTexture *texture, SceGxmTextureFilter magFilter)
-#[hostcall]
-pub(super) fn texture_set_mag_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
-    st.set_texture_filter(texture, 1, filter);
-    0
+pub(super) fn texture_set_mag_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let filter = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::MAG_FILTER, filter);
+    ctx.ret(0);
 }
 
 /// int sceGxmTextureSetMipFilter(SceGxmTexture *texture, SceGxmTextureMipFilter mipFilter)
-#[hostcall]
-pub(super) fn texture_set_mip_filter(st: &mut VitaState, texture: u32, filter: u32) -> i32 {
-    st.set_texture_filter(texture, 2, filter);
-    0
+///
+/// `SceGxmTextureMipFilter` is ALREADY SHIFTED into the control word
+/// (`SCE_GXM_TEXTURE_MIP_FILTER_ENABLED = 0x00000200`, i.e. bit 9), unlike
+/// `SceGxmTextureFilter`, whose values are a plain 0..3. Shifting a pre-shifted enum again
+/// would mask 0x200 down to zero and store "disabled" for every call that asked for enabled -
+/// silently, and visible only as absent mip filtering. The two neighbouring setters genuinely
+/// do need the shift, which is what makes this worth spelling out.
+pub(super) fn texture_set_mip_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let filter = ctx.arg(1);
+    let (shift, mask) = texword0::MIP_FILTER;
+    set_tex_field(ctx, texture, texword0::MIP_FILTER, (filter >> shift) & mask);
+    ctx.ret(0);
 }
 
+// NOTE `sceGxmTextureSetMipmapCount` and `sceGxmTextureGetMipFilter` exist in the API and are
+// NOT implemented here, because no title in the corpus links them and this project does not
+// hand-type a NID it has not verified against a real module. They are one line
+// each over `texword0::MIP_COUNT` / `MIP_FILTER` the moment a title needs them, and until then
+// an unregistered NID hard-fails at link, which is the correct outcome rather than a guess.
+
 /// int sceGxmTextureSetGammaMode(SceGxmTexture *texture, SceGxmTextureGammaMode gammaMode)
-#[hostcall]
-pub(super) fn texture_set_gamma_mode(st: &mut VitaState, texture: u32, gamma: u32) -> i32 {
-    st.set_texture_gamma(texture, gamma);
-    0
+///
+/// The enum's values are already SHIFTED into place in the control word
+/// (`SCE_GXM_TEXTURE_GAMMA_BGR = 0x08000000`, i.e. bit 27), so the argument is masked to the
+/// field's two bits rather than shifted again.
+pub(super) fn texture_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let texture = ctx.arg(0);
+    let gamma = ctx.arg(1);
+    let (shift, mask) = texword0::GAMMA_MODE;
+    set_tex_field(ctx, texture, texword0::GAMMA_MODE, (gamma >> shift) & mask);
+    // The mode itself lives in the word now; this only reports the first one of a run, because a
+    // gamma texture is sampled through an sRGB format.
+    st.note_texture_gamma(texture, gamma);
+    ctx.ret(0);
 }
 
 /// void sceGxmSetVertexUniformBuffer / sceGxmSetFragmentUniformBuffer
@@ -1757,45 +1992,58 @@ pub(super) fn set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str) {
 // --- Texture getters (read back the sticky sampler/format state) -------------
 
 /// unsigned int sceGxmTextureGetMipmapCountUnsafe(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_mipmap_count(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_mip_count(texture)
+pub(super) fn texture_get_mipmap_count(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::MIP_COUNT);
+    ctx.ret(v);
 }
 
 /// unsigned int sceGxmTextureGetLodBias(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_lod_bias(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_lod_bias(texture)
+pub(super) fn texture_get_lod_bias(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::LOD_BIAS);
+    ctx.ret(v);
 }
 
 /// SceGxmTextureAddrMode sceGxmTextureGetUAddrModeSafe(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_u_addr_mode(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_addr_mode(texture, 0)
+pub(super) fn texture_get_u_addr_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::UADDR_MODE);
+    ctx.ret(v);
 }
 
 /// SceGxmTextureAddrMode sceGxmTextureGetVAddrModeSafe(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_v_addr_mode(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_addr_mode(texture, 1)
+pub(super) fn texture_get_v_addr_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::VADDR_MODE);
+    ctx.ret(v);
 }
 
 /// SceGxmTextureFilter sceGxmTextureGetMinFilter(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_min_filter(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_filter(texture, 0)
+pub(super) fn texture_get_min_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::MIN_FILTER);
+    ctx.ret(v);
 }
 
 /// SceGxmTextureFilter sceGxmTextureGetMagFilter(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_mag_filter(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_filter(texture, 1)
+pub(super) fn texture_get_mag_filter(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let v = tex_field(ctx, texture, texword0::MAG_FILTER);
+    ctx.ret(v);
 }
 
 /// SceGxmTextureGammaMode sceGxmTextureGetGammaMode(const SceGxmTexture *texture)
-#[hostcall]
-pub(super) fn texture_get_gamma_mode(st: &mut VitaState, texture: u32) -> u32 {
-    st.texture_filter(texture, 2)
+///
+/// `SceGxmTextureGammaMode`'s values are already in control-word position
+/// (`GAMMA_R = 0x08000000`), so the answer is word 0 masked to the field, UNSHIFTED - the same
+/// shape `sceGxmTextureGetMipFilter` would take. See [`texture_set_mip_filter`] for why the
+/// neighbouring filter getters are different.
+pub(super) fn texture_get_gamma_mode(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let (shift, mask) = texword0::GAMMA_MODE;
+    let v = ctx.read_u32(texture) & (mask << shift);
+    ctx.ret(v);
 }
 
 /// unsigned int sceGxmTextureGetStride(const SceGxmTexture *texture)
@@ -2487,6 +2735,63 @@ pub(crate) mod inline_op_tests {
         [0x1234_5678, 0x0000_9CB6, 0x0000_002A, 0x0000_0007]
     }
 
+    /// Guest address the synthetic `SceGxmProgram` header sits at. Far enough from
+    /// [`PARAM`] that the two fixtures cannot overlap at any offset either one reads.
+    const PROGRAM: u32 = 0x200;
+
+    /// The program header fields the inline forms read, by byte offset. Only the read
+    /// fields are set; everything else stays zero, which is what a header we failed to
+    /// resolve looks like.
+    fn program_header() -> Vec<(u32, u32)> {
+        vec![
+            (GXP_PARAM_COUNT_OFF, 11),
+            // Comfortably under the clamp, so this is the INLINE case. The clamped case
+            // is checked separately - it is the one the inline form must refuse.
+            (GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF, 37),
+        ]
+    }
+
+    /// A guest image holding BOTH fixtures: the parameter record at [`PARAM`] and the
+    /// program header at [`PROGRAM`].
+    ///
+    /// One image rather than two, because an inline form is defined by (pointer argument,
+    /// offset) and nothing else - which structure the pointer names is not something the
+    /// lowering knows or needs to. Keeping both in one image lets the same check cover a
+    /// parameter getter and a program getter without a second harness.
+    fn fixture_image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 4096];
+        for (i, w) in param_record().iter().enumerate() {
+            let off = PARAM as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (off, w) in program_header() {
+            let at = PROGRAM as usize + off as usize;
+            bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Run a NID through the real dispatch over the fixture image, with `ptr` in r0, and
+    /// return the r0 the guest would see.
+    fn handler_result_at(func_nid: u32, ptr: u32) -> u32 {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = ptr;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = fixture_image();
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        regs[0]
+    }
+
+    /// The word at `ptr + offset` in the fixture image - the word the inline form reads.
+    fn fixture_word(ptr: u32, offset: u32) -> u32 {
+        let bytes = fixture_image();
+        let at = (ptr + offset) as usize;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+    }
+
     /// Run a NID through the real dispatch over a synthetic parameter record and
     /// return the r0 the guest would see.
     fn handler_result(func_nid: u32) -> u32 {
@@ -2538,7 +2843,55 @@ pub(crate) mod inline_op_tests {
         }
     }
 
-    /// The NIDs the test above checks.
+    /// The same equivalence for the getters handed a PROGRAM rather than a parameter
+    /// record. Split from the test above only because the pointer differs; the obligation
+    /// is identical, and `every_inlined_nid_is_covered` holds both lists together.
+    #[test]
+    fn program_inline_ops_match_their_handlers() {
+        for func_nid in COVERED_PROGRAM {
+            let op = inline_op(func_nid).expect("listed NID has an inline form");
+            let offset = op.offset().expect("a program getter reads through its pointer argument");
+            let word = fixture_word(PROGRAM, offset);
+            assert!(
+                !op.falls_back(word),
+                "{} fixture must exercise the INLINE arm",
+                crate::nid::name(func_nid)
+            );
+            assert_eq!(
+                op.eval(word),
+                handler_result_at(func_nid, PROGRAM),
+                "inline form of {} disagrees with its handler",
+                crate::nid::name(func_nid)
+            );
+        }
+    }
+
+    /// The clamped default-uniform-buffer case must NOT be answered inline.
+    ///
+    /// This is the whole reason `LoadScaled` carries a value guard. Inline, an unresolved
+    /// header's count would be shifted straight into a huge size; the handler clamps it.
+    /// A title uses this number as the length of its own uniform upload, so a wrong one
+    /// does not fail - it truncates or overruns the block, far from here.
+    #[test]
+    fn an_unresolved_uniform_buffer_count_falls_back_to_the_handler() {
+        let op = inline_op(g::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE).expect("has an inline form");
+        assert!(
+            op.falls_back(DEFAULT_UNIFORM_BUFFER_MAX_WORDS + 1),
+            "a count past the clamp must reach the handler"
+        );
+        assert!(
+            !op.falls_back(DEFAULT_UNIFORM_BUFFER_MAX_WORDS),
+            "the clamp itself is still answerable inline"
+        );
+        // ...and where it IS answerable, the two agree at the boundary.
+        assert_eq!(
+            op.eval(DEFAULT_UNIFORM_BUFFER_MAX_WORDS),
+            DEFAULT_UNIFORM_BUFFER_MAX_WORDS * 4,
+            "the scale is four bytes per SA register"
+        );
+    }
+
+    /// The NIDs the parameter-record test checks.
     const COVERED: [u32; 6] = [
         g::PROGRAM_PARAMETER_GET_CATEGORY,
         g::PROGRAM_PARAMETER_GET_TYPE,
@@ -2547,6 +2900,10 @@ pub(crate) mod inline_op_tests {
         g::PROGRAM_PARAMETER_GET_ARRAY_SIZE,
         g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX,
     ];
+
+    /// The NIDs the program-header test checks.
+    const COVERED_PROGRAM: [u32; 2] =
+        [g::PROGRAM_GET_PARAMETER_COUNT, g::PROGRAM_GET_DEFAULT_UNIFORM_BUFFER_SIZE];
 
     /// Only a call with NO host behaviour may be inlined. Inlining is invisible to
     /// the host - the handler simply never runs - so inlining a NID that touches
@@ -2558,7 +2915,7 @@ pub(crate) mod inline_op_tests {
     /// `inline_op`), and a sample of NIDs with real behaviour do not.
     #[test]
     fn only_pure_getters_are_inlined() {
-        for &nid in &COVERED {
+        for &nid in COVERED.iter().chain(COVERED_PROGRAM.iter()) {
             assert!(
                 inline_op(nid).is_some(),
                 "{} is listed as covered but has no inline form",
@@ -2566,12 +2923,14 @@ pub(crate) mod inline_op_tests {
             );
         }
         for nid in [
-            g::DRAW,                          // records a whole draw into the scene
-            g::END_SCENE,                     // completes and folds a frame
-            g::SET_VERTEX_PROGRAM,            // updates the bound program
-            g::PROGRAM_PARAMETER_GET_NAME,    // returns a pointer, not a bitfield
-            g::PROGRAM_GET_PARAMETER,         // computes an address from two reads
-            g::PROGRAM_GET_PARAMETER_COUNT,   // reads the PROGRAM, not a parameter
+            g::DRAW,                       // records a whole draw into the scene
+            g::END_SCENE,                  // completes and folds a frame
+            g::SET_VERTEX_PROGRAM,         // updates the bound program
+            g::PROGRAM_PARAMETER_GET_NAME, // returns a pointer, not a bitfield
+            g::PROGRAM_GET_PARAMETER,      // computes an address from two reads
+            // A string search over the whole parameter table: pure, but not ONE read.
+            // Memoizing it was tried and reverted - see `find_parameter`.
+            g::PROGRAM_FIND_PARAMETER_BY_NAME,
         ] {
             assert!(
                 inline_op(nid).is_none(),

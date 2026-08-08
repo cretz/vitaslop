@@ -56,14 +56,54 @@ export async function isImported(id, expectedCount) {
 
 /// Stream one `ReadableStream` (or `Blob`) into `dir` under `path`, without ever
 /// holding the whole thing. Returns the bytes written.
-async function storeOne(dir, path, source) {
+///
+/// `onBytes(n)` is called with each chunk's length as it passes through. It exists because
+/// a container's bytes are NOT spread evenly over its files: one title puts 660 of its 688
+/// MB into 28 of its 248 files, so a caller that only learns about a finished file shows a
+/// frozen counter for the entire minutes-long download of a single large one - which reads
+/// exactly like a hang, and was reported as one.
+async function storeOne(dir, path, source, onBytes = () => {}) {
   const fh = await dir.getFileHandle(encodeName(path), { create: true });
   const w = await fh.createWritable();
   const stream = source instanceof Blob ? source.stream() : source;
+  const counted = stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, ctrl) {
+        onBytes(chunk.byteLength);
+        ctrl.enqueue(chunk);
+      },
+    })
+  );
   // `pipeTo` hands the writable ownership of the stream and closes it on completion,
   // so a failure part-way cannot leave a half-written file locked open.
-  await stream.pipeTo(w);
+  await counted.pipeTo(w);
   return (await fh.getFile()).size;
+}
+
+/// How much room this origin has, or `null` where the browser will not say.
+///
+/// # Why this is checked BEFORE an import and not caught after
+/// A phone's quota for an origin is a fraction of its free disk, and these containers are
+/// 237 MB to 1719 MB. Discovering the limit by hitting it means a `QuotaExceededError`
+/// hundreds of megabytes into a download, over wifi, with the partial files still on disk.
+/// Asking first costs one call and turns that into a sentence naming both numbers.
+export async function storageRoom() {
+  if (!navigator.storage || !navigator.storage.estimate) return null;
+  const { quota, usage } = await navigator.storage.estimate();
+  if (typeof quota !== "number") return null;
+  return { quota, usage: usage || 0, free: quota - (usage || 0) };
+}
+
+/// Ask the browser to treat this origin's storage as persistent, so an imported title is not
+/// evicted under disk pressure - re-importing a gigabyte is not a cost to pay silently.
+/// Returns whether it was granted. A refusal is not fatal and is reported, not swallowed.
+export async function requestPersistence() {
+  if (!navigator.storage || !navigator.storage.persist) return false;
+  try {
+    return (await navigator.storage.persisted()) || (await navigator.storage.persist());
+  } catch {
+    return false;
+  }
 }
 
 /// Import a whole container into OPFS from a list of `{ path, source }`, where `source`
@@ -78,7 +118,18 @@ export async function importTitle(id, entries, onProgress = () => {}) {
   const dir = await titleDir(id);
   let bytes = 0;
   for (let i = 0; i < entries.length; i++) {
-    bytes += await storeOne(dir, entries[i].path, await entries[i].source());
+    // Report DURING each file as well as after it, throttled to every 4 MB so a slow large
+    // file still moves the counter without flooding the caller. See `storeOne`.
+    let inFlight = 0;
+    let reported = 0;
+    const written = await storeOne(dir, entries[i].path, await entries[i].source(), (n) => {
+      inFlight += n;
+      if (inFlight - reported >= 4 << 20) {
+        reported = inFlight;
+        onProgress(i, entries.length, bytes + inFlight, false);
+      }
+    });
+    bytes += written;
     onProgress(i + 1, entries.length, bytes, false);
   }
   // The marker goes last, so "present" always means "everything before it is there".

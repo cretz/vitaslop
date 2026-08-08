@@ -29,7 +29,7 @@
 //! [`SchedCore`] helpers (priority pick, frame counting, spawn/wake drain,
 //! deadlock/timed-wait, verdict), so the discipline is identical to native.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -70,14 +70,35 @@ mod hostcalls {
         static MS: Cell<f64> = const { Cell::new(0.0) };
         /// Of [`MS`], the part spent in the handler rather than around it.
         static DISPATCH_MS: Cell<f64> = const { Cell::new(0.0) };
+        /// Whether the live loop currently has per-call timing SAMPLED on. One cell shared by
+        /// the reader and the setter below - two `thread_local!` blocks declaring the same name
+        /// would be two different cells, and the setter would write one nothing reads.
+        static TIMING_SAMPLED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Whether to time each host call (`VITASLOP_PERF`). Read once and cached.
+    /// Whether to time each host call right now.
+    ///
+    /// # Why this is togglable rather than read once
+    /// The knob (`VITASLOP_PERF`) pins it on for a whole run, and the timing costs about 4 us
+    /// per call on a phone - roughly doubling a frame. That leaves a user of the live page with
+    /// two bad options: watch at full speed and learn nothing, or profile at half speed and
+    /// watch nothing. Neither is what anyone wants, and asking them to pick is the wrong
+    /// question.
+    ///
+    /// So the live loop SAMPLES it: on for one perf window in every few, off the rest, with the
+    /// numbers labelled as sampled. The average cost is the fraction of windows it runs in, and
+    /// the reading is the same reading. The knob still forces it permanently on, for a harness
+    /// that wants every call timed.
     pub fn timing_enabled() -> bool {
         thread_local! {
-            static ON: bool = vitaslop_runtime::knobs::flag("VITASLOP_PERF");
+            static FORCED: bool = vitaslop_runtime::knobs::flag("VITASLOP_PERF");
         }
-        ON.with(|on| *on)
+        FORCED.with(|on| *on) || TIMING_SAMPLED.with(|s| s.get())
+    }
+
+    /// Turn per-call timing on or off for the next stretch of the run. See `timing_enabled`.
+    pub fn set_timing_sampling(on: bool) {
+        TIMING_SAMPLED.with(|s| s.set(on));
     }
 
     /// Host calls one guest thread may make before the browser preempts it
@@ -293,6 +314,21 @@ mod hostcalls {
         (CALLS.with(|c| c.get()), MS.with(|m| m.get()))
     }
 
+    /// `(calls, total ms, handler ms, marshalling ms)` since the run started.
+    ///
+    /// The same split `record` logs, as a VALUE. The log line reaches a filter that has to be
+    /// configured to `vitaslop::perf=info` to see it, which on the live page means editing a
+    /// knob box to answer the single most load-bearing question about host-call cost - whether
+    /// the time is in the handler doing the guest's work, or around it copying a register file
+    /// the handler mostly does not read. That question deserves to be on the screen, not behind
+    /// a log filter.
+    pub fn split() -> (u64, f64, f64, f64) {
+        let calls = CALLS.with(|c| c.get());
+        let total = MS.with(|m| m.get());
+        let handler = DISPATCH_MS.with(|m| m.get());
+        (calls, total, handler, total - handler)
+    }
+
     thread_local! {
         /// JSPI SUSPENSIONS: every time a guest stack parked on a pending Promise.
         static SUSPENDS: Cell<u64> = const { Cell::new(0) };
@@ -337,6 +373,44 @@ mod hostcalls {
         RELEASED.with(|c| c.get())
     }
 
+    thread_local! {
+        /// Module instances actually INSTANTIATED, pooled on release, and taken back out
+        /// of the pool. The three together are what say whether the pool is working: a
+        /// title creating a guest thread per frame should show `created` going flat while
+        /// `reused` climbs with the frames. `created` alone cannot distinguish a pool
+        /// that is being used from one that is always empty.
+        static INSTANCES: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+    }
+
+    /// Count one `WebAssembly.Instance` of the transpiled title.
+    pub fn note_instance_created() {
+        INSTANCES.with(|c| {
+            let (a, b, d) = c.get();
+            c.set((a + 1, b, d));
+        });
+    }
+
+    /// Count one instance handed back to the pool by a finished thread.
+    pub fn note_instance_pooled() {
+        INSTANCES.with(|c| {
+            let (a, b, d) = c.get();
+            c.set((a, b + 1, d));
+        });
+    }
+
+    /// Count one instance taken from the pool for a new thread.
+    pub fn note_instance_reused() {
+        INSTANCES.with(|c| {
+            let (a, b, d) = c.get();
+            c.set((a, b, d + 1));
+        });
+    }
+
+    /// `(instantiated, pooled, reused)` so far.
+    pub fn instance_stats() -> (u64, u64, u64) {
+        INSTANCES.with(|c| c.get())
+    }
+
     /// `(suspensions, stack starts, abandoned stacks)` so far.
     ///
     /// These three are reported per frame because a process that grows by a fixed amount
@@ -373,12 +447,31 @@ pub fn host_call_totals() -> (u64, f64) {
     hostcalls::totals()
 }
 
+/// `(calls, total ms, handler ms, marshalling ms)` since the run started. See
+/// [`hostcalls::split`] - the split is only meaningful over calls that were actually timed.
+pub fn host_call_split() -> (u64, f64, f64, f64) {
+    hostcalls::split()
+}
+
+/// Turn per-call host-call TIMING on or off for the next stretch of the run, so the live loop
+/// can sample it instead of asking a user to choose between watching and profiling. See
+/// [`hostcalls::timing_enabled`].
+pub fn set_host_call_timing(on: bool) {
+    hostcalls::set_timing_sampling(on);
+}
+
 /// `(suspensions, JSPI stack starts, abandoned stacks, released threads)` so far. See
 /// [`hostcalls::stack_stats`] for why a per-frame count is what makes a per-frame process
 /// growth attributable.
 pub fn stack_stats() -> (u64, u64, u64, u64) {
     let (susp, starts, abandoned) = hostcalls::stack_stats();
     (susp, starts, abandoned, hostcalls::released())
+}
+
+/// `(instances instantiated, pooled, reused)` so far - see
+/// [`hostcalls::instance_stats`].
+pub fn instance_stats() -> (u64, u64, u64) {
+    hostcalls::instance_stats()
 }
 
 /// `(preemptions, of which on software fuel)` so far.
@@ -466,13 +559,17 @@ fn preempt_note() {
 /// block as the module is emitted, tested on loop back edges - see
 /// `vitaslop_transpiler::emit::Body` and `emit_fuel_check`.
 ///
-/// # This is the browser's GAME CLOCK RATE, and it is THE SAME UNIT AS NATIVE'S
-/// A preemption is what advances the virtual game clock (`SchedCore::on_quantum` ->
-/// `charge_cpu_quantum`, a flat `QUANTUM_CPU_US` each), so the clock's rate is the
-/// preemption rate. Native preempts on 5,000,000 units of wasmtime ENGINE FUEL over this
-/// very module. The transpiler now reproduces wasmtime's own accounting - its operator
-/// cost table and its flush points - so this is native's number in native's unit rather
-/// than a constant fitted to make two different scales agree.
+/// # It is the same UNIT as native's, and it is no longer the clock's RATE
+/// The transpiler reproduces wasmtime's own accounting - its operator cost table and its
+/// flush points - so a unit here is a unit there.
+///
+/// It used to be the clock's rate as well, because a preemption advanced the clock by a flat
+/// `QUANTUM_CPU_US`. That tied this number to native's preemption interval - they agree, both
+/// being [`QUANTUM_FUEL`](vitaslop_runtime::host::QUANTUM_FUEL) - but it also meant the clock
+/// measured how OFTEN a thread was preempted rather than how much it executed. The clock is now
+/// charged per unit of FUEL BURNED (`SchedCore::charge_guest_work`), so the two engines agree
+/// whatever their intervals are, and this is free to be chosen for what it actually trades off:
+/// preemption granularity against the cost of the check.
 ///
 /// It is deliberately the DOMINANT mechanism: the host-call quantum
 /// ([`hostcalls::quantum_calls`]) measures host-call DENSITY, which varies by an order of
@@ -542,6 +639,48 @@ type Host = Arc<Mutex<VitaEnv>>;
 #[derive(Clone)]
 struct SharedView {
     bytes: Uint8Array,
+    /// Byte offset of the GUEST-STORE DIRTY BLOCK this module was emitted with, or
+    /// `None` when it was built without one. The block is the epoch byte followed by
+    /// one stamp byte per 4 KB page - see `vitaslop_transpiler::emit::emit_dirty_mark`,
+    /// which writes it.
+    dirty_off: Option<u64>,
+}
+
+impl SharedView {
+    /// Absolute byte offset of page `p`'s stamp.
+    fn stamp_at(&self, block: u64, page: usize) -> u32 {
+        (block + transpiler_dirty_map_off() + page as u64) as u32
+    }
+
+    /// Stamp every page `[off, off + len)` touches with the current epoch.
+    ///
+    /// # This is not an extra - it is the other half of the map
+    /// The transpiler stamps what the GUEST stores, and a host call writes guest memory
+    /// too: a file read, a `memcpy` NID, a GXM transfer. Those writes are invisible to
+    /// translated code [[vitaslop-host-write-watch]], so a map that only the guest wrote
+    /// would report a texture the host had just overwritten as untouched - a silent
+    /// stale texture, the exact bug the compare exists to prevent.
+    /// Pages of the whole linear memory, which is what the map covers.
+    fn pages(&self) -> usize {
+        (self.bytes.length() as usize) >> vitaslop_transpiler::DIRTY_SHIFT
+    }
+
+    fn stamp_written(&self, off: usize, len: usize) {
+        let (Some(block), true) = (self.dirty_off, len > 0) else { return };
+        let epoch = self.bytes.get_index((block + vitaslop_transpiler::DIRTY_EPOCH_OFF) as u32);
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = (off + len - 1) >> shift;
+        // Nearly every host write is a pointer argument or a struct field and lands in
+        // ONE page; a single `set_index` is one boundary crossing where `fill` is one
+        // crossing plus a range, and crossings are what host calls are made of
+        // [[vitaslop-browser-host-call-cost]].
+        if first == last {
+            self.bytes.set_index(self.stamp_at(block, first), epoch);
+        } else {
+            self.bytes.fill(epoch, self.stamp_at(block, first), self.stamp_at(block, last + 1));
+        }
+    }
 }
 
 impl GuestMemory for SharedView {
@@ -553,7 +692,57 @@ impl GuestMemory for SharedView {
     }
     fn write(&mut self, off: usize, bytes: &[u8]) {
         self.bytes.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
+        self.stamp_written(off, bytes.len());
     }
+
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        let block = self.dirty_off?;
+        if len == 0 {
+            return Some(false);
+        }
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        // One page BELOW the range as well: a store is stamped against the page it
+        // STARTS in, and an 8-byte store starting in the page below can reach into
+        // this one. See `GuestMemory::dirty_since`.
+        let first = (off >> shift).saturating_sub(1);
+        // The map covers every page of the memory, and a texture lives in the guest
+        // region below it, so this clamp should never bite; it is here so that a bad
+        // length reads a short range rather than the bytes above the map.
+        let last = ((off + len - 1) >> shift).min(self.pages());
+        let mut pages = vec![0u8; last - first + 1];
+        self.bytes
+            .subarray(self.stamp_at(block, first), self.stamp_at(block, last + 1))
+            .copy_to(&mut pages);
+        Some(pages.iter().any(|&s| s >= stamp))
+    }
+
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        let block = self.dirty_off?;
+        let epoch_at = (block + vitaslop_transpiler::DIRTY_EPOCH_OFF) as u32;
+        let next = self.bytes.get_index(epoch_at).wrapping_add(1);
+        // The epoch is one byte and it is compared with `>=`, so it may not wrap
+        // silently: a stamp of 250 would suddenly read as "later than" a store at 3.
+        // Zeroing the map and restarting at 1 makes every existing stamp strictly
+        // greater than every map entry, i.e. "no store since" - which would be a LIE,
+        // so the caller is told and drops them. Rare by construction: the epoch only
+        // advances when a texture's bytes are actually established.
+        if next == 0 || next == u8::MAX {
+            let map = self.stamp_at(block, 0);
+            let pages = (self.len() >> vitaslop_transpiler::DIRTY_SHIFT) as u32 + 1;
+            let end = self.bytes.length().min(map + pages);
+            self.bytes.fill(0, map, end);
+            self.bytes.set_index(epoch_at, 1);
+            return Some((1, true));
+        }
+        self.bytes.set_index(epoch_at, next);
+        Some((next, false))
+    }
+}
+
+/// Byte offset of the page map within the dirty block. A thin wrapper so the two uses
+/// above read as offsets rather than as arithmetic on a transpiler constant.
+fn transpiler_dirty_map_off() -> u64 {
+    vitaslop_transpiler::DIRTY_MAP_OFF
 }
 
 // Batched register marshalling, in JS.
@@ -677,6 +866,32 @@ pub struct BrowserThread {
     /// the guest stack resumes. Native does this inside its import closure after the
     /// block await; the browser has no such re-entry, so it applies it here.
     host: Host,
+    /// The engine's shared instance pool, so a finished thread can give its instance
+    /// back instead of dropping it - see [`release`](ThreadHandle::release).
+    pool: InstancePool,
+}
+
+/// Instances whose guest thread has finished, reset and ready to run another. Shared
+/// between the engine (which takes from it) and every live thread (which gives back).
+type InstancePool = Rc<RefCell<Vec<ThreadEngine>>>;
+
+/// Whether a finished thread's module instance may be REUSED by the next thread
+/// (`VITASLOP_BROWSER_INSTANCE_POOL=0` to disable).
+///
+/// On by default: without it a title that creates a guest thread per frame instantiates the
+/// whole transpiled module per frame, and the browser is killed for it (see
+/// [`ThreadHandle::release`]). It is a knob because it is the kind of change that can only be
+/// cleared by A/B - a reused instance is supposed to be indistinguishable from a fresh one,
+/// and the one-line way to test that claim on any title is to turn the reuse off and see
+/// whether the behaviour moves.
+fn instance_pool_enabled() -> bool {
+    thread_local! {
+        static ON: bool = !matches!(
+            vitaslop_runtime::knobs::var("VITASLOP_BROWSER_INSTANCE_POOL").as_deref(),
+            Ok("0")
+        );
+    }
+    ON.with(|v| *v)
 }
 
 /// The per-thread engine state: one module instance and the JSPI machinery that drives
@@ -706,6 +921,32 @@ struct ThreadEngine {
     cont: Rc<RefCell<Option<Function>>>,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
+    /// This instance's SOFTWARE FUEL counter (`abi::FUEL_EXPORT`), or `None` in a build
+    /// with fuel switched off. Read to price this thread's guest work - see
+    /// [`BrowserThread::fuel_used`].
+    fuel: Option<WebAssembly::Global>,
+    /// The counter's value at the last reading, and the total it has burned. The counter
+    /// itself cannot be the answer: it counts DOWN and reloads to a full interval after
+    /// every yield, so only the differences between readings accumulate to guest work.
+    fuel_last: i64,
+    fuel_total: u64,
+    /// The instance's exports, kept so a REUSED instance can look up its next entry's
+    /// function and its `tp` global without instantiating anything.
+    exports: Object,
+    /// The instance's `reset` export (`abi::RESET_EXPORT`), called before the instance is
+    /// handed to another guest thread.
+    reset: Function,
+    /// Which guest thread this instance is currently running. A CELL, not a captured
+    /// value, because the import closure is built once per INSTANCE and an instance now
+    /// outlives the thread it was made for - the closure has to report the thread that is
+    /// running now, not the one it was created for.
+    thid: Rc<Cell<i32>>,
+    /// Set when this instance's guest stack parked on a never-resolving Promise (a
+    /// `sceKernelExitThread`, a process halt, or a fatal call). Such an instance is
+    /// DROPPED rather than pooled: a parked JSPI stack still references it, and while
+    /// that stack can never resume, reusing the instance underneath it would mean a
+    /// suspended frame and a live thread sharing one register file.
+    abandoned: Rc<Cell<bool>>,
 }
 
 impl ThreadHandle for BrowserThread {
@@ -716,15 +957,99 @@ impl ThreadHandle for BrowserThread {
         self.priority
     }
 
+    /// Guest work this thread has executed, in the SAME UNIT native reports.
+    ///
+    /// The transpiler's software fuel reproduces wasmtime's own operator cost table and
+    /// flush points, so a unit here is a unit there - which is what lets one game-clock
+    /// calibration serve both engines. It also removes a divergence the per-preemption
+    /// charge had: the two engines preempt at different intervals (this one every
+    /// [`fuel_interval`] units, native every `QUANTUM_FUEL`), and while the clock was
+    /// charged per preemption that ratio WAS a clock error. Charged per unit of fuel, the
+    /// interval is free to differ.
+    ///
+    /// The counter runs DOWN from a full interval and is reloaded after each yield, so the
+    /// reading is differenced rather than used directly. A reading ABOVE the last one means
+    /// a reload happened in between: the thread burned the rest of the old interval and
+    /// then the part of the new one it has already spent.
+    ///
+    /// # The reading is taken BEFORE the reload, and that is what has to be carried
+    /// The emitted fuel check calls the host and only THEN reloads the counter (see
+    /// `emit_fuel_check`), so at a fuel yield this reads a spent counter - zero or a little
+    /// below it. Recording that as the new baseline makes the NEXT yield difference to
+    /// nothing, and a thread that yields on fuel over and over - a spin - is then billed
+    /// **zero** for every interval it burns.
+    ///
+    /// That is not a small error. Measured on PCSA00015 in the browser: 7,953 of 8,000
+    /// scheduler rounds were fuel yields by one thread, each burning a full five-million
+    /// interval, while the game clock stood still at 3.454 s and the storage transfer the
+    /// thread was spinning on could never complete. The run stopped at frame 2 for ever.
+    ///
+    /// So a spent counter records the baseline the guest is ABOUT to restore - a full
+    /// interval - rather than the spent value. The next reading then differences against
+    /// what the counter will actually hold, and a spinning thread is billed one interval
+    /// per yield, which is what it burned.
+    fn fuel_used(&mut self) -> Option<u64> {
+        let interval = i64::from(fuel_interval());
+        let engine = self.engine.as_mut()?;
+        let now = engine.fuel.as_ref()?.value().as_f64()? as i64;
+        let burned = if now <= engine.fuel_last {
+            engine.fuel_last - now
+        } else {
+            engine.fuel_last + (interval - now)
+        };
+        // A spent counter means this suspend IS the fuel yield: the guest reloads to a full
+        // interval the instant it resumes, so that is the baseline to difference from.
+        engine.fuel_last = if now <= 0 { interval } else { now };
+        engine.fuel_total = engine.fuel_total.saturating_add(burned.max(0) as u64);
+        Some(engine.fuel_total)
+    }
+
+    /// Hand this thread's instance back: to the engine's POOL if it can be reused, else
+    /// dropped outright.
+    ///
+    /// # Why pooling is not an optimisation here
+    /// One instance is one funcref table with an entry per translated function - 106,572
+    /// of them on a measured retail title - allocated and eagerly initialized by every
+    /// `WebAssembly.Instance` call. This title creates a guest thread PER FRAME (measured
+    /// on both engines: one created and one finished, every frame, from frame 1), so
+    /// instantiating per thread hands the browser's GC a fresh copy of that table sixty
+    /// times a second. The renderer went 875 MB -> 2.19 GB in five seconds and was killed
+    /// at frame 22, with the emulator's own wasm heap FLAT at 44 MB throughout - the
+    /// growth was never the guest's memory, it was the instances around it. Native does
+    /// not care: a wasmtime instance's table is cheap and its store is dropped at once.
+    ///
+    /// A pooled instance is made indistinguishable from a fresh one by the module's own
+    /// `reset` export, which is the only thing that CAN do it completely - see
+    /// [`abi::RESET_EXPORT`].
     fn release(&mut self) {
-        let Some(engine) = self.engine.take() else { return };
-        // Break the closure -> register-file reference before dropping, so nothing the
-        // instance can still be reached through outlives this call.
+        let Some(mut engine) = self.engine.take() else { return };
+        // Break the closure -> register-file reference before dropping or pooling, so
+        // nothing the instance can still be reached through outlives this call.
         *engine.rt_cell.borrow_mut() = None;
         engine.signal.borrow_mut().take();
         engine.cont.borrow_mut().take();
         hostcalls::note_thread_released();
-        drop(engine);
+        if engine.abandoned.get() || !instance_pool_enabled() {
+            drop(engine);
+            return;
+        }
+        // Reset INSIDE the module: it clears the whole ARM and VFP/NEON file, the
+        // diagnostic latches, `tp` and the fuel counter. Doing it on release rather than
+        // on checkout means an instance is never sitting in the pool holding a finished
+        // thread's register values.
+        if engine.reset.call0(&JsValue::UNDEFINED).is_err() {
+            // A reset that failed leaves an instance nobody can characterise; drop it
+            // rather than lend it to the next thread.
+            drop(engine);
+            return;
+        }
+        engine.entries.clear();
+        engine.entry_idx = 0;
+        engine.entry_started = false;
+        engine.fuel_last = i64::from(fuel_interval());
+        engine.fuel_total = 0;
+        hostcalls::note_instance_pooled();
+        self.pool.borrow_mut().push(engine);
     }
 }
 
@@ -814,12 +1139,19 @@ pub struct BrowserEngine {
     /// of it (`vitaslop_transpiler::Artifact::mirror_off`). The scheduler refreshes it
     /// before every resume.
     mirror_off: Option<u64>,
+    /// Instances given back by finished threads, ready to run another - see
+    /// [`ThreadHandle::release`] for why this exists at all.
+    pool: InstancePool,
 }
 
 impl BrowserEngine {
-    /// Instantiate one guest thread: a fresh instance importing the shared memory and
-    /// a `Suspending` host-call trap, with each of `entries` wrapped by `promising` to
-    /// be run in sequence. `(r0, r1)` seed only the first entry.
+    /// Stand up one guest thread: an instance importing the shared memory and a
+    /// `Suspending` host-call trap, with each of `entries` wrapped by `promising` to be
+    /// run in sequence. `(r0, r1)` seed only the first entry.
+    ///
+    /// The instance comes from the POOL when a finished thread has left one there, and is
+    /// instantiated only when the pool is empty. A pooled instance was reset by the module
+    /// itself on release, so the two paths are indistinguishable to the guest.
     fn make_thread(
         &self,
         thid: i32,
@@ -830,19 +1162,89 @@ impl BrowserEngine {
         sp: u32,
         priority: i32,
     ) -> Result<BrowserThread, JsValue> {
+        let mut engine = match self.pool.borrow_mut().pop() {
+            Some(e) => {
+                hostcalls::note_instance_reused();
+                e
+            }
+            None => self.new_instance()?,
+        };
+        // Whoever built it, the instance is now this thread's: the import closure reports
+        // the thread through this cell, and the register file is live again.
+        engine.thid.set(thid);
+        *engine.rt_cell.borrow_mut() = Some(engine.rt.clone());
+
+        // This thread's thread-local storage, mirroring native `instantiate_thread_seq`:
+        // allocate the private block whose base is the thread pointer (TPIDRURO), copy
+        // the template's initialized `.tdata` head into it (the `.tbss` tail is already
+        // zero), and seed the instance's per-thread `tp` global before any entry runs
+        // (a `MRC p15,0,Rt,c13,c0,3` reads it). No guest code is running yet, so the
+        // shared-memory copy is safe. A title with no TLS template yields tp == 0, and
+        // `reset` has already put the global back to 0 for a reused instance.
+        let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
+        if tp != 0 {
+            if tls_len != 0 {
+                let view = &self.view.bytes;
+                let src = tls_src.wrapping_sub(self.base);
+                let dst = tp.wrapping_sub(self.base);
+                let head = view.subarray(src, src + tls_len).to_vec();
+                view.subarray(dst, dst + tls_len).copy_from(&head);
+            }
+            let tp_global = Reflect::get(&engine.exports, &JsValue::from_str(abi::TP_EXPORT))?
+                .dyn_into::<WebAssembly::Global>()?;
+            tp_global.set_value(&JsValue::from(tp));
+        }
+
+        // One `promising` wrapper per entry, in load order. Per THREAD, not per instance:
+        // a reused instance runs a different entry, and each wrapper is what allocates
+        // the JSPI stack the entry runs on.
+        for &entry in entries {
+            let entry_fn =
+                Reflect::get(&engine.exports, &JsValue::from_str(&abi::func_export(entry & !1)))?
+                    .dyn_into::<Function>()?;
+            engine.entries.push(
+                self.promising.call1(&JsValue::UNDEFINED, &entry_fn)?.dyn_into::<Function>()?,
+            );
+        }
+        engine.sp = sp;
+        engine.r0 = r0;
+        engine.r1 = r1;
+        engine.r2 = r2;
+
+        Ok(BrowserThread {
+            thid,
+            priority,
+            host: self.host.clone(),
+            pool: self.pool.clone(),
+            engine: Some(engine),
+        })
+    }
+
+    /// Instantiate the module for one guest thread: its own register file (the globals),
+    /// its own import closure, and the two one-slot channels JSPI drives it through.
+    /// Everything here is per-INSTANCE and survives into the pool; the per-THREAD arming
+    /// is in [`make_thread`].
+    fn new_instance(&self) -> Result<ThreadEngine, JsValue> {
         let signal: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
         let cont: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
         // The import closure needs the instance's globals, which only exist after
         // instantiation - the chicken-and-egg the runtime cell resolves (imports fire
         // only during execution, by when the cell is filled).
         let rt_cell: Rc<RefCell<Option<Rc<ThreadRt>>>> = Rc::new(RefCell::new(None));
+        // The thread this instance is running, and whether its stack has been abandoned.
+        // Cells rather than captured values because the instance outlives the thread.
+        let thid_cell = Rc::new(Cell::new(0i32));
+        let abandoned = Rc::new(Cell::new(false));
 
         let import_closure = {
             let host = self.host.clone();
             let rt_cell = rt_cell.clone();
             let signal = signal.clone();
             let cont = cont.clone();
+            let thid_cell = thid_cell.clone();
+            let abandoned = abandoned.clone();
             Closure::wrap(Box::new(move |selector: i32| -> JsValue {
+                let thid = thid_cell.get();
                 // A software fuel point (see `vitaslop_transpiler::emit::set_fuel_interval`)
                 // is not a host call and must not be billed as one: it carries no
                 // arguments and no return value, so marshalling the register file for it
@@ -937,16 +1339,19 @@ impl BrowserEngine {
                     // the scheduler may still start the thread's next entry on a fresh
                     // stack; on a halt the run is over).
                     SvcOutcome::ThreadExit => {
+                        abandoned.set(true);
                         deliver(&signal, &Ev::ThreadExit(regs[0]));
                         never()
                     }
                     SvcOutcome::Halt => {
+                        abandoned.set(true);
                         deliver(&signal, &Ev::Halt(regs[0]));
                         never()
                     }
                     // Unfaithful call (e.g. unimplemented NID): stop the run loudly as
                     // an error rather than fake a success (which would desync the guest).
                     SvcOutcome::Fatal(msg) => {
+                        abandoned.set(true);
                         deliver(&signal, &Ev::Error(msg));
                         never()
                     }
@@ -969,28 +1374,8 @@ impl BrowserEngine {
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env)?;
 
         let instance = WebAssembly::Instance::new(&self.module, &imports)?;
+        hostcalls::note_instance_created();
         let exports = instance.exports();
-
-        // This thread's thread-local storage, mirroring native `instantiate_thread_seq`:
-        // allocate the private block whose base is the thread pointer (TPIDRURO), copy
-        // the template's initialized `.tdata` head into it (the `.tbss` tail is already
-        // zero), and seed the instance's per-thread `tp` global before any entry runs
-        // (a `MRC p15,0,Rt,c13,c0,3` reads it). No guest code is running yet, so the
-        // shared-memory copy is safe. A title with no TLS template yields tp == 0 and
-        // this is a no-op.
-        let (tp, tls_src, tls_len) = self.host.lock().unwrap().thread_tls_base(thid);
-        if tp != 0 {
-            if tls_len != 0 {
-                let view = &self.view.bytes;
-                let src = tls_src.wrapping_sub(self.base);
-                let dst = tp.wrapping_sub(self.base);
-                let head = view.subarray(src, src + tls_len).to_vec();
-                view.subarray(dst, dst + tls_len).copy_from(&head);
-            }
-            let tp_global = Reflect::get(&exports, &JsValue::from_str(abi::TP_EXPORT))?
-                .dyn_into::<WebAssembly::Global>()?;
-            tp_global.set_value(&JsValue::from(tp));
-        }
 
         let regs = read_globals(&exports, |i| abi::reg_export(i), abi::REG_COUNT)?;
         let vfp = read_globals(&exports, |i| abi::vfp_s_export(i as u8), VFP_ARG_COUNT)?;
@@ -1003,37 +1388,37 @@ impl BrowserEngine {
         let staging = js_sys::Float64Array::new_with_length(FILE_LEN as u32);
         let rt =
             Rc::new(ThreadRt { regs, file, staging, view: self.view.clone(), base: self.base });
-        *rt_cell.borrow_mut() = Some(rt.clone());
 
-        let mut wrapped = Vec::with_capacity(entries.len());
-        for &entry in entries {
-            let entry_fn = Reflect::get(&exports, &JsValue::from_str(&abi::func_export(entry & !1)))?
-                .dyn_into::<Function>()?;
-            wrapped.push(
-                self.promising
-                    .call1(&JsValue::UNDEFINED, &entry_fn)?
-                    .dyn_into::<Function>()?,
-            );
-        }
+        // The module's own reset (see `abi::RESET_EXPORT`), resolved once here so
+        // releasing a thread is a single call and cannot fail on a lookup.
+        let reset = Reflect::get(&exports, &JsValue::from_str(abi::RESET_EXPORT))?
+            .dyn_into::<Function>()?;
 
-        Ok(BrowserThread {
-            thid,
-            priority,
-            host: self.host.clone(),
-            engine: Some(ThreadEngine {
-                rt,
-                rt_cell,
-                entries: wrapped,
-                entry_idx: 0,
-                entry_started: false,
-                sp,
-                r0,
-                r1,
-                r2,
-                signal,
-                cont,
-                _import: import_closure,
-            }),
+        Ok(ThreadEngine {
+            rt,
+            rt_cell,
+            entries: Vec::new(),
+            entry_idx: 0,
+            entry_started: false,
+            sp: 0,
+            r0: 0,
+            r1: 0,
+            r2: 0,
+            signal,
+            cont,
+            _import: import_closure,
+            // Absent in a build with `VITASLOP_BROWSER_FUEL=0`, which is exactly the
+            // build that has no fuel to report; the clock then falls back to advancing
+            // on flips and idles alone, as it did before fuel existed.
+            fuel: Reflect::get(&exports, &JsValue::from_str(abi::FUEL_EXPORT))
+                .ok()
+                .and_then(|g| g.dyn_into::<WebAssembly::Global>().ok()),
+            fuel_last: i64::from(fuel_interval()),
+            fuel_total: 0,
+            exports,
+            reset,
+            thid: thid_cell,
+            abandoned,
         })
     }
 }
@@ -1051,6 +1436,9 @@ impl GuestEngine for BrowserEngine {
         let view = &self.view.bytes;
         if off + bytes.len() <= view.length() as usize {
             view.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
+            // A scheduler-side write is a host write like any other - see
+            // `SharedView::stamp_written`.
+            self.view.stamp_written(off, bytes.len());
         }
     }
 
@@ -1166,6 +1554,17 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
             let _ = done.then2(&on_ok, &on_err);
             on_ok.forget();
             on_err.forget();
+        } else if t.cont.borrow().is_none() {
+            // NEITHER branch: the entry is already running and nothing is parked, so this
+            // resume starts nothing and un-parks nothing. It can only be waiting for an
+            // event some earlier turn already consumed - a scheduler-state bug, not guest
+            // behaviour - and it is invisible from outside because the thread burns no
+            // fuel and makes no host call while it happens.
+            tracing::warn!(
+                target: "vitaslop::sched",
+                "resume of thid {thid:#x} with no parked continuation and its entry \
+                 already started: nothing to run"
+            );
         } else if let Some(res) = t.cont.borrow_mut().take() {
             // A timed wait that expired owes this thread a return code other than the
             // 0 it parked with (a WAIT_TIMEOUT); write it into r0 before the guest
@@ -1227,6 +1626,11 @@ pub async fn run_frames(
     progress: &mut dyn FnMut(u64),
 ) -> RunReport {
     let mut rounds = 0u64;
+    // What the rounds ARE: idle-path turns (nothing runnable), and resumes split by why
+    // the thread stopped. A round count alone cannot tell a scheduler spinning on its own
+    // idle path from a guest being resumed and immediately blocking again, and those have
+    // nothing in common but the symptom.
+    let (mut idle_rounds, mut n_quantum, mut n_blocked, mut n_flip) = (0u64, 0u64, 0u64, 0u64);
     loop {
         if rounds >= max_rounds {
             return RunReport::RoundLimit;
@@ -1234,16 +1638,56 @@ pub async fn run_frames(
         rounds += 1;
         if rounds % PROGRESS_ROUNDS == 0 {
             progress(rounds);
+            // What a long frame is actually DOING, unconditionally: the game clock (a
+            // frame that grinds with a FROZEN clock is a livelock, one that grinds with a
+            // moving clock is just slow, and those need opposite fixes), and the NIDs the
+            // rounds are going into. The per-selector histogram already existed and
+            // nothing ever printed it, so "which call is it spinning on" - the one
+            // question a runaway frame asks - had no answer in a browser run.
+            let (clock_us, io_waiters) = {
+                let host = core.host().lock().unwrap();
+                (host.state.now_us(), host.state.has_io_waiters())
+            };
+            let top: Vec<String> = hostcalls::top_selectors(4)
+                .into_iter()
+                .map(|(sel, n)| format!("sel {sel}: {n}"))
+                .collect();
+            tracing::info!(
+                target: "vitaslop::sched",
+                "long frame: {rounds} rounds ({idle_rounds} idle, resumes: {n_quantum} \
+                 quantum / {n_blocked} blocked / {n_flip} flip), clock {:.3}s, \
+                 io_waiters={io_waiters}, hottest calls [{}]",
+                clock_us as f64 / 1e6,
+                top.join(", "),
+            );
         }
 
         let Some(idx) = core.pick_next() else {
+            idle_rounds += 1;
             match core.handle_idle() {
                 IdleStep::Done(report) => return report,
                 IdleStep::Continue => continue,
             }
         };
 
+        // A resume is the only AWAIT in this loop, so a resume that never comes back stops
+        // the run with no other trace: the round counter stops, no fuel is burned, no host
+        // call is made, and the frame never completes - which reads exactly like a quiet
+        // deadlock but is not one. This names the thread that went in, so the last line
+        // before the silence is the answer (`vitaslop::sched=trace`).
+        tracing::trace!(
+            target: "vitaslop::sched",
+            "resume thid={:#x} round={rounds}",
+            core.thread_mut(idx).thid(),
+        );
         let step = resume(core.thread_mut(idx)).await;
+        if let ThreadStep::Suspended(stop) = &step {
+            match stop {
+                Stop::Quantum => n_quantum += 1,
+                Stop::Blocked => n_blocked += 1,
+                Stop::Flip => n_flip += 1,
+            }
+        }
         let done = match step {
             ThreadStep::Finished(end) => core.on_finished(idx, end),
             ThreadStep::Suspended(stop) => core.on_suspended(idx, stop, max_frames),
@@ -1281,11 +1725,13 @@ impl BrowserSched {
         base: u32,
         mem_pages: u32,
         mirror_off: Option<u64>,
+        dirty_off: Option<u64>,
         entry: u32,
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
-        let (engine, host) = build_engine(module, image, base, mem_pages, mirror_off, env)?;
+        let (engine, host) =
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
         let main = engine.make_thread(
             0,
             &[entry & !1],
@@ -1310,11 +1756,13 @@ impl BrowserSched {
         base: u32,
         mem_pages: u32,
         mirror_off: Option<u64>,
+        dirty_off: Option<u64>,
         entries: &[u32],
         main_sp: u32,
         env: VitaEnv,
     ) -> Result<BrowserSched, JsValue> {
-        let (engine, host) = build_engine(module, image, base, mem_pages, mirror_off, env)?;
+        let (engine, host) =
+            build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
         let main = engine.make_thread(
             0,
             entries,
@@ -1337,6 +1785,7 @@ fn build_engine(
     base: u32,
     mem_pages: u32,
     mirror_off: Option<u64>,
+    dirty_off: Option<u64>,
     env: VitaEnv,
 ) -> Result<(BrowserEngine, Host), JsValue> {
     {
@@ -1361,7 +1810,7 @@ fn build_engine(
         // maximum` above makes this memory non-growable and its SharedArrayBuffer never
         // detaches - see [`SharedView`] for why rebuilding it per access was the whole
         // browser performance problem.
-        let view = SharedView { bytes: Uint8Array::new(&shared_mem.buffer()) };
+        let view = SharedView { bytes: Uint8Array::new(&shared_mem.buffer()), dirty_off };
         // Seed the image at offset 0.
         view.bytes.subarray(0, image.len() as u32).copy_from(image);
 
@@ -1396,6 +1845,7 @@ fn build_engine(
             _dispatch_miss: dispatch_miss,
             dispatch_miss_fn,
             mirror_off,
+            pool: Rc::new(RefCell::new(Vec::new())),
         };
 
         Ok((engine, host))

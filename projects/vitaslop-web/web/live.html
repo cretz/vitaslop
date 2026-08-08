@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#0b0b12" />
+    <link rel="icon" href="data:," />
+    <title>vitaslop</title>
+    <style>
+      :root {
+        --bg: #0b0b12;
+        --panel: #14141f;
+        --edge: #2a2a3a;
+        --ink: #d8d8e0;
+        --dim: #8a8a9a;
+        --accent: #8fe0a0;
+        --pad: #1c1c2a;
+        --pad-lit: #3a5a44;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        overscroll-behavior: none;
+      }
+      body { display: flex; flex-direction: column; }
+
+      /* ---- the launcher ---- */
+      #menu { padding: 16px; max-width: 720px; margin: 0 auto; width: 100%; overflow-y: auto; }
+      h1 { font-size: 17px; margin: 0 0 2px; color: var(--accent); letter-spacing: 0.5px; }
+      .sub { color: var(--dim); margin: 0 0 18px; font-size: 12px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+      }
+      .card h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+      .card .meta { color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+      label { display: block; margin: 10px 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.6px; }
+      select, input, textarea {
+        width: 100%;
+        background: #0f0f18;
+        color: var(--ink);
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        padding: 9px 10px;
+        font: inherit;
+        font-size: 13px;
+      }
+      textarea { min-height: 60px; resize: vertical; }
+      .row { display: flex; gap: 10px; }
+      .row > * { flex: 1; min-width: 0; }
+      button.play {
+        width: 100%;
+        margin-top: 14px;
+        padding: 13px;
+        font: inherit;
+        font-weight: 700;
+        font-size: 15px;
+        letter-spacing: 0.5px;
+        color: #08120c;
+        background: var(--accent);
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      button.play:active { transform: translateY(1px); }
+      .note { color: var(--dim); font-size: 11px; margin-top: 10px; }
+      .warn { color: #e0c07f; }
+      details summary { cursor: pointer; color: var(--dim); font-size: 12px; margin-top: 6px; }
+      .check label.inline {
+        display: block;
+        margin: 0;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 13px;
+        color: var(--ink);
+      }
+      .check input { width: auto; margin-right: 8px; transform: scale(1.3); vertical-align: middle; }
+      .check .hint { display: block; color: var(--dim); font-size: 11px; margin: 2px 0 0 30px; }
+      .check label.inline + label.inline { margin-top: 10px; }
+
+      /* ---- the player ---- */
+      #player { display: none; flex: 1; min-height: 0; flex-direction: column; }
+      #player.on { display: flex; }
+      #screenwrap {
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        aspect-ratio: 960 / 544;
+        max-height: 56vh;
+        object-fit: contain;
+        image-rendering: pixelated;
+        /* The canvas IS the Vita's front touch panel, so it must never pan or zoom the page. */
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #hud {
+        display: flex;
+        gap: 12px;
+        align-items: baseline;
+        padding: 4px 10px;
+        font-size: 11px;
+        color: var(--dim);
+        border-bottom: 1px solid var(--edge);
+        flex-wrap: wrap;
+      }
+      #fps { color: var(--accent); font-weight: 700; }
+      #status, #perf, #adapter { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+      #status { flex: 1 1 100%; color: var(--dim); }
+
+      /* ---- diagnostics ---- */
+      #diagbox {
+        border-bottom: 1px solid var(--edge);
+        background: #0d0d16;
+        flex: 0 0 auto;
+      }
+      #diagbox summary { margin: 0; padding: 6px 10px; font-size: 11px; }
+      #copydiag {
+        float: right;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        color: #08120c;
+        background: var(--accent);
+        border: 0;
+        border-radius: 5px;
+        padding: 3px 12px;
+        margin: -2px 0 0;
+      }
+      #diagbox[open] { max-height: 40vh; overflow: auto; }
+      #diag {
+        margin: 0;
+        padding: 0 10px 10px;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #a8b8c8;
+        /* Wrap rather than scroll sideways: a phone cannot pan a 400-character line, and
+           these lines are long by design (a whole counter set each). */
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      /* ---- the on-screen pad ---- */
+      #pad {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+      .btn {
+        background: var(--pad);
+        border: 1px solid var(--edge);
+        color: var(--ink);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 15px;
+        font-weight: 700;
+        width: 100%;
+        aspect-ratio: 1;
+        touch-action: none;
+      }
+      .btn.held { background: var(--pad-lit); border-color: var(--accent); }
+      .dpad, .faces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; width: min(42vw, 168px); }
+      .dpad .sp, .faces .sp { visibility: hidden; }
+      .mid { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+      .mid .small {
+        border-radius: 8px;
+        aspect-ratio: auto;
+        padding: 8px 12px;
+        font-size: 11px;
+        letter-spacing: 0.5px;
+        width: auto;
+      }
+      .shoulders { display: flex; gap: 8px; }
+      .stickpad {
+        position: relative;
+        width: min(34vw, 130px);
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: radial-gradient(circle, #1a1a28 60%, #12121c 100%);
+        border: 1px solid var(--edge);
+        touch-action: none;
+        margin-top: 8px;
+      }
+      .stickpad .knob {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 40%;
+        height: 40%;
+        margin: -20% 0 0 -20%;
+        border-radius: 50%;
+        background: #3a3a52;
+        border: 1px solid #4a4a68;
+        pointer-events: none;
+      }
+      .stickpad .lbl {
+        position: absolute;
+        bottom: -14px;
+        width: 100%;
+        text-align: center;
+        font-size: 9px;
+        color: var(--dim);
+        letter-spacing: 1px;
+      }
+      .stack { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    </style>
+  </head>
+  <body>
+    <!-- ============================ launcher ============================ -->
+    <div id="menu">
+      <h1>vitaslop</h1>
+      <p class="sub">
+        A clean-room Vita emulator running entirely in this browser - the guest's ARM code
+        transpiled to wasm, its GXM stream drawn with WebGPU. Pick a title and a recipe.
+      </p>
+      <div id="titles"><div class="card">looking for titles...</div></div>
+      <p class="note" id="caps"></p>
+    </div>
+
+    <!-- ============================= player ============================= -->
+    <div id="player">
+      <div id="hud">
+        <span id="fps">fps: --</span>
+        <span id="perf">perf: --</span>
+        <span id="adapter">adapter: --</span>
+        <span id="status">starting...</span>
+      </div>
+      <div id="screenwrap"><canvas id="screen" width="960" height="544"></canvas></div>
+      <!-- Every counter the run publishes, on the PAGE. The console is unreachable on a phone,
+           which is the device whose numbers are the ones that matter. -->
+      <details id="diagbox" open>
+        <summary>diagnostics <button id="copydiag" type="button">copy</button></summary>
+        <pre id="diag">waiting for the first perf window (30 presents)...</pre>
+      </details>
+      <div id="pad">
+        <div class="stack">
+          <div class="dpad">
+            <div class="sp"></div><div class="btn" data-btn="up">&#9650;</div><div class="sp"></div>
+            <div class="btn" data-btn="left">&#9664;</div><div class="sp"></div><div class="btn" data-btn="right">&#9654;</div>
+            <div class="sp"></div><div class="btn" data-btn="down">&#9660;</div><div class="sp"></div>
+          </div>
+          <div class="stickpad" data-stick="0"><div class="knob"></div><div class="lbl">LEFT STICK</div></div>
+        </div>
+        <div class="mid">
+          <div class="shoulders">
+            <div class="btn small" data-btn="l">L</div>
+            <div class="btn small" data-btn="r">R</div>
+          </div>
+          <div class="btn small" data-btn="start">START</div>
+          <div class="btn small" data-btn="select">SELECT</div>
+        </div>
+        <div class="stack">
+          <div class="faces">
+            <div class="sp"></div><div class="btn" data-btn="triangle">&#9651;</div><div class="sp"></div>
+            <div class="btn" data-btn="square">&#9633;</div><div class="sp"></div><div class="btn" data-btn="circle">&#9711;</div>
+            <div class="sp"></div><div class="btn" data-btn="cross">&#10005;</div><div class="sp"></div>
+          </div>
+          <div class="stickpad" data-stick="1"><div class="knob"></div><div class="lbl">RIGHT STICK</div></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import { forwardInput } from "./worker-input.js";
+      import { installPad, installGamepad } from "./pad.js";
+      import { importTitle, isImported, storageRoom, requestPersistence } from "./opfs.js";
+      import { startAudio } from "./audio.js";
+
+      const $ = (id) => document.getElementById(id);
+      const menu = $("menu");
+      const player = $("player");
+      const status = $("status");
+      const canvas = $("screen");
+
+      // The run is effectively unbounded - it plays until the tab closes. A recipe that runs
+      // out simply stops driving, and live input keeps working, which is what makes "watch it
+      // reach the race, then take over" one session rather than two.
+      const MAX_FRAMES = 0xffffffff;
+
+      /// What this browser can and cannot do HERE, stated up front rather than discovered as a
+      /// mysterious failure part-way through a gigabyte import.
+      ///
+      /// # Why this list is not decoration
+      /// Three of these are properties of the ORIGIN, not of the browser, and every one of them
+      /// is invisible when you develop against localhost - which is itself a secure context.
+      /// The first phone to open `http://<lan-ip>:8080` failed with
+      /// `Cannot read properties of undefined (reading 'getDirectory')`, because
+      /// `navigator.storage` is exposed only in a SECURE context and the title is streamed into
+      /// the storage it hands out. That is a one-line diagnosis and it was reported as a
+      /// stack-shaped mystery. `fatal` entries block PLAY and say what to do instead.
+      function capabilities() {
+        const out = [];
+        if (!("WebAssembly" in self)) out.push({ fatal: true, text: "no WebAssembly in this browser" });
+        if (!("gpu" in navigator)) {
+          out.push({
+            fatal: true,
+            text: "no WebGPU (navigator.gpu) - the renderer cannot start. Try a recent Chrome; on iOS, Safari 18.2+.",
+          });
+        }
+        if (!self.isSecureContext) {
+          out.push({
+            fatal: true,
+            text:
+              "this page is not a SECURE CONTEXT, so the browser hides the storage the title " +
+              "has to be copied into (navigator.storage). Serve with --https and accept the " +
+              "certificate once. http://localhost works too, but a LAN address does not.",
+          });
+        } else if (!navigator.storage || !navigator.storage.getDirectory) {
+          out.push({
+            fatal: true,
+            text: "this browser has no origin-private file system (navigator.storage.getDirectory).",
+          });
+        }
+        if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
+          out.push({
+            fatal: false,
+            text:
+              "no SharedArrayBuffer here, so this run will be SILENT. Video, input and the perf " +
+              "numbers are unaffected.",
+          });
+        }
+        return out;
+      }
+
+      // Was this tab ever in the background? A hidden tab has its timers and animation frames
+      // throttled hard, so a perf window that spans a backgrounded moment measures the throttle,
+      // not the emulator - and it looks exactly like a slow machine. The copy dump has to say so,
+      // because nothing else about the numbers reveals it.
+      let hiddenSince = document.visibilityState === "hidden" ? 1 : 0;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") hiddenSince++;
+      });
+
+      // "copy" on the diagnostics panel: put everything worth reporting on the clipboard in one
+      // tap, so a phone can hand over a full picture without a cable, a console or retyping.
+      //
+      // It copies the CONTEXT as well as the counters - the adapter, the frame rate, the last
+      // status line and whether debug capture was on - because every one of those changes how the
+      // numbers should be read, and a paste without them invites exactly the misreadings this
+      // session already produced twice (a present rate read as a guest rate, an instrumented
+      // frame time read as a real one).
+      $("copydiag").addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation(); // do not toggle the <details> it lives in
+        const btn = $("copydiag");
+        const text = [
+          `vitaslop diagnostics`,
+          `title: ${window.__runTitle || "?"}  recipe: ${window.__runRecipe || "(none)"}`,
+          `debug capture: ${window.__runDebug ? "ON (frame times inflated)" : "off"}`,
+          hiddenSince > 0
+            ? `WARNING: this tab was backgrounded ${hiddenSince}x during the run - a hidden tab is ` +
+              `throttled, so any window spanning that measures the throttle, not the emulator`
+            : `tab stayed in the foreground for the whole run`,
+          `knobs: ${JSON.stringify(window.__runKnobs || {})}`,
+          `user agent: ${navigator.userAgent}`,
+          `${$("adapter").textContent}`,
+          `${$("fps").textContent}`,
+          `${$("status").textContent}`,
+          ``,
+          $("diag").textContent,
+        ].join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = "copied";
+        } catch {
+          // The async clipboard needs a secure context and a user gesture; we have both, but a
+          // refusal must still leave the text reachable rather than silently doing nothing.
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand && document.execCommand("copy");
+          ta.remove();
+          btn.textContent = ok ? "copied" : "copy failed - select the text below";
+        }
+        setTimeout(() => (btn.textContent = "copy"), 2000);
+      });
+
+      const caps = capabilities();
+      const fatal = caps.some((c) => c.fatal);
+      $("caps").innerHTML = caps.length
+        ? '<span class="warn">' + caps.map((c) => (c.fatal ? "STOP: " : "note: ") + c.text).join("<br><br>") + "</span>"
+        : "WebGPU present, secure and cross-origin isolated - video and audio both available.";
+
+      // ---- the title list ----
+      const titles = await (await fetch("/titles.json")).json();
+      const wrap = $("titles");
+      wrap.innerHTML = "";
+      if (titles.length === 0) wrap.innerHTML = '<div class="card">no titles served</div>';
+
+      for (const t of titles) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const recipeOptions = [
+          '<option value="">interactive - no recipe (you drive from the first frame)</option>',
+          ...t.recipes.map(
+            (r) => `<option value="${r.name}">${r.name}${r.description ? " - " + r.description : ""}</option>`
+          ),
+        ].join("");
+        card.innerHTML = `
+          <h2>${t.name}</h2>
+          <div class="meta">${t.id} &middot; ${t.files} files &middot; ${t.mb} MB &middot; ${t.recipes.length} recipes</div>
+          <label for="r-${t.id}">Recipe</label>
+          <select id="r-${t.id}">${recipeOptions}</select>
+          <div class="row">
+            <div>
+              <label for="ss-${t.id}">Supersample</label>
+              <select id="ss-${t.id}">
+                <option value="1" selected>1x - fastest (recommended on a phone)</option>
+                <option value="2">2x - sharper, 4x the fragments (the review setting)</option>
+              </select>
+            </div>
+            <div>
+              <label for="ff-${t.id}">Fast-forward to frame</label>
+              <input id="ff-${t.id}" type="number" min="0" step="100" value="0" />
+            </div>
+          </div>
+          <div class="check">
+            <label class="inline"><input type="checkbox" id="dbg-${t.id}" /> capture debug
+              <span class="hint">times every host call and counts them by NID, so the diagnostics panel
+              can say where the guest CPU goes. Roughly DOUBLES the frame cost, so leave it off to
+              play - the ratios it reports stay valid, the frame times do not.</span>
+            </label>
+          </div>
+          <details>
+            <summary>knobs</summary>
+            <textarea id="k-${t.id}">VITASLOP_FRAME_TOPUP=0
+VITASLOP_GXP_LIVE=1
+VITASLOP_LOG=warn</textarea>
+            <p class="note">
+              One NAME=VALUE per line. The browser has no environment, so this is the only way
+              to reach a VITASLOP_* knob here.
+            </p>
+          </details>
+          <button class="play" id="p-${t.id}">PLAY</button>
+          <p class="note">
+            First play of a title copies it into this browser's storage (${t.mb} MB, once);
+            later plays start straight away. Fast-forward presents NOTHING while it runs, on
+            purpose - leave it at 0 to watch from the first frame.
+          </p>
+        `;
+        wrap.appendChild(card);
+        // A run that cannot possibly work must not be startable. Pressing PLAY into a
+        // missing secure context spent a minute of import before failing with a property
+        // access on `undefined`, which named nothing.
+        if (fatal) {
+          const b = $(`p-${t.id}`);
+          b.disabled = true;
+          b.style.opacity = "0.45";
+          b.textContent = "CANNOT RUN HERE - SEE ABOVE";
+          continue;
+        }
+        $(`p-${t.id}`).addEventListener("click", () => {
+          const knobs = {};
+          for (const line of $(`k-${t.id}`).value.split(/\r?\n/)) {
+            const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+            if (m) knobs[m[1]] = m[2];
+          }
+          knobs.VITASLOP_BROWSER_SUPERSAMPLE = $(`ss-${t.id}`).value;
+          if ($(`dbg-${t.id}`).checked) knobs.VITASLOP_DEBUG_CAPTURE = "1";
+          const ff = Number($(`ff-${t.id}`).value || 0);
+          if (ff > 0) knobs.VITASLOP_BROWSER_FASTFORWARD = String(ff);
+          boot(t, $(`r-${t.id}`).value, knobs).catch((e) => {
+            status.textContent = "failed to start: " + (e && e.message ? e.message : e);
+            console.error(e);
+          });
+        });
+      }
+
+      /// Import (once) and run one title. The whole emulator lives in a Web Worker; this page
+      /// owns the storage import, the audio context (there is no AudioContext in a worker) and
+      /// the input, and forwards each to the worker. Structurally the same boot as
+      /// game-worker.html, which the e2e harness drives - kept in step with it deliberately,
+      /// so a change here is exercised there.
+      async function boot(t, recipeName, knobs) {
+        menu.style.display = "none";
+        player.classList.add("on");
+        // What this run IS, for the copy button to report alongside the numbers.
+        window.__runTitle = `${t.name} (${t.id})`;
+        window.__runRecipe = recipeName;
+        window.__runKnobs = knobs;
+        window.__runDebug = !!knobs.VITASLOP_DEBUG_CAPTURE;
+        status.textContent = "reading the recipe...";
+
+        let recipe = "";
+        if (recipeName) {
+          recipe = await (
+            await fetch(`/recipe?title=${encodeURIComponent(t.id)}&name=${encodeURIComponent(recipeName)}`)
+          ).text();
+        }
+
+        status.textContent = "fetching the file list...";
+        const manifest = await (await fetch(`/game-manifest.json?title=${encodeURIComponent(t.id)}`)).json();
+
+        // The title goes into OPFS once and is read lazily from there. It cannot be held in
+        // memory: a retail container does not fit a wasm32 heap (measured at 8.01 GB peak
+        // against a 4 GB ceiling when it was copied in).
+        if (await isImported(t.id, manifest.length)) {
+          status.textContent = `already stored (${manifest.length} files); starting...`;
+          console.log(`[opfs] REUSED an existing import of ${t.id}`);
+        } else {
+          // Does it FIT, before a byte moves. A quota refusal hundreds of megabytes into a
+          // download over wifi is the same failure discovered the expensive way.
+          const room = await storageRoom();
+          const need = t.mb * 1e6;
+          if (room && room.free < need * 1.05) {
+            throw new Error(
+              `this title needs ${t.mb} MB but this browser will only give this site ` +
+                `${(room.free / 1e6) | 0} MB more (quota ${(room.quota / 1e6) | 0} MB, ` +
+                `${(room.usage / 1e6) | 0} MB already used). Free up space on the device, or ` +
+                `pick a smaller title.`
+            );
+          }
+          const persisted = await requestPersistence();
+          console.log(`[opfs] persistent storage ${persisted ? "GRANTED" : "refused - an import may be evicted"}`);
+          const t0 = performance.now();
+          const entries = manifest.map((p) => ({
+            path: p,
+            source: async () => (await fetch(`/game/${encodeURIComponent(t.id)}/${p}`)).body,
+          }));
+          await importTitle(t.id, entries, (done, total, bytes) => {
+            // MEGABYTES first, and a rate. The file count is the misleading half: this title's
+            // bytes are not spread evenly over its files, so `220/248` sat still for minutes
+            // while a single large file downloaded.
+            const mb = bytes / 1e6;
+            const secs = (performance.now() - t0) / 1000;
+            const rate = secs > 1 ? ` at ${(mb / secs).toFixed(1)} MB/s` : "";
+            const left = mb > 1 && secs > 2 ? `, ~${Math.max(0, Math.round((t.mb - mb) / (mb / secs)))}s left` : "";
+            status.textContent =
+              `copying into this browser: ${mb | 0} / ${t.mb} MB${rate}${left} ` +
+              `(file ${done}/${total}) - one time only`;
+          });
+          console.log(`[opfs] IMPORTED ${manifest.length} files for ${t.id}`);
+        }
+
+        // Transpile in a THROWAWAY worker: it costs ~460 MB of heap a wasm memory can never
+        // give back, so the peak has to die with the worker that paid it. Only the compiled
+        // module crosses over. It must also close its storage handles before the run worker
+        // opens its own - a sync access handle is an exclusive lock.
+        status.textContent = "transpiling the title (a few seconds, one time per load)...";
+        const prebuilt = await new Promise((resolve, reject) => {
+          const tw = new Worker("./transpile-worker.js", { type: "module" });
+          tw.onmessage = (e) => {
+            tw.terminate();
+            e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
+          };
+          tw.onerror = (e) => {
+            tw.terminate();
+            reject(new Error(e.message || "transpile worker failed to start"));
+          };
+          tw.postMessage({ titleId: t.id, knobs });
+        });
+
+        status.textContent = "starting the run...";
+        const worker = new Worker("./worker.js", { type: "module" });
+        worker.onmessage = (e) => {
+          const d = e.data;
+          if (d.type === "report") {
+            const el = $(d.id);
+            if (el) el.textContent = d.text;
+          } else if (d.type === "error") {
+            status.textContent = "error: " + d.message;
+            console.error("[worker]", d.message);
+          }
+        };
+        // A worker that dies without reporting would otherwise leave a stale status line.
+        worker.onerror = (e) => {
+          status.textContent = "worker error: " + (e.message || "died");
+          console.error("[worker] onerror:", e.message || e);
+        };
+
+        // Live input: pointer + keyboard from the page, the on-screen pad, and any real
+        // gamepad. All three post into the same worker input cell.
+        forwardInput(worker, canvas);
+        installPad(worker, $("pad"));
+        installGamepad(worker, (msg) => console.log("[pad] " + msg));
+
+        // Audio is a MAIN-THREAD API and the emulator is in a worker, so the page owns the
+        // context and the worker only fills a shared ring. A failure here must not take the
+        // run down - a silent emulator beats no emulator - but it must SAY so rather than
+        // look like silence the guest produced.
+        let audioRing;
+        try {
+          const audio = await startAudio();
+          audioRing = audio.ring;
+          window.__audioStats = audio.stats;
+        } catch (err) {
+          console.warn("[audio] could not start; this run will be SILENT:", err);
+        }
+
+        // Hand the canvas's render control to the worker. The title is NOT transferred - it is
+        // in storage and the worker opens its own handles to it.
+        const offscreen = canvas.transferControlToOffscreen();
+        worker.postMessage(
+          { offscreen, titleId: t.id, recipe, maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing },
+          [offscreen]
+        );
+      }
+    </script>
+  </body>
+</html>

@@ -55,7 +55,9 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_imports() {
         return None;
     }
-    gxm::inline_op(func_nid).or_else(|| display::inline_op(func_nid))
+    gxm::inline_op(func_nid)
+        .or_else(|| display::inline_op(func_nid))
+        .or_else(|| libkernel::inline_op(func_nid))
 }
 
 /// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
@@ -73,11 +75,39 @@ fn no_inline_imports() -> bool {
     *ON.get_or_init(|| std::env::var_os("VITASLOP_NO_INLINE_IMPORTS").is_some())
 }
 
-/// Diagnostic call-site profiler (env `VITASLOP_DBG_CALLSITES`): counts host calls
+/// Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls
 /// keyed by (function NID, guest return address). A busy-wait spin shows up as one
 /// (nid, lr) pair with an enormous count - the exact instruction to investigate.
+///
+/// Read through [`crate::knobs`], not `std::env`. The browser has no environment
+/// [[vitaslop-browser-has-no-env]], so an `env` read here made this profiler
+/// unreachable on the one engine whose host-call cost is in question: a phone spends
+/// ~16 ms of a 56 ms guest frame on ~4,950 host calls, and "which NIDs are those"
+/// could only be asked of the desktop.
+/// Also SAMPLABLE at runtime, for the same reason the browser's host-call timer is: the guest
+/// stack scan it does per call costs roughly as much as the call, so pinning it on for a whole
+/// run means the only way to learn which NIDs are hot is to run at half speed for as long as you
+/// want to watch. A caller that samples it for a window at a time gets the same histogram at a
+/// fraction of the cost - the counts are cumulative, so a sampled window is a fair sample of
+/// the calls made during it.
 static DBG_CALLSITES: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("VITASLOP_DBG_CALLSITES").is_ok());
+    LazyLock::new(|| crate::knobs::flag("VITASLOP_DBG_CALLSITES"));
+
+/// Sampling override for [`DBG_CALLSITES`], set by a frontend that profiles in bursts.
+static DBG_CALLSITES_SAMPLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the call-site profiler on or off for the next stretch of the run.
+pub fn set_callsite_profiling(on: bool) {
+    DBG_CALLSITES_SAMPLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the profiler is recording right now - the knob forces it on permanently, and a
+/// frontend can sample it on top of that.
+#[inline]
+fn callsite_profiling() -> bool {
+    *DBG_CALLSITES || DBG_CALLSITES_SAMPLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The guest code range scanned for the game-level caller in [`dispatch`] (env
 /// `VITASLOP_CODE_RANGE=lo-hi`, hex). A title's executable module is not always in
@@ -273,7 +303,7 @@ pub fn dispatch(
     // immediate LR is usually a thin libc lock wrapper, so scan the guest stack for
     // the first return address in the main module's code range - the game loop that
     // is actually spinning. Dumped by [`dump_call_sites`]. Zero cost when unset.
-    if *DBG_CALLSITES {
+    if callsite_profiling() {
         let mut caller = ctx.regs[14];
         let sp = ctx.regs[13];
         let (lo, hi) = *CALLSITE_CODE_RANGE;
@@ -632,25 +662,29 @@ pub fn dispatch(
         gxm_nid::TEXTURE_GET_WIDTH => cont!(gxm::texture_get_dim(ctx, 12)),
         gxm_nid::TEXTURE_GET_HEIGHT => cont!(gxm::texture_get_dim(ctx, 0)),
         gxm_nid::TEXTURE_GET_FORMAT => cont!(gxm::texture_get_format(ctx, st)),
-        // Texture filters: record the sticky min/mag/mip filter per texture so the
-        // getters read them back (and a future renderer can sample faithfully).
-        gxm_nid::TEXTURE_SET_MIN_FILTER => cont!(gxm::texture_set_min_filter(ctx, st)),
-        gxm_nid::TEXTURE_SET_MAG_FILTER => cont!(gxm::texture_set_mag_filter(ctx, st)),
-        gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx, st)),
+        // Texture filters: write the min/mag/mip filter into the guest's own control word 0,
+        // where the hardware keeps it - so a getter reads it back, a by-value copy of the struct
+        // carries it, and the getter can be INLINED into guest code (see `gxm::texword0`).
+        gxm_nid::TEXTURE_SET_MIN_FILTER => cont!(gxm::texture_set_min_filter(ctx)),
+        gxm_nid::TEXTURE_SET_MAG_FILTER => cont!(gxm::texture_set_mag_filter(ctx)),
+        gxm_nid::TEXTURE_SET_MIP_FILTER => cont!(gxm::texture_set_mip_filter(ctx)),
         gxm_nid::TEXTURE_SET_GAMMA_MODE => cont!(gxm::texture_set_gamma_mode(ctx, st)),
         gxm_nid::SET_FRAGMENT_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "fragment")),
         gxm_nid::SET_VERTEX_UNIFORM_BUFFER => cont!(gxm::set_uniform_buffer(ctx, "vertex")),
-        // Texture getters: read back the sticky sampler/format state a setter stored.
+        // Texture getters: pure field reads of the guest's control word 0. Every one of these
+        // ALSO has an inline form (`gxm::inline_op`), so on a build that inlines its imports the
+        // guest never reaches these at all - which is the point, since `GetLodBias` alone was the
+        // hottest host call one title makes.
         gxm_nid::TEXTURE_GET_MIPMAP_COUNT_UNSAFE | gxm_nid::TEXTURE_GET_MIPMAP_COUNT => {
-            cont!(gxm::texture_get_mipmap_count(ctx, st))
+            cont!(gxm::texture_get_mipmap_count(ctx))
         }
         gxm_nid::TEXTURE_GET_STRIDE => cont!(gxm::texture_get_stride(ctx, st)),
-        gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx, st)),
-        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx, st)),
-        gxm_nid::TEXTURE_GET_V_ADDR_MODE_SAFE => cont!(gxm::texture_get_v_addr_mode(ctx, st)),
-        gxm_nid::TEXTURE_GET_MIN_FILTER => cont!(gxm::texture_get_min_filter(ctx, st)),
-        gxm_nid::TEXTURE_GET_MAG_FILTER => cont!(gxm::texture_get_mag_filter(ctx, st)),
-        gxm_nid::TEXTURE_GET_GAMMA_MODE => cont!(gxm::texture_get_gamma_mode(ctx, st)),
+        gxm_nid::TEXTURE_GET_LOD_BIAS => cont!(gxm::texture_get_lod_bias(ctx)),
+        gxm_nid::TEXTURE_GET_U_ADDR_MODE_SAFE => cont!(gxm::texture_get_u_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_V_ADDR_MODE_SAFE => cont!(gxm::texture_get_v_addr_mode(ctx)),
+        gxm_nid::TEXTURE_GET_MIN_FILTER => cont!(gxm::texture_get_min_filter(ctx)),
+        gxm_nid::TEXTURE_GET_MAG_FILTER => cont!(gxm::texture_get_mag_filter(ctx)),
+        gxm_nid::TEXTURE_GET_GAMMA_MODE => cont!(gxm::texture_get_gamma_mode(ctx)),
         gxm_nid::TEXTURE_INIT_CUBE => cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE)),
         // Color-surface getters/setters beyond format.
         gxm_nid::COLOR_SURFACE_GET_DATA => cont!(gxm::color_surface_get_data(ctx, st)),
@@ -781,12 +815,12 @@ pub fn dispatch(
         // Texture sampler state: record wrap modes / LOD bias per texture (the plain
         // and "safe" variants set the same state; the safe one also validates on HW).
         gxm_nid::TEXTURE_SET_U_ADDR_MODE | gxm_nid::TEXTURE_SET_U_ADDR_MODE_SAFE => {
-            cont!(gxm::texture_set_u_addr_mode(ctx, st))
+            cont!(gxm::texture_set_u_addr_mode(ctx))
         }
         gxm_nid::TEXTURE_SET_V_ADDR_MODE | gxm_nid::TEXTURE_SET_V_ADDR_MODE_SAFE => {
-            cont!(gxm::texture_set_v_addr_mode(ctx, st))
+            cont!(gxm::texture_set_v_addr_mode(ctx))
         }
-        gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx, st)),
+        gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx)),
         gxm_nid::DRAW => cont!(gxm::draw(ctx, st)),
         gxm_nid::DRAW_INSTANCED => cont!(gxm::draw_instanced(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {

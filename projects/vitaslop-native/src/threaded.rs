@@ -60,7 +60,13 @@ pub use vitaslop_runtime::sched::RunReport;
 /// without a host call. A deterministic (retired-instruction) quantum so the
 /// interleaving is reproducible; large enough that a normal run of guest code
 /// between host calls completes in one slice.
-const DEFAULT_QUANTUM_FUEL: u64 = 1_000_000;
+///
+/// It is the runtime's [`QUANTUM_FUEL`](vitaslop_runtime::host::QUANTUM_FUEL) rather than a
+/// number of its own, because the same constant is the denominator the game clock prices
+/// guest work against. Two engines that preempt at different intervals may still keep the
+/// same clock - the charge is per unit of fuel - but the clock's calibration is stated
+/// against this one, so it must not drift from it silently.
+const DEFAULT_QUANTUM_FUEL: u64 = vitaslop_runtime::host::QUANTUM_FUEL;
 
 /// Headroom reserved above the main thread's initial stack pointer, below the top
 /// of the guest region. ELF/crt startup and some libc routines address memory at
@@ -83,6 +89,26 @@ fn main_stack_top(base: u32, mem_bytes: u32) -> u32 {
 /// needs to cross; exit codes and halt/exit kinds ride the fiber's own return value.
 struct Signal {
     stop: Stop,
+    /// Engine fuel this thread has burned in total, as of the last moment anything could
+    /// observe it. The game clock is charged for the DIFFERENCE across a resume, so this
+    /// is what makes a suspend cost what the guest actually executed.
+    ///
+    /// Two paths reach it, and both are exact. A host call can read `Caller::get_fuel`
+    /// directly, so any suspend that goes through the closure below samples the true
+    /// value. wasmtime's OWN periodic yield does not run any of our code - but it fires
+    /// every [`quantum_fuel`](WasmtimeEngine::quantum_fuel) units by construction, so a
+    /// resume that suspended without passing through the closure burned exactly that much,
+    /// and [`WasmtimeThread::resume`] adds it.
+    ///
+    /// Getting this second path right is not an edge case: a title's vblank spin reads the
+    /// clock through an INLINED mirror load and makes no host call at all, so it suspends
+    /// only on the periodic yield. Charging it nothing is a stopped clock, which is the
+    /// exact livelock the CPU charge exists to prevent.
+    fuel: u64,
+    /// How many times the host-call closure has suspended this thread. `resume` compares
+    /// it across a poll to tell a suspend it can see (a host call, which sampled `fuel`)
+    /// from one it cannot (wasmtime's periodic fuel yield).
+    host_suspends: u64,
 }
 
 /// The scheduler's per-thread store data: the shared host, this thread's id, the
@@ -93,6 +119,13 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     thid: i32,
     shared_mem: SharedMemory,
     base: u32,
+    /// Linear-memory offset of the guest-store dirty block, when this build was
+    /// transpiled with one (`VITASLOP_DIRTY_PAGES`). `None` in an ordinary NATIVE
+    /// build, and deliberately so: wasmtime bills every operator it executes, so the
+    /// stamps would burn fuel and speed the game clock up. It exists here to let the
+    /// mechanism be tested against the desktop's cheap bit-exact oracles before it is
+    /// trusted in the browser, which is the engine that uses it.
+    dirty_off: Option<u64>,
     signal: Arc<Mutex<Signal>>,
     /// Set by a host call that returned `Halt`, read by the fiber's async block.
     process_halt: bool,
@@ -105,6 +138,19 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     /// This thread's guest register/VFP globals, resolved once at instantiation.
     /// `None` only in the window before the instance exists. See [`GuestGlobals`].
     globals: Option<GuestGlobals>,
+    /// This thread's SOFTWARE fuel counter (`abi::FUEL_EXPORT`), present only when the
+    /// build emitted software fuel (`VITASLOP_FUEL`). Native does not need it - wasmtime
+    /// meters the store - so it exists here purely to be COMPARED against wasmtime's own
+    /// reading. See [`software_fuel_report`].
+    sw_fuel: Option<wasmtime::Global>,
+    /// The software counter's value at the last reading. It counts DOWN and reloads to a
+    /// full interval after each yield, so only differences accumulate to guest work -
+    /// exactly the arithmetic the browser host does, deliberately duplicated so a bug in
+    /// it shows up HERE, next to the ground truth.
+    sw_last: i64,
+    /// wasmtime's own cumulative reading at the last software-fuel sample, so the two
+    /// counters are differenced over exactly the same intervals.
+    sw_wasmtime_last: u64,
 }
 
 /// The wasm globals holding the guest register file, resolved once per thread.
@@ -156,6 +202,9 @@ pub struct WasmtimeThread {
     /// SceKernel priority (lower number = higher priority). The scheduler always
     /// runs the highest-priority runnable thread, matching the real kernel.
     priority: i32,
+    /// This thread's preemption interval, so [`resume`](GuestThread::resume) can price a
+    /// suspend that wasmtime took on its own (see [`Signal::fuel`]).
+    quantum_fuel: u64,
 }
 
 impl ThreadHandle for WasmtimeThread {
@@ -164,6 +213,10 @@ impl ThreadHandle for WasmtimeThread {
     }
     fn priority(&self) -> i32 {
         self.priority
+    }
+
+    fn fuel_used(&mut self) -> Option<u64> {
+        Some(self.signal.lock().unwrap().fuel)
     }
 }
 
@@ -175,10 +228,24 @@ impl GuestThread for WasmtimeThread {
         // overwrites it only if it suspends.
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        self.signal.lock().unwrap().stop = Stop::Quantum;
+        let before = {
+            let mut s = self.signal.lock().unwrap();
+            s.stop = Stop::Quantum;
+            s.host_suspends
+        };
         match self.future.as_mut().poll(&mut cx) {
             Poll::Ready(end) => ThreadStep::Finished(end),
-            Poll::Pending => ThreadStep::Suspended(self.signal.lock().unwrap().stop),
+            Poll::Pending => {
+                let mut s = self.signal.lock().unwrap();
+                if s.host_suspends == before {
+                    // Nothing of ours ran, so this is wasmtime's own periodic yield and
+                    // the thread burned exactly one interval getting here. Without this the
+                    // only threads that ever cost game time would be the ones that make
+                    // host calls, and a guest spin that reads an inlined mirror makes none.
+                    s.fuel = s.fuel.saturating_add(self.quantum_fuel);
+                }
+                ThreadStep::Suspended(s.stop)
+            }
         }
     }
 }
@@ -201,6 +268,9 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     /// of it (see `vitaslop_transpiler::InlineOp::LoadMirror`). The scheduler refreshes
     /// it before every resume.
     mirror_off: Option<u64>,
+    /// Linear-memory offset of the guest-store dirty block - see [`ThreadData`], which
+    /// carries it to the host-call view.
+    dirty_off: Option<u64>,
 }
 
 impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
@@ -223,6 +293,9 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
         let off = addr.wrapping_sub(self.base) as usize;
         if off + bytes.len() <= self.shared_mem.data().len() {
             write_shared(&self.shared_mem, off, bytes);
+            // A scheduler-side write is a host write like any other - see
+            // `SharedView::stamp_written`.
+            SharedView::new(&self.shared_mem, self.dirty_off).stamp_written(off, bytes.len());
         }
     }
 
@@ -369,6 +442,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             quantum_fuel,
             arm_word_off: artifact.arm_word_off,
             mirror_off: artifact.mirror_off,
+            dirty_off: artifact.dirty_off,
         };
 
         // The main thread: sp near the top of the region (with startup headroom), no
@@ -441,6 +515,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             quantum_fuel,
             arm_word_off: built.artifact.arm_word_off,
             mirror_off: built.artifact.mirror_off,
+            dirty_off: built.artifact.dirty_off,
         };
 
         // The main thread runs every module_start in load order, then (as the last
@@ -519,6 +594,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// [`vitaslop_runtime::sched::SchedCore::runnable_report`].
     pub fn runnable_report(&self) -> String {
         self.inner.runnable_report(vitaslop_runtime::host::guest_cores())
+    }
+
+    /// `(total fuel burned, samples, largest single burn)` - see
+    /// [`vitaslop_runtime::sched::SchedCore::fuel_report`].
+    pub fn fuel_report(&self) -> (u64, u64, u64) {
+        self.inner.fuel_report()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run
@@ -620,17 +701,22 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         sp: u32,
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
-        let signal = Arc::new(Mutex::new(Signal { stop: Stop::Quantum }));
+        let signal =
+            Arc::new(Mutex::new(Signal { stop: Stop::Quantum, fuel: 0, host_suspends: 0 }));
         let data = ThreadData {
             host: self.host.clone(),
             thid,
             shared_mem: self.shared_mem.clone(),
             base: self.base,
+            dirty_off: self.dirty_off,
             signal: signal.clone(),
             process_halt: false,
             thread_exit: false,
             fatal: None,
             globals: None,
+            sw_fuel: None,
+            sw_last: i64::from(vitaslop_transpiler::fuel_interval()),
+            sw_wasmtime_last: 0,
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
@@ -652,6 +738,10 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         // up by name (see `GuestGlobals`).
         let globals = GuestGlobals::resolve(&mut store, &instance);
         store.data_mut().globals = Some(globals);
+        // Absent unless this build emitted software fuel, which native never needs and
+        // only a comparison run turns on.
+        let sw_fuel = instance.get_global(&mut store, abi::FUEL_EXPORT);
+        store.data_mut().sw_fuel = sw_fuel;
 
         // This thread's thread-local-storage: a private block whose base becomes the
         // thread pointer (TPIDRURO). Copy the template's initialized `.tdata` head into
@@ -716,7 +806,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             FiberEnd::Returned(last_r0)
         });
 
-        Ok(WasmtimeThread { thid, future, signal, priority })
+        Ok(WasmtimeThread { thid, future, signal, priority, quantum_fuel: self.quantum_fuel })
     }
 }
 
@@ -1228,7 +1318,7 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                         let thid = data.thid;
                         let base = data.base;
                         let shared = data.shared_mem.clone();
-                        let mut view = SharedView::new(&shared);
+                        let mut view = SharedView::new(&shared, data.dirty_off);
                         let mut host = data.host.lock().unwrap();
                         host.set_current_thread(thid);
                         host.dispatch(selector as u32, &mut regs, &mut vfp, &mut view, base)
@@ -1302,11 +1392,11 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                             // Stay runnable but suspend so the scheduler re-picks by
                             // priority now (a higher-priority thread just became
                             // runnable and must preempt us).
-                            caller.data().signal.lock().unwrap().stop = Stop::Quantum;
+                            note_suspend(&mut caller, Stop::Quantum);
                             YieldNow(false).await;
                         }
                         SvcOutcome::Block => {
-                            caller.data().signal.lock().unwrap().stop = Stop::Blocked;
+                            note_suspend(&mut caller, Stop::Blocked);
                             YieldNow(false).await;
                             // Resumed. A timed wait that expired owes this thread a
                             // return code other than the 0 it parked with (a
@@ -1322,7 +1412,7 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                             }
                         }
                         SvcOutcome::Flip => {
-                            caller.data().signal.lock().unwrap().stop = Stop::Flip;
+                            note_suspend(&mut caller, Stop::Flip);
                             YieldNow(false).await;
                         }
                         SvcOutcome::ThreadExit => {
@@ -1349,6 +1439,100 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
     Ok(())
 }
 
+/// Record that this thread is about to suspend at `stop`, and sample the fuel it has
+/// burned so far.
+///
+/// The fuel reading is the point: `Caller::get_fuel` is the exact remaining fuel of this
+/// thread's store, and the store started at `u64::MAX`, so the difference is everything the
+/// thread has executed. Sampling it HERE - at the switch point, before the scheduler can
+/// look - is what lets the game clock be charged for guest work rather than for the number
+/// of times a thread happened to stop. See [`Signal::fuel`].
+fn note_suspend<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    stop: Stop,
+) {
+    // `get_fuel` fails only on a store without fuel consumption enabled, which this engine
+    // always enables; leave the previous reading rather than invent one if it ever does.
+    let burned = caller.get_fuel().ok().map(|left| u64::MAX - left);
+    sample_software_fuel(caller, burned);
+    let mut s = caller.data().signal.lock().unwrap();
+    s.stop = stop;
+    s.host_suspends = s.host_suspends.wrapping_add(1);
+    if let Some(burned) = burned {
+        s.fuel = burned;
+    }
+}
+
+/// The comparison totals: `(software fuel burned, wasmtime fuel burned over the same
+/// intervals, samples)`. A process-global because it is a whole-run diagnostic and the
+/// threads it is summed over are released as they finish.
+static SW_FUEL: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// `(software fuel, wasmtime fuel, samples)` over the whole run, or `None` when this
+/// build emitted no software fuel.
+///
+/// # What it is for
+/// The browser has no engine fuel, so the transpiler emits a counter that is supposed to
+/// reproduce wasmtime's own accounting - its operator cost table and its flush points -
+/// and the browser's game clock is driven by it. That claim was measured against the
+/// desktop's and disagreed by a factor of ten, which is either a wrong counter or a
+/// browser that really does ten times the work; nothing in a browser run can tell those
+/// apart, because it has no second opinion.
+///
+/// Running the SAME module on wasmtime with the counter compiled in gives it one. Both
+/// numbers here are sampled at the same instants (every host-call switch point) and cover
+/// the same guest execution, so their ratio is the counter's error and nothing else.
+///
+/// Note the wasmtime side is measured on an INSTRUMENTED module, so it legitimately reads
+/// a little high - it bills the counter's own `global.get`/`i32.sub`/`global.set`, which
+/// the module native normally runs does not contain. That biases the ratio TOWARDS one,
+/// so a ratio far from one is not an artefact of the experiment.
+pub fn software_fuel_report() -> Option<(u64, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let samples = SW_FUEL[2].load(Relaxed);
+    if samples == 0 {
+        return None;
+    }
+    Some((SW_FUEL[0].load(Relaxed), SW_FUEL[1].load(Relaxed), samples))
+}
+
+/// Read this thread's software fuel counter, difference it the way the browser host does,
+/// and accumulate it next to wasmtime's reading for the same interval. A no-op on a build
+/// without software fuel, which is every ordinary native run.
+fn sample_software_fuel<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+    wasmtime_total: Option<u64>,
+) {
+    // The global is exported unconditionally; it only COUNTS when this build emitted
+    // fuel. Without this the report would fire on every ordinary run and read a flat
+    // zero as "the counter says the guest did no work".
+    let interval = i64::from(vitaslop_transpiler::fuel_interval());
+    if interval == 0 {
+        return;
+    }
+    let Some(g) = caller.data().sw_fuel.clone() else { return };
+    let Some(now) = g.get(&mut *caller).i32().map(i64::from) else { return };
+    let last = caller.data().sw_last;
+    // A reading ABOVE the last one means a reload happened in between: the thread burned
+    // the rest of the old interval and then the part of the new one it has spent.
+    let burned = if now <= last { last - now } else { last + (interval - now) };
+    caller.data_mut().sw_last = now;
+
+    use std::sync::atomic::Ordering::Relaxed;
+    SW_FUEL[0].fetch_add(burned.max(0) as u64, Relaxed);
+    // wasmtime's side is a cumulative total, so difference it per thread the same way.
+    if let Some(total) = wasmtime_total {
+        let prev = caller.data().sw_wasmtime_last;
+        caller.data_mut().sw_wasmtime_last = total;
+        SW_FUEL[1].fetch_add(total.saturating_sub(prev), Relaxed);
+    }
+    SW_FUEL[2].fetch_add(1, Relaxed);
+}
+
 /// A future that suspends the fiber exactly once (the switch point), then
 /// completes. The scheduler decides when the fiber is polled again - immediately
 /// for a fuel/frame yield, or only after a wake for a block.
@@ -1371,12 +1555,53 @@ impl Future for YieldNow {
 struct SharedView {
     ptr: *mut u8,
     len: usize,
+    /// Offset of the guest-store dirty block, when this build was transpiled with one.
+    /// See [`ThreadData::dirty_off`] for why an ordinary native build has none.
+    dirty_off: Option<u64>,
 }
 
 impl SharedView {
-    fn new(mem: &SharedMemory) -> SharedView {
+    fn new(mem: &SharedMemory, dirty_off: Option<u64>) -> SharedView {
         let data = mem.data();
-        SharedView { ptr: data.as_ptr() as *mut u8, len: data.len() }
+        SharedView { ptr: data.as_ptr() as *mut u8, len: data.len(), dirty_off }
+    }
+
+    /// The dirty block's `[epoch byte][page map]`, as one mutable slice.
+    ///
+    /// SAFETY of the caller's use: the block lies above the guest region inside the
+    /// same linear memory, and scheduling is cooperative, so no fiber runs while a host
+    /// call holds this.
+    unsafe fn dirty_block(&self) -> Option<&mut [u8]> {
+        let off = self.dirty_off? as usize;
+        let end = self.len.min(off + vitaslop_transpiler::DIRTY_MAP_OFF as usize + self.pages() + 1);
+        Some(std::slice::from_raw_parts_mut(self.ptr.add(off), end - off))
+    }
+
+    fn pages(&self) -> usize {
+        self.len >> vitaslop_transpiler::DIRTY_SHIFT
+    }
+
+    /// Stamp every page `[off, off + len)` touches with the current epoch.
+    ///
+    /// # This is not an extra - it is the other half of the map
+    /// The transpiler stamps what the GUEST stores, and a host call writes guest memory
+    /// too: a file read, a `memcpy` NID, a GXM transfer. Those writes are invisible to
+    /// translated code [[vitaslop-host-write-watch]], so a map that only the guest
+    /// wrote would report a texture the host had just overwritten as untouched - a
+    /// silent stale texture, the exact bug the compare exists to prevent. Every backing
+    /// with a map must do this in its `write`.
+    fn stamp_written(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: see `dirty_block`.
+        let Some(block) = (unsafe { self.dirty_block() }) else { return };
+        let epoch = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize];
+        let map = &mut block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let first = off >> shift;
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1));
+        map[first..=last].fill(epoch);
     }
 }
 
@@ -1396,6 +1621,7 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(off), bytes.len());
         }
+        self.stamp_written(off, bytes.len());
     }
     fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
         if off.checked_add(len)? > self.len {
@@ -1405,6 +1631,37 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         // runs while a host call holds this borrow, so the bytes cannot change under
         // it. The lifetime is tied to `&self`, which lives only for the host call.
         Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off), len) })
+    }
+
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        if len == 0 {
+            return Some(false);
+        }
+        // SAFETY: see `dirty_block`.
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        // One page BELOW the range too - a store is stamped against the page it STARTS
+        // in. See `GuestMemory::dirty_since`.
+        let first = (off >> shift).saturating_sub(1);
+        // `max(first)` so a clamped range is a single page rather than a reversed slice.
+        let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1)).max(first);
+        Some(map[first..=last].iter().any(|&s| s >= stamp))
+    }
+
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        // SAFETY: see `dirty_block`.
+        let block = unsafe { self.dirty_block()? };
+        let next = block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize].wrapping_add(1);
+        // A one-byte epoch compared with `>=` may not wrap silently - see the browser's
+        // impl, which this mirrors exactly, for why the map is zeroed instead.
+        if next == 0 || next == u8::MAX {
+            block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].fill(0);
+            block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = 1;
+            return Some((1, true));
+        }
+        block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize] = next;
+        Some((next, false))
     }
 }
 

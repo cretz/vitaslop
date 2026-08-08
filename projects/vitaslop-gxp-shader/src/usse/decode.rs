@@ -558,11 +558,30 @@ fn r6_plain_source(bank_sel: u8, field_val: u32) -> Operand {
 
 /// Resolve a source operand whose `alt_opt<N>` bit is set (an exotic addressing mode). Per
 /// the henkaku "Operand N" table, `(alt_opt=1, opt)` selects: 00 index1 (RIO6), 01 constant
-/// (CNST6), 10 immediate (IMM6), 11 index2 (RIO6). Only the CONSTANT sub-mode is resolvable
-/// from clean facts (the CNST6 table), so it yields an inline constant operand; the index/
-/// immediate modes need the RIO6/IMM6 addressing this decoder does not model, so they return
-/// `None` and the caller blocks emit. `op_field` is the operand's register/value field.
+/// (CNST6), 10 immediate (IMM6), 11 index2 (RIO6).
+///
+/// CONSTANT yields an inline constant operand from the CNST6 table. IMMEDIATE yields an inline
+/// LITERAL: spec A.7 states it plainly - "the operand's `num` field IS the literal value
+/// (zero-extended); when loaded, it yields a scalar constant equal to `num`". The larger
+/// immediates the same paragraph describes are assembled from EXTRA per-instruction fields and
+/// belong to the instructions that have them (VBW's `src2_n | src2_sel<<7 | src2_exth<<14`,
+/// LIMM's three fields); the groups reaching here carry no such fields, so the 6-bit number is
+/// the whole value. The swizzle is still live and is the ordinary one - selectors 0..3 read the
+/// scalar, 4..7 are the constants 0.0/1.0/2.0/0.5 - so a `(5, 5, 0, 0)` swizzle over the
+/// immediate 0 is the vector `(1, 1, 0, 0)`, which is what a title's blocked instruction wanted.
+///
+/// The two INDEXED modes need RIO6 register-indirect addressing this decoder does not model, so
+/// they still return `None` and the caller blocks emit. `op_field` is the operand's
+/// register/value field.
 fn exotic_source(opt_sel: u8, op_field: u32, swizzle: [u8; 4], abs: bool, neg: bool) -> Option<Operand> {
+    if opt_sel & 3 == 0b10 {
+        // Immediate mode: the 6-bit field IS the literal.
+        let mut o = Operand::plain(Bank::Immediate, (op_field & 0x3f) as u8, opt_sel);
+        o.swizzle = swizzle;
+        o.abs = abs;
+        o.neg = neg;
+        return Some(o);
+    }
     if opt_sel & 3 == 0b01 {
         // Constant mode: the 6-bit field is the CNST6 selector. The operand's swizzle is
         // still live - per spec A.7 it chooses which hardware constant BANK each channel
@@ -1872,16 +1891,20 @@ fn decode_grp_tex(word: u64) -> Instr {
     }
     // `lod_mode` (E0.4) selects where the mip level comes from. Bias and explicit-LOD each
     // read one scalar from src2 and map onto a WGSL sample variant exactly; the GRADIENT form
-    // reads two derivative VECTORS whose component split this decoder has no corpus evidence
-    // for, so it stays blocked.
-    let lod = match bits(word, 41, 40) {
+    // reads two derivative VECTORS from src2, packed one after the other.
+    //
+    // The component split is spec E0.4, which is in that document's CONFIRMED list along with
+    // the rest of the `lod_mode` table: "for 2D the first 2 components are ddx and the next 2
+    // are ddy; for 3D the first 3 components are ddx and a SECOND REGISTER's 3 components are
+    // ddy". Only the 2D case is wired: it reads four components of one register and needs no
+    // decision about where the second register is. The 3D case does, and that is exactly the
+    // thing there is no evidence for, so it stays blocked.
+    let lod_mode = bits(word, 41, 40);
+    let lod = match lod_mode {
         0 => TexLod::Implicit,
         1 => TexLod::Bias,
         2 => TexLod::Level,
-        _ => {
-            blocked = blocked.or(Some("0xE0 tex gradient (lod_mode 3) not yet wired"));
-            TexLod::Implicit
-        }
+        _ => TexLod::Gradient,
     };
     // dim is base-0: 0 => 1D (padded to 2D), 1 => 2D, 2 => 3D/cube (3 coords), 3 => reserved.
     let dim_field = bits(word, 43, 42);
@@ -1894,6 +1917,17 @@ fn decode_grp_tex(word: u64) -> Instr {
             2
         }
     };
+    // A GRADIENT sample is wired for 2D only - see the `lod_mode` note above. With three
+    // coordinates the two derivative vectors are three components each and the second one
+    // begins in a register this decoder would have to GUESS at; a wrong guess samples the
+    // wrong mip of the right texture, which looks like a texture-filtering bug and not like a
+    // decode bug.
+    if matches!(lod, TexLod::Gradient) && coords != 2 {
+        blocked = blocked.or(Some(
+            "0xE0 tex gradient with a non-2D coordinate: the second derivative vector's \
+             register is not established - wire this case and re-run",
+        ));
+    }
     // Coordinate data type (`src0_type`, E0.2): 0 = F32, 1 = F16, 2 = C10. The coordinate is
     // usually computed by the F16 ALU pipeline, so reading it as F32 would sample garbage.
     let coord_half = match bits(word, 36, 35) {
@@ -1963,10 +1997,11 @@ fn decode_grp_tex(word: u64) -> Instr {
         (dest_bank, dest_reg as u8)
     };
 
-    // src2 carries the bias / explicit level when `lod_mode` asks for one. Like every other
-    // SMP operand it is double-register scaled (spec E0.2). It is read as F32: in the corpus
-    // the instruction immediately before each explicit-LOD sample is a `mov .f32` writing
-    // exactly this register, so the level is produced and consumed at 32-bit width.
+    // src2 carries the bias / explicit level - or, for a gradient sample, BOTH derivative
+    // vectors - when `lod_mode` asks for one. Like every other SMP operand it is
+    // double-register scaled (spec E0.2). It is read as F32: in the corpus the instruction
+    // immediately before each explicit-LOD sample is a `mov .f32` writing exactly this
+    // register, so the level is produced and consumed at 32-bit width.
     let mut tex_srcs = vec![coord];
     if !matches!(lod, TexLod::Implicit) {
         let src2_sel = bits(word, 29, 28) as u8;
@@ -3519,9 +3554,10 @@ mod tests {
     }
 
     /// `lod_mode` selects the sample variant (spec E0.4). Bias and explicit-LOD each read one
-    /// scalar from src2 and map exactly onto a WGSL sample function, so they decode; only the
-    /// GRADIENT form - whose two derivative vectors have no corpus evidence for their component
-    /// split - stays blocked, along with the gather/info sub-behaviours.
+    /// scalar from src2 and map exactly onto a WGSL sample function; the GRADIENT form reads
+    /// both derivative vectors from src2 and decodes for a 2D coordinate, where the split is
+    /// spec E0.4's "first 2 components ddx, next 2 ddy" and no register has to be guessed at.
+    /// A gradient with a 1D or 3D coordinate, and the gather/info sub-behaviours, stay blocked.
     #[test]
     fn tex_lod_modes_decode_except_gradient() {
         // sb_mode != 0 (gather/info) -> blocked.
@@ -3544,9 +3580,18 @@ mod tests {
         assert!(matches!(bias.op, Op::Tex { lod: TexLod::Bias, .. }));
         assert_eq!(bias.srcs.len(), 2, "bias reads its scalar from src2");
 
-        // Gradient stays blocked, naming itself.
-        let grad = decode(word_bits(&[(0x1c, 63, 59), (3, 41, 40)]));
-        assert!(grad.blocked.is_some_and(|b| b.contains("gradient")));
+        // The real 2D gradient sample this title draws its terrain with (dim 1 = 2D,
+        // lod_mode 3). It decodes, and it reads its derivatives from src2 like every other
+        // extra operand.
+        let grad = decode(0xe080878ce0408101);
+        assert!(grad.blocked.is_none(), "{:?}", grad.blocked);
+        assert!(matches!(grad.op, Op::Tex { coords: 2, lod: TexLod::Gradient, .. }));
+        assert_eq!(grad.srcs.len(), 2, "gradient reads both derivative vectors from src2");
+
+        // A gradient with a 3D coordinate still blocks: its second derivative vector starts in
+        // a register this decoder has no evidence for, and guessing samples the wrong mip.
+        let grad3d = word_bits(&[(0x1c, 63, 59), (3, 41, 40), (2, 43, 42)]);
+        assert!(decode(grad3d).blocked.is_some_and(|b| b.contains("gradient")));
     }
 
     #[test]

@@ -75,6 +75,54 @@ pub trait GuestMemory {
         let _ = (off, len);
         None
     }
+
+    /// Has the guest STORED anywhere in rebased `[off, off + len)` at or after epoch
+    /// `stamp`? `Some(true)` if it may have, `Some(false)` if it provably did not,
+    /// `None` if this backing tracks no stores at all.
+    ///
+    /// `None` is not "clean" - it is "no answer", and a caller that cannot tell the
+    /// difference would serve stale pixels. Every caller must fall back to reading the
+    /// bytes.
+    ///
+    /// The map is a byte per 4 KB page holding the epoch of the last store into it; the
+    /// transpiler writes it (`emit_dirty_mark`, which explains why it is an epoch and
+    /// not a flag) and this reads it. Nothing is ever cleared, so two callers asking
+    /// about overlapping pages cannot spoil each other's answer.
+    ///
+    /// # The one-page overhang
+    /// The transpiler stamps the page a store STARTS in, not every page it touches -
+    /// widening it costs as much again on the hottest path in the module, and the
+    /// reader gets it for free. The largest translated store is 8 bytes, so a store
+    /// reaching into a page can only have started in that page or the one below it.
+    /// An implementation therefore examines one page BELOW `off` as well, which makes
+    /// the answer exact.
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        let _ = (off, len, stamp);
+        None
+    }
+
+    /// Advance the guest-store epoch and return `(the stamp to record, whether the
+    /// epoch WRAPPED)`. `None` when this backing tracks no stores.
+    ///
+    /// A caller records the returned stamp against bytes it has just read out of guest
+    /// memory; a later [`dirty_since`](Self::dirty_since) with that stamp then answers
+    /// "has the guest written here since I read it?". Advancing BEFORE the caller
+    /// records is what makes it exact: the guest cannot run during a host call, so no
+    /// store can already carry the new epoch.
+    ///
+    /// The epoch is one byte, so it runs out; on wrap the map is zeroed and `true` is
+    /// returned, and every stamp recorded before that moment is meaningless. A caller
+    /// that sees `true` must discard its stamps and re-establish them the slow way.
+    ///
+    /// # Why `&self` for a method that writes
+    /// The map is not guest state and not Rust-owned memory: the only backing that has
+    /// one reaches it through a JS typed array over a `SharedArrayBuffer`, where no
+    /// `&mut [u8]` exists to alias. Taking `&mut self` would instead force
+    /// [`GuestCtx::borrow_bytes`]'s caller to hold a mutable borrow of guest memory
+    /// across the very compare it is trying to avoid.
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        None
+    }
 }
 
 /// The native/zero-copy backing: guest memory the runtime can borrow directly
@@ -275,6 +323,18 @@ impl<'a> GuestCtx<'a> {
     /// ([`GuestMemory::borrow`]).
     pub fn borrow_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.mem.borrow(self.offset(addr)?, len)
+    }
+
+    /// Has the guest stored anywhere in `[addr, addr + len)` at or after epoch
+    /// `stamp`? `None` when the engine tracks no stores, which is not an answer -
+    /// see [`GuestMemory::dirty_since`], which this forwards to.
+    pub fn dirty_since(&self, addr: u32, len: usize, stamp: u8) -> Option<bool> {
+        self.mem.dirty_since(self.offset(addr)?, len, stamp)
+    }
+
+    /// Advance the guest-store epoch - see [`GuestMemory::bump_dirty_epoch`].
+    pub fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        self.mem.bump_dirty_epoch()
     }
 
     /// Write `bytes` at guest address `addr` (clamped to range).
@@ -1589,9 +1649,12 @@ struct VertexStreamInfo {
 /// every one of them decoded as a null data pointer, and the light, bloom and composite passes
 /// all rendered pure black. The frame still looked like a frame, only far too dark.
 ///
-/// The ADDRESS is kept beside the words because the side tables (`texture_formats`,
-/// `texture_samplers`, `texture_extra`) are keyed by it - see
+/// The ADDRESS is kept beside the words because the two remaining side tables
+/// (`texture_formats`, `texture_extra`) are keyed by it - see
 /// `vitaslop-host-call-reference-semantics` for why identity and value both have to survive.
+/// The sampler wrap modes, filters, LOD bias, gamma and mip count used to be a third such
+/// table and are now read out of `words` itself, which is what lets them survive the by-value
+/// copy an address-keyed table cannot follow.
 #[derive(Clone, Copy, Debug, Default)]
 struct TextureBinding {
     unit: u32,
@@ -1637,31 +1700,27 @@ struct PrecomputedState {
     blend: crate::capture::BlendState,
 }
 
-/// Extra sticky per-texture state the `sceGxmTextureGet*` getters read back. The
-/// hardware packs these into the 16-byte control words; we keep them in a shadow
-/// (like `texture_samplers`) so a setter never risks corrupting a struct the guest
-/// re-reads, and a getter returns exactly what the guest set. Absent = GXM defaults.
-#[derive(Clone, Copy)]
+/// The ONE piece of per-texture state that cannot live in the guest's own control words.
+///
+/// Everything else this used to hold - the wrap modes, the three filters, the LOD bias, the
+/// gamma mode and the mip count - is now written into and read out of the guest's 16-byte
+/// `SceGxmTexture`, where the hardware keeps it (see `vita::gxm::texword0`). This shadow was
+/// address-keyed, and a `SceGxmTexture` is a POD the guest copies freely, so a copied texture
+/// silently lost all of it - the identical defect the doc on [`PrecomputedDraw`] below describes
+/// for precomputed draws, which this codebase had already fixed there.
+///
+/// The byte stride stays, and the reason is the refuse-to-guess rule rather than convenience: a
+/// `LINEAR_STRIDED` texture spreads its stride across word 0's `stride_ext`, `stride_low` and
+/// `stride` fields, and the vitasdk header documents their WIDTHS but not how they COMPOSE
+/// ("stride extension", "internal stride lower bits"). Packing it would mean inventing that, and
+/// a wrong packing would corrupt the neighbouring fields that ARE understood. So this holds what
+/// the guest passed to `sceGxmTextureInitLinearStrided`, and a by-value copy of a strided texture
+/// still loses its stride - which is a known, bounded gap, not a solved one.
+#[derive(Clone, Copy, Default)]
 struct TextureExtra {
-    /// Mip-map level count (1-based), from the `mipCount` argument to a non-strided
-    /// `sceGxmTextureInit*`. `SetData`/`SetFormat` leave it unchanged.
-    mip_count: u32,
     /// Explicit byte stride for a `LINEAR_STRIDED` texture (0 = derive from width x
     /// bytes-per-pixel, as the driver does for every other layout).
     byte_stride: u32,
-    /// Minification/magnification/mip filters (`SceGxmTextureFilter`).
-    min_filter: u32,
-    mag_filter: u32,
-    mip_filter: u32,
-    /// Gamma-correction mode (`SceGxmTextureGammaMode`, the raw enum word).
-    gamma: u32,
-}
-
-impl Default for TextureExtra {
-    fn default() -> Self {
-        // GXM defaults: one mip level, driver-derived stride, POINT filtering, no gamma.
-        TextureExtra { mip_count: 1, byte_stride: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
-    }
 }
 
 /// A precomputed draw: the vertex program, stream-0 vertex buffer, and draw
@@ -1718,15 +1777,35 @@ struct PrecomputedDraw {
 ///
 /// A backing that cannot lend its bytes (`borrow` returns `None`) falls back to
 /// re-reading every scene - slower, still correct.
+///
+/// # And why the compare is skipped where the engine can prove it pointless
+/// The compare is exact and it is enormous: measured on a live race, 116.8 MB a frame,
+/// 40% of the whole frame, RE-READING 0.0 MB - memory bandwidth spent proving nothing
+/// changed. An engine that stamps its guest stores
+/// ([`GuestMemory::dirty_since`]) can answer the same question by reading one byte per
+/// 4 KB page, and that is a proof, not a sample: it is the same guarantee, not a
+/// weaker one. Where the engine offers no stamps, the `memcmp` still runs. Neither
+/// path approximates, which is why there is no knob here.
 #[derive(Default)]
 struct TextureSnapshots {
     entries: HashMap<(u32, usize), Arc<[u8]>>,
+    /// The guest-store epoch each entry's bytes were established at, on an engine that
+    /// stamps stores. Absent for an entry means "no proof available" and costs a
+    /// compare, which is why a wrapped epoch can simply drop the whole map.
+    stamps: HashMap<(u32, usize), u8>,
     /// Total bytes held, so the cache cannot grow without bound across a long run.
     bytes: usize,
     /// Entries already checked this scene, so a texture bound by fifty draws is
     /// compared once, not fifty times. The cache's claim is "these bytes are
     /// unchanged since the last frame", and once per scene is what tests it.
     checked_this_scene: std::collections::HashSet<(u32, usize)>,
+    /// Entries already checked this FRAME. See [`Self::get_or_read`]: a texture that has
+    /// never been observed to change is compared once per frame rather than once per
+    /// scene, which is where nearly all of the compare bandwidth went.
+    checked_this_frame: std::collections::HashSet<(u32, usize)>,
+    /// Entries whose bytes HAVE been seen to change at least once. These keep the
+    /// per-scene cadence, because they are the ones the cadence exists for.
+    mutable: std::collections::HashSet<(u32, usize)>,
     /// Mean colour of a snapshot, keyed by the identity of the byte buffer itself and
     /// holding a strong reference to it.
     ///
@@ -1740,10 +1819,103 @@ struct TextureSnapshots {
     means: HashMap<usize, ([f32; 3], Arc<[u8]>)>,
 }
 
+/// Is the snapshot check allowed to run once per FRAME instead of once per SCENE? The one
+/// inexact cadence, and the only one that has to be asked for - see [`texture_check`].
+fn texture_check_per_frame() -> bool {
+    texture_check() == TextureCheck::Frame
+}
+
+/// How often, and by what means, a retained texture snapshot is re-validated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextureCheck {
+    /// The default and the exact one: once per scene, by the guest-store stamps where
+    /// the engine has them and by a byte compare where it does not.
+    Scene,
+    /// Once per FRAME for a texture never yet seen to change. Faster, NOT exact.
+    Frame,
+    /// Once per scene, by a byte compare ALWAYS - the stamps are ignored even where
+    /// the engine has them.
+    ///
+    /// Exact, and slower than `scene` on every engine, so it is not a performance
+    /// option: it exists to falsify the stamps. Two runs of one recipe that differ
+    /// only in this must be BIT-IDENTICAL, and if they are not, the dirty map missed a
+    /// store - which is a silent stale-texture bug and the only failure mode the
+    /// mechanism has.
+    Bytes,
+}
+
+/// How a retained texture snapshot is re-validated (`VITASLOP_TEXTURE_CHECK`): `scene`
+/// (default, exact), `frame` (faster, not exact) or `bytes` (exact, slower, ignores the
+/// guest-store stamps - the A/B that falsifies them). A value that is none of those is an
+/// ERROR rather than a silent fallback: a run configured by a typo would otherwise quietly
+/// publish frames at the accuracy nobody asked for.
+fn texture_check() -> TextureCheck {
+    static ON: std::sync::OnceLock<TextureCheck> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match crate::knobs::var("VITASLOP_TEXTURE_CHECK") {
+        Err(_) => TextureCheck::Scene,
+        Ok(v) => match v.trim() {
+            "scene" => TextureCheck::Scene,
+            "frame" => TextureCheck::Frame,
+            "bytes" => TextureCheck::Bytes,
+            other => panic!(
+                "VITASLOP_TEXTURE_CHECK={other:?} is not `scene` (exact, the default), \
+                 `frame` (faster, one scene of staleness the first time a texture changes) \
+                 or `bytes` (exact, slower, ignores the guest-store stamps - the A/B that \
+                 falsifies them)"
+            ),
+        },
+    })
+}
+
+/// Say - once - that the per-frame texture check is in effect. It trades exactness for
+/// speed, and an approximation nobody can see in the log is one that gets quoted as a
+/// measurement of the real thing. [[vitaslop-fallback-must-report]]
+fn report_texture_check_per_frame() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "VITASLOP_TEXTURE_CHECK=frame: a texture never yet seen to change is compared \
+             against guest memory ONCE PER FRAME, not once per scene. Faster, and NOT exact - \
+             a texture the guest rewrites mid-frame for the first time renders stale for the \
+             rest of that frame. Unset this for the exact per-scene check."
+        );
+    });
+}
+
 /// Byte budget for retained texture snapshots. Past it the cache is cleared whole
 /// (and says so): a level's working set is what it holds, and a title that exceeds
 /// this is telling us something worth seeing rather than something to silently trim.
-const TEXTURE_SNAPSHOT_BUDGET: usize = 192 << 20;
+///
+/// # What clearing it actually costs, measured
+/// "Cleared whole" is not a local event. Every retained entry is an `Arc` that the
+/// RENDERER's decode cache is keyed on by IDENTITY, so dropping them all means the next
+/// scene re-reads every texture into a fresh buffer, misses the decode cache on all of
+/// them, and re-decodes the whole working set inside one frame. MEASURED in the browser
+/// mid-race on a 703-draw frame: **263 textures decoded, 178 MB of RGBA8 produced, and
+/// `build` took 2,128 ms** - against 1.7 ms for a 430-draw frame that decoded nothing.
+///
+/// # The budget was NOT the cause of that burst, and the default is unchanged
+/// Raising it to 512 MB was tried and MEASURED: the clear never fired at either setting,
+/// and the burst frame was identical (2,145 ms against 2,128 ms, 263 decodes either way).
+/// The burst is the first PRESENTED frame after a fast-forward, which presents nothing and
+/// so leaves every cache cold - a property of the harness, not of this budget. The default
+/// stays at 192 MB because nothing measured asked for more, and a constant raised on a
+/// refuted theory is a constant fitted to noise.
+///
+/// What the investigation DID leave behind is the report below, which is now a `warn`:
+/// when this does fire it costs a full re-decode, and it used to say so only at `info`.
+/// `VITASLOP_SNAPSHOT_BUDGET_MB` overrides it - a mobile target will want it smaller.
+fn texture_snapshot_budget() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        crate::knobs::var("VITASLOP_SNAPSHOT_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(192)
+            << 20
+    })
+}
 
 impl TextureSnapshots {
     fn new() -> Self {
@@ -1753,33 +1925,154 @@ impl TextureSnapshots {
     /// The current bytes of the texture of `len` bytes at guest address `addr`,
     /// reusing the retained snapshot when guest memory still holds the same bytes.
     fn get_or_read(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
+        // The retained buffer, kept past the borrow below so the re-read at the bottom can
+        // hand back the SAME `Arc` when the bytes turn out to be identical - see there.
+        let mut retained: Option<Arc<[u8]>> = None;
         if let Some(p) = self.entries.get(&(addr, len)) {
+            retained = Some(p.clone());
             // Already compared this scene: the guest cannot have run since (a host
             // call is not preemptible), so nothing can have changed.
             if !self.checked_this_scene.insert((addr, len)) {
                 return p.clone();
             }
-            if let Some(live) = ctx.borrow_bytes(addr, len) {
-                if live == &p[..] {
-                    return p.clone();
+            // >>> OPT-IN ONLY (`VITASLOP_TEXTURE_CHECK=frame`): compare a texture never
+            // seen to change once per FRAME instead of once per SCENE.
+            //
+            // MEASURED on a live race with `bench --at`: the compare below is 40.2% of the
+            // whole frame - 1332 ms of a 3.31 s window - moving 116.8 MB per frame at
+            // 10.5 GB/s. It already runs at memory bandwidth, so the only thing left to
+            // change is how often it runs, and a frame here is eleven scenes. Doing it per
+            // frame took the title from 36.8 to 47.8 fps.
+            //
+            // It is NOT the default, because it is not exact and this emulator's job is to
+            // be exact. A texture that changes mid-frame for the FIRST time is seen one
+            // scene late (per-scene from then on, since a change puts it in `mutable`
+            // permanently) - one wrong frame, which is a visible artefact and not a
+            // rounding error. The strict cadence is what a claim of hardware accuracy
+            // rests on, so the fast path has to be asked for, and says so when taken.
+            if texture_check_per_frame()
+                && !self.mutable.contains(&(addr, len))
+                && !self.checked_this_frame.insert((addr, len))
+            {
+                report_texture_check_per_frame();
+                return p.clone();
+            }
+            // >>> THE EXACT SHORTCUT: ask the engine whether the guest stored here at all.
+            //
+            // On an engine that stamps its stores ([`GuestMemory::dirty_since`]), a
+            // texture no store has touched since these bytes were read CANNOT have
+            // changed. That is a proof, not a sample - the same guarantee the memcmp
+            // below gives - for the cost of reading one byte per 4 KB page instead of
+            // every byte of the texture twice. A missing stamp or a `None` answer is
+            // NOT "clean": both fall through to the compare.
+            //
+            // Charged to the compare phase, because it IS the compare on that engine -
+            // filing it elsewhere would make the phase look solved rather than moved.
+            let untouched = texture_check() != TextureCheck::Bytes && {
+                let _t = crate::perf::scope(crate::perf::Phase::DrawTextureCompare);
+                match self.stamps.get(&(addr, len)) {
+                    Some(&s) => ctx.dirty_since(addr, len, s) == Some(false),
+                    None => false,
                 }
+            };
+            if untouched {
+                return p.clone();
+            }
+            // Timed and COUNTED separately (see `Phase::DrawTextureCompare`): this is a
+            // memcmp of the whole texture, and it is charged to the snapshot phase while
+            // moving no bytes through `note_bytes` - so the phase reported "0.0 MB/frame"
+            // and read as pure per-draw overhead. The bytes compared are the size of the
+            // problem; the bytes re-read are only what actually changed.
+            // `Some(false)` unchanged, `Some(true)` changed, `None` a backing that cannot
+            // lend its bytes - which is not evidence either way, so it falls through to the
+            // re-read without being recorded as mutable.
+            let changed = {
+                let _t = crate::perf::scope(crate::perf::Phase::DrawTextureCompare);
+                ctx.borrow_bytes(addr, len).map(|live| {
+                    crate::perf::note_bytes(crate::perf::Phase::DrawTextureCompare, len);
+                    live != &p[..]
+                })
+            };
+            match changed {
+                Some(false) => {
+                    // Through `retained`, not `p`: stamping needs `&mut self` and `p`
+                    // borrows the entry table. They are the same `Arc`.
+                    let current = retained.clone().expect("set whenever an entry exists");
+                    // The compare has just re-established that these bytes are current,
+                    // so stamp them: without this the shortcut above could never take
+                    // hold for a texture whose stamp was dropped (a wrapped epoch, a
+                    // cleared cache), and it would pay the full compare for ever.
+                    self.restamp(ctx, addr, len);
+                    return current;
+                }
+                // Seen to change ONCE is enough to keep it on the per-scene cadence for
+                // the rest of the run. This is the set the frame-cadence shortcut above
+                // deliberately does not apply to.
+                Some(true) => {
+                    self.mutable.insert((addr, len));
+                    // Already proved different - the re-read below must not compare again.
+                    retained = None;
+                }
+                None => {}
             }
         }
-        let bytes: Arc<[u8]> = ctx.read_bytes(addr, len).into();
+        let raw = ctx.read_bytes(addr, len);
+        // A backing that cannot LEND its bytes (`borrow_bytes` returned `None`) reaches here
+        // every scene, whatever the texture is doing, so the copy above is the only way to
+        // find out whether anything changed. Compare it: consumers key their decode and
+        // upload caches on this buffer's IDENTITY, so handing back a fresh `Arc` holding
+        // byte-identical pixels would re-decode and re-upload an unchanged texture every
+        // scene. Same answer, same bytes, one buffer.
+        if let Some(p) = retained {
+            if raw[..] == p[..] {
+                self.restamp(ctx, addr, len);
+                return p;
+            }
+        }
+        let bytes: Arc<[u8]> = raw.into();
         crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
         self.insert(addr, len, bytes.clone());
+        self.restamp(ctx, addr, len);
         bytes
     }
 
+    /// Record that this entry's bytes are current AS OF NOW, so a later
+    /// [`GuestMemory::dirty_since`] can prove nothing has touched them. A no-op on an
+    /// engine that stamps no stores.
+    ///
+    /// The epoch is advanced first, so no store already carries the stamp we record: a
+    /// store made after this call is at or after it, and one made before is below it.
+    /// A WRAPPED epoch has zeroed the map, which makes every stamp taken before it a
+    /// lie - so they are all dropped, and each entry pays one compare to earn a new one.
+    fn restamp(&mut self, ctx: &GuestCtx, addr: u32, len: usize) {
+        let Some((stamp, wrapped)) = ctx.bump_dirty_epoch() else { return };
+        if wrapped {
+            self.stamps.clear();
+        }
+        self.stamps.insert((addr, len), stamp);
+    }
+
     fn insert(&mut self, addr: u32, len: usize, bytes: Arc<[u8]>) {
-        if self.bytes + bytes.len() > TEXTURE_SNAPSHOT_BUDGET {
-            tracing::info!(
+        if self.bytes + bytes.len() > texture_snapshot_budget() {
+            // A WARNING, not an info: this drops every buffer the renderer's decode cache
+            // is keyed on, so it costs a full re-decode of the working set inside the next
+            // frame - measured at 2.1 seconds of `build` in the browser. It was `info`,
+            // which the default `warn` filter discards, so the most expensive event in the
+            // frame was also the only one nobody could see. [[vitaslop-fallback-must-report]]
+            tracing::warn!(
                 target: "vitaslop::gxm",
                 held_mb = self.bytes >> 20,
                 entries = self.entries.len(),
-                "texture snapshot cache over budget - cleared"
+                "texture snapshot cache over budget - CLEARED WHOLE. Every retained buffer \
+                 is dropped, so the next frame re-reads and RE-DECODES the entire working \
+                 set. Raise VITASLOP_SNAPSHOT_BUDGET_MB if this repeats."
             );
             self.entries.clear();
+            // The cadence sets and the stamps describe entries that no longer exist.
+            self.mutable.clear();
+            self.checked_this_scene.clear();
+            self.checked_this_frame.clear();
+            self.stamps.clear();
             self.bytes = 0;
         }
         if let Some(old) = self.entries.insert((addr, len), bytes.clone()) {
@@ -1791,6 +2084,12 @@ impl TextureSnapshots {
     /// Start a new scene: every retained entry becomes due for one comparison again.
     fn begin_scene(&mut self) {
         self.checked_this_scene.clear();
+    }
+
+    /// Start a new FRAME: even a texture never seen to change is due for one comparison.
+    /// See [`Self::get_or_read`] for why the two cadences exist.
+    fn begin_frame(&mut self) {
+        self.checked_this_frame.clear();
     }
 
     /// The mean colour of `t`'s pixels, computed once per distinct byte buffer.
@@ -1823,6 +2122,15 @@ impl TextureSnapshots {
             }
             !overlaps
         });
+        // Keep the cadence bookkeeping in step with the entries it describes. A stale key
+        // here is harmless (the `entries` lookup misses first and the texture is re-read),
+        // but leaving it means the sets grow with every address the run ever touched.
+        let overlapping = |&(a, l): &(u32, usize)| {
+            (a as u64) < end && (addr as u64) < (a as u64 + l as u64)
+        };
+        self.mutable.retain(|k| !overlapping(k));
+        self.checked_this_scene.retain(|k| !overlapping(k));
+        self.checked_this_frame.retain(|k| !overlapping(k));
         self.bytes -= freed;
     }
 }
@@ -1946,6 +2254,24 @@ pub struct VitaState {
     /// than double-count. Exactly the role `io_charged_since_flip` plays for the
     /// storage clock. See [`VitaState::charge_cpu_quantum`].
     cpu_charged_since_flip: u64,
+    /// Sub-microsecond remainders of the two per-fuel charges, `(game clock, storage
+    /// clock)`, carried from one charge to the next.
+    ///
+    /// # Without these the clock STOPS on a title that yields in small bursts
+    /// A charge is `per_quantum * fuel / QUANTUM_FUEL`, and `QUANTUM_FUEL` is five
+    /// million. A thread that suspends after a few hundred fuel units - a spin whose loop
+    /// body makes one cheap host call - therefore rounds to **zero microseconds**, every
+    /// time, forever. That is not a rounding error, it is a stopped clock: measured on
+    /// PCSA00015 in the browser, one thread was resumed 198,968 times at frame 2 while the
+    /// game clock stood still at 3.44 s, because the storage transfer it was spinning on
+    /// could only complete when time passed and no time ever did.
+    ///
+    /// Carrying the remainder makes the charge exact in the long run - a hundred yields of
+    /// a tenth of a microsecond now cost ten microseconds instead of nothing - which is
+    /// what lets such a spin terminate. It is the same argument the CPU charge itself
+    /// rests on: work the guest really did has to cost time, or something waiting on time
+    /// waits for ever.
+    charge_rem: (u64, u64),
     /// Scheduler quanta and display flips observed, for the calibration diagnostic that
     /// sets `QUANTUM_CPU_US` (a quantum is worth one frame divided by the quanta a
     /// rendering frame actually takes - see [`VitaState::charge_cpu_quantum`]).
@@ -1975,6 +2301,9 @@ pub struct VitaState {
     /// [`ProgramReflection`]; cleared whenever a program is registered or unregistered,
     /// which is the only moment a header address can come to mean a different program.
     program_reflection: std::collections::HashMap<u32, ProgramReflection>,
+    /// Raw `SceGxmProgram` container bytes by header address - see [`VitaState::program_blob`].
+    /// Cleared alongside `program_reflection`, and for the same reason.
+    program_blobs: std::collections::HashMap<u32, std::sync::Arc<[u8]>>,
     color_surfaces: Vec<(u32, crate::capture::ColorSurface)>,
     /// Guest address of the displayQueue callback from sceGxmInitialize, and its
     /// data size. Recorded for faithfulness; the present address is captured from
@@ -2163,14 +2492,14 @@ pub struct VitaState {
     /// DRAW, while they grow with every distinct texture the title has ever touched.
     /// A linear scan made the capture cost of a frame grow with the size of the level.
     texture_formats: std::collections::HashMap<u32, u32>,
-    /// Sampler wrap/LOD state per guest `SceGxmTexture*`, as `(addr, (u_addr_mode,
-    /// v_addr_mode, lod_bias))`, set by `sceGxmTextureSet{U,V}AddrMode[Safe]` /
-    /// `SetLodBias`. Kept beside `texture_formats` (rather than mutated into the
-    /// guest control words) so recording the state never risks corrupting a struct
-    /// the guest re-reads. Absent = GXM defaults (REPEAT/REPEAT/0).
-    texture_samplers: std::collections::HashMap<u32, (u32, u32, u32)>,
-    /// Extra sticky per-texture state (`mipCount`, byte stride, min/mag/mip filter,
-    /// gamma) the `sceGxmTextureGet*` getters read back, keyed by `SceGxmTexture*`.
+    /// Memoised answers from [`Self::nearest_recorded_texture`], keyed by the NULL handle
+    /// address that asked. That search is a linear scan of `texture_formats`, and it feeds
+    /// a report that fires once per (unit, address) - see `snapshot_bound_textures`, where
+    /// running it on the ordinary by-value binding path cost 46% of a race frame.
+    nearby_texture_cache: std::collections::HashMap<u32, Option<(i64, u32)>>,
+    /// The one piece of per-texture state that cannot be packed into the guest's own control
+    /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
+    /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
     texture_extra: std::collections::HashMap<u32, TextureExtra>,
     /// Per-color-surface gamma-correction mode set by `sceGxmColorSurfaceSetGammaMode`,
     /// keyed by `SceGxmColorSurface*`. Absent = SCE_GXM_COLOR_SURFACE_GAMMA_NONE.
@@ -2234,10 +2563,13 @@ pub struct VitaState {
     /// The `SceGxmProgram*` the bound fragment uniform buffer was sized and filled for,
     /// the fragment-stage counterpart of [`Self::vertex_uniform_header`].
     fragment_uniform_header: u32,
-    /// `(stage, bound-for program, drawing program)` triples already reported by
-    /// [`Self::stale_uniforms`], so the warning fires once per pair instead of once per
-    /// draw (hundreds a frame).
-    reported_stale_uniforms: std::collections::HashSet<(&'static str, u32, u32)>,
+    /// How many times each `(stage, bound-for program, drawing program)` triple has been
+    /// seen by [`Self::stale_uniforms`]. A COUNT, not a set: the warning fires on powers of
+    /// ten, so a run says whether this happened to four draws or to four hundred thousand
+    /// without printing hundreds of lines a frame. "Once per pair" hides the scale, and the
+    /// scale is the whole question when the suspicion is that a stage is being starved of its
+    /// uniforms across a title.
+    reported_stale_uniforms: std::collections::HashMap<(&'static str, u32, u32), u64>,
     /// Colour-surface pairs already reported as overlapping in guest memory, so the report
     /// fires once per pair rather than once per `sceGxmColorSurfaceInit`.
     reported_surface_overlaps: std::collections::HashSet<(u32, u32)>,
@@ -2356,6 +2688,7 @@ impl VitaState {
             io_us: 0,
             io_waiters: Vec::new(),
             io_charged_since_flip: 0,
+            charge_rem: (0, 0),
             cpu_charged_since_flip: 0,
             next_flip_us: 0,
             display_sync: Self::SETBUF_NEXTFRAME,
@@ -2365,6 +2698,7 @@ impl VitaState {
             freed_memblocks: Vec::new(),
             vertex_programs: std::collections::HashMap::new(),
             program_reflection: std::collections::HashMap::new(),
+            program_blobs: std::collections::HashMap::new(),
             color_surfaces: Vec::new(),
             display_queue_cb: 0,
             display_queue_cb_data_size: 0,
@@ -2426,7 +2760,7 @@ impl VitaState {
             bound_textures: Vec::new(),
             bound_vertex_textures: Vec::new(),
             texture_formats: std::collections::HashMap::new(),
-            texture_samplers: std::collections::HashMap::new(),
+            nearby_texture_cache: std::collections::HashMap::new(),
             texture_extra: std::collections::HashMap::new(),
             color_surface_gamma: Vec::new(),
             texture_snapshots: TextureSnapshots::new(),
@@ -2445,7 +2779,7 @@ impl VitaState {
             bound_fragment_uniform_buf: 0,
             bound_fragment_uniform_size: 0,
             fragment_uniform_header: 0,
-            reported_stale_uniforms: std::collections::HashSet::new(),
+            reported_stale_uniforms: std::collections::HashMap::new(),
             reported_surface_overlaps: std::collections::HashSet::new(),
             notification_region: 0,
             visibility_buffer: 0,
@@ -5180,39 +5514,66 @@ impl VitaState {
     /// differently: the control words, the recorded exact format, the sampler state and the
     /// nearby-format search all mean the same thing whichever stage bound it.
     ///
-    /// Takes the bindings BY VALUE because the per-unit control state has to be read through a
-    /// shared borrow of `self` before the snapshot cache is borrowed mutably for the decode.
+    /// Takes the bindings as a SLICE the caller has moved out of `self` (`mem::take`, put
+    /// back after), because the per-unit control state has to be read through a borrow of
+    /// `self` while the snapshot cache is borrowed mutably for the decode. It used to take
+    /// them by value, which cloned both binding lists on EVERY draw - hundreds of times a
+    /// frame - for lists the caller owns and does not mutate here.
     fn snapshot_bound_textures(
         &mut self,
         ctx: &GuestCtx,
-        bindings: Vec<TextureBinding>,
+        bindings: &[TextureBinding],
     ) -> Vec<crate::capture::BoundTexture> {
-        let unit_state: Vec<(
-            TextureBinding,
-            Option<u32>,
-            (u32, u32, u32),
-            (u32, u32, u32),
-            Option<(i64, u32)>,
-        )> = bindings
+        // >>> THE NEARBY-FORMAT SEARCH IS FOR NULL HANDLES ONLY, AND IT IS MEMOISED.
+        //
+        // It is read in exactly one place: `decode_texture` hands it to
+        // `report_zero_texture_handle` inside the `binding.is_null()` arm, and nowhere
+        // else. It used to be computed whenever the address had no RECORDED format, which
+        // is the ordinary case for a texture bound by VALUE
+        // [[vitaslop-texture-binding-by-value]] rather than an error - so it ran for most
+        // units of most draws. And it is a LINEAR SCAN of every texture the title has ever
+        // initialised.
+        //
+        // MEASURED with `bench --at` on a live race: "draw: snapshot textures" was 46% of
+        // the entire frame, 17.9 us per draw, while moving 0.0 MB - a diagnostic costing
+        // half the frame rate and producing no data. Both engines paid it; this is shared
+        // runtime code.
+        //
+        // Memoised because a null handle rebound every frame would otherwise pay the scan
+        // every frame. The report fires once per (unit, address), so an answer that later
+        // goes stale can only change a message that will never be printed again.
+        for b in bindings {
+            if b.is_null()
+                && self.texture_format(b.addr).is_none()
+                && !self.nearby_texture_cache.contains_key(&b.addr)
+            {
+                let found = self.nearest_recorded_texture(b.addr, 4096);
+                self.nearby_texture_cache.insert(b.addr, found);
+            }
+        }
+        // Only the recorded FORMAT and the nearby-handle diagnostic still come from host state.
+        // The sampler wrap modes, filters, LOD bias and gamma now come out of the binding's own
+        // control words, which `decode_texture` already holds - so they cannot go stale, and they
+        // follow a by-value copy of the struct the way the hardware's do.
+        let unit_state: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>)> = bindings
             .iter()
             .map(|&b| {
-                let e = self.texture_extra(b.addr);
                 let format = self.texture_format(b.addr);
                 // Only for a handle with no format of its own: is there an initialised texture
                 // NEARBY? A struct the guest inits at one address and binds at another (off by a
                 // fixed member offset, or copied by value) is a completely different bug from one
                 // it never initialised at all, and the two are indistinguishable from the zero
                 // control words alone. Searching a window answers it in the run that hit it.
-                let nearby =
-                    format.is_none().then(|| self.nearest_recorded_texture(b.addr, 4096)).flatten();
-                (b, format, self.texture_sampler(b.addr), (e.min_filter, e.mag_filter, e.gamma), nearby)
+                // Resolved in the pre-pass above, for null handles only - see it for why.
+                let nearby = self.nearby_texture_cache.get(&b.addr).copied().flatten();
+                (b, format, nearby)
             })
             .collect();
         let snapshots = &mut self.texture_snapshots;
         unit_state
             .into_iter()
-            .filter_map(|(binding, format, sampler, filters, nearby)| {
-                decode_texture(ctx, snapshots, &binding, format, sampler, filters, nearby)
+            .filter_map(|(binding, format, nearby)| {
+                decode_texture(ctx, snapshots, &binding, format, nearby)
             })
             .collect()
     }
@@ -5294,23 +5655,6 @@ impl VitaState {
         &mut self.render_state
     }
 
-    /// The recorded sampler wrap/LOD state for a `SceGxmTexture*`, defaulting to the
-    /// GXM defaults (REPEAT/REPEAT/0) when the guest never set it.
-    fn texture_sampler(&self, texture_addr: u32) -> (u32, u32, u32) {
-        self.texture_samplers.get(&texture_addr).copied().unwrap_or((0, 0, 0))
-    }
-
-    /// Update one component of a texture's sampler state, keyed by its guest address.
-    /// `which`: 0 = U addr mode, 1 = V addr mode, 2 = LOD bias.
-    pub fn set_texture_sampler(&mut self, texture_addr: u32, which: u8, value: u32) {
-        let slot = self.texture_samplers.entry(texture_addr).or_insert((0, 0, 0));
-        match which {
-            0 => slot.0 = value,
-            1 => slot.1 = value,
-            _ => slot.2 = value,
-        }
-    }
-
     /// The color surface recorded for `addr` (its `SceGxmColorSurface*` struct
     /// address), if the guest initialized one there.
     pub fn color_surface(&self, addr: u32) -> Option<crate::capture::ColorSurface> {
@@ -5327,32 +5671,18 @@ impl VitaState {
         self.texture_extra.entry(texture_addr).or_default()
     }
 
-    /// Record the mip count / explicit byte stride a `sceGxmTextureInit*` established
-    /// (the 6th argument is `mipCount` for every layout except `LINEAR_STRIDED`, where
-    /// it is the byte stride). Called from the texture-init handler.
-    pub fn set_texture_init_extra(&mut self, texture_addr: u32, mip_count: u32, byte_stride: u32) {
-        let e = self.texture_extra_mut(texture_addr);
-        e.mip_count = mip_count.max(1);
-        e.byte_stride = byte_stride;
+    /// Record the explicit byte stride a `sceGxmTextureInitLinearStrided` established - the one
+    /// field of word 0 that cannot be packed into the guest's words. See [`TextureExtra`].
+    pub fn set_texture_stride(&mut self, texture_addr: u32, byte_stride: u32) {
+        self.texture_extra_mut(texture_addr).byte_stride = byte_stride;
     }
 
-    /// Record a texture filter. `which`: 0 = min, 1 = mag, 2 = mip.
-    pub fn set_texture_filter(&mut self, texture_addr: u32, which: u8, value: u32) {
-        let e = self.texture_extra_mut(texture_addr);
-        match which {
-            0 => e.min_filter = value,
-            1 => e.mag_filter = value,
-            _ => e.mip_filter = value,
-        }
-    }
-
-    /// Record a texture's gamma-correction mode (`sceGxmTextureSetGammaMode`).
+    /// Report the first `sceGxmTextureSetGammaMode` of a run.
     ///
-    /// The counterpart of [`Self::set_color_surface_gamma`]: a non-`NONE` mode makes the
-    /// hardware sampler sRGB-DECODE each fetched texel before filtering. The mode travels with
-    /// the binding (`BoundTexture::gamma`) and the renderer uploads such a texture through an
-    /// sRGB format, which puts the decode in exactly that place.
-    pub fn set_texture_gamma(&mut self, texture_addr: u32, gamma: u32) {
+    /// The mode itself is stored in the guest's control word 0 by the handler; this only says so
+    /// once, because a gamma texture is sampled through an sRGB format and that is a real change
+    /// in how its texels are decoded - the counterpart of [`Self::set_color_surface_gamma`].
+    pub fn note_texture_gamma(&mut self, texture_addr: u32, gamma: u32) {
         if gamma != 0 {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -5362,33 +5692,6 @@ impl VitaState {
                      on fetch as the hardware does"
                 );
             }
-        }
-        self.texture_extra_mut(texture_addr).gamma = gamma;
-    }
-
-    /// `sceGxmTextureGetMipmapCountUnsafe`.
-    pub fn texture_mip_count(&self, texture_addr: u32) -> u32 {
-        self.texture_extra(texture_addr).mip_count
-    }
-
-    /// `sceGxmTextureGetLodBias`.
-    pub fn texture_lod_bias(&self, texture_addr: u32) -> u32 {
-        self.texture_sampler(texture_addr).2
-    }
-
-    /// `sceGxmTextureGet{U,V}AddrModeSafe`. `which`: 0 = U, 1 = V.
-    pub fn texture_addr_mode(&self, texture_addr: u32, which: u8) -> u32 {
-        let s = self.texture_sampler(texture_addr);
-        if which == 0 { s.0 } else { s.1 }
-    }
-
-    /// `sceGxmTextureGet{Min,Mag}Filter` / gamma. `which`: 0 = min, 1 = mag, 2 = gamma.
-    pub fn texture_filter(&self, texture_addr: u32, which: u8) -> u32 {
-        let e = self.texture_extra(texture_addr);
-        match which {
-            0 => e.min_filter,
-            1 => e.mag_filter,
-            _ => e.gamma,
         }
     }
 
@@ -6169,6 +6472,18 @@ impl VitaState {
         self.vertex_programs.get(&self.bound_vertex_program)
     }
 
+    /// 1, 10, 100, ... - the schedule a repeating diagnostic reports on when what matters is
+    /// its ORDER OF MAGNITUDE and printing every occurrence would drown the log.
+    fn is_power_of_ten_impl(mut n: u64) -> bool {
+        if n == 0 {
+            return false;
+        }
+        while n % 10 == 0 {
+            n /= 10;
+        }
+        n == 1
+    }
+
     /// Is the bound default uniform buffer for `stage` left over from a DIFFERENT program
     /// than the one about to draw?
     ///
@@ -6189,12 +6504,19 @@ impl VitaState {
         if bound_for == drawing || drawing == 0 {
             return false;
         }
-        if self.reported_stale_uniforms.insert((stage, bound_for, drawing)) {
+        let n = self.reported_stale_uniforms.entry((stage, bound_for, drawing)).or_insert(0);
+        *n += 1;
+        // On powers of ten, so the log carries the SCALE without carrying a line per draw.
+        // Four dropped draws in a run is a curiosity; four hundred thousand is a stage
+        // rendering with a zeroed uniform bank, which comes out black and looks like a
+        // shading bug anywhere else in the pipeline.
+        if Self::is_power_of_ten_impl(*n) {
             tracing::warn!(
                 target: "vitaslop::gxm",
                 stage,
                 bound_for = format_args!("{bound_for:#x}"),
                 drawing = format_args!("{drawing:#x}"),
+                count = *n,
                 "STALE default uniform buffer: bound for another program, DROPPED for this draw"
             );
         }
@@ -6372,13 +6694,19 @@ impl VitaState {
             "bound_textures must stay sorted by unit - see bind_fragment_texture and \
              bind_precomputed_fragment_state"
         );
-        let mut textures = self.snapshot_bound_textures(ctx, self.bound_textures.clone());
+        // Moved out and put back rather than cloned: these two lists are rebuilt by the
+        // `sceGxmSet*Texture` setters, not by the snapshot, and cloning them per draw was
+        // two Vec allocations on the hottest path in the engine.
+        let frag_binds = std::mem::take(&mut self.bound_textures);
+        let mut textures = self.snapshot_bound_textures(ctx, &frag_binds);
+        self.bound_textures = frag_binds;
         // The VERTEX stage's own samplers, decoded exactly the same way. A vertex program that
         // fetches a texture builds its geometry from it - one retail title draws its whole
         // campaign map that way - so a draw that carries none of these renders as if the fetch
         // returned nothing, which is a blank screen rather than a visible error.
-        let vertex_textures =
-            self.snapshot_bound_textures(ctx, self.bound_vertex_textures.clone());
+        let vert_binds = std::mem::take(&mut self.bound_vertex_textures);
+        let vertex_textures = self.snapshot_bound_textures(ctx, &vert_binds);
+        self.bound_vertex_textures = vert_binds;
         drop(texture_phase);
         // The capture renderer samples a single texture (`textures.first()`). This title
         // binds the NORMAL map at unit 0, so pick the albedo sampler by fragment-program
@@ -6454,19 +6782,14 @@ impl VitaState {
             ctx, &vref, &material, &textures, &attributes, primitive, index_count, stride,
         );
         // Snapshot the raw shader blobs + SA uniform bytes for the GXP->WGSL recompiler
-        // path, but only when it is enabled (the reads + per-draw clones are pure cost on
-        // the default fixed-function path). The blob size is the container total-length
-        // field at header+0x08, the same idiom the GXP-bin dump uses.
+        // path, but only when it is enabled (the reads are pure cost on the default
+        // fixed-function path). The blobs come from `program_blob`, which reads each
+        // container out of guest memory ONCE and hands every later draw a shared `Arc` -
+        // see there for why a per-draw read is not affordable.
         let (vprog, fprog, vert_sa, frag_sa) = if gxp_live_capture() {
-            let read_blob = |hdr: u32| -> Vec<u8> {
-                if hdr == 0 {
-                    return Vec::new();
-                }
-                let sz = ctx.read_u32(hdr.wrapping_add(0x08)).clamp(0x40, 0x40000) as usize;
-                ctx.read_bytes(hdr, sz)
-            };
-            let vprog = read_blob(self.vertex_program_header(self.bound_vertex_program));
-            let fprog = read_blob(self.bound_fragment_program_header);
+            let vhdr = self.vertex_program_header(self.bound_vertex_program);
+            let vprog = self.program_blob(ctx, vhdr);
+            let fprog = self.program_blob(ctx, self.bound_fragment_program_header);
             // The vertex SA is the pre-stamp raw uniforms captured above (covers both the bound
             // buffer and the direct sceGxmSetUniformDataF path).
             let vert_sa = vert_sa_raw;
@@ -6477,21 +6800,22 @@ impl VitaState {
             };
             (vprog, fprog, vert_sa, frag_sa)
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            (crate::capture::no_program(), crate::capture::no_program(), Vec::new(), Vec::new())
         };
         let draw = crate::capture::Draw {
             primitive,
             index_format,
             index_count,
-            vertices,
+            vertices: vertices.into(),
             vertex_stride: stride,
             attributes,
             vertex_textures,
-            indices,
+            indices: indices.into(),
             uniforms,
             textures,
             render_state: self.render_state,
             blend: self.bound_fragment_blend,
+            fragment_program_header: self.bound_fragment_program_header,
             exposure,
             material,
             world,
@@ -6530,6 +6854,33 @@ impl VitaState {
     /// obviously correct is worth more here than evicting one entry.
     pub fn invalidate_program_reflection(&mut self) {
         self.program_reflection.clear();
+        self.program_blobs.clear();
+    }
+
+    /// The raw `SceGxmProgram` container bytes at `header`, read out of guest memory once and
+    /// shared by every draw that binds it afterwards.
+    ///
+    /// The recompiler path needs the whole container per draw, and a container is a few
+    /// kilobytes. A race frame submits 400+ draws over a couple of dozen distinct programs, so
+    /// reading it per draw copies the same bytes hundreds of times a frame - the single largest
+    /// avoidable item on the capture side of a recompiled frame. The bytes are IMMUTABLE while
+    /// the program is registered (GXM's shader patcher owns them; the guest does not rewrite a
+    /// live program), and the cache is dropped by [`invalidate_program_reflection`] at exactly
+    /// the moment a header address can come to mean a different program - the same discipline,
+    /// and the same clear, that `program_reflection` already relies on.
+    fn program_blob(&mut self, ctx: &GuestCtx, header: u32) -> std::sync::Arc<[u8]> {
+        if header == 0 {
+            return crate::capture::no_program();
+        }
+        if let Some(b) = self.program_blobs.get(&header) {
+            return b.clone();
+        }
+        // The blob size is the container total-length field at header+0x08, the same idiom the
+        // GXP-bin dump uses.
+        let sz = ctx.read_u32(header.wrapping_add(0x08)).clamp(0x40, 0x40000) as usize;
+        let blob: std::sync::Arc<[u8]> = std::sync::Arc::from(ctx.read_bytes(header, sz));
+        self.program_blobs.insert(header, blob.clone());
+        blob
     }
 
     /// The reflected constants of the program at `header`, walking its parameter table
@@ -7389,10 +7740,13 @@ fn albedo_name_score(name: &str) -> i32 {
 /// uses that size as the length of the block it writes into the buffer it reserved, so a
 /// wrong answer truncates its own uniform upload (see [`crate::vita::gxm`]).
 pub(crate) fn default_uniform_buffer_bytes(ctx: &GuestCtx, header: u32) -> u32 {
+    use crate::vita::gxm::{DEFAULT_UNIFORM_BUFFER_MAX_WORDS, GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF};
     if header == 0 {
         return 0;
     }
-    ctx.read_u32(header.wrapping_add(0x64)).min(4096).wrapping_mul(4)
+    ctx.read_u32(header.wrapping_add(GXP_DEFAULT_UNIFORM_BUFFER_COUNT_OFF))
+        .min(DEFAULT_UNIFORM_BUFFER_MAX_WORDS)
+        .wrapping_mul(4)
 }
 
 /// Diagnostic (`VITASLOP_GXM_UNIFORM_POISON=1`): fill a freshly reserved default uniform buffer
@@ -7631,16 +7985,42 @@ fn report_unreadable_texture(unit: u32, base_format: u32, addr: u32, len: usize,
 /// format whose byte size we do not know yet. The layout is the public GXM texture
 /// control-word format (vitasdk `gxm.h` `struct SceGxmTexture`): word 1 holds
 /// width/height (stored as size-1) and the base format, word 2 the data address.
-#[allow(clippy::too_many_arguments)]
+/// The single 1x1 zero-RGBA buffer substituted for every null texture handle.
+///
+/// Shared rather than allocated per call so its ADDRESS is stable: an identity-keyed
+/// consumer cache (`crate::render::tex_key`) would otherwise see a different texture every
+/// draw. The bytes are constant, so one buffer is as correct as a million.
+fn zero_texel() -> Arc<[u8]> {
+    static ZERO: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
+    ZERO.get_or_init(|| Arc::from([0u8, 0, 0, 0].as_slice())).clone()
+}
+
+/// The sampler state a texture's CONTROL WORD 0 carries, as
+/// `(u addr mode, v addr mode, lod bias, min filter, mag filter, gamma)`.
+///
+/// Field positions per `vita::gxm::texword0` (vitasdk `gxm.h`). The one type-dependent case is
+/// `min_filter`: for a `LINEAR_STRIDED` texture those bits are part of the stride, and the
+/// header states that such a texture uses its MAG filter for minification too - so reading bits
+/// 10..11 there would sample by a couple of stride bits instead of a filter mode.
+fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32) {
+    const TYPE_LINEAR_STRIDED: u32 = 1;
+    let mag = (w0 >> 12) & 0x3;
+    let min = if tex_type == TYPE_LINEAR_STRIDED { mag } else { (w0 >> 10) & 0x3 };
+    (
+        (w0 >> 6) & 0x7,  // uaddr_mode
+        (w0 >> 3) & 0x7,  // vaddr_mode
+        (w0 >> 21) & 0x3f, // lod_bias
+        min,
+        mag,
+        w0 & 0x1800_0000, // gamma_mode, in the enum's own already-shifted encoding
+    )
+}
+
 fn decode_texture(
     ctx: &GuestCtx,
     cache: &mut TextureSnapshots,
     binding: &TextureBinding,
     exact_format: Option<u32>,
-    sampler: (u32, u32, u32),
-    // `(min filter, mag filter, gamma mode)` - the sampler state that does not live in the
-    // guest's control words, so it has to travel with the binding.
-    filters: (u32, u32, u32),
     nearby: Option<(i64, u32)>,
 ) -> Option<crate::capture::BoundTexture> {
     let (unit, addr) = (binding.unit, binding.addr);
@@ -7681,17 +8061,26 @@ fn decode_texture(
             faces: 1,
             face_bytes: 4,
             data_addr: 0,
-            pixels: Arc::from([0u8, 0, 0, 0].as_slice()),
-            u_addr_mode: sampler.0,
-            v_addr_mode: sampler.1,
-            lod_bias: sampler.2,
-            min_filter: filters.0,
-            mag_filter: filters.1,
-            gamma: filters.2,
+            // ONE buffer for every null handle of the run, not one per draw. Consumers key
+            // their caches on this buffer's IDENTITY (see `crate::render::tex_key`), so a
+            // fresh allocation per draw would miss every time and churn a 512-entry decode
+            // cache on a unit whose contents are four constant zero bytes.
+            pixels: zero_texel(),
+            // A zeroed handle's control words are zero, so every one of these is the GXM
+            // default by construction - which is what the hardware would sample with too.
+            u_addr_mode: 0,
+            v_addr_mode: 0,
+            lod_bias: 0,
+            min_filter: 0,
+            mag_filter: 0,
+            gamma: 0,
         });
     }
 
     let tex_type = (w1 >> 29) & 0x7;
+    // The sampler state, out of the guest's own word 0 rather than a host-side map. See
+    // [`word0_sampler_state`] and `vita::gxm::texword0`.
+    let sampler = word0_sampler_state(w0, tex_type);
     // generic2 layout (non-swizzled/non-cube): width/height are 12-bit size-1.
     let width = ((w1 >> 12) & 0xfff) + 1;
     let height = (w1 & 0xfff) + 1;
@@ -7766,12 +8155,15 @@ fn decode_texture(
         face_bytes: total,
         data_addr,
         pixels,
+        // Straight out of the binding's own control word 0, so this is the state the guest
+        // handed to GXM for THIS texture - including a by-value copy, which an address-keyed
+        // shadow could not follow.
         u_addr_mode: sampler.0,
         v_addr_mode: sampler.1,
         lod_bias: sampler.2,
-        min_filter: filters.0,
-        mag_filter: filters.1,
-        gamma: filters.2,
+        min_filter: sampler.3,
+        mag_filter: sampler.4,
+        gamma: sampler.5,
     })
 }
 
@@ -7949,15 +8341,19 @@ pub trait ImportDispatch {
         false
     }
 
-    /// A thread used a whole scheduler quantum (or yielded without flipping). Lets the
-    /// host charge clocks that track executed work rather than rendered frames - today,
-    /// the modelled storage clock. The default ignores it.
+    /// A thread just suspended having burned `fuel` units of guest execution. Lets the
+    /// host charge clocks that track executed work rather than rendered frames - the game
+    /// clock and the modelled storage clock. The default ignores it.
+    ///
+    /// This is called for EVERY suspend, not only a preemption: a thread that blocks or
+    /// flips did guest work on the way there and must be billed for it, and a thread that
+    /// yielded immediately must not be billed for a quantum it never used.
     ///
     /// `runnable` is how many threads were ready to run at that moment, INCLUDING the
     /// one that just stopped. The scheduler runs one at a time; the device does not, so
-    /// this is what lets the host divide the quantum's WALL time among the cores that
-    /// would have been executing it in parallel. See [`VitaEnv::on_quantum`].
-    fn on_quantum(&mut self, _runnable: usize) {}
+    /// this is what lets the host divide the WALL time among the cores that would have
+    /// been executing it in parallel. See [`VitaEnv::on_guest_work`].
+    fn on_guest_work(&mut self, _runnable: usize, _fuel: u64) {}
 
     /// The `r0` value owed to thread `thid` as it resumes from a block (a timed wait
     /// that expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT`), if any. The engine
@@ -8086,12 +8482,31 @@ impl ImportDispatch for VitaEnv {
     /// are idle). The STORAGE clock divides by exactly the same figure and for exactly
     /// the same reason - it charges for elapsed wall time too, and the device does not
     /// get three times the bandwidth because three threads are running.
-    fn on_quantum(&mut self, runnable: usize) {
+    fn on_guest_work(&mut self, runnable: usize, fuel: u64) {
         let cores = runnable.clamp(1, guest_cores()) as u64;
+        // A quantum's worth of fuel costs a quantum's worth of time, so a thread that
+        // really does burn a whole preemption slice is charged exactly what it always was.
+        // What changes is everything either side of that: a voluntary yield after a
+        // hundred instructions now costs a hundred instructions, and a thread that blocks
+        // is billed for the work it did before blocking instead of for nothing.
+        // Divide ONCE, carrying the remainder (see `VitaState::charge_rem`). Dividing
+        // twice - by `QUANTUM_FUEL` and then by `cores` - truncated a small burn to zero
+        // microseconds and stopped the clock outright for a title that yields in short
+        // bursts, which is a livelock and not a rounding error.
+        let den = QUANTUM_FUEL.saturating_mul(cores);
+        let charge = |num: u64, rem: &mut u64| -> u64 {
+            let total = rem.saturating_add(num);
+            *rem = total % den;
+            total / den
+        };
+        let (mut cpu_rem, mut io_rem) = self.state.charge_rem;
+        let io_us = charge(QUANTUM_IO_US.saturating_mul(fuel), &mut io_rem);
+        let cpu_us = charge(quantum_cpu_us().saturating_mul(fuel), &mut cpu_rem);
+        self.state.charge_rem = (cpu_rem, io_rem);
         if self.state.has_io_waiters() {
-            self.state.charge_io_quantum(QUANTUM_IO_US / cores);
+            self.state.charge_io_quantum(io_us);
         }
-        self.state.charge_cpu_quantum(quantum_cpu_us() / cores);
+        self.state.charge_cpu_quantum(cpu_us);
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {
@@ -8107,6 +8522,8 @@ impl ImportDispatch for VitaEnv {
     }
 
     fn on_frame_boundary(&mut self, frame: u64) {
+        // Re-arm the per-frame texture comparison cadence - see `TextureSnapshots`.
+        self.state.texture_snapshots.begin_frame();
         self.state.world.set_frame(frame);
         self.state.set_cur_frame(frame);
         // Close the capture's frame so an observer can ask for the scenes THIS frame was
@@ -8140,30 +8557,49 @@ impl ImportDispatch for VitaEnv {
     }
 }
 
-/// Storage-clock time charged for one scheduler quantum, in microseconds. The default
-/// preemption quantum is 5,000,000 units of engine fuel, which is a few milliseconds of
-/// guest execution; the exact figure only matters when a title spins in guest code
-/// waiting for a load instead of rendering, since a rendering title's storage progress is
-/// pinned to its frames by [`VitaState::advance_io_frame`].
+/// The preemption quantum, in units of engine FUEL. Both engines must use this as their
+/// preemption granularity, and it is the denominator every per-quantum constant below is
+/// expressed against: a suspend that burned this much fuel costs exactly one quantum's
+/// worth of clock, and a suspend that burned a tenth of it costs a tenth.
+///
+/// It lives here rather than in an engine because it is a UNIT, not a policy. The two
+/// engines measure fuel the same way - it is proportional to executed wasm on both - so
+/// the same guest work must cost the same game time whichever one ran it, and that only
+/// holds while both divide by the same number.
+///
+/// **5,000,000 is what every real consumer preempts at** - the desktop's retail runner, the
+/// resident session, the recipe runner, and the browser's software-fuel interval (whose own
+/// knob is documented where it is read, not here: naming it in this comment makes the generated
+/// knob index attribute it to a constant rather than to the code that reads it). A 1,000,000
+/// default also exists on two constructors nothing production uses, and taking the calibration
+/// from THAT one made the game clock five times fast; the run that caught it reported a single
+/// suspend burning 5,000,000 against a stated interval of 1,000,000, which is impossible when
+/// the engine preempts at the interval. The headless run's `fuel ... max` line exists for
+/// exactly that check - a max above the interval is a broken reading, not a busy title.
+pub const QUANTUM_FUEL: u64 = 5_000_000;
+
+/// Storage-clock time charged for one full [`QUANTUM_FUEL`] of guest execution, in
+/// microseconds. The exact figure only matters when a title spins in guest code waiting
+/// for a load instead of rendering, since a rendering title's storage progress is pinned
+/// to its frames by [`VitaState::advance_io_frame`].
 const QUANTUM_IO_US: u64 = 2_000;
 
-/// Game-clock time charged for one scheduler quantum of guest execution, in
+/// Game-clock time charged for one full [`QUANTUM_FUEL`] of guest execution, in
 /// microseconds. See [`VitaState::charge_cpu_quantum`] for why the game clock must
 /// advance for CPU work at all.
 ///
-/// CALIBRATION. The preemption quantum is 5,000,000 units of engine fuel, which is about
-/// that many executed wasm instructions; the transpiler emits several wasm instructions
-/// per guest ARM instruction (register globals, flag computation), so a quantum is order
-/// 0.5-1 M ARM instructions, and the Vita's 444 MHz Cortex-A9 retires that in roughly
-/// 1-2 ms. 2 ms is the middle of that range, and it is the same figure and the same
-/// reasoning as [`QUANTUM_IO_US`] - one quantum of guest execution is one quantum of
-/// guest execution, whichever clock is being charged for it.
+/// CALIBRATION. A unit of fuel is about one executed wasm instruction; the transpiler
+/// emits several wasm instructions per guest ARM instruction (register globals, flag
+/// computation), so [`QUANTUM_FUEL`] is order 0.2-0.5 M ARM instructions, and the Vita's
+/// 444 MHz Cortex-A9 retires that in roughly 1-2 ms. 2 ms is the middle of that range, and
+/// it is the same figure and the same reasoning as [`QUANTUM_IO_US`] - one unit of guest
+/// execution is one unit of guest execution, whichever clock is charged for it.
 ///
-/// Sanity-checked against [`VitaState::quantum_flip_counts`], which the boot probe prints
-/// at the end of every run: a title in its loading phase shows tens of quanta per flip
-/// (its game clock rightly advances faster than 60 Hz, because it really is spending far
-/// more than a frame of CPU between flips), and a steadily rendering one shows few enough
-/// that [`VitaState::advance_time_frame`]'s top-up still pins it to 60 Hz.
+/// **This is a rate, not a per-suspend price.** It was the latter until the game clock ran
+/// 1.08x on one title and 4.34x on another with the same build on the same day, which is
+/// the signature of billing a fixed amount for a variable thing. Charging per unit of fuel
+/// is what makes one constant able to fit both, because fuel is what the two titles differ
+/// in. See [`SchedCore::charge_guest_work`](crate::sched::SchedCore).
 ///
 /// Override for an experiment with `VITASLOP_QUANTUM_CPU_US`; 0 restores the old model
 /// (a game clock that moves only on a flip or a scheduler idle) for an A/B.
@@ -8278,8 +8714,8 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         self.borrow_mut().release_earliest_io()
     }
 
-    fn on_quantum(&mut self, runnable: usize) {
-        self.borrow_mut().on_quantum(runnable);
+    fn on_guest_work(&mut self, runnable: usize, fuel: u64) {
+        self.borrow_mut().on_guest_work(runnable, fuel);
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {

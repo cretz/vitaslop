@@ -187,8 +187,9 @@ pub enum TestReduce {
 }
 
 /// How a texture sample (group 0xE0 SMP) supplies its mip level, from the encoding's
-/// `lod_mode` field (spec E0.4). `Bias` and `Level` read a scalar from src2; `Implicit` reads
-/// nothing and lets the hardware derive the level from the coordinate derivatives.
+/// `lod_mode` field (spec E0.4). `Bias` and `Level` read a scalar from src2, `Gradient` reads
+/// two derivative vectors from it, and `Implicit` reads nothing and lets the hardware derive
+/// the level from the coordinate derivatives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexLod {
     /// lod_mode 0 - hardware-derived level (`textureSample`).
@@ -197,6 +198,9 @@ pub enum TexLod {
     Bias,
     /// lod_mode 2 - src2 IS the level (`textureSampleLevel`).
     Level,
+    /// lod_mode 3 - src2 carries the explicit derivatives (`textureSampleGrad`). For a 2D
+    /// sample the first two components are `ddx` and the next two are `ddy` (spec E0.4).
+    Gradient,
 }
 
 /// The interpreted operation, classified from the henkaku SGX543 opcode map (a fact for

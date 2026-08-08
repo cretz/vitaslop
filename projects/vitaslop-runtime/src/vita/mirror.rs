@@ -31,8 +31,21 @@ use crate::host::VitaState;
 /// Slot 0: `sceDisplayGetVcount`.
 pub const SLOT_VCOUNT: u32 = 0;
 
+/// Slots 1-2: the virtual process clock in microseconds, low word then high word.
+///
+/// TWO CONTIGUOUS slots, and the pair forms depend on that adjacency - they read
+/// `mirror[slot]` and `mirror[slot + 1]` with one base address. Inserting a slot between
+/// them would compile and would serve a clock whose high word is something else entirely.
+///
+/// This backs the whole `sceKernelGetProcessTime` family, which after the vblank counter
+/// is the most-called host function a real title makes: 56,287 calls in one profile
+/// window. All three spellings are the same pure function of the clock and differ only in
+/// where they put it - through a pointer, in the r0/r1 return pair, or truncated to r0.
+pub const SLOT_CLOCK_LO: u32 = 1;
+pub const SLOT_CLOCK_HI: u32 = 2;
+
 /// How many slots the block has. The scheduler writes exactly this many.
-pub const SLOT_COUNT: usize = 1;
+pub const SLOT_COUNT: usize = 3;
 
 /// The current value of every mirror slot, in slot order.
 ///
@@ -40,7 +53,8 @@ pub const SLOT_COUNT: usize = 1;
 /// SAME function its host handler calls, so the inline and host forms cannot drift;
 /// `mirror_matches_its_handlers` holds them to that.
 pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
-    [super::display::vcount(st)]
+    let now = st.now_us();
+    [super::display::vcount(st), now as u32, (now >> 32) as u32]
 }
 
 #[cfg(test)]
@@ -99,8 +113,79 @@ mod tests {
     #[test]
     fn every_declared_slot_is_within_the_block() {
         assert_eq!(snapshot(&state_at(0)).len(), SLOT_COUNT, "snapshot fills every slot");
-        for slot in [SLOT_VCOUNT] {
+        for slot in [SLOT_VCOUNT, SLOT_CLOCK_LO, SLOT_CLOCK_HI] {
             assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
+        }
+    }
+
+    /// The clock's two slots must be ADJACENT, low first. Both pair forms read
+    /// `mirror[slot]` and `mirror[slot + 1]` off one base address, so this adjacency is
+    /// load-bearing: separating them still compiles and serves a clock whose high word is
+    /// whatever else landed next door.
+    #[test]
+    fn the_clock_slots_are_adjacent_and_ordered() {
+        assert_eq!(SLOT_CLOCK_HI, SLOT_CLOCK_LO + 1, "the high word follows the low word");
+    }
+
+    /// The whole `sceKernelGetProcessTime` family must read the same clock its handlers
+    /// do, in the right halves. A swapped pair is a clock that runs about 4295 seconds
+    /// per microsecond, which a title reads as enormous elapsed time - so it is not
+    /// subtle, but nothing else in the system would attribute it here.
+    #[test]
+    fn the_clock_mirror_matches_its_handlers() {
+        use crate::nid::libkernel as lk;
+        use vitaslop_transpiler::InlineOp;
+        // Values that span the 32-bit boundary in both directions, so a high word that is
+        // simply never written (or written from the low half) cannot pass.
+        for us in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x1_2345_6789, 4_000_000_000] {
+            let st = state_at(us);
+            let words = snapshot(&st);
+            let lo = words[SLOT_CLOCK_LO as usize];
+            let hi = words[SLOT_CLOCK_HI as usize];
+            assert_eq!(
+                (u64::from(hi) << 32) | u64::from(lo),
+                st.now_us(),
+                "the mirrored pair must reassemble the clock at {us} us"
+            );
+
+            // ...and each spelling must name the clock's LOW slot as its base, since both
+            // pair forms take the high word from the slot above it.
+            for nid in [lk::GET_PROCESS_TIME, lk::GET_PROCESS_TIME_WIDE, lk::GET_PROCESS_TIME_LOW] {
+                let op = super::super::libkernel::inline_op(nid).expect("has an inline form");
+                assert_eq!(
+                    op.mirror_slot(),
+                    Some(SLOT_CLOCK_LO),
+                    "{} must base at the clock's low slot",
+                    crate::nid::name(nid)
+                );
+            }
+            // The truncated spelling is the low word and nothing else.
+            let low = super::super::libkernel::inline_op(lk::GET_PROCESS_TIME_LOW).unwrap();
+            assert_eq!(low.eval(lo), st.now_us() as u32, "the Low spelling truncates");
+            assert!(
+                matches!(low, InlineOp::LoadMirror { .. }),
+                "the Low spelling reads ONE word, not a pair"
+            );
+        }
+    }
+
+    /// A blocking or state-touching kernel call must never be inlined, however pure it
+    /// looks: an inlined call never reaches the host, so the state change would simply
+    /// not happen and the symptom would surface far away.
+    #[test]
+    fn only_the_clock_is_inlined_in_libkernel() {
+        use crate::nid::libkernel as lk;
+        for nid in [
+            crate::vita::tm_nid::DELAY_THREAD, // blocks: that IS the behaviour
+            lk::CREATE_THREAD,                 // spawns
+            lk::EXIT_PROCESS,                  // halts the run
+            lk::GET_TLS_ADDR,                  // per-thread host state
+        ] {
+            assert!(
+                super::super::libkernel::inline_op(nid).is_none(),
+                "{} has behaviour and must stay a host call",
+                crate::nid::name(nid)
+            );
         }
     }
 

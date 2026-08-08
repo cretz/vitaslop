@@ -94,8 +94,15 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
         }
 
         let Some(extra) = decode::repeat_extra_iterations(word) else {
+            // An instruction whose GROUP is not decoded at all reaches here too, and its own
+            // reason is the more useful one: "repeat_count encoding not established" sends
+            // the reader to look for a four-bit field in a group that has no decoder yet,
+            // which is a wrong and expensive place to start. Only claim the repeat encoding
+            // is the blocker when nothing else already is.
             out.push(crate::ir::Instr {
-                blocked: Some("repeat_count encoding not established for this opcode group"),
+                blocked: instr
+                    .blocked
+                    .or(Some("repeat_count encoding not established for this opcode group")),
                 ..instr
             });
             continue;

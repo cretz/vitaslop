@@ -12,6 +12,7 @@ import init, {
   set_knob,
   worker_input_key,
   worker_input_pointer,
+  worker_input_stick,
 } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
 
@@ -43,6 +44,13 @@ self.onmessage = async (e) => {
   }
   if (d.type === "pointer") {
     worker_input_pointer(d.x, d.y, d.down);
+    return;
+  }
+  // An analog stick, in the guest's own 0..255 encoding (128 centred). `active: false`
+  // releases it back to whatever a scripted recipe says, which is NOT the same as sending
+  // 128 - see InputState::left_stick.
+  if (d.type === "stick") {
+    worker_input_stick(d.stick, d.x, d.y, d.active);
     return;
   }
 

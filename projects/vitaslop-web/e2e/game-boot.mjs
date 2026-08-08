@@ -3,13 +3,20 @@
 // bundle (cross-origin isolated for shared memory), lets the page fetch the files and
 // call run_game, and reports the boot result.
 //
-// This runs the browser the way a USER runs it: a headed window of the real installed
-// Chrome, on the real GPU. That is not a preference, it is the only configuration in
-// which the numbers mean anything - headless Chrome here has no GPU, so a headless run
-// rasterises every frame on the CPU through SwiftShader and any fps it prints describes
-// SwiftShader. Pass HEADLESS=1 to opt out, and ALLOW_SOFTWARE=1 to additionally accept a
-// software adapter; without the second, a software adapter is a hard failure at both
-// ends (the page refuses to render, and this harness refuses to publish a rate).
+// This runs the real installed Chrome on the real GPU. **USE HEADLESS=1** - it is the
+// polite mode (it never steals the foreground) and it is NOT a software run.
+//
+// MEASURED 2026-08-07, one retail title, same recipe, one variable changed: headed and
+// HEADLESS=1 both report `adapter: vendor=nvidia arch=blackwell | GPU`, both reach the
+// same frame, both at the same rate. Modern headless Chrome takes the GPU when asked, and
+// `--enable-gpu` below asks; the older claim that headless here has no GPU and falls back
+// to SwiftShader was left over from a build where that was true, and cost a session's
+// worth of foreground windows before anyone re-measured it.
+//
+// It is still never ASSUMED: SwiftShader is opt-in (ALLOW_SOFTWARE=1), the page refuses to
+// render on a software adapter, and this harness refuses to publish a rate from one - so
+// the adapter line is a thing the run PROVES, in either mode. Go headed only when you need
+// to watch the window.
 //
 // Env:  GAME_DIR     the extracted app dir (default: $VITASLOP_GAME_DIR)
 //       MAX_FRAMES   display flips to run to
@@ -19,7 +26,7 @@
 //       KNOBS        {"VITASLOP_GXP_LIVE":"1",...} - the browser has no environment
 //       WAIT_MS      how long to wait for TARGET_FRAME
 //       SHOT_DIR     where the screenshot and summary land
-//       HEADLESS=1   run without a window (software rendering - see above)
+//       HEADLESS=1   run without a window - the DEFAULT CHOICE; still the real GPU (above)
 //       ALLOW_SOFTWARE=1  accept a software adapter instead of failing
 import { chromium } from "playwright";
 import { createServer } from "node:http";
@@ -155,10 +162,21 @@ async function main() {
   // worse, would mean the harness never exercises the path the product actually takes
   // (mounting an already-installed title).
   //
-  // PROFILE_DIR overrides; the default lives in the scratch area, never in the repo.
-  const profileDir =
-    process.env.PROFILE_DIR ||
-    join(here, "..", "..", "..", "..", "working-area", "browser-profile");
+  // PROFILE_DIR is REQUIRED, and there is deliberately no default.
+  //
+  // The only two candidates are both wrong. The repo is forbidden scratch. The OS temp
+  // directory is where a 1.7 GB profile gets swept away between runs, and its whole value is
+  // surviving them - a profile that silently vanished would re-import the title and read as a
+  // slow run rather than a missing one. So the caller names it, the same way serve.mjs makes
+  // the caller name --games: a host path belongs in the invocation, never in a tracked file.
+  const profileDir = process.env.PROFILE_DIR;
+  if (!profileDir) {
+    throw new Error(
+      "PROFILE_DIR is required: the persistent Chrome profile holding the OPFS copy of the " +
+        "title. Pass an absolute path outside the repo, and pass the SAME one every run or " +
+        "the title is re-imported (over a gigabyte) each time."
+    );
+  }
   // A persistent profile is single-use: a second run while the first still holds it dies
   // with a bare "exitCode=21" and a wall of Chrome flags, which says nothing about the
   // actual cause. Name it.

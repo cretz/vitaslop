@@ -193,6 +193,16 @@ impl GeneralRenderer {
             trace: wgpu::Trace::Off,
         }))
         .ok()?;
+        // A wgpu VALIDATION error is reported out of band: the offending object becomes
+        // invalid and everything built from it silently does nothing. Without a handler that
+        // is a black frame and no message - indistinguishable from a scene the guest never
+        // submitted, which is the exact ambiguity every report in this renderer exists to
+        // remove. The BROWSER device has had one since the day its black world was chased for
+        // a session; this is the same device on the desktop and it never got one, so a
+        // headless run could fail validation in perfect silence.
+        device.on_uncaptured_error(std::sync::Arc::new(|e| {
+            tracing::error!(target: "vitaslop::gxm", "wgpu uncaptured error: {e}");
+        }));
         let gxm = GxmRenderer::new(&device, &queue, OUTPUT_FORMAT);
         Some(GeneralRenderer {
             device,
