@@ -139,6 +139,22 @@ pub struct Redirect {
 /// inlined if anyone would go looking for it in a trace. It does not touch the
 /// determinism signature, which folds the render stream and the egress ledger, not
 /// the call trace.
+///
+/// The storing forms extend that trade to the WRITE instruments, and they extend it
+/// FURTHER than the reading forms do - which is worth stating plainly, because the obvious
+/// guess is wrong. An inlined [`InlineOp::StoreArg`] writes guest memory as a plain wasm
+/// store, so `VITASLOP_HOST_WRITE_WATCH` - which reports writes a HOST CALL makes - does not
+/// see it. Neither does `VITASLOP_WATCH_STORE`: that watchpoint is emitted around the
+/// translated guest STORES ([`emit`]'s `Stmt::Store` arm) and nothing in `emit_import` goes
+/// near it, so an inlined store is invisible to BOTH watches at once. So before concluding
+/// from a silent write watch that nobody wrote a context field, run with
+/// `VITASLOP_NO_INLINE_IMPORTS=1` and the host call - and with it `VITASLOP_HOST_WRITE_WATCH`
+/// - comes back.
+///
+/// The guest-store DIRTY MAP is the one write instrument an inline form does not simply drop
+/// out of, because a texture read against a stale stamp is a wrong picture rather than a
+/// missing diagnostic line. See `emit::emit_dirty_range` for which forms owe it a stamp and
+/// why the others do not.
 pub struct InlineImport {
     /// The dense host-import index this replaces (the same index `Extern::import`
     /// carries).
@@ -153,10 +169,19 @@ pub struct InlineImport {
 /// small set is what makes that provable. Widen it only with a matching test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineOp {
-    /// `r0 = (u32_at(r0 + offset) >> shift) & mask` - read a word at a fixed offset
-    /// from the pointer argument and extract a bitfield. `mask` is applied after the
-    /// shift, so `mask = u32::MAX` means "the whole word".
-    LoadShiftMask { offset: u32, shift: u32, mask: u32 },
+    /// `r0 = ((u32_at(r0 + offset) >> shift) & mask) + plus` - read a word at a fixed offset
+    /// from the pointer argument, extract a bitfield, and add a fixed bias. `mask` is applied
+    /// after the shift, so `mask = u32::MAX` means "the whole word"; `plus = 0` means "the
+    /// field itself", which is what most getters want.
+    ///
+    /// # Why a bias belongs in the same form
+    /// A hardware field is not always the number the API returns. GXM stores a texture's
+    /// width and height as SIZE MINUS ONE, so `sceGxmTextureGetWidth` is the field plus one -
+    /// and that `+ 1` is part of DECODING the field, not a second operation on top of it.
+    /// Splitting it into its own variant would leave two forms that must be kept in step for
+    /// one idea; the bias is one `i32.add` the emitter drops entirely when it is zero, so an
+    /// unbiased form stays byte-identical to what it was before this existed.
+    LoadShiftMask { offset: u32, shift: u32, mask: u32, plus: u32 },
     /// `r0 = u32_at(mirror_base + slot * 4)` - read slot `slot` of the HOST MIRROR
     /// block, a small run of words the host keeps up to date in linear memory (see
     /// [`Artifact::mirror_off`]). Takes no guest argument and reads nothing the guest
@@ -204,6 +229,275 @@ pub enum InlineOp {
     /// The register-returning twin of [`InlineOp::StoreMirrorPair`], for the wide
     /// spelling of the same clock read. No pointer, so no guard.
     LoadMirrorPair { slot: u32 },
+    /// `u32_at(r0 + offset) = r1; r0 = 0` - store the SECOND argument through the pointer
+    /// argument at a fixed offset, then return success.
+    ///
+    /// # What this is for
+    /// Every form above reads. This one writes, and it exists because the largest block of
+    /// host calls a real title makes in steady gameplay is not getters at all - it is the
+    /// GXM draw state: `sceGxmSetVertexProgram`, `sceGxmSetCullMode`,
+    /// `sceGxmSetFrontDepthFunc` and their neighbours, measured at 248 calls per frame EACH
+    /// on one title, EIGHT of them from the same call site as every
+    /// `sceGxmDrawPrecomputed`. Nine crossings a draw, eight of them one-word state writes.
+    ///
+    /// A setter is only inlinable once its state lives in guest memory - which is where the
+    /// hardware keeps it, so this is the faithful shape as well as the fast one. See
+    /// `vitaslop_runtime::vita::gxmctx`.
+    ///
+    /// # Why it is exactly the host call
+    /// The handler writes one word at a fixed offset from a guest pointer and returns 0.
+    /// So does this. The pointer guard is the same one the reading forms use, so an
+    /// out-of-range pointer still reaches the handler and keeps its old semantics -
+    /// including the case where the handler would decline to write at all.
+    ///
+    /// A handler that does anything ELSE - reports, resolves a handle, sizes an allocation -
+    /// must not use this form. That is not a style rule: the inline call never reaches the
+    /// host, so whatever else the handler did simply stops happening, silently.
+    StoreArg { offset: u32 },
+    /// `u32_at(r0 + offset + r1 * 4) = r2; r0 = 0`, but ONLY when `r1 < count`; otherwise
+    /// the real host call runs.
+    ///
+    /// The indexed twin of [`InlineOp::StoreArg`], for the setters shaped
+    /// `set(context, index, value)` - `sceGxmSetVertexStream` is the one that pays here, at
+    /// 239 calls a frame. The bound is what makes it exact: an index past the end of the
+    /// array is a case only the handler defines (it reports it), and writing past the array
+    /// inline would corrupt whatever field follows with nothing to say so.
+    StoreArgIndexed { offset: u32, count: u32 },
+    /// `w = u32_at(r0 + offset); u32_at(r0 + offset) = (w & !(mask << shift)) | ((r1 & mask) << shift); r0 = 0`
+    /// - write one BITFIELD of a word through the pointer argument, leaving every other bit
+    /// alone, then return success.
+    ///
+    /// # Why a field form and not a store
+    /// [`InlineOp::StoreArg`] writes a whole word, which is right for a context field that
+    /// owns its word and wrong for the case here: a `SceGxmTexture`'s control word 0 packs
+    /// eight independent settings, and `sceGxmTextureSetMagFilter` changes one of them.
+    /// Storing the word would clear the address mode, the mip count and the LOD bias with it,
+    /// and the picture that results is not obviously a texture-state bug - it is a texture
+    /// that samples wrongly, which reads as a decode problem.
+    ///
+    /// This is the read-modify-write twin of [`InlineOp::LoadShiftMask`], over the same
+    /// `(offset, shift, mask)` a getter reads, so a setter and its getter can be given the
+    /// SAME field constants and cannot disagree about where the field is.
+    ///
+    /// # The value is MASKED, not rejected
+    /// A value wider than the field is truncated, because that is what the hardware does with
+    /// it and what the handler already does. This form is only admissible for a setter whose
+    /// handler uses its argument AS PASSED: a setter that pre-shifts (because its enum is
+    /// already in control-word position, like `SceGxmTextureMipFilter`) computes something
+    /// else and must stay on the host.
+    ///
+    /// # Read-modify-write with no yield point
+    /// Like the lock forms, this loads a word, computes, and stores it with no loop and no
+    /// call in between, so neither engine can preempt inside it - see
+    /// [`InlineOp::LwMutexLock`] for the whole argument. It needs less than the lock does:
+    /// two threads racing on one texture's control word is a data race the guest wrote, and
+    /// the host handler was no more atomic.
+    StoreArgField { offset: u32, shift: u32, mask: u32 },
+    /// `dst = r0 + offset + r1 * stride; dst[0] = r2; dst[1..=words] = *(r2 .. r2 + 4*words);
+    /// dst[words + 1] = 0; r0 = 0` - copy N words THROUGH a second pointer into an indexed
+    /// slot, recording where they came from.
+    ///
+    /// # Why a copy form exists at all
+    /// Every storing form above writes a value the guest passed. This one writes bytes it
+    /// FETCHES, and that is not a generalisation for its own sake - it is the only shape that
+    /// can serve `sceGxmSetFragmentTexture`, which is the largest single block of host calls
+    /// left in steady gameplay on a real title: 1,275 crossings per display frame, 1,025 of
+    /// them from ONE call site, measured over a 100-frame window of live racing.
+    ///
+    /// GXM copies a texture's control words BY VALUE at bind time
+    /// (`vitaslop-texture-binding-by-value`). Storing the POINTER and reading it at draw time
+    /// would be a different program - one where a texture the guest re-initialised between
+    /// bind and draw renders with its new contents - so `StoreArg` cannot serve this call
+    /// however much it looks like a setter. Copying the words at the moment of the bind is
+    /// what the hardware does, so this form is the faithful shape as well as the fast one.
+    ///
+    /// # Why each guard is there
+    /// - **Both pointers are bounds-checked**, the destination against its LAST word and the
+    ///   source against `4 * words`. Two pointers, two guards; either failing runs the handler.
+    /// - **`r1 < count`** keeps an out-of-range sampler unit on the host, which is the side
+    ///   that reports it. Writing past the array would corrupt whatever field follows.
+    /// - **`r2 != 0`** sends the UNBIND case to the handler. A null texture is not a copy at
+    ///   all - it clears the unit - and it is rare enough that a second inline arm would be
+    ///   more code than it saves.
+    ///
+    /// The trailing zero word is the "this came from a precomputed state" flag, which a
+    /// direct bind always clears. It is written rather than left alone because the slot is
+    /// reused: a unit bound by a precomputed state and then re-bound directly would otherwise
+    /// keep the old provenance and mislabel itself in every later report.
+    CopyArgIndexed { offset: u32, stride: u32, count: u32, words: u32 },
+    /// Take a recursive lock whose state lives in the guest WORK AREA pointed to by r0,
+    /// when it is uncontended. Everything else runs the real host call.
+    ///
+    /// ```text
+    /// take = r1 == 1
+    ///      & u32_at(r0 + layout.id) == r0
+    ///      & u32_at(r0 + layout.waiters) == 0
+    ///      & (u32_at(r0 + layout.count) == 0 | u32_at(r0 + layout.owner) == mirror[thread_slot])
+    /// if take { owner = mirror[thread_slot]; count += 1; r0 = 0 } else { host call }
+    /// ```
+    ///
+    /// # Why a lock can be inlined at all
+    /// `sceKernelLockLwMutex` is a USERSPACE function on the device. A lightweight mutex has
+    /// no kernel handle - its state lives in the caller-provided
+    /// `SceKernelLwMutexWork` - and the uncontended take is a compare-and-swap of that work
+    /// area with no syscall at all; only CONTENTION enters the kernel. So this form is not an
+    /// optimisation bolted onto a system call, it is the shape the call actually has, and the
+    /// fallback arm is the syscall the hardware would also have made.
+    ///
+    /// The pair is the largest single block of host calls left in steady gameplay on a real
+    /// title once the GXM draw state was inlined: 101,155 lock/unlock crossings in one profile
+    /// window, 28,316 of each at a single call site.
+    ///
+    /// # Why each term of the guard is there
+    /// - **`r1 == 1`** is the `lockCount` argument. A lock of any other count (including the
+    ///   illegal zero) is the handler's case; folding a multi-count acquire into `count += 1`
+    ///   would silently under-count the recursion and release the mutex early.
+    /// - **`id == r0`** identifies the work area as ITSELF. The kernel keeps an id inside the
+    ///   work area, and a caller may operate on a byte COPY of it staged elsewhere - a C++
+    ///   wrapper putting its embedded work struct on the stack. A copy carries the ORIGINAL's
+    ///   id, so it fails this test and the host resolves it. A never-created work area is
+    ///   zeroed, so it fails too and the host adopts it.
+    /// - **`waiters == 0`** keeps every mutex with a parked thread on the host, which is the
+    ///   only place that can wake one.
+    /// - **`count == 0 | owner == cur`** is free-or-mine. Testing `count` rather than `owner`
+    ///   for freeness is what lets `owner` be left stale on release: the main thread's id is
+    ///   0 by convention, so there is no owner value that can mean "nobody".
+    ///
+    /// The two writes are correct on both arms at once: `count + 1` takes a free mutex to 1
+    /// and a recursive one to `n + 1`, and re-writing `owner` with the value it already holds
+    /// is a no-op on the recursive arm. That is what collapses the two cases into one branch.
+    ///
+    /// # Why a plain read-modify-write is enough, when the hardware needs a CAS
+    /// This tests the count and then stores `count + 1`, which is only safe if the scheduler
+    /// cannot take the baton away in between - otherwise two threads read "free" and both
+    /// take the mutex, with no error and no host call to notice it. The device needs an
+    /// atomic compare-and-swap because its three cores really do run at once. Here they do
+    /// not: there is one baton, and it changes hands only at a SUSPENSION POINT.
+    ///
+    /// Both engines put those in the same places, and neither is inside this sequence:
+    /// wasmtime emits its `fuel_check` at function entry and loop headers only (an
+    /// `if`/`else`/`end` merely bumps a local counter), and the browser's software fuel
+    /// check is emitted on back edges only. This form has no loop and no call on the path
+    /// that writes, so it runs to completion or not at all.
+    ///
+    /// That is a property of the emitted code, so it is pinned by a test
+    /// (`a_lock_form_has_no_suspension_point`) rather than left as an argument. If either
+    /// engine ever gains a finer preemption point, this needs real atomics - not a re-run
+    /// of the test.
+    LwMutexLock { layout: LwMutexLayout, thread_slot: u32 },
+    /// Release a lock taken by [`InlineOp::LwMutexLock`], when nothing is parked on it.
+    ///
+    /// ```text
+    /// drop = r1 == 1
+    ///      & u32_at(r0 + layout.id) == r0
+    ///      & u32_at(r0 + layout.waiters) == 0
+    ///      & u32_at(r0 + layout.count) != 0
+    ///      & u32_at(r0 + layout.owner) == mirror[thread_slot]
+    /// if drop { count -= 1; r0 = 0 } else { host call }
+    /// ```
+    ///
+    /// The mirror image of the lock, with the free-or-mine disjunction replaced by a
+    /// conjunction: releasing requires that this thread really holds it. An unlock by a
+    /// non-owner, or of an already-free mutex, is an ERROR the handler defines and reports;
+    /// inline it would silently underflow the count.
+    ///
+    /// `owner` is deliberately NOT cleared when the count reaches zero. Every reader tests
+    /// `count` first, and there is no owner value that means "nobody" (thid 0 is the main
+    /// thread), so a stale owner is unobservable while a sentinel would be a second encoding
+    /// of the same fact.
+    LwMutexUnlock { layout: LwMutexLayout, thread_slot: u32 },
+    /// `memmove(r0, r1, r2); r0 unchanged` - copy the r2 bytes at the pointer in r1 to the
+    /// pointer in r0, and leave the destination in r0 as the return value.
+    ///
+    /// # Why a bulk form exists
+    /// Every form above moves a fixed, small number of words named at emit time. This one
+    /// moves a count the guest supplies, and it exists because `sceClibMemcpy`,
+    /// `sceClibMemset` and `sceClibMemcmp` together are 508,181 crossings of a real title's
+    /// 3.85 M - 13% of every host call it makes, with 403,687 memcmps at a SINGLE call site.
+    /// They are also the cleanest inline candidates in that tally: pure functions of guest
+    /// memory, with no kernel object, no handle to resolve and no host state anywhere near
+    /// them ([[vitaslop-guest-state-is-what-makes-a-call-inlinable]]).
+    ///
+    /// # Why it is exactly the host call
+    /// The handler reads the source into a buffer and then writes that buffer to the
+    /// destination, which is `memmove` semantics - an overlapping copy sees the ORIGINAL
+    /// bytes. `memory.copy` is specified the same way, so the two agree on the overlapping
+    /// case as well as the ordinary one. Picking a form with `memcpy` semantics instead
+    /// would differ from the handler exactly where C says the program is already wrong,
+    /// which is the worst place to differ.
+    ///
+    /// # The length is part of the guard
+    /// Both pointers AND the length are checked, because the length is what decides how far
+    /// past a pointer the access reaches: `len <= mem_bytes` and `p - base <= mem_bytes - len`
+    /// for each pointer. A rejected call runs the handler, which keeps its own truncating
+    /// behaviour at the end of memory (`GuestCtx::read_bytes` clamps and returns short) rather
+    /// than having it approximated here.
+    MemCopy,
+    /// `memset(r0, r1 & 0xff, r2); r0 unchanged` - fill the r2 bytes at the pointer in r0
+    /// with the low byte of r1, and leave the destination in r0 as the return value.
+    ///
+    /// `memory.fill` truncates its value operand to a byte, which is exactly what the
+    /// handler's `ch as u8` does. Guarded on the destination and the length like
+    /// [`InlineOp::MemCopy`].
+    MemFill,
+    /// `r0 = memcmp(r0, r1, r2)` - the difference of the first differing byte pair over the
+    /// r2 bytes at the pointers in r0 and r1, or 0 when they are equal.
+    ///
+    /// The only form that emits a LOOP, and the only one that can: the count is a runtime
+    /// value and there is no bulk instruction for a comparison. See
+    /// [`crate::emit`] for why that loop carries no fuel check.
+    ///
+    /// The answer is the ZERO-EXTENDED difference `a[i] - b[i]`, which is what the handler
+    /// computes and what C requires the SIGN of. [`mem_compare`] is the one definition of
+    /// it, called by the handler and asserted against the emitted code.
+    MemCompare,
+}
+
+/// The answer `sceClibMemcmp` gives for `a` and `b`: the difference of the first differing
+/// byte pair, or 0.
+///
+/// One definition, called by the host handler and asserted against the emitted
+/// [`InlineOp::MemCompare`] loop, so the two cannot drift. Written here rather than in the
+/// runtime because the emitter is what has to reproduce it, and a definition that lives
+/// beside the thing it defines is one a reader of either can find.
+///
+/// The bytes are zero-extended before subtracting - `0xff` against `0x01` is +254, not -2 -
+/// which is what C requires the sign of and what the ARM code the guest would otherwise have
+/// run computes.
+pub fn mem_compare(a: &[u8], b: &[u8]) -> i32 {
+    for (p, q) in a.iter().zip(b.iter()) {
+        if p != q {
+            return *p as i32 - *q as i32;
+        }
+    }
+    0
+}
+
+/// Byte offsets of the four words an [`InlineOp::LwMutexLock`] reads out of a lightweight
+/// mutex's guest work area.
+///
+/// The transpiler does not choose these - the runtime owns the layout (see
+/// `vitaslop_runtime::vita::lwwork`) and passes it in, so the emitted code and the host
+/// handlers read one set of numbers rather than two copies that can drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LwMutexLayout {
+    /// The work area's own address, stamped at create. See the `id == r0` term.
+    pub id: u32,
+    /// The owning thread's SceUID, meaningful only while `count` is non-zero.
+    pub owner: u32,
+    /// Recursion depth; zero means free.
+    pub count: u32,
+    /// How many threads the host has parked on this mutex. Non-zero sends every
+    /// operation to the host, which is the only side that can wake one.
+    pub waiters: u32,
+}
+
+impl LwMutexLayout {
+    /// The highest offset the layout reaches, which is what a pointer bound must be
+    /// computed against - the guard has to admit the LAST word, not the first.
+    pub fn top(self) -> u32 {
+        self.id.max(self.owner).max(self.count).max(self.waiters)
+    }
 }
 
 impl InlineOp {
@@ -214,20 +508,52 @@ impl InlineOp {
     /// unchanged, which needs no definition. For [`InlineOp::LoadScaled`] this is
     /// meaningful only when [`InlineOp::falls_back`] is false - the guarded case has no
     /// inline answer by construction.
+    ///
+    /// The STORE forms have no answer in r0 beyond the success code, so their meaning is
+    /// [`InlineOp::store_offset`] instead: what they write and where. `eval` returns 0 for
+    /// them, which IS the r0 they leave.
     pub fn eval(self, word: u32) -> u32 {
         match self {
-            InlineOp::LoadShiftMask { shift, mask, .. } => (word >> shift) & mask,
+            InlineOp::LoadShiftMask { shift, mask, plus, .. } => {
+                ((word >> shift) & mask).wrapping_add(plus)
+            }
             // The mirror word IS the answer; the host computed it.
             InlineOp::LoadMirror { .. } => word,
             InlineOp::LoadScaled { shl, .. } => word << shl,
             // The pair forms deliver the mirror words untouched, wherever they land.
             InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
+            // A void setter: the guest gets the success code and nothing else.
+            InlineOp::StoreArg { .. }
+            | InlineOp::StoreArgIndexed { .. }
+            | InlineOp::StoreArgField { .. } => 0,
+            // A copy: what it writes comes from the SOURCE pointer, not from a loaded word,
+            // so a one-word `eval` cannot express it. Its meaning is the layout it writes -
+            // held against the handler by `the_texture_binding_layout_is_closed`.
+            InlineOp::CopyArgIndexed { .. } => 0,
+            // A taken lock returns success; a refused one never gets here (the host call
+            // answers instead). Their real definition is a whole work-area state machine
+            // over four words, which `eval`'s one-word signature cannot express - see
+            // `vitaslop_runtime::vita::lwwork::fast_lock`, which the emitted code is held
+            // against directly.
+            InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 0,
+            // A bulk form's meaning is a RANGE of memory, which a one-word `eval` cannot
+            // express any more than it can express the copy form's. `MemCopy` and `MemFill`
+            // return the destination they were handed, so 0 here is not their r0 - the
+            // emitted code leaves r0 alone, and the execution test in
+            // `vitaslop-native/tests/inline_imports.rs` is what holds all three to their
+            // handlers.
+            InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => 0,
         }
     }
 
     /// Whether the loaded `word` sends this op to the host call instead of computing an
     /// answer inline. Only [`InlineOp::LoadScaled`] can, and a test pins the boundary:
     /// the point of the guard is that the handler, not this, defines the clamped case.
+    ///
+    /// This is about a loaded WORD. [`InlineOp::StoreArgIndexed`] also has a value guard,
+    /// but on its INDEX argument rather than on anything it read, so it has its own
+    /// predicate ([`InlineOp::falls_back_on_index`]) instead of overloading this one - two
+    /// different quantities under one name is how an off-by-one gets written.
     pub fn falls_back(self, word: u32) -> bool {
         match self {
             InlineOp::LoadScaled { max, .. } => word > max,
@@ -235,8 +561,21 @@ impl InlineOp {
         }
     }
 
+    /// Whether index argument `index` sends this op to the host call. Only
+    /// [`InlineOp::StoreArgIndexed`] has an index at all; every other form answers false
+    /// for every index, which is trivially true of a form that has none.
+    pub fn falls_back_on_index(self, index: u32) -> bool {
+        match self {
+            InlineOp::StoreArgIndexed { count, .. } | InlineOp::CopyArgIndexed { count, .. } => {
+                index >= count
+            }
+            _ => false,
+        }
+    }
+
     /// Byte offset from the pointer argument at which the word is read, for the forms
-    /// that read through a guest pointer. `None` for a form that does not take one.
+    /// that read through a guest pointer. `None` for a form that does not take one, and
+    /// for the forms that WRITE through it - see [`InlineOp::store_offset`].
     pub fn offset(self) -> Option<u32> {
         match self {
             InlineOp::LoadShiftMask { offset, .. } => Some(offset),
@@ -244,7 +583,37 @@ impl InlineOp {
             // Writes through r0 rather than reading through it, so it has no read offset
             // even though it is a pointer form. `emit_import` guards it on its own terms.
             InlineOp::StoreMirrorPair { .. } => None,
+            InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
+            // Reads the word it is about to rewrite, so its offset is a `store_offset` -
+            // reporting it here would make a getter test read the field mid-update.
+            InlineOp::StoreArgField { .. } => None,
+            // Reads through r2 and writes through r0, so neither pointer's offset is "the"
+            // offset.
+            InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorPair { .. } => None,
+            // Reads four words and writes two, so no single offset describes it.
+            InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => None,
+            // Reaches from the pointer itself for a length the guest supplies; there is no
+            // fixed offset to name.
+            InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
+        }
+    }
+
+    /// Byte offset from the pointer argument at which an argument-storing form WRITES its
+    /// word - for [`InlineOp::StoreArgIndexed`], the offset of element ZERO.
+    ///
+    /// Deliberately separate from [`InlineOp::offset`]: a test that holds a getter to its
+    /// handler reads the word at `offset()`, and a test that holds a SETTER to its handler
+    /// reads the word at `store_offset()` AFTER running it. Same number shape, opposite
+    /// direction, and conflating them would make the setter test read the word the handler
+    /// was about to overwrite.
+    pub fn store_offset(self) -> Option<u32> {
+        match self {
+            InlineOp::StoreArg { offset } => Some(offset),
+            InlineOp::StoreArgIndexed { offset, .. } => Some(offset),
+            InlineOp::CopyArgIndexed { offset, .. } => Some(offset),
+            InlineOp::StoreArgField { offset, .. } => Some(offset),
+            _ => None,
         }
     }
 
@@ -254,8 +623,19 @@ impl InlineOp {
     pub fn mirror_slot(self) -> Option<u32> {
         match self {
             InlineOp::LoadShiftMask { .. } | InlineOp::LoadScaled { .. } => None,
+            InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
+            InlineOp::StoreArgField { .. } => None,
+            InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
+            // The lock forms read the mirror too - the CURRENT THREAD, which is the one
+            // fact about the take that is not in the work area. Naming the slot here is
+            // what makes the layout pass reserve the block for them as well; a lock form
+            // omitted from this list would read a word nobody ever writes and take every
+            // mutex on behalf of thread zero.
+            InlineOp::LwMutexLock { thread_slot, .. }
+            | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
+            InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
         }
     }
 
@@ -1186,6 +1566,83 @@ mod tests {
         assert_eq!(artifact.funcs[0].export, "f_10000");
         // The module must validate.
         wasmparser::validate(&artifact.wasm).expect("valid wasm");
+    }
+
+    /// The lightweight-mutex forms must contain NO SUSPENSION POINT, and this is the whole
+    /// reason a non-atomic read-modify-write is safe in guest code.
+    ///
+    /// They load the count, test it, and store `count + 1`. If the scheduler could take the
+    /// baton away in between, two threads would both read "free" and both take the mutex -
+    /// a mutual-exclusion violation with no error and no host call, surfacing later as
+    /// corrupt data somewhere else. On hardware that window does not exist because the
+    /// uncontended take is a compare-and-swap; here it does not exist because of where the
+    /// two engines can preempt, and those are the only two facts holding it up:
+    ///
+    /// - **Native (wasmtime).** `fuel_check` - the only thing that yields - is emitted at
+    ///   FUNCTION ENTRY and LOOP HEADERS only (`wasmtime-internal-cranelift`,
+    ///   `fuel_function_entry` / `translate_loop_header`). An `if`/`else`/`end` merely
+    ///   increments a function-local counter; it cannot yield. A `call` can, because the
+    ///   callee may.
+    /// - **Browser.** [`emit::emit_fuel_check`] is emitted on BACK EDGES only, and says so.
+    ///
+    /// So the sequence is safe exactly while it contains no loop and no call on the path
+    /// that writes. That is what this asserts. It will fail if anyone puts a loop in the
+    /// emitted form, and it is the place to come back to if either engine ever gains a
+    /// finer preemption point - at which point this needs real atomics, not a re-test.
+    #[test]
+    fn a_lock_form_has_no_suspension_point() {
+        use wasmparser::{Operator, Payload};
+        // Thumb `bl` to the import stub at 0x10010, then `bx lr`.
+        let code: [u8; 8] = [
+            0x00, 0xf0, 0x06, 0xf8, // bl 0x10010
+            0x70, 0x47, // bx lr
+            0x00, 0x00,
+        ];
+        let layout = LwMutexLayout { id: 0, owner: 4, count: 8, waiters: 12 };
+        for op in [
+            InlineOp::LwMutexLock { layout, thread_slot: 3 },
+            InlineOp::LwMutexUnlock { layout, thread_slot: 3 },
+        ] {
+            let artifact = transpile(&Program {
+                code: &code,
+                base: 0x10000,
+                thumb: true,
+                entries: &[0x10000],
+                arm_entries: &[],
+                externs: &[Extern { addr: 0x10010, import: 0 }],
+                redirects: &[],
+                inline_imports: &[InlineImport { import: 0, op }],
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory: false,
+            })
+            .expect("transpile");
+            wasmparser::validate(&artifact.wasm).expect("valid wasm");
+            // The FIRST body is the translated guest function; the rest is emitter
+            // bookkeeping (the dispatcher, `emit_reset`) that no guest lock runs through.
+            let body = wasmparser::Parser::new(0)
+                .parse_all(&artifact.wasm)
+                .filter_map(|p| match p.expect("parse") {
+                    Payload::CodeSectionEntry(b) => Some(b),
+                    _ => None,
+                })
+                .next()
+                .expect("the guest function is emitted");
+            let ops: Vec<Operator> = body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("operators");
+            let loops = ops.iter().filter(|o| matches!(o, Operator::Loop { .. })).count();
+            assert_eq!(loops, 0, "{op:?} must emit no loop - a loop header is a yield point");
+            // Two calls, and both are the FALLBACK: one from the pointer guard and one from
+            // the predicate. Any third call would be on the served path, where a yield is
+            // exactly the race this test exists to rule out.
+            let calls = ops.iter().filter(|o| matches!(o, Operator::Call { .. })).count();
+            assert_eq!(calls, 2, "{op:?} must call the host on its two refusal arms and nowhere else");
+        }
     }
 
     /// A mirror-reading import must lower to a plain load of the reserved block, with

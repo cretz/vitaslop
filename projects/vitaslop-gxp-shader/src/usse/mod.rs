@@ -226,8 +226,17 @@ pub fn decode_shader(program: &Program) -> Shader {
                 instr.op = Op::Tex { unit: unit as u8, coords, coord_half, lod };
             }
             _ => {
-                instr.blocked =
-                    Some("SMP sampler operand does not resolve to a declared texture unit");
+                // Name the CAUSE when the container can see it. An odd control-word base is
+                // unaddressable by a double-register sampler field however the field decodes,
+                // so reporting the sampler operand there sends the reader to the one part of
+                // this that is known to be right.
+                instr.blocked = Some(if program.unaddressable_texture_controls().is_empty() {
+                    "SMP sampler operand does not resolve to a declared texture unit"
+                } else {
+                    "SMP sampler operand does not resolve: this program declares its texture \
+                     control words at an ODD SA register, which a double-register sampler field \
+                     cannot name (Program::unaddressable_texture_controls)"
+                });
             }
         }
     }

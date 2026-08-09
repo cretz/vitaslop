@@ -211,8 +211,25 @@ pub struct BoundTexture {
     /// back in +X, -X, +Y, -Y, +Z, -Z order - the same order WebGPU expects its array layers
     /// in. Face `f` starts at byte `f * face_bytes`.
     pub faces: u32,
-    /// Byte size of one face in `pixels` (the whole buffer when `faces` is 1).
+    /// Byte size of one face in `pixels` (the whole buffer when `faces` is 1), INCLUDING
+    /// every mip level of that face - so level 0 of face `f` still starts at
+    /// `f * face_bytes`, whether or not the chain was snapshotted.
     pub face_bytes: u32,
+    /// How many mip levels of each face `pixels` holds, counting level 0. Level `l` starts
+    /// at `f * face_bytes + crate::render::level_offset(.., l)`.
+    ///
+    /// # Why the chain is snapshotted at all
+    /// The hardware samples the guest's OWN mip levels. We used to read level 0 and box-filter
+    /// a chain from it, which is defensible for an image and not defensible at all for a
+    /// texture that is handed to the GPU still compressed: there is no box filter for a BC
+    /// block, so a compressed upload either carries the guest's levels or ships level 0 alone -
+    /// and level-0-alone is the "distant road reads as white speckle" failure
+    /// ([[vitaslop-textures-need-mips]]).
+    ///
+    /// 1 when the guest declared no mips, when the read of the fuller chain failed (a texture
+    /// whose allocation genuinely ends after level 0 - reported, never assumed), or for a CUBE
+    /// map, whose six chains' interleaving is not established.
+    pub levels: u32,
     pub data_addr: u32,
     /// The raw guest bytes of the texture, exactly as laid out in guest memory.
     ///
@@ -233,6 +250,18 @@ pub struct BoundTexture {
     /// than the broken thin strokes nearest sampling gives at sub-native scale.
     pub min_filter: u32,
     pub mag_filter: u32,
+    /// `SceGxmTextureMipFilter` (control word 0 bit 9, `vita::gxm::texword0::MIP_FILTER`):
+    /// 1 = the hardware filters BETWEEN mip levels, 0 = it does not.
+    ///
+    /// # Why this is worth carrying, and what it does NOT license
+    /// A texture with `mip_count` 1 and `mip_filter` 0 is one the hardware samples from its
+    /// base level and nothing else. Our renderer box-filters a chain for every RGBA8 texture
+    /// regardless, which is more anti-aliased than the device and was added to fix real
+    /// speckle - so this is not a licence to stop doing that. What it settles is narrower: for
+    /// a texture handed to the GPU still COMPRESSED, whose chain cannot be generated at all,
+    /// "the guest declares no levels AND does not filter between them" is the difference
+    /// between shipping one level faithfully and dropping a chain the hardware was using.
+    pub mip_filter: u32,
     /// The `SceGxmTextureGammaMode` set via `sceGxmTextureSetGammaMode`. Non-zero means the
     /// hardware sampler sRGB-DECODES each texel BEFORE filtering, so the shader receives
     /// linear values from memory that holds gamma-encoded ones. A renderer that ignores this
@@ -376,6 +405,15 @@ pub struct Draw {
     /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
     /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
     pub frag_sa: Vec<u8>,
+    /// GUEST ADDRESS the bytes above were read from, or 0 when there is no bound buffer.
+    ///
+    /// The bytes alone answer "what did this draw get"; only the address answers "who put it
+    /// there", and that is a different and often harder question. This block may come from our
+    /// recycled reserve ring OR - on a title that binds through precomputed states, which is
+    /// most of them - from guest-owned memory the guest allocated and writes itself. In the
+    /// second case the address is stable enough to point `VITASLOP_WATCH_STORE_LOG` at, which
+    /// is the one tool that names every guest writer of an address in a single run.
+    pub frag_sa_addr: u32,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -419,6 +457,18 @@ pub struct Scene {
     /// Without this the address falls through to a colour target (they are allocated near each
     /// other) or to guest bytes the GPU never wrote, and the pass reads a colour as a distance.
     pub depth: Option<DepthSurface>,
+    /// The `SceGxmMultisampleMode` of the RENDER TARGET this scene rasterises through
+    /// (`SceGxmRenderTargetParams::multisampleMode`): 0 = NONE, 1 = 2X, 2 = 4X.
+    ///
+    /// This lives on the scene rather than on the colour surface because it is a property
+    /// of the target, and it is the guest's own statement of how many samples per pixel the
+    /// hardware rasterises this pass with. It is NOT the same fact as
+    /// [`ColorSurface::scale_mode`]: the scale mode says the surface stores the RESOLVED
+    /// image, the multisample mode says how many samples were resolved into it. A renderer
+    /// needs both - the first to know the stored size is the sampled size, the second to
+    /// know the sample count - and reading either alone has already produced a wrong
+    /// conclusion here (see `report_scene_target`).
+    pub multisample: u32,
     pub draws: Vec<Draw>,
 }
 
@@ -1024,6 +1074,7 @@ mod extent_tests {
             fprog: no_program(),
             vert_sa: Vec::new(),
             frag_sa: Vec::new(),
+            frag_sa_addr: 0,
             shader_expanded: false,
         };
         Scene {
@@ -1038,6 +1089,7 @@ mod extent_tests {
                 gamma: 0,
             }),
             depth: None,
+            multisample: 0,
             draws: vec![draw],
         }
     }
@@ -1091,6 +1143,7 @@ mod retention_tests {
                 gamma: 0,
             }),
             depth: None,
+            multisample: 0,
             draws: Vec::new(),
         }
     }

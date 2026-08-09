@@ -357,24 +357,62 @@ impl RetailGuest {
     }
 }
 
-/// `VITASLOP_PEEK=<hex addr>:<len>[,<hex addr>:<len>]`: hex-dump guest memory at the END of a
+/// `VITASLOP_PEEK=<hex addr>[/<dec off>]*:<len>[,...]`: hex-dump guest memory at the END of a
 /// headless run, as words with their addresses.
 ///
 /// The alternative is a store watchpoint, and the two answer different questions. A watchpoint
 /// says WHO wrote a word; this says WHAT IS THERE, which is what you need when the suspicion is
 /// about the neighbours - "is this a table of records, and does the one next door hold the value
 /// this draw should have had". A watchpoint cannot show you a record nobody wrote.
+///
+/// # The `/off` hops, and why they are not a convenience
+/// What is actually being looked for is almost never at a fixed address: it is at the end of a
+/// POINTER CHAIN rooted in one. `0x816F07B8/0/4` reads the word at `0x816F07B8+0`, then the word
+/// at `that+4`, and dumps from there. Without the hops each link costs its own headless replay -
+/// the same run, three times, to walk two pointers - and the addresses in between are heap, so
+/// they move and the runs cannot even be mixed.
+///
+/// Every hop is PRINTED, and a hop through a null or unmapped word STOPS and says so, because
+/// the failure it replaces is silent: `read_guest` on a bad address returns zeros, so a broken
+/// chain otherwise hex-dumps a screenful of `00000000` that reads exactly like a real region
+/// nobody has written yet.
 fn peek_regions(guest: &RetailGuest) {
     let Ok(spec) = std::env::var("VITASLOP_PEEK") else { return };
     for part in spec.split(',') {
-        let Some((a, n)) = part.trim().split_once(':') else { continue };
-        let (Ok(addr), Ok(len)) = (
-            u32::from_str_radix(a.trim().trim_start_matches("0x"), 16),
+        let Some((a, n)) = part.trim().rsplit_once(':') else { continue };
+        let mut hops = a.trim().split('/');
+        let root = hops.next().unwrap_or_default();
+        let (Ok(mut addr), Ok(len)) = (
+            u32::from_str_radix(root.trim().trim_start_matches("0x"), 16),
             n.trim().parse::<usize>(),
         ) else {
-            println!("peek: {part:?} is not <hex addr>:<len>");
+            println!("peek: {part:?} is not <hex addr>[/<dec off>]*:<len>");
             continue;
         };
+        // Walk the chain, reporting each link. `continue 'part` is spelled as a flag because
+        // the dump below is shared with the no-hop case.
+        let mut broken = false;
+        for hop in hops {
+            let Ok(off) = hop.trim().parse::<u32>() else {
+                println!("peek: {hop:?} is not a decimal offset in {part:?}");
+                broken = true;
+                break;
+            };
+            let at = addr.wrapping_add(off);
+            let w = guest.peek(at, 4);
+            let next = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            println!("peek hop: [{at:#010x}] = {next:#010x}");
+            if next == 0 {
+                println!("peek: the chain in {part:?} hops through a NULL at {at:#010x} - stopping \
+                          rather than dumping address 0, which reads as an unwritten region.");
+                broken = true;
+                break;
+            }
+            addr = next;
+        }
+        if broken {
+            continue;
+        }
         let bytes = guest.peek(addr, len);
         for (i, row) in bytes.chunks(32).enumerate() {
             let words: Vec<String> = row
@@ -424,7 +462,7 @@ impl RetailGfx {
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-desktop-gxm"),
-            required_features: wgpu::Features::empty(),
+            required_features: vitaslop_platform::gpu::wanted_features(&adapter),
             // Raise resolution-derived limits to the adapter's: a real title binds
             // textures past the 2048 downlevel floor (some titles have a ~2480px atlas).
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
@@ -459,10 +497,22 @@ impl RetailGfx {
         surface.configure(&device, &config);
 
         let mut gxm = GxmRenderer::new(&device, &queue, render_format);
-        // Antialias the native path (which has the GPU headroom): 2x supersample resolves the
-        // sub-pixel-triangle / coincident-panel speckle a distant 3D vehicle shows, matching the
-        // software review shots. `VITASLOP_SSAA` overrides (1 disables). See GxmRenderer::set_supersample.
-        let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(2);
+        // ONE sample by default, because that is what the guest asks for. The display buffer's
+        // render target is created `SCE_GXM_MULTISAMPLE_NONE` on every title measured here -
+        // the console composites the front buffer at one sample - and the antialiasing the
+        // title DOES ask for now happens where it asked for it, on the render targets it
+        // created multisampled (`gpu::gxm_sample_count`).
+        //
+        // This used to default to 2, and the desktop defaulted differently from the browser,
+        // which is the shape of bug that makes a phone look broken next to a review shot. It
+        // was also not doing what it was believed to do: MEASURED on the front end, a 2x
+        // supersampled GAME MODE differs from a 1x one by 3.31% of pixels and a mean of
+        // 0.20/255, and its text edges come out very slightly SOFTER (mean |dx| 1.807 against
+        // 1.900). Supersampling the display was never the answer to a sharpness complaint.
+        //
+        // `VITASLOP_SSAA` survives as a review instrument - it is what the software oracle's
+        // parity probe compares against - not as a setting anything should ship with.
+        let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(1);
         gxm.set_supersample(ssaa);
         let depth = make_depth(&device, w, h);
         Ok(RetailGfx { surface, device, queue, config, gxm, builder: RenderSceneBuilder::new(), depth, render_format, adapter_name })
@@ -531,6 +581,11 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 ///   behind one display flip) and the GPU cost of rendering the final captured scene.
 /// - `VITASLOP_HEADLESS_SHOT_EVERY` - also write `<shot_dir>/fNNNNNN.png` every N display
 ///   flips, so one run shows the whole boot SEQUENCE rather than only its last frame.
+/// - `VITASLOP_HEADLESS_SHOT_FROM` / `VITASLOP_HEADLESS_SHOT_TO` - restrict those shots to an
+///   inclusive frame window (default: the whole run). A defect that lives in a TRANSITION -
+///   a fade, a wipe, a one-frame flash - is invisible at any interval coarse enough to cover
+///   a boot, and every-frame-from-boot is gigabytes of stored-deflate PNG. An empty window is
+///   an ERROR rather than a run that quietly writes nothing.
 ///
 /// NOTE what the timing does and does not measure. The guest advances every frame but the
 /// scene is RENDERED ONCE, at the end - so a wall-clock total over a headless run is CPU
@@ -643,12 +698,35 @@ fn report_frame_timing(
 /// stable median past the first-render pipeline/upload cost, cheap enough to always run.
 const WARM_RENDER_SAMPLES: usize = 60;
 
-pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
+pub fn headless_check(
+    dir: PathBuf,
+    shot_dir: PathBuf,
+    // The `--recipe` flag's contents, if it was given. Taken as a parameter rather than read
+    // from the environment here so the FLAG and the env knob land in the same place - the flag
+    // used to be parsed by `main` and then never passed, which is silent and unfalsifiable
+    // (see the comment at its parse site).
+    flag_recipe: Option<String>,
+) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
+    let env_recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
         .ok()
         .map(|p| std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}")))
         .transpose()?;
+    // Both spellings exist and the notes use both. If they are BOTH given they must agree,
+    // because silently preferring one is how a run ends up replaying a recipe nobody named.
+    if let (Some(a), Some(b)) = (&flag_recipe, &env_recipe) {
+        if a != b {
+            return Err("both --recipe and VITASLOP_HEADLESS_RECIPE are set and they are \
+                        different recipes - pass one, not two".into());
+        }
+    }
+    let recipe = flag_recipe.or(env_recipe);
+    // Say which way input is being driven, unconditionally. "Did the recipe apply" was
+    // previously answerable only by recognising the final screenshot.
+    println!(
+        "headless: input is {}",
+        if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
+    );
     let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
     let target: u64 = std::env::var("VITASLOP_HEADLESS_FRAMES")
         .ok()
@@ -686,6 +764,59 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // The WINDOW the periodic shots apply to (`VITASLOP_HEADLESS_SHOT_FROM` /
+    // `..._SHOT_TO`, inclusive, defaulting to the whole run). What this exists for is the
+    // class of defect that lives in a TRANSITION - a fade, a wipe, a one-frame flash -
+    // which a sampling interval coarse enough to survive a whole boot steps straight over.
+    // Shooting every frame from boot instead is not the answer: these PNGs are written with
+    // stored (uncompressed) deflate, so a 1400-frame run is gigabytes. A window makes
+    // `SHOT_EVERY=1` affordable exactly where the question is.
+    let shot_from: u64 = std::env::var("VITASLOP_HEADLESS_SHOT_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let shot_to: u64 = std::env::var("VITASLOP_HEADLESS_SHOT_TO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX);
+    if shot_to < shot_from {
+        return Err(format!(
+            "VITASLOP_HEADLESS_SHOT_TO={shot_to} is before VITASLOP_HEADLESS_SHOT_FROM={shot_from}, \
+             so the window is empty and the run would silently write no shots"
+        ));
+    }
+    // `VITASLOP_CALLSITES_WINDOW=<from>-<to>`: clear the call-site histogram at display frame
+    // `from` and print it at `to`, so the ranking describes those frames and not the boot.
+    //
+    // The end-of-run report below is cumulative, and a cumulative tally cannot rank STEADY
+    // work: boot is thousands of frames of loading, and its call mix is a different program
+    // from the one a frame rate is made of. That has mis-ranked this project's host-call list
+    // repeatedly - the fix has always been "sample twice and difference", and nobody does,
+    // because it costs two runs. One window costs none.
+    let callsite_window: Option<(u64, u64)> = match std::env::var("VITASLOP_CALLSITES_WINDOW") {
+        Err(_) => None,
+        Ok(s) => {
+            let (a, b) = s.split_once('-').ok_or_else(|| {
+                format!("VITASLOP_CALLSITES_WINDOW={s} is not <from>-<to>")
+            })?;
+            let from: u64 = a.trim().parse().map_err(|_| format!("bad window start in {s:?}"))?;
+            let to: u64 = b.trim().parse().map_err(|_| format!("bad window end in {s:?}"))?;
+            if to <= from {
+                return Err(format!(
+                    "VITASLOP_CALLSITES_WINDOW={s} ends at or before it starts, so it would \
+                     report an empty window"
+                ));
+            }
+            if !vitaslop_runtime::knobs::flag("VITASLOP_DBG_CALLSITES") {
+                return Err(
+                    "VITASLOP_CALLSITES_WINDOW needs VITASLOP_DBG_CALLSITES=1 - nothing records \
+                     call sites without it, so the window would report nothing"
+                        .into(),
+                );
+            }
+            Some((from, to))
+        }
+    };
     let mut periodic: Option<vitaslop_native::GeneralRenderer> = None;
     if shot_every > 0 {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -694,8 +825,70 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
     let mut frame_ms: Vec<f64> = Vec::new();
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
-        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && f % shot_every == 0) {
+        if let Some((from, to)) = callsite_window {
+            if f == from {
+                vitaslop_runtime::vita::reset_call_sites();
+                println!("callsites: window {from}..{to} OPEN (counts before this are discarded)");
+            }
+            if f == to {
+                println!(
+                    "callsites: window {from}..{to} = {} display frames\n{}",
+                    to - from,
+                    vitaslop_runtime::vita::call_sites_report(30)
+                );
+            }
+        }
+        let in_shot_window = f >= shot_from && f <= shot_to;
+        // >>> RENDER EVERY FRAME IN THE WINDOW, WRITE ONLY THE SAMPLED ONES.
+        //
+        // # A sampled render is not a faithful picture, and the way it fails is invisible
+        // A render target is guest memory: it keeps what was last written into it, and a title
+        // routinely paints something ONCE - at a screen transition - and samples it for the next
+        // thousand frames. The renderer serves that from `rtt_rendered` plus the targets still
+        // resident from earlier frames, so a target is only correct here if this process actually
+        // RENDERED the frame that painted it.
+        //
+        // Rendering only at the sampling interval breaks exactly that. MEASURED on PCSA00015's
+        // event briefing: sampled every 500 frames, the whole menu background is BLACK; rendering
+        // the 500 frames up to the same flip contiguously, it is the light grey panel the browser
+        // draws and the device draws. Nothing in the shot, the log or the scene composition says
+        // a layer is missing - the draw counts are identical (8 scenes / 49 draws either way),
+        // because the guest submitted the same work and it was OUR history that was empty.
+        //
+        // So every frame inside the window is rendered and only the sampled ones are written.
+        // The window is the knob that keeps this affordable: it is already there to make
+        // `SHOT_EVERY=1` cheap enough to catch a one-frame flash, and it now also bounds the
+        // cost of being faithful. Outside the window nothing is rendered, exactly as before.
+        if let (Some(r), true) = (periodic.as_mut(), shot_every > 1 && in_shot_window && f % shot_every != 0) {
             let scenes = guest.current();
+            if !scenes.is_empty() {
+                let _ = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+            }
+        }
+        if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_shot_window && f % shot_every == 0) {
+            let scenes = guest.current();
+            // The frame's COMPOSITION, taken while the scenes are borrowed and printed below
+            // with the clock. A frame that loses most of its picture from one flip to the next
+            // is either the guest drawing less or us placing less, and those are opposite bugs
+            // - these two counts separate them without another run. The scene and surface
+            // REPORTS cannot: they dedupe by design, so they say nothing about a given frame.
+            let scene_count = scenes.len();
+            let draw_count: usize = scenes.iter().map(|s| s.draws.len()).sum();
+            // ...and WHICH scenes, by the colour address each one rasterises into, in the
+            // order the guest submitted them. A count says a frame changed shape; only the
+            // addresses say whether a pass APPEARED, whether it targets the display buffer or
+            // an offscreen, and which pass is the one that stopped contributing. The scene
+            // reports above cannot answer that - they fire once per surface for a whole run.
+            let composition: Vec<String> = scenes
+                .iter()
+                .map(|s| match &s.color {
+                    Some(c) => format!("{:#x}:{}", c.data_addr, s.draws.len()),
+                    // A scene with no resolvable colour surface renders NOWHERE, and one of
+                    // those is already known to be load-bearing on this title (a later pass
+                    // samples its depth). Name it rather than letting it read as absent.
+                    None => format!("NO-COLOUR:{}", s.draws.len()),
+                })
+                .collect();
             if !scenes.is_empty() {
                 let fb = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
                 let path = shot_dir.join(format!("f{f:06}.png"));
@@ -707,11 +900,13 @@ pub fn headless_check(dir: PathBuf, shot_dir: PathBuf) -> Result<(), String> {
             // the two.
             let (clk_q, clk_topup, clk_idle) = guest.clock_sources();
             println!(
-                "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle)",
+                "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle), \
+                 {scene_count} scenes / {draw_count} draws [{}]",
                 guest.clock_us() as f64 / 1e6,
                 clk_q as f64 / 1e6,
                 clk_topup as f64 / 1e6,
                 clk_idle as f64 / 1e6,
+                composition.join(" "),
             );
         }
         if use_builtin_taps {

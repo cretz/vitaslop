@@ -167,11 +167,13 @@ pub(super) fn wait_thread_end(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
     SvcOutcome::Continue
 }
 
-/// SceUID sceKernelGetThreadId(void)
-/// Reports the running thread's id: the scheduler's `current` under preemption, or
-/// a fixed main-thread id in the single-thread-of-control bring-up.
-#[hostcall]
-pub(super) fn get_thread_id(st: &mut VitaState) -> i32 {
+/// The id `sceKernelGetThreadId` reports, as ONE definition.
+///
+/// Two things compute this now - the handler below and the host-mirror snapshot that backs
+/// its inlined form - and a second implementation of a value is exactly how the inline and
+/// host answers drift apart with nothing in the system to notice. `mirror_matches_its_handlers`
+/// holds them to this function.
+pub(crate) fn thread_id(st: &VitaState) -> i32 {
     if st.is_preemptive() {
         // A fiber reports the thread that ran it, because on hardware it executes on
         // that thread - only its stack differs. A job system that keys per-worker state
@@ -180,6 +182,14 @@ pub(super) fn get_thread_id(st: &mut VitaState) -> i32 {
     } else {
         MAIN_THREAD_ID
     }
+}
+
+/// SceUID sceKernelGetThreadId(void)
+/// Reports the running thread's id: the scheduler's `current` under preemption, or
+/// a fixed main-thread id in the single-thread-of-control bring-up.
+#[hostcall]
+pub(super) fn get_thread_id(st: &mut VitaState) -> i32 {
+    thread_id(st)
 }
 
 /// int sceKernelGetThreadExitStatus(SceUID thid, int *pExitStatus)
@@ -199,7 +209,9 @@ pub(super) fn get_thread_exit_status(ctx: &mut GuestCtx, st: &mut VitaState, thi
 /// majority that have real behaviour. Reached through [`crate::vita::inline_op`], which
 /// owns the global on/off switch.
 ///
-/// Only the process-clock family qualifies, and it qualifies for exactly the reason the
+/// Two families qualify, on two different arguments.
+///
+/// **The process-clock family** qualifies for exactly the reason the
 /// [`mirror`](crate::vita::mirror) module doc gives: the value is a pure function of the
 /// virtual clock, and the virtual clock advances only in the scheduler, with no guest
 /// thread live. So a word refreshed before every resume is not an approximation of the
@@ -212,16 +224,43 @@ pub(super) fn get_thread_exit_status(ctx: &mut GuestCtx, st: &mut VitaState, thi
 ///   - `...Wide()` returns it in the r0/r1 pair,
 ///   - `...Low()` returns its low half in r0.
 ///
+/// **The three `sceClibMem*` bulk primitives** qualify on the opposite ground: they touch no
+/// host value at all. Each is a pure function of guest memory, with no handle to resolve, no
+/// kernel object behind it and no `VitaState` field anywhere in its handler - which is what
+/// makes a call inlinable ([[vitaslop-guest-state-is-what-makes-a-call-inlinable]]). They
+/// earn their place by COUNT: 508,181 crossings of a real title's 3.85 M, 13% of every host
+/// call it makes, with 403,687 `sceClibMemcmp`s from a SINGLE call site.
+///
+/// The other `sceClib*` functions are deliberately NOT here. `strncpy` and `strnlen` scan for
+/// a NUL and then behave differently on either side of it, and `snprintf` formats - none is a
+/// bulk move, and each would be a new emitted form for a call count three orders of magnitude
+/// smaller. Their handlers stay the definition.
+///
 /// **Every entry here duplicates a handler below, and the two must agree.** The
-/// `mirror_matches_its_handlers` test holds them to that.
+/// `mirror_matches_its_handlers` test holds the clock family to that; the bulk family is held
+/// by `clib_memcmp` calling the shared [`vitaslop_transpiler::mem_compare`] the emitted loop
+/// is asserted against, and by the execution tests in
+/// `vitaslop-native/tests/inline_imports.rs`.
 pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::libkernel as lk;
-    use crate::vita::mirror::SLOT_CLOCK_LO;
-    use vitaslop_transpiler::InlineOp::{LoadMirror, LoadMirrorPair, StoreMirrorPair};
+    use crate::vita::mirror::{SLOT_CLOCK_LO, SLOT_THREAD_ID};
+    use vitaslop_transpiler::InlineOp::{
+        LoadMirror, LoadMirrorPair, MemCompare, MemCopy, MemFill, StoreMirrorPair,
+    };
     Some(match func_nid {
+        lk::CLIB_MEMCPY => MemCopy,
+        lk::CLIB_MEMSET => MemFill,
+        lk::CLIB_MEMCMP => MemCompare,
         lk::GET_PROCESS_TIME => StoreMirrorPair { slot: SLOT_CLOCK_LO },
         lk::GET_PROCESS_TIME_WIDE => LoadMirrorPair { slot: SLOT_CLOCK_LO },
         lk::GET_PROCESS_TIME_LOW => LoadMirror { slot: SLOT_CLOCK_LO },
+        // `sceKernelGetThreadId` takes no argument, touches nothing, and returns a value the
+        // guest cannot change: which thread the host handed the baton to. Same terms as the
+        // clock, and it earns its place by COUNT - on a real title's front end it is the
+        // most-called host function of the whole run at 1.64 million crossings, 1.51 million
+        // of them from ONE call site, for a one-word read. See [`SLOT_THREAD_ID`] for why it
+        // reads its own slot and not the scheduler's `current`.
+        lk::GET_THREAD_ID => LoadMirror { slot: SLOT_THREAD_ID },
         _ => return None,
     })
 }
@@ -542,17 +581,25 @@ pub(super) fn clib_memset(ctx: &mut GuestCtx, dst: Ptr, ch: i32, len: u32) -> Pt
 }
 
 /// int sceClibMemcmp(const void *a, const void *b, SceSize len)
+///
+/// The answer comes from [`vitaslop_transpiler::mem_compare`] rather than from a loop
+/// written here, because this call has an INLINE FORM ([`inline_op`]) whose emitted loop has
+/// to compute the same thing. Two hand-written loops in two languages agreeing today is not
+/// the same as their agreeing after either is touched, and the disagreement would be silent:
+/// the inline form serves every ordinary call and the handler only the ones near the end of
+/// guest memory, so a divergence would surface as a rare wrong comparison and nothing else.
+///
 /// Expression-bodied (no early `return`): `#[hostcall]` inlines the body into a
 /// `()` wrapper, so a `return` would escape the wrapper, not this handler.
 #[hostcall]
 pub(super) fn clib_memcmp(ctx: &mut GuestCtx, a: Ptr, b: Ptr, len: u32) -> i32 {
+    // `read_bytes` CLAMPS at the end of guest memory and returns short, so a pointer with
+    // fewer than `len` bytes in front of it compares only what is there. That is this
+    // handler's own behaviour and the inline form does not reproduce it - it hands exactly
+    // that case back here, which is why the two can differ about it without diverging.
     let x = ctx.read_bytes(a.addr(), len as usize);
     let y = ctx.read_bytes(b.addr(), len as usize);
-    x.iter()
-        .zip(y.iter())
-        .find(|(p, q)| p != q)
-        .map(|(p, q)| *p as i32 - *q as i32)
-        .unwrap_or(0)
+    vitaslop_transpiler::mem_compare(&x, &y)
 }
 
 /// SceSize sceClibStrnlen(const char *s, SceSize maxlen)

@@ -545,6 +545,16 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         self.inner.engine().host.lock().unwrap()
     }
 
+    /// Run `f` against the host WITH guest memory in hand - the accessor for anything that
+    /// reaches guest-resident state from outside a host call. See
+    /// [`vitaslop_runtime::sched::SchedCore::with_host_words`].
+    pub fn with_host_words<R>(
+        &mut self,
+        f: impl FnOnce(&mut H, &mut dyn vitaslop_runtime::host::GuestWords) -> R,
+    ) -> R {
+        self.inner.core_mut().with_host_words(f)
+    }
+
     /// Read `len` bytes of guest memory at guest address `addr` (diagnostic; the
     /// shared image outlives any trap, so a probe can inspect object state after a
     /// fault). Returns an empty vec if the range is out of bounds.

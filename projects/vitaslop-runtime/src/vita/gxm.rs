@@ -4,6 +4,7 @@
 //! index, and uniform data snapshotted from guest memory. No GPU is emulated and
 //! no pixel is drawn here; that is the renderer's job over this capture.
 
+use super::gxmctx;
 use crate::capture::{ColorSurface, VertexAttribute};
 use crate::host::{GuestCtx, VitaState, MAX_VERTEX_STREAMS};
 use crate::render::f32_to_half;
@@ -116,16 +117,21 @@ pub(super) fn create_render_target(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
-/// Report - once per (target, mode) - the MULTISAMPLE mode a render target was created with,
-/// and that we rasterize it at one sample regardless.
+/// Report - once per (target, mode) - the MULTISAMPLE mode a render target was created with.
 ///
 /// `SceGxmMultisampleMode` is `NONE`/`2X`/`4X`, and 4X means the hardware keeps 2x2 samples per
 /// pixel - which is why a 960x544 colour surface on this hardware carries a **1920x1088** depth
-/// surface, a pairing that otherwise reads as a decode error. Rendering it at one sample is an
-/// approximation (the title is aliased relative to hardware), and an approximation says so.
+/// surface, a pairing that otherwise reads as a decode error.
+///
+/// This line reports the REQUEST only. It used to end "we rasterize it at ONE sample", which
+/// stopped being true when the renderer began honouring the mode; the answer now belongs to
+/// the renderer, which reports a grant per target and WARNS on a refusal. A diagnostic that
+/// states someone else's behaviour goes stale the moment that behaviour changes, and this one
+/// did.
 /// The multisample mode a render target was created with, by handle. Recorded here rather than
-/// in `VitaState` because the only consumer is diagnostic - but it has to be a RECORD and not a
-/// re-read of the params struct, which is a caller stack frame that is gone by `beginScene`.
+/// in `VitaState` because it is read at `beginScene` to tell the renderer how many samples the
+/// pass wants - and it has to be a RECORD and not a re-read of the params struct, which is a
+/// caller stack frame that is gone by then.
 static MULTISAMPLE_BY_TARGET: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> =
     std::sync::Mutex::new(None);
 
@@ -154,11 +160,52 @@ fn report_multisample_mode(handle: u32, width: u32, height: u32, mode: u32) {
         };
         eprintln!(
             "gxm render target {handle:#x} ({width}x{height}) was created MULTISAMPLED ({name}), \
-             so on hardware its depth surface is {dw}x{dh} samples - we rasterize it at ONE \
-             sample, which is more aliased than the title intends"
+             so on hardware its depth surface is {dw}x{dh} samples. This is the REQUEST; whether \
+             a pass through this target got it is the renderer's own MULTISAMPLE granted/REFUSED \
+             line, and a refusal is a warning"
         );
     }
 }
+
+/// int sceGxmCreateContext(const SceGxmContextParams *params, SceGxmContext **context)
+///
+/// The context IS the guest's `params->hostMem`. On hardware GXM builds its context inside
+/// that buffer - the guest allocates it, passes it, and the returned `SceGxmContext *` points
+/// into it - and every `sceGxmSet*` writes one field of the structure there. Putting the
+/// sticky state where the hardware puts it is what lets those setters be INLINED into guest
+/// code instead of crossing the host boundary 1,240 times a frame; see [`super::gxmctx`].
+///
+/// # Why this refuses rather than falls back
+/// `hostMem` is not optional and `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` is 2 KB, so a title
+/// that passes null or a short buffer is one GXM itself would reject. Handing back an opaque
+/// handle anyway would leave every later setter writing to an address that is not a context
+/// and every draw reading a state nobody wrote - a wrong picture with no error, thousands of
+/// frames from the cause.
+pub(super) fn create_context(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
+    let params = ctx.arg(0);
+    let out = ctx.arg(1);
+    let host_mem = ctx.read_u32(params + CTX_PARAMS_HOST_MEM);
+    let host_mem_size = ctx.read_u32(params + CTX_PARAMS_HOST_MEM_SIZE);
+    if host_mem == 0 || host_mem_size < gxmctx::BYTES {
+        return crate::SvcOutcome::Fatal(format!(
+            "sceGxmCreateContext with hostMem={host_mem:#x} size={host_mem_size} - the context \
+             state lives in hostMem (as it does on hardware) and needs {} bytes of the {} GXM \
+             itself requires",
+            gxmctx::BYTES,
+            gxmctx::MINIMUM_HOST_MEM
+        ));
+    }
+    gxmctx::init(ctx, host_mem);
+    st.adopt_gxm_context(host_mem);
+    ctx.write_u32(out, host_mem);
+    ctx.ret(0);
+    crate::SvcOutcome::Continue
+}
+
+/// `SceGxmContextParams` field offsets (vitasdk `gxm.h`): `void *hostMem` then
+/// `SceSize hostMemSize`.
+const CTX_PARAMS_HOST_MEM: u32 = 0x00;
+const CTX_PARAMS_HOST_MEM_SIZE: u32 = 0x04;
 
 /// A create-call that writes a fresh opaque handle to its out-pointer at
 /// positional argument `out_arg`, returning 0.
@@ -260,28 +307,43 @@ const GXM_PARAM_RESOURCE_INDEX_OFF: u32 = 0xC;
 /// extending it.
 pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     use crate::nid::gxm as g;
-    use vitaslop_transpiler::InlineOp::{LoadScaled, LoadShiftMask};
+    use gxmctx::off as ctxoff;
+    use vitaslop_transpiler::InlineOp::{
+        CopyArgIndexed, LoadScaled, LoadShiftMask, StoreArg, StoreArgField, StoreArgIndexed,
+    };
+    // A `void sceGxmSet*(SceGxmContext *context, uint32 value)`: one word of the context
+    // block, at the offset its handler writes.
+    let store = |offset| StoreArg { offset };
     // The packed word's fields; `param_word` masks the word to 16 bits first, which
     // the 4-bit field masks below make redundant.
-    let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf };
+    let word = |shift| LoadShiftMask { offset: GXM_PARAM_WORD_OFF, shift, mask: 0xf, plus: 0 };
     // A field of a texture's CONTROL WORD 0, at the pointer itself (offset 0). Every one of
     // these is now a plain field of the guest's own struct rather than an entry in a host-side
     // map, which is what makes inlining them possible at all - see [`texword0`].
-    let tex = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift, mask };
+    let tex = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift, mask, plus: 0 };
     // ...and for the two enums whose values are already IN control-word position, the answer is
     // the masked word with no shift, so the mask is the field in place. See
     // [`texture_get_mip_filter`].
-    let tex_in_place = |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift: 0, mask: mask << shift };
+    let tex_in_place =
+        |(shift, mask): (u32, u32)| LoadShiftMask { offset: 0, shift: 0, mask: mask << shift, plus: 0 };
+    // A SETTER of a control-word-0 field: the read-modify-write twin of `tex`, over the SAME
+    // `(shift, mask)` pair, so a setter and its getter cannot disagree about where the field
+    // is. Only the setters that store their argument AS PASSED belong here - see
+    // [`texture_set_mip_filter`] for the one that does not, and why that matters.
+    let tex_set = |(shift, mask): (u32, u32)| StoreArgField { offset: 0, shift, mask };
+    // sceGxmTextureGetWidth/Height: the 12-bit SIZE-MINUS-ONE field of control word 1, plus
+    // one - see [`texture_get_dim`], whose `+ 1` this `plus` is.
+    let tex_dim = |shift| LoadShiftMask { offset: 4, shift, mask: 0xfff, plus: 1 };
     Some(match func_nid {
         g::PROGRAM_PARAMETER_GET_CATEGORY => word(0),
         g::PROGRAM_PARAMETER_GET_TYPE => word(4),
         g::PROGRAM_PARAMETER_GET_COMPONENT_COUNT => word(8),
         g::PROGRAM_PARAMETER_GET_CONTAINER_INDEX => word(12),
         g::PROGRAM_PARAMETER_GET_ARRAY_SIZE => {
-            LoadShiftMask { offset: GXM_PARAM_ARRAY_SIZE_OFF, shift: 0, mask: u32::MAX }
+            LoadShiftMask { offset: GXM_PARAM_ARRAY_SIZE_OFF, shift: 0, mask: u32::MAX, plus: 0 }
         }
         g::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => {
-            LoadShiftMask { offset: GXM_PARAM_RESOURCE_INDEX_OFF, shift: 0, mask: u32::MAX }
+            LoadShiftMask { offset: GXM_PARAM_RESOURCE_INDEX_OFF, shift: 0, mask: u32::MAX, plus: 0 }
         }
         // The texture sampler getters. `sceGxmTextureGetLodBias` is the single hottest host call
         // one title makes - 71,298 in one profile window - and every one of these is one load,
@@ -297,6 +359,28 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
             tex(texword0::MIP_COUNT)
         }
         g::TEXTURE_GET_GAMMA_MODE => tex_in_place(texword0::GAMMA_MODE),
+        // The three control-word-1 reads. `GetType` is the top three bits put back where they
+        // came from (`((w1 >> 29) & 7) << 29`), which is the whole word masked - the same
+        // shape `tex_in_place` has, one word over.
+        g::TEXTURE_GET_TYPE => LoadShiftMask { offset: 4, shift: 0, mask: 0x7 << 29, plus: 0 },
+        g::TEXTURE_GET_WIDTH => tex_dim(12),
+        g::TEXTURE_GET_HEIGHT => tex_dim(0),
+        // The control-word-0 SETTERS whose handler is `set_tex_field` and nothing else. Each
+        // is a read-modify-write of ONE field, which is why they need their own form: a whole
+        // word store would clear the seven settings packed beside the one being set, and the
+        // result is a texture that samples wrongly rather than an error anyone can see.
+        //
+        // `sceGxmTextureSetMipFilter` and `...SetGammaMode` are deliberately absent: their
+        // enums are already in control-word position so their handlers shift the argument DOWN
+        // first, which is a different program. `...SetGammaMode` also reports to the host.
+        g::TEXTURE_SET_U_ADDR_MODE | g::TEXTURE_SET_U_ADDR_MODE_SAFE => {
+            tex_set(texword0::UADDR_MODE)
+        }
+        g::TEXTURE_SET_V_ADDR_MODE | g::TEXTURE_SET_V_ADDR_MODE_SAFE => {
+            tex_set(texword0::VADDR_MODE)
+        }
+        g::TEXTURE_SET_MIN_FILTER => tex_set(texword0::MIN_FILTER),
+        g::TEXTURE_SET_MAG_FILTER => tex_set(texword0::MAG_FILTER),
         // The two PROGRAM-pointer reads. Everything above is handed a parameter record;
         // these are handed the `SceGxmProgram` itself, which changes nothing about the
         // lowering - an inline form is defined by (pointer argument, offset), and which
@@ -305,7 +389,7 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // Both are called per draw by a title that re-reflects its shader interface every
         // frame: 21,710 and 24,760 calls in one profile window.
         g::PROGRAM_GET_PARAMETER_COUNT => {
-            LoadShiftMask { offset: GXP_PARAM_COUNT_OFF, shift: 0, mask: u32::MAX }
+            LoadShiftMask { offset: GXP_PARAM_COUNT_OFF, shift: 0, mask: u32::MAX, plus: 0 }
         }
         // `default_uniform_buffer_bytes` is `read(+0x64).min(4096) * 4`. The scale is a
         // shift; the CLAMP is not, so the inline form covers values at or below the cap
@@ -317,9 +401,90 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
             max: DEFAULT_UNIFORM_BUFFER_MAX_WORDS,
             shl: 2,
         },
+        // The CONTEXT STATE SETTERS - the largest block of host calls a real title makes in
+        // steady gameplay, and the reason `StoreArg` exists at all. Measured on PCSA00027:
+        // the first five below are 248 calls a frame EACH, and eight draw-state calls share
+        // the single call site every `sceGxmDrawPrecomputed` comes from - nine crossings per
+        // draw, eight of them one-word writes into a structure the hardware keeps in guest
+        // memory anyway.
+        //
+        // Each is `set(context, value)` and its handler is `gxmctx::set(...)` and nothing
+        // else, which is exactly what `StoreArg` emits. See [`gxmctx`] for the layout these
+        // offsets come from - they are the same constants the handlers use, not a second
+        // copy, so the two cannot drift.
+        g::SET_VERTEX_PROGRAM => store(ctxoff::VERTEX_PROGRAM),
+        g::SET_FRAGMENT_PROGRAM => store(ctxoff::FRAGMENT_PROGRAM),
+        g::SET_CULL_MODE => store(ctxoff::CULL_MODE),
+        g::SET_FRONT_DEPTH_FUNC => store(ctxoff::FRONT_DEPTH_FUNC),
+        g::SET_FRONT_DEPTH_WRITE_ENABLE => store(ctxoff::FRONT_DEPTH_WRITE),
+        g::SET_TWO_SIDED_ENABLE => store(ctxoff::TWO_SIDED),
+        g::SET_BACK_DEPTH_FUNC => store(ctxoff::BACK_DEPTH_FUNC),
+        g::SET_BACK_DEPTH_WRITE_ENABLE => store(ctxoff::BACK_DEPTH_WRITE),
+        g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => store(ctxoff::FRONT_FRAGMENT_PROGRAM_ENABLE),
+        g::SET_BACK_FRAGMENT_PROGRAM_ENABLE => store(ctxoff::BACK_FRAGMENT_PROGRAM_ENABLE),
+        g::SET_FRONT_POLYGON_MODE => store(ctxoff::FRONT_POLYGON_MODE),
+        g::SET_BACK_POLYGON_MODE => store(ctxoff::BACK_POLYGON_MODE),
+        g::SET_FRONT_POINT_LINE_WIDTH => store(ctxoff::FRONT_POINT_LINE_WIDTH),
+        g::SET_FRONT_STENCIL_REF => store(ctxoff::FRONT_STENCIL_REF),
+        g::SET_VIEWPORT_ENABLE => store(ctxoff::VIEWPORT_ENABLE),
+        g::SET_FRONT_VISIBILITY_TEST_ENABLE => store(ctxoff::FRONT_VISIBILITY_TEST_ENABLE),
+        g::SET_FRONT_VISIBILITY_TEST_INDEX => store(ctxoff::FRONT_VISIBILITY_TEST_INDEX),
+        g::SET_FRONT_VISIBILITY_TEST_OP => store(ctxoff::FRONT_VISIBILITY_TEST_OP),
+        // The one INDEXED setter that qualifies: a stream binding is a plain pointer, so
+        // storing it is the whole call. An index past the end still reaches the handler,
+        // which is where the report of it lives.
+        g::SET_VERTEX_STREAM => StoreArgIndexed {
+            offset: ctxoff::STREAMS,
+            count: gxmctx::MAX_VERTEX_STREAMS as u32,
+        },
+        // The one COPY: a fragment texture binding is the four control words as they read at
+        // bind time, because GXM copies them by value. That is why this cannot be a store form
+        // - see `CopyArgIndexed` - and it is the largest single block of host calls left in
+        // steady gameplay, at 1,275 crossings a display frame over a live race.
+        //
+        // The handler still runs for every case it defines: an out-of-range unit, and a null
+        // texture (which UNBINDS rather than copying).
+        g::SET_FRAGMENT_TEXTURE => CopyArgIndexed {
+            offset: ctxoff::TEXTURES,
+            stride: gxmctx::TEXTURE_STRIDE,
+            count: gxmctx::MAX_TEXTURE_UNITS as u32,
+            words: gxmctx::TEXTURE_CONTROL_WORDS,
+        },
         _ => return None,
     })
 }
+
+/// Why the remaining `sceGxmSet*` calls are NOT inlined. Kept as code rather than a comment
+/// so a future reader adding one has to answer the same question, and so `only_pure_setters_
+/// are_inlined` can walk the list.
+///
+/// Three reasons, and only the first is about effort:
+/// - **More than one value word.** `sceGxmSetViewport` takes six floats,
+///   `sceGxmSetRegionClip` five, `sceGxmSetFrontStencilFunc` six. A store form writes one
+///   word. They still keep their state in the context block; they just cross to do it.
+/// - **The handler does something else.** `sceGxmSetRegionClip` reports that no renderer
+///   here consumes a scissor; `sceGxmSetVisibilityBuffer` clears the accumulated occlusion
+///   counts. Inlining silently deletes that, because the handler simply never runs.
+/// - **The call is not a store at all.** `sceGxmReserve*DefaultUniformBuffer` allocates and
+///   sizes a buffer from the bound program's reflected interface - real work, not an
+///   accessor, and no amount of moving state into the guest changes that.
+///
+/// `sceGxmSetFragmentTexture` used to be on this list, for a reason that was correct about
+/// the call and wrong about the conclusion: it copies a texture's control words BY VALUE
+/// (`vitaslop-texture-binding-by-value`), so storing the POINTER would be a different
+/// program. The answer was a COPY form rather than a store form - see
+/// `InlineOp::CopyArgIndexed` - which does what the hardware does, at bind time. "It is not a
+/// plain store" is a reason to widen the closed set by one proven operation, not a reason to
+/// keep crossing 1,275 times a frame.
+#[cfg(test)]
+const NOT_INLINABLE: &[(u32, &str)] = &[
+    (crate::nid::gxm::SET_VIEWPORT, "six value words"),
+    (crate::nid::gxm::SET_REGION_CLIP, "five value words, and it reports"),
+    (crate::nid::gxm::SET_FRONT_STENCIL_FUNC, "six value words"),
+    (crate::nid::gxm::SET_VISIBILITY_BUFFER, "clears the occlusion counters"),
+    (crate::nid::gxm::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER, "allocates and sizes a buffer"),
+    (crate::nid::gxm::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER, "allocates and sizes a buffer"),
+];
 
 /// unsigned int sceGxmProgramGetParameterCount(const SceGxmProgram *program)
 pub(super) fn program_get_parameter_count(ctx: &mut GuestCtx) {
@@ -566,7 +731,7 @@ fn write_texture_control_words(
     ctx.write_u32(addr, w0);
     ctx.write_u32(addr + 4, w1);
     ctx.write_u32(addr + 8, data & 0xffff_fffc);
-    ctx.write_u32(addr + 12, (swizzle & 0x7) << 29);
+    ctx.write_u32(addr + 12, (swizzle & 0x7) << texword3::SWIZZLE_SHIFT);
 }
 
 /// Map a `SceGxmColorFormat` to the `SceGxmTextureFormat` naming the same pixels.
@@ -938,7 +1103,7 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
         depth_stencil,
         depth,
     );
-    st.begin_scene(color, depth);
+    st.begin_scene(color, depth, multisample_mode_of(render_target));
     ctx.ret(0);
 }
 
@@ -1146,20 +1311,27 @@ pub(super) fn notification_wait(ctx: &mut GuestCtx, _st: &mut VitaState) {
 }
 
 /// void sceGxmSetVertexProgram(context, vertexProgram)
-pub(super) fn set_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let vp = ctx.arg(1);
-    st.bind_vertex_program(vp);
-    ctx.ret(0);
+///
+/// Stores the HANDLE in the context block. Resolving it to a `SceGxmProgram *` header is
+/// the reader's job (`VitaState::bound_vertex_program`), which moves that lookup from once
+/// per bind to once per draw and leaves this call as one guest store - the shape an inline
+/// form can take over. See [`gxmctx`].
+#[hostcall]
+pub(super) fn set_vertex_program(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, vertex_program: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::VERTEX_PROGRAM, vertex_program);
+    0
 }
 
 /// void sceGxmSetFragmentProgram(context, fragmentProgram)
-/// Record the bound fragment program's `SceGxmProgram*` so `record_draw` can reflect
-/// its samplers to pick the albedo texture. Rendering does not otherwise consume the
-/// fragment program (the capture renderer is fixed-function).
-pub(super) fn set_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let fp = ctx.arg(1);
-    st.bind_fragment_program(fp);
-    ctx.ret(0);
+///
+/// As [`set_vertex_program`]: the handle goes in the block and the header + blend state are
+/// derived from it at draw time. The blend equation is baked into the fragment program at
+/// creation (see [`crate::capture::BlendState`]), so it is a pure function of this handle
+/// and needs no separate record.
+#[hostcall]
+pub(super) fn set_fragment_program(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, fragment_program: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRAGMENT_PROGRAM, fragment_program);
+    0
 }
 
 /// int sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)
@@ -1286,7 +1458,11 @@ fn report_uniform_write(
     static WATCH: OnceLock<(Vec<u32>, Vec<String>)> = OnceLock::new();
     let (addrs, names) = WATCH.get_or_init(|| {
         let (mut a, mut n) = (Vec::new(), Vec::new());
-        for t in std::env::var("VITASLOP_UNIFORM_WATCH").unwrap_or_default().split(',') {
+        // Through the knob table, not `std::env::var`. This watch names the guest code that
+        // WROTE a uniform, and the uniform this project needs it for (`screenTintColour`, the
+        // white-out) is written on the BROWSER and never on the desktop - so the one engine
+        // that can answer could not set the knob at all.
+        for t in crate::knobs::var("VITASLOP_UNIFORM_WATCH").unwrap_or_default().split(',') {
             let t = t.trim();
             if t.is_empty() {
                 continue;
@@ -1322,7 +1498,10 @@ fn report_uniform_write(
     {
         return;
     }
-    eprintln!(
+    // At WARN on `vitaslop::gxm`, not `eprintln!`: a browser has no stderr the panel can show,
+    // and this watch exists to be read on the engine where the write happens.
+    tracing::warn!(
+        target: "vitaslop::gxm",
         "gxm uniform watch: sceGxmSetUniformDataF wrote {name} ({}) into {lo:#x}..={hi:#x} of \
          buffer {buffer:#x} - reg {base}, component offset {component_offset}, values {values:?}, \
          leaving {:08x} at {lo:#x}, from lr={:#010x}",
@@ -1333,11 +1512,13 @@ fn report_uniform_write(
 }
 
 /// void sceGxmSetVertexStream(context, unsigned int streamIndex, const void *data)
-pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, st: &mut VitaState) {
-    let stream_index = ctx.arg(1);
-    let data = ctx.arg(2);
-    st.bind_stream(stream_index, data);
-    ctx.ret(0);
+///
+/// A stream binding is a POINTER on hardware - unlike a texture binding, which GXM copies
+/// by value - so it lives in the context block like the rest of the sticky state.
+#[hostcall]
+pub(super) fn set_vertex_stream(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, stream_index: u32, data: u32) -> i32 {
+    gxmctx::set_stream(ctx, context, stream_index, data);
+    0
 }
 
 /// int sceGxmDraw(context, SceGxmPrimitiveType primitive, SceGxmIndexFormat
@@ -1391,36 +1572,16 @@ pub(super) const TYPE_CUBE_ARBITRARY: u32 = 7; // 0xE000_0000 >> 29
 pub(super) fn set_fragment_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
     let unit = ctx.arg(1);
     let texture = ctx.arg(2);
-    // Whether the control words are already zero AT BIND TIME. A texture that is live here and
-    // zero at draw time is a LIFETIME problem (the guest reused or cleared the struct, or the
-    // binding went stale); one that is zero here was never a texture at this address at all,
-    // and the address itself is what is wrong. The two need opposite investigations.
-    let live_at_bind = texture != 0
-        && (ctx.read_u32(texture)
-            | ctx.read_u32(texture + 4)
-            | ctx.read_u32(texture + 8)
-            | ctx.read_u32(texture + 12))
-            != 0;
-    // A non-null handle whose control words are all zero is the guest handing GXM a texture it
-    // never initialised. Name the CALL SITE the first time each address does it: the binding
-    // itself says nothing about why, and the caller is the only thing that can (see
-    // `vitaslop-re-undocumented-nid-from-callsite`).
-    if texture != 0 && !live_at_bind {
-        use std::collections::HashSet;
-        use std::sync::Mutex;
-        static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if g.get_or_insert_with(HashSet::new).insert(texture) {
-            eprintln!(
-                "gxm texture: sceGxmSetFragmentTexture(unit {unit}, {texture:#x}) with ALL-ZERO \
-                 control words, called from lr={:#010x}",
-                ctx.regs[14]
-            );
-        }
-    }
+    // NOTE the "all-zero control words at bind time" report that used to live here is GONE,
+    // and deliberately so rather than by omission. It compared the words at the bind against
+    // the words at the draw to tell a texture that was never initialised from one whose
+    // struct was reused afterwards. Now that a binding IS a by-value copy taken at the bind,
+    // the draw-time report can make that distinction from the binding alone - all-zero copied
+    // words mean they were zero when they were copied - so a second, bind-time report would
+    // be a worse-informed duplicate. It also could not have survived: this handler now runs
+    // for a few binds a run, not 1,275 a frame, so the report would have gone quiet and read
+    // as "this stopped happening".
     st.bind_fragment_texture(ctx, unit, texture);
-    st.note_direct_texture_bind();
-    st.note_texture_live_at_bind(texture, live_at_bind);
     ctx.ret(0);
 }
 
@@ -1539,80 +1700,85 @@ const FRAME_US: u64 = 1_000_000 / 60;
 
 // --- Fixed-function pipeline state setters ----------------------------------
 //
-// Each `sceGxmSet*` below mutates one field of the sticky GXM context state
-// ([`crate::capture::RenderState`]); the current state is snapshotted into every
-// draw at record time (see `VitaState::record_draw`). All return `void` on the
-// Vita - the `-> i32` (0) here just parks a defined value in r0 the caller ignores.
-// The first argument is the `SceGxmContext *` (a single implicit context here, so
-// it is unused); the enum arguments are stored verbatim as their raw GXM words.
+// Each `sceGxmSet*` below writes ONE WORD of the sticky GXM context state, which lives in
+// the guest's own context memory exactly as it does on hardware - see [`gxmctx`]. The state
+// is read back and snapshotted into every draw at record time (`VitaState::record_draw`).
+//
+// The single-word shape is deliberate and load-bearing: it is what
+// `InlineOp::StoreArg { offset }` can emit into guest code, which is how the eight-crossings-
+// per-draw block that used to dominate a gameplay frame stops crossing at all. A setter that
+// wrote a host field could not be inlined however cheap its handler was.
+//
+// All return `void` on the Vita - the `-> i32` (0) here just parks a defined value in r0 the
+// caller ignores. The enum arguments are stored verbatim as their raw GXM words.
 
 /// void sceGxmSetCullMode(SceGxmContext *context, SceGxmCullMode mode)
 #[hostcall]
-pub(super) fn set_cull_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
-    st.render_state_mut().cull_mode = mode;
+pub(super) fn set_cull_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::CULL_MODE, mode);
     0
 }
 
 /// void sceGxmSetTwoSidedEnable(SceGxmContext *context, SceGxmTwoSidedMode enable)
 #[hostcall]
-pub(super) fn set_two_sided_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().two_sided = enable;
+pub(super) fn set_two_sided_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::TWO_SIDED, enable);
     0
 }
 
 /// void sceGxmSetFrontDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
 #[hostcall]
-pub(super) fn set_front_depth_func(st: &mut VitaState, _context: u32, func: u32) -> i32 {
-    st.render_state_mut().front_depth_func = func;
+pub(super) fn set_front_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, func: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_FUNC, func);
     0
 }
 
 /// void sceGxmSetBackDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
 #[hostcall]
-pub(super) fn set_back_depth_func(st: &mut VitaState, _context: u32, func: u32) -> i32 {
-    st.render_state_mut().back_depth_func = func;
+pub(super) fn set_back_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, func: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_FUNC, func);
     0
 }
 
 /// void sceGxmSetFrontDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
 #[hostcall]
-pub(super) fn set_front_depth_write_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().front_depth_write = enable;
+pub(super) fn set_front_depth_write_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_WRITE, enable);
     0
 }
 
 /// void sceGxmSetFrontFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
 #[hostcall]
-pub(super) fn set_front_fragment_program_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().front_fragment_program_enable = enable;
+pub(super) fn set_front_fragment_program_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_FRAGMENT_PROGRAM_ENABLE, enable);
     0
 }
 
 /// void sceGxmSetBackFragmentProgramEnable(SceGxmContext *context, SceGxmFragmentProgramMode enable)
 #[hostcall]
-pub(super) fn set_back_fragment_program_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().back_fragment_program_enable = enable;
+pub(super) fn set_back_fragment_program_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_FRAGMENT_PROGRAM_ENABLE, enable);
     0
 }
 
 /// void sceGxmSetFrontPointLineWidth(SceGxmContext *context, unsigned int width)
 #[hostcall]
-pub(super) fn set_front_point_line_width(st: &mut VitaState, _context: u32, width: u32) -> i32 {
-    st.render_state_mut().front_point_line_width = width;
+pub(super) fn set_front_point_line_width(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, width: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_POINT_LINE_WIDTH, width);
     0
 }
 
 /// void sceGxmSetFrontPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
 #[hostcall]
-pub(super) fn set_front_polygon_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
-    st.render_state_mut().front_polygon_mode = mode;
+pub(super) fn set_front_polygon_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_POLYGON_MODE, mode);
     0
 }
 
 /// void sceGxmSetFrontStencilRef(SceGxmContext *context, unsigned int sref)
 #[hostcall]
-pub(super) fn set_front_stencil_ref(st: &mut VitaState, _context: u32, sref: u32) -> i32 {
-    st.render_state_mut().front_stencil_ref = sref;
+pub(super) fn set_front_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, sref: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_STENCIL_REF, sref);
     0
 }
 
@@ -1621,8 +1787,9 @@ pub(super) fn set_front_stencil_ref(st: &mut VitaState, _context: u32, sref: u32
 ///     depthPass, unsigned char compareMask, unsigned char writeMask)
 #[hostcall]
 pub(super) fn set_front_stencil_func(
-    st: &mut VitaState,
-    _context: u32,
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
     func: u32,
     stencil_fail: u32,
     depth_fail: u32,
@@ -1630,13 +1797,13 @@ pub(super) fn set_front_stencil_func(
     compare_mask: u32,
     write_mask: u32,
 ) -> i32 {
-    let rs = st.render_state_mut();
-    rs.front_stencil_func = func;
-    rs.front_stencil_op_fail = stencil_fail;
-    rs.front_stencil_op_depth_fail = depth_fail;
-    rs.front_stencil_op_depth_pass = depth_pass;
-    rs.front_stencil_compare_mask = compare_mask & 0xff;
-    rs.front_stencil_write_mask = write_mask & 0xff;
+    use gxmctx::off;
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_FUNC, func);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_FAIL, stencil_fail);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_DEPTH_FAIL, depth_fail);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_DEPTH_PASS, depth_pass);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_COMPARE_MASK, compare_mask & 0xff);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_WRITE_MASK, write_mask & 0xff);
     0
 }
 
@@ -1644,8 +1811,9 @@ pub(super) fn set_front_stencil_func(
 ///     float yOffset, float yScale, float zOffset, float zScale)
 #[hostcall]
 pub(super) fn set_viewport(
-    st: &mut VitaState,
-    _context: u32,
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
     x_offset: f32,
     x_scale: f32,
     y_offset: f32,
@@ -1653,14 +1821,16 @@ pub(super) fn set_viewport(
     z_offset: f32,
     z_scale: f32,
 ) -> i32 {
-    st.render_state_mut().viewport = [x_offset, x_scale, y_offset, y_scale, z_offset, z_scale];
+    for (i, v) in [x_offset, x_scale, y_offset, y_scale, z_offset, z_scale].iter().enumerate() {
+        gxmctx::set(ctx, context, gxmctx::off::VIEWPORT + i as u32 * 4, v.to_bits());
+    }
     0
 }
 
 /// void sceGxmSetViewportEnable(SceGxmContext *context, SceGxmViewportMode enable)
 #[hostcall]
-pub(super) fn set_viewport_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().viewport_enable = enable;
+pub(super) fn set_viewport_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::VIEWPORT_ENABLE, enable);
     0
 }
 
@@ -1668,17 +1838,19 @@ pub(super) fn set_viewport_enable(st: &mut VitaState, _context: u32, enable: u32
 ///     unsigned int xMin, unsigned int yMin, unsigned int xMax, unsigned int yMax)
 #[hostcall]
 pub(super) fn set_region_clip(
-    st: &mut VitaState,
-    _context: u32,
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
     mode: u32,
     x_min: u32,
     y_min: u32,
     x_max: u32,
     y_max: u32,
 ) -> i32 {
-    let rs = st.render_state_mut();
-    rs.region_clip_mode = mode;
-    rs.region_clip = [x_min, y_min, x_max, y_max];
+    gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP_MODE, mode);
+    for (i, v) in [x_min, y_min, x_max, y_max].iter().enumerate() {
+        gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP + i as u32 * 4, *v);
+    }
     report_region_clip_ignored(mode, [x_min, y_min, x_max, y_max]);
     0
 }
@@ -1856,6 +2028,34 @@ pub(super) fn param_get_semantic_index(ctx: &mut GuestCtx, _st: &mut VitaState, 
 ///   `stride`, and how those three COMPOSE is not published ("stride extension", "internal
 ///   stride lower bits"). That one stays in the host shadow, because packing it would mean
 ///   inventing the composition - see [`VitaState::texture_stride`].
+/// Control word 3, from vitasdk `gxm.h struct SceGxmTexture` (an approved permissive
+/// reference), declared LSB-first:
+///
+/// ```text
+///  bits 0-25   palette_addr      bits 28-30  swizzle_format
+///  bits 26-27  lod_min1          bit  31     normalize_mode
+/// ```
+///
+/// # This was off by one, and it was invisible in exactly one direction
+/// Both the writer and the reader used bit 29, so a texture WE initialised round-tripped
+/// perfectly - `Set` then `Get` agreed, and every test passed. The error only shows on the
+/// other path: a texture the GUEST built its own control words for, which is where
+/// `report_texture_resolved_from_control_words` fires. There, reading bits 29:31 of a word
+/// whose swizzle really sits at 28:30 returns `(swizzle >> 1) | (normalize_mode << 2)` - so
+/// ABGR and ARGB both read as ABGR, RGBA and BGRA both read as ARGB, and a set
+/// `normalize_mode` adds 4 to whatever came out.
+///
+/// A wrong SWIZZLE does not drop a texture or make it obviously garbage: it renders the real
+/// image with its channels permuted, which is the failure this codebase already warns about at
+/// `report_texture_resolved_from_control_words`. It is also the reason to fix the WRITER and
+/// not only the reader - the guest may read back the words we wrote, and it should find the
+/// field where the hardware puts it.
+pub(crate) mod texword3 {
+    /// Low bit of the 3-bit `swizzle_format` field.
+    pub const SWIZZLE_SHIFT: u32 = 28;
+    pub const SWIZZLE_MASK: u32 = 0x7;
+}
+
 mod texword0 {
     /// `(shift, mask)` of each field of control word 0.
     pub const VADDR_MODE: (u32, u32) = (3, 0x7);
@@ -2104,9 +2304,18 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
             size = format_args!("{}x{}", s.width, s.height),
             "colorSurfaceSetGammaMode"
         );
+        // >>> SAY WHICH WAY THE MODE WENT.
+        // This line used to read "GAMMA-CORRECT writes on the surface ..." for every call,
+        // including the ones passing mode 0 - which is the guest turning gamma OFF. So the
+        // most common reading of this diagnostic (`mode 0x0` beside the word GAMMA-CORRECT)
+        // asserted the opposite of what had happened, on the exact question - does this
+        // surface hold encoded bytes - that decides how everything sampling it must decode.
         eprintln!(
-            "gxm surface: GAMMA-CORRECT writes on the surface at data {:#x} ({}x{}), mode              {gamma:#x}",
-            s.data_addr, s.width, s.height
+            "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
+            if gamma != 0 { "GAMMA-CORRECT writes ENABLED" } else { "gamma-correct writes DISABLED (linear)" },
+            s.data_addr,
+            s.width,
+            s.height
         );
         st.set_color_surface(surface, s);
     }
@@ -2451,15 +2660,15 @@ pub(super) fn depth_stencil_surface_set_force_store_mode(
 
 /// void sceGxmSetBackDepthWriteEnable(SceGxmContext *context, SceGxmDepthWriteMode enable)
 #[hostcall]
-pub(super) fn set_back_depth_write_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().back_depth_write = enable;
+pub(super) fn set_back_depth_write_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_DEPTH_WRITE, enable);
     0
 }
 
 /// void sceGxmSetBackPolygonMode(SceGxmContext *context, SceGxmPolygonMode mode)
 #[hostcall]
-pub(super) fn set_back_polygon_mode(st: &mut VitaState, _context: u32, mode: u32) -> i32 {
-    st.render_state_mut().back_polygon_mode = mode;
+pub(super) fn set_back_polygon_mode(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, mode: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_POLYGON_MODE, mode);
     0
 }
 
@@ -2476,22 +2685,22 @@ pub(super) fn set_visibility_buffer(st: &mut VitaState, _context: u32, base: u32
 /// void sceGxmSetFrontVisibilityTestEnable(SceGxmContext *context,
 ///     SceGxmVisibilityTestMode enable)
 #[hostcall]
-pub(super) fn set_front_visibility_test_enable(st: &mut VitaState, _context: u32, enable: u32) -> i32 {
-    st.render_state_mut().front_visibility_test_enable = enable;
+pub(super) fn set_front_visibility_test_enable(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, enable: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_ENABLE, enable);
     0
 }
 
 /// void sceGxmSetFrontVisibilityTestIndex(SceGxmContext *context, unsigned int index)
 #[hostcall]
-pub(super) fn set_front_visibility_test_index(st: &mut VitaState, _context: u32, index: u32) -> i32 {
-    st.render_state_mut().front_visibility_test_index = index;
+pub(super) fn set_front_visibility_test_index(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, index: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_INDEX, index);
     0
 }
 
 /// void sceGxmSetFrontVisibilityTestOp(SceGxmContext *context, SceGxmVisibilityTestOp op)
 #[hostcall]
-pub(super) fn set_front_visibility_test_op(st: &mut VitaState, _context: u32, op: u32) -> i32 {
-    st.render_state_mut().front_visibility_test_op = op;
+pub(super) fn set_front_visibility_test_op(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, op: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_VISIBILITY_TEST_OP, op);
     0
 }
 
@@ -2702,14 +2911,29 @@ pub(super) fn precomputed_vertex_state_set_all_textures(
 pub(super) fn precomputed_state_set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str, all: bool) {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
+        // >>> `debug`, BECAUSE THIS SITE CANNOT KNOW WHETHER IT MATTERS - and the site that
+        // can already warns.
+        //
+        // Binding a non-default uniform buffer is only a defect if some shader READS one, and
+        // a guest may bind buffers no program declares. It does here: measured on PCSA00015,
+        // ZERO of its programs declare a `UniformBuffer` parameter, so this fired every run to
+        // announce a gap that starved nothing. `GxpLive::report_unfed_uniforms` makes exactly
+        // that check on the recompiler side - once per pair, against the parsed program - and
+        // warns only when a program really does declare one. That is the warning; this is the
+        // trace of the call.
+        //
+        // The general rule this is an instance of: **a report whose own site cannot tell
+        // whether the thing is wrong belongs at the site that can.** Warning from both means
+        // the noisy one drowns the true one, and the browser panel keeps 96 lines.
+        tracing::debug!(
             target: "vitaslop::gxm",
             stage,
             all,
             state = format_args!("{:#x}", ctx.arg(0)),
             "a precomputed state bound a non-default uniform buffer; the capture records \
              only the DEFAULT uniform buffer, so a shader reading that buffer index gets \
-             nothing"
+             nothing. Whether that starves anything is decided per PROGRAM - see \
+             `report_unfed_uniforms`, which warns when one actually declares a UniformBuffer"
         );
     }
     ctx.ret(0);
@@ -2726,7 +2950,7 @@ pub(crate) mod inline_op_tests {
 
     /// Guest address the synthetic `SceGxmProgramParameter` sits at. Word-aligned and
     /// away from 0 so a bug that reads the wrong base shows up as a mismatch.
-    const PARAM: u32 = 0x40;
+    pub(crate) const PARAM: u32 = 0x40;
 
     /// The parameter record: name offset, the packed word, array size, resource index.
     /// The packed word's nibbles are all DIFFERENT so a getter that reads the wrong
@@ -2914,18 +3138,22 @@ pub(crate) mod inline_op_tests {
     /// really does have an inline form (so `COVERED` cannot silently go stale against
     /// `inline_op`), and a sample of NIDs with real behaviour do not.
     #[test]
-    fn only_pure_getters_are_inlined() {
-        for &nid in COVERED.iter().chain(COVERED_PROGRAM.iter()) {
+    fn only_calls_with_no_other_behaviour_are_inlined() {
+        for &nid in COVERED.iter().chain(COVERED_PROGRAM.iter()).chain(COVERED_SETTERS.iter().map(|(n, _)| n))
+        {
             assert!(
                 inline_op(nid).is_some(),
                 "{} is listed as covered but has no inline form",
                 crate::nid::name(nid)
             );
         }
+        assert!(
+            inline_op(g::SET_VERTEX_STREAM).is_some(),
+            "the indexed setter has an inline form"
+        );
         for nid in [
             g::DRAW,                       // records a whole draw into the scene
             g::END_SCENE,                  // completes and folds a frame
-            g::SET_VERTEX_PROGRAM,         // updates the bound program
             g::PROGRAM_PARAMETER_GET_NAME, // returns a pointer, not a bitfield
             g::PROGRAM_GET_PARAMETER,      // computes an address from two reads
             // A string search over the whole parameter table: pure, but not ONE read.
@@ -2934,11 +3162,334 @@ pub(crate) mod inline_op_tests {
         ] {
             assert!(
                 inline_op(nid).is_none(),
-                "{} does more than one bitfield read and must not be inlined",
+                "{} does more than one memory access and must not be inlined",
+                crate::nid::name(nid)
+            );
+        }
+        // The setters that were CONSIDERED and refused, each with the reason on the entry.
+        // Listed rather than assumed, because "we did not get round to it" and "it must not
+        // be" look identical from outside `inline_op`.
+        for &(nid, why) in super::NOT_INLINABLE {
+            assert!(
+                inline_op(nid).is_none(),
+                "{} must NOT be inlined: it {why}",
                 crate::nid::name(nid)
             );
         }
     }
+
+    // --- The context-state SETTERS -------------------------------------------
+    //
+    // The obligation is the mirror image of the getters': a getter's inline form must
+    // compute what its handler returns, a setter's must WRITE what its handler writes,
+    // where its handler writes it. Both are second implementations of the same call that
+    // nothing else in the system compares, so both are pinned here.
+
+    /// Guest address of the synthetic context block. Not `PARAM`'s neighbourhood, and not
+    /// zero, so a form that ignored r0 would read a zeroed page instead of agreeing.
+    const CONTEXT: u32 = 0x400;
+
+    /// The value the setter is asked to store. Chosen so no default and no offset could
+    /// coincide with it.
+    const SET_VALUE: u32 = 0xA5A5_1234;
+
+    /// Run a setter NID through the real dispatch with `(r0, r1, r2) = (CONTEXT, a, b)` over
+    /// an initialised context block, and return the whole block afterwards.
+    fn setter_block(func_nid: u32, a: u32, b: u32) -> Vec<u8> {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = CONTEXT;
+        regs[1] = a;
+        regs[2] = b;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            // Start from the GXM defaults, so a handler that writes NOTHING is caught by the
+            // field still holding its default rather than by it holding zero - which is the
+            // default for several of these fields.
+            gxmctx::init(&mut ctx, CONTEXT);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        }
+        bytes
+    }
+
+    /// The word at `CONTEXT + offset` of a block.
+    fn block_word(block: &[u8], offset: u32) -> u32 {
+        let at = (CONTEXT + offset) as usize;
+        u32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"))
+    }
+
+    /// EVERY inlined setter must write exactly the word its inline form claims, at exactly
+    /// the offset its inline form claims, and NOTHING ELSE in the block.
+    ///
+    /// The "nothing else" half is the one that matters. A setter is a second implementation
+    /// of a one-word write; if the handler also touched a neighbouring field, the inline
+    /// form would silently stop doing so, and the guest would read a stale value out of a
+    /// field nobody thought was involved.
+    #[test]
+    fn inlined_setters_write_what_their_inline_forms_claim() {
+        let untouched = setter_block(g::SET_CULL_MODE, 0, 0);
+        for &(func_nid, name) in COVERED_SETTERS {
+            let op = inline_op(func_nid).expect("listed NID has an inline form");
+            let offset = op.store_offset().expect("a context setter writes through its pointer");
+            let block = setter_block(func_nid, SET_VALUE, 0);
+            assert_eq!(
+                block_word(&block, offset),
+                SET_VALUE,
+                "{name}: the handler must write the value at the offset its inline form uses"
+            );
+            assert_eq!(op.eval(0), 0, "{name}: a void setter returns the success code");
+            // Every OTHER word of the block must be exactly what a no-op left.
+            for w in 0..(gxmctx::BYTES / 4) {
+                let at = w * 4;
+                if at == offset {
+                    continue;
+                }
+                assert_eq!(
+                    block_word(&block, at),
+                    block_word(&untouched, at),
+                    "{name} changed the word at {at:#x}, which its inline form would not"
+                );
+            }
+        }
+    }
+
+    /// The indexed setter, over every index in range and one past the end.
+    ///
+    /// The out-of-range index is the arm the inline form hands BACK to the handler, so what
+    /// is checked there is that the handler declines to write - if it wrote past the array,
+    /// the guarded inline form would be the one behaving differently, not the handler.
+    #[test]
+    fn the_indexed_setter_writes_the_slot_its_inline_form_claims() {
+        let op = inline_op(g::SET_VERTEX_STREAM).expect("has an inline form");
+        let offset = op.store_offset().expect("writes through its pointer");
+        let untouched = setter_block(g::SET_CULL_MODE, 0, 0);
+        for index in 0..gxmctx::MAX_VERTEX_STREAMS as u32 {
+            assert!(!op.falls_back_on_index(index), "index {index} is in range");
+            let block = setter_block(g::SET_VERTEX_STREAM, index, SET_VALUE);
+            assert_eq!(block_word(&block, offset + index * 4), SET_VALUE, "stream {index}");
+        }
+        let past = gxmctx::MAX_VERTEX_STREAMS as u32;
+        assert!(op.falls_back_on_index(past), "one past the end is the handler's case");
+        let block = setter_block(g::SET_VERTEX_STREAM, past, SET_VALUE);
+        for w in 0..(gxmctx::BYTES / 4) {
+            assert_eq!(
+                block_word(&block, w * 4),
+                block_word(&untouched, w * 4),
+                "an out-of-range stream index must write NOTHING, not the word past the array"
+            );
+        }
+    }
+
+    /// The inlined setters, and the field each one owns. Written out rather than derived
+    /// from `inline_op`, so adding a setter there without a line here leaves
+    /// `only_calls_with_no_other_behaviour_are_inlined` failing.
+    ///
+    /// `SET_VERTEX_STREAM` is deliberately absent - it is indexed, and it has its own test.
+    const COVERED_SETTERS: &[(u32, &str)] = &[
+        (g::SET_VERTEX_PROGRAM, "sceGxmSetVertexProgram"),
+        (g::SET_FRAGMENT_PROGRAM, "sceGxmSetFragmentProgram"),
+        (g::SET_CULL_MODE, "sceGxmSetCullMode"),
+        (g::SET_FRONT_DEPTH_FUNC, "sceGxmSetFrontDepthFunc"),
+        (g::SET_FRONT_DEPTH_WRITE_ENABLE, "sceGxmSetFrontDepthWriteEnable"),
+        (g::SET_TWO_SIDED_ENABLE, "sceGxmSetTwoSidedEnable"),
+        (g::SET_BACK_DEPTH_FUNC, "sceGxmSetBackDepthFunc"),
+        (g::SET_BACK_DEPTH_WRITE_ENABLE, "sceGxmSetBackDepthWriteEnable"),
+        (g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE, "sceGxmSetFrontFragmentProgramEnable"),
+        (g::SET_BACK_FRAGMENT_PROGRAM_ENABLE, "sceGxmSetBackFragmentProgramEnable"),
+        (g::SET_FRONT_POLYGON_MODE, "sceGxmSetFrontPolygonMode"),
+        (g::SET_BACK_POLYGON_MODE, "sceGxmSetBackPolygonMode"),
+        (g::SET_FRONT_POINT_LINE_WIDTH, "sceGxmSetFrontPointLineWidth"),
+        (g::SET_FRONT_STENCIL_REF, "sceGxmSetFrontStencilRef"),
+        (g::SET_VIEWPORT_ENABLE, "sceGxmSetViewportEnable"),
+        (g::SET_FRONT_VISIBILITY_TEST_ENABLE, "sceGxmSetFrontVisibilityTestEnable"),
+        (g::SET_FRONT_VISIBILITY_TEST_INDEX, "sceGxmSetFrontVisibilityTestIndex"),
+        (g::SET_FRONT_VISIBILITY_TEST_OP, "sceGxmSetFrontVisibilityTestOp"),
+    ];
+}
+
+#[cfg(test)]
+mod texture_inline_tests {
+    //! The `SceGxmTexture` control-word getters and setters, each against its handler.
+    //!
+    //! These had no equivalence test at all before the setters were inlined, which was a gap
+    //! rather than a decision: a getter's inline form and its handler are two readings of one
+    //! bitfield, and the pair that matters most here is a getter and its SETTER, because they
+    //! are given the same `(shift, mask)` constants and a wrong pair would read back exactly
+    //! what it wrote while placing the field somewhere the hardware does not keep it.
+    //!
+    //! What makes a setter's failure invisible is that it writes a word it shares with seven
+    //! other settings. A form that stored the word instead of the field would leave a texture
+    //! whose address mode, mip count and LOD bias had all silently gone to zero - a picture
+    //! that reads as a decode bug, on a call the host no longer sees.
+
+    use super::inline_op_tests::{handler_result_over, PARAM};
+    use super::*;
+    use crate::nid::gxm as g;
+    use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+    use vitaslop_transpiler::InlineOp;
+
+    /// A synthetic texture's four control words. Every field a form under test reads holds a
+    /// DIFFERENT value, so a form that shifts by the wrong amount or masks the wrong width
+    /// cannot agree by coincidence - word 1 in particular carries a width and a height that
+    /// are neither equal nor zero.
+    ///
+    /// Content-free: these are field encodings, not game data.
+    fn texture_record() -> [u32; 4] {
+        [
+            // word 0: gamma 1, lod bias 0x15, mip count 0xb, mag 0x2, min 0x1, mip filter 1,
+            // uaddr 0x4, vaddr 0x3, and the low three bits set so a mask that is too wide shows.
+            (1 << 27) | (0x15 << 21) | (0xb << 17) | (0x2 << 12) | (0x1 << 10) | (1 << 9)
+                | (0x4 << 6) | (0x3 << 3) | 0x7,
+            // word 1: type 0x5 at bit 29, base format 0x0c at bit 24, width-1 = 1023 at bit 12,
+            // height-1 = 511 at bit 0. Width and height differ, so a form reading one shift for
+            // the other fails.
+            (0x5 << 29) | (0x0c << 24) | (1023 << 12) | 511,
+            0xDEAD_0004,
+            0xDEAD_0008,
+        ]
+    }
+
+    /// The word an inline form reads out of [`texture_record`], at its own offset.
+    fn word_at(offset: u32) -> u32 {
+        texture_record()[(offset / 4) as usize]
+    }
+
+    /// Every inlined texture GETTER computes what its handler returns.
+    #[test]
+    fn texture_getters_match_their_handlers() {
+        for func_nid in COVERED_GETTERS {
+            let op = inline_op(func_nid).expect("listed NID has an inline form");
+            let offset = op.offset().expect("a texture getter reads through its pointer argument");
+            assert_eq!(
+                op.eval(word_at(offset)),
+                handler_result_over(func_nid, texture_record()),
+                "inline form of {} disagrees with its handler",
+                crate::nid::name(func_nid)
+            );
+        }
+    }
+
+    /// `sceGxmTextureGetWidth`/`GetHeight` return SIZE, and the control word stores SIZE
+    /// MINUS ONE. The bias is the whole reason `LoadShiftMask` carries a `plus`, and a form
+    /// that dropped it would be off by one on every texture - which resizes a render target
+    /// by a pixel and is far easier to blame on a viewport than on a getter.
+    #[test]
+    fn the_dimension_getters_carry_the_size_minus_one_bias() {
+        let width = inline_op(g::TEXTURE_GET_WIDTH).expect("has an inline form");
+        let height = inline_op(g::TEXTURE_GET_HEIGHT).expect("has an inline form");
+        assert_eq!(width.eval(word_at(4)), 1024, "the fixture stores 1023 and the API says 1024");
+        assert_eq!(height.eval(word_at(4)), 512, "the fixture stores 511 and the API says 512");
+        // ...and a field of all ones still reads as the largest size, not as zero.
+        assert_eq!(width.eval(0xffff_ffff), 4096);
+    }
+
+    /// Run a texture setter through the real dispatch over [`texture_record`] and hand back
+    /// the four control words afterwards.
+    fn setter_words(func_nid: u32, value: u32) -> [u32; 4] {
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = PARAM;
+        regs[1] = value;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        for (i, w) in texture_record().iter().enumerate() {
+            let off = PARAM as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        }
+        let mut out = [0u32; 4];
+        for (i, w) in out.iter_mut().enumerate() {
+            let off = PARAM as usize + i * 4;
+            *w = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+        }
+        out
+    }
+
+    /// Every inlined texture SETTER writes exactly the field its inline form claims, and
+    /// leaves every other bit of the control words exactly as it found them.
+    ///
+    /// The value is deliberately WIDER than any field under test, so a form that failed to
+    /// mask it would spill into the neighbouring setting and be caught by the "nothing else
+    /// changed" half rather than by the field itself.
+    #[test]
+    fn texture_setters_write_the_field_their_inline_forms_claim() {
+        const WIDE: u32 = 0xFFFF_FFFF;
+        for &(func_nid, name) in COVERED_SETTERS {
+            let op = inline_op(func_nid).expect("listed NID has an inline form");
+            let InlineOp::StoreArgField { offset, shift, mask } = op else {
+                panic!("{name} must lower to a field store, got {op:?}");
+            };
+            assert_eq!(offset, 0, "{name}: every one of these is control word 0");
+            for value in [0u32, 1, 2, WIDE] {
+                let got = setter_words(func_nid, value);
+                let before = texture_record();
+                let want =
+                    (before[0] & !(mask << shift)) | ((value & mask) << shift);
+                assert_eq!(
+                    got[0], want,
+                    "{name}: the handler must write the field the inline form writes (value {value:#x})"
+                );
+                for i in 1..4 {
+                    assert_eq!(got[i], before[i], "{name} changed control word {i}");
+                }
+            }
+            assert_eq!(op.eval(0), 0, "{name}: a void setter returns the success code");
+        }
+    }
+
+    /// A setter and the getter of the SAME field must round-trip: what one writes, the other
+    /// reads. This is what catches a `(shift, mask)` pair that is self-consistent between the
+    /// two implementations of one call and still names the wrong bits.
+    #[test]
+    fn a_setter_and_its_getter_name_the_same_field() {
+        for &(set_nid, get_nid, name) in &[
+            (g::TEXTURE_SET_MAG_FILTER, g::TEXTURE_GET_MAG_FILTER, "magFilter"),
+            (g::TEXTURE_SET_MIN_FILTER, g::TEXTURE_GET_MIN_FILTER, "minFilter"),
+            (g::TEXTURE_SET_U_ADDR_MODE, g::TEXTURE_GET_U_ADDR_MODE_SAFE, "uAddrMode"),
+            (g::TEXTURE_SET_V_ADDR_MODE, g::TEXTURE_GET_V_ADDR_MODE_SAFE, "vAddrMode"),
+        ] {
+            let get = inline_op(get_nid).expect("the getter has an inline form");
+            // A value that fits every field under test, and is not the fixture's own.
+            let written = setter_words(set_nid, 2);
+            assert_eq!(get.eval(written[0]), 2, "{name} does not read back what it wrote");
+        }
+    }
+
+    /// The texture getters this module checks. Written out rather than derived from
+    /// `inline_op`, so a NID added there without a line here is not silently uncovered.
+    const COVERED_GETTERS: [u32; 11] = [
+        g::TEXTURE_GET_LOD_BIAS,
+        g::TEXTURE_GET_U_ADDR_MODE_SAFE,
+        g::TEXTURE_GET_V_ADDR_MODE_SAFE,
+        g::TEXTURE_GET_MIN_FILTER,
+        g::TEXTURE_GET_MAG_FILTER,
+        g::TEXTURE_GET_MIPMAP_COUNT,
+        g::TEXTURE_GET_MIPMAP_COUNT_UNSAFE,
+        g::TEXTURE_GET_GAMMA_MODE,
+        g::TEXTURE_GET_TYPE,
+        g::TEXTURE_GET_WIDTH,
+        g::TEXTURE_GET_HEIGHT,
+    ];
+
+    /// The texture setters this module checks, with the safe spellings included: they share a
+    /// handler and must therefore share an inline form, and "they obviously do" is exactly
+    /// the assumption a NID table typo defeats.
+    const COVERED_SETTERS: &[(u32, &str)] = &[
+        (g::TEXTURE_SET_MAG_FILTER, "sceGxmTextureSetMagFilter"),
+        (g::TEXTURE_SET_MIN_FILTER, "sceGxmTextureSetMinFilter"),
+        (g::TEXTURE_SET_U_ADDR_MODE, "sceGxmTextureSetUAddrMode"),
+        (g::TEXTURE_SET_V_ADDR_MODE, "sceGxmTextureSetVAddrMode"),
+        (g::TEXTURE_SET_U_ADDR_MODE_SAFE, "sceGxmTextureSetUAddrModeSafe"),
+        (g::TEXTURE_SET_V_ADDR_MODE_SAFE, "sceGxmTextureSetVAddrModeSafe"),
+    ];
 }
 
 #[cfg(test)]
@@ -3005,5 +3556,41 @@ mod semantic_tests {
         let semantic = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC, record(word));
         let index = handler_result_over(g::PROGRAM_PARAMETER_GET_SEMANTIC_INDEX, record(word));
         assert_eq!(semantic | (index << 8), word as u32, "the two fields reassemble the word");
+    }
+}
+
+#[cfg(test)]
+mod texture_control_word_field_tests {
+    use super::texword3;
+
+    /// `swizzle_format` is control word 3 bits 28:30, and `normalize_mode` is bit 31.
+    ///
+    /// From vitasdk `gxm.h struct SceGxmTexture`: word 3 is `palette_addr:26`, `lod_min1:2`,
+    /// `swizzle_format:3`, `normalize_mode:1`, so the swizzle's low bit is 26 + 2 = 28.
+    ///
+    /// This is a LAYOUT test, not a round-trip test, and that distinction is the whole point:
+    /// the shift was 29 in both the writer and the control-word reader, so every round-trip
+    /// agreed with itself while every GUEST-authored texture was read one bit off. A test that
+    /// wrote a swizzle and read it back would have passed against the bug.
+    #[test]
+    fn control_word_3_places_the_swizzle_at_bit_28_with_normalize_mode_above_it() {
+        assert_eq!(texword3::SWIZZLE_SHIFT, 26 + 2, "palette_addr:26 then lod_min1:2");
+        assert_eq!(texword3::SWIZZLE_MASK, 0x7, "swizzle_format is 3 bits");
+        // The field ends exactly below normalize_mode (bit 31); it does not overlap it.
+        assert_eq!(texword3::SWIZZLE_SHIFT + 3, 31);
+
+        let read = |w: u32| (w >> texword3::SWIZZLE_SHIFT) & texword3::SWIZZLE_MASK;
+        // Every selector survives a word that also carries a palette address, both lod_min1
+        // bits and normalize_mode - none of which may leak into the answer.
+        let noise = 0x03ff_ffff | (0b11 << 26) | (1 << 31);
+        for s in 0..8u32 {
+            let w = (noise & !(0x7 << texword3::SWIZZLE_SHIFT)) | (s << texword3::SWIZZLE_SHIFT);
+            assert_eq!(read(w), s, "selector {s} round-trips through a fully populated word");
+        }
+        // ...and the old shift is genuinely different, so this test fails against the bug:
+        // at shift 29 a word carrying swizzle 2 reads back as 1 (plus normalize_mode's bit).
+        let w = 2 << texword3::SWIZZLE_SHIFT;
+        assert_eq!(read(w), 2);
+        assert_eq!((w >> 29) & 0x7, 1, "the old reader halved every selector");
     }
 }

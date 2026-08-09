@@ -245,6 +245,56 @@ mod tests {
         );
     }
 
+    /// A knob whose reader ALREADY goes through this module must be in [`OVERRIDABLE`].
+    ///
+    /// # This has been forgotten four times, and it fails on the one engine it matters to
+    /// The browser has no environment ([[vitaslop-browser-has-no-env]]), so a knob reaches it
+    /// only through the override table. Routing a reader through `knobs::var`/`flag` and then
+    /// leaving the name out of `OVERRIDABLE` produces the worst possible pairing: the knob looks
+    /// browser-ready in every way a reader can check, and `set_override` PANICS on it - so
+    /// typing it into the phone's knobs box kills the run on boot with a black canvas and no
+    /// output. It happened to the call-site profiler, the inline-imports switch,
+    /// `VITASLOP_GXM_NO_MULTISAMPLE`, and then to all four compressed-texture knobs at once -
+    /// on a feature whose entire purpose was the phone.
+    ///
+    /// The condition is exactly checkable: the scanner already knows where each knob is READ,
+    /// so a read that names this module is a knob that has earned its place. `EXEMPT` is for the
+    /// handful that are routed for a different reason (a shared helper, a desktop-only path) and
+    /// each entry needs a stated one - it is not a place to put a knob that was simply
+    /// forgotten.
+    #[test]
+    fn a_knob_routed_through_this_module_is_reachable_from_the_browser() {
+        /// Routed, but deliberately not browser-reachable. Add with a REASON or not at all.
+        const EXEMPT: &[(&str, &str)] = &[];
+        let root = workspace_root();
+        let mut missing = Vec::new();
+        for k in scan_sources(&root) {
+            if OVERRIDABLE.contains(&k.name.as_str())
+                || EXEMPT.iter().any(|(n, _)| *n == k.name)
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(root.join(&k.file)) else { continue };
+            let Some(line) = text.lines().nth(k.line - 1) else { continue };
+            // The READ itself, not a mention: `knobs::var("NAME")` on one line. A doc comment
+            // that merely says the word "knobs" is not a read, which is why this looks for the
+            // call and the name together.
+            let routed = ["knobs::var(", "knobs::flag(", "knobs::var_os("]
+                .iter()
+                .any(|call| line.contains(call))
+                && line.contains(&k.name);
+            if routed {
+                missing.push(format!("{} ({}:{})", k.name, k.file, k.line));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these knobs are read through vitaslop_platform::knobs but are NOT in OVERRIDABLE, so \
+             setting one in the browser PANICS the run on boot:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
     #[test]
     fn knob_names_are_read_out_of_a_line() {
         assert_eq!(knob_names("std::env::var(\"VITASLOP_GXP_LIVE\")"), vec!["VITASLOP_GXP_LIVE"]);

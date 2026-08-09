@@ -16,6 +16,55 @@ import init, {
 } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
 
+// >>> FALL BACK TO A COMPATIBILITY-MODE ADAPTER WHEN THE NORMAL ONE IS BLOCKLISTED.
+//
+// Placed after the imports deliberately: ES module imports HOIST, so code written above them
+// still runs after they evaluate. What matters is only that this runs before the first adapter
+// request, which happens when the page posts the run message.
+//
+// Chrome keeps a WebGPU-specific blocklist, and in June 2026 it gained an entry for the
+// Imagination "ImgTec" driver v25.1 (crbug.com/520126488, CL 7952154). That driver has a real
+// defect - `textureSample` returns BLACK on PowerVR B- and D-series - so the block is correct
+// and must not be worked around with `enable-unsafe-webgpu`, which would put us back on a GPU
+// that returns wrong pixels. It shipped in Chrome 151 and took WebGPU away from a device that
+// had been running this emulator fine on Chrome 150.
+//
+// What the blocklist leaves standing is the COMPATIBILITY-MODE adapter, on the OpenGLES/ANGLE
+// backend rather than Vulkan - the Chromium engineer who wrote the CL says so explicitly
+// ("though compat mode still works"), and the device's own chrome://gpu reports that adapter as
+// Available while the Vulkan one is Blocklisted.
+//
+// It has to be asked for: Chrome only hands out a compat adapter for an explicit
+// `featureLevel: "compatibility"`. `wgpu` 30's WebGPU backend has no option for that, so the
+// request is patched here, at the one boundary both wgpu and our own probe pass through. The
+// shim is INERT unless the ordinary request has already failed, so a healthy device takes the
+// exact path it always did and pays one extra property read at startup.
+if (typeof navigator !== "undefined" && navigator.gpu && !navigator.gpu.__vitaslopCompatShim) {
+  const gpu = navigator.gpu;
+  const original = gpu.requestAdapter.bind(gpu);
+  gpu.requestAdapter = async (options) => {
+    const first = await original(options);
+    if (first) return first;
+    // Ask again in compatibility mode, keeping whatever else the caller wanted.
+    const compat = await original({ ...(options || {}), featureLevel: "compatibility" });
+    if (compat) {
+      // The renderer has to KNOW, not infer. Compatibility mode is not a slower version of
+      // WebGPU, it is a different validation regime: a texture may not carry a view of another
+      // format (so no sRGB twin on a render target), and `textureLoad` is refused on depth. Code
+      // that assumes the full regime does not run slowly there, it produces an invalid texture
+      // and every view, bind group and render pass built on it cascades into nothing - which
+      // arrives on screen as BLACK, with the cause 4,000 validation errors upstream.
+      globalThis.__vitaslopWebgpuCompat = true;
+      console.log(
+        "[gpu] no ordinary WebGPU adapter (this driver is likely blocklisted); " +
+          "running on a COMPATIBILITY-MODE adapter instead"
+      );
+    }
+    return compat;
+  };
+  gpu.__vitaslopCompatShim = true;
+}
+
 // Start loading the wasm module immediately; the first message awaits it.
 const ready = init();
 

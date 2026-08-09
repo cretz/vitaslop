@@ -725,6 +725,426 @@ pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
     })
 }
 
+/// Round `v` up to the next multiple of `to` (a power of two).
+fn align_up_to(v: u32, to: u32) -> u32 {
+    v.div_ceil(to) * to
+}
+
+/// The guest memory layout of ONE mip level of a texture: its own dimensions, the bytes
+/// per block-row, and the total bytes the level occupies.
+///
+/// Level `l` of a `width x height` image is `max(1, width >> l) x max(1, height >> l)`, laid
+/// out exactly the way level 0 is - which is why this is one function rather than the level-0
+/// arithmetic written out at the snapshot site plus a second copy for the chain. A SWIZZLED
+/// (Morton) level covers a power-of-two-padded BLOCK grid; a LINEAR one is row-major, with
+/// uncompressed rows padded to a multiple of 8 texels (the GXM linear alignment) and
+/// compressed rows block-packed.
+///
+/// `None` for a format [`block_layout`] cannot size.
+pub fn level_layout(base_format: u32, tex_type: u32, width: u32, height: u32, level: u32) -> Option<LevelLayout> {
+    let (block_w, block_h, block_bytes) = block_layout(base_format)?;
+    let w = (width >> level).max(1);
+    let h = (height >> level).max(1);
+    let blocks_x = w.div_ceil(block_w);
+    let blocks_y = h.div_ceil(block_h);
+    let (stride, bytes) = if swizzled_type(tex_type) {
+        let padded_x = blocks_x.next_power_of_two();
+        let padded_y = blocks_y.next_power_of_two();
+        (padded_x * block_bytes, padded_x * padded_y * block_bytes)
+    } else {
+        let row_blocks = if block_w == 1 { align_up_to(w, 8) } else { blocks_x };
+        (row_blocks * block_bytes, row_blocks * block_bytes * blocks_y)
+    };
+    Some(LevelLayout { width: w, height: h, blocks_x, blocks_y, stride, bytes })
+}
+
+/// One mip level's geometry in guest memory - see [`level_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LevelLayout {
+    /// The level's own texel dimensions (`max(1, base >> level)`).
+    pub width: u32,
+    pub height: u32,
+    /// Blocks needed to COVER those dimensions. For a swizzled level the stored grid is
+    /// each of these rounded up to a power of two, which is why `bytes` is not simply
+    /// `blocks_x * blocks_y * block_bytes`.
+    pub blocks_x: u32,
+    pub blocks_y: u32,
+    /// Bytes per stored block-row.
+    pub stride: u32,
+    /// Bytes the whole level occupies.
+    pub bytes: u32,
+}
+
+/// The most mip levels a `width x height` image can have, counting level 0: the chain ends
+/// at the level whose larger dimension is 1.
+pub fn max_mip_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+/// Byte offset of level `level` from the start of ONE face, and the sum of the whole
+/// `levels`-long chain when `level == levels`. Levels are stored consecutively, largest
+/// first. That ordering is a claim about the DEVICE and was MEASURED, not assumed: a real mip
+/// level is approximately a box filter of the one above it, and on this title's 2048x2048 atlas
+/// the mean absolute difference against that reference runs 2.4-6.6 for nine levels against
+/// 22-30 for an X-flipped control. See [[vitaslop-guest-mip-chain-layout]].
+pub fn level_offset(base_format: u32, tex_type: u32, width: u32, height: u32, level: u32) -> Option<u32> {
+    let mut off = 0u32;
+    for l in 0..level {
+        off += level_layout(base_format, tex_type, width, height, l)?.bytes;
+    }
+    Some(off)
+}
+
+/// One mip level of `t`, as a standalone single-face [`BoundTexture`] of that level's own
+/// dimensions.
+///
+/// Every decoder here reads `width`, `height`, `stride` and `face_bytes` off the texture and
+/// nothing else, so a level presented this way decodes through EXACTLY the same code as a
+/// level-0 texture of the same size - which is the point. The alternative was threading a level
+/// index through `texel_rgba_face`, `decode_face_fast`, `texel_byte_offset` and the PVRTC path,
+/// four places that would then each have to be right.
+///
+/// `None` when `t` does not hold that level, or when the format cannot be sized.
+pub fn level_view(t: &BoundTexture, face: u32, level: u32) -> Option<BoundTexture> {
+    let l = level_layout(t.base_format, t.tex_type, t.width, t.height, level)?;
+    let off = (face * t.face_bytes + level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
+    let end = off.checked_add(l.bytes as usize)?;
+    if level >= t.levels || end > t.pixels.len() {
+        return None;
+    }
+    Some(BoundTexture {
+        width: l.width,
+        height: l.height,
+        stride: l.stride,
+        faces: 1,
+        face_bytes: l.bytes,
+        levels: 1,
+        pixels: Arc::from(&t.pixels[off..end]),
+        ..t.clone()
+    })
+}
+
+/// The guest base formats that ARE a WebGPU block format, bit for bit.
+///
+/// `UBC1`/`UBC2`/`UBC3` are BC1/BC2/BC3 (DXT1/3/5) - the same 4x4 blocks with the same
+/// endpoint and index encoding, which is why [`decode_bc_texel`] decodes all three with the
+/// stock algorithm. BC4/BC5 (`0x88`..`0x8b`) are deliberately absent: they are one- and
+/// two-channel formats, and this decoder expands them into RGBA on its own terms, so handing
+/// the blocks to a `Bc4`/`Bc5` view would change which channel a shader reads. That is a real
+/// piece of work, not an oversight, and it is worth ~0 MB on the measured frame.
+fn block_format_for(base_format: u32) -> Option<BlockFormat> {
+    Some(match base_format {
+        0x85 => BlockFormat::Bc1,
+        0x86 => BlockFormat::Bc2,
+        0x87 => BlockFormat::Bc3,
+        _ => return None,
+    })
+}
+
+/// Lay the guest's own compressed blocks out the way a WebGPU upload reads them, or return
+/// `None` with a REPORT naming which condition stopped it.
+///
+/// # The four conditions, and why each one is a hard gate rather than a best effort
+/// 1. **The format must be one WebGPU has** ([`block_format_for`]).
+/// 2. **The channel swizzle must be the identity.** The swizzle is applied DURING the decode
+///    (`swizzle4` at the end of `decode_face_fast`) and there is no shader path for it, so a
+///    permuted texture handed over raw renders with its channels wrong - the failure that looks
+///    like a lighting or alpha bug and is neither.
+/// 3. **Both dimensions must be a multiple of the 4x4 block.** WebGPU refuses to CREATE a
+///    compressed texture whose size is not, so this one fails loudly either way; gating here
+///    turns a device-lost into a decode.
+/// 4. **The guest must actually have a mip chain**, unless the texture is small enough to have
+///    no chain at all. There is no box filter for a compressed block, so a passthrough without
+///    the guest's levels ships level 0 alone, and that is the "distant road reads as white
+///    speckle" failure ([[vitaslop-textures-need-mips]]) - trading a memory defect for an image
+///    defect, which is not a trade this makes silently.
+///
+/// A cube map is excluded for the same reason its chain is not snapshotted: how six chains
+/// interleave in guest memory is not established.
+fn compressed_source(t: &BoundTexture) -> Option<CompressedUpload> {
+    // Nothing here is worth doing on a GPU that cannot take the result - and this runs on the
+    // texture decode path of every engine, including one whose adapter exposes ASTC and ETC2
+    // but not BC.
+    if !vitaslop_platform::gpu::block_compression_available() || !compression_enabled() {
+        return None;
+    }
+    // The lossless handover first; the lossy re-encode is the fallback, never the preference.
+    // EVERY reason the passthrough declines - an unrepresentable format, a permuted channel
+    // swizzle, a missing mip chain - is a reason the transcode can handle, because it decodes to
+    // RGBA8 first and owns the encode from there. Routing refusals here rather than to the plain
+    // decode is worth 45 MB of one measured race frame: two 4096x2048 UBC2 surfaces that declare
+    // one mip level while asking the hardware to filter between levels, which the passthrough
+    // must refuse and the transcode can give a full chain.
+    passthrough_source(t).or_else(|| transcoded_source(t))
+}
+
+/// The lossless half of [`compressed_source`]: the guest's own blocks, or `None` with a report.
+fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
+    let why = |reason: &'static str| -> Option<CompressedUpload> {
+        report_passthrough_refused(t.base_format, reason);
+        None
+    };
+    // PVRTC has no WebGPU format on any adapter, so it can never pass through. Not reported as a
+    // refusal - there is nothing to fix about it, and a line that fires for every PVRTC texture
+    // in the title would bury the refusals that ARE actionable.
+    let format = block_format_for(t.base_format)?;
+    if (t.swizzle >> 12) & 0x7 != 0 {
+        return why("the channel swizzle is not the identity, and it is applied during the decode");
+    }
+    if t.faces != 1 {
+        return why("it is a cube map, whose six mip chains' interleaving is not established");
+    }
+    if t.width % 4 != 0 || t.height % 4 != 0 {
+        return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
+    }
+    // >>> "NO CHAIN" AND "NO MIP FILTER" ARE DIFFERENT FACTS, AND ONLY ONE OF THEM BLOCKS THIS.
+    //
+    // A texture the guest gave one level AND told the hardware not to filter between levels is
+    // one the DEVICE samples from its base level alone. Handing over that single level is then
+    // the faithful answer, not a shortcut - what would be lost is a chain we invented, which the
+    // Vita never had. MEASURED on a race frame: this is one 4096x2048 UBC2 surface priced at
+    // 42.7 MB as RGBA8 against 8 MB of blocks, i.e. the single largest texture in the frame.
+    //
+    // A texture with one level and mip filtering ON is the opposite case and stays refused: the
+    // hardware IS interpolating between levels, so dropping to level 0 is the "distant road
+    // reads as white speckle" failure ([[vitaslop-textures-need-mips]]).
+    let full_chain = max_mip_levels(t.width, t.height);
+    if t.levels < 2 && full_chain > 1 && t.mip_filter != 0 {
+        return why(
+            "the guest declares no mip chain for it yet asks the hardware to FILTER between \
+             levels, and a compressed level 0 on its own is the white-speckle failure a \
+             generated chain exists to prevent",
+        );
+    }
+    // `stride / block_bytes` is what the LINEAR decoder uses for its row pitch, so it is what
+    // this uses too - a second, independently written row walk is how two readers of the same
+    // bytes come to disagree.
+    let bb = format.block_bytes();
+    let swizzled = swizzled_type(t.tex_type);
+    let mut data: Vec<u8> = Vec::with_capacity(t.face_bytes as usize);
+    for level in 0..t.levels {
+        let l = level_layout(t.base_format, t.tex_type, t.width, t.height, level)?;
+        let base = (level_offset(t.base_format, t.tex_type, t.width, t.height, level)?) as usize;
+        let (pw, ph) = (l.blocks_x.next_power_of_two(), l.blocks_y.next_power_of_two());
+        for by in 0..l.blocks_y {
+            for bx in 0..l.blocks_x {
+                // The ONLY transformation between guest memory and the GPU: a swizzled texture
+                // stores its blocks in Morton order over a power-of-two-padded grid, and WebGPU
+                // wants them in linear block rows. It permutes whole blocks and touches no bit
+                // inside one, so it is still a passthrough - the picture the GPU decodes is the
+                // picture the hardware decodes.
+                let index = if swizzled { morton_index(bx, by, pw, ph) } else { by * (l.stride / bb) + bx };
+                let off = base + (index * bb) as usize;
+                match t.pixels.get(off..off + bb as usize) {
+                    Some(block) => data.extend_from_slice(block),
+                    // Unreachable given the snapshot sized the read from the same arithmetic -
+                    // and if that ever stops being true, a short read must not become a texture
+                    // of stale blocks.
+                    None => return why("its snapshot is shorter than its own block layout"),
+                }
+            }
+        }
+    }
+    Some(CompressedUpload { format, data: Arc::new(data), levels: t.levels, transcoded: false })
+}
+
+/// Whether compressed textures reach the GPU compressed at all. ON, and the only reason to set
+/// `VITASLOP_TEX_COMPRESS=0` is to A/B against the plain decode.
+///
+/// # ONE knob, and it only turns the feature OFF
+/// This was three: a passthrough switch, a transcode switch defaulting to OFF, and a mip probe.
+/// That is three forks the default path never takes, and the transcode one was worse than
+/// surface area - it put the large half of the win (232 MB -> 57 MB, at a measured mean error of
+/// 1.78/255) behind a flag that the engine the work exists for would never have set. A knob is
+/// not a way to defer a decision: if the measurement says it is better, it is the default.
+///
+/// Cached, like every knob on this path: this is tested once per distinct texture, and reading
+/// an unset environment variable on Windows copies and re-encodes the whole environment block.
+fn compression_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_TEX_COMPRESS").ok().as_deref() != Some("0"))
+}
+
+/// Re-encode a texture WebGPU has no format for (PVRTC), or one the passthrough refused, so it
+/// can live on the GPU compressed instead of landing there as RGBA8 at eight times its size.
+///
+/// # The trade, stated plainly, and why it is the DEFAULT
+/// PVRTC is 172.4 MB of a measured 274 MB race frame - the largest item by far, and the reason a
+/// phone's allocation fails and the draw comes out WHITE. It is also the one family that CANNOT
+/// pass through: no WebGPU adapter exposes a PVRTC format, so the choice is RGBA8 or a
+/// re-encode, and a re-encode means PVRTC -> RGBA8 -> BC, two lossy block codecs in series.
+///
+/// MEASURED against the plain decode on that frame: the working set goes **232 MB -> 57 MB**,
+/// the wall clock does not move (62.2 s against 63.9 s - the encode is one-off per texture and
+/// pays for itself in evictions not taken), and the picture costs **mean 1.78 of 255,
+/// PSNR 38.2 dB, 99.7% of channels within 16 levels** - indistinguishable side by side at
+/// 960x544. An 8x memory cut for an error smaller than the dithering already in the source is
+/// not a decision worth deferring to a flag nobody sets.
+///
+/// It is not "unfaithful" in any direction that was available: the Vita samples PVRTC directly
+/// and we cannot, so the real choice is between a picture that is slightly re-quantised and one
+/// that does not fit in memory.
+///
+/// # It supplies a full chain whichever way the guest stored the texture
+/// Unlike the passthrough, this path OWNS the encode, so a texture the guest left mipless can
+/// still be given a box-filtered chain - built in RGBA8, where a box filter is meaningful, and
+/// encoded level by level. That removes the one condition that refuses a passthrough outright.
+fn transcoded_source(t: &BoundTexture) -> Option<CompressedUpload> {
+    // Only formats that are ALREADY block-compressed on the guest. Re-encoding an uncompressed
+    // texture would be a pure quality loss to save memory the title never asked to spend, and
+    // the uncompressed formats are 0.8 MB of a 274 MB frame - there is nothing there to win.
+    if crate::pvrtc::Variant::from_base_format(t.base_format).is_none()
+        && block_format_for(t.base_format).is_none()
+    {
+        return None;
+    }
+    let why = |reason: &'static str| -> Option<CompressedUpload> {
+        report_passthrough_refused(t.base_format, reason);
+        None
+    };
+    // >>> THE ETC2 ARM IS OFF WHILE ITS COST IS MEASURED. This is a DIAGNOSTIC STATE, not a
+    // decision - restore it, or restore it with the encode moved off the guest's thread, once
+    // the A/B below has an answer.
+    //
+    // The encoder runs at a measured 6.2 Mtexel/s against BC1's 95, synchronously, on the guest
+    // thread, at the moment a texture is first seen. That is invisible on a desktop, which takes
+    // the BC arm, and it lands entirely on the one engine this work exists for. Sizing it: one
+    // 2048x2048 atlas with a full chain is ~5.6 Mtexel, so ~0.9 s at the DESKTOP rate, and this
+    // is wasm on a phone. A screen transition brings a whole screen's textures at once, which is
+    // why the device freezes on entering a screen and runs steadily inside one - and why nothing
+    // in the panel shows it, since every decode counter reads zero once the transition is past.
+    if vitaslop_platform::gpu::block_family() == BlockFamily::Etc2 {
+        return why(
+            "the ETC2 transcode is disabled while its cost is measured - the encoder runs at \
+             6.2 Mtexel/s on the guest's own thread, so a screen's worth of textures is tens of \
+             seconds of frozen guest at the transition that first binds them",
+        );
+    }
+    if t.faces != 1 {
+        return why("it is a cube map, whose six mip chains' interleaving is not established");
+    }
+    if t.width % 4 != 0 || t.height % 4 != 0 {
+        return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
+    }
+    // Every level as RGBA8: the guest's own where it has them, box-filtered from the level
+    // above where it does not. Mixing the two would be worse than either - the chain has to be
+    // consistent, so the guest's levels are used for as long as they last.
+    let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+    let want = max_mip_levels(t.width, t.height);
+    for level in 0..want {
+        if level < t.levels {
+            if let Some(view) = level_view(t, 0, level) {
+                let (w, h, rgba, seam) = decode_texture_seam(&view);
+                if seam != TexelSeam::Rgba8 {
+                    return why("it decodes onto the half seam, which is DATA and not colour");
+                }
+                levels.push((w, h, rgba));
+                continue;
+            }
+        }
+        let Some((pw, ph, prev)) = levels.last() else {
+            return why("its level 0 could not be decoded");
+        };
+        let (w, h, rgba) = halve_rgba8(*pw, *ph, prev);
+        levels.push((w, h, rgba));
+    }
+    // ONE format for the whole texture: a mip chain is a single GPU texture, so a level that
+    // happens to be opaque cannot be BC1 while its neighbour is BC3. Any alpha anywhere means
+    // the alpha-carrying format for all of it.
+    let opaque = levels.iter().all(|(_, _, px)| crate::bcenc::is_opaque(px));
+    // Encode for the family the ADAPTER takes. A desktop takes BC; the phone this work exists
+    // for takes ETC2 and nothing else, and encoding BC for it produced a 354 MB working set
+    // while the report claimed a win.
+    let family = vitaslop_platform::gpu::block_family();
+    let format = match (family, opaque) {
+        (BlockFamily::Etc2, true) => BlockFormat::Etc2Rgb8,
+        (BlockFamily::Etc2, false) => BlockFormat::Etc2Rgba8,
+        (_, true) => BlockFormat::Bc1,
+        (_, false) => BlockFormat::Bc3,
+    };
+    let mut data = Vec::new();
+    for (w, h, rgba) in &levels {
+        let block = match format {
+            BlockFormat::Bc1 => crate::bcenc::encode_bc1(*w, *h, rgba),
+            BlockFormat::Bc3 => crate::bcenc::encode_bc3(*w, *h, rgba),
+            BlockFormat::Etc2Rgb8 => crate::etcenc::encode_etc2_rgb8(*w, *h, rgba),
+            BlockFormat::Etc2Rgba8 => crate::etcenc::encode_etc2_rgba8(*w, *h, rgba),
+            // BC2 is never CHOSEN as a transcode target - its 4-bit uncompressed alpha is
+            // strictly worse than BC3's interpolated block at the same size.
+            BlockFormat::Bc2 => unreachable!("BC2 is a passthrough format, never a transcode one"),
+        };
+        data.extend_from_slice(&block);
+    }
+    report_transcoded(t.base_format, format);
+    Some(CompressedUpload { format, data: Arc::new(data), levels: levels.len() as u32, transcoded: true })
+}
+
+/// Report - once per (guest format, chosen block format) - that a texture was RE-ENCODED.
+///
+/// A transcode is not a passthrough and must never read like one in a log: the blocks the GPU
+/// gets are ours, not the guest's, and the picture is a second lossy step away from the asset.
+/// Whoever reads a capture and sees the working set collapse is entitled to know which of the
+/// two things did it.
+fn report_transcoded(base_format: u32, to: BlockFormat) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let key = (base_format, to as u32);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(key) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "gxm textures: base format {base_format:#04x} has no WebGPU format, so it is being \
+         RE-ENCODED to {to:?}. This is a second lossy step on top of \
+         the guest's own compression - it buys roughly 8x the GPU memory and costs image quality"
+    );
+}
+
+/// Report - once per (format, reason) - that a texture WebGPU has a block format for was
+/// decoded to RGBA8 anyway.
+///
+/// Every one of these is megabytes on a device that has none to spare, and each reason has a
+/// different fix. Silence here would leave "the working set did not shrink" with no way to tell
+/// a passthrough that never fired from one that fired and was not enough.
+fn report_passthrough_refused(base_format: u32, reason: &'static str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, &'static str)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((base_format, reason)) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "gxm textures: base format {base_format:#04x} is a block format the GPU could take \
+         verbatim, but it is being DECODED to RGBA8 instead because {reason}"
+    );
+}
+
+/// Box-filter one RGBA8 image down by two, for the mip levels a transcode has to invent when
+/// the guest supplied none.
+fn halve_rgba8(w: u32, h: u32, src: &[u8]) -> (u32, u32, Vec<u8>) {
+    let (dw, dh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut dst = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh as usize {
+        for x in 0..dw as usize {
+            for c in 0..4usize {
+                let x0 = (2 * x).min(w as usize - 1);
+                let x1 = (2 * x + 1).min(w as usize - 1);
+                let y0 = (2 * y).min(h as usize - 1);
+                let y1 = (2 * y + 1).min(h as usize - 1);
+                let at = |xx: usize, yy: usize| src[(yy * w as usize + xx) * 4 + c] as u32;
+                dst[(y * dw as usize + x) * 4 + c] =
+                    ((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8;
+            }
+        }
+    }
+    (dw, dh, dst)
+}
+
 /// Whether a `SceGxmTextureType` selector uses the GPU's Morton (Z-order) swizzled
 /// memory layout: `SCE_GXM_TEXTURE_SWIZZLED` (0), `SWIZZLED_ARBITRARY` (5), and both CUBE
 /// layouts (2, 7), whose individual faces are swizzled images.
@@ -775,7 +1195,7 @@ fn rgb565(c: u16) -> [u8; 3] {
 /// Decode one texel `(px, py)` in `[0,4)` from a 4x4 BC/DXT block. Handles BC1
 /// (`0x85`, 8-byte block, optional 1-bit alpha), BC2 (`0x86`, explicit 4-bit
 /// alpha) and BC3 (`0x87`, interpolated alpha). Returns straight RGBA8.
-fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) -> [u8; 4] {
+pub(crate) fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) -> [u8; 4] {
     let t = (py * 4 + px) as usize;
     // The BC1 color sub-block sits after the 8-byte alpha block for BC2/BC3.
     let color_off = if base_format == 0x85 { 0 } else { 8 };
@@ -938,14 +1358,67 @@ fn sample_texture_bilinear(t: &BoundTexture, u: f32, v: f32) -> [u8; 4] {
 /// `Rgba8Unorm` image it can point-sample with a REPEAT sampler for the identical
 /// result. Returns `(width, height, rgba)`; a zero-sized texture yields a 1x1 opaque
 /// magenta so an unexpected empty binding is visible rather than a GPU error.
+///
+/// Callers that must handle the 64-bit half-float family exactly want
+/// [`decode_texture_seam`]: this one narrows it back to bytes, which is right for a
+/// screenshot or a colour probe and wrong for a texture whose texels are data.
 pub fn decode_texture_rgba8(t: &BoundTexture) -> (u32, u32, Vec<u8>) {
+    let (w, h, data, seam) = decode_texture_seam(t);
+    match seam {
+        TexelSeam::Rgba8 => (w, h, data),
+        // Narrow, and say so in the only way that survives: the values are still right, only
+        // coarser. A caller wanting the exact lanes has the function above.
+        TexelSeam::Rgba16Float => (
+            w,
+            h,
+            data.chunks_exact(2)
+                .map(|c| {
+                    let v = half_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The full-precision decode: `(width, height, texels, the layout they are in)`.
+pub fn decode_texture_seam(t: &BoundTexture) -> (u32, u32, Vec<u8>, TexelSeam) {
     decode_texture_rgba8_counted(t, &mut BuildWork::default())
 }
 
 /// [`decode_texture_rgba8`], recording which path decoded it. See [`BuildWork`].
-fn decode_texture_rgba8_counted(t: &BoundTexture, work: &mut BuildWork) -> (u32, u32, Vec<u8>) {
+/// The seam a guest base format decodes ONTO - see [`TexelSeam`].
+///
+/// Only `0x1b` (F16F16F16F16) widens, and the restriction is deliberate.
+///
+/// It is the one format the half seam represents EXACTLY - the decode is a lane-for-lane copy of
+/// the guest's own halves through the channel swizzle, so nothing is converted and the narrowed
+/// reading stays identical to what the byte decoder produces from the same bytes. That identity
+/// is what keeps [`texel_rgba_face`] usable as the per-texel oracle for this format.
+///
+/// `0x1c`/`0x1d` (U16/S16 normalized) are deliberately NOT here. Core WebGPU has no filterable
+/// `rgba16unorm`, so they would have to go through f16, which is 11 bits of mantissa - better
+/// than 8, but still lossy, and lossy in a DIFFERENT way from the byte path, which makes the two
+/// decoders disagree for no exactness gained. Swapping one lossy conversion for another is not
+/// worth losing the oracle over. If a title is ever measured to store data in one of them, the
+/// answer is a third seam, not this one.
+pub fn seam_for_format(base_format: u32) -> TexelSeam {
+    match base_format {
+        0x1b => TexelSeam::Rgba16Float,
+        _ => TexelSeam::Rgba8,
+    }
+}
+
+fn decode_texture_rgba8_counted(
+    t: &BoundTexture,
+    work: &mut BuildWork,
+) -> (u32, u32, Vec<u8>, TexelSeam) {
+    let seam = seam_for_format(t.base_format);
     if t.width == 0 || t.height == 0 {
-        return (1, 1, vec![255, 0, 255, 255]);
+        return (1, 1, vec![255, 0, 255, 255], TexelSeam::Rgba8);
+    }
+    if seam == TexelSeam::Rgba16Float {
+        return decode_texture_rgba16f(t, work);
     }
     // A cube map decodes to its six faces stacked in `BoundTexture::faces` order, which is the
     // layer order the GPU binds them in.
@@ -968,7 +1441,47 @@ fn decode_texture_rgba8_counted(t: &BoundTexture, work: &mut BuildWork) -> (u32,
             }
         }
     }
-    (t.width, t.height, rgba)
+    (t.width, t.height, rgba, TexelSeam::Rgba8)
+}
+
+/// Decode an F16F16F16F16 texture onto the HALF seam, lane for lane.
+///
+/// A straight copy of the guest's own halves through the channel swizzle - bit-exact, which is
+/// the whole reason for the wider seam. See [`seam_for_format`] for why no other format is here.
+fn decode_texture_rgba16f(
+    t: &BoundTexture,
+    work: &mut BuildWork,
+) -> (u32, u32, Vec<u8>, TexelSeam) {
+    let faces = t.faces.max(1);
+    let texels = (t.width * t.height * faces) as usize;
+    let mut out = vec![0u8; texels * 8];
+    // The channel swizzle field, bits 12..14 of the full `SceGxmTextureFormat` - the same
+    // extraction `decode_uncompressed_at` does. Passing `t.swizzle` raw permutes by whatever the
+    // whole word happens to be, which is a plausible-looking wrong picture rather than an error.
+    let swizzle = (t.swizzle >> 12) & 0x7;
+    for f in 0..faces {
+        let face_len = (t.width * t.height * 8) as u64;
+        DECODE_BY_FORMAT.lock().unwrap()[(t.base_format & 0xff) as usize] += face_len;
+        work.tex_out_per_texel += face_len;
+        let mut o = (f * t.width * t.height * 8) as usize;
+        for y in 0..t.height {
+            for x in 0..t.width {
+                // The lane offsets are the byte-seam decoder's, so the two paths agree about
+                // WHICH lane is which; only the width of what is kept differs.
+                let base = texel_byte_offset(t, f, x, y);
+                let raw = |i: usize| -> u16 {
+                    let b = |k: usize| t.pixels.get(base + k).copied().unwrap_or(0);
+                    u16::from_le_bytes([b(i * 2), b(i * 2 + 1)])
+                };
+                let lanes = swizzle4_u16(raw(0), raw(1), raw(2), raw(3), swizzle);
+                for (i, l) in lanes.iter().enumerate() {
+                    out[o + i * 2..o + i * 2 + 2].copy_from_slice(&l.to_le_bytes());
+                }
+                o += 8;
+            }
+        }
+    }
+    (t.width, t.height, out, TexelSeam::Rgba16Float)
 }
 
 /// Decode one face of a BLOCK-COMPRESSED texture a block at a time, into `out`. Returns
@@ -1446,6 +1959,36 @@ fn swizzle4(b0: u8, b1: u8, b2: u8, b3: u8, swizzle: u32) -> [u8; 4] {
         2 => [b3, b2, b1, b0], // RGBA
         3 => [b1, b2, b3, b0], // BGRA
         _ => [b0, b1, b2, b3], // ABGR
+    }
+}
+
+/// [`swizzle4`] over 16-bit lanes, for the half seam. The selector means the same thing - it
+/// names CHANNELS, not byte widths - so the permutation is identical and only the lane type
+/// differs; `swizzle4_agrees_with_swizzle4_u16` is the test that keeps the two from drifting.
+fn swizzle4_u16(l0: u16, l1: u16, l2: u16, l3: u16, swizzle: u32) -> [u16; 4] {
+    match swizzle {
+        1 => [l2, l1, l0, l3], // ARGB
+        2 => [l3, l2, l1, l0], // RGBA
+        3 => [l1, l2, l3, l0], // BGRA
+        _ => [l0, l1, l2, l3], // ABGR
+    }
+}
+
+/// Byte offset of one texel of an UNCOMPRESSED texture, honouring the swizzled (Morton)
+/// layout exactly as [`texel_rgba_face`] does.
+///
+/// Factored out rather than duplicated because a second copy of this addressing is how the
+/// two decoders would come to disagree about where a texel is - and a texture read at the
+/// wrong offset produces plausible values, not obvious garbage.
+fn texel_byte_offset(t: &BoundTexture, face: u32, x: u32, y: u32) -> usize {
+    let bytes = block_layout(t.base_format).map_or(4, |(_, _, b)| b);
+    let face_base = (face * t.face_bytes) as usize;
+    if swizzled_type(t.tex_type) {
+        let pw = t.width.next_power_of_two();
+        let ph = t.height.next_power_of_two();
+        face_base + (morton_index(x, y, pw, ph) * bytes) as usize
+    } else {
+        face_base + (y * t.stride + x * bytes) as usize
     }
 }
 
@@ -3177,6 +3720,8 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
         stride: image.width * 4,
         faces: 1,
         face_bytes: image.width * image.height * 4,
+        // A rendered image is exactly one level: nothing generated a chain for it.
+        levels: 1,
         data_addr: proto.data_addr,
         pixels: Arc::from(image.rgba.as_slice()),
         u_addr_mode: proto.u_addr_mode,
@@ -3184,6 +3729,7 @@ fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
         lod_bias: proto.lod_bias,
         min_filter: proto.min_filter,
         mag_filter: proto.mag_filter,
+        mip_filter: proto.mip_filter,
         // The substitute holds the pixels this frame RENDERED, which are already linear in
         // whatever space the pass wrote them - there is no gamma-encoded memory here for a
         // sampler to decode, so the mode does not carry over from the prototype binding.
@@ -3612,7 +4158,10 @@ fn depth_passes(z: f32, stored: f32, func: u32) -> bool {
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use vitaslop_platform::gpu::{DrawSpace, GxmDraw, GxmTexture, RenderScene, GXM_VERTEX_STRIDE};
+use vitaslop_platform::gpu::{
+    BlockFamily, BlockFormat, CompressedUpload, DrawSpace, GxmDraw, GxmTexture, RenderScene,
+    TexelSeam, GXM_VERTEX_STRIDE,
+};
 
 /// Map the software rasterizer's internal [`Space`] to the neutral GPU
 /// [`DrawSpace`] the renderer consumes. One-to-one; kept as a small function so the
@@ -3732,8 +4281,51 @@ pub struct RenderSceneBuilder {
     /// buffer it was keyed on. The reference is not decoration: the key folds that buffer's
     /// address, and a freed buffer's address can be reused by an unrelated texture.
     decode_cache: HashMap<u64, (GxmTexture, Arc<[u8]>)>,
+    /// Per cached decode: `(the frame it was last used on, the decoded bytes it holds)`.
+    ///
+    /// # Why the budget cannot be enforced by clearing
+    /// This cache used to be emptied WHOLESALE when it went over budget. That is safe - the
+    /// keys fold the source bytes, so a re-decode is only work - but its failure shape is a
+    /// cliff, not a slope: once a title's per-frame working set exceeds the budget the clear
+    /// fires part-way through EVERY frame, evicting exactly what the next frame is about to
+    /// ask for, and the cross-frame hit rate goes to zero rather than down.
+    ///
+    /// MEASURED on PCSA00015's campaign map, on the target phone (PowerVR D-series):
+    /// `0.97 cache clears` per frame, 225 textures and 51 MB RE-DECODED every frame,
+    /// `build 718.3 ms` of an `878.2 ms` render against `cpu 94.1 ms` - the render was 90% of
+    /// the frame and the decode was 82% of the render. 1 fps. Nothing about that frame was a
+    /// shader or a draw-call problem; it was this cache missing every single time.
+    ///
+    /// So eviction is per entry, it never takes something the frame in flight has already
+    /// used, and the budget is floored at one frame's working set - see
+    /// [`RenderSceneBuilder::decode_frame_high`].
+    decode_used: HashMap<u64, (u64, usize)>,
+    /// Bumped by [`RenderSceneBuilder::begin_frame`]. Entries stamped with it are in use by
+    /// the frame being built and are not eviction candidates at any budget.
+    decode_epoch: u64,
+    /// The largest ONE-FRAME decode working set seen, and the floor the budget is raised to.
+    ///
+    /// A cache that cannot hold one frame is worse than none: every entry it drops mid-frame
+    /// is re-decoded before that same frame ends.
+    ///
+    /// # Why this floor cannot raise the PEAK heap
+    /// The obvious objection is that a 330 MB floor adds 330 MB to a wasm heap that is already
+    /// near what a phone will allow. It does not. Every decoded texture a frame samples is
+    /// held by that frame's built scenes for as long as the frame is being built and encoded -
+    /// the `GxmTexture`s carry `Arc`s to exactly these buffers - so the bytes are live during
+    /// the frame whether or not a cache also references them. The floor only extends their
+    /// LIFETIME across the frame boundary; the high-water mark is set by the frame itself and
+    /// is unchanged. What it trades is memory held between frames against a re-decode, which
+    /// is the trade a cache exists to make.
+    decode_frame_high: usize,
+    /// Bytes first touched by the CURRENT frame, accumulating toward [`Self::decode_frame_high`].
+    decode_frame_bytes: usize,
     /// Decoded RGBA8 bytes held by `decode_cache`, against `decode_cache_budget_bytes`.
     decode_cache_bytes: usize,
+    /// Keys this run has EVICTED and not yet seen come back, so a re-decode of one can be
+    /// counted as thrash rather than as ordinary miss traffic. Keys only - the point is
+    /// identity, and holding the pixels would defeat the eviction that put them here.
+    decode_evicted: std::collections::HashSet<u64>,
     /// The last reported "the whole scene was dropped" tally, so [`DropTally::report`]
     /// prints when the shape CHANGES rather than sixty times a second.
     last_empty: Option<DropTally>,
@@ -3800,10 +4392,32 @@ pub struct BuildWork {
     /// does not cover, and only this split says which.
     pub tex_out_blockwise: u64,
     pub tex_out_per_texel: u64,
-    /// Times the decode cache was cleared WHOLESALE on reaching `DECODE_CACHE_CAP`. Any
-    /// nonzero value here mid-run means the working set outgrew the cache and every entry
-    /// is being re-decoded, which is a cliff, not a gradient.
-    pub tex_cache_clears: u64,
+    /// Times a decode went over budget and ran an EVICTION PASS, and how many entries those
+    /// passes dropped.
+    ///
+    /// # This counter used to mean something else, and the old name outlived the change
+    /// It was `tex_cache_clears`, and it counted WHOLESALE clears of the decode cache. When
+    /// eviction went per-entry the counting site moved with it but the name and the doc did
+    /// not, so a healthy LRU under steady pressure - which runs an eviction pass whenever the
+    /// budget is touched, by design - reported "2.13 cache clears per frame" and read as the
+    /// exact cliff the per-entry rewrite had been done to remove. A stale name on a live
+    /// counter is worse than no counter: it does not merely fail to answer, it answers wrongly
+    /// and with a number attached.
+    ///
+    /// **Neither of these is the cliff signal.** A pass that sheds cold entries is the cache
+    /// working. What says the working set has outgrown the budget is
+    /// [`Self::tex_redecoded_after_evict`].
+    pub tex_evict_passes: u64,
+    pub tex_evicted: u64,
+    /// Textures decoded whose key had been EVICTED earlier in the run - the cache thrashing.
+    ///
+    /// This is the number the old `tex_cache_clears` was being read as. A cache under healthy
+    /// pressure evicts what is not coming back, so this stays near zero however many eviction
+    /// passes run; a cache whose budget is below the working set evicts exactly what the next
+    /// frame asks for, and then every eviction shows up here one frame later. It separates
+    /// "the cache is doing its job" from "the cache is a re-decode loop with extra steps",
+    /// which is the distinction a pass count cannot make in either direction.
+    pub tex_redecoded_after_evict: u64,
     /// Draws built, and how many of them ran their fixed-function representation.
     pub draws: u64,
     pub draws_fixed_function: u64,
@@ -3839,7 +4453,9 @@ impl BuildWork {
         self.tex_bytes += o.tex_bytes;
         self.tex_out_blockwise += o.tex_out_blockwise;
         self.tex_out_per_texel += o.tex_out_per_texel;
-        self.tex_cache_clears += o.tex_cache_clears;
+        self.tex_evict_passes += o.tex_evict_passes;
+        self.tex_evicted += o.tex_evicted;
+        self.tex_redecoded_after_evict += o.tex_redecoded_after_evict;
         self.draws += o.draws;
         self.draws_fixed_function += o.draws_fixed_function;
         self.gxp_vertex_bytes += o.gxp_vertex_bytes;
@@ -3857,7 +4473,8 @@ impl BuildWork {
             "build work/frame: {:.0} draws ({:.0} fixed-function), {:.0} vertices walked \
              (+{:.0} deferred depth-range), {:.0} indices scanned, textures {:.1} decoded \
              / {:.1} cached ({:.2} MB decoded: {:.2} MB fast-path + {:.2} MB per-texel), \
-             {:.2} cache clears, indices {:.1} expanded \
+             {:.2} evict passes dropping {:.1} entries, {:.1} RE-decoded after eviction, \
+             indices {:.1} expanded \
              / {:.1} cached ({:.2} clears), gxp shares {:.2} MB vertices, copies {:.2} MB \
              indices + {:.2} MB uniforms",
             self.draws as f64 / n,
@@ -3870,7 +4487,9 @@ impl BuildWork {
             self.tex_bytes as f64 / n / (1024.0 * 1024.0),
             self.tex_out_blockwise as f64 / n / (1024.0 * 1024.0),
             self.tex_out_per_texel as f64 / n / (1024.0 * 1024.0),
-            self.tex_cache_clears as f64 / n,
+            self.tex_evict_passes as f64 / n,
+            self.tex_evicted as f64 / n,
+            self.tex_redecoded_after_evict as f64 / n,
             self.index_expanded as f64 / n,
             self.index_expand_cached as f64 / n,
             self.index_cache_clears as f64 / n,
@@ -3890,7 +4509,9 @@ static BUILD_WORK: std::sync::Mutex<BuildWork> = std::sync::Mutex::new(BuildWork
     tex_bytes: 0,
     tex_out_blockwise: 0,
     tex_out_per_texel: 0,
-    tex_cache_clears: 0,
+    tex_evict_passes: 0,
+    tex_evicted: 0,
+    tex_redecoded_after_evict: 0,
     draws: 0,
     draws_fixed_function: 0,
     gxp_vertex_bytes: 0,
@@ -4208,6 +4829,11 @@ fn pvrtc_whole_image() -> bool {
 /// than a decoded image, and a scene can carry hundreds of distinct meshes.
 const INDEX_CACHE_CAP: usize = 4096;
 
+/// Cap on the remembered-evicted key set (`RenderSceneBuilder::decode_evicted`), in ENTRIES.
+/// Eight bytes each, so this is a fraction of a megabyte, and it is a DIAGNOSTIC bound: past it
+/// the thrash count under-reports rather than the set growing with the run.
+const EVICTED_KEYS_CAP: usize = 1 << 16;
+
 /// FNV-1a over a byte slice. Used to content-address a draw's index buffer; the same
 /// construction the renderer's packed-vertex cache uses, kept local so this file does not
 /// depend on the platform crate for one hash.
@@ -4233,9 +4859,39 @@ impl RenderSceneBuilder {
                 && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"),
             decode_cache: HashMap::new(),
             decode_cache_bytes: 0,
+            decode_used: HashMap::new(),
+            decode_epoch: 0,
+            decode_frame_high: 0,
+            decode_frame_bytes: 0,
+            decode_evicted: std::collections::HashSet::new(),
             last_empty: None,
             index_cache: HashMap::new(),
         }
+    }
+
+    /// Start a new FRAME's worth of scene building.
+    ///
+    /// A frame is many scenes ([[vitaslop-a-frame-is-many-scenes]]), so the builder cannot see
+    /// the boundary on its own - and the boundary is exactly what the texture cache needs, for
+    /// two things: which entries are in use right now (and so un-evictable), and how big one
+    /// frame's working set really is. Both engines call this immediately before building the
+    /// frame's scenes; a caller that forgets simply never bumps the epoch, which leaves every
+    /// entry looking in-use and the cache growing to the whole run, so it is a loud kind of
+    /// wrong rather than a silent one.
+    pub fn begin_frame(&mut self) {
+        // Take the finished frame's working set BEFORE resetting, so the floor is only ever
+        // set by a COMPLETE frame.
+        //
+        // It RELAXES rather than ratcheting: a plain running maximum would let one heavy
+        // loading frame pin the budget for the rest of the run, which is how a cache that was
+        // supposed to adapt turns into an unbounded one. Decaying by 1/16 a frame means a
+        // floor set by a burst is forgotten within a second of gameplay, while a working set
+        // that is genuinely this size re-asserts it on every frame and never decays at all.
+        self.decode_frame_high = self
+            .decode_frame_bytes
+            .max(self.decode_frame_high - self.decode_frame_high / 16);
+        self.decode_frame_bytes = 0;
+        self.decode_epoch = self.decode_epoch.wrapping_add(1);
     }
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
@@ -4243,16 +4899,60 @@ impl RenderSceneBuilder {
         let key = tex_key(t);
         if let Some((g, _)) = self.decode_cache.get(&key) {
             work.tex_cached += 1;
-            return g.clone();
+            let g = g.clone();
+            self.touch_decode(key, g.rgba.len());
+            return g;
         }
         work.tex_decoded += 1;
+        // Was this key here before and thrown out? That, and not the number of eviction passes,
+        // is what says the budget is under the working set - see `tex_redecoded_after_evict`.
+        // Removed on the way past, so one eviction can only ever be blamed once.
+        if self.decode_evicted.remove(&key) {
+            work.tex_redecoded_after_evict += 1;
+        }
         work.tex_bytes += t.pixels.len() as u64;
-        let (width, height, rgba) = decode_texture_rgba8_counted(t, work);
+        let (width, height, rgba, texel) = decode_texture_rgba8_counted(t, work);
         self.decode_cache_bytes += rgba.len();
-        if self.decode_cache_bytes >= decode_cache_budget_bytes() {
-            work.tex_cache_clears += 1;
-            self.decode_cache.clear();
-            self.decode_cache_bytes = rgba.len();
+        // The budget, floored at ONE FRAME's working set - see `decode_frame_high`. Eviction
+        // is per entry and never takes something this frame has already decoded, because that
+        // is precisely the entry the rest of the frame is about to ask for again.
+        let budget = decode_cache_budget_bytes().max(self.decode_frame_high);
+        if self.decode_cache_bytes >= budget {
+            let epoch = self.decode_epoch;
+            // Oldest first, so steady pressure sheds what has gone longest unused rather than
+            // whatever the hash order yields.
+            let mut stale: Vec<(u64, u64)> = self
+                .decode_used
+                .iter()
+                .filter(|(_, (used, _))| *used != epoch)
+                .map(|(k, (used, _))| (*k, *used))
+                .collect();
+            stale.sort_by_key(|(_, used)| *used);
+            let mut evicted = 0usize;
+            for (k, _) in stale {
+                if self.decode_cache_bytes < budget {
+                    break;
+                }
+                if self.decode_cache.remove(&k).is_some() {
+                    let bytes = self.decode_used.remove(&k).map_or(0, |(_, b)| b);
+                    self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
+                    // Bounded, and bounded by DROPPING rather than by clearing: this set exists
+                    // only to attribute a later re-decode, so forgetting an old eviction costs
+                    // an under-count of thrash and nothing else. Clearing it wholesale on a cap
+                    // would be the same failure shape the cache itself was rewritten to remove.
+                    if self.decode_evicted.len() < EVICTED_KEYS_CAP {
+                        self.decode_evicted.insert(k);
+                    }
+                    evicted += 1;
+                }
+            }
+            if evicted > 0 {
+                work.tex_evict_passes += 1;
+                work.tex_evicted += evicted as u64;
+            }
+            // If nothing was evictable every entry belongs to this frame, and the frame has to
+            // finish. The floor above means that state lasts exactly one frame: the next
+            // `begin_frame` records this working set and the budget rises to meet it.
         }
         // Carry the magnification filter so the GPU picks the matching sampler (LINEAR ->
         // bilinear, as the software `sample_texture_bilinear` does). SceGxmTextureFilter:
@@ -4265,15 +4965,39 @@ impl RenderSceneBuilder {
             height,
             faces: t.faces.max(1),
             rgba: Arc::new(rgba),
+            texel,
             base_format: t.base_format,
             swizzle: t.swizzle,
             filter_linear,
             addr_mode_u: t.u_addr_mode,
             addr_mode_v: t.v_addr_mode,
             gamma: t.gamma != 0,
+            // Built on the COLD path, beside the decode it may replace, and cached with it.
+            // Note the decode still happens: the renderer chooses between them, because whether
+            // the device can take blocks at all is not knowable here.
+            compressed: compressed_source(t),
         };
         self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
+        self.touch_decode(key, g.rgba.len());
         g
+    }
+
+    /// Mark a decoded texture as used by the frame being built, and count it toward that
+    /// frame's working set the FIRST time this frame touches it.
+    ///
+    /// Counting per lookup rather than per texture would inflate the learned floor by the
+    /// number of draws that sample it - a shadow map bound by two hundred draws is two hundred
+    /// lookups and one texture - which would then raise the budget to something the frame
+    /// never actually needed resident.
+    fn touch_decode(&mut self, key: u64, bytes: usize) {
+        let epoch = self.decode_epoch;
+        let first_this_frame = match self.decode_used.insert(key, (epoch, bytes)) {
+            Some((used, _)) => used != epoch,
+            None => true,
+        };
+        if first_this_frame {
+            self.decode_frame_bytes += bytes;
+        }
     }
 
     /// Reduce a captured scene to general draws. Each triangle-list draw is decoded
@@ -4634,6 +5358,7 @@ impl RenderSceneBuilder {
                     fprog: d.fprog.clone(),
                     vert_sa: d.vert_sa.clone(),
                     frag_sa: d.frag_sa.clone(),
+                    frag_sa_addr: d.frag_sa_addr,
                     vertices: d.vertices.clone(),
                     vertex_stride: d.vertex_stride,
                     attributes,
@@ -4728,11 +5453,68 @@ impl RenderSceneBuilder {
             width: c.width,
             height: c.height,
             gamma: c.gamma != 0,
+            // `SCE_GXM_COLOR_SURFACE_SCALE_MSAA_DOWNSCALE` == 1. Anything else is NONE as far
+            // as rasterisation goes - the enum's other values do not ask for a finer raster.
+            msaa_downscale: c.scale_mode == 1,
+            // How many samples per pixel the RENDER TARGET was created with. The scale mode
+            // above says this surface stores a resolved image; this says what was resolved
+            // into it. See `gpu::gxm_sample_count`.
+            multisample: scene.multisample,
         });
         // Where this scene's DEPTH lands, for the same reason as `target` above: a later pass
         // that samples this depth names exactly this address.
         let depth_addr = scene.depth.map(|d| d.depth_addr).unwrap_or(0);
-        RenderScene { draws, target, depth_min, depth_scale, depth_addr }
+        // A depth-only pass has no colour surface to take an extent from, and a
+        // `SceGxmDepthStencilSurface` carries none. Take the draws' viewport, which is the
+        // guest's own statement of the pixel region it rasterises into (GXM's viewport is
+        // offset/scale in pixels, so the width is `2*|xScale|`) - and only when the viewport
+        // is actually in effect, because with it disabled the transform is the render
+        // target's and says nothing. See `RenderScene::depth_extent`.
+        //
+        // >>> IT IS TAKEN FROM EVERY DRAW, NOT THE FIRST, AND THE AGREEMENT IS THE POINT.
+        // Reading only `draws.first()` makes the extent a GUESS that happens to be right
+        // whenever the pass is uniform - which is every pass anyone has looked at, so the
+        // reporting had to hedge forever and say "this size is DERIVED" on every run. A derived
+        // value that every contributing draw agrees on is not a guess, it is a measurement: if
+        // all the viewport-enabled draws in the pass name one rectangle, that rectangle IS the
+        // guest's statement of the region, and there is nothing left to warn about. If they
+        // disagree there is a real ambiguity, and THAT is worth saying out loud - so the caller
+        // is told which of the two it got instead of being told the size is derived either way.
+        let depth_extent = if target.is_none() && depth_addr != 0 {
+            let mut seen: Option<(u32, u32)> = None;
+            let mut agreed = true;
+            for d in scene.draws.iter().filter(|d| d.render_state.viewport_enable == 0) {
+                let v = d.render_state.viewport;
+                let e = ((2.0 * v[1].abs()) as u32, (2.0 * v[3].abs()) as u32);
+                if e.0 <= 1 || e.1 <= 1 {
+                    continue;
+                }
+                match seen {
+                    None => seen = Some(e),
+                    // Keep the LARGEST, so an ambiguous pass still gets a target big enough for
+                    // every draw in it rather than one that clips the others.
+                    Some(prev) if prev != e => {
+                        agreed = false;
+                        seen = Some((prev.0.max(e.0), prev.1.max(e.1)));
+                    }
+                    Some(_) => {}
+                }
+            }
+            seen.map(|(w, h)| (w, h, agreed))
+        } else {
+            None
+        };
+        let depth_extent_ambiguous = matches!(depth_extent, Some((_, _, false)));
+        let depth_extent = depth_extent.map(|(w, h, _)| (w, h));
+        RenderScene {
+            draws,
+            target,
+            depth_min,
+            depth_scale,
+            depth_addr,
+            depth_extent,
+            depth_extent_ambiguous,
+        }
     }
 }
 
@@ -4768,6 +5550,7 @@ mod geometry_tests {
             fprog: crate::capture::no_program(),
             vert_sa: vec![],
             frag_sa: vec![],
+            frag_sa_addr: 0,
             shader_expanded: false,
         }
     }
@@ -4822,6 +5605,7 @@ mod geometry_tests {
         let scene = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![
                 located_draw([10.0, 0.0, 5.0], &tri, mvp),
                 // Same placement as the first: one object drawn in two passes.
@@ -4855,7 +5639,7 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![d.clone()] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![d.clone()] }, 100, 100);
         let h = found[0].heading.expect("an identity rotation has a heading");
         assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
         assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
@@ -4866,7 +5650,7 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![turned] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![turned] }, 100, 100);
         let h = found[0].heading.unwrap();
         assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
 
@@ -4875,7 +5659,7 @@ mod geometry_tests {
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { color: None, depth: None, draws: vec![flat] }, 100, 100);
+        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![flat] }, 100, 100);
         assert_eq!(found[0].heading, None);
     }
 
@@ -4892,11 +5676,12 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { color: None, depth: None, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene { color: None, depth: None, multisample: 0, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
         // Next frame: something new is submitted first, and the car has moved.
         let after = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![
                 located_draw([99.0, 0.0, 0.0], &other, mvp),
                 located_draw([1.0, 0.0, 0.0], &car, mvp),
@@ -5222,6 +6007,7 @@ mod geometry_tests {
         let scene = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(8.0, 0.0, 0.0, 20.0, 20.0, true),
@@ -5255,7 +6041,7 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
         let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
@@ -5268,6 +6054,7 @@ mod geometry_tests {
         let scene = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(30.0, -50.0, -50.0, 0.0, 50.0, true),
@@ -5283,7 +6070,7 @@ mod geometry_tests {
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
@@ -5334,6 +6121,7 @@ mod geometry_tests {
             stride: 16,
             faces: 1,
             face_bytes: 64,
+            levels: 1,
             data_addr: 0x1000,
             pixels: vec![tex_byte; 64].into(),
             u_addr_mode: 0,
@@ -5341,6 +6129,7 @@ mod geometry_tests {
             lod_bias: 0,
             min_filter: 0,
             mag_filter: 0,
+            mip_filter: 0,
             gamma: 0,
         }];
         d
@@ -5351,6 +6140,7 @@ mod geometry_tests {
         let scene = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.0, 0.0, 7)],
         };
         let found = locate_sprites(&scene, 960, 544);
@@ -5365,6 +6155,7 @@ mod geometry_tests {
         let moved = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![sprite_quad(400.0, 200.0, 480.0, 280.0, 0.0, 0.0, 7)],
         };
         let after = locate_sprites(&moved, 960, 544);
@@ -5373,6 +6164,7 @@ mod geometry_tests {
         let other = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.5, 0.5, 7)],
         };
         assert_ne!(locate_sprites(&other, 960, 544)[0].id, s.id, "another atlas region");
@@ -5384,6 +6176,7 @@ mod geometry_tests {
         let build = |shift: f32, hero_extra: f32| Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: (0..12)
                 .map(|i| {
                     let x = 40.0 * i as f32 + shift;
@@ -5424,6 +6217,7 @@ mod geometry_tests {
         let scene = Scene {
             color: None,
             depth: None,
+            multisample: 0,
             draws: vec![
                 sprite_quad(10.0, 10.0, 50.0, 50.0, 0.0, 0.0, 1),
                 ground_quad(0.0, -10.0, -10.0, 10.0, 10.0, true),
@@ -5450,7 +6244,7 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { color: None, depth: None, draws }
+        Scene { color: None, depth: None, multisample: 0, draws }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
@@ -5495,7 +6289,7 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { color: None, depth: None, draws };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -5554,7 +6348,7 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { color: None, depth: None, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -5606,7 +6400,7 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { color: None, depth: None, draws };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws };
         let strict = world_extent(&scene, 1.0).unwrap();
         assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
         let dense = world_extent(&scene, 0.90).unwrap();
@@ -5664,9 +6458,9 @@ mod supersample_tests {
         }
         let tex = BoundTexture {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
-            faces: 1, face_bytes: 4,
+            faces: 1, face_bytes: 4, levels: 1,
             pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
-            lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0,
+            lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
         };
         let draw = Draw {
             fragment_program_header: 0,
@@ -5681,9 +6475,9 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
+            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
         };
-        let scene = Scene { color: None, depth: None, draws: vec![draw] };
+        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -5713,8 +6507,8 @@ mod supersample_tests {
         }
         let tex = BoundTexture {
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
-            faces: 1, face_bytes: tw * th * 4,
-            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0,
+            faces: 1, face_bytes: tw * th * 4, levels: 1,
+            pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
         };
         // A full-frame Pixel-space quad over a 32px frame, uv 0..1 across the 64px checker, so
         // it is minified 2x - the aliasing regime one sample per pixel cannot resolve.
@@ -5738,9 +6532,9 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], shader_expanded: false,
+            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
         };
-        let s = Scene { color: None, depth: None, draws: vec![draw] };
+        let s = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;
@@ -5780,6 +6574,7 @@ mod texture_tests {
             stride,
             faces: 1,
             face_bytes: pixels.len() as u32,
+            levels: 1,
             data_addr: 0,
             pixels: pixels.into(),
             u_addr_mode: 0,
@@ -5787,6 +6582,7 @@ mod texture_tests {
             lod_bias: 0,
             min_filter: 0,
             mag_filter: 0,
+            mip_filter: 0,
             gamma: 0,
         }
     }
@@ -5842,6 +6638,220 @@ mod texture_tests {
                 }
             }
         }
+    }
+
+    /// A mip chain's levels are consecutive and largest-first, and every level is laid out
+    /// exactly the way level 0 is.
+    ///
+    /// This is the arithmetic the snapshot sizes its read from and the passthrough finds its
+    /// blocks with, so it is asserted against hand-computed numbers rather than against a
+    /// second copy of itself. The SWIZZLED case is the one worth spelling out: a level's grid is
+    /// padded to a power of two in BLOCKS, so a 12x12 BC3 level is 3x3 blocks stored as 4x4.
+    #[test]
+    fn a_mip_level_is_laid_out_like_a_level_zero_of_its_own_size() {
+        // BC3 (16-byte 4x4 blocks), LINEAR: level l is w>>l wide, block-packed rows.
+        let l0 = level_layout(0x87, 3, 64, 32, 0).unwrap();
+        assert_eq!((l0.width, l0.height, l0.blocks_x, l0.blocks_y), (64, 32, 16, 8));
+        assert_eq!((l0.stride, l0.bytes), (16 * 16, 16 * 8 * 16));
+        let l2 = level_layout(0x87, 3, 64, 32, 2).unwrap();
+        assert_eq!((l2.width, l2.height, l2.blocks_x, l2.blocks_y), (16, 8, 4, 2));
+        assert_eq!(l2.bytes, 4 * 2 * 16);
+        // Offsets accumulate, so level 2 sits after levels 0 and 1.
+        let l1 = level_layout(0x87, 3, 64, 32, 1).unwrap();
+        assert_eq!(level_offset(0x87, 3, 64, 32, 2).unwrap(), l0.bytes + l1.bytes);
+        // SWIZZLED: the stored grid is padded to a power of two IN BLOCKS, which is why a
+        // level's size is not simply its block count times the block size.
+        let s = level_layout(0x87, 0, 12, 12, 0).unwrap();
+        assert_eq!((s.blocks_x, s.blocks_y), (3, 3));
+        assert_eq!(s.bytes, 4 * 4 * 16, "a 3x3 block grid is STORED as 4x4");
+        // The chain bottoms out at 1x1, which is still one whole block.
+        let last = level_layout(0x87, 3, 64, 32, 5).unwrap();
+        assert_eq!((last.width, last.height, last.bytes), (2, 1, 16));
+        assert_eq!(max_mip_levels(64, 32), 7);
+    }
+
+    /// The compressed passthrough must hand the GPU blocks that decode to the SAME image the
+    /// decoder produces from the guest's own bytes.
+    ///
+    /// A swizzled texture stores its blocks in Morton order and WebGPU wants linear block rows,
+    /// so the passthrough permutes them - and a permutation is exactly the kind of change that
+    /// produces a plausible picture with its 4x4 tiles shuffled. The check is therefore end to
+    /// end: decode the guest texture, then decode a LINEAR texture built from the passthrough
+    /// bytes, and require the two images to be identical. Nothing here trusts `morton_index`
+    /// twice over - the reference decode reaches its blocks by the decoder's own addressing.
+    #[test]
+    fn the_passthrough_preserves_the_image_it_hands_over() {
+        for &(fmt, bb) in &[(0x85u32, 8u32), (0x86, 16), (0x87, 16)] {
+            for &tex_type in &[0u32 /* swizzled */, 3 /* linear */] {
+                let (w, h) = (16u32, 8u32);
+                let levels = max_mip_levels(w, h);
+                let total = level_offset(fmt, tex_type, w, h, levels).unwrap() as usize;
+                let pixels: Vec<u8> = (0..total).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+                let mut t = tex(fmt, 0, w, h, w.div_ceil(4) * bb, pixels);
+                t.tex_type = tex_type;
+                t.levels = levels;
+                t.face_bytes = total as u32;
+                let c = compressed_source(&t).expect("a mipped, identity-swizzled, block-aligned texture");
+                assert_eq!(c.levels, levels);
+                assert_eq!(c.data.len(), (0..levels).map(|l| {
+                    let ll = level_layout(fmt, tex_type, w, h, l).unwrap();
+                    (ll.blocks_x * ll.blocks_y * bb) as usize
+                }).sum::<usize>());
+                // Level 0 of the passthrough, read back as a LINEAR texture of the same size.
+                let l0 = level_layout(fmt, tex_type, w, h, 0).unwrap();
+                let n0 = (l0.blocks_x * l0.blocks_y * bb) as usize;
+                let linear = tex(fmt, 0, w, h, l0.blocks_x * bb, c.data[..n0].to_vec());
+                let (_, _, want) = decode_texture_rgba8(&t);
+                let (_, _, got) = decode_texture_rgba8(&linear);
+                assert_eq!(got, want, "passthrough changed the image for {fmt:#x} type {tex_type}");
+            }
+        }
+    }
+
+    /// Every condition that refuses a LOSSLESS passthrough refuses it, and a texture meeting all
+    /// of them is accepted.
+    ///
+    /// Each condition is a different WRONG PICTURE rather than a slow one, so the temptation to
+    /// let one through "just this once" has to fail here. The mip condition is the subtle one:
+    /// dropping the chain trades a memory defect for the white-speckle image defect.
+    ///
+    /// Asserted against `passthrough_source`, NOT `compressed_source` - a refusal is not a
+    /// decision to decode, it is a decision to re-encode instead (see the test below). Pointing
+    /// this at the outer function would silently stop testing anything the day the fallback
+    /// landed, because every refusal would still come back `Some`.
+    #[test]
+    fn a_passthrough_is_refused_for_each_stated_reason() {
+        let build = |fmt: u32, tex_type: u32, w: u32, h: u32| {
+            let levels = max_mip_levels(w, h);
+            let total = level_offset(fmt, tex_type, w, h, levels).unwrap() as usize;
+            let mut t = tex(fmt, 0, w, h, w.div_ceil(4) * 16, vec![7u8; total]);
+            t.tex_type = tex_type;
+            t.levels = levels;
+            t.face_bytes = total as u32;
+            t
+        };
+        assert!(passthrough_source(&build(0x87, 3, 16, 8)).is_some(), "the accepted case");
+        // A format WebGPU does not have.
+        assert!(passthrough_source(&build(0x83, 3, 16, 8)).is_none(), "PVRTC has no WebGPU format");
+        assert!(passthrough_source(&build(0x88, 3, 16, 8)).is_none(), "BC4 is not a four-channel format");
+        // A non-identity channel swizzle - applied during the decode, with no shader path.
+        let mut s = build(0x87, 3, 16, 8);
+        s.swizzle = 1 << 12;
+        assert!(passthrough_source(&s).is_none(), "a permuted texture must not pass through raw");
+        // A size that is not a multiple of the 4x4 block: WebGPU refuses to create it.
+        assert!(passthrough_source(&build(0x87, 3, 14, 8)).is_none(), "14 is not a multiple of 4");
+        // No guest mip chain on a texture big enough to need one, while the guest asks the
+        // hardware to FILTER between levels - so the device really is reading levels we would
+        // not be supplying.
+        let mut m = build(0x87, 3, 16, 8);
+        m.levels = 1;
+        m.mip_filter = 1;
+        assert!(passthrough_source(&m).is_none(), "level 0 alone is the white-speckle failure");
+        // The same texture with mip filtering OFF is one the DEVICE samples from its base level
+        // alone, so one level is the faithful answer and not a dropped chain. This is the
+        // largest single texture in a measured race frame - 42.7 MB as RGBA8, 8 MB as blocks.
+        m.mip_filter = 0;
+        assert!(
+            passthrough_source(&m).is_some(),
+            "a texture the hardware itself samples mipless has no chain to lose"
+        );
+        // ... but a 4x4 texture HAS no chain to have, so one level is the whole truth.
+        let mut tiny = build(0x87, 3, 4, 4);
+        tiny.levels = 1;
+        assert!(passthrough_source(&tiny).is_some(), "a 4x4 texture's chain is one level");
+        // A cube map: how six chains interleave is not established.
+        let mut cube = build(0x87, 2, 16, 8);
+        cube.faces = 6;
+        assert!(passthrough_source(&cube).is_none(), "a cube map's chain layout is not established");
+    }
+
+    /// A refusal falls through to the TRANSCODE, not to the plain decode.
+    ///
+    /// This is where the megabytes actually are. Two 4096x2048 UBC2 surfaces in a measured race
+    /// frame declare one mip level while asking the hardware to filter between levels - the
+    /// passthrough must refuse them, and letting them land as RGBA8 costs 45.3 MB against the
+    /// 11.3 MB a re-encode with a generated chain costs. The distinction the test protects is
+    /// that a refusal is a decision about WHICH compressed path, never a decision to expand.
+    #[test]
+    fn a_refused_passthrough_falls_through_to_the_transcode() {
+        let (w, h) = (16u32, 8u32);
+        let levels = max_mip_levels(w, h);
+        let total = level_offset(0x87, 3, w, h, levels).unwrap() as usize;
+        let mut t = tex(0x87, 0, w, h, w.div_ceil(4) * 16, vec![7u8; total]);
+        t.tex_type = 3;
+        t.levels = 1;
+        t.mip_filter = 1;
+        t.face_bytes = total as u32;
+        assert!(passthrough_source(&t).is_none(), "the passthrough must refuse this");
+        let c = compressed_source(&t).expect("but it must still reach the GPU compressed");
+        assert!(c.transcoded, "and it must be labelled as re-encoded, not as guest blocks");
+        assert_eq!(c.levels, levels, "the transcode owns the encode, so it supplies the chain");
+    }
+
+    /// The PVRTC transcode must produce a texture the GPU can actually be given: one block
+    /// format for the whole chain, a FULL chain down to 1x1, and each level exactly its own
+    /// block count in bytes.
+    ///
+    /// The chain length is the part worth pinning. The passthrough carries the guest's levels
+    /// and refuses when there are none; this path owns the encode, so it can and must build the
+    /// rest - a transcode that quietly shipped one level would be the white-speckle failure with
+    /// a different cause. Here the source declares ONE level, and the result must still be the
+    /// full seven.
+    #[test]
+    fn a_transcode_builds_a_full_chain_even_from_a_mipless_source() {
+        // A PVRTC1 4bpp (0x83) source. The bytes are arbitrary - what is under test is the
+        // chain's SHAPE, and the decoder's own correctness has its own tests.
+        let (w, h) = (64u32, 64u32);
+        let level0 = level_layout(0x83, 0, w, h, 0).unwrap();
+        let mut t = tex(0x83, 0, w, h, level0.stride, vec![0x5Au8; level0.bytes as usize]);
+        t.tex_type = 0;
+        t.levels = 1;
+        t.face_bytes = level0.bytes;
+        let c = transcoded_source(&t).expect("PVRTC is exactly what this path is for");
+        assert_eq!(c.levels, max_mip_levels(w, h), "the chain must reach 1x1");
+        assert_eq!(c.levels, 7);
+        let bb = c.format.block_bytes();
+        let want: usize = (0..c.levels)
+            .map(|l| {
+                let (lw, lh) = ((w >> l).max(1), (h >> l).max(1));
+                (lw.div_ceil(4) * lh.div_ceil(4) * bb) as usize
+            })
+            .sum();
+        assert_eq!(c.data.len(), want, "every level is its own block count, no more and no less");
+    }
+
+    /// The transcode picks ONE format for the whole texture, and picks it by whether any level
+    /// has alpha.
+    ///
+    /// A mip chain is a single GPU texture, so a level that happens to be opaque cannot be BC1
+    /// while its neighbour is BC3 - and the decision has to look at every level, because a
+    /// box-filtered level can carry alpha that level 0's corner texels only hinted at.
+    #[test]
+    fn a_transcode_picks_one_format_for_the_whole_chain() {
+        let (w, h) = (16u32, 16u32);
+        let l0 = level_layout(0x83, 0, w, h, 0).unwrap();
+        // An all-ones PVRTC block decodes opaque, so this exercises the BC1 arm; the point of
+        // the assert is that the format does not vary level to level, whichever arm it takes.
+        let mut t = tex(0x83, 0, w, h, l0.stride, vec![0xFFu8; l0.bytes as usize]);
+        t.tex_type = 0;
+        t.levels = 1;
+        t.face_bytes = l0.bytes;
+        let c = transcoded_source(&t).unwrap();
+        let bb = c.format.block_bytes();
+        assert!(matches!(c.format, BlockFormat::Bc1 | BlockFormat::Bc3));
+        // Consistency check: the byte total is only reachable with ONE block size throughout.
+        let want: usize = (0..c.levels)
+            .map(|l| (((w >> l).max(1).div_ceil(4)) * ((h >> l).max(1).div_ceil(4)) * bb) as usize)
+            .sum();
+        assert_eq!(c.data.len(), want);
+    }
+
+    /// A format that is neither a WebGPU block format nor PVRTC is left alone entirely.
+    #[test]
+    fn an_ordinary_uncompressed_texture_is_not_transcoded() {
+        let t = tex(0x0c, 0, 16, 16, 64, vec![9u8; 16 * 16 * 4]);
+        assert!(transcoded_source(&t).is_none(), "U8U8U8U8 has nothing to transcode");
+        assert!(compressed_source(&t).is_none());
     }
 
     /// The block-wise decode path must produce EXACTLY what the per-texel path produces.
@@ -6046,7 +7056,7 @@ mod texture_tests {
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         let face_bytes = pixels.len() as u32;
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, gamma: 0 }
+        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
     }
 
     #[test]

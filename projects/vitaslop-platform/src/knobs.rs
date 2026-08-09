@@ -64,21 +64,93 @@ pub const OVERRIDABLE: &[&str] = &[
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
     "VITASLOP_GUEST_CORES",
+    // Force every pass to ONE sample, whatever `SceGxmMultisampleMode` the guest asked for.
+    // Reachable from the browser because that is the ONLY place the cost of multisampling can
+    // be priced: the phone is the target hardware and its GPU is a tile-based PowerVR, where
+    // MSAA is cheap for entirely different reasons than on this desktop. A render change that
+    // cannot be turned off on the machine that pays for it cannot be measured at all.
+    //
+    // Missing from this list when the knob was added, which is the third time that has
+    // happened here (the call-site profiler, then the inline-imports switch). It is not a
+    // silent omission: `set_override` PANICS on an unregistered name, so a phone run that
+    // typed it into the knobs box died on boot with a black canvas and no output.
+    "VITASLOP_GXM_NO_MULTISAMPLE",
+    // Poisons a freshly reserved default uniform buffer, so a lane the guest never wrote is
+    // distinguishable from one it wrote as zero. NOTE it only covers the RESERVE path, never a
+    // precomputed state's guest-owned buffer - so its silence is not evidence until the pattern
+    // is seen SOMEWHERE. Browser-reachable because the value it has to decide about
+    // (`screenTintColour`) only ever appears there.
+    "VITASLOP_GXM_UNIFORM_POISON",
     "VITASLOP_GXP_ALLOW_FIXED_FUNCTION",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
     "VITASLOP_GXP_FORCE",
+    // What a draw was FED - its default uniform bank decoded per parameter, its attribute
+    // ranges and its bound textures. Reachable from the browser because the defect it is
+    // pointed at (a composite that blows out to white from measurably correct inputs)
+    // reproduces THERE, and the values it prints come from the guest, which is the half that
+    // differs between engines.
+    "VITASLOP_GXP_INPUTS",
+    // The same, one line per SUBMISSION in order - which is how the frame's LAST pair (the
+    // composite) is identified at all.
+    "VITASLOP_GXP_INPUTS_ORDER",
+    // The per-VERTEX half of `..._INPUTS`, on its own name because it is unbounded in the one
+    // place that cannot afford it: the browser panel keeps 96 distinct lines, and a 288-vertex
+    // composite grid evicts every other finding - including the uniforms the run was taken for.
+    "VITASLOP_GXP_INPUTS_VERTS",
     "VITASLOP_GXP_KEYS",
     "VITASLOP_GXP_LIVE",
+    // Turns OFF the generated mip chain. Found missing by
+    // `a_knob_routed_through_this_module_is_reachable_from_the_browser`, which is the FIFTH
+    // instance of this omission - and it belongs here for the same reason `VITASLOP_TEX_COMPRESS`
+    // does: the chain is a third of every uploaded RGBA8 texture's bytes, so on the device that
+    // runs out of GPU memory it is both a memory lever and the A/B for whether the chain is what
+    // prevents speckle.
+    "VITASLOP_GXP_MIPS",
     "VITASLOP_GXP_NEGW",
     "VITASLOP_GXP_NOBLEND",
     "VITASLOP_GXP_NODEPTH",
     "VITASLOP_GXP_ONLY",
+    // Substitute a default-uniform register before a draw is submitted - the causality half of
+    // `VITASLOP_GXP_INPUTS`. Reachable from the browser for the same reason as that one: the
+    // white-out it is aimed at reproduces there and nowhere a file can be written.
+    "VITASLOP_GXP_SA",
     "VITASLOP_GXP_SOLID",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
     "VITASLOP_LOG",
+    // The SCOPED switch for the three `sceClibMem*` bulk primitives. Reachable from the
+    // browser on both counts at once: they are 13% of a real title's host calls, so pricing
+    // them is a device question; and they are the only inline forms that write a range the
+    // GUEST sizes and the only ones that stamp the guest-store dirty map, which is a path
+    // that exists on the browser and nowhere else. Read at LINK time; set it before the run.
+    "VITASLOP_NO_INLINE_CLIB",
+    // The A/B switch for the whole inline-import mechanism. Reachable from the browser for the
+    // same reason `VITASLOP_DBG_CALLSITES` is, and more sharply: inlining exists to stop paying
+    // for the host-call CROSSING, the crossing is a large share of a phone frame and a small one
+    // here, so "what did inlining buy" is a question only the browser can answer honestly. It is
+    // read at LINK time, so it must be set before the run starts, not toggled during it.
+    "VITASLOP_NO_INLINE_IMPORTS",
+    // The SCOPED version of the switch above, for the lightweight-mutex lock/unlock pair.
+    // Reachable from the browser for a sharper reason than the whole-mechanism one: turning
+    // everything off moves ~11,000 calls a frame and every preemption point with them, so a
+    // family worth ~1,000 calls cannot be priced against that baseline. This one changes
+    // nothing else. Read at LINK time; set it before the run, not during it.
+    "VITASLOP_NO_INLINE_LWMUTEX",
+    // The SCOPED switch for the fragment-texture bind. Reachable from the browser because it
+    // is not a perf question at all: the inline copy form replaced a handler that a title's
+    // every texture bind went through, so if a texture goes MISSING on a device, this knob is
+    // the one-run answer to "is it the inline form" - and the device is the only place the
+    // report came from. Read at LINK time; set it before the run, not during it.
+    "VITASLOP_NO_INLINE_TEXTURE",
     "VITASLOP_PERF",
+    // Sample the PRESENTED surface every N presents and describe it in the diagnostics panel.
+    // Reachable from the browser because it exists for a defect only the browser has: a blank
+    // screen over a healthy set of render counters, where the fault is either a blank picture
+    // or a picture the compositor never showed and no counter upstream of the surface can say
+    // which. The device has no screenshot tool and no console, so the answer has to arrive as
+    // text in the panel. Read when the surface is configured; set it before the run.
+    "VITASLOP_PRESENT_PROBE",
     // Whether PVRTC decodes a whole face at a time or one texel at a time. Reachable from
     // the browser because that is where PVRTC decode volume costs the most, so that is where
     // the exactness falsifier has to be runnable.
@@ -92,6 +164,18 @@ pub const OVERRIDABLE: &[&str] = &[
     // the most.
     "VITASLOP_TEXTURE_CHECK",
     "VITASLOP_TEX_CACHE_MB",
+    // Turns the compressed-texture upload OFF, for an A/B against the plain decode. That is the
+    // whole surface: the feature is ON, its measurement PRINTS, and there is nothing here to
+    // turn on. It began as four knobs - a passthrough switch, a transcode switch defaulting to
+    // OFF, a mip probe and a working-set report - and every one of them was a decision or a
+    // measurement that belonged in the default path rather than behind a flag the user would
+    // never set. Browser-reachable because the A/B is only interesting on the device whose GPU
+    // allocation fails at 274 MB and draws WHITE.
+    "VITASLOP_TEX_COMPRESS",
+    // Names the guest code that WROTE a uniform, by parameter name, with its `lr`. Needed in
+    // the browser because `screenTintColour` - the white-out - is written there and never on
+    // the desktop.
+    "VITASLOP_UNIFORM_WATCH",
 ];
 
 /// The override map, consulted by every reader in this module BEFORE the environment.

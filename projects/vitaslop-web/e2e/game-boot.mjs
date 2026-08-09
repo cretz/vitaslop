@@ -28,6 +28,9 @@
 //       SHOT_DIR     where the screenshot and summary land
 //       HEADLESS=1   run without a window - the DEFAULT CHOICE; still the real GPU (above)
 //       ALLOW_SOFTWARE=1  accept a software adapter instead of failing
+//       HIDE_SHOW_MS background the tab every N ms (HIDE_FOR_MS, HIDE_FROM_FRAME) and shoot
+//                    the frame right after each restore - a hidden tab is a DIFFERENT
+//                    environment, and some defects are only reported across that boundary
 import { chromium } from "playwright";
 import { createServer } from "node:http";
 import { readFile, readdir, stat, mkdir } from "node:fs/promises";
@@ -421,6 +424,75 @@ async function main() {
         }
       }, shotEveryMs);
     }
+    // `HIDE_SHOW_MS=N` (optionally `HIDE_FOR_MS=M`, `HIDE_FROM_FRAME=F`): every N ms, put
+    // the page in the BACKGROUND for M ms and bring it back.
+    //
+    // # Why the harness needs this at all
+    // A hidden tab is a different execution environment, not a paused one: Chrome stops
+    // `requestAnimationFrame`, throttles timers, and may drop the GPU work behind the
+    // canvas. The user's own report of the white-out is stated in exactly these terms -
+    // "every time I leave the browser and go back, it shows properly before the white light
+    // consumes it" - and the device capture records the tab being backgrounded five times in
+    // the run that went white. Every automated run before this one held the tab in the
+    // foreground for its whole life, so the harness could not produce the one state the
+    // defect was described in.
+    //
+    // Backgrounding is done by focusing a SECOND tab rather than by faking an event: only
+    // the real thing gets the real rAF and throttling behaviour, and a dispatched
+    // `visibilitychange` with `document.hidden` still false would test nothing.
+    const hideShowMs = Number(process.env.HIDE_SHOW_MS || 0);
+    const hideForMs = Number(process.env.HIDE_FOR_MS || 3000);
+    const hideFromFrame = Number(process.env.HIDE_FROM_FRAME || 0);
+    let hideTimer = null;
+    let hideCycles = 0;
+    let hideVerified = false;
+    if (hideShowMs > 0) {
+      const other = await page.context().newPage();
+      await other.goto("about:blank");
+      await page.bringToFront();
+      // Freezing through CDP as well as focusing another tab. Focusing another tab is the
+      // faithful thing and is what a user does, but it was MEASURED not to background
+      // anything under headless Chrome - the emulator ran straight through every hidden
+      // window at full rate - so on its own it is an experiment that silently tests nothing.
+      const cdp = await page.context().newCDPSession(page).catch(() => null);
+      let busy = false;
+      hideTimer = setInterval(async () => {
+        if (busy || liveFrame < hideFromFrame) return;
+        busy = true;
+        try {
+          const at = liveFrame;
+          await other.bringToFront();
+          if (cdp) await cdp.send("Page.setWebLifecycleState", { state: "frozen" }).catch(() => {});
+          await new Promise((r) => setTimeout(r, hideForMs));
+          if (cdp) await cdp.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+          await page.bringToFront();
+          // >>> THE CYCLE HAS TO PROVE IT HAPPENED.
+          // A page that kept running through the hidden window was never backgrounded, and a
+          // run full of cycles that did nothing reads exactly like a run that reproduced
+          // nothing. Compare the frame counter across the window: a genuinely hidden tab gets
+          // no `requestAnimationFrame`, so it advances by almost nothing.
+          const advanced = liveFrame - at;
+          const expected = (hideForMs / 1000) * 20; // ~20 fps is a conservative floor here
+          if (advanced < expected / 4) hideVerified = true;
+          hideCycles++;
+          console.log(
+            `[game] hide/show cycle ${hideCycles} around frame ${at} (hidden ${hideForMs} ms, ` +
+              `frames advanced ${advanced} while hidden${advanced < expected / 4 ? "" : " - NOT ACTUALLY BACKGROUNDED"})`
+          );
+          // A shot right after the restore, on its own schedule: the user's account is that
+          // the frame immediately after coming back is CORRECT and it degrades from there,
+          // so the periodic sampler is the wrong instrument for the interesting moment.
+          await page.locator("#screen").screenshot({
+            path: join(shotDir, `f${String(liveFrame).padStart(6, "0")}-shown.png`),
+            timeout: 20000,
+          }).catch(() => {});
+        } catch (e) {
+          console.log(`[game] hide/show cycle failed: ${e.message}`);
+        } finally {
+          busy = false;
+        }
+      }, hideShowMs);
+    }
     const waitMs = Number(process.env.WAIT_MS || 180000);
     const quietLimitMs = Number(process.env.QUIET_MS || 120000);
     const deadline = Date.now() + waitMs;
@@ -436,6 +508,18 @@ async function main() {
     }
     clearInterval(ticker);
     if (shotTimer) clearInterval(shotTimer);
+    if (hideTimer) {
+      clearInterval(hideTimer);
+      console.log(`[game] ${hideCycles} hide/show cycle(s) during the run`);
+      // Said at the END, unconditionally, because this decides whether the run is evidence
+      // about backgrounding at all. Without it a null result reads as a negative one.
+      if (!hideVerified) {
+        console.log(
+          "[game] WARNING: NO cycle actually backgrounded the page - the emulator kept running " +
+            "through every hidden window. This run says NOTHING about hide/show behaviour."
+        );
+      }
+    }
     // Let a few more live frames present so the FPS meter settles on a real cadence.
     await page.waitForFunction(() => /fps:\s*\d/.test(document.getElementById("fps")?.textContent || ""), { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(1500);

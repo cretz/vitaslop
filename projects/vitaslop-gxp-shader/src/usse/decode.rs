@@ -1957,9 +1957,23 @@ fn decode_grp_tex(word: u64) -> Instr {
     };
     let coord = Operand::plain(cbank, cidx, src0_sel as u8);
 
-    // Sampler unit = src1 register number. Under the shared double-register rule the bound
-    // texture's control words live at SA register `2 * src1_n`, which the container's
-    // texture-control table resolves to a GXM texture unit (see `Program::sampler_unit_at`).
+    // Sampler unit = src1 register number, DOUBLED: the bound texture's control words live at
+    // SA register `2 * src1_n`, which the container's texture-control table resolves to a GXM
+    // texture unit (see `Program::sampler_unit_at`).
+    //
+    // This used to rest on "the shared double-register rule" - an ANALOGY, and the same analogy
+    // that was wrong for this instruction's DESTINATION (see `dest_reg` below). It is now
+    // measured instead. Over three titles' corpora, `2 * src1_n` lands on a declared texture
+    // 166 times out of 167, while `src1_n`, `src1_n + dubuf` and `2 * src1_n + dubuf` land on
+    // one 4, 37 and 8 times. The doubling is also exercised on FOUR DISTINCT table slots inside
+    // a single program (`frag_82f324c0` samples units 11, 15, 0 and 1 at SA 14/18/22/26), which
+    // is what retires the old worry that it was only ever right by coincidence on a first slot.
+    // Test: `how_a_smp_sampler_field_addresses_the_texture_control_table`.
+    //
+    // The one program that disagrees is `frag_866a1840`, whose table places its only texture at
+    // an ODD SA register - see `Program::texture_control_base_is_addressable`. A double-register
+    // field cannot name an odd register at all, so that is a property of that blob and not a
+    // rule this one is missing; it stays BLOCKED rather than resolved by an invented offset.
     let unit = bits(word, 13, 7) as u8;
     // Result data type (`fconv_type`, E0.5): 0/3 = F32, 2 = F16, 1 = "the bound texture's
     // component type" - not knowable from the instruction alone, so it hard-blocks rather

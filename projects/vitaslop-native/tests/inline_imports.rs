@@ -141,7 +141,7 @@ fn run(vm: &mut Vm) -> bool {
 
 #[test]
 fn load_shift_mask_computes_eval_inline() {
-    let op = InlineOp::LoadShiftMask { offset: 4, shift: 8, mask: 0xf };
+    let op = InlineOp::LoadShiftMask { offset: 4, shift: 8, mask: 0xf, plus: 0 };
     let word = 0xABCD_1234u32;
     let mut vm = vm_with(op);
     vm.write_mem(PTR + 4, &word.to_le_bytes()).expect("seed the struct");
@@ -155,7 +155,7 @@ fn load_shift_mask_computes_eval_inline() {
 fn a_null_pointer_falls_back_to_the_handler() {
     // The guard's whole purpose: r0 - base wraps to a huge value, so the load would be
     // out of range, and the handler keeps defining what a null pointer means.
-    let op = InlineOp::LoadShiftMask { offset: 4, shift: 8, mask: 0xf };
+    let op = InlineOp::LoadShiftMask { offset: 4, shift: 8, mask: 0xf, plus: 0 };
     let mut vm = vm_with(op);
     vm.set_reg(0, 0);
     let crossed = run(&mut vm);
@@ -265,6 +265,438 @@ fn store_mirror_pair_falls_back_on_a_null_pointer() {
     assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
 }
 
+// --- The argument-storing forms ---------------------------------------------------
+//
+// These are the setters, not the getters, and the failure they can hide is worse: a
+// getter that answers wrongly at least answers, and a wrong value often shows up
+// downstream. A setter that writes the WRONG OFFSET writes a real word into a real
+// structure - the guest reads back a plausible number from the field next door and
+// renders a picture that is subtly wrong with nothing anywhere to report. So the word
+// under test is surrounded by SENTINELS, and every test asserts they survived.
+
+/// Fill `[OUT_PTR, OUT_PTR + words * 4)` with a distinctive pattern, so a store landing at
+/// the wrong offset is visible as a changed sentinel rather than as nothing at all.
+fn seed_sentinels(vm: &mut Vm, words: u32) {
+    for i in 0..words {
+        let bytes = (SENTINEL_BASE | i).to_le_bytes();
+        vm.write_mem(OUT_PTR + i * 4, &bytes).expect("seed the sentinel");
+    }
+}
+
+/// Assert every word of the seeded region still holds its sentinel, except `written`
+/// (a word index) which must hold `value`.
+fn assert_only_wrote(vm: &mut Vm, words: u32, written: Option<(u32, u32)>) {
+    for i in 0..words {
+        let got = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        match written {
+            Some((w, value)) if w == i => assert_eq!(got, value, "word {i} is the one written"),
+            _ => assert_eq!(got, SENTINEL_BASE | i, "word {i} must be UNTOUCHED"),
+        }
+    }
+}
+
+/// The sentinel pattern's high bits; the low bits carry the word index, so a store that
+/// lands one slot over is caught by value and not only by position.
+const SENTINEL_BASE: u32 = 0x5EED_0000;
+
+/// The value the guest asks the setter to store. Not a plausible sentinel.
+const STORED: u32 = 0xC0FF_EE01;
+
+#[test]
+fn store_arg_writes_r1_through_the_pointer() {
+    let op = InlineOp::StoreArg { offset: 8 };
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 6);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, STORED);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "an in-range pointer must not reach the host");
+    assert_only_wrote(&mut vm, 6, Some((2, STORED)));
+    assert_eq!(vm.get_reg(0), op.eval(0), "the call returns the handler's success code");
+}
+
+/// Offset zero is its own case: the emitted `i32.store` carries the offset as an immediate,
+/// and a form whose immediate is zero would still pass a test that only ever used one
+/// non-zero offset if the immediate were dropped entirely.
+#[test]
+fn store_arg_honours_an_offset_of_zero() {
+    let mut vm = vm_with(InlineOp::StoreArg { offset: 0 });
+    seed_sentinels(&mut vm, 4);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, STORED);
+    assert!(!run(&mut vm));
+    assert_only_wrote(&mut vm, 4, Some((0, STORED)));
+}
+
+#[test]
+fn store_arg_falls_back_on_a_null_pointer() {
+    // The arm nothing else notices. Inline, a null pointer would store to `0 - base`,
+    // which wraps to an address near the top of linear memory - a real write to a real
+    // page, silently corrupting whatever lives there. The guard must route it out.
+    let op = InlineOp::StoreArg { offset: 8 };
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 6);
+    vm.set_reg(0, 0);
+    vm.set_reg(1, STORED);
+    let crossed = run(&mut vm);
+    assert!(crossed, "a null pointer must reach the host");
+    assert_only_wrote(&mut vm, 6, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler's answer must survive");
+}
+
+#[test]
+fn store_arg_indexed_writes_the_slot_the_index_names() {
+    let op = InlineOp::StoreArgIndexed { offset: 4, count: 4 };
+    for index in 0..4u32 {
+        let mut vm = vm_with(op);
+        seed_sentinels(&mut vm, 6);
+        vm.set_reg(0, OUT_PTR);
+        vm.set_reg(1, index);
+        vm.set_reg(2, STORED);
+        let crossed = run(&mut vm);
+        assert!(!crossed, "index {index} is in range and must not reach the host");
+        // offset 4 = word 1, plus `index` words.
+        assert_only_wrote(&mut vm, 6, Some((1 + index, STORED)));
+        assert_eq!(vm.get_reg(0), 0, "the call returns success");
+    }
+}
+
+/// The index bound, both sides of it. `count - 1` is the last index the inline form may
+/// serve and `count` is the first it may not - and the one it may not is exactly the one
+/// that would write past the end of the array, over whatever field follows.
+#[test]
+fn store_arg_indexed_splits_exactly_at_its_bound() {
+    let op = InlineOp::StoreArgIndexed { offset: 4, count: 4 };
+    for (index, expect_crossing) in [(3u32, false), (4, true), (99, true)] {
+        let mut vm = vm_with(op);
+        seed_sentinels(&mut vm, 6);
+        vm.set_reg(0, OUT_PTR);
+        vm.set_reg(1, index);
+        vm.set_reg(2, STORED);
+        let crossed = run(&mut vm);
+        assert_eq!(crossed, expect_crossing, "at index={index}");
+        assert_eq!(op.falls_back_on_index(index), expect_crossing, "the predicate agrees");
+        if expect_crossing {
+            assert_only_wrote(&mut vm, 6, None);
+            assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler answers at index={index}");
+        } else {
+            assert_only_wrote(&mut vm, 6, Some((1 + index, STORED)));
+        }
+    }
+}
+
+#[test]
+fn store_arg_indexed_falls_back_on_a_null_pointer() {
+    let op = InlineOp::StoreArgIndexed { offset: 4, count: 4 };
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 6);
+    vm.set_reg(0, 0);
+    vm.set_reg(1, 1);
+    vm.set_reg(2, STORED);
+    assert!(run(&mut vm), "a null pointer must reach the host");
+    assert_only_wrote(&mut vm, 6, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+/// An indexed form's POINTER guard must be computed against its LAST element, not its
+/// first. A pointer that leaves room for element 0 but not element `count - 1` passes a
+/// first-element bound and then stores past the end of linear memory on a high index -
+/// which the engine traps rather than reports, so it looks like an engine bug.
+#[test]
+fn an_indexed_forms_pointer_bound_covers_its_last_element() {
+    let op = InlineOp::StoreArgIndexed { offset: 4, count: 4 };
+    // The last address the whole array fits at, and the first one it does not.
+    let last_fits = BASE + MEM_BYTES - (4 + 3 * 4) - 4;
+    for (ptr, expect_crossing) in [(last_fits, false), (last_fits + 4, true)] {
+        let mut vm = vm_with(op);
+        vm.set_reg(0, ptr);
+        vm.set_reg(1, 3);
+        vm.set_reg(2, STORED);
+        let crossed = run(&mut vm);
+        assert_eq!(crossed, expect_crossing, "at ptr={ptr:#x}");
+        if !expect_crossing {
+            let got = vm.read_mem(ptr + 4 + 3 * 4, 4).expect("the last element is in memory");
+            assert_eq!(u32::from_le_bytes(got[0..4].try_into().unwrap()), STORED);
+        }
+    }
+}
+
+// --- The lightweight-mutex forms --------------------------------------------------
+//
+// These are the only forms that both READ and WRITE, and the only ones whose guard is a
+// predicate over several words rather than a range check. Two things can go wrong that
+// nothing else would catch:
+//
+//   - A wrong term in the predicate takes a lock that should have gone to the host. There
+//     is no error and no crossing; two threads simply hold the same mutex, and what shows
+//     up is corrupted data somewhere else entirely, frames later.
+//   - A wrong OFFSET writes a real number into a real word of the work area. The mutex
+//     then behaves like a different mutex, and again nothing reports it.
+//
+// So every case is run through the real engine, checked against `lwwork`'s own definition
+// of the same decision, AND checked word for word against a host-side replay of it. The
+// work area is surrounded by sentinels so a store one slot over is visible.
+
+use vitaslop_runtime::host::GuestWords;
+use vitaslop_runtime::vita::lwwork;
+
+/// Where the test puts the mutex work area. Word 0 of the sentinel block, so
+/// [`assert_only_wrote`]'s neighbours bracket it.
+const WORK: u32 = OUT_PTR;
+/// The thread the mirror says is running, and one that is not.
+const CUR: i32 = 7;
+const OTHER: i32 = 9;
+
+/// A sparse word map, for replaying a case against [`lwwork`] outside the engine.
+#[derive(Default)]
+struct Words(std::collections::BTreeMap<u32, u32>);
+
+impl GuestWords for Words {
+    fn word(&self, addr: u32) -> u32 {
+        self.0.get(&addr).copied().unwrap_or(0)
+    }
+    fn set_word(&mut self, addr: u32, value: u32) {
+        self.0.insert(addr, value);
+    }
+}
+
+/// The four state words of a work area, in layout order.
+#[derive(Clone, Copy, Debug)]
+struct State {
+    id: u32,
+    owner: i32,
+    count: u32,
+    waiters: u32,
+}
+
+impl State {
+    /// A created, free mutex at [`WORK`].
+    fn free() -> State {
+        State { id: WORK, owner: 0, count: 0, waiters: 0 }
+    }
+    fn held_by(thid: i32, count: u32) -> State {
+        State { id: WORK, owner: thid, count, waiters: 0 }
+    }
+    fn write(self, w: &mut dyn GuestWords, at: u32) {
+        w.set_word(at + lwwork::off::ID, self.id);
+        w.set_word(at + lwwork::off::OWNER, self.owner as u32);
+        w.set_word(at + lwwork::off::COUNT, self.count);
+        w.set_word(at + lwwork::off::WAITERS, self.waiters);
+    }
+    fn read(w: &dyn GuestWords, at: u32) -> State {
+        State {
+            id: w.word(at + lwwork::off::ID),
+            owner: w.word(at + lwwork::off::OWNER) as i32,
+            count: w.word(at + lwwork::off::COUNT),
+            waiters: w.word(at + lwwork::off::WAITERS),
+        }
+    }
+    /// Seed the work area in the VM's own memory.
+    fn write_vm(self, vm: &mut Vm, at: u32) {
+        let mut words = Words::default();
+        self.write(&mut words, at);
+        for (&addr, &value) in &words.0 {
+            vm.write_mem(addr, &value.to_le_bytes()).expect("in range");
+        }
+    }
+    /// Read it back out of the VM.
+    fn read_vm(vm: &mut Vm, at: u32) -> State {
+        let mut words = Words::default();
+        for off in [lwwork::off::ID, lwwork::off::OWNER, lwwork::off::COUNT, lwwork::off::WAITERS] {
+            words.set_word(at + off, vm_word(vm, at + off));
+        }
+        State::read(&words, at)
+    }
+}
+
+/// One word of the VM's guest memory. `Vm::read_mem` needs `&mut`, so this cannot be a
+/// [`GuestWords`] impl - hence the free function.
+fn vm_word(vm: &mut Vm, addr: u32) -> u32 {
+    let b = vm.read_mem(addr, 4).expect("in range");
+    u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"))
+}
+
+/// Run one lock-or-unlock case through the emitted code and hold it to [`lwwork`].
+///
+/// Returns nothing because every assertion is here: what the guest sees in r0, whether the
+/// host was crossed, and every word of the work area including its neighbours.
+fn check_lw(lock: bool, before: State, ptr: u32, count_arg: u32, thid: i32) {
+    let op = if lock {
+        InlineOp::LwMutexLock { layout: lwwork::layout(), thread_slot: 3 }
+    } else {
+        InlineOp::LwMutexUnlock { layout: lwwork::layout(), thread_slot: 3 }
+    };
+    // What the definition says should happen, replayed on a plain word map.
+    let mut expect = Words::default();
+    before.write(&mut expect, WORK);
+    let taken = if lock {
+        lwwork::fast_lock(&mut expect, WORK, thid, count_arg)
+    } else {
+        lwwork::fast_unlock(&mut expect, WORK, thid, count_arg)
+    };
+    // ...and a pointer the guard rejects is the host's case whatever the words say.
+    let in_range = ptr == WORK;
+    let taken = taken && in_range;
+
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 6);
+    before.write_vm(&mut vm, WORK);
+    write_mirror(&mut vm, &[0, 0, 0, thid as u32]);
+    vm.set_reg(0, ptr);
+    vm.set_reg(1, count_arg);
+    let crossed = run(&mut vm);
+
+    let what = format!("{} {before:?} ptr={ptr:#x} n={count_arg} thid={thid}", if lock { "lock" } else { "unlock" });
+    assert_eq!(crossed, !taken, "crossing disagrees with lwwork: {what}");
+    let after = State::read_vm(&mut vm, WORK);
+    if taken {
+        assert_eq!(vm.get_reg(0), 0, "a served call returns success: {what}");
+        let want = State::read(&expect, WORK);
+        assert_eq!(after.id, want.id, "id: {what}");
+        assert_eq!(after.owner, want.owner, "owner: {what}");
+        assert_eq!(after.count, want.count, "count: {what}");
+        assert_eq!(after.waiters, want.waiters, "waiters: {what}");
+    } else {
+        assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler answers: {what}");
+        // A refused call must leave the work area EXACTLY as it found it. A form that
+        // wrote first and checked after would pass every other assertion here.
+        assert_eq!(after.id, before.id, "id: {what}");
+        assert_eq!(after.owner, before.owner, "owner: {what}");
+        assert_eq!(after.count, before.count, "count: {what}");
+        assert_eq!(after.waiters, before.waiters, "waiters: {what}");
+    }
+    // Words 4 and 5 are past the state; nothing may reach them.
+    for i in 4..6u32 {
+        let got = vm.read_mem(WORK + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, SENTINEL_BASE | i, "word {i} past the state must be UNTOUCHED: {what}");
+    }
+}
+
+/// The take, over every shape of work area, against the definition.
+#[test]
+fn lw_mutex_lock_matches_lwwork_on_every_arm() {
+    for &before in &[
+        // Served inline: free, free with a stale owner, and the owner recursing.
+        State::free(),
+        State { owner: OTHER, ..State::free() },
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 5),
+        // The host's: held by somebody else, a parked waiter, and a work area that is a
+        // COPY (its id names the original) or was never created (id zero).
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::free() },
+        State { id: WORK + 0x100, ..State::free() },
+        State { id: 0, ..State::free() },
+    ] {
+        check_lw(true, before, WORK, 1, CUR);
+    }
+}
+
+#[test]
+fn lw_mutex_unlock_matches_lwwork_on_every_arm() {
+    for &before in &[
+        // Served inline: the owner releasing, once and one of several.
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 3),
+        // The host's: nothing held, held by somebody else, a parked waiter to hand it to,
+        // a copy, a work area never created.
+        State::free(),
+        // A DOUBLE unlock by the last owner, which is the case the owner word alone
+        // cannot see: releasing leaves `owner` stale, so this reads as "mine" and is
+        // refused only by the count. Inline, `count - 1` would wrap it to four billion
+        // and the mutex would be permanently, invisibly held.
+        State::held_by(CUR, 0),
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::held_by(CUR, 1) },
+        State { id: WORK + 0x100, ..State::held_by(CUR, 1) },
+        State { id: 0, ..State::held_by(CUR, 1) },
+    ] {
+        check_lw(false, before, WORK, 1, CUR);
+    }
+}
+
+/// The lock/unlock COUNT argument. Only 1 is served; the handler defines the rest,
+/// including the illegal zero. Folding a multi-count acquire into `count += 1` would
+/// under-count the recursion and release the mutex while the guest still believed it held
+/// it - a data race with no error anywhere.
+#[test]
+fn a_count_argument_other_than_one_reaches_the_handler() {
+    for n in [0u32, 2, 3, 0xFFFF_FFFF] {
+        check_lw(true, State::free(), WORK, n, CUR);
+        check_lw(false, State::held_by(CUR, 4), WORK, n, CUR);
+    }
+}
+
+/// THREAD ZERO is the main thread by convention, so it is a real owner and not a sentinel.
+/// This is the case an implementation that spelled "free" as `owner == 0` gets wrong: the
+/// main thread would find every mutex it holds indistinguishable from a free one, recurse
+/// where it should have counted, and release early.
+#[test]
+fn the_main_thread_is_a_real_owner_not_a_free_marker() {
+    check_lw(true, State::held_by(0, 1), WORK, 1, 0); // recursive take, count 1 -> 2
+    check_lw(false, State::held_by(0, 1), WORK, 1, 0); // release, count 1 -> 0
+    // ...and thread 0 must NOT be able to take a mutex thread 9 holds, however its owner
+    // word reads.
+    check_lw(true, State::held_by(OTHER, 1), WORK, 1, 0);
+    check_lw(false, State::held_by(OTHER, 1), WORK, 1, 0);
+}
+
+/// The pointer guard, on the arm that matters. Inline, a null work pointer would read and
+/// WRITE at `0 - base`, which wraps near the top of linear memory: a real store into a real
+/// page, and the guest would believe it holds a lock that lives in somebody else's data.
+#[test]
+fn a_null_work_pointer_reaches_the_handler() {
+    check_lw(true, State::free(), 0, 1, CUR);
+    check_lw(false, State::held_by(CUR, 1), 0, 1, CUR);
+}
+
+/// The pointer bound must cover the LAST word of the layout. A bound computed for the id
+/// word alone would admit a pointer with room for one word and then read three past the end
+/// of guest memory - which the engine traps, so it presents as an engine bug rather than as
+/// this.
+#[test]
+fn the_pointer_bound_covers_the_whole_layout() {
+    let op = InlineOp::LwMutexLock { layout: lwwork::layout(), thread_slot: 3 };
+    let last_fits = BASE + MEM_BYTES - lwwork::BYTES;
+    for (ptr, expect_crossing) in [(last_fits, false), (last_fits + 4, true)] {
+        let mut vm = vm_with(op);
+        write_mirror(&mut vm, &[0, 0, 0, CUR as u32]);
+        // A canonical, free mutex right at the boundary.
+        State { id: ptr, owner: 0, count: 0, waiters: 0 }.write_vm(&mut vm, ptr);
+        vm.set_reg(0, ptr);
+        vm.set_reg(1, 1);
+        let crossed = run(&mut vm);
+        assert_eq!(crossed, expect_crossing, "at ptr={ptr:#x}");
+        if !expect_crossing {
+            assert_eq!(vm_word(&mut vm, ptr + lwwork::off::COUNT), 1, "it was taken");
+        }
+    }
+}
+
+/// A lock form must read the CURRENT THREAD from the mirror slot it names, not from a
+/// fixed one. Two slots holding different ids, one op each: an emitter that ignored
+/// `thread_slot` would take both locks for the same thread and pass every test above.
+#[test]
+fn a_lock_form_reads_the_thread_slot_it_names() {
+    for (slot, thid) in [(2u32, 11i32), (3, 22)] {
+        let op = InlineOp::LwMutexLock { layout: lwwork::layout(), thread_slot: slot };
+        let mut vm = vm_with(op);
+        // Every slot holds a DIFFERENT id, so reading the wrong one is visible.
+        write_mirror(&mut vm, &[99, 98, 11, 22]);
+        State::free().write_vm(&mut vm, WORK);
+        vm.set_reg(0, WORK);
+        vm.set_reg(1, 1);
+        assert!(!run(&mut vm), "a free canonical mutex is taken inline");
+        assert_eq!(
+            vm_word(&mut vm, WORK + lwwork::off::OWNER) as i32,
+            thid,
+            "slot {slot} names thread {thid}"
+        );
+    }
+}
+
 /// The mirror block must be sized from the TOP slot a pair form touches. Sized from the
 /// base slot, a pair's high word would read the page above the block - which for a clock
 /// is a garbage timestamp, not a fault, so nothing would report it.
@@ -275,6 +707,446 @@ fn a_pair_form_reserves_both_of_its_slots() {
     assert_eq!(base_only.top_mirror_slot(), Some(3));
     assert_eq!(pair.top_mirror_slot(), Some(4), "a pair reaches one slot further");
     assert_eq!(pair.mirror_slot(), Some(3), "...but still BASES at its own slot");
+}
+
+// --- the bias, and the field store ----------------------------------------------------
+
+/// The `plus` bias must be ADDED after the shift and mask, not folded into either. The case
+/// that separates the two: a field of all ones plus one, which carries out of the field.
+#[test]
+fn load_shift_mask_adds_its_bias_after_the_mask() {
+    let op = InlineOp::LoadShiftMask { offset: 4, shift: 12, mask: 0xfff, plus: 1 };
+    for word in [0x00FF_F000u32, 0xFFFF_FFFF, 0x0000_0000, 0xABCD_1234] {
+        let mut vm = vm_with(op);
+        vm.write_mem(PTR + 4, &word.to_le_bytes()).expect("seed the struct");
+        vm.set_reg(0, PTR);
+        assert!(!run(&mut vm), "an in-range pointer must not reach the host");
+        assert_eq!(vm.get_reg(0), op.eval(word), "word {word:#x}");
+    }
+}
+
+/// A bias of zero must emit NO add. Not a style point: every inline form that existed before
+/// the bias did carries `plus: 0`, and a build that emitted a `+ 0` for each of them would
+/// change the fuel every guest call to them costs - which moves the browser's clock and every
+/// preemption point with it, for nothing.
+#[test]
+fn a_zero_bias_is_the_unbiased_form_exactly() {
+    let op = InlineOp::LoadShiftMask { offset: 4, shift: 8, mask: 0xf, plus: 0 };
+    let word = 0xABCD_1234u32;
+    let mut vm = vm_with(op);
+    vm.write_mem(PTR + 4, &word.to_le_bytes()).expect("seed the struct");
+    vm.set_reg(0, PTR);
+    assert!(!run(&mut vm));
+    assert_eq!(vm.get_reg(0), (word >> 8) & 0xf, "the answer is the field itself");
+    assert_eq!(op.eval(word), (word >> 8) & 0xf, "...and `eval` agrees");
+}
+
+/// A field store must leave every bit outside its field exactly as it found it. This is the
+/// whole reason the form exists - the word it writes packs eight independent settings, and a
+/// whole-word store would clear seven of them with nothing to report it.
+#[test]
+fn store_arg_field_rewrites_only_its_field() {
+    // magFilter's shape: two bits at 12.
+    let op = InlineOp::StoreArgField { offset: 4, shift: 12, mask: 0x3 };
+    // A word with EVERY other bit set, so any bit the form clears is visible.
+    const BEFORE: u32 = 0xFFFF_FFFF;
+    for value in [0u32, 1, 2, 3, 0xFFFF_FFFF] {
+        let mut vm = vm_with(op);
+        seed_sentinels(&mut vm, 6);
+        vm.write_mem(OUT_PTR + 4, &BEFORE.to_le_bytes()).expect("seed the word");
+        vm.set_reg(0, OUT_PTR);
+        vm.set_reg(1, value);
+        assert!(!run(&mut vm), "an in-range pointer must not reach the host");
+        let got = vm.read_mem(OUT_PTR + 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, (BEFORE & !(0x3 << 12)) | ((value & 0x3) << 12), "value {value:#x}");
+        assert_eq!(vm.get_reg(0), 0, "a void setter returns the success code");
+        // ...and not one word either side of it moved.
+        assert_only_wrote(&mut vm, 6, Some((1, got)));
+    }
+}
+
+/// The same, starting from a word of all ZEROES, so a form that OR-ed without clearing first
+/// passes the test above (every bit was already set) and fails here.
+#[test]
+fn store_arg_field_clears_before_it_writes() {
+    let op = InlineOp::StoreArgField { offset: 0, shift: 6, mask: 0x7 };
+    let mut vm = vm_with(op);
+    vm.write_mem(OUT_PTR, &0xFFFF_FFFFu32.to_le_bytes()).expect("seed the word");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, 0);
+    assert!(!run(&mut vm));
+    let got = vm.read_mem(OUT_PTR, 4).expect("read back");
+    let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+    assert_eq!(got, 0xFFFF_FFFF & !(0x7 << 6), "writing zero must CLEAR the field");
+}
+
+/// A field store READS the word before writing it, so an out-of-range pointer would load
+/// garbage and store it back - which is worse than the plain store's failure, not better.
+#[test]
+fn store_arg_field_falls_back_on_a_null_pointer() {
+    let op = InlineOp::StoreArgField { offset: 4, shift: 12, mask: 0x3 };
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 6);
+    vm.set_reg(0, 0);
+    vm.set_reg(1, 2);
+    assert!(run(&mut vm), "a null pointer must reach the host");
+    assert_only_wrote(&mut vm, 6, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler's answer must survive");
+}
+
+// --- the bulk forms -------------------------------------------------------------------
+//
+// These are the only forms whose reach is chosen by the GUEST, so they are the only ones
+// whose guard is arithmetic rather than a constant, and the only ones that can walk off the
+// end of linear memory by being handed a large enough length with a perfectly ordinary
+// pointer. Both facts are tested below, on both arms.
+
+/// Where a bulk test puts its source buffer. Far enough from [`OUT_PTR`] that an overrun in
+/// either direction lands on sentinels rather than on the other buffer.
+const SRC_PTR: u32 = BASE + 0x4000;
+
+/// A pattern that is not a sentinel, not zero and not constant along its length, so a copy
+/// that transposes, truncates or repeats bytes is visible in the result.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(0x5b)).collect()
+}
+
+/// The last address at which `len` bytes still fit in guest memory, rebased to a pointer.
+/// The bulk guard's boundary is exactly here, and a form that computed it from the pointer
+/// alone would admit the address one past it.
+fn last_fitting_ptr(len: u32) -> u32 {
+    BASE + MEM_BYTES - len
+}
+
+#[test]
+fn mem_copy_moves_the_bytes_and_returns_the_destination() {
+    let src = pattern(300);
+    let mut vm = vm_with(InlineOp::MemCopy);
+    seed_sentinels(&mut vm, 128);
+    vm.write_mem(SRC_PTR, &src).expect("seed the source");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, src.len() as u32);
+    assert!(!run(&mut vm), "an in-range copy must not reach the host");
+    assert_eq!(vm.read_mem(OUT_PTR, src.len()).expect("read back"), src);
+    assert_eq!(vm.get_reg(0), OUT_PTR, "memcpy returns its destination");
+    // ...and stopped exactly there. A length the emitted code rounded up would overwrite
+    // the sentinel that follows, which nothing else in the assertion above would notice.
+    let past = vm.read_mem(OUT_PTR + src.len() as u32, 4).expect("read back");
+    let past = u32::from_le_bytes(past[0..4].try_into().expect("4 bytes"));
+    assert_eq!(past, SENTINEL_BASE | 75, "the byte after the copy is UNTOUCHED");
+}
+
+/// A zero length is a legal call, not an error, and it is the case a range computed as
+/// `addr + len - 1` gets catastrophically wrong: the subtraction wraps, and a form that
+/// stamped or filled that range would touch the whole of memory.
+#[test]
+fn mem_copy_of_zero_bytes_writes_nothing() {
+    let mut vm = vm_with(InlineOp::MemCopy);
+    seed_sentinels(&mut vm, 8);
+    vm.write_mem(SRC_PTR, &pattern(64)).expect("seed the source");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, 0);
+    assert!(!run(&mut vm), "a zero-length copy is still in range");
+    assert_only_wrote(&mut vm, 8, None);
+    assert_eq!(vm.get_reg(0), OUT_PTR);
+}
+
+/// An OVERLAPPING copy. The handler reads the whole source before writing, so it moves the
+/// ORIGINAL bytes; `memory.copy` is specified the same way. A form built on a
+/// forward byte loop would agree with it on every non-overlapping case and disagree here.
+#[test]
+fn mem_copy_moves_overlapping_bytes_as_the_handler_does() {
+    let src = pattern(64);
+    let mut vm = vm_with(InlineOp::MemCopy);
+    vm.write_mem(OUT_PTR, &src).expect("seed the buffer");
+    // Copy forward over itself by 8 bytes: dst[i] = src[i - 8].
+    vm.set_reg(0, OUT_PTR + 8);
+    vm.set_reg(1, OUT_PTR);
+    vm.set_reg(2, 56);
+    assert!(!run(&mut vm));
+    let got = vm.read_mem(OUT_PTR, 64).expect("read back");
+    let mut want = src.clone();
+    want.copy_within(0..56, 8);
+    assert_eq!(got, want, "the copy must see the ORIGINAL source bytes");
+}
+
+/// The length is part of the bound, and this is the case that proves it: a pointer that is
+/// perfectly ordinary on its own, with a length that reaches past the end of memory. A guard
+/// on the pointers alone admits it, and the access then traps in the engine rather than
+/// reaching the handler - which reads as a transpiler bug, not as a guest one.
+#[test]
+fn mem_copy_falls_back_when_the_length_runs_off_the_end() {
+    for (dst, src_ptr, len, expect_crossing) in [
+        // The last length that fits at this pointer, and the first that does not.
+        (last_fitting_ptr(64), SRC_PTR, 64u32, false),
+        (last_fitting_ptr(64), SRC_PTR, 65, true),
+        // The same boundary on the SOURCE, with an unimpeachable destination.
+        (OUT_PTR, last_fitting_ptr(64), 64, false),
+        (OUT_PTR, last_fitting_ptr(64), 65, true),
+        // A length larger than memory itself, which is what makes `mem_bytes - len` wrap.
+        (OUT_PTR, SRC_PTR, MEM_BYTES + 1, true),
+        (OUT_PTR, SRC_PTR, u32::MAX, true),
+        // ...and the null pointer, on each side in turn.
+        (0, SRC_PTR, 16, true),
+        (OUT_PTR, 0, 16, true),
+    ] {
+        let mut vm = vm_with(InlineOp::MemCopy);
+        vm.set_reg(0, dst);
+        vm.set_reg(1, src_ptr);
+        vm.set_reg(2, len);
+        assert_eq!(
+            run(&mut vm),
+            expect_crossing,
+            "dst={dst:#x} src={src_ptr:#x} len={len}"
+        );
+    }
+}
+
+#[test]
+fn mem_fill_writes_the_low_byte_of_r1() {
+    // A value whose low byte is what must land and whose high bytes must not: a form that
+    // stored the whole word, or masked the wrong end, fails here and nowhere else.
+    let mut vm = vm_with(InlineOp::MemFill);
+    seed_sentinels(&mut vm, 16);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, 0xDEAD_BE5A);
+    vm.set_reg(2, 20);
+    assert!(!run(&mut vm), "an in-range fill must not reach the host");
+    assert_eq!(vm.read_mem(OUT_PTR, 20).expect("read back"), vec![0x5Au8; 20]);
+    assert_eq!(vm.get_reg(0), OUT_PTR, "memset returns its destination");
+    // Byte 20 onward is still the sentinel's third byte, so the fill stopped where asked.
+    let tail = vm.read_mem(OUT_PTR + 20, 4).expect("read back");
+    let tail = u32::from_le_bytes(tail[0..4].try_into().expect("4 bytes"));
+    assert_eq!(tail, SENTINEL_BASE | 5, "the word after the fill is UNTOUCHED");
+}
+
+#[test]
+fn mem_fill_falls_back_when_the_length_runs_off_the_end() {
+    for (dst, len, expect_crossing) in [
+        (last_fitting_ptr(32), 32u32, false),
+        (last_fitting_ptr(32), 33, true),
+        (OUT_PTR, MEM_BYTES + 1, true),
+        (0, 16, true),
+    ] {
+        let mut vm = vm_with(InlineOp::MemFill);
+        vm.set_reg(0, dst);
+        vm.set_reg(1, 0);
+        vm.set_reg(2, len);
+        assert_eq!(run(&mut vm), expect_crossing, "dst={dst:#x} len={len}");
+    }
+}
+
+/// The emitted loop against [`vitaslop_transpiler::mem_compare`], which is the same function
+/// the host handler calls - so this is the definition, not a second opinion of it.
+///
+/// The cases are chosen to separate the ways a byte loop goes wrong: a difference in the
+/// FIRST byte (an off-by-one entry test skips it), in the LAST (an off-by-one exit test
+/// skips it), a difference past the length (it must NOT be seen), and a pair whose
+/// difference is negative one way and positive the other, which a sign-extended load would
+/// get backwards.
+#[test]
+fn mem_compare_computes_the_shared_definition() {
+    let cases: [(&[u8], &[u8]); 8] = [
+        (b"abc", b"abc"),
+        (b"abc", b"abd"),
+        (b"abc", b"abb"),
+        (b"xbc", b"abc"),
+        (b"abc", b"xbc"),
+        (b"", b""),
+        (&[0x01, 0x02, 0xff], &[0x01, 0x02, 0x01]),
+        (&[0x01, 0x02, 0x01], &[0x01, 0x02, 0xff]),
+    ];
+    for (a, b) in cases {
+        let mut vm = vm_with(InlineOp::MemCompare);
+        vm.write_mem(OUT_PTR, a).expect("seed a");
+        vm.write_mem(SRC_PTR, b).expect("seed b");
+        vm.set_reg(0, OUT_PTR);
+        vm.set_reg(1, SRC_PTR);
+        vm.set_reg(2, a.len() as u32);
+        assert!(!run(&mut vm), "an in-range compare must not reach the host");
+        assert_eq!(
+            vm.get_reg(0) as i32,
+            vitaslop_transpiler::mem_compare(a, b),
+            "comparing {a:?} against {b:?}"
+        );
+    }
+}
+
+/// A difference PAST the length must not be reported. This is the exit test, and getting it
+/// wrong produces an answer that is correct on almost every input a title supplies - two
+/// buffers that differ somewhere are the common case, and the extra byte the loop read is
+/// usually equal too.
+#[test]
+fn mem_compare_stops_at_the_length() {
+    let mut vm = vm_with(InlineOp::MemCompare);
+    vm.write_mem(OUT_PTR, &[1, 2, 3, 4]).expect("seed a");
+    vm.write_mem(SRC_PTR, &[1, 2, 3, 99]).expect("seed b");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, 3);
+    assert!(!run(&mut vm));
+    assert_eq!(vm.get_reg(0), 0, "the fourth byte is past the length and must not be read");
+}
+
+/// A compare writes nothing. Obvious, and worth an assertion anyway: it shares its guard and
+/// its locals with two forms that DO write, and the shared code is where a stray store
+/// would come from.
+#[test]
+fn mem_compare_writes_nothing() {
+    let mut vm = vm_with(InlineOp::MemCompare);
+    seed_sentinels(&mut vm, 8);
+    vm.write_mem(SRC_PTR, &pattern(32)).expect("seed b");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, 32);
+    assert!(!run(&mut vm));
+    assert_only_wrote(&mut vm, 8, None);
+}
+
+#[test]
+fn mem_compare_falls_back_when_the_length_runs_off_the_end() {
+    for (a, b, len, expect_crossing) in [
+        (last_fitting_ptr(16), SRC_PTR, 16u32, false),
+        (last_fitting_ptr(16), SRC_PTR, 17, true),
+        (OUT_PTR, last_fitting_ptr(16), 16, false),
+        (OUT_PTR, last_fitting_ptr(16), 17, true),
+        (OUT_PTR, SRC_PTR, MEM_BYTES + 1, true),
+        (0, SRC_PTR, 8, true),
+        (OUT_PTR, 0, 8, true),
+    ] {
+        let mut vm = vm_with(InlineOp::MemCompare);
+        vm.set_reg(0, a);
+        vm.set_reg(1, b);
+        vm.set_reg(2, len);
+        assert_eq!(run(&mut vm), expect_crossing, "a={a:#x} b={b:#x} len={len}");
+        if expect_crossing {
+            assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler's answer survives");
+        }
+    }
+}
+
+// --- the dirty stamp a bulk WRITE owes -------------------------------------------------
+
+/// Build a VM for `op` with guest-store tracking ON, and hand back the guest address of the
+/// dirty block.
+///
+/// Tracking is a per-thread emit-time setting, so it is turned on around the build and off
+/// again immediately: leaving it on would change every module a later test on this thread
+/// emits, and the symptom would be a byte-count assertion failing in a test that never
+/// mentions dirty pages.
+fn vm_with_dirty(op: InlineOp) -> (Vm, u32) {
+    vitaslop_transpiler::set_dirty_tracking(true);
+    let vm = vm_with(op);
+    vitaslop_transpiler::set_dirty_tracking(false);
+    let off = vm.dirty_off().expect("a tracked build reserves the dirty block");
+    (vm, BASE + off as u32)
+}
+
+/// Read page `page`'s stamp out of the map.
+fn stamp_of(vm: &mut Vm, block: u32, page: u32) -> u8 {
+    let at = block + vitaslop_transpiler::DIRTY_MAP_OFF as u32 + page;
+    vm.read_mem(at, 1).expect("the map is inside linear memory")[0]
+}
+
+/// Seed the epoch the guest will stamp with, and clear the pages the test looks at.
+fn seed_epoch(vm: &mut Vm, block: u32, epoch: u8, pages: std::ops::Range<u32>) {
+    vm.write_mem(block + vitaslop_transpiler::DIRTY_EPOCH_OFF as u32, &[epoch])
+        .expect("seed the epoch");
+    for p in pages {
+        let at = block + vitaslop_transpiler::DIRTY_MAP_OFF as u32 + p;
+        vm.write_mem(at, &[0]).expect("clear the stamp");
+    }
+}
+
+/// A bulk write must stamp EVERY page it touches, not just the one it starts in.
+///
+/// This is the assertion the whole `emit_dirty_range` helper exists for, and the failure it
+/// catches is silent by construction: a copy that stamps only its first page leaves the host
+/// believing the rest of a texture is exactly as it last read it, so the frame draws from
+/// bytes the guest has since replaced, with nothing reported anywhere
+/// ([[vitaslop-guest-store-stamps]]).
+#[test]
+fn a_bulk_copy_stamps_every_page_it_spans() {
+    const EPOCH: u8 = 0x2a;
+    let shift = vitaslop_transpiler::DIRTY_SHIFT;
+    // A destination part-way into a page, long enough to span three of them, so a form that
+    // stamped the first page, the last page, or a page count off by one all fail here.
+    let dst = OUT_PTR;
+    let len = (2 << shift) + 100;
+    let first = (dst - BASE) >> shift;
+    let last = (dst - BASE + len - 1) >> shift;
+    assert_eq!(last - first, 2, "the fixture must really span three pages");
+
+    let (mut vm, block) = vm_with_dirty(InlineOp::MemCopy);
+    seed_epoch(&mut vm, block, EPOCH, first.saturating_sub(1)..last + 2);
+    vm.write_mem(SRC_PTR, &pattern(len as usize)).expect("seed the source");
+    vm.set_reg(0, dst);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, len);
+    assert!(!run(&mut vm), "an in-range copy is still served inline when tracking is on");
+    for page in first..=last {
+        assert_eq!(stamp_of(&mut vm, block, page), EPOCH, "page {page} is in the copy");
+    }
+    // ...and stops. An over-wide stamp is only a lost optimisation, but it is also the
+    // signature of a page count computed from the wrong end.
+    assert_eq!(stamp_of(&mut vm, block, last + 1), 0, "the page after the copy is untouched");
+}
+
+#[test]
+fn a_bulk_fill_stamps_every_page_it_spans() {
+    const EPOCH: u8 = 0x71;
+    let shift = vitaslop_transpiler::DIRTY_SHIFT;
+    let len = (1 << shift) + 1;
+    let first = (OUT_PTR - BASE) >> shift;
+    let last = (OUT_PTR - BASE + len - 1) >> shift;
+    let (mut vm, block) = vm_with_dirty(InlineOp::MemFill);
+    seed_epoch(&mut vm, block, EPOCH, first..last + 2);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, 0xff);
+    vm.set_reg(2, len);
+    assert!(!run(&mut vm));
+    for page in first..=last {
+        assert_eq!(stamp_of(&mut vm, block, page), EPOCH, "page {page} is in the fill");
+    }
+    assert_eq!(stamp_of(&mut vm, block, last + 1), 0, "the page after the fill is untouched");
+}
+
+/// A ZERO-length write stamps nothing. `last = addr + len - 1` underflows here, and a range
+/// computed without the guard would ask `memory.fill` for four billion bytes - which traps,
+/// turning a legal `memcpy(d, s, 0)` into a dead guest.
+#[test]
+fn a_zero_length_bulk_write_stamps_nothing() {
+    const EPOCH: u8 = 0x5c;
+    let first = (OUT_PTR - BASE) >> vitaslop_transpiler::DIRTY_SHIFT;
+    let (mut vm, block) = vm_with_dirty(InlineOp::MemFill);
+    seed_epoch(&mut vm, block, EPOCH, first..first + 2);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, 0xff);
+    vm.set_reg(2, 0);
+    assert!(!run(&mut vm), "a zero-length fill is in range and must not trap");
+    assert_eq!(stamp_of(&mut vm, block, first), 0, "no page was written, so none is stamped");
+}
+
+/// A compare writes nothing and therefore stamps nothing. A stamp here is not merely
+/// wasteful: it would report a texture as overwritten every time a title compared it,
+/// which is a re-upload of every read-only texture on every frame that looks at one.
+#[test]
+fn a_bulk_compare_stamps_nothing() {
+    const EPOCH: u8 = 0x13;
+    let first = (OUT_PTR - BASE) >> vitaslop_transpiler::DIRTY_SHIFT;
+    let (mut vm, block) = vm_with_dirty(InlineOp::MemCompare);
+    seed_epoch(&mut vm, block, EPOCH, first..first + 2);
+    vm.write_mem(OUT_PTR, &pattern(64)).expect("seed a");
+    vm.write_mem(SRC_PTR, &pattern(64)).expect("seed b");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, SRC_PTR);
+    vm.set_reg(2, 64);
+    assert!(!run(&mut vm));
+    assert_eq!(vm.get_reg(0), 0, "identical buffers compare equal");
+    assert_eq!(stamp_of(&mut vm, block, first), 0, "a read stamps nothing");
 }
 
 /// Guard against the registers being read back from somewhere other than the globals the

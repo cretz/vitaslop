@@ -206,6 +206,31 @@ pub trait GuestEngine {
     }
 }
 
+/// Guest WORDS through an engine, for the scheduler's own use between resumes.
+///
+/// [`crate::host::GuestCtx`] is the ordinary way to touch guest memory, but it exists only
+/// while a host call is in flight. The scheduler sometimes has to settle guest-resident
+/// state with no call in flight at all - see [`crate::host::ImportDispatch::resolve_deferred`]
+/// - and the engine's byte read/write is all that is available there.
+///
+/// An unmapped address reads zero and swallows its write, which matches what a host call
+/// would do with the same address.
+struct EngineWords<'a, E: GuestEngine>(&'a mut E);
+
+impl<E: GuestEngine> crate::host::GuestWords for EngineWords<'_, E> {
+    fn word(&self, addr: u32) -> u32 {
+        let mut b = [0u8; 4];
+        if self.0.read_mem(addr, &mut b) {
+            u32::from_le_bytes(b)
+        } else {
+            0
+        }
+    }
+    fn set_word(&mut self, addr: u32, value: u32) {
+        self.0.write_mem(addr, &value.to_le_bytes());
+    }
+}
+
 /// One entry in the live thread table: the engine's thread plus the policy's state.
 struct Slot<T> {
     thread: T,
@@ -411,6 +436,19 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         &self.host
     }
 
+    /// Run `f` against the host WITH guest memory in hand, between resumes.
+    ///
+    /// The accessor for anything that has to reach guest-resident state from outside a host
+    /// call - a lightweight mutex handed over, a diagnostic that signals a cond from the
+    /// harness. Locking [`host`](Self::host) alone is not enough for those: the state they
+    /// touch lives in the guest, and a host that writes it nowhere leaves a woken thread
+    /// believing it holds a mutex the work area says is free.
+    pub fn with_host_words<R>(&mut self, f: impl FnOnce(&mut H, &mut dyn crate::host::GuestWords) -> R) -> R {
+        let mut words = EngineWords(&mut self.engine);
+        let mut host = self.host.lock().unwrap();
+        f(&mut host, &mut words)
+    }
+
     /// Frame boundaries observed so far.
     pub fn frames(&self) -> u64 {
         self.frames
@@ -469,6 +507,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             .find(|&i| runnable(&self.threads[i]) && self.threads[i].thread.priority() == best)?;
         self.cursor = idx + 1;
         self.threads[idx].picks += 1;
+        // The host's idea of the current thread is now a PROPERTY OF THE PICK, not of the
+        // next dispatch. It is mirrored into guest memory below, for the inlined
+        // lightweight-mutex take, and a resumed thread must read its own id from the first
+        // instruction - not the previous thread's until it happens to call the host.
+        let thid = self.threads[idx].thread.thid();
+        self.host.lock().unwrap().set_current_thread(thid);
         // Guest code is about to run, so the host-mirror block has to be current. This
         // is the one place both schedulers (native and browser) pass through on their
         // way to a resume, which is why the refresh lives here rather than in either
@@ -708,6 +752,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// Start any threads the last host call requested, and wake any it released. Call
     /// after every resume and after a clock advance.
     pub fn drain(&mut self) {
+        // FIRST, and before the wakes are taken: settle anything the host decided where it
+        // had no guest memory to decide it with (a lightweight mutex owed to a cond wait
+        // that timed out - see `ImportDispatch::resolve_deferred`). It can push wakes of
+        // its own, so it has to run ahead of the take below or they would sit until the
+        // next drain, one whole scheduling round late.
+        self.with_host_words(|host, words| host.resolve_deferred(words));
         let (spawns, wakes, stat_writes) = {
             let mut host = self.host.lock().unwrap();
             (host.take_spawns(), host.take_wakes(), host.take_stat_writes())
@@ -795,6 +845,12 @@ where
     /// A scheduler seeded with its `main` thread, ready to run.
     pub fn new(engine: E, host: Arc<Mutex<H>>, main: E::Thread) -> Self {
         Scheduler { core: SchedCore::new(engine, host, main), rounds_total: 0 }
+    }
+
+    /// The scheduling core, for the few things that need both the host and the engine at
+    /// once (see [`SchedCore::with_host_words`]).
+    pub fn core_mut(&mut self) -> &mut SchedCore<E, H> {
+        &mut self.core
     }
 
     /// Thread resumes so far. See [`rounds_total`](Self::rounds_total)'s field docs.

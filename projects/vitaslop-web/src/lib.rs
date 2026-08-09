@@ -346,7 +346,7 @@ impl Playback {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("vitaslop-web"),
-                required_features: wgpu::Features::empty(),
+                required_features: vitaslop_platform::gpu::wanted_features(&adapter),
                 // The same limits the native pixel oracle asks for - see the note on
                 // the retail device below. NOT the WebGL2 downlevel set: this is a
                 // WebGPU device.
@@ -476,11 +476,448 @@ struct LivePlayback {
     builder: RenderSceneBuilder,
     depth: wgpu::TextureView,
     render_format: wgpu::TextureFormat,
+    /// The surface description, kept so the diagnostics panel can carry it (see the note
+    /// where it is built).
+    surface_line: String,
+    /// The surface stores blue first, so the probe's per-channel means need swapping.
+    probe_bgra: bool,
     fps: FpsMeter,
     /// The clock `present` times itself with. `FpsMeter` owns one too, but it is behind
     /// that type's own accounting; the render split needs four reads of its own.
     perf: Option<web_sys::Performance>,
     split: RenderSplit,
+    /// Reads back WHAT WE PRESENTED, when `VITASLOP_PRESENT_PROBE` asks for it.
+    probe: Option<PresentProbe>,
+    /// ...and how bright each offscreen target of the chain is, on the same cadence.
+    targets: Option<TargetProbe>,
+    /// The most recent probe description, waiting for the next diagnostics window.
+    last_probe: Option<String>,
+    /// Presents since the run started. NOT `split.presents`, which `take_split` resets every
+    /// diagnostics window - a probe cadence driven off that one restarts at zero each window,
+    /// so it fires on the same relative frame forever and every report is labelled "frame 0".
+    presents_total: u64,
+}
+
+/// Sample every OFFSCREEN TARGET of a frame and describe how bright each one is.
+///
+/// # Why the presented surface is not enough
+/// A frame is a chain: the world and its intermediates render into offscreen targets and a
+/// final pass composites them. When the finished picture is wrong, the surface says only that
+/// - and every pass in the chain produces the same symptom in the composite. The native oracle
+/// answers this with `VITASLOP_GPU_CHAIN_DIR`, which writes a PNG per target; the browser has
+/// no filesystem, and the defect being chased here (a world that goes pure white while the UI
+/// survives) reproduces in the BROWSER and not, so far, anywhere a PNG can be written.
+///
+/// The other route was tried first and cannot work: `VITASLOP_GXP_SOLID` paints every
+/// recompiled draw magenta, but the frame's last pass is a fullscreen composite that is itself
+/// recompiled, so the whole screen comes back magenta and names nothing. That is recorded in
+/// the notes as a trap and it caught this session anyway.
+///
+/// Only a small corner of each target is copied - brightness is the question, not the image -
+/// so the whole probe is a few tens of kilobytes however many targets a frame has.
+struct TargetProbe {
+    /// One staging buffer per target address, kept across frames.
+    bufs: std::collections::HashMap<u32, (wgpu::Buffer, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// The targets copied on the frame in flight: `(address, width, height)` of the REGION.
+    pending: Vec<(u32, u32, u32)>,
+    awaiting_submit: bool,
+    frame: u64,
+}
+
+/// The edge of each sampled tile. 64 * 4 bytes is exactly the 256-byte row alignment WebGPU
+/// requires for a texture-to-buffer copy, so no padding arithmetic is needed.
+const TARGET_PROBE_EDGE: u32 = 64;
+
+/// How many tiles are sampled per target, spread across its INTERIOR.
+///
+/// # Why one corner is not a sample
+/// The first version copied a single 64x64 tile from each target's top-left, and it named the
+/// 1024x1024 target as pure white - which it is, in that corner, on BOTH engines: it is a
+/// shadow map and its corner is empty far-plane. Whole-image, the same target is 126.5 mean /
+/// 49.6% white. A corner reading would have identified an innocent pass as the cause of the
+/// white-out, confidently, with a number attached.
+///
+/// Four tiles at the quarter points sample where a render target actually has content. It is
+/// still a sample and not the image - a target could be white only between the tiles - but it
+/// cannot be fooled by one empty margin, which is the failure that actually happened.
+const TARGET_PROBE_TILES: u32 = 4;
+
+impl TargetProbe {
+    fn new() -> TargetProbe {
+        TargetProbe {
+            bufs: std::collections::HashMap::new(),
+            pending: Vec::new(),
+            awaiting_submit: false,
+            frame: 0,
+        }
+    }
+
+    /// Copy a corner of every target. Call before the submit that carries `encoder`.
+    fn capture(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &[(u32, &wgpu::Texture, u32, u32)],
+        frame: u64,
+    ) {
+        self.pending.clear();
+        self.frame = frame;
+        let row = TARGET_PROBE_EDGE * 4;
+        let tile_bytes = (row as u64) * (TARGET_PROBE_EDGE as u64);
+        for &(addr, tex, w, h) in targets {
+            let cw = w.min(TARGET_PROBE_EDGE);
+            let ch = h.min(TARGET_PROBE_EDGE);
+            if cw == 0 || ch == 0 {
+                continue;
+            }
+            let entry = self.bufs.entry(addr).or_insert_with(|| {
+                (
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("target-probe"),
+                        size: tile_bytes * TARGET_PROBE_TILES as u64,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    }),
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+            });
+            entry.1.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Four tiles at the quarter points, clamped so each one fits inside the target.
+            // The tile offsets are whole multiples of `tile_bytes`, itself a multiple of the
+            // 256-byte copy alignment, so no offset arithmetic can violate it.
+            let origins = [(w / 4, h / 4), (3 * w / 4, h / 4), (w / 4, 3 * h / 4), (3 * w / 4, 3 * h / 4)];
+            for (i, (ox, oy)) in origins.iter().enumerate() {
+                let x = (*ox).min(w.saturating_sub(cw));
+                let y = (*oy).min(h.saturating_sub(ch));
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x, y, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &entry.0,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: tile_bytes * i as u64,
+                            bytes_per_row: Some(row),
+                            rows_per_image: Some(TARGET_PROBE_EDGE),
+                        },
+                    },
+                    wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                );
+            }
+            self.pending.push((addr, cw, ch));
+        }
+        self.awaiting_submit = !self.pending.is_empty();
+    }
+
+    /// Request the maps, AFTER the submit. See `PresentProbe::begin_map` for why this cannot
+    /// be folded into `capture`.
+    fn begin_map(&mut self) {
+        if !self.awaiting_submit {
+            return;
+        }
+        self.awaiting_submit = false;
+        for (addr, _, _) in &self.pending {
+            if let Some((buf, ready)) = self.bufs.get(addr) {
+                let ready = ready.clone();
+                buf.slice(..).map_async(wgpu::MapMode::Read, move |_| {
+                    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }
+    }
+
+    /// Describe every target whose copy has landed, brightest first.
+    fn take_report(&mut self, swizzle_bgra: bool) -> Option<String> {
+        if self.pending.is_empty() || self.awaiting_submit {
+            return None;
+        }
+        let all_ready = self.pending.iter().all(|(a, _, _)| {
+            self.bufs
+                .get(a)
+                .is_some_and(|(_, r)| r.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        if !all_ready {
+            return None;
+        }
+        let mut rows: Vec<(f64, String)> = Vec::new();
+        for (addr, cw, ch) in std::mem::take(&mut self.pending) {
+            let Some((buf, _)) = self.bufs.get(&addr) else { continue };
+            let (mut sum, mut white, mut n) = (0u64, 0u64, 0u64);
+            if let Ok(view) = buf.slice(..).get_mapped_range() {
+                let tile = (TARGET_PROBE_EDGE as usize) * 4 * (TARGET_PROBE_EDGE as usize);
+                for t in 0..TARGET_PROBE_TILES as usize {
+                    for y in 0..ch as usize {
+                        let base = t * tile + y * (TARGET_PROBE_EDGE as usize) * 4;
+                        for x in 0..cw as usize {
+                            let p = &view[base + x * 4..base + x * 4 + 4];
+                            let (r, g, b) =
+                                if swizzle_bgra { (p[2], p[1], p[0]) } else { (p[0], p[1], p[2]) };
+                            sum += ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8) as u64;
+                            if r > 250 && g > 250 && b > 250 {
+                                white += 1;
+                            }
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            buf.unmap();
+            let mean = sum as f64 / n.max(1) as f64;
+            rows.push((
+                mean,
+                format!(
+                    "  {addr:#x}  mean {mean:6.1}  white {:5.1}%",
+                    white as f64 * 100.0 / n.max(1) as f64
+                ),
+            ));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out = format!(
+            "frame {}: {TARGET_PROBE_TILES} interior {TARGET_PROBE_EDGE}x{TARGET_PROBE_EDGE} \
+             tiles of every offscreen target, brightest first. A target reading ~255 mean / \
+             ~100% white is where the white ENTERS the chain; the ones below it are downstream. \
+             NOTE this is a sample, not the image - compare a suspect against the SAME tiles of \
+             a native `VITASLOP_GPU_CHAIN_DIR` dump before believing it.\n",
+            self.frame
+        );
+        for (_, line) in rows {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Some(out)
+    }
+}
+
+/// Sample the presented surface and describe it in TEXT.
+///
+/// # Why a render counter cannot answer "the screen is white"
+/// A white screen with a healthy panel - draws recompiled, nothing dropped, no WebGPU error,
+/// textures cached, and an fps meter that ticks AFTER `queue.present` - is consistent with two
+/// completely different faults: we presented white pixels, or we presented a picture the
+/// compositor never showed. Every counter in this file is upstream of the surface, so none of
+/// them can tell those apart, and on a phone there is no screenshot tool, no devtools and no
+/// pixel to sample by hand. This reads the surface itself, after the frame is encoded, and
+/// prints a summary a person can read out of the diagnostics panel.
+///
+/// It costs a full-surface copy and a buffer map, so it runs once every `every` presents and
+/// only when the knob asks. `VITASLOP_PRESENT_PROBE=120` is a reasonable cadence: twice a
+/// second at 60 fps, and the copy is 2 MB.
+struct PresentProbe {
+    /// Sample every N presents. Never zero.
+    every: u32,
+    /// The staging buffer the surface is copied into (`WIDTH * HEIGHT * 4`).
+    buffer: wgpu::Buffer,
+    /// `bytes_per_row` for the copy - the surface is `WIDTH` wide and 256-aligned already,
+    /// but a wrong assumption here is a validation error rather than a wrong picture, so it
+    /// is computed and asserted at construction.
+    bytes_per_row: u32,
+    /// Set by the map callback when a mapped read is ready. Shared with the callback, which
+    /// wgpu requires to be `'static` and thread-safe even on wasm.
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A copy is in flight (mapped or awaiting its callback), so no new one may start.
+    in_flight: bool,
+    /// The copy is encoded but its submit has not happened yet, so the map may not be
+    /// requested. See [`PresentProbe::begin_map`].
+    awaiting_submit: bool,
+    /// The frame the in-flight copy was taken on, for the report.
+    in_flight_frame: u64,
+}
+
+impl PresentProbe {
+    fn new(device: &wgpu::Device, every: u32) -> PresentProbe {
+        // WebGPU requires a 256-byte aligned `bytes_per_row` for a texture-to-buffer copy.
+        // 960 * 4 = 3840 = 15 * 256, so the surface needs no padding - but the ALIGNMENT is
+        // the rule, not the coincidence, so it is rounded explicitly and the buffer sized
+        // from the rounded value. A hard-coded 3840 would silently corrupt every row the day
+        // the surface stops being 960 wide.
+        let bytes_per_row = (WIDTH * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present-probe"),
+            size: (bytes_per_row as u64) * (HEIGHT as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        PresentProbe {
+            every: every.max(1),
+            buffer,
+            bytes_per_row,
+            ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: false,
+            awaiting_submit: false,
+            in_flight_frame: 0,
+        }
+    }
+
+    /// Should this present be sampled?
+    fn wants(&self, presents: u64) -> bool {
+        !self.in_flight && presents > 0 && presents % (self.every as u64) == 0
+    }
+
+    /// Queue the copy. Call with the encoder that is about to be submitted, BEFORE
+    /// `present` - the surface texture is not readable once presented.
+    fn capture(&mut self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, frame: u64) {
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.bytes_per_row),
+                    rows_per_image: Some(HEIGHT),
+                },
+            },
+            wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+        );
+        self.in_flight = true;
+        self.awaiting_submit = true;
+        self.in_flight_frame = frame;
+        self.ready.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Request the map, AFTER the encoder carrying the copy has been submitted.
+    ///
+    /// # Why this cannot be folded into `capture`
+    /// It was, and the probe then reported a 100% pure black surface on a frame that was
+    /// demonstrably rendering. `map_async` resolves against the buffer as the queue knows it
+    /// at the moment of the call; asking before the copy is submitted returns the buffer's
+    /// prior contents, which for a never-written staging buffer is zeros. The failure is
+    /// perfectly quiet - a valid map, a full buffer, every byte zero - and it reads exactly
+    /// like the defect the probe was built to diagnose. An instrument whose failure mode
+    /// imitates its subject has to be ordered correctly by construction, so the submit
+    /// boundary is now a separate call that cannot be skipped without leaving `awaiting_submit`
+    /// set and the probe visibly stuck.
+    fn begin_map(&mut self) {
+        if !self.awaiting_submit {
+            return;
+        }
+        self.awaiting_submit = false;
+        let ready = self.ready.clone();
+        self.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            // A failed map must not leave the probe stuck in flight forever; it is flagged
+            // ready and the reader reports the failure rather than silently sampling nothing.
+            let _ = r;
+            ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// If a mapped read is ready, describe it and release the buffer. Returns the report.
+    fn take_report(&mut self, swizzle_bgra: bool) -> Option<String> {
+        if !self.in_flight || !self.ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        // A map that FAILED still flags ready (see the callback), so the failure has to be
+        // reported here rather than read as an empty sample. Silence would look exactly like
+        // a probe that ran and found nothing worth saying.
+        let text = match self.buffer.slice(..).get_mapped_range() {
+            Ok(view) => {
+                let text =
+                    Self::describe(&view, self.bytes_per_row, self.in_flight_frame, swizzle_bgra);
+                drop(view);
+                self.buffer.unmap();
+                text
+            }
+            Err(e) => format!(
+                "presented frame {}: the surface readback FAILED to map ({e}), so this window \
+                 says nothing about what was presented",
+                self.in_flight_frame
+            ),
+        };
+        self.in_flight = false;
+        Some(text)
+    }
+
+    /// Turn the presented pixels into something readable on a phone.
+    ///
+    /// Three things, because each answers a different question the others cannot:
+    /// the WHITE and BLACK shares (is the surface uniform?), the channel means and extremes
+    /// (is it washed out, or clipped?), and an 8x6 luminance grid (does the picture have
+    /// STRUCTURE?). The grid is the one that settles "white screen": a uniform grid means we
+    /// presented a blank surface, and a varied one means we presented a picture and the
+    /// screen is not showing it.
+    fn describe(bytes: &[u8], bytes_per_row: u32, frame: u64, swizzle_bgra: bool) -> String {
+        const GRID_W: usize = 8;
+        const GRID_H: usize = 6;
+        let (mut white, mut black, mut total) = (0u64, 0u64, 0u64);
+        let (mut sum_r, mut sum_g, mut sum_b) = (0u64, 0u64, 0u64);
+        let (mut min_l, mut max_l) = (255u8, 0u8);
+        let mut cells = [[0u64; GRID_W]; GRID_H];
+        let mut cell_n = [[0u64; GRID_W]; GRID_H];
+        for y in 0..HEIGHT as usize {
+            let row = &bytes[y * bytes_per_row as usize..][..WIDTH as usize * 4];
+            for x in 0..WIDTH as usize {
+                let p = &row[x * 4..x * 4 + 4];
+                // The surface format may be BGRA; the channel order only matters for the
+                // per-channel means, never for luminance or the white/black shares.
+                let (r, g, b) = if swizzle_bgra { (p[2], p[1], p[0]) } else { (p[0], p[1], p[2]) };
+                total += 1;
+                sum_r += r as u64;
+                sum_g += g as u64;
+                sum_b += b as u64;
+                if r > 250 && g > 250 && b > 250 {
+                    white += 1;
+                }
+                if r < 5 && g < 5 && b < 5 {
+                    black += 1;
+                }
+                let l = ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8) as u8;
+                min_l = min_l.min(l);
+                max_l = max_l.max(l);
+                let cy = y * GRID_H / HEIGHT as usize;
+                let cx = x * GRID_W / WIDTH as usize;
+                cells[cy][cx] += l as u64;
+                cell_n[cy][cx] += 1;
+            }
+        }
+        let pct = |n: u64| n as f64 * 100.0 / total.max(1) as f64;
+        let mut out = format!(
+            "presented frame {frame}: {:.1}% pure white, {:.1}% pure black, \
+             mean rgb ({:.0},{:.0},{:.0}), luminance {min_l}..{max_l}\n",
+            pct(white),
+            pct(black),
+            sum_r as f64 / total.max(1) as f64,
+            sum_g as f64 / total.max(1) as f64,
+            sum_b as f64 / total.max(1) as f64,
+        );
+        // A uniform surface and a picture are told apart by this and nothing else above it.
+        out.push_str(if max_l - min_l < 8 {
+            "the surface is UNIFORM - we presented a blank picture, so the fault is UPSTREAM \
+             of the canvas\n"
+        } else {
+            "the surface HAS STRUCTURE - we presented a picture, so a blank SCREEN is a \
+             compositing fault, not a render one\n"
+        });
+        for row in cells.iter().zip(cell_n.iter()) {
+            out.push(' ');
+            for (sum, n) in row.0.iter().zip(row.1.iter()) {
+                let mean = (sum / (*n).max(1)) as u8;
+                // A coarse ramp: the SHAPE is the reading, not the exact level.
+                out.push(match mean {
+                    0..=31 => '.',
+                    32..=63 => ':',
+                    64..=95 => '-',
+                    96..=127 => '=',
+                    128..=159 => '+',
+                    160..=191 => '*',
+                    192..=223 => '#',
+                    _ => '@',
+                });
+                out.push(' ');
+            }
+            out.push('\n');
+        }
+        out
+    }
 }
 
 /// Where a presented frame's render time went. See [`LivePlayback::present`].
@@ -512,6 +949,18 @@ struct RenderSplit {
     worst_encode_ms: f64,
     worst_encode_draws: usize,
     worst_enc_work: vitaslop_platform::gpu::EncodeWork,
+    /// The worst encode frame's OWN prepare/upload/pass split.
+    ///
+    /// # Why the counters were not enough
+    /// A device capture produced a worst encode frame of 32.5 ms against a 10.8 ms window
+    /// mean, at 474 draws against 473 - and with every counter in `worst_enc_work` identical
+    /// to the mean's, down to the buffer count and the bytes written. Identical work, three
+    /// times the time. The counters say what was DONE and cannot say where the time went, and
+    /// the phase split was reported for the window mean only, so the one frame that needed
+    /// explaining was the one frame with no breakdown. `prepare` and `upload` have completely
+    /// different causes (bind-group construction against buffer writes and allocation), so
+    /// without this the outlier cannot even be attributed to a half.
+    worst_enc_phases: vitaslop_platform::gpu::EncodePhases,
     /// The window's build work, summed here rather than read globally, so it covers exactly
     /// the presents this window counted.
     work: vitaslop_runtime::render::BuildWork,
@@ -521,14 +970,19 @@ struct RenderSplit {
 
 /// Supersample factor for the live browser render (`VITASLOP_BROWSER_SUPERSAMPLE`).
 ///
-/// Defaults to 2, which is what the desktop review path uses, so a browser shot and a
-/// desktop shot are comparable by construction. Turn it down for a heavier scene or a
-/// weaker GPU; 1 is native resolution. A value that is not a positive integer is an
-/// ERROR rather than a silent fallback to the default - a run configured by a typo
-/// would otherwise publish a rate for a resolution nobody asked for.
+/// Defaults to 1 - the panel's own resolution, which is what the guest asks the display
+/// buffer to be rasterised at. The antialiasing a title really requests is on the render
+/// targets it creates multisampled, and that is honoured now, so there is nothing left for
+/// this to do but differ from the desktop. It used to default to 2 while the live page
+/// always overrode it to 1, which meant no engine ever ran the documented default and a
+/// phone could not be compared with a review shot at all.
+///
+/// A value that is not a positive integer is an ERROR rather than a silent fallback to the
+/// default - a run configured by a typo would otherwise publish a rate for a resolution
+/// nobody asked for.
 fn supersample() -> u32 {
     match vitaslop_runtime::knobs::var("VITASLOP_BROWSER_SUPERSAMPLE") {
-        Err(_) => 2,
+        Err(_) => 1,
         Ok(v) => v
             .parse::<u32>()
             .ok()
@@ -600,6 +1054,155 @@ const SOFTWARE_ADAPTER_MARKERS: &[&str] =
 /// vendor/architecture fields, which do name it, are only reachable through the raw
 /// `GPUAdapterInfo`. Requesting a second adapter is cheap (the page gets the same one) and
 /// is the only way to answer the question honestly.
+/// Establish that WebGPU is genuinely usable here BEFORE any of it reaches `wgpu`, and name the
+/// step that failed if it is not.
+///
+/// # Why this has to exist, and what it cost not to have it
+/// `wgpu::Instance::request_adapter` on the WebGPU backend can return `Ok` holding an adapter
+/// whose underlying JavaScript object is NULL. Nothing about that is visible from Rust: the
+/// `Result` is fine, the `Adapter` exists, and the first property read off it - `adapter.features`
+/// in the generated glue, which is the very first thing this renderer asks for - throws a JS
+/// `TypeError` that no Rust error handling can intercept. Inside the emulator's worker that kills
+/// the worker outright, and the user sees one line:
+///
+/// ```text
+/// worker error: Uncaught TypeError: Cannot read properties of null (reading 'features')
+/// ```
+///
+/// which names a property in generated glue and nothing about the cause. REPORTED FROM A DEVICE,
+/// twice - the first time on `.info`, and removing that read only moved it one property along,
+/// because it was a symptom. This is the cause: an adapter that does not exist must be refused at
+/// the boundary, not carried inward.
+///
+/// Every step here is reflection with a guard, so this function itself can never throw.
+async fn webgpu_preflight() -> Result<(), String> {
+    use js_sys::{Function, Reflect};
+    let global = js_sys::global();
+    let navigator = Reflect::get(&global, &JsValue::from_str("navigator"))
+        .map_err(|_| "no `navigator` in this context".to_string())?;
+    let gpu = Reflect::get(&navigator, &JsValue::from_str("gpu"))
+        .map_err(|_| "reading `navigator.gpu` threw".to_string())?;
+    if gpu.is_undefined() || gpu.is_null() {
+        return Err(
+            "`navigator.gpu` is absent - this browser has no WebGPU, or it is disabled for this \
+             origin. On Android, Chrome exposes WebGPU only on a SECURE context it trusts: a \
+             self-signed certificate that was clicked through can be enough to withhold it. \
+             Check chrome://gpu on the device."
+                .into(),
+        );
+    }
+    let request: Function = Reflect::get(&gpu, &JsValue::from_str("requestAdapter"))
+        .map_err(|_| "`navigator.gpu.requestAdapter` is unreadable".to_string())?
+        .dyn_into()
+        .map_err(|_| "`navigator.gpu.requestAdapter` is not callable".to_string())?;
+    // >>> ASK EVERY WAY THE SPEC ALLOWS, AND RETRY, BEFORE BELIEVING A NULL.
+    //
+    // Two different things make `requestAdapter` answer null, and only one of them is permanent.
+    //
+    // 1. TIMING. A phone that has just restarted its GPU process - which is what happens after a
+    //    page crashed one, and this renderer has crashed one - answers null for a moment and then
+    //    answers properly. A single ask turns a half-second race into "this device has no WebGPU".
+    //
+    // 2. THE REQUEST SHAPE. `powerPreference` is documented as a hint, but it is a hint an
+    //    implementation is free to fail: a device with one GPU and no "high performance" tier can
+    //    answer null to `high-performance` and hand over the very same adapter when asked with no
+    //    preference at all. This renderer asked for `high-performance` and nothing else, so a
+    //    device behaving that way looked exactly like a device with no WebGPU.
+    //
+    // So: every shape, several times, and the shape that works is the one the renderer then uses
+    // - see `PREFERRED_POWER`. Reporting which shapes were tried is what makes the failure
+    // actionable when none of them work.
+    let shapes: [(&str, Option<&str>); 3] =
+        [("high-performance", Some("high-performance")), ("default", None), ("low-power", Some("low-power"))];
+    for round in 0..3 {
+        for (name, pref) in shapes {
+            let got = adapter_once(&request, &gpu, pref).await?;
+            if !(got.is_null() || got.is_undefined()) {
+                set_preferred_power(pref);
+                if name != "high-performance" {
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "adapter: `high-performance` was refused; this device answered to \
+                         powerPreference `{name}`, which is what the renderer will use"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+        if round < 2 {
+            sleep_ms(300).await;
+        }
+    }
+    Err(
+        "`navigator.gpu.requestAdapter()` returned NULL for every powerPreference \
+         (high-performance, default, low-power), three times each over a second - WebGPU is \
+         present but this device will not hand over an adapter at all. That is a blocklisted or \
+         repeatedly-crashed GPU process rather than a missing feature: open `chrome://gpu` on the \
+         device and read `Graphics Feature Status` and `Problems Detected`. Note that Chrome \
+         disables acceleration for a PROFILE after enough GPU-process crashes, and that survives \
+         restarting the browser."
+            .into(),
+    )
+}
+
+/// The `powerPreference` this device actually answered to, chosen by [`webgpu_preflight`].
+///
+/// `wgpu` is asked with the same one. Preflighting with one shape and then letting the renderer
+/// request another would mean the check passed for a request nobody makes.
+static PREFERRED_POWER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_preferred_power(pref: Option<&str>) {
+    let v = match pref {
+        Some("low-power") => 2,
+        None => 1,
+        _ => 0,
+    };
+    PREFERRED_POWER.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn preferred_power() -> wgpu::PowerPreference {
+    match PREFERRED_POWER.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => wgpu::PowerPreference::None,
+        2 => wgpu::PowerPreference::LowPower,
+        _ => wgpu::PowerPreference::HighPerformance,
+    }
+}
+
+/// One `requestAdapter` call at a given `powerPreference` (`None` = ask with no preference at
+/// all, which is a different request and can succeed where a preference is refused), guarded.
+async fn adapter_once(
+    request: &js_sys::Function,
+    gpu: &JsValue,
+    power: Option<&str>,
+) -> Result<JsValue, String> {
+    use js_sys::{Object, Reflect};
+    let options = Object::new();
+    if let Some(p) = power {
+        let _ =
+            Reflect::set(&options, &JsValue::from_str("powerPreference"), &JsValue::from_str(p));
+    }
+    let promise: js_sys::Promise = request
+        .call1(gpu, &options)
+        .map_err(|e| format!("`requestAdapter` threw: {e:?}"))?
+        .dyn_into()
+        .map_err(|_| "`requestAdapter` did not return a promise".to_string())?;
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("`requestAdapter` rejected: {e:?}"))
+}
+
+/// `setTimeout` as an await point.
+async fn sleep_ms(ms: i32) {
+    let p = js_sys::Promise::new(&mut |resolve, _reject| {
+        let global = js_sys::global();
+        if let Ok(f) = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout")) {
+            if let Ok(f) = f.dyn_into::<js_sys::Function>() {
+                let _ = f.call2(&global, &resolve, &JsValue::from_f64(ms as f64));
+            }
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+}
+
 async fn probe_webgpu_adapter() -> Option<AdapterProbe> {
     use js_sys::{Function, Object, Reflect};
     let global = js_sys::global();
@@ -681,18 +1284,70 @@ impl LivePlayback {
         // rasteriser unless the run explicitly asked for one. An fps measured on
         // SwiftShader describes SwiftShader; publishing it as a browser number is the
         // mistake this check exists to make impossible.
-        let info = adapter.get_info();
+        // >>> `adapter.get_info()` IS NOT CALLED HERE, and that is deliberate.
+        //
+        // On the WebGPU backend it compiles to a bare `adapter.info` property read in the
+        // generated glue, with no guard. When that object is null the read throws a JS
+        // `TypeError` that no Rust `Result` can catch, and because this runs in the emulator's
+        // WORKER it takes the whole worker down - the user sees
+        // `worker error: Uncaught TypeError: Cannot read properties of null (reading 'info')`
+        // and nothing else. That was REPORTED from a device and never reproduced on this
+        // machine, which is exactly the shape of failure worth removing rather than explaining.
+        //
+        // Nothing is lost. `info.name` is EMPTY on every browser measured here (the device's own
+        // capture reads `wgpu name unavailable`), and the software check is what
+        // `probe_webgpu_adapter` already answers, more precisely: it reads vendor, architecture
+        // and `isFallbackAdapter` off `GPUAdapterInfo` through reflection, every step of which
+        // returns `None` instead of throwing. `device_type == Cpu` only ever caught a FALLBACK
+        // adapter, which that probe catches by name.
         let probe = probe_webgpu_adapter().await;
-        let software = probe.as_ref().is_some_and(|p| p.software)
-            || info.device_type == wgpu::DeviceType::Cpu;
+        let software = probe.as_ref().is_some_and(|p| p.software);
         let summary = format!(
             "adapter: {} | {}{}",
             probe.as_ref().map(|p| p.summary.as_str()).unwrap_or("navigator.gpu unreadable"),
-            if info.name.is_empty() { "wgpu name unavailable" } else { &info.name },
+            "wgpu name unavailable",
             if software { " | SOFTWARE RASTERISER" } else { " | GPU" },
         );
         web_sys::console::log_1(&JsValue::from_str(&summary));
         report.emit("adapter", &summary);
+        // >>> WHICH COMPRESSED TEXTURE FAMILIES THIS ADAPTER OFFERS, because it decides the
+        // single biggest memory question this renderer has and cannot be guessed from here.
+        //
+        // A guest PVRTC or UBC surface has no WebGPU format on every device we have looked at,
+        // so it is CPU-decoded to RGBA8 - an 8x expansion. MEASURED on a race frame: 121 PVRTC
+        // textures occupying 110 MB that are ~14 MB in their native 4bpp form, inside a 260 MB
+        // working set against a 256 MB budget. On a phone the allocation past that budget is
+        // what fails, and a failed texture draws WHITE.
+        //
+        // The fix depends entirely on what the DEVICE supports, and the two answers are
+        // different pieces of work: `texture-compression-bc` means the guest's UBC1/2/3 blocks
+        // can be handed over verbatim with no transcode at all, while ASTC or ETC2 alone means
+        // a real transcoder. Printing the set turns that from an argument into a lookup, and it
+        // costs one line per run. [[vitaslop-browser-gpu-must-be-proven]]
+        let f = adapter.features();
+        let compressed: Vec<&str> = [
+            (wgpu::Features::TEXTURE_COMPRESSION_BC, "bc"),
+            (wgpu::Features::TEXTURE_COMPRESSION_ETC2, "etc2"),
+            (wgpu::Features::TEXTURE_COMPRESSION_ASTC, "astc"),
+        ]
+        .iter()
+        .filter(|(bit, _)| f.contains(*bit))
+        .map(|(_, name)| *name)
+        .collect();
+        let compressed = format!(
+            "adapter compressed-texture support: {}",
+            if compressed.is_empty() {
+                "NONE - every PVRTC/UBC surface is decoded to RGBA8, ~8x expanded".to_string()
+            } else {
+                compressed.join(", ")
+            }
+        );
+        web_sys::console::log_1(&JsValue::from_str(&compressed));
+        // >>> ITS OWN ID. `Report::emit` RATE-LIMITS BY ID (100 ms), and this fires immediately
+        // after the `adapter` summary above - so publishing it under the same name meant it was
+        // DROPPED on every run this line has ever existed for. The one fact that decides whether
+        // any compressed-texture work reaches a device has never been visible on a device.
+        report.emit("adapter-compression", &compressed);
         if software && !allow_software_gpu() {
             return Err(JsValue::from_str(&format!(
                 "{summary}\nRefusing to run: this is a CPU rasteriser, not a GPU. A frame rate \
@@ -705,7 +1360,7 @@ impl LivePlayback {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("vitaslop-web-gxm"),
-                required_features: wgpu::Features::empty(),
+                required_features: vitaslop_platform::gpu::wanted_features(&adapter),
                 // Raise the resolution-derived limits to the adapter's: a real title
                 // binds textures past the conservative downlevel floor (some titles
                 // have a ~2480px atlas). WebGPU guarantees at least 8192, so this is
@@ -754,34 +1409,101 @@ impl LivePlayback {
         // already non-sRGB, so this is usually a no-op in the browser.
         let render_format = format.remove_srgb_suffix();
         let view_formats = if render_format == format { vec![] } else { vec![render_format] };
+        // OPAQUE if the platform offers it, rather than whatever it happens to list first.
+        //
+        // The guest's display buffer is an opaque picture: GXM's colour surface has no
+        // meaningful alpha for the compositor, and whatever alpha our draws leave in the
+        // framebuffer is a by-product of blending, not a transparency the page should honour.
+        // Under `PreMultiplied` the browser composites the canvas against the page using
+        // exactly that by-product, so a screen whose blending leaves alpha below 1 comes out
+        // washed toward the page behind it - and it varies frame to frame, which reads as
+        // flicker rather than as a wrong colour.
+        //
+        // Taking `alpha_modes[0]` hid this perfectly on every machine available here: desktop
+        // adapters list `Opaque` first, so the wrong branch was never taken locally, while an
+        // Android/PowerVR canvas commonly lists `PreMultiplied` first. That is the shape of
+        // defect that only ever appears on the target device.
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+        // The presentation oracle, off unless asked for. `COPY_SRC` is added to the surface
+        // ONLY when the probe is on: it is a usage the canvas has to honour, and a page that
+        // is not sampling its own output should not ask the platform for a capability it does
+        // not use.
+        let probe_every = vitaslop_runtime::knobs::var("VITASLOP_PRESENT_PROBE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        let surface_usage = if probe_every.is_some() {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        };
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: surface_usage,
                 format,
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: WIDTH,
                 height: HEIGHT,
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: caps.alpha_modes[0],
+                alpha_mode,
                 view_formats,
                 desired_maximum_frame_latency: 2,
             },
         );
+        // What the SURFACE actually is, on the page, next to the adapter.
+        //
+        // Every field here is chosen from what the platform offers, so every one of them can
+        // differ between the machine a change is written on and the phone it is judged on -
+        // and all four change how the finished picture looks without changing a single draw.
+        // A render defect that reproduces on one device and not the other is unfalsifiable
+        // until these are visible, which is the position this cost two sessions.
+        let surface_line = format!(
+            "surface: format {format:?}, rendered through {render_format:?}, alpha {alpha_mode:?}, \
+             present Fifo | offered formats {:?}, alpha modes {:?}",
+            caps.formats, caps.alpha_modes,
+        );
+        web_sys::console::log_1(&JsValue::from_str(&surface_line));
+        report.emit("surface", &surface_line);
 
         // Give the renderer a clock BEFORE it draws anything. See `perf_now`: without this the
         // encode phase split is zero here and reads as "encode costs nothing", on the one engine
         // where encode is 84% of the render.
         vitaslop_platform::gpu::set_wasm_clock(perf_now);
         let mut gxm = GxmRenderer::new(&device, &queue, render_format);
-        // 2x supersample: resolve the sub-pixel-triangle / coincident-panel speckle a distant 3D
-        // vehicle shows, matching the software review shots and the desktop path. The car content
-        // is light on fill, so 2x (4x the fragments of a 960x544 frame) stays within a flagship
-        // mobile GPU's budget; it is the one knob to turn down if a heavier scene needs it.
+        // ONE sample per pixel, which is what the guest asks its display buffer for. How finely
+        // a pass is rasterised is the guest's own call - it states samples-per-pixel per render
+        // target with `SceGxmMultisampleMode`, and the renderer honours that - so a blanket
+        // supersample here is a second, contradictory answer to a question already settled.
+        // (This comment used to promise 2x for aliasing; the aliasing it described was measured
+        // to be a depth problem, and 2x on this title's text came out very slightly SOFTER.)
+        // `VITASLOP_BROWSER_SUPERSAMPLE` survives as a parity instrument against the software
+        // oracle, not as a picture setting.
         gxm.set_supersample(supersample());
         let depth = make_depth(&device);
         let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
         let split_clock = Some(perf.clone());
+        let probe = probe_every.map(|every| PresentProbe::new(&device, every));
+        if probe.is_some() {
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                "VITASLOP_PRESENT_PROBE is on: the surface is sampled every {} presents and \
+                 described in the diagnostics panel. This costs a full-surface copy and a \
+                 buffer map on those frames.",
+                probe_every.unwrap_or(0)
+            );
+        }
+        // The surface's own description belongs in the PANEL, not only on the console.
+        //
+        // Every field in it is chosen from what the platform offers, so every one can differ
+        // between the machine a change is written on and the phone it is judged on - which is
+        // exactly the argument the line above it makes for printing it at all. It was emitted
+        // to a `surface` element that only the desktop test pages define, so on a phone the
+        // one report built for device-only render defects was invisible.
         let fps = FpsMeter::new(perf, report);
         Ok(LivePlayback {
             surface,
@@ -791,9 +1513,18 @@ impl LivePlayback {
             builder: RenderSceneBuilder::new(),
             depth,
             render_format,
+            surface_line,
+            probe_bgra: matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
             fps,
             perf: split_clock,
             split: RenderSplit::default(),
+            targets: probe.is_some().then(TargetProbe::new),
+            probe,
+            last_probe: None,
+            presents_total: 0,
         })
     }
 
@@ -827,6 +1558,10 @@ impl LivePlayback {
     fn present(&mut self, scenes: &[Scene]) {
         let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
         let t0 = clock(&self.perf);
+        // Tell the builder a new frame starts here. Its texture cache needs the boundary to
+        // know what is in use right now and how big one frame's working set is; without it the
+        // cache cannot tell a texture it is about to need again from one it is finished with.
+        self.builder.begin_frame();
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
         let draws: usize = built.iter().map(|b| b.draws.len()).sum();
         let t1 = clock(&self.perf);
@@ -853,7 +1588,40 @@ impl LivePlayback {
             CLEAR,
         );
         let t2 = clock(&self.perf);
+        // Sample the surface BEFORE it is presented - once presented it is no longer ours to
+        // read. The copy rides the same encoder, so it costs no extra submit.
+        self.presents_total += 1;
+        let sampling = self.probe.as_ref().is_some_and(|p| p.wants(self.presents_total));
+        if sampling {
+            let n = self.presents_total;
+            if let Some(probe) = self.probe.as_mut() {
+                probe.capture(&mut encoder, &frame.texture, n);
+            }
+            // The offscreen targets of the SAME frame, so the chain and the surface describe
+            // one picture rather than two moments.
+            if let Some(tp) = self.targets.as_mut() {
+                let list = self.gxm.rtt_targets();
+                tp.capture(&self.device, &mut encoder, &list, n);
+            }
+        }
         self.queue.submit([encoder.finish()]);
+        // The map is requested only now: before the submit it would resolve against an
+        // unwritten buffer and describe zeros. See `PresentProbe::begin_map`.
+        if let Some(probe) = self.probe.as_mut() {
+            probe.begin_map();
+        }
+        if let Some(tp) = self.targets.as_mut() {
+            tp.begin_map();
+        }
+        // Deliver any map callback that is ready.
+        //
+        // On the device the probe announced itself and then produced NOTHING, on two runs -
+        // the buffer was mapped and the callback never arrived. wgpu queues map callbacks
+        // internally and delivers them from `poll`; native calls it with a blocking wait,
+        // which a browser cannot do, so nothing was draining the queue at all. `Poll` is
+        // non-blocking and is a no-op when there is nothing pending, so it is safe to call
+        // every present rather than only when a probe is in flight.
+        let _ = self.device.poll(wgpu::PollType::Poll);
         self.queue.present(frame);
         let t3 = clock(&self.perf);
         // `encode_chain` already splits itself over every pass of the frame - prepare (the
@@ -875,6 +1643,7 @@ impl LivePlayback {
             self.split.worst_encode_ms = t2 - t1;
             self.split.worst_encode_draws = draws;
             self.split.worst_enc_work = enc_work;
+            self.split.worst_enc_phases = ph;
         }
         self.split.work.add_pub(&work);
         self.split.enc_work.add(&enc_work);
@@ -889,6 +1658,21 @@ impl LivePlayback {
         self.split.scenes += scenes.len() as u64;
         self.split.draws += draws as u64;
         self.split.presents += 1;
+        // Collect a finished readback. The map callback lands on an event-loop turn after the
+        // copy, so this is always a LATER frame than the one it describes - which is why the
+        // description carries its own frame number.
+        let bgra = self.probe_bgra;
+        if let Some(text) = self.probe.as_mut().and_then(|p| p.take_report(bgra)) {
+            self.last_probe = Some(text);
+        }
+        // The offscreen targets go into the SAME panel section, under the surface, because the
+        // two are one reading: the surface says the picture is wrong and the chain says where.
+        if let Some(text) = self.targets.as_mut().and_then(|t| t.take_report(bgra)) {
+            let mut s = self.last_probe.take().unwrap_or_default();
+            s.push_str("CHAIN TARGETS, ");
+            s.push_str(&text);
+            self.last_probe = Some(s);
+        }
         self.fps.tick();
     }
 
@@ -896,6 +1680,17 @@ impl LivePlayback {
     /// perf window so the two describe the same frames.
     fn take_split(&mut self) -> RenderSplit {
         core::mem::take(&mut self.split)
+    }
+
+    /// The surface description, for the diagnostics panel.
+    fn surface_line(&self) -> &str {
+        &self.surface_line
+    }
+
+    /// The latest presented-surface description, if the probe produced one since the last
+    /// window.
+    fn take_probe_report(&mut self) -> Option<String> {
+        self.last_probe.take()
     }
 }
 
@@ -1990,6 +2785,16 @@ async fn live_loop(
                 // twice in a row (three times counting the decode tally), and three near-identical
                 // 400-character lines look like the same line printed three times rather than
                 // three different frames.
+                //
+                // Tagging them was not enough, and the report came back. In a STEADY window every
+                // frame has the same draw count and the same counters, so the worst frame's
+                // payload is not merely similar to the mean's - it is BYTE-IDENTICAL, and the tag
+                // is the only thing that differs across 400 characters. That is a duplicate by any
+                // reading. So an identical payload is now collapsed to one short line that SAYS it
+                // is identical, which is both shorter and more informative than the repeat: "this
+                // window was uniform" is a fact about the run, and it is exactly what the repeated
+                // line was failing to convey. A window that is NOT uniform still prints both, which
+                // is when the second line earns its space.
                 let mut line = |diag: &mut String, tag: &str, text: &str| {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
                         "[perf] frame {frame_no} | {tag} | {text}"
@@ -1999,18 +2804,52 @@ async fn live_loop(
                     diag.push_str(text);
                     diag.push_str("\n\n");
                 };
+                // The worst-frame counterpart of `line`: `payload` is the worst frame's own
+                // counters and `mean` the window mean's, already formatted. When they agree there
+                // is nothing to compare, so `prefix` (its millisecond cost, which is NOT the mean's)
+                // is printed on its own.
+                let mut worst_line =
+                    |diag: &mut String, tag: &str, prefix: &str, payload: &str, mean: &str| {
+                        if payload == mean {
+                            let text = format!(
+                                "{prefix} - counters IDENTICAL to the window mean above, so this \
+                                 window was UNIFORM (not repeated here)"
+                            );
+                            line(diag, tag, &text);
+                        } else {
+                            line(diag, tag, &format!("{prefix} | {payload}"));
+                        }
+                    };
+                // FIRST, and only when there is one: anything the run reported at WARN or ERROR.
+                // A `WebGPU uncaptured error`, a dropped draw or a renderer fallback each turn a
+                // silent wrong picture into a named one, and on a phone the console they were
+                // written to does not exist. Nothing is printed when the run is clean, so a
+                // healthy panel is not made longer by the instrument.
+                if let Some(log) = crate::logging::page_log_report() {
+                    line(&mut diag, "WARNINGS AND ERRORS", &log);
+                }
+                // WHAT WE PRESENTED, when the probe is on. Directly under the warnings because
+                // it answers the question a silent panel raises: a healthy set of counters over
+                // a blank screen is either a blank picture or a picture nobody showed, and
+                // nothing else in this panel can tell those apart.
+                if let Some(probe) = playback.take_probe_report() {
+                    line(&mut diag, "PRESENTED SURFACE", &probe);
+                }
                 line(&mut diag, "RENDER SPLIT", &perf_line);
+                // The surface's format, alpha mode and present mode. Every one is chosen from
+                // what the platform offers, so every one can differ between desktop and phone.
+                line(&mut diag, "SURFACE", playback.surface_line());
                 // ...and WHAT `build` did to cost that, in counts rather than milliseconds.
                 // `build` is the largest part of the render half here and there is no
                 // `Instant` inside it on wasm32, so the only portable instrument is the
                 // work itself. See `vitaslop_runtime::render::BuildWork`.
                 let (bg_hit, bg_new) = vitaslop_platform::gpu::take_sampler_bg_counts();
+                let build_mean = s.work.line(s.presents.max(1));
                 line(
                     &mut diag,
                     "BUILD, window mean",
                     &format!(
-                        "{} | sampler bind groups {:.1} reused / {:.1} BUILT",
-                        s.work.line(s.presents.max(1)),
+                        "{build_mean} | sampler bind groups {:.1} reused / {:.1} BUILT",
                         bg_hit as f64 / np,
                         bg_new as f64 / np,
                     ),
@@ -2019,28 +2858,34 @@ async fn live_loop(
                 // reason: `encode` is the larger half of the render here and its three phases
                 // are timed but not attributed. Bytes and call counts say whether it is upload
                 // volume or per-call boundary overhead, which a millisecond never can.
-                line(&mut diag, "ENCODE, window mean", &s.enc_work.line(s.presents.max(1)));
+                let encode_mean = s.enc_work.line(s.presents.max(1));
+                line(&mut diag, "ENCODE, window mean", &encode_mean);
                 // The single worst present of the window, with ITS OWN counters. A mean over
-                // frames that differ by 2.5x in draw count describes none of them.
-                line(
+                // frames that differ by 2.5x in draw count describes none of them - and when they
+                // do NOT differ, saying so beats printing the same counters again.
+                worst_line(
                     &mut diag,
                     "BUILD, the single WORST frame of the window",
-                    &format!(
-                        "{:.1} ms over {} draws | {}",
-                        s.worst_build_ms,
-                        s.worst_draws,
-                        s.worst_work.line(1),
-                    ),
+                    &format!("{:.1} ms over {} draws", s.worst_build_ms, s.worst_draws),
+                    &s.worst_work.line(1),
+                    &build_mean,
                 );
-                line(
+                worst_line(
                     &mut diag,
                     "ENCODE, the single WORST frame of the window",
+                    // The phase split of THAT frame, next to its millisecond cost. When the
+                    // counters match the window mean exactly - which is when an outlier is most
+                    // puzzling - this is the only line that says which half of encode grew.
                     &format!(
-                        "{:.1} ms over {} draws | {}",
+                        "{:.1} ms over {} draws (prepare {:.1} + upload {:.1} + pass {:.1})",
                         s.worst_encode_ms,
                         s.worst_encode_draws,
-                        s.worst_enc_work.line(1),
+                        s.worst_enc_phases.prepare_ms,
+                        s.worst_enc_phases.upload_ms,
+                        s.worst_enc_phases.pass_ms,
                     ),
+                    &s.worst_enc_work.line(1),
+                    &encode_mean,
                 );
                 // What the decoder spent its bytes on, cumulative for the run. This decides
                 // whether a compressed upload path is worth building - see `decode_by_format`.

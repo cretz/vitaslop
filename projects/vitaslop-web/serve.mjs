@@ -24,7 +24,7 @@
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { spawnSync } from "node:child_process";
-import { readFile, readdir, stat, mkdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat, mkdir, writeFile, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,12 @@ import { dirname, join, extname, relative, sep, basename } from "node:path";
 const crateDir = dirname(fileURLToPath(import.meta.url));
 const webDir = join(crateDir, "web");
 const projects = dirname(crateDir);
+// Device diagnostics land in the SCRATCH area, never in the repo - see the sink endpoints in
+// the handler, and `no-repo-scratch-artifacts`. `projects` is <repo>/projects, so the repo root
+// is one level up and the scratch area is one level above THAT - writing to
+// `<repo>/working-area` (one `dirname` short) drops 44 files inside the git tree, which is
+// exactly what this comment exists to prevent and exactly what it did on the first attempt.
+const diagDir = join(dirname(dirname(projects)), "working-area", "device-diag");
 
 // --- args ---
 const args = process.argv.slice(2);
@@ -270,6 +276,51 @@ const handler = async (req, res) => {
     const url = new URL(req.url, "http://x");
     const path = decodeURIComponent(url.pathname);
 
+    // >>> THE DEVICE DIAGNOSTICS SINK.
+    //
+    // Getting a capture off a phone meant the user hand-copying a 4 KB dump out of an on-screen
+    // panel, screenshotting it, and pasting it - per screen, per attempt. That is a tax on the
+    // person doing the one thing this project cannot do for itself (run on the target device),
+    // and it makes anyone reluctant to take the SECOND capture, which is the one that turns an
+    // observation into an A/B.
+    //
+    // Two endpoints, both dev-server only:
+    //   GET  /diag-sink   - capability probe. The page streams ONLY if this answers, so a page
+    //                       served from anywhere else (the product, static hosting) never phones
+    //                       home and needs no flag to stop it. See
+    //                       [[vitaslop-web-is-the-product-not-the-tool]].
+    //   POST /diag        - one snapshot of the panel, appended under working-area.
+    if (path === "/diag-sink") {
+      res.writeHead(200, { "content-type": "text/plain", ...coi });
+      return res.end("ok");
+    }
+    //   POST /diag        - one snapshot of the panel, appended under working-area.
+    //   POST /diag-shot   - the canvas at that same moment, as a PNG beside it.
+    if ((path === "/diag" || path === "/diag-shot") && req.method === "POST") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks);
+      await mkdir(diagDir, { recursive: true });
+      const safe = (s, d) => (s || d).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+      const id = safe(url.searchParams.get("run"), "unknown");
+      const seq = safe(url.searchParams.get("seq"), "0000");
+      const tag = safe(url.searchParams.get("tag"), "tick");
+      if (path === "/diag-shot") {
+        // One file per shot: a screenshot is only useful next to the dump that describes the
+        // same moment, so the seq and tag are the join key between the two.
+        await writeFile(join(diagDir, `${id}-${seq}-${tag}.png`), body);
+      } else {
+        // One file per RUN, appended - so the history is in order in one place and two devices
+        // at once do not interleave.
+        const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+        await appendFile(
+          join(diagDir, `${id}.txt`),
+          `\n===== ${stamp}  seq ${seq}  ${tag} =====\n${body.toString("utf8")}\n`
+        );
+      }
+      res.writeHead(204, coi);
+      return res.end();
+    }
     if (path === "/titles.json") {
       res.writeHead(200, { "content-type": "application/json", ...coi });
       return res.end(JSON.stringify(listing));

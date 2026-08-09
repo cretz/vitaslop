@@ -56,21 +56,33 @@ fn main() {
             eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>]");
             std::process::exit(2);
         };
-        // `--recipe <file>` replays a scripted TAS recipe in the live window so a
-        // recorded playthrough can be watched (live keyboard/mouse still nudge it).
-        let recipe = args
+        // `--recipe <file>` replays a scripted TAS recipe. In the live window it drives input
+        // so a recorded playthrough can be watched (live keyboard/mouse still nudge it); under
+        // `--headless` it is what makes the run reach the screen the recipe is about.
+        //
+        // >>> IT USED TO BE DROPPED ON THE FLOOR UNDER `--headless`, and that is worth a
+        // comment because of HOW it failed. The flag was parsed and the file was READ and
+        // validated - so a bad path still exited 2, which is exactly the check that makes a
+        // flag look wired up - and then `headless_check` was called without it, silently
+        // running the built-in tap script instead. The run then ends on whatever screen the
+        // built-in taps reach, which is a perfectly ordinary-looking frame. Every conclusion
+        // drawn from it is about the wrong screen, and nothing anywhere says so.
+        let recipe_path = args
             .iter()
             .position(|a| a == "--recipe" || a == "-r")
             .and_then(|i| args.get(i + 1))
-            .map(|p| std::fs::read_to_string(p).unwrap_or_else(|e| {
+            .cloned();
+        let recipe = recipe_path.as_ref().map(|p| {
+            std::fs::read_to_string(p).unwrap_or_else(|e| {
                 eprintln!("cannot read recipe {p}: {e}");
                 std::process::exit(2);
-            }));
+            })
+        });
         // `--headless <dir>` validates the retail path without opening a window (drive
         // the tutorial + render one frame to a PNG); useful on a display-less box.
         let result = match args.iter().position(|a| a == "--headless") {
             Some(h) => match args.get(h + 1) {
-                Some(shot) => retail::headless_check(dir.into(), shot.into()),
+                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe),
                 None => {
                     eprintln!("--headless requires a shot directory");
                     std::process::exit(2);

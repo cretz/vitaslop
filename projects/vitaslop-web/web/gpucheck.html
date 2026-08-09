@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vitaslop webgpu check</title>
+    <style>
+      body { background:#0b0b12; color:#d8d8e0; font:15px/1.5 ui-monospace,Menlo,monospace; margin:0; padding:14px; }
+      h1 { font-size:16px; color:#8fe0a0; margin:0 0 10px; }
+      .row { border-bottom:1px solid #2a2a3a; padding:7px 0; }
+      .k { color:#8a8a9a; font-size:12px; }
+      .v { font-size:15px; word-break:break-all; }
+      .ok { color:#8fe0a0; } .bad { color:#ff8080; }
+      #copy { background:#8fe0a0; color:#08120c; border:0; border-radius:6px; padding:10px 16px; font:inherit; font-weight:700; margin-top:14px; }
+    </style>
+  </head>
+  <body>
+    <h1>vitaslop: where does WebGPU stop?</h1>
+    <div id="out"><div class="row">running...</div></div>
+    <button id="copy" type="button">copy all</button>
+
+    <script>
+      // >>> ONE QUESTION, ASKED IN BOTH PLACES.
+      //
+      // The emulator runs in a DEDICATED WORKER, not on the page. Every check written so far
+      // asked the MAIN THREAD whether WebGPU works and then assumed the worker would agree.
+      // Those are different contexts and a browser is free to treat them differently - so when a
+      // device that had been working stopped handing over an adapter, nothing on hand could say
+      // whether the loss was WebGPU, the origin, or the worker.
+      //
+      // This asks both, in the same page, and prints the two answers next to each other.
+      const out = document.getElementById("out");
+      const lines = [];
+      const add = (k, v, good) => {
+        lines.push(`${k}: ${v}`);
+        const d = document.createElement("div");
+        d.className = "row";
+        d.innerHTML =
+          `<div class="k">${k}</div><div class="v ${good === undefined ? "" : good ? "ok" : "bad"}">${v}</div>`;
+        out.appendChild(d);
+      };
+
+      async function askHere() {
+        const r = {};
+        r.secure = self.isSecureContext;
+        r.isolated = self.crossOriginIsolated;
+        r.hasGpu = !!navigator.gpu;
+        if (!navigator.gpu) return r;
+        for (const [name, opts] of [
+          ["high-performance", { powerPreference: "high-performance" }],
+          ["default", {}],
+          ["low-power", { powerPreference: "low-power" }],
+          ["fallback", { forceFallbackAdapter: true }],
+          ["compat(featureLevel)", { featureLevel: "compatibility" }],
+          ["compat(legacy flag)", { compatibilityMode: true }],
+          ["compat+low-power", { featureLevel: "compatibility", powerPreference: "low-power" }],
+        ]) {
+          try {
+            const a = await navigator.gpu.requestAdapter(opts);
+            r[name] = a ? `ADAPTER ${a.info?.vendor || "?"} / ${a.info?.architecture || "?"}` : "null";
+          } catch (e) {
+            r[name] = "threw: " + e;
+          }
+        }
+        return r;
+      }
+
+      // The same routine, shipped into a worker as a blob so it needs no extra file and cannot
+      // drift from the main-thread version above.
+      const workerSrc = `
+        self.onmessage = async () => {
+          const r = { secure: self.isSecureContext, isolated: self.crossOriginIsolated, hasGpu: !!self.navigator.gpu };
+          if (self.navigator.gpu) {
+            for (const [name, opts] of [
+              ["high-performance", { powerPreference: "high-performance" }],
+              ["default", {}],
+              ["low-power", { powerPreference: "low-power" }],
+              ["fallback", { forceFallbackAdapter: true }],
+              ["compat(featureLevel)", { featureLevel: "compatibility" }],
+              ["compat(legacy flag)", { compatibilityMode: true }],
+              ["compat+low-power", { featureLevel: "compatibility", powerPreference: "low-power" }],
+            ]) {
+              try {
+                const a = await self.navigator.gpu.requestAdapter(opts);
+                r[name] = a ? ("ADAPTER " + ((a.info && a.info.vendor) || "?") + " / " + ((a.info && a.info.architecture) || "?")) : "null";
+              } catch (e) { r[name] = "threw: " + e; }
+            }
+          }
+          self.postMessage(r);
+        };`;
+
+      function askInWorker() {
+        return new Promise((done) => {
+          try {
+            const w = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: "text/javascript" })));
+            const t = setTimeout(() => done({ error: "worker did not answer in 15s" }), 15000);
+            w.onmessage = (e) => { clearTimeout(t); done(e.data); };
+            w.onerror = (e) => { clearTimeout(t); done({ error: "worker error: " + (e.message || "died") }); };
+            w.postMessage("go");
+          } catch (e) {
+            done({ error: "could not start worker: " + e });
+          }
+        });
+      }
+
+      (async () => {
+        out.innerHTML = "";
+        add("url", location.href);
+        add("chrome", navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] || navigator.userAgent);
+        const here = await askHere();
+        const there = await askInWorker();
+        add("secure context", `page ${here.secure} / worker ${there.secure}`, here.secure);
+        add("cross-origin isolated", `page ${here.isolated} / worker ${there.isolated}`);
+        add("navigator.gpu present", `page ${here.hasGpu} / worker ${there.hasGpu}`, here.hasGpu);
+        for (const k of ["high-performance", "default", "low-power", "fallback", "compat(featureLevel)", "compat(legacy flag)", "compat+low-power"]) {
+          const p = here[k] ?? "-";
+          const t = there[k] ?? there.error ?? "-";
+          add(`requestAdapter(${k})`, `PAGE:   ${p}\nWORKER: ${t}`, String(p).startsWith("ADAPTER"));
+        }
+        if (there.error) add("worker", there.error, false);
+        document.getElementById("copy").onclick = () => {
+          navigator.clipboard.writeText(lines.join("\n")).then(
+            () => (document.getElementById("copy").textContent = "copied"),
+            () => (document.getElementById("copy").textContent = "copy failed - screenshot it")
+          );
+        };
+      })();
+    </script>
+  </body>
+</html>

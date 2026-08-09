@@ -568,11 +568,14 @@ fn retail_boot_probe() {
                 let rep = sched.run_frames(max_frames, chunk);
                 match rep {
                     RunReport::RoundLimit if waves < max_waves => {
-                        {
-                            let mut h = sched.host();
+                        // Guest memory in hand: a lightweight cond hands its bound MUTEX to
+                        // the thread it wakes, and that mutex lives in the guest's own work
+                        // area now, so signalling without memory would wake a thread that
+                        // believes it holds a lock the work area says is free.
+                        sched.with_host_words(|h, words| {
                             for &id in &sema_ids { h.state.sema_signal_wake(id, 1); }
-                            for &w in &cond_works { h.state.lwcond_signal(w, true); }
-                        }
+                            for &w in &cond_works { h.state.lwcond_signal(words, w, true); }
+                        });
                         waves += 1;
                         eprintln!("  wave {waves}: signalled at frame {}", sched.frames());
                     }

@@ -11,6 +11,7 @@ use vitaslop_transpiler::abi::{REG_COUNT, SP};
 
 use crate::capture::Capture;
 use crate::world::{DeterministicWorld, World};
+use crate::vita::lwwork;
 use crate::{vita, SvcOutcome};
 
 /// The number of VFP single-precision registers (s0..s15) that carry floating-
@@ -50,6 +51,25 @@ impl Ptr {
 /// Callers (via [`GuestCtx`]) validate `off` against [`len`](GuestMemory::len)
 /// and clamp before calling, so implementors may assume `off` and
 /// `off + buf.len()` are in range.
+/// Read and write single guest WORDS by guest address, for state that lives in guest
+/// memory and must be reachable from outside a host call.
+///
+/// [`GuestCtx`] is the ordinary way to touch guest memory, but it exists only for the
+/// duration of a dispatch. Some state the guest owns has to be maintained at points where
+/// no guest call is in flight - a lightweight mutex handed to a waiter whose cond wait
+/// TIMED OUT is decided in `advance_time_to`, on the scheduler's idle path, with no ctx
+/// anywhere. This is the narrow accessor those paths take instead, so the state can have
+/// exactly one home (see [`crate::vita::lwwork`]) rather than a guest copy and a host copy
+/// that agree until they do not.
+///
+/// An address outside the provisioned region reads zero and swallows its write, matching
+/// what [`GuestCtx`] does. That is a real answer for the callers here: a work area outside
+/// guest memory is not a mutex, and every fast path tests its identity stamp first.
+pub trait GuestWords {
+    fn word(&self, addr: u32) -> u32;
+    fn set_word(&mut self, addr: u32, value: u32);
+}
+
 pub trait GuestMemory {
     /// The size of the provisioned guest region, in bytes from `base`.
     fn len(&self) -> usize;
@@ -373,6 +393,17 @@ impl<'a> GuestCtx<'a> {
     /// Set the call's return value (r0).
     pub fn ret(&mut self, v: u32) {
         self.regs[0] = v;
+    }
+}
+
+/// The ordinary way to reach guest-resident state: through the call in flight, so the
+/// write watches and the range clamp all apply exactly as they do to any other host write.
+impl GuestWords for GuestCtx<'_> {
+    fn word(&self, addr: u32) -> u32 {
+        self.read_u32(addr)
+    }
+    fn set_word(&mut self, addr: u32, value: u32) {
+        self.write_u32(addr, value);
     }
 }
 
@@ -732,14 +763,17 @@ struct MutexRec {
     waiters: Vec<i32>,
 }
 
-/// A lightweight mutex's state (preemptive mode only), keyed by its guest work-area
-/// address rather than a kernel handle - a lightweight object's state lives in memory
-/// the title owns, not a kernel id. Otherwise identical to [`MutexRec`]: `owner` (None
-/// if free), recursion `count`, and the FIFO `waiters` parked in `sceKernelLockLwMutex`.
+/// What the HOST still keeps for a lightweight mutex: the threads parked on it, in FIFO
+/// order, and the work-area address that names it.
+///
+/// The ownership itself - identity, owner, recursion count - is NOT here. It lives in the
+/// guest's own work area ([`crate::vita::lwwork`]), which is where the hardware keeps it
+/// and what makes the uncontended take inlinable. Only the parked QUEUE stays host-side,
+/// because a list of thread ids in arrival order is not something guest memory holds
+/// usefully; its LENGTH is published into the work area so guest code can tell the case it
+/// may serve itself from the case only the host can.
 struct LwMutexRec {
     work: u32,
-    owner: Option<i32>,
-    count: i32,
     waiters: Vec<i32>,
 }
 
@@ -1690,14 +1724,21 @@ impl TextureBinding {
 
 #[derive(Clone, Default)]
 struct PrecomputedState {
+    /// The `SceGxmVertexProgram *` / `SceGxmFragmentProgram *` HANDLE this state was
+    /// initialised from. Kept alongside the resolved header because binding a precomputed
+    /// state leaves the CONTEXT bound to that program, and the context block stores handles
+    /// (see [`crate::vita::gxmctx`]) - it is the same fact the direct
+    /// `sceGxmSetFragmentProgram` path stores, so it must be stored in the same place.
+    program_handle: u32,
     program_header: u32,
     default_uniform_buffer: u32,
     /// (textureIndex, the texture captured BY VALUE - see [`TextureBinding`]).
     textures: Vec<(u32, TextureBinding)>,
-    /// For a FRAGMENT state, the blend equation of the program it was built from. A draw made
-    /// through a precomputed state never touches `sceGxmSetFragmentProgram`, so without this
-    /// it would inherit whatever the last direct bind left behind.
-    blend: crate::capture::BlendState,
+    // There is deliberately no `blend` here any more. A draw made through a precomputed
+    // state never calls `sceGxmSetFragmentProgram`, so this used to carry the blend equation
+    // to stop the draw inheriting whatever the last direct bind left behind. Now that
+    // binding the state writes its PROGRAM HANDLE into the context block, the blend follows
+    // from the handle like it does on the direct path - one fact, one place.
 }
 
 /// The ONE piece of per-texture state that cannot live in the guest's own control words.
@@ -1736,7 +1777,7 @@ struct TextureExtra {
 #[derive(Clone, Copy, Default)]
 struct PrecomputedDraw {
     vertex_program: u32,
-    streams: [u32; MAX_VERTEX_STREAMS],
+    streams: [u32; pdraw::STREAM_SLOTS],
     primitive: u32,
     index_format: u32,
     index_addr: u32,
@@ -2142,7 +2183,15 @@ mod pdraw {
     pub const OFF_VERTEX_PROGRAM: u32 = 4;
     /// Stream `i`'s buffer pointer, one word each: words 2, 7, 8, 9. Stream 0 keeps word 2
     /// (where it has always been) and the rest use the words that were spare.
-    pub const OFF_STREAM: [u32; super::MAX_VERTEX_STREAMS] = [8, 28, 32, 36];
+    ///
+    /// FOUR, not [`super::MAX_VERTEX_STREAMS`]: `SCE_GXM_PRECOMPUTED_DRAW_WORD_COUNT` is 11
+    /// and the other seven words are spoken for, so this encoding can carry four stream
+    /// pointers and no more. That is a limit of OUR packing (real GXM packs the block
+    /// differently), which is why a draw that needs a fifth stream is reported by
+    /// `precomputed_draw_set_stream` rather than silently dropping the buffer.
+    pub const OFF_STREAM: [u32; STREAM_SLOTS] = [8, 28, 32, 36];
+    /// How many stream pointers [`OFF_STREAM`] has room for.
+    pub const STREAM_SLOTS: usize = 4;
     pub const OFF_PRIMITIVE: u32 = 12;
     pub const OFF_INDEX_FORMAT: u32 = 16;
     pub const OFF_INDEX_ADDR: u32 = 20;
@@ -2153,7 +2202,12 @@ mod pdraw {
 
 /// `SCE_GXM_MAX_VERTEX_STREAMS`. A vertex program may source its attributes from up to
 /// this many separate guest buffers.
-pub(crate) const MAX_VERTEX_STREAMS: usize = 4;
+///
+/// One definition, in [`crate::vita::gxmctx`], because the context block reserves a slot per
+/// stream and a count that disagreed with the block's layout would read a neighbour's word.
+/// It used to be 4 here - the number of stream pointers a `SceGxmPrecomputedDraw` can carry
+/// in our packing, which is a different quantity entirely and is now `pdraw::STREAM_SLOTS`.
+pub(crate) use crate::vita::gxmctx::MAX_VERTEX_STREAMS;
 
 /// One reflected uniform parameter: where its components sit in the program's default
 /// uniform buffer and how they are packed. `res` is a 4-byte-register offset; each of
@@ -2203,8 +2257,9 @@ struct ProgramReflection {
     /// Direction and colour of the single directional light the material model uses.
     light_dir: Option<ParamRef>,
     light_col: Option<ParamRef>,
-    /// Size of the program's default uniform buffer, from the table's extent in
-    /// floats. See [`VitaState::reflected_uniform_size_bytes`].
+    /// Size of the program's default uniform buffer, from the table's extent in 32-bit
+    /// REGISTERS (each parameter's components packed at its own type's width, not one
+    /// register per component). See [`VitaState::reflected_uniform_size_bytes`].
     uniform_size_bytes: u32,
     /// Texture units the program's samplers occupy (one past the highest sampler
     /// resource index). This is the length of the texture array the whole-array
@@ -2312,20 +2367,19 @@ pub struct VitaState {
     pub display_queue_cb_data_size: u32,
     // In-progress scene (BeginScene..EndScene).
     scene: Option<crate::capture::Scene>,
-    bound_vertex_program: u32,
-    // The `SceGxmProgram*` of the fragment program bound by the last precomputed
-    // fragment state, so a draw can reflect which sampler unit is the albedo (base
-    // colour) and prefer it over a normal/spec/env map when picking the one texture
-    // the capture renderer samples. 0 when no fragment program is bound.
-    bound_fragment_program_header: u32,
-    /// The blend equation of the currently bound fragment program, snapshotted into every
-    /// draw. See [`crate::capture::BlendState`].
-    bound_fragment_blend: crate::capture::BlendState,
-    /// The guest vertex buffer bound to each stream index by `sceGxmSetVertexStream`.
-    /// GXM allows up to [`MAX_VERTEX_STREAMS`]; a mesh that splits per-vertex data from
-    /// per-instance data (particles, decals, instanced props) uses more than one, and
-    /// capturing only stream 0 decodes those attributes out of the wrong buffer.
-    bound_streams: [u32; MAX_VERTEX_STREAMS],
+    /// The guest `SceGxmContext *` the sticky draw state lives in - the `hostMem` the guest
+    /// handed `sceGxmCreateContext`, as on hardware. See [`crate::vita::gxmctx`].
+    ///
+    /// This is the only GXM context state left on the host, and it is an ADDRESS, not a
+    /// value: the bound vertex/fragment program, the vertex streams and the whole
+    /// [`crate::capture::RenderState`] are read back out of guest memory on demand
+    /// ([`Self::bound_vertex_program`] and friends). That is what lets their setters be
+    /// inlined into guest code instead of crossing the host boundary once per call.
+    ///
+    /// Zero until a context exists. A draw before then is reported, not guessed at.
+    gxm_context: u32,
+    /// Whether a draw with no context has already been reported, so the report is once.
+    reported_no_gxm_context: bool,
     pending_uniforms: Vec<f32>,
     // Threads the program created, and any pending synchronous thread run raised
     // by sceKernelStartThread (drained by the engine host after the call).
@@ -2376,6 +2430,10 @@ pub struct VitaState {
     current: i32,
     mutexes: Vec<MutexRec>,
     lwmutexes: Vec<LwMutexRec>,
+    /// Lightweight-mutex handoffs decided where no guest memory was reachable, settled by
+    /// [`resolve_deferred_lwmutex`](VitaState::resolve_deferred_lwmutex) before the next
+    /// resume. `(work area, thread to give it to)`.
+    pending_lwmutex_acquires: Vec<(u32, i32)>,
     conds: Vec<CondRec>,
     sema_waiters: Vec<SemaWaiter>,
     evf_waiters: Vec<EvfWaiter>,
@@ -2515,13 +2573,14 @@ pub struct VitaState {
     /// times per frame - so the lookup must be O(1), not a linear scan over every state.
     precomputed_vertex_states: std::collections::HashMap<u32, PrecomputedState>,
     precomputed_fragment_states: std::collections::HashMap<u32, PrecomputedState>,
-    /// Whether the current `bound_textures` came from a precomputed fragment state (true) or
-    /// from direct `sceGxmSetFragmentTexture` calls (false). Diagnostic only - see
-    /// [`VitaState::note_direct_texture_bind`].
-    textures_from_precomputed: bool,
-    /// Texture handles whose control words were non-zero when `sceGxmSetFragmentTexture` bound
-    /// them. Diagnostic - see [`VitaState::note_texture_live_at_bind`].
-    textures_live_at_bind: std::collections::HashSet<u32>,
+    // Two host-side texture diagnostics used to live here - "did the current bindings come
+    // from a precomputed state" and "which handles were live when they were bound". Both are
+    // now properties of the BINDING, in the context block: `from_precomputed` is per unit
+    // (a global one mislabels whichever path did not happen last), and "live at bind" is
+    // exactly "the copied control words are not all zero", because the copy happens AT the
+    // bind. Keeping host mirrors of them would have been worse than redundant once the bind
+    // went inline: the handler stops running, so they would have read as false for every
+    // binding in the run while looking like measurements.
     /// `SceGxmFragmentProgram*` handle -> (its `SceGxmProgram*`, the blend equation it was
     /// created with), recorded at `sceGxmShaderPatcherCreateFragmentProgram` so a precomputed
     /// fragment state can size its default uniform buffer and every draw can carry its real
@@ -2621,10 +2680,6 @@ pub struct VitaState {
     /// palette field's bit layout in the control words is not published, and a wrong
     /// packing would corrupt fields that ARE understood.
     texture_palettes: std::collections::HashMap<u32, u32>,
-    /// The live GXM fixed-function pipeline state (cull/depth/stencil/viewport/...),
-    /// mutated by the `sceGxmSet*` setters and snapshotted into each recorded draw.
-    /// Sticky across scenes, exactly like the real GXM context.
-    render_state: crate::capture::RenderState,
     /// Threads parked in `sceKernelWaitLwCond`, as `(thread id, cond work address,
     /// wake deadline)`. `deadline` is `Some(virtual_us)` for a timed wait (woken by
     /// a signal or when the clock reaches it) or `None` for an infinite wait (only a
@@ -2703,10 +2758,8 @@ impl VitaState {
             display_queue_cb: 0,
             display_queue_cb_data_size: 0,
             scene: None,
-            bound_vertex_program: 0,
-            bound_fragment_program_header: 0,
-            bound_fragment_blend: crate::capture::BlendState::default(),
-            bound_streams: [0; MAX_VERTEX_STREAMS],
+            gxm_context: 0,
+            reported_no_gxm_context: false,
             pending_uniforms: Vec::new(),
             threads: Vec::new(),
             free_stacks: Vec::new(),
@@ -2723,6 +2776,7 @@ impl VitaState {
             current: 0,
             mutexes: Vec::new(),
             lwmutexes: Vec::new(),
+            pending_lwmutex_acquires: Vec::new(),
             conds: Vec::new(),
             sema_waiters: Vec::new(),
             signal_waiters: Vec::new(),
@@ -2766,8 +2820,6 @@ impl VitaState {
             texture_snapshots: TextureSnapshots::new(),
             precomputed_vertex_states: std::collections::HashMap::new(),
             precomputed_fragment_states: std::collections::HashMap::new(),
-            textures_from_precomputed: false,
-            textures_live_at_bind: std::collections::HashSet::new(),
             fragment_programs: std::collections::HashMap::new(),
             uniform_ring: 0,
             uniform_ring_size: 0,
@@ -2796,7 +2848,6 @@ impl VitaState {
             net_errno: Vec::new(),
             fibers: Vec::new(),
             fiber_run_out: std::collections::HashMap::new(),
-            render_state: crate::capture::RenderState::default(),
             lwcond_waiters: Vec::new(),
             lwcond_mutex: Vec::new(),
             sleep_waiters: Vec::new(),
@@ -4091,31 +4142,35 @@ impl VitaState {
         }
     }
 
-    // --- lightweight mutexes (preemptive mode), keyed by guest work address -----
+    // --- lightweight mutexes, whose state lives in the GUEST WORK AREA -------------
     //
-    // A lightweight mutex has no kernel handle; its state lives in the caller's work
-    // area, so the host tracks ownership by that guest address. These mirror the
-    // heavyweight [`mutex_lock`]/[`mutex_contended`]/[`mutex_unlock`] exactly, so a
-    // `sceKernelLockLwMutex` genuinely blocks on contention and enforces mutual
-    // exclusion (the old "always succeed" stub did neither, so two threads could hold
-    // the same lightweight mutex across a yield and race the data it guards).
+    // A lightweight mutex has no kernel handle. Identity, owner and recursion count are
+    // four words of the caller's own `SceKernelLwMutexWork` (see `crate::vita::lwwork`),
+    // which is where the hardware keeps them and what lets the uncontended take be
+    // emitted straight into guest code. Everything below is the CONTENDED half plus the
+    // parked queue - the part a userspace CAS cannot do, and the part that on the device
+    // is a syscall too.
+    //
+    // These still mirror the heavyweight [`mutex_lock`]/[`mutex_contended`]/[`mutex_unlock`]
+    // in behaviour, so a `sceKernelLockLwMutex` genuinely blocks on contention and enforces
+    // mutual exclusion.
 
-    /// The record for the lightweight mutex at guest work address `work`, created
-    /// (unlocked) on first use - a title may lock a work area it zero-initialized
-    /// itself without a distinct create call.
+    /// The record for the lightweight mutex at guest work address `work`, created (with no
+    /// waiters) on first use - a title may lock a work area it zero-initialized itself
+    /// without a distinct create call.
     fn lwmutex_rec(&mut self, work: u32) -> &mut LwMutexRec {
         if !self.lwmutexes.iter().any(|m| m.work == work) {
-            self.lwmutexes.push(LwMutexRec { work, owner: None, count: 0, waiters: Vec::new() });
+            self.lwmutexes.push(LwMutexRec { work, waiters: Vec::new() });
         }
         self.lwmutexes.iter_mut().find(|m| m.work == work).expect("just inserted")
     }
 
-    /// Register the lightweight mutex at `work` (its canonical work-area address) at
-    /// `sceKernelCreateLwMutex`, so a later lock/unlock on a *copy* of the work area can
-    /// be resolved back to it by the identity stamped in the work area (see the lwsync
-    /// `resolve_mutex`). Idempotent - a re-create just keeps the existing record.
-    pub fn lwmutex_register(&mut self, work: u32) {
+    /// Register the lightweight mutex at `work` and lay its state out there
+    /// (`sceKernelCreateLwMutex`). Idempotent as a record; the work area is re-initialized,
+    /// which is what a re-create means.
+    pub fn lwmutex_register(&mut self, w: &mut dyn GuestWords, work: u32) {
         let _ = self.lwmutex_rec(work);
+        lwwork::init(w, work);
     }
 
     /// Whether `work` is a lightweight mutex we have a record for (created, or already
@@ -4124,66 +4179,95 @@ impl VitaState {
         self.lwmutexes.iter().any(|m| m.work == work)
     }
 
+    /// Adopt a work area no create was ever seen for, so it can be locked - and, from the
+    /// next lock on, be taken inline.
+    ///
+    /// A zero identity stamp is unambiguous: a byte COPY of a created mutex carries the
+    /// ORIGINAL's address there, so the only work area that can read zero is one no
+    /// `sceKernelCreateLwMutex` ever touched. Statically-initialized mutexes are ordinary
+    /// in libc, and this is the same lazy-by-address behaviour the host record has always
+    /// had - just written down where the guest can see it.
+    pub fn lwmutex_adopt(&mut self, w: &mut dyn GuestWords, work: u32) {
+        self.lwmutex_register(w, work);
+    }
+
     /// Lock the lightweight mutex at `work` for the current thread. Returns true if
     /// acquired (free, or already held by this thread - recursive), false if the caller
     /// was parked behind the owner (return [`SvcOutcome::Block`]).
-    pub fn lwmutex_lock(&mut self, work: u32) -> bool {
+    ///
+    /// The uncontended answer comes from [`lwwork::fast_lock`], which is the same function
+    /// the inline form is compiled from - so the two paths cannot decide differently about
+    /// the same four words.
+    pub fn lwmutex_lock(&mut self, w: &mut dyn GuestWords, work: u32) -> bool {
         let cur = self.current;
-        let m = self.lwmutex_rec(work);
-        match m.owner {
-            None => {
-                m.owner = Some(cur);
-                m.count = 1;
-                true
-            }
-            Some(o) if o == cur => {
-                m.count += 1;
-                true
-            }
-            Some(_) => {
-                m.waiters.push(cur);
-                false
-            }
+        if lwwork::fast_lock(w, work, cur, 1) {
+            return true;
         }
+        // Contended, or a work area the fast path will not serve. Take it anyway if it is
+        // free or ours - the fast path also refuses on a parked waiter, and the host is
+        // exactly the side allowed to barge past that.
+        let held = lwwork::count(w, work);
+        if held == 0 || lwwork::owner(w, work) == cur {
+            lwwork::set_owner_count(w, work, cur, held + 1);
+            return true;
+        }
+        let m = self.lwmutex_rec(work);
+        m.waiters.push(cur);
+        let parked = m.waiters.len();
+        lwwork::set_waiters(w, work, parked);
+        false
     }
 
     /// Whether locking the lightweight mutex at `work` now would contend (another
     /// thread owns it). Used by `sceKernelTryLockLwMutex`, which fails rather than blocks.
-    pub fn lwmutex_contended(&self, work: u32) -> bool {
-        let cur = self.current;
-        self.lwmutexes
-            .iter()
-            .find(|m| m.work == work)
-            .map(|m| matches!(m.owner, Some(o) if o != cur))
-            .unwrap_or(false)
+    pub fn lwmutex_contended(&self, w: &dyn GuestWords, work: u32) -> bool {
+        lwwork::count(w, work) != 0 && lwwork::owner(w, work) != self.current
     }
 
     /// Unlock the lightweight mutex at `work`. On full release, hand ownership to the
     /// next parked waiter (FIFO) and wake it.
-    pub fn lwmutex_unlock(&mut self, work: u32) {
-        let mut wake = None;
-        if let Some(m) = self.lwmutexes.iter_mut().find(|m| m.work == work) {
-            if m.count > 0 {
-                m.count -= 1;
-            }
-            if m.count == 0 {
-                if m.waiters.is_empty() {
-                    m.owner = None;
-                } else {
-                    let next = m.waiters.remove(0);
-                    m.owner = Some(next);
-                    m.count = 1;
-                    wake = Some(next);
-                }
-            }
+    pub fn lwmutex_unlock(&mut self, w: &mut dyn GuestWords, work: u32) {
+        let held = lwwork::count(w, work);
+        if held == 0 {
+            // An unlock with nothing held. The old host-side record silently ignored this
+            // and so does this, but say so: it is either a title bug or a mutex we failed
+            // to resolve, and both are worth seeing when a deadlock is being read.
+            tracing::debug!(
+                target: "vitaslop::sema",
+                work = format_args!("{work:#010x}"),
+                thread = format_args!("{:#x}", self.current),
+                "sceKernelUnlockLwMutex on a mutex nothing holds"
+            );
+            return;
         }
-        if let Some(next) = wake {
-            self.pending_wakes.push(next);
+        let remaining = held - 1;
+        if remaining != 0 {
+            lwwork::set_count(w, work, remaining);
+            return;
+        }
+        // Fully released. Hand it straight to the next parked thread rather than freeing
+        // it - a woken waiter that had to race for it could lose to a barging inline take
+        // and park again, forever.
+        let next = {
+            let m = self.lwmutex_rec(work);
+            let next = (!m.waiters.is_empty()).then(|| m.waiters.remove(0));
+            lwwork::set_waiters(w, work, m.waiters.len());
+            next
+        };
+        match next {
+            Some(thid) => {
+                lwwork::set_owner_count(w, work, thid, 1);
+                self.pending_wakes.push(thid);
+            }
+            None => lwwork::set_count(w, work, 0),
         }
     }
 
-    /// Forget the lightweight mutex at `work` (`sceKernelDeleteLwMutex`).
-    pub fn lwmutex_delete(&mut self, work: u32) {
+    /// Forget the lightweight mutex at `work` (`sceKernelDeleteLwMutex`), clearing the
+    /// identity stamp so a guest that kept the pointer cannot take the stale work area
+    /// inline.
+    pub fn lwmutex_delete(&mut self, w: &mut dyn GuestWords, work: u32) {
+        lwwork::clear(w, work);
         self.lwmutexes.retain(|m| m.work != work);
     }
 
@@ -4192,23 +4276,38 @@ impl VitaState {
     /// back to its mutex: if free the thread takes it and is woken now, else it queues
     /// behind the owner and is woken when the owner unlocks. Work-keyed twin of
     /// [`mutex_acquire_for`](Self::mutex_acquire_for).
-    fn lwmutex_acquire_for(&mut self, work: u32, thid: i32) {
-        let mut wake = true;
-        let m = self.lwmutex_rec(work);
-        match m.owner {
-            None => {
-                m.owner = Some(thid);
-                m.count = 1;
-            }
-            Some(o) if o == thid => m.count += 1,
-            Some(_) => {
-                m.waiters.push(thid);
-                wake = false; // woken later, when the owner unlocks
-            }
-        }
-        if wake {
+    fn lwmutex_acquire_for(&mut self, w: &mut dyn GuestWords, work: u32, thid: i32) {
+        let held = lwwork::count(w, work);
+        if held == 0 || lwwork::owner(w, work) == thid {
+            lwwork::set_owner_count(w, work, thid, held + 1);
             self.pending_wakes.push(thid);
+            return;
         }
+        let m = self.lwmutex_rec(work);
+        m.waiters.push(thid);
+        let parked = m.waiters.len();
+        lwwork::set_waiters(w, work, parked);
+        // Woken later, when the owner unlocks.
+    }
+
+    /// Resolve the deferred lightweight-mutex handoffs queued where no guest memory was
+    /// reachable, and report how many were applied.
+    ///
+    /// A lightweight-cond wait that TIMES OUT must re-acquire its bound mutex before it
+    /// runs, and that expiry is decided in [`advance_time_to`](Self::advance_time_to) - on
+    /// the scheduler's idle path, with no host call in flight and so no [`GuestCtx`]
+    /// anywhere. The decision needs to READ the work area (is it free?), which is why it
+    /// cannot simply be queued as a write. So it is queued as an INTENT and settled here,
+    /// by the scheduler, before anything is resumed.
+    ///
+    /// That is exact rather than nearly exact: no guest code runs between the expiry and
+    /// this drain, so there is no moment at which a guest could observe the difference.
+    pub fn resolve_deferred_lwmutex(&mut self, w: &mut dyn GuestWords) -> usize {
+        let queued = std::mem::take(&mut self.pending_lwmutex_acquires);
+        for &(work, thid) in &queued {
+            self.lwmutex_acquire_for(w, work, thid);
+        }
+        queued.len()
     }
 
     // --- condition variables (preemptive mode) ---
@@ -4307,11 +4406,11 @@ impl VitaState {
     /// creation was never observed upstream (the real bug lives there); faithful
     /// behavior here refuses to invent a binding.
     #[must_use]
-    pub fn lwcond_wait(&mut self, work: u32, timeout_us: u32) -> bool {
+    pub fn lwcond_wait(&mut self, w: &mut dyn GuestWords, work: u32, timeout_us: u32) -> bool {
         let Some(mutex_work) = self.lwcond_mutex_of(work) else {
             return false;
         };
-        self.lwmutex_unlock(mutex_work);
+        self.lwmutex_unlock(w, mutex_work);
         let deadline = (timeout_us != 0).then(|| self.virtual_us + timeout_us as u64);
         self.lwcond_waiters.push((self.current, work, deadline));
         true
@@ -4322,7 +4421,7 @@ impl VitaState {
     /// cond `work`. Each woken thread must re-acquire the cond's bound lightweight mutex
     /// before it runs (taken now if free, else queued behind the owner), mirroring the
     /// heavyweight [`cond_signal`](Self::cond_signal).
-    pub fn lwcond_signal(&mut self, work: u32, all: bool) {
+    pub fn lwcond_signal(&mut self, w: &mut dyn GuestWords, work: u32, all: bool) {
         let mut woke_one = false;
         let mut woken: Vec<i32> = Vec::new();
         self.lwcond_waiters.retain(|&(thid, w, _)| {
@@ -4337,7 +4436,7 @@ impl VitaState {
         match self.lwcond_mutex_of(work) {
             Some(mutex_work) => {
                 for thid in woken {
-                    self.lwmutex_acquire_for(mutex_work, thid);
+                    self.lwmutex_acquire_for(w, mutex_work, thid);
                 }
             }
             // No bound mutex recorded (a bare cond): just make the waiters runnable.
@@ -4872,7 +4971,10 @@ impl VitaState {
         for (thid, work) in expired_lw {
             self.pending_resume_codes.push((thid, SCE_KERNEL_ERROR_WAIT_TIMEOUT));
             match self.lwcond_mutex_of(work) {
-                Some(mutex_work) => self.lwmutex_acquire_for(mutex_work, thid),
+                // No guest memory is reachable here (see `resolve_deferred_lwmutex`), and
+                // deciding this needs to READ the work area, so queue the intent and let
+                // the scheduler settle it before anything resumes.
+                Some(mutex_work) => self.pending_lwmutex_acquires.push((mutex_work, thid)),
                 None => self.pending_wakes.push(thid),
             }
         }
@@ -5446,6 +5548,8 @@ impl VitaState {
         &mut self,
         color: Option<crate::capture::ColorSurface>,
         depth: Option<crate::capture::DepthSurface>,
+        // The render target's `SceGxmMultisampleMode` - see `capture::Scene::multisample`.
+        multisample: u32,
     ) {
         // Texture snapshots deliberately SURVIVE the scene - see `TextureSnapshots`
         // for what invalidates them instead. Only the verifier is re-armed here.
@@ -5455,58 +5559,106 @@ impl VitaState {
         // dead by now; see [`Self::alloc_default_uniform_buffer`] for what happens
         // when this is NOT recycled.
         self.uniform_ring_cursor = 0;
-        self.scene = Some(crate::capture::Scene { color, depth, draws: Vec::new() });
+        self.scene = Some(crate::capture::Scene { color, depth, multisample, draws: Vec::new() });
         self.pending_uniforms.clear();
     }
 
-    pub fn bind_vertex_program(&mut self, handle: u32) {
-        self.bound_vertex_program = handle;
-    }
+    // --- The sticky GXM context state ---------------------------------------
+    //
+    // It lives in the guest's context block, not here - see [`crate::vita::gxmctx`] for
+    // why. These are the read side: every one resolves through `self.gxm_context`, so
+    // there is exactly one home for each fact and no host copy to fall out of step with
+    // an inlined setter that never reaches the host at all.
 
-    /// `sceGxmSetFragmentProgram`: resolve the bound fragment program handle to its
-    /// `SceGxmProgram*` and remember it, so a draw can reflect its samplers to choose the
-    /// albedo texture. A null/unknown handle clears the binding (header 0).
-    pub fn bind_fragment_program(&mut self, handle: u32) {
-        self.bound_fragment_program_header = self.fragment_program_header(handle);
-        self.bound_fragment_blend = self.fragment_program_blend(handle);
-    }
-
-    /// `sceGxmSetVertexStream(context, streamIndex, data)`. A stream index beyond
-    /// [`MAX_VERTEX_STREAMS`] is not a thing GXM can produce, so it is reported rather
-    /// than silently dropped.
-    pub fn bind_stream(&mut self, index: u32, addr: u32) {
-        match self.bound_streams.get_mut(index as usize) {
-            Some(slot) => *slot = addr,
-            None => tracing::warn!(
+    /// Adopt the context `sceGxmCreateContext` just built.
+    ///
+    /// The capture keeps ONE scene and ONE draw stream, so a second context would
+    /// interleave two guests' draws into one frame. That is a real limitation and it says
+    /// so rather than quietly serving the newer context.
+    pub fn adopt_gxm_context(&mut self, context: u32) {
+        if self.gxm_context != 0 && self.gxm_context != context {
+            tracing::warn!(
                 target: "vitaslop::gxm",
-                index,
-                data = format_args!("{addr:#x}"),
-                "setVertexStream on a stream index beyond SCE_GXM_MAX_VERTEX_STREAMS - DROPPED"
-            ),
+                previous = format_args!("{:#x}", self.gxm_context),
+                context = format_args!("{context:#x}"),
+                "a SECOND sceGxmContext was created - the capture has one scene and one draw \
+                 stream, so draws from both will interleave into one frame"
+            );
+        }
+        self.gxm_context = context;
+    }
+
+    /// The bound `SceGxmVertexProgram *` handle.
+    pub fn bound_vertex_program(&self, ctx: &GuestCtx) -> u32 {
+        self.gxm_state_word(ctx, crate::vita::gxmctx::off::VERTEX_PROGRAM)
+    }
+
+    /// The `SceGxmProgram *` header of the bound FRAGMENT program, resolved from the
+    /// handle in the context block. 0 when nothing usable is bound.
+    ///
+    /// Resolved on read rather than at bind time: the bind is a store the transpiler can
+    /// inline, and a lookup that happens once per draw instead of once per bind is cheaper
+    /// anyway on a title that rebinds the same program repeatedly.
+    pub fn bound_fragment_program_header(&self, ctx: &GuestCtx) -> u32 {
+        self.fragment_program_header(self.bound_fragment_program(ctx))
+    }
+
+    /// The blend equation of the bound fragment program. Baked in at
+    /// `sceGxmShaderPatcherCreateFragmentProgram`, so it is a pure function of the handle.
+    pub fn bound_fragment_blend(&self, ctx: &GuestCtx) -> crate::capture::BlendState {
+        self.fragment_program_blend(self.bound_fragment_program(ctx))
+    }
+
+    /// The bound `SceGxmFragmentProgram *` handle.
+    fn bound_fragment_program(&self, ctx: &GuestCtx) -> u32 {
+        self.gxm_state_word(ctx, crate::vita::gxmctx::off::FRAGMENT_PROGRAM)
+    }
+
+    /// The guest vertex buffer bound to each stream index by `sceGxmSetVertexStream`.
+    /// GXM allows up to [`MAX_VERTEX_STREAMS`]; a mesh that splits per-vertex data from
+    /// per-instance data (particles, decals, instanced props) uses more than one, and
+    /// capturing only stream 0 decodes those attributes out of the wrong buffer.
+    pub fn bound_streams(&self, ctx: &GuestCtx) -> [u32; MAX_VERTEX_STREAMS] {
+        match self.gxm_context {
+            0 => [0; MAX_VERTEX_STREAMS],
+            c => crate::vita::gxmctx::streams(ctx, c),
         }
     }
 
-    /// Record `sceGxmSetFragmentTexture(unit, texture)`: remember which guest
-    /// `SceGxmTexture*` is bound to sampler `unit`. A zero address unbinds it.
-    /// Kept SORTED by unit: every draw reads this list and needs unit 0 first, so
-    /// maintaining the order at bind time (a handful of units, a handful of times per
-    /// draw) replaces cloning and re-sorting it inside every draw.
-    /// A `sceGxmSetFragmentTexture` happened, so the current sampler bindings came down the
-    /// DIRECT path rather than from a precomputed fragment state. Which of the two a missing
-    /// unit came through decides where to look for it, and after the fact they are
-    /// indistinguishable - both end as an address in `bound_textures`.
-    pub fn note_direct_texture_bind(&mut self) {
-        self.textures_from_precomputed = false;
-    }
-
-    /// Record whether a texture handle's control words were non-zero when it was BOUND, so a
-    /// handle that reads as zero at draw time can be classified. Only handles seen as zero at
-    /// draw time are ever looked up, so this keeps just the ones that were live.
-    pub fn note_texture_live_at_bind(&mut self, texture_addr: u32, live: bool) {
-        if live {
-            self.textures_live_at_bind.insert(texture_addr);
+    /// The live GXM fixed-function pipeline state (cull/depth/stencil/viewport/...),
+    /// snapshotted into each recorded draw. Sticky across scenes, exactly like the real
+    /// GXM context - because it IS the real GXM context.
+    pub fn render_state(&self, ctx: &GuestCtx) -> crate::capture::RenderState {
+        match self.gxm_context {
+            0 => crate::capture::RenderState::default(),
+            c => crate::vita::gxmctx::load(ctx, c),
         }
     }
+
+    /// One word of the context block, or 0 when there is no context.
+    fn gxm_state_word(&self, ctx: &GuestCtx, offset: u32) -> u32 {
+        match self.gxm_context {
+            0 => 0,
+            c => crate::vita::gxmctx::get(ctx, c, offset),
+        }
+    }
+
+    /// Write one word of the context block. The precomputed paths use this: they replay a
+    /// prebuilt state object as the equivalent sequence of setters, so what they change is
+    /// the same context state a `sceGxmSet*` would.
+    fn set_gxm_state_word(&self, ctx: &mut GuestCtx, offset: u32, value: u32) {
+        if self.gxm_context != 0 {
+            crate::vita::gxmctx::set(ctx, self.gxm_context, offset, value);
+        }
+    }
+
+    /// Record `sceGxmSetFragmentTexture(context, unit, texture)`: copy the texture's control
+    /// words into sampler `unit`'s slot of the context block. A zero address unbinds it.
+    ///
+    /// This is the FALLBACK half of the call. The transpiler emits the copy inline for the
+    /// ordinary case (`InlineOp::CopyArgIndexed`), so what reaches here is a null texture, an
+    /// out-of-range unit, or a pointer outside guest memory - the cases the inline form hands
+    /// back precisely because this side defines them.
 
     /// Decode a list of texture bindings into snapshotted [`crate::capture::BoundTexture`]s.
     ///
@@ -5601,21 +5753,50 @@ impl VitaState {
         }
     }
 
-    pub fn bind_fragment_texture(&mut self, ctx: &GuestCtx, unit: u32, texture_addr: u32) {
-        let binding = TextureBinding::read(ctx, unit, texture_addr, false);
-        match self.bound_textures.binary_search_by_key(&unit, |b| b.unit) {
-            Ok(i) => {
-                if texture_addr == 0 {
-                    self.bound_textures.remove(i);
-                } else {
-                    self.bound_textures[i] = binding;
-                }
-            }
-            Err(i) => {
-                if texture_addr != 0 {
-                    self.bound_textures.insert(i, binding);
-                }
-            }
+    pub fn bind_fragment_texture(&mut self, ctx: &mut GuestCtx, unit: u32, texture_addr: u32) {
+        // Into the CONTEXT BLOCK, which is where the inlined form of this call writes. The
+        // handler and the emitted code must leave byte-identical state, because a draw reads
+        // one array and cannot tell which path filled a slot - and after 1,275 binds a frame
+        // go inline, this handler runs only for the cases the inline form declines (a null
+        // texture, an out-of-range unit), which are exactly the ones a divergence would hide
+        // in. See `crate::vita::gxmctx::TexBinding`.
+        let context = self.gxm_context;
+        if context == 0 {
+            self.report_bind_without_context();
+            return;
+        }
+        let words = if texture_addr == 0 {
+            [0; 4]
+        } else {
+            [
+                ctx.read_u32(texture_addr),
+                ctx.read_u32(texture_addr + 4),
+                ctx.read_u32(texture_addr + 8),
+                ctx.read_u32(texture_addr + 12),
+            ]
+        };
+        crate::vita::gxmctx::set_texture_binding(
+            ctx,
+            context,
+            unit,
+            crate::vita::gxmctx::TexBinding { addr: texture_addr, words, from_precomputed: false },
+        );
+    }
+
+    /// Report - once - a texture bind that arrived before `sceGxmCreateContext`, so its state
+    /// has nowhere to live.
+    ///
+    /// Silently dropping it would be a draw missing a texture thousands of frames later, with
+    /// nothing pointing back at the bind. This cannot happen through a conforming title (GXM
+    /// takes the context as its first argument), which is why it is a report and not a case.
+    fn report_bind_without_context(&mut self) {
+        if !self.reported_no_gxm_context {
+            self.reported_no_gxm_context = true;
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                "a texture was bound before any sceGxmContext was created, so the binding has \
+                 nowhere to live and is DROPPED"
+            );
         }
     }
 
@@ -5647,12 +5828,6 @@ impl VitaState {
                 (d != 0 && d.unsigned_abs() <= u64::from(window)).then_some((d, f))
             })
             .min_by_key(|(d, _)| d.abs())
-    }
-
-    /// Mutable access to the live GXM fixed-function state, so a `sceGxmSet*` setter
-    /// updates the single field it owns (the state is sticky and snapshotted per draw).
-    pub fn render_state_mut(&mut self) -> &mut crate::capture::RenderState {
-        &mut self.render_state
     }
 
     /// The color surface recorded for `addr` (its `SceGxmColorSurface*` struct
@@ -5818,20 +5993,54 @@ impl VitaState {
     /// model is occlusion - geometry behind other geometry still counts - so a title
     /// using the query to hide a sun flare behind scenery will show the flare. That is
     /// an approximation, so it says so, once.
-    fn accumulate_visibility(&mut self, index_count: u32) {
-        if self.render_state.front_visibility_test_enable == 0 || self.visibility_buffer == 0 {
+    ///
+    /// # Why this is NOT fixed with a real GPU occlusion query, deliberately
+    /// WebGPU has occlusion queries and wiring one up is a morning's work. It is the wrong
+    /// move, and the reason is worth stating so nobody spends that morning:
+    ///
+    /// - The result would enter GUEST MEMORY. The visibility buffer is read by guest code,
+    ///   which branches on it, so the value decides what the title does next - not merely how
+    ///   it looks. Feeding it a GPU-measured number makes guest execution depend on the GPU.
+    /// - Two engines would then diverge on purpose. The desktop oracle and the browser use
+    ///   different adapters with different rasterisation at the sample level, so the same
+    ///   frame could take different branches on each, and the pixel oracle would stop being an
+    ///   oracle for anything downstream of a query.
+    /// - It is also ASYNCHRONOUS. A query result is available a frame or more after the pass
+    ///   that produced it, while the guest reads the buffer when the scene ends. Serving it
+    ///   would mean either stalling on the GPU every scene or handing the guest last frame's
+    ///   answer - and the second is a different wrong number, arrived at more expensively.
+    ///
+    /// So the approximation stays, and the trade is: a flare that should be hidden is visible
+    /// (a bounded, visible, reported error) instead of a title whose control flow depends on
+    /// which GPU is present (an unbounded, invisible, unreproducible one). Change this only
+    /// with a determinism story, not because the warning is annoying.
+    fn accumulate_visibility(&mut self, ctx: &GuestCtx, index_count: u32) {
+        use crate::vita::gxmctx::off;
+        if self.gxm_state_word(ctx, off::FRONT_VISIBILITY_TEST_ENABLE) == 0 || self.visibility_buffer == 0 {
             return;
         }
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // >>> STAYS AT `warn`. It was briefly moved to `debug` on the argument that a
+            // deliberate decision is not a defect, and that argument is wrong: the OUTPUT is
+            // still incorrect. Occluded geometry reports visible, guest code branches on it,
+            // and a title can therefore behave differently here than on hardware. "We chose
+            // this" describes why it has not been fixed, not whether it is broken - and a
+            // warning that is quiet because the cause is known is a warning that has been
+            // silenced. It fires ONCE per run, which is the right volume for a standing
+            // incorrect result. Fix it (a real query plus a determinism story) or leave it
+            // loud; do not lower it.
             tracing::warn!(
                 target: "vitaslop::gxm",
                 "an occlusion query is live; the capture does not rasterize, so the visibility \
                  buffer receives the SUBMITTED vertex count, not the count of samples that \
-                 passed - occluded geometry still reports visible"
+                 passed - occluded geometry still reports visible (e.g. a flare that should be \
+                 hidden behind scenery is not). This is a DELIBERATE approximation: the result \
+                 is read by guest code and branched on, so a real GPU query would make guest \
+                 control flow depend on which adapter is present. See `accumulate_visibility`."
             );
         }
-        let slot = self.render_state.front_visibility_test_index;
+        let slot = self.gxm_state_word(ctx, off::FRONT_VISIBILITY_TEST_INDEX);
         *self.visibility_counts.entry(slot).or_insert(0) += index_count;
     }
 
@@ -5957,7 +6166,7 @@ impl VitaState {
     /// draw's vertex program + stream-0 buffer and record it into the current scene,
     /// exactly as a `sceGxmDraw` would. The bound textures and reserved uniform buffer
     /// are whatever the guest set on the context around this call (sticky GXM state).
-    pub fn draw_precomputed(&mut self, ctx: &GuestCtx, precomputed: u32) {
+    pub fn draw_precomputed(&mut self, ctx: &mut GuestCtx, precomputed: u32) {
         let Some(d) = Self::precomputed_draw_read(ctx, precomputed) else {
             // A block with no initialised tag: the draw would be LOST, which shows up in the
             // frame only as missing geometry. Say so rather than return quietly.
@@ -5968,8 +6177,14 @@ impl VitaState {
             );
             return;
         };
-        self.bound_vertex_program = d.vertex_program;
-        self.bound_streams = d.streams;
+        // The precomputed block's bindings become the CONTEXT's, exactly as the equivalent
+        // sequence of `sceGxmSetVertexProgram` / `sceGxmSetVertexStream` calls would leave
+        // them - so they go where those setters put them, and not into a second copy here.
+        use crate::vita::gxmctx::off;
+        self.set_gxm_state_word(ctx, off::VERTEX_PROGRAM, d.vertex_program);
+        for (i, &addr) in d.streams.iter().enumerate() {
+            self.set_gxm_state_word(ctx, off::STREAMS + i as u32 * 4, addr);
+        }
         self.record_draw(ctx, d.primitive, d.index_format, d.index_addr, d.index_count);
     }
 
@@ -5986,16 +6201,27 @@ impl VitaState {
     /// for later uniform-buffer sizing). Replaces any prior record at that address.
     pub fn precomputed_vertex_state_init(&mut self, state: u32, vertex_program: u32) {
         let program_header = self.vertex_program_header(vertex_program);
-        self.precomputed_vertex_states
-            .insert(state, PrecomputedState { program_header, ..PrecomputedState::default() });
+        self.precomputed_vertex_states.insert(
+            state,
+            PrecomputedState {
+                program_handle: vertex_program,
+                program_header,
+                ..PrecomputedState::default()
+            },
+        );
     }
 
     /// `sceGxmPrecomputedFragmentStateInit(state, fragmentProgram, memBlock)`.
     pub fn precomputed_fragment_state_init(&mut self, state: u32, fragment_program: u32) {
         let program_header = self.fragment_program_header(fragment_program);
-        let blend = self.fragment_program_blend(fragment_program);
-        self.precomputed_fragment_states
-            .insert(state, PrecomputedState { program_header, blend, ..PrecomputedState::default() });
+        self.precomputed_fragment_states.insert(
+            state,
+            PrecomputedState {
+                program_handle: fragment_program,
+                program_header,
+                ..PrecomputedState::default()
+            },
+        );
     }
 
     /// `sceGxmPrecomputed{Vertex,Fragment}StateSetDefaultUniformBuffer(state, buffer)`:
@@ -6122,17 +6348,48 @@ impl VitaState {
     /// Apply `sceGxmSetPrecomputedFragmentState(context, state)`: bind this stage's
     /// textures to the context sampler units, exactly as a sequence of
     /// `sceGxmSetFragmentTexture` calls would, so `record_draw` snapshots them.
-    pub fn bind_precomputed_fragment_state(&mut self, ctx: &GuestCtx, state: u32) {
-        let (textures, header, uniform_buf, blend) = match self.precomputed_fragment_states.get(&state) {
-            Some(s) => (s.textures.clone(), s.program_header, s.default_uniform_buffer, s.blend),
+    pub fn bind_precomputed_fragment_state(&mut self, ctx: &mut GuestCtx, state: u32) {
+        let (textures, handle, header, uniform_buf) = match self.precomputed_fragment_states.get(&state) {
+            Some(s) => (s.textures.clone(), s.program_handle, s.program_header, s.default_uniform_buffer),
             None => return,
         };
         // The precomputed state stores (textureIndex, binding); the live bind list is keyed by
         // sampler UNIT, and for a fragment state the two are the same number.
-        self.bound_textures = textures.into_iter().map(|(_, b)| b).collect();
-        self.textures_from_precomputed = true;
-        self.bound_fragment_program_header = header;
-        self.bound_fragment_blend = blend;
+        //
+        // This writes the CONTEXT BLOCK, the same array the direct path and its inlined form
+        // write, so a draw sees one set of bindings whichever route filled it. Binding a
+        // precomputed state REPLACES the whole array on hardware, so every other unit is
+        // cleared first - leaving them would let a unit bound by an earlier direct call
+        // survive into a state that does not declare it.
+        let context = self.gxm_context;
+        if context == 0 {
+            self.report_bind_without_context();
+            return;
+        }
+        for unit in 0..crate::vita::gxmctx::MAX_TEXTURE_UNITS as u32 {
+            crate::vita::gxmctx::set_texture_binding(
+                ctx,
+                context,
+                unit,
+                crate::vita::gxmctx::TexBinding::default(),
+            );
+        }
+        for (_, b) in textures {
+            crate::vita::gxmctx::set_texture_binding(
+                ctx,
+                context,
+                b.unit,
+                crate::vita::gxmctx::TexBinding {
+                    addr: b.addr,
+                    words: b.words,
+                    from_precomputed: true,
+                },
+            );
+        }
+        // Binding a precomputed fragment state leaves the context bound to its program, so it
+        // goes where `sceGxmSetFragmentProgram` puts it. The blend equation follows from the
+        // handle and needs no separate record.
+        self.set_gxm_state_word(ctx, crate::vita::gxmctx::off::FRAGMENT_PROGRAM, handle);
         // Bind this stage's default uniform buffer (pointer + reflected size) so the draw
         // reads the per-material fragment uniforms (tint / light / fog) from guest memory,
         // exactly as the precomputed vertex path binds the vertex uniform buffer.
@@ -6207,7 +6464,7 @@ impl VitaState {
     const UNIFORM_RING_BYTES: u32 = 8 * 1024 * 1024;
 
     pub fn reserve_vertex_uniform_buffer(&mut self, ctx: &mut GuestCtx) -> u32 {
-        let header = self.vertex_program_header(self.bound_vertex_program);
+        let header = self.vertex_program_header(self.bound_vertex_program(ctx));
         let header_size = default_uniform_buffer_bytes(ctx, header);
         let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(MAX_DEFAULT_UNIFORM_REGS);
         let buf = self.alloc_default_uniform_buffer(size);
@@ -6217,7 +6474,7 @@ impl VitaState {
         self.vertex_uniform_header = header;
         tracing::trace!(
             target: "vitaslop::gxm",
-            program = format_args!("{:#x}", self.bound_vertex_program),
+            program = format_args!("{:#x}", self.bound_vertex_program(ctx)),
             header = format_args!("{header:#x}"),
             header_size,
             size,
@@ -6233,7 +6490,7 @@ impl VitaState {
     /// so a title that writes its per-material uniforms (tint / light / fog) directly into
     /// this buffer has them captured into the draw's material.
     pub fn reserve_fragment_uniform_buffer(&mut self, ctx: &GuestCtx) -> u32 {
-        let header = self.bound_fragment_program_header;
+        let header = self.bound_fragment_program_header(ctx);
         let header_size = default_uniform_buffer_bytes(ctx, header);
         let size = self.reflected_uniform_size_bytes(ctx, header).max(header_size).min(MAX_DEFAULT_UNIFORM_REGS);
         let buf = self.alloc_default_uniform_buffer(size);
@@ -6327,7 +6584,16 @@ impl VitaState {
     fn thread_wait_state(&self, thid: i32) -> String {
         for m in &self.lwmutexes {
             if m.waiters.contains(&thid) {
-                return format!("blocked on lwmutex work={:#010x} (owner={:?})", m.work, m.owner);
+                // No owner here on purpose: it lives in the guest's work area now, and
+                // this dump has no guest memory. Naming the address is enough to go and
+                // read it (`VITASLOP_PEEK=<work>:16`), and inventing a host-side echo of
+                // it would print a value the inline take never updated - a wrong answer
+                // in the one report that exists to explain a deadlock.
+                return format!(
+                    "blocked on lwmutex work={:#010x} ({} parked; owner is in the work area)",
+                    m.work,
+                    m.waiters.len()
+                );
             }
         }
         for m in &self.mutexes {
@@ -6421,10 +6687,9 @@ impl VitaState {
         }
         let _ = writeln!(s, "lwmutexes ({}):", self.lwmutexes.len());
         for m in &self.lwmutexes {
-            let _ = writeln!(
-                s, "  work={:#010x} owner={:?} count={} waiters={:x?}",
-                m.work, m.owner, m.count, m.waiters
-            );
+            // Owner and count are guest-resident (`vita::lwwork`) and this dump has no
+            // guest memory; `VITASLOP_PEEK=<work>:16` reads them, in that order.
+            let _ = writeln!(s, "  work={:#010x} parked={:x?}", m.work, m.waiters);
         }
         let _ = writeln!(s, "mutexes ({}):", self.mutexes.len());
         for m in &self.mutexes {
@@ -6468,8 +6733,8 @@ impl VitaState {
     }
 
     /// The bound vertex program's layout, if recorded.
-    fn bound_layout(&self) -> Option<&VertexProgramInfo> {
-        self.vertex_programs.get(&self.bound_vertex_program)
+    fn bound_layout(&self, ctx: &GuestCtx) -> Option<&VertexProgramInfo> {
+        self.vertex_programs.get(&self.bound_vertex_program(ctx))
     }
 
     /// 1, 10, 100, ... - the schedule a repeating diagnostic reports on when what matters is
@@ -6498,11 +6763,31 @@ impl VitaState {
     /// Reported unconditionally (once per program pair): a draw silently transformed by
     /// the wrong matrix is indistinguishable from a faithful render except by eye, and
     /// that is exactly how this class of bug survives.
-    fn stale_uniforms(&mut self, stage: &'static str, bound_for: u32, drawing: u32) -> bool {
+    fn stale_uniforms(
+        &mut self,
+        stage: &'static str,
+        bound_for: u32,
+        drawing: u32,
+        needs_bytes: u32,
+    ) -> bool {
         // `drawing == 0` means the program header was never recorded (an unknown handle),
         // so there is nothing to compare against and no evidence of staleness.
         if bound_for == drawing || drawing == 0 {
             return false;
+        }
+        // A program with NO default uniform block reads no SA bank, so a buffer left bound
+        // for a different program is not starving it of anything - there is nothing for it to
+        // be starved of. Dropping the binding is still right (it is not this draw's data), but
+        // it is bookkeeping, not a defect, and reporting it as one is what buried three real
+        // render defects under seventy lines of noise on the race screen.
+        //
+        // This is the common case by construction: the direct path reserves per program, and a
+        // title only omits the reserve for a program that needs no uniforms. That is why the
+        // counts are in the thousands on a title whose picture is broadly correct - the warning
+        // was measuring how OFTEN the guest binds a uniform-less fragment program after a
+        // uniform-taking one, which is a fact about the title, not about the emulator.
+        if needs_bytes == 0 {
+            return true;
         }
         let n = self.reported_stale_uniforms.entry((stage, bound_for, drawing)).or_insert(0);
         *n += 1;
@@ -6516,8 +6801,10 @@ impl VitaState {
                 stage,
                 bound_for = format_args!("{bound_for:#x}"),
                 drawing = format_args!("{drawing:#x}"),
+                needs_bytes,
                 count = *n,
-                "STALE default uniform buffer: bound for another program, DROPPED for this draw"
+                "STALE default uniform buffer: bound for another program, so this draw's stage \
+                 renders with NO uniform bank at all (it declares needs_bytes of them)"
             );
         }
         true
@@ -6531,12 +6818,23 @@ impl VitaState {
     /// A buffer bound for a different vertex program is NOT this draw's SA bank - see
     /// [`Self::stale_uniforms`] - so it is dropped rather than misread.
     fn current_vertex_uniforms(&mut self, ctx: &GuestCtx) -> Vec<f32> {
-        let drawing = self.vertex_program_header(self.bound_vertex_program);
-        let bound_for = self.vertex_uniform_header;
-        if self.stale_uniforms("vertex", bound_for, drawing) {
-            return self.pending_uniforms.clone();
+        // Only a BOUND buffer can be stale, so the test belongs behind the same guard the
+        // fragment stage uses in `record_draw`. With nothing bound - `vertex_uniform_header` is
+        // 0 after a null or never-built precomputed state, and after a cleared reservation -
+        // both arms below return `pending_uniforms` regardless, so testing staleness here
+        // cannot change a pixel and can only report a drop that did not happen. It did:
+        // 10,000 `bound_for=0x0` warnings in one PCSA00015 run, which reads as a rendering
+        // defect when the direct uniform path was serving those draws correctly.
+        if self.bound_vertex_uniform_buf != 0 {
+            let drawing = self.vertex_program_header(self.bound_vertex_program(ctx));
+            let needs = self
+                .reflected_uniform_size_bytes(ctx, drawing)
+                .max(default_uniform_buffer_bytes(ctx, drawing));
+            if self.stale_uniforms("vertex", self.vertex_uniform_header, drawing, needs) {
+                return self.pending_uniforms.clone();
+            }
         }
-        if self.bound_vertex_uniform_buf != 0 && self.bound_vertex_uniform_size >= 4 {
+        if self.bound_vertex_uniform_size >= 4 && self.bound_vertex_uniform_buf != 0 {
             let count = (self.bound_vertex_uniform_size / 4) as usize;
             ctx.read_f32s(self.bound_vertex_uniform_buf, count)
         } else {
@@ -6553,31 +6851,51 @@ impl VitaState {
         index_addr: u32,
         index_count: u32,
     ) {
+        // A draw with no context block behind it reads the GXM DEFAULTS for every piece of
+        // sticky state - no bound program, no streams, cull none, depth less-equal - which
+        // renders as missing geometry rather than as an error. Nothing else would report it,
+        // because reading a default is not a failure anywhere downstream.
+        if self.gxm_context == 0 && !self.reported_no_gxm_context {
+            self.reported_no_gxm_context = true;
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                "a draw was recorded before sceGxmCreateContext - every piece of sticky GXM \
+                 state reads as its DEFAULT, so this draw has no bound program and no vertex \
+                 streams"
+            );
+        }
         // Occlusion query: this draw contributes to whatever slot the front-face
         // visibility test currently names (no-op when no query is live).
-        self.accumulate_visibility(index_count);
+        self.accumulate_visibility(ctx, index_count);
         // Drop a default uniform buffer still bound for a DIFFERENT program before anything
         // below reads it (see [`Self::stale_uniforms`]). The vertex stage is handled inside
         // `current_vertex_uniforms`; the fragment stage has several independent readers
         // (material reflection, the recompiler's `frag_sa`, the draw dump), so clear it once
         // here and they all see the same truth.
         if self.bound_fragment_uniform_buf != 0 {
-            let drawing = self.bound_fragment_program_header;
-            if self.stale_uniforms("fragment", self.fragment_uniform_header, drawing) {
+            let drawing = self.bound_fragment_program_header(ctx);
+            // How much SA bank the program ABOUT TO DRAW actually declares. Zero means it
+            // reads none, and then a mismatched binding starves it of nothing - see
+            // `stale_uniforms`.
+            let needs = self
+                .reflected_uniform_size_bytes(ctx, drawing)
+                .max(default_uniform_buffer_bytes(ctx, drawing));
+            if self.stale_uniforms("fragment", self.fragment_uniform_header, drawing, needs) {
                 self.bound_fragment_uniform_buf = 0;
                 self.bound_fragment_uniform_size = 0;
             }
         }
         // Reflect both bound programs ONCE, here. Every name-based lookup below reads
         // these instead of re-walking a parameter table (see `ProgramReflection`).
-        let vheader = self.vertex_program_header(self.bound_vertex_program);
+        let vheader = self.vertex_program_header(self.bound_vertex_program(ctx));
         let vref = self.reflect_program(ctx, vheader);
-        let fref = self.reflect_program(ctx, self.bound_fragment_program_header);
+        let fheader = self.bound_fragment_program_header(ctx);
+        let fref = self.reflect_program(ctx, fheader);
         // The bound program's attributes, and the layout of each stream they name. The
         // attributes are rewritten below onto the single interleaved buffer this draw is
         // captured into, so what goes into the `Draw` is the REPACKED layout, not the
         // guest's.
-        let (mut attributes, streams) = match self.bound_layout() {
+        let (mut attributes, streams) = match self.bound_layout(ctx) {
             Some(info) => {
                 let used = info.attributes.iter().map(|a| a.stream_index as usize).max().map(|m| m + 1).unwrap_or(0);
                 (info.attributes.clone(), (0..used).map(|i| info.stream(i)).collect::<Vec<_>>())
@@ -6638,7 +6956,7 @@ impl VitaState {
             stride += s.stride;
         }
         let single_stream = matches!(streams.as_slice(), [s] if !s.per_instance);
-        let bound_streams = self.bound_streams;
+        let bound_streams = self.bound_streams(ctx);
         let vertices = crate::perf::time(crate::perf::Phase::DrawVertices, || {
             if single_stream {
                 // The overwhelmingly common case is one per-vertex stream, whose rows are
@@ -6689,15 +7007,34 @@ impl VitaState {
         // unit as it is bound, so this reads it in place rather than cloning and
         // re-sorting a fresh Vec for every draw.
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
-        debug_assert!(
-            self.bound_textures.windows(2).all(|w| w[0].unit <= w[1].unit),
-            "bound_textures must stay sorted by unit - see bind_fragment_texture and \
-             bind_precomputed_fragment_state"
-        );
-        // Moved out and put back rather than cloned: these two lists are rebuilt by the
-        // `sceGxmSet*Texture` setters, not by the snapshot, and cloning them per draw was
-        // two Vec allocations on the hottest path in the engine.
-        let frag_binds = std::mem::take(&mut self.bound_textures);
+        // The fragment bindings come from the CONTEXT BLOCK now, because that is where the
+        // inlined `sceGxmSetFragmentTexture` writes them and the host no longer sees most
+        // binds at all. Read in unit order, which is the order this list has always been in.
+        //
+        // `bound_textures` is reused as the scratch buffer rather than allocated here: it is
+        // taken and put back for the same reason it always was - the decode needs `self`
+        // borrowed mutably while the bindings are borrowed - and keeping the allocation
+        // avoids a Vec per draw on the hottest path in the engine.
+        let mut frag_binds = std::mem::take(&mut self.bound_textures);
+        frag_binds.clear();
+        let context = self.gxm_context;
+        if context != 0 {
+            for unit in 0..crate::vita::gxmctx::MAX_TEXTURE_UNITS as u32 {
+                let b = crate::vita::gxmctx::texture_binding(ctx, context, unit);
+                // A slot the guest never bound, or unbound, is not a binding. The old list
+                // simply had no entry for such a unit, so skipping keeps the exact shape
+                // every downstream reader (and `textures.first()`) already expects.
+                if b.addr == 0 {
+                    continue;
+                }
+                frag_binds.push(TextureBinding {
+                    unit,
+                    addr: b.addr,
+                    words: b.words,
+                    from_precomputed: b.from_precomputed,
+                });
+            }
+        }
         let mut textures = self.snapshot_bound_textures(ctx, &frag_binds);
         self.bound_textures = frag_binds;
         // The VERTEX stage's own samplers, decoded exactly the same way. A vertex program that
@@ -6773,11 +7110,7 @@ impl VitaState {
         drop(uniform_phase);
         // The per-draw diagnostic dump, after everything it reports has been computed
         // (it prints the reflected transform and material rather than recomputing them).
-        self.dump_gxp_blobs(
-            ctx,
-            self.bound_fragment_program_header,
-            self.vertex_program_header(self.bound_vertex_program),
-        );
+        self.dump_gxp_blobs(ctx, fheader, vheader);
         self.dump_draw_gxp(
             ctx, &vref, &material, &textures, &attributes, primitive, index_count, stride,
         );
@@ -6787,9 +7120,9 @@ impl VitaState {
         // container out of guest memory ONCE and hands every later draw a shared `Arc` -
         // see there for why a per-draw read is not affordable.
         let (vprog, fprog, vert_sa, frag_sa) = if gxp_live_capture() {
-            let vhdr = self.vertex_program_header(self.bound_vertex_program);
+            let vhdr = self.vertex_program_header(self.bound_vertex_program(ctx));
             let vprog = self.program_blob(ctx, vhdr);
-            let fprog = self.program_blob(ctx, self.bound_fragment_program_header);
+            let fprog = self.program_blob(ctx, fheader);
             // The vertex SA is the pre-stamp raw uniforms captured above (covers both the bound
             // buffer and the direct sceGxmSetUniformDataF path).
             let vert_sa = vert_sa_raw;
@@ -6802,6 +7135,9 @@ impl VitaState {
         } else {
             (crate::capture::no_program(), crate::capture::no_program(), Vec::new(), Vec::new())
         };
+        // ...and WHERE the fragment bank came from, which the bytes cannot say. See
+        // `capture::Draw::frag_sa_addr`.
+        let frag_sa_addr = if gxp_live_capture() { self.bound_fragment_uniform_buf } else { 0 };
         let draw = crate::capture::Draw {
             primitive,
             index_format,
@@ -6813,9 +7149,9 @@ impl VitaState {
             indices: indices.into(),
             uniforms,
             textures,
-            render_state: self.render_state,
-            blend: self.bound_fragment_blend,
-            fragment_program_header: self.bound_fragment_program_header,
+            render_state: self.render_state(ctx),
+            blend: self.bound_fragment_blend(ctx),
+            fragment_program_header: fheader,
             exposure,
             material,
             world,
@@ -6823,6 +7159,7 @@ impl VitaState {
             fprog,
             vert_sa,
             frag_sa,
+            frag_sa_addr,
             shader_expanded: Self::reflected_shader_expanded(&vref),
         };
         match self.scene.as_mut() {
@@ -6834,12 +7171,15 @@ impl VitaState {
     }
 
     /// Size in bytes of a program's default uniform buffer, computed from its
-    /// reflected parameter table: the maximum `resource_index + component_count *
-    /// array_size` (in floats) over the uniform (`category == 1`) parameters, times 4.
+    /// reflected parameter table: the maximum `resource_index + <registers this
+    /// parameter occupies>` over the uniform (`category == 1`) parameters, times 4.
     /// The program header's own size field (+0x2C) under-reports for shaders with a
     /// large uniform block (e.g. a world matrix at float 0 plus a world-to-projection
     /// matrix at float 16 plus lighting/fog), truncating the captured buffer and
     /// dropping the view-projection - so the reflected extent is the reliable size.
+    ///
+    /// A parameter's registers are NOT its component count: see the width table in
+    /// [`reflect_program_uncached`] for what counting them that way cost.
     fn reflected_uniform_size_bytes(&mut self, ctx: &GuestCtx, header: u32) -> u32 {
         self.reflect_program(ctx, header).uniform_size_bytes
     }
@@ -7029,7 +7369,7 @@ impl VitaState {
     fn dump_vertex_program_params(&self, ctx: &GuestCtx) {
         use std::sync::Mutex;
         static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-        let ph = self.vertex_program_header(self.bound_vertex_program);
+        let ph = self.vertex_program_header(self.bound_vertex_program(ctx));
         if ph == 0 {
             return;
         }
@@ -7154,7 +7494,7 @@ impl VitaState {
     fn dump_fragment_program_samplers(&self, ctx: &GuestCtx) {
         use std::sync::Mutex;
         static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-        let header = self.bound_fragment_program_header;
+        let header = self.bound_fragment_program_header(ctx);
         if header == 0 {
             return;
         }
@@ -7271,8 +7611,8 @@ impl VitaState {
             return;
         }
         let seq = self.scene.as_ref().map(|s| s.draws.len()).unwrap_or(0);
-        let vh = self.vertex_program_header(self.bound_vertex_program);
-        let fh = self.bound_fragment_program_header;
+        let vh = self.vertex_program_header(self.bound_vertex_program(ctx));
+        let fh = self.bound_fragment_program_header(ctx);
         // The caller has already reflected it - recomputing here would be a second
         // (and, with the ambient-mean cache, a differently-warmed) evaluation of the
         // same thing.
@@ -7556,7 +7896,7 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
     let mut r = ProgramReflection::default();
     let count = ctx.read_u32(header.wrapping_add(0x24));
     let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
-    let mut max_floats = 0u32;
+    let mut max_regs = 0u32;
     let mut best_albedo: Option<(i32, u32)> = None;
     // One scratch buffer for every name in the table: names are short and this walk is
     // the whole reason the per-draw version allocated.
@@ -7584,8 +7924,30 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
             }
             1 => {
                 let array = ctx.read_u32(p.wrapping_add(8)).max(1);
-                max_floats = max_floats.max(res.wrapping_add(comp.max(1).wrapping_mul(array)));
                 let is_f16 = ptype == 1;
+                // The extent this parameter occupies, in 32-BIT REGISTERS - which is what
+                // `resource_index` counts, and what the buffer is sized in.
+                //
+                // A component is not a register. The width comes from the type nibble, the
+                // same mapping as `ParamType::component_bytes`: F16/U16/S16/C10 pack two
+                // components per register and U8/S8 four, so an `F16[4]` at register 2 ends
+                // at register 4, not register 6. Counting every component as a register
+                // OVER-SIZES the buffer, and the over-size is not benign: the default
+                // uniform buffer is a recycled per-scene ring, so the bytes past what the
+                // guest wrote are the PREVIOUS draw's uniforms. That is how a fragment
+                // program declaring 16 bytes came to be captured with 24, whose tail
+                // "ramped smoothly" frame over frame and read exactly like a runaway
+                // exposure multiplier the guest was computing. It was our own arithmetic.
+                let comps = comp.max(1).wrapping_mul(array);
+                let regs = match ptype {
+                    1 | 2 | 5 | 6 => comps.div_ceil(2),
+                    7 | 8 => comps.div_ceil(4),
+                    // F32/U32/S32, and anything whose width this table does not know: one
+                    // register per component, which is the widest reading and so the one
+                    // that cannot truncate a buffer.
+                    _ => comps,
+                };
+                max_regs = max_regs.max(res.wrapping_add(regs));
                 let pref = ParamRef { res, comp: comp.max(1) as u8, f16: is_f16 };
                 // A 4x4 matrix is declared as component_count 4, array_size 4.
                 let is_matrix = comp == 4 && array == 4;
@@ -7645,7 +8007,7 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
         }
     }
     r.albedo_unit = best_albedo.map(|(_, u)| u);
-    r.uniform_size_bytes = max_floats.wrapping_mul(4);
+    r.uniform_size_bytes = max_regs.wrapping_mul(4);
     r
 }
 
@@ -7760,7 +8122,12 @@ pub(crate) fn default_uniform_buffer_bytes(ctx: &GuestCtx, header: u32) -> u32 {
 fn poison_uniform_buffer(ctx: &mut GuestCtx, buf: u32, size: u32) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if buf == 0 || !*ON.get_or_init(|| std::env::var_os("VITASLOP_GXM_UNIFORM_POISON").is_some()) {
+    // Through the knob table. This is the one experiment that separates "the guest wrote this"
+    // from "this is the previous draw's uniforms still in the ring", and the value it has to
+    // decide that about (`screenTintColour`, the white-out) only ever appears in the BROWSER -
+    // which has no environment, so the knob could not be set on the only engine that shows it.
+    if buf == 0 || !*ON.get_or_init(|| crate::knobs::var_os("VITASLOP_GXM_UNIFORM_POISON").is_some())
+    {
         return;
     }
     for i in 0..size / 4 {
@@ -7819,6 +8186,57 @@ fn report_unsized_texture_format(unit: u32, base_format: u32, tex_type: u32, wid
         "gxm texture: unit {unit} base format {base_format:#04x} (type {tex_type}, \
          {width}x{height}) has no known block size - EVERY unit bound to this format is left \
          unbound, and any shader sampling it falls back to fixed-function"
+    );
+}
+
+/// Report - once per base format - that a CUBE map declares mip levels this path deliberately
+/// does not read.
+///
+/// Six faces each carrying a chain can interleave two ways (chain per face, or every face's
+/// level 0 then every face's level 1), and no clean source this project may read publishes
+/// which. Guessing would put a face's level 1 where its level 2 belongs, which reads as a
+/// correctly-shaped cube map that goes wrong only when something minifies - the kind of defect
+/// that survives a whole session of looking at screenshots. So the chain is not read, and the
+/// six faces get their level 0 exactly as they always have.
+fn report_cube_mip_chain_skipped(unit: u32, base_format: u32, width: u32, height: u32, mip_field: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(base_format) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "gxm texture: unit {unit} bound a CUBE map ({width}x{height}, base format \
+         {base_format:#04x}) whose control word declares {mip_field} mip levels - only level 0 \
+         of each face is snapshotted, because how six chains interleave in guest memory is not \
+         established. A minified sample of this texture reads OUR box-filtered chain, not the \
+         guest's."
+    );
+}
+
+/// Report - once per base format - that the guest's mip chain could not be read, so the
+/// snapshot fell back to level 0 alone.
+///
+/// This is expected for a texture whose data pointer is a render target's colour surface: it
+/// has no mips in memory whatever its control word says, and the bytes past level 0 are
+/// somebody else's or nothing at all. It is NOT expected for an ordinary asset, and there the
+/// line is the difference between "the guest has no mips here" and "we computed the chain size
+/// wrong", which need opposite fixes.
+fn report_mip_chain_unreadable(unit: u32, base_format: u32, data_addr: u32, width: u32, height: u32, levels: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(base_format) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "gxm texture: unit {unit} ({width}x{height}, base format {base_format:#04x} at \
+         {data_addr:#010x}) declares {levels} mip levels but its memory does not extend that \
+         far - falling back to level 0 alone for every texture of this format"
     );
 }
 
@@ -8002,7 +8420,7 @@ fn zero_texel() -> Arc<[u8]> {
 /// `min_filter`: for a `LINEAR_STRIDED` texture those bits are part of the stride, and the
 /// header states that such a texture uses its MAG filter for minification too - so reading bits
 /// 10..11 there would sample by a couple of stride bits instead of a filter mode.
-fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32) {
+fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32, u32) {
     const TYPE_LINEAR_STRIDED: u32 = 1;
     let mag = (w0 >> 12) & 0x3;
     let min = if tex_type == TYPE_LINEAR_STRIDED { mag } else { (w0 >> 10) & 0x3 };
@@ -8013,6 +8431,7 @@ fn word0_sampler_state(w0: u32, tex_type: u32) -> (u32, u32, u32, u32, u32, u32)
         min,
         mag,
         w0 & 0x1800_0000, // gamma_mode, in the enum's own already-shifted encoding
+        (w0 >> 9) & 0x1,  // mip_filter (`vita::gxm::texword0::MIP_FILTER`)
     )
 }
 
@@ -8060,6 +8479,7 @@ fn decode_texture(
             stride: 4,
             faces: 1,
             face_bytes: 4,
+            levels: 1,
             data_addr: 0,
             // ONE buffer for every null handle of the run, not one per draw. Consumers key
             // their caches on this buffer's IDENTITY (see `crate::render::tex_key`), so a
@@ -8073,6 +8493,7 @@ fn decode_texture(
             lod_bias: 0,
             min_filter: 0,
             mag_filter: 0,
+            mip_filter: 0,
             gamma: 0,
         });
     }
@@ -8099,8 +8520,12 @@ fn decode_texture(
         Some(f) => ((f >> 24) & 0xff, f & 0x00ff_ffff),
         None => {
             let base = ((w1 >> 24) & 0x1f) | (((w0 >> 31) & 1) << 7);
-            report_texture_resolved_from_control_words(unit, base, (w3 >> 29) & 0x7);
-            (base, ((w3 >> 29) & 0x7) << 12)
+            // Bits 28:30, per vitasdk's `SceGxmTexture` - see `vita::gxm::texword3`, which
+            // records why reading bit 29 here was wrong yet passed every round-trip test.
+            use crate::vita::gxm::texword3;
+            let swz = (w3 >> texword3::SWIZZLE_SHIFT) & texword3::SWIZZLE_MASK;
+            report_texture_resolved_from_control_words(unit, base, swz);
+            (base, swz << 12)
         }
     };
 
@@ -8108,39 +8533,79 @@ fn decode_texture(
     // cannot size is dropped rather than guessed, but never silently: an undecoded unit shows up
     // downstream only as a missing sampler binding, which is far harder to trace back than the
     // format that caused it.
-    let Some((block_w, block_h, block_bytes)) = crate::render::block_layout(base_format) else {
+    // `stride` is the bytes per block-row we snapshot, and `level0` the bytes ONE level
+    // occupies. The layout arithmetic lives in `render::level_layout` so the chain read below
+    // and the level-0 read here cannot drift apart.
+    let Some(l0) = crate::render::level_layout(base_format, tex_type, width, height, 0) else {
         note_texture_drop(1);
         report_unsized_texture_format(unit, base_format, tex_type, width, height);
         return None;
     };
-    let blocks_x = width.div_ceil(block_w);
-    let blocks_y = height.div_ceil(block_h);
-    // `stride` is the bytes per block-row we snapshot, and `total` the bytes to read.
-    // A SWIZZLED (Morton) texture is stored over a power-of-two-padded block grid; a
-    // LINEAR one is row-major, with uncompressed rows padded to a multiple of 8
-    // texels (the GXM linear alignment) and compressed rows block-packed.
-    let (stride, total) = if crate::render::swizzled_type(tex_type) {
-        let padded_x = blocks_x.next_power_of_two();
-        let padded_y = blocks_y.next_power_of_two();
-        (padded_x * block_bytes, padded_x * padded_y * block_bytes)
-    } else {
-        let row_blocks = if block_w == 1 { align_up(width, 8) } else { blocks_x };
-        (row_blocks * block_bytes, row_blocks * block_bytes * blocks_y)
-    };
+    let stride = l0.stride;
+    let level0 = l0.bytes;
     // A CUBE texture stores its six faces back to back, each laid out exactly like a standalone
-    // texture of the same size - so one face is `total` bytes and the snapshot is six of them.
+    // texture of the same size - so one face is `level0` bytes and the snapshot is six of them.
     let faces = if crate::render::cube_type(tex_type) { 6 } else { 1 };
+    // >>> HOW MANY MIP LEVELS TO READ, and why the count is CLAMPED rather than trusted.
+    //
+    // `mip_count` is control word 0 bits 17-20 (`vita::gxm::texword0::MIP_COUNT`), and whether
+    // the driver packs the count or the count minus one is NOT settled by any clean source -
+    // that ambiguity is recorded at `texword0`, and it is unobservable through the API because
+    // both our writer and our reader use the same shift. It is observable HERE, from the data,
+    // and `report_mip_chain_probe` is the instrument that measures it.
+    //
+    // Reading the field AS the count is the conservative choice: if the truth is count-minus-one
+    // we stop one (1x1) level short, which costs a level nothing minifies far enough to sample,
+    // whereas the other error reads past the guest's allocation.
+    // >>> AND NOT READ AT ALL IF NOTHING CAN USE IT.
+    //
+    // The chain is ~33% more guest bytes per texture, and those bytes are re-COMPARED against
+    // guest memory once per scene to decide whether the snapshot is stale - a compare this
+    // project has measured at 40% of a frame. The only consumer today is the compressed upload
+    // path, so on a GPU that cannot take compressed textures this would be a third more of the
+    // most expensive loop in the capture, bought for nothing. Level 0 is unchanged either way,
+    // so this changes no picture on any engine.
+    let mip_field = if vitaslop_platform::gpu::block_compression_available() {
+        (w0 >> 17) & 0xf
+    } else {
+        1
+    };
+    let max_levels = crate::render::max_mip_levels(width, height);
+    let want_levels = if faces > 1 {
+        // Six chains, and how they interleave (chain per face, or level across all faces) is
+        // not established. Do not guess at it - level 0 of each face is what this path has
+        // always read, and it stays exactly that until a title makes the question answerable.
+        if mip_field > 1 {
+            report_cube_mip_chain_skipped(unit, base_format, width, height, mip_field);
+        }
+        1
+    } else {
+        mip_field.clamp(1, max_levels)
+    };
     // Read each distinct (address, size) once per scene and share the bytes with every
     // draw that binds it. A scene binds a handful of textures across hundreds of draws, so
     // re-reading them per draw is the difference between megabytes and gigabytes. The cache
     // is scene-scoped because a render target is written in one scene and sampled in a
     // later one - within a single scene the guest cannot rewrite a texture the GPU is
     // consuming, so the snapshot cannot go stale.
-    let len = (total * faces) as usize;
-    let pixels = cache.get_or_read(ctx, data_addr, len);
+    //
+    // >>> THE CHAIN READ CAN FAIL, AND FALLING BACK IS NOT SILENT. A texture whose allocation
+    // really does end after level 0 (a render target sampled as a texture, say - it has no
+    // mips whatever its control word says) makes the fuller read unmappable. That is a fact
+    // about this texture, not an error, so it degrades to level 0 and SAYS SO once per format.
+    let mut levels = want_levels;
+    let mut face_bytes = crate::render::level_offset(base_format, tex_type, width, height, levels)
+        .unwrap_or(level0);
+    let mut pixels = cache.get_or_read(ctx, data_addr, (face_bytes * faces) as usize);
+    if levels > 1 && pixels.len() < (face_bytes * faces) as usize {
+        report_mip_chain_unreadable(unit, base_format, data_addr, width, height, levels);
+        levels = 1;
+        face_bytes = level0;
+        pixels = cache.get_or_read(ctx, data_addr, (face_bytes * faces) as usize);
+    }
     if pixels.is_empty() {
         note_texture_drop(2);
-        report_unreadable_texture(unit, base_format, data_addr, len, width, height);
+        report_unreadable_texture(unit, base_format, data_addr, (face_bytes * faces) as usize, width, height);
         return None;
     }
     Some(crate::capture::BoundTexture {
@@ -8152,7 +8617,8 @@ fn decode_texture(
         height,
         stride,
         faces,
-        face_bytes: total,
+        face_bytes,
+        levels,
         data_addr,
         pixels,
         // Straight out of the binding's own control word 0, so this is the state the guest
@@ -8164,6 +8630,7 @@ fn decode_texture(
         min_filter: sampler.3,
         mag_filter: sampler.4,
         gamma: sampler.5,
+        mip_filter: sampler.6,
     })
 }
 
@@ -8265,10 +8732,29 @@ pub trait ImportDispatch {
     // cannot see (it lives in the host's sync objects) and the host cannot act on
     // (only the scheduler owns the fibers).
 
-    /// Tell the host which guest thread is about to run a host call, so a blocking
-    /// primitive knows whom to park and a wake knows whom to release. The scheduler
-    /// sets this before each dispatch.
+    /// Tell the host which guest thread is running, so a blocking primitive knows whom to
+    /// park and a wake knows whom to release.
+    ///
+    /// The scheduler sets this when it PICKS a thread, before anything of that thread's is
+    /// refreshed or resumed, and again before each dispatch. The first of those is the one
+    /// that matters and it was missing: the current thread is mirrored into guest memory
+    /// for the inlined lightweight-mutex take ([`crate::vita::mirror::SLOT_CURRENT_THREAD`]),
+    /// so a build that only set it at dispatch time would refresh the block with the
+    /// PREVIOUS thread's id and let a resumed thread take mutexes in its name until it
+    /// happened to make a host call.
     fn set_current_thread(&mut self, _thid: i32) {}
+
+    /// Settle any host state that was decided where no guest memory was reachable, and
+    /// report how many items were settled.
+    ///
+    /// Called by the scheduler at the top of every drain - after a resume and after a clock
+    /// advance, and always before a woken thread can run. Today this is the
+    /// lightweight-mutex handoff owed to a cond wait that timed out; see
+    /// [`VitaState::resolve_deferred_lwmutex`] for why that one cannot be a plain queued
+    /// write. The default settles nothing, which is correct for a host with no such state.
+    fn resolve_deferred(&mut self, _words: &mut dyn GuestWords) -> usize {
+        0
+    }
 
     /// The thread pointer (`TPIDRURO`) for thread `thid`: the base of its private
     /// thread-local-storage block, allocated on first request. The engine reads it
@@ -8421,6 +8907,10 @@ impl ImportDispatch for VitaEnv {
 
     fn set_current_thread(&mut self, thid: i32) {
         self.state.set_current(thid);
+    }
+
+    fn resolve_deferred(&mut self, words: &mut dyn GuestWords) -> usize {
+        self.state.resolve_deferred_lwmutex(words)
     }
 
     fn thread_tls_base(&mut self, thid: i32) -> (u32, u32, u32) {
@@ -8682,6 +9172,10 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         self.borrow_mut().set_current_thread(thid);
     }
 
+    fn resolve_deferred(&mut self, words: &mut dyn GuestWords) -> usize {
+        self.borrow_mut().resolve_deferred(words)
+    }
+
     fn thread_tls_base(&mut self, thid: i32) -> (u32, u32, u32) {
         self.borrow_mut().thread_tls_base(thid)
     }
@@ -8818,6 +9312,108 @@ mod hostcall_tests {
 }
 
 #[cfg(test)]
+mod program_reflection_tests {
+    //! The reflected extent of a program's default uniform buffer, in 32-bit registers.
+    //!
+    //! This is the size the capture reads out of the guest's reserved buffer, and the
+    //! buffer is a RECYCLED per-scene ring - so an over-read does not return zeros, it
+    //! returns a neighbouring draw's uniforms. That is a wrong answer wearing the shape
+    //! of a real one, which is why the width table is tested per type rather than on the
+    //! one program that exposed it.
+    use super::*;
+
+    /// Build a `SceGxmProgram` container just complete enough for
+    /// [`reflect_program_uncached`]: the parameter count at +0x24, the table offset at
+    /// +0x28, and one 16-byte record per parameter.
+    ///
+    /// A record is `{ +0 name offset (relative to the record), +4 packed type word,
+    /// +8 array size, +0xc resource index }`, and the packed word is
+    /// `category | type << 4 | components << 8`.
+    fn program_with_uniforms(params: &[(u32, u32, u32, u32)]) -> Vec<u8> {
+        const TABLE: u32 = 0x40;
+        let mut bytes = vec![0u8; (TABLE as usize) + params.len() * 16 + 64];
+        let put = |b: &mut Vec<u8>, at: u32, v: u32| {
+            b[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put(&mut bytes, 0x24, params.len() as u32);
+        // The table offset is stored RELATIVE to the field that holds it.
+        put(&mut bytes, 0x28, TABLE - 0x28);
+        for (i, &(ptype, comp, array, res)) in params.iter().enumerate() {
+            let p = TABLE + i as u32 * 16;
+            // Name offset 0 points the name reader at the record itself, which is a
+            // zero byte - an empty name. None of the name-matched fields are under
+            // test here, and an empty name cannot accidentally match one.
+            put(&mut bytes, p, 0);
+            put(&mut bytes, p + 4, 1 | (ptype << 4) | (comp << 8));
+            put(&mut bytes, p + 8, array);
+            put(&mut bytes, p + 0xc, res);
+        }
+        bytes
+    }
+
+    fn uniform_bytes(params: &[(u32, u32, u32, u32)]) -> u32 {
+        let mut bytes = program_with_uniforms(params);
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut mem = SliceMemory(&mut bytes);
+        let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        reflect_program_uncached(&ctx, 0).uniform_size_bytes
+    }
+
+    #[test]
+    fn f32_parameters_take_one_register_per_component() {
+        // A 4x4 matrix is declared components 4, array 4 - sixteen registers.
+        assert_eq!(uniform_bytes(&[(0, 4, 4, 0)]), 64);
+        // ...and one starting at register 16 ends at 32.
+        assert_eq!(uniform_bytes(&[(0, 4, 4, 0), (0, 4, 4, 16)]), 128);
+    }
+
+    #[test]
+    fn f16_parameters_pack_two_components_per_register() {
+        // THE CASE THAT WAS WRONG. This title's tone-map fragment program declares
+        // `exposure` F16[4] at register 0 and `luminanceFactor` F16[4] at register 2,
+        // and its own header says the buffer is 4 registers / 16 bytes. Counting a
+        // component as a register reported 24, and the extra 8 bytes were read out of
+        // the uniform RING - the previous draw's values, which drift smoothly frame
+        // over frame and read exactly like a runaway multiplier the guest is computing.
+        assert_eq!(uniform_bytes(&[(1, 4, 1, 0), (1, 4, 1, 2)]), 16);
+        // An F16 pair is one register; an odd component count still rounds up to one.
+        assert_eq!(uniform_bytes(&[(1, 2, 1, 0)]), 4);
+        assert_eq!(uniform_bytes(&[(1, 1, 1, 0)]), 4);
+        assert_eq!(uniform_bytes(&[(1, 3, 1, 5)]), 28);
+    }
+
+    #[test]
+    fn narrow_integer_parameters_use_their_own_widths() {
+        // U16/S16/C10 pack two per register, U8/S8 four - the same table as
+        // `ParamType::component_bytes`.
+        assert_eq!(uniform_bytes(&[(5, 4, 1, 0)]), 8);
+        assert_eq!(uniform_bytes(&[(6, 4, 1, 0)]), 8);
+        assert_eq!(uniform_bytes(&[(2, 4, 1, 0)]), 8);
+        assert_eq!(uniform_bytes(&[(7, 4, 1, 0)]), 4);
+        assert_eq!(uniform_bytes(&[(8, 8, 1, 0)]), 8);
+    }
+
+    #[test]
+    fn an_unknown_type_is_sized_as_wide_as_possible() {
+        // A type nibble this table does not know gets one register per component. That
+        // can only ever OVER-size, and an over-size is recoverable where a truncated
+        // buffer silently drops the tail of a matrix.
+        assert_eq!(uniform_bytes(&[(9, 4, 1, 0)]), 16);
+        assert_eq!(uniform_bytes(&[(0xf, 2, 2, 0)]), 16);
+    }
+
+    #[test]
+    fn the_extent_is_the_maximum_not_the_sum() {
+        // Two parameters that OVERLAP (a title may alias a block) size the buffer by
+        // the furthest reach, not by adding them up.
+        assert_eq!(uniform_bytes(&[(0, 4, 1, 0), (0, 4, 1, 0)]), 16);
+        // ...and order in the table does not matter.
+        assert_eq!(uniform_bytes(&[(0, 4, 1, 8), (0, 4, 1, 0)]), 48);
+    }
+}
+
+#[cfg(test)]
 mod savedata_tests {
     //! The in-memory savedata slot store: a created slot must round-trip on get, be
     //! namespaced per mount, and delete cleanly - the read-after-write faithfulness
@@ -8875,6 +9471,27 @@ mod preemptive_tests {
         let mut st = VitaState::new(0x1000, 0x10000, Box::new(DeterministicWorld::default()));
         st.set_preemptive(true);
         st
+    }
+
+    /// Guest memory for the tests that touch guest-resident state, as a sparse word map -
+    /// a lightweight mutex lives in the guest's own work area now, so a test of one needs
+    /// somewhere for it to live.
+    #[derive(Default)]
+    pub(super) struct Words(std::collections::BTreeMap<u32, u32>);
+
+    impl GuestWords for Words {
+        fn word(&self, addr: u32) -> u32 {
+            self.0.get(&addr).copied().unwrap_or(0)
+        }
+        fn set_word(&mut self, addr: u32, value: u32) {
+            self.0.insert(addr, value);
+        }
+    }
+
+    /// A work area laid out as a created lightweight mutex, the way
+    /// `sceKernelCreateLwMutex` leaves it.
+    fn created_lwmutex(st: &mut VitaState, w: &mut Words, work: u32) {
+        st.lwmutex_register(w, work);
     }
 
     /// The MOST RECENT park a thread registered, in microseconds from now. The last one,
@@ -9193,18 +9810,26 @@ mod preemptive_tests {
         let mut st = state();
         // A timed lightweight-cond wait that expires is owed WAIT_TIMEOUT. A cond
         // always has a bound mutex (set at CreateLwCond) - bind one so the wait parks.
+        let w = &mut Words::default();
+        created_lwmutex(&mut st, w, 0x9100);
         st.lwcond_bind_mutex(0x9000, 0x9100);
         st.set_current(1);
-        assert!(st.lwcond_wait(0x9000, 250)); // work-area address, 250 us timeout
+        assert!(st.lwcond_wait(w, 0x9000, 250)); // work-area address, 250 us timeout
         assert_eq!(st.earliest_lwcond_deadline(), Some(250));
         st.advance_time_to(250);
+        // The expiry owes thread 1 its mutex back, and `advance_time_to` has no guest
+        // memory to hand it over in - so nothing is woken until the scheduler settles it.
+        // Asserted rather than skipped: a wake that appeared here would mean the handoff
+        // had been guessed at instead of read.
+        assert!(st.take_wakes().is_empty(), "the handoff is deferred, so the wake is too");
+        assert_eq!(st.resolve_deferred_lwmutex(w), 1);
         assert_eq!(st.take_wakes(), vec![1]);
         assert_eq!(st.take_resume_code(1), Some(SCE_KERNEL_ERROR_WAIT_TIMEOUT));
         // A timed wait released by a signal instead returns 0 (no resume code).
         st.set_current(2);
-        assert!(st.lwcond_wait(0x9000, 250));
+        assert!(st.lwcond_wait(w, 0x9000, 250));
         st.set_current(3);
-        st.lwcond_signal(0x9000, false);
+        st.lwcond_signal(w, 0x9000, false);
         assert_eq!(st.take_wakes(), vec![2]);
         assert_eq!(st.take_resume_code(2), None);
     }
@@ -9232,64 +9857,76 @@ mod preemptive_tests {
     #[test]
     fn lightweight_mutex_blocks_and_hands_over_keyed_by_work_address() {
         let mut st = state();
+        let w = &mut Words::default();
         let work = 0x8000; // guest work-area address (no kernel handle)
+        created_lwmutex(&mut st, w, work);
+        created_lwmutex(&mut st, w, 0x9000);
         // Thread 1 locks the lightweight mutex; thread 2 contends and parks.
         st.set_current(1);
-        assert!(st.lwmutex_lock(work));
+        assert!(st.lwmutex_lock(w, work));
         st.set_current(2);
-        assert!(st.lwmutex_contended(work));
-        assert!(!st.lwmutex_lock(work), "contender must block, not silently succeed");
+        assert!(st.lwmutex_contended(w, work));
+        assert!(!st.lwmutex_lock(w, work), "contender must block, not silently succeed");
         assert!(st.take_wakes().is_empty());
+        // ...and the work area SAYS a thread is parked, which is what keeps the inline
+        // fast path off a mutex only the host can now release correctly.
+        assert_eq!(w.word(work + lwwork::off::WAITERS), 1);
         // Thread 1 unlocks: ownership passes to thread 2, which is woken.
         st.set_current(1);
-        st.lwmutex_unlock(work);
+        st.lwmutex_unlock(w, work);
         assert_eq!(st.take_wakes(), vec![2]);
+        assert_eq!(w.word(work + lwwork::off::WAITERS), 0, "the queue drained with the handoff");
+        assert_eq!(lwwork::owner(w, work), 2, "and thread 2 holds it now");
         // A different work address is an independent lock (thread 3 takes it freely).
         st.set_current(3);
-        assert!(st.lwmutex_lock(0x9000));
-        assert!(st.lwmutex_contended(work), "the first lock is still held by thread 2");
+        assert!(st.lwmutex_lock(w, 0x9000));
+        assert!(st.lwmutex_contended(w, work), "the first lock is still held by thread 2");
     }
 
     #[test]
     fn lightweight_mutex_is_recursive_for_the_owner() {
         let mut st = state();
+        let w = &mut Words::default();
         let work = 0x8000;
+        created_lwmutex(&mut st, w, work);
         st.set_current(1);
-        assert!(st.lwmutex_lock(work)); // count 1
-        assert!(st.lwmutex_lock(work)); // count 2 (recursive, same owner)
-        st.lwmutex_unlock(work); // count 1, still owned
+        assert!(st.lwmutex_lock(w, work)); // count 1
+        assert!(st.lwmutex_lock(w, work)); // count 2 (recursive, same owner)
+        st.lwmutex_unlock(w, work); // count 1, still owned
         st.set_current(2);
-        assert!(st.lwmutex_contended(work), "still held after one of two unlocks");
+        assert!(st.lwmutex_contended(w, work), "still held after one of two unlocks");
         st.set_current(1);
-        st.lwmutex_unlock(work); // count 0, released
+        st.lwmutex_unlock(w, work); // count 0, released
         st.set_current(2);
-        assert!(!st.lwmutex_contended(work), "free after the matching unlock");
+        assert!(!st.lwmutex_contended(w, work), "free after the matching unlock");
     }
 
     #[test]
     fn lightweight_cond_wait_releases_and_reacquires_its_bound_mutex() {
         let mut st = state();
+        let w = &mut Words::default();
         let mutex_work = 0x8000;
         let cond_work = 0x8100;
+        created_lwmutex(&mut st, w, mutex_work);
         st.lwcond_bind_mutex(cond_work, mutex_work);
         // Thread 1 holds the lwmutex, then waits on the lwcond: the wait releases the
         // mutex (so a sibling can take it) and parks thread 1.
         st.set_current(1);
-        assert!(st.lwmutex_lock(mutex_work));
-        assert!(st.lwcond_wait(cond_work, 0));
+        assert!(st.lwmutex_lock(w, mutex_work));
+        assert!(st.lwcond_wait(w, cond_work, 0));
         assert!(st.take_wakes().is_empty(), "waiter is parked, not runnable");
         st.set_current(2);
-        assert!(!st.lwmutex_contended(mutex_work), "the lwmutex was released by the wait");
+        assert!(!st.lwmutex_contended(w, mutex_work), "the lwmutex was released by the wait");
         // Thread 2 takes the lwmutex, then signals: the waiter must re-acquire the
         // mutex first, so it queues behind thread 2 (not woken yet).
-        assert!(st.lwmutex_lock(mutex_work));
-        st.lwcond_signal(cond_work, false);
+        assert!(st.lwmutex_lock(w, mutex_work));
+        st.lwcond_signal(w, cond_work, false);
         assert!(st.take_wakes().is_empty(), "waiter must re-acquire the lwmutex first");
         // Thread 2 unlocks: ownership passes to the waiter, which is finally woken.
-        st.lwmutex_unlock(mutex_work);
+        st.lwmutex_unlock(w, mutex_work);
         assert_eq!(st.take_wakes(), vec![1]);
         st.set_current(3);
-        assert!(st.lwmutex_contended(mutex_work), "the woken waiter re-acquired the lwmutex");
+        assert!(st.lwmutex_contended(w, mutex_work), "the woken waiter re-acquired the lwmutex");
     }
 
     #[test]

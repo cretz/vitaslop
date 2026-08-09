@@ -41,7 +41,7 @@ impl WgpuRenderer {
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gpu"),
-            required_features: wgpu::Features::empty(),
+            required_features: vitaslop_platform::gpu::wanted_features(&adapter),
             required_limits: wgpu::Limits::downlevel_defaults(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
@@ -183,7 +183,7 @@ impl GeneralRenderer {
         let adapter_name = adapter.get_info().name;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),
-            required_features: wgpu::Features::empty(),
+            required_features: vitaslop_platform::gpu::wanted_features(&adapter),
             // Raise the resolution-derived limits (max texture dimension, buffer/binding
             // sizes) to what the adapter really supports: a real title binds textures
             // larger than the 2048 downlevel floor (some titles have a ~2480px atlas).
@@ -287,6 +287,11 @@ impl GeneralRenderer {
             .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
             .unwrap_or_default();
         let t_build = std::time::Instant::now();
+        // A new frame for the builder's texture cache - the same boundary the browser marks.
+        // Both engines share this builder, so a cache policy that depends on the frame
+        // boundary has to be told about it from both, or the two diverge in how much they
+        // re-decode and the desktop stops being an oracle for the browser.
+        self.builder.begin_frame();
         let built: Vec<_> = scenes
             .iter()
             .enumerate()

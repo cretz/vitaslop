@@ -103,7 +103,19 @@
         aspect-ratio: 960 / 544;
         max-height: 56vh;
         object-fit: contain;
-        image-rendering: pixelated;
+        /* NO `image-rendering: pixelated` here, and that is deliberate.
+           The backing store is the panel's own 960x544. A phone lays the canvas out at
+           `width: 100%` of a ~390-430px viewport and then multiplies by a devicePixelRatio
+           of about 2.6-3.5, so the presented size is a NON-INTEGER multiple of 960 - and
+           `pixelated` resolves that by dropping and duplicating whole pixel columns
+           unevenly, which turns a 1px letter stem into 1px here and 2px there. That is the
+           "text edges are not crisp" the desktop never shows, because a desktop window
+           happens to land near 1:1. Nearest-neighbour is only correct at an INTEGER ratio,
+           and nothing here guarantees one, so take the browser's smooth resample.
+           MEASURED, on the front end: this is not the supersample factor. A 2x supersampled
+           GAME MODE differs from a 1x one by 3.31% of pixels and a mean of 0.20/255, and
+           its text is very slightly SOFTER (mean |dx| 1.807 against 1.900), not sharper -
+           supersampling cannot be the fix for a sharpness complaint on this content. */
         /* The canvas IS the Vita's front touch panel, so it must never pan or zoom the page. */
         touch-action: none;
         -webkit-user-select: none;
@@ -364,11 +376,11 @@
       // numbers should be read, and a paste without them invites exactly the misreadings this
       // session already produced twice (a present rate read as a guest rate, an instrumented
       // frame time read as a real one).
-      $("copydiag").addEventListener("click", async (e) => {
-        e.preventDefault();
-        e.stopPropagation(); // do not toggle the <details> it lives in
-        const btn = $("copydiag");
-        const text = [
+      // The dump itself, built ONCE for both readers: the copy button below and the dev-server
+      // sink. Two builders would drift, and the one that drifted would be the one nobody was
+      // looking at when it mattered.
+      const diagText = () =>
+        [
           `vitaslop diagnostics`,
           `title: ${window.__runTitle || "?"}  recipe: ${window.__runRecipe || "(none)"}`,
           `debug capture: ${window.__runDebug ? "ON (frame times inflated)" : "off"}`,
@@ -381,9 +393,98 @@
           `${$("adapter").textContent}`,
           `${$("fps").textContent}`,
           `${$("status").textContent}`,
+          // A worker that died takes its console with it. Carrying the fatal error in every
+          // later dump is what makes it reach disk at all: the sink's own POST races the
+          // worker's death, and the tick that follows does not.
+          window.__fatalWorkerError ? `
+FATAL WORKER ERROR
+${window.__fatalWorkerError}` : ``,
           ``,
           $("diag").textContent,
         ].join("\n");
+
+      // >>> STREAM THE DUMP TO THE DEV SERVER, IF THERE IS ONE.
+      //
+      // Capability discovery, not a flag: the page asks once whether `/diag-sink` exists, and
+      // only a dev server answers. Served from anywhere else this is one 404 at startup and
+      // then silence for ever - so the page that ships never phones anywhere and needs no knob
+      // to be told not to ([[vitaslop-web-is-the-product-not-the-tool]]).
+      //
+      // It exists because the alternative was a person on a phone hand-copying a 4 KB panel per
+      // capture, which made the SECOND capture - the one that turns an observation into an A/B -
+      // something nobody wanted to take.
+      (async () => {
+        try {
+          if (!(await fetch("/diag-sink")).ok) return;
+        } catch {
+          return;
+        }
+        const run = `${(window.__runTitle || "run").replace(/[^A-Za-z0-9_-]/g, "")}-${Date.now()}`;
+        let seq = 0;
+        // >>> AND THE PICTURE, NOT JUST THE NUMBERS.
+        //
+        // Half of every report about this emulator is "what does it look like", and the counters
+        // cannot answer it: a frame that is white and a frame that is correct produce the same
+        // draw counts (MEASURED - 1534 draws white against 1136 correct, so the numbers moved
+        // the wrong way). Pairing each dump with the frame it describes is what makes a capture
+        // self-contained.
+        //
+        // `toBlob` on a WebGPU canvas reads the CURRENT contents, so this is taken on an
+        // animation frame - after the present, before the next one clears it.
+        const screen = $("screen");
+        const shot = (n, tag) =>
+          new Promise((done) => {
+            requestAnimationFrame(() => {
+              try {
+                screen.toBlob((b) => {
+                  if (b) {
+                    fetch(`/diag-shot?run=${run}&seq=${n}&tag=${tag}`, { method: "POST", body: b })
+                      .catch(() => {});
+                  }
+                  done();
+                }, "image/png");
+              } catch {
+                done();
+              }
+            });
+          });
+        const send = (tag = "tick") => {
+          seq += 1;
+          // The sequence is captured HERE, not read inside `shot` - two sends close together
+          // otherwise share one number and the second shot overwrites the first, which is what
+          // happened to every `hidden`/`shown` pair on the first run.
+          const n = String(seq).padStart(4, "0");
+          fetch(`/diag?run=${run}&seq=${n}&tag=${tag}`, { method: "POST", body: diagText() }).catch(
+            () => {}
+          );
+          shot(n, tag);
+        };
+        // >>> A BURST ON RESTORE, because the event lasts about a SECOND and a 4 s tick cannot
+        // see it. The interesting window is entirely inside the first couple of seconds after
+        // the tab comes back: it renders correctly and is then consumed. Sampling that at 4 s
+        // catches the end state and nothing of the transition.
+        const burst = (tag) => {
+          for (const ms of [0, 150, 300, 500, 750, 1000, 1400, 1800, 2400, 3000]) {
+            setTimeout(() => send(tag), ms);
+          }
+        };
+        // Exposed so a fatal error can push a dump at once rather than waiting up to 4 s for a
+        // tick that a dead worker may never reach.
+        window.__diagSend = send;
+        setInterval(() => send("tick"), 4000);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "visible") burst("shown");
+          else send("hidden");
+        });
+        window.addEventListener("pagehide", () => send("pagehide"));
+        send("start");
+      })();
+
+      $("copydiag").addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation(); // do not toggle the <details> it lives in
+        const btn = $("copydiag");
+        const text = diagText();
         try {
           await navigator.clipboard.writeText(text);
           btn.textContent = "copied";
@@ -407,6 +508,52 @@
         ? '<span class="warn">' + caps.map((c) => (c.fatal ? "STOP: " : "note: ") + c.text).join("<br><br>") + "</span>"
         : "WebGPU present, secure and cross-origin isolated - video and audio both available.";
 
+      /// Prefill one title's card from the URL, so a run can be SET UP somewhere else and
+      /// opened as a link.
+      ///
+      /// # Why this exists
+      /// Every knob here has to be typed into a textarea, and the machine that decides which
+      /// knobs a measurement needs is not the phone holding it. An A/B is two runs differing
+      /// in ONE line, and a line retyped on a touch keyboard between them is exactly the
+      /// variable nobody wants in the experiment. A link carries the whole arm.
+      ///
+      /// `?recipe=<name>&ff=<frame>&debug=1&knobs=A=1,B=2` (knobs are comma- or
+      /// newline-separated). Knobs MERGE over the box's defaults rather than replacing them,
+      /// because some of those defaults are load-bearing per recipe (`VITASLOP_FRAME_TOPUP=0`)
+      /// and a link that silently dropped one would fail as a title that never finishes
+      /// loading. The box is opened whenever a preset applies, so what the link set is
+      /// visible and editable before PLAY rather than hidden behind a summary.
+      function applyUrlPreset(t) {
+        const q = new URLSearchParams(location.search);
+        const only = q.get("title");
+        if (only && only !== t.id) return;
+        if (!q.has("recipe") && !q.has("ff") && !q.has("debug") && !q.has("knobs")) return;
+
+        const recipe = q.get("recipe");
+        if (recipe !== null) {
+          const sel = $(`r-${t.id}`);
+          // A recipe this title does not have must SAY so - a silent fall back to
+          // "interactive, no recipe" looks like a recipe that ran and did nothing.
+          if ([...sel.options].some((o) => o.value === recipe)) sel.value = recipe;
+          else status.textContent = `link names recipe "${recipe}", which ${t.id} does not have`;
+        }
+        if (q.has("ff")) $(`ff-${t.id}`).value = String(Number(q.get("ff")) || 0);
+        if (q.has("debug")) $(`dbg-${t.id}`).checked = q.get("debug") !== "0";
+
+        const box = $(`k-${t.id}`);
+        const lines = new Map();
+        for (const line of box.value.split(/\r?\n/)) {
+          const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+          if (m) lines.set(m[1], m[2]);
+        }
+        for (const one of (q.get("knobs") || "").split(/[,\r\n]/)) {
+          const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(one);
+          if (m) lines.set(m[1], m[2]);
+        }
+        box.value = [...lines].map(([k, v]) => `${k}=${v}`).join("\n");
+        box.parentElement.open = true;
+      }
+
       // ---- the title list ----
       const titles = await (await fetch("/titles.json")).json();
       const wrap = $("titles");
@@ -427,14 +574,14 @@
           <div class="meta">${t.id} &middot; ${t.files} files &middot; ${t.mb} MB &middot; ${t.recipes.length} recipes</div>
           <label for="r-${t.id}">Recipe</label>
           <select id="r-${t.id}">${recipeOptions}</select>
+          <!-- NO supersample control. It was a per-platform picture setting whose default
+               here ("1x - recommended on a phone") silently overrode the engine's own
+               default on EVERY live run, so the phone and the desktop review shots were
+               never rendering the same way and no run ever used the documented default.
+               How finely a pass is rasterised is the guest's call, not the page's: the
+               title states it per render target with SceGxmMultisampleMode and the renderer
+               honours it. Anything still worth A/B-ing goes in the knobs box below. -->
           <div class="row">
-            <div>
-              <label for="ss-${t.id}">Supersample</label>
-              <select id="ss-${t.id}">
-                <option value="1" selected>1x - fastest (recommended on a phone)</option>
-                <option value="2">2x - sharper, 4x the fragments (the review setting)</option>
-              </select>
-            </div>
             <div>
               <label for="ff-${t.id}">Fast-forward to frame</label>
               <input id="ff-${t.id}" type="number" min="0" step="100" value="0" />
@@ -465,6 +612,7 @@ VITASLOP_LOG=warn</textarea>
           </p>
         `;
         wrap.appendChild(card);
+        applyUrlPreset(t);
         // A run that cannot possibly work must not be startable. Pressing PLAY into a
         // missing secure context spent a minute of import before failing with a property
         // access on `undefined`, which named nothing.
@@ -481,7 +629,6 @@ VITASLOP_LOG=warn</textarea>
             const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
             if (m) knobs[m[1]] = m[2];
           }
-          knobs.VITASLOP_BROWSER_SUPERSAMPLE = $(`ss-${t.id}`).value;
           if ($(`dbg-${t.id}`).checked) knobs.VITASLOP_DEBUG_CAPTURE = "1";
           const ff = Number($(`ff-${t.id}`).value || 0);
           if (ff > 0) knobs.VITASLOP_BROWSER_FASTFORWARD = String(ff);
@@ -589,9 +736,21 @@ VITASLOP_LOG=warn</textarea>
           }
         };
         // A worker that dies without reporting would otherwise leave a stale status line.
+        //
+        // >>> SAY WHERE IT DIED, NOT ONLY WHAT IT SAID.
+        // `e.message` alone gives a line like "Uncaught TypeError: Cannot read properties of
+        // null (reading 'info')" and nothing else - no file, no line, no stack. That is a
+        // message you can only act on if you can reproduce it, and a defect reported from a
+        // device is by definition one that did not reproduce here. The file and position come
+        // free on an ErrorEvent, and pushing them into the diagnostics sink puts them on disk
+        // beside the panel dump instead of only in a console nobody is holding.
         worker.onerror = (e) => {
-          status.textContent = "worker error: " + (e.message || "died");
-          console.error("[worker] onerror:", e.message || e);
+          const site = e.filename ? ` at ${e.filename}:${e.lineno || "?"}:${e.colno || "?"}` : "";
+          const detail = (e.message || "died") + site;
+          status.textContent = "worker error: " + detail;
+          console.error("[worker] onerror:", detail, e.error && e.error.stack ? "\n" + e.error.stack : "");
+          window.__fatalWorkerError = detail + (e.error && e.error.stack ? "\n" + e.error.stack : "");
+          if (typeof window.__diagSend === "function") window.__diagSend("worker-error");
         };
 
         // Live input: pointer + keyboard from the page, the on-screen pad, and any real

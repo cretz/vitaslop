@@ -15,5 +15,6 @@
 //! feature so the engine-agnostic runtime can depend on this crate for the
 //! neutral types without pulling in wgpu.
 
+pub mod diag;
 pub mod gpu;
 pub mod knobs;

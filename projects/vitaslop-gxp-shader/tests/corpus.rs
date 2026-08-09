@@ -1035,3 +1035,118 @@ fn tabulate_vertex_varying_output_words() {
         println!("  reserved={r:<3} {n} programs");
     }
 }
+
+/// >>> Does the size we hand the GUEST cover every uniform the program declares?
+///
+/// `sceGxmProgramGetDefaultUniformBufferSize` answers `default_uniform_regs * 4`, straight out
+/// of the container header (+0x64). A title uses that answer as the LENGTH of the `memcpy` that
+/// fills the buffer `sceGxmReserveFragmentDefaultUniformBuffer` just handed it - so a uniform
+/// whose registers lie past that length is NEVER WRITTEN BY THE GUEST, and the shader reads
+/// whatever the recycled reservation ring happened to hold.
+///
+/// That failure does not look like missing data. The ring holds the PREVIOUS draw's uniforms,
+/// which drift smoothly frame over frame, so the stale lane reads as a plausible animated value
+/// - and it differs between engines, because the two run different draw orders. This is the
+/// exact shape of the `screenTintColour` white-out.
+///
+/// The extent has to be measured in REGISTERS, not components: an F16 packs two components per
+/// 32-bit register, so an `F16[3]` at register 4 ends at register 5, not register 7.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn every_declared_uniform_fits_the_size_we_report_to_the_guest() {
+    let Some(dir) = corpus_dir() else { return };
+    let mut over = 0usize;
+    let mut total = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        total += 1;
+        for prm in &p.parameters {
+            if prm.category != vitaslop_gxp_shader::container::ParamCategory::Uniform {
+                continue;
+            }
+            let Some(cb) = prm.ptype.component_bytes() else { continue };
+            let components = (prm.component_count as u32).max(1) * prm.array_size.max(1);
+            // Registers this parameter spans, from its start register, rounding a partly
+            // filled last register up: that register still has to be copied for the
+            // components in it to arrive.
+            let regs = (components * cb).div_ceil(4);
+            let end = (prm.resource_index.max(0) as u32) + regs;
+            if end > p.default_uniform_regs {
+                over += 1;
+                println!(
+                    "{name}: {} {:?}[{}] at reg {} spans {} regs -> needs {} but header declares \
+                     {} (guest memcpys {} bytes; {} registers NEVER arrive)",
+                    prm.name,
+                    prm.ptype,
+                    components,
+                    prm.resource_index,
+                    regs,
+                    end,
+                    p.default_uniform_regs,
+                    p.default_uniform_regs * 4,
+                    end - p.default_uniform_regs,
+                );
+            }
+        }
+    }
+    println!("\n-- {over} declared uniforms lie past the reported size, over {total} programs --");
+}
+
+/// >>> How does a `SMP`'s sampler FIELD address the texture-control table? Ask the whole corpus.
+///
+/// `decode_shader` resolves it as `sa_register = 2 * field`. That rule is only ever exercised
+/// where it cannot be told apart from `field + default_uniform_regs` or from `field + 2`,
+/// because every program that uses it happens to sample its FIRST declared texture - and one
+/// blob (`frag_866a1840`) breaks it. Three data points that agree only because they are all the
+/// same case are one data point.
+///
+/// This prints, for every SMP in every blob, the raw field beside what each candidate rule would
+/// resolve to and what the container's own texture-control table actually says. A rule that
+/// reproduces the table on EVERY row is established; one that does not is dead. That is a
+/// decision the corpus can make offline, where a live run can only ever show one program.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn how_a_smp_sampler_field_addresses_the_texture_control_table() {
+    use vitaslop_gxp_shader::usse::decode;
+    use vitaslop_gxp_shader::ir::Op;
+    let Some(dir) = corpus_dir() else { return };
+    // Candidate rules, each `field -> sa_register`.
+    let rules: [(&str, fn(u32, u32) -> u32); 4] = [
+        ("2*field", |f, _| 2 * f),
+        ("field", |f, _| f),
+        ("field+dubuf", |f, d| f + d),
+        ("2*field+dubuf", |f, d| 2 * f + d),
+    ];
+    let mut hits = [0usize; 4];
+    let mut rows = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (i, &w) in p.code.iter().enumerate() {
+            let Op::Tex { unit: field, .. } = decode(w).op else { continue };
+            rows += 1;
+            let field = field as u32;
+            let resolved: Vec<String> = rules
+                .iter()
+                .enumerate()
+                .map(|(k, (label, f))| {
+                    let sa = f(field, p.default_uniform_regs);
+                    let ok = p.sampler_unit_at(sa).is_some();
+                    if ok {
+                        hits[k] += 1;
+                    }
+                    format!("{label}->sa{sa}{}", if ok { "*" } else { "" })
+                })
+                .collect();
+            println!(
+                "{name} #{i}: field={field} dubuf={} texctl={:?}  {}",
+                p.default_uniform_regs,
+                p.texture_control,
+                resolved.join("  "),
+            );
+        }
+    }
+    println!("\n-- {rows} SMP instructions; how often each rule lands on a DECLARED texture --");
+    for (k, (label, _)) in rules.iter().enumerate() {
+        println!("  {label:<16} {}/{rows}", hits[k]);
+    }
+}

@@ -17,6 +17,8 @@ use vitaslop_transpiler::abi;
 extern crate self as vitaslop_runtime;
 
 pub mod audio;
+pub mod bcenc;
+pub mod etcenc;
 pub mod capture;
 pub mod font;
 pub mod host;

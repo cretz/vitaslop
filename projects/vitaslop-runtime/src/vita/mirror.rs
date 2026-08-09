@@ -44,8 +44,50 @@ pub const SLOT_VCOUNT: u32 = 0;
 pub const SLOT_CLOCK_LO: u32 = 1;
 pub const SLOT_CLOCK_HI: u32 = 2;
 
+/// Slot 3: the SceUID of the thread that is about to run.
+///
+/// Not a value any host call returns - it is the one fact an inlined
+/// `sceKernelLockLwMutex` needs that is NOT in the guest's work area. The work area says
+/// who owns the mutex; only the host knows who is asking.
+///
+/// It qualifies for the block on the same terms as the clock, and the terms are the point:
+/// the current thread changes only when the scheduler switches, which happens with no
+/// guest thread live. What makes that true is [`crate::sched::SchedCore::pick_next`]
+/// setting it as part of choosing a thread, BEFORE the block is refreshed - if it were
+/// only set at each host-call dispatch, as it once was, a resumed thread would read the
+/// PREVIOUS thread's id right up until its first host call, and take every uncontended
+/// mutex in somebody else's name.
+pub const SLOT_CURRENT_THREAD: u32 = 3;
+
+/// Slot 4: the id `sceKernelGetThreadId` reports.
+///
+/// Deliberately NOT [`SLOT_CURRENT_THREAD`], even though the two agree on almost every
+/// thread. That slot is the SCHEDULER's `current` - the thread the baton is on - which is
+/// what a lightweight mutex records as its owner. This one is what the guest is TOLD, and
+/// for a thread running a fiber those differ on purpose: a fiber reports the thread that
+/// ran it, because on hardware it executes on that thread. Folding the two into one slot
+/// would make an inlined `sceKernelGetThreadId` return a different id from the handler for
+/// exactly the threads a job system keys its per-worker state off.
+///
+/// # Why it may live in the block at all
+/// The mirror contract is that a slot changes only while no guest code is running, and the
+/// refresh in [`crate::sched::SchedCore::pick_next`] is what makes that true for the
+/// scheduler's `current`. The fiber mapping needs its own argument, because a host call CAN
+/// move it mid-resume: `sceFiberSwitch` clears the running fiber's `runner`, which changes
+/// what `logical_thread` answers for the CALLING thread.
+///
+/// That is not observable, and the reason is the baton. Every call that moves the mapping -
+/// switch, return-to-thread, run - hands the baton to another thread and BLOCKS the caller,
+/// so the calling thread executes no further guest instruction on that resume. It reads the
+/// slot again only after a `pick_next` that refreshed it. A call that does not block
+/// (`sceFiberRun`, which sets the RUNNEE's `runner`) does not touch the caller's own mapping.
+///
+/// This one is the reason a NEW slot was cheaper than widening the old one: the argument
+/// above applies to the fiber mapping and not to anything else in the block.
+pub const SLOT_THREAD_ID: u32 = 4;
+
 /// How many slots the block has. The scheduler writes exactly this many.
-pub const SLOT_COUNT: usize = 3;
+pub const SLOT_COUNT: usize = 5;
 
 /// The current value of every mirror slot, in slot order.
 ///
@@ -54,7 +96,13 @@ pub const SLOT_COUNT: usize = 3;
 /// `mirror_matches_its_handlers` holds them to that.
 pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
     let now = st.now_us();
-    [super::display::vcount(st), now as u32, (now >> 32) as u32]
+    [
+        super::display::vcount(st),
+        now as u32,
+        (now >> 32) as u32,
+        st.current_thread() as u32,
+        super::libkernel::thread_id(st) as u32,
+    ]
 }
 
 #[cfg(test)]
@@ -107,13 +155,41 @@ mod tests {
         }
     }
 
+    /// The same drift check for `sceKernelGetThreadId`, over the thread ids the scheduler
+    /// actually sets rather than over the clock.
+    ///
+    /// It needs its own case because its slot is NOT the scheduler's `current`
+    /// ([`SLOT_THREAD_ID`] says why), so "the block holds the current thread" is not enough
+    /// to make the inline form right - the two agree for a plain thread and are meant to
+    /// differ for a fiber, and only comparing against the handler can tell a correct
+    /// difference from a wrong one.
+    #[test]
+    fn the_inline_thread_id_matches_its_handler() {
+        use crate::nid::libkernel as lk;
+        let mut st = state_at(0);
+        for thid in [0, 1, 7, 0x40010007u32 as i32, 1248] {
+            st.set_current(thid);
+            let words = snapshot(&st);
+            let op = super::super::libkernel::inline_op(lk::GET_THREAD_ID)
+                .expect("sceKernelGetThreadId has an inline form");
+            let InlineOp::LoadMirror { slot } = op else {
+                panic!("sceKernelGetThreadId must lower to a mirror read, got {op:?}");
+            };
+            assert_eq!(
+                op.eval(words[slot as usize]),
+                handler_result(lk::GET_THREAD_ID, &mut st),
+                "inline sceKernelGetThreadId disagrees with its handler for thread {thid}",
+            );
+        }
+    }
+
     /// Every slot the block declares is filled by [`snapshot`], and every slot an inline
     /// op names is one the block declares. A slot that no snapshot writes reads as a
     /// word that never changes, which for a clock is a spin that can never be satisfied.
     #[test]
     fn every_declared_slot_is_within_the_block() {
         assert_eq!(snapshot(&state_at(0)).len(), SLOT_COUNT, "snapshot fills every slot");
-        for slot in [SLOT_VCOUNT, SLOT_CLOCK_LO, SLOT_CLOCK_HI] {
+        for slot in [SLOT_VCOUNT, SLOT_CLOCK_LO, SLOT_CLOCK_HI, SLOT_CURRENT_THREAD, SLOT_THREAD_ID] {
             assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
         }
     }
@@ -169,11 +245,47 @@ mod tests {
         }
     }
 
+    /// The mirrored thread id must be the one the host would answer with, including for
+    /// the MAIN thread, whose id is 0 by convention. Zero is the value an unwritten slot
+    /// also reads as, so "the block is filled" and "the main thread is running" are
+    /// indistinguishable by value - which is exactly why
+    /// `every_declared_slot_is_within_the_block` and `SchedCore::new`'s refusal to start on
+    /// an unfilled block both matter, and why nothing may spell "unowned" as thread 0.
+    #[test]
+    fn the_current_thread_is_mirrored_including_thread_zero() {
+        let mut st = state_at(0);
+        for thid in [0i32, 1, 7, -1, i32::MAX] {
+            st.set_current(thid);
+            assert_eq!(
+                snapshot(&st)[SLOT_CURRENT_THREAD as usize],
+                thid as u32,
+                "the block must carry thread {thid} exactly as the host holds it"
+            );
+        }
+    }
+
+    /// The lightweight-mutex forms must base on the CURRENT THREAD slot. Any other slot is
+    /// a clock word, and a lock taken on behalf of "thread 1,700,000" is one no unlock will
+    /// ever match - a deadlock a long way from here.
+    #[test]
+    fn the_lock_forms_read_the_current_thread_slot() {
+        use crate::nid::lwsync as lw;
+        for nid in [lw::LOCK_LW_MUTEX, lw::LOCK_LW_MUTEX_CB, lw::UNLOCK_LW_MUTEX, lw::UNLOCK_LW_MUTEX2] {
+            let op = super::super::lwsync::inline_op(nid).expect("has an inline form");
+            assert_eq!(
+                op.mirror_slot(),
+                Some(SLOT_CURRENT_THREAD),
+                "{} must read the current-thread slot",
+                crate::nid::name(nid)
+            );
+        }
+    }
+
     /// A blocking or state-touching kernel call must never be inlined, however pure it
     /// looks: an inlined call never reaches the host, so the state change would simply
     /// not happen and the symptom would surface far away.
     #[test]
-    fn only_the_clock_is_inlined_in_libkernel() {
+    fn libkernel_calls_with_behaviour_are_not_inlined() {
         use crate::nid::libkernel as lk;
         for nid in [
             crate::vita::tm_nid::DELAY_THREAD, // blocks: that IS the behaviour

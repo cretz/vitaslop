@@ -349,6 +349,73 @@ fn emit_dirty_mark(f: &mut Body, addr_local: u32) {
     f.untolled(&W::LocalGet(addr_local));
 }
 
+/// Stamp every page `[addr_local, addr_local + len_local)` touches with the current epoch,
+/// for an inline form that writes a RANGE rather than a word. Consumes nothing from the
+/// stack and leaves nothing on it.
+///
+/// # Why the single-address mark cannot serve
+/// [`emit_dirty_mark`] stamps only the page the address starts in, and that is exact ONLY
+/// because the largest translated store is eight bytes, so a reader that also looks one page
+/// below misses nothing. A form whose length the guest chooses breaks that argument outright:
+/// a 64 KB `memcpy` crosses sixteen pages and stamping the first would report the other
+/// fifteen as untouched. What that produces is not an error - it is a texture the host
+/// believes it has already uploaded, drawn from bytes the guest has since overwritten
+/// ([[vitaslop-guest-store-stamps]]).
+///
+/// The host's own writes already stamp the same range (`SharedView::stamp_written`), so this
+/// is not a new contract - it is the emitted side of one that exists, and an inline form that
+/// skipped it would be the first writer of guest memory that stamps nothing.
+///
+/// # Which inline forms owe a stamp
+/// Only the ones that can write where a TEXTURE SNAPSHOT might be looking. The storing forms
+/// above ([`crate::InlineOp::StoreArg`] and its neighbours) all write into a structure the
+/// guest has handed to GXM or the kernel as private state - a context block, a lightweight
+/// mutex work area, a `SceKernelSysClock` - which is never a texture's own bytes, so they
+/// stamp nothing and cost nothing. A form that writes wherever the guest points it has no
+/// such argument available and must stamp. Widen that judgement only with a reason, not by
+/// analogy: an unstamped write to texture memory is a stale picture with nothing reporting.
+///
+/// Untolled throughout, like [`emit_dirty_mark`] and for the same reason: this is host
+/// bookkeeping that only one engine does, and billing it would charge the game clock for it.
+fn emit_dirty_range(f: &mut Body, addr_local: u32, len_local: u32) {
+    let off = DIRTY_OFF.with(|c| c.get());
+    if off == 0 {
+        return;
+    }
+    // A zero-length write touches no page, and `last = addr + len - 1` would underflow into
+    // a stamp of the whole map. The guard is a branch rather than a clamp because zero is a
+    // real case (`memcpy(d, s, 0)` is legal C and the handler accepts it), not an error.
+    f.untolled(&W::LocalGet(len_local));
+    f.untolled(&W::If(BlockType::Empty));
+    // dest = map + (addr >> DIRTY_SHIFT). `memory.fill` takes its address from the stack
+    // with no immediate offset, so the block base is added here rather than ridden in a
+    // MemArg the way the single-page mark rides it.
+    f.untolled(&W::LocalGet(addr_local));
+    f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+    f.untolled(&W::I32ShrU);
+    f.untolled(&W::I32Const((off + DIRTY_MAP_OFF) as i32));
+    f.untolled(&W::I32Add);
+    // value = the current epoch, read from its own word just below the map.
+    f.untolled(&W::I32Const(0));
+    f.untolled(&W::I32Load8U(MemArg { offset: off + DIRTY_EPOCH_OFF, align: 0, memory_index: 0 }));
+    // count = ((addr + len - 1) >> SHIFT) - (addr >> SHIFT) + 1, the pages the range spans.
+    f.untolled(&W::LocalGet(addr_local));
+    f.untolled(&W::LocalGet(len_local));
+    f.untolled(&W::I32Add);
+    f.untolled(&W::I32Const(1));
+    f.untolled(&W::I32Sub);
+    f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+    f.untolled(&W::I32ShrU);
+    f.untolled(&W::LocalGet(addr_local));
+    f.untolled(&W::I32Const(DIRTY_SHIFT as i32));
+    f.untolled(&W::I32ShrU);
+    f.untolled(&W::I32Sub);
+    f.untolled(&W::I32Const(1));
+    f.untolled(&W::I32Add);
+    f.untolled(&W::MemoryFill(0));
+    f.untolled(&W::End);
+}
+
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
 /// at transpile time, every word store to that exact guest address is preceded by an
 /// `unreachable`, so the first writer traps with a full wasm backtrace (and the
@@ -3945,6 +4012,11 @@ fn mem_arg() -> MemArg {
     MemArg { offset: 0, align: 0, memory_index: 0 }
 }
 
+/// A one-word access at a fixed byte offset from whatever address is on the stack.
+fn word_at(offset: u32) -> MemArg {
+    MemArg { offset: offset as u64, align: 0, memory_index: 0 }
+}
+
 /// Which host imports may be emitted inline, and how far into linear memory an
 /// inline load may reach. Built once per module from
 /// [`Program::inline_imports`](crate::Program::inline_imports).
@@ -3961,7 +4033,7 @@ pub struct InlineImports {
 enum InlineLowering {
     /// Read through the pointer in r0, falling back to the host call unless the
     /// rebased pointer is `<= limit`.
-    Guest { offset: u32, shift: u32, mask: u32, limit: u32 },
+    Guest { offset: u32, shift: u32, mask: u32, plus: u32, limit: u32 },
     /// Read through the pointer in r0 and shift the whole word LEFT, falling back to
     /// the host call when the pointer is out of range OR the loaded word exceeds `max`
     /// (the clamped case, which only the handler defines - see
@@ -3978,6 +4050,58 @@ enum InlineLowering {
     /// r0, then set r0 = 0. Guarded on the pointer, which must admit an EIGHT-byte
     /// store rather than the usual four.
     MirrorStorePair { off: u64, limit: u32 },
+    /// Store r1 at `r0 + offset` and set r0 = 0. Guarded on the pointer exactly like the
+    /// reading forms; a rejected pointer runs the handler, which keeps defining what
+    /// writing through it means.
+    ArgStore { offset: u32, limit: u32 },
+    /// Rewrite the `mask << shift` bitfield of the word at `r0 + offset` from r1 and set
+    /// r0 = 0, leaving every other bit of that word alone. Guarded on the pointer exactly
+    /// like [`InlineLowering::ArgStore`] - the word is READ as well as written, so a
+    /// rejected pointer would otherwise load garbage and store it back.
+    ArgStoreField { offset: u32, shift: u32, mask: u32, limit: u32 },
+    /// Store r2 at `r0 + offset + r1 * 4` and set r0 = 0, when `r1 < count`. Guarded on
+    /// BOTH the pointer and the index: an index past the end is the handler's case, and
+    /// `limit` is computed against the LAST element so an in-bounds index can never reach
+    /// past the end of guest memory.
+    ArgStoreIndexed { offset: u32, count: u32, limit: u32 },
+    /// Copy `words` words from the pointer in r2 into the slot at `r0 + offset + r1 * stride`,
+    /// stamping r2 itself ahead of them and a zero behind them. Guarded on BOTH pointers, on
+    /// the index, and on r2 being non-null - see [`crate::InlineOp::CopyArgIndexed`].
+    ArgCopyIndexed { offset: u32, stride: u32, count: u32, words: u32, limit: u32, src_limit: u32 },
+    /// Take (`lock`) or release (`!lock`) an uncontended lightweight mutex whose state is
+    /// the four words at `layout` from the pointer in r0, using the current thread id at
+    /// `thread_off` in the host-mirror block. Guarded on the pointer like every other
+    /// pointer form, and on its own predicate besides - see
+    /// [`crate::InlineOp::LwMutexLock`].
+    LwMutex { layout: crate::LwMutexLayout, thread_off: u64, limit: u32, lock: bool },
+    /// Move or compare `r2` bytes between the pointers in r0 and (for the two-pointer
+    /// kinds) r1. Guarded on both pointers AND the length, since the length is what decides
+    /// how far past a pointer the access reaches - see [`emit_bulk_guard`].
+    Bulk { kind: BulkKind, mem_bytes: u32 },
+}
+
+/// Which bulk operation an [`InlineLowering::Bulk`] performs. One enum rather than three
+/// lowerings because the guard is identical for all three and only the body differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BulkKind {
+    /// `sceClibMemcpy`: r0 <- r1, r2 bytes, r0 preserved.
+    Copy,
+    /// `sceClibMemset`: r0 <- low byte of r1, r2 bytes, r0 preserved.
+    Fill,
+    /// `sceClibMemcmp`: r0 = the first differing byte pair's difference over r2 bytes.
+    Compare,
+}
+
+impl BulkKind {
+    /// Whether r1 is a POINTER (and so needs its own bound) rather than a fill byte.
+    fn reads_second_pointer(self) -> bool {
+        matches!(self, BulkKind::Copy | BulkKind::Compare)
+    }
+
+    /// Whether the form WRITES guest memory, and therefore owes the dirty map a stamp.
+    fn writes(self) -> bool {
+        matches!(self, BulkKind::Copy | BulkKind::Fill)
+    }
 }
 
 impl InlineImports {
@@ -3994,11 +4118,11 @@ impl InlineImports {
     /// the host call is not merely correct but the only option).
     fn lower(&self, index: u32) -> Option<InlineLowering> {
         match *self.ops.get(&index)? {
-            crate::InlineOp::LoadShiftMask { offset, shift, mask } => {
+            crate::InlineOp::LoadShiftMask { offset, shift, mask, plus } => {
                 // The load reads 4 bytes at `r0 - base + offset`, so the last rebased
                 // address it may start from is `mem_bytes - 4 - offset`.
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
-                Some(InlineLowering::Guest { offset, shift, mask, limit })
+                Some(InlineLowering::Guest { offset, shift, mask, plus, limit })
             }
             crate::InlineOp::LoadScaled { offset, max, shl } => {
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
@@ -4022,6 +4146,67 @@ impl InlineImports {
                 let limit = self.mem_bytes.checked_sub(8)?;
                 Some(InlineLowering::MirrorStorePair { off: base + slot as u64 * 4, limit })
             }
+            crate::InlineOp::StoreArg { offset } => {
+                // Four bytes at `r0 - base + offset`, same arithmetic as the reading forms.
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
+                Some(InlineLowering::ArgStore { offset, limit })
+            }
+            crate::InlineOp::StoreArgField { offset, shift, mask } => {
+                // One word, read and written at the same address, so the same bound as a
+                // plain store.
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
+                Some(InlineLowering::ArgStoreField { offset, shift, mask, limit })
+            }
+            crate::InlineOp::StoreArgIndexed { offset, count } => {
+                // The LAST element is the one that decides the limit: an index guarded only
+                // against `count` still has to land inside memory, so the pointer bound is
+                // computed for `offset + (count - 1) * 4`. Bounding on element zero would
+                // let a pointer near the end of memory pass the guard and store past it.
+                let last = offset.checked_add(count.checked_sub(1)?.checked_mul(4)?)?;
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(last)?;
+                Some(InlineLowering::ArgStoreIndexed { offset, count, limit })
+            }
+            crate::InlineOp::CopyArgIndexed { offset, stride, count, words } => {
+                // The destination bound is computed against the LAST WORD of the LAST slot,
+                // for the same reason the indexed store's is: an index inside `count` still
+                // has to land inside memory, and bounding on slot zero would let a pointer
+                // near the end of memory pass and write past it.
+                let last_slot = offset.checked_add(count.checked_sub(1)?.checked_mul(stride)?)?;
+                let last_word = last_slot.checked_add(words.checked_add(1)?.checked_mul(4)?)?;
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(last_word)?;
+                // ...and the SOURCE against the last word it reads. Two pointers, two bounds:
+                // a guard on one of them is not a guard.
+                let src_limit = self.mem_bytes.checked_sub(words.checked_mul(4)?)?;
+                Some(InlineLowering::ArgCopyIndexed { offset, stride, count, words, limit, src_limit })
+            }
+            crate::InlineOp::LwMutexLock { layout, thread_slot }
+            | crate::InlineOp::LwMutexUnlock { layout, thread_slot } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                // The pointer must admit the LAST word of the layout, not the first: the
+                // guard is one comparison for four accesses.
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.top())?;
+                let lock = matches!(*self.ops.get(&index)?, crate::InlineOp::LwMutexLock { .. });
+                Some(InlineLowering::LwMutex {
+                    layout,
+                    thread_off: base + thread_slot as u64 * 4,
+                    limit,
+                    lock,
+                })
+            }
+            // No constant limit to precompute: the bound depends on the LENGTH the guest
+            // passes, so the whole comparison is built at runtime from `mem_bytes`.
+            crate::InlineOp::MemCopy => Some(InlineLowering::Bulk {
+                kind: BulkKind::Copy,
+                mem_bytes: self.mem_bytes,
+            }),
+            crate::InlineOp::MemFill => Some(InlineLowering::Bulk {
+                kind: BulkKind::Fill,
+                mem_bytes: self.mem_bytes,
+            }),
+            crate::InlineOp::MemCompare => Some(InlineLowering::Bulk {
+                kind: BulkKind::Compare,
+                mem_bytes: self.mem_bytes,
+            }),
         }
     }
 }
@@ -4062,8 +4247,61 @@ fn emit_pointer_guard(f: &mut Body, base: u32, limit: u32, index: u32) {
     f.instruction(&W::Else);
 }
 
+/// Emit the guard a BULK form needs, leaving the emitter inside the IN-RANGE arm with the
+/// rebased destination in `L_T0`, the rebased second pointer (or the raw r1) in `L_T1`, and
+/// the byte count in `L_T2`.
+///
+/// # Why the length is part of the bound
+/// Every other pointer form reaches a distance named at emit time, so its bound is a
+/// constant computed once in [`InlineImports::lower`]. Here the guest chooses the distance,
+/// so the bound moves with it: the access at `p` reaches `p + len - 1`, and the only
+/// admissible pointers are those with `len` bytes left in front of them. That is
+/// `len <= mem_bytes` and `p - base <= mem_bytes - len`, per pointer.
+///
+/// The length term is not redundant with the pointer terms and cannot be dropped: without
+/// it `mem_bytes - len` wraps to a huge value for an absurd length and every pointer passes.
+/// The terms are combined with `or` rather than nested `if`s so the fallback is a single
+/// `call`, and `or` evaluates both sides - which is why the wrapped subtraction is computed
+/// even on the rejecting path and must be harmless there. It is: it is arithmetic on
+/// operands, not an access.
+fn emit_bulk_guard(f: &mut Body, base: u32, mem_bytes: u32, kind: BulkKind, index: u32) {
+    // t2 = len, and the first rejecting term: a length larger than memory itself.
+    f.instruction(&W::GlobalGet(abi::reg_global(2)));
+    f.instruction(&W::LocalTee(L_T2));
+    f.instruction(&W::I32Const(mem_bytes as i32));
+    f.instruction(&W::I32GtU);
+    // ...or the destination leaves less than `len` bytes in front of it. The single
+    // unsigned compare rejects a pointer below the image base as well, by wrapping.
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Const(base as i32));
+    f.instruction(&W::I32Sub);
+    f.instruction(&W::LocalTee(L_T0));
+    f.instruction(&W::I32Const(mem_bytes as i32));
+    f.instruction(&W::LocalGet(L_T2));
+    f.instruction(&W::I32Sub);
+    f.instruction(&W::I32GtU);
+    f.instruction(&W::I32Or);
+    if kind.reads_second_pointer() {
+        // ...or the source does. Two pointers, two bounds: a guard on one of them is not a
+        // guard.
+        f.instruction(&W::GlobalGet(abi::reg_global(1)));
+        f.instruction(&W::I32Const(base as i32));
+        f.instruction(&W::I32Sub);
+        f.instruction(&W::LocalTee(L_T1));
+        f.instruction(&W::I32Const(mem_bytes as i32));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Sub);
+        f.instruction(&W::I32GtU);
+        f.instruction(&W::I32Or);
+    }
+    f.instruction(&W::If(BlockType::Empty));
+    f.instruction(&W::I32Const(index as i32));
+    f.instruction(&W::Call(IMPORT_FUNC));
+    f.instruction(&W::Else);
+}
+
 fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
-    let (offset, shift, mask, limit) = match inline.lower(index) {
+    let (offset, shift, mask, plus, limit) = match inline.lower(index) {
         None => {
             f.instruction(&W::I32Const(index as i32));
             f.instruction(&W::Call(IMPORT_FUNC));
@@ -4106,6 +4344,311 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End);
             return;
         }
+        Some(InlineLowering::ArgStore { offset, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // *(u32 *)(r0 + offset) = r1
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            // The handler returns 0, and the guarded path is the one it would have taken.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::ArgStoreField { offset, shift, mask, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // *(u32 *)(r0 + offset) = (old & !(mask << shift)) | ((r1 & mask) << shift).
+            // The address is pushed once for the store and once for the load inside it,
+            // rather than parked in a local, because `L_T0` already holds it and a second
+            // `local.get` is what the reading forms cost too.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(!(mask << shift) as i32));
+            f.instruction(&W::I32And);
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(mask as i32));
+            f.instruction(&W::I32And);
+            if shift != 0 {
+                f.instruction(&W::I32Const(shift as i32));
+                f.instruction(&W::I32Shl);
+            }
+            f.instruction(&W::I32Or);
+            f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            // The handler returns 0, and the guarded path is the one it would have taken.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::ArgStoreIndexed { offset, count, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // In range. Hand an out-of-bounds INDEX back to the handler - it is the one
+            // that defines that case (it reports it), and storing past the array here
+            // would overwrite a neighbouring field with nothing to say so.
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(count as i32));
+            f.instruction(&W::I32GeU);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            // *(u32 *)(r0 + offset + r1 * 4) = r2
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(2));
+            f.instruction(&W::I32Shl);
+            f.instruction(&W::I32Add);
+            f.instruction(&W::GlobalGet(abi::reg_global(2)));
+            f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End); // the index guard's `if`
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
+        Some(InlineLowering::ArgCopyIndexed { offset, stride, count, words, limit, src_limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // The destination is in range. Three more conditions have to hold before this can
+            // be a copy, and they are combined into ONE branch so the fallback is a single
+            // `call` rather than three nested ones: the sampler unit must be inside the array,
+            // and the source pointer must be non-null AND in range. Every one of them is a
+            // case the handler defines - an out-of-range unit is REPORTED, a null texture
+            // UNBINDS - so falling back is not a safety net here, it is the specification.
+            //
+            // r1 < count
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(count as i32));
+            f.instruction(&W::I32LtU);
+            // r2 != 0
+            f.instruction(&W::GlobalGet(abi::reg_global(2)));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Ne);
+            f.instruction(&W::I32And);
+            // (r2 - base) <= src_limit, the same single unsigned compare the destination
+            // guard uses, and it rejects a below-image pointer by wrapping.
+            f.instruction(&W::GlobalGet(abi::reg_global(2)));
+            f.instruction(&W::I32Const(base as i32));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::LocalTee(L_T1));
+            f.instruction(&W::I32Const(src_limit as i32));
+            f.instruction(&W::I32LeU);
+            f.instruction(&W::I32And);
+            f.instruction(&W::If(BlockType::Empty));
+            // dst = (r0 - base) + offset + r1 * stride, held in T2 because every store below
+            // reads it. `offset` rides in each store's MemArg, so T2 is the slot base.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(stride as i32));
+            f.instruction(&W::I32Mul);
+            f.instruction(&W::I32Add);
+            f.instruction(&W::LocalTee(L_T2));
+            // dst[0] = r2 - the source address, kept for IDENTITY only. `LocalTee` above left
+            // the address on the stack for this first store.
+            f.instruction(&W::GlobalGet(abi::reg_global(2)));
+            f.instruction(&W::I32Store(MemArg { offset: offset as u64, align: 0, memory_index: 0 }));
+            // dst[1 + k] = *(u32 *)(r2 + 4k) - the control words, copied BY VALUE at the
+            // moment of the bind, which is the whole reason this is a copy form.
+            for k in 0..words {
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Load(MemArg { offset: (k * 4) as u64, align: 0, memory_index: 0 }));
+                f.instruction(&W::I32Store(MemArg {
+                    offset: (offset + 4 + k * 4) as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            // dst[words + 1] = 0 - "not from a precomputed state". Written, not left alone:
+            // the slot is reused, and a unit bound by a precomputed state and then re-bound
+            // directly would otherwise keep the old provenance for the rest of the run.
+            f.instruction(&W::LocalGet(L_T2));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Store(MemArg {
+                offset: (offset + 4 + words * 4) as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::Else);
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::End); // the combined index/source guard
+            f.instruction(&W::End); // the destination pointer guard
+            return;
+        }
+        Some(InlineLowering::LwMutex { layout, thread_off, limit, lock }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // In range. Two values are read once and used twice, so they go in locals:
+            // the current thread id from the mirror, and the recursion count (tested in
+            // the predicate, then incremented or decremented).
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: thread_off, align: 0, memory_index: 0 }));
+            f.instruction(&W::LocalSet(L_T2));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(word_at(layout.count)));
+            f.instruction(&W::LocalSet(L_T1));
+
+            // The predicate, built on the stack. Every term is a comparison, so each
+            // leaves exactly 0 or 1 and the combining `and`/`or` are bitwise-safe; a raw
+            // word used as a truth value here would AND its BITS with the terms either
+            // side and admit takes that should have fallen back.
+            //
+            // r1 == 1: the lock/unlock COUNT argument. Anything else is the handler's.
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(1));
+            f.instruction(&W::I32Eq);
+            // ...and the work area names ITSELF, so this pointer is the canonical mutex
+            // rather than a byte copy of one (which carries the original's id).
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(word_at(layout.id)));
+            f.instruction(&W::GlobalGet(abi::reg_global(0)));
+            f.instruction(&W::I32Eq);
+            f.instruction(&W::I32And);
+            // ...and nothing is parked on it. Only the host can wake a parked thread, so
+            // a mutex with waiters stays entirely on the host.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(word_at(layout.waiters)));
+            f.instruction(&W::I32Eqz);
+            f.instruction(&W::I32And);
+            if lock {
+                // ...and it is free OR already mine (a recursive take).
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Eqz);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Load(word_at(layout.owner)));
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::I32Eq);
+                f.instruction(&W::I32Or);
+                f.instruction(&W::I32And);
+            } else {
+                // ...and it is held, AND held by me. Both, not either: releasing a mutex
+                // this thread does not own is an error only the handler defines, and
+                // decrementing a zero count inline would wrap it to four billion.
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Eqz);
+                f.instruction(&W::I32Eqz);
+                f.instruction(&W::I32And);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Load(word_at(layout.owner)));
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::I32Eq);
+                f.instruction(&W::I32And);
+            }
+
+            f.instruction(&W::If(BlockType::Empty));
+            if lock {
+                // owner = cur. A no-op on the recursive arm, which is what lets one
+                // branch serve both cases.
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::I32Store(word_at(layout.owner)));
+            }
+            // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
+            // alone: every reader tests `count` first, and thid 0 is a real thread, so
+            // there is no owner value that could mean "nobody".
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Const(1));
+            f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
+            f.instruction(&W::I32Store(word_at(layout.count)));
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::Else);
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::End); // the predicate's `if`
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
+        Some(InlineLowering::Bulk { kind, mem_bytes }) => {
+            emit_bulk_guard(f, base, mem_bytes, kind, index);
+            // In range. The dirty stamp goes FIRST for the writing kinds, so a reader that
+            // races the copy sees the page marked before any of its bytes change rather
+            // than after some of them have - the same order `emit_dirty_mark` uses, and the
+            // same reason.
+            if kind.writes() {
+                emit_dirty_range(f, L_T0, L_T2);
+            }
+            match kind {
+                BulkKind::Copy => {
+                    // memmove(dst, src, len). `memory.copy` is specified to behave as if
+                    // the source were read in full before the destination is written, which
+                    // is exactly what the handler's read-then-write does - so the two agree
+                    // on an OVERLAPPING copy as well as on an ordinary one.
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+                    // r0 is left alone: it is the destination, which is what the handler
+                    // returns.
+                }
+                BulkKind::Fill => {
+                    // memset(dst, ch, len). `memory.fill` truncates its value operand to a
+                    // byte, which is the handler's `ch as u8`. r1 is passed raw for that
+                    // reason - masking it here would be a second spelling of one rule.
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::GlobalGet(abi::reg_global(1)));
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&W::MemoryFill(0));
+                }
+                BulkKind::Compare => {
+                    // r0 = 0 up front: it is the answer for equal buffers AND for a zero
+                    // length, so the loop only ever has to write the differing case.
+                    f.instruction(&W::I32Const(0));
+                    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+                    // The one form that loops, because a comparison has no bulk instruction
+                    // and the count is a runtime value.
+                    //
+                    // No fuel CHECK is emitted on this back edge, which makes the loop a
+                    // region the scheduler cannot preempt. That is deliberate and it is
+                    // what the host call already was: a handler runs to completion too.
+                    // It cannot livelock, because the trip count is `r2` and the guard
+                    // above has already bounded `r2` by the size of guest memory.
+                    f.instruction(&W::Block(BlockType::Empty));
+                    f.instruction(&W::Loop(BlockType::Empty));
+                    // Nothing left to compare: the buffers are equal, and r0 already says so.
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&W::I32Eqz);
+                    f.instruction(&W::BrIf(1));
+                    // t3 = a[i] - b[i], both ZERO-extended, which is the difference C
+                    // requires the sign of and what `crate::mem_compare` computes.
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Load8U(mem_arg()));
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::I32Load8U(mem_arg()));
+                    f.instruction(&W::I32Sub);
+                    f.instruction(&W::LocalTee(L_T3));
+                    f.instruction(&W::If(BlockType::Empty));
+                    f.instruction(&W::LocalGet(L_T3));
+                    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+                    // Out of the `if`, the `loop` and the `block` at once: the first
+                    // difference is the answer and nothing after it is read.
+                    f.instruction(&W::Br(2));
+                    f.instruction(&W::End); // the difference test
+                    // Advance both pointers and count one byte off.
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(1));
+                    f.instruction(&W::I32Add);
+                    f.instruction(&W::LocalSet(L_T0));
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::I32Const(1));
+                    f.instruction(&W::I32Add);
+                    f.instruction(&W::LocalSet(L_T1));
+                    f.instruction(&W::LocalGet(L_T2));
+                    f.instruction(&W::I32Const(1));
+                    f.instruction(&W::I32Sub);
+                    f.instruction(&W::LocalSet(L_T2));
+                    f.instruction(&W::Br(0));
+                    f.instruction(&W::End); // the loop
+                    f.instruction(&W::End); // the block
+                }
+            }
+            f.instruction(&W::End); // the bulk guard's `if`
+            return;
+        }
         Some(InlineLowering::GuestScaled { offset, max, shl, limit }) => {
             emit_pointer_guard(f, base, limit, index);
             // In range. Load the word, and hand the CLAMPED case back to the handler:
@@ -4129,7 +4672,9 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the pointer guard's `if`
             return;
         }
-        Some(InlineLowering::Guest { offset, shift, mask, limit }) => (offset, shift, mask, limit),
+        Some(InlineLowering::Guest { offset, shift, mask, plus, limit }) => {
+            (offset, shift, mask, plus, limit)
+        }
     };
     emit_pointer_guard(f, base, limit, index);
     f.instruction(&W::LocalGet(L_T0));
@@ -4141,6 +4686,12 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
     if mask != u32::MAX {
         f.instruction(&W::I32Const(mask as i32));
         f.instruction(&W::I32And);
+    }
+    // The bias, dropped entirely when it is zero - so every form that had no bias before
+    // this existed still emits exactly the instructions it did.
+    if plus != 0 {
+        f.instruction(&W::I32Const(plus as i32));
+        f.instruction(&W::I32Add);
     }
     f.instruction(&W::GlobalSet(abi::reg_global(0)));
     f.instruction(&W::End);

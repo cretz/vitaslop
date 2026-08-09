@@ -157,6 +157,9 @@ pub struct Vm {
     /// Linear-memory offset of the host-mirror block, when this program inlined any
     /// read of it. See [`Vm::mirror_off`].
     mirror_off: Option<u64>,
+    /// Linear-memory offset of the guest-store dirty block, when this program was emitted
+    /// with store tracking on. See [`Vm::dirty_off`].
+    dirty_off: Option<u64>,
 }
 
 /// The result of a fuel-bounded guest call ([`Vm::call_bounded`]).
@@ -253,7 +256,8 @@ impl Vm {
         // Record the instance so an import handler can re-enter guest code.
         store.data_mut().instance = Some(instance);
 
-        let mut vm = Vm { store, instance, base, mirror_off: artifact.mirror_off };
+        let mut vm =
+            Vm { store, instance, base, mirror_off: artifact.mirror_off, dirty_off: artifact.dirty_off };
         vm.write_mem(base, program.code)?;
         vm.set_reg(abi::SP, base.wrapping_add(program.mem_bytes));
         Ok(vm)
@@ -264,6 +268,18 @@ impl Vm {
     /// write it through is `base + mirror_off`.
     pub fn mirror_off(&self) -> Option<u64> {
         self.mirror_off
+    }
+
+    /// Linear-memory offset of the guest-store DIRTY BLOCK, when this program was emitted
+    /// with store tracking on (`vitaslop_transpiler::emit::set_dirty_tracking`). The epoch
+    /// byte is at `dirty_off + DIRTY_EPOCH_OFF` and page `p`'s stamp at
+    /// `dirty_off + DIRTY_MAP_OFF + p`.
+    ///
+    /// `None` means this module stamps NOTHING, which is not the same as "no page is
+    /// dirty" - a reader that treats it as the latter concludes a texture is unchanged
+    /// because the evidence was never recorded.
+    pub fn dirty_off(&self) -> Option<u64> {
+        self.dirty_off
     }
 
     /// Like [`Vm::new`] but transpiles a single module *leniently*: a function
@@ -321,7 +337,13 @@ impl Vm {
         let instance = linker.instantiate(&mut store, &module)?;
         store.data_mut().instance = Some(instance);
 
-        let mut vm = Vm { store, instance, base, mirror_off: built.artifact.mirror_off };
+        let mut vm = Vm {
+            store,
+            instance,
+            base,
+            mirror_off: built.artifact.mirror_off,
+            dirty_off: built.artifact.dirty_off,
+        };
         vm.write_mem(base, code)?;
         vm.set_reg(abi::SP, base.wrapping_add(mem_bytes));
         Ok((vm, built.stubbed))
@@ -381,7 +403,13 @@ impl Vm {
         // here - carried rather than hardcoded so the refusal stays the single place that
         // decides it.
         let mut vm =
-            Vm { store, instance, base: linked.base, mirror_off: built.artifact.mirror_off };
+            Vm {
+                store,
+                instance,
+                base: linked.base,
+                mirror_off: built.artifact.mirror_off,
+                dirty_off: built.artifact.dirty_off,
+            };
         vm.write_mem(linked.base, &linked.image)?;
         vm.set_reg(abi::SP, linked.base.wrapping_add(linked.mem_bytes));
         // Report stubs as (guest addr, wasm function index) so a trap backtrace can

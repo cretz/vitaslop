@@ -14,11 +14,13 @@ pub mod gesture;
 pub mod net;
 pub mod fios2;
 pub mod gxm;
+pub mod gxmctx;
 pub mod iofilemgr;
 pub mod jpeg;
 pub mod jpegenc;
 pub mod libkernel;
 pub mod lwsync;
+pub mod lwwork;
 pub mod mirror;
 pub mod ngs;
 pub mod processmgr;
@@ -48,16 +50,111 @@ use std::sync::{LazyLock, Mutex};
 /// behaviour, which is nearly all of them.
 ///
 /// The one place that decides what may be inlined, because only this crate knows what
-/// a NID means. Two shapes qualify and no others: a pure read through a guest pointer
-/// (the GXM reflection getters) and a read of a host value that cannot change while
-/// guest code runs (the mirror block - see [`mirror`]).
+/// a NID means. Three shapes qualify and no others:
+/// - a pure read through a guest pointer (the GXM reflection getters);
+/// - a read of a host value that cannot change while guest code runs (the mirror block -
+///   see [`mirror`]);
+/// - a read-modify-write of state the guest OWNS, whose contended cases still reach the
+///   host. That is the GXM context setters ([`gxmctx`]) and the uncontended half of a
+///   lightweight mutex ([`lwwork`]), and the second one is only admissible because on the
+///   device that half is userspace too;
+/// - a BULK move or compare over guest memory and nothing else (the `sceClibMem*` trio in
+///   [`libkernel`]), which is the first shape whose reach the guest chooses rather than the
+///   emitter, and so the first whose guard is arithmetic rather than a constant.
 pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_imports() {
+        return None;
+    }
+    if func_nid == gxm_nid::SET_FRAGMENT_TEXTURE && no_inline_texture() {
+        return None;
+    }
+    if no_inline_clib() && is_clib_bulk(func_nid) {
         return None;
     }
     gxm::inline_op(func_nid)
         .or_else(|| display::inline_op(func_nid))
         .or_else(|| libkernel::inline_op(func_nid))
+        .or_else(|| (!no_inline_lwmutex()).then(|| lwsync::inline_op(func_nid)).flatten())
+}
+
+/// The three NIDs [`no_inline_clib`] scopes over. Named here rather than tested against
+/// `libkernel::inline_op`'s output, because the switch is about which CALLS are rerouted and
+/// the answer must not change if a fourth form is ever added to that function for a NID this
+/// switch was never meant to cover.
+fn is_clib_bulk(func_nid: u32) -> bool {
+    use crate::nid::libkernel as lk;
+    matches!(func_nid, lk::CLIB_MEMCPY | lk::CLIB_MEMSET | lk::CLIB_MEMCMP)
+}
+
+/// `VITASLOP_NO_INLINE_CLIB`: route `sceClibMemcpy`, `sceClibMemset` and `sceClibMemcmp`
+/// through the host, leaving every other inline form on.
+///
+/// A SCOPED A/B switch like [`no_inline_lwmutex`], and it is BOTH of the things those two
+/// switches are separately: a price tag and a correctness falsifier.
+///
+/// As a price tag, it is the only way to learn what this family is worth. The three are 13%
+/// of a real title's host calls, so turning the whole mechanism off to measure them buys a
+/// baseline that also moves ~11,000 other calls a frame and every preemption point with them
+/// - against which 500,000 crossings over a run are not separable.
+///
+/// As a falsifier, it is the switch to reach for first if a title ever renders differently
+/// after this change. These forms are the first that WRITE a range the guest sizes, so they
+/// are the first that could plausibly corrupt memory rather than merely answer wrongly - and
+/// they are also the first that owe the guest-store dirty map a range stamp, which is a
+/// browser-only path a desktop run cannot exercise at all. Both arms write the same bytes by
+/// construction (the handler and `emit_dirty_range`'s `memory.copy` do the same move), so a
+/// picture that CHANGES when this is set is a real divergence and one that does not clears
+/// the forms.
+///
+/// Read through [`crate::knobs`] and listed in `OVERRIDABLE`, so a live page on a PHONE can
+/// throw it between two runs of one build - which is the only machine whose answer counts.
+/// Read at LINK time, so it must be set for the whole run.
+fn no_inline_clib() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_CLIB"))
+}
+
+/// `VITASLOP_NO_INLINE_LWMUTEX`: route the lightweight-mutex lock and unlock through the
+/// host, leaving every other inline form on.
+///
+/// A SCOPED A/B switch, and it exists because the whole-mechanism one
+/// ([`no_inline_imports`]) cannot answer what one family is worth. Turning everything off
+/// changes ~11,000 host calls a frame and moves every preemption point with them; against
+/// that baseline a family worth ~1,000 calls is inside the noise, which is exactly the
+/// position the draw-state work was left in on the browser.
+///
+/// It also has to be reachable from a PHONE, which is the only machine whose answer counts
+/// (a desktop crossing is cheap enough that a count-based win barely registers there). So
+/// it is read through [`crate::knobs`] and listed in `OVERRIDABLE`, and a live page can
+/// throw it between two runs of the same build.
+///
+/// Read at LINK time, so it must be set for the whole run.
+fn no_inline_lwmutex() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_LWMUTEX"))
+}
+
+/// `VITASLOP_NO_INLINE_TEXTURE`: route `sceGxmSetFragmentTexture` through the host,
+/// leaving every other inline form on.
+///
+/// A SCOPED A/B switch like [`no_inline_lwmutex`], but it exists for a different reason, and
+/// the difference is the point: this one is a CORRECTNESS falsifier, not a price tag. The
+/// inline copy form took over a call every fragment texture bind in the title goes through
+/// (1,275 a frame in a race), so it is the one change that can make a texture DISAPPEAR - and
+/// the report that some text went missing came from a phone, against a build whose desktop
+/// "verification" compared two different screens. Without a knob, answering it means
+/// rebuilding an old revision and getting the user to run it; with one, it is a line typed
+/// into the live page's knobs box and one run.
+///
+/// It only answers anything because both paths write the SAME bytes: the handler ends in
+/// `gxmctx::set_texture_binding` and the emitted code writes that slot directly, held together
+/// by `the_texture_binding_layout_is_closed`. So a picture that CHANGES when this is set is a
+/// real divergence between the two writers, and one that does not clears the inline form.
+///
+/// Read at LINK time, so it must be set for the whole run.
+fn no_inline_texture() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_TEXTURE"))
 }
 
 /// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
@@ -70,9 +167,21 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
 /// differently. Turning inlining off is how a signature is compared against a
 /// pre-inlining run, which is the only way to tell a real behaviour change from that
 /// re-interleaving. Read at LINK time, so it must be set for the whole run.
+///
+/// Read through [`crate::knobs`], not `std::env`. The browser has no environment
+/// [[vitaslop-browser-has-no-env]], so an `env` read here made the A/B switch for the whole
+/// inline mechanism unreachable on the ONE engine whose host-call cost is the reason the
+/// mechanism exists: a phone pays ~36% of its host-call time in the CROSSING, against a
+/// desktop where inlining ~1,089 calls a frame is worth 3.5%. Measuring what inlining buys
+/// there could only ever be extrapolated from here. Exactly the defect the call-site
+/// profiler below had, and for the same reason.
+///
+/// (Do not name another knob with its literal `VITASLOP_*` token in a doc comment here: the
+/// `KNOBS.md` indexer treats any such token as a READ SITE, and the cross-reference then
+/// overwrites that knob's real entry with this one's summary.)
 fn no_inline_imports() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VITASLOP_NO_INLINE_IMPORTS").is_some())
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_IMPORTS"))
 }
 
 /// Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls
@@ -241,11 +350,26 @@ pub fn dump_call_sites(top: usize) {
     eprintln!("{}", call_sites_report(top));
 }
 
+/// Forget every call site recorded so far, so the counts that follow describe a WINDOW
+/// rather than the run.
+///
+/// A boot-inclusive tally and a steady-gameplay tally measure different programs, and the
+/// difference is not small: on one title `sceKernelDelayThread` reads as the #1 call from
+/// boot, and ~46,000 of that total is a single LOADING-phase call site that appears in no
+/// steady window at all. Ranking work to remove off a cumulative tally has mis-ranked this
+/// project's host-call list three times. Differencing two samples answers the same
+/// question, but only if somebody remembers to take two - this makes the windowed reading
+/// the cheap one.
+pub fn reset_call_sites() {
+    CALLSITE_HIST.lock().unwrap().clear();
+}
+
 /// The hottest call sites as text, so a live session can print them too rather than only
-/// an after-the-run probe. Counts are CUMULATIVE from boot, which is what makes them
-/// useful: sample twice around a known number of display frames and the difference is
-/// calls-per-frame, which is how you tell a title pacing itself off the display from one
-/// running its own loop at a rate we are not presenting at.
+/// an after-the-run probe. Counts are CUMULATIVE from boot (or from the last
+/// [`reset_call_sites`]), which is what makes them useful: sample twice around a known
+/// number of display frames and the difference is calls-per-frame, which is how you tell a
+/// title pacing itself off the display from one running its own loop at a rate we are not
+/// presenting at.
 pub fn call_sites_report(top: usize) -> String {
     use std::fmt::Write;
     let h = CALLSITE_HIST.lock().unwrap();
@@ -619,9 +743,11 @@ pub fn dispatch(
         gxm_nid::MAP_VERTEX_USSE_MEMORY | gxm_nid::MAP_FRAGMENT_USSE_MEMORY => {
             cont!(gxm::map_usse(ctx, st))
         }
-        gxm_nid::CREATE_CONTEXT | gxm_nid::SHADER_PATCHER_CREATE => {
-            cont!(gxm::out_handle(ctx, st, 1))
-        }
+        // Split from `SHADER_PATCHER_CREATE`: a shader patcher really is an opaque handle,
+        // but a CONTEXT is a guest structure the sticky draw state lives in - see
+        // [`gxm::create_context`].
+        gxm_nid::CREATE_CONTEXT => gxm::create_context(ctx, st),
+        gxm_nid::SHADER_PATCHER_CREATE => cont!(gxm::out_handle(ctx, st, 1)),
         gxm_nid::CREATE_RENDER_TARGET => cont!(gxm::create_render_target(ctx, st)),
         gxm_nid::SYNC_OBJECT_CREATE => cont!(gxm::out_handle(ctx, st, 0)),
         gxm_nid::SHADER_PATCHER_REGISTER_PROGRAM => cont!(gxm::register_program(ctx, st)),

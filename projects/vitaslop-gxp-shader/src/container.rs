@@ -378,6 +378,22 @@ impl Program {
         self.texture_control.iter().find(|(base, _)| *base == sa_register).map(|(_, unit)| *unit)
     }
 
+    /// Every declared texture whose control words start at an SA register a `SMP` cannot name.
+    ///
+    /// A `SMP`'s sampler field is a DOUBLE-register number, so the only SA registers reachable
+    /// by it are the EVEN ones. A texture-control base that is odd is therefore unaddressable by
+    /// any sampler field, whatever the rest of the program does.
+    ///
+    /// This exists because the failure otherwise surfaces in completely the wrong place. The
+    /// instruction blocks with "SMP sampler operand does not resolve to a declared texture
+    /// unit", which reads as a decode gap in the sampler field - and the sampler field is fine.
+    /// The odd base is a property of the CONTAINER, and it is visible here without executing or
+    /// even decoding anything. One blob across three titles is in this state
+    /// (`frag_866a1840`: one texture, unit 1, base SA 7).
+    pub fn unaddressable_texture_controls(&self) -> Vec<(u32, u32)> {
+        self.texture_control.iter().copied().filter(|(base, _)| base % 2 != 0).collect()
+    }
+
     /// Whether the SAMPLER declared at GXM texture `unit` is a CUBE map (three sample
     /// coordinates naming a direction) rather than a 2D or 3D texture. Drives both the WGSL
     /// texture type the recompiled fragment declares and the view dimension the renderer binds,
@@ -1643,5 +1659,24 @@ mod tests {
         // A vertex blob (no varyings_offset set) yields no fragment interpolants.
         let b = build_blob(false, &[], &[0u64]);
         assert!(Program::parse(&b).unwrap().interpolants.is_empty());
+    }
+
+    /// An ODD texture-control base is unaddressable by a `SMP`, whose sampler field is a
+    /// DOUBLE-register number - so `Program::unaddressable_texture_controls` reports it and an
+    /// even base is silent. This is the container-visible cause of the one blocked sampler in
+    /// three titles' corpora, and it is checked here rather than only in the corpus oracle so
+    /// the rule survives without game bytes.
+    #[test]
+    fn an_odd_texture_control_base_is_not_addressable_by_a_double_register_sampler_field() {
+        let mut p = Program::parse(&build_blob(false, &[], &[0u64])).unwrap();
+        p.texture_control = vec![(6, 0), (100, 1)];
+        assert!(p.unaddressable_texture_controls().is_empty(), "even bases are addressable");
+        // Every even base is reachable by exactly the field that halves it.
+        assert_eq!(p.sampler_unit_at(2 * 3), Some(0));
+        assert_eq!(p.sampler_unit_at(2 * 50), Some(1));
+        p.texture_control = vec![(7, 1)];
+        assert_eq!(p.unaddressable_texture_controls(), vec![(7, 1)]);
+        // ...and no sampler field names it, which is why the instruction blocks.
+        assert!((0..64).all(|f| p.sampler_unit_at(2 * f).is_none()));
     }
 }
