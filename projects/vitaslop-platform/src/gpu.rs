@@ -298,6 +298,134 @@ pub fn block_compression_available() -> bool {
     BLOCK_COMPRESSION.load(std::sync::atomic::Ordering::Relaxed) != 2
 }
 
+/// The last complete frame's uploaded texture working set, in bytes. `0` before the first frame.
+static LAST_WORKING_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Is the texture working set close enough to its budget that spending CPU to shrink it is still
+/// worth something?
+///
+/// # Compression is a means, and this is the end it serves
+/// Re-encoding a texture exists to make a frame's textures FIT. Once they fit with room to spare,
+/// further compression buys memory nobody needs at a CPU cost this device cannot afford - and it
+/// is the one resource it has least of. MEASURED on the target phone after the PVRTC transcode
+/// landed: the race frame's working set fell from **256 MB against a 256 MB budget** to **82 MB**,
+/// at which point the remaining BC textures could have been left alone entirely.
+///
+/// Two-thirds rather than the whole budget, because the answer has to be given BEFORE the work:
+/// a texture skipped at 90% would be wanted again the moment the next screen loaded, and a
+/// control that only reacts at the limit oscillates across it.
+pub fn texture_budget_pressure() -> bool {
+    let ws = LAST_WORKING_SET.load(std::sync::atomic::Ordering::Relaxed);
+    // Unknown (no frame finished yet) counts as PRESSURE: the first frames of a screen are
+    // exactly when the working set is being built, and guessing "plenty of room" there would
+    // skip the compression that stops the budget being blown in the first place.
+    // The same budget the uploader enforces, read the same way, so the two cannot disagree about
+    // what "tight" means.
+    let budget = crate::knobs::var("VITASLOP_TEX_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+        * 1024
+        * 1024;
+    ws == 0 || ws * 3 >= budget * 2
+}
+
+/// The decoded texels of a [`GxmTexture`] - produced the FIRST time something reads them, and
+/// never produced at all when nothing does.
+///
+/// # >>> THE DECODE WAS UNCONDITIONAL, AND THE PATH THAT SHIPS THROWS IT AWAY
+/// Every bound texture was expanded to RGBA8 the moment it was captured, and the result was
+/// then held for the life of the run in the decode cache. That is exactly right for the
+/// fixed-function renderer, which samples those bytes. It is pure waste for the configuration
+/// this project actually ships: the recompiler path hands the GPU the guest's own compressed
+/// BLOCKS ([`CompressedUpload`]), so `upload_gxp_texture` returns before it ever looks at
+/// `rgba`, and the expansion is a PVRTC or BC decode of the whole image whose only consumer is
+/// the allocator that frees it.
+///
+/// It cost twice over. Once in CPU - the decode is the single most expensive thing a screen
+/// transition does, and it ran for textures whose blocks were about to be handed over untouched.
+/// And once in MEMORY - eight bytes of RGBA8 per byte of guest texture, resident in the decode
+/// cache, which is what pushed a phone's working set past its budget and started the eviction
+/// thrash that the compressed upload had just been written to prevent. A transcode paid it
+/// TWICE: `transcoded_source` decodes each level itself, so the eager decode was a second,
+/// discarded copy of level 0.
+///
+/// Laziness rather than a flag, deliberately: every consumer that genuinely needs texels
+/// (the software rasterizer, the fixed-function upload, the vertex-texture clip probe, the
+/// diagnostics) keeps working unchanged and simply pays for what it reads. There is no
+/// configuration in which this returns different bytes from the eager decode - it returns the
+/// same bytes, or nobody asks.
+pub struct Texels(std::sync::Arc<TexelsInner>);
+
+struct TexelsInner {
+    ready: std::sync::OnceLock<Vec<u8>>,
+    /// The decode itself. `None` is an already-materialised buffer (see [`Texels::ready`]).
+    make: Option<Box<dyn Fn() -> Vec<u8> + Send + Sync>>,
+}
+
+impl Texels {
+    /// Texels that already exist. No decode is deferred and [`Texels::resident`] is true from
+    /// the start.
+    pub fn ready(v: Vec<u8>) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(v);
+        Texels(std::sync::Arc::new(TexelsInner { ready: cell, make: None }))
+    }
+
+    /// Texels that will be produced by `f` if anything reads them. `f` runs AT MOST once, and
+    /// every clone of this handle shares the one result.
+    pub fn lazy(f: impl Fn() -> Vec<u8> + Send + Sync + 'static) -> Self {
+        Texels(std::sync::Arc::new(TexelsInner {
+            ready: std::sync::OnceLock::new(),
+            make: Some(Box::new(f)),
+        }))
+    }
+
+    /// Have these texels actually been produced? Used by accounting that must not FORCE the
+    /// decode just to price it - reading `len()` there would defeat the whole mechanism.
+    pub fn resident(&self) -> bool {
+        self.0.ready.get().is_some()
+    }
+
+    /// Bytes currently held, WITHOUT forcing the decode: 0 while it has not run.
+    pub fn resident_len(&self) -> usize {
+        self.0.ready.get().map_or(0, |v| v.len())
+    }
+}
+
+impl std::ops::Deref for Texels {
+    type Target = Vec<u8>;
+
+    /// Reading the texels IS the decode. Every existing `t.rgba.len()` / `&t.rgba` /
+    /// `t.rgba.get(..)` call site keeps its meaning; what changes is when the work happens.
+    fn deref(&self) -> &Vec<u8> {
+        self.0.ready.get_or_init(|| match &self.0.make {
+            Some(f) => f(),
+            // Unreachable: `ready` sets the cell, `lazy` sets `make`. An empty buffer is the
+            // only honest answer that is not a panic inside a `Deref`.
+            None => Vec::new(),
+        })
+    }
+}
+
+impl Clone for Texels {
+    fn clone(&self) -> Self {
+        Texels(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for Texels {
+    /// Deliberately does NOT force the decode. A `{:?}` of a texture is a diagnostic, and a
+    /// diagnostic that performs the expensive work it is reporting on is an instrument whose
+    /// failure imitates its subject.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.ready.get() {
+            Some(v) => write!(f, "Texels({} bytes)", v.len()),
+            None => write!(f, "Texels(not decoded)"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GxmTexture {
     pub key: u64,
@@ -313,8 +441,9 @@ pub struct GxmTexture {
     /// Number of `width x height` images `rgba` holds back to back: 1 normally, 6 for a
     /// cube map (in +X, -X, +Y, -Y, +Z, -Z order, which is WebGPU's array-layer order).
     pub faces: u32,
-    /// The decoded texels, in the layout [`Self::texel`] names.
-    pub rgba: std::sync::Arc<Vec<u8>>,
+    /// The decoded texels, in the layout [`Self::texel`] names - produced on first READ, so a
+    /// texture the GPU takes compressed is never expanded at all. See [`Texels`].
+    pub rgba: Texels,
     /// Which layout `rgba` is in - four bytes a texel, or four HALVES a texel.
     ///
     /// # Why this seam is not always RGBA8
@@ -422,10 +551,22 @@ pub enum BlockFamily {
 #[derive(Clone, Debug)]
 pub struct CompressedUpload {
     pub format: BlockFormat,
-    /// Level 0 first, then each smaller level, block-packed with no row padding, layer-major
-    /// over the texture's faces - which is precisely what `TextureDataOrder::LayerMajor`
-    /// reads, level by level, at each level's block-rounded PHYSICAL size.
-    pub data: std::sync::Arc<Vec<u8>>,
+    /// The dimensions `data` actually describes, which are NOT always the guest texture's.
+    ///
+    /// # A transcode may deliberately deliver a SMALLER texture first
+    /// Re-encoding a 2048x2048 atlas costs seconds of CPU on the device this exists for, and a
+    /// screen transition asks for a hundred textures at once. So the transcode is tiered: the
+    /// first version of a texture is built from the guest's own SMALL mip levels - a 64x64
+    /// pyramid is 1/1000th of the texels and effectively free - and larger tiers replace it over
+    /// the following frames. Sampling a smaller texture with the same coordinates is simply
+    /// lower resolution, so the picture is soft for a moment instead of the guest being frozen.
+    ///
+    /// The passthrough always sets these to the guest's own size: handing over blocks the guest
+    /// already made costs nothing, so there is nothing to spread out.
+    pub width: u32,
+    pub height: u32,
+    /// The blocks themselves, or the recipe for the GPU to make them. See [`CompressedData`].
+    pub data: CompressedData,
     /// Mip levels `data` holds per face, counting level 0. These are the GUEST'S levels: there
     /// is no box filter for a compressed block, so a passthrough either carries the chain the
     /// hardware itself samples or ships level 0 alone, and level-0-alone is the "distant road
@@ -442,6 +583,151 @@ pub struct CompressedUpload {
     /// blocks as "guest blocks, guest mips". A provenance that can be inferred today is a
     /// provenance that will be wrong later.
     pub transcoded: bool,
+}
+
+impl CompressedUpload {
+    /// Bytes this upload will occupy on the GPU, whichever side produced them.
+    ///
+    /// A GPU-built chain is priced from its geometry rather than from a buffer, because the
+    /// buffer does not exist yet on the CPU side and never will - which is the entire point.
+    /// The CPU-built blocks, or `None` when the GPU will build them.
+    ///
+    /// Every caller of this is asserting something about the BYTES, which only exist on the CPU
+    /// path. A GPU plan has no bytes to assert about by construction - that is what it is for -
+    /// so the `Option` is the honest signature rather than an empty slice that would let a test
+    /// pass by measuring nothing.
+    pub fn cpu_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            CompressedData::Cpu(v) => Some(v),
+            CompressedData::Gpu(_) => None,
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        match &self.data {
+            CompressedData::Cpu(v) => v.len(),
+            CompressedData::Gpu(_) => {
+                let bb = self.format.block_bytes() as usize;
+                (0..self.levels)
+                    .map(|l| {
+                        let w = (self.width >> l).max(1);
+                        let h = (self.height >> l).max(1);
+                        (w.div_ceil(4) * h.div_ceil(4)) as usize * bb
+                    })
+                    .sum()
+            }
+        }
+    }
+}
+
+/// Where a [`CompressedUpload`]'s blocks come from.
+///
+/// # >>> THE ENCODER IS THE MOST EXPENSIVE THING THIS EMULATOR DOES, AND IT RAN ON THE IDLE SIDE
+/// A screen transition on the target device binds a hundred textures at once, every one of them
+/// PVRTC, which no WebGPU adapter can be handed compressed. Each has to be decoded and re-encoded,
+/// and the device's CPU encoder runs at about 1 Mtexel/s - so a single 1024x1024 atlas with its
+/// chain is well over a second of frozen guest, and a transition frame MEASURED at
+/// **BUILD 21,182 ms**. Over the same frame the GPU was doing essentially nothing: `pass 3.3 ms`
+/// against 128 ms of CPU.
+///
+/// Block encoding is embarrassingly parallel over independent 4x4 blocks and needs no guest state
+/// at all, so it belongs on the processor that is idle. [`CompressedData::Gpu`] carries the guest's
+/// own bytes and a description of how to read them; the decode, the mip chain and the block encode
+/// then happen in compute shaders and the result is copied straight into the compressed texture.
+/// **Nothing crosses back to the CPU**, so there is no stall to schedule around and no readback.
+///
+/// It is not a quality trade in either direction: the GPU runs the same algorithm over the same
+/// texels at the guest's own resolution. `gpu_etc2_matches_the_cpu_encoder` is what says so,
+/// against the CPU encoder this replaces, over the same corpus its own error ceilings are written
+/// from.
+#[derive(Clone, Debug)]
+pub enum CompressedData {
+    /// Blocks already built on the CPU: level 0 first, then each smaller level, block-packed with
+    /// no row padding, layer-major over the texture's faces - which is precisely what
+    /// `TextureDataOrder::LayerMajor` reads, level by level, at each level's block-rounded
+    /// PHYSICAL size.
+    Cpu(std::sync::Arc<Vec<u8>>),
+    /// The guest's raw bytes, to be decoded, mipped and encoded on the GPU.
+    Gpu(GpuTranscode),
+}
+
+/// Everything the GPU needs to build a texture's blocks from the guest's own bytes.
+///
+/// The layout arithmetic (which level starts where, how many blocks, Morton or linear) is done
+/// ONCE on the CPU, where `level_layout` and `morton_index` already live and are already tested,
+/// and handed over as a table. A second implementation of that addressing in WGSL is exactly the
+/// kind of duplicate that drifts, and its failure mode is a texture that decodes plausibly out of
+/// the wrong bytes.
+#[derive(Clone, Debug)]
+pub struct GpuTranscode {
+    /// The guest's pixel bytes for face 0. Single-face only - a cube map's six chains are not
+    /// established, and the CPU path refuses them for the same reason.
+    pub src: std::sync::Arc<[u8]>,
+    /// How to read `src`.
+    pub codec: SourceCodec,
+    /// Texel dimensions of level 0.
+    pub width: u32,
+    pub height: u32,
+    /// Levels the FINISHED texture will have: a full chain down to 1x1. Levels past
+    /// `src_levels.len()` are box-filtered on the GPU from the level above, exactly as the CPU
+    /// transcode does in RGBA8.
+    pub levels: u32,
+    /// The guest's own levels present in `src`, largest first.
+    pub src_levels: Vec<SrcLevel>,
+}
+
+/// One guest mip level inside [`GpuTranscode::src`].
+#[derive(Clone, Copy, Debug)]
+pub struct SrcLevel {
+    /// Byte offset of this level from the start of `src`.
+    pub byte_offset: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Blocks needed to cover the level, in the SOURCE codec's block geometry (4x4 for PVRTC
+    /// 4bpp and for BC, 8x4 for PVRTC 2bpp).
+    pub blocks_x: u32,
+    pub blocks_y: u32,
+    /// The power-of-two-padded grid a SWIZZLED level's Morton addressing runs over. Equal to
+    /// `blocks_x`/`blocks_y` when the level is stored linearly.
+    pub padded_x: u32,
+    pub padded_y: u32,
+    /// Block rows are Morton-ordered over the padded grid rather than laid out linearly.
+    pub swizzled: bool,
+}
+
+/// The wgpu format a [`BlockFormat`] uploads through, in its plain or sRGB twin.
+///
+/// The renderer's own `block_wgpu_format` is the definition; this forwards to it so the GPU
+/// transcoder ([`crate::texenc`]) creates its texture through exactly the same mapping the
+/// uploader would have. Two spellings of "which wgpu format is this" is how a gamma decode ends
+/// up applied on one path and not the other.
+#[cfg(feature = "gpu")]
+pub fn block_wgpu_format_pub(f: BlockFormat, gamma: bool) -> wgpu::TextureFormat {
+    gxm::block_wgpu_format_pub(f, gamma)
+}
+
+/// The compressed format the GUEST stored a texture in, as the GPU decoder needs to read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceCodec {
+    /// PVRTC1 (`two = false`) or PVRTC2, at 2 or 4 bits per texel.
+    Pvrtc { two: bool, four_bpp: bool },
+    /// The guest's `UBC1`/`UBC2`/`UBC3` (base formats `0x85`/`0x86`/`0x87`), which ARE BC1/2/3.
+    ///
+    /// On a desktop these pass through untouched and this never runs. It exists for an adapter
+    /// with no BC at all - the target device - where the alternatives are an RGBA8 expansion at
+    /// four times the size or a CPU decode plus a CPU re-encode, which is the single most
+    /// expensive path in the texture pipeline.
+    Bc { base_format: u32 },
+}
+
+impl SourceCodec {
+    /// Bytes in one SOURCE block. PVRTC is always 8; BC1 is 8 and BC2/BC3 are 16.
+    pub fn block_bytes(self) -> u32 {
+        match self {
+            SourceCodec::Pvrtc { .. } | SourceCodec::Bc { base_format: 0x85 } => 8,
+            SourceCodec::Bc { .. } => 16,
+        }
+    }
 }
 
 /// The per-material forward-lighting inputs the GPU `fs_opaque` needs to reproduce the
@@ -1026,10 +1312,14 @@ mod render {
 #[cfg(feature = "gpu")]
 mod gxm {
     use super::{
-        gxm_sample_count, BlockFamily, BlockFormat, CompressedUpload, DrawSpace, RenderScene,
-        TexelSeam, DEPTH_FORMAT, GXM_VERTEX_STRIDE, MSAA_SAMPLES,
+        gxm_sample_count, BlockFamily, BlockFormat, CompressedData, CompressedUpload, DrawSpace,
+        RenderScene, TexelSeam, DEPTH_FORMAT, GXM_VERTEX_STRIDE, MSAA_SAMPLES,
     };
-    use std::collections::{HashMap, HashSet};
+    // >>> HASHED WITH FxHash, NOT SipHash. Every one of these is probed per DRAW - the
+    // pipeline cache, the sampler bind groups, the view cache, the packed-geometry memo -
+    // and a race frame submits hundreds of draws each naming several of them. See
+    // `crate::fasthash` for what that trade is and why the keys here make it a safe one.
+    use crate::fasthash::{FxHashMap as HashMap, FxHashSet as HashSet};
     use wgpu::util::DeviceExt;
 
     /// The millisecond clock the wasm [`Stopwatch`] reads, installed by the frontend.
@@ -1538,11 +1828,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// [`uploaded_texture_bytes`] with the device decision already made, so the arithmetic can
     /// be tested without a GPU.
     fn texture_upload_bytes(t: &GxmTexture, passthrough: bool) -> usize {
-        // A texture that passes through compressed occupies exactly the bytes handed over -
-        // no estimate needed, and no 4/3 either, because `data` already holds the chain.
+        // A texture that reaches the GPU compressed occupies exactly the blocks it is made of -
+        // no estimate needed, and no 4/3 either, because the chain is already counted. A
+        // GPU-built chain is priced from its geometry, which is the same number the CPU one
+        // reports for the same shape; see `CompressedUpload::byte_len`.
         if passthrough {
             if let Some(c) = t.compressed.as_ref() {
-                return c.data.len();
+                return c.byte_len();
             }
         }
         let (w, h) = (t.width.max(1) as usize, t.height.max(1) as usize);
@@ -1581,6 +1873,35 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// sRGB-decoded by the hardware sampler before filtering, and an `...UnormSrgb` format puts
     /// that decode in exactly the same place. So the same bytes serve both, which is why gamma
     /// never disqualifies a passthrough.
+    /// Report - once per guest base format - that the GPU transcoder declined a texture and it
+    /// took the CPU decode instead.
+    ///
+    /// Not a fault and not a wrong picture: every shape the transcoder declines is one the decode
+    /// handles correctly. It is reported because the whole point of the GPU path is that a screen
+    /// transition stops costing seconds, and "the transition is still slow" has two completely
+    /// different causes - the shaders never ran, or they ran and something else is the weight.
+    /// Silence here would leave those indistinguishable.
+    fn report_gpu_transcode_refused(base_format: u32) {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.get_or_insert_with(HashSet::new).insert(base_format) {
+            return;
+        }
+        report_warn!(
+            "gxm textures: base format {base_format:#04x} asked for a GPU transcode and the \
+             transcoder declined it, so it is being decoded and re-encoded on the CPU instead. \
+             The picture is the same; the cost is not.",
+        );
+    }
+
+    /// [`block_wgpu_format`], reachable from outside this module. See
+    /// [`super::block_wgpu_format_pub`].
+    pub(super) fn block_wgpu_format_pub(f: BlockFormat, gamma: bool) -> wgpu::TextureFormat {
+        block_wgpu_format(f, gamma)
+    }
+
     fn block_wgpu_format(f: BlockFormat, gamma: bool) -> wgpu::TextureFormat {
         match (f, gamma) {
             (BlockFormat::Bc1, false) => wgpu::TextureFormat::Bc1RgbaUnorm,
@@ -2073,6 +2394,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// (this reads 0), or it fired and the remaining formats are the weight (this reads
         /// high) - and the byte total alone cannot tell them apart.
         tex_uploaded_compressed,
+        /// Of those, how many had their blocks BUILT ON THE GPU from the guest's own bytes,
+        /// with no CPU decode and no CPU encode ([`crate::texenc`]).
+        ///
+        /// The number this is read against is `tex_gpu_encode_refused`. A transition that is
+        /// still slow with this high is slow for some other reason; a transition that is still
+        /// slow with the refusals high is one where the shaders declined the shapes that matter,
+        /// and those two have nothing in common to fix.
+        tex_encoded_on_gpu,
+        /// Uploads that asked for a GPU transcode and were declined by it, falling back to the
+        /// CPU decode. Never a wrong picture - only a slower one.
+        tex_gpu_encode_refused,
     }
 
     /// Bump one encode counter. Relaxed: these are a diagnostic, and no reader depends on
@@ -2091,7 +2423,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!(
                 "encode work/frame: {:.1} passes, {:.0} draws, {:.0} pipeline + {:.0} bind-group \
                  + {:.0} vertex-buffer + {:.0} viewport sets, textures {:.1} UPLOADED \
-                 ({:.2} MB, {:.1} COMPRESSED passthrough, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
+                 ({:.2} MB, {:.1} COMPRESSED passthrough, {:.1} ENCODED ON THE GPU, {:.1} GPU \
+                 encodes refused, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
                  passes dropping {:.1} entries, {:.2} WHOLESALE clears, {:.1} DESTROYED), bind groups {:.1} built \
                  / {:.1} reused, {:.2} pipelines built, buffers {:.1} created / {:.1} destroyed ({:.2} MB \
                  written), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
@@ -2105,6 +2438,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 per(self.tex_uploaded),
                 mb(self.tex_upload_bytes),
                 per(self.tex_uploaded_compressed),
+                per(self.tex_encoded_on_gpu),
+                per(self.tex_gpu_encode_refused),
                 per(self.tex_reuploaded_after_evict),
                 per(self.tex_view_cached),
                 per(self.tex_view_evict_passes),
@@ -2205,7 +2540,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     ) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert(depth_addr) {
             return;
         }
@@ -2814,6 +3149,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// groups that just went stale. See the eviction site for why a generation counter was
         /// the wrong instrument here.
         sampler_bgs: HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>)>,
+        /// The GPU texture transcoder's compute pipelines ([`crate::texenc`]).
+        ///
+        /// Built on first use rather than in `new`, for the same reason `bc_supported` is asked
+        /// once: it compiles three compute shaders, and a run whose adapter takes the guest's
+        /// blocks verbatim never transcodes anything and should not pay for them. Held here
+        /// rather than in a global because "there is only ever one device" is true today and is
+        /// not a thing this code should assert.
+        texenc: Option<crate::texenc::Transcoder>,
     }
 
     /// Which depth the recompiled vertex stage writes (`VITASLOP_GXP_ZFIX`).
@@ -2950,32 +3293,33 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                pipelines: HashMap::new(),
-                pair_keys: HashMap::new(),
-                views: HashMap::new(),
+                pipelines: HashMap::default(),
+                pair_keys: HashMap::default(),
+                views: HashMap::default(),
                 views_bytes: 0,
-                views_used: HashMap::new(),
-                views_evicted: HashSet::new(),
+                views_used: HashMap::default(),
+                views_evicted: HashSet::default(),
                 views_epoch: 0,
                 views_frame_high: 0,
                 views_frame_bytes: 0,
                 bc_supported: None,
-                samplers_by_mode: HashMap::new(),
+                texenc: None,
+                samplers_by_mode: HashMap::default(),
                 negw: match crate::knobs::var("VITASLOP_GXP_NEGW").ok().as_deref() {
                     Some("0") | Some("off") => NegW::Off,
                     Some("negate") => NegW::Negate,
                     Some("force") => NegW::Force,
                     _ => NegW::Auto,
                 },
-                negw_by_key: HashMap::new(),
+                negw_by_key: HashMap::default(),
                 scene_negw: false,
                 scene_depth_fit: DEPTH_FIT_RECIP_W,
-                negw_by_target: HashMap::new(),
-                ubo_bgs: HashMap::new(),
+                negw_by_target: HashMap::default(),
+                ubo_bgs: HashMap::default(),
                 ubo_bgs_gen: u64::MAX,
-                packed: HashMap::new(),
-                depth_bgs: HashMap::new(),
-                sampler_bgs: HashMap::new(),
+                packed: HashMap::default(),
+                depth_bgs: HashMap::default(),
+                sampler_bgs: HashMap::default(),
             }
         }
 
@@ -3334,8 +3678,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     BlockFamily::None
                 }
             });
+            // Built here rather than lazily at the upload site, because that site holds `self`
+            // destructured and cannot reach back for a `&mut`. Three compute shaders, once.
+            if self.texenc.is_none() {
+                self.texenc = Some(crate::texenc::Transcoder::new(device));
+            }
             let GxpLive {
                 pipelines,
+                texenc,
                 views: view_cache,
                 views_bytes: view_cache_bytes,
                 views_used,
@@ -3480,6 +3830,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 views_frame_high, views_frame_bytes, samplers_by_mode, *force,
                 rendered, depth_rendered,
                 sampler_bgs, bc,
+                texenc.as_ref().expect("built at the top of this function"),
             )?;
             // group3: the scene depth range the injected clip fixup maps through, as one vec4
             // (min, scale, unused, unused) - the same values the fixed-function path uses, so
@@ -3593,6 +3944,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             sampler_bgs: &mut HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>)>,
             // Which block family this device accepts - resolved once per renderer by the caller.
             bc: BlockFamily,
+            // The GPU transcoder's pipelines, built once per renderer by the caller.
+            texenc: &crate::texenc::Transcoder,
         ) -> Option<wgpu::BindGroup> {
             // What this group will NAME, accumulated as the units resolve, so the finished
             // group can be looked up instead of rebuilt. See `GxpLive::sampler_bgs`.
@@ -3724,7 +4077,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     .collect();
                                 stale.sort_by_key(|(_, used)| *used);
                                 let mut evicted = 0usize;
-                                let mut just_evicted: HashSet<(u64, SamplerDim)> = HashSet::new();
+                                let mut just_evicted: HashSet<(u64, SamplerDim)> = HashSet::default();
                                 for (k, _) in stale {
                                     if *view_cache_bytes < budget {
                                         break;
@@ -3789,7 +4142,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             if views_evicted.remove(&cache_key) {
                                 enc(&ENC.tex_reuploaded_after_evict, 1);
                             }
-                            let tex = upload_gxp_texture(device, queue, &gt.tex, bc);
+                            let tex = upload_gxp_texture(
+                                device,
+                                queue,
+                                &gt.tex,
+                                bc,
+                                texenc,
+                            );
                             let view = tex.create_view(&wgpu::TextureViewDescriptor {
                                 dimension: Some(want.view_dimension()),
                                 ..Default::default()
@@ -3989,7 +4348,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Upload a decoded [`GxmTexture`] to a GPU texture for the recompiler path, in whichever
     /// of the two seams it was decoded onto (see [`TexelSeam`]).
-    fn upload_gxp_texture(device: &wgpu::Device, queue: &wgpu::Queue, t: &GxmTexture, bc: BlockFamily) -> wgpu::Texture {
+    fn upload_gxp_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        t: &GxmTexture,
+        bc: BlockFamily,
+        texenc: &crate::texenc::Transcoder,
+    ) -> wgpu::Texture {
         let (w, h) = (t.width.max(1), t.height.max(1));
         // A cube map uploads as six array layers; the view below then reads them as a cube.
         let layers = t.faces.max(1);
@@ -4001,9 +4366,36 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // and one report: the counters have to say which path a texture took, or a working set
         // that fails to shrink is indistinguishable from a passthrough that never fired.
         if let Some(c) = compressed_upload(bc, t) {
+            // >>> THE BLOCKS THAT DO NOT EXIST YET ARE MADE HERE, ON THE GPU.
+            //
+            // A `CompressedData::Gpu` upload carries the guest's own bytes and a description of
+            // how to read them, and nothing has been decoded or encoded on the CPU at all. The
+            // transcoder runs the decode, the mip chain and the block encode in compute shaders
+            // and copies the result straight into the texture. A refusal here is not a failure:
+            // every shape it declines falls through to the ordinary decode below, which produces
+            // the same picture and only costs more.
+            if let CompressedData::Gpu(plan) = &c.data {
+                if let Some(tex) = texenc.run(device, queue, c, plan, t.gamma) {
+                    enc(&ENC.tex_uploaded, 1);
+                    enc(&ENC.tex_upload_bytes, c.byte_len() as u64);
+                    enc(&ENC.tex_uploaded_compressed, 1);
+                    enc(&ENC.tex_encoded_on_gpu, 1);
+                    return tex;
+                }
+                enc(&ENC.tex_gpu_encode_refused, 1);
+                report_gpu_transcode_refused(t.base_format);
+            } else {
             enc(&ENC.tex_uploaded, 1);
-            enc(&ENC.tex_upload_bytes, c.data.len() as u64);
+            enc(&ENC.tex_upload_bytes, c.byte_len() as u64);
             enc(&ENC.tex_uploaded_compressed, 1);
+            // The compressed data's OWN dimensions, which a tiered transcode makes smaller than
+            // the guest texture's - see `CompressedUpload::width`. Using `w`/`h` here would
+            // declare a 2048x2048 texture over a 64x64 pyramid's bytes, which is a validation
+            // error at best and a read past the buffer at worst.
+            let (w, h) = (c.width.max(1), c.height.max(1));
+            let CompressedData::Cpu(bytes) = &c.data else {
+                unreachable!("the GPU arm returns or falls through above")
+            };
             return device.create_texture_with_data(
                 queue,
                 &wgpu::TextureDescriptor {
@@ -4017,8 +4409,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     view_formats: &[],
                 },
                 wgpu::util::TextureDataOrder::LayerMajor,
-                &c.data,
+                bytes,
             );
+            }
         }
         let bpt = t.texel.bytes_per_texel();
         // Guard against a short pixel buffer (a not-fully-decoded format): pad to the full size.
@@ -4208,7 +4601,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             (t.unit, t.tex.data_addr, t.tex.width, t.tex.height).hash(&mut h);
         }
         let inputs_hash = h.finish();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((key, inputs_hash)) {
             return;
         }
@@ -4646,7 +5039,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_sa_override(key: u64, stage: char, reg: usize, word: u32) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u64, char, usize)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, stage, reg)) {
             // At WARN, not `report!`. This one carries a correctness guarantee - "a run whose
@@ -4844,7 +5237,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 width,
                 height,
                 faces,
-                rgba: std::sync::Arc::new(Vec::new()),
+                rgba: crate::gpu::Texels::ready(Vec::new()),
                 texel,
                 base_format: 0,
                 swizzle: 0,
@@ -4872,7 +5265,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let n = blocks.len();
             t.compressed = Some(CompressedUpload {
                 format: BlockFormat::Bc3,
-                data: std::sync::Arc::new(blocks),
+                width: 256,
+                height: 256,
+                data: crate::gpu::CompressedData::Cpu(std::sync::Arc::new(blocks)),
                 levels: 9,
                 transcoded: false,
             });
@@ -4925,7 +5320,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     #[cfg(test)]
     mod depth_bind_cache_bound_tests {
         use super::{clear_if_at_cap, DEPTH_BG_CACHE_CAP};
-        use std::collections::HashMap;
+        use crate::fasthash::FxHashMap as HashMap;
 
         /// The defect, reproduced as the access PATTERN that caused it: a race moves the depth
         /// range every frame, so every insertion carries a key never seen before and never
@@ -4937,7 +5332,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// the ceiling happens to be.
         #[test]
         fn a_never_repeating_key_cannot_grow_the_cache_without_bound() {
-            let mut map: HashMap<u64, u64> = HashMap::new();
+            let mut map: HashMap<u64, u64> = HashMap::default();
             // Ten times the cap of distinct keys, as a long race would produce.
             for k in 0..(DEPTH_BG_CACHE_CAP as u64 * 10) {
                 if !map.contains_key(&k) {
@@ -4956,7 +5351,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// that throws away a working set. A menu holds one depth range all screen.
         #[test]
         fn a_cache_under_its_cap_is_left_alone() {
-            let mut map: HashMap<u64, u64> = HashMap::new();
+            let mut map: HashMap<u64, u64> = HashMap::default();
             for k in 0..(DEPTH_BG_CACHE_CAP as u64 - 1) {
                 map.insert(k, k);
             }
@@ -5018,7 +5413,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         #[test]
         fn length_reaches_the_whole_hash() {
             let v = vec![0u8; 64];
-            let mut seen = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for n in 0..=64 {
                 assert!(seen.insert(super::fnv64(0, &v[..n])), "zero-fill of length {n} collided");
             }
@@ -5467,7 +5862,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             .max_by_key(|&b| b)?;
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
             report!(
@@ -5540,7 +5935,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         views_used: &HashMap<(u64, SamplerDim), (u64, usize, u32, Residency)>,
         epoch: u64,
     ) -> Vec<String> {
-        let mut by_format: HashMap<(u32, Residency), (usize, usize)> = HashMap::new();
+        let mut by_format: HashMap<(u32, Residency), (usize, usize)> = HashMap::default();
         for (_, (used, b, fmt, resident)) in views_used.iter() {
             if *used == epoch {
                 let e = by_format.entry((*fmt, *resident)).or_insert((0, 0));
@@ -5583,6 +5978,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static WORST: AtomicUsize = AtomicUsize::new(0);
         const STEP_MB: usize = 32;
+        // Publish the frame's working set whether or not it is a new high, so the CPU side can
+        // ask whether compressing anything further is still buying something. See
+        // [`texture_budget_pressure`].
+        crate::gpu::LAST_WORKING_SET.store(bytes, Ordering::Relaxed);
         let mb = bytes / (1024 * 1024);
         let prev = WORST.load(Ordering::Relaxed);
         if mb < prev + if prev == 0 { 1 } else { STEP_MB } {
@@ -5657,7 +6056,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_zero_texel_sample(key: u64, unit: u8) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
             report!(
@@ -5742,7 +6141,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_gamma_mode_changed(addr: u32, gamma: bool) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u32, bool)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((addr, gamma)) {
             report!(
@@ -5763,7 +6162,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_gamma_surface(addr: u32, honoured: bool) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(addr) {
             if honoured {
@@ -5790,7 +6189,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_depth_sample_bound(key: u64, unit: u8, addr: u32) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u64, u8)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((key, unit)) {
             report!(
@@ -5810,7 +6209,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_depth_conversion(addr: u32, mode: u32, konst: f32, depth_min: f32, depth_scale: f32) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((addr, mode)) {
             if mode == 5 {
@@ -5847,7 +6246,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_unconverted_depth_sample(addr: u32) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(addr) {
             report!(
@@ -5863,7 +6262,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_viewport_problem(vp: &[f32; 6], what: &str) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         let vps = format!("{vp:?}");
         if seen.insert((vps.clone(), what.to_string())) {
@@ -5912,7 +6311,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if unfed.is_empty() {
             return;
         }
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((key, stage.to_string())) {
             return;
         }
@@ -5928,7 +6327,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_fallback(key: u64, reason: &str) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         // A poisoned lock must not lose the diagnostic - recover the set and report anyway.
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(key) {
@@ -5973,7 +6372,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn fallback_reasons() -> &'static std::sync::Mutex<HashMap<u64, String>> {
         use std::sync::{Mutex, OnceLock};
         static REASONS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
-        REASONS.get_or_init(|| Mutex::new(HashMap::new()))
+        REASONS.get_or_init(|| Mutex::new(HashMap::default()))
     }
 
     /// The recorded fallback reason for `key`, or a placeholder if the pair fell back before
@@ -6003,7 +6402,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_branches(key: u64, gxp: &GxpRecompile) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if !seen.insert(key) {
             return;
@@ -6151,7 +6550,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_forced_negw(target: u32) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(target) {
             report!(
                 "gxp clip: pass into {target:#010x}: VITASLOP_GXP_NEGW=force - correcting the \
@@ -6172,7 +6571,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_zero_color_mask(key: u64) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         if seen.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
             report!(
                 "gxp pair {key:016x}: the guest's blend info gives this pair a colour write mask \
@@ -6187,7 +6586,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     fn report_unmapped_blend(what: &str) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
         let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert(what.to_string()) {
             report_warn!("gxm blend: {what} has no wgpu equivalent - substituting ONE, which is an approximation");
@@ -7019,9 +7418,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 sampler_point,
                 sampler_linear,
                 white_bind,
-                views: HashMap::new(),
+                views: HashMap::default(),
                 views_bytes: 0,
-                tex_binds: HashMap::new(),
+                tex_binds: HashMap::default(),
                 vbo: None,
                 ibo: None,
                 ubo: None,
@@ -7040,16 +7439,16 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 resolve_layout,
                 resolve_scale_buf,
                 ss_target: None,
-                rtt: HashMap::new(),
-                rtt_rendered: HashMap::new(),
-                rtt_binds: HashMap::new(),
-                rtt_reads_snapshot: HashSet::new(),
-                rtt_depth_rendered: HashMap::new(),
+                rtt: HashMap::default(),
+                rtt_rendered: HashMap::default(),
+                rtt_binds: HashMap::default(),
+                rtt_reads_snapshot: HashSet::default(),
+                rtt_depth_rendered: HashMap::default(),
                 retired_buffers: Vec::new(),
                 keep_depth: false,
                 rtt_hits: 0,
                 last_chain_shape: None,
-                sampled_addrs: HashSet::new(),
+                sampled_addrs: HashSet::default(),
                 gxp: GxpLive::from_env(),
             }
         }
@@ -8184,7 +8583,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // supposed to put the world on screen" rather than "did this one bind right".
             let trace_all = std::env::var("VITASLOP_CHAIN_DRAWS").map(|v| v == "all").unwrap_or(false);
             // Fallback draws of THIS pass, by reason - see `fallback_reasons`.
-            let mut fb_reasons: HashMap<String, usize> = HashMap::new();
+            let mut fb_reasons: HashMap<String, usize> = HashMap::default();
             for (di, d) in scene.draws.iter().enumerate() {
                 if trace_draws {
                     // The sampled texture's own dimensions matter as much as its address: a

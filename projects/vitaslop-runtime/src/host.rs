@@ -1,10 +1,12 @@
-//! The host-call boundary: how a guest NID import trap becomes a typed Rust
+﻿//! The host-call boundary: how a guest NID import trap becomes a typed Rust
 //! handler. `GuestCtx` marshals AAPCS arguments (r0..r3 then stack) and guest
 //! memory in and out; `VitaEnv` owns the per-run state (allocator, handles,
 //! capture, world) and routes a dense import index to a per-module handler.
 //! See `projects/vitaslop-runtime/README.md`.
 
-use std::collections::HashMap;
+// The per-draw maps below are hashed with FxHash rather than SipHash. See `crate::fasthash` for
+// why, and for what that trade actually is.
+use crate::fasthash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use vitaslop_transpiler::abi::{REG_COUNT, SP};
@@ -1829,24 +1831,53 @@ struct PrecomputedDraw {
 /// path approximates, which is why there is no knob here.
 #[derive(Default)]
 struct TextureSnapshots {
-    entries: HashMap<(u32, usize), Arc<[u8]>>,
+    entries: FxHashMap<(u32, usize), Arc<[u8]>>,
     /// The guest-store epoch each entry's bytes were established at, on an engine that
     /// stamps stores. Absent for an entry means "no proof available" and costs a
     /// compare, which is why a wrapped epoch can simply drop the whole map.
-    stamps: HashMap<(u32, usize), u8>,
+    stamps: FxHashMap<(u32, usize), u8>,
     /// Total bytes held, so the cache cannot grow without bound across a long run.
     bytes: usize,
     /// Entries already checked this scene, so a texture bound by fifty draws is
     /// compared once, not fifty times. The cache's claim is "these bytes are
     /// unchanged since the last frame", and once per scene is what tests it.
-    checked_this_scene: std::collections::HashSet<(u32, usize)>,
+    checked_this_scene: FxHashSet<(u32, usize)>,
+    /// The guest-store epoch every snapshot taken in the CURRENT scene is stamped with, or 0
+    /// before this scene has taken one. See [`Self::restamp`] for why a scene shares one.
+    scene_stamp: u8,
+    /// VERTEX buffer snapshots, by `(guest address, byte length)`.
+    ///
+    /// # Why vertices live in the texture cache, and why they are checked DIFFERENTLY
+    /// They are here because they share the one thing that makes either work: the guest-store
+    /// epoch, which is global guest state. Two caches arming their own scene stamps would spend
+    /// the one-byte epoch twice as fast, which is the exact failure this whole mechanism just
+    /// came back from.
+    ///
+    /// They are checked differently because the risk is not the same. A texture bound by fifty
+    /// draws is compared once a scene, on the argument that a title does not rewrite a texture
+    /// while drawing with it. That argument does NOT hold for geometry: writing vertices and
+    /// drawing them, repeatedly, within one scene is exactly how dynamic geometry works - UI
+    /// text, particles, anything skinned on the CPU. So a vertex read never takes the
+    /// once-a-scene shortcut and always asks the dirty map, which is one page-range read against
+    /// re-copying the whole buffer.
+    ///
+    /// The payoff is that STATIC geometry - a track, a ship hull, written once at load - has a
+    /// page stamp far below the current epoch and is proved unchanged without being read at all.
+    /// MEASURED on the device before this existed: `draw: read+interleave vertices` moved
+    /// **6.06 MB every frame**, as a fresh allocation and a full copy per draw, 953 draws a
+    /// frame, each one a boundary crossing in the browser.
+    vertex_entries: FxHashMap<(u32, usize), Arc<[u8]>>,
+    /// Epoch each vertex snapshot's bytes were established at. Same contract as `stamps`.
+    vertex_stamps: FxHashMap<(u32, usize), u8>,
+    /// Bytes held by `vertex_entries`, against [`vertex_snapshot_budget`].
+    vertex_bytes: usize,
     /// Entries already checked this FRAME. See [`Self::get_or_read`]: a texture that has
     /// never been observed to change is compared once per frame rather than once per
     /// scene, which is where nearly all of the compare bandwidth went.
-    checked_this_frame: std::collections::HashSet<(u32, usize)>,
+    checked_this_frame: FxHashSet<(u32, usize)>,
     /// Entries whose bytes HAVE been seen to change at least once. These keep the
     /// per-scene cadence, because they are the ones the cadence exists for.
-    mutable: std::collections::HashSet<(u32, usize)>,
+    mutable: FxHashSet<(u32, usize)>,
     /// Mean colour of a snapshot, keyed by the identity of the byte buffer itself and
     /// holding a strong reference to it.
     ///
@@ -1857,8 +1888,110 @@ struct TextureSnapshots {
     /// what actually determines the answer: a re-read allocates a new buffer, so a
     /// changed texture cannot hit a stale mean. The strong reference is what makes the
     /// address a valid key - without it a freed buffer's address could be reused.
-    means: HashMap<usize, ([f32; 3], Arc<[u8]>)>,
+    means: FxHashMap<usize, ([f32; 3], Arc<[u8]>)>,
+    /// INDEX buffer snapshots, already scanned and REBASED, by `(guest address, byte length,
+    /// element size)`.
+    ///
+    /// # Why the derived value and not the bytes
+    /// Every draw read its index buffer out of guest memory, folded the whole thing for its
+    /// min/max, rewrote every element to rebase it onto the vertex window, and then converted the
+    /// `Vec` into an `Arc` - a second allocation and a second full copy. Four passes over the
+    /// indices per draw, ~650 draws a frame, and in the browser the read is also a crossing into
+    /// JS. MEASURED on the browser-like configuration of `bench --at 7400`: `draw: read indices`
+    /// 1.4% and `draw: scan/rebase indices` 2.3% of the window, on top of the allocation churn
+    /// neither of those timers can see.
+    ///
+    /// All three outputs are a pure function of the source bytes, so the cache holds the ANSWER
+    /// rather than the input: a hit costs one dirty-map query and an `Arc` clone, and does none
+    /// of the four passes.
+    ///
+    /// Checked like VERTICES, not like textures - it always asks the dirty map and never takes
+    /// the once-a-scene shortcut. Geometry written and drawn within one scene is exactly how
+    /// dynamic meshes work, and an index buffer is geometry.
+    index_entries: FxHashMap<(u32, usize, usize), (Arc<[u8]>, u32, u32)>,
+    /// Epoch each index snapshot was established at. Same contract as `stamps`.
+    index_stamps: FxHashMap<(u32, usize, usize), u8>,
+    /// Bytes held by `index_entries`, against [`vertex_snapshot_budget`] - the same budget,
+    /// because they are the same kind of thing and a level's geometry turns over together.
+    index_bytes: usize,
+    /// Everything [`decode_texture`] derives from a binding's four CONTROL WORDS, memoised by
+    /// those words. `None` is a binding the decode drops (an unsizeable format), which is worth
+    /// remembering for exactly the same reason.
+    ///
+    /// # Why this is the largest capture phase left, and why a memo is the answer
+    /// `draw: snapshot textures` MEASURED at **11.7% of a browser-like race window, moving
+    /// 0.0 MB** - so it is not volume, it is per-draw arithmetic repeated on bindings that do
+    /// not change. Every draw re-derived, per bound unit: the recorded format (a hash lookup),
+    /// the nearby-handle diagnostic (another), the base format and swizzle, the size fields, the
+    /// block geometry, the mip-level clamp and the whole chain's byte extent
+    /// ([`crate::render::level_offset`] walks every level). A race frame does that ~2,000 times
+    /// for a handful of distinct textures.
+    ///
+    /// All of it is a pure function of the control words, which is exactly what a GXM binding
+    /// IS: the words are copied BY VALUE at bind time ([[vitaslop-texture-binding-by-value]]),
+    /// so two bindings with the same words describe the same texture. What is NOT cached is the
+    /// PIXELS - those still go through [`Self::get_or_read`] every time, so a texture the guest
+    /// rewrites is still seen to change. The memo covers the description; the snapshot covers
+    /// the contents.
+    ///
+    /// Cleared when a recorded format changes (see `set_texture_format`), because that is the
+    /// one input that is not in the key.
+    templates: FxHashMap<[u32; 4], Option<TextureTemplate>>,
+    /// A whole DRAW's worth of snapshotted textures, by the bindings that produced it, FOR THIS
+    /// SCENE.
+    ///
+    /// # Why a per-scene cache of the whole answer is exactly equivalent
+    /// [`Self::get_or_read`] compares a texture at most once per scene: the first draw of the
+    /// scene that binds it establishes the buffer, and every later draw in that scene gets the
+    /// SAME `Arc` back by construction ("the guest cannot have run since - a host call is not
+    /// preemptible"). So for a fixed set of bindings, every draw of a scene was already
+    /// guaranteed to produce a bitwise identical list; this just stops rebuilding it.
+    ///
+    /// A race frame binds a handful of distinct texture sets across ~650 draws, so the hit rate
+    /// is essentially the draw count. What a hit avoids is the whole of `decode_texture` per
+    /// unit - the template probe, the recorded-format probe, the snapshot probe and the
+    /// `Vec<BoundTexture>` the draw would otherwise allocate and fill.
+    ///
+    /// The key folds the fragment program header as well as the bindings, because the ALBEDO
+    /// REORDER below is a function of the program's reflection - two draws binding the same
+    /// textures through different fragment programs want them in different orders, and a shared
+    /// entry would hand the second one the first one's albedo.
+    snapshot_sets: FxHashMap<u64, Arc<[crate::capture::BoundTexture]>>,
 }
+
+/// What a binding's control words say, once, so no draw has to work it out again. See
+/// [`TextureSnapshots::templates`].
+#[derive(Clone, Copy)]
+struct TextureTemplate {
+    base_format: u32,
+    swizzle: u32,
+    tex_type: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    faces: u32,
+    /// Bytes one face occupies including `levels` mip levels, and the whole snapshot's length.
+    face_bytes: u32,
+    read_len: u32,
+    levels: u32,
+    /// The same two if the chain read comes up short and the texture falls back to level 0 -
+    /// precomputed here so the fallback costs no arithmetic either.
+    level0_bytes: u32,
+    level0_read_len: u32,
+    data_addr: u32,
+    u_addr_mode: u32,
+    v_addr_mode: u32,
+    lod_bias: u32,
+    min_filter: u32,
+    mag_filter: u32,
+    gamma: u32,
+    mip_filter: u32,
+}
+
+/// Distinct control-word sets the template memo will hold. A title binds a few hundred distinct
+/// textures; this is a bound on a pathological case, not a working limit. Cleared whole when hit,
+/// which costs re-derivation and never correctness - the key IS the input.
+const TEXTURE_TEMPLATE_CAP: usize = 4096;
 
 /// Is the snapshot check allowed to run once per FRAME instead of once per SCENE? The one
 /// inexact cadence, and the only one that has to be asked for - see [`texture_check`].
@@ -1924,6 +2057,21 @@ fn report_texture_check_per_frame() {
     });
 }
 
+/// Byte budget for retained VERTEX snapshots, separate from the texture one so a level's
+/// geometry and its textures cannot evict each other.
+///
+/// A race frame of this project's heaviest title reads about 6 MB of vertices, and a level's
+/// whole static geometry is a small multiple of that, so 64 MB holds it comfortably while staying
+/// a bound rather than a licence to grow with the run.
+///
+/// Deliberately a CONSTANT and not a knob. A knob here would be a way of not deciding, and the
+/// engine that pays for this runs whatever is defaulted ([[vitaslop-pick-the-default-dont-add-a-knob]]).
+/// If it ever needs changing, the number to change it against is the `draw: read+interleave
+/// vertices` figure in the device panel's bytes line.
+const fn vertex_snapshot_budget() -> usize {
+    64 << 20
+}
+
 /// Byte budget for retained texture snapshots. Past it the cache is cleared whole
 /// (and says so): a level's working set is what it holds, and a title that exceeds
 /// this is telling us something worth seeing rather than something to silently trim.
@@ -1966,6 +2114,9 @@ impl TextureSnapshots {
     /// The current bytes of the texture of `len` bytes at guest address `addr`,
     /// reusing the retained snapshot when guest memory still holds the same bytes.
     fn get_or_read(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
+        // One epoch per scene, taken at the scene's first snapshot - see `restamp` for why this
+        // is not per texture, and what it cost when it was.
+        self.arm_scene_stamp(ctx);
         // The retained buffer, kept past the borrow below so the re-read at the bottom can
         // hand back the SAME `Arc` when the bytes turn out to be identical - see there.
         let mut retained: Option<Arc<[u8]>> = None;
@@ -2043,7 +2194,7 @@ impl TextureSnapshots {
                     // so stamp them: without this the shortcut above could never take
                     // hold for a texture whose stamp was dropped (a wrapped epoch, a
                     // cleared cache), and it would pay the full compare for ever.
-                    self.restamp(ctx, addr, len);
+                    self.restamp(addr, len);
                     return current;
                 }
                 // Seen to change ONCE is enough to keep it on the per-scene cadence for
@@ -2066,31 +2217,238 @@ impl TextureSnapshots {
         // scene. Same answer, same bytes, one buffer.
         if let Some(p) = retained {
             if raw[..] == p[..] {
-                self.restamp(ctx, addr, len);
+                self.restamp(addr, len);
                 return p;
             }
         }
         let bytes: Arc<[u8]> = raw.into();
         crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
         self.insert(addr, len, bytes.clone());
-        self.restamp(ctx, addr, len);
+        self.restamp(addr, len);
         bytes
     }
 
-    /// Record that this entry's bytes are current AS OF NOW, so a later
-    /// [`GuestMemory::dirty_since`] can prove nothing has touched them. A no-op on an
-    /// engine that stamps no stores.
+    /// Record that this entry's bytes are current as of THIS SCENE, so a later
+    /// [`GuestMemory::dirty_since`] can prove nothing has touched them.
     ///
-    /// The epoch is advanced first, so no store already carries the stamp we record: a
-    /// store made after this call is at or after it, and one made before is below it.
-    /// A WRAPPED epoch has zeroed the map, which makes every stamp taken before it a
-    /// lie - so they are all dropped, and each entry pays one compare to earn a new one.
-    fn restamp(&mut self, ctx: &GuestCtx, addr: u32, len: usize) {
+    /// # >>> THE EPOCH IS ONE BYTE, AND ADVANCING IT PER SNAPSHOT SPENT IT IN HALF A FRAME
+    /// This used to call [`GuestCtx::bump_dirty_epoch`] itself, once per re-stamped texture.
+    /// The epoch is a single byte, compared with `>=`, so it may not wrap silently - on wrap the
+    /// whole dirty map is zeroed and every stamp taken before it is dropped as a lie.
+    ///
+    /// MEASURED on a live race with `bench --at 7400`: hundreds of re-stamps a frame against
+    /// **254** usable epoch values. The map was therefore wiped repeatedly and almost no stamp
+    /// survived long enough to prove anything, so the shortcut this mechanism exists for barely
+    /// fired and nearly every texture fell through to the full memcmp. Half the guest CPU was
+    /// spent proving, the hard way, something the stamps already knew.
+    ///
+    /// **The A/B, same build, same window, dirty map ON in both arms** - which is the BROWSER's
+    /// configuration, and the browser is the only engine that runs with it (native leaves the
+    /// map off because wasmtime bills the marks and they would speed the guest clock up):
+    ///
+    /// | arm | `texture snapshot compare` | bytes/frame | frame |
+    /// |---|---|---|---|
+    /// | epoch per snapshot | 35.9% of the window | 76.2 MB | ~22.2 ms (45 fps) |
+    /// | one epoch per scene | **2.8%** | **2.9 MB** | **10.9 ms (92 fps)** |
+    ///
+    /// A 26x cut in bytes moved and 2.05x on guest CPU, from advancing a counter less often.
+    ///
+    /// The epoch does not need to advance per texture. It needs to advance whenever the GUEST
+    /// may have run since the last batch of stamps, and within a scene every snapshot is taken
+    /// from host calls that cannot be preempted. So it advances ONCE per scene ([`Self::
+    /// scene_stamp`]), which is eleven times a frame on this title instead of five hundred, and
+    /// the byte now lasts about twenty-three frames rather than half of one.
+    ///
+    /// A store made during this scene writes the current epoch, which EQUALS the stamp recorded
+    /// here, and `>=` reports it dirty - so sharing one stamp across a scene stays exact in the
+    /// direction that matters. It is conservative only for a page written earlier in the same
+    /// scene, which costs one compare and then re-stamps clean.
+    fn restamp(&mut self, addr: u32, len: usize) {
+        if self.scene_stamp != 0 {
+            self.stamps.insert((addr, len), self.scene_stamp);
+        }
+    }
+
+    /// The current bytes of the VERTEX buffer of `len` bytes at guest address `addr`, reusing
+    /// the retained snapshot when the guest provably has not stored there since.
+    ///
+    /// # This is the texture shortcut, aimed at the next biggest thing the capture moves
+    /// Every draw used to `read_bytes` its whole vertex range - one allocation and one full copy
+    /// out of guest memory - and then convert that `Vec` into an `Arc`, which is a SECOND
+    /// allocation and copy. Twice the buffer, twice, per draw. In the browser each read is also a
+    /// crossing into JS.
+    ///
+    /// The dirty map answers "has the guest written here since I read it?" for the cost of one
+    /// page-range read, and static geometry answers no for the whole run. When it answers yes the
+    /// bytes are re-read, which is exactly the old behaviour, so dynamic geometry is unaffected.
+    ///
+    /// Returning the SAME `Arc` matters beyond the copy: the renderer's packed-vertex cache keys
+    /// on this buffer's identity, so an equal-but-different buffer misses it
+    /// ([[vitaslop-content-hash-cache-must-verify]]).
+    fn get_or_read_vertices(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
+        if len == 0 {
+            return Arc::from(&[][..]);
+        }
+        self.arm_scene_stamp(ctx);
+        // NO once-a-scene shortcut here - see `vertex_entries` for why geometry cannot take one.
+        if let Some(p) = self.vertex_entries.get(&(addr, len)) {
+            let clean = match self.vertex_stamps.get(&(addr, len)) {
+                Some(&s) => ctx.dirty_since(addr, len, s) == Some(false),
+                None => false,
+            };
+            if clean {
+                return p.clone();
+            }
+        }
+        let raw = ctx.read_bytes(addr, len);
+        crate::perf::note_bytes(crate::perf::Phase::DrawVertices, raw.len());
+        // Same bytes as last time? Hand back the SAME buffer. The guest may have rewritten the
+        // page with identical contents (a rebuilt-every-frame buffer whose contents are static
+        // is common), and a fresh `Arc` there would miss every downstream cache keyed on
+        // identity while being byte-for-byte the thing they already hold.
+        if let Some(p) = self.vertex_entries.get(&(addr, len)) {
+            if raw[..] == p[..] {
+                let same = p.clone();
+                self.stamp_vertices(addr, len);
+                return same;
+            }
+        }
+        let bytes: Arc<[u8]> = raw.into();
+        // A budget, cleared whole when exceeded. The keys are (address, length) rather than
+        // content, so a clear costs re-reads and never correctness - and geometry turns over
+        // with the level, so a level change should not leave the previous one's meshes resident.
+        if self.vertex_bytes + bytes.len() > vertex_snapshot_budget() {
+            self.vertex_entries.clear();
+            self.vertex_stamps.clear();
+            self.vertex_bytes = 0;
+        }
+        if let Some(old) = self.vertex_entries.insert((addr, len), bytes.clone()) {
+            self.vertex_bytes -= old.len();
+        }
+        self.vertex_bytes += bytes.len();
+        self.stamp_vertices(addr, len);
+        bytes
+    }
+
+    /// The draw's index buffer, ALREADY scanned and rebased: `(indices, first_vertex,
+    /// vertex_count)`.
+    ///
+    /// # What is cached is the answer, not the input
+    /// A draw's index work is four passes: read the bytes out of guest memory, fold them for
+    /// their min and max, rewrite every element to rebase it onto the `min..=max` vertex window,
+    /// and convert the `Vec` into an `Arc` (a second allocation and a second full copy). All
+    /// three outputs are a pure function of the source bytes, so a buffer the guest provably has
+    /// not written since is worth exactly one dirty-map query and an `Arc` clone.
+    ///
+    /// Static geometry - a track, a hull, a UI mesh built once at load - answers "unchanged" for
+    /// the whole run, which is the case this exists for. Dynamic geometry re-reads, which is
+    /// precisely the old behaviour.
+    ///
+    /// # The window is part of the value, and it must be
+    /// `first_vertex`/`vertex_count` are derived from the SAME bytes as the rebased buffer and
+    /// are what the vertex read is sized from. Caching the buffer without them would hand a draw
+    /// rebased indices alongside a freshly-computed window, and if those ever disagreed the mesh
+    /// would index off the end of its own vertices - a prefix of the geometry, silently.
+    fn get_or_read_indices(
+        &mut self,
+        ctx: &GuestCtx,
+        addr: u32,
+        len: usize,
+        elem: usize,
+    ) -> (Arc<[u8]>, u32, u32) {
+        if len == 0 {
+            return (Arc::from(&[][..]), 0, 0);
+        }
+        self.arm_scene_stamp(ctx);
+        let key = (addr, len, elem);
+        // NO once-a-scene shortcut, for the reason `vertex_entries` gives: an index buffer is
+        // geometry, and write-then-draw inside one scene is how dynamic meshes work.
+        if let Some(v) = self.index_entries.get(&key) {
+            let clean = match self.index_stamps.get(&key) {
+                Some(&s) => ctx.dirty_since(addr, len, s) == Some(false),
+                None => false,
+            };
+            if clean {
+                return v.clone();
+            }
+        }
+        let mut raw = crate::perf::time(crate::perf::Phase::DrawIndices, || {
+            ctx.read_bytes(addr, len)
+        });
+        crate::perf::note_bytes(crate::perf::Phase::DrawIndices, raw.len());
+        let index_of = |c: &[u8]| match elem {
+            2 => u16::from_le_bytes([c[0], c[1]]) as u32,
+            _ => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+        };
+        let (first_vertex, vertex_count) =
+            crate::perf::time(crate::perf::Phase::DrawIndexScan, || {
+                let (min_index, max_index) =
+                    raw.chunks(elem).fold((u32::MAX, 0u32), |(lo, hi), c| {
+                        let i = index_of(c);
+                        (lo.min(i), hi.max(i))
+                    });
+                let (first_vertex, vertex_count) = if min_index > max_index {
+                    (0, 0) // no indices at all
+                } else {
+                    (min_index, max_index - min_index + 1)
+                };
+                if first_vertex > 0 {
+                    for c in raw.chunks_mut(elem) {
+                        let rebased = index_of(c) - first_vertex;
+                        match elem {
+                            2 => c[..2].copy_from_slice(&(rebased as u16).to_le_bytes()),
+                            _ => c[..4].copy_from_slice(&rebased.to_le_bytes()),
+                        }
+                    }
+                }
+                (first_vertex, vertex_count)
+            });
+        let value = (Arc::<[u8]>::from(raw), first_vertex, vertex_count);
+        // The same budget the vertex snapshots use, and cleared the same way: the keys are
+        // (address, length, element size) rather than content, so a clear costs re-reads and can
+        // never cost correctness.
+        if self.index_bytes + value.0.len() > vertex_snapshot_budget() {
+            self.index_entries.clear();
+            self.index_stamps.clear();
+            self.index_bytes = 0;
+        }
+        if let Some((old, ..)) = self.index_entries.insert(key, value.clone()) {
+            self.index_bytes -= old.len();
+        }
+        self.index_bytes += value.0.len();
+        if self.scene_stamp != 0 {
+            self.index_stamps.insert(key, self.scene_stamp);
+        }
+        value
+    }
+
+    /// Record that a vertex snapshot's bytes are current as of this scene. See [`Self::restamp`].
+    fn stamp_vertices(&mut self, addr: u32, len: usize) {
+        if self.scene_stamp != 0 {
+            self.vertex_stamps.insert((addr, len), self.scene_stamp);
+        }
+    }
+
+    /// Advance the guest-store epoch for a new scene, at the FIRST snapshot the scene takes.
+    ///
+    /// Done lazily here rather than in [`Self::begin_scene`] because that has no [`GuestCtx`] to
+    /// reach the map through, and because a scene that snapshots nothing should not spend an
+    /// epoch value at all - a title with many texture-free passes would otherwise burn the byte
+    /// on scenes that never ask a question of it.
+    fn arm_scene_stamp(&mut self, ctx: &GuestCtx) {
+        if self.scene_stamp != 0 {
+            return;
+        }
         let Some((stamp, wrapped)) = ctx.bump_dirty_epoch() else { return };
+        // A wrapped epoch zeroed the map, so every stamp taken before it describes a page whose
+        // record is gone. They are dropped, and each entry pays one compare to earn a new one.
+        // BOTH sets of stamps, because both rest on the same map.
         if wrapped {
             self.stamps.clear();
+            self.vertex_stamps.clear();
+            self.index_stamps.clear();
         }
-        self.stamps.insert((addr, len), stamp);
+        self.scene_stamp = stamp;
     }
 
     fn insert(&mut self, addr: u32, len: usize, bytes: Arc<[u8]>) {
@@ -2115,6 +2473,9 @@ impl TextureSnapshots {
             self.checked_this_frame.clear();
             self.stamps.clear();
             self.bytes = 0;
+            // NOT `scene_stamp`: the epoch describes guest memory, not this cache, and the
+            // scene is still the same one. Clearing it here would take a second epoch value for
+            // one scene, which is exactly the spending this rewrite exists to stop.
         }
         if let Some(old) = self.entries.insert((addr, len), bytes.clone()) {
             self.bytes -= old.len();
@@ -2122,9 +2483,18 @@ impl TextureSnapshots {
         self.bytes += bytes.len();
     }
 
-    /// Start a new scene: every retained entry becomes due for one comparison again.
+    /// Start a new scene: every retained entry becomes due for one comparison again, and the
+    /// next snapshot takes a fresh guest-store epoch.
     fn begin_scene(&mut self) {
         self.checked_this_scene.clear();
+        // Cleared with the cadence set it depends on - see `snapshot_sets`. It holds `Arc`s to
+        // pixel buffers that this scene has not yet re-established as current, so it cannot
+        // outlive the scene that took them.
+        self.snapshot_sets.clear();
+        // Zero means "this scene has not taken one yet" - `arm_scene_stamp` fills it in on the
+        // first snapshot. It is not a valid stamp: the epoch counter restarts at 1 after a wrap
+        // and never returns to 0, so a stale 0 can never be mistaken for a real one.
+        self.scene_stamp = 0;
     }
 
     /// Start a new FRAME: even a texture never seen to change is due for one comparison.
@@ -2154,6 +2524,10 @@ impl TextureSnapshots {
     /// released. Not needed for correctness (the comparison covers content changes),
     /// but a snapshot of freed memory is dead weight the cache should not hold.
     fn invalidate_range(&mut self, addr: u32, len: usize) {
+        // The per-scene lists hold `Arc`s to snapshots this is about to drop. Keeping them would
+        // hand a later draw of the same scene a texture whose memory the guest has released,
+        // which is the one thing this function exists to stop.
+        self.snapshot_sets.clear();
         let end = addr as u64 + len as u64;
         let mut freed = 0usize;
         self.entries.retain(|&(a, l), bytes| {
@@ -2173,6 +2547,353 @@ impl TextureSnapshots {
         self.checked_this_scene.retain(|k| !overlapping(k));
         self.checked_this_frame.retain(|k| !overlapping(k));
         self.bytes -= freed;
+
+        // The same for VERTEX snapshots. Correctness does not rest on this either - freed memory
+        // that comes back as a new mesh is WRITTEN by the guest, which stamps its pages, so the
+        // dirty map reports it changed - but a vertex snapshot has no byte comparison behind it,
+        // only the stamps, so leaving a freed range cached is a claim resting on one mechanism
+        // where the texture path has two. Dropping it costs a re-read and removes the question.
+        let mut vfreed = 0usize;
+        self.vertex_entries.retain(|k, bytes| {
+            if overlapping(k) {
+                vfreed += bytes.len();
+                return false;
+            }
+            true
+        });
+        self.vertex_stamps.retain(|k, _| !overlapping(k));
+        self.vertex_bytes -= vfreed;
+    }
+}
+
+/// The guest-store stamp mechanism, exercised against a memory that implements the dirty map
+/// the way both real engines do.
+///
+/// # Why this is worth its length
+/// The stamps are the difference between proving a texture unchanged for the cost of one byte
+/// per 4 KB page and proving it by comparing every byte of it twice. MEASURED on a live race:
+/// the compare is **44% of the whole frame and 105.8 MB moved per frame**. And the mechanism
+/// fails SILENTLY - when the stamps stop working the picture is still perfectly correct, just
+/// half the speed, so nothing in a capture points at it. It was in fact broken for its entire
+/// life on the only engine that runs it, and the symptom was "the phone is slow".
+///
+/// The native engine does not stamp by default (wasmtime bills every operator, so the marks
+/// would speed the guest clock up), which is exactly why these are unit tests over a fake
+/// backing rather than something the desktop's own runs would have caught.
+#[cfg(test)]
+mod texture_snapshot_stamp_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    const PAGE: usize = 1 << 12;
+
+    /// Shared counters, readable while `GuestCtx` holds the memory mutably borrowed.
+    #[derive(Clone, Default)]
+    struct Counters {
+        /// Times the epoch was advanced. The number this whole exercise is about.
+        bumps: Rc<Cell<u32>>,
+        /// Times the snapshot cache borrowed bytes to COMPARE them.
+        borrows: Rc<Cell<u32>>,
+        /// Times the epoch ran out and the map had to be wiped.
+        wraps: Rc<Cell<u32>>,
+    }
+
+    /// Guest memory with a working dirty map: one byte per page holding the epoch of the last
+    /// store into it, and a one-byte epoch - the same shape, and the same `>=` comparison, as
+    /// `vitaslop-native`'s `SharedView` and the browser's.
+    struct StampedMemory {
+        bytes: Vec<u8>,
+        map: Vec<Cell<u8>>,
+        epoch: Cell<u8>,
+        c: Counters,
+    }
+
+    impl StampedMemory {
+        fn new(len: usize, c: Counters) -> Self {
+            StampedMemory {
+                bytes: vec![0u8; len],
+                map: (0..len.div_ceil(PAGE) + 1).map(|_| Cell::new(0)).collect(),
+                epoch: Cell::new(1),
+                c,
+            }
+        }
+
+        /// A GUEST store: change the bytes and stamp the page, exactly as emitted code does.
+        fn guest_store(&mut self, off: usize, value: u8) {
+            self.bytes[off] = value;
+            self.map[off >> 12].set(self.epoch.get());
+        }
+    }
+
+    impl GuestMemory for StampedMemory {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn read(&self, off: usize, buf: &mut [u8]) {
+            buf.copy_from_slice(&self.bytes[off..off + buf.len()]);
+        }
+        fn write(&mut self, off: usize, bytes: &[u8]) {
+            self.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+        }
+        fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+            self.c.borrows.set(self.c.borrows.get() + 1);
+            self.bytes.get(off..off.checked_add(len)?)
+        }
+        fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+            if len == 0 {
+                return Some(false);
+            }
+            // One page below too - see `GuestMemory::dirty_since`'s overhang note.
+            let first = (off >> 12).saturating_sub(1);
+            let last = ((off + len - 1) >> 12).min(self.map.len() - 1).max(first);
+            Some(self.map[first..=last].iter().any(|s| s.get() >= stamp))
+        }
+        fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+            self.c.bumps.set(self.c.bumps.get() + 1);
+            let next = self.epoch.get().wrapping_add(1);
+            if next == 0 || next == u8::MAX {
+                self.c.wraps.set(self.c.wraps.get() + 1);
+                for s in &self.map {
+                    s.set(0);
+                }
+                self.epoch.set(1);
+                return Some((1, true));
+            }
+            self.epoch.set(next);
+            Some((next, false))
+        }
+    }
+
+    fn ctx_over<'a>(
+        regs: &'a mut [u32; REG_COUNT],
+        vfp: &'a mut [u32; VFP_ARG_COUNT],
+        mem: &'a mut StampedMemory,
+    ) -> GuestCtx<'a> {
+        GuestCtx::new(regs, vfp, mem, 0)
+    }
+
+    /// >>> THE REGRESSION THIS EXISTS FOR: one epoch per SCENE, not one per snapshot.
+    ///
+    /// The epoch is a single byte compared with `>=`, so it cannot wrap silently - a wrap zeroes
+    /// the whole map and invalidates every stamp taken before it. Advancing it once per
+    /// re-stamped texture spent all 254 usable values in HALF A FRAME of a real race (572
+    /// re-stamps a frame), so no stamp ever survived to prove anything and every texture fell
+    /// through to the full byte compare. The mechanism was, in effect, off.
+    #[test]
+    fn the_epoch_advances_once_per_scene_not_once_per_snapshot() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(400 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+
+        // 300 distinct textures a scene, over 4 scenes. Under the old rule that is 1,200
+        // epoch values against the 254 that exist, so the map would be wiped four times over.
+        for _scene in 0..4 {
+            snaps.begin_scene();
+            for t in 0..300u32 {
+                snaps.get_or_read(&ctx, t * PAGE as u32, 64);
+            }
+        }
+        assert_eq!(c.bumps.get(), 4, "one epoch per scene, four scenes");
+        assert_eq!(c.wraps.get(), 0, "254 values must comfortably outlast four scenes");
+    }
+
+    /// An unchanged texture must be proved unchanged WITHOUT its bytes being compared, and the
+    /// caller must get back the very same buffer.
+    ///
+    /// Buffer IDENTITY is not incidental: the renderer's decode and upload caches are keyed on
+    /// it, so handing back an equal-but-different `Arc` re-decodes and re-uploads a texture that
+    /// did not change.
+    #[test]
+    fn an_untouched_texture_is_proved_clean_without_a_compare() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+
+        snaps.begin_scene();
+        let first = snaps.get_or_read(&ctx, 8 * PAGE as u32, 2048);
+        let after_read = c.borrows.get();
+
+        // Three more scenes with no guest store at all.
+        for _ in 0..3 {
+            snaps.begin_scene();
+            let again = snaps.get_or_read(&ctx, 8 * PAGE as u32, 2048);
+            assert!(Arc::ptr_eq(&first, &again), "an unchanged texture must be the SAME buffer");
+        }
+        assert_eq!(
+            c.borrows.get(),
+            after_read,
+            "the stamps must prove it clean - borrowing the bytes again IS the compare"
+        );
+    }
+
+    /// And the shortcut must never hide a real change: a guest store into the texture's page
+    /// has to produce fresh bytes on the next scene.
+    ///
+    /// This is the half that makes the test above meaningful. An implementation that always
+    /// answered "clean" would pass the first test perfectly and serve stale pixels forever.
+    #[test]
+    fn a_guest_store_is_never_missed() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+
+        let addr = 8 * PAGE as u32;
+        let first = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.begin_scene();
+            snaps.get_or_read(&ctx, addr, 2048)
+        };
+        assert_eq!(first[7], 0);
+
+        // The guest writes one byte of it, stamping its page with the current epoch.
+        mem.guest_store(8 * PAGE + 7, 0xAB);
+
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+        snaps.begin_scene();
+        let again = snaps.get_or_read(&ctx, addr, 2048);
+        assert!(!Arc::ptr_eq(&first, &again), "a written texture must be re-read");
+        assert_eq!(again[7], 0xAB, "and it must carry the new byte");
+
+        // Having been re-read, it must go back to being provably clean rather than paying the
+        // compare for ever after.
+        let settled = c.borrows.get();
+        for _ in 0..3 {
+            snaps.begin_scene();
+            let stable = snaps.get_or_read(&ctx, addr, 2048);
+            assert!(Arc::ptr_eq(&again, &stable));
+        }
+        assert_eq!(c.borrows.get(), settled, "it must re-stamp clean after the re-read");
+    }
+
+    /// Static geometry must be read ONCE and then proved unchanged, handing back the same buffer.
+    #[test]
+    fn static_vertices_are_read_once_and_then_proved_clean() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+        let addr = 12 * PAGE as u32;
+
+        snaps.begin_scene();
+        let first = snaps.get_or_read_vertices(&ctx, addr, 4096);
+        assert_eq!(first.len(), 4096);
+
+        // Fifty draws across five scenes from the same untouched mesh.
+        for _ in 0..5 {
+            snaps.begin_scene();
+            for _ in 0..10 {
+                let again = snaps.get_or_read_vertices(&ctx, addr, 4096);
+                assert!(Arc::ptr_eq(&first, &again), "static geometry must be the SAME buffer");
+            }
+        }
+    }
+
+    /// >>> THE PROPERTY THAT DIFFERS FROM TEXTURES: geometry rewritten WITHIN a scene must be
+    /// seen, on the very next draw.
+    ///
+    /// A texture bound by many draws is compared once a scene, on the argument that a title does
+    /// not rewrite a texture while drawing with it. Writing vertices and drawing them repeatedly
+    /// inside one scene is exactly how dynamic geometry works, so the vertex path deliberately
+    /// takes no once-a-scene shortcut. If it ever did, UI text and particles would render one
+    /// draw stale and the symptom would be geometry a frame behind itself.
+    #[test]
+    fn vertices_rewritten_within_one_scene_are_seen_immediately() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let addr = 12 * PAGE as u32;
+
+        {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.begin_scene();
+            let v = snaps.get_or_read_vertices(&ctx, addr, 1024);
+            assert_eq!(v[5], 0);
+        }
+        // NO new scene - the guest writes and draws again, as dynamic geometry does.
+        for round in 1..=4u8 {
+            mem.guest_store(12 * PAGE + 5, round);
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            let v = snaps.get_or_read_vertices(&ctx, addr, 1024);
+            assert_eq!(v[5], round, "a mid-scene rewrite must be visible to the next draw");
+        }
+    }
+
+    /// A rewrite that lands on IDENTICAL bytes must hand back the same buffer, not an equal one.
+    ///
+    /// A title that rebuilds a buffer every frame from unchanged inputs is common, and the
+    /// renderer's packed-vertex cache keys on this buffer's identity - so a fresh `Arc` there
+    /// would miss a cache holding the byte-for-byte same geometry.
+    #[test]
+    fn an_identical_rewrite_keeps_the_same_buffer() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let addr = 12 * PAGE as u32;
+
+        let first = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.begin_scene();
+            snaps.get_or_read_vertices(&ctx, addr, 1024)
+        };
+        // Rewrite the SAME value: the dirty map says "touched", the bytes say "identical".
+        mem.guest_store(12 * PAGE + 5, 0);
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+        snaps.begin_scene();
+        let again = snaps.get_or_read_vertices(&ctx, addr, 1024);
+        assert!(Arc::ptr_eq(&first, &again), "identical bytes must keep the same buffer");
+    }
+
+    /// Freed guest memory must not keep serving its old geometry.
+    #[test]
+    fn a_freed_range_drops_its_vertex_snapshot() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let addr = 12 * PAGE as u32;
+
+        let first = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.begin_scene();
+            snaps.get_or_read_vertices(&ctx, addr, 1024)
+        };
+        snaps.invalidate_range(addr, 1024);
+        let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+        let again = snaps.get_or_read_vertices(&ctx, addr, 1024);
+        assert!(!Arc::ptr_eq(&first, &again), "a freed range must be re-read");
+    }
+
+    /// A texture whose page is written EVERY scene must be re-read every scene - the mechanism
+    /// must not become sticky in the other direction.
+    #[test]
+    fn a_texture_written_every_scene_is_re_read_every_scene() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        let addr = 8 * PAGE as u32;
+
+        let mut last: Option<Arc<[u8]>> = None;
+        for scene in 0..6u8 {
+            mem.guest_store(8 * PAGE + 3, scene + 1);
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.begin_scene();
+            let got = snaps.get_or_read(&ctx, addr, 2048);
+            assert_eq!(got[3], scene + 1, "scene {scene} must see its own write");
+            if let Some(prev) = last {
+                assert!(!Arc::ptr_eq(&prev, &got));
+            }
+            last = Some(got);
+        }
     }
 }
 
@@ -2549,12 +3270,21 @@ pub struct VitaState {
     /// Maps, not lists: these three are looked up once per BOUND TEXTURE UNIT per
     /// DRAW, while they grow with every distinct texture the title has ever touched.
     /// A linear scan made the capture cost of a frame grow with the size of the level.
-    texture_formats: std::collections::HashMap<u32, u32>,
+    texture_formats: crate::fasthash::FxHashMap<u32, u32>,
     /// Memoised answers from [`Self::nearest_recorded_texture`], keyed by the NULL handle
     /// address that asked. That search is a linear scan of `texture_formats`, and it feeds
     /// a report that fires once per (unit, address) - see `snapshot_bound_textures`, where
     /// running it on the ordinary by-value binding path cost 46% of a race frame.
     nearby_texture_cache: std::collections::HashMap<u32, Option<(i64, u32)>>,
+    /// Scratch for [`Self::snapshot_bound_textures`]'s per-unit pass, kept so the hottest
+    /// function in the capture does not allocate a `Vec` on every draw.
+    ///
+    /// It exists at all because the per-unit control state must be read through a shared borrow
+    /// of `self` while the snapshot cache is borrowed mutably; `mem::take` on a field is what
+    /// lets that be one reused buffer rather than a fresh allocation per draw. On this title's
+    /// race that is ~644 draws a frame, and in the browser an allocation is a good deal dearer
+    /// than it is here.
+    texture_unit_scratch: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>)>,
     /// The one piece of per-texture state that cannot be packed into the guest's own control
     /// words - see [`TextureExtra`]. Everything the sampler getters used to read from here now
     /// lives in the guest's `SceGxmTexture`, where the hardware keeps it.
@@ -2813,8 +3543,9 @@ impl VitaState {
             shader_programs: Vec::new(),
             bound_textures: Vec::new(),
             bound_vertex_textures: Vec::new(),
-            texture_formats: std::collections::HashMap::new(),
+            texture_formats: Default::default(),
             nearby_texture_cache: std::collections::HashMap::new(),
+            texture_unit_scratch: Vec::new(),
             texture_extra: std::collections::HashMap::new(),
             color_surface_gamma: Vec::new(),
             texture_snapshots: TextureSnapshots::new(),
@@ -5707,27 +6438,30 @@ impl VitaState {
         // The sampler wrap modes, filters, LOD bias and gamma now come out of the binding's own
         // control words, which `decode_texture` already holds - so they cannot go stale, and they
         // follow a by-value copy of the struct the way the hardware's do.
-        let unit_state: Vec<(TextureBinding, Option<u32>, Option<(i64, u32)>)> = bindings
+        // Taken out and put back rather than allocated: this runs on every draw, and the buffer
+        // it needs is the same one every time. See `texture_unit_scratch`.
+        let mut unit_state = std::mem::take(&mut self.texture_unit_scratch);
+        unit_state.clear();
+        unit_state.extend(bindings.iter().map(|&b| {
+            let format = self.texture_format(b.addr);
+            // Only for a handle with no format of its own: is there an initialised texture
+            // NEARBY? A struct the guest inits at one address and binds at another (off by a
+            // fixed member offset, or copied by value) is a completely different bug from one
+            // it never initialised at all, and the two are indistinguishable from the zero
+            // control words alone. Searching a window answers it in the run that hit it.
+            // Resolved in the pre-pass above, for null handles only - see it for why.
+            let nearby = self.nearby_texture_cache.get(&b.addr).copied().flatten();
+            (b, format, nearby)
+        }));
+        let snapshots = &mut self.texture_snapshots;
+        let out = unit_state
             .iter()
-            .map(|&b| {
-                let format = self.texture_format(b.addr);
-                // Only for a handle with no format of its own: is there an initialised texture
-                // NEARBY? A struct the guest inits at one address and binds at another (off by a
-                // fixed member offset, or copied by value) is a completely different bug from one
-                // it never initialised at all, and the two are indistinguishable from the zero
-                // control words alone. Searching a window answers it in the run that hit it.
-                // Resolved in the pre-pass above, for null handles only - see it for why.
-                let nearby = self.nearby_texture_cache.get(&b.addr).copied().flatten();
-                (b, format, nearby)
+            .filter_map(|(binding, format, nearby)| {
+                decode_texture(ctx, snapshots, binding, *format, *nearby)
             })
             .collect();
-        let snapshots = &mut self.texture_snapshots;
-        unit_state
-            .into_iter()
-            .filter_map(|(binding, format, nearby)| {
-                decode_texture(ctx, snapshots, &binding, format, nearby)
-            })
-            .collect()
+        self.texture_unit_scratch = unit_state;
+        out
     }
 
     /// `_sceGxmSetVertexTexture`: bind a texture to a VERTEX-stage sampler unit.
@@ -5804,8 +6538,20 @@ impl VitaState {
     /// `sceGxmTextureInit*`/`SetFormat`), so a later decode recovers the exact
     /// channel swizzle rather than the lossy 3-bit control-word field.
     pub fn set_texture_format(&mut self, texture_addr: u32, format: u32) {
-        self.texture_formats.insert(texture_addr, format);
+        let changed = self.texture_formats.insert(texture_addr, format) != Some(format);
         TEXTURE_INITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The per-binding memo derives its answer partly from this map
+        // ([`TextureSnapshots::templates`]), so a recorded format that CHANGES invalidates it.
+        // Dropped wholesale rather than by key: the memo is keyed on control words and this is
+        // keyed on an address, so there is no key to remove - and a texture re-initialised at a
+        // live address is a load-screen event, not a per-frame one.
+        if changed {
+            self.texture_snapshots.templates.clear();
+            // ...and the per-scene lists BUILT from those templates, for the same reason. A set
+            // cached earlier in this scene describes the texture as it was before the guest
+            // re-initialised it, and the old code re-derived it on the very next draw.
+            self.texture_snapshots.snapshot_sets.clear();
+        }
     }
 
 
@@ -6904,41 +7650,20 @@ impl VitaState {
         };
         // Index element size: U16 (0) is 2 bytes, U32 is 4.
         let index_elem = if index_format == 0 { 2 } else { 4 };
-        let mut indices = crate::perf::time(crate::perf::Phase::DrawIndices, || {
-            ctx.read_bytes(index_addr, index_count as usize * index_elem)
-        });
-        let index_of = |c: &[u8]| match index_elem {
-            2 => u16::from_le_bytes([c[0], c[1]]) as u32,
-            _ => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-        };
         // Snapshot exactly the vertices this draw REFERENCES, not the whole prefix of the
         // stream. A chunked world mesh draws a few hundred vertices out of a shared buffer of
         // tens of thousands, so copying `0..=max_index` per draw costs hundreds of megabytes a
         // frame (and reads far past what the draw can touch). Take the `min..=max` window and
         // rebase the indices onto it, which leaves every consumer's indexing unchanged.
-        let (first_vertex, vertex_count) =
-            crate::perf::time(crate::perf::Phase::DrawIndexScan, || {
-                let (min_index, max_index) =
-                    indices.chunks(index_elem).fold((u32::MAX, 0u32), |(lo, hi), c| {
-                        let i = index_of(c);
-                        (lo.min(i), hi.max(i))
-                    });
-                let (first_vertex, vertex_count) = if min_index > max_index {
-                    (0, 0) // no indices at all
-                } else {
-                    (min_index, max_index - min_index + 1)
-                };
-                if first_vertex > 0 {
-                    for c in indices.chunks_mut(index_elem) {
-                        let rebased = index_of(c) - first_vertex;
-                        match index_elem {
-                            2 => c[..2].copy_from_slice(&(rebased as u16).to_le_bytes()),
-                            _ => c[..4].copy_from_slice(&rebased.to_le_bytes()),
-                        }
-                    }
-                }
-                (first_vertex, vertex_count)
-            });
+        //
+        // Read, scanned, rebased and shared in one call - and skipped entirely for a buffer the
+        // guest provably has not written since. See `get_or_read_indices`.
+        let (indices, first_vertex, vertex_count) = self.texture_snapshots.get_or_read_indices(
+            ctx,
+            index_addr,
+            index_count as usize * index_elem,
+            index_elem,
+        );
         // Interleave every stream this draw's attributes name into ONE buffer, and rewrite
         // the attributes onto it. A vertex here is the concatenation of its row from each
         // used stream, so the result is a plain single-stream mesh that indexes exactly as
@@ -6957,18 +7682,21 @@ impl VitaState {
         }
         let single_stream = matches!(streams.as_slice(), [s] if !s.per_instance);
         let bound_streams = self.bound_streams(ctx);
-        let vertices = crate::perf::time(crate::perf::Phase::DrawVertices, || {
+        let snapshots = &mut self.texture_snapshots;
+        let vertices: Arc<[u8]> = crate::perf::time(crate::perf::Phase::DrawVertices, || {
             if single_stream {
                 // The overwhelmingly common case is one per-vertex stream, whose rows are
                 // already contiguous: take them in one read rather than one per vertex (this
                 // path runs for every draw of every frame, over meshes of thousands of
                 // vertices).
-                let v = ctx.read_bytes(
+                //
+                // ...and better than one read: a SNAPSHOT, so a mesh the guest has not touched
+                // since the last draw is not read at all. See `get_or_read_vertices`.
+                return snapshots.get_or_read_vertices(
+                    ctx,
                     bound_streams[0].wrapping_add(first_vertex * stride),
                     (vertex_count * stride) as usize,
                 );
-                crate::perf::note_bytes(crate::perf::Phase::DrawVertices, v.len());
-                return v;
             }
             let mut vertices = vec![0u8; (vertex_count * stride) as usize];
             for (si, s) in streams.iter().enumerate() {
@@ -6996,7 +7724,13 @@ impl VitaState {
                     vertices[dst..dst + row_len].copy_from_slice(row);
                 }
             }
-            vertices
+            // The multi-stream path is NOT snapshotted: its result is an interleave of several
+            // guest buffers, so a snapshot key would have to fold every stream's address, length
+            // and stride, and its validity would rest on all of them at once. It is also the
+            // uncommon case. Left as the plain read it always was, rather than given a cache
+            // whose invalidation is harder to argue than the copy it saves.
+            crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
+            Arc::from(vertices)
         });
         for a in &mut attributes {
             a.offset += base.get(a.stream_index as usize).copied().unwrap_or(0) as u16;
@@ -7020,13 +7754,17 @@ impl VitaState {
         let context = self.gxm_context;
         if context != 0 {
             for unit in 0..crate::vita::gxmctx::MAX_TEXTURE_UNITS as u32 {
-                let b = crate::vita::gxmctx::texture_binding(ctx, context, unit);
                 // A slot the guest never bound, or unbound, is not a binding. The old list
                 // simply had no entry for such a unit, so skipping keeps the exact shape
                 // every downstream reader (and `textures.first()`) already expects.
-                if b.addr == 0 {
+                //
+                // The ADDRESS alone decides that, and reading the whole binding to find out was
+                // ninety-six guest reads a draw for the three or four units a title actually
+                // uses. See `texture_binding_addr`.
+                if crate::vita::gxmctx::texture_binding_addr(ctx, context, unit) == 0 {
                     continue;
                 }
+                let b = crate::vita::gxmctx::texture_binding(ctx, context, unit);
                 frag_binds.push(TextureBinding {
                     unit,
                     addr: b.addr,
@@ -7035,7 +7773,31 @@ impl VitaState {
                 });
             }
         }
-        let mut textures = self.snapshot_bound_textures(ctx, &frag_binds);
+        // >>> THE WHOLE LIST IS SHARED WITHIN A SCENE. See `TextureSnapshots::snapshot_sets`.
+        //
+        // The key is what the list is a function of: the bindings, and the fragment program
+        // header, which decides the albedo reorder below. The reorder is applied BEFORE the
+        // entry is stored, so a hit is the finished list.
+        let set_key = {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut mix = |v: u64| {
+                h ^= v;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            };
+            mix(fheader as u64);
+            for b in &frag_binds {
+                mix(b.unit as u64);
+                for w in b.words {
+                    mix(w as u64);
+                }
+            }
+            h
+        };
+        let cached_set = self.texture_snapshots.snapshot_sets.get(&set_key).cloned();
+        let mut textures = match cached_set {
+            Some(_) => Vec::new(),
+            None => self.snapshot_bound_textures(ctx, &frag_binds),
+        };
         self.bound_textures = frag_binds;
         // The VERTEX stage's own samplers, decoded exactly the same way. A vertex program that
         // fetches a texture builds its geometry from it - one retail title draws its whole
@@ -7054,16 +7816,24 @@ impl VitaState {
         // one-dimensional lookup table (a fog ramp) or a cube map (an irradiance probe) can sort
         // ahead of the real albedo by unit number, and neither is indexed by surface UV. See
         // `Draw::albedo`, which drops a leading non-surface texture rather than stretch it.
-        if let Some(pos) =
-            textures.iter().position(|t| t.height > 1 && t.faces <= 1).filter(|&p| p > 0)
-        {
-            textures[..=pos].rotate_right(1);
-        }
-        if let Some(unit) = Self::fragment_albedo_unit(&fref) {
-            if let Some(pos) = textures.iter().position(|t| t.unit == unit) {
-                textures[..=pos].rotate_right(1);
+        let textures: Arc<[crate::capture::BoundTexture]> = match cached_set {
+            Some(set) => set,
+            None => {
+                if let Some(pos) =
+                    textures.iter().position(|t| t.height > 1 && t.faces <= 1).filter(|&p| p > 0)
+                {
+                    textures[..=pos].rotate_right(1);
+                }
+                if let Some(unit) = Self::fragment_albedo_unit(&fref) {
+                    if let Some(pos) = textures.iter().position(|t| t.unit == unit) {
+                        textures[..=pos].rotate_right(1);
+                    }
+                }
+                let set: Arc<[crate::capture::BoundTexture]> = textures.into();
+                self.texture_snapshots.snapshot_sets.insert(set_key, set.clone());
+                set
             }
-        }
+        };
         if dump_fprog() {
             self.dump_fragment_program_samplers(ctx);
         }
@@ -7142,7 +7912,7 @@ impl VitaState {
             primitive,
             index_format,
             index_count,
-            vertices: vertices.into(),
+            vertices,
             vertex_stride: stride,
             attributes,
             vertex_textures,
@@ -8448,7 +9218,7 @@ fn decode_texture(
     }
     // The control words come from the BINDING, captured when the guest handed the texture to
     // GXM, not from guest memory now. See `TextureBinding`.
-    let [w0, w1, w2, w3] = binding.words;
+    //
     // All four control words zero is not a texture - it is a handle that was never
     // initialised, or one whose memory is not readable (an unmapped read yields zero). Either
     // way the unit ends up unbound, and it is a completely different bug from a format we
@@ -8498,6 +9268,79 @@ fn decode_texture(
         });
     }
 
+    // >>> EVERYTHING BELOW IS A PURE FUNCTION OF THE FOUR CONTROL WORDS, SO IT IS DONE ONCE.
+    //
+    // See [`TextureSnapshots::templates`]. The PIXELS are deliberately not part of it - they
+    // still go through `get_or_read` on every draw, so a texture the guest rewrites is still
+    // seen to change. Only the description is remembered.
+    let template = match cache.templates.get(&binding.words) {
+        Some(t) => *t,
+        None => {
+            let t = build_texture_template(unit, binding.words, exact_format);
+            if cache.templates.len() >= TEXTURE_TEMPLATE_CAP {
+                cache.templates.clear();
+            }
+            cache.templates.insert(binding.words, t);
+            t
+        }
+    };
+    let Some(t) = template else {
+        note_texture_drop(1);
+        return None;
+    };
+    let mut levels = t.levels;
+    let mut face_bytes = t.face_bytes;
+    let mut pixels = cache.get_or_read(ctx, t.data_addr, t.read_len as usize);
+    // >>> THE CHAIN READ CAN FAIL, AND FALLING BACK IS NOT SILENT. A texture whose allocation
+    // really does end after level 0 (a render target sampled as a texture, say - it has no
+    // mips whatever its control word says) makes the fuller read unmappable. That is a fact
+    // about this texture, not an error, so it degrades to level 0 and SAYS SO once per format.
+    if levels > 1 && pixels.len() < t.read_len as usize {
+        report_mip_chain_unreadable(unit, t.base_format, t.data_addr, t.width, t.height, levels);
+        levels = 1;
+        face_bytes = t.level0_bytes;
+        pixels = cache.get_or_read(ctx, t.data_addr, t.level0_read_len as usize);
+    }
+    if pixels.is_empty() {
+        note_texture_drop(2);
+        report_unreadable_texture(unit, t.base_format, t.data_addr, t.read_len as usize, t.width, t.height);
+        return None;
+    }
+    return Some(crate::capture::BoundTexture {
+        unit,
+        base_format: t.base_format,
+        swizzle: t.swizzle,
+        tex_type: t.tex_type,
+        width: t.width,
+        height: t.height,
+        stride: t.stride,
+        faces: t.faces,
+        face_bytes,
+        levels,
+        data_addr: t.data_addr,
+        pixels,
+        u_addr_mode: t.u_addr_mode,
+        v_addr_mode: t.v_addr_mode,
+        lod_bias: t.lod_bias,
+        min_filter: t.min_filter,
+        mag_filter: t.mag_filter,
+        gamma: t.gamma,
+        mip_filter: t.mip_filter,
+    });
+}
+
+/// Derive everything a binding's four control words say about its texture. Called once per
+/// distinct control-word set; see [`TextureSnapshots::templates`].
+///
+/// `None` is a binding the decode DROPS - a format that cannot be sized. It is memoised too,
+/// because a dropped binding is re-bound every frame like any other and re-deriving the drop is
+/// the same work as re-deriving the answer.
+fn build_texture_template(
+    unit: u32,
+    words: [u32; 4],
+    exact_format: Option<u32>,
+) -> Option<TextureTemplate> {
+    let [w0, w1, w2, w3] = words;
     let tex_type = (w1 >> 29) & 0x7;
     // The sampler state, out of the guest's own word 0 rather than a host-side map. See
     // [`word0_sampler_state`] and `vita::gxm::texword0`.
@@ -8537,7 +9380,6 @@ fn decode_texture(
     // occupies. The layout arithmetic lives in `render::level_layout` so the chain read below
     // and the level-0 read here cannot drift apart.
     let Some(l0) = crate::render::level_layout(base_format, tex_type, width, height, 0) else {
-        note_texture_drop(1);
         report_unsized_texture_format(unit, base_format, tex_type, width, height);
         return None;
     };
@@ -8582,34 +9424,12 @@ fn decode_texture(
     } else {
         mip_field.clamp(1, max_levels)
     };
-    // Read each distinct (address, size) once per scene and share the bytes with every
-    // draw that binds it. A scene binds a handful of textures across hundreds of draws, so
-    // re-reading them per draw is the difference between megabytes and gigabytes. The cache
-    // is scene-scoped because a render target is written in one scene and sampled in a
-    // later one - within a single scene the guest cannot rewrite a texture the GPU is
-    // consuming, so the snapshot cannot go stale.
-    //
-    // >>> THE CHAIN READ CAN FAIL, AND FALLING BACK IS NOT SILENT. A texture whose allocation
-    // really does end after level 0 (a render target sampled as a texture, say - it has no
-    // mips whatever its control word says) makes the fuller read unmappable. That is a fact
-    // about this texture, not an error, so it degrades to level 0 and SAYS SO once per format.
-    let mut levels = want_levels;
-    let mut face_bytes = crate::render::level_offset(base_format, tex_type, width, height, levels)
+    // The chain's byte extent, and the level-0 fallback the caller drops to when the guest's
+    // allocation turns out not to reach that far. `level_offset` walks every level, which is
+    // exactly the sort of per-draw arithmetic this memo exists to stop repeating.
+    let face_bytes = crate::render::level_offset(base_format, tex_type, width, height, want_levels)
         .unwrap_or(level0);
-    let mut pixels = cache.get_or_read(ctx, data_addr, (face_bytes * faces) as usize);
-    if levels > 1 && pixels.len() < (face_bytes * faces) as usize {
-        report_mip_chain_unreadable(unit, base_format, data_addr, width, height, levels);
-        levels = 1;
-        face_bytes = level0;
-        pixels = cache.get_or_read(ctx, data_addr, (face_bytes * faces) as usize);
-    }
-    if pixels.is_empty() {
-        note_texture_drop(2);
-        report_unreadable_texture(unit, base_format, data_addr, (face_bytes * faces) as usize, width, height);
-        return None;
-    }
-    Some(crate::capture::BoundTexture {
-        unit,
+    Some(TextureTemplate {
         base_format,
         swizzle,
         tex_type,
@@ -8618,9 +9438,11 @@ fn decode_texture(
         stride,
         faces,
         face_bytes,
-        levels,
+        read_len: face_bytes * faces,
+        levels: want_levels,
+        level0_bytes: level0,
+        level0_read_len: level0 * faces,
         data_addr,
-        pixels,
         // Straight out of the binding's own control word 0, so this is the state the guest
         // handed to GXM for THIS texture - including a by-value copy, which an address-keyed
         // shadow could not follow.

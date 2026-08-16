@@ -396,6 +396,44 @@ pub fn decode_face(
     }
 }
 
+/// Whether a whole PVRTC face decodes to alpha 255 everywhere, WITHOUT decoding it.
+///
+/// # Why this can be answered from the flags alone
+/// Every texel's alpha is one of three things: an interpolation between the surrounding blocks'
+/// A and B alphas, one of those two directly (PVRTC2's hard-transition mode), or zero
+/// (4bpp punch-through). A block declares its two colours OPAQUE with two flag bits, and an
+/// opaque colour's alpha is exactly 255 - so if every block in the image declares both colours
+/// opaque, every interpolation is between two 255s and every direct read is a 255. The one
+/// remaining way to get a non-255 alpha is punch-through, which is a property of the modulation
+/// MODE bit, also in the same word.
+///
+/// So the answer is one 32-bit word per eight bytes of source, against a whole-image decode plus
+/// a scan of the result. That difference is the point: the GPU transcode's value is that the CPU
+/// never expands the texture, and deciding its format from decoded texels would have put most of
+/// the cost straight back.
+///
+/// Conservative in the safe direction. A block whose colours are opaque in the DATA but which
+/// declares itself translucent reads as translucent here, which costs the 8 bpp format instead of
+/// 4 bpp - memory, never a wrong picture. The reverse cannot happen: this returns true only when
+/// every path to a non-opaque alpha has been ruled out by a flag.
+pub fn face_is_opaque(bytes: &[u8], variant: Variant) -> bool {
+    for chunk in bytes.chunks_exact(8) {
+        let c = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let op_b = c & 0x8000_0000 != 0;
+        let (op_a, h) = if variant.two { (op_b, c & 0x8000 != 0) } else { (c & 0x8000 != 0, false) };
+        if !op_a || !op_b {
+            return false;
+        }
+        // 4bpp punch-through: modulation code 2 forces a texel fully transparent, and only the
+        // mode bit says whether that encoding is in use. 2bpp's `m` is the sub-sampled modulation
+        // mode, which has no punch-through, so it does not disqualify the block.
+        if variant.four_bpp && (c & 1 != 0) && !h {
+            return false;
+        }
+    }
+    true
+}
+
 /// A PVRTC sub-mode this decoder does not model.
 #[derive(Clone, Copy)]
 enum Unmodelled {

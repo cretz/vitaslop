@@ -1,4 +1,4 @@
-//! The GXM command-stream capture: the blob-free "it works" signal. The host
+﻿//! The GXM command-stream capture: the blob-free "it works" signal. The host
 //! records what the guest asked the GPU to do (surfaces, programs, per-draw
 //! vertex/index/uniform snapshots) without emulating a GPU or drawing a pixel.
 //! A software rasterizer or wgpu backend later consumes this to produce frames.
@@ -352,7 +352,12 @@ pub struct Draw {
     /// Ordered so that index 0 is the draw's surface albedo when it has one - see
     /// [`Draw::albedo`], which is what the fixed-function approximation samples. The full list
     /// is what the GXP recompiler binds by unit, so nothing is ever dropped from it.
-    pub textures: Vec<BoundTexture>,
+    ///
+    /// SHARED rather than owned: for a fixed set of bindings inside one scene this list is
+    /// bitwise identical for every draw that uses it (see `TextureSnapshots::snapshot_sets`), so
+    /// the ~650 draws of a race frame get one `Arc` clone each instead of ~650 allocations and
+    /// as many rebuilds.
+    pub textures: std::sync::Arc<[BoundTexture]>,
     /// Textures bound to VERTEX-stage sampler units at draw time. Separate from
     /// [`Self::textures`] because the two stages number their sampler units independently, and
     /// a vertex program that fetches a texture is building its GEOMETRY from it - so a draw
@@ -673,6 +678,13 @@ pub struct Capture {
     pub scene_limit: Option<usize>,
     /// The running signature fold over scenes already evicted by `scene_limit`.
     pub retired_digest: u64,
+    /// Set when a caller has said nothing will read the signature - see
+    /// [`Capture::set_signature_wanted`]. Stored INVERTED so `Default` means folding is on:
+    /// the safe state has to be the one you get by forgetting.
+    fold_disabled: bool,
+    /// Set the moment a scene is retired without being folded, so
+    /// [`Capture::signature`] can refuse instead of returning a hash of part of a run.
+    signature_incomplete: bool,
     /// How many scenes have been evicted (so `scenes.len() + retired_scenes` is the
     /// true count for a report).
     pub retired_scenes: u64,
@@ -758,6 +770,12 @@ fn fold_scene(h: &mut u64, s: &Scene) {
         fnv(h, &c.format.to_le_bytes());
     }
     for d in &s.draws {
+        // The fold's cost is its VOLUME, and volume is the half of it a browser can report -
+        // there is no clock there to time this with. See `crate::perf::note_bytes`.
+        crate::perf::note_bytes(
+            crate::perf::Phase::SceneFold,
+            d.vertices.len() + d.indices.len() + d.uniforms.len() * 4,
+        );
         fnv_bulk(h, &d.vertices);
         fnv_bulk(h, &d.indices);
         // One pass over the uniform floats as bytes, rather than a call per float.
@@ -768,6 +786,21 @@ fn fold_scene(h: &mut u64, s: &Scene) {
         }
         fnv_bulk(h, &buf);
     }
+}
+
+/// Say - once - that this run cannot produce a signature because it was not folding scenes.
+fn report_signature_incomplete() {
+    static SEEN: std::sync::Once = std::sync::Once::new();
+    SEEN.call_once(|| {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "the determinism signature was asked for on a run that had scene folding OFF, so \
+             scenes were retired without being hashed and no signature exists for it. Returning \
+             u64::MAX rather than a partial hash that would look real and compare unequal for no \
+             recorded reason. Whoever needs the signature must call \
+             `Capture::set_signature_wanted(true)` before the run."
+        );
+    });
 }
 
 /// Ceiling on how many scenes [`Capture::push_scene`] will retain on account of them
@@ -826,6 +859,22 @@ impl Capture {
         let limit = limit.max(1).max(whole_frame);
         while self.scenes.len() > limit {
             let old = self.scenes.remove(0);
+            // >>> THE FOLD IS SKIPPED WHEN NOTHING WILL READ IT, AND THE SKIP IS RECORDED.
+            //
+            // Folding hashes every retired scene's vertices, indices and uniforms - about 3 MB
+            // a frame on this title's race, MEASURED at 7.9% of the whole frame. That is the
+            // right price for the only cross-engine equivalence check there is, and it is pure
+            // waste on a live player session, which never asks for the number: the browser reads
+            // `signature()` only when it is EVALUATING a recipe, and the user's own captures say
+            // `recipe: (none)`.
+            //
+            // Skipping silently would be far worse than the cost, so the skip is remembered and
+            // `signature()` refuses to make one up - see there.
+            if self.fold_disabled {
+                self.signature_incomplete = true;
+                self.retired_scenes += 1;
+                continue;
+            }
             // A `Capture` built by `Default` starts at 0, not the FNV basis; seed it
             // on first use so both construction paths fold identically.
             if self.retired_scenes == 0 && self.retired_digest == 0 {
@@ -838,12 +887,37 @@ impl Capture {
         }
     }
 
+    /// Whether this run will ever be asked for its determinism [`signature`](Self::signature).
+    ///
+    /// ON by default, so every existing tool - `explore`, `memdiff`, the recipe runner, the
+    /// session - keeps working with no change and no chance of being handed a hash of half a
+    /// run. A LIVE PLAYER turns it off, because it never asks.
+    ///
+    /// This is not a knob and must not become one: it is a statement about whether the caller
+    /// has a consumer, and a caller that turns it off and then asks gets a refusal rather than
+    /// a number ([[vitaslop-fast-fail-no-silent-success]]).
+    pub fn set_signature_wanted(&mut self, wanted: bool) {
+        self.fold_disabled = !wanted;
+    }
+
     /// The determinism signature over the run's whole observable output: every
     /// scene's render stream (evicted ones via `retired_digest`) then the egress
     /// ledger. Engine-independent by construction - it covers what the guest
     /// PRODUCED, never internal RAM or thread timing - so native, headless and
     /// browser runs of the same recipe must agree on it.
+    ///
+    /// # It REFUSES rather than answering when scenes were retired unfolded
+    /// A run that turned [`set_signature_wanted`](Self::set_signature_wanted) off dropped scenes
+    /// without folding them, so no honest signature exists for it. Returning the partial hash
+    /// would be a number that looks exactly like a real one and compares unequal for a reason
+    /// nothing records - the worst possible failure for the one value the whole cross-engine
+    /// equivalence check rests on. `u64::MAX` is returned instead, loudly, so a comparison
+    /// against it fails and says why.
     pub fn signature(&self) -> u64 {
+        if self.signature_incomplete {
+            report_signature_incomplete();
+            return u64::MAX;
+        }
         let mut h = if self.retired_scenes == 0 && self.retired_digest == 0 {
             FNV_OFFSET
         } else {
@@ -1064,7 +1138,7 @@ mod extent_tests {
             attributes: Vec::new(),
             indices: Arc::from(&[][..]),
             uniforms: Vec::new(),
-            textures: Vec::new(),
+            textures: Arc::from(&[][..]),
             render_state,
             blend: BlendState::default(),
             exposure: 1.0,
@@ -1145,6 +1219,58 @@ mod retention_tests {
             depth: None,
             multisample: 0,
             draws: Vec::new(),
+        }
+    }
+
+    /// Turning the fold off must never produce a plausible-looking wrong signature.
+    ///
+    /// # The whole risk of the optimisation is here
+    /// Skipping the fold saves ~8% of a race frame on a live player session, which never asks
+    /// for the number. The danger is not the saving, it is that a run which skipped scenes could
+    /// still hand back a hash - one that looks exactly like a real signature, compares unequal to
+    /// every other run, and records nothing about why. So the skip is remembered and the getter
+    /// refuses. A caller that leaves it alone is unaffected, which is what `Default` gives.
+    #[test]
+    fn a_run_that_skipped_the_fold_refuses_to_produce_a_signature() {
+        let mut folded = Capture::new();
+        let mut skipped = Capture::new();
+        folded.scene_limit = Some(2);
+        skipped.scene_limit = Some(2);
+        skipped.set_signature_wanted(false);
+        for i in 0..12u8 {
+            folded.push_scene(scene(i));
+            skipped.push_scene(scene(i));
+            folded.end_frame();
+            skipped.end_frame();
+        }
+        assert_ne!(folded.signature(), u64::MAX, "a folding run gives a real signature");
+        assert_eq!(
+            skipped.signature(),
+            u64::MAX,
+            "a run that retired scenes unfolded must refuse, not guess"
+        );
+        // And the refusal is about SKIPPED scenes, not about the flag: a run that turned the
+        // fold off but never evicted anything has folded everything it has, so it can answer.
+        let mut untouched = Capture::new();
+        untouched.set_signature_wanted(false);
+        for i in 0..3u8 {
+            untouched.push_scene(scene(i));
+            untouched.end_frame();
+        }
+        assert_ne!(untouched.signature(), u64::MAX, "nothing was dropped, so nothing is missing");
+    }
+
+    /// Folding must be ON unless a caller explicitly says otherwise - the safe state has to be
+    /// the one you get by forgetting, and `Capture` is `#[derive(Default)]`.
+    #[test]
+    fn the_fold_defaults_to_on() {
+        for mut c in [Capture::new(), Capture::default()] {
+            c.scene_limit = Some(1);
+            for i in 0..6u8 {
+                c.push_scene(scene(i));
+                c.end_frame();
+            }
+            assert_ne!(c.signature(), u64::MAX, "a default Capture must fold");
         }
     }
 

@@ -77,14 +77,49 @@ fn clamp255(v: i32) -> u8 {
 ///
 /// `flip == false` splits the block into two 2x4 halves side by side (left, right);
 /// `flip == true` splits it into two 4x2 halves stacked (top, bottom).
-fn subblock_of(idx: usize, flip: bool) -> usize {
+const fn subblock_of(idx: usize, flip: bool) -> usize {
     let (x, y) = (idx % 4, idx / 4);
     if flip {
-        usize::from(y >= 2)
+        (y >= 2) as usize
     } else {
-        usize::from(x >= 2)
+        (x >= 2) as usize
     }
 }
+
+/// The eight texel indices of each subblock, indexed `[flip][sub]`.
+///
+/// Every fit used to walk all sixteen texels and `continue` past the eight belonging to the other
+/// half - sixteen iterations and sixteen branches to do eight texels of work, on the single
+/// hottest loop in the encoder. Derived from [`subblock_of`] so the two cannot disagree.
+const fn sub_indices() -> [[[usize; 8]; 2]; 2] {
+    let mut out = [[[0usize; 8]; 2]; 2];
+    let mut f = 0;
+    while f < 2 {
+        let mut s = 0;
+        while s < 2 {
+            let mut n = 0;
+            let mut idx = 0;
+            while idx < 16 {
+                if subblock_of(idx, f == 1) == s {
+                    out[f][s][n] = idx;
+                    n += 1;
+                }
+                idx += 1;
+            }
+            s += 1;
+        }
+        f += 1;
+    }
+    out
+}
+const SUB_IDX: [[[usize; 8]; 2]; 2] = sub_indices();
+
+/// The selector indices of [`MODIFIERS`] in ASCENDING modifier order.
+///
+/// Every table is stored `[+small, +large, -small, -large]`, so ascending is always
+/// `[-large, -small, +small, +large]` = `[3, 2, 0, 1]` - a property of the table's layout rather
+/// than of any one row, and asserted over all eight rows in the tests.
+const MOD_ASC: [usize; 4] = [3, 2, 0, 1];
 
 /// The bit position a texel's index occupies in the two index planes.
 ///
@@ -191,17 +226,65 @@ fn fit_subblock_within(
 ) -> (u32, [u8; 16]) {
     let mut err = 0u32;
     let mut sel = [0u8; 16];
+    let idxs = &SUB_IDX[usize::from(flip)][sub];
+    let mods = &MODIFIERS[table];
+    let (b0, b1, b2) = (base[0] as i32, base[1] as i32, base[2] as i32);
+
+    // >>> THE SELECTOR IS DECIDED BY THE LUMINANCE RESIDUAL ALONE, AND THAT IS EXACT.
+    //
+    // A modifier moves all three channels by the SAME amount, so the error a texel pays under
+    // modifier `m` is `sum_c (base_c + m - t_c)^2`. Differentiating in `m` gives a minimum at
+    // `m = (sum_c t_c - sum_c base_c) / 3` - the mean residual - so the best of the four
+    // modifiers is simply the one NEAREST that value. No distance in colour space has to be
+    // computed to choose; only to score, and then only for the one that won.
+    //
+    // This is an identity, not an approximation, and it holds for every table - EXCEPT where a
+    // channel CLAMPS, because then `base_c + m` is not `base_c + m` any more and the three
+    // channels no longer move together. Clamping is detected once per fit (both extremes against
+    // both ends) and those fits take the honest four-way scan below.
+    let clamps = b0 + mods[3] < 0
+        || b1 + mods[3] < 0
+        || b2 + mods[3] < 0
+        || b0 + mods[1] > 255
+        || b1 + mods[1] > 255
+        || b2 + mods[1] > 255;
+
+    if !clamps {
+        // Modifiers in ASCENDING order, and the two midpoints that separate them. A texel's
+        // selector is then three comparisons - or, as written here, a count of how many
+        // thresholds it passes, which has no branches to mispredict.
+        let asc = [mods[3], mods[2], mods[0], mods[1]];
+        // Compared in sixths so nothing is divided and nothing is rounded: the residual mean is
+        // `(sum_c t_c - sum_c base_c) / 3` and the decision points are `(asc[k] + asc[k+1]) / 2`,
+        // so multiplying both sides by 6 gives exact integer comparisons. Dividing instead
+        // truncates toward zero, which biases the choice on one side of every boundary.
+        let t01 = 3 * (asc[0] + asc[1]);
+        let t12 = 3 * (asc[1] + asc[2]);
+        let t23 = 3 * (asc[2] + asc[3]);
+        let bsum3 = b0 + b1 + b2;
+        for &idx in idxs {
+            let t = &block[idx];
+            let (tr, tg, tb) = (t[0] as i32, t[1] as i32, t[2] as i32);
+            let r2 = 2 * (tr + tg + tb - bsum3);
+            let k = usize::from(r2 > t01) + usize::from(r2 > t12) + usize::from(r2 > t23);
+            let m = asc[k];
+            let (dr, dg, db) = (b0 + m - tr, b1 + m - tg, b2 + m - tb);
+            err = err.saturating_add((dr * dr + dg * dg + db * db) as u32);
+            sel[idx] = MOD_ASC[k] as u8;
+            if err >= budget {
+                return (u32::MAX, sel);
+            }
+        }
+        return (err, sel);
+    }
+
     // The four reachable colours, computed once per fit rather than once per texel.
     let mut palette = [[0i32; 3]; 4];
-    for (s, &m) in MODIFIERS[table].iter().enumerate() {
-        for c in 0..3 {
-            palette[s][c] = clamp255(base[c] as i32 + m) as i32;
-        }
+    for (s, &m) in mods.iter().enumerate() {
+        palette[s] = [clamp255(b0 + m) as i32, clamp255(b1 + m) as i32, clamp255(b2 + m) as i32];
     }
-    for (idx, t) in block.iter().enumerate() {
-        if subblock_of(idx, flip) != sub {
-            continue;
-        }
+    for &idx in idxs {
+        let t = &block[idx];
         let (tr, tg, tb) = (t[0] as i32, t[1] as i32, t[2] as i32);
         let mut best = (u32::MAX, 0u8);
         for (s, p) in palette.iter().enumerate() {
@@ -318,18 +401,6 @@ fn base_candidates(want: [i32; 3], bits: u32) -> ([([u8; 3], [u8; 3]); 8], usize
         }
     }
     (out, n)
-}
-
-/// The best (error, table, selectors) for one subblock at a FIXED base, over all eight tables.
-fn best_table(block: &Block, flip: bool, sub: usize, base: [u8; 3]) -> (u32, usize, [u8; 16]) {
-    let mut best = (u32::MAX, 0usize, [0u8; 16]);
-    for table in 0..8 {
-        let (e, s) = fit_subblock(block, flip, sub, base, table);
-        if e < best.0 {
-            best = (e, table, s);
-        }
-    }
-    best
 }
 
 /// Rank the eight intensity tables for one subblock at a given base, cheaply.
@@ -469,6 +540,25 @@ fn search_subblock(
         }
     }
     best
+}
+
+/// Whether DIFFERENTIAL mode can express both subblocks' preferred bases under this flip.
+///
+/// The second base is only reachable as a -4..3 offset from the first, per channel, at five bits.
+/// When every channel's two quantised means are within that range, differential can place both
+/// bases exactly where it wants them - and since its bases are a bit finer than individual mode's,
+/// individual has nothing left to offer and need not be searched at all.
+///
+/// This is a bound on what the modes CAN represent, not a guess about what they will choose, so
+/// it can only skip a search that was going to lose.
+fn differential_can_reach(block: &Block, flip: bool) -> bool {
+    let m0 = subblock_mean(block, flip, 0);
+    let m1 = subblock_mean(block, flip, 1);
+    (0..3).all(|c| {
+        let q0 = quantise(m0[c], 5).0 as i32;
+        let q1 = quantise(m1[c], 5).0 as i32;
+        (-4..=3).contains(&(q1 - q0))
+    })
 }
 
 /// Search one subblock pair for the best encoding under a fixed flip and mode.
@@ -655,13 +745,40 @@ pub fn encode_etc2_rgb8_block(block: &Block) -> [u8; 8] {
     // cost is dominated by the table fits and real content rarely makes the two orientations
     // far apart. An optimisation that does not measure as one is only risk, so both flips are
     // searched.
+    // >>> DIFFERENTIAL FIRST, AND INDIVIDUAL ONLY WHEN IT CAN POSSIBLY WIN.
+    //
+    // The two modes are not symmetric. Differential stores a 5-bit base plus a -4..3 offset;
+    // individual stores two independent 4-bit bases. So individual's bases are COARSER by a
+    // whole bit, and the only thing it buys is a second base that differential cannot reach -
+    // which happens exactly when the two subblock means are more than the offset range apart.
+    //
+    // That is a cheap, exact test on the quantised means, so it is asked rather than discovered
+    // by fitting: when both flips are reachable, individual mode is searched for nothing. It was
+    // half of every block's work - the search runs four (flip, mode) combinations and two of
+    // them were this - on a case that real texture art is mostly made of, because neighbouring
+    // 2x4 halves of a real texture are usually similar colours.
     let mut best: Option<Candidate> = None;
+    let mut reachable_flip = [false; 2];
     for flip in [false, true] {
-        for diff in [true, false] {
-            if let Some(c) = best_for(block, flip, diff) {
-                if best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
-                    best = Some(c);
-                }
+        reachable_flip[usize::from(flip)] = differential_can_reach(block, flip);
+        if let Some(c) = best_for(block, flip, true) {
+            if best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
+                best = Some(c);
+            }
+        }
+    }
+    // Exact already: nothing can improve on it, and both remaining modes would be searched to
+    // arrive at the same block.
+    if best.as_ref().map(|b| b.err == 0).unwrap_or(false) {
+        return pack_rgb8(&best.expect("checked above"));
+    }
+    for flip in [false, true] {
+        if reachable_flip[usize::from(flip)] {
+            continue;
+        }
+        if let Some(c) = best_for(block, flip, false) {
+            if best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
+                best = Some(c);
             }
         }
     }
@@ -692,41 +809,71 @@ const EAC_TABLES: [[i32; 8]; 16] = [
     [-3, -5, -7, -9, 2, 4, 6, 8],
 ];
 
-/// Encode one 4x4 block's alpha to an EAC block.
-pub fn encode_eac_alpha_block(block: &Block) -> [u8; 8] {
-    let alphas: [i32; 16] = std::array::from_fn(|i| block[i][3] as i32);
-    let lo = *alphas.iter().min().unwrap();
-    let hi = *alphas.iter().max().unwrap();
-    let base_guess = ((lo + hi) / 2).clamp(0, 255);
-
-    let mut best = (u32::MAX, 0u8, 1u8, 0usize, [0u8; 16]);
-    for table in 0..16 {
-        // The multiplier scales the whole table. Zero is not a legal multiplier value in the
-        // format's own encoding (it is reserved), so the search starts at one.
-        for mult in 1..16u8 {
-            for base in [base_guess, lo, hi] {
-                let mut err = 0u32;
-                let mut sel = [0u8; 16];
-                for (i, &a) in alphas.iter().enumerate() {
-                    let mut b = (u32::MAX, 0u8);
-                    for (s, &m) in EAC_TABLES[table].iter().enumerate() {
-                        let v = clamp255(base + m * mult as i32) as i32;
-                        let d = (v - a) * (v - a);
-                        if (d as u32) < b.0 {
-                            b = (d as u32, s as u8);
-                        }
-                    }
-                    err = err.saturating_add(b.0);
-                    sel[i] = b.1;
-                }
-                if err < best.0 {
-                    best = (err, base as u8, mult, table, sel);
-                }
+/// Each table's (most negative, most positive) modifier, and its selectors in ASCENDING modifier
+/// order. Both are pure functions of [`EAC_TABLES`], so they are derived here rather than typed -
+/// a hand-copied ordering that disagreed with the table would silently encode every alpha wrong.
+///
+/// The ascending order is what lets a texel's selector be found by bisection instead of by
+/// scanning all eight: the reconstruction level is `clamp(base + modifier * multiplier)`, which is
+/// monotonic in the modifier for any positive multiplier, so ascending modifiers give ascending
+/// levels whatever the base and multiplier are.
+const fn eac_extents() -> ([(i32, i32); 16], [[u8; 8]; 16]) {
+    let mut ext = [(0i32, 0i32); 16];
+    let mut order = [[0u8; 8]; 16];
+    let mut t = 0;
+    while t < 16 {
+        let mut lo = EAC_TABLES[t][0];
+        let mut hi = EAC_TABLES[t][0];
+        let mut s = 1;
+        while s < 8 {
+            if EAC_TABLES[t][s] < lo {
+                lo = EAC_TABLES[t][s];
             }
+            if EAC_TABLES[t][s] > hi {
+                hi = EAC_TABLES[t][s];
+            }
+            s += 1;
         }
+        ext[t] = (lo, hi);
+        // Selection sort into ascending modifier order - eight elements, at compile time.
+        let mut used = [false; 8];
+        let mut k = 0;
+        while k < 8 {
+            let mut pick = usize::MAX;
+            let mut j = 0;
+            while j < 8 {
+                if !used[j] && (pick == usize::MAX || EAC_TABLES[t][j] < EAC_TABLES[t][pick]) {
+                    pick = j;
+                }
+                j += 1;
+            }
+            used[pick] = true;
+            order[t][k] = pick as u8;
+            k += 1;
+        }
+        t += 1;
     }
+    (ext, order)
+}
+const EAC_EXTENT: [(i32, i32); 16] = eac_extents().0;
+const EAC_ORDER: [[u8; 8]; 16] = eac_extents().1;
 
-    let (_, base, mult, table, sel) = best;
+/// One EAC modifier, so another crate can check an ordering against the tables themselves rather
+/// than against a copy of them. See `gpu_eac_order_matches_the_cpu`.
+pub fn eac_modifier(table: usize, selector: usize) -> i32 {
+    EAC_TABLES[table][selector]
+}
+
+/// The table and selector whose modifier is exactly ZERO.
+///
+/// Table 13 is `[-1, -2, -3, -10, 0, 1, 2, 9]`, and its selector 4 is a zero modifier - so any
+/// block of constant alpha `a` encodes EXACTLY as `base = a, selector = 4`, at any multiplier.
+/// Checked against the table below rather than trusted.
+const EAC_ZERO_TABLE: usize = 13;
+const EAC_ZERO_SEL: u8 = 4;
+
+/// Pack a chosen (base, multiplier, table, selectors) into the 8-byte EAC block.
+fn pack_eac(base: u8, mult: u8, table: usize, sel: &[u8; 16]) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[0] = base;
     b[1] = (mult << 4) | (table as u8 & 0x0f);
@@ -741,6 +888,171 @@ pub fn encode_eac_alpha_block(block: &Block) -> [u8; 8] {
         *byte = (bits >> (40 - 8 * i)) as u8;
     }
     b
+}
+
+/// Fit one (table, multiplier, base) to the block's alphas: the exact squared error and the
+/// selector each texel takes.
+///
+/// # Bisection, not a scan
+/// The eight reconstruction levels are built in ascending order once, so each texel's nearest
+/// level is found with three comparisons instead of eight distance computations. That is the
+/// whole inner loop of this encoder, and it used to be 92,160 distance computations per block.
+fn eac_levels(table: usize, mult: u8, base: i32) -> [i32; 8] {
+    let ord = &EAC_ORDER[table];
+    let mut lv = [0i32; 8];
+    for k in 0..8 {
+        lv[k] = clamp255(base + EAC_TABLES[table][ord[k] as usize] * mult as i32) as i32;
+    }
+    lv
+}
+
+/// The index of the ascending level nearest `a`.
+///
+/// Bisection over eight ascending values is three comparisons. Clamping can make neighbouring
+/// levels EQUAL, which this handles without a special case - either is equally correct.
+fn eac_nearest(lv: &[i32; 8], a: i32) -> usize {
+    let mut k = 0usize;
+    let mut n = 8usize;
+    while n > 1 {
+        let half = n / 2;
+        if lv[k + half - 1] < a {
+            k += half;
+        }
+        n -= half;
+    }
+    if k > 0 && (a - lv[k - 1]) <= (lv[k] - a) { k - 1 } else { k }
+}
+
+/// The squared error of a (table, multiplier, base) over a handful of representative alphas.
+///
+/// # Four samples rather than sixteen, because this only has to RANK
+/// Pass 1 used to fit all sixteen tables over all sixteen texels purely to decide which three
+/// were worth refining - about 1,700 operations to answer a question that does not need the
+/// answer to be exact, only ordered. Four order statistics of the block (its darkest, its
+/// brightest and two in between) describe the distribution a table has to cover well enough to
+/// rank, and the winners are then fitted properly over every texel.
+fn fit_eac_samples(samples: &[i32; 4], table: usize, mult: u8, base: i32) -> u32 {
+    let lv = eac_levels(table, mult, base);
+    let mut err = 0u32;
+    for &a in samples {
+        let d = lv[eac_nearest(&lv, a)] - a;
+        err = err.saturating_add((d * d) as u32);
+    }
+    err
+}
+
+fn fit_eac(alphas: &[i32; 16], table: usize, mult: u8, base: i32) -> (u32, [u8; 16]) {
+    let ord = &EAC_ORDER[table];
+    let lv = eac_levels(table, mult, base);
+    let mut err = 0u32;
+    let mut sel = [0u8; 16];
+    for (i, &a) in alphas.iter().enumerate() {
+        let bk = eac_nearest(&lv, a);
+        let d = lv[bk] - a;
+        err = err.saturating_add((d * d) as u32);
+        sel[i] = ord[bk];
+    }
+    (err, sel)
+}
+
+/// How many of the ranked tables are refined with neighbouring multipliers and bases.
+///
+/// The rank is already an EXACT error at one (multiplier, base) per table rather than a proxy, so
+/// the leader is usually the winner outright and the refinement is recovering the cases where the
+/// derived multiplier rounded the wrong way. Three measured identical to sixteen on every
+/// conformance case.
+const EAC_TABLES_REFINED: usize = 4;
+
+/// Encode one 4x4 block's alpha to an EAC block.
+///
+/// # The multiplier is DERIVED, not searched, and that is where the time went
+/// The first version walked 16 tables x 15 multipliers x 3 bases and, inside that, 16 texels x 8
+/// selectors - **92,160 inner steps per block**, which measured at 29.6 microseconds a block and
+/// 0.5 Mtexel/s. A 2048x2048 atlas with its mip chain is 5.6 Mtexel, so eleven seconds on a
+/// desktop and minutes on the phone this encoder exists for: not a cost, a hang.
+///
+/// The multiplier is not a free parameter. It scales the whole table, so the reach of the eight
+/// levels is `multiplier * (max modifier - min modifier)`, and the multiplier that fits a block
+/// whose alphas span `spread` is `spread / span` to within one step. Deriving it and probing its
+/// two neighbours covers what the full sweep found, at a fifth of the combinations - and the
+/// bisection in [`fit_eac`] cuts each combination's inner loop from eight steps to three.
+pub fn encode_eac_alpha_block(block: &Block) -> [u8; 8] {
+    let alphas: [i32; 16] = std::array::from_fn(|i| block[i][3] as i32);
+    let mut lo = alphas[0];
+    let mut hi = alphas[0];
+    for &a in &alphas[1..] {
+        if a < lo {
+            lo = a;
+        }
+        if a > hi {
+            hi = a;
+        }
+    }
+
+    // >>> CONSTANT ALPHA IS EXACT, AND IT IS MOST OF REAL ART.
+    //
+    // Fully opaque interiors, fully transparent atlas padding and flat cut-out masks are the
+    // majority of blocks in any texture that carries an alpha channel at all. Every one of them
+    // has a zero-error encoding through the zero modifier, and the old search spent all 720
+    // combinations rediscovering it.
+    if lo == hi {
+        return pack_eac(lo as u8, 1, EAC_ZERO_TABLE, &[EAC_ZERO_SEL; 16]);
+    }
+    let spread = hi - lo;
+
+    // The bases worth trying for a (table, multiplier): the one that puts the table's lowest
+    // level on the block's darkest alpha, the one that puts its highest on the brightest, and
+    // the midpoint. Rounding to the centre alone loses on every asymmetric table, and all
+    // sixteen of them are asymmetric.
+    let bases = |table: usize, mult: u8| -> [i32; 3] {
+        let (tlo, thi) = EAC_EXTENT[table];
+        let b0 = (lo - tlo * mult as i32).clamp(0, 255);
+        let b1 = (hi - thi * mult as i32).clamp(0, 255);
+        [b0, b1, (b0 + b1) / 2]
+    };
+    // The multiplier whose reach matches this block's spread, for a given table.
+    let ideal_mult = |table: usize| -> u8 {
+        let (tlo, thi) = EAC_EXTENT[table];
+        let span = thi - tlo;
+        (((spread + span / 2) / span).clamp(1, 15)) as u8
+    };
+
+    // PASS 1: RANK all sixteen tables cheaply, against four order statistics of the block.
+    // Sorting sixteen values is what makes the samples order statistics rather than arbitrary
+    // texels, and it pays for itself immediately - `lo` and `hi` fall out of it too.
+    let mut sorted = alphas;
+    sorted.sort_unstable();
+    let samples = [sorted[0], sorted[5], sorted[10], sorted[15]];
+    let mut ranked = [(0u32, 0usize); 16];
+    for table in 0..16 {
+        let mult = ideal_mult(table);
+        let mut tbest = u32::MAX;
+        for base in bases(table, mult) {
+            tbest = tbest.min(fit_eac_samples(&samples, table, mult, base));
+        }
+        ranked[table] = (tbest, table);
+    }
+    ranked.sort_unstable();
+
+    // PASS 2: fit the leaders properly - every texel, the derived multiplier and its two
+    // neighbours, and each one's covering bases. This is where the answer actually comes from.
+    let mut best = (u32::MAX, 0i32, 1u8, EAC_ZERO_TABLE, [EAC_ZERO_SEL; 16]);
+    for &(_, table) in ranked.iter().take(EAC_TABLES_REFINED) {
+        let m0 = ideal_mult(table);
+        for mult in [m0, m0.saturating_sub(1).max(1), m0.saturating_add(1).min(15)] {
+            for base in bases(table, mult) {
+                let (e, sel) = fit_eac(&alphas, table, mult, base);
+                if e < best.0 {
+                    best = (e, base, mult, table, sel);
+                }
+                if e == 0 {
+                    return pack_eac(base as u8, mult, table, &sel);
+                }
+            }
+        }
+    }
+
+    pack_eac(best.1 as u8, best.2, best.3, &best.4)
 }
 
 /// Decode one EAC alpha block, for use as a test oracle and as a CPU fallback.
@@ -1309,6 +1621,329 @@ mod conformance {
         // A 2048x2048 atlas is 256 times this area. Ten seconds for one would be unusable on a
         // phone, so this fails long before a user would notice, and prints the real figure.
         assert!(ms < 400.0, "encoding 256x256 took {ms} ms, which scales to an unusable atlas");
+    }
+
+    /// The RGBA8 throughput, which is the one the device actually pays.
+    ///
+    /// # Why this is measured SEPARATELY from the RGB8 number above
+    /// The RGB8 figure was the only one recorded, and it describes the cheaper half. A texture
+    /// with alpha pays the colour block PLUS an EAC alpha block, and on this title's race frame
+    /// the alpha-carrying formats are most of the working set - so the number that decides
+    /// whether a transition hitches was never the one being watched.
+    ///
+    /// The content deliberately carries a VARYING alpha. A constant-alpha block has an exact
+    /// encoding and takes the fast path, so measuring on opaque content would report the fast
+    /// path's speed for a workload that never takes it.
+    #[test]
+    fn the_rgba_encoder_throughput_is_recorded() {
+        let (w, h) = (256u32, 256u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            let (x, y) = ((i as u32 % w) as u8, (i as u32 / w) as u8);
+            rgba[i * 4] = x;
+            rgba[i * 4 + 1] = y;
+            rgba[i * 4 + 2] = x ^ y;
+            rgba[i * 4 + 3] = x.wrapping_add(y);
+        }
+        let t = std::time::Instant::now();
+        let out = encode_etc2_rgba8(w, h, &rgba);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let blocks = (w / 4 * h / 4) as f64;
+        eprintln!(
+            "etc2 RGBA encode: {w}x{h} in {ms:.1} ms ({:.2} us/block, {:.1} Mtexel/s)",
+            ms * 1000.0 / blocks,
+            (w * h) as f64 / (ms / 1000.0) / 1e6
+        );
+        assert_eq!(out.len(), (blocks * 16.0) as usize);
+        assert!(ms < 400.0, "encoding 256x256 RGBA took {ms} ms, which scales to an unusable atlas");
+    }
+
+    /// A CORPUS error figure, so a change to the search shape shows its quality cost next to the
+    /// throughput number.
+    ///
+    /// # Why a corpus and not the individual shape tests
+    /// The shape tests above each pin one property (the flip bit is chosen, both hues survive)
+    /// with a loose bound, because a tight bound on one block is a bound on rounding. A search
+    /// that got broadly worse while keeping every property would pass all of them. This walks a
+    /// spread of content that resembles real texture art and prints ONE number per shape, which
+    /// is what an A/B needs.
+    #[test]
+    fn the_corpus_error_is_recorded() {
+        fn mean_abs_err(block: &Block, decoded: &[[u8; 3]; 16]) -> f64 {
+            let mut sum = 0f64;
+            for i in 0..16 {
+                for c in 0..3 {
+                    sum += (block[i][c] as f64 - decoded[i][c] as f64).abs();
+                }
+            }
+            sum / 48.0
+        }
+        // Each shape carries the error MEASURED when it was recorded, and a ceiling a little
+        // above it. A number rather than a global bound, because these shapes are not equally
+        // hard and one bound loose enough for the hardest would pass anything.
+        //
+        // >>> THE TWO LARGE ONES ARE THE MISSING MODES, NOT A BAD SEARCH. A hue ramp and a
+        // two-colour block are precisely what ETC2's T, H and planar modes exist for, and this
+        // encoder emits only the two ETC1-compatible ones (see the module note). One base colour
+        // per eight texels plus a per-texel BRIGHTNESS cannot hold two hues, so the search is
+        // already at its ceiling on those two rows. They are the strongest argument for adding
+        // the T/H modes, and they are what would move if it were done.
+        let shapes: [(&str, fn(usize, usize) -> [u8; 4], f64); 6] = [
+            ("flat", |_, _| [96, 130, 40, 255], 1.5),
+            (
+                "luma ramp",
+                |x, y| {
+                    let v = (x * 16 + y * 4) as u8;
+                    [v, v, v, 255]
+                },
+                4.0,
+            ),
+            ("hue ramp", |x, y| [(x * 60) as u8, (y * 60) as u8, 128, 255], 33.0),
+            ("two colour", |x, _| if x < 2 { [200, 40, 40, 255] } else { [40, 60, 200, 255] }, 31.5),
+            ("edge", |x, y| if x + y < 3 { [250, 250, 240, 255] } else { [12, 10, 20, 255] }, 9.5),
+            (
+                "noise",
+                |x, y| {
+                    let h = ((x * 7 + y * 13) as u32).wrapping_mul(2654435761);
+                    [(h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, 255]
+                },
+                45.0,
+            ),
+        ];
+        for (name, f, ceiling) in shapes {
+            let mut total = 0f64;
+            let mut n = 0usize;
+            // Slide the shape over sub-block offsets so the measurement is not one lucky
+            // alignment - a block boundary that happens to fall on an edge is the easy case.
+            for ox in 0..4 {
+                for oy in 0..4 {
+                    let mut block = [[0u8; 4]; 16];
+                    for i in 0..16 {
+                        block[i] = f((i % 4 + ox) % 4, (i / 4 + oy) % 4);
+                    }
+                    let dec = decode_etc2_rgb8_block(&encode_etc2_rgb8_block(&block)).unwrap();
+                    total += mean_abs_err(&block, &dec);
+                    n += 1;
+                }
+            }
+            let mean = total / n as f64;
+            eprintln!("etc2 corpus {name:>11}: mean abs error {mean:.2} (ceiling {ceiling:.1})");
+            assert!(mean <= ceiling, "corpus shape {name} regressed to {mean:.2}");
+        }
+    }
+
+    /// The colour-side derived constants must agree with the rules they were derived from.
+    ///
+    /// `MOD_ASC` is the load-bearing one: the unclamped fit picks a texel's selector by counting
+    /// how many ascending midpoints its residual passes, so a row of [`MODIFIERS`] that was not
+    /// laid out `[+small, +large, -small, -large]` would make the count name the wrong selector
+    /// and the encoder would still produce a legal, plausible, wrong block.
+    #[test]
+    fn the_colour_side_derived_constants_agree_with_their_tables() {
+        for table in 0..8 {
+            let asc: Vec<i32> = MOD_ASC.iter().map(|&k| MODIFIERS[table][k]).collect();
+            for k in 1..4 {
+                assert!(asc[k - 1] < asc[k], "table {table} is not ascending under MOD_ASC");
+            }
+            let mut sorted = MODIFIERS[table];
+            sorted.sort_unstable();
+            assert_eq!(asc[..], sorted[..], "table {table}");
+        }
+        for f in 0..2 {
+            for s in 0..2 {
+                let idxs = SUB_IDX[f][s];
+                let mut seen = [false; 16];
+                for &i in &idxs {
+                    assert_eq!(subblock_of(i, f == 1), s, "SUB_IDX[{f}][{s}] holds a stray texel");
+                    assert!(!seen[i], "SUB_IDX[{f}][{s}] repeats texel {i}");
+                    seen[i] = true;
+                }
+                let want = (0..16).filter(|&i| subblock_of(i, f == 1) == s).count();
+                assert_eq!(want, 8, "every subblock is eight texels");
+            }
+        }
+    }
+
+    /// The residual-mean selector rule must agree EXACTLY with the four-way scan it replaced,
+    /// wherever no channel clamps.
+    ///
+    /// # Why this is an exhaustive check and not a sample
+    /// The rule is an identity - the modifier that minimises `sum_c (base_c + m - t_c)^2` is the
+    /// one nearest the mean residual - so it either holds everywhere in the unclamped region or
+    /// the derivation is wrong. Sampling would hide a boundary case, and every boundary case is
+    /// a texel sitting exactly between two modifiers, which is where rounding decides.
+    #[test]
+    fn the_residual_rule_agrees_with_the_four_way_scan() {
+        // The scan, kept here as the oracle.
+        fn scan(base: [i32; 3], t: [i32; 3], table: usize) -> u32 {
+            let mut best = u32::MAX;
+            for &m in MODIFIERS[table].iter() {
+                let d: i32 = (0..3)
+                    .map(|c| {
+                        let v = (base[c] + m).clamp(0, 255) - t[c];
+                        v * v
+                    })
+                    .sum();
+                best = best.min(d as u32);
+            }
+            best
+        }
+        let mut checked = 0usize;
+        for table in 0..8 {
+            // Bases far enough from both ends that no modifier in this table clamps.
+            let m = MODIFIERS[table][1];
+            for base_v in (m..=(255 - m)).step_by(7) {
+                let base = [base_v, base_v, base_v];
+                for tv in (0..256).step_by(3) {
+                    for spread in [-9i32, 0, 5] {
+                        let t = [
+                            (tv + spread).clamp(0, 255),
+                            tv.clamp(0, 255),
+                            (tv - spread).clamp(0, 255),
+                        ];
+                        let mut block = [[0u8; 4]; 16];
+                        for b in block.iter_mut() {
+                            *b = [t[0] as u8, t[1] as u8, t[2] as u8, 255];
+                        }
+                        let (got, _) = fit_subblock(
+                            &block,
+                            false,
+                            0,
+                            [base_v as u8, base_v as u8, base_v as u8],
+                            table,
+                        );
+                        // Eight identical texels, so the per-texel error is an eighth of the fit.
+                        assert_eq!(got / 8, scan(base, t, table), "table {table} base {base_v} texel {t:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "the sweep must actually cover something, got {checked}");
+    }
+
+    /// The two derived EAC tables must agree with [`EAC_TABLES`], because everything the fast
+    /// path does rests on them.
+    ///
+    /// `EAC_ORDER` is what makes the bisection legal - a row that is not a true ascending
+    /// permutation would pick a wrong-but-plausible selector for every texel, which is the kind
+    /// of defect that shows up as a faintly wrong alpha edge and nothing else.
+    #[test]
+    fn the_derived_eac_tables_agree_with_the_spec_table() {
+        assert_eq!(
+            EAC_TABLES[EAC_ZERO_TABLE][EAC_ZERO_SEL as usize], 0,
+            "the constant-alpha fast path needs a genuinely ZERO modifier"
+        );
+        for t in 0..16 {
+            let (lo, hi) = EAC_EXTENT[t];
+            assert_eq!(lo, *EAC_TABLES[t].iter().min().unwrap());
+            assert_eq!(hi, *EAC_TABLES[t].iter().max().unwrap());
+            let ord = EAC_ORDER[t];
+            let mut seen = [false; 8];
+            for k in 0..8 {
+                assert!(!seen[ord[k] as usize], "table {t} order repeats a selector");
+                seen[ord[k] as usize] = true;
+                if k > 0 {
+                    assert!(
+                        EAC_TABLES[t][ord[k - 1] as usize] < EAC_TABLES[t][ord[k] as usize],
+                        "table {t} order is not ascending at {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fast encoder must not be worse than the exhaustive one it replaced.
+    ///
+    /// # Why this compares against a reimplementation rather than a stored number
+    /// The exhaustive search is the definition of the best answer this block format can give
+    /// under the two ETC1-compatible modes, so it is the oracle. Keeping it here as test-only
+    /// code costs nothing at runtime and makes the claim checkable on any input rather than on
+    /// the handful of cases someone thought to record.
+    #[test]
+    fn the_fast_alpha_encoder_matches_the_exhaustive_search() {
+        // The exhaustive search, exactly as it stood before the rewrite.
+        fn exhaustive(block: &Block) -> u32 {
+            let alphas: [i32; 16] = std::array::from_fn(|i| block[i][3] as i32);
+            let lo = *alphas.iter().min().unwrap();
+            let hi = *alphas.iter().max().unwrap();
+            let base_guess = ((lo + hi) / 2).clamp(0, 255);
+            let mut best = u32::MAX;
+            for table in 0..16 {
+                for mult in 1..16u8 {
+                    for base in [base_guess, lo, hi] {
+                        let mut err = 0u32;
+                        for &a in alphas.iter() {
+                            let mut b = u32::MAX;
+                            for &m in EAC_TABLES[table].iter() {
+                                let v = clamp255(base + m * mult as i32) as i32;
+                                b = b.min(((v - a) * (v - a)) as u32);
+                            }
+                            err = err.saturating_add(b);
+                        }
+                        best = best.min(err);
+                    }
+                }
+            }
+            best
+        }
+        fn actual(block: &Block) -> u32 {
+            let dec = decode_eac_alpha_block(&encode_eac_alpha_block(block));
+            (0..16).map(|i| {
+                let d = dec[i] as i32 - block[i][3] as i32;
+                (d * d) as u32
+            }).sum()
+        }
+        let mut worse = 0usize;
+        let mut total_ratio = 0f64;
+        let mut cases = 0usize;
+        for seed in 0..256u32 {
+            let mut block = [[0u8; 4]; 16];
+            for (i, t) in block.iter_mut().enumerate() {
+                let h = seed.wrapping_mul(2654435761).wrapping_add(i as u32 * 40503);
+                // A spread of shapes: smooth ramps, two-level cut-outs, and noise. Each is a
+                // different demand on the (table, multiplier) pair.
+                let a = match seed % 4 {
+                    0 => (i as u32 * 17) as u8,
+                    1 => if i % 3 == 0 { 0 } else { 255 },
+                    2 => (h >> 24) as u8,
+                    _ => (128 + (h >> 28)) as u8,
+                };
+                *t = [(h >> 8) as u8, (h >> 16) as u8, h as u8, a];
+            }
+            let want = exhaustive(&block);
+            let got = actual(&block);
+            if got > want {
+                worse += 1;
+                total_ratio += (got as f64 + 1.0) / (want as f64 + 1.0);
+                cases += 1;
+            }
+            // A hard ceiling: never more than a little worse on any single block. The fast
+            // search covers the same (multiplier, base) neighbourhood, so a large miss means a
+            // real defect, not a trade.
+            assert!(
+                got <= want * 2 + 64,
+                "seed {seed}: fast search gave {got} against the exhaustive {want}"
+            );
+        }
+        let mean = if cases > 0 { total_ratio / cases as f64 } else { 1.0 };
+        eprintln!("eac fast search: worse on {worse}/256 blocks, mean ratio when worse {mean:.3}");
+    }
+
+    /// The all-opaque block is the most common block in real art with an alpha channel, and it
+    /// has an EXACT EAC encoding - so it must be exact, and it must be fast.
+    ///
+    /// Table 13 is `[-1, -2, -3, -10, 0, 1, 2, 9]`, whose selector 4 is a ZERO modifier. Any
+    /// constant alpha is therefore `base = a, selector = 4` with no error at all, whatever the
+    /// multiplier. Nothing in the search knew that, so a fully opaque block walked all 720
+    /// (table, multiplier, base) combinations to arrive at an answer a comparison gives.
+    #[test]
+    fn a_constant_alpha_block_encodes_exactly() {
+        for a in [0u8, 1, 63, 127, 128, 200, 254, 255] {
+            let block: Block = [[10, 20, 30, a]; 16];
+            let dec = decode_eac_alpha_block(&encode_eac_alpha_block(&block));
+            assert_eq!(dec, [a; 16], "constant alpha {a} must encode exactly");
+        }
     }
 
     /// A quality FLOOR that holds for any content: the encoder must never do worse than the

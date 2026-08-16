@@ -252,6 +252,20 @@ pub fn set_texture_binding(ctx: &mut GuestCtx, context: u32, unit: u32, b: TexBi
 }
 
 /// Read sampler `unit`'s binding.
+/// Just the `data` pointer bound to fragment sampler `unit`, or 0 if nothing is bound there.
+///
+/// # Why this exists beside [`texture_binding`]
+/// A draw has to find out WHICH of the sixteen units are bound, and almost none of them are - a
+/// real title uses three or four. Asking [`texture_binding`] reads six guest words per unit,
+/// ninety-six per draw, and then throws away the ninety it read for empty slots. This reads the
+/// one word that decides, so the other five are read only for a unit that has something in it.
+pub fn texture_binding_addr(ctx: &GuestCtx, context: u32, unit: u32) -> u32 {
+    if unit as usize >= MAX_TEXTURE_UNITS {
+        return 0;
+    }
+    get(ctx, context, texture_at(unit))
+}
+
 pub fn texture_binding(ctx: &GuestCtx, context: u32, unit: u32) -> TexBinding {
     if unit as usize >= MAX_TEXTURE_UNITS {
         return TexBinding::default();

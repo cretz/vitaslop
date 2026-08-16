@@ -109,12 +109,29 @@ static BYTES: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::C
 /// Time alone cannot tell a phase that is slow from a phase that is merely large: a
 /// millisecond spent copying is a volume problem (copy less) and a millisecond spent
 /// per call is an overhead problem (call less), and the two have no fix in common.
-/// Only counted while timing is on, so the report never mixes a measured window with
-/// a stale total.
+///
+/// # >>> COUNTED ALWAYS, AND ON EVERY TARGET, WHICH IS THE POINT
+/// This used to be gated on [`enabled`], i.e. on `VITASLOP_PERF`, which is an ENVIRONMENT
+/// variable - and the browser has no environment ([[vitaslop-browser-has-no-env]]). Timing is
+/// gated too and is `#[cfg]`-ed out of wasm entirely, because `std::time::Instant` does not work
+/// there. So the ONE engine whose CPU cost decides this project could not report a single phase
+/// figure of any kind, and a device capture showed only two totals with nothing between them.
+///
+/// That is how a defect that spent **44% of every frame comparing 105.8 MB of texture** survived:
+/// it was invisible on the engine that paid for it and switched off on the engine that did not.
+/// A byte count needs no clock, and there are a handful of these calls per draw against thousands
+/// of operations, so it is counted unconditionally on every target. **Volume is a measurement in
+/// its own right** - the 105.8 MB would have named the defect on its own, with no timer at all.
 pub fn note_bytes(phase: Phase, n: usize) {
-    if enabled() {
-        BYTES[phase.index()].fetch_add(n as u64, Relaxed);
-    }
+    BYTES[phase.index()].fetch_add(n as u64, Relaxed);
+}
+
+/// Bytes charged to each phase since the last [`reset`] or [`take_bytes`], and zero them.
+///
+/// Taken rather than read so a caller can report PER FRAME without keeping its own baseline -
+/// a running total looks like a per-frame figure that keeps growing, which reads as a leak.
+pub fn take_bytes() -> [u64; Phase::COUNT] {
+    std::array::from_fn(|i| BYTES[i].swap(0, Relaxed))
 }
 
 /// Is phase timing on (`VITASLOP_PERF` set)? Read once and cached.

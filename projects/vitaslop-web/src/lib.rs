@@ -2345,6 +2345,17 @@ async fn live_loop(
     recipe: Option<vitaslop_runtime::recipe::Recipe>,
 ) {
     let mut eval = recipe.as_ref().map(|r| vitaslop_runtime::recipe_eval::RecipeEval::new(r, None));
+    // >>> ONLY FOLD THE DETERMINISM SIGNATURE WHEN SOMETHING WILL READ IT.
+    //
+    // This function is the ONLY place in the browser that asks for it, and only when it is
+    // evaluating a recipe (see the `eval.finish(frames, sig)` at the end of the run). A live
+    // player session has no recipe - the user's own device captures read `recipe: (none)` - and
+    // folding hashes every retired scene's vertices, indices and uniforms: about 3 MB a frame on
+    // this title's race, MEASURED at 7.9% of the whole frame, for a number nobody asks for.
+    //
+    // `Capture::signature` refuses rather than returning a partial hash when this was off, so
+    // the failure mode of getting this wrong is a loud one.
+    sched.host.lock().unwrap().state.capture.set_signature_wanted(eval.is_some());
     let perf = global_performance();
 
     // Real-time pacing: advance the guest at 60 Hz of WALL-CLOCK time, not as fast as
@@ -2860,6 +2871,37 @@ async fn live_loop(
                 // volume or per-call boundary overhead, which a millisecond never can.
                 let encode_mean = s.enc_work.line(s.presents.max(1));
                 line(&mut diag, "ENCODE, window mean", &encode_mean);
+                // >>> WHAT THE GUEST-CPU HALF MOVED, IN BYTES. The only phase instrument this
+                // engine can have.
+                //
+                // `cpu N ms/frame` is one number covering translated guest code, the scheduler
+                // and every capture phase, and wasm has no `Instant` to split it with - so a
+                // device capture had NOTHING between "the guest cost 130 ms" and the render
+                // counters below. That is exactly how a defect spending 44% of every frame
+                // comparing 105.8 MB of texture went unseen here while being plainly visible in
+                // the desktop profiler.
+                //
+                // A byte count needs no clock. Volume is a measurement in its own right: a phase
+                // moving a hundred megabytes a frame is a volume problem whatever the clock says,
+                // and this line alone would have named it.
+                let bytes = vitaslop_runtime::perf::take_bytes();
+                let moved: Vec<String> = vitaslop_runtime::perf::Phase::all()
+                    .iter()
+                    .zip(bytes.iter())
+                    .filter(|(_, b)| **b > 0)
+                    .map(|(p, b)| format!("{} {:.2} MB", p.label(), *b as f64 / np / (1024.0 * 1024.0)))
+                    .collect();
+                if !moved.is_empty() {
+                    line(
+                        &mut diag,
+                        "GUEST CPU, bytes moved per frame",
+                        &format!(
+                            "{} | a phase moving tens of MB a frame is the cost, whatever it \
+                             times at",
+                            moved.join(", ")
+                        ),
+                    );
+                }
                 // The single worst present of the window, with ITS OWN counters. A mean over
                 // frames that differ by 2.5x in draw count describes none of them - and when they
                 // do NOT differ, saying so beats printing the same counters again.

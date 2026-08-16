@@ -1225,7 +1225,7 @@ fn retail_boot_probe() {
                     let n = d.uniforms.len().min(32);
                     eprintln!("    uniforms[..{n}]: {:?}", &d.uniforms[..n]);
                 }
-                for t in &d.textures {
+                for t in d.textures.iter() {
                     eprintln!(
                         "    tex unit={} base_fmt={:#04x} swizzle={:#08x} type={:#x} {}x{} stride={} addr={:#010x} pixels={} minf={} magf={}",
                         t.unit, t.base_format, t.swizzle, t.tex_type, t.width, t.height, t.stride,
