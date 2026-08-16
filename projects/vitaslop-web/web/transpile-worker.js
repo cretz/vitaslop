@@ -17,6 +17,15 @@
 import init, { transpile_title, set_knob } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
 
+// The panic sink, same contract as the run worker's (see web/worker.js). A panic in the
+// transpiler aborts this worker before its `catch` can post anything, so without this the page
+// sees only "transpile worker failed to start".
+globalThis.__vitaslopPanic = (text) => {
+  try {
+    self.postMessage({ type: "panic", message: text });
+  } catch {}
+};
+
 const ready = init();
 
 self.onmessage = async (e) => {

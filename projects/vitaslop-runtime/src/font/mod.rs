@@ -256,6 +256,41 @@ impl FontLibrary {
         Some(h)
     }
 
+    /// `scePvfOpenUserMemory`: open a font from bytes the title already holds in GUEST
+    /// MEMORY, rather than from a file.
+    ///
+    /// Identical to [`Self::open_user_file`] once the bytes are in hand - the difference
+    /// is entirely on the caller's side (a guest pointer and a length instead of a path),
+    /// so they share everything below the read. Titles use this for a font they have
+    /// already loaded into their own heap, or one packed inside an archive they unpack
+    /// themselves, which a path-based open cannot reach at all.
+    pub fn open_user_memory(&mut self, lib: u32, bytes: &[u8]) -> Option<u32> {
+        self.open_user_file(lib, bytes)
+    }
+
+    /// `scePvfClose`: drop a font handle.
+    ///
+    /// Returns whether the handle was one this library had open, so the caller can report
+    /// `SCE_PVF_ERROR_ARG` for a handle that was never issued (or was closed twice) rather
+    /// than succeeding - a double close that reads as success hides a title's own
+    /// use-after-free from it.
+    ///
+    /// The glyph cache is keyed by `(face, size, char)`, so the closed font's entries
+    /// become unreachable the moment its face goes; they are dropped here rather than left
+    /// to accumulate for the life of a run that opens and closes fonts per screen.
+    ///
+    /// The face is only dropped when NO other open font is using it, so closing one of two
+    /// handles on the same face does not pull the cache out from under the other.
+    pub fn close(&mut self, font: u32) -> bool {
+        let Some(state) = self.fonts.remove(&font) else { return false };
+        let face = state.face;
+        if self.fonts.values().any(|f| f.face == face) {
+            return true;
+        }
+        self.cache.retain(|k, _| k.face != face);
+        true
+    }
+
     pub fn font_exists(&self, font: u32) -> bool {
         self.fonts.contains_key(&font)
     }

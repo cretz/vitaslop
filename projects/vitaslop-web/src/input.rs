@@ -13,7 +13,8 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use vitaslop_runtime::{CtrlFrame, RecipeWorld, TouchFrame, World};
+use crate::location::SharedLocation;
+use vitaslop_runtime::{CtrlFrame, LocationFix, LocationPermission, RecipeWorld, TouchFrame, World};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
@@ -81,6 +82,13 @@ const FRAME_US: u64 = 16_666;
 pub struct BrowserWorld {
     recipe: Option<RecipeWorld>,
     live: SharedInput,
+    /// The host's location provider (see [`crate::location`]). Read on every guest
+    /// query rather than cached, so a fix cannot go stale behind the title's back.
+    location: SharedLocation,
+    /// Whether this run has asked the host to acquire position. Guards the outbound
+    /// request so a title polling its permission dialog every frame - which is what the
+    /// observed retail caller does - does not post a message per frame.
+    location_requested: bool,
     monotonic_us: u64,
     wall_us: u64,
     rng: u64,
@@ -89,10 +97,12 @@ pub struct BrowserWorld {
 impl BrowserWorld {
     /// A world driven by `live` input, optionally overlaid on a scripted `recipe`
     /// (frame-keyed touch/button directives). Pass `None` for a purely live session.
-    pub fn new(recipe: Option<RecipeWorld>, live: SharedInput) -> Self {
+    pub fn new(recipe: Option<RecipeWorld>, live: SharedInput, location: SharedLocation) -> Self {
         BrowserWorld {
             recipe,
             live,
+            location,
+            location_requested: false,
             monotonic_us: 0,
             wall_us: 1_500_000_000_000_000,
             rng: 0x9E37_79B9_7F4A_7C15,
@@ -133,6 +143,26 @@ impl World for BrowserWorld {
             }
         }
         self.recipe.as_mut().map(|r| r.poll_touch(port)).unwrap_or_default()
+    }
+    fn location_permission(&mut self) -> LocationPermission {
+        self.location.lock().unwrap().permission
+    }
+    fn request_location(&mut self) {
+        if self.location_requested {
+            return;
+        }
+        self.location_requested = true;
+        crate::location::start_host_watch();
+    }
+    fn release_location(&mut self) {
+        if !self.location_requested {
+            return;
+        }
+        self.location_requested = false;
+        crate::location::stop_host_watch();
+    }
+    fn poll_location(&mut self) -> Option<LocationFix> {
+        self.location.lock().unwrap().fix
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
         // SplitMix64, matching the runtime worlds: deterministic and cheap.

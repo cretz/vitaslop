@@ -146,6 +146,25 @@ pub trait ThreadHandle {
     fn fuel_used(&mut self) -> Option<u64> {
         None
     }
+
+    /// Total GUEST ARM INSTRUCTIONS this thread has retired since it started, from the
+    /// emitted per-block counter (`abi::ARM_COUNT_GLOBAL`), or `None` from an engine that
+    /// does not carry one.
+    ///
+    /// # Why the clock is billed in this and not in fuel
+    /// Fuel counts executed WASM OPERATORS. That is the right unit for PREEMPTION - it
+    /// bounds real work on both engines - and the wrong unit for the emulated CPU clock,
+    /// because the number of operators a guest instruction becomes is a property of THIS
+    /// TRANSPILER's codegen. Billing the clock in operators means every codegen improvement
+    /// silently speeds the emulated console up: three changes in one session cut executed
+    /// operators 28% for identical guest work, which would have made the emulated Vita
+    /// 1.39x faster with nothing in a run to notice it by, and it took a hand-tuned
+    /// compensation constant to undo. Guest instructions do not move when the codegen does.
+    ///
+    /// Cumulative, for the same reason [`Self::fuel_used`] is: the scheduler differences it.
+    fn arm_retired(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// A guest thread the scheduler can resume *synchronously* to its next switch point.
@@ -254,11 +273,15 @@ struct Slot<T> {
     /// Cumulative [`GuestThread::fuel_used`] as of this thread's last suspend, so the
     /// next one can be charged for the DIFFERENCE - the work this resume actually did.
     fuel_seen: u64,
+    /// Cumulative [`ThreadHandle::arm_retired`] as of this thread's last suspend. The
+    /// GAME CLOCK is charged for the difference; `fuel_seen` above now only feeds the fuel
+    /// report and the preemption accounting.
+    arm_seen: u64,
 }
 
 impl<T> Slot<T> {
     fn new(thread: T, state: ThreadState) -> Slot<T> {
-        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0 }
+        Slot { thread, state, cooled: false, picks: 0, quanta: 0, fuel_seen: 0, arm_seen: 0 }
     }
 }
 
@@ -600,7 +623,18 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // jump the game clock by hours rather than showing up as a small drift.
         let burned = total.saturating_sub(self.threads[idx].fuel_seen);
         self.threads[idx].fuel_seen = total;
-        if burned == 0 {
+        // The GUEST INSTRUCTIONS this resume retired, which is what the emulated CPU clock
+        // is billed in. Differenced exactly as fuel is. An engine with no such counter
+        // falls back to fuel below, which is the pre-2026-08-16 behaviour.
+        let retired = match self.threads[idx].thread.arm_retired() {
+            Some(t) => {
+                let d = t.saturating_sub(self.threads[idx].arm_seen);
+                self.threads[idx].arm_seen = t;
+                Some(d)
+            }
+            None => None,
+        };
+        if burned == 0 && retired.unwrap_or(0) == 0 {
             return;
         }
         let runnable = self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
@@ -616,7 +650,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.fuel_total = self.fuel_total.saturating_add(burned);
         self.fuel_samples += 1;
         self.fuel_max = self.fuel_max.max(burned);
-        self.host.lock().unwrap().on_guest_work(runnable, burned);
+        self.host.lock().unwrap().on_guest_work(runnable, burned, retired);
     }
 
     /// `(total fuel burned, samples, largest single burn)`.

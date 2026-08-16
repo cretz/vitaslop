@@ -169,17 +169,62 @@ pub struct RenderSplit {
     pub phases: vitaslop_platform::gpu::EncodePhases,
 }
 
+/// The adapter this renderer runs on: the high-performance one, unless `WGPU_ADAPTER_NAME`
+/// names another.
+///
+/// # >>> THIS EXISTS SO A DEVICE-ONLY DEFECT CAN BE REPRODUCED HERE.
+/// `request_adapter` returns ONE adapter, and on a laptop that is the discrete GPU. This machine
+/// also has an Intel iGPU which, on Vulkan, exposes **ETC2** - the family the target phone uses
+/// and the one the whole GPU texture transcode is written for. Without a way to reach it, every
+/// ETC2-only path is unexercised here and its first execution is on the user's phone. That has
+/// already cost one shipped build: the transcode's `copyBufferToTexture` extent was wrong, the
+/// whole command buffer was invalidated, and every transcoded texture was created and never
+/// written.
+///
+/// `WGPU_ADAPTER_NAME` is wgpu's own convention (a case-insensitive substring of the adapter
+/// name), not a vitaslop knob, and it pairs with `WGPU_BACKEND`. **Unset, this is exactly the
+/// call it replaces**, so the default path and the determinism oracle are untouched.
+///
+/// It reports what it took, because "the same run behaves differently" with no line saying which
+/// GPU answered is the ambiguity every report in this renderer exists to remove.
+fn pick_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
+    let want = std::env::var("WGPU_ADAPTER_NAME").ok().filter(|s| !s.is_empty());
+    if let Some(want) = want {
+        let lower = want.to_lowercase();
+        let found = block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .find(|a| a.get_info().name.to_lowercase().contains(&lower));
+        match found {
+            Some(a) => {
+                let i = a.get_info();
+                eprintln!(
+                    "gpu: WGPU_ADAPTER_NAME={want} selected {:?} {:?} {}",
+                    i.backend, i.device_type, i.name
+                );
+                return Some(a);
+            }
+            // Falling back silently would run the test on the DEFAULT adapter and report a pass
+            // for a configuration that was never exercised, which is worse than not running.
+            None => {
+                eprintln!("gpu: WGPU_ADAPTER_NAME={want} matched no adapter - REFUSING to fall back");
+                return None;
+            }
+        }
+    }
+    block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    }))
+    .ok()
+}
+
 impl GeneralRenderer {
     /// Acquire a GPU and build the general pipeline. `None` if no adapter is available.
     pub fn new() -> Option<Self> {
         let instance = wgpu::Instance::default();
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        }))
-        .ok()?;
+        let adapter = pick_adapter(&instance)?;
         let adapter_name = adapter.get_info().name;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),

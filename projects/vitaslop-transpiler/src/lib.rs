@@ -26,6 +26,7 @@ pub use emit::fuel_interval;
 /// [`DIRTY_MAP_OFF`]). A host that stamps its own reads against the epoch can prove a
 /// region of guest memory unchanged without reading it.
 pub use emit::{set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_SHIFT};
+mod flags;
 mod ir;
 mod lower;
 
@@ -684,6 +685,14 @@ pub struct Artifact {
     /// in a build that has no map. `None` means "this module tracks nothing", which is
     /// why it is an `Option` rather than an offset of zero.
     pub dirty_off: Option<u64>,
+    /// Wasm operators emitted per GUEST INSTRUCTION for this build.
+    ///
+    /// A host should report it, because it is the hidden term in the emulated CPU's
+    /// speed: the game clock is charged per unit of fuel and a unit of fuel is an
+    /// executed wasm operator, so the emulated Vita runs at `fuel rate / expansion`.
+    /// Improve the codegen and the console gets faster unless the calibration moves with
+    /// it. See [`emit::Expansion`].
+    pub expansion: emit::Expansion,
 }
 
 /// A transpiled function: the guest address it starts at and its wasm export.
@@ -989,7 +998,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off } =
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } =
         emit::emit_module(
             &ordered,
             &func_index,
@@ -1005,7 +1014,7 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
-    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off })
+    Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion })
 }
 
 /// The output of a lenient whole-program build ([`transpile_lenient`]): the module
@@ -1142,7 +1151,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         .enumerate()
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off } = emit::emit_module(
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } = emit::emit_module(
         &ordered,
         &func_index,
         program.base,
@@ -1157,7 +1166,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
-        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off },
+        artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion },
         stubbed,
         stub_wasm_indices,
     }
@@ -1448,6 +1457,9 @@ mod tests {
                 })
                 .collect();
             let audited = bodies.len() - 1;
+            // Guest instructions committed across the whole module, so the clock's half of
+            // every commit is audited too. See where it is asserted, below the loop.
+            let mut lifted: i64 = 0;
             for body in bodies.into_iter().take(audited) {
                 let ops: Vec<Operator> = body
                     .get_operators_reader()
@@ -1463,42 +1475,67 @@ mod tests {
                 // Wasmtime charges a function one unit for being entered at all, so that
                 // an empty one still costs something; `Body::new` starts at 1 to match.
                 let mut charged: i64 = 0;
+                let mut instructions: i64 = 0;
                 let mut owed: i64 = 1;
                 let mut i = 0;
                 while i < ops.len() {
-                    // A commit:  global.get $fuel ; i32.const N ; i32.sub ; global.set $fuel
+                    // A commit:  global.get $work ; i64.const PACKED ; i64.add ; global.set $work
+                    //
+                    // PACKED carries BOTH counters (see `abi::pack_work`): guest
+                    // instructions in the high 32 bits, operators in the low 32. One add
+                    // advances both, which is what makes billing the clock in guest
+                    // instructions cost no extra code at all.
                     if let [
                         Operator::GlobalGet { global_index: g },
-                        Operator::I32Const { value },
-                        Operator::I32Sub,
+                        Operator::I64Const { value },
+                        Operator::I64Add,
                         Operator::GlobalSet { global_index: h },
                     ] = ops[i..(i + 4).min(ops.len())]
                     {
-                        if g == abi::FUEL_GLOBAL && h == abi::FUEL_GLOBAL {
-                            assert!(value > 0, "{what}: a commit of {value} is dead code");
-                            charged += value as i64;
+                        if g == abi::WORK_GLOBAL && h == abi::WORK_GLOBAL {
+                            let ops_half = value & abi::WORK_OPS_MASK;
+                            let instr_half = value >> abi::WORK_INSTR_SHIFT;
+                            assert!(
+                                ops_half > 0 || instr_half > 0,
+                                "{what}: a commit of 0 is dead code"
+                            );
+                            // The halves must not have bled into each other. Both count
+                            // UP precisely so the add cannot borrow; a negative here would
+                            // mean that reasoning is wrong.
+                            assert!(instr_half >= 0, "{what}: the instruction half went negative");
+                            charged += ops_half;
+                            instructions += instr_half;
                             i += 4;
                             continue;
                         }
                     }
-                    // A back-edge test:  global.get $fuel ; i32.const 0 ; i32.le_s ; if
-                    //   ; i32.const -1 ; call $host ; i32.const INTERVAL ; global.set $fuel ; end
+                    // A back-edge test:
+                    //   global.get $work ; i64.const MASK ; i64.and ; i64.const INTERVAL ;
+                    //   i64.ge_u ; if ; i32.const -1 ; call $host ;
+                    //   global.get $work ; i64.const !MASK ; i64.and ; global.set $work ; end
                     if let [
                         Operator::GlobalGet { global_index: g },
-                        Operator::I32Const { value: 0 },
-                        Operator::I32LeS,
-                        Operator::If { .. },
+                        Operator::I64Const { value: mask },
+                        Operator::I64And,
+                        Operator::I64Const { value: interval },
                     ] = ops[i..(i + 4).min(ops.len())]
                     {
-                        if g == abi::FUEL_GLOBAL {
+                        if g == abi::WORK_GLOBAL && mask == abi::WORK_OPS_MASK {
+                            assert_eq!(
+                                interval, INTERVAL as i64,
+                                "{what}: a back-edge test must compare the whole interval"
+                            );
+                            // The yield must clear ONLY the operator half - clearing the
+                            // whole global would reset the clock's instruction total every
+                            // quantum and the game clock would never advance.
                             assert!(
                                 matches!(
-                                    ops[i + 6],
-                                    Operator::I32Const { value } if value == INTERVAL
+                                    ops[i + 9],
+                                    Operator::I64Const { value } if value == !abi::WORK_OPS_MASK
                                 ),
-                                "{what}: a back-edge test must reload the whole interval"
+                                "{what}: a yield must preserve the guest-instruction half"
                             );
-                            i += 9;
+                            i += 12;
                             continue;
                         }
                     }
@@ -1509,7 +1546,21 @@ mod tests {
                     charged, owed,
                     "{what}: the body commits {charged} fuel where wasmtime bills {owed}"
                 );
+                // The clock's half rides the same commits, so it is auditable by the same
+                // walk. Accumulated across the module rather than asserted per body: the
+                // dispatcher and the reset thunk lift no guest code and correctly commit
+                // no instructions, so a per-body assert would fire on them.
+                lifted += instructions;
             }
+            // The module lifted guest code, so its commits must have carried a guest
+            // instruction count. Zero here means the clock's half of the packed commit
+            // was dropped - a game clock that never advances, which is the livelock
+            // `Signal::fuel` documents arriving by a new route.
+            assert!(
+                lifted > 0,
+                "{what}: the module committed no guest instructions at all, so the clock \
+                 would never advance"
+            );
         };
 
         // Straight-line only, so every operator in the body is reached and the totals can

@@ -105,6 +105,11 @@ struct Signal {
     /// only on the periodic yield. Charging it nothing is a stopped clock, which is the
     /// exact livelock the CPU charge exists to prevent.
     fuel: u64,
+    /// GUEST ARM INSTRUCTIONS this thread has retired in total, from the emitted per-block
+    /// counter. This - not [`Self::fuel`] - is what the game clock is billed in, because an
+    /// ARM instruction is the same amount of guest work whatever the codegen turns it into.
+    /// See `sched::ThreadHandle::arm_retired`.
+    arm: u64,
     /// How many times the host-call closure has suspended this thread. `resume` compares
     /// it across a poll to tell a suspend it can see (a host call, which sampled `fuel`)
     /// from one it cannot (wasmtime's periodic fuel yield).
@@ -217,6 +222,37 @@ impl ThreadHandle for WasmtimeThread {
 
     fn fuel_used(&mut self) -> Option<u64> {
         Some(self.signal.lock().unwrap().fuel)
+    }
+
+    /// >>> DELIBERATELY `None` ON NATIVE, AND THE REASON IS A LIVELOCK, NOT AN OMISSION.
+    ///
+    /// The guest-instruction counter is a wasm GLOBAL, and reading a global needs the
+    /// thread's `Store` - which only exists inside the fiber. So [`sample_arm_instructions`]
+    /// runs from the host-call closure, and it therefore sees only suspends that go through
+    /// a host call. wasmtime's OWN periodic preemption (`fuel_async_yield_interval`) runs
+    /// none of our code, so a thread that spins WITHOUT making a host call is never sampled.
+    ///
+    /// That thread exists and is ordinary: a title's vblank spin reads the clock through an
+    /// INLINED mirror load and makes no host call at all. Billing the clock from an unsampled
+    /// counter charges it nothing, the clock never advances, and the load it is waiting on
+    /// can never complete. MEASURED: WipEout boots in 6 s and then fast-forwards for over
+    /// ten minutes without reaching frame 300. It is exactly the stopped-clock livelock
+    /// [`Signal::fuel`] documents, arriving by a new route.
+    ///
+    /// So native keeps its fuel-derived clock (`arm_retired` -> `None` selects the fallback
+    /// in `on_guest_work`), which is bit-for-bit the behaviour it had before. This costs
+    /// nothing today: `QUANTUM_ARM` is calibrated as `QUANTUM_FUEL / expansion` at the
+    /// measured expansion, so the two units price identical guest work identically. They
+    /// diverge only when the CODEGEN changes - at which point the browser's clock stays put
+    /// and native's drifts, which is strictly better than today, where both drift.
+    ///
+    /// **What closes it**: move native's preemption onto the EMITTED fuel check
+    /// (`set_fuel_interval`), so every preemption is an `env.import` call and passes through
+    /// the closure - the same mechanism the browser already uses. That is a real change to
+    /// native codegen and scheduling (it moves the headless render SHA), so it wants its own
+    /// verification rather than being folded in here.
+    fn arm_retired(&mut self) -> Option<u64> {
+        None
     }
 }
 
@@ -475,6 +511,30 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         quantum_fuel: u64,
     ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
         let built = transpiler::transpile_lenient(&linked.shared_program());
+        // >>> THE CODE EXPANSION FACTOR, reported unconditionally on the engine that takes
+        // every calibration measurement. The game clock is charged per unit of fuel and a
+        // unit of fuel is one executed wasm operator, so the emulated Vita's CPU speed is
+        // `fuel rate / this number`. Codegen work moves it, and until it was printed
+        // nothing in a run said so - the constant it calibrates
+        // (`vitaslop_runtime::host::QUANTUM_CPU_US`) derives from a figure that was only
+        // ever estimated in a comment.
+        {
+            let x = built.artifact.expansion;
+            tracing::info!(
+                target: "vitaslop::perf",
+                "code expansion: {:.2} wasm operators per guest instruction \
+                 ({} instructions -> {} operators), of which {:.1}% ({}) are moves of the \
+                 ARM registers and flags to and from the instance globals. The game clock \
+                 is billed in guest INSTRUCTIONS where the emitted work counter exists \
+                 (the browser), and that counter rides the fuel commit at no extra cost, \
+                 so the expansion no longer divides the emulated CPU's speed there",
+                x.per_instruction(),
+                x.arm_instructions,
+                x.emitted_ops,
+                x.core_state_share(),
+                x.core_state_ops,
+            );
+        }
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
 
@@ -712,7 +772,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
         priority: i32,
     ) -> Result<WasmtimeThread, RunError> {
         let signal =
-            Arc::new(Mutex::new(Signal { stop: Stop::Quantum, fuel: 0, host_suspends: 0 }));
+            Arc::new(Mutex::new(Signal { stop: Stop::Quantum, fuel: 0, arm: 0, host_suspends: 0 }));
         let data = ThreadData {
             host: self.host.clone(),
             thid,
@@ -725,7 +785,7 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             fatal: None,
             globals: None,
             sw_fuel: None,
-            sw_last: i64::from(vitaslop_transpiler::fuel_interval()),
+            sw_last: 0,
             sw_wasmtime_last: 0,
         };
         let mut store = Store::new(&self.engine, data);
@@ -1525,11 +1585,15 @@ fn sample_software_fuel<H: ImportDispatch + Send + 'static>(
         return;
     }
     let Some(g) = caller.data().sw_fuel.clone() else { return };
-    let Some(now) = g.get(&mut *caller).i32().map(i64::from) else { return };
+    // The counter is the PACKED i64 work global: operators in the low half, guest
+    // instructions in the high half (see `abi::WORK_GLOBAL`). Only the operator half is
+    // wasmtime's unit, so only that half is comparable with wasmtime's own reading.
+    let Some(now) = g.get(&mut *caller).i64().map(|v| v & abi::WORK_OPS_MASK) else { return };
     let last = caller.data().sw_last;
-    // A reading ABOVE the last one means a reload happened in between: the thread burned
-    // the rest of the old interval and then the part of the new one it has spent.
-    let burned = if now <= last { last - now } else { last + (interval - now) };
+    // The operator half counts UP to the interval and is cleared at each yield, so a
+    // reading BELOW the last one means a yield happened in between: the thread finished
+    // the old interval and then spent part of the new one.
+    let burned = if now >= last { now - last } else { (interval - last) + now };
     caller.data_mut().sw_last = now;
 
     use std::sync::atomic::Ordering::Relaxed;

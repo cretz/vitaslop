@@ -19,9 +19,18 @@ use yaxpeax_arm::armv7::{
 
 use crate::Error;
 use crate::ir::{
-    Block, BinOp, ElemLane, FBinOp, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType, Stmt, Term,
-    Value, VfpOp, VfpReg,
+    Block, BinOp, ElemLane, FBinOp, FlagMask, Func, MemSize, NeonBin, NeonReg, NeonStmt, NeonType,
+    Stmt, Term, Value, VfpOp, VfpReg,
 };
+
+/// What lowering records for a flag statement's observable set.
+///
+/// Lowering sees one instruction at a time and cannot know which flags a later block
+/// reads, so it claims all of them. [`crate::flags::annotate`] runs over the finished
+/// function and narrows each one. Keeping the pessimistic value HERE rather than as an
+/// implicit default is deliberate: a build that skips the liveness pass emits exactly the
+/// code it emitted before the pass existed.
+const ALL_FLAGS: FlagMask = FlagMask::ALL;
 
 /// A resolved import: the guest stub address a `bl`/`blx` targets maps to a
 /// dense host-import index.
@@ -1301,7 +1310,8 @@ pub fn discover(
         // block, so a branch/switch that targets it stays well-formed (the target is
         // a real block) while executing it faults loudly.
         if trap_leaders.contains(&addr) {
-            blocks.push(Block { addr, stmts: Vec::new(), term: Term::Unreachable });
+            // A trap block runs no guest instructions, so it is billed nothing.
+            blocks.push(Block { addr, stmts: Vec::new(), term: Term::Unreachable, arm_count: 0 });
             continue;
         }
         // A leader can be out of bounds (a branch target past the image); such a
@@ -1311,6 +1321,8 @@ pub fn discover(
         }
         let mut cursor = addr;
         let mut stmts = Vec::new();
+        // Guest instructions lifted into this block - the emulator's unit of guest work.
+        let mut arm_count = 0u32;
         let term = loop {
             let Some((inst, len, applied, in_it)) = decoded.get(&cursor) else {
                 // Fell through to code that was never decoded (off image or
@@ -1322,6 +1334,7 @@ pub fn discover(
             if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
                 match switches.get(&cursor) {
                     Some(info) => {
+                        arm_count += 1;
                         break Term::Switch {
                             index: Value::Reg(info.index),
                             targets: info.targets.clone(),
@@ -1345,6 +1358,7 @@ pub fn discover(
                     Err(e) => return Err(e),
                 };
             stmts.append(&mut effects);
+            arm_count += 1;
             cursor = cursor.wrapping_add(*len);
             if let Some(t) = term {
                 break t;
@@ -1354,7 +1368,7 @@ pub fn discover(
                 break Term::Fallthrough;
             }
         };
-        blocks.push(Block { addr, stmts, term });
+        blocks.push(Block { addr, stmts, term, arm_count });
     }
     blocks.sort_by_key(|b| b.addr);
 
@@ -1396,7 +1410,12 @@ pub fn discover(
         }
         if !missing.is_empty() {
             blocks.extend(
-                missing.iter().map(|&addr| Block { addr, stmts: Vec::new(), term: Term::Unreachable }),
+                missing.iter().map(|&addr| Block {
+                    addr,
+                    stmts: Vec::new(),
+                    term: Term::Unreachable,
+                    arm_count: 0,
+                }),
             );
             blocks.sort_by_key(|b| b.addr);
         }
@@ -1418,8 +1437,20 @@ pub fn discover(
         }
     }
 
+    // The function is complete, so its flag liveness is knowable. Annotating HERE rather
+    // than at each of the three `discover` call sites is what makes it unmissable: a
+    // build path that forgot the pass would silently emit the slow code and pass every
+    // test, which is the shape of defect this project keeps meeting.
+    let mut func = Func { addr: entry, thumb, blocks, stub: false };
+    // Fold runs of same-condition predication (a Thumb `IT` block) into one guard BEFORE
+    // liveness runs, so the analysis sees the shape the emitter will actually emit.
+    for b in &mut func.blocks {
+        crate::flags::merge_guards(&mut b.stmts);
+    }
+    crate::flags::annotate(&mut func);
+
     Ok(Discovered {
-        func: Func { addr: entry, thumb, blocks, stub: false },
+        func,
         callees: callees.into_iter().collect(),
         code_pointers: code_pointers.into_iter().collect(),
         arm_code_pointers: arm_code_pointers.into_iter().collect(),
@@ -1882,7 +1913,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                     Value::Imm(v) => modified_imm_carry(v, inst.thumb),
                     _ => None,
                 };
-                out.push(Stmt::FlagsLogic { value: src.clone(), carry });
+                out.push(Stmt::FlagsLogic { value: src.clone(), carry, live: ALL_FLAGS });
             }
             out.push(Stmt::SetReg(rd, src));
         }
@@ -1907,7 +1938,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             let value = Value::Not(Box::new(src));
             if sets_flags {
-                out.push(Stmt::FlagsLogic { value: value.clone(), carry });
+                out.push(Stmt::FlagsLogic { value: value.clone(), carry, live: ALL_FLAGS });
             }
             out.push(Stmt::SetReg(rd, value));
         }
@@ -1932,7 +1963,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         ADD => {
             let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
-                out.push(Stmt::FlagsAdd { a: rn.clone(), b: op2.clone(), cin: Value::Imm(0) });
+                out.push(Stmt::FlagsAdd {
+                    a: rn.clone(),
+                    b: op2.clone(),
+                    cin: Value::Imm(0),
+                    live: ALL_FLAGS,
+                });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Add, rn, op2)));
         }
@@ -1943,6 +1979,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                     a: rn.clone(),
                     b: Value::Not(Box::new(op2.clone())),
                     cin: Value::Imm(1),
+                    live: ALL_FLAGS,
                 });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, rn, op2)));
@@ -1955,7 +1992,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         ADC => {
             let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             if sets_flags {
-                out.push(Stmt::FlagsAdd { a: rn, b: op2, cin: Value::Flag(crate::abi::Flag::C) });
+                out.push(Stmt::FlagsAdd {
+                    a: rn,
+                    b: op2,
+                    cin: Value::Flag(crate::abi::Flag::C),
+                    live: ALL_FLAGS,
+                });
                 out.push(Stmt::SetReg(rd, Value::CarryAddResult));
             } else {
                 let sum =
@@ -1968,7 +2010,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             let not_op2 = Value::Not(Box::new(op2));
             if sets_flags {
-                out.push(Stmt::FlagsAdd { a: rn, b: not_op2, cin: Value::Flag(crate::abi::Flag::C) });
+                out.push(Stmt::FlagsAdd {
+                    a: rn,
+                    b: not_op2,
+                    cin: Value::Flag(crate::abi::Flag::C),
+                    live: ALL_FLAGS,
+                });
                 out.push(Stmt::SetReg(rd, Value::CarryAddResult));
             } else {
                 let diff = bin(
@@ -1987,6 +2034,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                     a: op2.clone(),
                     b: Value::Not(Box::new(rn.clone())),
                     cin: Value::Imm(1),
+                    live: ALL_FLAGS,
                 });
             }
             out.push(Stmt::SetReg(rd, bin(BinOp::Sub, op2, rn)));
@@ -1994,12 +2042,17 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         CMP => {
             let a = operand_value(&ops[0], pc_const).ok_or_else(err)?;
             let b = operand_value(&ops[1], pc_const).ok_or_else(err)?;
-            out.push(Stmt::FlagsAdd { a, b: Value::Not(Box::new(b)), cin: Value::Imm(1) });
+            out.push(Stmt::FlagsAdd {
+                a,
+                b: Value::Not(Box::new(b)),
+                cin: Value::Imm(1),
+                live: ALL_FLAGS,
+            });
         }
         CMN => {
             let a = operand_value(&ops[0], pc_const).ok_or_else(err)?;
             let b = operand_value(&ops[1], pc_const).ok_or_else(err)?;
-            out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0) });
+            out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0), live: ALL_FLAGS });
         }
 
         AND | BIC | ORR | ORN | EOR | TST => {
@@ -2024,10 +2077,14 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             let result = bin(binop, rn, op2);
             if inst.opcode == TST {
-                out.push(Stmt::FlagsLogic { value: result, carry: imm_carry });
+                out.push(Stmt::FlagsLogic { value: result, carry: imm_carry, live: ALL_FLAGS });
             } else {
                 if sets_flags {
-                    out.push(Stmt::FlagsLogic { value: result.clone(), carry: imm_carry });
+                    out.push(Stmt::FlagsLogic {
+                        value: result.clone(),
+                        carry: imm_carry,
+                        live: ALL_FLAGS,
+                    });
                 }
                 out.push(Stmt::SetReg(rd, result));
             }
@@ -2046,7 +2103,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 let result = bin(binop, rn.clone(), sh.clone());
                 if sets_flags {
                     let carry = shift_carry(inst.opcode, &rn, &sh);
-                    out.push(Stmt::FlagsLogic { value: result.clone(), carry });
+                    out.push(Stmt::FlagsLogic {
+                        value: result.clone(),
+                        carry,
+                        live: ALL_FLAGS,
+                    });
                 }
                 out.push(Stmt::SetReg(rd, result));
             } else {
@@ -2059,7 +2120,14 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                     LSR => ShiftKind::Lsr,
                     _ => ShiftKind::Asr,
                 };
-                out.push(Stmt::ShiftRegFlags { kind, rd, rn, amount: sh, set_flags: sets_flags });
+                out.push(Stmt::ShiftRegFlags {
+                    kind,
+                    rd,
+                    rn,
+                    amount: sh,
+                    set_flags: sets_flags,
+                    live: ALL_FLAGS,
+                });
             }
         }
         // ror rd, rn, rm/#imm: rotate right. Amount is masked mod 32 (wasm rotr,
@@ -2070,7 +2138,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let result = bin(BinOp::Ror, rn, sh);
             if sets_flags {
                 let carry = bin(BinOp::And, bin(BinOp::Lsr, result.clone(), Value::Imm(31)), Value::Imm(1));
-                out.push(Stmt::FlagsLogic { value: result.clone(), carry: Some(carry) });
+                out.push(Stmt::FlagsLogic {
+                    value: result.clone(),
+                    carry: Some(carry),
+                    live: ALL_FLAGS,
+                });
             }
             out.push(Stmt::SetReg(rd, result));
         }
@@ -2105,7 +2177,7 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             let result = bin(BinOp::Mul, rn, op2);
             if sets_flags {
-                out.push(Stmt::FlagsLogic { value: result.clone(), carry: None });
+                out.push(Stmt::FlagsLogic { value: result.clone(), carry: None, live: ALL_FLAGS });
             }
             out.push(Stmt::SetReg(rd, result));
         }

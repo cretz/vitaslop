@@ -96,7 +96,7 @@ struct Summary {
 /// failure - a failure is reported in the summary so the page can show every one.
 #[wasm_bindgen]
 pub fn run_conformance() -> Result<String, JsValue> {
-    console_error_panic_hook::set_once();
+    crate::logging::install_panic_hook();
     let cases = suite::embedded_cases().map_err(|e| JsValue::from_str(&e))?;
     let outcomes = harness::run_all(&mut WebEngine, &cases);
     let passed = outcomes.iter().filter(|o| o.pass).count();

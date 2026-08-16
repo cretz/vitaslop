@@ -108,6 +108,26 @@ pub mod off {
     /// `addr` is kept for identity only - which decoded texture this binding resolves to -
     /// and is never re-read for control words. `addr == 0` means the unit is unbound.
     pub const TEXTURES: u32 = 0xd0;
+
+    /// First byte after the texture block - where any state added later starts. The map up
+    /// to here is PACKED (every offset is the previous one's end), so a new field cannot be
+    /// squeezed in among the existing ones without moving them, and moving them would
+    /// change the layout of a block a running title already holds.
+    pub const AFTER_TEXTURES: u32 =
+        TEXTURES + (super::MAX_TEXTURE_UNITS as u32) * super::TEXTURE_STRIDE;
+
+    /// BACK-face stencil state (`sceGxmSetBackStencilFunc`), the two-sided counterpart of
+    /// the `FRONT_STENCIL_*` block above. Only consulted when `TWO_SIDED` is enabled - with
+    /// two-sided disabled the hardware applies the front state to both faces - but it is
+    /// recorded unconditionally, because a title sets it once at start-up and enables
+    /// two-sided later, and state that was dropped when it was set is not there when it
+    /// starts mattering.
+    pub const BACK_STENCIL_FUNC: u32 = AFTER_TEXTURES;
+    pub const BACK_STENCIL_OP_FAIL: u32 = AFTER_TEXTURES + 0x04;
+    pub const BACK_STENCIL_OP_DEPTH_FAIL: u32 = AFTER_TEXTURES + 0x08;
+    pub const BACK_STENCIL_OP_DEPTH_PASS: u32 = AFTER_TEXTURES + 0x0c;
+    pub const BACK_STENCIL_COMPARE_MASK: u32 = AFTER_TEXTURES + 0x10;
+    pub const BACK_STENCIL_WRITE_MASK: u32 = AFTER_TEXTURES + 0x14;
 }
 
 /// `SCE_GXM_MAX_TEXTURE_UNITS` (vitasdk `gxm.h`).
@@ -125,7 +145,7 @@ pub const MAX_VERTEX_STREAMS: usize = 16;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::TEXTURES + (MAX_TEXTURE_UNITS as u32) * TEXTURE_STRIDE;
+pub const BYTES: u32 = off::BACK_STENCIL_WRITE_MASK + 4;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -307,6 +327,12 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     w(off::FRONT_STENCIL_OP_DEPTH_PASS, rs.front_stencil_op_depth_pass);
     w(off::FRONT_STENCIL_COMPARE_MASK, rs.front_stencil_compare_mask);
     w(off::FRONT_STENCIL_WRITE_MASK, rs.front_stencil_write_mask);
+    w(off::BACK_STENCIL_FUNC, rs.back_stencil_func);
+    w(off::BACK_STENCIL_OP_FAIL, rs.back_stencil_op_fail);
+    w(off::BACK_STENCIL_OP_DEPTH_FAIL, rs.back_stencil_op_depth_fail);
+    w(off::BACK_STENCIL_OP_DEPTH_PASS, rs.back_stencil_op_depth_pass);
+    w(off::BACK_STENCIL_COMPARE_MASK, rs.back_stencil_compare_mask);
+    w(off::BACK_STENCIL_WRITE_MASK, rs.back_stencil_write_mask);
     w(off::VIEWPORT_ENABLE, rs.viewport_enable);
     for (i, v) in rs.viewport.iter().enumerate() {
         w(off::VIEWPORT + i as u32 * 4, v.to_bits());
@@ -354,6 +380,12 @@ pub fn load(ctx: &GuestCtx, context: u32) -> crate::capture::RenderState {
         front_stencil_op_depth_pass: r(off::FRONT_STENCIL_OP_DEPTH_PASS),
         front_stencil_compare_mask: r(off::FRONT_STENCIL_COMPARE_MASK),
         front_stencil_write_mask: r(off::FRONT_STENCIL_WRITE_MASK),
+        back_stencil_func: r(off::BACK_STENCIL_FUNC),
+        back_stencil_op_fail: r(off::BACK_STENCIL_OP_FAIL),
+        back_stencil_op_depth_fail: r(off::BACK_STENCIL_OP_DEPTH_FAIL),
+        back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
+        back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK),
+        back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK),
         viewport_enable: r(off::VIEWPORT_ENABLE),
         viewport,
         region_clip_mode: r(off::REGION_CLIP_MODE),
@@ -387,6 +419,12 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::FRONT_STENCIL_OP_DEPTH_PASS, "front_stencil_op_depth_pass"),
     (off::FRONT_STENCIL_COMPARE_MASK, "front_stencil_compare_mask"),
     (off::FRONT_STENCIL_WRITE_MASK, "front_stencil_write_mask"),
+    (off::BACK_STENCIL_FUNC, "back_stencil_func"),
+    (off::BACK_STENCIL_OP_FAIL, "back_stencil_op_fail"),
+    (off::BACK_STENCIL_OP_DEPTH_FAIL, "back_stencil_op_depth_fail"),
+    (off::BACK_STENCIL_OP_DEPTH_PASS, "back_stencil_op_depth_pass"),
+    (off::BACK_STENCIL_COMPARE_MASK, "back_stencil_compare_mask"),
+    (off::BACK_STENCIL_WRITE_MASK, "back_stencil_write_mask"),
     (off::VIEWPORT_ENABLE, "viewport_enable"),
     (off::REGION_CLIP_MODE, "region_clip_mode"),
     (off::FRONT_VISIBILITY_TEST_ENABLE, "front_visibility_test_enable"),

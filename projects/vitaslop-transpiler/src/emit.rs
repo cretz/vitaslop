@@ -35,7 +35,7 @@ use wasm_encoder::{
 };
 
 use crate::abi;
-use crate::ir::{BinOp, Block, ConditionCode, Func, MemSize, Stmt, Term, Value};
+use crate::ir::{BinOp, Block, ConditionCode, FlagMask, Func, MemSize, Stmt, Term, Value};
 
 /// Wasmtime's own fuel cost for one operator, from `wasmtime_environ`'s
 /// `default_operator_cost`: an operator that generates no machine code costs nothing,
@@ -122,6 +122,17 @@ struct Body {
     fuelled: bool,
     /// Fuel charged but not yet committed to the counter - wasmtime's `fuel_consumed`.
     pending: u32,
+    /// Guest ARM instructions retired but not yet committed. Rides the SAME commit as
+    /// `pending` (see [`Body::flush`]), which is why the clock costs nothing.
+    pending_arm: u32,
+    /// Every operator this body has emitted, by the same cost rule, whether or not this
+    /// build meters fuel. Counted unconditionally because it is a property of the CODE,
+    /// and a native build that never meters is exactly the build whose expansion factor
+    /// the calibration needs (see [`Expansion`]).
+    billed: u64,
+    /// Of `billed`, the moves of ARM core state (registers and flags) to and from the
+    /// instance's globals. See [`Expansion::core_state_ops`].
+    core_state: u64,
 }
 
 impl Body {
@@ -133,13 +144,25 @@ impl Body {
             // Wasmtime starts a function at one, so that even an empty one costs
             // something. Entering a function is real work: it is a call.
             pending: u32::from(fuelled),
+            pending_arm: 0,
+            billed: 1,
+            core_state: 0,
         }
     }
 
     /// Emit one instruction of translated guest work, billing it as wasmtime would.
     fn instruction(&mut self, i: &W) -> &mut Self {
+        let cost = operator_cost(i);
+        self.billed += u64::from(cost);
+        // The 16 registers and the 4 flags occupy the first globals, in that order (see
+        // `abi`), so one range test identifies a core-state move.
+        if let W::GlobalGet(g) | W::GlobalSet(g) = i {
+            if *g < abi::REG_COUNT as u32 + abi::FLAG_COUNT as u32 {
+                self.core_state += 1;
+            }
+        }
         if self.fuelled {
-            self.pending += operator_cost(i);
+            self.pending += cost;
             if operator_flushes(i) {
                 self.flush();
             }
@@ -155,19 +178,34 @@ impl Body {
         self
     }
 
-    /// Commit the buffered charge to the fuel counter. A no-op when nothing is buffered,
+    /// Commit the buffered charge to the work counter. A no-op when nothing is buffered,
     /// which is common - a flush point immediately after another one buffers nothing, and
-    /// emitting a `-= 0` for it would be pure code size on the hottest path there is.
+    /// emitting a `+= 0` for it would be pure code size on the hottest path there is.
+    ///
+    /// # One `i64.add` commits BOTH counters
+    /// [`abi::WORK_GLOBAL`] packs guest instructions in its high half and operators in its
+    /// low half, both counting UP, so one add of a packed constant advances both with no
+    /// borrow between them. That is what makes billing the clock in guest instructions
+    /// FREE: it is the same four operators the operator-only commit already cost.
     fn flush(&mut self) {
-        if !self.fuelled || self.pending == 0 {
+        if !self.fuelled || (self.pending == 0 && self.pending_arm == 0) {
             return;
         }
-        let owed = self.pending as i32;
+        let packed = abi::pack_work(self.pending_arm, self.pending);
         self.pending = 0;
-        self.untolled(&W::GlobalGet(abi::FUEL_GLOBAL));
-        self.untolled(&W::I32Const(owed));
-        self.untolled(&W::I32Sub);
-        self.untolled(&W::GlobalSet(abi::FUEL_GLOBAL));
+        self.pending_arm = 0;
+        self.untolled(&W::GlobalGet(abi::WORK_GLOBAL));
+        self.untolled(&W::I64Const(packed));
+        self.untolled(&W::I64Add);
+        self.untolled(&W::GlobalSet(abi::WORK_GLOBAL));
+    }
+
+    /// Buffer a basic block's GUEST INSTRUCTION count, committed by the next [`flush`]
+    /// alongside the operator charge. Costs nothing on its own - see [`flush`].
+    fn charge_guest_instructions(&mut self, n: u32) {
+        if self.fuelled {
+            self.pending_arm += n;
+        }
     }
 
     fn into_function<L>(self, locals: L) -> Function
@@ -592,6 +630,57 @@ pub fn fuel_interval() -> u32 {
     }
 }
 
+/// `VITASLOP_FLAG_POISON=0|1` - the FALSIFIER for the flag-liveness pass
+/// ([`crate::flags`]). Instead of leaving an elided flag alone, store this constant into
+/// it, so a flag the analysis called dead and something then READS carries a value that
+/// is wrong rather than merely stale.
+///
+/// # Why this can be trusted where a code review cannot
+/// Dead-flag elimination is the one optimisation here whose mistakes are invisible: the
+/// wrong answer is not a crash or a wrong pixel, it is a flag that happens to hold the
+/// right value anyway on the run you tried. The ARM conformance corpus checks all four
+/// flags but only at a case's END, where every flag is live by construction, so it cannot
+/// see a mid-function claim at all.
+///
+/// # How to run it: TWO poisoned builds against each other, never against the plain one
+/// `VITASLOP_FLAG_POISON=0` and `VITASLOP_FLAG_POISON=1` emit the same NUMBER of
+/// operators and differ only in one constant. So they burn identical fuel, advance the
+/// guest clock identically, and schedule identically - a perfect A/B in which the single
+/// variable is the value an elided flag holds. Run the title in both and compare the
+/// renders: identical means nothing read a flag the analysis called dead, because a read
+/// would have to resolve differently for 0 than for 1. A difference names a bug in the
+/// analysis, loudly.
+///
+/// It takes a VALUE rather than being a plain switch for exactly that reason: a flag holds
+/// 0 or 1, so a single poison constant leaves half of all wrong reads accidentally right.
+///
+/// **Do NOT compare a poisoned build against the ordinary one.** The stores go through
+/// [`Body::untolled`], which excludes them from the SOFTWARE fuel counter - and that
+/// counter is the browser's. Native has no software fuel; it meters with wasmtime, which
+/// bills every operator in the module including these. MEASURED: the same 7450-frame race
+/// burns 339,995,880,296 fuel poisoned against 325,596,212,794 plain, so the poisoned run
+/// has a different clock and a different thread interleaving and its render legitimately
+/// differs. `untolled` means "not OUR fuel", not "free".
+///
+/// RESULT, 2026-08-15f: both poison arms rendered SHA-256 `50164a52...` at frame 7450 of
+/// `campaign-race.recipe`, bit-identical, on identical fuel. No elided flag was read.
+fn flag_poison() -> Option<i32> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<i32>> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_FLAG_POISON").ok().and_then(|s| s.trim().parse().ok())
+    })
+}
+
+/// Store the poison value into `flag`, if this build is a falsifier build. Untolled, so
+/// it is invisible to the fuel counter and therefore to the clock. See [`flag_poison`].
+fn poison_flag(f: &mut Body, flag: abi::Flag) {
+    if let Some(v) = flag_poison() {
+        f.untolled(&W::I32Const(v));
+        f.untolled(&W::GlobalSet(abi::flag_global(flag)));
+    }
+}
+
 /// Emit a fuel point: decrement this thread's quantum and, when it runs out, hand the
 /// scheduler a turn. A no-op unless the build opted into fuel, so an ordinary module is
 /// byte-identical.
@@ -642,16 +731,29 @@ fn emit_fuel_check(f: &mut Body) {
     // Commit anything still buffered first: the test must see what this thread has just
     // done, not what it had done one basic block ago.
     f.flush();
-    // The counter is DECREMENTED by `Body`'s own accounting; this only tests it.
-    // Decrementing here as well would double-charge the block carrying the back edge.
-    f.untolled(&W::GlobalGet(abi::FUEL_GLOBAL));
-    f.untolled(&W::I32Const(0));
-    f.untolled(&W::I32LeS);
+    // The counter is ADVANCED by `Body`'s own accounting; this only tests it. Advancing
+    // here as well would double-charge the block carrying the back edge.
+    //
+    // The operator half is the LOW 32 bits of `WORK_GLOBAL`, so the test masks it out and
+    // compares it against the interval. It counts UP (both halves do, so the packed commit
+    // needs no borrow), hence `ge_u` against the interval rather than the old `le_s`
+    // against zero. `ge_u` also keeps the "a counter that somehow overshot must still
+    // preempt" property the signed test had.
+    f.untolled(&W::GlobalGet(abi::WORK_GLOBAL));
+    f.untolled(&W::I64Const(abi::WORK_OPS_MASK));
+    f.untolled(&W::I64And);
+    f.untolled(&W::I64Const(i64::from(n)));
+    f.untolled(&W::I64GeU);
     f.untolled(&W::If(BlockType::Empty));
     f.untolled(&W::I32Const(abi::FUEL_SELECTOR as i32));
     f.untolled(&W::Call(IMPORT_FUNC));
-    f.untolled(&W::I32Const(n as i32));
-    f.untolled(&W::GlobalSet(abi::FUEL_GLOBAL));
+    // Clear the OPERATOR half and keep the instruction half: the quantum restarts, the
+    // guest's retired-instruction total does not. Zeroing the whole global here would
+    // reset the clock's counter every quantum and the game clock would never advance.
+    f.untolled(&W::GlobalGet(abi::WORK_GLOBAL));
+    f.untolled(&W::I64Const(!abi::WORK_OPS_MASK));
+    f.untolled(&W::I64And);
+    f.untolled(&W::GlobalSet(abi::WORK_GLOBAL));
     f.untolled(&W::End);
 }
 
@@ -924,6 +1026,65 @@ pub struct EmitOutput {
     /// See [`emit_dirty_mark`] for what the guest writes and why, and
     /// `TextureSnapshots` in the runtime for what reads it.
     pub dirty_off: Option<u64>,
+    /// How many wasm operators this module emits per GUEST INSTRUCTION - see
+    /// [`Expansion`].
+    pub expansion: Expansion,
+}
+
+/// The module's CODE EXPANSION: guest instructions lifted, and wasm operators emitted for
+/// them.
+///
+/// # Why a host needs this number
+/// The emulator's game clock is charged per unit of engine FUEL, and a unit of fuel is one
+/// executed wasm operator. So the emulated Vita's CPU SPEED is
+/// `fuel_rate / expansion` - and `expansion` is a property of this transpiler's codegen,
+/// not of the device. Improve the codegen and the emulated console silently gets faster,
+/// which is a faithfulness change nobody asked for and nothing reports.
+///
+/// Until now that factor was a guess written into a doc comment on the calibration
+/// constant ("order 0.2-0.5 M ARM instructions"). This measures it. It is STATIC - every
+/// emitted operator counted once, not weighted by how often it runs - so it is a property
+/// of the build rather than of a run, which is exactly what makes it comparable between
+/// two builds.
+///
+/// The executed figure, which is what the clock actually rides on, is the `fuel ... /frame`
+/// line a run reports; compare the two builds' ratio of THAT when a run is available.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Expansion {
+    /// Guest ARM/Thumb instructions lifted into emitted functions.
+    pub arm_instructions: u64,
+    /// Wasm operators emitted for them, counted by the same cost rule the fuel counter
+    /// uses, so this is directly comparable with a run's fuel figures.
+    pub emitted_ops: u64,
+    /// Of those, how many are a `global.get`/`global.set` of the ARM CORE STATE - the 16
+    /// registers and the four flags.
+    ///
+    /// This is the share of the translated code that exists only to move guest state
+    /// between the instance's globals and the operand stack. In both V8 and Cranelift a
+    /// mutable global is a load/store against the instance rather than a machine register,
+    /// so it is a memory access per guest operand. It is broken out because it is the
+    /// candidate for the next large codegen change (promoting a function's registers into
+    /// wasm LOCALS, which the engine can register-allocate), and a change that size wants
+    /// its ceiling measured before it is attempted rather than after.
+    pub core_state_ops: u64,
+}
+
+impl Expansion {
+    /// Wasm operators per guest instruction, or 0.0 when nothing was lifted.
+    pub fn per_instruction(&self) -> f64 {
+        if self.arm_instructions == 0 {
+            return 0.0;
+        }
+        self.emitted_ops as f64 / self.arm_instructions as f64
+    }
+
+    /// Share of emitted operators that are core-state moves, as a percentage.
+    pub fn core_state_share(&self) -> f64 {
+        if self.emitted_ops == 0 {
+            return 0.0;
+        }
+        100.0 * self.core_state_ops as f64 / self.emitted_ops as f64
+    }
 }
 
 /// Host-mirror slots per page. The block is one page, which is far more than the
@@ -1136,10 +1297,12 @@ pub fn emit_module(
     // thread instantiation; read by `MRC p15,0,Rt,c13,c0,3` (see `abi::TP_GLOBAL`).
     globals.global(i32_global, &ConstExpr::i32_const(0)); // TP_GLOBAL
     globals.global(i32_global, &ConstExpr::i32_const(0)); // WATCH_STORE_COUNT_GLOBAL
-    // The software fuel counter (see `emit_fuel_check`). Seeded with a full quantum so
-    // the first back edge a fresh thread takes does not immediately yield; zero, unread
-    // and unwritten in a build that did not ask for fuel.
-    globals.global(i32_global, &ConstExpr::i32_const(fuel_interval() as i32)); // FUEL_GLOBAL
+    // The software WORK counter (see `emit_fuel_check` and `abi::WORK_GLOBAL`): guest
+    // instructions in its high half, operators since the last yield in its low half. Both
+    // start at zero - the operator half counts UP to the interval now, so a fresh thread
+    // is at the START of its quantum rather than needing to be seeded with one.
+    let i64_global = GlobalType { val_type: ValType::I64, mutable: true, shared: false };
+    globals.global(i64_global, &ConstExpr::i64_const(0)); // WORK_GLOBAL
 
     let mut exports = ExportSection::new();
     exports.export(abi::MEMORY_EXPORT, ExportKind::Memory, 0);
@@ -1170,7 +1333,7 @@ pub fn emit_module(
     // The software fuel counter, so a host can see how much of a thread's quantum is
     // left. Always exported (like `guest_pc`) so the export list does not depend on a
     // build option; it reads 0 and never moves unless fuel was asked for.
-    exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::FUEL_GLOBAL);
+    exports.export(abi::FUEL_EXPORT, ExportKind::Global, abi::WORK_GLOBAL);
 
     // Populate the dense funcref table: table[i] = the i-th translated function
     // (wasm index IMPORT_FUNCS + i), matching the ascending-address order of `funcs`
@@ -1183,10 +1346,11 @@ pub fn emit_module(
     }
 
     let mut code = CodeSection::new();
+    let mut expansion = Expansion::default();
     for (i, func) in funcs.iter().enumerate() {
         let idx = IMPORT_FUNCS + i as u32;
         exports.export(&abi::func_export(func.addr), ExportKind::Func, idx);
-        code.function(&emit_func(func, func_index, base, &inline));
+        code.function(&emit_func(func, func_index, base, &inline, &mut expansion));
     }
     code.function(&emit_dispatch(funcs, addr_table_off));
     code.function(&emit_reset());
@@ -1243,6 +1407,7 @@ pub fn emit_module(
         arm_word_off,
         mirror_off,
         dirty_off,
+        expansion,
     }
 }
 
@@ -1307,15 +1472,17 @@ fn emit_reset() -> Function {
     // the wrong globals and a reused instance would carry a previous thread's state.
     assert_eq!(
         g,
-        abi::FUEL_GLOBAL,
+        abi::WORK_GLOBAL,
         "emit_reset must walk the globals section in declaration order; it stopped at {g} \
-         but the fuel counter is global {}",
-        abi::FUEL_GLOBAL,
+         but the work counter is global {}",
+        abi::WORK_GLOBAL,
     );
-    // The fuel counter, seeded with a full quantum exactly as instantiation does, so a
-    // reused thread's first back edge does not immediately yield.
-    f.instruction(&W::I32Const(fuel_interval() as i32));
-    f.instruction(&W::GlobalSet(abi::FUEL_GLOBAL));
+    // The work counter, BOTH halves, exactly as instantiation leaves them. A reused
+    // instance that carried the previous thread's instruction total would make the
+    // scheduler's next delta enormous, which is a game clock that jumps by hours - and one
+    // that carried its operator half would preempt the new thread almost immediately.
+    f.instruction(&W::I64Const(0));
+    f.instruction(&W::GlobalSet(abi::WORK_GLOBAL));
     f.instruction(&W::End);
     f
 }
@@ -1441,6 +1608,8 @@ fn emit_func(
     func_index: &BTreeMap<u32, u32>,
     base: u32,
     inline: &InlineImports,
+    // Accumulates this function's contribution to the module's `Expansion`.
+    expansion: &mut Expansion,
 ) -> Function {
     // Locals: $bb + i32 scratch temps (flag computation), then one i64 scratch
     // (double-register split/merge) and one v128 scratch (NEON quad staging).
@@ -1492,10 +1661,16 @@ fn emit_func(
 
     let n = func.blocks.len() as u32;
 
+    // The guest instructions this function lifts. Counted from the blocks rather than
+    // from the emitted code, which is the point of the measurement.
+    expansion.arm_instructions += func.blocks.iter().map(|b| u64::from(b.arm_count)).sum::<u64>();
+
     // Single-block functions need no dispatch machinery.
     if n == 1 {
         emit_block(&mut f, &func.blocks[0], func, func_index, base, inline, 0);
         f.instruction(&W::End);
+        expansion.emitted_ops += f.billed;
+        expansion.core_state_ops += f.core_state;
         return f.into_function(locals);
     }
 
@@ -1517,6 +1692,8 @@ fn emit_func(
     f.instruction(&W::End); // loop
     f.instruction(&W::End); // $exit block
     f.instruction(&W::End); // function body
+    expansion.emitted_ops += f.billed;
+    expansion.core_state_ops += f.core_state;
     f.into_function(locals)
 }
 
@@ -1531,6 +1708,21 @@ fn emit_block(
     inline: &InlineImports,
     loop_depth: u32,
 ) {
+    // >>> THE EMULATED CPU CLOCK'S UNIT. Add this block's GUEST INSTRUCTION count to the
+    // per-thread counter both engines' schedulers read (`abi::ARM_COUNT_GLOBAL`).
+    //
+    // Per BLOCK rather than per instruction: `arm_count` is a compile-time constant for
+    // the whole block and a block runs to completion or traps, so one add is exact for
+    // every path that retires. Four operators per block, and they are UNTOLLED - this is
+    // our instrumentation, and billing it as guest work would charge the guest for the
+    // clock that measures it (the same rule `Body` already applies to fuel bookkeeping).
+    //
+    // A block with no guest instructions (a synthesised dispatch or trap block) emits
+    // nothing, so the hottest zero-work paths stay byte-identical.
+    // The emulated CPU clock's unit. Buffered here and committed by the next flush point
+    // in the SAME `i64.add` that commits the operator charge, so it emits NO code of its
+    // own - see `Body::flush` and `abi::WORK_GLOBAL`.
+    f.charge_guest_instructions(block.arm_count);
     // Diagnostic guest-PC tracking (opt-in): record this block's start address before
     // running it, so a trap's register dump can name the faulting instruction.
     if track_pc() {
@@ -1884,21 +2076,56 @@ fn emit_stmt(
                 f.instruction(&store_op(*size));
             }
         }
-        Stmt::FlagsAdd { a, b, cin } => emit_flags_add(f, a, b, cin, base),
-        Stmt::FlagsLogic { value, carry } => {
-            emit_value(f, value, base);
-            f.instruction(&W::LocalTee(L_T0));
-            f.instruction(&W::I32Eqz);
-            f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Const(31));
-            f.instruction(&W::I32ShrU);
-            f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+        Stmt::FlagsAdd { a, b, cin, live } => emit_flags_add(f, a, b, cin, *live, base),
+        // A logical flag update whose result nothing can observe is dropped whole - unlike
+        // `FlagsAdd`, nothing reads back its intermediate. `value` is a pure expression by
+        // construction (`ir::Value` has no side effects; a `Load` cannot fault, since the
+        // guest's whole address space is the linear memory), so not evaluating it is not
+        // observable either.
+        Stmt::FlagsLogic { value, carry, live } => {
+            if !live.has(abi::Flag::Z) {
+                poison_flag(f, abi::Flag::Z);
+            }
+            if !live.has(abi::Flag::N) {
+                poison_flag(f, abi::Flag::N);
+            }
+            match (live.has(abi::Flag::Z), live.has(abi::Flag::N)) {
+                (false, false) => {}
+                // Both: the original sequence exactly - `tee` feeds Z from the stack and
+                // leaves the value in the scratch local for N.
+                (true, true) => {
+                    emit_value(f, value, base);
+                    f.instruction(&W::LocalTee(L_T0));
+                    f.instruction(&W::I32Eqz);
+                    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(31));
+                    f.instruction(&W::I32ShrU);
+                    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+                }
+                // Only one of them: the value is used once, so it never reaches the
+                // scratch local at all.
+                (true, false) => {
+                    emit_value(f, value, base);
+                    f.instruction(&W::I32Eqz);
+                    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+                }
+                (false, true) => {
+                    emit_value(f, value, base);
+                    f.instruction(&W::I32Const(31));
+                    f.instruction(&W::I32ShrU);
+                    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+                }
+            }
             if let Some(c) = carry {
-                emit_value(f, c, base);
-                f.instruction(&W::I32Const(1));
-                f.instruction(&W::I32And);
-                f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::C)));
+                if live.has(abi::Flag::C) {
+                    emit_value(f, c, base);
+                    f.instruction(&W::I32Const(1));
+                    f.instruction(&W::I32And);
+                    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::C)));
+                } else {
+                    poison_flag(f, abi::Flag::C);
+                }
             }
         }
         Stmt::Svc(imm) => {
@@ -2024,8 +2251,8 @@ fn emit_stmt(
         }
         Stmt::Uadd8 { rd, rn, rm } => emit_uadd8(f, *rd, *rn, *rm),
         Stmt::Sel { rd, rn, rm } => emit_sel(f, *rd, *rn, *rm),
-        Stmt::ShiftRegFlags { kind, rd, rn, amount, set_flags } => {
-            emit_shift_reg_flags(f, *kind, *rd, rn, amount, *set_flags, base)
+        Stmt::ShiftRegFlags { kind, rd, rn, amount, set_flags, live } => {
+            emit_shift_reg_flags(f, *kind, *rd, rn, amount, *set_flags, *live, base)
         }
     }
 }
@@ -2142,6 +2369,7 @@ fn emit_shift_reg_flags(
     rn: &Value,
     amount: &Value,
     set_flags: bool,
+    live: FlagMask,
     base: u32,
 ) {
     use crate::ir::ShiftKind::*;
@@ -2198,13 +2426,28 @@ fn emit_shift_reg_flags(
         return;
     }
     // Z = (result == 0); N = result[31].
-    f.instruction(&W::LocalGet(L_T2));
-    f.instruction(&W::I32Eqz);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
-    f.instruction(&W::LocalGet(L_T2));
-    f.instruction(&W::I32Const(31));
-    f.instruction(&W::I32ShrU);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+    if live.has(abi::Flag::Z) {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+    } else {
+        poison_flag(f, abi::Flag::Z);
+    }
+    if live.has(abi::Flag::N) {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Const(31));
+        f.instruction(&W::I32ShrU);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+    } else {
+        poison_flag(f, abi::Flag::N);
+    }
+    // The exact shifter carry-out is the expensive half of this form - a per-kind
+    // sequence plus a select against the old C for a zero amount. Skipping it when no
+    // reader can see C is the whole point of the mask here.
+    if !live.has(abi::Flag::C) {
+        poison_flag(f, abi::Flag::C);
+        return;
+    }
     // Shifter carry-out for a NON-zero amount -> L_T3 (the amt==0 case is folded in
     // by the final select, which keeps the old C).
     match kind {
@@ -3887,62 +4130,174 @@ fn emit_elem_mem(
 /// add/sub/cmp, the C flag for adc/sbc. Uses i64 for an always-correct unsigned
 /// carry. `cin` is emitted once into a local, since a flag read must not be
 /// duplicated if it ever had a cost.
-fn emit_flags_add(f: &mut Body, a: &Value, b: &Value, cin: &Value, base: u32) {
-    emit_value(f, a, base);
-    f.instruction(&W::LocalSet(L_T0)); // a
-    emit_value(f, b, base);
-    f.instruction(&W::LocalSet(L_T1)); // b
-    emit_value(f, cin, base);
-    f.instruction(&W::LocalSet(L_T3)); // cin
-    // res = a + b + cin
-    f.instruction(&W::LocalGet(L_T0));
-    f.instruction(&W::LocalGet(L_T1));
-    f.instruction(&W::I32Add);
-    f.instruction(&W::LocalGet(L_T3));
-    f.instruction(&W::I32Add);
-    f.instruction(&W::LocalSet(L_T2)); // res
+/// Emit the flag computation for `a + b + cin`, computing only the flags in `live`.
+///
+/// # The result is always computed, the flags are not
+/// `L_T2` (the sum) is a value in its own right, not only a flag input: an `adc`/`sbc`
+/// that sets flags reads it back as [`Value::CarryAddResult`], because the C flag it
+/// would otherwise re-read has already been overwritten with the carry-OUT. So the sum
+/// stays unconditional and only the four flag derivations are gated, leaving a floor of
+/// six operators even when every flag is dead. Dropping that floor would mean proving no
+/// following statement reads [`Value::CarryAddResult`], and a wholly-dead compare is rare
+/// enough that the proof is not worth its risk - the flags are where the cost is.
+///
+/// Each block below is exactly the code that was there before `live` existed, so a fully
+/// live statement emits byte-for-byte what it always did.
+fn emit_flags_add(f: &mut Body, a: &Value, b: &Value, cin: &Value, live: FlagMask, base: u32) {
+    // >>> THE OPERANDS ONLY NEED KEEPING FOR THE CARRY AND THE OVERFLOW.
+    //
+    // `a`, `b` and `cin` went into scratch locals because C re-reads all three (widened to
+    // i64) and V re-reads `a` and `b`. Z and N read only the SUM. So when the expensive
+    // pair is dead the three stores and their three reads are dead with them, and the sum
+    // is built straight on the stack: nine operators become three. That is the `cmp`
+    // feeding a conditional branch - the shape this whole pass exists for - so it is worth
+    // spelling the three cases out rather than always paying the general one.
+    //
+    // Evaluation ORDER is `a`, then `b`, then `cin` in every case, exactly as before: the
+    // operands can contain loads, and reordering them would reorder guest reads.
+    let keep_operands = live.has(abi::Flag::C) || live.has(abi::Flag::V);
+    let keep_cin = live.has(abi::Flag::C);
+    if keep_operands {
+        emit_value(f, a, base);
+        f.instruction(&W::LocalSet(L_T0)); // a
+        emit_value(f, b, base);
+        f.instruction(&W::LocalSet(L_T1)); // b
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Add);
+        if keep_cin {
+            emit_value(f, cin, base);
+            f.instruction(&W::LocalTee(L_T3)); // cin, kept for the i64 carry below
+        } else {
+            emit_value(f, cin, base);
+        }
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalSet(L_T2)); // res
+    } else {
+        // res = a + b + cin, entirely on the stack.
+        emit_value(f, a, base);
+        emit_value(f, b, base);
+        f.instruction(&W::I32Add);
+        emit_value(f, cin, base);
+        f.instruction(&W::I32Add);
+        f.instruction(&W::LocalSet(L_T2)); // res
+    }
     // Z = res == 0
-    f.instruction(&W::LocalGet(L_T2));
-    f.instruction(&W::I32Eqz);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+    if live.has(abi::Flag::Z) {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::Z)));
+    } else {
+        poison_flag(f, abi::Flag::Z);
+    }
     // N = res >> 31
-    f.instruction(&W::LocalGet(L_T2));
-    f.instruction(&W::I32Const(31));
-    f.instruction(&W::I32ShrU);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
-    // C = (a_u64 + b_u64 + cin) >> 32
-    f.instruction(&W::LocalGet(L_T0));
-    f.instruction(&W::I64ExtendI32U);
-    f.instruction(&W::LocalGet(L_T1));
-    f.instruction(&W::I64ExtendI32U);
-    f.instruction(&W::I64Add);
-    f.instruction(&W::LocalGet(L_T3));
-    f.instruction(&W::I64ExtendI32U);
-    f.instruction(&W::I64Add);
-    f.instruction(&W::I64Const(32));
-    f.instruction(&W::I64ShrU);
-    f.instruction(&W::I32WrapI64);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::C)));
+    if live.has(abi::Flag::N) {
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Const(31));
+        f.instruction(&W::I32ShrU);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::N)));
+    } else {
+        poison_flag(f, abi::Flag::N);
+    }
+    // C = (a_u64 + b_u64 + cin) >> 32 - nine operators and the only i64 arithmetic in the
+    // integer path, so this is the single most valuable one to skip.
+    if live.has(abi::Flag::C) {
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Add);
+        f.instruction(&W::LocalGet(L_T3));
+        f.instruction(&W::I64ExtendI32U);
+        f.instruction(&W::I64Add);
+        f.instruction(&W::I64Const(32));
+        f.instruction(&W::I64ShrU);
+        f.instruction(&W::I32WrapI64);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::C)));
+    } else {
+        poison_flag(f, abi::Flag::C);
+    }
     // V = (~(a^b) & (a^res)) >> 31
-    f.instruction(&W::LocalGet(L_T0));
-    f.instruction(&W::LocalGet(L_T1));
-    f.instruction(&W::I32Xor);
-    f.instruction(&W::I32Const(-1));
-    f.instruction(&W::I32Xor);
-    f.instruction(&W::LocalGet(L_T0));
-    f.instruction(&W::LocalGet(L_T2));
-    f.instruction(&W::I32Xor);
-    f.instruction(&W::I32And);
-    f.instruction(&W::I32Const(31));
-    f.instruction(&W::I32ShrU);
-    f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::V)));
+    if live.has(abi::Flag::V) {
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Xor);
+        f.instruction(&W::I32Const(-1));
+        f.instruction(&W::I32Xor);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Xor);
+        f.instruction(&W::I32And);
+        f.instruction(&W::I32Const(31));
+        f.instruction(&W::I32ShrU);
+        f.instruction(&W::GlobalSet(abi::flag_global(abi::Flag::V)));
+    } else {
+        poison_flag(f, abi::Flag::V);
+    }
+}
+
+/// Split `v` into a dynamic part and a constant addend such that
+/// `v == dynamic + constant` in WRAPPING 32-bit arithmetic, which is the only arithmetic
+/// either ARM or wasm `i32` does here.
+///
+/// Used by [`emit_addr`] to fold the rebase subtraction into an address's own
+/// displacement. Every ARM addressing mode that is not a bare register carries one -
+/// `[r1, #8]`, `[sp, #-4]`, a literal pool address - so this is one of the most common
+/// shapes in the whole instruction stream.
+fn split_const_addend(v: &Value) -> (Option<&Value>, u32) {
+    match v {
+        Value::Imm(k) => (None, *k),
+        Value::Bin(BinOp::Add, a, b) => match (&**a, &**b) {
+            (Value::Imm(k), other) | (other, Value::Imm(k)) => {
+                let (dynamic, c) = split_const_addend(other);
+                (dynamic, c.wrapping_add(*k))
+            }
+            _ => (Some(v), 0),
+        },
+        // `a - k` is `a + (-k)`; the negation is exact in wrapping arithmetic.
+        Value::Bin(BinOp::Sub, a, b) => match &**b {
+            Value::Imm(k) => {
+                let (dynamic, c) = split_const_addend(a);
+                (dynamic, c.wrapping_sub(*k))
+            }
+            _ => (Some(v), 0),
+        },
+        _ => (Some(v), 0),
+    }
 }
 
 /// Emit a guest address as a linear-memory offset (guest addr - base).
+///
+/// # The rebase is free on any address with a displacement
+/// The obvious form is `<address expression>; i32.const base; i32.sub`, and for
+/// `[r1, #8]` that is five operators: read r1, push 8, add, push base, subtract. But
+/// `(r1 + 8) - base` and `r1 + (8 - base)` are the same value - wrapping addition is
+/// associative, and both ARM and wasm `i32` wrap - so the two constants fold into one and
+/// it becomes three: read r1, push `8 - base`, add. An absolute address folds all the way
+/// to a single constant, and a displacement that happens to equal the base folds to
+/// nothing at all.
+///
+/// This is an identity, not an approximation: no address is out of range here that was in
+/// range before, and no access moves. That matters because the alternative - putting the
+/// displacement in the load's own `MemArg.offset` - is NOT an identity: wasm adds that
+/// offset in 64 bits without wrapping, so a guest pointer just below `base` with a
+/// positive displacement would trap where it used to read. Two operators are not worth a
+/// difference in when the emulator faults.
 fn emit_addr(f: &mut Body, addr: &Value, base: u32) {
-    emit_value(f, addr, base);
-    f.instruction(&W::I32Const(base as i32));
-    f.instruction(&W::I32Sub);
+    let (dynamic, constant) = split_const_addend(addr);
+    let offset = constant.wrapping_sub(base);
+    match dynamic {
+        None => {
+            f.instruction(&W::I32Const(offset as i32));
+        }
+        Some(v) => {
+            emit_value(f, v, base);
+            if offset != 0 {
+                f.instruction(&W::I32Const(offset as i32));
+                f.instruction(&W::I32Add);
+            }
+        }
+    }
 }
 
 fn emit_value(f: &mut Body, v: &Value, base: u32) {
@@ -3990,6 +4345,84 @@ fn emit_value(f: &mut Body, v: &Value, base: u32) {
                 f.instruction(&load_op(*size, *signed));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod addr_fold_tests {
+    use super::*;
+
+    /// Evaluate the split the way [`emit_addr`] does, given a value for the dynamic part.
+    /// The whole optimisation is the claim that this equals the unfolded
+    /// `(address) - base`, so the test states that claim directly.
+    fn folded(addr: &Value, base: u32, dynamic_value: u32) -> u32 {
+        let (dynamic, constant) = split_const_addend(addr);
+        let offset = constant.wrapping_sub(base);
+        match dynamic {
+            None => offset,
+            Some(_) => dynamic_value.wrapping_add(offset),
+        }
+    }
+
+    /// Evaluate the address expression itself, then subtract the base - the form the
+    /// emitter used before the fold. Only the shapes the fold recognises are needed.
+    fn unfolded(addr: &Value, base: u32, dynamic_value: u32) -> u32 {
+        fn eval(v: &Value, r: u32) -> u32 {
+            match v {
+                Value::Imm(k) => *k,
+                Value::Reg(_) => r,
+                Value::Bin(BinOp::Add, a, b) => eval(a, r).wrapping_add(eval(b, r)),
+                Value::Bin(BinOp::Sub, a, b) => eval(a, r).wrapping_sub(eval(b, r)),
+                _ => unreachable!("not a shape these tests build"),
+            }
+        }
+        eval(addr, dynamic_value).wrapping_sub(base)
+    }
+
+    /// The fold is an IDENTITY, including at the wrap. `base` is a real Vita region base
+    /// and the register values include the ones that make the arithmetic wrap round zero,
+    /// which is the only place an associativity claim could fail.
+    #[test]
+    fn folding_the_rebase_into_the_displacement_changes_no_address() {
+        let base = 0x8000_0000u32;
+        let shapes = [
+            Value::Reg(1),
+            Value::Imm(0x8100_0000),
+            Value::Bin(BinOp::Add, Box::new(Value::Reg(1)), Box::new(Value::Imm(8))),
+            Value::Bin(BinOp::Add, Box::new(Value::Imm(8)), Box::new(Value::Reg(1))),
+            Value::Bin(BinOp::Sub, Box::new(Value::Reg(1)), Box::new(Value::Imm(4))),
+            // A displacement that cancels the base exactly, which folds to no operator.
+            Value::Bin(BinOp::Add, Box::new(Value::Reg(1)), Box::new(Value::Imm(base))),
+            // Nested, as a pre-indexed form with two constant steps lowers.
+            Value::Bin(
+                BinOp::Add,
+                Box::new(Value::Bin(
+                    BinOp::Add,
+                    Box::new(Value::Reg(1)),
+                    Box::new(Value::Imm(16)),
+                )),
+                Box::new(Value::Imm(0x20)),
+            ),
+        ];
+        for r in [0u32, 1, 0x7FFF_FFFF, base, base + 0x1000, 0xFFFF_FFFF, base.wrapping_sub(1)] {
+            for shape in &shapes {
+                assert_eq!(
+                    folded(shape, base, r),
+                    unfolded(shape, base, r),
+                    "shape {shape:?} at r={r:#x}"
+                );
+            }
+        }
+    }
+
+    /// A dynamic subtrahend is NOT a constant addend and must not be folded, or
+    /// `[r1, -r2]` would rebase by the wrong amount.
+    #[test]
+    fn a_register_operand_is_never_folded_into_the_constant() {
+        let v = Value::Bin(BinOp::Sub, Box::new(Value::Reg(1)), Box::new(Value::Reg(2)));
+        let (dynamic, c) = split_const_addend(&v);
+        assert!(dynamic.is_some());
+        assert_eq!(c, 0);
     }
 }
 

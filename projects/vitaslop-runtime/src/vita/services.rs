@@ -154,6 +154,29 @@ pub(super) fn netctl_adhoc_get_state(ctx: &mut GuestCtx, _st: &mut VitaState, st
     0
 }
 
+/// int sceNetCtlAdhocGetPeerList(unsigned int *buflen, void *buf)
+///
+/// The devices sharing this ad-hoc network. There is no radio here, so the list is EMPTY -
+/// which is a real console state (a title that is first to a lobby sees exactly this), not
+/// a failure, so it succeeds.
+///
+/// The API is the usual two-call shape: `buf == NULL` asks for the size needed, a non-null
+/// `buf` fills it. Both answers are the same here - zero peers - so `*buflen` is set to 0
+/// either way and `buf` is never written. Reporting a non-zero length and leaving the
+/// buffer untouched would hand the caller stack garbage to iterate as peers.
+#[hostcall]
+pub(super) fn netctl_adhoc_get_peer_list(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    buflen: Ptr,
+    _buf: Ptr,
+) -> i32 {
+    if !buflen.is_null() {
+        ctx.write_u32(buflen.addr(), 0);
+    }
+    0
+}
+
 /// int sceNetCtlAdhocDisconnect(void)
 /// Leave the ad-hoc network. Reported as success rather than an error, because success is
 /// what the caller is asking for: its postcondition - not connected - already holds. This
@@ -658,6 +681,39 @@ fn rtc_get_time64_t_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
     }
 }
 
+/// int sceRtcGetTime_t(const SceDateTime *time, time_t *piTime)
+///
+/// The 32-bit sibling of [`rtc_get_time64_t`]: the same conversion, written as a single
+/// word because the Vita's `time_t` is 32 bits.
+///
+/// # The 2038 case is reported, not truncated
+/// A 32-bit `time_t` cannot represent a date past 2038-01-19, and this API has no error
+/// for it. Truncating would hand back a date in 1901 that a title would then compare and
+/// sort by - a wrong answer that looks like a right one, and exactly the kind of silent
+/// corruption a savedata timestamp must not have. So an out-of-range conversion is refused
+/// with `SCE_RTC_ERROR_INVALID_YEAR`, which is the closest thing the API has to "this year
+/// does not fit", and the out-parameter is left alone.
+#[hostcall]
+pub(super) fn rtc_get_time_t(ctx: &mut GuestCtx, _st: &mut VitaState, time: Ptr, out: Ptr) -> i32 {
+    rtc_get_time_t_impl(ctx, time, out)
+}
+
+fn rtc_get_time_t_impl(ctx: &mut GuestCtx, time: Ptr, out: Ptr) -> i32 {
+    if time.is_null() || out.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    match rtc_decode_broken_down(ctx, time) {
+        Err(e) => e,
+        Ok((secs, _micro)) => {
+            if i32::try_from(secs).is_err() {
+                return SCE_RTC_ERROR_INVALID_YEAR;
+            }
+            ctx.write_u32(out.addr(), secs as u32);
+            0
+        }
+    }
+}
+
 fn rtc_get_tick_impl(ctx: &mut GuestCtx, time: Ptr, tick: Ptr) -> i32 {
     if time.is_null() || tick.is_null() {
         return SCE_RTC_ERROR_INVALID_POINTER;
@@ -849,6 +905,34 @@ pub(super) fn apputil_savedata_slot_set_param(ctx: &mut GuestCtx, st: &mut VitaS
         0
     } else {
         tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotSetParam -> SLOT_NOT_FOUND");
+        SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND
+    }
+}
+
+/// int sceAppUtilSaveDataSlotDelete(unsigned int slotId,
+///     SceAppUtilSaveDataMountPoint *mountPoint)
+///
+/// Remove a slot - the title's "delete this save" path. A slot that was never created
+/// reports SAVEDATA_SLOT_NOT_FOUND rather than succeeding, exactly as
+/// [`apputil_savedata_slot_set_param`] does and for the same reason: a delete that always
+/// succeeds tells a title its save is gone when there was never one there, and the two
+/// cases lead to different screens.
+///
+/// After this a `GetParam` for the same slot reports SLOT_NOT_FOUND again, so
+/// create/delete round-trips through the same in-memory store the rest of the family uses.
+#[hostcall]
+pub(super) fn apputil_savedata_slot_delete(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    slot_id: u32,
+    mount: Ptr,
+) -> i32 {
+    let mount_name = read_mount_name(ctx, mount);
+    if st.savedata_slot_remove(&mount_name, slot_id) {
+        tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotDelete -> OK");
+        0
+    } else {
+        tracing::debug!(target: "vitaslop::cb", slot = slot_id, "sceAppUtilSaveDataSlotDelete -> SLOT_NOT_FOUND");
         SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND
     }
 }

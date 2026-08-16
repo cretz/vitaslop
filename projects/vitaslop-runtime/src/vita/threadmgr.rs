@@ -22,6 +22,44 @@ pub(super) fn get_thread_current_priority(st: &mut VitaState) -> i32 {
     st.current_priority()
 }
 
+/// The CPU affinity mask a thread gets when it has never asked for one.
+///
+/// `SCE_KERNEL_CPU_MASK_USER_ALL` in `psp2/kernel/threadmgr/thread.h` terms: the three
+/// cores a title's threads may run on (the console has four Cortex-A9 cores and the system
+/// software reserves one - the same fact [`crate::host::guest_cores`] encodes). 0 is
+/// deliberately NOT the default: it means "inherit", and reporting it would tell a title
+/// that queried an untouched thread that its affinity is unset when the kernel would name
+/// the real set.
+pub(crate) const CPU_MASK_USER_ALL: i32 = 0x0007_0000;
+
+/// int sceKernelChangeThreadCpuAffinityMask(SceUID thid, int mask)
+///
+/// Records the requested mask so [`get_thread_cpu_affinity_mask`] reports it back, and
+/// changes NOTHING about where the thread runs.
+///
+/// # Why recording it is the faithful answer and pinning would not be
+/// This emulator runs guest threads on ONE baton, interleaved cooperatively - that is the
+/// whole scheduler. There is no per-core placement to honour, so a mask cannot be obeyed;
+/// the question is only what a title is TOLD. A title sets affinity to spread work and
+/// then, commonly, reads it back to confirm - so a setter that silently discards the value
+/// makes the getter contradict it, which is a disagreement the guest can see. Accepting and
+/// remembering it is consistent, and the scheduling difference from the console is already
+/// modelled where it belongs: `guest_cores` divides the clock charge by how many threads
+/// would really have been running at once.
+#[hostcall]
+pub(super) fn change_thread_cpu_affinity_mask(st: &mut VitaState, thid: i32, mask: i32) -> i32 {
+    st.set_thread_cpu_affinity(thid, mask)
+}
+
+/// int sceKernelGetThreadCpuAffinityMask(SceUID thid)
+///
+/// Returns the mask itself (a non-negative value) or a negative error, which is why it is
+/// an `i32` return and not an out-parameter.
+#[hostcall]
+pub(super) fn get_thread_cpu_affinity_mask(st: &mut VitaState, thid: i32) -> i32 {
+    st.thread_cpu_affinity(thid)
+}
+
 /// int sceKernelDeleteThread(SceUID thid)
 /// Delete a DORMANT thread: drop its record so its SceUID stops resolving, and give its
 /// stack back for reuse. A running thread cannot be deleted (`NOT_DORMANT`) - accepting

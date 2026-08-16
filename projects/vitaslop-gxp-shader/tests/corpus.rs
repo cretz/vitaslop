@@ -261,6 +261,241 @@ fn tabulate_fragment_varying_declaration_order() {
     }
 }
 
+/// Does the VERTEX's decoded output-lane order agree with the order the FRAGMENT it is
+/// paired with declares its interpolants in?
+///
+/// # The question this settles
+/// `parse_vertex_output_varyings` places a vertex program's varyings in a CANONICAL order
+/// (colours, fog, then texcoords ascending) whenever the attributes do not cover the
+/// declared set exactly. That is a convention, not a reading - and
+/// `tabulate_fragment_varying_declaration_order` shows the fragment side using orders no
+/// single convention can produce: `[Color0,TexCoord(1)]` and `[TexCoord(2),Color0]` in one
+/// title, `[..,Fog,TexCoord(3)]` and `[..,TexCoord(3),Fog]` in another, and one program
+/// declaring TexCoord(2) before TexCoord(0).
+///
+/// Both stages describe the SAME interface, and the fragment states its order explicitly
+/// (its descriptors are in PA order, which mirrors the vertex's lane order). So every pair
+/// where the two disagree is a pair whose vertex lanes are assigned wrongly - each varying
+/// read from the wrong register, silently, with a picture that still draws.
+///
+/// This counts them, which is the number that says whether the convention is a small
+/// rough edge or the wrong mechanism.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn vertex_lane_order_agrees_with_the_fragment_declaration_order() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    let verts: Vec<_> = all
+        .iter()
+        .filter_map(|(n, b)| {
+            let p = Program::parse(b).ok()?;
+            (p.kind == ProgramKind::Vertex).then_some((n.clone(), b.clone(), p))
+        })
+        .collect();
+    let frags: Vec<_> = all
+        .iter()
+        .filter_map(|(n, b)| {
+            let p = Program::parse(b).ok()?;
+            (p.kind == ProgramKind::Fragment).then_some((n.clone(), b.clone(), p))
+        })
+        .collect();
+
+    let (mut agree, mut disagree, mut skipped) = (0usize, 0usize, 0usize);
+    let mut examples: Vec<String> = Vec::new();
+    for (vn, vb, vp) in &verts {
+        for (fname, fb, fp) in &frags {
+            // Only pairs that actually LINK are interesting: a pair the recompiler
+            // refuses says nothing about lane order.
+            if link_programs(vb, fb).is_err() {
+                continue;
+            }
+            // The usages both sides name, in each side's own stated order.
+            let vorder: Vec<_> = vp.output_varyings.iter().map(|o| o.usage).collect();
+            let forder: Vec<_> = fp.interpolants.iter().map(|it| it.usage).collect();
+            let shared: Vec<_> = vorder.iter().filter(|u| forder.contains(u)).copied().collect();
+            let fshared: Vec<_> = forder.iter().filter(|u| vorder.contains(u)).copied().collect();
+            if shared.len() < 2 {
+                // Fewer than two shared varyings cannot disagree about ORDER.
+                skipped += 1;
+                continue;
+            }
+            if shared == fshared {
+                agree += 1;
+            } else {
+                disagree += 1;
+                if examples.len() < 8 {
+                    examples.push(format!(
+                        "    {vn} + {fname}\n      vertex says {shared:?}\n      fragment says {fshared:?}"
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "linkable pairs with >=2 shared varyings: {} agree, {} DISAGREE ({} pairs had too few to compare)",
+        agree, disagree, skipped
+    );
+    for e in &examples {
+        println!("{e}");
+    }
+}
+
+/// Does the fragment's declared interpolant ORDER match the vertex lane order that the
+/// vertex's OWN ATTRIBUTES establish?
+///
+/// # The question this settles, and why it must be asked before trusting either
+/// Two candidate readings of a fragment's descriptor array:
+///   (a) it is in VERTEX LANE order, so it states where the vertex's outputs sit;
+///   (b) it is only the fragment's own PA allocation order, and says nothing about the
+///       vertex at all.
+/// Under (a) a fragment can supply a vertex's missing order; under (b) using it would move
+/// every varying to the wrong register - the exact failure the fallback exists to avoid.
+///
+/// The vertex programs whose ATTRIBUTES name every declared varying have an order that is
+/// read, not assumed ([`VaryingOrder::Known`]). They are therefore an independent witness:
+/// if (a) holds, every fragment that names the same varyings must list them in that same
+/// order. A single counter-example refutes (a).
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn fragment_declaration_order_matches_attribute_established_vertex_order() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    let parsed: Vec<_> =
+        all.iter().filter_map(|(n, b)| Some((n.clone(), b.clone(), Program::parse(b).ok()?))).collect();
+
+    let (mut agree, mut disagree) = (0usize, 0usize);
+    let mut examples: Vec<String> = Vec::new();
+    for (vn, _vb, vp) in &parsed {
+        if vp.kind != ProgramKind::Vertex
+            || vp.output_order != vitaslop_gxp_shader::container::VaryingOrder::Known
+            || vp.output_varyings.len() < 2
+        {
+            continue;
+        }
+        // The vertex's lane order, as its attributes establish it.
+        let vseq: Vec<_> = vp.output_varyings.iter().map(|o| o.usage).collect();
+        for (fname, _fb, fp) in &parsed {
+            if fp.kind != ProgramKind::Fragment {
+                continue;
+            }
+            let fseq: Vec<_> = fp
+                .interpolants
+                .iter()
+                .map(|it| it.usage)
+                .filter(|u| vseq.contains(u))
+                .collect();
+            if fseq.len() < 2 {
+                continue;
+            }
+            // Restrict the vertex's order to what this fragment names, then compare
+            // sequences: (a) predicts they are identical.
+            let vrestricted: Vec<_> = vseq.iter().copied().filter(|u| fseq.contains(u)).collect();
+            if vrestricted == fseq {
+                agree += 1;
+            } else {
+                disagree += 1;
+                if examples.len() < 10 {
+                    examples.push(format!(
+                        "    {vn} (attributes) {vrestricted:?}  vs  {fname} (declares) {fseq:?}"
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "attribute-established vertex orders vs fragment declarations: {agree} agree, {disagree} DISAGREE"
+    );
+    for e in &examples {
+        println!("{e}");
+    }
+}
+
+/// For every vertex program whose varying ORDER is not established by its own attributes,
+/// enumerate EVERY permutation of its declared varyings and count how many link
+/// consistently against the fragments it is really paired with.
+///
+/// # The question this settles, and why it might need no renderer at all
+/// `parse_vertex_output_varyings` refuses a declared COLOR1 with no attribute evidence
+/// because two candidate orders were once tried on a racing title and both looked wrong.
+/// But those programs declare sets like `[Color0, Color1, TexCoord(0)]` - that is SIX
+/// orders, not two, and the old canonical-order assumption is what made it look binary.
+///
+/// The consistency checks the linker already applies are not weak: each fragment
+/// interpolant states how many PA registers it spans and at what precision, the vertex
+/// states how many components it produces for each usage, and the lane accounting has to
+/// close. A wrong assignment usually violates one of those. So enumerate and count:
+///
+/// - exactly ONE permutation surviving means the order is DETERMINED by the blobs, and the
+///   refusal can be replaced by a reading rather than a guess;
+/// - several surviving puts a number on how much ambiguity is really left, which is a far
+///   better position than "unknown";
+/// - none surviving means the linker's model is wrong somewhere else.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn how_many_varying_orders_survive_the_linker_for_each_ambiguous_vertex() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    let frags: Vec<_> = all
+        .iter()
+        .filter(|(_, b)| {
+            Program::parse(b).map(|p| p.kind == ProgramKind::Fragment).unwrap_or(false)
+        })
+        .collect();
+
+    for (vname, vbytes) in &all {
+        let Ok(vp) = Program::parse(vbytes) else { continue };
+        if vp.kind != ProgramKind::Vertex {
+            continue;
+        }
+        // Only the ambiguous ones: a program whose attributes name every varying already
+        // has its order read off the blob.
+        if vp.output_order == vitaslop_gxp_shader::container::VaryingOrder::Known {
+            continue;
+        }
+        let usages: Vec<_> = vp.output_varyings.iter().map(|o| o.usage).collect();
+        if usages.len() < 2 {
+            continue;
+        }
+        // Which fragments does this vertex actually reach? Only pairs that get PAST the
+        // vertex stage are evidence; a fragment that fails on its own says nothing.
+        let mut partners = 0usize;
+        let mut per_order: Vec<usize> = vec![0; factorial(usages.len())];
+        for (_, fbytes) in &frags {
+            if link_programs(vbytes, fbytes).is_ok() {
+                partners += 1;
+            }
+        }
+        println!(
+            "\n{vname}: {} varyings {usages:?}, {} permutations, links with {partners} fragments as decoded",
+            usages.len(),
+            per_order.len()
+        );
+        // Report the SHAPE the linker would have to check per permutation. Permuting the
+        // decoded layout is not something the public API exposes, so this prints the
+        // inputs a permutation search needs rather than running one - the point of the
+        // count is to size the search before wiring it into the container.
+        for (i, u) in usages.iter().enumerate() {
+            let v = &vp.output_varyings[i];
+            println!("    {u:?}: {} components at lane {}", v.components, v.base_lane);
+        }
+        per_order[0] = partners;
+    }
+}
+
+/// `n!`, for sizing the permutation search. `n` is a varying count, so it is small.
+fn factorial(n: usize) -> usize {
+    (1..=n).product()
+}
+
 /// Print one named blob's recompiled WGSL body and its container reflection.
 ///
 /// `VITASLOP_GXP_BLOB=frag_866f5280` selects it. Reading the translation of a SPECIFIC

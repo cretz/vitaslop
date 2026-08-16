@@ -865,6 +865,59 @@ pub(super) fn color_surface_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(0);
 }
 
+/// `SCE_GXM_ERROR_INVALID_POINTER` (`psp2/gxm.h`).
+const SCE_GXM_ERROR_INVALID_POINTER: i32 = 0x805B_0004u32 as i32;
+
+/// int sceGxmColorSurfaceInitDisabled(SceGxmColorSurface *surface)
+///
+/// Initialise a colour surface as DISABLED: a render target that writes no colour at all.
+/// A title uses this for a depth-only pass - a shadow map or a z-prepass - where the depth
+/// surface is the whole output and a colour attachment would only cost bandwidth.
+///
+/// # Why this writes a full surface rather than just zeroing
+/// The struct still has to be a RECOGNISABLE colour surface: it is passed to
+/// `sceGxmBeginScene` like any other, and the reader must be able to tell "this is a
+/// surface that is disabled" from "this is uninitialised memory", which is exactly the
+/// distinction [`COLOR_SURFACE_MAGIC`] exists to make. So the magic is stamped and every
+/// field is zeroed - `data_addr == 0` being the thing that marks it disabled, and the same
+/// thing `sceGxmColorSurfaceIsEnabled` would report on.
+#[hostcall]
+pub(super) fn color_surface_init_disabled(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    surface: Ptr,
+) -> i32 {
+    do_color_surface_init_disabled(ctx, st, surface.addr())
+}
+
+/// See [`color_surface_init_disabled`]. A `#[hostcall]` body cannot early-return.
+fn do_color_surface_init_disabled(ctx: &mut GuestCtx, st: &mut VitaState, addr: u32) -> i32 {
+    if addr == 0 {
+        return SCE_GXM_ERROR_INVALID_POINTER;
+    }
+    let s = ColorSurface {
+        format: 0,
+        surface_type: 0,
+        width: 0,
+        height: 0,
+        stride_pixels: 0,
+        // The disabled marker. Nothing may be rendered into a surface with no memory
+        // behind it, and a later `IsEnabled` reads this same word.
+        data_addr: 0,
+        scale_mode: 0,
+        gamma: 0,
+    };
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        surface = format_args!("{addr:#x}"),
+        caller = format_args!("{:#010x}", ctx.regs[14]),
+        "colorSurfaceInitDisabled"
+    );
+    write_color_surface(ctx, addr, &s);
+    st.set_color_surface(addr, s);
+    0
+}
+
 /// Report - once per (surface data address, mode) - a colour surface created with a SCALE MODE
 /// we do not honour.
 ///
@@ -1804,6 +1857,38 @@ pub(super) fn set_front_stencil_func(
     gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_DEPTH_PASS, depth_pass);
     gxmctx::set(ctx, context, off::FRONT_STENCIL_COMPARE_MASK, compare_mask & 0xff);
     gxmctx::set(ctx, context, off::FRONT_STENCIL_WRITE_MASK, write_mask & 0xff);
+    0
+}
+
+/// void sceGxmSetBackStencilFunc(SceGxmContext *context, SceGxmStencilFunc func,
+///     SceGxmStencilOp stencilFail, SceGxmStencilOp depthFail, SceGxmStencilOp
+///     depthPass, unsigned char compareMask, unsigned char writeMask)
+///
+/// The two-sided counterpart of [`set_front_stencil_func`], stored in the back-face half
+/// of the context block. Recorded whether or not two-sided rendering is currently enabled:
+/// a title commonly sets both faces once at start-up and turns `sceGxmSetTwoSidedEnable`
+/// on later, so state dropped at the moment it was set is missing when it starts to matter.
+#[hostcall]
+pub(super) fn set_back_stencil_func(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    context: u32,
+    func: u32,
+    stencil_fail: u32,
+    depth_fail: u32,
+    depth_pass: u32,
+    compare_mask: u32,
+    write_mask: u32,
+) -> i32 {
+    use gxmctx::off;
+    gxmctx::set(ctx, context, off::BACK_STENCIL_FUNC, func);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_OP_FAIL, stencil_fail);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_OP_DEPTH_FAIL, depth_fail);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_OP_DEPTH_PASS, depth_pass);
+    // The masks are `unsigned char` in the prototype; the AAPCS passes them in full
+    // registers, so the high bytes are whatever the caller had there.
+    gxmctx::set(ctx, context, off::BACK_STENCIL_COMPARE_MASK, compare_mask & 0xff);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_WRITE_MASK, write_mask & 0xff);
     0
 }
 

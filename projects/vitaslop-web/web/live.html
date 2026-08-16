@@ -155,6 +155,21 @@
         margin: -2px 0 0;
       }
       #diagbox[open] { max-height: 40vh; overflow: auto; }
+      /* A fatal error is not a counter and must not scroll away inside the panel with them:
+         it opens the box itself, sits above everything, and is never overwritten by a later
+         report. Hidden entirely until there is one. */
+      #fatal {
+        display: none;
+        margin: 0 0 6px;
+        padding: 6px 10px;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #ffd9d9;
+        background: #3a0d12;
+        border-left: 3px solid #ff5566;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
       #diag {
         margin: 0;
         padding: 0 10px 10px;
@@ -267,6 +282,7 @@
            which is the device whose numbers are the ones that matter. -->
       <details id="diagbox" open>
         <summary>diagnostics <button id="copydiag" type="button">copy</button></summary>
+        <pre id="fatal"></pre>
         <pre id="diag">waiting for the first perf window (30 presents)...</pre>
       </details>
       <div id="pad">
@@ -299,6 +315,7 @@
 
     <script type="module">
       import { forwardInput } from "./worker-input.js";
+      import { forwardLocation } from "./location.js";
       import { installPad, installGamepad } from "./pad.js";
       import { importTitle, isImported, storageRoom, requestPersistence } from "./opfs.js";
       import { startAudio } from "./audio.js";
@@ -402,6 +419,29 @@ ${window.__fatalWorkerError}` : ``,
           ``,
           $("diag").textContent,
         ].join("\n");
+
+      // >>> ONE PLACE A FATAL ERROR LANDS, AND IT IS ON THE SCREEN.
+      //
+      // Everything that kills the run - a worker `onerror`, a reported error, and above all a
+      // Rust PANIC forwarded by `globalThis.__vitaslopPanic` in the worker - comes here. The
+      // status line cannot serve: it is one ellipsised row, it is overwritten by the next
+      // report, and a panic message is multi-line with a stack under it.
+      //
+      // This is the whole point of the change: on a phone there is no console, so a crash used
+      // to be reportable only as "it stopped". Now the text is on the page, in the copy dump,
+      // and in the `/diag` sink, and the panel OPENS itself so it cannot be missed while
+      // collapsed.
+      //
+      // Appends rather than replaces - a panic often follows a first error that explains it,
+      // and keeping only the last one throws away the cause to keep the symptom.
+      const reportFatal = (text) => {
+        const box = $("fatal");
+        box.textContent = box.textContent ? box.textContent + "\n\n" + text : text;
+        box.style.display = "block";
+        $("diagbox").open = true;
+        window.__fatalWorkerError = box.textContent;
+        if (typeof window.__diagSend === "function") window.__diagSend("fatal");
+      };
 
       // >>> STREAM THE DUMP TO THE DEV SERVER, IF THERE IS ONE.
       //
@@ -635,6 +675,7 @@ VITASLOP_LOG=warn</textarea>
           boot(t, $(`r-${t.id}`).value, knobs).catch((e) => {
             status.textContent = "failed to start: " + (e && e.message ? e.message : e);
             console.error(e);
+            reportFatal("BOOT FAILED\n" + ((e && (e.stack || e.message)) || e));
           });
         });
       }
@@ -713,6 +754,14 @@ VITASLOP_LOG=warn</textarea>
         const prebuilt = await new Promise((resolve, reject) => {
           const tw = new Worker("./transpile-worker.js", { type: "module" });
           tw.onmessage = (e) => {
+            // A panic report is NOT the end of this worker's message stream - the abort trap
+            // follows it - so it must not terminate the worker or settle the promise. It is
+            // recorded, and the `error`/`onerror` that arrives next settles it.
+            if (e.data.type === "panic") {
+              console.error("[transpile] panic:", e.data.message);
+              reportFatal("RUST PANIC IN THE TRANSPILE WORKER\n" + e.data.message);
+              return;
+            }
             tw.terminate();
             e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
           };
@@ -733,6 +782,16 @@ VITASLOP_LOG=warn</textarea>
           } else if (d.type === "error") {
             status.textContent = "error: " + d.message;
             console.error("[worker]", d.message);
+            reportFatal("WORKER ERROR\n" + d.message);
+          } else if (d.type === "panic") {
+            // A Rust panic. This arrives BEFORE the `unreachable` trap that the worker's
+            // `onerror` will report a moment later, so the two lines appear in causal order:
+            // the panic that names the file, the line and the reason, then the trap that is
+            // only a wasm offset. Reading them the other way round is what made the last
+            // device crash report unactionable.
+            status.textContent = "PANIC (see diagnostics)";
+            console.error("[worker] panic:", d.message);
+            reportFatal("RUST PANIC IN THE RUN WORKER\n" + d.message);
           }
         };
         // A worker that dies without reporting would otherwise leave a stale status line.
@@ -749,8 +808,9 @@ VITASLOP_LOG=warn</textarea>
           const detail = (e.message || "died") + site;
           status.textContent = "worker error: " + detail;
           console.error("[worker] onerror:", detail, e.error && e.error.stack ? "\n" + e.error.stack : "");
-          window.__fatalWorkerError = detail + (e.error && e.error.stack ? "\n" + e.error.stack : "");
-          if (typeof window.__diagSend === "function") window.__diagSend("worker-error");
+          reportFatal(
+            "WORKER DIED\n" + detail + (e.error && e.error.stack ? "\n" + e.error.stack : "")
+          );
         };
 
         // Live input: pointer + keyboard from the page, the on-screen pad, and any real
@@ -758,6 +818,14 @@ VITASLOP_LOG=warn</textarea>
         forwardInput(worker, canvas);
         installPad(worker, $("pad"));
         installGamepad(worker, (msg) => console.log("[pad] " + msg));
+
+        // SceLibLocation: the page owns navigator.geolocation (Window-only) and the
+        // worker owns the guest. Nothing is requested until the guest asks - the browser
+        // permission prompt appears when the title calls sceLocationConfirm, which is
+        // exactly when its own permission dialog would appear on a console. Its notes go
+        // into the diagnostics mirror so a device run says why location did or did not
+        // work, rather than the title sitting on "acquiring" with nothing logged.
+        forwardLocation(worker);
 
         // Audio is a MAIN-THREAD API and the emulator is in a worker, so the page owns the
         // context and the worker only fills a shared ring. A failure here must not take the

@@ -3224,6 +3224,10 @@ pub struct VitaState {
     pub audio: Box<dyn crate::audio::AudioSink + Send>,
     /// Opened NGS/audio port and handle bookkeeping (see `vita::ngs` / `vita::audio`).
     pub(crate) audio_state: crate::vita::audio::AudioState,
+    /// SceLibLocation handles and permission-dialog state (see `vita::location`). The
+    /// position itself is never stored here - it is read from [`World`] at each call, so
+    /// a fix cannot go stale behind the guest's back.
+    pub(crate) location: crate::vita::location::LocationState,
     /// Bring-up aid: halt the run when the guest calls sceGxmTerminate. The cube
     /// entry is `_start`, which spins forever after `main` returns (there is no OS
     /// to exit to yet), so terminate is the clean stopping point after teardown.
@@ -3534,6 +3538,7 @@ impl VitaState {
             world,
             audio: Box::new(crate::audio::NullSink::default()),
             audio_state: crate::vita::audio::AudioState::default(),
+            location: crate::vita::location::LocationState::default(),
             halt_on_terminate: false,
             process_param: 0,
             modules: Vec::new(),
@@ -4580,6 +4585,38 @@ impl VitaState {
         self.free_stacks.push(rec.stack);
         tracing::trace!(target: "vitaslop::thread", uid = thid, "delete");
         Ok(())
+    }
+
+    /// Record a thread's requested CPU affinity mask (`sceKernelChangeThreadCpuAffinityMask`).
+    ///
+    /// Stored, not obeyed: this scheduler interleaves guest threads on one baton, so there
+    /// is no per-core placement to honour. What matters is that the getter agrees with the
+    /// setter - a title that sets an affinity and reads it back must not be contradicted.
+    /// The `cpu_affinity` field is the same one `sceKernelCreateThread` fills and
+    /// `sceKernelGetThreadInfo` already reports, so all three now tell one story.
+    pub fn set_thread_cpu_affinity(&mut self, thid: i32, mask: i32) -> i32 {
+        // 0 addresses the CALLING thread throughout the threadmgr API.
+        let target = if thid == 0 { self.current } else { thid };
+        match self.threads.iter_mut().find(|t| t.uid == target) {
+            Some(t) => {
+                t.cpu_affinity = mask;
+                0
+            }
+            None => SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID as i32,
+        }
+    }
+
+    /// A thread's CPU affinity mask, or a negative error. See
+    /// [`Self::set_thread_cpu_affinity`].
+    pub fn thread_cpu_affinity(&self, thid: i32) -> i32 {
+        let target = if thid == 0 { self.current } else { thid };
+        match self.threads.iter().find(|t| t.uid == target) {
+            // A thread created with 0 ("inherit") has never named a set, and the kernel
+            // answers with the real one it may run on rather than the sentinel.
+            Some(t) if t.cpu_affinity == 0 => crate::vita::threadmgr::CPU_MASK_USER_ALL,
+            Some(t) => t.cpu_affinity,
+            None => SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID as i32,
+        }
     }
 
     /// The priority the current thread is running at (lower = higher priority).
@@ -9661,7 +9698,7 @@ pub trait ImportDispatch {
     /// one that just stopped. The scheduler runs one at a time; the device does not, so
     /// this is what lets the host divide the WALL time among the cores that would have
     /// been executing it in parallel. See [`VitaEnv::on_guest_work`].
-    fn on_guest_work(&mut self, _runnable: usize, _fuel: u64) {}
+    fn on_guest_work(&mut self, _runnable: usize, _fuel: u64, _retired: Option<u64>) {}
 
     /// The `r0` value owed to thread `thid` as it resumes from a block (a timed wait
     /// that expired, returning `SCE_KERNEL_ERROR_WAIT_TIMEOUT`), if any. The engine
@@ -9794,8 +9831,19 @@ impl ImportDispatch for VitaEnv {
     /// are idle). The STORAGE clock divides by exactly the same figure and for exactly
     /// the same reason - it charges for elapsed wall time too, and the device does not
     /// get three times the bandwidth because three threads are running.
-    fn on_guest_work(&mut self, runnable: usize, fuel: u64) {
+    fn on_guest_work(&mut self, runnable: usize, fuel: u64, retired: Option<u64>) {
         let cores = runnable.clamp(1, guest_cores()) as u64;
+        // >>> A QUANTUM OF GUEST WORK, IN THE UNIT THE ENGINE CAN REPORT.
+        //
+        // GUEST INSTRUCTIONS when the engine carries the emitted per-block counter, which
+        // is the whole point: an ARM instruction is the same amount of guest work whatever
+        // this transpiler's codegen turns it into, so the emulated console's speed stops
+        // moving every time the codegen improves. Fuel (wasm operators) is the fallback for
+        // an engine with no such counter, and is exactly the pre-2026-08-16 behaviour.
+        let (work, quantum) = match retired {
+            Some(r) => (r, QUANTUM_ARM),
+            None => (fuel, QUANTUM_FUEL),
+        };
         // A quantum's worth of fuel costs a quantum's worth of time, so a thread that
         // really does burn a whole preemption slice is charged exactly what it always was.
         // What changes is everything either side of that: a voluntary yield after a
@@ -9805,15 +9853,15 @@ impl ImportDispatch for VitaEnv {
         // twice - by `QUANTUM_FUEL` and then by `cores` - truncated a small burn to zero
         // microseconds and stopped the clock outright for a title that yields in short
         // bursts, which is a livelock and not a rounding error.
-        let den = QUANTUM_FUEL.saturating_mul(cores);
+        let den = quantum.saturating_mul(cores);
         let charge = |num: u64, rem: &mut u64| -> u64 {
             let total = rem.saturating_add(num);
             *rem = total % den;
             total / den
         };
         let (mut cpu_rem, mut io_rem) = self.state.charge_rem;
-        let io_us = charge(QUANTUM_IO_US.saturating_mul(fuel), &mut io_rem);
-        let cpu_us = charge(quantum_cpu_us().saturating_mul(fuel), &mut cpu_rem);
+        let io_us = charge(QUANTUM_IO_US.saturating_mul(work), &mut io_rem);
+        let cpu_us = charge(quantum_cpu_us().saturating_mul(work), &mut cpu_rem);
         self.state.charge_rem = (cpu_rem, io_rem);
         if self.state.has_io_waiters() {
             self.state.charge_io_quantum(io_us);
@@ -9900,12 +9948,43 @@ const QUANTUM_IO_US: u64 = 2_000;
 /// microseconds. See [`VitaState::charge_cpu_quantum`] for why the game clock must
 /// advance for CPU work at all.
 ///
-/// CALIBRATION. A unit of fuel is about one executed wasm instruction; the transpiler
-/// emits several wasm instructions per guest ARM instruction (register globals, flag
-/// computation), so [`QUANTUM_FUEL`] is order 0.2-0.5 M ARM instructions, and the Vita's
-/// 444 MHz Cortex-A9 retires that in roughly 1-2 ms. 2 ms is the middle of that range, and
-/// it is the same figure and the same reasoning as [`QUANTUM_IO_US`] - one unit of guest
-/// execution is one unit of guest execution, whichever clock is charged for it.
+/// CALIBRATION. A unit of fuel is one executed wasm operator, and the transpiler emits
+/// several of them per guest ARM instruction (register globals, flag computation), so
+/// [`QUANTUM_FUEL`] is some number of ARM instructions and the Vita's 444 MHz Cortex-A9
+/// retires that in some time. The original figure took the expansion as "order 0.2-0.5 M
+/// ARM instructions" and picked 2 ms as the middle of the resulting range.
+///
+/// # >>> THE EXPANSION FACTOR IS PART OF THIS CONSTANT, AND IT MOVES WHEN THE CODEGEN DOES
+/// That is the trap. The emulated Vita's CPU speed is `fuel rate / operators-per-guest-
+/// instruction`, so ANY improvement to the transpiler's output makes the emulated console
+/// faster unless this constant moves with it - silently, with nothing in a run to notice
+/// it by. It is now MEASURED and printed every run (`code expansion:` on
+/// `vitaslop::perf`, from `vitaslop_transpiler::emit::Expansion`), so the input to this
+/// calibration is finally an observation rather than an estimate.
+///
+/// **2026-08-15f, measured on PCSA00015:** three codegen changes (flag liveness, folding
+/// the rebase into the address displacement, and dropping the scratch stores a dead carry
+/// no longer needs) took the static expansion from **14.61 to 9.87** operators per guest
+/// instruction, and the EXECUTED figure on the race window from **108.3 to 77.9 M fuel per
+/// frame** for the same guest work - a factor of 1.390. Left alone, that made the emulated
+/// console 1.39x faster than it had been the day before, which is a fidelity change no one
+/// asked for. So this went **2000 -> 2780 us**: the same emulated CPU speed as before the
+/// codegen work, asserting nothing new about the device.
+///
+/// **What this compensation is NOT.** It restores the status quo; it does not claim to be
+/// right. Now that the expansion is measured, the honest derivation is
+/// `QUANTUM_FUEL / expansion / (444 MHz x IPC)`, which at the measured 9.87 gives
+/// 506,586 guest instructions and so **1141 us at IPC 1.0, about 1521 us at IPC 0.75** -
+/// both well below even the old 2000. Choosing between them means choosing an IPC for a
+/// Cortex-A9 on game code, which is a claim about the DEVICE and wants its own
+/// measurement rather than being folded into an optimisation.
+///
+/// **And the compensation is a treadmill.** It has to be redone, by hand, after every
+/// codegen change, and it can only ever be right for the instruction mix it was measured
+/// on (the static factor says 1.391 where the race window says 1.316 - a real spread
+/// between screens). The fix that ends it is to bill the clock in GUEST INSTRUCTIONS,
+/// which do not move when the codegen improves; `ir::Block::arm_count` already carries
+/// the per-block count for exactly that. See the agent notes.
 ///
 /// **This is a rate, not a per-suspend price.** It was the latter until the game clock ran
 /// 1.08x on one title and 4.34x on another with the same build on the same day, which is
@@ -9915,7 +9994,37 @@ const QUANTUM_IO_US: u64 = 2_000;
 ///
 /// Override for an experiment with `VITASLOP_QUANTUM_CPU_US`; 0 restores the old model
 /// (a game clock that moves only on a flip or a scheduler idle) for an A/B.
-const QUANTUM_CPU_US: u64 = 2_000;
+const QUANTUM_CPU_US: u64 = 2_780;
+
+/// GUEST ARM INSTRUCTIONS in one quantum of guest work - the unit [`QUANTUM_CPU_US`] and
+/// [`QUANTUM_IO_US`] are priced against, on any engine that carries the emitted per-block
+/// instruction counter (`abi::ARM_COUNT_GLOBAL`).
+///
+/// # This ends the treadmill, and the value is chosen to change NOTHING else
+/// The clock used to be billed in [`QUANTUM_FUEL`] wasm operators, so the emulated Vita's
+/// CPU speed was `fuel rate / code expansion` - and the expansion is a property of this
+/// transpiler's codegen. Every codegen improvement therefore made the emulated console
+/// faster, silently, and had to be undone by hand: 2026-08-15f cut executed operators 28%
+/// and had to move `QUANTUM_CPU_US` 2000 -> 2780 to restore the speed the console had the
+/// day before. That compensation could only ever be right for the instruction mix it was
+/// measured on (the static factor said 1.391 where the race window said 1.316) and it had
+/// to be redone after every codegen change.
+///
+/// So this is `QUANTUM_FUEL / expansion` at the expansion measured when the switch was
+/// made - **5,000,000 / 9.87 = 506,586** - which makes the changeover EXACTLY
+/// speed-neutral. That is the point: a mechanism change should change one thing, and the
+/// thing it changes is that the clock no longer moves when the codegen does. It is not a
+/// claim that this speed is right.
+///
+/// # What the honest derivation says, which is a SEPARATE decision
+/// A quantum is now 506,586 real ARM instructions, and the device is a 444 MHz Cortex-A9,
+/// so a quantum is worth `506_586 / (444e6 * IPC)` seconds: **1141 us at IPC 1.0, about
+/// 1521 us at IPC 0.75**. The constant above is 2780, so the emulated CPU currently runs
+/// roughly **2.4x slower than a 444 MHz A9 at IPC 1.0** (1.8x at IPC 0.75). Closing that
+/// gap is a fidelity change with a visible effect on gameplay speed, and choosing an IPC
+/// for a Cortex-A9 on game code is a claim about the DEVICE that wants its own
+/// measurement - so it is deliberately NOT folded into this mechanism change.
+const QUANTUM_ARM: u64 = 506_586;
 
 /// [`QUANTUM_CPU_US`], overridable per-run by `VITASLOP_QUANTUM_CPU_US` (the knob exists
 /// to take the calibration measurement and to A/B it; 0 restores the pre-calibration
@@ -10030,8 +10139,8 @@ impl ImportDispatch for std::rc::Rc<std::cell::RefCell<VitaEnv>> {
         self.borrow_mut().release_earliest_io()
     }
 
-    fn on_guest_work(&mut self, runnable: usize, fuel: u64) {
-        self.borrow_mut().on_guest_work(runnable, fuel);
+    fn on_guest_work(&mut self, runnable: usize, fuel: u64, retired: Option<u64>) {
+        self.borrow_mut().on_guest_work(runnable, fuel, retired);
     }
 
     fn take_resume_code(&mut self, thid: i32) -> Option<u32> {

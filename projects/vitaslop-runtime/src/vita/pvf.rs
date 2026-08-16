@@ -113,6 +113,69 @@ pub(super) fn open_user_file(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, f
     font
 }
 
+/// ScePvfFontId scePvfOpenUserMemory(ScePvfLibId libID, ScePvfPointer addr,
+///     ScePvfU32 size, ScePvfError *errorCode)
+///
+/// Open a font from bytes the title already holds in GUEST MEMORY. Titles use this for a
+/// font they unpacked from their own archive, which a path-based open cannot reach at all.
+///
+/// A zero-length or null buffer is rejected before the read rather than after: reading
+/// zero bytes and then failing to parse them reports the same error by a longer route, but
+/// a huge bogus `size` would first copy that much guest memory.
+#[hostcall]
+pub(super) fn open_user_memory(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    addr: Ptr,
+    size: u32,
+    error_code: Ptr,
+) -> u32 {
+    do_open_user_memory(ctx, st, lib, addr.addr(), size, error_code.addr())
+}
+
+fn do_open_user_memory(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    lib: u32,
+    addr: u32,
+    size: u32,
+    error_code: u32,
+) -> u32 {
+    let (font, err) = if addr == 0 || size == 0 {
+        (0, SCE_PVF_ERROR_ARG)
+    } else {
+        let bytes = ctx.read_bytes(addr, size as usize);
+        match st.fonts.open_user_memory(lib, &bytes) {
+            Some(f) => (f, 0),
+            None if !st.fonts.lib_exists(lib) => (0, SCE_PVF_ERROR_LIBID),
+            // The lib is fine, so the bytes are not a font this backend can parse.
+            None => (0, SCE_PVF_ERROR_NOFILE),
+        }
+    };
+    tracing::debug!(target: "vitaslop::cb", lib, size, font, err, "scePvfOpenUserMemory");
+    if error_code != 0 {
+        ctx.write_u32(error_code, err as u32);
+    }
+    font
+}
+
+/// ScePvfError scePvfClose(ScePvfFontId fontID)
+///
+/// Drop a font handle and, once no open font still uses its face, its cached glyphs.
+///
+/// A handle that was never issued - or was already closed - is refused with
+/// `SCE_PVF_ERROR_ARG` rather than succeeding: a double close that reads as success hides
+/// a title's own use-after-free from it, and this is the one call positioned to notice.
+#[hostcall]
+pub(super) fn close(st: &mut VitaState, font: u32) -> i32 {
+    if st.fonts.close(font) {
+        0
+    } else {
+        SCE_PVF_ERROR_ARG
+    }
+}
+
 /// ScePvfError scePvfSetSkewValue(ScePvfFontId fontID, ScePvfFloat32 angleX,
 ///     ScePvfFloat32 angleY)
 /// Faux-italic skew is a visual-only transform not yet modeled by the backend; accept

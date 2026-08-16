@@ -28,7 +28,10 @@ vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-console_error_panic_hook = "0.1"
+# No `console_error_panic_hook`: it prints the panic to the console and nowhere else, and the
+# machine whose panics matter (the phone) has no console. `logging::install_panic_hook` does the
+# same job and additionally puts the text in the on-page diagnostics panel and through the
+# worker's `__vitaslopPanic` sink to the page.
 # The runtime emits its diagnostics as `tracing` events. On native a subscriber turns
 # them into stderr lines under RUST_LOG; without one here the browser DROPS every one of
 # them, so the same emulator is silent in the one place it is hardest to observe. These
@@ -53,4 +56,10 @@ features = [
     "EventTarget", "PointerEvent", "KeyboardEvent", "DomRect",
     # The worker production path presents to a transferred OffscreenCanvas.
     "OffscreenCanvas",
+    # SceLibLocation: the browser's own positioning provider. `Geolocation` is a
+    # Window-only API, so the worker engine relays through the page - which is what
+    # `DedicatedWorkerGlobalScope` is for here (detecting which side we are on, and
+    # posting the request across). See `src/location.rs`.
+    "Navigator", "Geolocation", "Position", "Coordinates", "PositionError",
+    "DedicatedWorkerGlobalScope",
 ]

@@ -53,8 +53,8 @@ pub use sched::{
     ThreadHandle, ThreadStep,
 };
 pub use world::{
-    CtrlFrame, DeterministicWorld, Record, Replay, TouchFrame, TouchPoint, World, WorldEvent,
-    MAX_TOUCH_POINTS,
+    CtrlFrame, DeterministicWorld, LocationFix, LocationPermission, Record, Replay, TouchFrame,
+    TouchPoint, World, WorldEvent, MAX_TOUCH_POINTS,
 };
 
 /// Write a Vita host handler as a typed function; the macro generates the AAPCS-

@@ -320,6 +320,81 @@ pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
     }
 }
 
+/// `SCE_KERNEL_ERROR_EVF_COND` (`psp2/kernel/error.h`): a POLL whose condition the current
+/// pattern does not satisfy. This is the whole difference between poll and wait - the wait
+/// parks, the poll says "not yet" - so it must be a real error rather than a success with a
+/// stale pattern, which a caller polling in a loop cannot tell from the bits being set.
+const SCE_KERNEL_ERROR_EVF_COND: u32 = 0x8002_80E3;
+
+/// int sceKernelPollEventFlag(int evid, unsigned int bits, unsigned int wait,
+///     unsigned int *outBits)
+///
+/// The non-blocking `sceKernelWaitEventFlag`: identical test, identical clear-on-match
+/// side effect, but it reports `SCE_KERNEL_ERROR_EVF_COND` instead of parking when the
+/// pattern does not satisfy the condition.
+///
+/// It shares [`VitaState::evf_try_wait`] with the wait, deliberately: the wait mode's
+/// AND/OR semantics and its CLEAR_ALL / CLEAR_PAT side effects are the subtle part, and a
+/// second copy of them here would be a second thing to get wrong. `outBits` receives the
+/// pattern AT MATCH (before the mode's clear), which is what the waiting path delivers too.
+///
+/// In the non-preemptive single-thread model there is nothing that could set the bits
+/// later, so - exactly as [`wait_event_flag`] argues - whatever would have set them has
+/// already run, and the current pattern is reported as a success.
+#[hostcall]
+pub(super) fn poll_event_flag(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    bits: u32,
+    mode: u32,
+    out: Ptr,
+) -> i32 {
+    do_poll_event_flag(ctx, st, id, bits, mode, out.addr())
+}
+
+/// See [`poll_event_flag`]. Split out because a `#[hostcall]` body cannot early-return.
+fn do_poll_event_flag(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    bits: u32,
+    mode: u32,
+    out: u32,
+) -> i32 {
+    if !st.is_preemptive() {
+        let pattern = st.event_pattern(id);
+        if out != 0 {
+            ctx.write_u32(out, pattern);
+        }
+        return 0;
+    }
+    match st.evf_try_wait(id, bits, mode) {
+        Some(at_match) => {
+            tracing::trace!(
+                target: "vitaslop::sema",
+                id, bits, mode, thread = st.current_thread(),
+                "evf poll satisfied"
+            );
+            if out != 0 {
+                ctx.write_u32(out, at_match);
+            }
+            0
+        }
+        None => {
+            // The out-parameter is deliberately NOT written on a failed poll: there is no
+            // matched pattern to report, and writing the current one would hand a caller
+            // that ignores the return code a pattern that never satisfied its condition.
+            tracing::trace!(
+                target: "vitaslop::sema",
+                id, bits, mode, thread = st.current_thread(),
+                "evf poll NOT satisfied"
+            );
+            SCE_KERNEL_ERROR_EVF_COND as i32
+        }
+    }
+}
+
 // --- delete (shared: no teardown needed for these lightweight handles) ---
 
 /// int sceKernelDelete{Mutex,Sema,EventFlag}(SceUID id), and sceKernelCloseMutex - all

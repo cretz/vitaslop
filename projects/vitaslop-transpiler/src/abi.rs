@@ -205,16 +205,58 @@ pub const TP_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 3;
 /// writes it per thread with that thread's TLS block base.
 pub const TP_EXPORT: &str = "tp";
 
-/// WASM global index of the software fuel counter, appended after the store-watchpoint
+/// WASM global index of the software WORK counter, appended after the store-watchpoint
 /// counter. Per-instance, and in this engine an instance IS a guest thread, so each
 /// thread carries its own quantum with no host bookkeeping. Zero and never read unless
 /// the build opted into fuel (see `emit::set_fuel_interval`).
-pub const FUEL_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 5;
+///
+/// # >>> IT IS AN i64 CARRYING TWO COUNTERS, AND THAT IS WHAT MAKES THE CLOCK FREE.
+/// The emulated CPU clock must be billed in GUEST INSTRUCTIONS, not wasm operators: the
+/// number of operators a guest instruction becomes is a property of this transpiler's
+/// codegen, so a clock billed in operators speeds the emulated console up every time the
+/// codegen improves (measured: one session's three changes cut operators 28% for identical
+/// guest work). But preemption still wants OPERATORS, because that is what bounds real
+/// work between yields.
+///
+/// Two counters, then - and a separate one cost four extra operators on every basic block,
+/// which is a real tax on the browser, the engine this ships on. So they share one i64:
+///
+/// ```text
+///   bits 63..32   guest ARM instructions retired   (counts UP, never reset)
+///   bits 31..0    wasm operators since last yield  (counts UP, zeroed at each yield)
+/// ```
+///
+/// Both halves count UP, so a single `i64.add` of a packed constant updates both with NO
+/// borrow between them - the emitted commit is the same four operators the fuel commit
+/// already cost. The low half is zeroed at every yield and a yield happens every
+/// [`emit::fuel_interval`] operators, so it never approaches 2^32 and never carries into
+/// the instruction count.
+pub const WORK_GLOBAL: u32 = TOTAL_GLOBAL_COUNT + 5;
 
-/// Exported name of the software fuel counter (see [`FUEL_GLOBAL`]). Exported so a host
-/// can read how much of a thread's quantum is left; nothing needs to WRITE it - the
-/// emitted code reloads it itself after each yield.
-pub const FUEL_EXPORT: &str = "fuel";
+/// Low half of [`WORK_GLOBAL`]: operators since the last yield.
+pub const WORK_OPS_MASK: i64 = 0xFFFF_FFFF;
+
+/// Shift of the guest-instruction half of [`WORK_GLOBAL`].
+pub const WORK_INSTR_SHIFT: u32 = 32;
+
+/// Pack one flush's `(guest instructions, operators)` into the constant a single
+/// `i64.add` commits to [`WORK_GLOBAL`].
+///
+/// Both are non-negative and each fits 32 bits by construction (a basic block cannot hold
+/// 4 billion instructions, and the operator half is committed far more often than it could
+/// overflow), so this is a plain shift-or rather than a wrapping add.
+pub const fn pack_work(instructions: u32, operators: u32) -> i64 {
+    ((instructions as i64) << WORK_INSTR_SHIFT) | (operators as i64)
+}
+
+/// Exported name of the software work counter (see [`WORK_GLOBAL`]). Exported so a host
+/// can read both halves at a switch point; nothing needs to WRITE it - the emitted code
+/// clears the operator half itself after each yield.
+pub const FUEL_EXPORT: &str = "work";
+
+/// Alias kept for the one thing that reads only the operator half. Both halves live in
+/// [`WORK_GLOBAL`]; see it for the layout and for why they share a global.
+pub const FUEL_GLOBAL: u32 = WORK_GLOBAL;
 
 /// Exported name of the instance RESET function: `() -> ()`. It returns every
 /// per-instance global - the ARM register file and its flags, the whole VFP/NEON file,

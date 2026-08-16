@@ -307,6 +307,46 @@ pub struct OutputVarying {
     pub components: u32,
 }
 
+/// Whether a vertex program's own container establishes the ORDER its output varyings sit
+/// in, or whether the order in [`Program::output_varyings`] is only a placeholder that the
+/// paired FRAGMENT must confirm.
+///
+/// # Why this distinction exists
+/// The varyings block states WHICH varyings a vertex program outputs and how wide each is,
+/// but - measured, not assumed - it does not state their ORDER. For a long time that gap
+/// was filled with a convention (colours, fog, then texcoords ascending). The corpus
+/// refutes any such convention outright: one title declares both `[Color0, TexCoord(1)]`
+/// and `[TexCoord(2), Color0]`, another declares both `[.., Fog, TexCoord(3)]` and
+/// `[.., TexCoord(3), Fog]`, and one program puts TexCoord(2) before TexCoord(0). Measured
+/// over every linkable pair, the convention disagrees with the fragment's own declaration
+/// on 997 of 1037 comparable pairs of one title - each of which was reading every varying
+/// from the wrong register while still drawing a picture.
+///
+/// So the order is resolved at LINK time, where the fragment's descriptor array states it
+/// explicitly. See `link::resolve_vertex_lane_order`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaryingOrder {
+    /// The order is established by this program alone and needs no confirmation: either the
+    /// attributes named every declared varying (so their resource order IS the lane order),
+    /// or there are fewer than two varyings, so there is nothing to order.
+    Known,
+    /// The sequence is the historical CONVENTION (colours, fog, then texcoords ascending).
+    /// It carries the right set and the right widths. The convention is not a reading and
+    /// the corpus shows it disagreeing with the fragment side on other titles, but every
+    /// title currently rendering does so through it, so it is accepted here UNCHANGED.
+    Assumed,
+    /// The sequence is the convention AND this program declares a COLOR1 - the one case
+    /// measured wrong BOTH ways on a real title (saturated yellow one way, pure green the
+    /// other), so the convention is not trusted at all here.
+    ///
+    /// The container used to REFUSE outright, which stops one title dead. It now states
+    /// the SET and the widths - both of which the block genuinely does say - and leaves the
+    /// ORDER to `link::resolve_ambiguous_order`, which tries every permutation and accepts
+    /// one only when it is the ONLY one both stages' own declarations admit. That is a
+    /// reading rather than a guess: if several survive it still refuses, and says how many.
+    Ambiguous,
+}
+
 /// A parsed GXP program: header facts, the full parameter table, and the raw USSE
 /// instruction words. Owns its data so it can outlive the source bytes.
 #[derive(Debug, Clone)]
@@ -351,6 +391,9 @@ pub struct Program {
     /// decoded placement does not reproduce the block's own total output-lane count - the
     /// linker then falls back rather than route varyings by an unvalidated layout.
     pub output_varyings: Vec<OutputVarying>,
+    /// Whether [`Self::output_varyings`]'s SEQUENCE is established by this program alone, or
+    /// is a placeholder the paired fragment must confirm. See [`VaryingOrder`].
+    pub output_order: VaryingOrder,
     /// Size of the default uniform buffer in 32-bit SA registers (header +0x64). A UNIFORM
     /// parameter's `resource_index` is a register index into this buffer, and the buffer is
     /// loaded at SA register 0 in the main program's address space - so the shader's `sa[k]`
@@ -566,17 +609,18 @@ impl Program {
         let temp_reg_count = temp1.max(temp2);
 
         let parameters = parse_parameters(bytes)?;
-        let (interpolants, varyings_error, output_varyings) = if kind == ProgramKind::Fragment {
-            match parse_fragment_interpolants(bytes) {
-                Ok(v) => (v, None, Vec::new()),
-                Err(why) => (Vec::new(), Some(why), Vec::new()),
-            }
-        } else {
-            match parse_vertex_output_varyings(bytes, &parameters) {
-                Ok(v) => (Vec::new(), None, v),
-                Err(why) => (Vec::new(), Some(why), Vec::new()),
-            }
-        };
+        let (interpolants, varyings_error, output_varyings, output_order) =
+            if kind == ProgramKind::Fragment {
+                match parse_fragment_interpolants(bytes) {
+                    Ok(v) => (v, None, Vec::new(), VaryingOrder::Known),
+                    Err(why) => (Vec::new(), Some(why), Vec::new(), VaryingOrder::Known),
+                }
+            } else {
+                match parse_vertex_output_varyings(bytes, &parameters) {
+                    Ok((v, order)) => (Vec::new(), None, v, order),
+                    Err(why) => (Vec::new(), Some(why), Vec::new(), VaryingOrder::Known),
+                }
+            };
 
         // USSE code region: [asm_abs .. min(literal_abs, params_abs)]. Self-relative
         // offsets from their own field address.
@@ -636,6 +680,7 @@ impl Program {
             interpolants,
             varyings_error,
             output_varyings,
+            output_order,
             hash: fnv1a64(bytes),
         })
     }
@@ -975,14 +1020,14 @@ const CLIP_PLANE_MASK: u32 = 0x000f;
 fn parse_vertex_output_varyings(
     bytes: &[u8],
     parameters: &[Parameter],
-) -> Result<Vec<OutputVarying>, &'static str> {
+) -> Result<(Vec<OutputVarying>, VaryingOrder), &'static str> {
     let Some(rel) = rd_u32(bytes, OFF_VARYINGS_OFFSET) else {
         return Err("the varyings-block offset field is outside the blob");
     };
     if rel == 0 {
         // No block at all. A program with no varyings block outputs clip position and nothing
         // else, which is exactly what a depth-only (shadow/z-prepass) vertex program is.
-        return Ok(Vec::new());
+        return Ok((Vec::new(), VaryingOrder::Known));
     }
     let Some(block) = OFF_VARYINGS_OFFSET.checked_add(rel as usize) else {
         return Err("the varyings-block offset overflowed");
@@ -1047,15 +1092,30 @@ fn parse_vertex_output_varyings(
     // with no attribute evidence to name it is refused, exactly as the whole 8-lane region was
     // before: a fallback draws an approximation that looks like scenery, where a guessed layout
     // draws a confident, wrong picture nobody can tell from a correct one.
-    if evidence.is_none() && vo1 & COLOR1_PRESENT_BIT != 0 {
-        return Err(
-            "the varyings block declares a COLOR1 output whose lane position nothing in this \
-             program names (no attribute carries the semantic)",
-        );
-    }
-    if let Some(order) = evidence {
-        declared = order;
-    }
+    //
+    // >>> AND THE ORDER PROBLEM IS WIDER THAN COLOR1, MEASURED - BUT IT IS NOT SETTLED, SO
+    // >>> THIS STAYS AS IT IS. See `VaryingOrder` and the two corpus tests
+    // `vertex_lane_order_agrees_with_the_fragment_declaration_order` and
+    // `fragment_declaration_order_matches_attribute_established_vertex_order`. In short: the
+    // canonical order below disagrees with the paired FRAGMENT's declaration on 997 of 1037
+    // comparable pairs of one title - but the fragment's declaration is NOT a statement about
+    // vertex lanes either, because on three vertex programs whose attributes establish
+    // `[TexCoord(0), Color0]` the fragment declares `[Color0, TexCoord(0)]`. Each candidate
+    // reading refutes the other, and the title whose convention "fails" 96% of the time
+    // renders correctly today, so its real pairs are among the ones that agree.
+    // **Settling this needs a RENDER ORACLE, not more container reading.** Until there is
+    // one, the convention stands and COLOR1 stays refused.
+    let ambiguous = evidence.is_none() && vo1 & COLOR1_PRESENT_BIT != 0;
+    let order = match evidence {
+        Some(ev) => {
+            declared = ev;
+            VaryingOrder::Known
+        }
+        // Fewer than two varyings cannot be mis-ordered, so the order is right by default.
+        None if declared.len() < 2 => VaryingOrder::Known,
+        None if ambiguous => VaryingOrder::Ambiguous,
+        None => VaryingOrder::Assumed,
+    };
 
     let mut out = Vec::new();
     let mut lane = VERTEX_POSITION_LANES;
@@ -1069,7 +1129,7 @@ fn parse_vertex_output_varyings(
     if lane + clip_lanes != total_lanes {
         return Err("the varyings block's declared outputs do not fill its total output lanes");
     }
-    Ok(out)
+    Ok((out, order))
 }
 
 /// The output-varying order implied by this vertex program's ATTRIBUTES, or `None` when the

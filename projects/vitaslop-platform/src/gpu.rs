@@ -181,8 +181,31 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     // runs on. BC is preferred where both exist: the guest's own `UBC1/2/3` blocks ARE BC, so
     // that adapter can take them with no re-encode at all, while ETC2 always costs a lossy
     // transcode. An adapter that offers neither keeps the RGBA8 decode.
-    let want = adapter.features()
-        & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_COMPRESSION_ETC2);
+    let mut have = adapter.features();
+    // >>> `VITASLOP_NO_BC=1` MAKES A DESKTOP BEHAVE LIKE THE TARGET DEVICE.
+    //
+    // The phone's adapter exposes `etc2, astc` and no BC, so it takes the transcode path for
+    // EVERY compressed texture - which is where the GPU encoder, the ETC2 target and the whole
+    // `CompressedData::Gpu` plan live. A desktop with BC never enters any of it, so all of it
+    // was unexercised locally and its first real execution was on the user's phone. That has
+    // already cost one shipped build.
+    //
+    // On this machine the Intel iGPU exposes BOTH families over Vulkan, so
+    // `WGPU_ADAPTER_NAME=Arc WGPU_BACKEND=vulkan VITASLOP_NO_BC=1` is the device's texture
+    // configuration, on real content, with the headless renderer.
+    //
+    // It only ever REMOVES a capability - the same shape as `VITASLOP_TEX_COMPRESS=0`, and the
+    // reason a knob is admissible here at all ([[vitaslop-knob-is-the-gate-not-the-level]]): it
+    // cannot make this build do something a real adapter would not.
+    if crate::knobs::var("VITASLOP_NO_BC").ok().as_deref() == Some("1") {
+        have.remove(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        report_warn!(
+            "gxm textures: VITASLOP_NO_BC=1 - pretending this adapter has no BC, so every \
+             compressed texture takes the TRANSCODE path exactly as the target device does"
+        );
+    }
+    let want =
+        have & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_COMPRESSION_ETC2);
     set_block_family(if want.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
         BlockFamily::Bc
     } else if want.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {

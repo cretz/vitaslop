@@ -23,6 +23,7 @@ mod audio;
 mod browser_sched;
 mod conformance;
 mod input;
+mod location;
 mod logging;
 mod opfs;
 mod web_vm;
@@ -1910,13 +1911,24 @@ fn transpile_here(
     let t = perf.now();
     let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
     let ms = perf.now() - t;
+    // >>> THE EXPANSION FACTOR IS REPORTED, because the emulated CPU's SPEED depends on
+    // it. The game clock is charged per unit of fuel and a unit of fuel is one executed
+    // wasm operator, so the console runs at `fuel rate / operators-per-guest-instruction`.
+    // Improve this transpiler's codegen and the emulated Vita silently gets faster unless
+    // the calibration moves with it - a faithfulness change with nothing to notice it by.
+    // Printing it is what turns that into something a capture can be read against.
+    let x = built.artifact.expansion;
     web_sys::console::log_1(&JsValue::from_str(&format!(
         "[setup] transpiled wasm {} MB, {} functions (the per-instance funcref table), \
-         guest memory {} MB, emulator heap {} MB",
+         guest memory {} MB, emulator heap {} MB | code expansion {:.2} wasm operators \
+         per guest instruction ({} instructions -> {} operators)",
         built.artifact.wasm.len() / (1024 * 1024),
         built.artifact.funcs.len(),
         linked.mem_bytes / (1024 * 1024),
         wasm_heap_mb(),
+        x.per_instruction(),
+        x.arm_instructions,
+        x.emitted_ops,
     )));
     Ok(Transpiled {
         wasm: built.artifact.wasm,
@@ -1935,7 +1947,7 @@ fn transpile_here(
 /// `{ module, memPages, mirrorOff }` for [`run_game_worker`] to run against.
 #[wasm_bindgen]
 pub async fn transpile_title(source: JsValue) -> Result<JsValue, JsValue> {
-    console_error_panic_hook::set_once();
+    crate::logging::install_panic_hook();
     logging::init();
     let perf = global_performance().ok_or_else(|| JsValue::from_str("no performance clock"))?;
     let Mounted { linked, .. } = mount_and_link(source).await?;
@@ -2096,7 +2108,14 @@ async fn setup_game(
     } else {
         None
     };
-    let world = Box::new(BrowserWorld::new(recipe_world, live));
+    // The host's location provider. Created and registered HERE rather than passed in by
+    // each engine, because both engines want exactly the same cell and the exported
+    // `worker_location_*` entry points find it through the thread-local registry - so an
+    // engine that forgot to pass one would silently have no provider.
+    let location: crate::location::SharedLocation =
+        Arc::new(Mutex::new(crate::location::LiveLocation::default()));
+    crate::location::set_shared_location(location.clone());
+    let world = Box::new(BrowserWorld::new(recipe_world, live, location));
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
@@ -2237,7 +2256,7 @@ pub async fn run_game(
     max_rounds: f64,
 ) -> Result<String, JsValue> {
     let _ = max_rounds;
-    console_error_panic_hook::set_once();
+    crate::logging::install_panic_hook();
     logging::init();
 
     let live: Arc<Mutex<InputState>> = Arc::new(Mutex::new(InputState::default()));
@@ -2284,7 +2303,7 @@ pub async fn run_game_worker(
     prebuilt: JsValue,
     audio_ring: JsValue,
 ) -> Result<String, JsValue> {
-    console_error_panic_hook::set_once();
+    crate::logging::install_panic_hook();
     logging::init();
 
     let live: Arc<Mutex<InputState>> = Arc::new(Mutex::new(InputState::default()));
@@ -2967,6 +2986,44 @@ async fn live_loop(
                             if total > 0.0 { marshal * 100.0 / total } else { 0.0 },
                         ),
                     );
+                    // >>> AND BY TIME, NOT ONLY BY COUNT. A count ranks how OFTEN the
+                    // boundary is crossed; it cannot rank what the crossings COST, and two
+                    // NIDs called equally often can differ by an order of magnitude in what
+                    // they do. This is the reading that decides whether a host call is
+                    // worth inlining into the guest, and until now it existed only on the
+                    // desktop - which is not the machine whose numbers matter
+                    // ([[vitaslop-desktop-cannot-price-a-count-win]]).
+                    {
+                        let host = sched.host.lock().unwrap();
+                        let rows: Vec<String> = browser_sched::host_calls_by_ms(12)
+                            .into_iter()
+                            .map(|(sel, calls, ms)| {
+                                let name = match host.import_at(sel) {
+                                    Some((_, func_nid)) => {
+                                        let n = vitaslop_runtime::nid::name(func_nid);
+                                        if n.is_empty() || n == "?" {
+                                            format!("{func_nid:#010x}")
+                                        } else {
+                                            n.to_string()
+                                        }
+                                    }
+                                    None => format!("selector {sel}"),
+                                };
+                                format!(
+                                    "{ms:>9.0} ms {:>7.2} us/call x{calls:<9} {name}",
+                                    if calls > 0 { ms * 1000.0 / calls as f64 } else { 0.0 }
+                                )
+                            })
+                            .collect();
+                        if !rows.is_empty() {
+                            line(
+                                &mut diag,
+                                "HOST CALLS by TIME, cumulative (debug capture inflates the \
+                                 totals; the SHARES and the us/call ordering are the reading)",
+                                &rows.join("\n"),
+                            );
+                        }
+                    }
                     line(&mut diag, "HOST CALLS by NID, cumulative", &vitaslop_runtime::vita::call_sites_report(20));
                 }
                 report.emit("diag", &diag);
@@ -2984,7 +3041,7 @@ async fn live_loop(
 /// short status string (also useful for the page to display).
 #[wasm_bindgen]
 pub async fn run(canvas: JsValue) -> Result<String, JsValue> {
-    console_error_panic_hook::set_once();
+    crate::logging::install_panic_hook();
     let canvas: HtmlCanvasElement = canvas.dyn_into()?;
 
     let cpu = run_cube_scheduled().await?;

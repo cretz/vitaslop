@@ -149,6 +149,17 @@ mod hostcalls {
         /// the way native's `perf` module does. Selectors are dense loader indices.
         static PER_SELECTOR: std::cell::RefCell<Vec<u64>> =
             std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        /// Milliseconds per import selector, filled only while per-call timing is on.
+        ///
+        /// # Why a COUNT by NID was not enough
+        /// The panel could already say which NID is called most, and the desktop `bench`
+        /// could say which one COSTS most - but the desktop is not the machine whose
+        /// numbers matter, and "the crossing costs many times a native one" was an
+        /// assertion this project carried from an old measurement without reproducing it.
+        /// A count cannot settle it: two NIDs called equally often can differ by an order
+        /// of magnitude in what they do. This is the browser's own per-NID cost.
+        static PER_SELECTOR_MS: std::cell::RefCell<Vec<f64>> =
+            std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
     }
 
     /// Highest selector tracked per-NID; a real title imports a few hundred. Calls above
@@ -186,14 +197,41 @@ mod hostcalls {
             std::cell::RefCell::new(std::collections::BTreeMap::new());
     }
 
-    /// Count one call against `selector`, made by guest thread `thid`.
-    pub fn note_selector(selector: u32, thid: i32) {
+    /// Count one call against `selector`, made by guest thread `thid`, and - when per-call
+    /// timing is on - charge it `ms`.
+    pub fn note_selector(selector: u32, thid: i32, ms: f64) {
         PER_SELECTOR.with(|v| {
             if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
                 *slot += 1;
             }
         });
+        if ms != 0.0 {
+            PER_SELECTOR_MS.with(|v| {
+                if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                    *slot += ms;
+                }
+            });
+        }
         PER_THID.with(|m| *m.borrow_mut().entry(thid).or_insert(0) += 1);
+    }
+
+    /// The `n` costliest selectors as `(selector, calls, ms)`, descending by ms. Empty
+    /// when nothing was timed, which is the honest answer for a run without debug capture
+    /// rather than a list of zeroes that reads like "these calls are free".
+    pub fn top_selectors_by_ms(n: usize) -> Vec<(u32, u64, f64)> {
+        let calls = PER_SELECTOR.with(|v| v.borrow().clone());
+        PER_SELECTOR_MS.with(|v| {
+            let ms = v.borrow();
+            let mut all: Vec<(u32, u64, f64)> = ms
+                .iter()
+                .enumerate()
+                .filter(|&(_, &m)| m > 0.0)
+                .map(|(i, &m)| (i as u32, calls[i], m))
+                .collect();
+            all.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+            all.truncate(n);
+            all
+        })
     }
 
     /// Calls per guest thread, descending.
@@ -449,6 +487,14 @@ pub fn host_call_totals() -> (u64, f64) {
 
 /// `(calls, total ms, handler ms, marshalling ms)` since the run started. See
 /// [`hostcalls::split`] - the split is only meaningful over calls that were actually timed.
+/// The `n` costliest host calls as `(selector, calls, ms)`, descending by total time.
+///
+/// Only meaningful with per-call timing on (debug capture, or `VITASLOP_PERF`), and empty
+/// without it. See [`hostcalls::top_selectors_by_ms`].
+pub fn host_calls_by_ms(n: usize) -> Vec<(u32, u64, f64)> {
+    hostcalls::top_selectors_by_ms(n)
+}
+
 pub fn host_call_split() -> (u64, f64, f64, f64) {
     hostcalls::split()
 }
@@ -930,6 +976,11 @@ struct ThreadEngine {
     /// every yield, so only the differences between readings accumulate to guest work.
     fuel_last: i64,
     fuel_total: u64,
+    /// The GUEST-INSTRUCTION half of the same `work` global, at the last reading, and the
+    /// total retired. That half counts UP and is never reset by the guest, so a reading is
+    /// a running total and the delta between readings is what this resume retired.
+    arm_last: u64,
+    arm_total: u64,
     /// The instance's exports, kept so a REUSED instance can look up its next entry's
     /// function and its `tp` global without instantiating anything.
     exports: Object,
@@ -947,6 +998,26 @@ struct ThreadEngine {
     /// that stack can never resume, reusing the instance underneath it would mean a
     /// suspended frame and a live thread sharing one register file.
     abandoned: Rc<Cell<bool>>,
+}
+
+impl BrowserThread {
+    /// Read the packed `work` global once and split it into
+    /// `(operators since the last yield, guest instructions retired)`.
+    ///
+    /// # Why both halves come from ONE read
+    /// They live in one i64 global (see `abi::WORK_GLOBAL`) so the emitted code can advance
+    /// both with a single `i64.add`, which is what makes billing the clock in guest
+    /// instructions cost no extra code. Reading them separately would also cost two
+    /// boundary crossings per suspend for a value that is already in hand.
+    ///
+    /// An i64 global crosses into JS as a BigInt, which `as_f64` does not accept - hence
+    /// the explicit BigInt conversion rather than the numeric path the i32 counter used.
+    fn read_work(&mut self) -> Option<(u64, u64)> {
+        let raw = self.engine.as_ref()?.fuel.as_ref()?.value();
+        let packed = js_sys::BigInt::new(&raw).ok()?;
+        let bits = u64::try_from(packed).ok()?;
+        Some((bits & abi::WORK_OPS_MASK as u64, bits >> abi::WORK_INSTR_SHIFT))
+    }
 }
 
 impl ThreadHandle for BrowserThread {
@@ -990,18 +1061,33 @@ impl ThreadHandle for BrowserThread {
     /// per yield, which is what it burned.
     fn fuel_used(&mut self) -> Option<u64> {
         let interval = i64::from(fuel_interval());
+        let (ops, _) = self.read_work()?;
         let engine = self.engine.as_mut()?;
-        let now = engine.fuel.as_ref()?.value().as_f64()? as i64;
-        let burned = if now <= engine.fuel_last {
-            engine.fuel_last - now
+        let now = ops as i64;
+        // The operator half counts UP to the interval and is CLEARED at each yield, so a
+        // reading below the last one means a yield happened in between: the thread
+        // finished the old interval and then spent part of the new one.
+        let burned = if now >= engine.fuel_last {
+            now - engine.fuel_last
         } else {
-            engine.fuel_last + (interval - now)
+            (interval - engine.fuel_last) + now
         };
-        // A spent counter means this suspend IS the fuel yield: the guest reloads to a full
-        // interval the instant it resumes, so that is the baseline to difference from.
-        engine.fuel_last = if now <= 0 { interval } else { now };
+        engine.fuel_last = now;
         engine.fuel_total = engine.fuel_total.saturating_add(burned.max(0) as u64);
         Some(engine.fuel_total)
+    }
+
+    /// Guest ARM instructions retired, from the high half of the same `work` global.
+    ///
+    /// Simpler than the operator half: it only counts UP and is never cleared, so the
+    /// reading IS a running total and there is no wrap or reload case to reason about.
+    fn arm_retired(&mut self) -> Option<u64> {
+        let (_, instructions) = self.read_work()?;
+        let engine = self.engine.as_mut()?;
+        let retired = instructions.saturating_sub(engine.arm_last);
+        engine.arm_last = instructions;
+        engine.arm_total = engine.arm_total.saturating_add(retired);
+        Some(engine.arm_total)
     }
 
     /// Hand this thread's instance back: to the engine's POOL if it can be reused, else
@@ -1048,6 +1134,11 @@ impl ThreadHandle for BrowserThread {
         engine.entry_started = false;
         engine.fuel_last = i64::from(fuel_interval());
         engine.fuel_total = 0;
+        // The instance's `reset` export zeroes the counter itself; this is the HOST's
+        // matching baseline. Leaving it would make the next thread's first delta the whole
+        // of the previous thread's total, which is a game clock that jumps by hours.
+        engine.arm_last = 0;
+        engine.arm_total = 0;
         hostcalls::note_instance_pooled();
         self.pool.borrow_mut().push(engine);
     }
@@ -1279,8 +1370,9 @@ impl BrowserEngine {
                 // Split the call the way native's `perf` module does: the handler versus
                 // everything around it. The difference is register MARSHALLING - work the
                 // guest never asked for - and the two need completely different fixes.
-                hostcalls::note_selector(selector as u32, thid);
-                if hostcalls::record(clock() - t0, d1 - d0) {
+                let total_ms = clock() - t0;
+                hostcalls::note_selector(selector as u32, thid, total_ms);
+                if hostcalls::record(total_ms, d1 - d0) {
                     // Name the NIDs the guest is spending its calls on. This is the
                     // browser twin of what native's per-selector `perf` breakdown does,
                     // and it is the difference between "millions of host calls" and
@@ -1415,6 +1507,8 @@ impl BrowserEngine {
                 .and_then(|g| g.dyn_into::<WebAssembly::Global>().ok()),
             fuel_last: i64::from(fuel_interval()),
             fuel_total: 0,
+            arm_last: 0,
+            arm_total: 0,
             exports,
             reset,
             thid: thid_cell,

@@ -74,6 +74,15 @@ pub struct RenderState {
     pub front_stencil_op_depth_pass: u32,
     pub front_stencil_compare_mask: u32,
     pub front_stencil_write_mask: u32,
+    /// BACK-face stencil state (`sceGxmSetBackStencilFunc`). Applied only when
+    /// `two_sided` is enabled; with it disabled the hardware uses the front state for both
+    /// faces, so these are recorded but not consulted.
+    pub back_stencil_func: u32,
+    pub back_stencil_op_fail: u32,
+    pub back_stencil_op_depth_fail: u32,
+    pub back_stencil_op_depth_pass: u32,
+    pub back_stencil_compare_mask: u32,
+    pub back_stencil_write_mask: u32,
     pub viewport_enable: u32,
     /// `xOffset, xScale, yOffset, yScale, zOffset, zScale` from sceGxmSetViewport.
     pub viewport: [f32; 6],
@@ -109,6 +118,15 @@ impl Default for RenderState {
             front_stencil_op_depth_pass: 0,       // SCE_GXM_STENCIL_OP_KEEP
             front_stencil_compare_mask: 0xff,
             front_stencil_write_mask: 0xff,
+            // The same defaults as the front face: with two-sided disabled (the default)
+            // the front state applies to both, so matching it is what makes an unset back
+            // face agree with the face it is actually rendered as.
+            back_stencil_func: 0x0E00_0000,       // SCE_GXM_STENCIL_FUNC_ALWAYS
+            back_stencil_op_fail: 0,              // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_op_depth_fail: 0,        // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_op_depth_pass: 0,        // SCE_GXM_STENCIL_OP_KEEP
+            back_stencil_compare_mask: 0xff,
+            back_stencil_write_mask: 0xff,
             viewport_enable: 0x0000_0000,         // SCE_GXM_VIEWPORT_ENABLED
             viewport: [0.0; 6],
             region_clip_mode: 0x0000_0000,        // SCE_GXM_REGION_CLIP_NONE

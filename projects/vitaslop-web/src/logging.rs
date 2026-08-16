@@ -13,7 +13,10 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::fmt::MakeWriter;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 
 /// How many DISTINCT WARN/ERROR lines the page mirror holds.
 ///
@@ -98,6 +101,132 @@ fn push_page_log(text: &str) {
     log.lines.push_back((text.to_string(), 1));
 }
 
+/// Set once, so a second entry point calling this is a no-op.
+static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// The global function a host page/worker may expose to receive a panic report.
+///
+/// A string, not a channel: the panic hook runs on the edge of an abort and must not depend on
+/// anything it might have poisoned.
+const PANIC_SINK: &str = "__vitaslopPanic";
+
+/// Frame-name fragments that belong to the PANIC MACHINERY rather than to the code that
+/// panicked. Every one of these sits between the hook and the real fault, in a fixed order.
+///
+/// They are dropped from the FRONT of the stack only, so a legitimate later frame that happens
+/// to contain one of these strings is kept.
+const PANIC_MACHINERY: &[&str] = &[
+    "js_sys::Error::new",
+    "__wbg_new",
+    "logging::install_panic_hook",
+    "panicking::",
+    "rust_begin_unwind",
+    "panic_fmt",
+    "__rust_end_short_backtrace",
+];
+
+/// The JS stack at the panic, with the hook's own frames removed.
+///
+/// # Why the trim is not cosmetic
+/// The JS stack is what names the FRAMES; the Rust location names only the line that gave up.
+/// A panic inside shared code (a slice index, an `unwrap` on a `None` a caller produced) is
+/// attributed only by the frames above it.
+///
+/// V8 caps a stack at TEN frames by default, and getting here costs six of them - the hook, the
+/// `Error` it constructs, and the four `std` panicking frames. MEASURED before this trim: the
+/// captured stack ended one frame into real code. So the cap is raised and the machinery is
+/// dropped, which turns ten frames of overhead-plus-nothing into thirty frames of caller.
+///
+/// `stack` and `stackTraceLimit` are both V8/SpiderMonkey extensions rather than standard, so
+/// both are reached reflectively and an engine without them yields no stack rather than an error.
+fn panic_stack() -> String {
+    let error_ctor = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Error")).ok();
+    if let Some(ctor) = &error_ctor {
+        let _ = js_sys::Reflect::set(
+            ctor,
+            &JsValue::from_str("stackTraceLimit"),
+            &JsValue::from_f64(30.0),
+        );
+    }
+    let raw = js_sys::Reflect::get(
+        js_sys::Error::new("panic").as_ref(),
+        &JsValue::from_str("stack"),
+    )
+    .ok()
+    .and_then(|v| v.as_string())
+    .unwrap_or_default();
+
+    // The first line is the Error's own message ("Error: panic"), which is this hook talking to
+    // itself; the frames follow. Drop that, then drop leading machinery frames.
+    let mut lines = raw.lines();
+    if raw.starts_with("Error") {
+        lines.next();
+    }
+    let kept: Vec<&str> = lines
+        .skip_while(|l| PANIC_MACHINERY.iter().any(|m| l.contains(m)))
+        .collect();
+    kept.join("\n")
+}
+
+/// Install the panic hook that puts the panic MESSAGE where a phone can read it.
+///
+/// # Why `console_error_panic_hook` is not enough
+/// A Rust panic under `panic = "abort"` reaches the browser as
+/// `Uncaught RuntimeError: unreachable at ...vitaslop_web_bg.wasm:1:3542933`, and that offset is
+/// worthless: the wasm ships `lto = "fat"` with `codegen-units = 1`, so there is no symbol to
+/// resolve it against. The only useful text - `panicked at src/....rs:NNN: <message>` - is
+/// printed by the panic hook, and `console_error_panic_hook` prints it to the CONSOLE and
+/// nowhere else.
+///
+/// **On a phone there is no console.** The device is the only machine whose numbers are not a
+/// proxy, and it is the machine where the one line that names the fault was unreachable. A
+/// device report therefore arrived as "it crashed, here is a wasm offset", which is a defect
+/// that cannot be worked on. That is the same argument the counters and the WARN/ERROR mirror
+/// above were already moved on; the panic - the single most valuable line the emulator can ever
+/// emit - was the one thing left behind.
+///
+/// So the hook writes the panic THREE ways, and each covers a case the others do not:
+/// 1. `console.error`, for a desktop run with devtools open (what we had).
+/// 2. [`push_page_log`], so it appears in the on-page diagnostics panel and in every later
+///    `/diag` dump - which is what reaches disk on the dev server.
+/// 3. A call to `globalThis.__vitaslopPanic`, if the host defined one. The run worker wires that
+///    to `postMessage`, so the page can show the text AT ONCE rather than waiting for a perf
+///    window that a dead worker will never publish. The panel is rebuilt from reports, and after
+///    a panic there are no more reports - so (2) alone would show the panic only if something
+///    else happened to be still running.
+///
+/// The hook is deliberately total: no `unwrap`, no allocation it cannot afford to lose, and a
+/// missing sink is silence rather than a second panic inside the panic hook.
+pub fn install_panic_hook() {
+    if PANIC_HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        // `payload_as_str` covers the two payload shapes a `panic!` can produce (`&str` and
+        // `String`); anything else is a payload nobody in this workspace creates.
+        let message = info.payload_as_str().unwrap_or("<non-string panic payload>");
+        let stack = panic_stack();
+        let text = if stack.is_empty() {
+            format!("PANIC at {location}: {message}")
+        } else {
+            format!("PANIC at {location}: {message}\n{stack}")
+        };
+
+        web_sys::console::error_1(&JsValue::from_str(&text));
+        push_page_log(&text);
+
+        let global = js_sys::global();
+        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
+            if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+                let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&text));
+            }
+        }
+    }));
+}
 
 /// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.
 ///

@@ -772,6 +772,7 @@ mod tests {
     /// register counts), for testing the vertex binding plan without a real blob.
     fn vertex_program(secondary_reg_count: u16, attrs: Vec<Parameter>) -> Program {
         Program {
+            output_order: crate::container::VaryingOrder::Known,
             varyings_error: None,
             default_uniform_regs: 0,
             secondary_code: Vec::new(),

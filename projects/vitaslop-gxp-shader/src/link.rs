@@ -45,7 +45,9 @@
 
 use core::fmt::Write as _;
 
-use crate::container::{ParseError, Program, ProgramKind, VaryingUsage};
+use crate::container::{
+    OutputVarying, ParseError, Program, ProgramKind, VaryingOrder, VaryingUsage,
+};
 use crate::ir::{Bank, Op, Shader};
 use crate::module::{plan_bindings, plan_vertex_bindings, BindingPlan, ColorOutput, VertexBindingPlan};
 use crate::wgsl::{emit_body, EmitError, TexBinding, BANK_REGS};
@@ -90,10 +92,25 @@ pub enum LinkError {
     VertexRecompile(RecompileError),
     /// The fragment program could not be recompiled to WGSL (names the underlying gap).
     FragmentRecompile(RecompileError),
-    /// The vertex output layout does not match the validated linkable signature: clip POSITION
-    /// in `o0..o3` plus a varyings block whose decoded placement reproduces the container's own
-    /// total output-lane count. Its varying placement cannot be derived safely - fall back.
-    UnsupportedVertexLayout,
+    /// The vertex program does not write all four lanes of clip POSITION into `o0..o3`, which is
+    /// what the rasteriser consumes. `written` is the o-bank lane mask over `o0..o3` as the
+    /// instruction walk saw it. Fall back.
+    ///
+    /// This and [`LinkError::VertexVaryingsUndecoded`] used to be one variant whose message ORed
+    /// them together, so a real failure named two possible causes and settled neither. They are
+    /// different defects - one is a gap in the OUTPUT-bank write model, the other in the varying
+    /// BLOCK decode - and they are not fixed in the same place.
+    VertexClipPositionNotWritten { written: [bool; 4] },
+    /// The vertex program's varyings block did not decode, so where its outputs land is unknown
+    /// and no fragment input can be fed from it faithfully. `why` is the decode's own reason.
+    /// Fall back.
+    VertexVaryingsUndecoded { why: &'static str },
+    /// The vertex program's varying ORDER is not stated by its own container, and searching
+    /// every permutation against this fragment did not leave exactly one that both stages'
+    /// declarations admit. `surviving` is how many did - 0 means the linker's model is
+    /// wrong somewhere else, more than 1 means the blobs genuinely do not pin the order and
+    /// picking one would be a confident wrong picture. Fall back.
+    VaryingOrderAmbiguous { varyings: usize, surviving: usize },
     /// The fragment reads an interpolant with usage `usage` that the vertex program does not
     /// produce, so it would sample an uninterpolated value. A wrong pairing, or a usage
     /// (colour, fog, position) whose vertex-side placement is not established. Fall back.
@@ -138,9 +155,26 @@ impl core::fmt::Display for LinkError {
             LinkError::WrongKind => write!(f, "program kind mismatch (expected a vertex + a fragment)"),
             LinkError::VertexRecompile(e) => write!(f, "vertex recompile failed: {e}"),
             LinkError::FragmentRecompile(e) => write!(f, "fragment recompile failed: {e}"),
-            LinkError::UnsupportedVertexLayout => write!(
+            LinkError::VertexClipPositionNotWritten { written } => write!(
                 f,
-                "vertex output layout is not linkable (clip position not in o0..o3, or the varyings block does not validate)"
+                "the vertex program does not write clip POSITION into o0..o3 - of those four lanes \
+                 it writes [{}]",
+                (0..4)
+                    .map(|i| if written[i] { format!("o{i}") } else { format!("-{i}") })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            LinkError::VertexVaryingsUndecoded { why } => write!(
+                f,
+                "the vertex program's varyings block did not decode ({why}), so where its outputs \
+                 land is unknown"
+            ),
+            LinkError::VaryingOrderAmbiguous { varyings, surviving } => write!(
+                f,
+                "the vertex program's varyings block does not state the ORDER of its {varyings} \
+                 outputs, and {surviving} of the {} possible orders link consistently against \
+                 this fragment - so the two programs' own declarations do not pin it down",
+                (1..=*varyings).product::<usize>()
             ),
             LinkError::UnfedVarying { usage } => write!(
                 f,
@@ -232,8 +266,12 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     // 1024x1024 shadow pass - 13 of its 16 draws fell back with a message naming a layout
     // problem that did not exist.
     let written = output_written_lanes(&vrc.shader);
-    if !(0..4).all(|l| written.get(l).copied().unwrap_or(false)) || vprog.varyings_error.is_some() {
-        return Err(LinkError::UnsupportedVertexLayout);
+    let clip: [bool; 4] = std::array::from_fn(|l| written.get(l).copied().unwrap_or(false));
+    if !clip.iter().all(|w| *w) {
+        return Err(LinkError::VertexClipPositionNotWritten { written: clip });
+    }
+    if let Some(why) = vprog.varyings_error {
+        return Err(LinkError::VertexVaryingsUndecoded { why });
     }
 
     // Match the two stages' own statements of the interface, by usage.
@@ -595,7 +633,103 @@ fn is_passthrough(fshader: &Shader, inputs: &[bool]) -> bool {
     crate::module::writes_no_color_register(fshader) && !inputs.iter().any(|&r| r)
 }
 
+
+/// The most varyings a permutation search will consider. 8! is 40,320 attempts, each a
+/// cheap interface plan; beyond that the factorial makes the search itself the problem, and
+/// a program with nine ambiguous varyings has never been seen.
+const MAX_PERMUTED_VARYINGS: usize = 8;
+
+/// Re-lay `vout` in the order given by `perm` (indices into `vout`), recomputing each
+/// varying's base lane from the origin the container established.
+///
+/// Only the SEQUENCE changes. The set, the widths and the lane the varying region starts
+/// at are all statements the container really makes, and none of them is being re-guessed.
+fn permute_varyings(vout: &[OutputVarying], perm: &[usize]) -> Vec<OutputVarying> {
+    let origin = vout.iter().map(|v| v.base_lane).min().unwrap_or(0);
+    let mut lane = origin;
+    perm.iter()
+        .map(|&i| {
+            let v = OutputVarying { usage: vout[i].usage, base_lane: lane, components: vout[i].components };
+            lane += vout[i].components;
+            v
+        })
+        .collect()
+}
+
+/// Every permutation of `0..n`, smallest-first (Heap's algorithm would do, but the counts
+/// here are tiny and a plain recursive build keeps the order deterministic - which matters,
+/// because a tie has to be reported as a tie rather than resolved by iteration order).
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for head in 0..n {
+        for rest in permutations(n - 1) {
+            let mut p = Vec::with_capacity(n);
+            p.push(head);
+            p.extend(rest.into_iter().map(|i| if i >= head { i + 1 } else { i }));
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Resolve a vertex program whose varying ORDER the container could not read
+/// ([`VaryingOrder::Ambiguous`]) by trying every permutation against THIS fragment and
+/// keeping the ones both stages' declarations admit.
+///
+/// # Why this is a reading and not a guess
+/// The checks it filters on are not weak. Each fragment interpolant states how many PA
+/// registers it spans and at what precision; the vertex states how many components it
+/// produces for each usage; and the lane accounting has to close. A varying assigned to
+/// the wrong slot generally lands a 2-component value where the fragment reads 4, which
+/// [`plan_interface`] already rejects. So a permutation that survives is one the blobs
+/// themselves permit, and if exactly ONE does, the order is determined by the data.
+///
+/// If several survive the pair is still refused, with the count - because "we could not
+/// tell which of three" is a fact worth reporting, and picking one would be exactly the
+/// confident wrong picture this whole path exists to avoid.
+fn resolve_ambiguous_order(
+    vprog: &Program,
+    fprog: &Program,
+    fshader: &Shader,
+) -> Result<Vec<OutputVarying>, LinkError> {
+    let vout = &vprog.output_varyings;
+    if vout.len() > MAX_PERMUTED_VARYINGS {
+        return Err(LinkError::VaryingOrderAmbiguous { varyings: vout.len(), surviving: 0 });
+    }
+    let mut survivors: Vec<Vec<OutputVarying>> = Vec::new();
+    for perm in permutations(vout.len()) {
+        let candidate = permute_varyings(vout, &perm);
+        if plan_interface_with(vprog, fprog, fshader, &candidate).is_ok() {
+            survivors.push(candidate);
+        }
+    }
+    match survivors.len() {
+        1 => Ok(survivors.pop().expect("checked")),
+        n => Err(LinkError::VaryingOrderAmbiguous { varyings: vout.len(), surviving: n }),
+    }
+}
+
 fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
+    // A program whose order the container could read is planned directly against it - this
+    // is every program that links today, and its behaviour is untouched.
+    if vprog.output_order != VaryingOrder::Ambiguous {
+        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
+    }
+    let resolved = resolve_ambiguous_order(vprog, fprog, fshader)?;
+    plan_interface_with(vprog, fprog, fshader, &resolved)
+}
+
+/// [`plan_interface`] against an EXPLICIT vertex lane layout, so the permutation search can
+/// try one without mutating the program.
+fn plan_interface_with(
+    vprog: &Program,
+    fprog: &Program,
+    fshader: &Shader,
+    vout: &[OutputVarying],
+) -> Result<Interface, LinkError> {
     let (mut inputs, untouched) = pa_read_before_write(fshader);
     let primary_regs = fprog.primary_reg_count as u32;
 
@@ -644,13 +778,8 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     //
     // It is never a prefetch coordinate source (those are named by TEXCOORD index), so it only
     // has to be handled where an interpolant's own data registers are read.
-    let vertex_output = |usage| {
-        vprog
-            .output_varyings
-            .iter()
-            .find(|v| v.usage == usage)
-            .ok_or(LinkError::UnfedVarying { usage })
-    };
+    let vertex_output =
+        |usage| vout.iter().find(|v| v.usage == usage).ok_or(LinkError::UnfedVarying { usage });
 
     let mut iface = Interface {
         components: Vec::new(),
@@ -1337,6 +1466,9 @@ mod tests {
     /// A minimal vertex `Program` carrying only the fields the linker reads.
     fn vertex_program(secondary_reg_count: u16, attrs: Vec<Parameter>, hash: u64) -> Program {
         Program {
+            // These fixtures set `output_varyings` explicitly, so their order IS the order
+            // under test - it must not be re-derived from a fragment.
+            output_order: crate::container::VaryingOrder::Known,
             varyings_error: None,
             default_uniform_regs: 0,
             secondary_code: Vec::new(),

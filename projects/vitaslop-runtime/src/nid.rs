@@ -38,6 +38,9 @@ pub mod gxm {
     pub const CREATE_RENDER_TARGET: u32 = 0x207A_F96B;
     pub const DESTROY_RENDER_TARGET: u32 = 0x0B94_C50A;
     pub const COLOR_SURFACE_INIT: u32 = 0xED0F_6E25;
+    /// `sceGxmColorSurfaceInitDisabled`: a colour surface that writes nothing, which is
+    /// what a depth-only pass (a shadow map, a z-prepass) binds.
+    pub const COLOR_SURFACE_INIT_DISABLED: u32 = 0x6136_39FA;
     pub const DEPTH_STENCIL_SURFACE_INIT: u32 = 0xCA9D_41D1;
     pub const SYNC_OBJECT_CREATE: u32 = 0x6A60_13E1;
     pub const SYNC_OBJECT_DESTROY: u32 = 0x889A_E88C;
@@ -107,6 +110,9 @@ pub mod gxm {
     pub const SET_FRONT_POLYGON_MODE: u32 = 0xFD93_209D;
     pub const SET_FRONT_STENCIL_REF: u32 = 0x8FA6_FE44;
     pub const SET_FRONT_STENCIL_FUNC: u32 = 0xB864_5A9A;
+    /// `sceGxmSetBackStencilFunc`: the two-sided counterpart, applied when
+    /// `sceGxmSetTwoSidedEnable` is on. Recorded unconditionally - see `vita::gxm`.
+    pub const SET_BACK_STENCIL_FUNC: u32 = 0x1A68_C8D2;
     pub const SET_VIEWPORT: u32 = 0x3EB3_380B;
     pub const SET_VIEWPORT_ENABLE: u32 = 0x814F_61EB;
     pub const SET_REGION_CLIP: u32 = 0x70C8_6868;
@@ -442,6 +448,8 @@ pub mod services {
     pub const RTC_GET_CURRENT_TICK: u32 = 0x23F7_9274;
     pub const RTC_GET_TICK: u32 = 0xF2B2_38E2;
     pub const RTC_GET_TIME64_T: u32 = 0xC995_DE02;
+    /// `sceRtcGetTime_t`: the 32-bit `time_t` sibling of `RTC_GET_TIME64_T`.
+    pub const RTC_GET_TIME_T: u32 = 0x8DE6_FEB7;
     pub const RTC_GET_CURRENT_NETWORK_TICK: u32 = 0xCDDD_25FE;
     pub const RTC_SET_TICK: u32 = 0xCD89_F464;
     pub const RTC_CONVERT_UTC_TO_LOCAL_TIME: u32 = 0x1282_C436;
@@ -475,6 +483,7 @@ pub mod services {
     pub const APPUTIL_SAVEDATA_SLOT_GET_PARAM: u32 = 0x93F0_D89F;
     pub const APPUTIL_SAVEDATA_SLOT_CREATE: u32 = 0x7E8F_E96A;
     pub const APPUTIL_SAVEDATA_SLOT_SET_PARAM: u32 = 0x9863_0136;
+    pub const APPUTIL_SAVEDATA_SLOT_DELETE: u32 = 0x266A_7646;
     pub const APPUTIL_SAVEDATA_DATA_SAVE: u32 = 0x6076_47BA;
     pub const APPUTIL_SAVEDATA_DATA_REMOVE: u32 = 0xD1C6_AB8E;
     pub const APPUTIL_SAVEDATA_GET_QUOTA: u32 = 0xC560_E716;
@@ -593,6 +602,29 @@ pub mod services {
     pub const CAMERA_SET_REVERSE: u32 = 0x1175_F477;
     pub const CAMERA_SET_BACKLIGHT: u32 = 0xAE07_1044;
     pub const CAMERA_SET_WHITE_BALANCE: u32 = 0x4D45_14AC;
+    // SceLibLocation: the positioning service, backed by the HOST's own location
+    // provider (see `vita::location`) - real in the browser, absent on a bare desktop.
+    // Prototypes: `psp2/location.h`; NIDs: `db/360/SceLibLocation.yml`.
+    // The CALLBACK entry points (Start/StopLocationCallback, Start/StopHeadingCallback)
+    // and SetGpsEmulationFile are deliberately absent - see the module docs.
+    pub const LOCATION_OPEN: u32 = 0xDD27_1661;
+    pub const LOCATION_CLOSE: u32 = 0x14FE_76E8;
+    pub const LOCATION_REOPEN: u32 = 0xB1F5_5065;
+    pub const LOCATION_GET_METHOD: u32 = 0x188C_E004;
+    pub const LOCATION_CONFIRM: u32 = 0xC895_E567;
+    pub const LOCATION_CONFIRM_GET_STATUS: u32 = 0x730F_F842;
+    pub const LOCATION_CONFIRM_GET_RESULT: u32 = 0xFF01_6C13;
+    pub const LOCATION_CONFIRM_ABORT: u32 = 0xE3CB_F875;
+    pub const LOCATION_GET_LOCATION: u32 = 0x15BC_27C8;
+    pub const LOCATION_GET_LOCATION_WITH_TIMEOUT: u32 = 0x16F4_1ED0;
+    pub const LOCATION_CANCEL_GET_LOCATION: u32 = 0x7150_3251;
+    pub const LOCATION_GET_HEADING: u32 = 0x4E9E_5ED9;
+    pub const LOCATION_GET_PERMISSION: u32 = 0x4826_22C6;
+    pub const LOCATION_DENY_APPLICATION: u32 = 0x8AAF_3FBD;
+    // LOCATION_INIT is declared further down, with the device-service inits it was
+    // first grouped with. It keeps its original home so this block stays additive.
+    pub const LOCATION_TERM: u32 = 0x1E80_199A;
+    pub const LOCATION_SET_THREAD_PARAMETER: u32 = 0xAA02_6B53;
     // SceJpegEnc: the hardware JPEG encoder. Setup only - see `vita::jpegenc` for why
     // Encode/Csc are deliberately left unimplemented. Prototypes: `psp2/jpegenc.h`.
     pub const JPEGENC_GET_CONTEXT_SIZE: u32 = 0x2B55_844D;
@@ -691,6 +723,11 @@ pub mod services {
     pub const NETCTL_ADHOC_REGISTER_CALLBACK: u32 = 0xFFA9_D594;
     pub const NETCTL_ADHOC_GET_IN_ADDR: u32 = 0x7118_C99D;
     pub const NETCTL_ADHOC_GET_STATE: u32 = 0x0961_A561;
+    /// `sceNetCtlAdhocGetPeerList`: EMPTY offline, which is a real console state.
+    pub const NETCTL_ADHOC_GET_PEER_LIST: u32 = 0x7758_6C59;
+    /// `sceMotionMagnetometerOn`: enable magnetometer sampling. Accepted like
+    /// `MOTION_START_SAMPLING` - see the group it dispatches with.
+    pub const MOTION_MAGNETOMETER_ON: u32 = 0x122A_79F8;
     pub const NETCTL_ADHOC_DISCONNECT: u32 = 0xED43_B79A;
     pub const POWER_SET_CONFIGURATION_MODE: u32 = 0x3CE1_87B6;
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
@@ -747,6 +784,11 @@ pub mod threadmgr {
     pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
     pub const GET_PROCESS_ID: u32 = 0x9DCB_4B7A;
     pub const GET_THREAD_CURRENT_PRIORITY: u32 = 0x0141_4F0B;
+    /// CPU affinity: RECORDED, not obeyed - this scheduler interleaves on one baton, so
+    /// there is no placement to honour. Kept so the getter agrees with the setter and with
+    /// `sceKernelGetThreadInfo`. See `vita::threadmgr`.
+    pub const CHANGE_THREAD_CPU_AFFINITY_MASK: u32 = 0x1512_9174;
+    pub const GET_THREAD_CPU_AFFINITY_MASK: u32 = 0xF1AE_5654;
     /// `sceKernelCloseSema`: releases a semaphore id (same effect as DeleteSema in
     /// this model - the id becomes invalid). Routed to the shared delete handler.
     pub const CLOSE_SEMA: u32 = 0xA2D8_1F9E;
@@ -770,6 +812,11 @@ pub mod pvf {
     pub const SET_EM: u32 = 0xDFB6_77C5;
     pub const OPEN: u32 = 0xE354_34BB;
     pub const OPEN_USER_FILE: u32 = 0xD535_520F;
+    /// `scePvfOpenUserMemory`: the same open from bytes the title already holds, which a
+    /// path-based open cannot reach (a font unpacked from the title's own archive).
+    pub const OPEN_USER_MEMORY: u32 = 0x9E65_E4ED;
+    /// `scePvfClose`: drop a font handle and its cached glyphs.
+    pub const CLOSE: u32 = 0xD282_C23C;
     pub const SET_RESOLUTION: u32 = 0xC444_4FB3;
     pub const SET_CHAR_SIZE: u32 = 0xF17A_DE4D;
     pub const SET_SKEW_VALUE: u32 = 0x3DD0_9BC9;
@@ -839,6 +886,9 @@ pub mod sync {
     /// crucial behaviour is that it actually BLOCKS until the bits are set (a stub
     /// that returns success immediately lets a thread race past the worker it waits on).
     pub const WAIT_EVENT_FLAG_CB: u32 = 0xE737_B1DF;
+    /// `sceKernelPollEventFlag`: the non-blocking `WAIT_EVENT_FLAG`. Reports
+    /// `SCE_KERNEL_ERROR_EVF_COND` instead of parking when the pattern does not satisfy.
+    pub const POLL_EVENT_FLAG: u32 = 0x1FBB_0FE1;
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
     pub const GET_SYSTEM_TIME_WIDE: u32 = 0xF4EE_4FA9;
@@ -1018,6 +1068,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::CREATE_RENDER_TARGET => "sceGxmCreateRenderTarget",
         g::DESTROY_RENDER_TARGET => "sceGxmDestroyRenderTarget",
         g::COLOR_SURFACE_INIT => "sceGxmColorSurfaceInit",
+        g::COLOR_SURFACE_INIT_DISABLED => "sceGxmColorSurfaceInitDisabled",
         g::DEPTH_STENCIL_SURFACE_INIT => "sceGxmDepthStencilSurfaceInit",
         g::SYNC_OBJECT_CREATE => "sceGxmSyncObjectCreate",
         g::SYNC_OBJECT_DESTROY => "sceGxmSyncObjectDestroy",
@@ -1166,6 +1217,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => "sceRtcGetCurrentClockLocalTime",
         sv::RTC_GET_TICK => "sceRtcGetTick",
         sv::RTC_GET_TIME64_T => "sceRtcGetTime64_t",
+        sv::RTC_GET_TIME_T => "sceRtcGetTime_t",
         sv::RTC_GET_CURRENT_NETWORK_TICK => "sceRtcGetCurrentNetworkTick",
         sv::RTC_SET_TICK => "sceRtcSetTick",
         sv::RTC_CONVERT_UTC_TO_LOCAL_TIME => "sceRtcConvertUtcToLocalTime",
@@ -1211,6 +1263,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_SAVEDATA_SLOT_GET_PARAM => "sceAppUtilSaveDataSlotGetParam",
         sv::APPUTIL_SAVEDATA_SLOT_CREATE => "sceAppUtilSaveDataSlotCreate",
         sv::APPUTIL_SAVEDATA_SLOT_SET_PARAM => "sceAppUtilSaveDataSlotSetParam",
+        sv::APPUTIL_SAVEDATA_SLOT_DELETE => "sceAppUtilSaveDataSlotDelete",
         sv::APPUTIL_SAVEDATA_DATA_SAVE => "sceAppUtilSaveDataDataSave",
         sv::NP_CHECK_CALLBACK => "sceNpCheckCallback",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
@@ -1226,6 +1279,22 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::CAMERA_SET_REVERSE => "sceCameraSetReverse",
         sv::CAMERA_SET_BACKLIGHT => "sceCameraSetBacklight",
         sv::CAMERA_SET_WHITE_BALANCE => "sceCameraSetWhiteBalance",
+        sv::LOCATION_OPEN => "sceLocationOpen",
+        sv::LOCATION_CLOSE => "sceLocationClose",
+        sv::LOCATION_REOPEN => "sceLocationReopen",
+        sv::LOCATION_GET_METHOD => "sceLocationGetMethod",
+        sv::LOCATION_CONFIRM => "sceLocationConfirm",
+        sv::LOCATION_CONFIRM_GET_STATUS => "sceLocationConfirmGetStatus",
+        sv::LOCATION_CONFIRM_GET_RESULT => "sceLocationConfirmGetResult",
+        sv::LOCATION_CONFIRM_ABORT => "sceLocationConfirmAbort",
+        sv::LOCATION_GET_LOCATION => "sceLocationGetLocation",
+        sv::LOCATION_GET_LOCATION_WITH_TIMEOUT => "sceLocationGetLocationWithTimeout",
+        sv::LOCATION_CANCEL_GET_LOCATION => "sceLocationCancelGetLocation",
+        sv::LOCATION_GET_HEADING => "sceLocationGetHeading",
+        sv::LOCATION_GET_PERMISSION => "sceLocationGetPermission",
+        sv::LOCATION_DENY_APPLICATION => "sceLocationDenyApplication",
+        sv::LOCATION_TERM => "sceLocationTerm",
+        sv::LOCATION_SET_THREAD_PARAMETER => "sceLocationSetThreadParameter",
         sv::JPEGENC_GET_CONTEXT_SIZE => "sceJpegEncoderGetContextSize",
         sv::JPEGENC_INIT => "sceJpegEncoderInit",
         sv::JPEGENC_END => "sceJpegEncoderEnd",
@@ -1298,6 +1367,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::SET_EVENT_FLAG => "sceKernelSetEventFlag",
         sy::WAIT_EVENT_FLAG => "sceKernelWaitEventFlag",
         sy::WAIT_EVENT_FLAG_CB => "sceKernelWaitEventFlagCB",
+        sy::POLL_EVENT_FLAG => "sceKernelPollEventFlag",
         sy::CLEAR_EVENT_FLAG => "sceKernelClearEventFlag",
         sy::DELETE_EVENT_FLAG => "sceKernelDeleteEventFlag",
         sy::GET_SYSTEM_TIME_WIDE => "sceKernelGetSystemTimeWide",
@@ -1318,6 +1388,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_FRONT_POLYGON_MODE => "sceGxmSetFrontPolygonMode",
         g::SET_FRONT_STENCIL_REF => "sceGxmSetFrontStencilRef",
         g::SET_FRONT_STENCIL_FUNC => "sceGxmSetFrontStencilFunc",
+        g::SET_BACK_STENCIL_FUNC => "sceGxmSetBackStencilFunc",
         g::SET_VIEWPORT => "sceGxmSetViewport",
         g::SET_VIEWPORT_ENABLE => "sceGxmSetViewportEnable",
         g::SET_REGION_CLIP => "sceGxmSetRegionClip",
@@ -1411,6 +1482,8 @@ pub fn name(func_nid: u32) -> &'static str {
         pv::SET_EM => "scePvfSetEM",
         pv::OPEN => "scePvfOpen",
         pv::OPEN_USER_FILE => "scePvfOpenUserFile",
+        pv::OPEN_USER_MEMORY => "scePvfOpenUserMemory",
+        pv::CLOSE => "scePvfClose",
         pv::SET_RESOLUTION => "scePvfSetResolution",
         pv::SET_CHAR_SIZE => "scePvfSetCharSize",
         pv::SET_SKEW_VALUE => "scePvfSetSkewValue",
@@ -1423,6 +1496,8 @@ pub fn name(func_nid: u32) -> &'static str {
         pv::PIXEL_TO_POINT_V => "scePvfPixelToPointV",
         // Threadmgr, sysmem, display additions.
         tm::GET_THREAD_CURRENT_PRIORITY => "sceKernelGetThreadCurrentPriority",
+        tm::CHANGE_THREAD_CPU_AFFINITY_MASK => "sceKernelChangeThreadCpuAffinityMask",
+        tm::GET_THREAD_CPU_AFFINITY_MASK => "sceKernelGetThreadCpuAffinityMask",
         tm::CLOSE_SEMA => "sceKernelCloseSema",
         tm::CHANGE_THREAD_VFP_EXCEPTION => "sceKernelChangeThreadVfpException",
         s::FREE_MEM_BLOCK => "sceKernelFreeMemBlock",
@@ -1484,9 +1559,11 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_SNS_FACEBOOK_INIT => "sceNpSnsFacebookInit",
         sv::LOCATION_INIT => "sceLocationInit",
         sv::MOTION_START_SAMPLING => "sceMotionStartSampling",
+        sv::MOTION_MAGNETOMETER_ON => "sceMotionMagnetometerOn",
         sv::NETCTL_ADHOC_REGISTER_CALLBACK => "sceNetCtlAdhocRegisterCallback",
         sv::NETCTL_ADHOC_GET_IN_ADDR => "sceNetCtlAdhocGetInAddr",
         sv::NETCTL_ADHOC_GET_STATE => "sceNetCtlAdhocGetState",
+        sv::NETCTL_ADHOC_GET_PEER_LIST => "sceNetCtlAdhocGetPeerList",
         sv::NETCTL_ADHOC_DISCONNECT => "sceNetCtlAdhocDisconnect",
         sv::POWER_SET_CONFIGURATION_MODE => "scePowerSetConfigurationMode",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",

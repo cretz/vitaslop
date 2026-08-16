@@ -13,6 +13,10 @@ import init, {
   worker_input_key,
   worker_input_pointer,
   worker_input_stick,
+  worker_location_fix,
+  worker_location_error,
+  worker_location_unavailable,
+  worker_location_note,
 } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
 
@@ -65,6 +69,27 @@ if (typeof navigator !== "undefined" && navigator.gpu && !navigator.gpu.__vitasl
   gpu.__vitaslopCompatShim = true;
 }
 
+// >>> THE PANIC SINK. A Rust panic in here is the most valuable line this emulator can emit and
+// it was the one line a phone could not read.
+//
+// Under `panic = "abort"` the panic arrives at JS as `Uncaught RuntimeError: unreachable at
+// ...vitaslop_web_bg.wasm:1:3542933` - an offset into a fat-LTO, one-codegen-unit blob, which
+// resolves to nothing. The message and the `src/....rs:NNN` location exist only inside the Rust
+// panic hook, which used to print them to the console. There is no console on a phone.
+//
+// `logging::install_panic_hook` calls this if it is defined, so the text is posted to the page
+// the instant the panic happens, not on the next perf window - a panicking run publishes no
+// further reports, so anything that waits for one waits for ever.
+//
+// Defined BEFORE `init()`: a panic during instantiation is still a panic worth reading.
+globalThis.__vitaslopPanic = (text) => {
+  try {
+    self.postMessage({ type: "panic", message: text });
+  } catch {
+    // A panic hook that throws replaces a diagnosable crash with an undiagnosable one.
+  }
+};
+
 // Start loading the wasm module immediately; the first message awaits it.
 const ready = init();
 
@@ -100,6 +125,40 @@ self.onmessage = async (e) => {
   // 128 - see InputState::left_stick.
   if (d.type === "stick") {
     worker_input_stick(d.stick, d.x, d.y, d.active);
+    return;
+  }
+
+  // Position from the page's watchPosition (see web/location.js). `navigator.geolocation`
+  // is Window-only, so the page owns the API and this worker only receives its answers.
+  //
+  // The nullable fields are passed through UNCHANGED - `null` and `NaN` both mean the
+  // browser could not supply that component, and the Rust side turns either into the
+  // guest's INVALID sentinel. Substituting a 0 here would be a heading of due north and a
+  // speed of standing still, which is a measurement the device never made.
+  if (d.type === "location-fix") {
+    worker_location_fix(
+      d.latitude,
+      d.longitude,
+      d.altitude ?? undefined,
+      d.accuracy ?? undefined,
+      d.heading ?? undefined,
+      d.speed ?? undefined,
+      d.timestamp
+    );
+    return;
+  }
+  if (d.type === "location-error") {
+    worker_location_error(d.code);
+    return;
+  }
+  if (d.type === "location-unavailable") {
+    worker_location_unavailable();
+    return;
+  }
+  // A note from the page's relay. It goes through the wasm logger so it reaches the
+  // on-page WARN mirror and the /diag sink - a phone has no console to read.
+  if (d.type === "location-note") {
+    worker_location_note(String(d.message));
     return;
   }
 

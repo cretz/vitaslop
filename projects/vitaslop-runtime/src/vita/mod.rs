@@ -19,6 +19,7 @@ pub mod iofilemgr;
 pub mod jpeg;
 pub mod jpegenc;
 pub mod libkernel;
+pub mod location;
 pub mod lwsync;
 pub mod lwwork;
 pub mod mirror;
@@ -599,6 +600,7 @@ pub fn dispatch(
         // A real wait: parks under the preemptive scheduler until SetEventFlag
         // satisfies the pattern (or the timeout passes).
         sync_nid::WAIT_EVENT_FLAG | sync_nid::WAIT_EVENT_FLAG_CB => sync::wait_event_flag(ctx, st),
+        sync_nid::POLL_EVENT_FLAG => cont!(sync::poll_event_flag(ctx, st)),
         sync_nid::CLEAR_EVENT_FLAG => cont!(sync::clear_event_flag(ctx, st)),
         sync_nid::DELETE_EVENT_FLAG => cont!(sync::delete_object(ctx, st)),
         sync_nid::GET_SYSTEM_TIME_WIDE => cont!(sync::get_system_time_wide(ctx, st)),
@@ -655,6 +657,12 @@ pub fn dispatch(
         tm_nid::GET_PROCESS_ID => cont!(threadmgr::get_process_id(ctx, st)),
         tm_nid::GET_THREAD_CURRENT_PRIORITY => {
             cont!(threadmgr::get_thread_current_priority(ctx, st))
+        }
+        tm_nid::CHANGE_THREAD_CPU_AFFINITY_MASK => {
+            cont!(threadmgr::change_thread_cpu_affinity_mask(ctx, st))
+        }
+        tm_nid::GET_THREAD_CPU_AFFINITY_MASK => {
+            cont!(threadmgr::get_thread_cpu_affinity_mask(ctx, st))
         }
         // Closing a semaphore invalidates its id, same as deleting it in this model.
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
@@ -763,6 +771,7 @@ pub fn dispatch(
         gxm_nid::PROGRAM_PARAMETER_GET_ARRAY_SIZE => cont!(gxm::param_get_array_size(ctx)),
         gxm_nid::PROGRAM_PARAMETER_GET_NAME => cont!(gxm::param_get_name(ctx)),
         gxm_nid::COLOR_SURFACE_INIT => cont!(gxm::color_surface_init(ctx, st)),
+        gxm_nid::COLOR_SURFACE_INIT_DISABLED => cont!(gxm::color_surface_init_disabled(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::create_fragment_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
@@ -927,6 +936,7 @@ pub fn dispatch(
         gxm_nid::SET_FRONT_POLYGON_MODE => cont!(gxm::set_front_polygon_mode(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_REF => cont!(gxm::set_front_stencil_ref(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_FUNC => cont!(gxm::set_front_stencil_func(ctx, st)),
+        gxm_nid::SET_BACK_STENCIL_FUNC => cont!(gxm::set_back_stencil_func(ctx, st)),
         gxm_nid::SET_VIEWPORT => cont!(gxm::set_viewport(ctx, st)),
         gxm_nid::SET_VIEWPORT_ENABLE => cont!(gxm::set_viewport_enable(ctx, st)),
         gxm_nid::SET_REGION_CLIP => cont!(gxm::set_region_clip(ctx, st)),
@@ -1121,6 +1131,8 @@ pub fn dispatch(
         pvf_nid::DONE_LIB => cont!(pvf::done_lib(ctx, st)),
         pvf_nid::OPEN => cont!(pvf::open(ctx, st)),
         pvf_nid::OPEN_USER_FILE => cont!(pvf::open_user_file(ctx, st)),
+        pvf_nid::OPEN_USER_MEMORY => cont!(pvf::open_user_memory(ctx, st)),
+        pvf_nid::CLOSE => cont!(pvf::close(ctx, st)),
         pvf_nid::SET_EM => cont!(pvf::set_em(ctx, st)),
         pvf_nid::SET_RESOLUTION => cont!(pvf::set_resolution(ctx, st)),
         pvf_nid::SET_CHAR_SIZE => cont!(pvf::set_char_size(ctx, st)),
@@ -1208,6 +1220,7 @@ pub fn dispatch(
         }
         sv_nid::RTC_GET_TICK => cont!(services::rtc_get_tick(ctx, st)),
         sv_nid::RTC_GET_TIME64_T => cont!(services::rtc_get_time64_t(ctx, st)),
+        sv_nid::RTC_GET_TIME_T => cont!(services::rtc_get_time_t(ctx, st)),
         sv_nid::RTC_GET_CURRENT_NETWORK_TICK => {
             cont!(services::rtc_get_current_network_tick(ctx, st))
         }
@@ -1248,6 +1261,9 @@ pub fn dispatch(
         sv_nid::APPUTIL_SAVEDATA_SLOT_SET_PARAM => {
             cont!(services::apputil_savedata_slot_set_param(ctx, st))
         }
+        sv_nid::APPUTIL_SAVEDATA_SLOT_DELETE => {
+            cont!(services::apputil_savedata_slot_delete(ctx, st))
+        }
         sv_nid::APPUTIL_SAVEDATA_DATA_SAVE => {
             cont!(services::apputil_savedata_data_save(ctx, st))
         }
@@ -1262,6 +1278,9 @@ pub fn dispatch(
         }
         sv_nid::NETCTL_ADHOC_GET_IN_ADDR => cont!(services::netctl_adhoc_get_in_addr(ctx, st)),
         sv_nid::NETCTL_ADHOC_GET_STATE => cont!(services::netctl_adhoc_get_state(ctx, st)),
+        sv_nid::NETCTL_ADHOC_GET_PEER_LIST => {
+            cont!(services::netctl_adhoc_get_peer_list(ctx, st))
+        }
         sv_nid::NETCTL_ADHOC_DISCONNECT => cont!(services::netctl_adhoc_disconnect(ctx, st)),
         sv_nid::MP4_OPEN_FILE => cont!(video::mp4_open_file(ctx, st)),
         sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
@@ -1323,6 +1342,27 @@ pub fn dispatch(
         sv_nid::CAMERA_SET_REVERSE => cont!(camera::set_reverse(ctx, st)),
         sv_nid::CAMERA_SET_BACKLIGHT => cont!(camera::set_backlight(ctx, st)),
         sv_nid::CAMERA_SET_WHITE_BALANCE => cont!(camera::set_white_balance(ctx, st)),
+        // SceLibLocation: the positioning service, served from the host's own provider
+        // through the `World` seam (see `vita::location`).
+        sv_nid::LOCATION_OPEN => cont!(location::open(ctx, st)),
+        sv_nid::LOCATION_CLOSE => cont!(location::close(ctx, st)),
+        sv_nid::LOCATION_REOPEN => cont!(location::reopen(ctx, st)),
+        sv_nid::LOCATION_GET_METHOD => cont!(location::get_method(ctx, st)),
+        sv_nid::LOCATION_CONFIRM => cont!(location::confirm(ctx, st)),
+        sv_nid::LOCATION_CONFIRM_GET_STATUS => cont!(location::confirm_get_status(ctx, st)),
+        sv_nid::LOCATION_CONFIRM_GET_RESULT => cont!(location::confirm_get_result(ctx, st)),
+        sv_nid::LOCATION_CONFIRM_ABORT => cont!(location::confirm_abort(ctx, st)),
+        sv_nid::LOCATION_GET_LOCATION => cont!(location::get_location(ctx, st)),
+        sv_nid::LOCATION_GET_LOCATION_WITH_TIMEOUT => {
+            cont!(location::get_location_with_timeout(ctx, st))
+        }
+        sv_nid::LOCATION_CANCEL_GET_LOCATION => cont!(location::cancel_get_location(ctx, st)),
+        sv_nid::LOCATION_GET_HEADING => cont!(location::get_heading(ctx, st)),
+        sv_nid::LOCATION_GET_PERMISSION => cont!(location::get_permission(ctx, st)),
+        sv_nid::LOCATION_DENY_APPLICATION => cont!(location::deny_application(ctx, st)),
+        sv_nid::LOCATION_INIT => cont!(location::init(ctx, st)),
+        sv_nid::LOCATION_TERM => cont!(location::term(ctx, st)),
+        sv_nid::LOCATION_SET_THREAD_PARAMETER => cont!(location::set_thread_parameter(ctx, st)),
         sv_nid::TOUCH_READ => cont!(touch::read(ctx, st)),
         sv_nid::TOUCH_PEEK => cont!(touch::peek(ctx, st)),
         sv_nid::TOUCH_GET_PANEL_INFO => cont!(touch::get_panel_info(ctx, st)),
@@ -1416,9 +1456,14 @@ pub fn dispatch(
         | sv_nid::NP_COMMERCE2_CREATE_SESSION_CREATE_REQ
         | sv_nid::NP_COMMERCE2_CREATE_SESSION_START
         | sv_nid::NP_SNS_FACEBOOK_INIT
-        // Device services: location/motion sampling, ad-hoc power/config.
-        | sv_nid::LOCATION_INIT
+        // Device services: motion sampling, ad-hoc power/config. LOCATION_INIT moved
+        // out of this group when SceLibLocation got a real implementation - it now has
+        // a dedicated arm above, alongside the rest of its family.
         | sv_nid::MOTION_START_SAMPLING
+        // Turning the magnetometer on succeeds for the same reason sampling does: the
+        // enable is a statement, not a query, and nothing here reads a compass - a title
+        // that then asks for a heading gets the API's own "could not determine".
+        | sv_nid::MOTION_MAGNETOMETER_ON
         | sv_nid::POWER_SET_CONFIGURATION_MODE
         // Shared dialog config accepted for every family.
         | sv_nid::COMMON_DIALOG_SET_CONFIG_PARAM

@@ -6,6 +6,7 @@
 //! flags, better register allocation, a relooper - grow later without touching
 //! the front or back end.
 
+pub use crate::flags::FlagMask;
 pub use yaxpeax_arm::armv7::ConditionCode;
 
 /// Width of a memory access.
@@ -407,10 +408,16 @@ pub enum Stmt {
     /// Set N,Z,C,V for the result of `a + b + cin`. Subtraction and compare pass
     /// `b` already bit-inverted with `cin = 1` (ARM computes `a - b` as
     /// `a + ~b + 1`), so this one primitive covers adds/subs/cmp/cmn/adc/sbc.
-    FlagsAdd { a: Value, b: Value, cin: Value },
+    ///
+    /// `live` is which of those four a later read can actually observe - see
+    /// [`crate::flags`]. Lowering cannot know (the consumer may be blocks away), so it
+    /// writes [`FlagMask::ALL`] and the liveness pass narrows it before emission. An
+    /// un-narrowed statement therefore emits exactly what it always did.
+    FlagsAdd { a: Value, b: Value, cin: Value, live: FlagMask },
     /// Set N,Z from `value` (logical result); set C to bit 0 of `carry` if
-    /// present (the shifter carry-out); leave V unchanged.
-    FlagsLogic { value: Value, carry: Option<Value> },
+    /// present (the shifter carry-out); leave V unchanged. `live` as for
+    /// [`Stmt::FlagsAdd`].
+    FlagsLogic { value: Value, carry: Option<Value>, live: FlagMask },
     /// Service an ARM `svc #imm` through the host `svc` import.
     Svc(u32),
     /// Service a Vita NID call through the host `import` import, by dense index.
@@ -469,8 +476,16 @@ pub enum Stmt {
     /// dedicated exact model rather than a `Bin` shift plus `FlagsLogic`. When
     /// `set_flags`, sets N,Z from the result and C to the exact shifter carry-out
     /// (V unchanged); otherwise only writes `rd`. Immediate-amount shifts keep the
-    /// simpler `Bin`+`FlagsLogic` path (their amount is known at lowering).
-    ShiftRegFlags { kind: ShiftKind, rd: u8, rn: Value, amount: Value, set_flags: bool },
+    /// simpler `Bin`+`FlagsLogic` path (their amount is known at lowering). `live` as
+    /// for [`Stmt::FlagsAdd`], and ignored when `set_flags` is false.
+    ShiftRegFlags {
+        kind: ShiftKind,
+        rd: u8,
+        rn: Value,
+        amount: Value,
+        set_flags: bool,
+        live: FlagMask,
+    },
 }
 
 /// Which register-controlled shift [`Stmt::ShiftRegFlags`] performs.
@@ -525,6 +540,13 @@ pub struct Block {
     pub addr: u32,
     pub stmts: Vec<Stmt>,
     pub term: Term,
+    /// How many GUEST instructions were lifted into this block.
+    ///
+    /// This is the emulator's unit of guest work - see [`crate::emit::emit_work_charge`].
+    /// It is a property of the ARM code, so it does not move when the wasm this lowers to
+    /// gets better, which is the whole reason the clock and the scheduler are billed in it
+    /// rather than in emitted operators.
+    pub arm_count: u32,
 }
 
 /// A discovered guest function: one wasm function. Blocks are sorted ascending by
@@ -580,7 +602,9 @@ impl Func {
         Func {
             addr,
             thumb,
-            blocks: vec![Block { addr, stmts: vec![stmt], term: Term::Return }],
+            // One instruction's worth of work: a thunk stands in for the single guest
+            // operation (an import call, a redirect) the stub would have performed.
+            blocks: vec![Block { addr, stmts: vec![stmt], term: Term::Return, arm_count: 1 }],
             stub: false,
         }
     }
