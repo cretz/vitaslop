@@ -235,6 +235,33 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             f32::from_bits(r & mask)
         }
+        // Group 0x15 IMAD32, scalar on channel 0: the lane holds an integer's BIT PATTERN, the
+        // same representation the bitwise ops above read and write.
+        //
+        // An IMMEDIATE source is read as the INTEGER its number spells, not through
+        // `read_channel` - that helper yields a literal as an f32 (`48.0`), whose bit pattern is
+        // not 48. The emitter materialises the same literal as `48u`, so reading it any other
+        // way here would make this reference disagree with the code that ships, which is the one
+        // thing an oracle may never do.
+        Op::IntMad { signed, bits } => {
+            if bits != 32 {
+                return Err("imad (only the 32-bit width is established)");
+            }
+            let raw = |n: usize| -> Result<u32, &'static str> {
+                let o = instr.srcs.get(n).ok_or("operand")?;
+                if matches!(o.bank, Bank::Immediate) {
+                    return Ok(o.index as u32);
+                }
+                Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
+            };
+            let (a, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            let r = if signed {
+                ((a as i32).wrapping_mul(b as i32).wrapping_add(d as i32)) as u32
+            } else {
+                a.wrapping_mul(b).wrapping_add(d)
+            };
+            f32::from_bits(r)
+        }
         // A truncating float->integer convert whose result is the integer's BIT PATTERN in the
         // lane - which is what the integer ops above then read. Matching `emit_pack_to_int`,
         // including its clamp: the source can be a NaN or a huge float, and an unclamped
@@ -252,6 +279,13 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // A format convert between float widths is value-preserving; this register file holds
         // one f32 per lane and carries no packing, so it is the identity here.
         Op::Pack { .. } => s(0, c)?,
+        // The 8-bit combiner is EMITTABLE but not interpretable here, and that is a property
+        // of this register file rather than of the instruction: it holds one f32 per lane,
+        // where the 8-bit pipeline holds four unsigned-normalised BYTES in one register. There
+        // is no value this function could return that means the same thing, so it refuses.
+        Op::Sop2 { .. } => {
+            return Err("sop2.fx8 (this register file is one f32 per lane, not four bytes)")
+        }
         _ => return Err("unmodeled"),
     })
 }
@@ -465,6 +499,42 @@ mod tests {
         let cc = Operand::plain(Bank::Temp, 4, 0);
         run(&shader(vec![instr(Op::Mad, d, vec![a, b, cc])]), &mut regs).unwrap();
         assert_eq!(&regs.r[0..4], &[21.0, 31.0, 41.0, 51.0]);
+    }
+
+    /// Group 0x15 IMAD32 over the lane's INTEGER bit pattern, with an inline literal for the
+    /// multiplier - the exact shape of the instruction that established the group:
+    /// `pa[2] = pa[2] * 48 + sa[24]`.
+    ///
+    /// The literal is the point of the test. A `Bank::Immediate` operand read through the
+    /// ordinary float path yields `48.0`, whose bit pattern is 0x42400000, and an integer
+    /// multiply by that is not wrong by a little - it is wrong by nine orders of magnitude.
+    #[test]
+    fn int_mad_multiplies_a_bit_pattern_by_an_inline_literal() {
+        let mut regs = RegFile::with_lanes(32);
+        regs.pa[2] = f32::from_bits(7);
+        regs.sa[24] = f32::from_bits(1000);
+        let d = Operand::plain(Bank::PrimaryAttr, 2, 2);
+        let a = Operand::plain(Bank::PrimaryAttr, 2, 2);
+        let b = Operand::plain(Bank::Immediate, 48, 2);
+        let cc = Operand::plain(Bank::SecondaryAttr, 24, 3);
+        let mut i = instr(Op::IntMad { signed: true, bits: 32 }, d, vec![a, b, cc]);
+        // The group is scalar and carries no write mask.
+        i.write_mask = [true, false, false, false];
+        run(&shader(vec![i]), &mut regs).unwrap();
+        assert_eq!(regs.pa[2].to_bits(), 7 * 48 + 1000);
+    }
+
+    /// A width the decoder does not establish must hard-fail here too, rather than be
+    /// interpreted at 32 bits and quietly disagree with a shader that never gets emitted.
+    #[test]
+    fn int_mad_refuses_an_unestablished_width() {
+        let mut regs = RegFile::with_lanes(8);
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let a = Operand::plain(Bank::Temp, 1, 0);
+        let b = Operand::plain(Bank::Temp, 2, 0);
+        let cc = Operand::plain(Bank::Temp, 3, 0);
+        let i = instr(Op::IntMad { signed: false, bits: 16 }, d, vec![a, b, cc]);
+        assert!(run(&shader(vec![i]), &mut regs).is_err(), "a 16-bit imad must hard-fail");
     }
 
     #[test]

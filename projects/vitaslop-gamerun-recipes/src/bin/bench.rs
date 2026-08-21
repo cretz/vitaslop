@@ -124,6 +124,19 @@ fn main() -> ExitCode {
     // One retained scene, as every run does: retaining more is megabytes a frame and
     // would make the measurement describe the benchmark rather than the game.
     sched.host().state.capture.scene_limit = Some(1);
+    // >>> AND NO DETERMINISM SIGNATURE, because this tool has no consumer for one.
+    //
+    // The fold hashes every retired scene's vertices, indices and uniforms - 3.5 MB a frame
+    // on a race, MEASURED at 8.0% of this very window. `bench` never prints a signature and
+    // never compares one, so leaving it on made the instrument charge the guest for 8% of
+    // work the shipping engine does not do, and understated everything else it ranks by that
+    // much. `VITASLOP_SIGNATURE=1` asks for one back, in the same spelling every other engine
+    // uses.
+    sched
+        .host()
+        .state
+        .capture
+        .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
     let build_ms = boot.elapsed().as_secs_f64() * 1000.0;
     println!("bench: booted in {build_ms:.0} ms, fast-forwarding to frame {at}...");
 
@@ -155,6 +168,7 @@ fn main() -> ExitCode {
     // which is the only place a "this title costs 4x" claim means anything.
     let clock_before = sched.host().state.now_us();
     let (fuel_before, samples_before, _) = sched.fuel_report();
+    let arm_before = sched.arm_report();
     let mut frame_ms: Vec<f64> = Vec::with_capacity(frames as usize);
     let window = std::time::Instant::now();
     let target = sched.frames() + frames;
@@ -182,6 +196,7 @@ fn main() -> ExitCode {
         fuel: fuel_after - fuel_before,
         suspends: samples_after - samples_before,
         fuel_max,
+        arm: sched.arm_report().saturating_sub(arm_before),
     };
     report(&frame_ms, window_s, rounds, &sched, top, json, &win);
     ExitCode::SUCCESS
@@ -199,6 +214,12 @@ struct Window {
     /// Largest single burn seen in the RUN. A burn above the preemption interval means the
     /// reading is broken, not that the title is busy, so it is carried as the falsifier.
     fuel_max: u64,
+    /// Guest ARM instructions RETIRED over the window. Unlike fuel this does not move when
+    /// the codegen does, so `arm / wall time` is our effective guest MIPS - an ABSOLUTE
+    /// number, against the device's Cortex-A9 at ~444 MHz and ~1-1.5 IPC (~450-650 MIPS).
+    /// Every codegen result this project holds is a RELATIVE one; this is the number that
+    /// says whether there is anything left to win at all.
+    arm: u64,
 }
 
 /// Percentile of an unsorted sample (nearest rank on the sorted copy).
@@ -231,6 +252,21 @@ fn report(
         pct(frame_ms, 1.0),
         total_ms / frame_ms.len() as f64
     );
+    // >>> AND THE LOW END, WHICH IS THE STATISTIC AN A/B SHOULD BE READ ON.
+    //
+    // Interference only ever ADDS time: another process taking a core, a thermal step, the
+    // OS scheduling something else. So on a machine that is not exclusively ours - and it
+    // usually is not - the fastest frames are the ones least contaminated, and p50 carries
+    // whatever the rest of the box was doing. MEASURED on this machine at 24% background
+    // load: the p50 spread WITHIN one arm reached 14%, which swamps every codegen change
+    // this project has ever made, while p10 held to a few percent. Read `p10` for an A/B,
+    // `p50` for what a user would feel, and always quote the within-arm spread.
+    println!(
+        "bench: low end - min {:.2} ms, p10 {:.2} ms, p25 {:.2} ms - READ AN A/B ON p10",
+        pct(frame_ms, 0.0),
+        pct(frame_ms, 0.10),
+        pct(frame_ms, 0.25),
+    );
 
     // What the DEVICE was charged, per frame of the measured window. A console frame is
     // 16,667 us, so `clock/frame` divided by that IS the title's clock ratio on this
@@ -247,6 +283,35 @@ fn report(
         if win.suspends == 0 { 0 } else { win.fuel / win.suspends },
         win.fuel_max,
         vitaslop_runtime::host::QUANTUM_FUEL,
+    );
+
+    // >>> THE ABSOLUTE THROUGHPUT NUMBER, and the only one here that is not relative.
+    //
+    // Retired ARM instructions over the window divided by the window's WALL time. The
+    // device is a Cortex-A9 at ~444 MHz retiring ~1-1.5 per cycle, so ~450-650 MIPS is
+    // what the hardware does; the ratio below is what we do against it. Printed even at
+    // zero, because a zero means the engine carries no per-block counter and that has to
+    // be visible rather than looking like an idle title.
+    const DEVICE_MIPS: f64 = 550.0;
+    let mips = win.arm as f64 / 1e6 / window_s.max(1e-9);
+    println!(
+        "bench: guest throughput - {:.1} M ARM instructions retired ({:.2} M/frame), \
+         {mips:.0} MIPS effective, {:.2}x a ~{DEVICE_MIPS:.0} MIPS Cortex-A9",
+        win.arm as f64 / 1e6,
+        win.arm as f64 / 1e6 / n,
+        mips / DEVICE_MIPS,
+    );
+    // >>> CODEGEN DENSITY: wasm operators emitted per guest ARM instruction.
+    //
+    // The two counters above are independent - fuel moves with the codegen, retired ARM
+    // does not - so their RATIO is what this transpiler charges to run one guest
+    // instruction. It is the steering number for codegen work, and the one thing an
+    // operator-count A/B cannot tell you on its own: -28% of a bad ratio is still a bad
+    // ratio. Do NOT read it as time: V8 and cranelift do not charge operators
+    // proportionally, which is exactly why the relative results disappointed.
+    println!(
+        "bench: codegen density - {:.1} wasm operators per retired ARM instruction",
+        win.fuel as f64 / win.arm.max(1) as f64,
     );
 
     // What `RenderSceneBuilder::build` did, in the same units the browser reports, so the
@@ -285,11 +350,37 @@ fn report(
             marshal_ms,
             100.0 * marshal_ms / total_ms.max(1e-6)
         );
+        // The scheduler's own phases ARE measured, and they live in this remainder rather
+        // than in the handler bucket - so the translated-code share is the remainder minus
+        // them, and that is a measurement rather than a second subtraction.
+        let sched_ms: f64 = vitaslop_runtime::perf::Phase::all()
+            .iter()
+            .filter(|p| p.label().starts_with("scheduler:"))
+            .map(|p| vitaslop_runtime::perf::read(*p).0 as f64 / 1e6)
+            .sum();
         println!(
             "bench: remainder {:.0} ms ({:.1}%) is translated guest code + scheduler, BY \
-             SUBTRACTION - not measured directly",
+             SUBTRACTION - of which the scheduler MEASURES {:.0} ms ({:.1}%), leaving \
+             translated guest code at {:.1}%",
             rest_ms,
-            100.0 * rest_ms / total_ms.max(1e-6)
+            100.0 * rest_ms / total_ms.max(1e-6),
+            sched_ms,
+            100.0 * sched_ms / total_ms.max(1e-6),
+            100.0 * (rest_ms - sched_ms) / total_ms.max(1e-6),
+        );
+        // The same absolute number charged only for the time host calls did NOT take. It
+        // is an UPPER BOUND on what the emitted code does, not a measurement of it: the
+        // scheduler is in this bucket too (see the remainder line above), and every host
+        // call inlined into emitted code has moved out of `import_ms` and into it.
+        // Charged only for the time translated code actually had: host calls out, and the
+        // scheduler's own measured phases out too. This is the transpiler's throughput.
+        let code_ms = (rest_ms - sched_ms).max(1e-6);
+        println!(
+            "bench:   translated-code throughput {:.0} MIPS ({:.2}x a ~{DEVICE_MIPS:.0} MIPS \
+             Cortex-A9), over {:.0} ms of the window",
+            win.arm as f64 / 1e3 / code_ms,
+            (win.arm as f64 / 1e3 / code_ms) / DEVICE_MIPS,
+            code_ms,
         );
 
         // Inside the handler bucket: the phases of the GXM capture path. These are a
@@ -305,7 +396,16 @@ fn report(
             .collect();
         if !phases.is_empty() {
             let frames = frame_ms.len() as f64;
-            println!("bench: capture phases (inside the handler bucket):");
+            // >>> THE `scheduler:` PHASES ARE NOT IN THE HANDLER BUCKET, AND THE OLD LABEL
+            // SAID THEY WERE. `SchedOverhead` is timed around `pick_next`/the drain, which
+            // run BETWEEN guest resumes and outside `env.import` entirely - so they sit in
+            // the REMAINDER alongside translated guest code, not inside `handler`. Anyone
+            // summing this list as a subset of the handler bucket double-counted 7.8% of
+            // the window, and the two names are marked below so nobody has to know that.
+            println!(
+                "bench: phases - `draw:`/`scene:` are INSIDE the handler bucket; `scheduler:` \
+                 is inside the REMAINDER (it runs between resumes, not in a host call):"
+            );
             for (label, ms, hits, bytes) in &phases {
                 // Bytes per FRAME, because that is the number a fix has to move: a
                 // phase copying tens of megabytes a frame is a volume problem however
@@ -359,10 +459,14 @@ fn report(
 
     if json {
         println!(
-            "BENCHJSON {{\"frames\":{},\"p50_ms\":{:.3},\"p95_ms\":{:.3},\"mean_ms\":{:.3},\
+            "BENCHJSON {{\"frames\":{},\"p10_ms\":{:.3},\"min_ms\":{:.3},\
+             \"p50_ms\":{:.3},\"p95_ms\":{:.3},\"mean_ms\":{:.3},\
              \"window_s\":{:.3},\"host_calls\":{},\"import_pct\":{:.2},\
-             \"clock_ms_per_frame\":{:.3},\"clock_ratio\":{:.3},\"fuel_per_frame\":{}}}",
+             \"clock_ms_per_frame\":{:.3},\"clock_ratio\":{:.3},\"fuel_per_frame\":{},\
+             \"arm_per_frame\":{},\"mips\":{:.1}}}",
             frame_ms.len(),
+            pct(frame_ms, 0.10),
+            pct(frame_ms, 0.0),
             pct(frame_ms, 0.50),
             pct(frame_ms, 0.95),
             total_ms / frame_ms.len() as f64,
@@ -372,6 +476,8 @@ fn report(
             win.clock_us as f64 / 1000.0 / n,
             win.clock_us as f64 / n / (1_000_000.0 / 60.0),
             (win.fuel as f64 / n) as u64,
+            (win.arm as f64 / n) as u64,
+            mips,
         );
     }
 }

@@ -1,82 +1,70 @@
-@title PCSA00015 front end - title screen, GAME MODE, campaign intro, campaign map
+@title PCSA00015 front end - title screen and GAME MODE
 @game  PCSA00015
-# (no cadence shots - every shot below is explicit)
+# (no cadence shots - judge this title through `vitaslop-desktop --headless`)
 
 # ============================================================================
 # WHAT THIS RECIPE DOES
-# Boots the title and drives its TOUCH front end as far as it currently goes:
+# Boots the title and drives its TOUCH front end:
 #
-#   loading -> PRESS ANY BUTTON TO START -> GAME MODE (4 tiles)
-#     -> SINGLE PLAYER CAMPAIGN -> the campaign intro text -> the campaign MAP
+#   loading -> attract demo -> PRESS ANY BUTTON TO START -> GAME MODE (4 tiles)
 #
-# Every input here was found in a resident session and is reproducible; the
-# shots below are the evidence for each screen.
+# >>> RETIMED 2026-08-17d. THE OLD FRAME NUMBERS WERE FIVE TIMES TOO LATE.
+# The committed version pressed its first button at f28000, which was right when
+# it was authored and is not right now: on the derived guest clock the loading
+# screen finishes about f5040 and the attract demo is running by f5100, so every
+# cue fired long after the screen it was aimed at and the run never left the
+# attract loop. Do not scale these numbers by hand if the clock moves again -
+# re-measure with `VITASLOP_HEADLESS_SHOT_EVERY` and look at the shots.
 #
-# >>> IT NEEDS `VITASLOP_FRAME_TOPUP=0`, AND THAT IS NOT OPTIONAL.
-# With the default per-flip clock top-up, a displayed frame carries about a
-# TENTH of the guest work a console frame carries (measured: 3120 fps with
-# barely one whole scheduler quantum per frame), so this title never finishes
-# loading at all - a 300,000-frame run ends still on the loading screen. With
-# the top-up off it reaches PRESS ANY BUTTON by f30000. See
-# `VitaState::advance_time_frame` for the mechanism and why it is a knob rather
-# than the default.
+# HOW THESE FRAMES WERE MEASURED (repeat this, do not guess):
+#   VITASLOP_GXP_LIVE=1 VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1 \
+#   VITASLOP_HEADLESS_FRAMES=9200 VITASLOP_HEADLESS_SHOT_EVERY=200 \
+#   VITASLOP_HEADLESS_SHOT_FROM=5200 VITASLOP_LOG=error \
+#   vitaslop-desktop --game <wipeout>/extracted --recipe <this> --headless <dir>
+# `VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1` is for FINDING FRAMES ONLY - one draw on
+# the loading path still blocks on USSE group 0x1d, and without it a periodic
+# shot that lands on that frame kills the run. Take the judged shot WITHOUT it.
 #
-#   VITASLOP_FRAME_TOPUP=0 play --game <dir> --recipe <this> --max-frames 40000
+# >>> THE SCREEN THIS RECIPE EXISTS FOR IS THE TITLE SCREEN AT ~f5600.
+# White frame, the hex lattice, the logo, PRESS ANY BUTTON TO START and the
+# copyright line. That lattice is the over-embossed one the user has reported:
+# see `working-area/agent-notes.md` for what is measured about it.
 #
-# THE TITLE IS TOUCH-DRIVEN, and this recipe is the proof: the four GAME MODE
-# tiles, the confirm checkmark and the map's own back button all respond to a
-# `touch=`, and `cross` works on the two screens that say "press any button".
-# `touch=X,Y` is in PANEL coordinates, which are screen*2.
-#
-# >>> WHERE IT STOPS, AND WHY - read this before extending it
-# The campaign MAP renders its HUD and nothing else, and it is FROZEN: the
-# scene digest is bit-identical over 25,000 frames, and a 4x4 grid of taps
-# across the whole map body produces the SAME digest as no input at all. The
-# nodes the intro text tells you to touch are not there to be touched.
-#
-# Two measured facts about that, so the next session does not re-derive them:
-#   1. The map's geometry IS being submitted - one pass carries 20,160 world
-#      triangles - but its render target is a 1x1 colour surface (the title
-#      really does init it 1x1 with stride 8, which is GXM's legal minimum), so
-#      nothing of it reaches the display. Only the 27-draw HUD pass targets the
-#      960x544 surface.
-#   2. There is NO game-logic thread left. `threads` at the map lists the
-#      render thread, audio, the FIOS workers and one "NEW THREAD" blocked on a
-#      semaphore that nothing signals. The main thread is gone.
-# So the map is a STALL to diagnose, not a screen to find the right tap for.
+# TOUCH COORDINATES are in PANEL coordinates, which are screen*2.
 # ============================================================================
 
 0: @section boot
-# No input while it loads. This is the boot ladder of boot.recipe, unchanged.
+# No input while it loads. Loading reaches 99% by about f5035 and the attract
+# demo takes over immediately after.
 
-28000: cross
-28000: @shot title-screen
-28020:
-# "PRESS ANY BUTTON TO START" -> GAME MODE
+5150: cross
+5170:
+# Any button during the attract demo brings up the title screen: WIPEOUT 2048
+# over the hex lattice, PRESS ANY BUTTON TO START. It is up from about f5200.
 
-28620: touch=472,524
-28620: @shot game-mode
-28640:
+5450: cross
+5470:
+# >>> THE TITLE SCREEN WANTS A BUTTON, NOT A TOUCH, AND THAT IS WHAT THE OLD
+# RECIPE GOT WRONG. It had `touch=472,524` here - the SINGLE PLAYER CAMPAIGN
+# tile's coordinates, aimed at a GAME MODE screen that was not up yet - so the
+# tap fell on PRESS ANY BUTTON TO START, which ignores it, and the run sat on
+# the title screen for the rest of its length. The screen is measurably still
+# there at f6400 under the old cue and gone by f5700 under this one.
+# GAME MODE (four tiles) is up by about f5750.
+
+5750: touch=472,524
+5790:
 # The SINGLE PLAYER CAMPAIGN tile (screen 236,262). The two greyed tiles are
 # ONLINE CAMPAIGN and CROSS-PLAY - this build is signed out, so they are
-# correctly unavailable.
+# correctly unavailable. The campaign INTRO ("It's the year 2048...") is up by
+# about f6000 and waits on its confirm button.
 
-29040: cross
-29040: @shot campaign-intro
-29060:
-# The intro text ("Touch the nodes to play events"). `cross` brings up its
-# confirm checkmark rather than dismissing it.
+6200: touch=1764,960
+6240:
+# The confirm tick, bottom right (screen 882,480). Past it is the CAMPAIGN MAP:
+# the A.G.R.C 2048 hex chain, with the first event node captioned TOUCH TO START
+# and every later node still locked. It is up by about f6700.
 
-29460: touch=1760,952
-29460: @shot campaign-intro-confirm
-29480:
-# The checkmark, bottom right (screen 880,476).
-
-33000: @section campaign-map
-33000: @shot campaign-map
-
-# @todo The map is frozen - see the header. Next: find who should signal the
-# semaphore "NEW THREAD" waits on, and why the map pass targets a 1x1 surface.
-# @todo No @assert yet: the map has no progress value, and the screens above
-# are only evidenced by their shots. The first assertable thing here would be a
-# watch on whatever the front end advances when a node is selected.
+7000: touch=1016,570
+7040:
+# That first node (screen 508,285).

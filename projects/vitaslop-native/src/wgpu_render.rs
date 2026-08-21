@@ -246,7 +246,13 @@ impl GeneralRenderer {
         // a session; this is the same device on the desktop and it never got one, so a
         // headless run could fail validation in perfect silence.
         device.on_uncaptured_error(std::sync::Arc::new(|e| {
-            tracing::error!(target: "vitaslop::gxm", "wgpu uncaptured error: {e}");
+            let msg = e.to_string();
+            tracing::error!(target: "vitaslop::gxm", "wgpu uncaptured error: {msg}");
+            // The same poison list the browser fills, for the same reason: a refused pipeline
+            // bound into a pass takes every other draw in the frame with it. The desktop is the
+            // pixel oracle, so it must degrade the same way or the two renderers disagree about
+            // what a frame contains. See `vitaslop_platform::gpu::note_device_error`.
+            vitaslop_platform::gpu::note_device_error("wgpu", &msg);
         }));
         let gxm = GxmRenderer::new(&device, &queue, OUTPUT_FORMAT);
         Some(GeneralRenderer {

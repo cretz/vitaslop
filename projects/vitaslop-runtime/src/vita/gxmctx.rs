@@ -12,7 +12,7 @@
 //!      that writes guest memory is one wasm store; one that writes a host field is a full
 //!      boundary crossing. That is the entire cost of these calls - the handlers are three
 //!      instructions - and on a phone the crossing is 36% of host-call time against a
-//!      desktop where it barely registers. Measured on PCSA00027 at 248 calls per frame
+//!      desktop where it barely registers. Measured on a retail title at 248 calls per frame
 //!      EACH, the scalar setters below are the largest single block of host calls left in
 //!      steady gameplay.
 //!
@@ -37,9 +37,6 @@
 //!   different program - one where a texture the guest re-initialised between bind and draw
 //!   renders with its NEW contents. That is a faithfulness regression, not a speedup, so
 //!   those 259 calls a frame stay on the host until an inline form can copy 16 words.
-//! - **The default-uniform-buffer reserves.** `sceGxmReserve*DefaultUniformBuffer` allocates
-//!   and sizes a buffer from the bound program's reflected interface. That is real work, not
-//!   an accessor.
 //! - **The multi-argument setters' arguments beyond the first** are written here by their
 //!   handlers like everything else; they simply cannot be INLINED, because a store form
 //!   writes one word. `sceGxmSetViewport` takes six.
@@ -128,7 +125,62 @@ pub mod off {
     pub const BACK_STENCIL_OP_DEPTH_PASS: u32 = AFTER_TEXTURES + 0x0c;
     pub const BACK_STENCIL_COMPARE_MASK: u32 = AFTER_TEXTURES + 0x10;
     pub const BACK_STENCIL_WRITE_MASK: u32 = AFTER_TEXTURES + 0x14;
+
+    /// First byte after the back-stencil block, where the default-uniform state starts.
+    pub const AFTER_BACK_STENCIL: u32 = BACK_STENCIL_WRITE_MASK + 4;
+
+    /// The default-uniform RING: three guest ADDRESSES - where the ring starts, one past
+    /// where it ends, and the next free byte in it.
+    ///
+    /// On hardware the default uniform buffer is a ring the driver recycles inside the
+    /// memory the guest gave GXM, and every `sceGxmReserve*DefaultUniformBuffer` is a bump
+    /// of a cursor in that ring. Keeping the cursor here rather than on the host is what
+    /// makes the reserve inlinable at all - it is the same move `gxmctx` is entirely about
+    /// - and it is also where the hardware keeps it.
+    ///
+    /// The cursor is an ABSOLUTE address rather than an offset so the emitted form can hand
+    /// it straight back to the guest; the ring base is 16-aligned, so aligning the absolute
+    /// cursor and aligning an offset from it are the same arithmetic.
+    pub const UNIFORM_RING_BASE: u32 = AFTER_BACK_STENCIL;
+    pub const UNIFORM_RING_END: u32 = AFTER_BACK_STENCIL + 0x04;
+    pub const UNIFORM_RING_CURSOR: u32 = AFTER_BACK_STENCIL + 0x08;
+
+    /// The VERTEX stage's bound default uniform buffer, as three consecutive words:
+    /// `[buffer address, size in bytes, the `SceGxmProgram *` it was sized for]`.
+    ///
+    /// The header is not decoration: a buffer still bound for a DIFFERENT program is not
+    /// this draw's uniform bank, and the only way a draw can tell is by comparing what the
+    /// buffer was reserved for against what is about to be drawn (see
+    /// `VitaState::stale_uniforms`).
+    pub const VERTEX_UNIFORM: u32 = AFTER_BACK_STENCIL + 0x0c;
+    /// The FRAGMENT stage's, in the same three-word shape - which is what lets ONE inline
+    /// form serve both stages with only the record's offset changing.
+    pub const FRAGMENT_UNIFORM: u32 = AFTER_BACK_STENCIL + 0x18;
 }
+
+/// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
+/// the same three fields in the same order, so the inline form is parameterised by the
+/// record's base alone.
+pub mod uniform_record {
+    /// The reserved buffer's guest address, or 0 for "nothing bound".
+    pub const BUF: u32 = 0x00;
+    /// Its size in BYTES, as the program's reflected interface asked for - which is not
+    /// the same as the bytes taken from the ring (see [`super::UNIFORM_MIN_ALLOC`]).
+    pub const SIZE: u32 = 0x04;
+    /// The `SceGxmProgram *` the size was computed from.
+    pub const HEADER: u32 = 0x08;
+    /// Bytes one record occupies.
+    pub const BYTES: u32 = 0x0c;
+}
+
+/// Bytes the ring hands out for a reserve, at least. A program with no default uniforms
+/// asks for zero, and handing back the same address twice would let two draws' buffers
+/// alias; the floor keeps every reserve in a scene at a distinct address, exactly as it
+/// did when the bump lived on the host.
+pub const UNIFORM_MIN_ALLOC: u32 = 256;
+
+/// Alignment of every buffer the ring hands out, and of the ring itself.
+pub const UNIFORM_ALIGN: u32 = 16;
 
 /// `SCE_GXM_MAX_TEXTURE_UNITS` (vitasdk `gxm.h`).
 pub const MAX_TEXTURE_UNITS: usize = 16;
@@ -145,7 +197,7 @@ pub const MAX_VERTEX_STREAMS: usize = 16;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::BACK_STENCIL_WRITE_MASK + 4;
+pub const BYTES: u32 = off::FRAGMENT_UNIFORM + uniform_record::BYTES;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -172,6 +224,17 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
     ctx.write_u32(context.wrapping_add(off::FRAGMENT_PROGRAM), 0);
     for i in 0..(MAX_TEXTURE_UNITS as u32) * TEXTURE_STRIDE / 4 {
         ctx.write_u32(context.wrapping_add(off::TEXTURES + i * 4), 0);
+    }
+    // The default-uniform ring starts EMPTY - a base of 0 is what both the handler and the
+    // inline form read as "no ring here yet", and the ring is attached separately (see
+    // `VitaState::attach_uniform_ring`) because only the host can allocate one.
+    for offset in [off::UNIFORM_RING_BASE, off::UNIFORM_RING_END, off::UNIFORM_RING_CURSOR] {
+        ctx.write_u32(context.wrapping_add(offset), 0);
+    }
+    for record in [off::VERTEX_UNIFORM, off::FRAGMENT_UNIFORM] {
+        for w in 0..uniform_record::BYTES / 4 {
+            ctx.write_u32(context.wrapping_add(record + w * 4), 0);
+        }
     }
     // Stamped LAST, so a partially written block is never mistaken for a complete one.
     ctx.write_u32(context.wrapping_add(off::MAGIC), MAGIC);
@@ -203,9 +266,22 @@ pub fn stream(ctx: &GuestCtx, context: u32, index: u32) -> u32 {
 
 /// All [`MAX_VERTEX_STREAMS`] stream pointers, in stream order.
 pub fn streams(ctx: &GuestCtx, context: u32) -> [u32; MAX_VERTEX_STREAMS] {
+    // Sixteen words, and it runs per draw - so one read, for the reason spelled out on
+    // [`load`] and [`texture_bindings`]. `MAX_VERTEX_STREAMS` of them is sixteen virtual
+    // calls through `dyn GuestMemory` where one does.
+    const SPAN: usize = MAX_VERTEX_STREAMS * 4;
+    let mut scratch = [0u8; SPAN];
+    let block: &[u8] = match ctx.borrow_bytes(context.wrapping_add(off::STREAMS), SPAN) {
+        Some(b) => b,
+        None => {
+            ctx.read_into(context.wrapping_add(off::STREAMS), &mut scratch);
+            &scratch
+        }
+    };
     let mut out = [0u32; MAX_VERTEX_STREAMS];
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = get(ctx, context, off::STREAMS + i as u32 * 4);
+        let at = i * 4;
+        *slot = u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
     }
     out
 }
@@ -286,6 +362,70 @@ pub fn texture_binding_addr(ctx: &GuestCtx, context: u32, unit: u32) -> u32 {
     get(ctx, context, texture_at(unit))
 }
 
+/// Every BOUND sampler unit's binding, read out of the block in ONE borrow.
+///
+/// # Why a bulk reader exists
+/// A draw has to find out which of the sixteen units are bound and what they hold, and doing
+/// that a word at a time costs forty-odd `read_u32`s - each a bounds check and a VIRTUAL CALL
+/// through `dyn GuestMemory`, which is what makes them expensive rather than the four bytes
+/// they move. MEASURED on a retail race, `draw: snapshot textures` was **7.5%
+/// of the guest window over 627 draws a frame at 1.21 us each, moving 0.0 MB** - a phase whose
+/// whole cost was the calls, not the data.
+///
+/// One `borrow_bytes` over the whole block is one virtual call, and the parse afterwards is
+/// ordinary Rust over a slice. The per-unit readers stay for the callers that want one unit.
+///
+/// Falls back to the per-unit path when the backing cannot hand out a slice, so an engine
+/// without `borrow` still answers - identically, which is what `out` being filled the same way
+/// on both arms means.
+pub fn texture_bindings(ctx: &GuestCtx, context: u32, out: &mut Vec<(u32, TexBinding)>) {
+    out.clear();
+    const SPAN: usize = MAX_TEXTURE_UNITS * TEXTURE_STRIDE as usize;
+    // >>> THE FALLBACK USED TO BE PER-UNIT, AND IT IS THE BROWSER THAT TAKES IT.
+    //
+    // `borrow` hands back a slice into guest memory, and only NATIVE can: the browser's guest
+    // memory is a SharedArrayBuffer that is not this module's own linear memory, so no `&[u8]`
+    // can be formed over it and `borrow` returns `None` there permanently. The old fallback
+    // then read the block a WORD AT A TIME - sixteen units by up to six `read_u32`s, ~96
+    // virtual calls through `dyn GuestMemory` per draw - which is the exact cost this bulk
+    // reader was written to remove, reintroduced on the one engine that ships.
+    //
+    // MEASURED once the browser could time its own phases: `draw: decode texture bindings`
+    // was **2.24 ms of a ~17 ms frame on a retail title (13%), 4.9 us per draw over 457 draws**,
+    // against 0.6 us on the desktop, which takes the `borrow` path and never saw it.
+    //
+    // A bulk `read` into a 384-byte stack buffer needs no slice and is ONE virtual call, so
+    // both engines now parse the same bytes the same way and the fallback is a copy rather
+    // than a different algorithm. [[vitaslop-fallback-must-report]] is the rule this broke:
+    // it answered identically and eight times slower, silently.
+    let mut scratch = [0u8; SPAN];
+    let block: &[u8] = match ctx.borrow_bytes(context.wrapping_add(off::TEXTURES), SPAN) {
+        Some(b) => b,
+        None => {
+            ctx.read_into(context.wrapping_add(off::TEXTURES), &mut scratch);
+            &scratch
+        }
+    };
+    let word = |at: usize| u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+    for unit in 0..MAX_TEXTURE_UNITS {
+        let at = unit * TEXTURE_STRIDE as usize;
+        let addr = word(at);
+        // A slot the guest never bound, or unbound, is not a binding - the same test, and the
+        // same skip, the per-unit path makes.
+        if addr == 0 {
+            continue;
+        }
+        out.push((
+            unit as u32,
+            TexBinding {
+                addr,
+                words: [word(at + 4), word(at + 8), word(at + 12), word(at + 16)],
+                from_precomputed: word(at + 4 + TEXTURE_CONTROL_WORDS as usize * 4) != 0,
+            },
+        ));
+    }
+}
+
 pub fn texture_binding(ctx: &GuestCtx, context: u32, unit: u32) -> TexBinding {
     if unit as usize >= MAX_TEXTURE_UNITS {
         return TexBinding::default();
@@ -301,6 +441,60 @@ pub fn texture_binding(ctx: &GuestCtx, context: u32, unit: u32) -> TexBinding {
         ],
         from_precomputed: get(ctx, context, at + 4 + TEXTURE_CONTROL_WORDS * 4) != 0,
     }
+}
+
+/// One stage's bound default uniform buffer, as the block holds it.
+///
+/// The same three words the inline `sceGxmReserve*DefaultUniformBuffer` writes and the
+/// same three the draw reads, so an inlined reserve and a handled one are indistinguishable
+/// downstream. `buf == 0` means the stage has nothing bound and the draw falls back to the
+/// `sceGxmSetUniformDataF` capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct UniformBinding {
+    pub buf: u32,
+    pub size: u32,
+    pub header: u32,
+}
+
+/// Read the stage's binding out of the block. `record` is [`off::VERTEX_UNIFORM`] or
+/// [`off::FRAGMENT_UNIFORM`].
+pub fn uniform_binding(ctx: &GuestCtx, context: u32, record: u32) -> UniformBinding {
+    UniformBinding {
+        buf: get(ctx, context, record + uniform_record::BUF),
+        size: get(ctx, context, record + uniform_record::SIZE),
+        header: get(ctx, context, record + uniform_record::HEADER),
+    }
+}
+
+/// Write the stage's binding into the block - the fallback half of what the emitted
+/// reserve does, and the whole of what the precomputed-state paths do.
+pub fn set_uniform_binding(ctx: &mut GuestCtx, context: u32, record: u32, b: UniformBinding) {
+    set(ctx, context, record + uniform_record::BUF, b.buf);
+    set(ctx, context, record + uniform_record::SIZE, b.size);
+    set(ctx, context, record + uniform_record::HEADER, b.header);
+}
+
+/// The ring's `(base, end, cursor)`, all guest addresses. A base of 0 means no ring is
+/// attached, which is the only state in which a reserve has to allocate one.
+pub fn uniform_ring(ctx: &GuestCtx, context: u32) -> (u32, u32, u32) {
+    (
+        get(ctx, context, off::UNIFORM_RING_BASE),
+        get(ctx, context, off::UNIFORM_RING_END),
+        get(ctx, context, off::UNIFORM_RING_CURSOR),
+    )
+}
+
+/// Attach a ring at `[base, base + size)` and park its cursor at the start.
+pub fn set_uniform_ring(ctx: &mut GuestCtx, context: u32, base: u32, size: u32) {
+    set(ctx, context, off::UNIFORM_RING_BASE, base);
+    set(ctx, context, off::UNIFORM_RING_END, base.wrapping_add(size));
+    set(ctx, context, off::UNIFORM_RING_CURSOR, base);
+}
+
+/// Move the ring's cursor back to the start of the ring, for a new scene.
+pub fn rewind_uniform_ring(ctx: &mut GuestCtx, context: u32) {
+    let base = get(ctx, context, off::UNIFORM_RING_BASE);
+    set(ctx, context, off::UNIFORM_RING_CURSOR, base);
 }
 
 /// Serialise a whole [`crate::capture::RenderState`] into the block.
@@ -352,7 +546,118 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
 /// crossing per SETTER with a handful of guest-memory reads per DRAW - about 30 loads
 /// against the 1,240 crossings a frame the setters used to cost.
 pub fn load(ctx: &GuestCtx, context: u32) -> crate::capture::RenderState {
-    let r = |offset| get(ctx, context, offset);
+    Block::read(ctx, context).render_state()
+}
+
+/// A COPY of the whole context block, taken in ONE read of guest memory.
+///
+/// # Why the block is taken whole, once
+/// Every reader here used to reach into guest memory for itself: [`load`] copied the whole
+/// block, [`texture_bindings`] copied the sampler span, [`streams`] copied the stream span,
+/// and the scalar readers took a `read_u32` each. A DRAW calls most of them, so it crossed
+/// the guest-memory boundary about a dozen times to read one 652-byte structure that cannot
+/// change while it does - the guest does not run during a host call.
+///
+/// In the browser each of those crossings is a JS boundary crossing
+/// ([[vitaslop-count-calls-not-bytes-across-the-guest-boundary]]), and 652 bytes is one
+/// `copy_to`. So the block is snapshotted once and every reader parses the snapshot. The
+/// free functions below are kept for the callers that want one field and have no draw to
+/// hang a snapshot off.
+///
+/// A snapshot is only valid for the host call that took it, which is the only scope it is
+/// ever used in - it is a local, never a field.
+pub enum Block<'a> {
+    /// Lent in place by a backing that can hand out a slice - every in-process host. No copy
+    /// at all, which is what the readers used to do one span at a time.
+    Lent(&'a [u8]),
+    /// Copied, for a backing that cannot lend: the browser's guest memory is a
+    /// `SharedArrayBuffer` that is not this module's linear memory, so no `&[u8]` exists over
+    /// it and [`crate::host::GuestMemory::borrow`] returns `None` there PERMANENTLY. One copy
+    /// of 652 bytes, against the dozen boundary crossings the per-span readers cost.
+    Copied([u8; BYTES as usize]),
+}
+
+impl<'a> Block<'a> {
+    /// Snapshot the block at `context`. A context of 0, or one outside guest memory, reads
+    /// as zeros - which is what the per-field readers already answered for it, and
+    /// [`Self::is_context`] is how a caller tells that from a real block.
+    pub fn read(ctx: &'a GuestCtx, context: u32) -> Block<'a> {
+        if context == 0 {
+            return Block::Copied([0u8; BYTES as usize]);
+        }
+        if let Some(b) = ctx.borrow_bytes(context, BYTES as usize) {
+            return Block::Lent(b);
+        }
+        let mut bytes = [0u8; BYTES as usize];
+        ctx.read_into(context, &mut bytes);
+        Block::Copied(bytes)
+    }
+
+    /// The block's bytes, however they were obtained.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Block::Lent(b) => b,
+            Block::Copied(b) => b,
+        }
+    }
+
+    /// One word of the snapshot. The counterpart of [`get`].
+    pub fn word(&self, offset: u32) -> u32 {
+        let b = self.bytes();
+        let at = offset as usize;
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    /// Whether this snapshot came from a block [`init`] stamped. The counterpart of
+    /// [`is_context`].
+    pub fn is_context(&self) -> bool {
+        self.word(off::MAGIC) == MAGIC
+    }
+
+    /// One stage's bound default uniform buffer. The counterpart of [`uniform_binding`].
+    pub fn uniform_binding(&self, record: u32) -> UniformBinding {
+        UniformBinding {
+            buf: self.word(record + uniform_record::BUF),
+            size: self.word(record + uniform_record::SIZE),
+            header: self.word(record + uniform_record::HEADER),
+        }
+    }
+
+    /// All [`MAX_VERTEX_STREAMS`] stream pointers. The counterpart of [`streams`].
+    pub fn streams(&self) -> [u32; MAX_VERTEX_STREAMS] {
+        std::array::from_fn(|i| self.word(off::STREAMS + i as u32 * 4))
+    }
+
+    /// Every BOUND sampler unit's binding. The counterpart of [`texture_bindings`].
+    pub fn texture_bindings(&self, out: &mut Vec<(u32, TexBinding)>) {
+        out.clear();
+        for unit in 0..MAX_TEXTURE_UNITS {
+            let at = off::TEXTURES + unit as u32 * TEXTURE_STRIDE;
+            let addr = self.word(at);
+            // A slot the guest never bound, or unbound, is not a binding - the same test,
+            // and the same skip, the per-unit path makes.
+            if addr == 0 {
+                continue;
+            }
+            out.push((
+                unit as u32,
+                TexBinding {
+                    addr,
+                    words: [
+                        self.word(at + 4),
+                        self.word(at + 8),
+                        self.word(at + 12),
+                        self.word(at + 16),
+                    ],
+                    from_precomputed: self.word(at + 4 + TEXTURE_CONTROL_WORDS * 4) != 0,
+                },
+            ));
+        }
+    }
+
+    /// The whole render state, parsed out of the snapshot. The body [`load`] used to be.
+    pub fn render_state(&self) -> crate::capture::RenderState {
+    let r = |offset: u32| -> u32 { self.word(offset) };
     let mut viewport = [0f32; 6];
     for (i, v) in viewport.iter_mut().enumerate() {
         *v = f32::from_bits(r(off::VIEWPORT + i as u32 * 4));
@@ -394,6 +699,7 @@ pub fn load(ctx: &GuestCtx, context: u32) -> crate::capture::RenderState {
         front_visibility_test_index: r(off::FRONT_VISIBILITY_TEST_INDEX),
         front_visibility_test_op: r(off::FRONT_VISIBILITY_TEST_OP),
     }
+    }
 }
 
 /// Every scalar field, as `(offset, name)`. The list a test walks to prove the layout has no
@@ -432,6 +738,9 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::FRONT_VISIBILITY_TEST_OP, "front_visibility_test_op"),
     (off::VERTEX_PROGRAM, "vertex_program"),
     (off::FRAGMENT_PROGRAM, "fragment_program"),
+    (off::UNIFORM_RING_BASE, "uniform_ring_base"),
+    (off::UNIFORM_RING_END, "uniform_ring_end"),
+    (off::UNIFORM_RING_CURSOR, "uniform_ring_cursor"),
 ];
 
 #[cfg(test)]
@@ -463,6 +772,15 @@ mod tests {
         for unit in 0..MAX_TEXTURE_UNITS as u32 {
             for w in 0..TEXTURE_STRIDE / 4 {
                 claimed.push((off::TEXTURES + unit * TEXTURE_STRIDE + w * 4, "textures"));
+            }
+        }
+        // Both stages' three-word uniform records, word by word for the same reason the
+        // texture slots are: a `uniform_record::BYTES` that disagreed with what a record
+        // actually holds would leave a word no field owns, and the inline reserve writes
+        // through those offsets without ever consulting this list.
+        for record in [off::VERTEX_UNIFORM, off::FRAGMENT_UNIFORM] {
+            for w in 0..uniform_record::BYTES / 4 {
+                claimed.push((record + w * 4, "uniform_record"));
             }
         }
         claimed.sort();
@@ -513,6 +831,71 @@ mod tests {
         );
     }
 
+    /// The emitted `sceGxmReserve*DefaultUniformBuffer` and the handler behind it must
+    /// describe the SAME ring, the SAME record and the SAME program handle.
+    ///
+    /// Two implementations of one bump: the transpiler emits one into guest code and it runs
+    /// hundreds of times a frame; the handler runs a handful of times a run (a context with
+    /// no ring yet, a scene that overran it). A disagreement about any offset would therefore
+    /// be invisible in every ordinary reserve and show up only on the rare fallback, as one
+    /// draw's uniforms appearing on another - which reads as a shader bug thousands of frames
+    /// from the cause.
+    ///
+    /// The record shape is the half the emitter ASSUMES rather than reads: it writes the
+    /// buffer, the size and the header at `record + 0 / 4 / 8`. So that is asserted here
+    /// rather than trusted.
+    #[test]
+    fn the_uniform_reserve_layout_is_closed() {
+        use crate::vita::gxmprog;
+        assert_eq!(uniform_record::BUF, 0, "the emitter writes the buffer at record + 0");
+        assert_eq!(uniform_record::SIZE, 4, "...the size at record + 4");
+        assert_eq!(uniform_record::HEADER, 8, "...and the header at record + 8");
+        assert_eq!(uniform_record::BYTES, 12, "a record is exactly those three words");
+        assert!(UNIFORM_ALIGN.is_power_of_two(), "the emitted mask is `!(align - 1)`");
+        assert_eq!(
+            UNIFORM_MIN_ALLOC % UNIFORM_ALIGN,
+            0,
+            "the floor is a whole number of alignments, so the smallest reserve still \
+             leaves the cursor aligned and the emitted `align` is a no-op rather than a \
+             silent second bump"
+        );
+        for (nid, record, program) in [
+            (
+                crate::nid::gxm::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER,
+                off::VERTEX_UNIFORM,
+                off::VERTEX_PROGRAM,
+            ),
+            (
+                crate::nid::gxm::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER,
+                off::FRAGMENT_UNIFORM,
+                off::FRAGMENT_PROGRAM,
+            ),
+        ] {
+            let op = crate::vita::gxm::inline_op(nid).expect("the reserve has an inline form");
+            let vitaslop_transpiler::InlineOp::ReserveUniformBuffer { layout: l } = op else {
+                panic!("a reserve must lower to a ring-bump form, got {op:?}");
+            };
+            assert_eq!(l.record, record, "each stage records into its OWN slot");
+            assert_eq!(l.ctx_program, program, "...and reads its OWN bound program");
+            assert_eq!((l.ctx_magic_at, l.ctx_magic), (off::MAGIC, MAGIC));
+            assert_eq!((l.prog_magic_at, l.prog_magic), (gxmprog::off::MAGIC, gxmprog::MAGIC));
+            assert_eq!(l.ctx_ring_base, off::UNIFORM_RING_BASE);
+            assert_eq!(l.ctx_ring_end, off::UNIFORM_RING_END);
+            assert_eq!(l.ctx_ring_cursor, off::UNIFORM_RING_CURSOR);
+            assert_eq!(l.prog_size, gxmprog::off::UNIFORM_SIZE);
+            assert_eq!(l.prog_alloc, gxmprog::off::UNIFORM_ALLOC);
+            assert_eq!(l.prog_header, gxmprog::off::HEADER);
+            assert_eq!(l.align, UNIFORM_ALIGN);
+            // Every word the emitted code reaches must be inside the block it is bounded
+            // against, or the guard admits a pointer whose last access lands outside it.
+            assert!(l.ctx_top() + 4 <= BYTES, "the form stays inside the context block");
+            assert!(
+                l.prog_top() + 4 <= gxmprog::BYTES,
+                "...and inside the program handle block"
+            );
+        }
+    }
+
     /// The block fits in the smallest `hostMem` a conforming title can supply. If it ever
     /// stops fitting, that is a decision to make deliberately, not to discover on a title.
     #[test]
@@ -535,6 +918,181 @@ mod tests {
         let mut mem = SliceMemory(&mut bytes);
         let mut ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
         f(&mut ctx)
+    }
+
+    /// >>> THE TWO `texture_bindings` PATHS AGREE, WHICH NO ENGINE CAN CHECK ON ITS OWN.
+    ///
+    /// It reads the sampler block by BORROWING a slice where the backing lends one and by
+    /// COPYING it where it does not - and which path a run takes is a property of the
+    /// ENGINE, not of the input. Native always lends (its guest memory is a raw pointer);
+    /// the browser never can (its guest memory is a SharedArrayBuffer that is not this
+    /// module's own linear memory). So each engine exercises exactly one path in every run
+    /// it will ever make, and a divergence between them is invisible to both.
+    ///
+    /// That is not hypothetical: the copy path used to read the block a WORD AT A TIME,
+    /// ~96 virtual calls per draw, and cost **13.7% of every browser frame** while the
+    /// desktop - which never ran it - showed the same phase at 1.55%. It answered
+    /// identically and eight times slower, silently.
+    #[test]
+    fn both_sampler_block_readers_return_the_same_bindings() {
+        use crate::{GuestMemory, SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::REG_COUNT;
+
+        /// A backing that refuses to lend, which is the browser's shape. Everything else
+        /// delegates, so the ONLY difference between the two arms is the `borrow`.
+        struct NoBorrow<'a>(SliceMemory<'a>, std::cell::Cell<usize>);
+        impl GuestMemory for NoBorrow<'_> {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+            fn read(&self, off: usize, buf: &mut [u8]) {
+                self.1.set(self.1.get() + 1);
+                self.0.read(off, buf)
+            }
+            fn write(&mut self, off: usize, bytes: &[u8]) {
+                self.0.write(off, bytes)
+            }
+            // The whole point: `None`, exactly as the browser's `SharedView` does.
+        }
+
+        // A block with bindings in a scattered set of units - including the last one, so a
+        // reader that stopped short would be caught - and unbound holes between them.
+        let mut image = vec![0u8; 4096];
+        let mut expect_units = Vec::new();
+        for (i, unit) in [0usize, 1, 5, 15].into_iter().enumerate() {
+            let at = (CONTEXT + off::TEXTURES) as usize + unit * TEXTURE_STRIDE as usize;
+            let addr = 0xd000_0000u32 + i as u32;
+            image[at..at + 4].copy_from_slice(&addr.to_le_bytes());
+            for w in 0..TEXTURE_CONTROL_WORDS as usize {
+                let v = 0x1111_0000u32 + ((i as u32) << 8) + w as u32;
+                image[at + 4 + w * 4..at + 8 + w * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            // The provenance flag, non-zero on every other binding.
+            let pv = (i % 2) as u32;
+            let po = at + 4 + TEXTURE_CONTROL_WORDS as usize * 4;
+            image[po..po + 4].copy_from_slice(&pv.to_le_bytes());
+            expect_units.push(unit as u32);
+        }
+
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+
+        let borrowed = {
+            let mut bytes = image.clone();
+            let mut mem = SliceMemory(&mut bytes);
+            let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            assert!(ctx.borrow_bytes(CONTEXT, 4).is_some(), "the lending arm must lend");
+            let mut out = Vec::new();
+            texture_bindings(&ctx, CONTEXT, &mut out);
+            out
+        };
+        let (copied, reads) = {
+            let mut bytes = image.clone();
+            let mut inner = SliceMemory(&mut bytes);
+            let mut mem = NoBorrow(inner_of(&mut inner), std::cell::Cell::new(0));
+            let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            assert!(ctx.borrow_bytes(CONTEXT, 4).is_none(), "the copying arm must not lend");
+            let mut out = Vec::new();
+            texture_bindings(&ctx, CONTEXT, &mut out);
+            let n = match &mem {
+                NoBorrow(_, c) => c.get(),
+            };
+            (out, n)
+        };
+
+        assert_eq!(
+            borrowed.iter().map(|(u, _)| *u).collect::<Vec<_>>(),
+            expect_units,
+            "the bound units themselves"
+        );
+        assert_eq!(borrowed, copied, "the borrowing and copying readers disagree");
+        // >>> AND THE COPY IS ONE READ, WHICH IS THE PROPERTY THAT ACTUALLY REGRESSED.
+        //
+        // The equality above would have passed the whole time this was slow: the per-unit
+        // path was CORRECT, it just made ~96 virtual calls per draw instead of one. A test
+        // that only checks the answer cannot see a defect that only changes the cost, and
+        // this one cost 13.7% of a browser frame for however long it stood.
+        assert!(
+            reads <= 1,
+            "the copying reader made {reads} reads of guest memory; it must take the whole \
+             sampler block in ONE, or the browser pays a virtual call per word again"
+        );
+    }
+
+    /// >>> `load` AND `streams` AGREE ACROSS THE BORROW/COPY SPLIT TOO.
+    ///
+    /// Same argument as `both_sampler_block_readers_return_the_same_bindings`, and it is
+    /// MORE load-bearing here: `load` produces the `RenderState` recorded into every draw,
+    /// and the renderer turns cull / depth / stencil / blend straight into a WebGPU pipeline
+    /// descriptor. A copy path that disagreed with the borrow path would not merely look
+    /// wrong - it could produce a pipeline the DEVICE rejects, on the engine no desktop run
+    /// ever exercises.
+    #[test]
+    fn load_and_streams_agree_across_the_borrow_and_copy_paths() {
+        use crate::{GuestMemory, SliceMemory, VFP_ARG_COUNT};
+        use vitaslop_transpiler::abi::REG_COUNT;
+
+        struct NoBorrow<'a>(SliceMemory<'a>, std::cell::Cell<usize>);
+        impl GuestMemory for NoBorrow<'_> {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+            fn read(&self, off: usize, buf: &mut [u8]) {
+                self.1.set(self.1.get() + 1);
+                self.0.read(off, buf)
+            }
+            fn write(&mut self, off: usize, bytes: &[u8]) {
+                self.0.write(off, bytes)
+            }
+        }
+
+        // A DISTINCT value in every word of the block, so two fields that swapped offsets
+        // cannot cancel out and a reader that stopped short is caught.
+        let mut image = vec![0u8; 8192];
+        for w in 0..(BYTES as usize / 4) {
+            let at = CONTEXT as usize + w * 4;
+            let v = 0x4000_0000u32 + w as u32;
+            image[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+
+        let (rs_borrow, st_borrow) = {
+            let mut bytes = image.clone();
+            let mut mem = SliceMemory(&mut bytes);
+            let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            assert!(ctx.borrow_bytes(CONTEXT, 4).is_some(), "the lending arm must lend");
+            (load(&ctx, CONTEXT), streams(&ctx, CONTEXT))
+        };
+        let (rs_copy, st_copy, reads) = {
+            let mut bytes = image.clone();
+            let mut inner = SliceMemory(&mut bytes);
+            let mut mem = NoBorrow(inner_of(&mut inner), std::cell::Cell::new(0));
+            let ctx = GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            assert!(ctx.borrow_bytes(CONTEXT, 4).is_none(), "the copying arm must not lend");
+            let rs = load(&ctx, CONTEXT);
+            let st = streams(&ctx, CONTEXT);
+            let n = match &mem {
+                NoBorrow(_, c) => c.get(),
+            };
+            (rs, st, n)
+        };
+
+        assert_eq!(rs_borrow, rs_copy, "load disagrees across the borrow/copy split");
+        assert_eq!(st_borrow, st_copy, "streams disagrees across the borrow/copy split");
+        // One read for `load`, one for `streams` - the cost property, which an
+        // equality-only test cannot see (the per-word path was correct, just 57x the calls).
+        assert!(
+            reads <= 2,
+            "the copying path made {reads} reads; `load` and `streams` must take ONE each"
+        );
+    }
+
+    /// Re-wrap a `SliceMemory`'s buffer, so the no-borrow arm can hold one by value without
+    /// the test needing two separate buffers to keep the borrow checker happy.
+    fn inner_of<'a>(m: &'a mut crate::SliceMemory<'_>) -> crate::SliceMemory<'a> {
+        crate::SliceMemory(m.0)
     }
 
     /// Every field survives a write and a read back, with a DISTINCT value each, so a pair

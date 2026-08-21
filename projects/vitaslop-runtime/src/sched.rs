@@ -303,6 +303,26 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     engine: E,
     host: Arc<Mutex<H>>,
     threads: Vec<Slot<E::Thread>>,
+    /// Wakes that arrived for a thread which was not blocked YET.
+    ///
+    /// # The lost wakeup this exists to stop
+    /// A wake is applied by matching a thread id against the threads currently in
+    /// [`ThreadState::Blocked`]. A wake for a thread in any other state used to be dropped
+    /// on the floor - and there is a real ordering in which that happens every time: a host
+    /// call parks the caller (`pace_flip` registers a sleep waiter with a deadline that has
+    /// ALREADY passed, because the guest is late), the expiry runs and pushes the wake while
+    /// the thread is still RUNNABLE, the wake is discarded, and only then does the scheduler
+    /// mark the thread blocked. Nothing is left to wake it.
+    ///
+    /// MEASURED: a retail headless run ends at frame 1 with eight "blocked" threads, and
+    /// the eighth is its `Graphics::RenderThread`, parked on nothing - no semaphore, no
+    /// lwcond, no sleep waiter. It was written up in the notes as a frame-clock trap and
+    /// worked around with a knob for several sessions.
+    ///
+    /// So a wake with nobody to deliver it to is REMEMBERED, and the next block by that
+    /// thread consumes the token instead of parking. That is the same contract a condition
+    /// variable's wakeup token has, and for the same reason.
+    wake_tokens: std::collections::HashSet<i32>,
     /// Round-robin cursor: the index after the last thread resumed.
     cursor: usize,
     /// Frame boundaries (display flips) observed so far.
@@ -321,6 +341,21 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     fuel_total: u64,
     fuel_samples: u64,
     fuel_max: u64,
+    /// Total GUEST ARM INSTRUCTIONS retired, summed over every charged suspension - see
+    /// [`SchedCore::arm_report`]. This is the numerator of the only ABSOLUTE throughput
+    /// number the project has: retired instructions divided by wall time is our effective
+    /// guest MIPS, which a relative operator-count A/B can never produce.
+    arm_total: u64,
+    /// Suspensions the clock was NOT charged for, split by why: the engine reported no fuel
+    /// counter at all, or it reported that the resume did no work.
+    ///
+    /// A suspension that bills nothing is invisible in every total - it does not move the
+    /// clock, and it does not even count as a SAMPLE - so a thread suspending thousands of
+    /// times for nothing looks exactly like a quiet frame from the outside. It is not: each
+    /// one is a full JSPI suspend and resume, and on the browser that is the most expensive
+    /// thing a scheduler round can do.
+    fuel_unreported: u64,
+    fuel_idle: u64,
 }
 
 impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
@@ -328,6 +363,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// clones ride into each thread), so pass the same `Arc` the engine was built with.
     pub fn new(engine: E, host: Arc<Mutex<H>>, main: E::Thread) -> Self {
         let mut core = SchedCore {
+            wake_tokens: std::collections::HashSet::new(),
             engine,
             host,
             threads: vec![Slot::new(main, ThreadState::Runnable)],
@@ -337,6 +373,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             fuel_total: 0,
             fuel_samples: 0,
             fuel_max: 0,
+            arm_total: 0,
+            fuel_unreported: 0,
+            fuel_idle: 0,
         };
         // If this build inlined any host-mirror read, the host must actually be filling
         // the block. Check it once, here, while the failure is still one line from its
@@ -365,11 +404,50 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         let Some(base) = self.engine.mirror_base() else {
             return 0;
         };
-        // Split borrows: the engine writes memory, the host supplies the values.
-        let engine = &mut self.engine;
-        self.host.lock().unwrap().refresh_mirror(&mut |slot, value| {
-            engine.write_mem(base.wrapping_add(slot * 4), &value.to_le_bytes());
-        })
+        // >>> GATHER, THEN WRITE ONCE. This runs before EVERY resume, and a resume is the
+        // scheduler's unit of work - MEASURED at 544-789 rounds a frame on one title.
+        //
+        // Writing the slots one at a time was one `write_mem` per slot, and on the browser
+        // a `write_mem` is TWO JS calls (`subarray` to make a view, then `copy_from`) plus
+        // a dirty stamp. Six slots by ~700 rounds is about 8,400 boundary crossings a frame
+        // to move twenty-four bytes. The bytes were never the cost; the calls were - the
+        // same thing that made `texture_bindings` 13.7% of a browser frame.
+        //
+        // The block is contiguous from slot 0 by construction (`vita::mirror::snapshot`
+        // fills every slot), so the gathered bytes are one range. A host that ever writes a
+        // SPARSE set falls back to per-slot writes rather than having the gaps clobbered
+        // with zeros - that would be a silent wrong answer, and this is a cache the guest
+        // reads as truth.
+        const CAP_SLOTS: usize = 64;
+        let mut buf = [0u8; CAP_SLOTS * 4];
+        let mut seen = [false; CAP_SLOTS];
+        let mut top = 0usize;
+        let mut overflow: Vec<(u32, u32)> = Vec::new();
+        let written = self.host.lock().unwrap().refresh_mirror(&mut |slot, value| {
+            let s = slot as usize;
+            if s < CAP_SLOTS {
+                buf[s * 4..s * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                seen[s] = true;
+                top = top.max(s + 1);
+            } else {
+                // A block this big means the "only values that cannot change while guest
+                // code runs" rule was abandoned; carry it correctly and let the size show.
+                overflow.push((slot, value));
+            }
+        });
+        if seen[..top].iter().all(|&s| s) {
+            self.engine.write_mem(base, &buf[..top * 4]);
+        } else {
+            for (s, _) in seen[..top].iter().enumerate().filter(|(_, set)| **set) {
+                let at = s * 4;
+                self.engine
+                    .write_mem(base.wrapping_add(s as u32 * 4), &buf[at..at + 4]);
+            }
+        }
+        for (slot, value) in overflow {
+            self.engine.write_mem(base.wrapping_add(slot * 4), &value.to_le_bytes());
+        }
+        written
     }
 
     /// Borrow the engine (e.g. to read guest memory or the shared host after a run).
@@ -504,6 +582,79 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         &mut self.threads[idx].thread
     }
 
+    /// `VITASLOP_SCHED_CORES=<n>`: cap the baton to the top `n` runnable PRIORITIES, as the
+    /// console's core count would. `None` (the default) keeps the current discipline.
+    ///
+    /// A DIAGNOSTIC, deliberately not a default - see the knob's entry in
+    /// `vitaslop_platform::knobs::OVERRIDABLE` for the livelock it can cause. Read once.
+    fn sched_cores() -> Option<usize> {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Option<usize>> = OnceLock::new();
+        *CELL.get_or_init(|| {
+            vitaslop_platform::knobs::var("VITASLOP_SCHED_CORES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        })
+    }
+
+    /// `VITASLOP_SCHED_RR=1`: round-robin every runnable thread, ignoring priority. A
+    /// DIAGNOSTIC for the ordering question only - see the use site in [`Self::pick_next`].
+    fn sched_rr() -> bool {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<bool> = OnceLock::new();
+        *CELL.get_or_init(|| {
+            vitaslop_platform::knobs::var("VITASLOP_SCHED_RR").is_ok_and(|s| s.trim() == "1")
+        })
+    }
+
+    /// `VITASLOP_SCHED_TRACE=<from>-<to>` (display frames, inclusive): print one line per
+    /// scheduling transition inside that window - every pick, every block WITH WHAT IT IS
+    /// WAITING ON, every wake, and every idle clock jump, each stamped with the frame and
+    /// the virtual clock.
+    ///
+    /// # Why the scheduler needs its own timeline
+    /// A guest-side block trace answers "in what order did these functions run". It cannot
+    /// answer WHY that was the order, and for a defect that turns on two threads' relative
+    /// progress inside one frame, the why is the whole question: a thread that runs late
+    /// because it was descheduled and a thread that runs late because it was parked on a
+    /// semaphore until another thread signalled it are the same picture from the guest's
+    /// side and different bugs. Reconstructing this by A/B-ing scheduler policies costs a
+    /// three-minute run per guess and confounds every guess with the timing it perturbs.
+    fn sched_trace_window() -> &'static Option<(u64, u64)> {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let s = vitaslop_platform::knobs::var("VITASLOP_SCHED_TRACE").ok()?;
+            let (from, to) = s.split_once('-').unwrap_or_else(|| {
+                panic!("VITASLOP_SCHED_TRACE: {s:?} is not <from>-<to> (decimal frames)")
+            });
+            match (from.trim().parse::<u64>(), to.trim().parse::<u64>()) {
+                (Ok(from), Ok(to)) if from <= to => Some((from, to)),
+                _ => panic!("VITASLOP_SCHED_TRACE: {s:?} is not a valid frame window"),
+            }
+        })
+    }
+
+    /// Emit one [`sched_trace_window`] line, if the run is inside the window.
+    fn sched_trace(&self, what: &str) {
+        let Some((from, to)) = *Self::sched_trace_window() else { return };
+        if self.frames < from || self.frames > to {
+            return;
+        }
+        let now = self.host.lock().unwrap().clock_us();
+        eprintln!("[sched] frame={} us={now} {what}", self.frames);
+    }
+
+    /// Is the scheduler timeline live right now? Lets a caller skip building a line's
+    /// text (which locks the host) when nothing would print it.
+    fn sched_trace_on(&self) -> bool {
+        match *Self::sched_trace_window() {
+            Some((from, to)) => self.frames >= from && self.frames <= to,
+            None => false,
+        }
+    }
+
     /// The next thread to run, advancing the round-robin cursor past it: the
     /// highest-priority runnable thread (lowest priority number), round-robin among
     /// threads sharing that priority. This is the real SceKernel discipline - a strict
@@ -517,19 +668,78 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // the cooldowns and start a fresh round. This keeps strict priority for the
         // normal case (cooperative threads never cool) while guaranteeing every runnable
         // thread makes progress, the way separate cores do on real hardware.
-        if !self.threads.iter().any(|t| t.state == ThreadState::Runnable && !t.cooled) {
+        let n = self.threads.len();
+        // DIAGNOSTIC (`VITASLOP_SCHED_CORES=<n>`): the cooldown below eventually admits EVERY
+        // runnable thread regardless of priority, so a low-priority thread can hold the baton in
+        // a quantum the hardware would never have given it - measured at 13.2% of quanta with
+        // more than three runnable threads on one title. This cap answers "does a bug depend on
+        // that". Unset, it costs nothing and changes nothing.
+        //
+        // **The cap is on THREADS, not on priority LEVELS**, and getting that wrong wastes a
+        // whole experiment: a three-core console runs three THREADS at once, while capping
+        // distinct priorities is no restriction at all when several threads share one. This
+        // title has FOUR threads at `0xa0`, and a priority-level cap reproduced the uncapped
+        // schedule to the digit - 483,268 resumes and identical per-thread picks.
+        //
+        // Ties are broken by the round-robin cursor, so which of several equal-priority threads
+        // is the one left out ROTATES, rather than one being starved for the whole run.
+        let admitted: Option<Vec<usize>> = Self::sched_cores().map(|cores| {
+            let mut order: Vec<usize> = (0..n)
+                .map(|k| (self.cursor + k) % n)
+                .filter(|&i| self.threads[i].state == ThreadState::Runnable)
+                .collect();
+            order.sort_by_key(|&i| self.threads[i].thread.priority());
+            order.truncate(cores);
+            order
+        });
+        // The cooldown clear has to look at the ADMITTED set, not at every runnable thread: a
+        // capped-out thread that is uncooled would otherwise hold the clear off for ever, and
+        // every admitted thread being cooled would then leave nothing pickable at all.
+        let admitted_uncooled = (0..n).any(|i| {
+            self.threads[i].state == ThreadState::Runnable
+                && !self.threads[i].cooled
+                && admitted.as_ref().is_none_or(|a| a.contains(&i))
+        });
+        if !admitted_uncooled {
             for t in self.threads.iter_mut() {
                 t.cooled = false;
             }
         }
-        let n = self.threads.len();
-        let runnable = |t: &Slot<E::Thread>| t.state == ThreadState::Runnable && !t.cooled;
-        let best = self.threads.iter().filter(|t| runnable(t)).map(|t| t.thread.priority()).min()?;
-        let idx = (0..n)
-            .map(|k| (self.cursor + k) % n)
-            .find(|&i| runnable(&self.threads[i]) && self.threads[i].thread.priority() == best)?;
+        let runnable = |i: usize, t: &Slot<E::Thread>| {
+            t.state == ThreadState::Runnable
+                && !t.cooled
+                && admitted.as_ref().is_none_or(|a| a.contains(&i))
+        };
+        // EXPERIMENT (`VITASLOP_SCHED_RR=1`): ignore priority entirely and round-robin every
+        // runnable thread. Not a model of anything - it exists to answer whether a defect
+        // depends on strict priority placing a whole frame of the top thread's work ahead of
+        // the first instruction of a lower-priority thread woken by the SAME event.
+        let best = if Self::sched_rr() {
+            (0..n).filter(|&i| runnable(i, &self.threads[i])).map(|i| self.threads[i].thread.priority()).min()?;
+            i32::MIN
+        } else {
+            (0..n)
+                .filter(|&i| runnable(i, &self.threads[i]))
+                .map(|i| self.threads[i].thread.priority())
+                .min()?
+        };
+        let idx = (0..n).map(|k| (self.cursor + k) % n).find(|&i| {
+            runnable(i, &self.threads[i])
+                && (best == i32::MIN || self.threads[i].thread.priority() == best)
+        })?;
         self.cursor = idx + 1;
         self.threads[idx].picks += 1;
+        if self.sched_trace_on() {
+            let runnable_now: Vec<i32> = (0..n)
+                .filter(|&i| self.threads[i].state == ThreadState::Runnable)
+                .map(|i| self.threads[i].thread.thid())
+                .collect();
+            self.sched_trace(&format!(
+                "PICK t{:#x} prio={:#x} (runnable {runnable_now:x?})",
+                self.threads[idx].thread.thid(),
+                self.threads[idx].thread.priority()
+            ));
+        }
         // The host's idea of the current thread is now a PROPERTY OF THE PICK, not of the
         // next dispatch. It is mirrored into guest memory below, for the inlined
         // lightweight-mutex take, and a resumed thread must read its own id from the first
@@ -540,7 +750,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // is the one place both schedulers (native and browser) pass through on their
         // way to a resume, which is why the refresh lives here rather than in either
         // loop - a resume path that skipped it would serve a stale clock.
-        self.refresh_mirror();
+        {
+            let _m = crate::perf::scope(crate::perf::Phase::SchedMirror);
+            self.refresh_mirror();
+        }
         Some(idx)
     }
 
@@ -559,7 +772,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.charge_guest_work(idx);
         match stop {
             Stop::Blocked => {
-                self.threads[idx].state = ThreadState::Blocked;
+                self.block_or_consume_token(idx);
                 None
             }
             Stop::Flip => {
@@ -572,11 +785,14 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // The park may be zero (the guest is already late), in which case the
                 // sleep waiter fires on the next scheduler pass and this costs one
                 // reschedule - which is also what hardware does at a frame boundary.
-                self.threads[idx].state = ThreadState::Blocked;
+                self.block_or_consume_token(idx);
                 // Count the frame and advance any frame-keyed input (a scripted TAS
                 // recipe) in lockstep with the render loop.
                 self.frames += 1;
-                self.host.lock().unwrap().on_frame_boundary(self.frames);
+                {
+                    let _f = crate::perf::scope(crate::perf::Phase::FrameBoundary);
+                    self.host.lock().unwrap().on_frame_boundary(self.frames);
+                }
                 // Let the engine arm anything keyed to a frame (see
                 // [`GuestEngine::on_frame`]); a no-op in an ordinary build.
                 self.engine.on_frame(self.frames);
@@ -617,7 +833,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// thread could run on hardware, so it is not consulted; the thread that just stopped is
     /// still counted, since it was running.
     fn charge_guest_work(&mut self, idx: usize) {
-        let Some(total) = self.threads[idx].thread.fuel_used() else { return };
+        let Some(total) = self.threads[idx].thread.fuel_used() else {
+            self.fuel_unreported += 1;
+            return;
+        };
         // Saturating, not wrapping: an engine that reports a cumulative counter which ever
         // goes backwards is one whose accounting is wrong, and a huge bogus charge would
         // jump the game clock by hours rather than showing up as a small drift.
@@ -635,6 +854,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             None => None,
         };
         if burned == 0 && retired.unwrap_or(0) == 0 {
+            self.fuel_idle += 1;
             return;
         }
         let runnable = self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
@@ -650,6 +870,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.fuel_total = self.fuel_total.saturating_add(burned);
         self.fuel_samples += 1;
         self.fuel_max = self.fuel_max.max(burned);
+        self.arm_total = self.arm_total.saturating_add(retired.unwrap_or(0));
         self.host.lock().unwrap().on_guest_work(runnable, burned, retired);
     }
 
@@ -661,6 +882,19 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// surprising timing is already in front of them.
     pub fn fuel_report(&self) -> (u64, u64, u64) {
         (self.fuel_total, self.fuel_samples, self.fuel_max)
+    }
+
+    /// Total GUEST ARM INSTRUCTIONS retired so far, or 0 from an engine with no such
+    /// counter. Cumulative, so a caller measuring a window differences it.
+    pub fn arm_report(&self) -> u64 {
+        self.arm_total
+    }
+
+    /// `(suspensions the engine reported no fuel for, suspensions that did no work)` - the two
+    /// ways a scheduler round can cost a full suspend and bill the clock nothing. See the
+    /// fields for why a silent one is worse than a slow one.
+    pub fn unbilled_report(&self) -> (u64, u64) {
+        (self.fuel_unreported, self.fuel_idle)
     }
 
     /// A resumed thread (thread `idx`) finished with `end`; returns `Some(report)` if
@@ -730,6 +964,27 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// and wake what expires - how a frame-pacing / timed condition wait makes progress
     /// without a real signaller. Only purely infinite waits with no timer deadlock.
     pub fn handle_idle(&mut self) -> IdleStep {
+        // >>> DELIVER WHAT IS ALREADY OWED BEFORE CONCLUDING NOTHING CAN RUN.
+        //
+        // A wake is produced by the host (a timer expiring, a signal, an I/O completion)
+        // and APPLIED by `drain`. Those are separate steps, and a wake produced after the
+        // last drain sits in the host's pending list until the next one. Reaching this
+        // function without draining therefore asks "is anything runnable?" while holding
+        // the very wake that would make something runnable - and answering "no" to that is
+        // a deadlock report for a run that was fine.
+        //
+        // MEASURED on a retail title, which stops at frame 1 and has been written up as a
+        // frame-clock trap for several sessions. The order is exactly:
+        //   PARK thid=0x11a us=714      (pace_flip parks the render thread)
+        //   PARK-EXPIRE thid=0x11a      (the deadline passes; a wake is pushed)
+        //   BLOCK thid=0x11a            (only NOW is the thread marked blocked)
+        //   ...deadlock, with that wake still undelivered.
+        // The thread is parked on nothing, no timer names it, and the run ends one frame
+        // into a title that was about to render its title screen.
+        self.drain();
+        if self.threads.iter().any(|t| t.state == ThreadState::Runnable) {
+            return IdleStep::Continue;
+        }
         let blocked: Vec<i32> = self
             .threads
             .iter()
@@ -739,18 +994,36 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         if blocked.is_empty() {
             return IdleStep::Done(RunReport::Finished(self.main_exit_code()));
         }
-        let deadline = self.host.lock().unwrap().earliest_deadline();
-        // An outstanding storage transfer comes FIRST, before any timed wait. Nothing is
-        // runnable, so the modelled device is the only thing left with work to do, and
-        // completing it is the next thing that happens - no game time passes while it
-        // does. Jumping the clock to a pending timeout instead is wrong twice over: it
-        // makes a thread waiting on a zero-length delay spin forever without the clock
-        // moving (the livelock that kept the I/O model switched off), and, worse, when the
-        // nearest timeout is far away it LEAPS the game clock over a load. A title that
-        // paces its simulation off the wall clock but caps how far it will step per frame
-        // then runs its clock fast and its world slow - which showed up as a car crawling
-        // at 16 mph while its race timer counted five times too quickly.
-        if self.host.lock().unwrap().release_earliest_io() {
+        let (deadline, io_remaining, now) = {
+            let h = self.host.lock().unwrap();
+            (h.earliest_deadline(), h.earliest_io_remaining_us(), h.clock_us())
+        };
+        // >>> AN OUTSTANDING TRANSFER AND A PENDING TIMED WAIT ARE HONOURED IN TIME ORDER.
+        //
+        // Both are things that complete on their own while no guest code runs, and both
+        // are counted in microseconds at the same rate - one display frame of game time
+        // buys one display frame of storage time - so the next thing that happens is
+        // simply whichever of the two is nearer.
+        //
+        // The rule used to be "the transfer comes FIRST, before any timed wait", on the
+        // reasoning that nothing the guest can observe is lost because no guest code can
+        // run until something completes. What that misses is the DISPLAY: the render
+        // thread's vblank wait is a timed wait, so a transfer always beat the next flip
+        // however large it was modelled to be, and the storage clock only advances on
+        // flips and quanta - so its size bought nothing. A 250x bandwidth sweep on a
+        // retail racer's course load moved the modelled cost of the read and left the
+        // frame it landed on unchanged to the digit, which is the measurement that says
+        // the model was not reaching the guest at all.
+        //
+        // The two hazards the old ordering was written against both survive this: a
+        // zero-length poll cannot livelock the storage clock, because a spinning thread is
+        // charged through `charge_io_quantum` and an idle jump now through
+        // `charge_io_idle` - the clock the original livelock had no sources for at all;
+        // and the game clock can no longer LEAP over a load, because a far-away timeout
+        // does not win against a nearer transfer.
+        if storage_completes_first(io_remaining, deadline, now)
+            && self.host.lock().unwrap().release_earliest_io()
+        {
             self.drain();
             return IdleStep::Continue;
         }
@@ -775,11 +1048,60 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                         );
                     }
                 }
-                self.host.lock().unwrap().advance_time_to(t);
+                if self.sched_trace_on() {
+                    let now = self.host.lock().unwrap().clock_us();
+                    self.sched_trace(&format!("IDLE-JUMP to {t} (+{}us)", t.saturating_sub(now)));
+                }
+                {
+                    let mut h = self.host.lock().unwrap();
+                    // The device was reading across this idle interval too. Without this
+                    // the storage clock advances only on flips and quanta, so a title
+                    // waiting on a load - which is idle by definition - never pays the
+                    // transfer down and the model's own units stop meaning anything.
+                    h.charge_io_idle(t.saturating_sub(now));
+                    h.advance_time_to(t);
+                }
                 self.drain();
                 IdleStep::Continue
             }
-            None => IdleStep::Done(RunReport::Deadlock(blocked)),
+            None => {
+                // >>> A DEADLOCK IS THE ONE MOMENT THE WAIT STATE IS THE WHOLE ANSWER, and
+                // it used to be the one moment nothing printed it. `Deadlock([..])` names the
+                // blocked THREADS and not what any of them is waiting ON, so the report is a
+                // list of numbers - and a run that stops this way looks, from the outside,
+                // exactly like a clock pathology. MEASURED cost: a retail headless run
+                // has stopped at frame 1 for several sessions, was written up in the notes as a
+                // frame-clock trap, and was worked around with `VITASLOP_FRAME_TOPUP=0` rather
+                // than diagnosed. It is a deadlock of eight threads.
+                //
+                // `debug_sync_dump` already builds exactly the right text and was only ever
+                // reachable from a debugger command and a browser stall path.
+                // Split the blocked threads by whether the host is actually waiting on
+                // them. A thread with NO wait record cannot be woken by anything - that is
+                // a lost wakeup in this emulator, not a guest deadlock, and calling it a
+                // deadlock has sent several sessions looking at the guest's locking.
+                let (dump, orphans) = {
+                    let h = self.host.lock().unwrap();
+                    let orphans: Vec<i32> =
+                        blocked.iter().copied().filter(|&t| !h.thread_has_wait_record(t)).collect();
+                    (h.sync_dump(), orphans)
+                };
+                if orphans.is_empty() {
+                    eprintln!(
+                        "DEADLOCK: {} thread(s) blocked with no timeout and no pending I/O,                          so nothing can wake them: {blocked:?}
+{dump}",
+                        blocked.len()
+                    );
+                } else {
+                    eprintln!(
+                        "LOST WAKEUP (reported as a deadlock): {} of {} blocked thread(s) have                          NO wait record in the host - nothing is waiting on them, so no signal,                          timeout or I/O completion can ever name them. This is an emulator bug,                          not a guest deadlock. Orphaned: {orphans:x?}; all blocked:                          {blocked:?}
+{dump}",
+                        orphans.len(),
+                        blocked.len()
+                    );
+                }
+                IdleStep::Done(RunReport::Deadlock(blocked))
+            }
         }
     }
 
@@ -807,23 +1129,65 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 self.engine.spawn(&sp)
             });
             match spawned {
-                Ok(thread) => self.threads.push(Slot::new(thread, ThreadState::Runnable)),
+                Ok(thread) => {
+                    self.sched_trace(&format!(
+                        "SPAWN t{:#x} prio={:#x} entry={:#010x}",
+                        thread.thid(),
+                        thread.priority(),
+                        sp.entry
+                    ));
+                    self.threads.push(Slot::new(thread, ThreadState::Runnable))
+                }
                 // A spawn whose entry was not translated: record it as finished with
                 // code 0 so a later join does not hang.
                 Err(()) => self.host.lock().unwrap().set_thread_exit(sp.thid, 0),
             }
         }
         for thid in wakes {
-            if let Some(t) = self
+            match self
                 .threads
                 .iter_mut()
                 .find(|t| t.thread.thid() == thid && t.state == ThreadState::Blocked)
             {
-                t.state = ThreadState::Runnable;
-                // A freshly woken thread is immediately eligible: it did cooperative
-                // work (it blocked), so it must not inherit a stale spin cooldown.
-                t.cooled = false;
+                Some(t) => {
+                    t.state = ThreadState::Runnable;
+                    // A freshly woken thread is immediately eligible: it did cooperative
+                    // work (it blocked), so it must not inherit a stale spin cooldown.
+                    t.cooled = false;
+                    let prio = t.thread.priority();
+                    self.sched_trace(&format!("WAKE  t{thid:#x} prio={prio:#x}"));
+                }
+                // Not blocked yet - the wake raced ahead of the block. Keep it; the block
+                // that follows will consume it instead of parking. See `wake_tokens`.
+                None => {
+                    if self.threads.iter().any(|t| {
+                        t.thread.thid() == thid && !matches!(t.state, ThreadState::Finished(_))
+                    }) {
+                        self.wake_tokens.insert(thid);
+                    }
+                }
             }
+        }
+    }
+
+    /// Park thread `idx`, UNLESS a wake for it already arrived while it was still
+    /// runnable - in which case consume that token and leave it eligible.
+    ///
+    /// Blocking on a wait that has already been satisfied is the lost wakeup this whole
+    /// mechanism exists to prevent; see [`SchedCore::wake_tokens`] for the ordering that
+    /// produces it and the run it stopped dead.
+    fn block_or_consume_token(&mut self, idx: usize) {
+        let thid = self.threads[idx].thread.thid();
+        if self.wake_tokens.remove(&thid) {
+            self.threads[idx].state = ThreadState::Runnable;
+            self.threads[idx].cooled = false;
+            self.sched_trace(&format!("BLOCK t{thid:#x} SKIPPED (wake token already owed)"));
+            return;
+        }
+        self.threads[idx].state = ThreadState::Blocked;
+        if self.sched_trace_on() {
+            let why = self.host.lock().unwrap().thread_wait_reason(thid);
+            self.sched_trace(&format!("BLOCK t{thid:#x} on {why}"));
         }
     }
 
@@ -919,6 +1283,11 @@ where
         self.core.fuel_report()
     }
 
+    /// Cumulative retired guest ARM instructions - see [`SchedCore::arm_report`].
+    pub fn arm_report(&self) -> u64 {
+        self.core.arm_report()
+    }
+
     /// Run cooperatively until the process halts, every thread finishes, or the run
     /// deadlocks / errors. Returns the verdict.
     pub fn run(&mut self) -> RunReport {
@@ -961,5 +1330,85 @@ where
             self.core.drain();
             drop(drain);
         }
+    }
+}
+
+/// Whether the modelled storage device completes its earliest outstanding transfer
+/// BEFORE the next timed wait expires, given the game clock reads `now_us`.
+///
+/// Both quantities are microseconds and both advance at the same rate through an idle
+/// interval, so this is a plain comparison of what happens next. It is a free function
+/// so the rule can be tested without a scheduler: it is the whole of the ordering that a
+/// retail racer's course load depends on, and it used to be the constant `true`.
+///
+/// A deadline that has already passed expired before any transfer can complete, so it
+/// goes first. That cannot starve the device: a woken poller burning its quantum charges
+/// the storage clock, as does the idle jump itself.
+fn storage_completes_first(
+    io_remaining_us: Option<u64>,
+    next_deadline_us: Option<u64>,
+    now_us: u64,
+) -> bool {
+    match (io_remaining_us, next_deadline_us) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(io), Some(t)) => io <= t.saturating_sub(now_us),
+    }
+}
+
+#[cfg(test)]
+mod idle_order_tests {
+    use super::storage_completes_first;
+
+    const FRAME_US: u64 = 1_000_000 / 60;
+
+    #[test]
+    fn nothing_in_flight_never_takes_the_storage_branch() {
+        assert!(!storage_completes_first(None, Some(1_000), 0));
+        assert!(!storage_completes_first(None, None, 0));
+    }
+
+    #[test]
+    fn a_transfer_with_no_timed_wait_against_it_completes() {
+        assert!(storage_completes_first(Some(40_000), None, 0));
+    }
+
+    #[test]
+    fn the_vblank_beats_a_transfer_that_is_worth_more_than_a_frame() {
+        // The defect this exists to prevent: a 2 MB read modelled at ~38 ms used to
+        // complete ahead of a vblank 3 ms away, so it cost the guest no display frames
+        // at all and its modelled size meant nothing.
+        assert!(!storage_completes_first(Some(38_286), Some(3_000), 0));
+        // One frame of it paid down still leaves more than a frame owed, so the next
+        // vblank goes first again; after two, what is left fits inside a frame and the
+        // transfer completes. That is 2 MB costing three display frames, which is the
+        // whole point of modelling it.
+        assert!(!storage_completes_first(Some(38_286 - FRAME_US), Some(FRAME_US), 0));
+        assert!(storage_completes_first(Some(38_286 - 2 * FRAME_US), Some(FRAME_US), 0));
+    }
+
+    #[test]
+    fn a_short_transfer_beats_a_distant_timeout() {
+        // The other half of the rule, and the reason the game clock cannot LEAP a load:
+        // a timeout a second away does not get to run before a 200 us read completes.
+        assert!(storage_completes_first(Some(200), Some(1_000_000), 0));
+    }
+
+    #[test]
+    fn an_already_expired_deadline_runs_before_any_transfer() {
+        // A zero-length poll re-armed every iteration names a deadline behind the clock.
+        // It expired before the transfer will complete, so it goes first - and that
+        // cannot starve the device the way it once could, because the woken thread
+        // burning its quantum charges the storage clock (`charge_io_quantum`) and an idle
+        // jump charges it too (`charge_io_idle`). The livelock this ordering was
+        // originally written against was a storage clock with no such sources at all.
+        assert!(!storage_completes_first(Some(5_000), Some(100), 200));
+    }
+
+    #[test]
+    fn the_comparison_is_against_the_clock_now_not_the_raw_deadline() {
+        // 5 ms of transfer left against a deadline 1 ms away: the deadline is at
+        // 101_000 on a clock reading 100_000, so the transfer must NOT win.
+        assert!(!storage_completes_first(Some(5_000), Some(101_000), 100_000));
     }
 }

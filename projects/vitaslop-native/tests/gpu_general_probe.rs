@@ -263,7 +263,8 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut v, 48.0, 48.0, 1.0, 1.0, white);
         pixel_vertex(&mut v, 16.0, 48.0, 0.0, 1.0, white);
         let scene = Scene {
-            color: None,
+            precompile: Default::default(),
+color: None,
             depth: None,
             multisample: 0,
             draws: vec![quad(v, pixel_attrs(), vec![solid_texture(4, [220, 40, 40, 255])])],
@@ -320,7 +321,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
-        assert_parity(&mut gpu, &Scene { color: None, depth: None, multisample: 0, draws: vec![draw] }, "ndc-vertexcolor");
+        assert_parity(&mut gpu, &Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] }, "ndc-vertexcolor");
     }
 
     // 3. Alpha blend in submission order: an opaque red quad, then a half-alpha blue
@@ -339,7 +340,8 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut front, 56.0, 56.0, 0.0, 0.0, blue_half);
         pixel_vertex(&mut front, 24.0, 56.0, 0.0, 0.0, blue_half);
         let scene = Scene {
-            color: None,
+            precompile: Default::default(),
+color: None,
             depth: None,
             multisample: 0,
             draws: vec![
@@ -362,7 +364,7 @@ fn general_renderer_matches_software_oracle() {
         // = 0.501 -> ~128. This pins the exposure/tonemap curve independent of lighting.
         let dark = solid_texture(4, [64, 64, 64, 255]);
         let draw = mvp_quad([255, 0, 0, 255], vec![dark], 4.0, false, flat_material());
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-exposure");
         let c = center(&sw);
         assert!(c[0] > 100 && c[0] < 155, "exposed dark albedo should be ~mid-grey, got {c:?}");
@@ -387,7 +389,7 @@ fn general_renderer_matches_software_oracle() {
             has_light: true,
         };
         let draw = mvp_quad([255, 0, 255, 255], vec![white], 1.0, false, mat);
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-lit-tint");
         let c = center(&sw);
         // albedo 1.0 * tint 0.05 * (ambient 0 + light 1 * N.L 1) = 0.05; reinhard -> ~12.
@@ -402,7 +404,7 @@ fn general_renderer_matches_software_oracle() {
     {
         let blue = solid_texture(4, [40, 40, 220, 255]);
         let draw = mvp_quad([255, 255, 255, 180], vec![blue], 1.0, true, FragmentMaterial::default());
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-depthdisabled-overlay");
         let c = center(&sw);
         // Blended, not opaque-replaced: alpha 180/255 over the dark clear keeps the blue
@@ -449,7 +451,7 @@ fn general_renderer_matches_software_oracle() {
         pixel_vertex(&mut v, 56.0, 8.0, 1.0, 0.0, white);
         pixel_vertex(&mut v, 56.0, 56.0, 1.0, 1.0, white);
         pixel_vertex(&mut v, 8.0, 56.0, 0.0, 1.0, white);
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![quad(v, pixel_attrs(), vec![tex])] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![quad(v, pixel_attrs(), vec![tex])] };
         assert_parity_tol(&mut gpu, &scene, "linear-filter", 9.0);
     }
 
@@ -500,7 +502,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] };
         let sw = assert_parity(&mut gpu, &scene, "mvp-opaque-untextured");
         let c = center(&sw);
         // R = reinhard(200/255*2) = 1.568/2.568 = 0.611 -> ~156; must be reddish (R>G>B).
@@ -550,7 +552,7 @@ fn general_renderer_matches_software_oracle() {
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
             };
-            Scene { color: None, depth: None, multisample: 0, draws: vec![draw] }
+            Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![draw] }
         };
         let a = cull_tri([0, 1, 2]);
         let b = cull_tri([0, 2, 1]);
@@ -581,7 +583,7 @@ fn general_renderer_matches_software_oracle() {
     {
         let red = mvp_quad([220, 20, 20, 255], vec![], 1.0, false, flat_material());
         let blue = mvp_quad([20, 20, 220, 255], vec![], 1.0, false, flat_material());
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![red, blue] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![red, blue] };
         let sw = assert_parity(&mut gpu, &scene, "depthfunc-lessequal");
         let c = center(&sw);
         // The winning face is blue: its dominant blue channel survives (Reinhard-compressed
@@ -631,7 +633,7 @@ fn general_renderer_supersample_matches_software() {
     }
     let sprite = quad(sprite_v, pixel_attrs(), vec![tex]);
     let backdrop = mvp_quad([60, 160, 60, 255], vec![], 1.0, false, flat_material());
-    let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![backdrop, sprite] };
+    let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![backdrop, sprite] };
 
     // Factor-1 must still be exactly the non-supersampled path (a sanity anchor).
     gpu.set_supersample(1);

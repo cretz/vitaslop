@@ -39,7 +39,15 @@ console.log("--- loaded, title:", await page.title());
 // Click through to the title the device would pick, if the page offers a picker.
 // The page lists titles as cards, each with its own recipe <select> and PLAY button, keyed
 // by TITLE_ID. Drive it the way a person does: choose the recipe, then press PLAY.
-const titleId = process.env.TITLE_ID || "PCSA00015";
+// No default: a title id names a specific commercial title, and this repo keeps those out
+// of tracked source (they live in the BYO game directories and in the recipe tree). Fail
+// loudly rather than fall back to one - a silent default is how a probe ends up driving a
+// title the caller did not ask for.
+const titleId = process.env.TITLE_ID;
+if (!titleId) {
+  console.error("probe-live: TITLE_ID is required (the id of the dump under --games)");
+  process.exit(2);
+}
 const recipe = process.env.RECIPE_NAME || "";
 await page.waitForSelector(`#p-${titleId}`, { timeout: 30000 });
 if (recipe) {

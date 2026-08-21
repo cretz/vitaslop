@@ -1397,9 +1397,63 @@ impl LivePlayback {
         // draws nothing and reports NOTHING, which is indistinguishable from a scene the
         // guest never submitted. Native's wgpu default panics on this; the browser has to
         // be told. See `vitaslop-platform`'s `report!` macro for the same lesson.
-        device.on_uncaptured_error(std::sync::Arc::new(|e| {
-            tracing::error!(target: "vitaslop::gxm", "WebGPU uncaptured error: {e}");
-        }));
+        // >>> AND IT IS INSTALLED AS A RAW JS HANDLER, NOT THROUGH `on_uncaptured_error`,
+        // BECAUSE THAT ONE PANICS AND TAKES THE WORKER WITH IT.
+        //
+        // wgpu 30's `crate::Error::from_js` maps only `GPUValidationError` and
+        // `GPUOutOfMemoryError` and ends in `panic!("Unexpected error")` for anything else -
+        // which in practice is **`GPUInternalError`**, the error a driver raises when it
+        // fails on a shader the validator already accepted. That is not hypothetical: an
+        // Android PowerVR (img-tec D-series) device raised it on a retail title and the
+        // panic killed the run worker four times over, so the ONE report that could have
+        // named the bad pair was replaced by a wgpu backtrace.
+        //
+        // Handling it in JS means the error object never reaches that converter. A
+        // `GPUInternalError` is exactly the case we most need reported - it is the device
+        // telling us the shader is beyond it - and it must not be the case that crashes.
+        match device.as_webgpu() {
+            Some(raw) => {
+                let cb = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(
+                    |ev: web_sys::Event| {
+                        // `GPUUncapturedErrorEvent.error` is a `GPUError`, whose `message` is
+                        // the device's own text. Read it reflectively: the concrete subclass
+                        // (validation / out-of-memory / internal) is what wgpu chokes on, and
+                        // naming it here is the diagnosis rather than a crash.
+                        let err = js_sys::Reflect::get(&ev, &JsValue::from_str("error")).ok();
+                        let kind = err
+                            .as_ref()
+                            .and_then(|e| js_sys::Reflect::get(e, &JsValue::from_str("constructor")).ok())
+                            .and_then(|c| js_sys::Reflect::get(&c, &JsValue::from_str("name")).ok())
+                            .and_then(|n| n.as_string())
+                            .unwrap_or_else(|| "GPUError".into());
+                        let msg = err
+                            .and_then(|e| js_sys::Reflect::get(&e, &JsValue::from_str("message")).ok())
+                            .and_then(|m| m.as_string())
+                            .unwrap_or_default();
+                        tracing::error!(
+                            target: "vitaslop::gxm",
+                            "WebGPU uncaptured error [{kind}]: {msg}"
+                        );
+                        // The message names the pipeline by its label, which is the shader-pair
+                        // key. That is the only diagnosis a phone offers - and, more urgently,
+                        // the only way to stop ONE refused pipeline invalidating every command
+                        // buffer that binds it and blanking the whole frame. See
+                        // `vitaslop_platform::gpu::note_device_error`.
+                        vitaslop_platform::gpu::note_device_error(&kind, &msg);
+                    },
+                );
+                raw.set_onuncapturederror(Some(cb.as_ref().unchecked_ref()));
+                // Leaked deliberately: it must outlive the device, and the device outlives
+                // the run. Dropping it would leave JS calling a freed closure.
+                cb.forget();
+            }
+            // Not the WebGPU backend (a native build sharing this path): fall back to
+            // wgpu's own hook, which is correct there - it is only the WEB converter that
+            // panics on an unmapped class.
+            None => device.on_uncaptured_error(std::sync::Arc::new(|e| {
+                tracing::error!(target: "vitaslop::gxm", "WebGPU uncaptured error: {e}");
+            })),
+        }
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -1844,6 +1898,19 @@ struct Prebuilt {
     mem_pages: u32,
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
+    /// Guest address of each transpiled function, in wasm function order.
+    ///
+    /// # Why this has to cross the worker boundary
+    /// The production path transpiles in a THROWAWAY worker and hands the run worker a
+    /// compiled module. The run worker therefore never sees the artifact - so it never
+    /// learns which guest function each wasm index is, and a guest fault's backtrace comes
+    /// back as bare module indices that nobody holding a phone can resolve. MEASURED: the
+    /// first device capture after the fatal box was wired showed ten frames of
+    /// `wasm-function[5362]` and nothing else, because the table was recorded in the worker
+    /// that had already been thrown away.
+    ///
+    /// It is ~88 KB for a retail title (one u32 per function), transferred once at setup.
+    func_addrs: Vec<u32>,
 }
 
 impl Prebuilt {
@@ -1877,7 +1944,13 @@ impl Prebuilt {
         } else {
             Some(dirty.as_f64().ok_or_else(|| JsValue::from_str("bad prebuilt.dirtyOff"))? as u64)
         };
-        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off }))
+        // Absent is tolerated: an older transpile worker did not send it, and a backtrace
+        // with unnamed frames is worse than one with names but not worth failing the run.
+        let func_addrs = match get("funcAddrs")? {
+            v if v.is_undefined() || v.is_null() => Vec::new(),
+            v => js_sys::Uint32Array::new(&v).to_vec(),
+        };
+        Ok(Some(Prebuilt { module, mem_pages, mirror_off, dirty_off, func_addrs }))
     }
 }
 
@@ -1888,6 +1961,8 @@ struct Transpiled {
     mirror_off: Option<u64>,
     dirty_off: Option<u64>,
     ms: f64,
+    /// Guest address of each transpiled function - see [`Prebuilt::func_addrs`].
+    func_addrs: Vec<u32>,
 }
 
 /// Transpile `linked` in THIS worker. Costs ~463 MB of heap that can never be given back
@@ -1908,6 +1983,31 @@ fn transpile_here(
     // game clock cannot tell the difference. Native does not do this either: wasmtime
     // bills every operator it executes, so the stamps would speed its clock up.
     vitaslop_transpiler::set_dirty_tracking(true);
+    // Hand the engine-agnostic runtime this engine's clock, so its per-phase timers work
+    // HERE. They are `#[cfg]`-inert on wasm without one - there is no `Instant` - which is
+    // why a browser frame could only ever report one undifferentiated number while the
+    // desktop profiler split the same code into eight phases. Gated on `VITASLOP_PERF`
+    // inside `perf`, so an ordinary run still pays nothing.
+    vitaslop_runtime::perf::set_clock(browser_sched::perf_clock);
+    // And whether to hold the ARM register file in wasm LOCALS along each straight-line
+    // run instead of on its globals (`transpiler::promote`). Routed through the override
+    // table rather than read from the environment because THIS is the engine that has to
+    // answer the question: promotion adds operators and removes none, so fuel and the
+    // expansion factor cannot see it, and V8 wall-clock on matched frames is the only
+    // instrument that can.
+    //
+    // `knobs::flag` honours `=0` as OFF - it did not always, and that cost a measurement:
+    // an A/B whose OFF arm was written `VITASLOP_PROMOTE_REGS=0` ran the PROMOTED build in
+    // both arms and reported a clean, meaningless "no difference". See `knobs::flag`.
+    vitaslop_transpiler::set_promote_registers(
+        vitaslop_runtime::knobs::flag("VITASLOP_PROMOTE_REGS"),
+    );
+    // And which carry/overflow forms `emit_flags_add` uses. Routed the same way and for the
+    // same reason: `flags-add` was 39% of every operator the transpiler emitted, the new
+    // closed forms cut the module 5.3% and executed operators 8.7%, and THREE interleaved
+    // desktop repeats put the wall-clock difference inside the noise. V8 on a phone is the
+    // engine the answer belongs to. `=1` selects the OLD 64-bit carry.
+    vitaslop_transpiler::set_flags_wide_c(vitaslop_runtime::knobs::flag("VITASLOP_FLAGS_WIDE_C"));
     let t = perf.now();
     let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
     let ms = perf.now() - t;
@@ -1930,12 +2030,30 @@ fn transpile_here(
         x.arm_instructions,
         x.emitted_ops,
     )));
+    // >>> AND WHICH BUILD THIS IS, so an A/B can never again be a build measured against
+    // itself. The register file is either on its globals or in locals, and the two are
+    // indistinguishable from every other counter a run reports - the expansion factor
+    // moves (9.87 -> 10.33 on one title) but nothing SAYS which arm produced it.
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "[setup] register promotion {} | {} accesses would become LOCAL ({:.1}% of all \
+         operators), {} left on their globals, {} operators of overhead",
+        if vitaslop_transpiler::promote_registers() { "ON" } else { "OFF" },
+        x.promotion.converted,
+        x.promotion.converted_share(x.emitted_ops),
+        x.promotion.left,
+        x.promotion.overhead,
+    )));
+    let func_addrs: Vec<u32> = built.artifact.funcs.iter().map(|f| f.addr).collect();
+    // Record it for THIS worker too: the main-thread path transpiles in place and runs the
+    // guest itself, so it needs the table without any handoff.
+    browser_sched::record_function_addresses(func_addrs.clone());
     Ok(Transpiled {
         wasm: built.artifact.wasm,
         mem_pages: built.artifact.mem_pages,
         mirror_off: built.artifact.mirror_off,
         dirty_off: built.artifact.dirty_off,
         ms,
+        func_addrs,
     })
 }
 
@@ -1956,6 +2074,13 @@ pub async fn transpile_title(source: JsValue) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
     js_sys::Reflect::set(&out, &JsValue::from_str("module"), &module)?;
     js_sys::Reflect::set(&out, &JsValue::from_str("memPages"), &JsValue::from_f64(built.mem_pages as f64))?;
+    // The wasm-index -> guest-address table, so the RUN worker can name guest functions in
+    // a fault backtrace. See `Prebuilt::func_addrs`.
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("funcAddrs"),
+        &js_sys::Uint32Array::from(&built.func_addrs[..]),
+    )?;
     js_sys::Reflect::set(
         &out,
         &JsValue::from_str("mirrorOff"),
@@ -2166,6 +2291,7 @@ async fn setup_game(
                  emulator heap {} MB",
                 wasm_heap_mb()
             )));
+            browser_sched::record_function_addresses(p.func_addrs);
             (p.module, p.mem_pages, p.mirror_off, p.dirty_off, 0.0)
         }
         None => {
@@ -2305,6 +2431,16 @@ pub async fn run_game_worker(
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
     logging::init();
+    // >>> THE PHASE CLOCK BELONGS TO THIS WORKER, AND IT WAS BEING INSTALLED IN THE WRONG ONE.
+    //
+    // `transpile_here` also calls this - and `transpile_here` normally runs in a THROWAWAY
+    // worker, so its `set_clock` died with that worker and the RUN worker never had one. On
+    // `wasm32` `perf::scope` returns `None` without a clock, so **every phase timer in the
+    // browser was silently inert**: a run with `VITASLOP_PERF=1` printed the guest-access
+    // counts (which need no clock) and an EMPTY phase table, which reads as "no phase costs
+    // anything" rather than "nothing was measured".
+    // [[vitaslop-instrument-failure-imitating-its-subject]]
+    vitaslop_runtime::perf::set_clock(browser_sched::perf_clock);
 
     let live: Arc<Mutex<InputState>> = Arc::new(Mutex::new(InputState::default()));
     // Register the shared input cell so the page's forwarded pointer/keyboard messages
@@ -2374,7 +2510,18 @@ async fn live_loop(
     //
     // `Capture::signature` refuses rather than returning a partial hash when this was off, so
     // the failure mode of getting this wrong is a loud one.
-    sched.host.lock().unwrap().state.capture.set_signature_wanted(eval.is_some());
+    //
+    // >>> AND A RECIPE IS NOT ITSELF A READER. The only consumer of the number is
+    // `RecipeEval::finish`, which uses it if and only if the recipe DECLARES `@sig`; every
+    // other recipe run folded 3 MB a frame to print a hash nothing compared. The user drives
+    // this page with a recipe selected from the menu - that is what the recipe dropdown IS -
+    // so "has a recipe" was true for every session anyone has ever measured, including every
+    // browser number in the notes. Gated on the declaration instead, with a knob to ask for it
+    // when the point of the run is to LEARN the signature and bless it into a recipe.
+    let want_sig = eval.is_some()
+        && (recipe.as_ref().and_then(|r| r.meta.sig).is_some()
+            || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
+    sched.host.lock().unwrap().state.capture.set_signature_wanted(want_sig);
     let perf = global_performance();
 
     // Real-time pacing: advance the guest at 60 Hz of WALL-CLOCK time, not as fast as
@@ -2394,6 +2541,10 @@ async fn live_loop(
     let mut cpu_frames = 0u32;
     let mut render_ms = 0.0f64;
     let mut presents = 0u32;
+    // Cumulative guest-store epoch wraps at the start of the current perf window, so the
+    // window's own count is a difference rather than a running total that only grows.
+    let mut epoch_wraps_at_window_start = 0u64;
+    let mut epoch_rebases_at_window_start = 0u64;
 
     // How long a fast-forward tick may run before returning to the event loop. Long
     // enough that the fast-forward is CPU-bound rather than paced by the tick rate
@@ -2656,10 +2807,23 @@ async fn live_loop(
                 // renderer at frame 22. `created` going flat while `reused` climbs is the
                 // only evidence that the pool is doing its job.
                 let (inst_new, _pooled, inst_reused) = browser_sched::instance_stats();
+                // The FUEL the scheduler actually billed, next to the preemption count that is
+                // supposed to be proportional to it. A preemption fires when the emitted counter
+                // reaches `fuel_interval()`, so `fuel / on_fuel` must sit near that interval;
+                // when it collapses, the preemptions are firing on a counter that is not
+                // tracking work and each one costs a full JSPI suspend for nothing. Nothing else
+                // on this line can tell "this frame did an enormous amount of guest work" apart
+                // from "this frame suspended thousands of times and did none", and those are
+                // opposite bugs.
+                let (fuel_total, fuel_samples, fuel_max) = sched.core.fuel_report();
+                let (raw_last, raw_min) = browser_sched::raw_fuel_stats();
+                let (unbilled_none, unbilled_idle) = sched.core.unbilled_report();
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[live] {status} | clock {:.2}s over {flips} flips ({quanta} quanta, \
                      {:.1} us/frame; {:.2}s quanta + {:.2}s idle) \
-                     | preempt {preempts} ({on_fuel} on fuel) | wasm heap {} MB \
+                     | preempt {preempts} ({on_fuel} on fuel) \
+                     | fuel {fuel_total} over {fuel_samples} (max {fuel_max}, \
+                     raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | wasm heap {} MB \
                      | jspi {susp} susp, {starts} stacks, {abandoned} abandoned, \
                      {released} released | instances {inst_new} new, {inst_reused} reused \
                      | threads {live_threads} live, {finished_threads} finished",
@@ -2688,6 +2852,19 @@ async fn live_loop(
                         "status",
                         &format!("frame {frames} ENDED (live via WebGPU) | {report_step:?}"),
                     );
+                    // >>> A GUEST TRAP IS A FATAL OUTCOME AND BELONGS IN THE FATAL BOX.
+                    // It is not a Rust panic, so the panic hook never sees it, and the
+                    // status line it lands on is rebuilt away by the next panel refresh.
+                    // On the device that meant a full guest fault - backtrace and all -
+                    // showed up only in the status text and had to be copied out by hand.
+                    // The wasm indices in that backtrace are named here too: on their own
+                    // they are module numbers nobody holding a phone can resolve.
+                    if let RunReport::Error(why) = &report_step {
+                        crate::logging::report_fatal(&format!(
+                            "GUEST FAULT at frame {frames} - the run is over.\n{}",
+                            browser_sched::name_guest_frames(why)
+                        ));
+                    }
                     web_sys::console::log_1(&JsValue::from_str(&format!(
                         "live run ended at frame {frames}: {report_step:?}"
                     )));
@@ -2698,10 +2875,25 @@ async fn live_loop(
                     // recipe says it should - and assertions past the frame reached count
                     // as failures, so a run that stalled short cannot read as a pass.
                     if let Some(eval) = eval.as_mut() {
-                        let sig = sched.host.lock().unwrap().state.capture.signature();
+                        let sig = if want_sig {
+                            sched.host.lock().unwrap().state.capture.signature()
+                        } else {
+                            u64::MAX
+                        };
                         eval.finish(frames, sig);
+                        // Say WHICH of the two things happened rather than printing an
+                        // all-ones hash that reads like a real one. A run that was meant to
+                        // learn the signature and did not fold has to be told so here, at the
+                        // only place it would ever have looked.
+                        let sig_text = if want_sig {
+                            format!("sig {sig:#018x}")
+                        } else {
+                            "sig NOT FOLDED (this recipe declares no @sig; set \
+                             VITASLOP_SIGNATURE=1 to compute one)"
+                                .to_string()
+                        };
                         web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[recipe] {} | sig {sig:#018x}",
+                            "[recipe] {} | {sig_text}",
                             eval.summary()
                         )));
                         for a in eval.asserts.iter().filter(|a| !a.passed) {
@@ -2904,10 +3096,9 @@ async fn live_loop(
                 // moving a hundred megabytes a frame is a volume problem whatever the clock says,
                 // and this line alone would have named it.
                 let bytes = vitaslop_runtime::perf::take_bytes();
-                let moved: Vec<String> = vitaslop_runtime::perf::Phase::all()
+                let moved: Vec<String> = bytes
                     .iter()
-                    .zip(bytes.iter())
-                    .filter(|(_, b)| **b > 0)
+                    .filter(|(_, b)| *b > 0)
                     .map(|(p, b)| format!("{} {:.2} MB", p.label(), *b as f64 / np / (1024.0 * 1024.0)))
                     .collect();
                 if !moved.is_empty() {
@@ -2920,6 +3111,170 @@ async fn live_loop(
                             moved.join(", ")
                         ),
                     );
+                }
+                // >>> AND NOW THE TIME, WHICH THIS ENGINE COULD NEVER REPORT BEFORE.
+                //
+                // The comment above is still true about why bytes are counted unconditionally,
+                // but the clock half is no longer missing: `perf::set_clock` hands the runtime
+                // `performance.now()`, so the same phases the desktop profiler splits are split
+                // here too, on the engine that actually pays for them. MEASURED before this
+                // existed: the browser's host-call bucket is 46% of a frame at 6.3 us a call
+                // against the desktop's 1.58 us for the SAME handler work - so a phase's share
+                // here is nothing like its share there, and reading the desktop's ranking as if
+                // it were the browser's is how the previous two attempts at this path were
+                // aimed. Gated on `VITASLOP_PERF` like every other clock read.
+                if vitaslop_runtime::perf::enabled() {
+                    let timed: Vec<String> = vitaslop_runtime::perf::Phase::all()
+                        .iter()
+                        .map(|p| (p, vitaslop_runtime::perf::read(*p)))
+                        .filter(|(_, (ns, _, _))| *ns > 0)
+                        .map(|(p, (ns, hits, _))| {
+                            format!(
+                                "{} {:.2} ms/frame over {:.0} entries",
+                                p.label(),
+                                ns as f64 / 1.0e6 / np,
+                                hits as f64 / np,
+                            )
+                        })
+                        .collect();
+                    if !timed.is_empty() {
+                        line(
+                            &mut diag,
+                            "GUEST CPU, phase TIME per frame",
+                            &format!(
+                                "{} | these are INSIDE the host-call bucket, so compare them \
+                                 against its ms, not against the frame",
+                                timed.join(", ")
+                            ),
+                        );
+                    }
+                    // >>> HOW OFTEN THE HOST REACHED INTO GUEST MEMORY, which is the number
+                    // that names a whole CLASS of defect on sight and needs no clock.
+                    //
+                    // A `dyn GuestMemory` access is a bounds check and a virtual call, and
+                    // here it crosses into a SharedArrayBuffer view. A structure read one
+                    // word at a time and the same structure read in one block move identical
+                    // bytes and differ by tens of times in cost, so the byte counters above
+                    // are blind to the difference and so is a phase timer that has not been
+                    // split finely enough. WORD READS PER DRAW is the tell: it should be
+                    // near zero, and every time it is not, something is looping over a
+                    // structure a word at a time.
+                    let (words, bulk) = vitaslop_runtime::perf::guest_accesses();
+                    let draws = np.max(1.0);
+                    let total_wraps = vitaslop_runtime::perf::epoch_wraps();
+                    let epoch_wraps_window = total_wraps - epoch_wraps_at_window_start;
+                    epoch_wraps_at_window_start = total_wraps;
+                    let total_rebases = vitaslop_runtime::perf::epoch_rebases();
+                    let epoch_rebases_window = total_rebases - epoch_rebases_at_window_start;
+                    epoch_rebases_at_window_start = total_rebases;
+                    line(
+                        &mut diag,
+                        "GUEST CPU, guest-memory accesses per frame",
+                        &format!(
+                            "{:.0} single-WORD reads, {:.0} bulk reads - a word count that \
+                             scales with DRAWS is a structure being read a word at a time",
+                            words as f64 / draws,
+                            bulk as f64 / draws,
+                        ),
+                    );
+                    // >>> AND HOW OFTEN THE GUEST-STORE EPOCH WRAPPED IN THIS WINDOW, because
+                    // a wrap is a CLIFF and the byte counter above only shows its average.
+                    //
+                    // Every wrap drops every texture stamp, so the next use of each retained
+                    // snapshot copies the whole texture across the guest boundary to compare
+                    // it. One wrap costs the working set; spread over the window it reads as a
+                    // small per-draw cost with no cause. See `perf::EPOCH_WRAPS`.
+                    line(
+                        &mut diag,
+                        "GUEST CPU, guest-store epoch wraps",
+                        &format!(
+                            "{} in this window ({:.2} per presented frame) - each one drops                              every snapshot stamp, so the whole texture working set is                              re-compared over the frames that follow",
+                            epoch_wraps_window,
+                            epoch_wraps_window as f64 / draws,
+                        ),
+                    );
+                    line(
+                        &mut diag,
+                        "GUEST CPU, guest-store epoch renumberings",
+                        &format!(
+                            "{} in this window - each one is a wrap AVOIDED by handing back                              the unused low half of the range",
+                            epoch_rebases_window,
+                        ),
+                    );
+                    // >>> AND WHICH PHASE THEY WERE IN. The total names the class; this names
+                    // the line. Nested scopes double count (an inner phase's reads are in its
+                    // parent's row too), so read a child out of its parent rather than summing
+                    // the row - and the difference between this table's largest row and the
+                    // total above is the reads that happen in no named phase at all, which is
+                    // where the last search has to go.
+                    let mut rows: Vec<(&'static str, u64)> = vitaslop_runtime::perf::Phase::all()
+                        .iter()
+                        .map(|p| (p.label(), vitaslop_runtime::perf::word_reads(*p)))
+                        .filter(|(_, n)| *n > 0)
+                        .collect();
+                    rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                    if !rows.is_empty() {
+                        line(
+                            &mut diag,
+                            "GUEST CPU, single-WORD reads by phase, per frame",
+                            &format!(
+                                "{} | NESTED SCOPES DOUBLE COUNT; what these do not account                                  for is in no named phase",
+                                rows.iter()
+                                    .map(|(l, n)| format!("{l} {:.0}", *n as f64 / draws))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                    // >>> AND THE HOST CALLS RANKED BY TIME, which closes the frame.
+                    //
+                    // The phases above are the parts of the handler someone thought to name;
+                    // MEASURED, they account for about half of the host-call bucket, and the
+                    // rest was attributed to nothing at all. The browser has always been able
+                    // to rank selectors by TIME (`host_calls_by_ms`) and has only ever
+                    // reported them by COUNT, which answers a different question - a NID called
+                    // a million times cheaply and one called twice for a millisecond look the
+                    // same in a count and need opposite fixes.
+                    let by_ms = browser_sched::host_calls_by_ms(8);
+                    if !by_ms.is_empty() {
+                        let named: Vec<String> = {
+                            let h = sched.host.lock().unwrap();
+                            by_ms
+                                .iter()
+                                .map(|(sel, calls, ms)| {
+                                    let name = match h.import_at(*sel) {
+                                        Some((_, func_nid)) => {
+                                            let n = vitaslop_runtime::nid::name(func_nid);
+                                            if n.is_empty() || n == "?" {
+                                                format!("{func_nid:#010x}")
+                                            } else {
+                                                n.to_string()
+                                            }
+                                        }
+                                        None => format!("selector {sel}"),
+                                    };
+                                    format!(
+                                        "{name} {:.2} us each over {calls} calls ({:.0} ms)",
+                                        if *calls == 0 { 0.0 } else { ms * 1000.0 / *calls as f64 },
+                                        ms,
+                                    )
+                                })
+                                .collect()
+                        };
+                        // CUMULATIVE since the run started, and said so: `hostcalls` keeps
+                        // running totals and there is no per-window baseline here. The
+                        // us/call and the RANK are what this line is for and neither
+                        // depends on the divisor; dividing a run total by a window's frame
+                        // count would have printed a per-frame figure that is simply wrong.
+                        line(
+                            &mut diag,
+                            "GUEST CPU, top host calls by TIME (cumulative, whole run)",
+                            &named.join(", "),
+                        );
+                    }
+                    // Per WINDOW, like the byte counters above: a running total looks like a
+                    // per-frame figure that keeps climbing, which reads as a leak.
+                    vitaslop_runtime::perf::reset();
                 }
                 // The single worst present of the window, with ITS OWN counters. A mean over
                 // frames that differ by 2.5x in draw count describes none of them - and when they

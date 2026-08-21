@@ -228,6 +228,31 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Report a FATAL run outcome that is not a Rust panic, through the same three channels
+/// [`install_panic_hook`] uses.
+///
+/// # Why this exists
+/// The panic hook covers a panic and nothing else, and the failure that actually reaches a
+/// player is not a panic: a guest trap surfaces as a `RunReport::Error(..)` on the run's
+/// ordinary status line, which the page shows for a moment and the diagnostics panel then
+/// rebuilds away. MEASURED on the user's device: a guest fault ("memory access
+/// out of bounds", with a full wasm backtrace) reached the status line and **never appeared
+/// in the fatal box at all** - the whole crash report had to be copied out of the status
+/// text by hand.
+///
+/// A panic and a guest trap are the same thing to a person holding the phone: the run is
+/// over and they need to know why. So they go to the same place.
+pub fn report_fatal(text: &str) {
+    web_sys::console::error_1(&JsValue::from_str(text));
+    push_page_log(text);
+    let global = js_sys::global();
+    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
+        if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+}
+
 /// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.
 ///
 /// A player's browser should be quiet. Everything below `warn` here is diagnostic - the

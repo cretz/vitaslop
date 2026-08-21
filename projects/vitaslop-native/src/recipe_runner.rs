@@ -86,9 +86,15 @@ pub struct RecipeReport {
     pub frames: u64,
     /// The engine's verdict.
     pub run: RunReport,
-    /// The determinism signature over the observable output (render stream + egress).
-    /// Comparable across engines and runs.
-    pub sig: u64,
+    /// The determinism signature over the observable output (render stream + egress),
+    /// comparable across engines and runs - or `None` on a run that did not fold one.
+    ///
+    /// `None` is not a failure: folding costs 3.5 MB a frame (8.0% of a race frame) and a
+    /// run only pays it when something will read the number - a recipe that declares `@sig`,
+    /// or `VITASLOP_SIGNATURE=1`. An `Option` rather than a sentinel because a sentinel
+    /// compares unequal and reads like a real hash, which is exactly the confusion
+    /// `Capture::signature`'s own refusal exists to avoid.
+    pub sig: Option<u64>,
     /// Every assertion's outcome, in recipe order.
     pub asserts: Vec<AssertOutcome>,
     /// Every screenshot's outcome.
@@ -113,7 +119,11 @@ impl RecipeReport {
     pub fn render_text(&self) -> String {
         let mut s = String::new();
         let passed = self.asserts.iter().filter(|a| a.passed).count();
-        s.push_str(&format!("RUN {:?} frames={} sig={:#018x}\n", self.run, self.frames, self.sig));
+        let sig = match self.sig {
+            Some(s) => format!("{s:#018x}"),
+            None => "(not folded - no reader; set VITASLOP_SIGNATURE=1)".to_string(),
+        };
+        s.push_str(&format!("RUN {:?} frames={} sig={sig}\n", self.run, self.frames));
         for a in &self.asserts {
             s.push_str(&format!(
                 "ASSERT f{:<5} {:<7} {} -> {}\n",
@@ -200,6 +210,19 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     let world = recipe.clone().into_world();
     let mut sched = boot_retail(game_dir, Box::new(world), opts.quantum_fuel)?;
     sched.host().state.capture.scene_limit = opts.scene_limit;
+    // >>> A RECIPE IS NOT ITSELF A READER OF THE DETERMINISM SIGNATURE, and folding one
+    // costs 3.5 MB a frame - MEASURED at 8.0% of a desktop race frame. The only consumer is
+    // `RecipeEval::finish`, which uses the number if and only if the recipe DECLARES `@sig`.
+    // The BROWSER has been gated on that declaration since 2026-08-19e; this side was not,
+    // so every desktop recipe run - every `--headless` render and every `bench` on this
+    // machine - has been paying it to produce a hash nothing compared, and every desktop
+    // measurement carried 8% of work the shipping engine does not do.
+    //
+    // `VITASLOP_SIGNATURE=1` asks for one deliberately, which is what a run whose POINT is
+    // to learn the signature and bless it into a recipe wants. Same spelling as the browser,
+    // so the two engines decide this the same way.
+    let want_sig = recipe.meta.sig.is_some() || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE");
+    sched.host().state.capture.set_signature_wanted(want_sig);
 
     // Auto-pick the observation start: full log when watching, else just before the
     // first assert/shot so a deep-level run does not step thousands of idle frames.
@@ -263,16 +286,23 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     let frames = sched.frames();
 
     // Determinism signature + egress ledger from the captured output.
+    // The signature is only ASKED FOR when it was folded - calling `signature()` on a run
+    // that was not folding returns a sentinel and warns, which is the right refusal but not
+    // something to provoke on every ordinary run.
     let (sig, egress) = {
         let host = sched.host();
         let cap = &host.state.capture;
-        (signature(cap), cap.egress.iter().map(|e| format!("f{:<5} {:?}", e.frame, e.kind)).collect())
+        (
+            want_sig.then(|| signature(cap)),
+            cap.egress.iter().map(|e| format!("f{:<5} {:?}", e.frame, e.kind)).collect(),
+        )
     };
 
     // Close the run: assertions past the frame actually reached are FAILURES (a run that
     // stalled short has not passed the checks it never ran), and a pinned `@sig` is
-    // itself an assertion.
-    eval.finish(frames, sig);
+    // itself an assertion. A recipe that declares `@sig` always folded, so the number the
+    // assertion needs is always there.
+    eval.finish(frames, sig.unwrap_or(u64::MAX));
 
     Ok(RecipeReport {
         frames,

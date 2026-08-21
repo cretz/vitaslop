@@ -30,10 +30,11 @@
 //!   This is the cross-stage linkage: the fragment module declares the varyings it needs;
 //!   feeding them faithfully requires the matching vertex program's output layout.
 //! * **Output** -> `@location(0)`. Native-colour shaders leave RGBA in OUTPUT reg 0 (`o0`);
-//!   non-native-colour shaders leave it in PRIMATTR reg 0 (`pa0`). Which one applies is
+//!   non-native-colour shaders leave it in the PRIMATTR register their LAST write targets,
+//!   which is not always `pa0` (see [`ColorOutput::NonNativePa`]). Which one applies is
 //!   determined here from the shader's actual writes (a shader that writes the OUTPUT bank
-//!   is native), matching the SGX "the value left in o0/pa0 at program end is the colour"
-//!   rule without needing to guess a header flag.
+//!   is native), matching the SGX "the value left in the colour register at program end is the
+//!   colour" rule without needing to guess a header flag.
 
 use core::fmt::Write as _;
 
@@ -47,8 +48,21 @@ use crate::wgsl::{tex_units, TexBinding, BANK_REGS};
 pub enum ColorOutput {
     /// Native colour: RGBA in OUTPUT register 0 (`o0`).
     NativeO0,
-    /// Non-native colour: RGBA in PRIMATTR register 0 (`pa0`).
-    NonNativePa0,
+    /// Non-native colour: RGBA in PRIMATTR register `base` (and `base + 1` when the colour is
+    /// packed F16 pairs, or `base..base + 4` at F32).
+    ///
+    /// # The base is NOT always 0, and assuming it was painted a surface black
+    /// A fragment's primary-attribute allocation holds its interpolants FIRST - including a
+    /// PDS-prefetched sample, which occupies registers of its own - and a non-native colour
+    /// goes wherever the program's own writes put it, which is above them. MEASURED on one
+    /// title's bright-pass (`frag_8669f600`, pair `553fa1bb8c47dce0`):
+    /// `primary_reg_count = 4`, the one descriptor is prefetch-only and takes `pa[0..2)`, and
+    /// both of the program's two instructions write `pa[2]`. Reading the colour at `pa0` - or,
+    /// as the old code did, falling through to the OUTPUT bank because `pa0` was never written
+    /// - returns registers nothing ever filled, so that pass wrote (0,0,0,0) into the 128x128
+    /// surface the glare chain blurs, and the game's whole bloom/glare composite added exactly
+    /// nothing for the entire run.
+    NonNativePa(u32),
 }
 
 /// The precision the final colour registers hold, which decides how many registers the four
@@ -197,15 +211,28 @@ fn color_output(shader: &Shader) -> ColorOutput {
     if writes_bank(shader, Bank::Output) {
         return ColorOutput::NativeO0;
     }
-    let writes_pa0 = shader.instrs.iter().any(|i| {
-        i.dest.as_ref().is_some_and(|d| {
-            d.bank == Bank::PrimaryAttr && d.index == 0 && i.write_mask.iter().take(4).any(|&m| m)
+    // WHICH primary-attribute register: the base of the LAST instruction that writes the bank.
+    // A fragment program's final act is to leave its colour in the register the hardware emits,
+    // so the last write names it - and unlike "register 0" that is a reading of the program
+    // rather than a convention. It reproduces every non-native pair of the frame this was
+    // measured on (the two whose colour is at `pa0` still resolve to 0) and it is the only thing
+    // that answers for the one whose colour is at `pa2` - see [`ColorOutput::NonNativePa`].
+    let last_pa = shader
+        .instrs
+        .iter()
+        .rev()
+        .find(|i| {
+            i.dest
+                .as_ref()
+                .is_some_and(|d| d.bank == Bank::PrimaryAttr && i.write_mask.iter().take(4).any(|&m| m))
         })
-    });
-    if writes_pa0 {
-        ColorOutput::NonNativePa0
-    } else {
-        ColorOutput::NativeO0
+        .and_then(|i| i.dest.as_ref())
+        .map(|d| d.index as u32);
+    match last_pa {
+        Some(base) => ColorOutput::NonNativePa(base),
+        // Writes neither bank: the caller refuses this pair rather than let a default pick a
+        // register the program never filled. See [`writes_no_color_register`].
+        None => ColorOutput::NativeO0,
     }
 }
 
@@ -215,14 +242,14 @@ fn color_output(shader: &Shader) -> ColorOutput {
 /// initial state) is reported as [`ColorPrecision::F32`], the raw-bit-pattern reading, which is
 /// what the zero-initialised registers mean either way.
 fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
-    let bank = match color {
-        ColorOutput::NativeO0 => Bank::Output,
-        ColorOutput::NonNativePa0 => Bank::PrimaryAttr,
+    let (bank, base) = match color {
+        ColorOutput::NativeO0 => (Bank::Output, 0),
+        ColorOutput::NonNativePa(base) => (Bank::PrimaryAttr, base),
     };
     let last = shader.instrs.iter().rev().find(|i| {
         i.dest
             .as_ref()
-            .is_some_and(|d| d.bank == bank && d.index == 0 && i.write_mask.iter().any(|&m| m))
+            .is_some_and(|d| d.bank == bank && d.index as u32 == base && i.write_mask.iter().any(|&m| m))
     });
     match last {
         Some(i) if i.half_precision => ColorPrecision::F16,
@@ -239,7 +266,12 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
 /// unconditionally, which is a WGSL parse error on any pair with fewer varyings - and since
 /// every pair is compiled, one unlucky pair took the whole run down with it. A diagnostic that
 /// cannot be aimed at one shader has to degrade on the others, not abort.
-pub(crate) fn color_return_expr(bank: &str, precision: ColorPrecision, varyings: u32) -> String {
+pub(crate) fn color_return_expr(
+    bank: &str,
+    base: u32,
+    precision: ColorPrecision,
+    varyings: u32,
+) -> String {
     // Diagnostic (`VITASLOP_GXP_PROBE=<bank><index>`, e.g. `r6` or `pa0`): return that register
     // pair AS the colour instead of the shader's own result. A recompiled shader that paints a
     // wrong colour is otherwise a black box - this bisects it by making any intermediate
@@ -275,12 +307,16 @@ pub(crate) fn color_return_expr(bank: &str, precision: ColorPrecision, varyings:
     }
     match precision {
         ColorPrecision::F32 => format!(
-            "vec4<f32>(bitcast<f32>({bank}[0]), bitcast<f32>({bank}[1]), \
-             bitcast<f32>({bank}[2]), bitcast<f32>({bank}[3]))"
+            "vec4<f32>(bitcast<f32>({bank}[{base}]), bitcast<f32>({bank}[{}]), \
+             bitcast<f32>({bank}[{}]), bitcast<f32>({bank}[{}]))",
+            base + 1,
+            base + 2,
+            base + 3
         ),
-        ColorPrecision::F16 => {
-            format!("vec4<f32>(unpack2x16float({bank}[0]), unpack2x16float({bank}[1]))")
-        }
+        ColorPrecision::F16 => format!(
+            "vec4<f32>(unpack2x16float({bank}[{base}]), unpack2x16float({bank}[{}]))",
+            base + 1
+        ),
     }
 }
 
@@ -389,13 +425,13 @@ pub fn build_module(body: &str, plan: &BindingPlan, writes_depth: bool) -> Fragm
 
     m.push_str(body);
 
-    let ret = match plan.color {
-        ColorOutput::NativeO0 => "o",
-        ColorOutput::NonNativePa0 => "pa",
+    let (ret, base) = match plan.color {
+        ColorOutput::NativeO0 => ("o", 0),
+        ColorOutput::NonNativePa(base) => ("pa", base),
     };
     // The standalone fragment wrapper has no inter-stage varyings at all (it is compiled
     // without a vertex partner), so the varying probe can never apply here.
-    let color = color_return_expr(ret, plan.color_precision, 0);
+    let color = color_return_expr(ret, base, plan.color_precision, 0);
     if writes_depth {
         let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);\n}}");
     } else {
@@ -443,6 +479,17 @@ pub struct VertexAttribute {
     /// Base scalar lane in the PA bank the attribute's first component loads into.
     pub base_lane: u32,
     /// Number of scalar lanes (components) the attribute spans (1..4).
+    ///
+    /// # ONE PA REGISTER PER COMPONENT, INCLUDING FOR A COLOUR - MEASURED
+    /// A vertex COLOUR is the one attribute a packed reading is tempting for: the
+    /// fixed-function colour path is F16, and one title's sky family reads a
+    /// four-component half varying out of a run its vertex fills with two lanes, which two
+    /// packed pairs would explain exactly.
+    /// **It is refuted by the frame.** Delivering every `SEMANTIC_COLOR` attribute as
+    /// `ceil(n / 2)` registers of packed halves takes that title's tree/scenery pair
+    /// (`5bcabf3a0a944a13`, 33,762 pixels) from `(50, 65, 38)` to `(0, 2, 0)` - BLACK - because
+    /// its vertex reads the same attribute one F32 component per register. Colours are not
+    /// packed, so whatever feeds that sky's third modulate component, it is not this.
     pub components: u32,
 }
 
@@ -501,6 +548,21 @@ fn output_write_extent(shader: &Shader) -> u32 {
 /// Build the [`VertexBindingPlan`] for a decoded vertex program from its parameter table
 /// (attributes) + the declared SA register count + the output write extent. `varying_vec4s`
 /// packs every written output lane beyond clip position (`o[4..]`) four lanes per `@location`.
+/// Emit one vertex attribute's load into the PA bank, shared by the standalone wrapper and the
+/// linked module so both deliver an attribute identically.
+pub(crate) fn emit_attribute_load(m: &mut String, a: &VertexAttribute) {
+    const COMP: [&str; 4] = ["x", "y", "z", "w"];
+    for c in 0..a.components {
+        let _ = writeln!(
+            m,
+            "  pa[{}] = bitcast<u32>(in.a{}.{});",
+            a.base_lane + c,
+            a.location,
+            COMP[(c & 3) as usize]
+        );
+    }
+}
+
 pub fn plan_vertex_bindings(program: &Program, shader: &Shader) -> VertexBindingPlan {
     let mut attributes: Vec<VertexAttribute> = program
         .parameters
@@ -593,17 +655,8 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
     let _ = writeln!(m, "  var idx: array<i32, 2>;");
 
     // Load PA registers from the vertex attributes (vertex inputs are plain f32 components).
-    const COMP: [&str; 4] = ["x", "y", "z", "w"];
     for a in &plan.attributes {
-        for c in 0..a.components {
-            let _ = writeln!(
-                m,
-                "  pa[{}] = bitcast<u32>(in.a{}.{});",
-                a.base_lane + c,
-                a.location,
-                COMP[c as usize]
-            );
-        }
+        emit_attribute_load(&mut m, a);
     }
     // Load SA lanes from the uniform buffer.
     if sa_vec4 > 0 {
@@ -690,7 +743,34 @@ mod tests {
     fn non_native_color_detected_from_pa0_write() {
         // A shader that writes PRIMATTR reg 0 and never writes OUTPUT is non-native colour.
         let sh = shader(vec![instr(Op::Mov, Some(Operand::plain(Bank::PrimaryAttr, 0, 2)), vec![Operand::plain(Bank::Temp, 4, 0)], [true; 4])]);
-        assert_eq!(plan_bindings(&sh, 0, |_| false).color, ColorOutput::NonNativePa0);
+        assert_eq!(plan_bindings(&sh, 0, |_| false).color, ColorOutput::NonNativePa(0));
+    }
+
+    #[test]
+    fn a_non_native_colour_above_the_interpolants_is_read_where_the_program_wrote_it() {
+        // One title's bright-pass (`frag_8669f600`): its one varying descriptor is
+        // PREFETCH-ONLY and takes `pa[0..2)`, so the program's own writes - and its colour -
+        // are at `pa[2]`. The old rule looked for `pa0`, found nothing, fell through to the
+        // OUTPUT bank, and returned four registers the program never wrote: the pass emitted
+        // (0,0,0,0) into the surface the glare chain blurs, and the whole bloom composite added
+        // nothing. A colour register that is never written is not an approximation, it is a
+        // black surface with no error anywhere - which is the failure this crate exists to
+        // refuse.
+        let mut mad = instr(
+            Op::Mul,
+            Some(Operand::plain(Bank::PrimaryAttr, 2, 1)),
+            vec![Operand::plain(Bank::PrimaryAttr, 0, 2), Operand::plain(Bank::SecondaryAttr, 0, 3)],
+            [true; 4],
+        );
+        mad.half_precision = true;
+        let plan = plan_bindings(&shader(vec![mad]), 4, |_| false);
+        assert_eq!(plan.color, ColorOutput::NonNativePa(2));
+        assert_eq!(plan.color_precision, ColorPrecision::F16);
+        let wgsl = build_module("", &plan, false).wgsl;
+        assert!(
+            wgsl.contains("return vec4<f32>(unpack2x16float(pa[2]), unpack2x16float(pa[3]));"),
+            "{wgsl}"
+        );
     }
 
     #[test]
@@ -708,7 +788,7 @@ mod tests {
         );
         half.half_precision = true;
         let plan = plan_bindings(&shader(vec![half]), 4, |_| false);
-        assert_eq!(plan.color, ColorOutput::NonNativePa0);
+        assert_eq!(plan.color, ColorOutput::NonNativePa(0));
         assert_eq!(plan.color_precision, ColorPrecision::F16);
         let wgsl = build_module("", &plan, false).wgsl;
         assert!(
@@ -775,6 +855,8 @@ mod tests {
             output_order: crate::container::VaryingOrder::Known,
             varyings_error: None,
             default_uniform_regs: 0,
+            sa_base_from_container: true,
+            containers: Vec::new(),
             secondary_code: Vec::new(),
             literals: Vec::new(),
             texture_control: Vec::new(),

@@ -156,6 +156,12 @@ struct ThreadData<H: ImportDispatch + Send + 'static> {
     /// wasmtime's own cumulative reading at the last software-fuel sample, so the two
     /// counters are differenced over exactly the same intervals.
     sw_wasmtime_last: u64,
+    /// The EMITTED work counter's yield interval in wasm operators, or 0 when this build
+    /// carries no counter. Taken from the engine rather than from
+    /// `transpiler::fuel_interval()`, which is a THREAD-LOCAL set at transpile time: what
+    /// the module contains is a property of the module, and a runtime reading of it must
+    /// not depend on which thread asks.
+    fuel_interval: u32,
 }
 
 /// The wasm globals holding the guest register file, resolved once per thread.
@@ -210,6 +216,10 @@ pub struct WasmtimeThread {
     /// This thread's preemption interval, so [`resume`](GuestThread::resume) can price a
     /// suspend that wasmtime took on its own (see [`Signal::fuel`]).
     quantum_fuel: u64,
+    /// The EMITTED work counter's interval, or 0 on a build without one. Non-zero means
+    /// [`Signal::arm`] is sampled at every switch point and the game clock is billed in
+    /// guest instructions - see [`ThreadHandle::arm_retired`].
+    fuel_interval: u32,
 }
 
 impl ThreadHandle for WasmtimeThread {
@@ -224,35 +234,37 @@ impl ThreadHandle for WasmtimeThread {
         Some(self.signal.lock().unwrap().fuel)
     }
 
-    /// >>> DELIBERATELY `None` ON NATIVE, AND THE REASON IS A LIVELOCK, NOT AN OMISSION.
+    /// Guest ARM instructions this thread has retired, from the EMITTED per-block counter
+    /// - the unit the game clock is billed in on both engines.
     ///
-    /// The guest-instruction counter is a wasm GLOBAL, and reading a global needs the
-    /// thread's `Store` - which only exists inside the fiber. So [`sample_arm_instructions`]
-    /// runs from the host-call closure, and it therefore sees only suspends that go through
-    /// a host call. wasmtime's OWN periodic preemption (`fuel_async_yield_interval`) runs
-    /// none of our code, so a thread that spins WITHOUT making a host call is never sampled.
+    /// # Why this needs native's preemption to be ours rather than wasmtime's
+    /// The counter is a wasm GLOBAL, and reading a global needs the thread's `Store`,
+    /// which only exists inside the fiber. So it is sampled from the host-call closure
+    /// ([`note_suspend`]) and sees only suspends that pass through it. While native
+    /// preempted with `fuel_async_yield_interval`, wasmtime's own periodic yield ran none
+    /// of our code, so a thread that spun WITHOUT making a host call was never sampled at
+    /// all - and that thread is ordinary, since a title's vblank spin reads the clock
+    /// through an INLINED mirror load. Billing an unsampled counter charged it nothing,
+    /// the clock stopped, and the wait it was spinning on could never complete. MEASURED
+    /// at the time: a retail boot ran in 6 s and then fast-forwarded for over ten minutes
+    /// without reaching frame 300.
     ///
-    /// That thread exists and is ordinary: a title's vblank spin reads the clock through an
-    /// INLINED mirror load and makes no host call at all. Billing the clock from an unsampled
-    /// counter charges it nothing, the clock never advances, and the load it is waiting on
-    /// can never complete. MEASURED: WipEout boots in 6 s and then fast-forwards for over
-    /// ten minutes without reaching frame 300. It is exactly the stopped-clock livelock
-    /// [`Signal::fuel`] documents, arriving by a new route.
+    /// The retail path now emits the transpiler's own fuel check
+    /// (`from_linked` -> `set_fuel_interval`), so a preemption IS an `env.import` call and
+    /// every switch point passes through the closure - the mechanism the browser already
+    /// used. A spin with no host call yields on its loop back edge instead, which is
+    /// exactly the case that used to livelock.
     ///
-    /// So native keeps its fuel-derived clock (`arm_retired` -> `None` selects the fallback
-    /// in `on_guest_work`), which is bit-for-bit the behaviour it had before. This costs
-    /// nothing today: `QUANTUM_ARM` is calibrated as `QUANTUM_FUEL / expansion` at the
-    /// measured expansion, so the two units price identical guest work identically. They
-    /// diverge only when the CODEGEN changes - at which point the browser's clock stays put
-    /// and native's drifts, which is strictly better than today, where both drift.
+    /// And the high half is CUMULATIVE (see `abi::WORK_GLOBAL`), never cleared, so even a
+    /// stretch that somehow suspends without being sampled - wasmtime's backstop yield,
+    /// see [`GuestThread::resume`] - only DEFERS the charge to the next sample. It cannot
+    /// lose it. That is what makes a stopped clock unreachable by this route.
     ///
-    /// **What closes it**: move native's preemption onto the EMITTED fuel check
-    /// (`set_fuel_interval`), so every preemption is an `env.import` call and passes through
-    /// the closure - the same mechanism the browser already uses. That is a real change to
-    /// native codegen and scheduling (it moves the headless render SHA), so it wants its own
-    /// verification rather than being folded in here.
+    /// `None` on a build with no counter (the raw-image path: the ARM corpus and unit
+    /// tests, whose mock hosts have no clock), which selects the fuel-derived fallback in
+    /// `on_guest_work`.
     fn arm_retired(&mut self) -> Option<u64> {
-        None
+        (self.fuel_interval != 0).then(|| self.signal.lock().unwrap().arm)
     }
 }
 
@@ -279,6 +291,14 @@ impl GuestThread for WasmtimeThread {
                     // only threads that ever cost game time would be the ones that make
                     // host calls, and a guest spin that reads an inlined mirror makes none.
                     s.fuel = s.fuel.saturating_add(self.quantum_fuel);
+                    // A build with the emitted work check has wasmtime's periodic yield
+                    // switched OFF (see `instantiate_thread_seq`), so there is nothing left
+                    // that can suspend a fiber without running our code. Reaching here is
+                    // therefore an ENGINE surprise rather than a preemption, and it is
+                    // silent otherwise: the thread just resumes.
+                    if self.fuel_interval != 0 {
+                        note_unattributed_suspend();
+                    }
                 }
                 ThreadStep::Suspended(s.stop)
             }
@@ -296,6 +316,9 @@ pub struct WasmtimeEngine<H: ImportDispatch + Send + 'static> {
     host: Arc<Mutex<H>>,
     base: u32,
     quantum_fuel: u64,
+    /// The EMITTED work counter's yield interval, in wasm operators, or 0 when this
+    /// build carries no counter (see [`ThreadData::fuel_interval`]).
+    fuel_interval: u32,
     /// Linear-memory offset of the "diagnostics armed" word, when this build was
     /// transpiled with `VITASLOP_ARM_AT_FRAME` (see
     /// [`vitaslop_transpiler::arm_at_frame`]). `None` in an ordinary build.
@@ -354,6 +377,10 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
     /// frame. One word in shared linear memory covers every guest thread at once,
     /// which is the whole reason the gate is not a wasm global.
     fn on_frame(&mut self, frames: u64) {
+        // Stamp the frame first, unconditionally: every host-side diagnostic that
+        // prints a line reads it, and a trace line with no frame on it cannot be
+        // placed against a crash frame or a recipe cue at all.
+        CURRENT_FRAME.store(frames, std::sync::atomic::Ordering::Relaxed);
         let (Some(off), Some(at)) = (self.arm_word_off, transpiler::arm_at_frame()) else {
             return;
         };
@@ -377,6 +404,17 @@ impl<H: ImportDispatch + Send + 'static> GuestEngine for WasmtimeEngine<H> {
 /// emitted code. True from the start when no frame gate was requested, so an
 /// ungated run behaves exactly as before.
 static DIAG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The frame the run has reached, stamped by [`WasmtimeEngine::on_frame`]. Read by the
+/// host-side diagnostics so every line they print carries a frame number: a block trace
+/// that says only "this happened" cannot be lined up with a crash frame, a recipe cue or
+/// another instrument's output, which is most of what such a trace is for.
+static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The frame the run has reached (0 before the first flip).
+pub fn current_frame() -> u64 {
+    CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Are the frame-gated diagnostics live yet?
 fn diag_armed() -> bool {
@@ -476,6 +514,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             host: host.clone(),
             base,
             quantum_fuel,
+            // The raw-image path (the ARM corpus, unit tests) keeps wasmtime's own
+            // periodic preemption: its hosts are mock `ImportDispatch`es with no
+            // scheduler and no game clock, so there is nothing for a work counter to
+            // bill. See `from_linked`, which is the retail path.
+            fuel_interval: 0,
             arm_word_off: artifact.arm_word_off,
             mirror_off: artifact.mirror_off,
             dirty_off: artifact.dirty_off,
@@ -510,7 +553,20 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         host: H,
         quantum_fuel: u64,
     ) -> Result<(ThreadedScheduler<H>, Vec<(u32, u32)>), RunError> {
+        // >>> THE RETAIL PATH EMITS THE WORK COUNTER, AND PREEMPTS ON IT. This is what
+        // lets native bill its game clock in GUEST INSTRUCTIONS like the browser does,
+        // rather than in wasm operators - see `WasmtimeThread::arm_retired` for the
+        // livelock that kept it on operators until now, and `host::QUANTUM_ARM` for what
+        // the unit buys. The interval is the same quantum wasmtime's periodic yield used,
+        // so the preemption GRANULARITY is unchanged; what changes is that every
+        // preemption is now a call through our own import, where the counter can be read.
+        transpiler::set_fuel_interval(u32::try_from(quantum_fuel).unwrap_or(u32::MAX));
         let built = transpiler::transpile_lenient(&linked.shared_program());
+        // Leave the thread as we found it: the emitted module carries its own interval
+        // and every runtime reader takes it from `ThreadData`, so nothing after this
+        // point should depend on a thread-local that another transpile could inherit.
+        transpiler::set_fuel_interval(u32::MAX);
+        let fuel_interval = u32::try_from(quantum_fuel).unwrap_or(u32::MAX);
         // >>> THE CODE EXPANSION FACTOR, reported unconditionally on the engine that takes
         // every calibration measurement. The game clock is charged per unit of fuel and a
         // unit of fuel is one executed wasm operator, so the emulated Vita's CPU speed is
@@ -520,6 +576,20 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // ever estimated in a comment.
         {
             let x = built.artifact.expansion;
+            // >>> MODULE SIZE, which is a cost no operator count and no wall clock reports.
+            // The engine this ships on is a phone browser, where the module has to be
+            // fetched, parsed and compiled before a frame is drawn and where the project
+            // has repeatedly found itself memory-bound. A codegen change that emits fewer
+            // operators emits fewer BYTES too, and that is worth something on its own.
+            tracing::info!(
+                target: "vitaslop::perf",
+                "module: {:.2} MB of wasm ({} bytes) for {} guest instructions - {:.1} bytes \
+                 each",
+                built.artifact.wasm.len() as f64 / (1024.0 * 1024.0),
+                built.artifact.wasm.len(),
+                x.arm_instructions,
+                built.artifact.wasm.len() as f64 / x.arm_instructions.max(1) as f64,
+            );
             tracing::info!(
                 target: "vitaslop::perf",
                 "code expansion: {:.2} wasm operators per guest instruction \
@@ -534,7 +604,155 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 x.core_state_share(),
                 x.core_state_ops,
             );
+            // >>> AND THE SPLIT OF THAT BOOKKEEPING, because the total names no fix. Three
+            // unrelated mechanisms share it: the work counter (commits + fuel checks), the
+            // guest-store dirty map, and the promotion cache. The commits-per-guest-
+            // instruction figure is the one that says whether the flush POLICY costs more
+            // than the commit does.
+            {
+                let cache = x
+                    .unbilled_ops
+                    .saturating_sub(x.unbilled_work_ops)
+                    .saturating_sub(x.unbilled_dirty_ops);
+                let pct = |n: u64| 100.0 * n as f64 / x.unbilled_ops.max(1) as f64;
+                tracing::info!(
+                    target: "vitaslop::perf",
+                    "bookkeeping split: work counter {} ops ({:.1}%) over {} commits \
+                     ({:.2} commits per guest instruction), dirty map {} ops ({:.1}%), \
+                     promotion cache {} ops ({:.1}%)",
+                    x.unbilled_work_ops,
+                    pct(x.unbilled_work_ops),
+                    x.work_flushes,
+                    x.work_flushes as f64 / x.arm_instructions.max(1) as f64,
+                    x.unbilled_dirty_ops,
+                    pct(x.unbilled_dirty_ops),
+                    cache,
+                    pct(cache),
+                );
+            }
+            // >>> AND WHICH LOWERING SPENDS THEM. The average is a corpus statistic; a fix
+            // has to land on a particular lowering, and the two are not the same question.
+            // Ranked by TOTAL operators (what a change is worth) with the per-statement
+            // cost alongside (how bad the lowering is), because those two rankings
+            // disagree: a 40-operator lowering used twice is not the target a 6-operator
+            // one used a million times is.
+            {
+                let mut rows: Vec<(&'static str, u64, u64)> =
+                    vitaslop_transpiler::StmtKind::ALL
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| (k.label(), x.by_stmt[i].0, x.by_stmt[i].1))
+                        .filter(|r| r.2 != 0)
+                        .collect();
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = rows.iter().map(|r| r.1).sum();
+                let line: Vec<String> = rows
+                    .iter()
+                    .map(|(label, ops, n)| {
+                        format!(
+                            "{label} {:.1}% ({ops} ops over {n}, {:.1} each)",
+                            100.0 * *ops as f64 / total.max(1) as f64,
+                            *ops as f64 / *n as f64,
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    target: "vitaslop::perf",
+                    "operators by lowering: {}",
+                    line.join("; "),
+                );
+            }
+            // >>> AND INSIDE THE LARGEST LINE, the shape that dominates it. `flags-add` is
+            // already gated on flag liveness, so its cost is decided by WHICH flags stay
+            // live - and C alone is nine of its operators.
+            {
+                let total: u64 = x.flags_add_live.iter().sum();
+                let mut rows: Vec<(String, u64)> = (0..16usize)
+                    .filter(|m| x.flags_add_live[*m] != 0)
+                    .map(|m| {
+                        let name: String = [(0, 'N'), (1, 'Z'), (2, 'C'), (3, 'V')]
+                            .iter()
+                            .filter(|(b, _)| m & (1 << b) != 0)
+                            .map(|(_, c)| *c)
+                            .collect();
+                        (if name.is_empty() { "-".into() } else { name }, x.flags_add_live[m])
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                let line: Vec<String> = rows
+                    .iter()
+                    .map(|(n, c)| format!("{n} {c} ({:.1}%)", 100.0 * *c as f64 / total.max(1) as f64))
+                    .collect();
+                tracing::info!(
+                    target: "vitaslop::perf",
+                    "flags-add by live mask: {} - and {} of {total} ({:.1}%) have a \
+                     compile-time carry-in",
+                    line.join(", "),
+                    x.flags_add_const_cin,
+                    100.0 * x.flags_add_const_cin as f64 / total.max(1) as f64,
+                );
+            }
+            // >>> THE CONTROL-FLOW SHAPE. Not an operator count and not priced by one: a
+            // dispatch re-entry is an INDIRECT BRANCH through the function's `br_table`,
+            // which costs a prediction rather than an operator.
+            tracing::info!(
+                target: "vitaslop::perf",
+                "control flow: {} blocks ({:.1} guest instructions each), {:.1}% end in a \
+                 FALLTHROUGH (straight-line, free), {} dispatch re-entries - one indirect \
+                 branch per {:.1} guest instructions",
+                x.blocks,
+                x.arm_instructions as f64 / x.blocks.max(1) as f64,
+                100.0 * x.fallthrough_blocks as f64 / x.blocks.max(1) as f64,
+                x.dispatch_reentries,
+                x.arm_instructions as f64 / x.dispatch_reentries.max(1) as f64,
+            );
+            // What the counter does NOT bill, so the standing cross-check against
+            // wasmtime's own metering (`software_fuel_report`) has a predicted value
+            // instead of an unexplained one.
+            tracing::info!(
+                target: "vitaslop::perf",
+                "work counter: {} operators of its own bookkeeping are NOT billed \
+                 ({:.1}% of what the module executes), so a real engine's metering of the \
+                 same code reads that much HIGHER than ours",
+                x.unbilled_ops,
+                x.unbilled_share(),
+            );
+            // >>> AND WHAT PROMOTING THOSE MOVES INTO WASM LOCALS WOULD ACTUALLY BE
+            // WORTH. The share above is a CEILING and reads far higher than the truth:
+            // most core-state accesses sit in straight-line runs too short to pay a
+            // promotion back. See `transpiler::promote` for the policy and for the
+            // measured price of a converted access.
+            let p = x.promotion;
+            tracing::info!(
+                target: "vitaslop::perf",
+                "register promotion model: {} straight-line runs, {} accesses would \
+                 become LOCAL ({:.1}% of all operators), {} would stay on their globals, \
+                 costing {} added operators ({:+.1}%); longest run {} accesses",
+                p.runs,
+                p.converted,
+                p.converted_share(x.emitted_ops),
+                p.left,
+                p.overhead,
+                p.overhead_share(x.emitted_ops),
+                p.longest_run,
+            );
+            // WHAT ENDED THE RUNS the unpromotable accesses were in. A call is not
+            // negotiable - the callee reaches the same globals - but a scope boundary is
+            // an `if`/`end` from ARM predication, which a smarter policy could carry a
+            // cache across. This split is what says whether writing that policy pays.
+            tracing::info!(
+                target: "vitaslop::perf",
+                "register promotion, accesses left behind by cause: {} call, {} scope \
+                 (if/else/end), {} branch, {} return/trap",
+                p.lost_to[transpiler::promote::Ender::Call as usize],
+                p.lost_to[transpiler::promote::Ender::Scope as usize],
+                p.lost_to[transpiler::promote::Ender::Branch as usize],
+                p.lost_to[transpiler::promote::Ender::Exit as usize],
+            );
         }
+        // Record the wasm-index -> guest-address table before anything can trap, so a
+        // backtrace names guest code instead of listing module indices.
+        record_function_addresses(built.artifact.funcs.iter().map(|f| f.addr).collect());
         wasmparser::validate(&built.artifact.wasm)
             .map_err(|e| RunError::Wasm(format!("invalid module: {e}")))?;
 
@@ -573,6 +791,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             host: host.clone(),
             base: linked.base,
             quantum_fuel,
+            fuel_interval,
             arm_word_off: built.artifact.arm_word_off,
             mirror_off: built.artifact.mirror_off,
             dirty_off: built.artifact.dirty_off,
@@ -670,6 +889,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
     /// [`vitaslop_runtime::sched::SchedCore::fuel_report`].
     pub fn fuel_report(&self) -> (u64, u64, u64) {
         self.inner.fuel_report()
+    }
+
+    /// Cumulative retired guest ARM instructions - see
+    /// [`vitaslop_runtime::sched::SchedCore::arm_report`].
+    pub fn arm_report(&self) -> u64 {
+        self.inner.arm_report()
     }
 
     /// Run cooperatively until the process halts, every thread finishes, or the run
@@ -787,12 +1012,32 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             sw_fuel: None,
             sw_last: 0,
             sw_wasmtime_last: 0,
+            fuel_interval: self.fuel_interval,
         };
         let mut store = Store::new(&self.engine, data);
         store.set_fuel(u64::MAX).map_err(|e| RunError::Wasm(e.to_string()))?;
-        store
-            .fuel_async_yield_interval(Some(self.quantum_fuel))
-            .map_err(|e| RunError::Wasm(e.to_string()))?;
+        // >>> ON A BUILD WITH THE EMITTED WORK CHECK, THAT CHECK IS THE ONLY THING THAT
+        // PREEMPTS. wasmtime's periodic yield is switched OFF rather than kept as a
+        // backstop, and the reason is that it is not one: its interval is free-running on
+        // ITS own fuel and our yields do not reset it, so it fires on a fixed period no
+        // matter how often the emitted check has already preempted. MEASURED with it left
+        // on at eight times the interval: it fired anyway, and because that path credits a
+        // blind quantum to a reading that is otherwise absolute, the per-suspend burn read
+        // up to 9.1 M against a 5 M interval.
+        //
+        // Switching it off also makes native preempt at EXACTLY the points the browser
+        // does - the same emitted check in the same module - which is what lets a desktop
+        // run stand in for a browser one. The runaway risk it used to cover is the risk
+        // the browser has always carried: a guest loop with no back-edge check would spin
+        // there too, and the product does not.
+        //
+        // Fuel consumption stays ON either way: `note_suspend` reads it as the second
+        // opinion the software counter is checked against.
+        let yield_at = match self.fuel_interval {
+            0 => Some(self.quantum_fuel),
+            _ => None,
+        };
+        store.fuel_async_yield_interval(yield_at).map_err(|e| RunError::Wasm(e.to_string()))?;
 
         let mut linker = Linker::new(&self.engine);
         bind_svc(&mut linker)?;
@@ -876,7 +1121,14 @@ impl<H: ImportDispatch + Send + 'static> WasmtimeEngine<H> {
             FiberEnd::Returned(last_r0)
         });
 
-        Ok(WasmtimeThread { thid, future, signal, priority, quantum_fuel: self.quantum_fuel })
+        Ok(WasmtimeThread {
+            thid,
+            future,
+            signal,
+            priority,
+            quantum_fuel: self.quantum_fuel,
+            fuel_interval: self.fuel_interval,
+        })
     }
 }
 
@@ -909,13 +1161,23 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                         // a machine register trace is being captured (the file is the record,
                         // and a wide qdiff hook range would otherwise flood stderr), or when
                         // only the histogram is wanted.
-                        if qdiff_regtrace().is_none() && !block_hist_enabled() {
+                        if qdiff_regtrace().is_none()
+                            && !block_hist_enabled()
+                            && trace_frame_window_open(current_frame())
+                        {
                             let thid = caller.data().thid;
                             let r: [u32; 13] = std::array::from_fn(|i| get_reg(&mut caller, i));
+                            let frame = current_frame();
+                            // The watched words (VITASLOP_REGTRACE_WATCH) belong on this line
+                            // too, not only in the machine regtrace file. A control-flow trace
+                            // says which branch was taken but never WHICH STATE decided it, and
+                            // for a guard that another thread or a host call writes, the
+                            // deciding word is not in any register the block reads.
+                            let watched = watch_words(&mut caller);
                             eprintln!(
-                                "[trace] t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
+                                "[trace] frame={frame} t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
                                  r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} \
-                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} lr={:#010x}",
+                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} lr={:#010x}{watched}",
                                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
                                 r[8], r[9], r[10], r[11], r[12], get_reg(&mut caller, 14),
                             );
@@ -946,6 +1208,72 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
+}
+
+/// `VITASLOP_TRACE_FRAMES=<from>-<to>` (decimal display frames, inclusive) - print the
+/// per-block `[trace]` lines only inside that frame window. Unset traces the whole run.
+///
+/// `VITASLOP_TRACE_BLOCKS` selects WHICH blocks to trace but not WHEN, and the two are
+/// not interchangeable: a function that a title calls every frame emits its whole boot
+/// history before reaching the frame under investigation. On this codebase's own titles
+/// that is a quarter of a million lines before the first flip, which buries the twenty
+/// lines the question is about and slows the run enough to move the schedule being
+/// measured. The window is applied HOST-side, so it needs no re-transpile and can be
+/// changed between runs of the same build.
+///
+/// This is the block tracer's counterpart to [`transpiler::arm_at_frame`], which already
+/// gates the qdiff snapshot and register trace the same way.
+fn trace_frame_window() -> &'static Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let s = std::env::var("VITASLOP_TRACE_FRAMES").ok()?;
+        let (from, to) = s.split_once('-').unwrap_or_else(|| {
+            panic!("VITASLOP_TRACE_FRAMES: {s:?} is not <from>-<to> (decimal frames)")
+        });
+        match (from.trim().parse::<u64>(), to.trim().parse::<u64>()) {
+            (Ok(from), Ok(to)) if from <= to => Some((from, to)),
+            _ => panic!("VITASLOP_TRACE_FRAMES: {s:?} is not a valid frame window <from>-<to>"),
+        }
+    })
+}
+
+/// The `VITASLOP_REGTRACE_WATCH` words, formatted as ` mADDR=VALUE` fields ready to append
+/// to a trace line. Empty when the knob is unset, so an unwatched trace is unchanged.
+///
+/// Shared by the human block trace and the machine register trace so the two never disagree
+/// about what a word held at the same block entry.
+fn watch_words<H: ImportDispatch + Send + 'static>(caller: &mut Caller<'_, ThreadData<H>>) -> String {
+    let watch = qdiff_regtrace_watch();
+    if watch.is_empty() {
+        return String::new();
+    }
+    let base = caller.data().base;
+    let shared = caller.data().shared_mem.clone();
+    let data = shared.data();
+    // SAFETY: as in `qdiff_dump_snapshot` - `UnsafeCell<u8>` is repr(transparent) over `u8`,
+    // and no other fiber runs while this svc handler executes.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+    let mut out = String::new();
+    for &addr in watch {
+        let off = addr.wrapping_sub(base) as usize;
+        match bytes.get(off..off + 4) {
+            Some(w) => out.push_str(&format!(
+                " m{addr:08x}={:08x}",
+                u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+            )),
+            None => out.push_str(&format!(" m{addr:08x}=oob")),
+        }
+    }
+    out
+}
+
+/// Is `frame` inside the [`trace_frame_window`]? True everywhere when no window is set.
+fn trace_frame_window_open(frame: u64) -> bool {
+    match trace_frame_window() {
+        Some((from, to)) => frame >= *from && frame <= *to,
+        None => true,
+    }
 }
 
 // --- qemu-diff capture: full-state snapshot + per-block register trace ------------
@@ -1169,26 +1497,7 @@ fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     // Optional watched memory words (VITASLOP_REGTRACE_WATCH). Appended after the
     // fixed reg+flag columns so the qdiff host tool's parser, which reads the leading
     // 21 fields, is unaffected.
-    let watch = qdiff_regtrace_watch();
-    if !watch.is_empty() {
-        let base = caller.data().base;
-        let shared = caller.data().shared_mem.clone();
-        let data = shared.data();
-        // SAFETY: as in `qdiff_dump_snapshot` - `UnsafeCell<u8>` is repr(transparent)
-        // over `u8`, and no other fiber runs while this svc handler executes.
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
-        for &addr in watch {
-            let off = addr.wrapping_sub(base) as usize;
-            match bytes.get(off..off + 4) {
-                Some(w) => line.push_str(&format!(
-                    " m{addr:08x}={:08x}",
-                    u32::from_le_bytes([w[0], w[1], w[2], w[3]])
-                )),
-                None => line.push_str(&format!(" m{addr:08x}=oob")),
-            }
-        }
-    }
+    line.push_str(&watch_words(caller));
     line.push('\n');
     let mut guard = qdiff_regtrace_writer().lock().unwrap();
     if guard.is_none() {
@@ -1462,11 +1771,11 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                             // Stay runnable but suspend so the scheduler re-picks by
                             // priority now (a higher-priority thread just became
                             // runnable and must preempt us).
-                            note_suspend(&mut caller, Stop::Quantum);
+                            note_suspend(&mut caller, Stop::Quantum, selector as u32);
                             YieldNow(false).await;
                         }
                         SvcOutcome::Block => {
-                            note_suspend(&mut caller, Stop::Blocked);
+                            note_suspend(&mut caller, Stop::Blocked, selector as u32);
                             YieldNow(false).await;
                             // Resumed. A timed wait that expired owes this thread a
                             // return code other than the 0 it parked with (a
@@ -1482,7 +1791,7 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                             }
                         }
                         SvcOutcome::Flip => {
-                            note_suspend(&mut caller, Stop::Flip);
+                            note_suspend(&mut caller, Stop::Flip, selector as u32);
                             YieldNow(false).await;
                         }
                         SvcOutcome::ThreadExit => {
@@ -1520,16 +1829,77 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
 fn note_suspend<H: ImportDispatch + Send + 'static>(
     caller: &mut Caller<'_, ThreadData<H>>,
     stop: Stop,
+    selector: u32,
 ) {
     // `get_fuel` fails only on a store without fuel consumption enabled, which this engine
     // always enables; leave the previous reading rather than invent one if it ever does.
     let burned = caller.get_fuel().ok().map(|left| u64::MAX - left);
-    sample_software_fuel(caller, burned);
+    sample_software_fuel(caller, burned, selector);
+    let retired = sample_arm_instructions(caller);
     let mut s = caller.data().signal.lock().unwrap();
     s.stop = stop;
     s.host_suspends = s.host_suspends.wrapping_add(1);
     if let Some(burned) = burned {
         s.fuel = burned;
+    }
+    if let Some(retired) = retired {
+        s.arm = retired;
+    }
+}
+
+/// Read this thread's cumulative GUEST ARM INSTRUCTION count out of the emitted work
+/// counter's high half (see `abi::WORK_GLOBAL`). `None` on a build without the counter.
+///
+/// This is the reading the game clock is billed from - see
+/// [`ThreadHandle::arm_retired`], which is where the unit is argued for.
+fn sample_arm_instructions<H: ImportDispatch + Send + 'static>(
+    caller: &mut Caller<'_, ThreadData<H>>,
+) -> Option<u64> {
+    if caller.data().fuel_interval == 0 {
+        return None;
+    }
+    let g = caller.data().sw_fuel.clone()?;
+    let packed = g.get(&mut *caller).i64()? as u64;
+    Some(packed >> abi::WORK_INSTR_SHIFT)
+}
+
+/// Times a fiber suspended without any of our code running, on a build where the emitted
+/// work check is the only preemption there is. See [`GuestThread::resume`].
+static UNATTRIBUTED_SUSPENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Report a suspend nothing of ours produced, the FIRST time it happens. Silence here
+/// would read as the ordinary path, which is exactly what it is not.
+fn note_unattributed_suspend() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if UNATTRIBUTED_SUSPENDS.fetch_add(1, Relaxed) == 0 {
+        tracing::warn!(
+            target: "vitaslop::sched",
+            "a guest fiber suspended without passing through the host-call closure, on a \
+             build whose only preemption is the emitted work check. Nothing in this engine \
+             should be able to do that (wasmtime's periodic yield is off), so the thread's \
+             burn for that slice is priced from a stale reading",
+        );
+    }
+}
+
+/// Suspends nothing of ours produced, over the whole run. Zero is the expected reading;
+/// see [`note_unattributed_suspend`].
+pub fn unattributed_suspends() -> u64 {
+    UNATTRIBUTED_SUSPENDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Report the one reading that says the software work counter is being read wrong: it
+/// went DOWN between two samples, which can only mean a clear this closure never saw.
+fn note_software_fuel_went_backwards(last: i64, now: i64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, Relaxed) == 0 {
+        tracing::warn!(
+            target: "vitaslop::sched",
+            "the software work counter went BACKWARDS ({last} -> {now}): the operator half \
+             was cleared by a fuel yield this host never saw, so its comparison against \
+             wasmtime undercounts by whole intervals",
+        );
     }
 }
 
@@ -1544,6 +1914,14 @@ static SW_FUEL: [std::sync::atomic::AtomicU64; 3] = [
 
 /// `(software fuel, wasmtime fuel, samples)` over the whole run, or `None` when this
 /// build emitted no software fuel.
+///
+/// # It runs on every retail run now, and it is a STANDING cross-check
+/// The retail path emits the work counter unconditionally (it is what preempts and what
+/// the game clock is billed from), so this comparison is no longer an opt-in experiment.
+/// It costs one global read per switch point and it is the only thing in the project that
+/// can say the counter still agrees with a real engine's accounting after a codegen
+/// change. A ratio that walks away from one is a codegen change the counter does not
+/// model.
 ///
 /// # What it is for
 /// The browser has no engine fuel, so the transpiler emits a counter that is supposed to
@@ -1576,11 +1954,12 @@ pub fn software_fuel_report() -> Option<(u64, u64, u64)> {
 fn sample_software_fuel<H: ImportDispatch + Send + 'static>(
     caller: &mut Caller<'_, ThreadData<H>>,
     wasmtime_total: Option<u64>,
+    selector: u32,
 ) {
     // The global is exported unconditionally; it only COUNTS when this build emitted
     // fuel. Without this the report would fire on every ordinary run and read a flat
     // zero as "the counter says the guest did no work".
-    let interval = i64::from(vitaslop_transpiler::fuel_interval());
+    let interval = i64::from(caller.data().fuel_interval);
     if interval == 0 {
         return;
     }
@@ -1590,11 +1969,24 @@ fn sample_software_fuel<H: ImportDispatch + Send + 'static>(
     // wasmtime's unit, so only that half is comparable with wasmtime's own reading.
     let Some(now) = g.get(&mut *caller).i64().map(|v| v & abi::WORK_OPS_MASK) else { return };
     let last = caller.data().sw_last;
-    // The operator half counts UP to the interval and is cleared at each yield, so a
-    // reading BELOW the last one means a yield happened in between: the thread finished
-    // the old interval and then spent part of the new one.
-    let burned = if now >= last { now - last } else { (interval - last) + now };
-    caller.data_mut().sw_last = now;
+    // >>> THE CLEAR IS TRACKED, NOT INFERRED FROM THE READING, AND THAT IS THE WHOLE
+    // ACCURACY OF THIS INSTRUMENT. The operator half counts UP and the emitted code zeroes
+    // it immediately after each fuel yield, so a reading below the last one means a yield
+    // happened in between - but "how MANY" is not recoverable from two readings, and
+    // guessing one undercounts by a whole interval for every extra yield. MEASURED with
+    // the guess in place: the counter read 0.41x wasmtime over a 3000-frame run, which
+    // looks exactly like a counter that bills 41% of what it should.
+    //
+    // Every clear is preceded by a `FUEL_SELECTOR` call through this very closure, so the
+    // clears can be COUNTED instead: after one, the next reading starts from zero.
+    let burned = (now - last).max(0);
+    caller.data_mut().sw_last =
+        if selector == vitaslop_transpiler::abi::FUEL_SELECTOR { 0 } else { now };
+    // A reading below the last one is now impossible - it would mean a clear this closure
+    // never saw, i.e. an operator charge going unbilled somewhere.
+    if now < last {
+        note_software_fuel_went_backwards(last, now);
+    }
 
     use std::sync::atomic::Ordering::Relaxed;
     SW_FUEL[0].fetch_add(burned.max(0) as u64, Relaxed);
@@ -1723,6 +2115,25 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         Some(map[first..=last].iter().any(|&s| s >= stamp))
     }
 
+    fn dirty_epoch(&self) -> Option<u8> {
+        // SAFETY: see `dirty_block`.
+        let block = unsafe { self.dirty_block()? };
+        Some(block[vitaslop_transpiler::DIRTY_EPOCH_OFF as usize])
+    }
+
+    /// See `GuestMemory::rebase_dirty_epoch`. Mirrors the browser's, over the slice.
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        // SAFETY: see `dirty_block`.
+        let block = unsafe { self.dirty_block()? };
+        for p in block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..].iter_mut() {
+            *p = if *p >= floor { *p - floor + 1 } else { 0 };
+        }
+        let at = vitaslop_transpiler::DIRTY_EPOCH_OFF as usize;
+        let next = if block[at] >= floor { block[at] - floor + 1 } else { 1 };
+        block[at] = next;
+        Some(next)
+    }
+
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
         // SAFETY: see `dirty_block`.
         let block = unsafe { self.dirty_block()? };
@@ -1758,6 +2169,15 @@ fn write_shared(mem: &SharedMemory, off: usize, bytes: &[u8]) {
 /// locals across statements), the globals hold the exact ARM state at the faulting
 /// instruction - so on a MemoryOutOfBounds this shows the garbage pointer that was
 /// dereferenced (and `this` in r0..r3 for a C++ vtable dispatch). Diagnostic only.
+///
+/// >>> THAT "no caching in wasm locals" IS A REAL PRECONDITION, AND ONE BUILD BREAKS IT.
+/// `VITASLOP_PROMOTE_REGS` holds the register file in wasm LOCALS along each straight-line
+/// run and writes back only at calls, branches and returns (see `transpiler::promote`). A
+/// trap in the middle of such a run therefore leaves the globals holding the values from
+/// the last write-back, not the faulting instruction - so this dump goes STALE rather than
+/// wrong-looking, which is the worse failure for a diagnostic. The knob is off by default;
+/// if it is ever made the default, this dump has to spill the promoted locals first or say
+/// that it cannot.
 fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
     let mut s = String::from("regs at trap:");
     for i in 0..abi::REG_COUNT {
@@ -1783,6 +2203,61 @@ fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
     s
 }
 
+/// Guest address of each transpiled function, indexed by wasm function index minus
+/// [`abi::IMPORT_FUNC_COUNT`]. Recorded once, when the module is built.
+static FUNC_ADDRS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Record the emitted module's function table so a trap backtrace can name guest code.
+///
+/// # Why a process-wide latch rather than plumbing
+/// A trap surfaces deep inside a fiber closure that has no reference to the artifact, and
+/// the module is built exactly once per run. Threading the table down to that point would
+/// touch every layer between for a diagnostic; a `OnceLock` set at build time reaches it
+/// from anywhere and cannot be set twice.
+pub fn record_function_addresses(addrs: Vec<u32>) {
+    let _ = FUNC_ADDRS.set(addrs);
+}
+
+/// Rewrite `<wasm function N>` in a trap backtrace to name the GUEST function it is.
+///
+/// # Why this is not optional
+/// A wasm backtrace is a list of module indices. On its own it says a fault happened
+/// nineteen frames deep and nothing about where, and the indices are useless to anyone
+/// without the module in front of them - a device capture pasted into a chat window is
+/// exactly that situation. The mapping is `funcs[N - IMPORT_FUNC_COUNT]` (the imports occupy
+/// the low indices), which is the same arithmetic the retail probe's `VITASLOP_WASM_INDICES`
+/// does by hand, applied where the trap is actually printed.
+///
+/// MEASURED on the crash this was written for: the raw backtrace is
+/// `6676 -> 12889 -> 6808` repeating nineteen frames, which reads as noise. Named, the
+/// repeat is a guest routine recursing through the indirect-call dispatcher, which is a
+/// description of the bug.
+fn name_guest_frames(s: &str) -> String {
+    let Some(addrs) = FUNC_ADDRS.get() else { return s.to_string() };
+    const MARK: &str = "<wasm function ";
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut rest = s;
+    while let Some(at) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(at + MARK.len());
+        out.push_str(head);
+        let end = tail.find('>').unwrap_or(tail.len());
+        let (num, after) = tail.split_at(end);
+        out.push_str(num);
+        if let Ok(widx) = num.trim().parse::<usize>() {
+            match widx.checked_sub(abi::IMPORT_FUNC_COUNT as usize).and_then(|i| addrs.get(i)) {
+                Some(a) => out.push_str(&format!(" = guest {a:#010x}")),
+                // Above every guest function sit the dispatcher and `reset`, emitted last.
+                // Saying so is as useful as an address: a backtrace that ALTERNATES with the
+                // dispatcher is an indirect-call chain, which is a fact about the bug.
+                None => out.push_str(" = dispatcher/reset (not guest code)"),
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn trap_detail(e: &wasmtime::Error) -> String {
     let mut s = match e.downcast_ref::<wasmtime::Trap>() {
         Some(t) => format!("{t:?}: {e}"),
@@ -1806,7 +2281,9 @@ fn trap_detail(e: &wasmtime::Error) -> String {
             break;
         }
     }
-    s
+    // Name the guest functions in the backtrace. Done here, at the one place a trap is
+    // turned into text, so every caller gets it and none has to remember.
+    name_guest_frames(&s)
 }
 
 // --- register/vfp accessors (Caller during a call, Store during setup) --------

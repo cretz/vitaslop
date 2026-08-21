@@ -16,10 +16,19 @@ mod emit;
 /// writing [`Artifact::arm_word_off`] when the run reaches it.
 pub use emit::arm_at_frame;
 pub use emit::set_fuel_interval;
+/// Whether emitted modules hold the ARM register file in wasm LOCALS along each
+/// straight-line run (`VITASLOP_PROMOTE_REGS`), and the per-thread override a test uses
+/// to emit both arms in one process. See [`promote`].
+pub use emit::{promote_registers, set_promote_registers};
+/// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
+/// has no environment, so it selects the arm through the setter.
+pub use emit::{flags_wide_c, set_flags_wide_c};
 /// The fuel interval modules emitted on this thread carry, so a HOST can read the
 /// software counter the emitted code maintains: the counter runs DOWN from this and
 /// reloads to it, so only a host that knows the interval can difference it.
 pub use emit::fuel_interval;
+/// The lowering categories operator cost is attributed to - see [`emit::Expansion::by_stmt`].
+pub use emit::StmtKind;
 /// The guest-store DIRTY MAP: whether to emit it, and where a host reads it. The map
 /// is one byte per 4 KB page holding the epoch of the last store into that page, laid
 /// out at [`Artifact::dirty_off`] as `[epoch byte][map]` (see [`DIRTY_EPOCH_OFF`] and
@@ -29,6 +38,9 @@ pub use emit::{set_dirty_tracking, DIRTY_EPOCH_OFF, DIRTY_MAP_OFF, DIRTY_SHIFT};
 mod flags;
 mod ir;
 mod lower;
+/// Holding the ARM register file in wasm LOCALS instead of globals: the policy, and the
+/// model that prices it. Public because the price is a number a host reports.
+pub mod promote;
 
 use std::collections::BTreeMap;
 
@@ -294,6 +306,26 @@ pub enum InlineOp {
     /// two threads racing on one texture's control word is a data race the guest wrote, and
     /// the host handler was no more atomic.
     StoreArgField { offset: u32, shift: u32, mask: u32 },
+    /// `w = u32_at(r0 + offset); u32_at(r0 + offset) = (w & !mask) | (r1 & mask); r0 = 0` -
+    /// [`InlineOp::StoreArgField`] for a setter whose argument is ALREADY in field position.
+    ///
+    /// # Why this is a second form and not a flag on the first
+    /// `StoreArgField` shifts the argument UP into the field, which is right for an enum
+    /// numbered from zero (`SceGxmTextureFilter` is 0..3) and wrong for one whose constants are
+    /// the control-word bits themselves (`SCE_GXM_TEXTURE_MIP_FILTER_ENABLED` IS `0x200`). The
+    /// handlers for those shift the argument DOWN first, so giving them the shifting form would
+    /// mask `0x200` to zero and store "disabled" for every call that asked for enabled -
+    /// silently, visible only as absent mip filtering. The two really are different programs,
+    /// and the way to keep them from being confused is to make the emitter carry both.
+    ///
+    /// The mask here is the field IN PLACE (`mask << shift` of the getter's pair), so a caller
+    /// still derives it from the one `(shift, mask)` constant its getter reads and the two
+    /// cannot drift apart.
+    ///
+    /// Everything else - the truncation of a wider value, the single load/compute/store with no
+    /// yield point, the admissibility rule that the handler must do this and nothing else -
+    /// is exactly as [`InlineOp::StoreArgField`] states it.
+    StoreArgFieldInPlace { offset: u32, mask: u32 },
     /// `dst = r0 + offset + r1 * stride; dst[0] = r2; dst[1..=words] = *(r2 .. r2 + 4*words);
     /// dst[words + 1] = 0; r0 = 0` - copy N words THROUGH a second pointer into an indexed
     /// slot, recording where they came from.
@@ -326,6 +358,123 @@ pub enum InlineOp {
     /// reused: a unit bound by a precomputed state and then re-bound directly would otherwise
     /// keep the old provenance and mislabel itself in every later report.
     CopyArgIndexed { offset: u32, stride: u32, count: u32, words: u32 },
+    /// Bump a RING CURSOR in the structure r0 points at, hand the block back through r1,
+    /// and record what was handed out - when everything the answer depends on is already in
+    /// guest memory. Everything else runs the real host call.
+    ///
+    /// ```text
+    /// h    = u32_at(r0 + l.program)                  -- the bound program handle
+    /// cur  = align(u32_at(r0 + l.ring_cursor), l.align)
+    /// take = u32_at(r0 + l.context_magic_at) == l.context_magic
+    ///      & u32_at(h + l.program_magic_at) == l.program_magic
+    ///      & u32_at(r0 + l.ring_base) != 0
+    ///      & cur + u32_at(h + l.prog_alloc) <= u32_at(r0 + l.ring_end)
+    /// if take {
+    ///     u32_at(r0 + l.ring_cursor) = cur + u32_at(h + l.prog_alloc)
+    ///     u32_at(r0 + l.record + 0)  = cur
+    ///     u32_at(r0 + l.record + 4)  = u32_at(h + l.prog_size)
+    ///     u32_at(r0 + l.record + 8)  = u32_at(h + l.prog_header)
+    ///     u32_at(r1) = cur; r0 = 0
+    /// } else { host call }
+    /// ```
+    ///
+    /// # Why an ALLOCATING call can be inlined at all
+    /// It looks like the one shape that cannot: the handler resolves a handle, reflects a
+    /// program's interface to size a buffer, allocates, and leaves three facts behind for
+    /// the draw to read. Every one of those was a reason to keep crossing, and every one of
+    /// them turned out to be a fact that does not change after the program is CREATED.
+    /// Moving the size to the handle it belongs to ([`vitaslop_runtime::vita::gxmprog`]) and
+    /// the ring plus the bound record to the context block
+    /// ([`vitaslop_runtime::vita::gxmctx`]) leaves an allocation that is a bump of one word,
+    /// and both of those are where the hardware keeps the same facts: GXM's default uniform
+    /// buffer IS a driver-recycled ring inside the memory the guest handed over.
+    ///
+    /// This is the largest single item left in a gameplay frame's host-call budget -
+    /// MEASURED per frame at **1,189 crossings on one title (53% of everything it calls)**
+    /// and 601 on another - and in the browser a crossing is ~1.4 us of marshalling alone.
+    ///
+    /// # Why each term of the guard is there
+    /// - **The context magic** identifies r0 as a block this engine laid out. Without it an
+    ///   arbitrary pointer would be read as a ring and the guest handed a "buffer" at an
+    ///   address computed from whatever was there.
+    /// - **The program magic** does the same for the bound handle, and it is the term that
+    ///   covers "nothing is bound" (the word is 0) as well as "this is not our handle".
+    /// - **A non-zero ring base** is how a context whose ring was never attached - the host
+    ///   allocates it, and an exhausted heap declines - reaches the handler, which is the
+    ///   side that can allocate one.
+    /// - **The fit** sends a scene that overruns the ring to the handler, because WRAPPING
+    ///   aliases two live buffers and that is a fidelity loss the handler reports once.
+    ///   Inlining the wrap would make it silent.
+    ///
+    /// # What it does NOT do, and must not
+    /// The handler also POISONS the vertex buffer when `VITASLOP_GXM_UNIFORM_POISON` is set,
+    /// which is the diagnostic that separates "the guest wrote this" from "this is the last
+    /// draw's uniforms still in the ring". An inlined call never reaches the host, so that
+    /// fill would simply stop happening - which is why the runtime withholds this form
+    /// entirely while the poison knob is on rather than emitting an approximation of it.
+    ///
+    /// # Read-modify-write with no yield point
+    /// The cursor is loaded, bumped and stored with no loop and no call in between, so
+    /// neither engine can preempt inside it and two threads cannot be handed the same
+    /// block - see [`InlineOp::LwMutexLock`] for the whole argument. The host handler was no
+    /// more atomic than this.
+    ReserveUniformBuffer { layout: UniformRingLayout },
+    /// Copy `r3` floats from the pointer at `[sp]` into TWO places - the uniform buffer in
+    /// r0 at the register the parameter record in r1 names, and the engine's fallback SA
+    /// bank - then return success. Everything else runs the real host call.
+    ///
+    /// ```text
+    /// src  = u32_at(sp)
+    /// idx  = u32_at(r1 + l.param_index_at)              -- the parameter's resource_index
+    /// at   = idx + r2                                    -- the first REGISTER written
+    /// bank = mirror[l.bank_slot]
+    /// take = ((u32_at(r1 + l.param_packed_at) >> l.type_shift) & l.type_mask) != l.f16_type
+    ///      & idx <= l.max_regs & r2 <= l.max_regs & r3 <= l.max_regs & at + r3 <= l.max_regs
+    ///      & bank != 0
+    ///      & every pointer admits 4*r3 bytes
+    /// if take {
+    ///     memcpy(r0 + at*4, src, r3*4)
+    ///     memcpy(bank + l.bank_data_at + at*4, src, r3*4)
+    ///     if at + r3 > u32_at(bank + l.bank_len_at) { u32_at(bank + l.bank_len_at) = at + r3 }
+    ///     r0 = 0
+    /// } else { host call }
+    /// ```
+    ///
+    /// # Why this one is worth a form of its own
+    /// After the GXM draw state, the texture binds and the default-uniform reserves were
+    /// inlined, `sceGxmSetUniformDataF` is what a real title has LEFT: **1,106 calls a frame
+    /// on one racing title, 58% of every host call it still makes.** It is also the last
+    /// GXM call in the per-draw sequence that was not a plain fact about guest memory - and
+    /// it turned out to be one, once the fallback bank moved into guest memory beside
+    /// everything else the draw path reads (`vitaslop_runtime::host::SA_BANK_DATA`).
+    ///
+    /// # Why the copy is exactly what the handler does
+    /// The handler reads each component with `read_f32` and writes it back with `to_bits`,
+    /// which is bit-preserving in both directions, so a component's four bytes arrive
+    /// unchanged - a NaN payload included. `memory.copy` moves the same bytes. The two
+    /// destinations are written in the same order the handler writes them, and neither can
+    /// overlap the source in a way the handler would have seen differently: `memory.copy`
+    /// is specified to read the source in full before writing, which is what the handler's
+    /// read-into-a-`Vec`-then-write does.
+    ///
+    /// # The FIFTH ARGUMENT
+    /// `sourceData` is the fifth parameter, which AAPCS puts on the STACK. This is the only
+    /// form that reads one, and it reads it exactly where `GuestCtx::arg(4)` does: the word
+    /// at `sp`. Guarded like any other pointer - a stack pointer near the end of memory runs
+    /// the handler.
+    ///
+    /// # What it refuses, and why each refusal is the handler's case
+    /// - **An F16 parameter.** Two components share a register, so the write is a
+    ///   read-modify-write per half and a byte copy is simply a different program. The
+    ///   handler keeps it ([`vitaslop_runtime::host::VitaState::set_uniform_halves`]).
+    /// - **A null or unreadable parameter record**, where the handler defines the base as 0.
+    /// - **A negative or absurd `resource_index`**, which the handler clamps - and a clamp
+    ///   is not expressible here, the same reason [`InlineOp::LoadScaled`] has a value guard.
+    /// - **A write past the bank's ceiling**, which the handler drops from the bank while
+    ///   still writing the buffer. Two different destinations disagreeing is precisely the
+    ///   sort of case to leave in one place.
+    /// - **No bank at all**, which is an arena that could not place one.
+    SetUniformData { layout: UniformDataLayout },
     /// Take a recursive lock whose state lives in the guest WORK AREA pointed to by r0,
     /// when it is uncontended. Everything else runs the real host call.
     ///
@@ -493,6 +642,97 @@ pub struct LwMutexLayout {
     pub waiters: u32,
 }
 
+/// Where an [`InlineOp::ReserveUniformBuffer`] finds every word it reads and writes.
+///
+/// The transpiler does not choose any of these - the runtime owns both structures
+/// (`vitaslop_runtime::vita::gxmctx` and `::gxmprog`) and passes them in, so the emitted
+/// code and the host handler read one set of numbers rather than two copies that can drift.
+/// The `*_at` offsets are byte offsets from the pointer named in their prefix: `ctx_` from
+/// the context in r0, `prog_` from the bound program handle read out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniformRingLayout {
+    /// Offset of the context block's identity stamp, and the value it must hold.
+    pub ctx_magic_at: u32,
+    pub ctx_magic: u32,
+    /// Offset of the bound program HANDLE within the context block. Which stage this form
+    /// serves is decided here and at [`Self::record`], and nowhere else.
+    pub ctx_program: u32,
+    /// The ring's three words: base, one-past-the-end, and the next free byte. All guest
+    /// ADDRESSES, so the bumped cursor is the answer the guest wants with no rebasing.
+    pub ctx_ring_base: u32,
+    pub ctx_ring_end: u32,
+    pub ctx_ring_cursor: u32,
+    /// Offset of this stage's three-word bound-uniform record: `[buffer, size, header]`.
+    pub record: u32,
+    /// Offset of the handle's identity stamp, and the value it must hold.
+    pub prog_magic_at: u32,
+    pub prog_magic: u32,
+    /// The handle's memoised `default uniform buffer` size in bytes (recorded), the bytes
+    /// a reserve takes from the ring for it (never smaller), and the `SceGxmProgram *`.
+    pub prog_size: u32,
+    pub prog_alloc: u32,
+    pub prog_header: u32,
+    /// Alignment every handed-out block gets. A power of two; the ring base has it too, so
+    /// aligning the absolute cursor and aligning an offset from the base agree.
+    pub align: u32,
+}
+
+impl UniformRingLayout {
+    /// The highest offset reached from the CONTEXT pointer, which is what its bound must be
+    /// computed against - the guard has to admit the last word, not the first.
+    pub fn ctx_top(self) -> u32 {
+        self.ctx_magic_at
+            .max(self.ctx_program)
+            .max(self.ctx_ring_base)
+            .max(self.ctx_ring_end)
+            .max(self.ctx_ring_cursor)
+            .max(self.record + 8)
+    }
+
+    /// The highest offset reached from the PROGRAM HANDLE, for the same reason.
+    pub fn prog_top(self) -> u32 {
+        self.prog_magic_at.max(self.prog_size).max(self.prog_alloc).max(self.prog_header)
+    }
+}
+
+/// Where an [`InlineOp::SetUniformData`] finds the two records it reads.
+///
+/// As with [`UniformRingLayout`], the runtime owns every number here (the GXM parameter
+/// record's own layout, and its fallback SA bank's) and passes them in, so the emitted code
+/// and the handler cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniformDataLayout {
+    /// Host-mirror slot holding the SA bank's guest address.
+    pub bank_slot: u32,
+    /// Byte offsets within the bank: its high-water float count, and its first float.
+    pub bank_len_at: u32,
+    pub bank_data_at: u32,
+    /// Byte offset of the parameter record's packed word, and the field within it that
+    /// carries the component TYPE - plus the value of that field which means F16, the one
+    /// case this form must refuse.
+    pub param_packed_at: u32,
+    pub type_shift: u32,
+    pub type_mask: u32,
+    pub f16_type: u32,
+    /// Byte offset of the parameter's `resource_index` - the register it starts at.
+    pub param_index_at: u32,
+    /// The bank's capacity in registers, which is also the ceiling the handler refuses past.
+    pub max_regs: u32,
+}
+
+impl UniformDataLayout {
+    /// The highest offset reached from the PARAMETER pointer, which is what its bound is
+    /// computed against.
+    pub fn param_top(self) -> u32 {
+        self.param_packed_at.max(self.param_index_at)
+    }
+
+    /// The highest byte offset reached from the BANK pointer: its last float.
+    pub fn bank_top(self) -> u32 {
+        self.bank_len_at.max(self.bank_data_at + self.max_regs * 4 - 4)
+    }
+}
+
 impl LwMutexLayout {
     /// The highest offset the layout reaches, which is what a pointer bound must be
     /// computed against - the guard has to admit the LAST word, not the first.
@@ -526,7 +766,8 @@ impl InlineOp {
             // A void setter: the guest gets the success code and nothing else.
             InlineOp::StoreArg { .. }
             | InlineOp::StoreArgIndexed { .. }
-            | InlineOp::StoreArgField { .. } => 0,
+            | InlineOp::StoreArgField { .. }
+            | InlineOp::StoreArgFieldInPlace { .. } => 0,
             // A copy: what it writes comes from the SOURCE pointer, not from a loaded word,
             // so a one-word `eval` cannot express it. Its meaning is the layout it writes -
             // held against the handler by `the_texture_binding_layout_is_closed`.
@@ -537,6 +778,14 @@ impl InlineOp {
             // `vitaslop_runtime::vita::lwwork::fast_lock`, which the emitted code is held
             // against directly.
             InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 0,
+            // A successful reserve returns 0, and a refused one never gets here (the host
+            // call answers instead). Its real meaning is a bump over two structures, which
+            // `eval`'s one-word signature cannot express - the execution test in
+            // `vitaslop-native/tests/inline_imports.rs` is what holds it to its handler.
+            InlineOp::ReserveUniformBuffer { .. } => 0,
+            // A successful uniform write returns 0; its meaning is two byte ranges, which
+            // `eval`'s one-word signature cannot express any more than the copy form's.
+            InlineOp::SetUniformData { .. } => 0,
             // A bulk form's meaning is a RANGE of memory, which a one-word `eval` cannot
             // express any more than it can express the copy form's. `MemCopy` and `MemFill`
             // return the destination they were handed, so 0 here is not their r0 - the
@@ -587,7 +836,7 @@ impl InlineOp {
             InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
             // Reads the word it is about to rewrite, so its offset is a `store_offset` -
             // reporting it here would make a getter test read the field mid-update.
-            InlineOp::StoreArgField { .. } => None,
+            InlineOp::StoreArgField { .. } | InlineOp::StoreArgFieldInPlace { .. } => None,
             // Reads through r2 and writes through r0, so neither pointer's offset is "the"
             // offset.
             InlineOp::CopyArgIndexed { .. } => None,
@@ -597,6 +846,11 @@ impl InlineOp {
             // Reaches from the pointer itself for a length the guest supplies; there is no
             // fixed offset to name.
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
+            // Reads through two pointers and writes through three; no single offset
+            // describes it, and its layout is what a test holds it to instead.
+            InlineOp::ReserveUniformBuffer { .. } => None,
+            // Reads a record, a stack word and a source buffer, and writes two ranges.
+            InlineOp::SetUniformData { .. } => None,
         }
     }
 
@@ -614,6 +868,7 @@ impl InlineOp {
             InlineOp::StoreArgIndexed { offset, .. } => Some(offset),
             InlineOp::CopyArgIndexed { offset, .. } => Some(offset),
             InlineOp::StoreArgField { offset, .. } => Some(offset),
+            InlineOp::StoreArgFieldInPlace { offset, .. } => Some(offset),
             _ => None,
         }
     }
@@ -625,7 +880,7 @@ impl InlineOp {
         match self {
             InlineOp::LoadShiftMask { .. } | InlineOp::LoadScaled { .. } => None,
             InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
-            InlineOp::StoreArgField { .. } => None,
+            InlineOp::StoreArgField { .. } | InlineOp::StoreArgFieldInPlace { .. } => None,
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
@@ -637,6 +892,11 @@ impl InlineOp {
             InlineOp::LwMutexLock { thread_slot, .. }
             | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
+            // Everything it reads is in the two guest structures it is handed.
+            InlineOp::ReserveUniformBuffer { .. } => None,
+            // Reads the SA bank's ADDRESS out of the block - the one slot that is not a
+            // value the guest asked for. See `vitaslop_runtime::vita::mirror::SLOT_SA_BANK`.
+            InlineOp::SetUniformData { layout } => Some(layout.bank_slot),
         }
     }
 
@@ -1952,5 +2212,89 @@ mod tests {
         };
         assert!(has_shared_mem_import(&shared), "shared build imports env.memory");
         assert!(!has_shared_mem_import(&plain), "plain build imports no memory");
+    }
+
+    /// A long straight-line run of register arithmetic, transpiled both ways.
+    ///
+    /// Three things have to be true at once and each fails silently on its own:
+    /// promotion must actually FIRE (a policy that promotes nothing passes every
+    /// correctness test there is), the unpromoted module must be BYTE-IDENTICAL to one
+    /// built before promotion existed, and the promoted module must still be valid wasm
+    /// with its register file properly written back.
+    ///
+    /// The straight-line shape is the point: the policy only promotes within a run
+    /// bounded by branches and calls, so a corpus of one-instruction cases - which is
+    /// what the ARM corpus is - exercises none of it.
+    #[test]
+    fn promotion_fires_on_a_straight_run_and_changes_nothing_when_off() {
+        // add r0,r0,r1 / add r0,r0,r1 / add r0,r0,r1 / add r0,r0,r1 / bx lr.
+        // r0 is touched eight times and r1 four, both far past the threshold.
+        const ADD_R0_R0_R1: [u8; 4] = [0x01, 0x00, 0x80, 0xe0];
+        const BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+        let mut code = Vec::new();
+        for _ in 0..4 {
+            code.extend_from_slice(&ADD_R0_R0_R1);
+        }
+        code.extend_from_slice(&BX_LR);
+
+        let build = |promote: bool| -> Vec<u8> {
+            set_promote_registers(promote);
+            let a = transpile(&Program {
+                code: &code,
+                base: 0x10000,
+                thumb: false,
+                entries: &[0x10000],
+                arm_entries: &[],
+                externs: &[],
+                redirects: &[],
+                inline_imports: &[],
+                noreturn_svc: &[],
+                mem_bytes: 0x20000,
+                discover_code_pointers: false,
+                import_memory: false,
+            })
+            .expect("transpile");
+            wasmparser::validate(&a.wasm).expect("valid wasm");
+            a.wasm
+        };
+
+        let plain = build(false);
+        let promoted = build(true);
+
+        // Count register-file traffic in each. `local.get`/`local.set`/`local.tee` of the
+        // promoted range replace `global.get`/`global.set` of globals 0..20.
+        fn core_global_ops(wasm: &[u8]) -> usize {
+            use wasmparser::{Operator, Parser, Payload};
+            let mut n = 0;
+            for payload in Parser::new(0).parse_all(wasm) {
+                if let Ok(Payload::CodeSectionEntry(body)) = payload {
+                    let mut reader = body.get_operators_reader().unwrap();
+                    while let Ok(op) = reader.read() {
+                        if let Operator::GlobalGet { global_index } | Operator::GlobalSet
+                        { global_index } = op
+                        {
+                            if promote::is_core(global_index) {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            n
+        }
+
+        let plain_ops = core_global_ops(&plain);
+        let promoted_ops = core_global_ops(&promoted);
+        assert!(
+            promoted_ops < plain_ops,
+            "promotion must actually fire on a straight run: {plain_ops} core-global \
+             accesses unpromoted, {promoted_ops} promoted"
+        );
+
+        // And it must be entirely absent when not asked for. This is the guarantee that
+        // lets the two arms be compared at all: the OFF arm is the build that shipped.
+        set_promote_registers(false);
+        let plain_again = build(false);
+        assert_eq!(plain, plain_again, "an unpromoted build must be deterministic");
     }
 }

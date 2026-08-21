@@ -470,6 +470,19 @@ impl Draw {
 /// draws issued into it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
+    /// Shader PAIRS the guest's patcher named since the previous scene, as
+    /// `(vertex container bytes, fragment container bytes)` - see
+    /// `VitaState::queue_shader_precompile`. The renderer prepares these before it encodes,
+    /// which is where the device does its shader work and where the spare time is.
+    ///
+    /// Not part of the frame's CONTENT: it carries no draw and no pixel, and the determinism
+    /// signature must not fold it in.
+    ///
+    /// An `Arc` around the whole list, not a `Vec` of them: the list is NOT drained (see
+    /// `VitaState::shader_precompile`), so every scene carries the whole thing - and once a
+    /// title's precomputed states name a few hundred pairs, cloning it per scene is hundreds of
+    /// atomic refcount bumps eleven times a frame. One refcount says the same thing.
+    pub precompile: std::sync::Arc<Vec<(std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>>,
     pub color: Option<ColorSurface>,
     /// The `SceGxmDepthStencilSurface` this scene rendered its depth into, when the guest
     /// passed one to `sceGxmBeginScene`.
@@ -1170,6 +1183,7 @@ mod extent_tests {
             shader_expanded: false,
         };
         Scene {
+            precompile: Default::default(),
             color: Some(ColorSurface {
                 format: 0,
                 surface_type: 0,
@@ -1224,6 +1238,7 @@ mod retention_tests {
     /// A scene distinguishable by `tag` through the part of it the signature folds.
     fn scene(tag: u8) -> Scene {
         Scene {
+            precompile: Default::default(),
             color: Some(ColorSurface {
                 format: tag as u32,
                 surface_type: 0,

@@ -14,7 +14,7 @@
 //!   2. **A lock whose state lives on the host cannot be inlined.** With the state here,
 //!      the uncontended take is a handful of wasm instructions and the boundary crossing
 //!      is gone; contention still reaches the host, which is the only side that can park
-//!      and wake a thread. Measured on PCSA00027 after the GXM draw state was inlined, the
+//!      and wake a thread. Measured on a retail title after the GXM draw state was inlined, the
 //!      lock/unlock pair was the largest single block of host calls left: 101,155 crossings
 //!      in one profile window, 28,316 of each at one call site.
 //!

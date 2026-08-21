@@ -224,10 +224,10 @@ impl core::fmt::Display for LinkError {
     }
 }
 
-/// PA registers a prefetched sample's result occupies: two, holding its four components as
-/// packed F16 halves. See [`crate::container::SamplePrefetch`].
-/// The widest a prefetched sample can be, in PA registers. The per-descriptor width is
-/// [`crate::container::Interpolant::prefetch_regs`]; this is only the upper bound.
+/// The ORDINARY width of a prefetched sample's result, in PA registers: two, holding its four
+/// components as packed F16 halves. The per-descriptor width is
+/// [`crate::container::Interpolant::prefetch_regs`], which is 1, 2 or 4 - this is only the
+/// common case the test helpers build. See [`crate::container::SamplePrefetch`].
 const PREFETCH_REGS: u32 = 2;
 
 impl std::error::Error for LinkError {}
@@ -287,7 +287,7 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     // The precision comes from the interpolant that lands there: a HALF descriptor packs four
     // components into two registers, which is the shape `ColorPrecision::F16` unpacks.
     if is_passthrough(&frc.shader, &pa_read_before_write(&frc.shader).0) {
-        fplan.color = ColorOutput::NonNativePa0;
+        fplan.color = ColorOutput::NonNativePa(0);
         fplan.color_precision = match fprog.interpolants.iter().find(|it| it.pa_base == 0) {
             Some(it) if it.half => crate::module::ColorPrecision::F16,
             _ => crate::module::ColorPrecision::F32,
@@ -517,8 +517,8 @@ struct PlannedPrefetch {
     unit: u8,
     /// First PA register the packed F16 result components land in.
     pa_base: u32,
-    /// How many PA registers the result occupies: 2 (four components) or 1 (two). See
-    /// [`crate::container::Interpolant::prefetch_regs`].
+    /// How many PA registers the result occupies: 4 (four unpacked F32 components), 2 (four
+    /// packed F16 components) or 1 (two). See [`crate::container::Interpolant::prefetch_regs`].
     ///
     /// Writing two unconditionally is not a harmless over-write: the register after a
     /// one-register prefetch belongs to the NEXT interpolant, so it clobbers a varying the
@@ -712,10 +712,466 @@ fn resolve_ambiguous_order(
     }
 }
 
+/// Which OUTPUT-bank scalar lanes a vertex program's code actually writes.
+///
+/// This is the vertex program's own statement about its lane layout, and it is the evidence
+/// the containers do not carry. A varying occupies a contiguous run of lanes, so the set of
+/// written lanes - and, more tellingly, the HOLES in it - shows where the runs begin and end.
+fn written_output_lanes(vshader: &Shader) -> Vec<bool> {
+    let mut w = Vec::new();
+    for instr in &vshader.instrs {
+        let Some(d) = instr.dest.as_ref() else { continue };
+        if d.bank != Bank::Output {
+            continue;
+        }
+        for c in 0..4 {
+            if instr.write_mask[c] {
+                let lane = d.index as usize + c;
+                if w.len() <= lane {
+                    w.resize(lane + 1, false);
+                }
+                w[lane] = true;
+            }
+        }
+    }
+    w
+}
+
+/// Does the CONVENTION's lane layout agree with what the vertex program's code writes?
+///
+/// # Why this is the check that was missing
+/// The varyings block states the SET of varyings and each one's width, but not their ORDER,
+/// and the convention (colours, fog, then texcoords ascending) fills that in. Until now the
+/// convention was either trusted outright (`Assumed`) or refused outright (`Ambiguous`, the
+/// COLOR1 case) - and neither was ever checked against the one witness that can speak: the
+/// program's own writes.
+///
+/// It can speak, and it is precise. MEASURED on `vert_82bfdfb0`, whose layout
+/// the convention puts at `Fog@4..5, TexCoord(0)@6..10, TexCoord(1)@10..14, ...`: the code
+/// writes lanes `[4, 6,7,8,9, 10..21]` - **lane 5 is not written**, exactly the reserved
+/// second lane of a one-component Fog. A layout that placed anything else at lane 4 would
+/// have to explain that hole. Across that program's siblings this hole falls where the
+/// convention says every time, which is why that title renders correctly under it.
+///
+/// So: accept the convention when the code does not contradict it. The test is that every
+/// lane the code writes falls INSIDE some declared varying's span (or the clip position),
+/// and that each declared varying's FIRST lane is written - a varying whose run begins on a
+/// lane the program never wrote is a run that is not there.
+///
+/// Trailing lanes of a run may legitimately be unwritten (a three-component colour in a
+/// four-lane slot, a one-component fog in its two-lane slot), so absence inside a run is not
+/// evidence against it; a written lane OUTSIDE every run is.
+fn convention_agrees_with_the_code(vout: &[OutputVarying], vshader: &Shader) -> bool {
+    let written = written_output_lanes(vshader);
+    let in_a_run = |lane: usize| {
+        // The clip position owns the first lanes and is not a varying.
+        lane < crate::container::VERTEX_POSITION_LANES as usize
+            || vout.iter().any(|v| {
+                let lo = v.base_lane as usize;
+                lane >= lo && lane < lo + v.components as usize
+            })
+    };
+    if written.iter().enumerate().any(|(lane, &w)| w && !in_a_run(lane)) {
+        return false;
+    }
+    vout.iter().all(|v| written.get(v.base_lane as usize).copied().unwrap_or(false))
+}
+
+/// The vertex lane order the paired FRAGMENT's declaration implies, or `None` when the two
+/// sides do not name the same set of varyings.
+///
+/// # The competing reading, spelled out so it can be MEASURED rather than argued
+/// The convention orders a vertex's varyings `Color0, Color1, Fog, TexCoord0..9`. The
+/// fragment states an order explicitly - its interpolant descriptors accumulate a PA base in
+/// declaration order - and a texcoord consumed by a PDS PREFETCH takes its place in that
+/// sequence even though it never lands in a PA register of its own. The two disagree on most
+/// of one title's pairs, and neither reading had a witness that could settle it.
+///
+/// It has one now: one title's trackside billboard (`79d26abb534d2ea4`). Under the
+/// convention its `Color1` is fed the vertex's UV attribute and the panel paints a
+/// green-to-red ramp; the fragment's own order puts `TexCoord(0)` in that slot instead.
+/// `VITASLOP_GXP_VARYING_ORDER=fragment` selects this reading so the two can be compared on
+/// that frame. It is a DIAGNOSTIC and off by default - the convention still ships until the
+/// oracle says otherwise.
+fn fragment_declared_order(vprog: &Program, fprog: &Program) -> Option<Vec<OutputVarying>> {
+    let mut want: Vec<VaryingUsage> = Vec::new();
+    for it in &fprog.interpolants {
+        want.push(it.usage);
+        // The prefetched texcoord is interpolated and delivered like any other varying; it is
+        // simply consumed by the sampler rather than left in a register, so it occupies its
+        // place in the sequence and must not be skipped.
+        if let Some(pf) = &it.prefetch {
+            want.push(VaryingUsage::TexCoord(pf.source_texcoord));
+        }
+    }
+    let vout = &vprog.output_varyings;
+    // All-or-nothing, for the same reason `attribute_order` is: a partial cover would order
+    // some varyings by the fragment and the rest by the convention, which is neither reading.
+    let mut a: Vec<String> = want.iter().map(|u| format!("{u:?}")).collect();
+    let mut b: Vec<String> = vout.iter().map(|v| format!("{:?}", v.usage)).collect();
+    a.sort();
+    b.sort();
+    if a != b {
+        return None;
+    }
+    let perm: Vec<usize> = want
+        .iter()
+        .map(|u| vout.iter().position(|v| v.usage == *u).expect("cover checked above"))
+        .collect();
+    Some(permute_varyings(vout, &perm))
+}
+
+/// One vertex ATTRIBUTE copied straight into output lanes: `(the varying its semantic names,
+/// the lanes it was copied to)`, one entry per attribute that is forwarded at all.
+///
+/// # Why a MOVE is evidence the varyings block is not
+/// The block states the SET of varyings and each one's width; the order is the convention's to
+/// fill in, and there has been no witness for it that is not itself a convention.
+/// `mov Output[n] <- PrimaryAttr[m]` is one: register `m` belongs to a declared attribute, that
+/// attribute's semantic names a varying, and lane `n` therefore carries that varying. It is a
+/// statement about ONE lane, so unlike [`crate::container::attribute_order`] - which needs the
+/// attributes to cover the declared set EXACTLY, i.e. a passthrough program - it survives the
+/// other varyings being computed rather than forwarded. Almost no real program is a
+/// passthrough; plenty forward one input.
+///
+/// Only `Mov` counts. A value that is computed with says nothing about which varying it IS.
+fn forwarding_claims(vprog: &Program, vshader: &Shader) -> Vec<(VaryingUsage, Vec<u32>)> {
+    use crate::container::{ParamCategory, SEMANTIC_COLOR, SEMANTIC_FOGCOORD, SEMANTIC_TEXCOORD};
+    // The varying an attribute's semantic names. POSITION, normals, tangents and blend weights
+    // are consumed rather than forwarded and name no varying.
+    let usage_of = |p: &crate::container::Parameter| match p.semantic {
+        SEMANTIC_FOGCOORD => Some(VaryingUsage::Fog),
+        SEMANTIC_COLOR => match p.semantic_index {
+            0 => Some(VaryingUsage::Color0),
+            1 => Some(VaryingUsage::Color1),
+            _ => None,
+        },
+        SEMANTIC_TEXCOORD => Some(VaryingUsage::TexCoord(p.semantic_index)),
+        _ => None,
+    };
+    let mut by_attr: Vec<(i32, VaryingUsage, Vec<u32>)> = Vec::new();
+    for instr in &vshader.instrs {
+        if !matches!(instr.op, Op::Mov) {
+            continue;
+        }
+        let (Some(d), Some(s)) = (instr.dest.as_ref(), instr.srcs.first()) else { continue };
+        if d.bank != Bank::Output || s.bank != Bank::PrimaryAttr {
+            continue;
+        }
+        for c in 0..4 {
+            if !instr.write_mask[c] {
+                continue;
+            }
+            let src_reg = s.index as u32 + s.swizzle[c] as u32;
+            let Some(a) = vprog.parameters.iter().find(|a| {
+                a.category == ParamCategory::Attribute
+                    && a.resource_index >= 0
+                    && src_reg >= a.resource_index as u32
+                    && src_reg < a.resource_index as u32 + a.component_count as u32
+            }) else {
+                continue;
+            };
+            let Some(u) = usage_of(a) else { continue };
+            let lane = d.index as u32 + c as u32;
+            match by_attr.iter_mut().find(|(reg, _, _)| *reg == a.resource_index) {
+                Some((_, _, lanes)) => {
+                    if !lanes.contains(&lane) {
+                        lanes.push(lane);
+                    }
+                }
+                None => by_attr.push((a.resource_index, u, vec![lane])),
+            }
+        }
+    }
+    for (_, _, lanes) in &mut by_attr {
+        lanes.sort_unstable();
+    }
+    by_attr.into_iter().map(|(_, u, lanes)| (u, lanes)).collect()
+}
+
+/// Does a candidate lane layout put a forwarded attribute into a varying that is not the one its
+/// semantic names? Returns the first contradiction, spelled out.
+///
+/// # The bar this sets, and why it is set so high
+/// A claim counts ONLY when the attribute's lanes are exactly one declared run - same first
+/// lane, same length. Anything less is not an order question:
+///
+/// - A PARTIAL run is PACKING. One title writes `VertexColour1` into lane 9 of a four-lane
+/// `TexCoord(0)@6..10` - a scalar tucked into a spare texcoord channel, which is a thing
+/// shaders do and says nothing about where TexCoord(0) sits. - Lanes spanning SEVERAL runs is
+/// DUPLICATION. One title's `uv1_uv2` is copied to `16..18` and `18..20` at once; one
+/// attribute cannot name two varyings, so it names neither.
+///
+/// What is left is the shape that can only be an order statement: a whole run, filled by one
+/// attribute, whose semantic names a different varying than the layout does. MEASURED across
+/// four corpora, exactly that shape appears on one title's billboard family (`In.UV1` fills
+/// the whole of what the convention calls `Color1`) and on ONE program of a second title, and
+/// on NOTHING at all in a third - which is what makes it usable: that third renders correctly
+/// under the convention today and any reading that moves its lanes is wrong.
+fn forwarding_contradicts(vout: &[OutputVarying], claims: &[(VaryingUsage, Vec<u32>)]) -> Option<String> {
+    for (usage, lanes) in claims {
+        let (Some(&first), Some(&last)) = (lanes.first(), lanes.last()) else { continue };
+        // Contiguous, or it is not a run.
+        if last + 1 - first != lanes.len() as u32 {
+            continue;
+        }
+        let Some(run) = vout
+            .iter()
+            .find(|v| v.base_lane == first && v.components == lanes.len() as u32)
+        else {
+            continue;
+        };
+        if run.usage != *usage {
+            return Some(format!(
+                "lanes {first}..{} are filled by one attribute whose semantic is {usage:?}, but \
+                 this layout puts {:?} there",
+                last + 1,
+                run.usage
+            ));
+        }
+    }
+    None
+}
+
+/// Re-order a convention-placed layout so that every forwarded attribute's usage STARTS at the
+/// lane that attribute actually fills. Returns `None` when no permutation does.
+///
+/// # Why this is a reading of the VERTEX and the two refused ones were not
+/// A `mov Output[n] <- PrimaryAttr[m]` says lane `n` carries the varying that attribute's
+/// semantic names ([`forwarding_claims`]). The convention says which usage sits where. When they
+/// disagree, the move is the statement about THIS program and the convention is a statement about
+/// programs in general, so the move wins - and it wins without consulting the paired fragment
+/// (objection 1 of the history at the call site) and without changing any usage's declared WIDTH
+/// (objection 2). Only the ORDER moves; every usage keeps the components the container gave it,
+/// and the lane budget therefore still closes exactly.
+///
+/// **The rule is a START match, not a whole-run match.** A claim's width is the container's
+/// declared component count, which for an attribute the guest binds narrower than it declares
+/// spans more lanes than the usage's run - so requiring the run to have the claim's LENGTH is
+/// what made the witness unusable. The first lane is the part the copy cannot be wrong about.
+///
+/// MEASURED on one title's sky/background family (five vertex programs, all identical in
+/// shape): the convention gives `Color0@4x4 Color1@8x4 TexCoord(0)@12x2` while the code copies
+/// `In.UV1` - a TEXCOORD - from lane 8. The permutation that starts `TexCoord(0)` at 8 is
+/// `Color0@4x4 TexCoord(0)@8x2 Color1@10x4`, whose budget closes at 14 lanes exactly, and it is
+/// what makes the sky sample its own gradient texture instead of a vertex colour, removes the
+/// vertical seam across the road, and paints the trackside billboard its artwork. On the
+/// billboard's own program (17 lanes, four varyings) the same permutation leaves the computed
+/// reflection vector at `TexCoord(1)@14x3`, feeding the cube map coordinates the convention had
+/// pointed at lanes nothing writes.
+fn layout_from_forwarding_claims(
+    vout: &[OutputVarying],
+    claims: &[(VaryingUsage, Vec<u32>)],
+) -> Option<Vec<OutputVarying>> {
+    // Which usage each claimed START lane demands. A lane claimed by two attributes is not a
+    // statement about either, so it is dropped rather than resolved.
+    let mut want: Vec<(u32, VaryingUsage)> = Vec::new();
+    for (usage, lanes) in claims {
+        let (Some(&first), Some(&last)) = (lanes.first(), lanes.last()) else { continue };
+        if last + 1 - first != lanes.len() as u32 {
+            continue; // not one run, so it names no single varying
+        }
+        match want.iter().position(|(l, _)| *l == first) {
+            Some(i) if want[i].1 != *usage => {
+                want.remove(i);
+            }
+            Some(_) => {}
+            None => want.push((first, *usage)),
+        }
+    }
+    if want.is_empty() {
+        return None;
+    }
+    // Walk the lanes in order. At each run boundary the evidence gets first refusal: if a claim
+    // names a usage for THIS lane and that usage is still unplaced, it goes here. Otherwise the
+    // convention's own order supplies the next one.
+    //
+    // Greedy rather than "satisfy every claim at once" because the two are not equally strong. A
+    // claim's start lane is only reachable if the widths of what precedes it add up to it, and
+    // whether they do is a fact about the container, not a choice - so a claim the walk never
+    // arrives at is unsatisfiable by construction and ignoring it decides nothing. Requiring all
+    // of them instead makes one unreachable claim throw away a layout the reachable ones settle,
+    // which is exactly what happened on the family this was written for: `In.VColor` fills lanes
+    // 12..14, no width arrangement puts a four-lane `Color0` there, and demanding it refused the
+    // `TexCoord(0)@8` the same program states plainly.
+    let origin = vout.iter().map(|v| v.base_lane).min().unwrap_or(0);
+    let mut placed = vec![false; vout.len()];
+    let mut out: Vec<OutputVarying> = Vec::with_capacity(vout.len());
+    let mut lane = origin;
+    while out.len() < vout.len() {
+        let claimed = want
+            .iter()
+            .find(|(l, _)| *l == lane)
+            .and_then(|(_, u)| vout.iter().position(|v| v.usage == *u).filter(|&i| !placed[i]));
+        let i = claimed.or_else(|| (0..vout.len()).find(|&i| !placed[i]))?;
+        placed[i] = true;
+        out.push(OutputVarying {
+            usage: vout[i].usage,
+            base_lane: lane,
+            components: vout[i].components,
+        });
+        lane += vout[i].components;
+    }
+    // A walk that lands back on the convention has resolved nothing - report no resolution rather
+    // than a layout that changed no lane. (The claims are only consulted at all when
+    // `forwarding_contradicts` has already fired, so this is the case where the contradiction is
+    // real but the evidence cannot reach the lane that would fix it.)
+    (out != vout).then_some(out)
+}
+
+/// Say, once per distinct contradiction, that a vertex program's own forwarding moves refuse the
+/// lane layout it was about to be linked with - and which layout was used instead.
+fn report_forwarding_contradiction(hash: u64, why: &str, resolution: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(hash) {
+        return;
+    }
+    eprintln!("gxp link: vertex {hash:016x}: {why} - {resolution}");
+}
+
+/// Diagnostic (`VITASLOP_GXP_VARYING_LAYOUT=<vhash>:<usage>@<lane>x<comps>,...`): plan ONE
+/// vertex program against a lane layout typed by hand.
+///
+/// # Why a knob and not another reading
+/// The container comment on `parse_vertex_output_varyings` ends "settling this needs a RENDER
+/// ORACLE, not more container reading", and the candidate layouts a permutation can reach are
+/// not the whole space: `permute_varyings` carries each usage's WIDTH with it, so a layout that
+/// gives `TexCoord(0)` four lanes and `Color1` two is unreachable however the runs are reordered
+/// - and that is exactly the shape a vertex whose forwarding moves fill a four-lane run from a
+/// texcoord attribute is asking for. This types a layout directly so the frame can judge it.
+///
+/// Usages are spelled `c0`, `c1`, `fog`, `t0`..`t9`. The vertex hash is the one the
+/// `gxp pair`/`gxp link` lines print. Anything unparsable is ignored with a report rather than
+/// silently dropped - a diagnostic that quietly does nothing is worse than none.
+fn hand_typed_layout(vprog: &Program) -> Option<Vec<OutputVarying>> {
+    let spec = std::env::var("VITASLOP_GXP_VARYING_LAYOUT").ok()?;
+    // Several programs, separated by `;` - a family shares one defect and has to be judged as a
+    // family, not one member at a time.
+    let (hash, list) = spec.split(';').find_map(|one| {
+        let (h, rest) = one.split_once(':')?;
+        (u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()? == vprog.hash)
+            .then_some((h, rest))
+    })?;
+    let _ = hash;
+    let mut out = Vec::new();
+    for item in list.split(',') {
+        let item = item.trim();
+        let (usage, rest) = item.split_once('@')?;
+        let (lane, comps) = rest.split_once('x')?;
+        let usage = match usage.trim() {
+            "c0" => VaryingUsage::Color0,
+            "c1" => VaryingUsage::Color1,
+            "fog" => VaryingUsage::Fog,
+            t if t.starts_with('t') => VaryingUsage::TexCoord(t[1..].parse().ok()?),
+            other => {
+                eprintln!("gxp link: VITASLOP_GXP_VARYING_LAYOUT: unknown usage {other:?}");
+                return None;
+            }
+        };
+        out.push(OutputVarying {
+            usage,
+            base_lane: lane.trim().parse().ok()?,
+            components: comps.trim().parse().ok()?,
+        });
+    }
+    let shown: Vec<String> = out
+        .iter()
+        .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
+        .collect();
+    eprintln!(
+        "gxp link: vertex {:016x}: HAND-TYPED lane layout {} (VITASLOP_GXP_VARYING_LAYOUT)",
+        vprog.hash,
+        shown.join(" ")
+    );
+    Some(out)
+}
+
 fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
+    if let Some(order) = hand_typed_layout(vprog) {
+        return plan_interface_with(vprog, fprog, fshader, &order);
+    }
+    if std::env::var("VITASLOP_GXP_VARYING_ORDER").as_deref() == Ok("fragment") {
+        if let Some(order) = fragment_declared_order(vprog, fprog) {
+            return plan_interface_with(vprog, fprog, fshader, &order);
+        }
+    }
+    // A `Known` order was read off the attributes and is not the convention's to be checked.
+    if vprog.output_order == VaryingOrder::Known {
+        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
+    }
+    // >>> EVERYTHING BELOW IS A LAYOUT THE CONVENTION PLACED, so ask the vertex program's own
+    // forwarding moves whether it is the layout the program was compiled against. See
+    // `forwarding_claims` for why a move can answer that and the varyings block cannot.
+    let vshader = crate::usse::decode_shader(vprog);
+    let claims = forwarding_claims(vprog, &vshader);
+    if let Some(why) = forwarding_contradicts(&vprog.output_varyings, &claims) {
+        // >>> IT NOW ACTS, FROM THE VERTEX ALONE - see `layout_from_forwarding_claims`. The
+        // history below is why it took three attempts, and every objection in it still stands
+        // against the reading it refused; none of them applies to this one, which never consults
+        // the fragment and never changes a usage's width.
+        //
+        // 2026-08-19b resolved a contradiction by switching that pair to
+        // `fragment_declared_order`. It made that billboard paint its banner, and
+        // it is still backed out, because a rule that gives ONE vertex program two different
+        // lane orders depending on its pairing is not a reading of anything. (The lurid green
+        // sky first blamed on this change was MEASURED not to be it - that title's world
+        // frame is byte-identical with this resolution backed out - but the two structural
+        // faults below stand on their own and the resolution goes anyway.)
+        //
+        // Two things are wrong with resolving it that way, and both are structural:
+        //
+        // 1. **It makes a vertex program's LANE ORDER depend on which fragment it is paired
+        //    with.** The order is a property of the vertex program alone - it is baked into the
+        //    code that writes those lanes - so a rule that gives one program two orders is not a
+        //    reading of anything. MEASURED: of five vertex programs of one title with IDENTICAL
+        //    contradiction evidence, two switched and three did not, decided by nothing but
+        //    which fragments they happened to be paired with.
+        // 2. **A claim's WIDTH is the container's declared component count, not the bound one.**
+        //    `In.UV1` declares 4 components and the guest binds it `F16x2`, so PA[6] and PA[7]
+        //    carry the (0,1) missing-component fill and no data - yet the claim spans four lanes
+        //    and matches a four-lane run it has no business matching. The linker cannot see the
+        //    bound layout; that is runtime state.
+        //
+        // So the witness stays, because what it FINDS is real and is the only statement about
+        // lane order that is not itself a convention, and the convention stands until a reading
+        // exists that resolves it from the VERTEX alone. Do not reconnect this to the fragment.
+        // Value-sensitive, because a knob used as an A/B ARM has to be: a presence-only reader
+        // turns `=0` into an ON arm and both arms then measure the same build.
+        let resolve = std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0");
+        match layout_from_forwarding_claims(&vprog.output_varyings, &claims).filter(|_| resolve) {
+            Some(order) => {
+                let shown: Vec<String> = order
+                    .iter()
+                    .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
+                    .collect();
+                report_forwarding_contradiction(
+                    vprog.hash,
+                    &why,
+                    &format!("RESOLVED from the vertex alone -> {}", shown.join(" ")),
+                );
+                return plan_interface_with(vprog, fprog, fshader, &order);
+            }
+            None => report_forwarding_contradiction(
+                vprog.hash,
+                &why,
+                "the convention stands - no permutation puts the forwarded attribute's usage at \
+                 the lane it fills, so this pair's varyings may be routed wrongly",
+            ),
+        }
+    }
     // A program whose order the container could read is planned directly against it - this
     // is every program that links today, and its behaviour is untouched.
     if vprog.output_order != VaryingOrder::Ambiguous {
+        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
+    }
+    // >>> ASK THE VERTEX PROGRAM'S OWN CODE before refusing. `Ambiguous` means "the
+    // convention placed a COLOR1 and no attribute confirms it" - which is a statement about
+    // the CONTAINERS, and the containers are not the only witness. If the code's writes
+    // agree with the convention's layout, the layout is read rather than assumed.
+    if convention_agrees_with_the_code(&vprog.output_varyings, &vshader) {
         return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
     }
     let resolved = resolve_ambiguous_order(vprog, fprog, fshader)?;
@@ -825,7 +1281,7 @@ fn plan_interface_with(
             // components into a smaller span, and it is what the clamp below fixes; it is not a
             // property of the hardware. The fragment reads a PREFIX.
             //
-            // The evidence is a real draw plus a count. PCSA00027's tutorial pairs a vertex
+            // The evidence is a real draw plus a count. One title's tutorial pairs a vertex
             // writing four TexCoord(0) components with a fragment declaring ONE half register
             // (two components), and that draw is correct on the device - a shipping title's
             // shaders are. It is not a one-off either: across that title's 47 fragment blobs, 21
@@ -1093,6 +1549,10 @@ fn gxp_window_position(fc: vec4<f32>) -> vec4<f32> {
 // `range.w` names which forward map the vertex stage applied, because there is more than one
 // and only the renderer knows which is in force.
 fn gxp_depth_to_window(d: f32, interpolated: f32) -> f32 {
+  // The guest's OWN viewport depth mapping was applied in the vertex stage, so a depth the
+  // shader computes - which is already in the guest's window encoding - needs only the clamp
+  // that mapping carries. Checked first because it is the default forward map.
+  if (gxp_depth.range.w >= 2.5) { return clamp(d, 0.0, 1.0); }
   // The GL-style remap: the guest's own clip z, read in [-w, w], mapped into [0, w]. The
   // guest's window depth IS z/w there, so this is just the same affine map on it.
   if (gxp_depth.range.w > 0.5 && gxp_depth.range.w < 1.5) { return clamp((d + 1.0) * 0.5, 0.0, 1.0); }
@@ -1204,15 +1664,7 @@ fn build_linked_module(
     emit_register_banks(&mut m);
     // Load PA registers from the vertex attributes (vertex inputs are plain f32 components).
     for a in &vplan.attributes {
-        for c in 0..a.components {
-            let _ = writeln!(
-                m,
-                "  pa[{}] = bitcast<u32>(in.a{}.{});",
-                a.base_lane + c,
-                a.location,
-                comp(c)
-            );
-        }
+        crate::module::emit_attribute_load(&mut m, a);
     }
     emit_secondary_attrs(&mut m, "vs_sa", vsa_regs, vliterals);
     m.push_str(vbody);
@@ -1346,7 +1798,21 @@ fn build_linked_module(
             "  let pf{i} = textureSample(t{0}, s{0}, vec{n}<f32>({coord}));",
             pf.unit
         );
-        if pf.regs > 1 {
+        if pf.regs == 4 {
+            // Four registers: the same four components UNPACKED, one full-precision component
+            // each. The one program in these corpora that asks for this reads them back with an
+            // F32-granular four-component swizzle off its prefetch base, so packing them in
+            // halves here would feed it two registers of packed pairs and two of whatever the
+            // allocation held.
+            for c in 0..4 {
+                let _ = writeln!(
+                    m,
+                    "  pa[{}] = bitcast<u32>(pf{i}.{});",
+                    pf.pa_base + c,
+                    ["x", "y", "z", "w"][c as usize]
+                );
+            }
+        } else if pf.regs > 1 {
             // Two registers: four F16 components, packed two per register.
             let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.xy);", pf.pa_base);
             let _ = writeln!(m, "  pa[{}] = pack2x16float(pf{i}.zw);", pf.pa_base + 1);
@@ -1365,18 +1831,21 @@ fn build_linked_module(
     }
     emit_secondary_attrs(&mut m, "fs_sa", fsa_regs, fliterals);
     m.push_str(fbody);
-    let ret = match fplan.color {
-        ColorOutput::NativeO0 => "o",
-        ColorOutput::NonNativePa0 => "pa",
+    let (ret, base) = match fplan.color {
+        ColorOutput::NativeO0 => ("o", 0),
+        ColorOutput::NonNativePa(base) => ("pa", base),
     };
-    let color = crate::module::color_return_expr(ret, fplan.color_precision, varying_locations);
+    let color =
+        crate::module::color_return_expr(ret, base, fplan.color_precision, varying_locations);
     if writes_depth {
         let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);\n}}");
     } else {
         let _ = writeln!(m, "  return {color};\n}}");
     }
 
-    m
+    // Last, and in this order: `resolve_sa_init` is what decides whether the SA bank is
+    // subscripted dynamically at all, and `size_register_banks` sizes what comes out of it.
+    size_register_banks(&resolve_sa_init(&m))
 }
 
 /// Emit a stage's SA-bank initialisation: the default uniform buffer copied verbatim into
@@ -1385,26 +1854,573 @@ fn build_linked_module(
 /// and only the instruction reading it decides which.
 fn emit_secondary_attrs(m: &mut String, binding: &str, uniform_regs: u32, literals: &[(u32, u32)]) {
     if uniform_regs > 0 {
-        let _ = writeln!(
-            m,
-            "  for (var k: u32 = 0u; k < {uniform_regs}u; k = k + 1u) {{ sa[k] = {binding}.data[k / 4u][k % 4u]; }}"
-        );
+        // A MARKER, resolved by [`resolve_sa_init`] once the stage's whole body exists - the
+        // form this becomes depends on which SA registers the body reads and which it writes,
+        // and neither is known here.
+        let _ = writeln!(m, "  {SA_INIT_MARKER}{binding}:{uniform_regs}");
     }
     for &(reg, value) in literals {
         let _ = writeln!(m, "  sa[{reg}] = {value:#010x}u;");
     }
 }
 
+/// The marker [`emit_secondary_attrs`] leaves for [`resolve_sa_init`], carrying the stage's
+/// uniform binding name and its default-uniform register count. It is a WGSL line comment, so
+/// a module that somehow reached a driver with one unresolved still compiles.
+const SA_INIT_MARKER: &str = "//@@GXP_SA_INIT:";
+
+/// Turn each stage's SA-bank marker into the reads the body actually needs.
+///
+/// # The bank was COPIED, and the copy was the bug
+/// This used to emit one loop per stage:
+///
+/// ```text
+///   for (var gxp_sa_k: u32 = 0u; gxp_sa_k < 78u; gxp_sa_k = gxp_sa_k + 1u)
+///     { sa[gxp_sa_k] = vs_sa.data[gxp_sa_k / 4u][gxp_sa_k % 4u]; }
+/// ```
+///
+/// - it runs per INVOCATION - 78 to 90 iterations for every vertex of every draw, to copy a
+///   uniform that a constant subscript could have read directly, and
+/// - `sa[gxp_sa_k]` is a DYNAMIC subscript into a function-local array, which is the one
+///   construct that forces a driver to materialise the whole bank as indexable storage.
+///
+/// **The second point is not theoretical: it turned a retail race BLACK on an
+/// Android PowerVR (img-tec D-series).** While the banks were declared at the full
+/// [`BANK_REGS`] the driver had no choice but scratch memory and compiled it; once
+/// [`size_register_banks`] cut them to their real extent, the four pairs with the largest
+/// default-uniform banks (83, 95, 95 and 107 registers - every smaller pair in the title
+/// compiled) failed pipeline creation outright with `CreateGraphicsPipelines failed with
+/// VK_ERROR_UNKNOWN`, and ONE failed pipeline in a pass invalidates the whole command buffer,
+/// so the frame drew nothing at all.
+///
+/// # What it emits instead
+/// A read of an SA register the body never WRITES becomes a direct constant-subscript uniform
+/// read - `vs_sa.data[8][3]` for `sa[35]` - which is what a hand-written shader would have said.
+/// Only registers the body does write keep a local slot, initialised once at entry. On the four
+/// pairs above that is 2 of 78 and 2 of 90: the loop and the bank both disappear.
+///
+/// # Where it refuses
+/// A stage that subscripts `sa` DYNAMICALLY (an `indexed_element` register-indirect read) keeps
+/// the loop verbatim: the index is not known here, so no substitution can be proved safe and
+/// the bank has to hold every register the index could reach. That is the same boundary
+/// [`bank_extent`] draws, and for the same reason.
+fn resolve_sa_init(module: &str) -> String {
+    let mut out = String::with_capacity(module.len());
+    let mut rest = module;
+    while let Some(at) = rest.find(BANKS_MARKER) {
+        let after = at + BANKS_MARKER.len();
+        out.push_str(&rest[..after]);
+        let body = &rest[after..];
+        // A stage's body ends where the next stage's declarations begin - the same regions
+        // `size_register_banks` walks, and this pass runs first so that one sees the result.
+        let end = body.find(BANKS_MARKER).unwrap_or(body.len());
+        out.push_str(&resolve_sa_init_region(&body[..end]));
+        rest = &body[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_sa_init_region(region: &str) -> String {
+    let Some(mark) = region.find(SA_INIT_MARKER) else {
+        return region.to_string();
+    };
+    let line_start = region[..mark].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = region[mark..].find('\n').map_or(region.len(), |i| mark + i + 1);
+    let spec = region[mark + SA_INIT_MARKER.len()..line_end].trim();
+    let Some((binding, regs)) = spec.split_once(':') else {
+        return region.to_string();
+    };
+    let Ok(uniform_regs) = regs.parse::<usize>() else {
+        return region.to_string();
+    };
+    // Everything the marker precedes. Scanning from here rather than from the top of the region
+    // keeps every byte offset below relative to ONE string: the text before the marker is the
+    // bank declarations and the attribute loads, which name no SA register.
+    let body = &region[line_end..];
+
+    let loop_form = || {
+        // `gxp_sa_k` is named, not `k`, because `bank_extent` has to recognise this exact
+        // subscript: it is the one NON-constant index into a bank that is statically bounded by
+        // its own literal, and every other non-constant subscript is not bounded at all.
+        format!(
+            "{}  for (var gxp_sa_k: u32 = 0u; gxp_sa_k < {uniform_regs}u; \
+             gxp_sa_k = gxp_sa_k + 1u) {{ sa[gxp_sa_k] = {binding}.data[gxp_sa_k / 4u]\
+             [gxp_sa_k % 4u]; }}\n{}",
+            &region[..line_start],
+            &region[line_end..]
+        )
+    };
+    match arm("VITASLOP_GXP_SA_DIRECT") {
+        // `0` - the copy loop, verbatim.
+        Some("0") => return loop_form(),
+        // `unroll` - copy every uniform register into the bank one constant subscript at a
+        // time, and change NOTHING else: no read substitution, no compaction. This arm exists
+        // to answer one question and it is not a perf arm. The direct form moves pixels on this
+        // desktop GPU (0.47/255 mean over a race frame, concentrated on one material), and the
+        // two candidate explanations - a value error in the substitution, or the driver
+        // contracting differently once the copy shape changes - are told apart by an arm whose
+        // EXPRESSIONS are identical to the loop form's and whose copy shape is not.
+        Some("unroll") => {
+            let mut init = String::new();
+            for reg in 0..uniform_regs {
+                let _ = writeln!(init, "  sa[{reg}] = {binding}.data[{}][{}];", reg / 4, reg % 4);
+            }
+            return format!("{}{init}{}", &region[..line_start], &region[line_end..]);
+        }
+        _ => {}
+    }
+    let Some(uses) = sa_uses(body) else {
+        // Dynamically subscripted: the bank has to hold everything the index could reach.
+        return loop_form();
+    };
+    // >>> WRITTEN IS A PROPERTY OF THE REGISTER, NOT OF THE OCCURRENCE, and reading it per
+    // occurrence is a silent wrong-value bug rather than a compile failure. A program that
+    // computes `sa[39] = 1.0 / sa[39]` and reads `sa[39]` again later has one occurrence marked
+    // written and two not; substituting THOSE hands the later read the register's original
+    // uniform value and the shader carries on with it. MEASURED, on one title's on-track
+    // run: the world came back correct in geometry and blown out in exposure, because the
+    // reciprocal a lighting term divides by had reverted to the value it was taken from.
+    let high = uses.iter().map(|u| u.reg).max().unwrap_or(0);
+    let mut written = vec![false; high + 1];
+    for u in &uses {
+        written[u.reg] |= u.written;
+    }
+    // Rewrite every read of a NEVER-written uniform-backed register into the uniform read it is.
+    let mut rewritten = String::with_capacity(body.len());
+    let mut at = 0usize;
+    for u in &uses {
+        if written[u.reg] || u.reg >= uniform_regs {
+            continue;
+        }
+        rewritten.push_str(&body[at..u.start]);
+        let _ = write!(rewritten, "{binding}.data[{}][{}]", u.reg / 4, u.reg % 4);
+        at = u.end;
+    }
+    rewritten.push_str(&body[at..]);
+
+    // What survives keeps a local slot, loaded once at entry. A register the body writes may
+    // also be READ before that write (the half-precision and 8-bit stores are read-modify-write
+    // by construction, and the case above reads its own register), so the load is not optional.
+    let mut init = String::new();
+    for (reg, w) in written.iter().enumerate().take(uniform_regs) {
+        if *w {
+            let _ = writeln!(init, "  sa[{reg}] = {binding}.data[{}][{}];", reg / 4, reg % 4);
+        }
+    }
+    // What is left is a SPARSE set of constant subscripts - the two or three registers the body
+    // writes, plus the container literals, which sit at whatever high register the compiler that
+    // built the blob chose (register 92 of 107 in one of the four pairs above). `bank_extent`
+    // sizes an array by its HIGH WATER MARK, so a bank with fifteen live registers is declared
+    // with a hundred, and the dead slots are exactly the storage this whole pass exists to stop
+    // handing a driver. Every subscript here is a literal, so they can simply be renumbered.
+    compact_sa_registers(&format!("{}{init}{rewritten}", &region[..line_start]))
+}
+
+/// Renumber a stage's surviving `sa[N]` subscripts onto `0..k`, in first-appearance order.
+///
+/// Only ever called on a region [`resolve_sa_init_region`] has already proved carries no dynamic
+/// SA subscript, so the mapping is total: every reference is a literal this pass can see and
+/// rewrite. A region it cannot prove that of is returned untouched.
+fn compact_sa_registers(region: &str) -> String {
+    let Some(uses) = sa_uses(region) else {
+        return region.to_string();
+    };
+    let mut map: Vec<(usize, usize)> = Vec::new();
+    let mut out = String::with_capacity(region.len());
+    let mut at = 0usize;
+    for u in &uses {
+        let slot = match map.iter().find(|(from, _)| *from == u.reg) {
+            Some((_, to)) => *to,
+            None => {
+                let to = map.len();
+                map.push((u.reg, to));
+                to
+            }
+        };
+        out.push_str(&region[at..u.start]);
+        let _ = write!(out, "sa[{slot}]");
+        at = u.end;
+    }
+    out.push_str(&region[at..]);
+    out
+}
+
+/// One `sa[N]` occurrence in an emitted stage body.
+struct SaUse {
+    reg: usize,
+    /// Byte range of the whole `sa[N]` text, so a read can be replaced in place.
+    start: usize,
+    end: usize,
+    /// Followed by ` = `, i.e. this occurrence is the DESTINATION of an assignment. A
+    /// read-modify-write store names the same register on both sides and produces one use of
+    /// each kind, which is exactly right: the register is written, so it keeps its slot.
+    written: bool,
+}
+
+/// Every `sa[N]` in `body`, or `None` if any occurrence is subscripted dynamically.
+fn sa_uses(body: &str) -> Option<Vec<SaUse>> {
+    let mut uses = Vec::new();
+    let bytes = body.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find("sa") {
+        let start = from + rel;
+        from = start + 2;
+        // A bank name is a whole identifier followed immediately by its subscript, so `vs_sa`,
+        // `fs_sa` and `gxp_sa_k` are excluded by the two boundary tests.
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                continue;
+            }
+        }
+        if bytes.get(from) != Some(&b'[') {
+            continue;
+        }
+        let sub = &body[from + 1..];
+        let digits = sub.len() - sub.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 || sub.as_bytes().get(digits) != Some(&b']') {
+            return None;
+        }
+        let end = from + 1 + digits + 1;
+        uses.push(SaUse {
+            reg: sub[..digits].parse().ok()?,
+            start,
+            end,
+            // ` = ` and not ` == `: a comparison reads its left operand.
+            written: body[end..].starts_with(" = "),
+        });
+        from = end;
+    }
+    Some(uses)
+}
+
+/// `VITASLOP_GXP_SIZE_BANKS=0` restores the pre-2026-08-20b emission - every register bank
+/// declared at the full [`BANK_REGS`] - and is the A/B arm for [`size_register_banks`].
+///
+/// VALUE-sensitive, because an arm has to be. Kept rather than deleted because the sizing is
+/// the difference between a driver keeping a program's registers in registers and spilling them
+/// to scratch, which is worth **10.13 -> 4.08 ms** of warm GPU render on one title's
+/// on-track run here and is a bigger and less predictable number on a phone; a session that
+/// measures a device needs to be able to take both arms without rebuilding.
+fn arm_on(name: &str) -> bool {
+    arm(name).map(|v| v != "0").unwrap_or(true)
+}
+
+/// An arm that has more than two positions, as a trimmed static string. `None` is the default.
+///
+/// # >>> IT MUST BE READABLE IN THE BROWSER, AND THAT IS NOT A CONVENIENCE
+/// `wasm32-unknown-unknown` has no environment, so until [`set_arm`] existed both arms in this
+/// file were hardwired ON in the browser and could not be taken there at all. The bug that made
+/// this urgent - a phone whose driver refused four pipelines and drew a BLACK RACE - would have
+/// been bisected in one run by `VITASLOP_GXP_SIZE_BANKS=0`, and instead cost an offline hunt
+/// through the shader corpus. The engine that ships is the engine that has to be A/B-able.
+///
+/// Leaked deliberately and once per distinct value: this is read while emitting a shader, the
+/// set of values is the set of arms a human can type, and the alternative is threading a
+/// configuration struct through the whole emitter for a diagnostic.
+fn arm(name: &str) -> Option<&'static str> {
+    if let Some(v) = arms().lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        return Some(v);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let v = std::env::var(name).ok()?;
+        return Some(Box::leak(v.trim().to_string().into_boxed_str()));
+    }
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
+type Arms = std::collections::HashMap<String, &'static str>;
+
+fn arms() -> &'static std::sync::Mutex<Arms> {
+    static ARMS: std::sync::OnceLock<std::sync::Mutex<Arms>> = std::sync::OnceLock::new();
+    ARMS.get_or_init(Default::default)
+}
+
+/// Set one of this crate's emission arms for a platform that has no environment to read it
+/// from - the browser. Takes precedence over `std::env` where there is one, so a harness can
+/// pin an arm without the process's environment agreeing.
+///
+/// The names are [`SIZE_BANKS_ARM`] and [`SA_DIRECT_ARM`]; anything else is ignored on purpose,
+/// because this is called from a generic knob table and a typo there must not become an arm.
+pub fn set_arm(name: &str, value: &str) {
+    if name != SIZE_BANKS_ARM && name != SA_DIRECT_ARM {
+        return;
+    }
+    let v: &'static str = Box::leak(value.trim().to_string().into_boxed_str());
+    arms().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), v);
+}
+
+/// `0` declares every register bank at the full [`BANK_REGS`] - see [`size_register_banks`].
+pub const SIZE_BANKS_ARM: &str = "VITASLOP_GXP_SIZE_BANKS";
+/// `0` restores the SA copy loop, `unroll` the constant-subscript copy - see [`resolve_sa_init`].
+pub const SA_DIRECT_ARM: &str = "VITASLOP_GXP_SA_DIRECT";
+
+/// The marker a stage's register-bank declarations are emitted as, resolved to real sizes by
+/// [`size_register_banks`] once the whole module is built and every subscript is known.
+const BANKS_MARKER: &str = "  //@@GXP_REGISTER_BANKS\n";
+
 /// Emit the per-entry-point USSE register-file locals (raw 32-bit registers, matching the
 /// emitter): the `r`/`o`/`i`/`pa`/`sa` banks plus the predicate registers.
+///
+/// Emits a MARKER, not the declarations. See [`size_register_banks`] for why the sizes cannot
+/// be known here.
 fn emit_register_banks(m: &mut String) {
-    for bank in ["r", "o", "i", "pa", "sa"] {
-        let _ = writeln!(m, "  var {bank}: array<u32, {BANK_REGS}>;");
-    }
+    m.push_str(BANKS_MARKER);
     let _ = writeln!(m, "  var p: array<bool, 4>;");
     // The INDEX register file, for register-INDIRECT operands. Two registers, because the
     // extension row names exactly two indexed banks (INDEXED1 -> i0, INDEXED2 -> i1).
     let _ = writeln!(m, "  var idx: array<i32, 2>;");
+}
+
+/// Replace each stage's bank marker with declarations sized to what that stage's emitted code
+/// actually subscripts.
+///
+/// # Why this is a text pass and not a walk of the IR
+/// [`BANK_REGS`] is 512 per bank, five banks, per entry point - 10 KB of function-local storage
+/// in every module we hand a driver, where a real program touches at most a couple of dozen
+/// registers. That is the shape the USSE register file has, not the shape the program has, and
+/// the driver pays for it twice: once compiling (it has to prove 2,560 slots dead before it can
+/// keep the live ones in registers) and once at runtime, where a bank it fails to promote
+/// becomes per-invocation scratch memory. A phone GPU is where that second cost lands.
+///
+/// The bound is taken from the EMITTED TEXT rather than re-derived from the instruction stream
+/// because the text is the only thing that cannot be wrong: register indices are resolved by
+/// the emitter through the decoder's doubling, swizzle selectors, write masks, half-precision
+/// pairing and the linker's own prologue/epilogue, and a second implementation of those rules
+/// that disagreed by one would corrupt a shader silently. Scanning `bank[N]` counts exactly
+/// what the module references.
+///
+/// # Why under-sizing cannot corrupt a shader
+/// A constant subscript past the end of a WGSL array is a VALIDATION ERROR, so a reference this
+/// scan missed fails the module loudly at `create_shader_module` rather than reading a
+/// neighbour. The one form that would fail silently is a DYNAMIC subscript - `indexed_element`
+/// clamps to `BANK_REGS - 1`, and a smaller array would fold every high index onto its last
+/// element - so a bank with any dynamic subscript keeps its full size. That is the whole safety
+/// argument: constant indices are checked by the compiler, dynamic ones are not shrunk.
+fn size_register_banks(module: &str) -> String {
+    const BANKS: [&str; 5] = ["r", "o", "i", "pa", "sa"];
+    let sized = arm_on("VITASLOP_GXP_SIZE_BANKS");
+    let mut out = String::with_capacity(module.len());
+    let mut rest = module;
+    while let Some(at) = rest.find(BANKS_MARKER) {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + BANKS_MARKER.len()..];
+        // A stage's references end where the next stage's declarations begin.
+        let region = match body.find(BANKS_MARKER) {
+            Some(next) => &body[..next],
+            None => body,
+        };
+        for bank in BANKS {
+            match if sized { bank_extent(region, bank) } else { None } {
+                Some(0) => {} // never referenced - declaring it would be dead storage
+                Some(n) => {
+                    let _ = writeln!(out, "  var {bank}: array<u32, {n}>;");
+                }
+                None => {
+                    let _ = writeln!(out, "  var {bank}: array<u32, {BANK_REGS}>;");
+                }
+            }
+        }
+        rest = body;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// How many registers of `bank` the emitted `region` references: `Some(high_water + 1)`, or
+/// `None` when it is subscripted dynamically and therefore cannot be bounded here.
+fn bank_extent(region: &str, bank: &str) -> Option<usize> {
+    let mut high = 0usize;
+    let mut any = false;
+    let bytes = region.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = region[from..].find(bank) {
+        let start = from + rel;
+        from = start + bank.len();
+        // A bank name is a whole identifier followed immediately by its subscript, so `idx[`,
+        // `in.`, `gxp_sa_k` and every other identifier containing these letters are excluded by
+        // the two boundary tests.
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
+                continue;
+            }
+        }
+        if bytes.get(from) != Some(&b'[') {
+            continue;
+        }
+        let sub = &region[from + 1..];
+        let digits = sub.len() - sub.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 && sub.as_bytes().get(digits) == Some(&b']') {
+            let n: usize = sub[..digits].parse().ok()?;
+            high = high.max(n);
+            any = true;
+            continue;
+        }
+        // The default-uniform copy loop is bounded by its own literal; every other dynamic
+        // subscript is not bounded at all.
+        if let Some(tail) = sub.strip_prefix("gxp_sa_k]") {
+            let _ = tail;
+            if let Some(bound) = uniform_loop_bound(region) {
+                high = high.max(bound.saturating_sub(1));
+                any = true;
+                continue;
+            }
+        }
+        return None;
+    }
+    Some(if any { high + 1 } else { 0 })
+}
+
+/// The literal register count the SA copy loop emitted by [`emit_secondary_attrs`] runs to.
+fn uniform_loop_bound(region: &str) -> Option<usize> {
+    let at = region.find("gxp_sa_k < ")? + "gxp_sa_k < ".len();
+    let sub = &region[at..];
+    let digits = sub.len() - sub.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    sub[..digits].parse().ok()
+}
+
+/// The bank sizing is a TEXT pass over emitted WGSL, and the one failure mode that would not
+/// announce itself is shrinking a bank a DYNAMIC subscript still clamps to `BANK_REGS - 1`.
+/// Every case here is about that boundary.
+#[cfg(test)]
+mod bank_sizing_tests {
+    use super::*;
+
+    fn one_stage(body: &str) -> String {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        m.push_str(body);
+        m.push_str("}\n");
+        size_register_banks(&m)
+    }
+
+    #[test]
+    fn a_bank_is_sized_to_its_highest_constant_subscript() {
+        let out = one_stage("  r[3] = pa[0];\n  o[11] = r[3];\n");
+        assert!(out.contains("var r: array<u32, 4>;"), "{out}");
+        assert!(out.contains("var pa: array<u32, 1>;"), "{out}");
+        assert!(out.contains("var o: array<u32, 12>;"), "{out}");
+    }
+
+    #[test]
+    fn a_bank_nothing_subscripts_is_not_declared_at_all() {
+        let out = one_stage("  r[0] = 1u;\n");
+        assert!(out.contains("var r: array<u32, 1>;"), "{out}");
+        assert!(!out.contains("var sa:"), "an unreferenced bank is dead storage: {out}");
+        assert!(!out.contains("var i:"), "{out}");
+    }
+
+    #[test]
+    fn a_dynamically_subscripted_bank_keeps_its_full_size() {
+        // This is the emission of `wgsl::indexed_element`, whose clamp names `BANK_REGS - 1`:
+        // a smaller array would fold every high index onto its last element SILENTLY.
+        let out = one_stage("  r[0] = sa[min(u32(max(idx[0] + 2i, 0i)), 511u)];\n");
+        assert!(out.contains(&format!("var sa: array<u32, {BANK_REGS}>;")), "{out}");
+        assert!(out.contains("var r: array<u32, 1>;"), "the other banks still size: {out}");
+    }
+
+    /// A default-uniform register the body only READS never reaches the bank at all: it is read
+    /// straight out of the uniform, so nineteen declared registers become none.
+    #[test]
+    fn a_read_only_uniform_register_is_read_from_the_uniform_and_not_copied() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        emit_secondary_attrs(&mut m, "vs_sa", 19, &[]);
+        m.push_str("  o[0] = sa[2];\n}\n");
+        let out = size_register_banks(&resolve_sa_init(&m));
+        assert!(out.contains("o[0] = vs_sa.data[0][2];"), "{out}");
+        assert!(!out.contains("gxp_sa_k"), "the copy loop is gone: {out}");
+        assert!(!out.contains("var sa:"), "nothing subscripts the bank now: {out}");
+    }
+
+    /// One the body WRITES keeps a slot, loaded once - and the slot is renumbered, because the
+    /// register it came from is only an index into the guest's uniform buffer.
+    #[test]
+    fn a_written_uniform_register_keeps_one_compacted_slot() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        emit_secondary_attrs(&mut m, "vs_sa", 19, &[]);
+        m.push_str("  sa[17] = 1u;\n  o[0] = sa[17];\n  o[1] = sa[2];\n}\n");
+        let out = size_register_banks(&resolve_sa_init(&m));
+        assert!(out.contains("var sa: array<u32, 1>;"), "one live register: {out}");
+        assert!(out.contains("sa[0] = vs_sa.data[4][1];"), "loaded before its write: {out}");
+        assert!(out.contains("o[1] = vs_sa.data[0][2];"), "the read-only one is direct: {out}");
+    }
+
+    /// A register the body OVERWRITES with a function of itself keeps every one of its reads on
+    /// the local slot - including the ones after the write.
+    ///
+    /// This is the case that made a retail race come back blown out: the
+    /// substitution was decided per OCCURRENCE, so `sa[5]`'s later read was rewritten to the
+    /// uniform and the reciprocal computed into it was thrown away. Nothing about that fails to
+    /// compile.
+    #[test]
+    fn a_register_the_body_recomputes_is_not_substituted_after_its_write() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        emit_secondary_attrs(&mut m, "vs_sa", 19, &[]);
+        m.push_str("  sa[5] = bitcast<u32>(1.0 / bitcast<f32>(sa[5]));\n  o[0] = sa[5];\n}\n");
+        let out = size_register_banks(&resolve_sa_init(&m));
+        assert!(out.contains("sa[0] = vs_sa.data[1][1];"), "{out}");
+        assert!(out.contains("o[0] = sa[0];"), "the later read stays on the slot: {out}");
+        assert_eq!(out.matches("vs_sa.data").count(), 1, "only the entry load reads it: {out}");
+    }
+
+    /// A stage that indexes the bank DYNAMICALLY cannot have either rewrite proved safe, so it
+    /// keeps the copy loop and the loop's own literal bounds the bank.
+    #[test]
+    fn a_dynamically_indexed_stage_keeps_the_uniform_copy_loop() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        emit_secondary_attrs(&mut m, "vs_sa", 19, &[]);
+        m.push_str("  o[0] = sa[min(u32(max(idx[0] + 2i, 0i)), 511u)];\n}\n");
+        let out = size_register_banks(&resolve_sa_init(&m));
+        assert!(out.contains("gxp_sa_k < 19u"), "{out}");
+        // And the bank keeps its FULL size, because `indexed_element`'s clamp names
+        // `BANK_REGS - 1` - the case `a_dynamically_subscripted_bank_keeps_its_full_size`
+        // covers. The loop is what makes the copy correct for an index nothing here bounds.
+        assert!(out.contains(&format!("var sa: array<u32, {BANK_REGS}>;")), "{out}");
+    }
+
+    /// The literals the CONTAINER carries are stored at whatever register the blob's own
+    /// compiler chose, which in the retail corpus is register 92 of 107. They are live and must
+    /// survive - compacted, like every other survivor.
+    #[test]
+    fn container_literals_survive_the_compaction() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        emit_secondary_attrs(&mut m, "vs_sa", 19, &[(92, 0x3f80_0000)]);
+        m.push_str("  o[0] = sa[92];\n}\n");
+        let out = size_register_banks(&resolve_sa_init(&m));
+        assert!(out.contains("var sa: array<u32, 1>;"), "{out}");
+        assert!(out.contains("sa[0] = 0x3f800000u;"), "{out}");
+        assert!(out.contains("o[0] = sa[0];"), "{out}");
+    }
+
+    #[test]
+    fn the_two_stages_of_a_module_are_sized_independently() {
+        let mut m = String::from("@vertex\nfn vs_main() -> VsOut {\n");
+        emit_register_banks(&mut m);
+        m.push_str("  o[30] = 1u;\n}\n@fragment\nfn fs_main() -> @location(0) vec4<f32> {\n");
+        emit_register_banks(&mut m);
+        m.push_str("  o[1] = 1u;\n}\n");
+        let out = size_register_banks(&m);
+        assert!(out.contains("var o: array<u32, 31>;"), "{out}");
+        assert!(out.contains("var o: array<u32, 2>;"), "the fragment must not inherit 31: {out}");
+    }
+
+    #[test]
+    fn an_identifier_that_merely_contains_a_bank_name_is_not_one() {
+        // `idx[..]` and `in.a0` both contain bank letters; neither is a bank subscript, and
+        // reading one as a dynamic index would silently give up the sizing for that bank.
+        let out = one_stage("  idx[0] = 2i;\n  pa[1] = bitcast<u32>(in.a0.x);\n");
+        assert!(out.contains("var pa: array<u32, 2>;"), "{out}");
+        assert!(!out.contains("var i:"), "`idx` is not the `i` bank: {out}");
+    }
 }
 
 #[cfg(test)]
@@ -1421,6 +2437,41 @@ mod tests {
 
     fn shader(kind: ProgramKind, instrs: Vec<Instr>) -> Shader {
         Shader { kind, instrs }
+    }
+
+    #[test]
+    fn a_forwarding_claim_places_its_usage_at_the_lane_the_vertex_fills() {
+        // One title's sky/background family. The convention gives
+        // `Color0@4x4 Color1@8x4 TexCoord(0)@12x2`; the code copies `In.UV1` - a TEXCOORD - from
+        // lane 8, and copies `In.VColor` into lanes 12..14, which no four-lane `Color0` can ever
+        // start at. The reachable claim settles the order and the unreachable one is ignored: an
+        // earlier version demanded BOTH and therefore refused the very layout this family states.
+        let vout = vec![
+            OutputVarying { usage: VaryingUsage::Color0, base_lane: 4, components: 4 },
+            OutputVarying { usage: VaryingUsage::Color1, base_lane: 8, components: 4 },
+            OutputVarying { usage: VaryingUsage::TexCoord(0), base_lane: 12, components: 2 },
+        ];
+        let claims = vec![
+            (VaryingUsage::TexCoord(0), vec![8, 9, 10, 11]),
+            (VaryingUsage::Color0, vec![12, 13]),
+        ];
+        let got = layout_from_forwarding_claims(&vout, &claims).expect("the TexCoord claim is reachable");
+        assert_eq!(
+            got,
+            vec![
+                OutputVarying { usage: VaryingUsage::Color0, base_lane: 4, components: 4 },
+                OutputVarying { usage: VaryingUsage::TexCoord(0), base_lane: 8, components: 2 },
+                OutputVarying { usage: VaryingUsage::Color1, base_lane: 10, components: 4 },
+            ]
+        );
+
+        // No usage's WIDTH moves, so the lane budget still closes exactly - the objection that
+        // sank the previous attempt at resolving this.
+        assert_eq!(got.iter().map(|v| v.components).sum::<u32>(), 10);
+
+        // A claim the convention already satisfies changes nothing, and "nothing" is reported as
+        // no resolution rather than as a layout.
+        assert!(layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])]).is_none());
     }
 
     #[test]
@@ -1471,6 +2522,8 @@ mod tests {
             output_order: crate::container::VaryingOrder::Known,
             varyings_error: None,
             default_uniform_regs: 0,
+            sa_base_from_container: true,
+            containers: Vec::new(),
             secondary_code: Vec::new(),
             literals: Vec::new(),
             texture_control: Vec::new(),

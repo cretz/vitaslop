@@ -1149,6 +1149,410 @@ fn a_bulk_compare_stamps_nothing() {
     assert_eq!(stamp_of(&mut vm, block, first), 0, "a read stamps nothing");
 }
 
+// --- InlineOp::ReserveUniformBuffer ---------------------------------------------------
+//
+// The form that HANDS THE GUEST AN ADDRESS rather than answering a question, so its
+// failures are a class the others do not have: a wrong bump gives two draws the same
+// buffer (one object's uniforms on another) and a bump that escapes the ring gives the
+// guest a pointer into someone else's memory. Both are silent. Hence an execution test
+// per arm rather than only a layout assertion.
+
+/// The context block the reserve bumps, and the program handle it reads its size from.
+/// Placed away from [`OUT_PTR`], which here is the `void **uniformBuffer` out-parameter.
+const CTX_PTR: u32 = BASE + 0x4000;
+const PROG_PTR: u32 = BASE + 0x5000;
+/// The ring the bump hands blocks out of.
+const RING: u32 = BASE + 0x8000;
+const RING_BYTES: u32 = 0x1000;
+
+const CTX_MAGIC: u32 = 0x5658_4354;
+const PROG_MAGIC: u32 = 0x5658_5047;
+/// What one reserve asks for, and what the handle says to record for it. Deliberately
+/// different numbers, because they are different fields and a form that confused them
+/// would pass a test that used one value for both.
+const U_SIZE: u32 = 0x30;
+const U_ALLOC: u32 = 0x100;
+
+/// The layout the runtime passes for the VERTEX stage, spelled out here rather than
+/// imported: this test is about what the EMITTER does with a layout, and reading the
+/// runtime's own constants would make it agree with itself.
+fn reserve_layout() -> vitaslop_transpiler::UniformRingLayout {
+    vitaslop_transpiler::UniformRingLayout {
+        ctx_magic_at: 0x00,
+        ctx_magic: CTX_MAGIC,
+        ctx_program: 0x88,
+        ctx_ring_base: 0x10,
+        ctx_ring_end: 0x14,
+        ctx_ring_cursor: 0x18,
+        record: 0x20,
+        prog_magic_at: 0x00,
+        prog_magic: PROG_MAGIC,
+        prog_size: 0x04,
+        prog_alloc: 0x08,
+        prog_header: 0x0c,
+        align: 16,
+    }
+}
+
+const PROG_HEADER: u32 = 0x8123_4567;
+
+/// A VM with a stamped context block (ring attached, cursor at `cursor`) and a stamped
+/// program handle bound into it.
+fn vm_with_reserve(cursor: u32) -> Vm {
+    let l = reserve_layout();
+    let mut vm = vm_with(InlineOp::ReserveUniformBuffer { layout: l });
+    let mut w = |addr: u32, v: u32| vm.write_mem(addr, &v.to_le_bytes()).expect("seed");
+    w(CTX_PTR + l.ctx_magic_at, CTX_MAGIC);
+    w(CTX_PTR + l.ctx_program, PROG_PTR);
+    w(CTX_PTR + l.ctx_ring_base, RING);
+    w(CTX_PTR + l.ctx_ring_end, RING + RING_BYTES);
+    w(CTX_PTR + l.ctx_ring_cursor, cursor);
+    for k in 0..3 {
+        w(CTX_PTR + l.record + k * 4, SENTINEL_BASE | k);
+    }
+    w(PROG_PTR + l.prog_magic_at, PROG_MAGIC);
+    w(PROG_PTR + l.prog_size, U_SIZE);
+    w(PROG_PTR + l.prog_alloc, U_ALLOC);
+    w(PROG_PTR + l.prog_header, PROG_HEADER);
+    vm.write_mem(OUT_PTR, &SENTINEL_BASE.to_le_bytes()).expect("seed the out-parameter");
+    vm
+}
+
+fn word(vm: &mut Vm, addr: u32) -> u32 {
+    let b = vm.read_mem(addr, 4).expect("read back");
+    u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"))
+}
+
+/// The ordinary case: bump the cursor, hand the block back, record all three words.
+#[test]
+fn reserve_bumps_the_ring_and_records_the_binding() {
+    let l = reserve_layout();
+    let mut vm = vm_with_reserve(RING);
+    vm.set_reg(0, CTX_PTR);
+    vm.set_reg(1, OUT_PTR);
+    assert!(!run(&mut vm), "a fully seeded context must not reach the host");
+    assert_eq!(word(&mut vm, OUT_PTR), RING, "the guest is handed the block");
+    assert_eq!(word(&mut vm, CTX_PTR + l.ctx_ring_cursor), RING + U_ALLOC, "the cursor advances");
+    assert_eq!(word(&mut vm, CTX_PTR + l.record), RING, "...the record names it");
+    assert_eq!(word(&mut vm, CTX_PTR + l.record + 4), U_SIZE, "...at its RECORDED size");
+    assert_eq!(word(&mut vm, CTX_PTR + l.record + 8), PROG_HEADER, "...for its program");
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+/// Two reserves in a row must not alias, and the second must start ALIGNED. This is the
+/// failure that puts one object's model matrix on another, and the one a single-call test
+/// cannot see at all.
+#[test]
+fn two_reserves_hand_out_distinct_aligned_blocks() {
+    let l = reserve_layout();
+    // A cursor deliberately off an alignment boundary, which is what an unaligned size
+    // would leave behind.
+    let mut vm = vm_with_reserve(RING + 4);
+    vm.set_reg(0, CTX_PTR);
+    vm.set_reg(1, OUT_PTR);
+    assert!(!run(&mut vm));
+    let first = word(&mut vm, OUT_PTR);
+    assert_eq!(first, RING + 16, "the block starts at the next 16-byte boundary");
+    vm.set_reg(0, CTX_PTR);
+    vm.set_reg(1, OUT_PTR);
+    assert!(!run(&mut vm));
+    let second = word(&mut vm, OUT_PTR);
+    assert_eq!(second, first + U_ALLOC, "the second block starts past the first");
+    assert_eq!(second % l.align, 0, "and is aligned");
+    assert!(second - first >= U_SIZE, "the two do not overlap");
+}
+
+/// A reserve that would leave the ring is the handler's: it WRAPS and reports the
+/// aliasing, and inlining that would make a real fidelity loss silent.
+#[test]
+fn reserve_hands_an_overrun_to_the_handler() {
+    let l = reserve_layout();
+    let mut vm = vm_with_reserve(RING + RING_BYTES - U_ALLOC + 16);
+    vm.set_reg(0, CTX_PTR);
+    vm.set_reg(1, OUT_PTR);
+    assert!(run(&mut vm), "a reserve that does not fit must reach the host");
+    assert_eq!(word(&mut vm, OUT_PTR), SENTINEL_BASE, "and must write nothing itself");
+    assert_eq!(word(&mut vm, CTX_PTR + l.record), SENTINEL_BASE, "...including the record");
+}
+
+/// The last block that FITS must still be handed out inline. The boundary is where an
+/// off-by-one lives, and either side of it is a different program.
+#[test]
+fn reserve_splits_exactly_at_the_end_of_the_ring() {
+    let mut vm = vm_with_reserve(RING + RING_BYTES - U_ALLOC);
+    vm.set_reg(0, CTX_PTR);
+    vm.set_reg(1, OUT_PTR);
+    assert!(!run(&mut vm), "a block ending exactly at the end of the ring fits");
+    assert_eq!(word(&mut vm, OUT_PTR), RING + RING_BYTES - U_ALLOC);
+}
+
+/// Each way the seeding can be wrong, and the assertion that ALL of them cross. Every one
+/// is a case the handler defines: nothing bound, a pointer we did not stamp, a context
+/// with no ring yet.
+#[test]
+fn reserve_falls_back_on_every_unstamped_case() {
+    let l = reserve_layout();
+    let cases: [(&str, u32, u32); 5] = [
+        ("no bound program", l.ctx_program, 0),
+        ("a handle we did not create", l.ctx_program, PROG_PTR + 0x40),
+        ("a block that is not a context", l.ctx_magic_at, CTX_MAGIC ^ 1),
+        ("no ring attached", l.ctx_ring_base, 0),
+        ("a cursor below the ring", l.ctx_ring_cursor, RING - 0x100),
+    ];
+    for (what, at, value) in cases {
+        let mut vm = vm_with_reserve(RING);
+        vm.write_mem(CTX_PTR + at, &value.to_le_bytes()).expect("break one word");
+        vm.set_reg(0, CTX_PTR);
+        vm.set_reg(1, OUT_PTR);
+        assert!(run(&mut vm), "{what} must reach the host");
+        assert_eq!(word(&mut vm, OUT_PTR), SENTINEL_BASE, "{what} must write nothing");
+        assert_eq!(
+            word(&mut vm, CTX_PTR + l.ctx_ring_cursor),
+            if at == l.ctx_ring_cursor { value } else { RING },
+            "{what} must not move the cursor"
+        );
+    }
+}
+
+/// The two pointer arms nothing else notices. A null context would rebase to an address
+/// near the top of linear memory - a real page - and be read as a ring; a null
+/// out-parameter would have the block stored there.
+#[test]
+fn reserve_falls_back_on_a_null_pointer_either_side() {
+    for (r0, r1) in [(0, OUT_PTR), (CTX_PTR, 0)] {
+        let mut vm = vm_with_reserve(RING);
+        vm.set_reg(0, r0);
+        vm.set_reg(1, r1);
+        assert!(run(&mut vm), "a null pointer must reach the host");
+        assert_eq!(
+            word(&mut vm, CTX_PTR + reserve_layout().ctx_ring_cursor),
+            RING,
+            "and must not have bumped anything on the way"
+        );
+    }
+}
+
+// --- InlineOp::SetUniformData ----------------------------------------------------------
+//
+// The form that writes the bytes a SHADER READS, into two places at once, from a pointer
+// the caller left on the STACK. Its failure modes are a wrong picture rather than a missing
+// one, and none of them would trip an assertion anywhere else - hence an execution test per
+// arm.
+
+/// The parameter record, the uniform buffer the guest names, the SA bank, and the stack
+/// slot holding the fifth argument. All far enough apart that a copy landing in the wrong
+/// one is visible as a sentinel that did not change.
+const PARAM_REC: u32 = BASE + 0x6000;
+const UBUF: u32 = BASE + 0x9000;
+const SA_BANK: u32 = BASE + 0xA000;
+const STACK: u32 = BASE + 0xC000;
+const SRC: u32 = BASE + 0xD000;
+
+const MAX_REGS: u32 = 64;
+const BANK_DATA: u32 = 4;
+/// The parameter's `resource_index`: the register the write starts at. Non-zero, because a
+/// form that ignored it would pass every test that used zero.
+const RES_INDEX: u32 = 3;
+
+fn uniform_data_layout() -> vitaslop_transpiler::UniformDataLayout {
+    vitaslop_transpiler::UniformDataLayout {
+        bank_slot: 0,
+        bank_len_at: 0,
+        bank_data_at: BANK_DATA,
+        param_packed_at: 4,
+        type_shift: 4,
+        type_mask: 0xf,
+        f16_type: 1,
+        param_index_at: 12,
+        max_regs: MAX_REGS,
+    }
+}
+
+/// A VM with a parameter record of component type `type_bits`, `count` floats staged at
+/// [`SRC`], and the stack slot pointing at them.
+fn vm_with_uniform_data(type_bits: u32, count: u32) -> Vm {
+    let mut vm = vm_with(InlineOp::SetUniformData { layout: uniform_data_layout() });
+    seed_uniform_data(&mut vm, type_bits, count);
+    vm
+}
+
+/// The same fixture on a build that TRACKS guest stores, for the dirty-map assertion.
+fn vm_with_dirty_uniform_data() -> (Vm, u32) {
+    let (mut vm, block) = vm_with_dirty(InlineOp::SetUniformData { layout: uniform_data_layout() });
+    seed_uniform_data(&mut vm, 0, 8);
+    (vm, block)
+}
+
+fn seed_uniform_data(vm: &mut Vm, type_bits: u32, count: u32) {
+    let l = uniform_data_layout();
+    write_mirror(vm, &[SA_BANK]);
+    let mut w = |addr: u32, v: u32| vm.write_mem(addr, &v.to_le_bytes()).expect("seed");
+    w(PARAM_REC + l.param_packed_at, type_bits << l.type_shift);
+    w(PARAM_REC + l.param_index_at, RES_INDEX);
+    w(STACK, SRC);
+    for i in 0..count {
+        w(SRC + i * 4, UNIFORM_VALUES | i);
+    }
+    // Sentinels across both destinations, so a copy at the wrong offset shows up as a word
+    // that changed when it should not have.
+    for i in 0..MAX_REGS {
+        w(UBUF + i * 4, SENTINEL_BASE | i);
+        w(SA_BANK + BANK_DATA + i * 4, SENTINEL_BASE | i);
+    }
+    w(SA_BANK, 0);
+    vm.set_reg(13, STACK);
+}
+
+/// The float bit patterns the guest hands over. Distinctive, and each carries its own index.
+const UNIFORM_VALUES: u32 = 0x4B10_0000;
+
+/// The ordinary case: the same bytes land in the buffer at the parameter's register, in the
+/// bank at the same register, and the bank's high-water mark rises to cover them.
+#[test]
+fn set_uniform_data_writes_the_buffer_and_the_bank() {
+    let l = uniform_data_layout();
+    const COUNT: u32 = 4;
+    const OFFSET: u32 = 2;
+    let mut vm = vm_with_uniform_data(0, COUNT);
+    vm.set_reg(0, UBUF);
+    vm.set_reg(1, PARAM_REC);
+    vm.set_reg(2, OFFSET);
+    vm.set_reg(3, COUNT);
+    assert!(!run(&mut vm), "a readable F32 parameter must not reach the host");
+    let at = RES_INDEX + OFFSET;
+    for i in 0..MAX_REGS {
+        let want = if (at..at + COUNT).contains(&i) {
+            UNIFORM_VALUES | (i - at)
+        } else {
+            SENTINEL_BASE | i
+        };
+        assert_eq!(word(&mut vm, UBUF + i * 4), want, "buffer register {i}");
+        assert_eq!(word(&mut vm, SA_BANK + BANK_DATA + i * 4), want, "bank register {i}");
+    }
+    assert_eq!(word(&mut vm, SA_BANK + l.bank_len_at), at + COUNT, "the high-water mark covers it");
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+/// The high-water mark rises and never falls: two calls setting different uniforms must
+/// leave BOTH readable, which is what the guest's own buffer does.
+#[test]
+fn set_uniform_data_raises_the_high_water_mark_but_never_lowers_it() {
+    let l = uniform_data_layout();
+    let mut vm = vm_with_uniform_data(0, 8);
+    // A far write first...
+    vm.set_reg(0, UBUF);
+    vm.set_reg(1, PARAM_REC);
+    vm.set_reg(2, 20);
+    vm.set_reg(3, 4);
+    assert!(!run(&mut vm));
+    assert_eq!(word(&mut vm, SA_BANK + l.bank_len_at), RES_INDEX + 24);
+    // ...then a nearer one, which must not shrink the mark.
+    vm.set_reg(0, UBUF);
+    vm.set_reg(1, PARAM_REC);
+    vm.set_reg(2, 0);
+    vm.set_reg(3, 2);
+    assert!(!run(&mut vm));
+    assert_eq!(word(&mut vm, SA_BANK + l.bank_len_at), RES_INDEX + 24, "the mark holds");
+    assert_eq!(word(&mut vm, SA_BANK + BANK_DATA + RES_INDEX * 4), UNIFORM_VALUES, "and both writes are there");
+    assert_eq!(word(&mut vm, SA_BANK + BANK_DATA + (RES_INDEX + 20) * 4), UNIFORM_VALUES);
+}
+
+/// A count of zero writes nothing and still succeeds - `memory.copy` of zero bytes is legal
+/// and the handler accepts it, so the two must agree rather than one of them refusing.
+#[test]
+fn set_uniform_data_of_no_components_writes_nothing() {
+    let l = uniform_data_layout();
+    let mut vm = vm_with_uniform_data(0, 0);
+    vm.set_reg(0, UBUF);
+    vm.set_reg(1, PARAM_REC);
+    vm.set_reg(2, 0);
+    vm.set_reg(3, 0);
+    assert!(!run(&mut vm));
+    assert_eq!(word(&mut vm, SA_BANK + l.bank_len_at), RES_INDEX, "the mark covers an empty write");
+    for i in 0..MAX_REGS {
+        assert_eq!(word(&mut vm, UBUF + i * 4), SENTINEL_BASE | i, "buffer register {i} untouched");
+    }
+}
+
+/// Every arm that belongs to the handler. Each one is a case the handler DEFINES - an F16
+/// parameter packs two components per register, a clamped or absurd index is the handler's
+/// clamp, a write past the ceiling is dropped from the bank but not from the buffer - and
+/// each must leave both destinations alone here.
+#[test]
+fn set_uniform_data_falls_back_on_every_case_the_handler_defines() {
+    let l = uniform_data_layout();
+    // (what, r1, r2, r3, and an optional (address, value) to break first)
+    let cases: [(&str, u32, u32, u32, Option<(u32, u32)>); 6] = [
+        ("an F16 parameter", PARAM_REC, 0, 4, Some((PARAM_REC + l.param_packed_at, 1 << l.type_shift))),
+        ("a null parameter record", 0, 0, 4, None),
+        ("a NEGATIVE resource_index", PARAM_REC, 0, 4, Some((PARAM_REC + l.param_index_at, 0xFFFF_FFFF))),
+        ("a resource_index past the ceiling", PARAM_REC, 0, 4, Some((PARAM_REC + l.param_index_at, MAX_REGS + 1))),
+        ("a write that ends past the ceiling", PARAM_REC, MAX_REGS - 4, 4, None),
+        ("no bank at all", PARAM_REC, 0, 4, None),
+    ];
+    for (what, r1, r2, r3, poke) in cases {
+        let mut vm = vm_with_uniform_data(0, 8);
+        if what == "no bank at all" {
+            write_mirror(&mut vm, &[0]);
+        }
+        if let Some((addr, value)) = poke {
+            vm.write_mem(addr, &value.to_le_bytes()).expect("break one word");
+        }
+        vm.set_reg(0, UBUF);
+        vm.set_reg(1, r1);
+        vm.set_reg(2, r2);
+        vm.set_reg(3, r3);
+        assert!(run(&mut vm), "{what} must reach the host");
+        for i in 0..MAX_REGS {
+            assert_eq!(word(&mut vm, UBUF + i * 4), SENTINEL_BASE | i, "{what}: buffer register {i}");
+        }
+        assert_eq!(word(&mut vm, SA_BANK + l.bank_len_at), 0, "{what}: the mark did not move");
+    }
+}
+
+/// The three pointer arms nothing else notices: a null buffer, a source pointer off the end
+/// of memory, and a stack pointer that cannot even be read for the fifth argument.
+#[test]
+fn set_uniform_data_falls_back_on_a_bad_pointer() {
+    for (what, r0, src, sp) in [
+        ("a null uniform buffer", 0, SRC, STACK),
+        ("a source past the end of memory", UBUF, BASE + MEM_BYTES - 4, STACK),
+        ("a null stack pointer", UBUF, SRC, 0),
+    ] {
+        let mut vm = vm_with_uniform_data(0, 4);
+        vm.write_mem(STACK, &src.to_le_bytes()).expect("stage the fifth argument");
+        vm.set_reg(13, sp);
+        vm.set_reg(0, r0);
+        vm.set_reg(1, PARAM_REC);
+        vm.set_reg(2, 0);
+        vm.set_reg(3, 4);
+        assert!(run(&mut vm), "{what} must reach the host");
+        assert_eq!(word(&mut vm, SA_BANK + BANK_DATA), SENTINEL_BASE, "{what} wrote nothing");
+    }
+}
+
+/// The write STAMPS the dirty map over the buffer it wrote, and only over that.
+///
+/// A uniform buffer is wherever the guest put it, so this form has no argument for skipping
+/// the stamp - the same position `sceClibMemcpy` is in. An unstamped write is a page the
+/// host believes it has already uploaded, drawn from bytes the guest has since changed.
+#[test]
+fn set_uniform_data_stamps_the_buffer_it_wrote() {
+    const EPOCH: u8 = 0x21;
+    let l = uniform_data_layout();
+    let first = (UBUF - BASE) >> vitaslop_transpiler::DIRTY_SHIFT;
+    let (mut vm, block) = vm_with_dirty_uniform_data();
+    let vm = &mut vm;
+    seed_epoch(vm, block, EPOCH, first..first + 2);
+    vm.set_reg(0, UBUF);
+    vm.set_reg(1, PARAM_REC);
+    vm.set_reg(2, 0);
+    vm.set_reg(3, 4);
+    assert!(!run(vm));
+    assert_eq!(stamp_of(vm, block, first), EPOCH, "the page the buffer is on is stamped");
+    assert_eq!(word(vm, SA_BANK + l.bank_len_at), RES_INDEX + 4, "and the write happened");
+}
+
 /// Guard against the registers being read back from somewhere other than the globals the
 /// emitted code writes - if `set_reg`/`get_reg` did not round-trip, every assertion above
 /// would be vacuous.

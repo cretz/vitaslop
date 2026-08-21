@@ -190,6 +190,28 @@ mod hostcalls {
     }
 
     thread_local! {
+        /// The RAW software-fuel counter as `fuel_used` last read it, and the smallest such
+        /// reading. A preemption fires only once the counter has reached `fuel_interval()`, so
+        /// a small reading here is the one thing that separates "this frame executed an
+        /// enormous amount of guest work" from "this frame preempted on a counter that is not
+        /// tracking work" - and those are opposite bugs that look identical from the outside.
+        static RAW_FUEL: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((0, i64::MAX)) };
+    }
+
+    /// Record one raw counter reading.
+    pub fn note_raw_fuel(now: i64) {
+        RAW_FUEL.with(|c| {
+            let (_, lo) = c.get();
+            c.set((now, lo.min(now)));
+        });
+    }
+
+    /// `(the last raw counter reading, the smallest one seen)`.
+    pub fn raw_fuel() -> (i64, i64) {
+        RAW_FUEL.with(|c| c.get())
+    }
+
+    thread_local! {
         /// Calls per GUEST thread id. Every guest thread runs on this one worker, so
         /// "which thread is burning the calls" is not answerable from the totals - and
         /// that is exactly the question when one thread spins while another never runs.
@@ -479,6 +501,15 @@ mod hostcalls {
     }
 }
 
+/// The monotonic millisecond clock this engine measures with, as a plain `fn` the
+/// engine-agnostic runtime can hold. Handed to `vitaslop_runtime::perf::set_clock` at
+/// startup: without it the runtime's phase timers are silently inert on `wasm32` (there is
+/// no `Instant` there), which is why the browser could report a frame total and nothing
+/// inside it.
+pub fn perf_clock() -> f64 {
+    hostcalls::now()
+}
+
 /// Total host calls and milliseconds spent in them since the run started. Published in
 /// the per-frame status so a slow frame names its own cause.
 pub fn host_call_totals() -> (u64, f64) {
@@ -530,6 +561,12 @@ pub fn instance_stats() -> (u64, u64, u64) {
 /// screen the calibration was taken on and wrong everywhere else.
 pub fn preemption_stats() -> (u64, u64) {
     (hostcalls::quanta(), hostcalls::fuel_yields())
+}
+
+/// `(the last raw software-fuel reading, the smallest one seen)` - see
+/// [`hostcalls::note_raw_fuel`].
+pub fn raw_fuel_stats() -> (i64, i64) {
+    hostcalls::raw_fuel()
 }
 
 /// Announce, once, HOW this run preempts a guest thread - because it is not how native
@@ -685,6 +722,24 @@ type Host = Arc<Mutex<VitaEnv>>;
 #[derive(Clone)]
 struct SharedView {
     bytes: Uint8Array,
+    /// A `Uint32Array` and a `Uint16Array` over the SAME buffer, from offset 0, so a
+    /// rebased byte offset indexes as `off >> 2` / `off >> 1`.
+    ///
+    /// # These are the scalar path, and they exist because a block read is not one
+    /// `read(off, &mut [0u8; 4])` here is `subarray` - a boundary crossing that ALLOCATES
+    /// a JS typed array - plus `copy_to`, a second crossing. Through these it is one
+    /// `get_index`, no allocation. Every host handler that reads a guest struct field, a
+    /// pointer or a flag pays that, tens of thousands of times a presented frame
+    /// ([[vitaslop-count-calls-not-bytes-across-the-guest-boundary]] counted ~22,000 on a
+    /// racing title's on-track frame AFTER the four biggest per-word readers had been
+    /// bulk-converted).
+    ///
+    /// Sound for the same reason the byte view is built once: the memory is created
+    /// `initial == maximum`, so it never grows and its `SharedArrayBuffer` never detaches.
+    /// Only ALIGNED accesses go through them - the caller's offset is checked, and a
+    /// misaligned one falls back to the byte path, because a typed array cannot express it.
+    words: js_sys::Uint32Array,
+    halves: js_sys::Uint16Array,
     /// Byte offset of the GUEST-STORE DIRTY BLOCK this module was emitted with, or
     /// `None` when it was built without one. The block is the epoch byte followed by
     /// one stamp byte per 4 KB page - see `vitaslop_transpiler::emit::emit_dirty_mark`,
@@ -741,6 +796,37 @@ impl GuestMemory for SharedView {
         self.stamp_written(off, bytes.len());
     }
 
+    // >>> THE SCALAR PATH: ONE CROSSING, NO ALLOCATION. See `SharedView::words`.
+    fn read_u32(&self, off: usize) -> u32 {
+        if off & 3 != 0 {
+            let mut b = [0u8; 4];
+            self.read(off, &mut b);
+            return u32::from_le_bytes(b);
+        }
+        self.words.get_index((off >> 2) as u32)
+    }
+
+    fn read_u16(&self, off: usize) -> u16 {
+        if off & 1 != 0 {
+            let mut b = [0u8; 2];
+            self.read(off, &mut b);
+            return u16::from_le_bytes(b);
+        }
+        self.halves.get_index((off >> 1) as u32)
+    }
+
+    fn write_u32(&mut self, off: usize, v: u32) {
+        if off & 3 != 0 {
+            self.write(off, &v.to_le_bytes());
+            return;
+        }
+        self.words.set_index((off >> 2) as u32, v);
+        // The other half of the map, exactly as `write` owes it - a host write the guest
+        // cannot see stamped would let a texture snapshot report memory the host had just
+        // overwritten as untouched. See `stamp_written`.
+        self.stamp_written(off, 4);
+    }
+
     fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
         let block = self.dirty_off?;
         if len == 0 {
@@ -760,6 +846,33 @@ impl GuestMemory for SharedView {
             .subarray(self.stamp_at(block, first), self.stamp_at(block, last + 1))
             .copy_to(&mut pages);
         Some(pages.iter().any(|&s| s >= stamp))
+    }
+
+    fn dirty_epoch(&self) -> Option<u8> {
+        let block = self.dirty_off?;
+        Some(self.bytes.get_index((block + vitaslop_transpiler::DIRTY_EPOCH_OFF) as u32))
+    }
+
+    /// See [`GuestMemory::rebase_dirty_epoch`]. The map crosses the boundary TWICE - once out,
+    /// once back - which is two crossings and 131 KB against the 53 MB of texture a wrap makes
+    /// the host re-read.
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        let block = self.dirty_off?;
+        let map = self.stamp_at(block, 0);
+        // `pages() + 1` for the same reason `bump_dirty_epoch` uses it: the map covers every
+        // page of the memory and the last one is partial.
+        let end = self.bytes.length().min(map + self.pages() as u32 + 1);
+        let mut pages = vec![0u8; (end - map) as usize];
+        self.bytes.subarray(map, end).copy_to(&mut pages);
+        for p in pages.iter_mut() {
+            *p = if *p >= floor { *p - floor + 1 } else { 0 };
+        }
+        self.bytes.subarray(map, end).copy_from(&pages);
+        let epoch_at = (block + vitaslop_transpiler::DIRTY_EPOCH_OFF) as u32;
+        let cur = self.bytes.get_index(epoch_at);
+        let next = if cur >= floor { cur - floor + 1 } else { 1 };
+        self.bytes.set_index(epoch_at, next);
+        Some(next)
     }
 
     fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
@@ -971,16 +1084,32 @@ struct ThreadEngine {
     /// with fuel switched off. Read to price this thread's guest work - see
     /// [`BrowserThread::fuel_used`].
     fuel: Option<WebAssembly::Global>,
-    /// The counter's value at the last reading, and the total it has burned. The counter
-    /// itself cannot be the answer: it counts DOWN and reloads to a full interval after
-    /// every yield, so only the differences between readings accumulate to guest work.
+    /// The baseline the NEXT reading is differenced against, and the total burned. The
+    /// counter itself cannot be the answer: the guest clears it after every yield, so only
+    /// the differences between readings accumulate to guest work.
     fuel_last: i64,
+    /// The last RAW reading. A counter is a value, not an event: the scheduler may read it
+    /// twice without the guest having run in between, and billing that twice is a game clock
+    /// that runs fast for no reason.
+    fuel_raw: i64,
     fuel_total: u64,
     /// The GUEST-INSTRUCTION half of the same `work` global, at the last reading, and the
     /// total retired. That half counts UP and is never reset by the guest, so a reading is
     /// a running total and the delta between readings is what this resume retired.
     arm_last: u64,
     arm_total: u64,
+    /// The `work` global's two halves as they read at THIS suspension, or `None` when the
+    /// thread has run since the last reading.
+    ///
+    /// # Why the reading is cached and not simply taken twice
+    /// `fuel_used` and `arm_retired` are the two halves of one 64-bit global and are called
+    /// back to back by `SchedCore::charge_guest_work`, once per scheduler round. Each call
+    /// was a `Global::value()` (a boundary crossing) plus a `BigInt` construction and a
+    /// conversion back to `i64` - and a BigInt round trip is the dearest way JS has of
+    /// moving 64 bits. The guest cannot run between the two calls, so the second reading is
+    /// the first by construction. Cleared in `resume`, which is the only place the guest
+    /// runs.
+    work_read: Option<(u64, u64)>,
     /// The instance's exports, kept so a REUSED instance can look up its next entry's
     /// function and its `tp` global without instantiating anything.
     exports: Object,
@@ -1012,11 +1141,31 @@ impl BrowserThread {
     ///
     /// An i64 global crosses into JS as a BigInt, which `as_f64` does not accept - hence
     /// the explicit BigInt conversion rather than the numeric path the i32 counter used.
+    /// # The global is a BIT PATTERN, and reading it as a MAGNITUDE stopped the clock
+    /// `WORK_INSTR_SHIFT` is 32, so the instruction half owns bits 32..64 - and the moment a
+    /// thread retires 2^31 guest instructions, bit 63 is set and the i64 is NEGATIVE.
+    /// `u64::try_from` REFUSES a negative BigInt, so this returned `None`, `fuel_used` returned
+    /// `None`, and `charge_guest_work` billed that thread nothing from then on. The game clock
+    /// simply stopped advancing for it, so whatever it was waiting on never arrived and it spun
+    /// - **3,164 suspensions in one frame, 986 ms of wall time, and not one of them billed**
+    /// (a retail boot, frame 174, at a guest clock of 4.87 s, which is where a long-lived
+    /// thread crosses 2^31 retired instructions).
+    ///
+    /// It is read as `i64` and reinterpreted, because the value was never a number: it is two
+    /// counters packed into one word so the emitted code can advance both with a single add.
     fn read_work(&mut self) -> Option<(u64, u64)> {
+        if let Some(cached) = self.engine.as_ref()?.work_read {
+            return Some(cached);
+        }
         let raw = self.engine.as_ref()?.fuel.as_ref()?.value();
-        let packed = js_sys::BigInt::new(&raw).ok()?;
-        let bits = u64::try_from(packed).ok()?;
-        Some((bits & abi::WORK_OPS_MASK as u64, bits >> abi::WORK_INSTR_SHIFT))
+        // `unchecked_into`, not `BigInt::new`: the global is declared `i64`, so its value IS
+        // a BigInt and `BigInt(x)` would be a JS function call to convert it to itself.
+        let packed: js_sys::BigInt = raw.unchecked_into();
+        let bits = i64::try_from(packed).ok()? as u64;
+        let (ops, instructions) = abi::split_work(bits);
+        let out = (u64::from(ops), u64::from(instructions));
+        self.engine.as_mut()?.work_read = Some(out);
+        Some(out)
     }
 }
 
@@ -1050,30 +1199,41 @@ impl ThreadHandle for BrowserThread {
     /// nothing, and a thread that yields on fuel over and over - a spin - is then billed
     /// **zero** for every interval it burns.
     ///
-    /// That is not a small error. Measured on PCSA00015 in the browser: 7,953 of 8,000
+    /// That is not a small error. Measured on a retail title in the browser: 7,953 of 8,000
     /// scheduler rounds were fuel yields by one thread, each burning a full five-million
     /// interval, while the game clock stood still at 3.454 s and the storage transfer the
     /// thread was spinning on could never complete. The run stopped at frame 2 for ever.
     ///
-    /// So a spent counter records the baseline the guest is ABOUT to restore - a full
-    /// interval - rather than the spent value. The next reading then differences against
-    /// what the counter will actually hold, and a spinning thread is billed one interval
-    /// per yield, which is what it burned.
+    /// So a spent counter records the baseline the guest is ABOUT to restore - **ZERO**, which
+    /// is what the emitted clear leaves - rather than the spent value.
+    ///
+    /// # MEASURED, and recording `now` instead cost a title a 990 ms frame
+    /// The old code recorded `now` and relied on the NEXT reading being smaller to detect the
+    /// clear. At a fuel yield the reading is always `interval + overshoot`, and a tight loop's
+    /// overshoot is CONSTANT - so the difference is exactly zero, every time, for ever.
+    /// Measured on a retail boot in the browser: frame 174 makes **3,176 fuel yields
+    /// and bills 1.28 MB of fuel** - 403 per yield against a 5,000,000 interval - and produces
+    /// **16 non-zero samples out of 3,176 suspends**, because `charge_guest_work` skips a
+    /// suspend that burned nothing. The game clock therefore advanced exactly as much over that
+    /// frame as over its quiet neighbours while the frame took 990 ms of wall time.
     fn fuel_used(&mut self) -> Option<u64> {
         let interval = i64::from(fuel_interval());
         let (ops, _) = self.read_work()?;
         let engine = self.engine.as_mut()?;
         let now = ops as i64;
-        // The operator half counts UP to the interval and is CLEARED at each yield, so a
-        // reading below the last one means a yield happened in between: the thread
-        // finished the old interval and then spent part of the new one.
-        let burned = if now >= engine.fuel_last {
-            now - engine.fuel_last
-        } else {
-            (interval - engine.fuel_last) + now
-        };
-        engine.fuel_last = now;
-        engine.fuel_total = engine.fuel_total.saturating_add(burned.max(0) as u64);
+        // Nothing has run since the last reading, so there is nothing to bill. Without this the
+        // clear-aware baseline below would re-bill the same spent counter on a second read.
+        if now == engine.fuel_raw {
+            return Some(engine.fuel_total);
+        }
+        hostcalls::note_raw_fuel(now);
+        let burned = (now - engine.fuel_last).max(0);
+        engine.fuel_raw = now;
+        // The emitted check calls the host only once the counter has REACHED the interval, and
+        // the guest clears it immediately after that call returns (see `emit_fuel_check`), so a
+        // reading at or above the interval is a spent counter whose successor starts from zero.
+        engine.fuel_last = if now >= interval { 0 } else { now };
+        engine.fuel_total = engine.fuel_total.saturating_add(burned as u64);
         Some(engine.fuel_total)
     }
 
@@ -1084,7 +1244,13 @@ impl ThreadHandle for BrowserThread {
     fn arm_retired(&mut self) -> Option<u64> {
         let (_, instructions) = self.read_work()?;
         let engine = self.engine.as_mut()?;
-        let retired = instructions.saturating_sub(engine.arm_last);
+        // The half is 32 bits WIDE, so it wraps - at 2^32 retired instructions, which a
+        // long-lived thread reaches inside ten seconds of guest time. `saturating_sub` turned
+        // that wrap into a zero and then kept returning zeros, which is the emulated CPU clock
+        // quietly stopping. Difference it modulo the field instead, which is what a counter of
+        // fixed width means.
+        const WRAP: u64 = 1 << abi::WORK_INSTR_SHIFT;
+        let retired = instructions.wrapping_sub(engine.arm_last) % WRAP;
         engine.arm_last = instructions;
         engine.arm_total = engine.arm_total.saturating_add(retired);
         Some(engine.arm_total)
@@ -1132,13 +1298,17 @@ impl ThreadHandle for BrowserThread {
         engine.entries.clear();
         engine.entry_idx = 0;
         engine.entry_started = false;
-        engine.fuel_last = i64::from(fuel_interval());
+        // ZERO, because that is what the instance's `reset` export leaves in the counter -
+        // the same rule `fuel_used` follows after a clear.
+        engine.fuel_last = 0;
+        engine.fuel_raw = 0;
         engine.fuel_total = 0;
         // The instance's `reset` export zeroes the counter itself; this is the HOST's
         // matching baseline. Leaving it would make the next thread's first delta the whole
         // of the previous thread's total, which is a game clock that jumps by hours.
         engine.arm_last = 0;
         engine.arm_total = 0;
+        engine.work_read = None;
         hostcalls::note_instance_pooled();
         self.pool.borrow_mut().push(engine);
     }
@@ -1505,9 +1675,11 @@ impl BrowserEngine {
             fuel: Reflect::get(&exports, &JsValue::from_str(abi::FUEL_EXPORT))
                 .ok()
                 .and_then(|g| g.dyn_into::<WebAssembly::Global>().ok()),
-            fuel_last: i64::from(fuel_interval()),
+            fuel_last: 0,
+            fuel_raw: 0,
             fuel_total: 0,
             arm_last: 0,
+            work_read: None,
             arm_total: 0,
             exports,
             reset,
@@ -1604,6 +1776,9 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
     // A released thread is a finished one, and `pick_next` never returns a finished
     // thread - so reaching here without engine state is a scheduler bug, not an input.
     let t = t.engine.as_mut().expect("resume of a released (finished) thread");
+    // The guest is about to run, so the cached `work` reading stops being current. See
+    // `work_read`.
+    t.work_read = None;
     loop {
         // A fresh step channel for this turn; the import closure or the entry's
         // completion fills its resolver.
@@ -1756,9 +1931,25 @@ pub async fn run_frames(
             );
         }
 
-        let Some(idx) = core.pick_next() else {
+        // >>> THE BROWSER'S OWN SCHEDULER WORK, WHICH WAS NEVER TIMED HERE.
+        //
+        // `Phase::SchedOverhead` is charged by the NATIVE scheduler's `run_frames`, and the
+        // browser drives `SchedCore` from this loop instead - so on the engine that ships,
+        // the scheduler's share of a frame was simply absent from every report. On the
+        // desktop the same phase is **11.2% of a frame on a retail title**, and that title switches
+        // threads 230 times a frame, so "absent" is not the same as "small".
+        //
+        // Timed around the PICK and the DRAIN, never around the resume: resuming runs the
+        // guest, and timing that would measure the guest. Same rule the native loop states.
+        let pick = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedOverhead);
+        let picked = core.pick_next();
+        drop(pick);
+        let Some(idx) = picked else {
             idle_rounds += 1;
-            match core.handle_idle() {
+            let idle = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedIdle);
+            let step = core.handle_idle();
+            drop(idle);
+            match step {
                 IdleStep::Done(report) => return report,
                 IdleStep::Continue => continue,
             }
@@ -1782,6 +1973,9 @@ pub async fn run_frames(
                 Stop::Flip => n_flip += 1,
             }
         }
+        // The post-resume bookkeeping is scheduler work too, and it is where the guest
+        // clock is charged and the wake queue is applied.
+        let book = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedBook);
         let done = match step {
             ThreadStep::Finished(end) => core.on_finished(idx, end),
             ThreadStep::Suspended(stop) => core.on_suspended(idx, stop, max_frames),
@@ -1791,6 +1985,7 @@ pub async fn run_frames(
         }
         // A host call in this resume may have started threads or woken parked ones.
         core.drain();
+        drop(book);
     }
 }
 
@@ -1904,7 +2099,15 @@ fn build_engine(
         // maximum` above makes this memory non-growable and its SharedArrayBuffer never
         // detaches - see [`SharedView`] for why rebuilding it per access was the whole
         // browser performance problem.
-        let view = SharedView { bytes: Uint8Array::new(&shared_mem.buffer()), dirty_off };
+        let buffer = shared_mem.buffer();
+        let view = SharedView {
+            bytes: Uint8Array::new(&buffer),
+            // Over the SAME buffer from offset 0, so a rebased byte offset indexes as
+            // `off >> 2` / `off >> 1`. Built once, for the reason the byte view is.
+            words: js_sys::Uint32Array::new(&buffer),
+            halves: js_sys::Uint16Array::new(&buffer),
+            dirty_off,
+        };
         // Seed the image at offset 0.
         view.bytes.subarray(0, image.len() as u32).copy_from(image);
 
@@ -1944,4 +2147,55 @@ fn build_engine(
 
         Ok((engine, host))
     }
+}
+
+/// Guest address of each transpiled function, indexed by wasm function index minus
+/// `abi::IMPORT_FUNC_COUNT`. Recorded once, when the module is built.
+static FUNC_ADDRS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Record the emitted module's function table so a trap backtrace can name guest code.
+pub fn record_function_addresses(addrs: Vec<u32>) {
+    let _ = FUNC_ADDRS.set(addrs);
+}
+
+/// Rewrite `wasm-function[N]` in a V8 stack to name the GUEST function it is.
+///
+/// # Why the browser needs its own copy of this
+/// The native engine prints `<wasm function N>` and this prints `wasm-function[N]`, and the
+/// mapping is the same arithmetic in both: `funcs[N - IMPORT_FUNC_COUNT]`, the imports
+/// occupying the low indices. What differs is who reads it. A native backtrace is read by
+/// someone with the module on disk; a browser one is read off a phone screen, pasted into a
+/// chat window, by someone who cannot resolve a module index at all.
+///
+/// MEASURED on the device: a guest fault came back as ten frames of bare indices
+/// (`wasm-function[5362]`, `[12889]` repeating). Named, the same stack says the fault is in
+/// guest `0x81134030` and that the repeating frame is the INDIRECT-CALL DISPATCHER - i.e.
+/// a guest routine recursing through function pointers, which is a description of the bug.
+pub fn name_guest_frames(s: &str) -> String {
+    let Some(addrs) = FUNC_ADDRS.get() else { return s.to_string() };
+    const MARK: &str = "wasm-function[";
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut rest = s;
+    while let Some(at) = rest.find(MARK) {
+        let (head, tail) = rest.split_at(at + MARK.len());
+        out.push_str(head);
+        let end = tail.find(']').unwrap_or(tail.len());
+        let (num, after) = tail.split_at(end);
+        out.push_str(num);
+        if let Ok(widx) = num.trim().parse::<usize>() {
+            match widx
+                .checked_sub(vitaslop_transpiler::abi::IMPORT_FUNC_COUNT as usize)
+                .and_then(|i| addrs.get(i))
+            {
+                Some(a) => out.push_str(&format!("={a:#010x}")),
+                // The dispatcher and `reset` are emitted above every guest function. Saying
+                // so is as useful as an address: a stack that ALTERNATES with the dispatcher
+                // is an indirect-call chain.
+                None => out.push_str("=dispatcher"),
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }

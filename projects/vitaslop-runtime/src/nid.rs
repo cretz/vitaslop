@@ -891,6 +891,40 @@ pub mod sync {
     pub const POLL_EVENT_FLAG: u32 = 0x1FBB_0FE1;
     pub const CLEAR_EVENT_FLAG: u32 = 0x4CB8_7CA7;
     pub const DELETE_EVENT_FLAG: u32 = 0x5840_162C;
+
+    // --- SIMPLE EVENTS: the NIDs are known, the SIGNATURES are not, and that is why
+    // none of these is dispatched. ---
+    //
+    // A simple event is the kernel's other bit-pattern primitive: an object holding a
+    // pattern that `SET_EVENT` ORs into and `WAIT_EVENT` blocks on. It looks like the
+    // event FLAG with a smaller API, and it was implemented that way and then REVERTED,
+    // because the argument positions are a guess:
+    //
+    // * No allowed source on this machine publishes a prototype. The vitasdk headers have
+    //   no `SimpleEvent` anywhere; the NID db carries names and NIDs and nothing else.
+    // * A Vita event carries 64-bit USER DATA that `sceKernelSetEvent` sets and the wait
+    //   reports, which - if real - puts a `pUserData` pointer where the obvious reading
+    //   puts the TIMEOUT. Reading a timeout from a pointer that is actually user data
+    //   parks a thread on a nonsense deadline: a HANG, which is the one failure mode this
+    //   runtime must never produce silently.
+    // * Nothing exercises it. One title imports all four and never calls one - an
+    //   unimplemented NID is FATAL, and the title drives a full race - so there is no
+    //   evidence to check a guess against and no benefit to offset the risk.
+    //
+    // **Leaving them unhandled is the fix, not the omission.** The unimplemented-NID path
+    // is fatal AND dumps r0-r3, the first stack words and what each pointer-looking
+    // argument points at - which is precisely the evidence a signature needs. The first
+    // title that really calls one will print its own prototype.
+    pub const CREATE_SIMPLE_EVENT: u32 = 0xE6DB_2494;
+    pub const DELETE_SIMPLE_EVENT: u32 = 0x208C_FE28;
+    pub const OPEN_SIMPLE_EVENT: u32 = 0x4E1E_4DF8;
+    pub const CLOSE_SIMPLE_EVENT: u32 = 0xFEF4_CA53;
+    pub const SET_EVENT: u32 = 0x3242_18CD;
+    pub const WAIT_EVENT: u32 = 0x120F_03AF;
+    pub const WAIT_EVENT_CB: u32 = 0xA049_0795;
+    pub const POLL_EVENT: u32 = 0x241F_3634;
+    pub const CANCEL_EVENT: u32 = 0x603A_B770;
+
     pub const GET_SYSTEM_TIME_WIDE: u32 = 0xF4EE_4FA9;
     // Condition variables (SceLibKernel create/wait + SceThreadmgr signal/delete).
     pub const CREATE_COND: u32 = 0x5057_2FDA;
@@ -1370,6 +1404,15 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::POLL_EVENT_FLAG => "sceKernelPollEventFlag",
         sy::CLEAR_EVENT_FLAG => "sceKernelClearEventFlag",
         sy::DELETE_EVENT_FLAG => "sceKernelDeleteEventFlag",
+        sy::CREATE_SIMPLE_EVENT => "sceKernelCreateSimpleEvent",
+        sy::DELETE_SIMPLE_EVENT => "sceKernelDeleteSimpleEvent",
+        sy::OPEN_SIMPLE_EVENT => "sceKernelOpenSimpleEvent",
+        sy::CLOSE_SIMPLE_EVENT => "sceKernelCloseSimpleEvent",
+        sy::SET_EVENT => "sceKernelSetEvent",
+        sy::WAIT_EVENT => "sceKernelWaitEvent",
+        sy::WAIT_EVENT_CB => "sceKernelWaitEventCB",
+        sy::POLL_EVENT => "sceKernelPollEvent",
+        sy::CANCEL_EVENT => "sceKernelCancelEvent",
         sy::GET_SYSTEM_TIME_WIDE => "sceKernelGetSystemTimeWide",
         sy::CREATE_COND => "sceKernelCreateCond",
         sy::WAIT_COND => "sceKernelWaitCond",

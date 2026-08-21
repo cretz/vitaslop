@@ -86,8 +86,27 @@ pub const SLOT_CURRENT_THREAD: u32 = 3;
 /// above applies to the fiber mapping and not to anything else in the block.
 pub const SLOT_THREAD_ID: u32 = 4;
 
+/// Slot 5: the guest address of the fallback SA bank (`VitaState::sa_bank`).
+///
+/// The one slot that is not a value the guest is asking for - it is an ADDRESS the emitted
+/// `sceGxmSetUniformDataF` needs, and the reason the block is where it lives is that that
+/// call takes no context pointer. Its five arguments are a buffer, a parameter record, two
+/// counts and a source; none of them names the engine's own bank, so there is nowhere else
+/// an inlined form could find it.
+///
+/// # Why it satisfies the contract above
+/// Trivially, and by construction rather than by argument: [`VitaState::set_alloc_base`]
+/// places the bank before a single guest instruction runs, and nothing moves it afterwards.
+/// A constant is a value that cannot change while guest code is running.
+///
+/// A zero here means the arena could not place a bank, and the emitted form treats that as
+/// "not answerable inline" and runs the handler - which then also does nothing, because the
+/// bank is the only home there is. Same answer either way, which is what makes the fallback
+/// exact rather than merely safe.
+pub const SLOT_SA_BANK: u32 = 5;
+
 /// How many slots the block has. The scheduler writes exactly this many.
-pub const SLOT_COUNT: usize = 5;
+pub const SLOT_COUNT: usize = 6;
 
 /// The current value of every mirror slot, in slot order.
 ///
@@ -102,6 +121,7 @@ pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
         (now >> 32) as u32,
         st.current_thread() as u32,
         super::libkernel::thread_id(st) as u32,
+        st.sa_bank(),
     ]
 }
 

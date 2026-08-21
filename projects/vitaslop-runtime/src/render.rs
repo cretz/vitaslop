@@ -1251,10 +1251,32 @@ fn gpu_transcode(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<
             crate::pvrtc::face_is_opaque(face, v),
         ),
         None => match t.base_format {
-            0x85 | 0x86 | 0x87 => (
-                SourceCodec::Bc { base_format: t.base_format },
-                t.base_format == 0x85 && bc1_face_is_opaque(face),
-            ),
+            0x85 | 0x86 | 0x87 => {
+                // >>> A BC SOURCE IS RE-ENCODED ONLY WHILE THE BUDGET IS TIGHT, exactly as the
+                // CPU path decides it - and for a reason the CPU path's own cost argument
+                // happens to share but does not state: **decoding BC to RGBA8 is EXACT**. Those
+                // are the texels the hardware samples, so RGBA8 is the faithful upload and an
+                // ETC2 re-encode is a SECOND lossy step on top of the guest's own compression.
+                //
+                // PVRTC above is not subject to this: no adapter has a PVRTC format at all, so
+                // its only alternative is an eight-fold expansion, and transcoding it is the
+                // whole reason this path exists. BC is the opposite case - it passes through
+                // untouched on any desktop and, where it cannot, it still DECODES exactly.
+                //
+                // This gate was missing here while the CPU path had it, so the cheap GPU encoder
+                // took the trade unconditionally. MEASURED on the user's device: format 0x87
+                // re-encoded to `Etc2Rgba8` on a frame whose whole texture working set was
+                // **1 MB against a 256 MB budget** - paying picture quality to shrink something
+                // that fit many times over. A cheap encoder is a reason to spend CPU, never a
+                // reason to spend QUALITY. [[vitaslop-never-trade-quality]]
+                if !vitaslop_platform::gpu::texture_budget_pressure() {
+                    return None;
+                }
+                (
+                    SourceCodec::Bc { base_format: t.base_format },
+                    t.base_format == 0x85 && bc1_face_is_opaque(face),
+                )
+            }
             _ => return None,
         },
     };
@@ -3755,6 +3777,9 @@ pub fn render_map(
             raster_triangle(
                 &mut fb, &mut depth, &screen, &verts, texture, uv_div, true,
                 SCE_GXM_DEPTH_FUNC_LESS_EQUAL, d.exposure, &d.material, &d.world, None, 0, false,
+                // This is the top-down HEIGHT-FIELD render, not the guest's screen: its
+                // projection is the tool's own, so a screen-space scissor has no meaning here.
+                None,
             );
         }
     }
@@ -4161,6 +4186,21 @@ fn render_scene_onto(
         let depth_test = matches!(space, Space::Mvp(_))
             && d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED;
         let depth_func = d.render_state.front_depth_func;
+        // The guest's REGION CLIP for this draw, in RASTER pixels (so it scales with `ssaa`
+        // exactly as a Pixel-space vertex does). GXM states the rectangle INCLUSIVE at both
+        // ends. Both enabled modes keep the INSIDE of it - see
+        // `vitaslop_platform::gpu::RegionClip`, where two titles' rectangles settle which
+        // reading of the mode enum is right; `ALL` clips everything and is expressed here as
+        // an empty rectangle.
+        let scissor: Option<[i32; 4]> = match d.render_state.region_clip_mode & 0xC000_0000 {
+            0x0000_0000 => None,
+            0x4000_0000 => Some([0, 0, -1, -1]),
+            _ => {
+                let r = d.render_state.region_clip;
+                let sc = |v: u32| (v as f32 * ssaa) as i32;
+                Some([sc(r[0]), sc(r[1]), sc(r[2].saturating_add(1)) - 1, sc(r[3].saturating_add(1)) - 1])
+            }
+        };
         // Back-face culling as the GPU does it, per the draw's SceGxmCullMode. Real 3D
         // titles enable it on nearly every world/vehicle mesh; without it the hidden
         // interior faces of a thin shell z-fight the outer faces into speckle. Only
@@ -4232,7 +4272,7 @@ fn render_scene_onto(
                 n_culled += 1;
                 continue;
             }
-            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug);
+            raster_triangle(fb, depth, &screen, &verts, texture, uv_div, depth_test, depth_func, d.exposure, &d.material, &d.world, trace, di, uv_debug, scissor);
         }
         if stats {
             let wrote = fb.drawn_pixels(clear).saturating_sub(pixels_before);
@@ -4264,6 +4304,10 @@ fn raster_triangle(
     trace: Option<(i32, i32)>,
     draw_idx: usize,
     uv_debug: bool,
+    // The draw's region clip as an INCLUSIVE `[x0, y0, x1, y1]` in raster pixels, or `None`
+    // for the whole framebuffer. An empty rectangle (`x1 < x0`) draws nothing, which is what
+    // `SCE_GXM_REGION_CLIP_ALL` asks for.
+    scissor: Option<[i32; 4]>,
 ) {
     let (w, h) = (fb.width as i32, fb.height as i32);
     // World-space normals at the three vertices (constant per triangle), interpolated per
@@ -4272,10 +4316,19 @@ fn raster_triangle(
     let wn: [[f32; 3]; 3] =
         [world_normal(verts[0].normal, world), world_normal(verts[1].normal, world), world_normal(verts[2].normal, world)];
     let has_normal = verts.iter().any(|v| v.normal != [0.0, 0.0, 0.0]);
-    let min_x = s.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
-    let max_x = s.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil().min((w - 1) as f32) as i32;
-    let min_y = s.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
-    let max_y = s.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max).ceil().min((h - 1) as f32) as i32;
+    let mut min_x = s.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
+    let mut max_x = s.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil().min((w - 1) as f32) as i32;
+    let mut min_y = s.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor().max(0.0) as i32;
+    let mut max_y = s.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max).ceil().min((h - 1) as f32) as i32;
+    // The guest's REGION CLIP, which is GXM's hardware scissor. The GPU path issues it as
+    // `set_scissor_rect`; here the only thing that restricts a triangle is its bounding box,
+    // so the clip narrows that. Same restriction, expressed in the terms this rasterizer has.
+    if let Some([sx0, sy0, sx1, sy1]) = scissor {
+        min_x = min_x.max(sx0);
+        max_x = max_x.min(sx1);
+        min_y = min_y.max(sy0);
+        max_y = max_y.min(sy1);
+    }
     if min_x > max_x || min_y > max_y {
         return;
     }
@@ -4608,7 +4661,7 @@ pub struct RenderSceneBuilder {
     /// fires part-way through EVERY frame, evicting exactly what the next frame is about to
     /// ask for, and the cross-frame hit rate goes to zero rather than down.
     ///
-    /// MEASURED on PCSA00015's campaign map, on the target phone (PowerVR D-series):
+    /// MEASURED on one title's campaign map, on the target phone (PowerVR D-series):
     /// `0.97 cache clears` per frame, 225 textures and 51 MB RE-DECODED every frame,
     /// `build 718.3 ms` of an `878.2 ms` render against `cpu 94.1 ms` - the render was 90% of
     /// the frame and the decode was 82% of the render. 1 fps. Nothing about that frame was a
@@ -5800,6 +5853,10 @@ impl RenderSceneBuilder {
                 },
                 gxp,
                 shader_only,
+                region_clip: vitaslop_platform::gpu::RegionClip {
+                    mode: d.render_state.region_clip_mode,
+                    rect: d.render_state.region_clip,
+                },
             });
         }
         // PASS TWO: a reader turned up, so the opaque MVP draws the main loop stepped over
@@ -5901,6 +5958,9 @@ impl RenderSceneBuilder {
         let depth_extent_ambiguous = matches!(depth_extent, Some((_, _, false)));
         let depth_extent = depth_extent.map(|(w, h, _)| (w, h));
         RenderScene {
+            // Carried through untouched: the builder turns DRAWS into render state, and a pair
+            // the patcher named has no draw yet - that is the whole point of it arriving early.
+            precompile: scene.precompile.clone(),
             draws,
             target,
             depth_min,
@@ -5997,6 +6057,7 @@ mod geometry_tests {
         mvp[11] = 1.0; // w = z
         let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
         let scene = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6033,7 +6094,7 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![d.clone()] }, 100, 100);
+        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![d.clone()] }, 100, 100);
         let h = found[0].heading.expect("an identity rotation has a heading");
         assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
         assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
@@ -6044,7 +6105,7 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![turned] }, 100, 100);
+        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![turned] }, 100, 100);
         let h = found[0].heading.unwrap();
         assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
 
@@ -6053,7 +6114,7 @@ mod geometry_tests {
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { color: None, depth: None, multisample: 0, draws: vec![flat] }, 100, 100);
+        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![flat] }, 100, 100);
         assert_eq!(found[0].heading, None);
     }
 
@@ -6070,9 +6131,10 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { color: None, depth: None, multisample: 0, draws: vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
         // Next frame: something new is submitted first, and the car has moved.
         let after = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6399,6 +6461,7 @@ mod geometry_tests {
     fn map_keeps_the_higher_surface_and_measures_its_height() {
         // A wide floor with a small block standing on it.
         let scene = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6435,7 +6498,7 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
         let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
@@ -6446,6 +6509,7 @@ mod geometry_tests {
         // A depth-WRITING roof over half the floor: the ceiling option is the only way to
         // see what is under it.
         let scene = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6464,7 +6528,7 @@ mod geometry_tests {
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
@@ -6533,6 +6597,7 @@ mod geometry_tests {
     #[test]
     fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
         let scene = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6548,6 +6613,7 @@ mod geometry_tests {
         // The SAME sprite 300 pixels along keeps its id - which a 3D geometry hash could
         // not do, because a 2D sprite's position IS its vertex data.
         let moved = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6557,6 +6623,7 @@ mod geometry_tests {
         assert_eq!(after[0].id, s.id, "identity must survive motion");
         // A different region of the same sheet is a DIFFERENT sprite.
         let other = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6569,6 +6636,7 @@ mod geometry_tests {
     fn sprite_motion_removes_the_scene_scroll() {
         // A backdrop of many sprites panning left by 6px, and one that moves against it.
         let build = |shift: f32, hero_extra: f32| Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6610,6 +6678,7 @@ mod geometry_tests {
         // The two locators must partition the scene, or an object gets counted twice - or,
         // worse, a title gets an empty report from the one that does not apply to it.
         let scene = Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
@@ -6639,7 +6708,7 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { color: None, depth: None, multisample: 0, draws }
+        Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
@@ -6684,7 +6753,7 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { color: None, depth: None, multisample: 0, draws };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -6743,7 +6812,7 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -6795,7 +6864,7 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { color: None, depth: None, multisample: 0, draws };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws };
         let strict = world_extent(&scene, 1.0).unwrap();
         assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
         let dense = world_extent(&scene, 0.90).unwrap();
@@ -6872,7 +6941,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
         };
-        let scene = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -6929,7 +6998,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
         };
-        let s = Scene { color: None, depth: None, multisample: 0, draws: vec![draw] };
+        let s = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;

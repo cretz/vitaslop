@@ -194,6 +194,15 @@ pub struct RetailGuest {
     scenes: Vec<Scene>,
     finished: bool,
     err: Option<String>,
+    /// The report that ENDED the run, when one did.
+    ///
+    /// Without this a run that stops early prints only the frame it reached, and every
+    /// terminal outcome looks identical to "the target was reached": a deadlock, a thread
+    /// exiting, a round budget running out and a clean finish all produce the same line.
+    /// MEASURED cost of not having it: a retail headless run that stops at frame 1 was
+    /// read as a clock pathology and worked around three times before anyone asked what
+    /// actually ended it.
+    ended_by: Option<String>,
     /// Decrypt + link + transpile + instantiate time, measured once at construction.
     pub build_ms: f64,
 }
@@ -239,10 +248,21 @@ impl RetailGuest {
             env.state.add_file(&path, bytes);
         }
 
-        let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
+        let (mut sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
             .map_err(|e| format!("scheduler: {e:?}"))?;
+        // >>> NO DETERMINISM SIGNATURE unless something will read it. The fold hashes every
+        // retired scene's vertices, indices and uniforms - 3.5 MB a frame on a race, MEASURED
+        // at 8.0% of a desktop frame - and this path never prints or compares one. The
+        // BROWSER has been gated since 2026-08-19e; the desktop was not, so `--headless`
+        // renders (the GPU oracle every render decision here is judged by) were paying it.
+        // `VITASLOP_SIGNATURE=1` asks for one back, the same spelling both other engines use.
+        sched
+            .host()
+            .state
+            .capture
+            .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, build_ms })
+        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, ended_by: None, build_ms })
     }
 
     /// Step the guest one display frame. Keeps the newest captured scene and drops the
@@ -291,7 +311,10 @@ impl RetailGuest {
                 self.finished = true;
                 self.err = Some(e);
             }
-            _ => self.finished = true,
+            other => {
+                self.finished = true;
+                self.ended_by = Some(format!("{other:?}"));
+            }
         }
     }
 
@@ -349,6 +372,10 @@ impl RetailGuest {
     }
     pub fn error(&self) -> Option<&str> {
         self.err.as_deref()
+    }
+    /// Why the run ended, when it ended before the frame target. See [`Self::ended_by`].
+    pub fn ended_by(&self) -> Option<&str> {
+        self.ended_by.as_deref()
     }
 
     /// Guest memory at `addr`, for `VITASLOP_PEEK`.
@@ -600,11 +627,121 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 /// does heavy one-off work, then whatever screen it settles on. The median of the tail is
 /// the closest thing here to "what a frame costs on this screen", and it is only a frame
 /// RATE if the title is actually doing work on that screen rather than idling for input.
+/// One rendered frame of the shot window: what it cost, what it drew, and what the encoder
+/// had to CREATE for it. See [`report_hiccups`].
+struct Hiccup {
+    frame: u64,
+    guest_ms: f64,
+    render_ms: f64,
+    scenes: usize,
+    draws: usize,
+    pipelines_built: u64,
+    tex_uploaded: u64,
+    tex_upload_bytes: u64,
+    bind_groups_built: u64,
+    buffer_bytes: u64,
+}
+
+impl Hiccup {
+    fn total_ms(&self) -> f64 {
+        self.guest_ms + self.render_ms
+    }
+}
+
+/// Name the frames that HITCHED, with the two halves of each one's cost side by side.
+///
+/// # Why a ranked list and not another percentile
+/// `report_frame_timing` already prints p50/p95/max over the run, and a hiccup is exactly what
+/// that cannot describe: a distribution says how often an expensive frame happens, never which
+/// one or why, and a max is one number with no context attached. A player reporting "little
+/// hiccups" is reporting a handful of named frames, so this prints those frames -
+/// [[vitaslop-a-range-is-not-a-distribution]] applies to a p95 as much as to a min/max.
+///
+/// Rows are ranked by TOTAL (guest + render) because that is what a frame costs, and both halves
+/// are printed because they have opposite fixes. The scene and draw counts sit on the same row so
+/// a frame that costs 5x while drawing 5x as much - which is work, not a hiccup - can be told
+/// apart from one that costs 5x drawing the same thing, which is not.
+///
+/// The BASELINE is the median of the same window, not of the run: a window inside a race and a
+/// window over a boot are different workloads, and a ratio against the wrong one is meaningless.
+fn report_hiccups(rows: &[Hiccup]) {
+    if rows.len() < 8 {
+        // Under a handful of frames there is no baseline to be an outlier against, and ranking
+        // three frames by cost is just printing them.
+        return;
+    }
+    let mut totals: Vec<f64> = rows.iter().map(Hiccup::total_ms).collect();
+    totals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = totals[totals.len() / 2];
+    let mut worst: Vec<&Hiccup> = rows.iter().collect();
+    worst.sort_by(|a, b| b.total_ms().partial_cmp(&a.total_ms()).unwrap_or(std::cmp::Ordering::Equal));
+    // How much of the window is spent in frames that cost more than twice the median - the one
+    // number that says whether the hitches are a curiosity or the experience.
+    let spikes: Vec<&&Hiccup> = worst.iter().filter(|r| r.total_ms() > 2.0 * median).collect();
+    let window_ms: f64 = totals.iter().sum();
+    let spike_ms: f64 = spikes.iter().map(|r| r.total_ms()).sum();
+    println!(
+        "hiccups: {} frames rendered in the shot window, median {median:.2} ms/frame; {} frames \
+         cost MORE THAN 2x that and they are {:.1}% of the window's time",
+        rows.len(),
+        spikes.len(),
+        100.0 * spike_ms / window_ms.max(1e-9),
+    );
+    println!(
+        "hiccups: the 12 most expensive frames. `built` is what the encoder had to CREATE for \
+         that frame - a pipeline, a texture upload, a bind group - and it is what separates a \
+         hitch that will not repeat from one that will."
+    );
+    for r in worst.iter().take(12) {
+        println!(
+            "hiccups:   f{:06}  guest {:7.2} + render {:7.2} = {:7.2} ms ({:5.1}x median)  \
+             {:2} scenes / {:4} draws  built: {} pipelines, {} textures ({:.2} MB), \
+             {} bind groups, {:.2} MB buffers",
+            r.frame,
+            r.guest_ms,
+            r.render_ms,
+            r.total_ms(),
+            r.total_ms() / median.max(1e-9),
+            r.scenes,
+            r.draws,
+            r.pipelines_built,
+            r.tex_uploaded,
+            r.tex_upload_bytes as f64 / (1024.0 * 1024.0),
+            r.bind_groups_built,
+            r.buffer_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
+    // And the same counters over the WHOLE window, so a per-frame row can be read as "this
+    // frame's share" rather than as a number on its own.
+    let (p, t, b) = rows.iter().fold((0u64, 0u64, 0u64), |a, r| {
+        (a.0 + r.pipelines_built, a.1 + r.tex_uploaded, a.2 + r.bind_groups_built)
+    });
+    println!(
+        "hiccups: over the whole window the encoder built {p} pipelines, uploaded {t} textures \
+         and built {b} bind groups"
+    );
+    // ...and what those pipeline builds actually SPENT, split into the two halves that have
+    // different fixes. A 2.5-second first frame is not actionable until it says which half.
+    let (module_ms, create_ms) = vitaslop_platform::gpu::take_pipeline_build_split();
+    let pre_ms = vitaslop_platform::gpu::take_precompile_ms();
+    println!(
+        "hiccups: the pipeline builds of the WHOLE RUN cost {module_ms:.0} ms compiling WGSL + \
+         {create_ms:.0} ms creating pipelines, IN the frame that drew them, plus {pre_ms:.0} ms \
+         compiling WGSL AHEAD of any draw (when the guest's shader patcher named the pair, which \
+         is where the device does its shader work). The in-frame WGSL figure is what the \
+         preparation failed to catch; the pipeline half also needs that draw's blend, depth, \
+         cull, format and sample count, and cannot be moved without them."
+    );
+}
+
 fn report_frame_timing(
     frame_ms: &[f64],
     cold_render_ms: f64,
     warm_render_ms: &[f64],
     split: vitaslop_native::RenderSplit,
+    // Encode counters already taken per frame by the hiccup log, folded back in so this
+    // report still covers the whole run.
+    enc_window: &vitaslop_platform::gpu::EncodeWork,
 ) {
     if frame_ms.is_empty() {
         println!("timing: no frames advanced");
@@ -670,7 +807,20 @@ fn report_frame_timing(
     // browser's render on a burst frame and the three phase timings do not say what is IN it -
     // upload volume and per-call boundary overhead live in the same phase and have opposite
     // fixes. The browser prints this identical line, which is what makes the two comparable.
-    println!("timing: {}", vitaslop_platform::gpu::take_encode_work().line(n));
+    let mut enc = vitaslop_platform::gpu::take_encode_work();
+    enc.add(enc_window);
+    println!("timing: {}", enc.line(n));
+    // ...and inside `prepare`, which is most of `encode`, WHERE. Only when asked for: the split
+    // reads a clock six times a draw, which is affordable here and is not in the browser.
+    //
+    // This reader sees the WARM RE-RENDER LOOP only - the shot window drains the same counters
+    // per frame for its own report. One scene rendered sixty times hits every cache, so read
+    // this as the floor: the hashing and the arena copies are real per-frame costs and the
+    // repack is priced at zero here in a way a moving frame's is not.
+    let prep = vitaslop_platform::gpu::take_prepare_split();
+    if !prep.is_empty() {
+        println!("timing: warm re-render {}", prep.line(n));
+    }
     println!("timing: {}", vitaslop_runtime::render::decode_by_format_line());
     let (bg_hit, bg_new) = vitaslop_platform::gpu::take_sampler_bg_counts();
     println!(
@@ -823,6 +973,32 @@ pub fn headless_check(
         periodic = Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
     }
     let mut frame_ms: Vec<f64> = Vec::new();
+    // >>> THE HICCUP LOG: per-frame `(frame, guest ms, render ms, scenes, draws)` for every
+    // frame INSIDE the shot window, where the renderer runs on every frame rather than only on
+    // the sampled ones.
+    //
+    // A percentile distribution says a run has expensive frames; it never says WHICH frame or
+    // WHY, and "the run has a p99 of 40 ms" is not something anyone can act on. A hiccup is one
+    // named frame, and the two halves next to each other are what separate a guest stall (a
+    // streamed load, a GC sweep, a lock) from a render stall (a pipeline built mid-race, a
+    // texture transcode, a scene that suddenly carries three times the draws). The draw and
+    // scene counts are on the same row for the same reason: a frame that costs 5x while drawing
+    // 5x as much is not a hiccup, it is work.
+    //
+    // Outside the shot window nothing is rendered, so a row there would report a render cost of
+    // zero and read as a guest-only frame. Only the window is logged.
+    let mut hiccups: Vec<Hiccup> = Vec::new();
+    // Encode counters folded up across the window's per-frame takes, so the run-total report
+    // below still sees every one of them. `take_encode_work` RESETS, and the hiccup rows need
+    // per-frame deltas, so the two readers have to cooperate rather than race.
+    let mut enc_total = vitaslop_platform::gpu::EncodeWork::default();
+    // The same, for the sub-phases INSIDE `prepare` (`VITASLOP_PREPARE_SPLIT=1`). Folded up
+    // over the WINDOW rather than read from the warm re-render loop, because the warm loop
+    // renders one scene sixty times: its packed-vertex cache hits every time, so it prices the
+    // hashing and the arena copies honestly and prices the REPACK at zero. A race frame moves
+    // its geometry, and this is the reader that sees that.
+    let mut prep_total = vitaslop_platform::gpu::PrepareSplit::default();
+    let mut prep_frames = 0u64;
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
         if let Some((from, to)) = callsite_window {
@@ -848,21 +1024,27 @@ pub fn headless_check(
         // resident from earlier frames, so a target is only correct here if this process actually
         // RENDERED the frame that painted it.
         //
-        // Rendering only at the sampling interval breaks exactly that. MEASURED on PCSA00015's
-        // event briefing: sampled every 500 frames, the whole menu background is BLACK; rendering
-        // the 500 frames up to the same flip contiguously, it is the light grey panel the browser
-        // draws and the device draws. Nothing in the shot, the log or the scene composition says
-        // a layer is missing - the draw counts are identical (8 scenes / 49 draws either way),
-        // because the guest submitted the same work and it was OUR history that was empty.
+        // Rendering only at the sampling interval breaks exactly that. MEASURED on one
+        // title's event briefing: sampled every 500 frames, the whole menu background is
+        // BLACK; rendering the 500 frames up to the same flip contiguously, it is the light
+        // grey panel the browser draws and the device draws. Nothing in the shot, the log or
+        // the scene composition says a layer is missing - the draw counts are identical (8
+        // scenes / 49 draws either way), because the guest submitted the same work and it was
+        // OUR history that was empty.
         //
         // So every frame inside the window is rendered and only the sampled ones are written.
         // The window is the knob that keeps this affordable: it is already there to make
         // `SHOT_EVERY=1` cheap enough to catch a one-frame flash, and it now also bounds the
         // cost of being faithful. Outside the window nothing is rendered, exactly as before.
+        let mut render_ms = 0.0f64;
+        let mut frame_shape = (0usize, 0usize);
         if let (Some(r), true) = (periodic.as_mut(), shot_every > 1 && in_shot_window && f % shot_every != 0) {
             let scenes = guest.current();
             if !scenes.is_empty() {
+                frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
+                let t = std::time::Instant::now();
                 let _ = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+                render_ms = t.elapsed().as_secs_f64() * 1000.0;
             }
         }
         if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_shot_window && f % shot_every == 0) {
@@ -889,8 +1071,11 @@ pub fn headless_check(
                     None => format!("NO-COLOUR:{}", s.draws.len()),
                 })
                 .collect();
+            frame_shape = (scene_count, draw_count);
             if !scenes.is_empty() {
+                let t = std::time::Instant::now();
                 let fb = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+                render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 let path = shot_dir.join(format!("f{f:06}.png"));
                 std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
             }
@@ -919,7 +1104,29 @@ pub fn headless_check(
         if timing {
             let t = std::time::Instant::now();
             guest.advance();
-            frame_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            let guest_ms = t.elapsed().as_secs_f64() * 1000.0;
+            frame_ms.push(guest_ms);
+            if in_shot_window && periodic.is_some() {
+                // The encode counters THIS frame moved. A hitch with a pipeline build in it and
+                // a hitch with a megabyte of texture in it look identical in milliseconds and
+                // need different fixes, and neither is visible in a run total.
+                let e = vitaslop_platform::gpu::take_encode_work();
+                hiccups.push(Hiccup {
+                    frame: f,
+                    guest_ms,
+                    render_ms,
+                    scenes: frame_shape.0,
+                    draws: frame_shape.1,
+                    pipelines_built: e.pipelines_built,
+                    tex_uploaded: e.tex_uploaded,
+                    tex_upload_bytes: e.tex_upload_bytes,
+                    bind_groups_built: e.bind_groups_built,
+                    buffer_bytes: e.buffer_bytes,
+                });
+                enc_total.add(&e);
+                prep_total.add(&vitaslop_platform::gpu::take_prepare_split());
+                prep_frames += 1;
+            }
         } else {
             guest.advance();
         }
@@ -940,7 +1147,14 @@ pub fn headless_check(
     // scheduler handed the baton on. The second half is what the game clock divides by
     // (the device runs three of them at once), so a clock that looks wrong on a loading
     // screen is answered here or nowhere.
-    if std::env::var_os("VITASLOP_CPU_SHARE").is_some() {
+    //
+    // ...and ALWAYS when the run ended in a guest error, knob or no knob. A guest fault is
+    // almost always a question about ordering - which thread published what before which
+    // other thread read it - and the CPU share plus the runnable histogram are the only
+    // description of the schedule this run leaves behind. Asking for it after the fact costs
+    // a whole replay, and on a fault whose frame moves with the clock that replay is not
+    // guaranteed to reproduce the same fault.
+    if std::env::var_os("VITASLOP_CPU_SHARE").is_some() || guest.error().is_some() {
         print!("{}", guest.scheduler_report());
     }
     // VITASLOP_DUMP_STDOUT=<path>: write everything the GUEST logged to fd 1/2 this run.
@@ -952,6 +1166,12 @@ pub fn headless_check(
         std::fs::write(&path, bytes).map_err(|e| format!("write guest stdout: {e}"))?;
         println!("headless: wrote {len} bytes of GUEST log to {path}");
     }
+    // Also before the error check, and for the same reason: a guest fault is the run whose
+    // memory you most need to look at. `VITASLOP_PEEK` used to be evaluated only after a
+    // clean render, so the one question it exists to answer - "what was in that record when
+    // the guest dereferenced it" - was the one question it could not be asked. It reads guest
+    // memory and prints; it cannot fail the run.
+    peek_regions(&guest);
     if let Some(e) = guest.error() {
         return Err(format!("guest error at frame {}: {e}", guest.frames()));
     }
@@ -976,7 +1196,13 @@ pub fn headless_check(
             let _ = renderer.render_frame(&scenes, GAME_W, GAME_H, CLEAR);
             warm.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split());
+        report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split(), &enc_total);
+        report_hiccups(&hiccups);
+        // Where `prepare` went, averaged over the WINDOW's real frames. `encode` is most of a
+        // render and `prepare` is most of `encode`; this is the line that says what in it.
+        if !prep_total.is_empty() {
+            println!("hiccups: {}", prep_total.line(prep_frames));
+        }
     }
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = shot_dir.join("desktop.png");
@@ -993,9 +1219,13 @@ pub fn headless_check(
         std::fs::write(&sw_path, sw.to_png()).map_err(|e| format!("write png: {e}"))?;
         println!("headless: wrote {}", sw_path.display());
     }
-    peek_regions(&guest);
     let frames = guest.frames();
     let clock_s = guest.clock_us() as f64 / 1e6;
+    if let Some(why) = guest.ended_by() {
+        println!(
+            "headless: the run ENDED BEFORE the frame target ({frames} of {target}): {why}.              That is the guest stopping, not the target being met - a deadlock, a thread              exiting or a round budget running out all land here."
+        );
+    }
     println!(
         "headless: reached frame {frames}, wrote {} (guest clock {clock_s:.1}s = {:.2}x the {:.1}s those frames are worth)",
         path.display(),
@@ -1015,14 +1245,22 @@ pub fn headless_check(
             vitaslop_runtime::host::QUANTUM_FUEL,
         );
     }
-    // Only on a run that opted into software fuel (`VITASLOP_FUEL`), which is a
-    // comparison run: the browser's clock is driven by that counter and nothing in a
-    // browser run can say whether it agrees with wasmtime's.
+    // The emitted work counter against wasmtime's own metering, over the same intervals.
+    // Both engines preempt on that counter and the game clock is billed from it, and
+    // nothing in a BROWSER run can say whether it agrees with a real engine - this is
+    // where that is checked. It reads a little under 1.00 by construction: wasmtime bills
+    // the counter's own operators, which the counter does not bill itself.
     if let Some((sw, wt, n)) = vitaslop_native::threaded::software_fuel_report() {
         println!(
             "headless: software fuel {sw} vs wasmtime {wt} over {n} samples (ratio {:.2}x)",
             sw as f64 / wt.max(1) as f64,
         );
+    }
+    // Zero unless the engine suspended a fiber without running any of our code, which on
+    // a build with the emitted work check should be impossible.
+    let stray = vitaslop_native::threaded::unattributed_suspends();
+    if stray != 0 {
+        println!("headless: {stray} suspends were not produced by the emitted work check");
     }
     Ok(())
 }

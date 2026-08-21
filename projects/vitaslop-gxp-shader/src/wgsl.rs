@@ -18,7 +18,10 @@
 use core::fmt::Write as _;
 
 use crate::container::ProgramKind;
-use crate::ir::{Bank, BitwiseKind, CompareMethod, Instr, Op, Operand, Predicate, Shader, TestAlu, TestCmp, TestReduce, TexLod};
+use crate::ir::{
+    Bank, BitwiseKind, CompareMethod, Instr, Op, Operand, Predicate, Shader, SopFactor, SopOp,
+    TestAlu, TestCmp, TestReduce, TexLod,
+};
 
 /// Why WGSL emission hard-failed. Each variant pinpoints what to implement next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +290,12 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
 pub enum Prec {
     F32,
     F16,
+    /// Four 8-bit UNSIGNED-NORMALISED channels in ONE register: channel `c` is byte `c`,
+    /// valued `byte / 255`. This is the register view the 8-bit families (the SOP2M combiner
+    /// and the INT8 test ALU) see, and it is not a narrower float - reading such a register
+    /// through [`Prec::F32`] reinterprets the byte pattern as an f32, which turns the corpus's
+    /// alpha-test flag of 0x00000001 into a denormal indistinguishable from zero.
+    Fx8,
 }
 
 impl Prec {
@@ -319,6 +328,9 @@ fn read_lane(prefix: &str, base: u32, sel: u32, prec: Prec) -> String {
     match prec {
         Prec::F32 => format!("bitcast<f32>({prefix}[{}])", base + sel),
         Prec::F16 => format!("unpack2x16float({prefix}[{}])[{}]", base + (sel >> 1), sel & 1),
+        // All four channels live in ONE register, so the selector picks a BYTE and never a
+        // neighbouring register the way the two float widths do.
+        Prec::Fx8 => format!("unpack4x8unorm({prefix}[{base}])[{sel}]"),
     }
 }
 
@@ -342,6 +354,10 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
                 let bits = CNST6_F16[(sel & 3) as usize][(op.index & 0x3f) as usize];
                 format!("unpack2x16float({bits:#010x}u)[0]")
             }
+            // The hardware constant table has an F32 and an F16 view and no established 8-bit
+            // one. Refusing is exact: no corpus program reads the constant bank from an 8-bit
+            // instruction, and picking either float table would silently substitute a value.
+            (Prec::Fx8, _) => return None,
         };
         if op.abs {
             e = format!("abs({e})");
@@ -411,6 +427,18 @@ fn store_stmt(op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<String> 
                     "  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (pack2x16float(vec2<f32>(0.0, {expr})) & 0xffff0000u);\n"
                 )
             }
+        }
+        // One BYTE of one register, read-modify-write so the other three channels keep their
+        // bytes. Rounded, not truncated: the value is a `byte/255` unorm coming back the way
+        // it went out, and truncating loses the last representable step on every round trip.
+        Prec::Fx8 => {
+            let reg = op.index as u32;
+            let shift = 8 * c as u32;
+            let keep = !(0xffu32 << shift);
+            format!(
+                "  {prefix}[{reg}] = ({prefix}[{reg}] & {keep:#010x}u) | \
+                 (u32(clamp({expr}, 0.0, 1.0) * 255.0 + 0.5) << {shift}u);\n"
+            )
         }
     })
 }
@@ -1014,7 +1042,12 @@ fn emit_instr(
         Op::PackToInt { bits, signed, .. } => {
             emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
+        Op::IntMad { signed, bits } => emit_int_mad(s, instr, dest, signed, bits).ok_or_else(unmapped),
         Op::LoadIndex { addend } => emit_load_index(s, instr, dest, addend).ok_or_else(unmapped),
+        Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
+            emit_sop2(s, instr, dest, mask, color, alpha, (f1, f1_complement), (f2, f2_complement))
+                .ok_or_else(unmapped)
+        }
         other => Err(EmitError::UnsupportedOp {
             index,
             byte_offset,
@@ -1306,10 +1339,15 @@ fn emit_test(
             bools.push(format!("(({} & {}) {op} 0u)", raw(s1)?, raw(s2)?));
             continue;
         }
+        // The 8-bit family reads its operands as four unorm BYTES of one register, not as a
+        // float lane. Taking the instruction's own precision here instead would read the flag
+        // register 0x00000001 as an f32 denormal, compare it equal to zero, and turn the alpha
+        // test it gates into a no-op that draws every cut-out texel.
+        let p = if matches!(alu, TestAlu::Fx8Sub) { Prec::Fx8 } else { p };
         let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
         let value = match alu {
             TestAlu::Add => format!("({a} + {b})"),
-            TestAlu::Sub => format!("({a} - {b})"),
+            TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
             TestAlu::Mul => format!("({a} * {b})"),
             // Resolved above - the raw-lane path never reaches here.
             TestAlu::BitAnd => unreachable!("bitwise test resolved before the float path"),
@@ -1331,16 +1369,17 @@ fn emit_test(
             if !instr.write_mask[c] {
                 continue;
             }
-            let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
+            let wp = if matches!(alu, TestAlu::Fx8Sub) { Prec::Fx8 } else { p };
+            let (a, b) = (src_channel(s1, c, wp)?, src_channel(s2, c, wp)?);
             let value = match alu {
                 TestAlu::Add => format!("({a} + {b})"),
-                TestAlu::Sub => format!("({a} - {b})"),
+                TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
                 TestAlu::Mul => format!("({a} * {b})"),
                 // A bitwise write-back is not modelled in the float store path; the corpus has
                 // no such instruction, so refusing is exact rather than restrictive.
                 TestAlu::BitAnd => return None,
             };
-            body.store(dest, c, &value, p)?;
+            body.store(dest, c, &value, wp)?;
         }
     }
     Some(())
@@ -1428,9 +1467,111 @@ fn emit_tex(
     Some(())
 }
 
+/// The 8-bit sum-of-products combiner ([`Op::Sop2`]), one statement per written channel:
+///
+/// ```text
+///   dest.c = op_c( coeff1.c * src1.c , coeff2.c * src2.c )
+/// ```
+///
+/// where `op_c` is the COLOUR operation for channels 0..2 and the ALPHA operation for channel
+/// 3, and each coefficient comes from its selector (optionally one's-complemented). Everything
+/// is read and written through [`Prec::Fx8`], so the arithmetic happens on `byte / 255` values
+/// and lands back in the right byte of the destination register.
+///
+/// # The selector is a coefficient, and that is the whole instruction
+/// `Zero` with the complement bit set is the coefficient 1, which makes the term a plain copy
+/// of its source register. Reading the selector as "the operand is zero" instead makes this
+/// instruction a constant and leaves the register it names doing nothing, which is how the
+/// family read as unusable for several sessions. See [`SopFactor`].
+#[allow(clippy::too_many_arguments)]
+fn emit_sop2(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    color: SopOp,
+    alpha: SopOp,
+    (f1, f1_complement): (SopFactor, bool),
+    (f2, f2_complement): (SopFactor, bool),
+) -> Option<()> {
+    let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
+    // The coefficient for channel `c`. An ALPHA selector broadcasts channel 3, which is what
+    // makes "modulate by the source's alpha" one instruction.
+    let coeff = |f: SopFactor, complement: bool, c: usize| -> Option<String> {
+        let base = match f {
+            SopFactor::Zero => "0.0".to_string(),
+            SopFactor::Src1Color => src_channel(s1, c, Prec::Fx8)?,
+            SopFactor::Src1Alpha => src_channel(s1, 3, Prec::Fx8)?,
+            SopFactor::Src2Color => src_channel(s2, c, Prec::Fx8)?,
+            SopFactor::Src2Alpha => src_channel(s2, 3, Prec::Fx8)?,
+        };
+        Some(if complement { format!("(1.0 - {base})") } else { base })
+    };
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let t1 = format!("({} * {})", coeff(f1, f1_complement, c)?, src_channel(s1, c, Prec::Fx8)?);
+        let t2 = format!("({} * {})", coeff(f2, f2_complement, c)?, src_channel(s2, c, Prec::Fx8)?);
+        let op = if c == 3 { alpha } else { color };
+        let expr = match op {
+            SopOp::Add => format!("({t1} + {t2})"),
+            SopOp::Sub => format!("({t1} - {t2})"),
+            SopOp::Min => format!("min({t1}, {t2})"),
+            SopOp::Max => format!("max({t1}, {t2})"),
+        };
+        body.store(dest, c, &expr, Prec::Fx8)?;
+    }
+    Some(())
+}
+
 /// Integer bitwise / shift on channel 0 only, operating on the 32-bit lane bit pattern:
 /// `dest.x = bitcast<f32>(bitcast<u32>(src1.x) OP b)`, where `b` is the inline immediate or
 /// `bitcast<u32>(src2.x)`. Shift amounts are masked to 31; ASR uses a signed shift.
+/// Emit a group-0x15 IMAD32: `dest = src0 * src1 + src2`, scalar, over the 32-bit lane read as
+/// an integer.
+///
+/// The register file is `array<u32>`, so this is the natural view and no bitcast is needed for
+/// the UNSIGNED form. The signed form goes through `i32` for the multiply and the add - the two
+/// differ on overflow, and WGSL defines both as wrapping, so the signedness has to be honoured
+/// rather than let a `u32` multiply stand in.
+///
+/// Only channel 0 is written: the group carries no write mask, and the instruction is scalar.
+fn emit_int_mad(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    signed: bool,
+    bits: u8,
+) -> Option<()> {
+    // The decoder only produces 32 today and blocks the narrower widths by name; this keeps the
+    // emitter honest if that ever changes without the emitter being taught the masking.
+    if bits != 32 {
+        return None;
+    }
+    // Each source is read as a raw lane. An IMMEDIATE source is materialised inline - it has no
+    // register-file storage - which is the one case `bank_prefix` cannot spell.
+    let raw = |o: &Operand| -> Option<String> {
+        if matches!(o.bank, Bank::Immediate) {
+            return Some(format!("{}u", o.index as u32));
+        }
+        if matches!(o.bank, Bank::Indexed) {
+            return indexed_element(o, 0);
+        }
+        Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
+    };
+    let a = raw(instr.srcs.first()?)?;
+    let b = raw(instr.srcs.get(1)?)?;
+    let c = raw(instr.srcs.get(2)?)?;
+    let expr = if signed {
+        format!("bitcast<u32>(bitcast<i32>({a}) * bitcast<i32>({b}) + bitcast<i32>({c}))")
+    } else {
+        format!("({a} * {b} + {c})")
+    };
+    writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, expr).ok();
+    Some(())
+}
+
 fn emit_bitwise(
     body: &mut Dest,
     instr: &Instr,
@@ -1622,6 +1763,72 @@ mod tests {
         let wgsl = emit_fragment(&shader(vec![instr(Op::Mul, Some(d), vec![a, b])])).unwrap();
         assert!(wgsl.contains(&st("o", 0, &format!("({} * {})", rd("r", 4), rd("sa", 8)))), "got:\n{wgsl}");
         assert!(wgsl.contains(&st("o", 3, &format!("({} * {})", rd("r", 7), rd("sa", 11)))), "got:\n{wgsl}");
+    }
+
+    /// The 8-bit combiner emits its whole term structure, reads its sources as BYTES, and
+    /// writes one byte back without disturbing the other three.
+    ///
+    /// The byte view is the part worth a test of its own: the flag this instruction writes in
+    /// the real corpus is the bit pattern 0x00000001, which read as an f32 is a denormal that
+    /// compares equal to zero. An F32 read here would emit WGSL that validates, runs, and
+    /// silently disables the alpha test the flag gates.
+    #[test]
+    fn emits_the_eight_bit_combiner_as_bytes() {
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let a = Operand::plain(Bank::SecondaryAttr, 9, 3);
+        let b = Operand::plain(Bank::Temp, 4, 0);
+        let mut ins = instr(
+            Op::Sop2 {
+                color: SopOp::Add,
+                alpha: SopOp::Add,
+                f1: SopFactor::Zero,
+                f1_complement: true,
+                f2: SopFactor::Zero,
+                f2_complement: false,
+            },
+            Some(d),
+            vec![a, b],
+        );
+        ins.write_mask = [true, false, false, false];
+        let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
+        assert!(
+            wgsl.contains("(1.0 - 0.0) * unpack4x8unorm(sa[9])[0]"),
+            "the complemented zero coefficient multiplies src1, making the term a copy:\n{wgsl}"
+        );
+        assert!(
+            wgsl.contains("0.0 * unpack4x8unorm(r[4])[0]"),
+            "the second term is scaled to nothing but is still READ:\n{wgsl}"
+        );
+        assert!(
+            wgsl.contains("r[0] = (r[0] & 0xffffff00u) |"),
+            "channel 0 is byte 0, and the other three bytes survive the write:\n{wgsl}"
+        );
+        assert!(!wgsl.contains("r[1] ="), "one register, not four:\n{wgsl}");
+    }
+
+    /// The 8-bit TEST reads its operands as bytes too, and from the register the combiner
+    /// wrote. Same reason as above: an F32 read of the flag register compares a denormal
+    /// against zero and reports equal.
+    #[test]
+    fn emits_the_eight_bit_test_as_bytes() {
+        let a = Operand::plain(Bank::Temp, 0, 0);
+        let b = Operand::plain(Bank::SecondaryAttr, 7, 3);
+        let ins = instr(
+            Op::Test {
+                alu: TestAlu::Fx8Sub,
+                cmp: TestCmp::Eq,
+                reduce: TestReduce::Channel(0),
+                pdst: 1,
+                write_back: false,
+            },
+            None,
+            vec![a, b],
+        );
+        let wgsl = emit_fragment(&shader(vec![ins])).unwrap();
+        assert!(
+            wgsl.contains("p[1] = ((unpack4x8unorm(r[0])[0] - unpack4x8unorm(sa[7])[0]) == 0.0)"),
+            "got:\n{wgsl}"
+        );
     }
 
     #[test]

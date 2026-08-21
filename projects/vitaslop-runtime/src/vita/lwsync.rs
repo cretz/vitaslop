@@ -278,6 +278,20 @@ pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bo
     // Success returns 0 whether acquired now or after a wake by the releasing thread.
     ctx.ret(0);
     let acquired = st.lwmutex_lock(ctx, work);
+    // >>> WHAT THIS TRACE CAN AND CANNOT SEE. Only the SLOW half arrives here, so an
+    // uncontended take - the common case, emitted as `InlineOp::LwMutexLock` straight into guest
+    // code - produces NO trace line at all. An empty lwmutex log therefore means "never
+    // contended", NOT "never taken", and reading it the second way is how a lock gets wrongly
+    // ruled out. To see every take, watch the WORK AREA in guest memory instead
+    // (`VITASLOP_WATCH_STORE=<work addr>`, which now covers vector stores too).
+    tracing::trace!(
+        target: "vitaslop::sema",
+        work = format_args!("{work:#010x}").to_string(),
+        thread = st.current_thread(),
+        lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
+        acquired,
+        "lwmutex lock (CONTENDED path only)"
+    );
     if acquired || !st.is_preemptive() {
         // The single-thread model has nobody to wake a parked caller, so it cannot park
         // one. It also cannot reach here: with one thread of control every lock is free or

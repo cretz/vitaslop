@@ -183,6 +183,7 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     seed.data_addr = SEED_ADDR;
     seed.pixels = std::iter::repeat([MID, MID, MID, 255]).take(16).flatten().collect::<Vec<u8>>().into();
     let mut scenes = vec![Scene {
+        precompile: Default::default(),
         color: Some(surface(gamma)),
         depth: None,
         multisample: 0,
@@ -190,6 +191,7 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     }];
     for _ in 0..feedback {
         scenes.push(Scene {
+            precompile: Default::default(),
             color: Some(surface(gamma)),
             depth: None,
             multisample: 0,
@@ -204,7 +206,8 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     let mut display_surface = surface(0);
     display_surface.data_addr = DISPLAY_ADDR;
     scenes.push(Scene {
-        color: Some(display_surface),
+        precompile: Default::default(),
+color: Some(display_surface),
         depth: None,
         multisample: 0,
         draws: vec![quad_inset(white, Some(texture_naming_target()), 8.0)],
@@ -234,7 +237,7 @@ fn a_gamma_target_survives_being_sampled_by_the_pass_that_draws_into_it() {
     // to the display in one pass. If either of these is wrong then nothing further down
     // measures the renderer, it measures the test.
     let direct_color = gpu.render_frame(
-        &[Scene { color: None, depth: None, multisample: 0, draws: vec![quad_inset([MID, MID, MID, 255], None, 8.0)] }],
+        &[Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws: vec![quad_inset([MID, MID, MID, 255], None, 8.0)] }],
         W, H, CLEAR,
     );
     eprintln!(
@@ -244,6 +247,7 @@ fn a_gamma_target_survives_being_sampled_by_the_pass_that_draws_into_it() {
     );
     let direct_tex = gpu.render_frame(
         &[Scene {
+            precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,

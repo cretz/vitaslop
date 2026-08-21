@@ -249,6 +249,39 @@ pub const fn pack_work(instructions: u32, operators: u32) -> i64 {
     ((instructions as i64) << WORK_INSTR_SHIFT) | (operators as i64)
 }
 
+/// Split a reading of [`WORK_GLOBAL`] into `(operators, guest instructions)`.
+///
+/// # The global is a BIT PATTERN, and it goes NEGATIVE as an i64
+/// The instruction half owns bits 32..64, so bit 63 is set - and the value is a negative `i64`
+/// - from 2^31 retired instructions onward, which a long-lived guest thread reaches in a few
+/// seconds. A host that reads the global as a MAGNITUDE (`u64::try_from` on the BigInt a wasm
+/// `i64` global crosses into JS as) simply fails from that point on, and a failed reading is a
+/// thread whose work is never billed. That is what stalled a retail boot for 986 ms in
+/// one frame.
+pub const fn split_work(bits: u64) -> (u32, u32) {
+    ((bits & WORK_OPS_MASK as u64) as u32, (bits >> WORK_INSTR_SHIFT) as u32)
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+
+    #[test]
+    fn the_work_counter_survives_its_instruction_half_setting_the_sign_bit() {
+        // 2^31 retired instructions: the packed i64 is NEGATIVE from here on.
+        let packed = pack_work(1 << 31, 1234);
+        assert!(packed < 0, "the premise: {packed}");
+        assert_eq!(split_work(packed as u64), (1234, 1 << 31));
+
+        // And at the very top of both fields, where a magnitude reading is furthest off.
+        let packed = pack_work(u32::MAX, u32::MAX);
+        assert_eq!(split_work(packed as u64), (u32::MAX, u32::MAX));
+
+        // The ordinary case still round-trips, so the fix is not a special case.
+        assert_eq!(split_work(pack_work(7, 5_000_000) as u64), (5_000_000, 7));
+    }
+}
+
 /// Exported name of the software work counter (see [`WORK_GLOBAL`]). Exported so a host
 /// can read both halves at a switch point; nothing needs to WRITE it - the emitted code
 /// clears the operator half itself after each yield.

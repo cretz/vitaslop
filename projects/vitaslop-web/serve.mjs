@@ -95,8 +95,8 @@ async function walk(root, dir = root, out = []) {
 /// The title id a directory holds, or null if it is not a title root.
 ///
 /// # Why this is read out of the container and not configured
-/// A title's id is IN it: the decrypted-dump manifest carries `content_id=UP9000-PCSA00015_00-...`
-/// and the id is the middle field. Reading it means no table mapping directory names to ids
+/// A title's id is IN it: the decrypted-dump manifest carries a
+/// `content_id=<region>-<title id>_00-<...>` line, and the id is the middle field. Reading it means no table mapping directory names to ids
 /// can go stale, and - the reason that matters - the id is what the recipe tree is keyed by
 /// and what OPFS stores the import under, so a wrong one would silently play the wrong
 /// recipe or re-import a title that is already stored.

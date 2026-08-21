@@ -27,10 +27,19 @@ const SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID: u32 = 0x8002_8101;
 /// SceUID sceKernelCreateMutex(const char *name, SceUInt attr, int initCount,
 ///     SceKernelMutexOptParam *option)
 #[hostcall]
-pub(super) fn create_mutex(st: &mut VitaState, _name: Ptr, _attr: u32, _init: i32, _opt: Ptr) -> i32 {
+pub(super) fn create_mutex(st: &mut VitaState, _name: Ptr, attr: u32, _init: i32, _opt: Ptr) -> i32 {
     // Recording ownership state is harmless single-thread (lock/unlock take the
     // immediate path there) and necessary for preemptive blocking.
-    st.create_mutex()
+    let id = st.create_mutex();
+    // `attr` carries the waiter discipline (TH_FIFO 0x0000 vs TH_PRIO 0x2000) and the
+    // recursion/ceiling bits. It is traced rather than dropped because "which discipline did
+    // the guest ask for" is the first question any thread-ordering investigation asks, and a
+    // silently discarded argument reads as "the guest never said".
+    tracing::trace!(
+        target: "vitaslop::sema",
+        id, attr = format_args!("{attr:#x}"), thread = st.current_thread(), "mutex create"
+    );
+    id
 }
 
 /// int sceKernelLockMutex(SceUID mutexid, int lockCount, unsigned int *timeout),
@@ -45,15 +54,33 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
         ctx.ret(0);
         return SvcOutcome::Continue;
     }
+    // `lr` is the whole point of tracing this: "which mutex" is rarely the question, "which
+    // guest code took it, and did the other thread take the same one" always is. Traced on the
+    // `vitaslop::sema` target alongside the semaphores and event flags, which carried every
+    // other blocking primitive EXCEPT the mutexes - so a run asking what serialises two threads
+    // saw everything but the answer.
+    let lr = format_args!("{:#010x}", ctx.regs[14]).to_string();
     if try_lock && st.mutex_contended(id) {
+        tracing::trace!(
+            target: "vitaslop::sema",
+            id, thread = st.current_thread(), lr, "mutex TRYLOCK refused"
+        );
         ctx.ret(ERR_MUTEX_FAILED_TO_OWN);
         return SvcOutcome::Continue;
     }
     // The return value on success is 0, whether acquired now or after a wake.
     ctx.ret(0);
     if st.mutex_lock(id) {
+        tracing::trace!(
+            target: "vitaslop::sema",
+            id, thread = st.current_thread(), lr, try_lock, "mutex lock acquired"
+        );
         SvcOutcome::Continue
     } else {
+        tracing::trace!(
+            target: "vitaslop::sema",
+            id, thread = st.current_thread(), lr, "mutex lock BLOCK"
+        );
         SvcOutcome::Block
     }
 }
@@ -62,6 +89,7 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
 #[hostcall]
 pub(super) fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
     if st.is_preemptive() {
+        tracing::trace!(target: "vitaslop::sema", id, thread = st.current_thread(), "mutex unlock");
         st.mutex_unlock(id);
     }
     0
@@ -241,16 +269,49 @@ pub(super) fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
 
 /// SceUID sceKernelCreateEventFlag(const char *name, int attr, int initPattern,
 ///     SceKernelEventFlagOptParam *opt)
+///
+/// The NAME is read only to be REPORTED. A wait report that says a thread is parked on
+/// "eventflag uid=0x118" names a host-assigned integer the guest never chose and nothing
+/// in the title can be searched for; the guest's own name for it ("NU::Geom::Request", and
+/// so on) is the difference between a uid and a subsystem. `sceKernelCreateSema` has
+/// always recorded its name for exactly this reason - the event flag was the one primitive
+/// that dropped it.
 #[hostcall]
-pub(super) fn create_event_flag(st: &mut VitaState, _name: Ptr, _attr: u32, init: u32, _opt: Ptr) -> i32 {
-    st.create_event_flag(init)
+pub(super) fn create_event_flag(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    _attr: u32,
+    init: u32,
+    _opt: Ptr,
+) -> i32 {
+    let name =
+        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let id = st.create_event_flag(init);
+    st.name_event_flag(id, &name);
+    tracing::trace!(
+        target: "vitaslop::sema",
+        id, init, name, thread = st.current_thread(),
+        lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
+        "evf create"
+    );
+    id
 }
 
 /// int sceKernelSetEventFlag(SceUID evid, unsigned int bitPattern)
 /// Preemptive: also releases any parked waiters the new pattern satisfies.
 #[hostcall]
-pub(super) fn set_event_flag(st: &mut VitaState, id: i32, bits: u32) -> i32 {
-    tracing::trace!(target: "vitaslop::sema", id, bits, thread = st.current_thread(), "evf set");
+pub(super) fn set_event_flag(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, bits: u32) -> i32 {
+    // `lr` is what makes a set/wait pair searchable: a flag that is WAITED on and never SET is
+    // either a subsystem the title does not use or a signal this engine is failing to deliver,
+    // and the two are indistinguishable from the uid alone. The setter's call site names the
+    // guest code, which is the only way to read the difference out of the binary.
+    tracing::trace!(
+        target: "vitaslop::sema",
+        id, bits, thread = st.current_thread(),
+        lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
+        "evf set"
+    );
     if st.is_preemptive() {
         st.event_set_wake(id, bits);
     } else {
@@ -312,6 +373,7 @@ pub(super) fn wait_event_flag(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutc
             tracing::trace!(
                 target: "vitaslop::sema",
                 id, bits, mode, timeout_us, thread = st.current_thread(),
+                lr = format_args!("{:#010x}", ctx.regs[14]).to_string(),
                 "evf wait BLOCK"
             );
             st.evf_block(id, bits, mode, out, timeout_us);

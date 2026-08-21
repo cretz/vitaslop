@@ -60,6 +60,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // is where outgrowing it costs the most: a wholesale clear there re-decodes hundreds of
     // textures inside one frame's `build`.
     "VITASLOP_DECODE_CACHE_MB",
+    // The A/B arm for `emit_flags_add`'s carry and overflow forms. It is here because the
+    // BROWSER is the engine that has to answer: `flags-add` was 39% of every operator the
+    // transpiler emitted, the closed forms cut the module 5.3% and executed operators 8.7%,
+    // and three interleaved desktop repeats put the wall-clock difference inside the noise.
+    "VITASLOP_FLAGS_WIDE_C",
     "VITASLOP_FRAME_TOPUP",
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
@@ -82,6 +87,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // (`screenTintColour`) only ever appears there.
     "VITASLOP_GXM_UNIFORM_POISON",
     "VITASLOP_GXP_ALLOW_FIXED_FUNCTION",
+    "VITASLOP_GXP_CULL",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
     "VITASLOP_GXP_FORCE",
@@ -114,7 +120,22 @@ pub const OVERRIDABLE: &[&str] = &[
     // Substitute a default-uniform register before a draw is submitted - the causality half of
     // `VITASLOP_GXP_INPUTS`. Reachable from the browser for the same reason as that one: the
     // white-out it is aimed at reproduces there and nowhere a file can be written.
+    // For a title whose `sceGxmShaderPatcherCreateFragmentProgram` passes a NULL vertexProgram -
+    // so the call names no shader PAIR and nothing can be prepared from it - offer the CROSS
+    // PRODUCT of its created fragment and vertex programs and keep the ones that LINK.
+    // Speculative work paid on a loading screen; how much of it is wasted is a per-title
+    // measurement, which is what this exists to take. Reachable from the browser because that
+    // is where an in-frame shader compile costs the most.
+    "VITASLOP_GXP_PRECOMPILE_CROSS",
     "VITASLOP_GXP_SA",
+    // The SHADER EMITTER's two arms, forwarded into `vitaslop_gxp_shader::link` by
+    // `set_override` below rather than read through `var` - that crate has no dependencies by
+    // design and cannot see this table. Both are here because of the black race: a phone whose
+    // driver refused four pipelines could not be handed either arm, and `SIZE_BANKS=0` alone
+    // would have bisected it in one run. `SA_DIRECT` also takes `unroll`, which is the control
+    // that separates a value change from a driver-codegen one.
+    "VITASLOP_GXP_SA_DIRECT",
+    "VITASLOP_GXP_SIZE_BANKS",
     "VITASLOP_GXP_SOLID",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
@@ -137,12 +158,27 @@ pub const OVERRIDABLE: &[&str] = &[
     // family worth ~1,000 calls cannot be priced against that baseline. This one changes
     // nothing else. Read at LINK time; set it before the run, not during it.
     "VITASLOP_NO_INLINE_LWMUTEX",
+    // The SCOPED switch for the two default-uniform RESERVES, which are the largest single
+    // family of host calls a gameplay frame still made before they were inlined (1,189 a
+    // frame on one title, 53% of everything it calls). Reachable from the browser for both
+    // of the reasons the two switches around it are separately: the phone is the only machine
+    // where a count-based win is worth measuring, and this form is the first that hands the
+    // guest an ADDRESS rather than answering a question, so it is the one to fall back to if
+    // a title's uniforms ever look wrong. Read at LINK time; set it before the run.
+    "VITASLOP_NO_INLINE_RESERVE",
     // The SCOPED switch for the fragment-texture bind. Reachable from the browser because it
     // is not a perf question at all: the inline copy form replaced a handler that a title's
     // every texture bind went through, so if a texture goes MISSING on a device, this knob is
     // the one-run answer to "is it the inline form" - and the device is the only place the
     // report came from. Read at LINK time; set it before the run, not during it.
     "VITASLOP_NO_INLINE_TEXTURE",
+    // The SCOPED switch for `sceGxmSetUniformDataF`, which after every other GXM inlining is
+    // the largest single call a real title still makes (1,106 a frame on a race, 58% of the
+    // remainder). Reachable from the browser because that is where a count-based win is
+    // worth having, and because this form writes the bytes a SHADER READS - a fault in it is
+    // a wrong picture, and the phone is where wrong pictures have been reported from. Read
+    // at LINK time; set it before the run.
+    "VITASLOP_NO_INLINE_UNIFORM_DATA",
     "VITASLOP_PERF",
     // Sample the PRESENTED surface every N presents and describe it in the diagnostics panel.
     // Reachable from the browser because it exists for a defect only the browser has: a blank
@@ -150,11 +186,51 @@ pub const OVERRIDABLE: &[&str] = &[
     // or a picture the compositor never showed and no counter upstream of the surface can say
     // which. The device has no screenshot tool and no console, so the answer has to arrive as
     // text in the panel. Read when the surface is configured; set it before the run.
+    // Break `prepare`'s milliseconds down INSIDE one draw (hash / repack / arena copy /
+    // uniforms / samplers / depth) and count the bytes each phase moved. Reachable from the
+    // browser because that is where a per-draw cost is amplified, and gated because it is the
+    // one instrument here that reads a CLOCK on a path making no WebGPU call - six reads a
+    // draw across several hundred draws a frame would move the number they report.
+    "VITASLOP_PREPARE_SPLIT",
     "VITASLOP_PRESENT_PROBE",
+    // Hold the ARM register file in wasm LOCALS along each straight-line run instead of on
+    // its globals (`transpiler::promote`). Reachable from the browser because the browser is
+    // the ONLY place it can be priced: promotion adds operators and removes none, so fuel,
+    // the code-expansion factor and the guest clock are all blind to it by construction, and
+    // matched-frame V8 wall-clock is the only instrument left. An emit-time knob, so it is
+    // read once before the transpile rather than by a running thread.
+    "VITASLOP_PROMOTE_REGS",
     // Whether PVRTC decodes a whole face at a time or one texel at a time. Reachable from
     // the browser because that is where PVRTC decode volume costs the most, so that is where
     // the exactness falsifier has to be runnable.
     "VITASLOP_PVRTC_DECODE",
+    // Keep geometry that has not changed since the renderer first saw it RESIDENT on the GPU
+    // instead of copying it into a per-frame arena and uploading it again. `0` sends every draw
+    // back through the arenas, which is the A/B arm. Reachable from the browser because that is
+    // where a per-frame upload costs the most.
+    "VITASLOP_RESIDENT_GEOM",
+    // The byte budget for each of the two resident geometry heaps, in MB (default 48). A heap
+    // that fills at its budget is RESET and says so; a reset every few frames means the working
+    // set does not fit and this is the number to change.
+    "VITASLOP_RESIDENT_GEOM_MB",
+    "VITASLOP_RTT_BG_CACHE",
+    // DIAGNOSTIC, not a shipped behaviour: cap how many runnable threads may hold the baton,
+    // by priority, as the console's core count would. Unset (the default) keeps the current
+    // discipline, where the spin cooldown eventually admits every runnable thread whatever its
+    // priority - which is why a below-third-priority thread can run in a quantum the hardware
+    // would not have given it. Set to 3 to ask whether a bug depends on that.
+    //
+    // It is a knob rather than a default because a strict core cap can LIVELOCK on priority
+    // inversion (a high-priority thread spinning on a lock a capped-out low-priority thread
+    // holds), and the cooldown it replaces is the anti-starvation mechanism. Answering the
+    // question is worth a run that may hang; shipping it is not, until it has an escape hatch.
+    "VITASLOP_SCHED_CORES",
+    // Fold the determinism signature on a browser recipe run that does NOT declare `@sig`.
+    // The fold hashes every retired scene's vertices, indices and uniforms - about 3 MB a
+    // frame on a race, MEASURED at 7.7% of the guest window - and the only consumer is an
+    // `@sig` assertion, so a recipe without one pays for a number nothing compares. Set this
+    // when the point of the run is to LEARN the signature and bless it into a recipe.
+    "VITASLOP_SIGNATURE",
     // Byte budget for retained texture snapshots. Reachable from the browser because
     // exceeding it there costs a full re-decode of the working set in one frame.
     "VITASLOP_SNAPSHOT_BUDGET_MB",
@@ -226,12 +302,29 @@ pub fn log_filter() -> String {
     }
 }
 
-/// A presence flag: set (to anything, including the empty string) means on.
+/// A boolean knob: set means on, EXCEPT for the values that plainly mean off.
 ///
-/// This is the house convention for a boolean knob, and it is deliberately not
-/// value-sensitive: `NAME=0` still reads as ON, the same as it does through the shell.
+/// # `NAME=0` used to mean ON, and that cost a whole measurement
+/// This was a pure presence flag - set to anything, including `0` and the empty string,
+/// meant on - on the reasoning that that is what a shell does. It is also what nobody
+/// expects, and the failure is silent in the worst way: an A/B needs an OFF arm, and
+/// `VITASLOP_PROMOTE_REGS=0` typed into the page's knobs box produced a promoted build in
+/// BOTH arms. The run compared a build against itself and reported no difference - a clean,
+/// plausible, meaningless zero (27 matched frame pairs, +0.12%, median ratio exactly
+/// 1.0000). Nothing about it looked wrong.
+///
+/// The same trap was latent on `VITASLOP_GXP_LIVE`, the renderer's master switch, where
+/// `=0` would have turned the recompiler ON.
+///
+/// So the off values are honoured: `0`, `false`, `no`, `off` (any case, surrounding space
+/// ignored). Everything else set - including the empty string, which is how a shell writes
+/// "present" - is on, so `NAME=` and `NAME=1` are unchanged. The transpiler's own
+/// environment readers already worked this way; this makes the two agree.
 pub fn flag(name: &str) -> bool {
-    var_os(name).is_some()
+    match var(name) {
+        Err(_) => false,
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+    }
 }
 
 /// Set a knob for this process, for a platform where the environment cannot be.
@@ -249,6 +342,12 @@ pub fn set_override(name: &str, value: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(name.to_string(), value.to_string());
+    // The shader emitter keeps its own arm table: `vitaslop-gxp-shader` has NO dependencies on
+    // purpose (it is the wasm-safe, game-data-free half of the renderer), so it cannot read
+    // this one. Forwarding here is what makes those arms reachable from the browser at all,
+    // and `set_arm` ignores every name but its own two.
+    #[cfg(feature = "gpu")]
+    vitaslop_gxp_shader::link::set_arm(name, value);
 }
 
 #[cfg(test)]
@@ -264,6 +363,27 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, OVERRIDABLE);
+    }
+
+    /// `NAME=0` must mean OFF.
+    ///
+    /// This is pinned because the opposite behaviour is invisible when it is wrong: a
+    /// boolean knob that reads `0` as ON turns the OFF arm of an A/B into a second copy of
+    /// the ON arm, and the run then reports "no difference" - which is exactly what a
+    /// correct null result looks like. It cost a full measurement once already.
+    #[test]
+    fn a_boolean_knob_reads_zero_and_friends_as_off() {
+        // `set_override` is the platform-independent way in, and every name it accepts must
+        // be in OVERRIDABLE - so this uses one that is.
+        const NAME: &str = "VITASLOP_GXP_LIVE";
+        for off in ["0", "false", "no", "off", "OFF", " 0 ", "False"] {
+            set_override(NAME, off);
+            assert!(!flag(NAME), "{off:?} must read as OFF");
+        }
+        for on in ["1", "", "yes", "true", "2"] {
+            set_override(NAME, on);
+            assert!(flag(NAME), "{on:?} must read as ON");
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod net;
 pub mod fios2;
 pub mod gxm;
 pub mod gxmctx;
+pub mod gxmprog;
 pub mod iofilemgr;
 pub mod jpeg;
 pub mod jpegenc;
@@ -72,6 +73,12 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_clib() && is_clib_bulk(func_nid) {
         return None;
     }
+    if is_uniform_reserve(func_nid) && (no_inline_reserve() || uniform_poison()) {
+        return None;
+    }
+    if func_nid == gxm_nid::SET_UNIFORM_DATA_F && (no_inline_uniform_data() || uniform_watch()) {
+        return None;
+    }
     gxm::inline_op(func_nid)
         .or_else(|| display::inline_op(func_nid))
         .or_else(|| libkernel::inline_op(func_nid))
@@ -113,6 +120,80 @@ fn is_clib_bulk(func_nid: u32) -> bool {
 fn no_inline_clib() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_CLIB"))
+}
+
+/// The two NIDs [`no_inline_reserve`] and the poison knob scope over.
+fn is_uniform_reserve(func_nid: u32) -> bool {
+    use crate::nid::gxm as g;
+    matches!(
+        func_nid,
+        g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER | g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER
+    )
+}
+
+/// `VITASLOP_NO_INLINE_RESERVE`: route `sceGxmReserve{Vertex,Fragment}DefaultUniformBuffer`
+/// through the host, leaving every other inline form on.
+///
+/// A SCOPED A/B switch like [`no_inline_texture`], and for the same two reasons at once.
+/// As a price tag it is the only way to weigh this family: it is 1,189 crossings a frame on
+/// one title, and the whole-mechanism switch moves ~11,000 and every preemption point with
+/// them, so that baseline cannot separate it. As a falsifier it is the first thing to reach
+/// for if a title's uniforms ever look wrong after this change - both arms compute the same
+/// buffer from the same three words (`gxmctx::UNIFORM_RING_*` and the handle's memoised
+/// size), so a picture that CHANGES when this is set is a real divergence between the two
+/// writers and one that does not clears the form.
+///
+/// Read through [`crate::knobs`] and listed in `OVERRIDABLE`, so a live page on a PHONE can
+/// throw it between two runs of one build. Read at LINK time, so it must be set for the
+/// whole run.
+fn no_inline_reserve() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_RESERVE"))
+}
+
+/// Whether `VITASLOP_GXM_UNIFORM_POISON` is on, which WITHHOLDS the inline reserve.
+///
+/// Not a knob of its own - it is the diagnostic that fills a freshly reserved vertex buffer
+/// with a quiet NaN so a lane the guest never wrote is distinguishable from one it wrote
+/// zero into (`crate::host::poison_uniform_buffer`). An inlined call never reaches the host,
+/// so the fill would simply stop happening and the instrument would report "the guest wrote
+/// every lane" for every draw - an instrument whose failure imitates its subject
+/// [[vitaslop-instrument-failure-imitating-its-subject]]. So the form is withheld while the
+/// poison is on rather than emitting an approximation of it.
+fn uniform_poison() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var_os("VITASLOP_GXM_UNIFORM_POISON").is_some())
+}
+
+/// `VITASLOP_NO_INLINE_UNIFORM_DATA`: route `sceGxmSetUniformDataF` through the host,
+/// leaving every other inline form on.
+///
+/// The scoped A/B switch for the largest single host call a real title has left once the
+/// draw state, the texture binds and the default-uniform reserves are inlined - **1,106
+/// calls a frame on a retail race, 58% of what it still makes.** It is also the
+/// falsifier to reach for first if a title's uniforms ever look wrong after this change,
+/// which matters more here than for the other forms: this one writes the bytes a shader
+/// reads, so a fault in it is a wrong PICTURE rather than a missing one.
+///
+/// Read through [`crate::knobs`] and listed in `OVERRIDABLE`, so a live page on a PHONE can
+/// throw it between two runs of one build. Read at LINK time, so it must be set for the
+/// whole run.
+fn no_inline_uniform_data() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_UNIFORM_DATA"))
+}
+
+/// Whether `VITASLOP_UNIFORM_WATCH` names anything, which WITHHOLDS the inline form.
+///
+/// The watch names the guest code that wrote a uniform, and it lives inside the handler
+/// (`vita::gxm::report_uniform_write`). An inlined call never reaches the host, so with the
+/// form on, the one instrument for "who wrote this uniform" would report NOTHING and read as
+/// "nobody writes it" - the failure mode
+/// [[vitaslop-instrument-failure-imitating-its-subject]] is about. Same treatment
+/// [`uniform_poison`] gets, and for the same reason.
+fn uniform_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_UNIFORM_WATCH").is_ok_and(|s| !s.trim().is_empty()))
 }
 
 /// `VITASLOP_NO_INLINE_LWMUTEX`: route the lightweight-mutex lock and unlock through the

@@ -87,6 +87,12 @@ impl FlagMask {
     pub const fn without(self, other: FlagMask) -> FlagMask {
         FlagMask(self.0 & !other.0)
     }
+
+    /// The raw bitset, for bucketing sites by mask in a measurement. Not for logic - use
+    /// [`has`](Self::has), which names the flag it tests.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 /// The flags a condition code tests.
@@ -197,6 +203,159 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
         // rather than folded into a wildcard so the match stays exhaustive.
         Stmt::Guard(..) => (FlagMask::ALL, FlagMask::NONE),
     }
+}
+
+/// Apply `f` to every [`Value`] a statement evaluates, INCLUDING the bodies of nested
+/// guards.
+///
+/// Exhaustive, with no wildcard arm, for exactly the reason [`stmt_effect`] is: a statement
+/// kind added later must be given an answer here rather than silently reporting that it
+/// evaluates nothing. Both consumers of this ask a question whose wrong answer is a
+/// miscompile.
+fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
+    match s {
+        Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. } => f(v),
+        Stmt::Store { addr, data, .. } => {
+            f(addr);
+            f(data);
+        }
+        Stmt::MulLong { rn, rm, .. } => {
+            f(rn);
+            f(rm);
+        }
+        Stmt::FlagsAdd { a, b, cin, .. } => {
+            f(a);
+            f(b);
+            f(cin);
+        }
+        Stmt::FlagsLogic { value, carry, .. } => {
+            f(value);
+            if let Some(c) = carry {
+                f(c);
+            }
+        }
+        Stmt::ShiftRegFlags { rn, amount, .. } => {
+            f(rn);
+            f(amount);
+        }
+        Stmt::VfpMem { addr, .. } => f(addr),
+        Stmt::Neon(NeonStmt::ElemMem { addr, .. }) => f(addr),
+        Stmt::CallIndirect { addr, .. } => f(addr),
+        Stmt::Guard(_, inner) => {
+            for s in inner {
+                for_each_value(s, f);
+            }
+        }
+        // Carry no value expression at all.
+        Stmt::Vfp(_)
+        | Stmt::Neon(_)
+        | Stmt::Uadd8 { .. }
+        | Stmt::Sel { .. }
+        | Stmt::Import(_)
+        | Stmt::Svc(_)
+        | Stmt::Call { .. } => {}
+    }
+}
+
+/// Does this value expression, at any depth, read the sum a preceding [`Stmt::FlagsAdd`]
+/// left in its scratch local?
+fn value_reads_carry_sum(v: &Value) -> bool {
+    match v {
+        Value::CarryAddResult => true,
+        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::Flag(_) => false,
+        Value::Not(a) | Value::Clz(a) | Value::Load { addr: a, .. } => value_reads_carry_sum(a),
+        Value::Bin(_, a, b) => value_reads_carry_sum(a) || value_reads_carry_sum(b),
+    }
+}
+
+/// Does this value expression, at any depth, contain a guest memory LOAD?
+fn value_has_load(v: &Value) -> bool {
+    match v {
+        Value::Load { .. } => true,
+        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::Flag(_)
+        | Value::CarryAddResult => false,
+        Value::Not(a) | Value::Clz(a) => value_has_load(a),
+        Value::Bin(_, a, b) => value_has_load(a) || value_has_load(b),
+    }
+}
+
+/// >>> DROP A `FlagsAdd` WHOSE FLAGS ARE ALL DEAD AND WHOSE SUM NOTHING READS.
+///
+/// [`annotate`] already tells each flag writer which flags can be observed, and the
+/// emitter skips the derivations for the dead ones - but it still emits the SUM, because a
+/// following `adc`/`sbc` may read it back as [`Value::CarryAddResult`]. MEASURED on a
+/// retail title: **32.4% of all `FlagsAdd` sites have every flag dead**, which makes that sum
+/// - two operand evaluations, an add and a store to a scratch local - pure waste at nearly
+/// a third of the largest single lowering in the codegen. `emit_flags_add` cannot see its
+/// successor, so the decision has to be made here.
+///
+/// # When it is legal, and the two things that make it so
+/// - **`CarryAddResult` is only ever valid immediately after a `FlagsAdd`** (see its doc,
+///   and `lower.rs`, which is the only producer: `adc`/`sbc` that set flags). So the scan
+///   stops at the next `FlagsAdd` - past that, the local belongs to a different statement
+///   and nothing may read this one's value.
+/// - **A dropped statement must not drop a guest memory READ.** A `Value::Load` is called
+///   pure, and it is for reordering, but it can also TRAP - so a site whose operands
+///   contain one is left alone rather than reasoned about. Data-processing operands are
+///   registers, immediates and shifted registers, so this costs approximately nothing; it
+///   is here so the pass cannot become a way to delete a fault.
+///
+/// Applied to every statement list, guard bodies included, since lowering puts a predicated
+/// `adc` and its result in the same list.
+pub fn drop_dead_flag_adds(func: &mut Func) {
+    for block in &mut func.blocks {
+        drop_dead_in_list(&mut block.stmts);
+    }
+}
+
+fn drop_dead_in_list(stmts: &mut Vec<Stmt>) {
+    for s in stmts.iter_mut() {
+        if let Stmt::Guard(_, inner) = s {
+            drop_dead_in_list(inner);
+        }
+    }
+    let mut i = 0;
+    while i < stmts.len() {
+        let droppable = match &stmts[i] {
+            Stmt::FlagsAdd { a, b, cin, live } => {
+                live.is_empty()
+                    && !value_has_load(a)
+                    && !value_has_load(b)
+                    && !value_has_load(cin)
+                    && !sum_is_read_after(stmts, i)
+            }
+            _ => false,
+        };
+        if droppable {
+            stmts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Does anything after `stmts[i]` - up to the next `FlagsAdd`, which redefines the scratch
+/// local - read the sum it computed?
+fn sum_is_read_after(stmts: &[Stmt], i: usize) -> bool {
+    for s in &stmts[i + 1..] {
+        if matches!(s, Stmt::FlagsAdd { .. }) {
+            return false;
+        }
+        let mut found = false;
+        for_each_value(s, &mut |v| found |= value_reads_carry_sum(v));
+        if found {
+            return true;
+        }
+        // A guard body could hold the reader, and `for_each_value` walks into it - but a
+        // guard could equally hold a `FlagsAdd` that redefines the local, and then a later
+        // read is not ours. Treating that as a read is the conservative direction.
+        if let Stmt::Guard(_, inner) = s {
+            if inner.iter().any(|s| matches!(s, Stmt::FlagsAdd { .. })) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// What a terminator does: the flags it reads, the blocks control may reach from it inside

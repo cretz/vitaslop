@@ -1448,6 +1448,9 @@ pub fn discover(
         crate::flags::merge_guards(&mut b.stmts);
     }
     crate::flags::annotate(&mut func);
+    // And with liveness settled, a flag statement whose four flags are ALL dead and whose
+    // sum nothing reads back is not a cheaper statement - it is no statement at all.
+    crate::flags::drop_dead_flag_adds(&mut func);
 
     Ok(Discovered {
         func,

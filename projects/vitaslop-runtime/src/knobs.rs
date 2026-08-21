@@ -116,7 +116,14 @@ fn knob_names(line: &str) -> Vec<String> {
         {
             end += 1;
         }
-        out.push(line[start..end].to_string());
+        // `VITASLOP_` with NOTHING after the underscore is not a knob name - it is the
+        // wildcard `VITASLOP_*` a doc comment uses to talk about knobs in general. Indexing
+        // it produced a phantom row in `KNOBS.md` named `VITASLOP_`, whose summary was
+        // whatever doc comment happened to sit above the mention. The comment that warns
+        // about this hazard was itself the thing generating it.
+        if end > start + "VITASLOP_".len() {
+            out.push(line[start..end].to_string());
+        }
         i = end.max(start + 1);
     }
     out
@@ -303,6 +310,15 @@ mod tests {
             vec!["VITASLOP_A2".to_string(), "VITASLOP_B".to_string()]
         );
         assert!(knob_names("nothing here").is_empty());
+        // The WILDCARD a doc comment uses to talk about knobs in general is not a knob.
+        // It used to index as one, under the empty name, and take over a row of the table.
+        assert!(knob_names("/// every `VITASLOP_*` identifier").is_empty());
+        assert!(knob_names("// VITASLOP_ on its own").is_empty());
+        // ...but a real name on the same line as a wildcard still lands.
+        assert_eq!(
+            knob_names("/// `VITASLOP_*` - see VITASLOP_REAL_ONE"),
+            vec!["VITASLOP_REAL_ONE".to_string()]
+        );
     }
 
     #[test]

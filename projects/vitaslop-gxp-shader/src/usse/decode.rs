@@ -15,7 +15,10 @@
 //! risk an inexact translation. No guess is ever emitted, so a wrong translation can never
 //! paint a pixel.
 
-use crate::ir::{Bank, CompareMethod, Instr, Op, Operand, Predicate, TestAlu, TestCmp, TestReduce, TexLod};
+use crate::ir::{
+    Bank, CompareMethod, Instr, Op, Operand, Predicate, SopFactor, SopOp, TestAlu, TestCmp,
+    TestReduce, TexLod,
+};
 
 /// A field descriptor: name and bit width, MSB-first within its 32-bit word.
 type Field = (&'static str, u8);
@@ -268,13 +271,146 @@ pub fn decode(word: u64) -> Instr {
         0x08 => decode_grp_pack(word),
         0x09 => decode_grp_test(word),
         0x0a | 0x0b | 0x0c | 0x0d => decode_grp_bitwise(word, op1),
+        0x12 => decode_grp_sop2m(word),
         0x14 => decode_grp_i16mad(word),
+        0x15 => decode_grp_imad32(word),
         0x1c => decode_grp_tex(word),
         0x1f => decode_grp_flow(word),
         _ => classified_stub(word, op1, hi, lo),
     }
 }
 
+
+/// Decode a group-0x90 SOP2M, the 8-BIT FIXED-POINT SUM-OF-PRODUCTS combiner (opcode1 0x12).
+///
+/// | field | bits | | field | bits |
+/// |---|---|---|---|---|
+/// | `pred` (2-bit short form) | 58:57 | | `wmask` | 46:43 |
+/// | `mod1` | 56 | | `aop` (alpha op) | 42:41 |
+/// | `cop` (colour op) | 53:52 | | `sel1` / `sel2` | 40:38 / 37:35 |
+/// | `destbankext` | 51 | | `destbank` | 33:32 |
+/// | `src1bankext` / `src2bankext` | 49 / 48 | | `src1bank` / `src2bank` | 31:30 / 29:28 |
+/// | `mod2` | 47 | | `destnum` | 27:21 |
+/// | | | | `src1num` / `src2num` | 13:7 / 6:0 |
+///
+/// # The write mask is ROTATED, and it is the one field that is easy to get silently wrong
+/// The raw field carries ALPHA in bit 0 and RGB in bits 3:1. Rotating alpha up to bit 3 gives
+/// the ordinary `[x, y, z, w]` order every other group uses. Reading it unrotated writes the
+/// wrong channel with no other symptom.
+///
+/// # What is NOT modelled, and blocks rather than guessing
+/// Selector values 1, 4 and 5 (the reference material establishes 0, 2, 3, 6 and 7 only), a
+/// destination bank extension (no corpus program sets it), and the `sel`/`mod` combination is
+/// otherwise taken exactly as documented. [[vitaslop-fx8-family-is-a-wall]] recorded this
+/// whole family as unreadable from four sources; what changed is the OPERAND grammar and the
+/// fact that the selector picks a COEFFICIENT rather than an operand - see [`SopFactor`].
+///
+/// # The corpus check that says the layout is right
+/// Five captured fragment programs carry this instruction, always in the alpha-test macro,
+/// and in every one the destination this decode produces is EXACTLY the register the next two
+/// instructions (an OR that zeroes it under the inverse predicate, and a VTST that compares it
+/// against zero) write and read. Two different destinations across the five programs, both
+/// matching. A wrong bank or number field would have to be wrong in the same direction as an
+/// independently-decoded neighbour to produce that.
+fn decode_grp_sop2m(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    let pred = short_predicate(bits(word, 58, 57));
+
+    let sop_op = |v: u32| match v {
+        0 => SopOp::Add,
+        1 => SopOp::Sub,
+        2 => SopOp::Min,
+        _ => SopOp::Max,
+    };
+    let color = sop_op(bits(word, 53, 52));
+    let alpha = sop_op(bits(word, 42, 41));
+
+    let mut factor = |v: u32| match v {
+        0 => SopFactor::Zero,
+        2 => SopFactor::Src1Color,
+        3 => SopFactor::Src1Alpha,
+        6 => SopFactor::Src2Color,
+        7 => SopFactor::Src2Alpha,
+        _ => {
+            // 1, 4 and 5 are absent from every source consulted. A combiner coefficient that
+            // is guessed wrong scales a whole term, so this blocks.
+            blocked = blocked.or(Some("0x90 SOP2M source selector 1/4/5 not established"));
+            SopFactor::Zero
+        }
+    };
+    let f1 = factor(bits(word, 40, 38));
+    let f2 = factor(bits(word, 37, 35));
+
+    // Sources. An 8-bit type is never double-register scaled, so the operand's number is a
+    // direct register index, exactly as the bitwise family's is.
+    let mut source = |bank_sel: u8, field_val: u32, ext: bool| -> Operand {
+        if ext {
+            // The IMMEDIATE row is assembled per group and this layout carries no extended
+            // immediate fields, so the operand's own number IS the literal - the same rule the
+            // TEST group states.
+            if bank_sel & 3 == 2 {
+                return Operand::plain(Bank::Immediate, (field_val & 0x7f) as u8, bank_sel);
+            }
+            match ext_source(bank_sel, field_val, true) {
+                Ok(o) => return o,
+                Err(why) => {
+                    blocked = blocked.or(Some(why));
+                    return Operand::plain(Bank::Temp, 0, bank_sel);
+                }
+            }
+        }
+        let (bank, index) = r7_source_bank_index(bank_sel, field_val);
+        Operand::plain(bank, index, bank_sel)
+    };
+    let s1 = source(bits(word, 31, 30) as u8, bits(word, 13, 7), bits(word, 49, 49) != 0);
+    let s2 = source(bits(word, 29, 28) as u8, bits(word, 6, 0), bits(word, 48, 48) != 0);
+
+    // Destination. The extension bit selects a different bank row that no corpus program uses,
+    // so it is reported rather than resolved from an unchecked table.
+    if bits(word, 51, 51) != 0 {
+        blocked = blocked.or(Some("0x90 SOP2M destination bank extension not established"));
+    }
+    let dest_sel = bits(word, 33, 32) as u8;
+    let dest = match r7_dest_bank_index(dest_sel, bits(word, 27, 21)) {
+        Some((b, i)) => Some(Operand::plain(b, i, dest_sel)),
+        None => {
+            blocked = blocked.or(Some("0x90 SOP2M destination in index mode"));
+            None
+        }
+    };
+
+    // ALPHA IN BIT 0, RGB IN BITS 3:1 - rotate alpha to the top so the mask is [x,y,z,w].
+    let raw_mask = bits(word, 46, 43);
+    let rotated = ((raw_mask & 0b1110) >> 1) | ((raw_mask & 1) << 3);
+    let write_mask = [
+        rotated & 1 != 0,
+        rotated & 2 != 0,
+        rotated & 4 != 0,
+        rotated & 8 != 0,
+    ];
+
+    Instr {
+        op: Op::Sop2 {
+            color,
+            alpha,
+            f1,
+            f1_complement: bits(word, 56, 56) != 0,
+            f2,
+            f2_complement: bits(word, 47, 47) != 0,
+        },
+        pred,
+        dest,
+        write_mask,
+        srcs: vec![s1, s2],
+        // The register file this instruction sees is four 8-bit channels, which is neither of
+        // the two float widths `half_precision` selects between. The emitter reads the data
+        // type off the OP, so this stays false rather than claiming an F16 read.
+        half_precision: false,
+        raw: word,
+        group: 0x12,
+        blocked,
+    }
+}
 
 /// Decode a group-0x48 VTST (test -> predicate). The field layout is a fact from the SGX543
 /// ISA reference's TEST group, cross-checked between a field-level decoder layout and the
@@ -323,6 +459,12 @@ fn decode_grp_test(word: u64) -> Instr {
         (0, 13) => (TestAlu::Mul, prec == 0, true),
         (0, 14) => (TestAlu::Sub, prec == 0, true),
         (3, 0) => (TestAlu::BitAnd, false, false),
+        // The 8-BIT family (alu_sel 2). Its operands are read as four 8-bit unsigned-
+        // normalised channels whatever `prec` says - the precision bit selects between the two
+        // FLOAT widths and has no meaning once the family is an integer one. This is the arm
+        // the corpus's alpha-test macro takes, always as the subtract that turns a comparison
+        // into a test against zero.
+        (2, 8) => (TestAlu::Fx8Sub, false, false),
         _ => {
             blocked = blocked.or(Some("0x48 VTST ALU family/op not modeled"));
             (TestAlu::Sub, prec == 0, true)
@@ -1770,6 +1912,143 @@ fn decode_grp_i16mad(word: u64) -> Instr {
     }
 }
 
+/// Decode a group-0x15 IMAD32, the 32-BIT INTEGER MULTIPLY-ADD: `dest = src0 * src1 + src2`.
+///
+/// # The layout, and what makes it a decode rather than a reading
+/// Every one of the 64 bits is accounted for, and the four reserved-zero groups (bit 47, bits
+/// 41:40, bits 37:35) are checked rather than ignored - a word that sets one is a different
+/// encoding and is BLOCKED, not decoded through this table.
+///
+/// ```text
+///   63:59 opcode1 = 0x15   58:57 pred (short)     56 src0_high   54 nosched
+///   53 src1_high  52 src2_high  51 dest_ext  50 end  49 src1_ext  48 src2_ext
+///   47 =0  46:44 repeat  43 signed  42 saturate  41:40 =0  39:38 src2_type
+///   37:35 =0  34 src0_bank  33:32 dest_bank  31:30 src1_bank  29:28 src2_bank
+///   27:21 dest_n  20:14 src0_n  13:7 src1_n  6:0 src2_n        (all numbers DIRECT)
+/// ```
+///
+/// **No operand here is double-register scaled and there is no write mask or swizzle** - the
+/// instruction is scalar on the selected word. Scaling a number that is already direct reads
+/// the wrong register entirely, which is the failure mode
+/// [`r7_double_source_bank_index`] documents from the other direction.
+///
+/// # Why the bank tables are corroborated rather than assumed
+/// The destination bank field goes through [`bank_rsi2`] and the src1/src2 fields through
+/// [`bank_rs2`] - the tables this decoder already carried for unrelated groups, established
+/// from a different source. They agree, field for field, with the layout this group was
+/// extracted under. `src0` is the exception: it is a ONE-bit selector with its own table
+/// (0 = TEMP, 1 = PRIMATTR) and no extension bit at all.
+///
+/// # What is decoded and what is blocked
+/// Blocked, each naming itself, because the evidence establishes the field but not its
+/// meaning: SATURATION (the clamping rule is not established, and a wrong clamp is a silently
+/// wrong number), a `src2_type` other than 32-bit (the 16-bit forms exist but which of the
+/// three remaining values means what does not), a REPEAT count above zero (which operands a
+/// repeat increments is not established for this group), and a destination bank EXTENSION.
+///
+/// # The IMMEDIATE source
+/// `src1` with its extension bit set and bank selector 2 is an inline literal, and the literal
+/// is the 7-bit `src1_n` zero-extended - the same assembly rule the TEST group uses for its own
+/// immediate. It is resolved here rather than in [`ext_source`] because how a literal is put
+/// together is group-specific, which is exactly why that helper refuses it.
+fn decode_grp_imad32(word: u64) -> Instr {
+    let mut blocked = None;
+    let mut block = |reason: &'static str| {
+        if blocked.is_none() {
+            blocked = Some(reason);
+        }
+    };
+
+    // The reserved bits are part of the evidence: the layout closes only because they are zero
+    // on every word it was checked against, so a word that sets one is outside it.
+    if bits(word, 47, 47) != 0 || bits(word, 41, 40) != 0 || bits(word, 37, 35) != 0 {
+        block("0x15 IMAD32: a bit this group's layout requires to be zero is set, so this is a \
+               different encoding and its fields are not established");
+    }
+    if bits(word, 42, 42) != 0 {
+        block("0x15 IMAD32: the saturating form - the clamping rule is not established");
+    }
+    if bits(word, 46, 44) != 0 {
+        block("0x15 IMAD32: a repeat count above zero - which operands a repeat increments is \
+               not established for this group");
+    }
+    let signed = bits(word, 43, 43) != 0;
+    if bits(word, 39, 38) != 2 {
+        block("0x15 IMAD32: a 16-bit source width - the group encodes one, but which of the \
+               three non-32-bit selector values means what is not established");
+    }
+
+    // Destination: 2-bit bank + a 1-bit extension. Only the unextended row is established here.
+    let dest_ext = bits(word, 51, 51) != 0;
+    let dest = if dest_ext {
+        block("0x15 IMAD32: an extended destination bank");
+        None
+    } else {
+        match r7_dest_bank_index(bits(word, 33, 32) as u8, bits(word, 27, 21)) {
+            Some((bank, index)) => Some(Operand::plain(bank, index, bits(word, 33, 32) as u8)),
+            None => {
+                block("0x15 IMAD32: an index-mode destination");
+                None
+            }
+        }
+    };
+
+    // src0: a ONE-bit bank selector with its own table and no extension bit.
+    let src0_sel = bits(word, 34, 34) as u8;
+    let src0_bank = if src0_sel == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+    let src0 = Operand::plain(src0_bank, r7_reg_index(bits(word, 20, 14)), src0_sel);
+
+    // src1 / src2: a 2-bit bank selector plus an extension bit each.
+    let mut source = |ext: bool, sel: u8, field: u32| -> Operand {
+        if !ext {
+            let (bank, index) = r7_source_bank_index(sel, field);
+            return Operand::plain(bank, index, sel);
+        }
+        if sel & 3 == 2 {
+            // IMMEDIATE: the 7-bit number IS the literal, zero-extended.
+            return Operand::plain(Bank::Immediate, (field & 0x7f) as u8, sel);
+        }
+        match ext_source(sel, field, true) {
+            Ok(o) => o,
+            Err(reason) => {
+                block(reason);
+                Operand::plain(Bank::Temp, 0, sel)
+            }
+        }
+    };
+    let src1 = source(bits(word, 49, 49) != 0, bits(word, 31, 30) as u8, bits(word, 13, 7));
+    let src2 = source(bits(word, 48, 48) != 0, bits(word, 29, 28) as u8, bits(word, 6, 0));
+
+    if dest.is_none() {
+        // A blocked destination still has to produce a well-formed instruction for the
+        // listing; the block above is what stops it being emitted.
+        return Instr {
+            op: Op::IntMad { signed, bits: 32 },
+            pred: short_predicate(bits(word, 58, 57)),
+            dest: None,
+            write_mask: [true, false, false, false],
+            srcs: vec![src0, src1, src2],
+            half_precision: false,
+            raw: word,
+            group: 0x15,
+            blocked,
+        };
+    }
+
+    Instr {
+        op: Op::IntMad { signed, bits: 32 },
+        pred: short_predicate(bits(word, 58, 57)),
+        dest,
+        // Scalar: this group carries no write mask, so it writes the one word it names.
+        write_mask: [true, false, false, false],
+        srcs: vec![src0, src1, src2],
+        half_precision: false,
+        raw: word,
+        group: 0x15,
+        blocked,
+    }
+}
+
 /// Decode a group-0x40 VPCK (pack / unpack / format-convert). The encoding is a fact from
 /// the SGX543 ISA reference (group VPCK): `src_fmt`
 /// (bits 43:41) and `dest_fmt` (40:38) pick source/dest formats (0=U8 1=S8 2=O8 3=U16
@@ -2083,6 +2362,13 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // bits in this group are scattered singles, not a contiguous field at any position a
         // repeat count occupies elsewhere.
         0x00 | 0x03 => Some(0),
+        // 0x90 SOP2M: no repeat_count field either, and the field table accounts for every bit
+        // - the four bits at 47:44, where every group that HAS a repeat count puts it, are the
+        // second complement bit plus the top three bits of the write mask. Both are read by
+        // `decode_grp_sop2m` and both are corroborated by the corpus: the mask names exactly
+        // the channel the following test reads, and the complement is what turns the zero
+        // coefficient into the copy the macro needs. A repeat count cannot also live there.
+        0x12 => Some(0),
         // 0x14 I16MAD: the reference does not carry this group's layout, so there is no
         // documented repeat field to read. What IS known is that every occurrence in the corpus
         // is one fixed word outside its register-number field, so for that word the answer is
@@ -2091,6 +2377,14 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // encoding is unknown, and unknown means blocked, not zero: a dropped iteration is
         // exactly the invisible failure this pass exists to prevent.
         0x14 if word & !(0xf << 14) == I16MAD_LOAD_INDEX_WORD => Some(0),
+        // 0x15 IMAD32: a THREE-bit repeat count at 46:44, and bit 47 is a reserved zero rather
+        // than the top of it. Reading it as the usual four bits at 47:44 would be harmless on
+        // every word whose bit 47 is clear and would double the count on any word where it is
+        // not - and `decode_grp_imad32` blocks such a word anyway, because a set bit 47 means
+        // the whole layout is a different one. The field's POSITION is established; what a
+        // repeat ITERATES over in this group is not, so a non-zero count is `None` (blocked)
+        // rather than an unroll count - the same stance `decode_grp_imad32` takes.
+        0x15 if bits(word, 46, 44) == 0 => Some(0),
         _ => None,
     }
 }
@@ -2621,6 +2915,60 @@ mod tests {
         // opt1 = 00 (index1 mode) is a real RIO6 addressing mode not modeled -> still blocked.
         let idx = decode(base); // bits 31:30 = 00
         assert!(idx.blocked.is_some(), "src1 ext index1 mode must stay blocked");
+    }
+
+    /// The group-0x15 IMAD32 layout, checked against the one real word that established it -
+    /// instruction #3 of a shipped vertex program, at code byte 0x18.
+    ///
+    /// The reading is `pa[2] = pa[2] * 48 + sa[24]`, signed, unpredicated, one iteration. What
+    /// makes it a decode rather than a plausible story is that it CLOSES: all four reserved-zero
+    /// groups read zero, every register number is inside its 7-bit field, the width selector
+    /// holds its one defined value, and the arithmetic is the shape a vertex program's
+    /// matrix-palette address computation has - an index scaled by a 48-byte stride (three vec4
+    /// rows) offset by a uniform base. Nothing in the word is left over.
+    #[test]
+    fn group_15_imad32_closes_on_the_word_that_established_it() {
+        let instr = decode(0xa882_0886_b040_9818);
+        assert_eq!(instr.group, 0x15);
+        assert_eq!(instr.op, Op::IntMad { signed: true, bits: 32 });
+        assert_eq!(instr.pred, Predicate::Always);
+        assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
+        let dest = instr.dest.expect("a decoded destination");
+        assert_eq!((dest.bank, dest.index), (Bank::PrimaryAttr, 2));
+        assert_eq!((instr.srcs[0].bank, instr.srcs[0].index), (Bank::PrimaryAttr, 2));
+        // src1 is an IMMEDIATE literal, not a register: its bank-extension bit is set and its
+        // bank selector names the immediate row, so the 7-bit number IS the value.
+        assert_eq!((instr.srcs[1].bank, instr.srcs[1].index), (Bank::Immediate, 48));
+        assert_eq!((instr.srcs[2].bank, instr.srcs[2].index), (Bank::SecondaryAttr, 24));
+        // Scalar: the group carries no write mask, so exactly one channel is written.
+        assert_eq!(instr.write_mask, [true, false, false, false]);
+        // And the repeat encoding agrees: three bits at 46:44, reading zero here.
+        assert_eq!(repeat_extra_iterations(0xa882_0886_b040_9818), Some(0));
+    }
+
+    /// A group-0x15 word that sets a bit the layout requires to be zero is a DIFFERENT encoding,
+    /// and must hard-fail rather than be decoded through a table that was never fitted to it.
+    /// Same for the forms whose fields are established but whose meaning is not - saturation,
+    /// a narrower width, and a non-zero repeat.
+    #[test]
+    fn group_15_imad32_blocks_what_it_cannot_establish() {
+        let base: u64 = 0xa882_0886_b040_9818;
+        for (name, word) in [
+            ("reserved bit 47", base | 1 << 47),
+            ("reserved bits 41:40", base | 1 << 40),
+            ("reserved bits 37:35", base | 1 << 35),
+            ("saturation", base | 1 << 42),
+            ("a repeat count", base | 1 << 44),
+        ] {
+            assert!(
+                decode(word).blocked.is_some(),
+                "{name} must block rather than decode through this layout"
+            );
+        }
+        // The width selector: 2 is the established 32-bit value, so clearing it to a 16-bit
+        // form must block.
+        let narrow = (base & !(0b11 << 38)) | (1 << 38);
+        assert!(decode(narrow).blocked.is_some(), "a 16-bit width must block");
     }
 
     #[test]
@@ -3204,6 +3552,128 @@ mod tests {
             Predicate::IfNotP(1),
             "kill runs when the alpha test FAILS - the analyzer ordering of bits[42:41]"
         );
+    }
+
+    /// The five-instruction ALPHA-TEST MACRO that group 0x90 (SOP2M) and the INT8 test family
+    /// exist for, decoded end to end from one real fragment program:
+    ///
+    /// ```text
+    /// #3  vtst  p0 = (t0.x - sa8) <= 0        sa8 is the reference, 0.01
+    /// #4  sop2  t0.x = 1 * sa9                sa9 is the literal 1 - the "discard" flag
+    /// #5  or    t0.x = sa7 | 0     IF NOT p0  sa7 is the literal 0 - the "keep" flag
+    /// #6  vtst  p1 = (t0.x - sa7) == 0        in the 8-BIT family
+    /// #7  kill                     IF NOT p1
+    /// ```
+    ///
+    /// This one chain pins every field at once, which is why it is worth more than any of the
+    /// assertions below taken separately:
+    ///
+    /// * The SOP2M destination must be the register the OR writes and the VTST reads. Those
+    ///   two are decoded by unrelated code paths (the bitwise group and the test group), so a
+    ///   wrong bank or number field here cannot accidentally agree with them.
+    /// * The write mask must name the channel `chan_cc` reduces on. It is the one field whose
+    ///   raw encoding is ROTATED, and reading it unrotated names a different channel.
+    /// * The coefficient must come out as ONE, not zero. The selector picks a FACTOR that
+    ///   multiplies the named source, so `Zero` plus the complement bit is a copy of sa9 -
+    ///   whereas reading the selector as the OPERAND makes this instruction a constant, leaves
+    ///   sa9 unread, and makes the macro discard every pixel of every draw.
+    /// * The 8-bit test must read its operands as BYTES. sa9 is the bit pattern 0x00000001,
+    ///   which as an f32 is a denormal that compares equal to zero - so an F32 read of the same
+    ///   registers turns the whole macro into a no-op that draws every cut-out texel opaque.
+    #[test]
+    fn the_real_alpha_test_macro_decodes_end_to_end() {
+        // #4 and #6 of one program; #5 and #7 are decoded by groups already covered.
+        const SOP2M: u64 = 0x91811000e0000480;
+        const VTST8: u64 = 0x48880185300a0007;
+
+        let s = decode(SOP2M);
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        assert_eq!(
+            s.op,
+            Op::Sop2 {
+                color: SopOp::Add,
+                alpha: SopOp::Add,
+                f1: SopFactor::Zero,
+                f1_complement: true,
+                f2: SopFactor::Zero,
+                f2_complement: false,
+            },
+            "coefficient 1 - 0 = 1 on the first term, 0 on the second: a copy of src1"
+        );
+        assert_eq!(s.pred, Predicate::Always, "the flag is set unconditionally");
+        let d = s.dest.expect("SOP2M writes a register");
+        assert_eq!((d.bank, d.index), (Bank::Temp, 0), "the register the OR and the VTST use");
+        assert_eq!(
+            s.write_mask,
+            [true, false, false, false],
+            "raw mask 0b0010 rotates to 0b0001 - channel 0, which is what chan_cc reduces on"
+        );
+        assert_eq!(
+            (s.srcs[0].bank, s.srcs[0].index),
+            (Bank::SecondaryAttr, 9),
+            "src1 is the literal 1, and it is READ - the selector is a coefficient, not the operand"
+        );
+        assert_eq!(
+            (s.srcs[1].bank, s.srcs[1].index),
+            (Bank::Immediate, 0),
+            "src2 is an inline immediate, multiplied by a zero coefficient"
+        );
+
+        let t = decode(VTST8);
+        assert!(t.blocked.is_none(), "{:?}", t.blocked);
+        assert_eq!(
+            t.op,
+            Op::Test {
+                alu: TestAlu::Fx8Sub,
+                cmp: TestCmp::Eq,
+                reduce: TestReduce::Channel(0),
+                pdst: 1,
+                write_back: false,
+            }
+        );
+        assert!(!t.half_precision, "the 8-bit family ignores the float precision bit");
+        assert_eq!(
+            (t.srcs[0].bank, t.srcs[0].index),
+            (Bank::Temp, 0),
+            "src1 is the flag register the SOP2M above wrote"
+        );
+        assert_eq!(
+            (t.srcs[1].bank, t.srcs[1].index),
+            (Bank::SecondaryAttr, 7),
+            "src2 is the literal 0, NOT double-register scaled: an 8-bit operand is a direct              register number, and scaling it would read sa14 instead"
+        );
+    }
+
+    /// The SECOND program's pair, which is the same macro on a different register. It is here
+    /// because agreement across two destinations is what makes the destination-field decode a
+    /// measurement rather than a coincidence: both words differ from the pair above in exactly
+    /// the destination bank and number, and both still name the register their own VTST reads.
+    #[test]
+    fn the_alpha_test_macro_agrees_on_a_second_destination() {
+        let s = decode(0x91811002e0200480);
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        let d = s.dest.expect("SOP2M writes a register");
+        assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, 1));
+        assert_eq!((s.srcs[0].bank, s.srcs[0].index), (Bank::SecondaryAttr, 9));
+
+        let t = decode(0x48880185b00a0087);
+        assert!(t.blocked.is_none(), "{:?}", t.blocked);
+        assert_eq!(
+            (t.srcs[0].bank, t.srcs[0].index),
+            (Bank::PrimaryAttr, 1),
+            "the test reads exactly what the combiner wrote"
+        );
+    }
+
+    /// A selector value the reference material does not establish must BLOCK. A combiner
+    /// coefficient scales a whole term, so a guessed one is a wrong picture with no other
+    /// symptom - the failure mode this family was left unwired for in the first place.
+    #[test]
+    fn an_unestablished_sop2m_selector_blocks() {
+        // The same word with sel1 = 1 (bits 40:38), which no source consulted defines.
+        let word = 0x91811000e0000480 | (1u64 << 38);
+        let s = decode(word);
+        assert!(s.blocked.is_some(), "selector 1 is not established and must not be guessed");
     }
 
     /// The one real DEPTHF in the corpus, and the two instructions around it that say what it

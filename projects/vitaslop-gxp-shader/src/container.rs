@@ -407,6 +407,18 @@ pub struct Program {
     /// one entry per texture (the four consecutive control words share a base). A USSE `SMP`
     /// resolves its sampler through this - see [`Program::sampler_unit_at`].
     pub texture_control: Vec<(u32, u32)>,
+    /// Whether [`Self::literals`] and [`Self::texture_control`] were placed using the CONTAINER
+    /// table's own stored base, rather than the default-uniform-buffer-size fallback.
+    ///
+    /// False means the blob declares no LITERAL and no DATA container, so both tables were
+    /// placed by the rule that usually equals the stored base and sometimes does not. Nothing
+    /// about such a program is known to be wrong - it is a statement about the EVIDENCE, and it
+    /// exists so a placement that could be wrong can be reported instead of assumed.
+    pub sa_base_from_container: bool,
+    /// The container table as the blob declares it, kept because "where did this program put
+    /// its literals and its texture control words" is the question a wrong SA base makes
+    /// expensive, and it is not answerable from anything else in here.
+    pub containers: Vec<Container>,
     /// Stable content hash of the whole blob, for pipeline caching (FNV-1a).
     pub hash: u64,
 }
@@ -459,20 +471,90 @@ impl Program {
     }
 }
 
-/// Parse the SA-resident constant/texture tables. Both are indexed in the same "table"
-/// space, which the main program sees offset by the default-uniform-buffer size:
-/// `sa_register = table_index + default_uniform_regs` (table indices 0 and 1 are reserved).
-/// Verified by exact tiling against `secondary_reg_count` on every captured fragment blob,
-/// and semantically (a fog `1.0h` literal read as `1.0 - fogcoord`).
-fn parse_sa_tables(bytes: &[u8], default_uniform_regs: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
-    let sa_reg = |table_index: u32| table_index.wrapping_add(default_uniform_regs);
+/// A container-table entry: which SA-resident block it describes, where that block starts in
+/// the SA register file, and how big it is.
+///
+/// # This table is what says where a literal or a texture's control words live
+/// Both tables below are indexed in a "table" space that has to be added to a BASE, and the
+/// base is a STORED field here rather than anything derived. Every block the program declares
+/// gets one entry, found by matching [`Self::index`] - the entries are NOT in index order and
+/// the array position means nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Container {
+    /// Which block this describes. The numbering is fixed by the format: 0..13 are the
+    /// ordinary uniform buffers, **14 the DEFAULT uniform buffer, 15 TEXTURE, 16 LITERAL,
+    /// 17 SCRATCH, 18 THREAD, 19 DATA**.
+    pub index: u16,
+    /// First SA register of the block.
+    pub base_sa: u16,
+}
+
+/// Parse the container table (header `container_count` at +0x90, self-relative
+/// `container_offset` at +0x94, 8-byte entries).
+fn parse_containers(bytes: &[u8]) -> Vec<Container> {
+    let mut out = Vec::new();
+    let (Some(count), Some(rel)) = (rd_u32(bytes, OFF_CONTAINER_COUNT), rd_u32(bytes, OFF_CONTAINER_OFFSET))
+    else {
+        return out;
+    };
+    let base = OFF_CONTAINER_OFFSET.wrapping_add(rel as usize);
+    for i in 0..count as usize {
+        let e = base.wrapping_add(i * CONTAINER_ENTRY);
+        match (rd_u16(bytes, e), rd_u16(bytes, e + 4)) {
+            (Some(index), Some(base_sa)) => out.push(Container { index, base_sa }),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Container index of the LITERAL block, and of the DATA block the texture-control table is
+/// placed against.
+const CONTAINER_LITERAL: u16 = 16;
+const CONTAINER_DATA: u16 = 19;
+
+/// Parse the SA-resident constant/texture tables.
+///
+/// Both are indexed in a "table" space that is added to their CONTAINER's own `base_sa`:
+/// `sa_register = container.base_sa + table_index`.
+///
+/// # The base is STORED, and substituting the default-uniform-buffer size is what hid a bug
+/// This used to read `sa_register = table_index + default_uniform_regs`, which tiled exactly
+/// against `secondary_reg_count` on five fragment blobs and held for a year - because a
+/// container laid out immediately after the default uniform buffer has exactly that base.
+/// The two rules are not the same rule, and where they disagree the substitute puts a
+/// texture's control words at an ODD SA register, which no `SMP` sampler field can name
+/// (see [`Program::unaddressable_texture_controls`]). A base that the format stores must be
+/// read, not re-derived from something that usually equals it.
+///
+/// When a container is ABSENT the old rule is kept as the fallback and
+/// [`Program::sa_base_from_container`] reports false, so a caller can say so rather than a
+/// blob silently placing every literal and every texture somewhere plausible and wrong.
+fn parse_sa_tables(
+    bytes: &[u8],
+    default_uniform_regs: u32,
+    containers: &[Container],
+) -> (Vec<(u32, u32)>, Vec<(u32, u32)>, bool) {
+    let base_of = |index: u16| {
+        containers.iter().find(|c| c.index == index).map(|c| u32::from(c.base_sa))
+    };
+    // The literal table names the LITERAL container; the texture-control table names DATA.
+    // Either falling back to the other is the reference behaviour for a program that declares
+    // only one of them.
+    let literal_base = base_of(CONTAINER_LITERAL).or_else(|| base_of(CONTAINER_DATA));
+    let texture_base = base_of(CONTAINER_DATA).or_else(|| base_of(CONTAINER_LITERAL));
+    let from_container = literal_base.is_some() && texture_base.is_some();
+    let literal_base = literal_base.unwrap_or(default_uniform_regs);
+    let texture_base = texture_base.unwrap_or(default_uniform_regs);
     let mut literals = Vec::new();
     if let (Some(count), Some(rel)) = (rd_u32(bytes, OFF_LITERAL_COUNT), rd_u32(bytes, OFF_LITERAL_OFFSET)) {
         let base = OFF_LITERAL_OFFSET.wrapping_add(rel as usize);
         for i in 0..count as usize {
             let e = base.wrapping_add(i * LITERAL_ENTRY);
             match (rd_u32(bytes, e), rd_u32(bytes, e + 4)) {
-                (Some(index), Some(value)) => literals.push((sa_reg(index), value)),
+                (Some(index), Some(value)) => {
+                    literals.push((index.wrapping_add(literal_base), value))
+                }
                 _ => break,
             }
         }
@@ -487,10 +569,10 @@ fn parse_sa_tables(bytes: &[u8], default_uniform_regs: u32) -> (Vec<(u32, u32)>,
             if e & 0x3 != 0 {
                 continue;
             }
-            texture_control.push((sa_reg(e >> 16), (e & 0xffff) >> 2));
+            texture_control.push(((e >> 16).wrapping_add(texture_base), (e & 0xffff) >> 2));
         }
     }
-    (literals, texture_control)
+    (literals, texture_control, from_container)
 }
 
 /// Why a blob failed to parse. Parsing is fast-fail: a malformed or out-of-range field
@@ -549,6 +631,12 @@ const OFF_TEXTURE_OFFSET: usize = 0x84;
 const LITERAL_ENTRY: usize = 8;
 /// On-disk size of one texture-control-word entry (a single packed u32).
 const TEXTURE_ENTRY: usize = 4;
+/// Container table: how many entries, and where they are (self-relative to its own field, the
+/// same convention as every other table offset in this header).
+const OFF_CONTAINER_COUNT: usize = 0x90;
+const OFF_CONTAINER_OFFSET: usize = 0x94;
+/// On-disk size of one container entry: four u16 - `index`, unused, `base_sa`, `size_in_f32`.
+const CONTAINER_ENTRY: usize = 8;
 /// Minimum header size to safely read every fixed field above (through 0x78).
 const MIN_HEADER: usize = 0x7c;
 /// On-disk size of one parameter entry.
@@ -661,7 +749,9 @@ impl Program {
         let secondary_code = parse_secondary_code(bytes)?;
 
         let default_uniform_regs = rd_u32(bytes, OFF_DEFAULT_UNIFORM_REGS).unwrap_or(0);
-        let (literals, texture_control) = parse_sa_tables(bytes, default_uniform_regs);
+        let containers = parse_containers(bytes);
+        let (literals, texture_control, sa_base_from_container) =
+            parse_sa_tables(bytes, default_uniform_regs, &containers);
 
         Ok(Program {
             kind,
@@ -671,6 +761,8 @@ impl Program {
             default_uniform_regs,
             literals,
             texture_control,
+            sa_base_from_container,
+            containers,
             primary_reg_count,
             secondary_reg_count,
             temp_reg_count,
@@ -854,8 +946,40 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
         };
 
         // `size` bit 6 says the prefetched sample occupies TWO PA registers (four packed F16
-        // components) rather than one - see `Interpolant::prefetch_regs`.
-        let prefetch_regs = if size & 0x40 != 0 { 2 } else { 1 };
+        // components) rather than one, and bit 7 says it occupies FOUR - the same four
+        // components UNPACKED, one F32 per register. See `Interpolant::prefetch_regs`.
+        //
+        // BIT 7 IS OBSERVED ON EXACTLY ONE DESCRIPTOR across five captured corpora (one retail
+        // racer's in-race composite, `size=0xf0`), so it is not a bit the corpus alone could
+        // teach. What settles it is that TWO independent statements agree on four:
+        //  * CLOSURE. That program declares 8 PA registers and its one descriptor spans 4 data
+        //    registers; at a two-register prefetch the spans sum to 6 and fall short, at four
+        //    they close exactly. Reading bit 7 as a widening of the register-COUNT field
+        //    instead would span 10 and OVERRUN, which closure refuses.
+        //  * THE PROGRAM'S OWN READS. It packs from PrimaryAttr[4] with a four-component
+        //    F32-granular swizzle - pa[4], pa[5], pa[6], pa[7] - and multiplies the result by
+        //    its four F32 data registers. A sample packed into two registers would be read at
+        //    HALF granularity, as every other prefetching program in these corpora reads its.
+        //
+        // A precision-based reading (F16 sample -> 2 registers, F32 -> 4) was REFUTED by the
+        // same closure: the prefetch-ONLY descriptors carry no precision bit either, and at
+        // four registers each they overrun their program's PA allocation.
+        //
+        // Bit 7 without bit 6 has never been seen and is not a shape this reading covers, so it
+        // is refused rather than guessed at - binding a wrong PA map paints a silently wrong
+        // picture, which is the one outcome this decoder must not produce.
+        if size & 0x80 != 0 && size & 0x40 == 0 {
+            return Err(
+                "a varying descriptor sets the wide-prefetch bit without the two-register bit,                  which is not a prefetch width this decoder has ever observed",
+            );
+        }
+        let prefetch_regs = if size & 0x80 != 0 {
+            4
+        } else if size & 0x40 != 0 {
+            2
+        } else {
+            1
+        };
         let span = register_count + if prefetch.is_some() { prefetch_regs } else { 0 };
         out.push(Interpolant {
             usage,
@@ -898,7 +1022,7 @@ pub fn raw_varying_block_words(bytes: &[u8], n: usize) -> Option<Vec<u32>> {
 /// The OUTPUT lanes a vertex program's clip POSITION occupies. The rasteriser consumes these;
 /// they are never a varying. Every other output lane is either a reserved fog / point-size slot
 /// or an interpolated varying.
-const VERTEX_POSITION_LANES: u32 = 4;
+pub(crate) const VERTEX_POSITION_LANES: u32 = 4;
 
 /// The reserved output region - the lanes between the clip POSITION and the texcoords - and the
 /// `vertex_outputs1` bits that declare what is in it. SETTLED BY CORPUS CLOSURE, not by the
@@ -1448,6 +1572,100 @@ mod tests {
         b
     }
 
+    /// Build a blob carrying a CONTAINER table, a texture-control table and a literal table,
+    /// with a header long enough to hold the container fields at 0x90/0x94. `containers` is
+    /// `(container_index, base_sa)`; `textures` is `(sa_offset, unit)` for word 0.
+    fn build_blob_with_containers(
+        default_regs: u32,
+        containers: &[(u16, u16)],
+        textures: &[(u16, u16)],
+        literals: &[(u32, u32)],
+    ) -> Vec<u8> {
+        let header_len = 0x100usize;
+        let cont_abs = header_len;
+        let tex_abs = cont_abs + containers.len() * CONTAINER_ENTRY;
+        let lit_abs = tex_abs + textures.len() * TEXTURE_ENTRY;
+        let code_abs = (lit_abs + literals.len() * LITERAL_ENTRY + 7) & !7;
+        let total = code_abs + 8;
+        let mut b = vec![0u8; total];
+
+        b[0..4].copy_from_slice(&GXP_MAGIC.to_le_bytes());
+        b[OFF_MAJOR] = 1;
+        b[OFF_MINOR] = 4;
+        b[OFF_SIZE..OFF_SIZE + 4].copy_from_slice(&(total as u32).to_le_bytes());
+        b[OFF_TYPE] = 0x01;
+        // No parameters; the table sits at the end so nothing overlaps.
+        b[OFF_PARAMS_OFFSET..OFF_PARAMS_OFFSET + 4]
+            .copy_from_slice(&((total - OFF_PARAMS_OFFSET) as u32).to_le_bytes());
+        b[OFF_ASM_OFFSET..OFF_ASM_OFFSET + 4]
+            .copy_from_slice(&((code_abs - OFF_ASM_OFFSET) as u32).to_le_bytes());
+        b[OFF_DEFAULT_UNIFORM_REGS..OFF_DEFAULT_UNIFORM_REGS + 4]
+            .copy_from_slice(&default_regs.to_le_bytes());
+
+        b[OFF_CONTAINER_COUNT..OFF_CONTAINER_COUNT + 4]
+            .copy_from_slice(&(containers.len() as u32).to_le_bytes());
+        b[OFF_CONTAINER_OFFSET..OFF_CONTAINER_OFFSET + 4]
+            .copy_from_slice(&((cont_abs - OFF_CONTAINER_OFFSET) as u32).to_le_bytes());
+        for (i, (index, base_sa)) in containers.iter().enumerate() {
+            let e = cont_abs + i * CONTAINER_ENTRY;
+            b[e..e + 2].copy_from_slice(&index.to_le_bytes());
+            b[e + 4..e + 6].copy_from_slice(&base_sa.to_le_bytes());
+        }
+        b[OFF_TEXTURE_COUNT..OFF_TEXTURE_COUNT + 4]
+            .copy_from_slice(&(textures.len() as u32).to_le_bytes());
+        b[OFF_TEXTURE_OFFSET..OFF_TEXTURE_OFFSET + 4]
+            .copy_from_slice(&((tex_abs - OFF_TEXTURE_OFFSET) as u32).to_le_bytes());
+        for (i, (sa_offset, unit)) in textures.iter().enumerate() {
+            let e = tex_abs + i * TEXTURE_ENTRY;
+            let packed = (u32::from(*sa_offset) << 16) | (u32::from(*unit) << 2);
+            b[e..e + 4].copy_from_slice(&packed.to_le_bytes());
+        }
+        b[OFF_LITERAL_COUNT..OFF_LITERAL_COUNT + 4]
+            .copy_from_slice(&(literals.len() as u32).to_le_bytes());
+        b[OFF_LITERAL_OFFSET..OFF_LITERAL_OFFSET + 4]
+            .copy_from_slice(&((lit_abs - OFF_LITERAL_OFFSET) as u32).to_le_bytes());
+        for (i, (index, value)) in literals.iter().enumerate() {
+            let e = lit_abs + i * LITERAL_ENTRY;
+            b[e..e + 4].copy_from_slice(&index.to_le_bytes());
+            b[e + 4..e + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        b
+    }
+
+    /// A literal's and a texture's SA register come from their CONTAINER's stored base, not
+    /// from the default-uniform-buffer size.
+    ///
+    /// The two agree whenever a container is laid out immediately after the default uniform
+    /// buffer, which is why the substitute rule tiled exactly on five real blobs and survived
+    /// for a year. This test is built so they DISAGREE: the default uniform buffer is 4
+    /// registers and the containers sit at 20 and 24, so a texture whose table offset is 3
+    /// lands at 27 under the format's rule and at an ODD 7 under the substitute - and 7 is
+    /// exactly the value that made one real program unaddressable by any SMP sampler field.
+    #[test]
+    fn a_containers_stored_base_places_its_table_not_the_uniform_buffer_size() {
+        let blob = build_blob_with_containers(
+            4,
+            &[(14, 0), (16, 20), (19, 24)],
+            &[(3, 1)],
+            &[(2, 0x0000_3c00)],
+        );
+        let p = Program::parse(&blob).expect("blob parses");
+        assert!(p.sa_base_from_container, "both containers are present");
+        assert_eq!(p.texture_control, vec![(27, 1)], "24 (DATA) + 3, not 4 + 3");
+        assert_eq!(p.literals, vec![(22, 0x0000_3c00)], "20 (LITERAL) + 2, not 4 + 2");
+    }
+
+    /// With no container table the old rule is the fallback, and the program SAYS so rather
+    /// than presenting a placement it cannot support.
+    #[test]
+    fn a_blob_with_no_containers_falls_back_and_reports_it() {
+        let blob = build_blob_with_containers(4, &[], &[(3, 1)], &[(2, 7)]);
+        let p = Program::parse(&blob).expect("blob parses");
+        assert!(!p.sa_base_from_container, "no container declares a base");
+        assert_eq!(p.texture_control, vec![(7, 1)], "the default-uniform-buffer fallback");
+        assert_eq!(p.literals, vec![(6, 7)]);
+    }
+
     /// The secondary program is stated three times over - a count and a start/end offset pair -
     /// and the parser only accepts a blob where all three agree, because the alternative is
     /// slicing an instruction stream out of the wrong bytes and running it into the SA bank.
@@ -1676,6 +1894,43 @@ mod tests {
         assert_eq!(p.interpolants[0].prefetch_base(), Some(2));
         assert_eq!(p.interpolants[1].prefetch_base(), Some(6));
         assert_eq!(p.interpolants[2].prefetch_base(), None);
+    }
+
+    #[test]
+    fn a_wide_prefetch_descriptor_takes_four_pa_registers() {
+        // frag_866a6180's only descriptor, verbatim: a retail racer's in-race composite. `size`
+        // is 0xf0 - the register-count field says four data registers, bit 6 says the prefetched
+        // sample is more than one register and bit 7 says it is FOUR (the four components
+        // unpacked, one F32 each), so the span is 8 and closes exactly against the program's own
+        // eight allocated PA registers. At the two-register reading the span is 6, the program
+        // reads PA[6] with nothing feeding it, and the pair falls back.
+        let b = build_frag_with_varyings(&[(0x0ec0_1900, 0, 0xf0, 0x30)]);
+        let p = Program::parse(&b).expect("parse");
+        assert_eq!(
+            p.interpolants,
+            vec![Interpolant {
+                usage: VaryingUsage::TexCoord(1),
+                pa_base: 0,
+                register_count: 4,
+                span: 8,
+                half: false,
+                prefetch: Some(SamplePrefetch { unit: 0, source_texcoord: 0, last: true }),
+                prefetch_regs: 4,
+            }]
+        );
+        assert_eq!(p.interpolants[0].prefetch_base(), Some(4));
+    }
+
+    #[test]
+    fn the_wide_prefetch_bit_without_the_two_register_bit_is_refused() {
+        // Bit 7 without bit 6 is a width this decoder has never observed. Picking either
+        // neighbouring reading would shift every later interpolant's PA base, which is a wrong
+        // register map rather than a missing feature - so the whole block yields nothing and the
+        // pair falls back, loudly.
+        let b = build_frag_with_varyings(&[(0x0ec0_1900, 0, 0xb0, 0x30)]);
+        let p = Program::parse(&b).expect("parse");
+        assert!(p.interpolants.is_empty(), "{:?}", p.interpolants);
+        assert!(p.varyings_error.is_some());
     }
 
     #[test]

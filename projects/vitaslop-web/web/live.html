@@ -279,8 +279,11 @@
       </div>
       <div id="screenwrap"><canvas id="screen" width="960" height="544"></canvas></div>
       <!-- Every counter the run publishes, on the PAGE. The console is unreachable on a phone,
-           which is the device whose numbers are the ones that matter. -->
-      <details id="diagbox" open>
+           which is the device whose numbers are the ones that matter.
+           CLOSED by default: this page is the PRODUCT, and on a phone an open counter panel takes
+           40vh of the screen the game is meant to be on. It opens itself on a fatal error (see
+           `#fatal`), which is the one time it must not be behind a click. -->
+      <details id="diagbox">
         <summary>diagnostics <button id="copydiag" type="button">copy</button></summary>
         <pre id="fatal"></pre>
         <pre id="diag">waiting for the first perf window (30 presents)...</pre>

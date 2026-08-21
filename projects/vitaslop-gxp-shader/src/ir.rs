@@ -159,6 +159,42 @@ pub enum TestAlu {
     Mul,
     /// `src1 & src2` on the raw 32-bit lane (the BITWISE family's AND).
     BitAnd,
+    /// `src1' - src2` in the 8-BIT fixed-point pipeline (the INT8 family's FPSUB8), where a
+    /// register holds four 8-bit unsigned-normalised channels rather than one float.
+    ///
+    /// It is a distinct member rather than a flag on [`Self::Sub`] because the ALU family
+    /// changes how the OPERANDS ARE READ, not just what is done to them: reading an 8-bit
+    /// lane as an F32 register turns the byte pattern 0x00000001 into a denormal, which
+    /// compares equal to zero and silently disables the alpha test the corpus uses this for.
+    Fx8Sub,
+}
+
+/// One term's coefficient in the 8-bit sum-of-products combiner ([`Op::Sop2`]). The field
+/// selects a FACTOR that multiplies the term's own source register - it does not select the
+/// operand. That distinction is the whole instruction: with the factor `Zero` and the term's
+/// complement bit set, the coefficient becomes `1 - 0 = 1` and the term is a plain copy of
+/// its source, which is exactly how the corpus's alpha-test macro moves a register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopFactor {
+    /// Constant 0 in every channel.
+    Zero,
+    /// Source 1's own channel value.
+    Src1Color,
+    /// Source 1's alpha, broadcast to every channel.
+    Src1Alpha,
+    /// Source 2's own channel value.
+    Src2Color,
+    /// Source 2's alpha, broadcast to every channel.
+    Src2Alpha,
+}
+
+/// The per-channel operation the 8-bit combiner applies to its two terms ([`Op::Sop2`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopOp {
+    Add,
+    Sub,
+    Min,
+    Max,
 }
 
 /// The per-channel boolean a test instruction forms from its ALU result `r` against zero.
@@ -247,6 +283,28 @@ pub enum Op {
     /// 2 is an immediate (already rotated/inverted at decode); otherwise source 2 is a
     /// register (`srcs[1]`). Emitted via `bitcast<u32>`.
     Bitwise { kind: BitwiseKind, imm: Option<u32>, lane_bits: u8 },
+    /// The 8-BIT FIXED-POINT SUM-OF-PRODUCTS combiner (group 0x12, "SOP2M"): a register is
+    /// four 8-bit unsigned-normalised channels, and the instruction computes
+    ///
+    /// ```text
+    ///   term1  = coeff(f1, complement1) * src1
+    ///   term2  = coeff(f2, complement2) * src2
+    ///   rgb    = color(term1.rgb, term2.rgb)
+    ///   alpha  = alpha(term1.a,   term2.a)
+    /// ```
+    ///
+    /// The RGB channels and the alpha channel carry INDEPENDENT operations over the SAME two
+    /// terms, which is what makes this one instruction rather than two. See [`SopFactor`] for
+    /// why the coefficient is not the operand.
+    Sop2 {
+        color: SopOp,
+        alpha: SopOp,
+        f1: SopFactor,
+        /// `f1` is used as `1 - f1` (a one's complement of the COEFFICIENT, not of the source).
+        f1_complement: bool,
+        f2: SopFactor,
+        f2_complement: bool,
+    },
     /// Format pack/convert (group 0x40, VPCK). A float<->float repack (F16<->F32) preserves
     /// the NUMBER while changing its STORAGE width, so it is emitted like a move - but the
     /// source and destination are read and written at their own precisions, which is the whole
@@ -262,6 +320,15 @@ pub enum Op {
     /// (VBW, the integer MADs) read and write. The normalized (`scale` set) and C10/O8 forms
     /// stay blocked - they change the value by a factor this does not model.
     PackToInt { bits: u8, signed: bool, src_half: bool },
+    /// Integer multiply-add (group 0x15, IMAD32): `dest = src0 * src1 + src2`, scalar, on the
+    /// 32-bit lane read as an integer of the given signedness. `bits` is the operand width;
+    /// only 32 is decoded, because the narrower selector values are encoded but not
+    /// established (the decoder blocks them by name rather than guessing).
+    ///
+    /// This shares no encoding with [`Op::LoadIndex`]'s group 0x14 despite the neighbouring
+    /// opcode: the two groups carry different field layouts, and reading one through the
+    /// other's table is how a "similar" group silently addresses the wrong registers.
+    IntMad { signed: bool, bits: u8 },
     /// Load an INDEX register (group 0x14, I16MAD, in the one encoding the corpus establishes):
     /// `i[dest] = src + addend`, as a 16-bit integer.
     ///
@@ -338,6 +405,8 @@ impl Op {
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. }
                 | Op::Pack { .. } | Op::PackToInt { .. } | Op::Bitwise { .. }
+                | Op::Sop2 { .. }
+                | Op::IntMad { .. }
                 | Op::LoadIndex { .. }
                 | Op::Test { .. } | Op::Kill | Op::DepthF
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
@@ -375,8 +444,10 @@ impl Op {
             Op::Tex { .. } => "tex",
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
+            Op::IntMad { .. } => "imad",
             Op::LoadIndex { .. } => "loadidx",
             Op::Bitwise { .. } => "bitwise",
+            Op::Sop2 { .. } => "sop2.fx8",
             Op::Test { .. } => "vtst",
             Op::Kill => "kill",
             Op::DepthF => "depthf",
