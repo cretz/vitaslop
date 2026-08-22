@@ -841,11 +841,23 @@ impl GuestMemory for SharedView {
         // region below it, so this clamp should never bite; it is here so that a bad
         // length reads a short range rather than the bytes above the map.
         let last = ((off + len - 1) >> shift).min(self.pages());
-        let mut pages = vec![0u8; last - first + 1];
-        self.bytes
-            .subarray(self.stamp_at(block, first), self.stamp_at(block, last + 1))
-            .copy_to(&mut pages);
-        Some(pages.iter().any(|&s| s >= stamp))
+        // >>> A REUSED SCRATCH BUFFER, NOT A FRESH `Vec` PER CALL. This is asked once per
+        // retained snapshot per scene - hundreds of times a presented frame - and a wasm
+        // allocation is dearer than the two boundary crossings around it. Thread-local
+        // because the trait method takes `&self` (see `GuestMemory::dirty_since` for why it
+        // must), and every engine thread has its own.
+        thread_local! {
+            static PAGES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        PAGES.with(|p| {
+            let mut pages = p.borrow_mut();
+            pages.clear();
+            pages.resize(last - first + 1, 0);
+            self.bytes
+                .subarray(self.stamp_at(block, first), self.stamp_at(block, last + 1))
+                .copy_to(&mut pages);
+            Some(pages.iter().any(|&s| s >= stamp))
+        })
     }
 
     fn dirty_epoch(&self) -> Option<u8> {
@@ -1874,7 +1886,24 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
 /// calls a long frame retires a few thousand rounds a second, so a 100,000-round window
 /// would have said nothing for minutes - which is exactly the silence this report exists
 /// to break.
-const PROGRESS_ROUNDS: u64 = 2_000;
+/// >>> AND SIZED SMALL, BECAUSE A LONG FRAME IS NOT ALWAYS A BUSY ONE.
+///
+/// The reasoning above assumes a frame that grinds retires rounds while it grinds. A frame
+/// that blocks - one host call reading tens of megabytes off storage, one driver call
+/// compiling a pipeline - retires almost NONE, so a window of thousands never fires and the
+/// page shows the last frame it FINISHED for as long as the block lasts. That is exactly the
+/// report this exists to prevent, and it is the shape a user describes as "it never went to
+/// frame 2".
+///
+/// The callback is cheap to reach (its first act is a rate-limited emit, ten a second), so the
+/// cost of a small window is one clock read per 64 rounds - unmeasurable next to a round, which
+/// is a resume of translated guest code.
+const PROGRESS_ROUNDS: u64 = 64;
+
+/// How often the heavier per-frame report - the game clock, the I/O waiters and the hottest
+/// NIDs - is built. Coarse on purpose: it locks the host and walks a histogram, which answers
+/// "what is it spinning ON" and is only a question worth asking of a frame that IS spinning.
+const LONG_FRAME_ROUNDS: u64 = 2_000;
 
 /// The browser preemptive run loop: the async twin of native's
 /// `Scheduler::run_frames`, composing the shared [`SchedCore`]. Runs until the process
@@ -1905,8 +1934,16 @@ pub async fn run_frames(
             return RunReport::RoundLimit;
         }
         rounds += 1;
-        if rounds % PROGRESS_ROUNDS == 0 {
+        // `rounds == 1` as well as the window: a frame that blocks on its FIRST call would
+        // otherwise say nothing at all, and "frame N in progress: 1 round" against a frozen
+        // clock is the whole diagnosis.
+        if rounds == 1 || rounds % PROGRESS_ROUNDS == 0 {
             progress(rounds);
+        }
+        // The HEAVY half of the report keeps the coarse window: it takes the host lock and
+        // builds a selector histogram, which is not something to do every 64 rounds. The
+        // cheap half above is what a blocked frame needs; this is what a SPINNING one does.
+        if rounds % LONG_FRAME_ROUNDS == 0 {
             // What a long frame is actually DOING, unconditionally: the game clock (a
             // frame that grinds with a FROZEN clock is a livelock, one that grinds with a
             // moving clock is just slow, and those need opposite fixes), and the NIDs the

@@ -63,6 +63,18 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
         // Module 0 is the source player; its params carry the AT9 buffer + config.
         if module == 0 {
             st.audio_state.at9.set_player_params(ctx, voice, addr);
+        } else if !st.audio_state.at9.set_module_params(ctx, voice, addr) {
+            // An unrecognised non-source module. Dumped rather than dropped: one of
+            // these turned out to carry the master level, and it was identified from
+            // exactly this report.
+            tracing::debug!(
+                target: "vitaslop::at9",
+                voice = format_args!("{voice:#x}"),
+                module,
+                id = format_args!("{:#010x}", ctx.read_u32(addr)),
+                "non-source module params, not interpreted: {:02x?}",
+                ctx.read_bytes(addr, 48)
+            );
         }
     }
     ctx.ret(0);
@@ -212,10 +224,44 @@ pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, _st: &mut VitaState, _voi
     0
 }
 
+/// The declared size of a params interface, by id - what `uSize` must say for a reader
+/// to recognise the struct. Sizes are the ones the layouts in [`crate::vita::at9`] were
+/// established from; an id we do not know keeps the block size, which is the only
+/// honest claim available for it and which every reader will (correctly) refuse.
+fn params_interface_size(param_id: u32) -> u32 {
+    match param_id {
+        0x0101_5caa => 96, // the ATRAC9 player
+        0x0101_5ce6 => 84, // the PCM player
+        0x0101_5ce1 => 40, // the buss
+        _ => NGS_BLOCK_SIZE,
+    }
+}
+
 /// SceInt32 sceNgsVoiceLockParams(SceNgsHVoice voice, SceUInt32 moduleId,
 ///                                SceUInt32 paramInterfaceId, SceNgsBufferInfo *buffer)
 /// Return a stable, writable params buffer as `{ data, size }` so the title's
 /// per-frame lock/edit/unlock cycle reuses one block instead of leaking each frame.
+///
+/// >>> THE BUFFER COMES BACK CARRYING ITS `SceNgsParamsDescriptor` HEADER
+/// >>> (`{ uId, uSize }`), AND THAT IS WHAT MAKES A TITLE'S MUSIC AUDIBLE.
+///
+/// Lock does not hand out blank memory on the device: it hands back the voice's
+/// CURRENT parameters, which already begin with the descriptor naming which params
+/// interface they are. A title therefore writes only the fields it wants to change
+/// and never writes `uId` itself.
+///
+/// Handing back a zeroed block instead left `uId == 0`, so
+/// [`At9Voice::load_params`](crate::vita::at9) rejected every source that arrived this
+/// way at its first check - while the buffer's other fields (source pointer, byte
+/// count, channel count, and a valid `0xFE` ATRAC9 config word) were all correct and
+/// sitting right there. MEASURED on a title's music voice: every field parsed, only
+/// the id was zero. The whole engine below this - decoder, mixer, sink, ring, worklet
+/// - was correct and produced exactly nothing, because a stream of digital silence is
+/// what a rejected source sounds like.
+///
+/// The id written is the one the CALLER asked for (`param`), which is the same
+/// interface it is about to write params for; a buffer already handed out keeps its
+/// contents, because it IS the voice's persistent parameter state across the cycle.
 #[hostcall]
 pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, param: u32, buffer: Ptr) -> i32 {
     let key = (voice, module, param);
@@ -224,6 +270,18 @@ pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u
         None => {
             let a = st.galloc(NGS_BLOCK_SIZE, 16);
             st.audio_state.ngs_param_bufs.push((key, a));
+            // `uSize` is the size of the PARAMS INTERFACE being locked, not of the
+            // block we happen to allocate for it.
+            //
+            // >>> WRITING THE BLOCK SIZE HERE BROKE EVERY VOICE THAT ARRIVES THIS WAY.
+            // The readers check `uSize` to confirm they are looking at the struct they
+            // were REd from, which is exactly the check that keeps a wrong layout from
+            // being applied to audio - so a descriptor claiming 256 was refused by name,
+            // and a whole title's sound effects went silent behind a correct-looking
+            // report. Measured on a retail title: every PCM voice refused with
+            // "uSize 256, not the 84 this layout was REd from".
+            ctx.write_u32(a, param);
+            ctx.write_u32(a + NGS_PARAMS_DESC_SIZE_OFF, params_interface_size(param));
             a
         }
     };
@@ -246,11 +304,83 @@ pub(super) fn voice_def_get(_ctx: &mut GuestCtx, st: &mut VitaState) -> u32 {
 }
 
 /// SceInt32 sceNgsPatchCreateRouting(const SceNgsPatchSetupInfo *info, SceNgsHPatch *handle)
+///
+/// `SceNgsPatchSetupInfo` opens with the SOURCE voice handle, which is what makes a patch
+/// addressable back to the voice it carries - and that is what
+/// [`voice_patch_set_volume`] needs to turn a routing volume into a voice gain. The
+/// mapping is recorded here rather than rediscovered later, because the patch handle is
+/// otherwise an opaque block with nothing linking it to anything.
 #[hostcall]
-pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, _info: Ptr, handle: Ptr) -> i32 {
+pub(super) fn patch_create_routing(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr, handle: Ptr) -> i32 {
     let patch = st.galloc(NGS_BLOCK_SIZE, 16);
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), patch);
+    }
+    if !info.is_null() {
+        // `SceNgsPatchSetupInfo`: source voice at +0x00, destination voice at +0x0c.
+        // Confirmed over 276 routings in one run - the destinations form a small tree
+        // (many sources -> two sub-busses -> one -> one) and every destination is a
+        // voice that never carries a source of its own.
+        let source_voice = ctx.read_u32(info.addr());
+        let destination_voice = ctx.read_u32(info.addr() + 0x0c);
+        tracing::debug!(
+            target: "vitaslop::at9",
+            patch = format_args!("{patch:#x}"),
+            source_voice = format_args!("{source_voice:#x}"),
+            destination_voice = format_args!("{destination_voice:#x}"),
+            "patch routing created"
+        );
+        st.audio_state.ngs_patch_voice.push((patch, source_voice));
+        st.audio_state.at9.set_route(source_voice, destination_voice);
+    }
+    0
+}
+
+/// SceInt32 sceNgsVoicePatchSetVolume(SceNgsHPatch patch, SceInt32 outputChannel,
+///                                    SceInt32 inputChannel, SceFloat32 volume)
+///
+/// >>> WITHOUT THIS EVERY VOICE MIXES AT FULL SCALE, WHICH CLIPS.
+///
+/// The routing volume is how NGS actually balances a mix: a title sets many voices
+/// playing and turns most of them well down. Stubbed to `ret(0)`, one title's front end
+/// summed ~100 simultaneous voices at unity and CLAMPED 14.7% of its nonzero samples -
+/// gross distortion that reads as a broken decoder. Applying the volume is not a
+/// refinement, it is the difference between a mix and a clipped sum.
+#[hostcall]
+pub(super) fn voice_patch_set_volume(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    patch: u32,
+    _output_channel: i32,
+    _input_channel: i32,
+    volume: f32,
+) -> i32 {
+    st.audio_state.set_patch_volume(patch, volume);
+    0
+}
+
+/// SceInt32 sceNgsVoicePatchSetVolumesMatrix(SceNgsHPatch patch,
+///                                           const SceNgsVolumeMatrix *matrix)
+///
+/// The matrix is a 2x2 of `SceFloat32` (source channels x destination channels). It is
+/// reduced to ONE per-voice gain, because the mixer downstream is per voice: the loudest
+/// entry is taken, which is the only reduction that cannot make a voice quieter than the
+/// title asked for on any channel.
+#[hostcall]
+pub(super) fn voice_patch_set_volumes_matrix(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    patch: u32,
+    matrix: Ptr,
+) -> i32 {
+    // No early `return` here: `#[hostcall]` rewrites the body, so one would not mean
+    // what it reads as.
+    if !matrix.is_null() {
+        let loudest = (0..4u32)
+            .map(|i| f32::from_bits(ctx.read_u32(matrix.addr() + i * 4)))
+            .filter(|v| v.is_finite())
+            .fold(0.0f32, f32::max);
+        st.audio_state.set_patch_volume(patch, loudest);
     }
     0
 }
@@ -305,9 +435,11 @@ pub(super) fn voice_set_params_block(
             let params = base + NGS_MODULE_PARAM_HEADER_BYTES;
             let entry_bytes = ctx.read_u32(params + NGS_PARAMS_DESC_SIZE_OFF);
             // Module 0 is the source player; its params carry the AT9 buffer + config.
-            // Every other module is a synthesiser stage nothing here runs.
+            // Of the rest, only the buss module is understood - see `set_module_params`.
             if module == 0 {
                 st.audio_state.at9.set_player_params(ctx, voice, params);
+            } else {
+                st.audio_state.at9.set_module_params(ctx, voice, params);
             }
             applied += 1;
             // A zero or absurd size cannot be stepped over; stop rather than spin.
@@ -340,6 +472,155 @@ fn report_block_layout_mismatch(size: u32, walked: u32, entries: u32) {
              (8-byte header + descriptor size) entries - walked {walked} bytes in \
              {entries} entr(ies). The entry layout is REd from one title; the remainder \
              was NOT applied."
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_params_tests {
+    //! The lock/write/unlock cycle a title's music takes, end to end against real
+    //! `VitaState` and guest memory.
+    //!
+    //! These pin the contract whose absence made EVERY title silent: a params buffer
+    //! handed back by `sceNgsVoiceLockParams` must already carry its
+    //! `SceNgsParamsDescriptor` id, because the title never writes one and the AT9
+    //! reader rejects the source without it. The failure had no symptom other than
+    //! correctly-paced digital silence, which is why it survived a working decoder, a
+    //! working mixer and a working browser sink.
+    use super::*;
+    use crate::host::{GuestCtx, SliceMemory, VFP_ARG_COUNT};
+    use crate::world::DeterministicWorld;
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    /// The AT9 params descriptor id, as `vita::at9` matches it.
+    const AT9_PLAYER_ID: u32 = 0x0101_5caa;
+    /// Offsets inside the player params, mirrored from `vita::at9`.
+    const OFF_BUFFER_PTR: u32 = 0x08;
+    const OFF_BUFFER_BYTES: u32 = 0x0c;
+    const OFF_CHANNELS: u32 = 0x58;
+    const OFF_CONFIG: u32 = 0x5c;
+
+    /// A real ATRAC9 config word (48 kHz stereo), taken from a title's music voice. It
+    /// is a four-byte format descriptor, and the decoder must accept it for the voice
+    /// to start - which is what makes `plays` below a genuine end-to-end assertion
+    /// rather than a check that we set a flag.
+    const AT9_CONFIG: [u8; 4] = [0xfe, 0x74, 0x09, 0xf0];
+
+    /// Guest memory large enough for `galloc` (which starts a megabyte above the base)
+    /// plus the 5 MB main-stack reserve it refuses to encroach on.
+    const MEM_BYTES: u32 = 16 * 1024 * 1024;
+
+    struct Harness {
+        st: VitaState,
+        mem: Vec<u8>,
+        regs: [u32; REG_COUNT],
+        vfp: [u32; VFP_ARG_COUNT],
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            Harness {
+                st: VitaState::new(0, MEM_BYTES, Box::new(DeterministicWorld::default())),
+                mem: vec![0u8; MEM_BYTES as usize],
+                regs: [0u32; REG_COUNT],
+                vfp: [0u32; VFP_ARG_COUNT],
+            }
+        }
+
+        /// Call a host handler with the given guest arguments in r0..r3.
+        fn call(&mut self, f: fn(&mut GuestCtx, &mut VitaState), args: [u32; 4]) {
+            self.regs[..4].copy_from_slice(&args);
+            let mut mem = SliceMemory(&mut self.mem);
+            let mut ctx = GuestCtx::new(&mut self.regs, &mut self.vfp, &mut mem, 0);
+            f(&mut ctx, &mut self.st);
+        }
+
+        fn read_u32(&self, addr: u32) -> u32 {
+            let a = addr as usize;
+            u32::from_le_bytes([self.mem[a], self.mem[a + 1], self.mem[a + 2], self.mem[a + 3]])
+        }
+
+        fn write_u32(&mut self, addr: u32, v: u32) {
+            let a = addr as usize;
+            self.mem[a..a + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        /// Lock module 0's AT9 player params and return the buffer the title gets.
+        fn lock(&mut self, voice: u32) -> u32 {
+            let info = 0x2000u32; // somewhere harmless for the SceNgsBufferInfo out-param
+            self.call(voice_lock_params, [voice, 0, AT9_PLAYER_ID, info]);
+            self.read_u32(info)
+        }
+
+        /// Fill in a params buffer the way a title does: everything but the id.
+        fn write_source(&mut self, buf: u32, data_ptr: u32, data_bytes: u32) {
+            self.write_u32(buf + OFF_BUFFER_PTR, data_ptr);
+            self.write_u32(buf + OFF_BUFFER_BYTES, data_bytes);
+            self.write_u32(buf + OFF_CHANNELS, 2);
+            let a = (buf + OFF_CONFIG) as usize;
+            self.mem[a..a + 4].copy_from_slice(&AT9_CONFIG);
+        }
+    }
+
+    /// THE REGRESSION. Lock must hand back a buffer that already names which params
+    /// interface it is - the title asked for one by id and writes only the fields it
+    /// wants to change.
+    #[test]
+    fn locked_params_buffer_carries_its_descriptor_id() {
+        let mut h = Harness::new();
+        let buf = h.lock(0x1234);
+        assert_ne!(buf, 0, "lock must hand back a buffer");
+        assert_eq!(
+            h.read_u32(buf),
+            AT9_PLAYER_ID,
+            "the params buffer must carry the descriptor id the caller locked; a zero here \
+             is the defect that made every AT9 source be rejected and every title silent"
+        );
+        assert_eq!(
+            h.read_u32(buf + NGS_PARAMS_DESC_SIZE_OFF),
+            96,
+            "uSize must be the size of the PARAMS INTERFACE locked (96 for the AT9 player), \
+             not the size of the block allocated for it - the readers check it to confirm they \
+             are looking at the struct they were REd from, so a block size here makes every \
+             voice that arrives this way refuse itself"
+        );
+    }
+
+    /// The same buffer, filled in as a title fills it, is accepted as an AT9 source and
+    /// the voice actually starts - which requires the real decoder to accept the config.
+    #[test]
+    fn a_locked_and_unlocked_source_plays() {
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let buf = h.lock(voice);
+        // A source buffer somewhere in guest memory; the bytes need not decode for the
+        // voice to START, which is the step this test is about.
+        h.write_source(buf, 0x0020_0000, 0x3fc0);
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        h.call(voice_play, [voice, 0, 0, 0]);
+        assert!(
+            h.st.audio_state.at9.any_playing(),
+            "after lock -> write -> unlock -> play the voice must be playing; if it is not, \
+             the source was rejected and the title will be silent"
+        );
+    }
+
+    /// The negative control, which is what the engine did before: with the descriptor id
+    /// cleared, the identical params are refused. Without this a future change that
+    /// stops writing the id would leave both tests above passing for the wrong reason
+    /// only if it also broke lock - this pins the id itself as the load-bearing field.
+    #[test]
+    fn a_source_without_its_descriptor_id_is_refused() {
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let buf = h.lock(voice);
+        h.write_source(buf, 0x0020_0000, 0x3fc0);
+        h.write_u32(buf, 0); // undo the descriptor id
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        h.call(voice_play, [voice, 0, 0, 0]);
+        assert!(
+            !h.st.audio_state.at9.any_playing(),
+            "a params buffer with no descriptor id is not an AT9 source and must not play"
         );
     }
 }

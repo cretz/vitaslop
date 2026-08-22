@@ -541,6 +541,53 @@ async function main() {
         `[audio] context=${audio.state} written=${audio.written} (${secs(audio.written)}s) ` +
           `read=${audio.read} (${secs(audio.read)}s) underrun=${audio.underrun} overrun=${audio.overrun}`
       );
+      // >>> COUNTERS CANNOT TELL MUSIC FROM SILENCE. A frame of zeroes is written and
+      // read exactly like a frame of music, and an engine that produced nothing but
+      // perfectly paced digital silence reported healthy counters for a long time. The
+      // peak below is the cheap half of the answer; AUDIO_DUMP=<file> writes the ring's
+      // last ~0.5s as raw s16le so a real signal check can run on it offline.
+      // The whole-run high-water mark. This is the load-bearing check: the ring probe
+      // below only sees the last half second, and a title with sparse audio (one
+      // measured front end is silent 95% of the time) shows an empty ring at the end of
+      // a run that was full of sound.
+      console.log(
+        audio.peak > 0
+          ? `[audio] RUN PEAK ${audio.peak.toFixed(4)} (${(20 * Math.log10(audio.peak)).toFixed(1)} dBFS) - the run PRODUCED SOUND`
+          : `[audio] RUN PEAK 0 - NOTHING was audible at any point, despite the counters above`
+      );
+      const probe = await page
+        .evaluate(() => {
+          if (!window.__audioSamples) return null;
+          const s = window.__audioSamples();
+          let peak = 0;
+          for (let i = 0; i < s.length; i++) peak = Math.max(peak, Math.abs(s[i]));
+          return { peak, count: s.length, pcm: Array.from(s) };
+        })
+        .catch(() => null);
+      if (!probe) {
+        console.log("[audio] this page exposes no sample probe - cannot tell silence from sound");
+      } else if (probe.peak === 0) {
+        console.log(
+          `[audio] the ring's last 0.5s is silent (${probe.count} samples, every one zero)` +
+            (audio.peak > 0
+              ? " - which is only a quiet MOMENT, since the run peak above is non-zero"
+              : ", and so was the whole run")
+        );
+      } else {
+        console.log(
+          `[audio] ring carries SOUND: peak ${probe.peak.toFixed(4)} ` +
+            `(${(20 * Math.log10(probe.peak)).toFixed(1)} dBFS) over ${probe.count} samples`
+        );
+      }
+      if (probe && process.env.AUDIO_DUMP) {
+        const fsp = await import("node:fs/promises");
+        const buf = Buffer.alloc(probe.pcm.length * 2);
+        for (let i = 0; i < probe.pcm.length; i++) {
+          buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(probe.pcm[i] * 32768))), i * 2);
+        }
+        await fsp.writeFile(process.env.AUDIO_DUMP, buf);
+        console.log(`[audio] wrote ${buf.length} bytes of ring PCM to ${process.env.AUDIO_DUMP}`);
+      }
     } else {
       console.log("[audio] no ring on this page - the run was SILENT");
     }

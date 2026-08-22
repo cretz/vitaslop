@@ -316,8 +316,9 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
     use crate::nid::gxm as g;
     use gxmctx::off as ctxoff;
     use vitaslop_transpiler::InlineOp::{
-        CopyArgIndexed, LoadScaled, LoadShiftMask, ReserveUniformBuffer, SetUniformData, StoreArg,
-        StoreArgField, StoreArgFieldInPlace, StoreArgIndexed,
+        BindPrecomputedState, CopyArgIndexed, LoadScaled, LoadShiftMask, ReserveUniformBuffer,
+        SetUniformData, StoreArg, StoreArgField, StoreArgFieldInPlace, StoreArgIndexed,
+        StoreArgRun, StoreVfpRun,
     };
     // A `void sceGxmSet*(SceGxmContext *context, uint32 value)`: one word of the context
     // block, at the offset its handler writes.
@@ -411,6 +412,15 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // [`vitaslop_transpiler::InlineOp::StoreArgFieldInPlace`] for the form that matches it.
         // Another **465.6 calls a frame** on the same title, from the same loop.
         g::TEXTURE_SET_MIP_FILTER => tex_set_in_place(texword0::MIP_FILTER),
+        // `sceGxmTextureSetData(texture, data)`: control word 2 is the data address with the
+        // two low LOD bits packed under it, and the handler is exactly "keep the two low
+        // bits, store the aligned pointer, return 0" - which IS the in-place field store,
+        // with the field being every bit but those two. The argument arrives already in
+        // field position (a pointer's low two bits are alignment, not payload), so the
+        // in-place form is the right one for the same reason MIP_FILTER's is. MEASURED at
+        // 32 calls per frame on a racing title's race - a texture data swap per animated
+        // texture per frame - each one a full crossing to mask one word.
+        g::TEXTURE_SET_DATA => StoreArgFieldInPlace { offset: 8, mask: 0xffff_fffc },
         // The two PROGRAM-pointer reads. Everything above is handed a parameter record;
         // these are handed the `SceGxmProgram` itself, which changes nothing about the
         // lowering - an inline form is defined by (pointer argument, offset), and which
@@ -457,6 +467,22 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         g::SET_FRONT_POINT_LINE_WIDTH => store(ctxoff::FRONT_POINT_LINE_WIDTH),
         g::SET_FRONT_STENCIL_REF => store(ctxoff::FRONT_STENCIL_REF),
         g::SET_VIEWPORT_ENABLE => store(ctxoff::VIEWPORT_ENABLE),
+        // `sceGxmSetViewport(context, 6 floats)`: the handler stores the six argument
+        // floats' raw bits into six consecutive context words and returns 0, which is the
+        // VFP run form exactly - the hardfloat AAPCS carries them in s0..s5. ~12 calls per
+        // frame on a racing title's race, each a full crossing to move 24 bytes.
+        g::SET_VIEWPORT => StoreVfpRun { offset: ctxoff::VIEWPORT, count: 6 },
+        // `sceGxmSetRegionClip(context, mode, xMin, yMin, xMax, yMax)`: five argument words
+        // stored as passed into the five consecutive words at REGION_CLIP_MODE (the mode,
+        // then the four bounds at REGION_CLIP = REGION_CLIP_MODE + 4). The last two
+        // arguments ride the guest stack, which the run form reads exactly where
+        // `GuestCtx::arg` does. Another ~12 calls per frame from the same draw loop.
+        g::SET_REGION_CLIP => StoreArgRun { offset: ctxoff::REGION_CLIP_MODE, count: 5 },
+        // The two per-draw-loop state binds: a copy between two guest structures now that
+        // the precomputed state lives in guest memory (`vita::gxmstate`). 24 calls per
+        // frame EACH on a racing title's race - the last non-draw GXM crossings it makes.
+        g::SET_PRECOMPUTED_VERTEX_STATE => BindPrecomputedState { layout: bind_state_layout(false) },
+        g::SET_PRECOMPUTED_FRAGMENT_STATE => BindPrecomputedState { layout: bind_state_layout(true) },
         g::SET_FRONT_VISIBILITY_TEST_ENABLE => store(ctxoff::FRONT_VISIBILITY_TEST_ENABLE),
         g::SET_FRONT_VISIBILITY_TEST_INDEX => store(ctxoff::FRONT_VISIBILITY_TEST_INDEX),
         g::SET_FRONT_VISIBILITY_TEST_OP => store(ctxoff::FRONT_VISIBILITY_TEST_OP),
@@ -560,6 +586,35 @@ fn uniform_ring_layout(record: u32) -> vitaslop_transpiler::UniformRingLayout {
     }
 }
 
+/// Where `InlineOp::BindPrecomputedState` finds everything, per stage - the one place the
+/// context, state-struct and arrays-block offsets meet the emitter. Pinned to the handlers
+/// by the `precomputed_state_binds` tests.
+fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
+    use crate::vita::gxmstate;
+    vitaslop_transpiler::BindStateLayout {
+        ctx_magic_at: gxmctx::off::MAGIC,
+        ctx_magic: gxmctx::MAGIC,
+        st_magic_at: gxmstate::off::MAGIC,
+        st_magic: if fragment { gxmstate::MAGIC_FRAGMENT } else { gxmstate::MAGIC_VERTEX },
+        st_block_at: gxmstate::off::BLOCK,
+        st_buf_at: gxmstate::off::BUF,
+        st_size_at: gxmstate::off::SIZE,
+        st_header_at: gxmstate::off::HEADER,
+        st_handle_at: gxmstate::off::HANDLE,
+        ctx_record: if fragment { gxmctx::off::FRAGMENT_UNIFORM } else { gxmctx::off::VERTEX_UNIFORM },
+        copy_dst: if fragment { gxmctx::off::TEXTURES } else { gxmctx::off::VERTEX_UNIFORM_BUFFERS },
+        copy_bytes: if fragment {
+            gxmstate::FRAGMENT_BLOCK_BYTES
+        } else {
+            // The vertex block's TABLE half only - the recorded (never-applied) textures
+            // behind it stay behind, see `gxmstate::VERTEX_BLOCK_BYTES`.
+            gxmstate::VERTEX_BLOCK_TEXTURES
+        },
+        ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
+        has_prog: fragment,
+    }
+}
+
 /// Why the remaining `sceGxmSet*` calls are NOT inlined. Kept as code rather than a comment
 /// so a future reader adding one has to answer the same question, and so `only_pure_setters_
 /// are_inlined` can walk the list.
@@ -589,9 +644,13 @@ fn uniform_ring_layout(record: u32) -> vitaslop_transpiler::UniformRingLayout {
 /// keep crossing 1,275 times a frame.
 #[cfg(test)]
 const NOT_INLINABLE: &[(u32, &str)] = &[
-    (crate::nid::gxm::SET_VIEWPORT, "six value words"),
-    (crate::nid::gxm::SET_REGION_CLIP, "five value words, and it reports"),
-    (crate::nid::gxm::SET_FRONT_STENCIL_FUNC, "six value words"),
+    // `SET_VIEWPORT` and `SET_REGION_CLIP` used to sit here under "six value words" /
+    // "five value words" - which was a fact about the FORMS available, not about the
+    // calls, and the run forms (`StoreVfpRun` / `StoreArgRun`) closed it.
+    (
+        crate::nid::gxm::SET_FRONT_STENCIL_FUNC,
+        "masks two of its six value words (`& 0xff`), which a run form stores as passed",
+    ),
     (crate::nid::gxm::SET_VISIBILITY_BUFFER, "clears the occlusion counters"),
 ];
 
@@ -2345,24 +2404,31 @@ pub(super) fn texture_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState) {
 ///
 /// Binds a NON-default uniform buffer for the given stage.
 ///
-/// The capture carries only the DEFAULT uniform buffer (the SA bank) with each draw, so
-/// this buffer's CONTENTS do not reach the scene: a recompiled shader that reads uniform
-/// buffer `bufferIndex` reads nothing. That is a real gap rather than a no-op, so it says
-/// so once - an unreported approximation is indistinguishable on screen from a faithful
-/// render, which is exactly how a wrong "it renders correctly" claim gets made. Once per
-/// run rather than per call, because it is a property of the title's shaders, not an event.
+/// The VERTEX binding is sticky context state exactly like a stream pointer, and a draw
+/// whose vertex program declares a non-default uniform buffer reads it back to snapshot
+/// the buffer's bytes for the recompiled shader's MEMORY LOADS (see
+/// `VitaState::capture_mem_window`). The FRAGMENT side has no consumer - no captured
+/// fragment program loads memory, and one that did would refuse to link
+/// (`LinkError::FragmentMemLoad`) - so its binding is not recorded, and that gap is stated
+/// once rather than the call quietly succeeding.
 pub(super) fn set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str) {
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let context = ctx.arg(0);
     let index = ctx.arg(1);
     let data = ctx.arg(2);
+    if stage == "vertex" {
+        gxmctx::set_vertex_uniform_buffer(ctx, context, index, data);
+        ctx.ret(0);
+        return;
+    }
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             target: "vitaslop::gxm",
             stage,
             index,
             data = format_args!("{data:#x}"),
-            "a non-default uniform buffer was bound; the capture records only the DEFAULT \
-             uniform buffer, so a recompiled shader reading this buffer index gets nothing"
+            "a non-default FRAGMENT uniform buffer was bound; fragment memory loads are not \
+             wired, so a fragment program reading this buffer falls back at link"
         );
     }
     ctx.ret(0);
@@ -2627,17 +2693,21 @@ pub(super) fn draw_precomputed(ctx: &mut GuestCtx, st: &mut VitaState) {
 // --- Precomputed vertex/fragment state family -------------------------------
 //
 // A precomputed state bundles one shader stage's default uniform buffer + textures
-// into a guest struct the game builds once and binds per draw (this title draws
+// into a guest struct the game builds once and binds per draw (one title draws
 // almost entirely through this path - `sceGxmSetUniformDataF` is never called). The
-// struct is opaque, so we key the recorded state by its guest address, mirroring the
-// precomputed-draw family. `Init`/`SetDefaultUniformBuffer`/`SetTexture` record the
-// bundle; `sceGxmSetPrecomputed{Vertex,Fragment}State` applies it to the live bind
-// state so `record_draw` snapshots the same uniforms and textures the direct path would.
+// state lives IN the guest struct plus a guest-heap arrays block (`vita::gxmstate`),
+// so a state the title `memcpy`s keeps working and the per-draw binds are inlinable
+// (`InlineOp::BindPrecomputedState`). `Init`/`SetDefaultUniformBuffer`/`SetTexture`
+// write the bundle; `sceGxmSetPrecomputed{Vertex,Fragment}State` applies it to the
+// context block so `record_draw` snapshots the same uniforms and textures the direct
+// path would.
 
 /// unsigned int sceGxmGetPrecomputedVertexStateSize(const SceGxmVertexProgram *program)
 /// The size the guest allocates for the state's memBlock. The public struct is
 /// SCE_GXM_PRECOMPUTED_VERTEX_STATE_WORD_COUNT (7) u32 words = 0x1C bytes; the state
-/// data lives in our side table, so the guest's block is bookkeeping we do not consume.
+/// lives in the STRUCT plus an arrays block this engine allocates from the guest heap
+/// (`vita::gxmstate`), so the guest's memBlock is bookkeeping we do not consume - its
+/// real-driver size is not ours to define, which is why the arrays do not live there.
 #[hostcall]
 pub(super) fn get_precomputed_vertex_state_size(_program: u32) -> u32 {
     7 * 4
@@ -2669,28 +2739,28 @@ pub(super) fn precomputed_fragment_state_init(ctx: &mut GuestCtx, st: &mut VitaS
 
 /// void sceGxmPrecomputedVertexStateSetDefaultUniformBuffer(state, void *defaultBuffer)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_set_default_uniform_buffer(st: &mut VitaState, state: u32, buffer: u32) -> i32 {
-    st.precomputed_vertex_state_set_uniform_buffer(state, buffer);
+pub(super) fn precomputed_vertex_state_set_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+    st.precomputed_vertex_state_set_uniform_buffer(ctx, state, buffer);
     0
 }
 
 /// void sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer(state, void *defaultBuffer)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_set_default_uniform_buffer(st: &mut VitaState, state: u32, buffer: u32) -> i32 {
-    st.precomputed_fragment_state_set_uniform_buffer(state, buffer);
+pub(super) fn precomputed_fragment_state_set_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, buffer: u32) -> i32 {
+    st.precomputed_fragment_state_set_uniform_buffer(ctx, state, buffer);
     0
 }
 
 /// void *sceGxmPrecomputedVertexStateGetDefaultUniformBuffer(const ...State *state)
 #[hostcall]
-pub(super) fn precomputed_vertex_state_get_default_uniform_buffer(st: &mut VitaState, state: u32) -> u32 {
-    st.precomputed_vertex_state_uniform_buffer(state)
+pub(super) fn precomputed_vertex_state_get_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32) -> u32 {
+    st.precomputed_vertex_state_uniform_buffer(ctx, state)
 }
 
 /// void *sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer(const ...State *state)
 #[hostcall]
-pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(st: &mut VitaState, state: u32) -> u32 {
-    st.precomputed_fragment_state_uniform_buffer(state)
+pub(super) fn precomputed_fragment_state_get_default_uniform_buffer(ctx: &mut GuestCtx, st: &mut VitaState, state: u32) -> u32 {
+    st.precomputed_fragment_state_uniform_buffer(ctx, state)
 }
 
 /// int sceGxmPrecomputedVertexStateSetTexture(state, unsigned int textureIndex,
@@ -3087,7 +3157,32 @@ pub(super) fn precomputed_vertex_state_set_all_textures(
 /// draw carries only the DEFAULT uniform buffer, so a shader reading buffer index N
 /// reads nothing. Recording the pointer would not change that, so what matters is that
 /// the gap is stated rather than the call quietly succeeding.
-pub(super) fn precomputed_state_set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str, all: bool) {
+pub(super) fn precomputed_state_set_uniform_buffer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    stage: &'static str,
+    all: bool,
+) {
+    // The VERTEX bindings are recorded and applied at bind time, because a recompiled
+    // vertex program's MEMORY LOADS chase them (see `VitaState::capture_mem_window`). The
+    // ALL form reads one pointer per possible index; a slot the guest's (shorter) array did
+    // not cover is only ever consumed if the program declares that buffer index, in which
+    // case the array covered it.
+    if stage == "vertex" {
+        let state = ctx.arg(0);
+        if all {
+            let array = ctx.arg(1);
+            for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                let data = ctx.read_u32(array.wrapping_add(i * 4));
+                st.precomputed_vertex_state_set_nondefault_uniform_buffer(ctx, state, i, data);
+            }
+        } else {
+            let (index, data) = (ctx.arg(1), ctx.arg(2));
+            st.precomputed_vertex_state_set_nondefault_uniform_buffer(ctx, state, index, data);
+        }
+        ctx.ret(0);
+        return;
+    }
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         // >>> `debug`, BECAUSE THIS SITE CANNOT KNOW WHETHER IT MATTERS - and the site that
@@ -3600,6 +3695,313 @@ pub(crate) mod inline_op_tests {
 }
 
 #[cfg(test)]
+mod run_setter_tests {
+    //! The two RUN setters against their handlers: `sceGxmSetViewport` (six VFP argument
+    //! floats into six context words) and `sceGxmSetRegionClip` (five core-register/stack
+    //! argument words into five context words). The obligation is the store-form one -
+    //! the inline form must WRITE what the handler writes, bit for bit, and nothing else -
+    //! held here by dispatching the real handler and checking the words against the very
+    //! values the emitted form would store.
+
+    use super::*;
+    use crate::nid::gxm as g;
+    use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::{REG_COUNT, SP};
+    use vitaslop_transpiler::InlineOp;
+
+    const CTX: u32 = 0x100;
+    const STACK: u32 = 0x800;
+
+    /// Dispatch `func_nid` over a zeroed 4 KB guest image with the given registers, VFP
+    /// bits and stack words, and hand the memory back.
+    fn dispatch_over(
+        func_nid: u32,
+        regs: &mut [u32; REG_COUNT],
+        vfp: &mut [u32; VFP_ARG_COUNT],
+        stack: &[u32],
+    ) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4096];
+        regs[SP] = STACK;
+        for (i, w) in stack.iter().enumerate() {
+            let off = STACK as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(regs, vfp, &mut mem, 0);
+            crate::vita::dispatch(crate::nid::lib::SCE_GXM, func_nid, &mut ctx, &mut st);
+        }
+        bytes
+    }
+
+    fn word(bytes: &[u8], addr: u32) -> u32 {
+        let a = addr as usize;
+        u32::from_le_bytes(bytes[a..a + 4].try_into().expect("4 bytes"))
+    }
+
+    /// The viewport handler stores the six argument floats' RAW BITS - a signalling-NaN
+    /// pattern included, so a form that round-tripped through a float op would show - and
+    /// the inline form claims exactly that run.
+    #[test]
+    fn set_viewport_stores_the_six_vfp_argument_bit_patterns() {
+        let op = inline_op(g::SET_VIEWPORT).expect("has an inline form");
+        assert_eq!(
+            op,
+            InlineOp::StoreVfpRun { offset: gxmctx::off::VIEWPORT, count: 6 },
+            "sceGxmSetViewport lowers to the six-word VFP run at the viewport block"
+        );
+        let bits: [u32; 6] = [
+            0x3f80_0000, // 1.0
+            0xbf00_0000, // -0.5
+            0x7fa0_0001, // a signalling NaN pattern - bit-exactness or nothing
+            0x0000_0001, // a denormal
+            0x4479_c000, // 999.0
+            0x8000_0000, // -0.0
+        ];
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = CTX;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        vfp[..6].copy_from_slice(&bits);
+        let bytes = dispatch_over(g::SET_VIEWPORT, &mut regs, &mut vfp, &[]);
+        for (i, &b) in bits.iter().enumerate() {
+            assert_eq!(
+                word(&bytes, CTX + gxmctx::off::VIEWPORT + i as u32 * 4),
+                b,
+                "viewport word {i} must be the raw bits of s{i}"
+            );
+        }
+        assert_eq!(regs[0], 0, "the handler returns success");
+        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+    }
+
+    /// The region-clip handler stores its five argument words AS PASSED - the last two off
+    /// the guest stack - into the five consecutive words starting at the mode. The
+    /// adjacency the run form rests on is asserted, not assumed.
+    #[test]
+    fn set_region_clip_stores_the_five_argument_words_from_registers_and_stack() {
+        assert_eq!(
+            gxmctx::off::REGION_CLIP,
+            gxmctx::off::REGION_CLIP_MODE + 4,
+            "the run form stores mode + bounds as ONE contiguous run"
+        );
+        let op = inline_op(g::SET_REGION_CLIP).expect("has an inline form");
+        assert_eq!(
+            op,
+            InlineOp::StoreArgRun { offset: gxmctx::off::REGION_CLIP_MODE, count: 5 },
+            "sceGxmSetRegionClip lowers to the five-word argument run at the mode word"
+        );
+        // Values wider than any plausible clip bound, so a handler that masked one would
+        // disagree with the run form and this test is what would say so.
+        let args = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004, 0xEEEE_0005];
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = CTX;
+        regs[1] = args[0]; // mode
+        regs[2] = args[1]; // xMin
+        regs[3] = args[2]; // yMin
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        // xMax and yMax are AAPCS stack arguments.
+        let bytes = dispatch_over(g::SET_REGION_CLIP, &mut regs, &mut vfp, &args[3..]);
+        for (i, &v) in args.iter().enumerate() {
+            assert_eq!(
+                word(&bytes, CTX + gxmctx::off::REGION_CLIP_MODE + i as u32 * 4),
+                v,
+                "region-clip word {i} must be argument {} as passed",
+                i + 1
+            );
+        }
+        assert_eq!(regs[0], 0, "the handler returns success");
+        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+    }
+}
+
+#[cfg(test)]
+mod precomputed_state_binds {
+    //! The GUEST-RESIDENT precomputed state (`vita::gxmstate`) against the binds that
+    //! apply it - and the inline layout against both, so the emitted form, the host
+    //! handler and the state writers cannot disagree about where a fact lives.
+
+    use super::*;
+    use crate::nid::gxm as g;
+    use crate::vita::gxmstate;
+    use crate::{DeterministicWorld, SliceMemory, VFP_ARG_COUNT};
+    use vitaslop_transpiler::abi::REG_COUNT;
+
+    const CTX: u32 = 0x400;
+    const VSTATE: u32 = 0x200;
+    const FSTATE: u32 = 0x240;
+    const COPY: u32 = 0x280;
+    const UB: u32 = 0x3000;
+    const TEXTURE: u32 = 0x3800;
+
+    struct Rig {
+        st: VitaState,
+        bytes: Vec<u8>,
+        regs: [u32; REG_COUNT],
+        vfp: [u32; VFP_ARG_COUNT],
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            // Big enough that `galloc` (whose cursor starts at base + 1 MB) lands inside
+            // the slice - the state's arrays block comes from the guest heap.
+            let mut r = Rig {
+                st: VitaState::new(0, 0x20_0000, Box::new(DeterministicWorld::default())),
+                bytes: vec![0u8; 0x20_0000],
+                regs: [0u32; REG_COUNT],
+                vfp: [0u32; VFP_ARG_COUNT],
+            };
+            // A context block the binds can write. `gxm_context` is what the handlers use.
+            {
+                let mut mem = SliceMemory(&mut r.bytes);
+                let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
+                gxmctx::init(&mut ctx, CTX);
+            }
+            r.st.adopt_gxm_context(CTX);
+            r
+        }
+
+        fn call(&mut self, nid: u32, args: &[u32]) {
+            self.regs[..4].fill(0);
+            for (i, a) in args.iter().enumerate() {
+                self.regs[i] = *a;
+            }
+            let mut mem = SliceMemory(&mut self.bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut self.regs, &mut self.vfp, &mut mem, 0);
+            crate::vita::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, &mut self.st);
+        }
+
+        fn word(&self, addr: u32) -> u32 {
+            let a = addr as usize;
+            u32::from_le_bytes(self.bytes[a..a + 4].try_into().expect("4 bytes"))
+        }
+    }
+
+    /// The vertex bind: the state's uniform-buffer table lands over the context's,
+    /// wholesale, and the record carries the struct's memoised words - through the real
+    /// dispatch, over a state built by the real setters.
+    #[test]
+    fn vertex_bind_replaces_the_table_and_record_from_the_guest_state() {
+        let mut r = Rig::new();
+        r.call(g::PRECOMPUTED_VERTEX_STATE_INIT, &[VSTATE, 0, 0]);
+        assert_eq!(r.word(VSTATE + gxmstate::off::MAGIC), gxmstate::MAGIC_VERTEX);
+        let block = r.word(VSTATE + gxmstate::off::BLOCK);
+        assert_ne!(block, 0, "Init attaches an arrays block from the guest heap");
+        r.call(g::PRECOMPUTED_VERTEX_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[VSTATE, UB]);
+        r.call(g::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER, &[VSTATE, 3, 0xAB00_0000]);
+        // A stale direct binding in a slot the state does NOT declare must not survive.
+        {
+            let mut mem = SliceMemory(&mut r.bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
+            gxmctx::set_vertex_uniform_buffer(&mut ctx, CTX, 5, 0xDEAD_0000);
+        }
+        r.call(g::SET_PRECOMPUTED_VERTEX_STATE, &[CTX, VSTATE]);
+        for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+            let want = if i == 3 { 0xAB00_0000 } else { 0 };
+            assert_eq!(
+                r.word(CTX + gxmctx::off::VERTEX_UNIFORM_BUFFERS + i * 4),
+                want,
+                "table slot {i} after the bind"
+            );
+        }
+        assert_eq!(r.word(CTX + gxmctx::off::VERTEX_UNIFORM), UB, "record: buffer");
+        assert_eq!(
+            r.word(CTX + gxmctx::off::VERTEX_UNIFORM + 8),
+            r.word(VSTATE + gxmstate::off::HEADER),
+            "record: header comes from the struct"
+        );
+    }
+
+    /// The fragment bind: the 16-slot texture array lands wholesale (a unit bound directly
+    /// beforehand does not survive), the program handle is bound, and the record follows.
+    #[test]
+    fn fragment_bind_replaces_the_texture_array_program_and_record() {
+        let mut r = Rig::new();
+        // A texture struct with distinctive control words for the state to copy by value.
+        for (k, w) in [0x1111_2222u32, 0x3333_4444, 0x5555_6666, 0x7777_0004].iter().enumerate() {
+            let at = (TEXTURE as usize) + k * 4;
+            r.bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        r.call(g::PRECOMPUTED_FRAGMENT_STATE_INIT, &[FSTATE, 0x77, 0]);
+        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[FSTATE, UB]);
+        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE, &[FSTATE, 2, TEXTURE]);
+        // Bind unit 7 DIRECTLY, then apply the state: the state does not declare unit 7,
+        // so the bind must clear it.
+        {
+            let mut mem = SliceMemory(&mut r.bytes);
+            let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
+            gxmctx::set_texture_binding(
+                &mut ctx,
+                CTX,
+                7,
+                gxmctx::TexBinding { addr: 0x1234, words: [1, 2, 3, 4], from_precomputed: false },
+            );
+        }
+        r.call(g::SET_PRECOMPUTED_FRAGMENT_STATE, &[CTX, FSTATE]);
+        let slot = CTX + gxmctx::off::TEXTURES + 2 * gxmctx::TEXTURE_STRIDE;
+        assert_eq!(r.word(slot), TEXTURE, "unit 2: the bound texture's address");
+        assert_eq!(r.word(slot + 4), 0x1111_2222, "unit 2: control word 0, copied BY VALUE");
+        assert_eq!(r.word(slot + 20), 1, "unit 2: marked from_precomputed");
+        let stale = CTX + gxmctx::off::TEXTURES + 7 * gxmctx::TEXTURE_STRIDE;
+        assert_eq!(r.word(stale), 0, "unit 7: the direct bind must NOT survive");
+        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77, "the program handle");
+        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "record: buffer");
+    }
+
+    /// A state the guest `memcpy`s keeps working - the fidelity half of moving the state
+    /// into guest memory (the copy aliases the same arrays block, as on hardware). The old
+    /// address-keyed table failed exactly this.
+    #[test]
+    fn a_memcpyd_state_binds_like_the_original() {
+        let mut r = Rig::new();
+        r.call(g::PRECOMPUTED_FRAGMENT_STATE_INIT, &[FSTATE, 0x77, 0]);
+        r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[FSTATE, UB]);
+        let (from, to) = (FSTATE as usize, COPY as usize);
+        let bytes: Vec<u8> = r.bytes[from..from + gxmstate::off::BYTES as usize].to_vec();
+        r.bytes[to..to + bytes.len()].copy_from_slice(&bytes);
+        r.call(g::SET_PRECOMPUTED_FRAGMENT_STATE, &[CTX, COPY]);
+        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "the copy binds");
+        assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77);
+    }
+
+    /// The inline layout names exactly the offsets the state writers and binds use - the
+    /// one place the emitted form could silently drift from the handlers.
+    #[test]
+    fn the_inline_layout_matches_the_guest_structures() {
+        for (nid, fragment) in
+            [(g::SET_PRECOMPUTED_VERTEX_STATE, false), (g::SET_PRECOMPUTED_FRAGMENT_STATE, true)]
+        {
+            let op = inline_op(nid).expect("the bind has an inline form");
+            let vitaslop_transpiler::InlineOp::BindPrecomputedState { layout: l } = op else {
+                panic!("{} must lower to a state bind", crate::nid::name(nid));
+            };
+            assert_eq!(l, super::bind_state_layout(fragment));
+            assert_eq!(l.ctx_magic, gxmctx::MAGIC);
+            assert_eq!(l.st_magic_at, gxmstate::off::MAGIC);
+            assert_eq!(l.st_block_at, gxmstate::off::BLOCK);
+            assert_eq!(
+                (l.st_buf_at, l.st_size_at, l.st_header_at, l.st_handle_at),
+                (gxmstate::off::BUF, gxmstate::off::SIZE, gxmstate::off::HEADER, gxmstate::off::HANDLE)
+            );
+            if fragment {
+                assert_eq!(l.st_magic, gxmstate::MAGIC_FRAGMENT);
+                assert_eq!(l.copy_dst, gxmctx::off::TEXTURES);
+                assert_eq!(l.copy_bytes, gxmstate::FRAGMENT_BLOCK_BYTES);
+                assert!(l.has_prog, "the fragment bind stores the program handle");
+                assert_eq!(l.ctx_prog, gxmctx::off::FRAGMENT_PROGRAM);
+                assert_eq!(l.ctx_record, gxmctx::off::FRAGMENT_UNIFORM);
+            } else {
+                assert_eq!(l.st_magic, gxmstate::MAGIC_VERTEX);
+                assert_eq!(l.copy_dst, gxmctx::off::VERTEX_UNIFORM_BUFFERS);
+                assert_eq!(l.copy_bytes, gxmstate::VERTEX_BLOCK_TEXTURES);
+                assert!(!l.has_prog, "the vertex bind leaves the bound program alone");
+                assert_eq!(l.ctx_record, gxmctx::off::VERTEX_UNIFORM);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod texture_inline_tests {
     //! The `SceGxmTexture` control-word getters and setters, each against its handler.
     //!
@@ -3788,6 +4190,55 @@ mod texture_inline_tests {
     /// inline form.
     const COVERED_SETTERS_IN_PLACE: &[(u32, &str)] =
         &[(g::TEXTURE_SET_MIP_FILTER, "sceGxmTextureSetMipFilter")];
+
+    /// `sceGxmTextureSetData` against its handler: the aligned pointer lands in control
+    /// word 2 with the two low LOD bits PRESERVED, nothing else moves, and the inline form
+    /// is the in-place field store over exactly that mask.
+    ///
+    /// Its own fixture rather than [`texture_record`], because the shared record's word 2
+    /// has zero low bits - a form that failed to preserve the LOD bits would pass over it
+    /// by coincidence, and preserving them is the whole reason this is a FIELD store.
+    #[test]
+    fn texture_set_data_keeps_the_lod_bits_and_stores_the_aligned_pointer() {
+        let op = inline_op(g::TEXTURE_SET_DATA).expect("has an inline form");
+        let InlineOp::StoreArgFieldInPlace { offset, mask } = op else {
+            panic!("sceGxmTextureSetData must lower to an in-place field store, got {op:?}");
+        };
+        assert_eq!(offset, 8, "the data address is control word 2");
+        assert_eq!(mask, 0xffff_fffc, "the field is every bit but the two low LOD bits");
+        // Word 2 carries LOD bits 0b11 and a data-address bit beside them; the argument
+        // carries dirty low bits, so a form that failed to mask either side would show.
+        let before: [u32; 4] = [0x1111_1111, 0x2222_2222, 0xDEAD_0007, 0x4444_4444];
+        let data = 0x1234_5676u32;
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = PARAM;
+        regs[1] = data;
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut bytes = vec![0u8; 4096];
+        for (i, w) in before.iter().enumerate() {
+            let off = PARAM as usize + i * 4;
+            bytes[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        let mut mem = SliceMemory(&mut bytes);
+        {
+            let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+            super::super::dispatch(crate::nid::lib::SCE_GXM, g::TEXTURE_SET_DATA, &mut ctx, &mut st);
+        }
+        let mut after = [0u32; 4];
+        for (i, w) in after.iter_mut().enumerate() {
+            let off = PARAM as usize + i * 4;
+            *w = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+        }
+        let want = (before[2] & !mask) | (data & mask);
+        assert_eq!(after[2], want, "the handler must write what the inline form writes");
+        assert_eq!(after[2], 0x1234_5677, "aligned pointer over preserved LOD bits 0b11");
+        for i in [0usize, 1, 3] {
+            assert_eq!(after[i], before[i], "control word {i} must not move");
+        }
+        assert_eq!(regs[0], 0, "the handler returns success");
+        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+    }
 
     /// The in-place twin of [`texture_setters_write_the_field_their_inline_forms_claim`].
     ///

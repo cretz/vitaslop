@@ -1719,6 +1719,31 @@ impl FileTable {
 /// program handle so a later Draw knows how to snapshot the vertex buffer.
 struct VertexProgramInfo {
     attributes: Vec<crate::capture::VertexAttribute>,
+    /// >>> THE INTERLEAVED LAYOUT A DRAW ACTUALLY CAPTURES INTO, BUILT ONCE HERE.
+    ///
+    /// `record_draw` interleaves every stream an attribute names into ONE packed buffer and
+    /// rewrites the attributes onto it. What that rewrite produces - the packed row stride,
+    /// each stream's byte base within a row, whether the mesh is a single per-vertex stream,
+    /// and the rebased attribute list - depends only on this program's declared attributes and
+    /// its streams' strides, all of which are fixed when the vertex program is CREATED.
+    ///
+    /// It was recomputed on every draw, at the cost of cloning the attribute list, collecting a
+    /// stream vector, building a base vector and looping over the attributes to add the bases -
+    /// four allocations and two loops per draw, 983 draws a presented frame, all to arrive at
+    /// the same constant every time. Doing it at registration makes a draw a refcount bump and
+    /// two field reads. Rebuilt whenever the handle is registered again, which is the only
+    /// moment any of it can change.
+    packed_attributes: std::sync::Arc<[crate::capture::VertexAttribute]>,
+    /// The streams an attribute actually names (`0..=max stream_index`), in stream order.
+    used_streams: std::sync::Arc<[VertexStreamInfo]>,
+    /// Byte offset of each used stream's row within a packed row - the prefix sum of the
+    /// strides above.
+    stream_base: std::sync::Arc<[u32]>,
+    /// Bytes per packed vertex: the sum of the used streams' strides.
+    packed_stride: u32,
+    /// Exactly one used stream, stepped per VERTEX - the overwhelmingly common case, whose
+    /// rows are already contiguous in guest memory and can be taken in one read.
+    single_stream: bool,
     /// One entry per `SceGxmVertexStream` the program was created with, in stream order.
     /// A draw's attributes name a stream each, and only this tells us how wide that
     /// stream's rows are and whether it is stepped per vertex or per instance.
@@ -1806,24 +1831,6 @@ impl TextureBinding {
     }
 }
 
-#[derive(Clone, Default)]
-struct PrecomputedState {
-    /// The `SceGxmVertexProgram *` / `SceGxmFragmentProgram *` HANDLE this state was
-    /// initialised from. Kept alongside the resolved header because binding a precomputed
-    /// state leaves the CONTEXT bound to that program, and the context block stores handles
-    /// (see [`crate::vita::gxmctx`]) - it is the same fact the direct
-    /// `sceGxmSetFragmentProgram` path stores, so it must be stored in the same place.
-    program_handle: u32,
-    program_header: u32,
-    default_uniform_buffer: u32,
-    /// (textureIndex, the texture captured BY VALUE - see [`TextureBinding`]).
-    textures: Vec<(u32, TextureBinding)>,
-    // There is deliberately no `blend` here any more. A draw made through a precomputed
-    // state never calls `sceGxmSetFragmentProgram`, so this used to carry the blend equation
-    // to stop the draw inheriting whatever the last direct bind left behind. Now that
-    // binding the state writes its PROGRAM HANDLE into the context block, the blend follows
-    // from the handle like it does on the direct path - one fact, one place.
-}
 
 /// The ONE piece of per-texture state that cannot live in the guest's own control words.
 ///
@@ -2019,15 +2026,26 @@ struct TextureSnapshots {
     /// Cleared when a recorded format changes (see `set_texture_format`), because that is the
     /// one input that is not in the key.
     templates: FxHashMap<[u32; 4], Option<TextureTemplate>>,
-    /// A whole DRAW's worth of snapshotted textures, by the bindings that produced it, FOR THIS
-    /// SCENE.
+    /// A whole DRAW's worth of snapshotted textures, by the bindings that produced it - kept
+    /// ACROSS scenes and RE-PROVEN on first use in each new scene.
     ///
-    /// # Why a per-scene cache of the whole answer is exactly equivalent
-    /// [`Self::get_or_read`] compares a texture at most once per scene: the first draw of the
-    /// scene that binds it establishes the buffer, and every later draw in that scene gets the
-    /// SAME `Arc` back by construction ("the guest cannot have run since - a host call is not
-    /// preemptible"). So for a fixed set of bindings, every draw of a scene was already
-    /// guaranteed to produce a bitwise identical list; this just stops rebuilding it.
+    /// # Why a cache of the whole answer is exactly equivalent
+    /// Within a scene: [`Self::get_or_read`] compares a texture at most once per scene; the
+    /// first draw of the scene that binds it establishes the buffer, and every later draw in
+    /// that scene gets the SAME `Arc` back by construction ("the guest cannot have run since -
+    /// a host call is not preemptible"). So for a fixed set of bindings, every draw of a scene
+    /// was already guaranteed to produce a bitwise identical list; this just stops rebuilding
+    /// it.
+    ///
+    /// Across scenes: the guest HAS run, so nothing is believed until it is re-proven. A kept
+    /// entry carries the [`Self::decoded`] keys and pixel buffers it was built from
+    /// ([`SetEntry::deps`]); the first hit of a new scene runs each through
+    /// [`Self::get_or_read`] - the stamps-then-compare ladder a rebuild would use - and the
+    /// entry survives only if every buffer comes back POINTER-identical. That is the same
+    /// proof, so keeping the entry changes what is rederived, never what is answered. This
+    /// used to be cleared whole at every scene start, and a race frame is ~11 scenes binding
+    /// the same sets, so ~45% of draws paid a full set rebuild for an answer the stamps
+    /// already knew. `VITASLOP_TEX_MEMO_PER_SCENE=1` restores that cadence as the A/B arm.
     ///
     /// A race frame binds a handful of distinct texture sets across ~650 draws, so the hit rate
     /// is essentially the draw count. What a hit avoids is the whole of `decode_texture` per
@@ -2037,18 +2055,73 @@ struct TextureSnapshots {
     /// The key folds the fragment program header as well as the bindings, because the ALBEDO
     /// REORDER below is a function of the program's reflection - two draws binding the same
     /// textures through different fragment programs want them in different orders, and a shared
-    /// entry would hand the second one the first one's albedo.
-    snapshot_sets: FxHashMap<u64, Arc<[crate::capture::BoundTexture]>>,
-    /// One finished [`crate::capture::BoundTexture`] per BINDING, FOR THIS SCENE - the
-    /// per-unit counterpart of [`Self::snapshot_sets`], and the one that actually carries a
-    /// race frame. See the memo in `decode_texture` for why the set cache does not: the
-    /// combinations of bindings a scene draws are many, the bindings themselves are few, and
-    /// a set miss re-read every one of its units.
+    /// entry would hand the second one the first one's albedo. The fold is 64 bits and a fold
+    /// is not a proof, so every hit also verifies the EXACT key material stored beside the
+    /// list ([`SetEntry::bindings`], [[vitaslop-content-hash-cache-must-verify]]).
+    snapshot_sets: FxHashMap<u64, SetEntry>,
+    /// One finished [`crate::capture::BoundTexture`] per BINDING - the per-unit counterpart
+    /// of [`Self::snapshot_sets`], and the one that actually carries a race frame. See the
+    /// memo in `decode_texture` for why the set cache does not: the combinations of bindings
+    /// a scene draws are many, the bindings themselves are few, and a set miss re-read every
+    /// one of its units.
     ///
-    /// `Err` is a binding the decode drops, with its drop code, so a memoised failure is not
-    /// re-derived either.
-    decoded: FxHashMap<(u32, [u32; 4]), Result<crate::capture::BoundTexture, u8>>,
+    /// Kept across scenes under the same re-proof discipline as the set cache - see
+    /// [`DecodedEntry`] and [`Self::decoded_validated`]. An `Err` result is a binding the
+    /// decode drops, with its drop code; it is memoised within a scene (so a loss is counted
+    /// per draw without being re-derived per draw) and re-attempted each new scene, exactly
+    /// as it was when this map died with the scene.
+    decoded: FxHashMap<(u32, [u32; 4]), DecodedEntry>,
+    /// Which scene the run is in, monotonically. What makes the two memos above safe to KEEP
+    /// across scenes: an entry proven current in scene N says nothing about scene N+1 (the
+    /// guest ran in between), so each carries the scene it was last proven in, and a stale one
+    /// is re-proven - one [`Self::get_or_read`] per underlying snapshot and a pointer compare -
+    /// before it is believed. See [`Self::begin_scene`].
+    scene_seq: u64,
 }
+
+/// One decoded binding, kept across scenes. See [`TextureSnapshots::decoded`].
+#[derive(Clone)]
+struct DecodedEntry {
+    /// The decode's answer: the finished texture, or the drop code the decode reported.
+    res: Result<crate::capture::BoundTexture, u8>,
+    /// The `(addr, len)` snapshot the pixels came from - the [`TextureSnapshots::get_or_read`]
+    /// key a re-proof asks about. `None` for a dropped binding, which has no pixels.
+    snap: Option<(u32, usize)>,
+    /// The decode fell back to level 0 (mip chain unreadable). Kept on the per-scene cadence -
+    /// dropped when its scene goes stale - so the retry semantics are unchanged: the fuller
+    /// chain is re-attempted each scene exactly as before the memo survived scenes.
+    degraded: bool,
+    /// Scene this entry was last PROVEN current in ([`TextureSnapshots::scene_seq`]).
+    valid_scene: u64,
+}
+
+/// A whole draw's finished texture list, kept across scenes. See
+/// [`TextureSnapshots::snapshot_sets`].
+struct SetEntry {
+    list: Arc<[crate::capture::BoundTexture]>,
+    /// The stage tag the map key folded first: the fragment program header for the fragment
+    /// stage, [`VERTEX_STAGE_TAG`] for the vertex stage. Verified on every hit.
+    tag: u64,
+    /// The EXACT bindings (`unit, addr, control words`) behind the map key's 64-bit fold,
+    /// verified on every hit - a fold is not a proof
+    /// ([[vitaslop-content-hash-cache-must-verify]]).
+    bindings: Vec<(u32, u32, [u32; 4])>,
+    /// The [`TextureSnapshots::decoded`] key AND the pixel buffer `list` holds for each
+    /// non-null unit, for the per-scene re-proof: the entry survives a scene change only if
+    /// every one of these re-validates to the SAME buffer. `None` marks a set that must not
+    /// outlive its scene (a unit was dropped or degraded), so building it - and counting its
+    /// drops - stays a per-scene event.
+    deps: Option<Vec<((u32, [u32; 4]), Arc<[u8]>)>>,
+    /// How many null-handle units `list` carries. Their per-set-build drop-0 notes are
+    /// re-issued when a kept set is re-proven, so the counter keeps its per-scene cadence.
+    null_drops: u32,
+    /// Scene this entry was last PROVEN current in.
+    valid_scene: u64,
+}
+
+/// The stage tag [`SetEntry`] and the vertex-stage set key carry, so a vertex list and a
+/// fragment list of identical bindings cannot collide in the shared map ("VERTEX").
+const VERTEX_STAGE_TAG: u64 = 0x5645_5254_5845_5300;
 
 /// What a binding's control words say, once, so no draw has to work it out again. See
 /// [`TextureSnapshots::templates`].
@@ -2088,6 +2161,30 @@ const TEXTURE_TEMPLATE_CAP: usize = 4096;
 /// inexact cadence, and the only one that has to be asked for - see [`texture_check`].
 fn texture_check_per_frame() -> bool {
     texture_check() == TextureCheck::Frame
+}
+
+/// `VITASLOP_TEX_MEMO_PER_SCENE`: clear the per-binding and per-set texture memos at every
+/// scene start (the pre-cross-scene cadence) instead of keeping them and re-proving each
+/// entry on first use per scene. The A/B arm for the cross-scene memo; BOTH arms are exact -
+/// the difference is only what gets rederived, never what is answered.
+fn tex_memo_per_scene() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_TEX_MEMO_PER_SCENE"))
+}
+
+/// Say - once - that a set-cache hit's stored bindings did not match the probe's, i.e. the
+/// 64-bit fold collided. Treated as a miss, so it costs a rebuild and never an answer; said
+/// aloud because a collision here is rare enough that one occurring is worth a line.
+fn report_set_key_collision() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "texture set-cache key collision: two distinct binding sets folded to one 64-bit \
+             key. Handled exactly (the exact-match check treated it as a miss); noted because \
+             it should be vanishingly rare."
+        );
+    });
 }
 
 /// How often, and by what means, a retained texture snapshot is re-validated.
@@ -2671,11 +2768,17 @@ impl TextureSnapshots {
     /// next snapshot takes a fresh guest-store epoch.
     fn begin_scene(&mut self) {
         self.checked_this_scene.clear();
-        // Cleared with the cadence set it depends on - see `snapshot_sets`. It holds `Arc`s to
-        // pixel buffers that this scene has not yet re-established as current, so it cannot
-        // outlive the scene that took them.
-        self.snapshot_sets.clear();
-        self.decoded.clear();
+        // The finished-list and per-binding memos are NOT cleared: each entry carries the
+        // scene it was last proven in, and its first use in a new scene re-proves it against
+        // the guest-store epoch before it is believed (see [`SetEntry::deps`]). The proof is
+        // the same `get_or_read` ladder a rebuild would run, so keeping the entry changes
+        // what is REDERIVED, never what is answered. `VITASLOP_TEX_MEMO_PER_SCENE` is the
+        // A/B arm: the old cadence, cleared whole.
+        if tex_memo_per_scene() {
+            self.snapshot_sets.clear();
+            self.decoded.clear();
+        }
+        self.scene_seq += 1;
         // Zero means "this scene has not taken one yet" - `arm_scene_stamp` fills it in on the
         // first snapshot. It is not a valid stamp: the epoch counter restarts at 1 after a wrap
         // and never returns to 0, so a stale 0 can never be mistaken for a real one.
@@ -2686,6 +2789,173 @@ impl TextureSnapshots {
     /// See [`Self::get_or_read`] for why the two cadences exist.
     fn begin_frame(&mut self) {
         self.checked_this_frame.clear();
+    }
+
+    /// The memoised decode for `key`, PROVEN current for this scene - or `None` when there is
+    /// no entry or the entry could not be proven (it is dropped here and the caller rebuilds).
+    ///
+    /// The proof: the pixels came out of [`Self::get_or_read`] under `snap`, so asking it
+    /// again this scene and getting the SAME buffer back (`Arc::ptr_eq`) re-establishes every
+    /// byte through the same stamps-then-compare ladder a rebuild would use. A changed texture
+    /// returns a fresh buffer, the pointers differ, and the entry dies.
+    /// Bound on distinct per-binding decodes held across a long run, now that the map
+    /// survives scenes. Cleared whole when hit - re-derivation, never correctness - like
+    /// [`TEXTURE_TEMPLATE_CAP`] and the set cache's own cap.
+    const DECODED_CAP: usize = 16_384;
+
+    fn decoded_validated(
+        &mut self,
+        ctx: &GuestCtx,
+        key: (u32, [u32; 4]),
+    ) -> Option<Result<crate::capture::BoundTexture, u8>> {
+        let (snap, degraded, valid_scene, pixels) = match self.decoded.get(&key) {
+            None => return None,
+            Some(e) => (
+                e.snap,
+                e.degraded,
+                e.valid_scene,
+                e.res.as_ref().ok().map(|t| t.pixels.clone()),
+            ),
+        };
+        if valid_scene == self.scene_seq {
+            return self.decoded.get(&key).map(|e| e.res.clone());
+        }
+        // A dropped or degraded decode is re-attempted each new scene, exactly as it was
+        // when this memo died with its scene: a texture that becomes readable is picked up
+        // at the next scene, not never.
+        let Some(held) = pixels.filter(|_| !degraded) else {
+            self.decoded.remove(&key);
+            return None;
+        };
+        let (addr, len) = snap.expect("an Ok entry always records its snapshot key");
+        let current = self.get_or_read(ctx, addr, len);
+        if Arc::ptr_eq(&current, &held) {
+            // Re-fetched rather than held across the `get_or_read`: that call can clear
+            // this very map (its insert enforces the snapshot budget), and then there is
+            // nothing left to stamp - which falls through to the rebuild, correctly.
+            if let Some(e) = self.decoded.get_mut(&key) {
+                e.valid_scene = self.scene_seq;
+                return Some(e.res.clone());
+            }
+        }
+        self.decoded.remove(&key);
+        None
+    }
+
+    /// The finished list for this exact set of bindings, PROVEN current for this scene.
+    ///
+    /// `tag` and `bindings` are the exact key material; `key` is their 64-bit fold, and the
+    /// fold alone is never trusted - a hit whose stored bindings differ is a collision and is
+    /// treated as a miss ([[vitaslop-content-hash-cache-must-verify]]).
+    fn set_validated(
+        &mut self,
+        ctx: &GuestCtx,
+        key: u64,
+        tag: u64,
+        bindings: &[TextureBinding],
+    ) -> Option<Arc<[crate::capture::BoundTexture]>> {
+        let entry = self.snapshot_sets.get(&key)?;
+        if entry.tag != tag
+            || entry.bindings.len() != bindings.len()
+            || !entry
+                .bindings
+                .iter()
+                .zip(bindings)
+                .all(|(&(u, a, w), b)| u == b.unit && a == b.addr && w == b.words)
+        {
+            report_set_key_collision();
+            return None;
+        }
+        if entry.valid_scene == self.scene_seq {
+            return Some(entry.list.clone());
+        }
+        // Built with a dropped or degraded unit: it dies with its scene, so the drop is
+        // counted - and the read retried - exactly as often as before.
+        let Some(deps) = entry.deps.clone() else {
+            self.snapshot_sets.remove(&key);
+            return None;
+        };
+        let (list, null_drops) = (entry.list.clone(), entry.null_drops);
+        for (dep_key, held) in deps {
+            // The pointer compare against the SET's own buffer is what makes this exact
+            // even when the per-binding entry was independently rebuilt this scene: a
+            // "valid" decode holding DIFFERENT bytes than this list must kill the list.
+            match self.decoded_validated(ctx, dep_key) {
+                Some(Ok(t)) if Arc::ptr_eq(&t.pixels, &held) => {}
+                _ => {
+                    self.snapshot_sets.remove(&key);
+                    return None;
+                }
+            }
+        }
+        // The null-handle units' per-build drop notes, re-issued so keeping the set does
+        // not quiet the counter that reports them.
+        for _ in 0..null_drops {
+            note_texture_drop(0);
+        }
+        if let Some(e) = self.snapshot_sets.get_mut(&key) {
+            e.valid_scene = self.scene_seq;
+        }
+        Some(list)
+    }
+
+    /// Remember a finished list under its fold, with the exact key material and the
+    /// per-binding facts a later scene's re-proof will check. See [`SetEntry`].
+    fn set_insert(
+        &mut self,
+        key: u64,
+        tag: u64,
+        bindings: &[TextureBinding],
+        list: Arc<[crate::capture::BoundTexture]>,
+    ) {
+        let mut null_drops = 0u32;
+        let mut deps = Some(Vec::with_capacity(bindings.len()));
+        for b in bindings {
+            // Mirrors `decode_texture`'s early arms exactly. `addr == 0` returns `None`
+            // there - the unit is silently absent from the list, noting nothing - so it
+            // contributes no dep and no re-issued note here. A null HANDLE (readable
+            // address, all-zero control words) binds the constant zero texel and notes
+            // drop 0 once per set build; constants need no re-proof, only the re-note.
+            if b.addr == 0 {
+                continue;
+            }
+            if b.is_null() {
+                null_drops += 1;
+                continue;
+            }
+            let dep_key = (b.addr, b.words);
+            // The buffer recorded here is the one `list` holds for this unit: the list's
+            // items are clones of the entry being probed, taken within this same host call,
+            // so nothing can have rebuilt it in between. A unit whose decode dropped or
+            // degraded (or whose entry the snapshot budget just evicted) makes the whole
+            // set per-scene.
+            let pixels = self.decoded.get(&dep_key).and_then(|e| match (&e.res, e.degraded) {
+                (Ok(t), false) => Some(t.pixels.clone()),
+                _ => None,
+            });
+            match (deps.as_mut(), pixels) {
+                (Some(d), Some(p)) => d.push((dep_key, p)),
+                _ => deps = None,
+            }
+        }
+        // A bound on distinct sets held across a long run, in the spirit of
+        // [`TEXTURE_TEMPLATE_CAP`]: cleared whole when hit, which costs re-derivation and
+        // never correctness - the entries re-prove themselves from live guest state.
+        const SET_CAP: usize = 16_384;
+        if self.snapshot_sets.len() >= SET_CAP {
+            self.snapshot_sets.clear();
+        }
+        self.snapshot_sets.insert(
+            key,
+            SetEntry {
+                list,
+                tag,
+                bindings: bindings.iter().map(|b| (b.unit, b.addr, b.words)).collect(),
+                deps,
+                null_drops,
+                valid_scene: self.scene_seq,
+            },
+        );
     }
 
     /// The mean colour of `t`'s pixels, computed once per distinct byte buffer.
@@ -3181,6 +3451,16 @@ struct ProgramReflection {
     /// REGISTERS (each parameter's components packed at its own type's width, not one
     /// register per component). See [`VitaState::reflected_uniform_size_bytes`].
     uniform_size_bytes: u32,
+    /// The program header's OWN default-uniform-buffer size field, clamped and scaled -
+    /// what [`default_uniform_buffer_bytes`] reads, memoised here.
+    ///
+    /// It is a word of the container, which is immutable while the program is registered
+    /// (the same fact `program_blobs` and this whole table rest on), and the staleness check
+    /// in `record_draw` read it FRESH on every draw of every frame. MEASURED in the browser:
+    /// two single-word guest reads per draw, ~2,000 a presented frame, which is where the
+    /// draw path's whole remaining word-read count came from. A word read is a bounds check
+    /// and a virtual call into a typed array there [[vitaslop-browser-scalar-reads-are-a-typed-array]].
+    default_uniform_bytes: u32,
     /// Texture units the program's samplers occupy (one past the highest sampler
     /// resource index). This is the length of the texture array the whole-array
     /// setter `sceGxmPrecomputed*StateSetAllTextures` is given.
@@ -3271,14 +3551,24 @@ pub struct VitaState {
     /// Vertex program handle -> its attribute layout. A map, not a list: every draw
     /// resolves the bound handle several times, and a title registers hundreds of
     /// programs, so a linear scan here was per-draw cost that grew with the level.
-    vertex_programs: std::collections::HashMap<u32, VertexProgramInfo>,
+    /// >>> AND AN INTEGER HASHER, LIKE EVERY OTHER PER-DRAW MAP HERE. The key is a guest
+    /// address; SipHash on it is tens of nanoseconds per probe, and a draw probes this and the
+    /// two below several times each - about 4,000 probes a presented frame. See
+    /// [`crate::fasthash`], which the texture maps have used since the same measurement.
+    vertex_programs: FxHashMap<u32, VertexProgramInfo>,
     /// Reflected constants of each `SceGxmProgram`, keyed by its header address. See
     /// [`ProgramReflection`]; cleared whenever a program is registered or unregistered,
     /// which is the only moment a header address can come to mean a different program.
-    program_reflection: std::collections::HashMap<u32, ProgramReflection>,
+    program_reflection: FxHashMap<u32, ProgramReflection>,
     /// Raw `SceGxmProgram` container bytes by header address - see [`VitaState::program_blob`].
     /// Cleared alongside `program_reflection`, and for the same reason.
-    program_blobs: std::collections::HashMap<u32, std::sync::Arc<[u8]>>,
+    program_blobs: FxHashMap<u32, std::sync::Arc<[u8]>>,
+    /// Whether (and how) each VERTEX program's 0xE8 memory loads need a guest-memory window
+    /// snapshotted at draw time - `vitaslop_gxp_shader::mem_window_for_vertex_blob`, memoised
+    /// by header address. `None` for the overwhelming majority of programs, so the per-draw
+    /// cost of this feature on every other title is one map lookup. Cleared alongside
+    /// `program_reflection`, and for the same reason.
+    mem_window_specs: FxHashMap<u32, Option<vitaslop_gxp_shader::MemWindow>>,
     /// Shader PAIRS the guest's patcher has named but the renderer has not been told about yet
     /// - see [`VitaState::queue_shader_precompile`]. Drained onto the next scene handed to the
     /// renderer, which compiles them before it encodes anything.
@@ -3513,7 +3803,7 @@ pub struct VitaState {
     /// address that asked. That search is a linear scan of `texture_formats`, and it feeds
     /// a report that fires once per (unit, address) - see `snapshot_bound_textures`, where
     /// running it on the ordinary by-value binding path cost 46% of a race frame.
-    nearby_texture_cache: std::collections::HashMap<u32, Option<(i64, u32)>>,
+    nearby_texture_cache: FxHashMap<u32, Option<(i64, u32)>>,
     /// Scratch for [`Self::snapshot_bound_textures`]'s per-unit pass, kept so the hottest
     /// function in the capture does not allocate a `Vec` on every draw.
     ///
@@ -3534,13 +3824,13 @@ pub struct VitaState {
     /// texture bound by hundreds of draws is read from guest memory once and shared. Cleared
     /// at `beginScene` - see the note in `decode_texture` for why that is the right scope.
     texture_snapshots: TextureSnapshots,
-    /// Precomputed vertex/fragment states (`sceGxmPrecomputed{Vertex,Fragment}StateInit`
-    /// + setters), keyed by the guest state-struct address, applied to the live bind
-    /// state by `sceGxmSetPrecomputed{Vertex,Fragment}State`. A HashMap (not the Vec the
-    /// other GXM tables use) because the bind lookup runs once per draw - thousands of
-    /// times per frame - so the lookup must be O(1), not a linear scan over every state.
-    precomputed_vertex_states: std::collections::HashMap<u32, PrecomputedState>,
-    precomputed_fragment_states: std::collections::HashMap<u32, PrecomputedState>,
+    /// How many precomputed states have been INITIALISED, for
+    /// [`Self::report_precomputed_state_programs`]'s ladder. The states themselves live in
+    /// GUEST memory now (`vita::gxmstate`) - the struct plus an arrays block this engine
+    /// allocates from the guest heap - which is what lets the per-draw binds be inlined
+    /// and lets a state the guest `memcpy`s keep working (the same by-value fix the
+    /// precomputed-DRAW family got, see [`pdraw`]).
+    precomputed_state_count: u32,
     // Two host-side texture diagnostics used to live here - "did the current bindings come
     // from a precomputed state" and "which handles were live when they were bound". Both are
     // now properties of the BINDING, in the context block: `from_precomputed` is per unit
@@ -3720,9 +4010,10 @@ impl VitaState {
             quantum_count: 0,
             flip_count: 0,
             freed_memblocks: Vec::new(),
-            vertex_programs: std::collections::HashMap::new(),
-            program_reflection: std::collections::HashMap::new(),
-            program_blobs: std::collections::HashMap::new(),
+            vertex_programs: FxHashMap::default(),
+            program_reflection: FxHashMap::default(),
+            program_blobs: FxHashMap::default(),
+            mem_window_specs: FxHashMap::default(),
             pending_precompile: Default::default(),
             precompiled_pairs: std::collections::HashSet::new(),
             created_vertex_headers: Vec::new(),
@@ -3792,13 +4083,12 @@ impl VitaState {
             bound_textures: Vec::new(),
             bound_vertex_textures: Vec::new(),
             texture_formats: Default::default(),
-            nearby_texture_cache: std::collections::HashMap::new(),
+            nearby_texture_cache: FxHashMap::default(),
             texture_unit_scratch: Vec::new(),
             texture_extra: std::collections::HashMap::new(),
             color_surface_gamma: Vec::new(),
             texture_snapshots: TextureSnapshots::new(),
-            precomputed_vertex_states: std::collections::HashMap::new(),
-            precomputed_fragment_states: std::collections::HashMap::new(),
+            precomputed_state_count: 0,
             fragment_programs: std::collections::HashMap::new(),
             uniform_ring_wrapped: false,
             reported_reserve_without_context: false,
@@ -4043,6 +4333,17 @@ impl VitaState {
         }
         let len = ctx.read_u32(bank).min(MAX_DEFAULT_UNIFORM_REGS) as usize;
         ctx.read_f32s(bank + SA_BANK_DATA, len)
+    }
+
+    /// The same bank as BYTES - see [`Self::current_vertex_uniform_bytes`] for why both forms
+    /// exist and why neither is derived from the other.
+    fn sa_bank_bytes(&self, ctx: &GuestCtx) -> Vec<u8> {
+        let bank = self.sa_bank;
+        if bank == 0 {
+            return Vec::new();
+        }
+        let len = ctx.read_u32(bank).min(MAX_DEFAULT_UNIFORM_REGS) as usize;
+        ctx.read_bytes(bank + SA_BANK_DATA, len * 4)
     }
 
     // --- SceIoFilemgr virtual filesystem ---
@@ -6599,9 +6900,50 @@ impl VitaState {
         streams: Vec<(u32, bool)>,
         program_header: u32,
     ) {
-        let streams =
-            streams.into_iter().map(|(stride, per_instance)| VertexStreamInfo { stride, per_instance }).collect();
-        self.vertex_programs.insert(handle, VertexProgramInfo { attributes, streams, program_header });
+        let streams: Vec<VertexStreamInfo> = streams
+            .into_iter()
+            .map(|(stride, per_instance)| VertexStreamInfo { stride, per_instance })
+            .collect();
+        // The packed layout every draw of this program will capture into - see
+        // `VertexProgramInfo::packed_attributes` for why it belongs here and not in the draw.
+        let used = attributes
+            .iter()
+            .map(|a| a.stream_index as usize)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let used_streams: std::sync::Arc<[VertexStreamInfo]> =
+            (0..used).map(|i| streams.get(i).copied().unwrap_or_default()).collect();
+        let mut base = Vec::with_capacity(used_streams.len());
+        let mut packed_stride = 0u32;
+        for s in used_streams.iter() {
+            base.push(packed_stride);
+            packed_stride += s.stride;
+        }
+        let stream_base: std::sync::Arc<[u32]> = base.into();
+        let packed_attributes: std::sync::Arc<[crate::capture::VertexAttribute]> = attributes
+            .iter()
+            .map(|a| {
+                let mut a = *a;
+                a.offset += stream_base.get(a.stream_index as usize).copied().unwrap_or(0) as u16;
+                a.stream_index = 0;
+                a
+            })
+            .collect();
+        let single_stream = matches!(&*used_streams, [s] if !s.per_instance);
+        self.vertex_programs.insert(
+            handle,
+            VertexProgramInfo {
+                attributes,
+                streams,
+                program_header,
+                packed_attributes,
+                used_streams,
+                stream_base,
+                packed_stride,
+                single_stream,
+            },
+        );
     }
 
     /// The `SceGxmProgram*` a vertex program handle was created from, if recorded.
@@ -7368,34 +7710,90 @@ impl VitaState {
     // into the live bind state so `record_draw` snapshots the same bytes it would on the
     // direct `sceGxmSetUniformDataF`/`sceGxmSetFragmentTexture` path.
 
-    /// `sceGxmPrecomputedVertexStateInit(state, vertexProgram, memBlock)`: start a fresh
-    /// vertex-state record bound to the vertex program (resolved to its `SceGxmProgram*`
-    /// for later uniform-buffer sizing). Replaces any prior record at that address.
-    pub fn precomputed_vertex_state_init(&mut self, ctx: &GuestCtx, state: u32, vertex_program: u32) {
+    /// The guest state struct at `state`, ENSURED: stamped `magic` with an arrays block of
+    /// `block_bytes` behind it (see [`crate::vita::gxmstate`]). Returns the block address.
+    ///
+    /// A struct that already carries the stamp keeps its block - `Init` re-zeroes what it
+    /// must - and one that does not (never initialised, or a setter arrived first, which
+    /// the old table served through `entry().or_default()`) gets a fresh zeroed block from
+    /// the guest heap. The title's own `memBlock` is deliberately NOT used: its size is the
+    /// real driver's, which this engine does not define.
+    fn ensure_state_block(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        magic: u32,
+        block_bytes: u32,
+    ) -> u32 {
+        use crate::vita::gxmstate::off;
+        if ctx.read_u32(state.wrapping_add(off::MAGIC)) == magic {
+            let block = ctx.read_u32(state.wrapping_add(off::BLOCK));
+            if block != 0 {
+                return block;
+            }
+        }
+        let block = self.galloc(block_bytes, 16);
+        for w in 0..off::BYTES / 4 {
+            ctx.write_u32(state.wrapping_add(w * 4), 0);
+        }
+        for w in 0..block_bytes / 4 {
+            ctx.write_u32(block.wrapping_add(w * 4), 0);
+        }
+        ctx.write_u32(state.wrapping_add(off::BLOCK), block);
+        ctx.write_u32(state.wrapping_add(off::MAGIC), magic);
+        block
+    }
+
+    /// `sceGxmPrecomputedVertexStateInit(state, vertexProgram, memBlock)`: stamp the guest
+    /// struct, attach its arrays block, and memoise the program facts the bind needs -
+    /// including the stage's uniform SIZE, which is fixed the moment the program exists
+    /// (the same move the inlined reserve rests on). Replaces any prior state there.
+    pub fn precomputed_vertex_state_init(&mut self, ctx: &mut GuestCtx, state: u32, vertex_program: u32) {
+        use crate::vita::gxmstate::{self, off};
         let program_header = self.vertex_program_header(vertex_program);
-        self.precomputed_vertex_states.insert(
-            state,
-            PrecomputedState {
-                program_handle: vertex_program,
-                program_header,
-                ..PrecomputedState::default()
-            },
-        );
+        let block =
+            self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        // Re-init REPLACES: the arrays block and the mutable fields go back to zero.
+        for w in 0..gxmstate::VERTEX_BLOCK_BYTES / 4 {
+            ctx.write_u32(block.wrapping_add(w * 4), 0);
+        }
+        // What the vertex bind's record carries: the reflected extent, never smaller than
+        // the header's own declared default-uniform size - computed here once, exactly as
+        // the bind used to compute it per call. Both inputs are immutable while the
+        // program is registered (see `ProgramReflection`).
+        let size = self
+            .reflected_uniform_size_bytes(ctx, program_header)
+            .max(default_uniform_buffer_bytes(ctx, program_header));
+        ctx.write_u32(state.wrapping_add(off::HANDLE), vertex_program);
+        ctx.write_u32(state.wrapping_add(off::HEADER), program_header);
+        ctx.write_u32(state.wrapping_add(off::BUF), 0);
+        ctx.write_u32(state.wrapping_add(off::SIZE), size);
+        self.precomputed_state_count += 1;
         self.cross_precomputed_state_programs(ctx, program_header, true);
         self.report_precomputed_state_programs();
     }
 
     /// `sceGxmPrecomputedFragmentStateInit(state, fragmentProgram, memBlock)`.
-    pub fn precomputed_fragment_state_init(&mut self, ctx: &GuestCtx, state: u32, fragment_program: u32) {
+    pub fn precomputed_fragment_state_init(&mut self, ctx: &mut GuestCtx, state: u32, fragment_program: u32) {
+        use crate::vita::gxmstate::{self, off};
         let program_header = self.fragment_program_header(fragment_program);
-        self.precomputed_fragment_states.insert(
+        let block = self.ensure_state_block(
+            ctx,
             state,
-            PrecomputedState {
-                program_handle: fragment_program,
-                program_header,
-                ..PrecomputedState::default()
-            },
+            gxmstate::MAGIC_FRAGMENT,
+            gxmstate::FRAGMENT_BLOCK_BYTES,
         );
+        for w in 0..gxmstate::FRAGMENT_BLOCK_BYTES / 4 {
+            ctx.write_u32(block.wrapping_add(w * 4), 0);
+        }
+        // The fragment bind's record uses the reflected size alone, exactly as the bind
+        // used to compute it per call.
+        let size = self.uniform_size_bytes(ctx, program_header);
+        ctx.write_u32(state.wrapping_add(off::HANDLE), fragment_program);
+        ctx.write_u32(state.wrapping_add(off::HEADER), program_header);
+        ctx.write_u32(state.wrapping_add(off::BUF), 0);
+        ctx.write_u32(state.wrapping_add(off::SIZE), size);
+        self.precomputed_state_count += 1;
         self.cross_precomputed_state_programs(ctx, program_header, false);
         self.report_precomputed_state_programs();
     }
@@ -7457,19 +7855,17 @@ impl VitaState {
     /// [`Self::report_program_creation_frame`]: a handful of lines a run, answering a question
     /// every session on this hitch has to ask first.
     fn report_precomputed_state_programs(&self) {
-        use std::collections::HashSet;
-        let distinct = |m: &std::collections::HashMap<u32, PrecomputedState>| {
-            m.values().map(|s| s.program_header).filter(|h| *h != 0).collect::<HashSet<_>>().len()
-        };
-        let n = self.precomputed_vertex_states.len() + self.precomputed_fragment_states.len();
+        // The distinct-header lists ARE the two counts: `cross_precomputed_state_programs`
+        // pushes each non-zero header once.
+        let n = self.precomputed_state_count;
         if n > 4 && !n.is_power_of_two() && n % 50 != 0 {
             return;
         }
         eprintln!(
             "gxm precompile: precomputed states name {} distinct vertex + {} distinct fragment \
              programs ({} states) by frame {}",
-            distinct(&self.precomputed_vertex_states),
-            distinct(&self.precomputed_fragment_states),
+            self.precomputed_state_vertex_headers.len(),
+            self.precomputed_state_fragment_headers.len(),
             n,
             self.cur_frame
         );
@@ -7478,33 +7874,101 @@ impl VitaState {
     /// `sceGxmPrecomputed{Vertex,Fragment}StateSetDefaultUniformBuffer(state, buffer)`:
     /// store the guest pointer the game will write this stage's uniforms into. The record
     /// is created lazily so a setter before `Init` (unexpected) still lands.
-    pub fn precomputed_vertex_state_set_uniform_buffer(&mut self, state: u32, buffer: u32) {
-        self.precomputed_vertex_states.entry(state).or_default().default_uniform_buffer = buffer;
+    pub fn precomputed_vertex_state_set_uniform_buffer(&mut self, ctx: &mut GuestCtx, state: u32, buffer: u32) {
+        use crate::vita::gxmstate::{self, off};
+        self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
-    pub fn precomputed_fragment_state_set_uniform_buffer(&mut self, state: u32, buffer: u32) {
-        self.precomputed_fragment_states.entry(state).or_default().default_uniform_buffer = buffer;
+    pub fn precomputed_fragment_state_set_uniform_buffer(&mut self, ctx: &mut GuestCtx, state: u32, buffer: u32) {
+        use crate::vita::gxmstate::{self, off};
+        self.ensure_state_block(ctx, state, gxmstate::MAGIC_FRAGMENT, gxmstate::FRAGMENT_BLOCK_BYTES);
+        ctx.write_u32(state.wrapping_add(off::BUF), buffer);
+    }
+
+    /// `sceGxmPrecomputedVertexStateSetUniformBuffer(state, bufferIndex, bufferData)`: store
+    /// the NON-default uniform buffer binding, applied to the context block's table when the
+    /// state is bound (the same table the direct `sceGxmSetVertexUniformBuffer` writes).
+    pub fn precomputed_vertex_state_set_nondefault_uniform_buffer(
+        &mut self,
+        ctx: &mut GuestCtx,
+        state: u32,
+        index: u32,
+        buffer: u32,
+    ) {
+        use crate::vita::gxmstate::{self};
+        if (index as usize) < crate::vita::gxmctx::MAX_UNIFORM_BUFFERS {
+            let block =
+                self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+            ctx.write_u32(block.wrapping_add(index * 4), buffer);
+        }
     }
 
     /// `sceGxmPrecomputed{Vertex,Fragment}StateGetDefaultUniformBuffer(state)`: the pointer
     /// last set (0 if never set), so a Set/Get round-trips faithfully.
-    pub fn precomputed_vertex_state_uniform_buffer(&self, state: u32) -> u32 {
-        self.precomputed_vertex_states.get(&state).map(|s| s.default_uniform_buffer).unwrap_or(0)
+    pub fn precomputed_vertex_state_uniform_buffer(&self, ctx: &GuestCtx, state: u32) -> u32 {
+        use crate::vita::gxmstate::{self, off};
+        if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_VERTEX {
+            ctx.read_u32(state.wrapping_add(off::BUF))
+        } else {
+            0
+        }
     }
-    pub fn precomputed_fragment_state_uniform_buffer(&self, state: u32) -> u32 {
-        self.precomputed_fragment_states.get(&state).map(|s| s.default_uniform_buffer).unwrap_or(0)
+    pub fn precomputed_fragment_state_uniform_buffer(&self, ctx: &GuestCtx, state: u32) -> u32 {
+        use crate::vita::gxmstate::{self, off};
+        if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_FRAGMENT {
+            ctx.read_u32(state.wrapping_add(off::BUF))
+        } else {
+            0
+        }
     }
 
     /// `sceGxmPrecomputed{Vertex,Fragment}StateSetTexture(state, index, texture)`: bind a
     /// `SceGxmTexture*` to this stage's sampler `index` (0 unbinds), replacing any prior
-    /// binding at that index. Textures are kept sorted by index so the bound order is
-    /// stable when the state is applied.
-    pub fn precomputed_vertex_state_set_texture(&mut self, ctx: &GuestCtx, state: u32, index: u32, texture: u32) {
+    /// binding at that index - written into the state's guest texture array, in the
+    /// context block's own slot layout, so the fragment bind is one wholesale copy.
+    pub fn precomputed_vertex_state_set_texture(&mut self, ctx: &mut GuestCtx, state: u32, index: u32, texture: u32) {
+        use crate::vita::gxmstate::{self};
+        if index as usize >= crate::vita::gxmctx::MAX_TEXTURE_UNITS {
+            self.report_precomputed_texture_unit(index, texture);
+            return;
+        }
         let b = TextureBinding::read(ctx, index, texture, true);
-        Self::state_set_texture(self.precomputed_vertex_states.entry(state).or_default(), index, b);
+        let block =
+            self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
+        gxmstate::write_texture_slot(
+            ctx,
+            block.wrapping_add(gxmstate::VERTEX_BLOCK_TEXTURES),
+            index,
+            b.addr,
+            b.words,
+        );
     }
-    pub fn precomputed_fragment_state_set_texture(&mut self, ctx: &GuestCtx, state: u32, index: u32, texture: u32) {
+    pub fn precomputed_fragment_state_set_texture(&mut self, ctx: &mut GuestCtx, state: u32, index: u32, texture: u32) {
+        use crate::vita::gxmstate::{self};
+        if index as usize >= crate::vita::gxmctx::MAX_TEXTURE_UNITS {
+            self.report_precomputed_texture_unit(index, texture);
+            return;
+        }
         let b = TextureBinding::read(ctx, index, texture, true);
-        Self::state_set_texture(self.precomputed_fragment_states.entry(state).or_default(), index, b);
+        let block = self.ensure_state_block(
+            ctx,
+            state,
+            gxmstate::MAGIC_FRAGMENT,
+            gxmstate::FRAGMENT_BLOCK_BYTES,
+        );
+        gxmstate::write_texture_slot(ctx, block, index, b.addr, b.words);
+    }
+
+    /// Say that a precomputed-state texture setter named a unit past the array. The old
+    /// path recorded any index and dropped it at BIND time (`set_texture_binding`'s own
+    /// check); with the array written at SET time the check moves here, same outcome.
+    fn report_precomputed_texture_unit(&self, unit: u32, texture: u32) {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            unit,
+            texture = format_args!("{texture:#x}"),
+            "precomputed state SetTexture on a unit beyond SCE_GXM_MAX_TEXTURE_UNITS - DROPPED"
+        );
     }
 
     /// `sceGxmPrecomputedDrawSetAllVertexStreams(precomputedDraw, streamDataArray)`:
@@ -7538,119 +8002,109 @@ impl VitaState {
     /// Note the array is of `SceGxmTexture` STRUCTS, not pointers: element `i` lives at
     /// `textureArray + i*16`, and that address is exactly what the per-index setter takes.
     /// The length is the program's texture-unit count, since the caller passes none.
-    pub fn precomputed_vertex_state_set_all_textures(&mut self, ctx: &GuestCtx, state: u32, array: u32) {
-        let header = self.precomputed_vertex_states.get(&state).map(|s| s.program_header).unwrap_or(0);
+    pub fn precomputed_vertex_state_set_all_textures(&mut self, ctx: &mut GuestCtx, state: u32, array: u32) {
+        use crate::vita::gxmstate::{self, off};
+        let header = if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_VERTEX {
+            ctx.read_u32(state.wrapping_add(off::HEADER))
+        } else {
+            0
+        };
         let n = self.reflect_program(ctx, header).texture_unit_count;
         for i in 0..n {
             self.precomputed_vertex_state_set_texture(ctx, state, i, array.wrapping_add(i * 16));
         }
     }
 
-    pub fn precomputed_fragment_state_set_all_textures(&mut self, ctx: &GuestCtx, state: u32, array: u32) {
-        let header = self.precomputed_fragment_states.get(&state).map(|s| s.program_header).unwrap_or(0);
+    pub fn precomputed_fragment_state_set_all_textures(&mut self, ctx: &mut GuestCtx, state: u32, array: u32) {
+        use crate::vita::gxmstate::{self, off};
+        let header = if ctx.read_u32(state.wrapping_add(off::MAGIC)) == gxmstate::MAGIC_FRAGMENT {
+            ctx.read_u32(state.wrapping_add(off::HEADER))
+        } else {
+            0
+        };
         let n = self.reflect_program(ctx, header).texture_unit_count;
         for i in 0..n {
             self.precomputed_fragment_state_set_texture(ctx, state, i, array.wrapping_add(i * 16));
         }
     }
 
-    fn state_set_texture(s: &mut PrecomputedState, index: u32, binding: TextureBinding) {
-        s.textures.retain(|(i, _)| *i != index);
-        if binding.addr != 0 {
-            s.textures.push((index, binding));
-            s.textures.sort_by_key(|(i, _)| *i);
-        }
-    }
-
-    /// Apply `sceGxmSetPrecomputedVertexState(context, state)`: bind this stage's default
-    /// uniform buffer (pointer + size, sized from the vertex program header at +0x2C) so
-    /// the next `record_draw` reads its uniforms from guest memory. A state that was never
-    /// built (or a null bind) clears the binding, restoring the direct uniform path.
+    /// Apply `sceGxmSetPrecomputedVertexState(context, state)`: replace the context's
+    /// non-default uniform-buffer table with the state's, wholesale, and bind the state's
+    /// default uniform buffer record. A state that was never initialised (no magic) clears
+    /// both, exactly as the old table's miss arm did.
+    ///
+    /// This is the HOST side of `InlineOp::BindPrecomputedState` - the fallback for a
+    /// pointer or magic the emitted guard declines, and the definition the inline form is
+    /// held to. It writes exactly the words the inline form writes.
     pub fn bind_precomputed_vertex_state(&mut self, ctx: &mut GuestCtx, state: u32) {
-        // The fields are copied out before the reflection lookup below, which needs
-        // `&mut self` to fill its cache.
-        let bound = self
-            .precomputed_vertex_states
-            .get(&state)
-            .map(|s| (s.default_uniform_buffer, s.program_header));
-        let (buf, size, header) = match bound {
-            Some((default_uniform_buffer, program_header)) => {
-                // Not clamped by `uniform_size_bytes`: this buffer is the GUEST'S, sized by
-                // the guest when it built the precomputed state, so the extent to read is
-                // whatever the program declares. Kept as it was.
-                let size = self
-                    .reflected_uniform_size_bytes(ctx, program_header)
-                    .max(default_uniform_buffer_bytes(ctx, program_header));
-                tracing::trace!(
-                    target: "vitaslop::gxm",
-                    buffer = format_args!("{default_uniform_buffer:#x}"),
-                    size,
-                    header = format_args!("{program_header:#x}"),
-                    "bindPrecomputedVertexState"
-                );
-                (default_uniform_buffer, size, program_header)
-            }
-            None => (0, 0, 0),
+        use crate::vita::{gxmctx, gxmstate};
+        let inited = state != 0
+            && ctx.read_u32(state.wrapping_add(gxmstate::off::MAGIC)) == gxmstate::MAGIC_VERTEX;
+        let (buf, size, header, block) = if inited {
+            (
+                ctx.read_u32(state.wrapping_add(gxmstate::off::BUF)),
+                ctx.read_u32(state.wrapping_add(gxmstate::off::SIZE)),
+                ctx.read_u32(state.wrapping_add(gxmstate::off::HEADER)),
+                ctx.read_u32(state.wrapping_add(gxmstate::off::BLOCK)),
+            )
+        } else {
+            (0, 0, 0, 0)
         };
-        self.bind_uniform_buffer(ctx, crate::vita::gxmctx::off::VERTEX_UNIFORM, buf, size, header);
+        // The whole table, zeros included - the same replace-not-merge the fragment bind's
+        // texture copy performs: a buffer bound by an earlier direct call must not survive
+        // into a state that does not declare it.
+        let context = self.gxm_context;
+        for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+            let addr = if block != 0 { ctx.read_u32(block.wrapping_add(i * 4)) } else { 0 };
+            gxmctx::set_vertex_uniform_buffer(ctx, context, i, addr);
+        }
+        self.bind_uniform_buffer(ctx, gxmctx::off::VERTEX_UNIFORM, buf, size, header);
     }
 
     /// Apply `sceGxmSetPrecomputedFragmentState(context, state)`: bind this stage's
     /// textures to the context sampler units, exactly as a sequence of
     /// `sceGxmSetFragmentTexture` calls would, so `record_draw` snapshots them.
     pub fn bind_precomputed_fragment_state(&mut self, ctx: &mut GuestCtx, state: u32) {
-        let (textures, handle, header, uniform_buf) = match self.precomputed_fragment_states.get(&state) {
-            Some(s) => (s.textures.clone(), s.program_handle, s.program_header, s.default_uniform_buffer),
-            None => return,
-        };
-        // The precomputed state stores (textureIndex, binding); the live bind list is keyed by
-        // sampler UNIT, and for a fragment state the two are the same number.
-        //
-        // This writes the CONTEXT BLOCK, the same array the direct path and its inlined form
-        // write, so a draw sees one set of bindings whichever route filled it. Binding a
-        // precomputed state REPLACES the whole array on hardware, so every other unit is
-        // cleared first - leaving them would let a unit bound by an earlier direct call
-        // survive into a state that does not declare it.
+        use crate::vita::{gxmctx, gxmstate};
+        // A state never initialised through our Init has no magic; the old table's miss
+        // arm returned without touching anything, so this does too.
+        if state == 0
+            || ctx.read_u32(state.wrapping_add(gxmstate::off::MAGIC)) != gxmstate::MAGIC_FRAGMENT
+        {
+            return;
+        }
         let context = self.gxm_context;
         if context == 0 {
             self.report_bind_without_context();
             return;
         }
-        for unit in 0..crate::vita::gxmctx::MAX_TEXTURE_UNITS as u32 {
-            crate::vita::gxmctx::set_texture_binding(
-                ctx,
-                context,
-                unit,
-                crate::vita::gxmctx::TexBinding::default(),
-            );
-        }
-        for (_, b) in textures {
-            crate::vita::gxmctx::set_texture_binding(
-                ctx,
-                context,
-                b.unit,
-                crate::vita::gxmctx::TexBinding {
-                    addr: b.addr,
-                    words: b.words,
-                    from_precomputed: true,
-                },
-            );
+        // The state's texture array lands over the context's, WHOLESALE - the array is
+        // kept in the context block's own slot layout precisely so this is one copy.
+        // Binding a precomputed state REPLACES the whole array on hardware; the block's
+        // unset slots are zero, which is the context's own unbound encoding, so a unit
+        // bound by an earlier direct call cannot survive into a state that does not
+        // declare it.
+        //
+        // This is the HOST side of `InlineOp::BindPrecomputedState` - the fallback for a
+        // pointer or magic the emitted guard declines - and it writes exactly the words
+        // the inline form writes.
+        let block = ctx.read_u32(state.wrapping_add(gxmstate::off::BLOCK));
+        for w in 0..gxmstate::FRAGMENT_BLOCK_BYTES / 4 {
+            let v = if block != 0 { ctx.read_u32(block.wrapping_add(w * 4)) } else { 0 };
+            gxmctx::set(ctx, context, gxmctx::off::TEXTURES + w * 4, v);
         }
         // Binding a precomputed fragment state leaves the context bound to its program, so it
         // goes where `sceGxmSetFragmentProgram` puts it. The blend equation follows from the
         // handle and needs no separate record.
-        self.set_gxm_state_word(ctx, crate::vita::gxmctx::off::FRAGMENT_PROGRAM, handle);
-        // Bind this stage's default uniform buffer (pointer + reflected size) so the draw
-        // reads the per-material fragment uniforms (tint / light / fog) from guest memory,
-        // exactly as the precomputed vertex path binds the vertex uniform buffer.
-        let size = self.uniform_size_bytes(ctx, header);
-        self.bind_uniform_buffer(
-            ctx,
-            crate::vita::gxmctx::off::FRAGMENT_UNIFORM,
-            uniform_buf,
-            size,
-            header,
-        );
+        let handle = ctx.read_u32(state.wrapping_add(gxmstate::off::HANDLE));
+        self.set_gxm_state_word(ctx, gxmctx::off::FRAGMENT_PROGRAM, handle);
+        // Bind this stage's default uniform buffer (pointer + the size memoised at Init) so
+        // the draw reads the per-material fragment uniforms (tint / light / fog) from guest
+        // memory, exactly as the precomputed vertex path binds the vertex uniform buffer.
+        let buf = ctx.read_u32(state.wrapping_add(gxmstate::off::BUF));
+        let size = ctx.read_u32(state.wrapping_add(gxmstate::off::SIZE));
+        let header = ctx.read_u32(state.wrapping_add(gxmstate::off::HEADER));
+        self.bind_uniform_buffer(ctx, gxmctx::off::FRAGMENT_UNIFORM, buf, size, header);
     }
 
     /// `sceGxmReserveVertexDefaultUniformBuffer(context, void **uniformBuffer)`: hand
@@ -8213,6 +8667,47 @@ impl VitaState {
     ///
     /// A buffer bound for a different vertex program is NOT this draw's SA bank - see
     /// [`Self::stale_uniforms`] - so it is dropped rather than misread.
+    /// WHERE this draw's vertex uniforms live: `Some((address, byte length))` for a bound
+    /// default uniform buffer, `None` for "the `sceGxmSetUniformDataF` SA bank".
+    ///
+    /// Split out from the two readers below because the DECISION - which includes the
+    /// staleness check, which reports - must be made once and identically however the bytes
+    /// are then taken. `record_draw` needs the same bank as FLOATS (for the transform
+    /// reflection) and as BYTES (the recompiler's `vert_sa`), and it used to read floats and
+    /// then serialise them back to bytes: a third buffer per draw for data it had already had
+    /// in that form. One decision, two readers, no round trip.
+    fn current_vertex_uniform_src(
+        &mut self,
+        ctx: &GuestCtx,
+        blk: &crate::vita::gxmctx::Block<'_>,
+    ) -> Option<(u32, usize)> {
+        let bound = blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM);
+        if bound.buf != 0 {
+            let drawing =
+                self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
+            let refl = self.reflect_program(ctx, drawing);
+            let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
+            if self.stale_uniforms("vertex", bound.header, drawing, needs) {
+                return None;
+            }
+        }
+        (bound.size >= 4 && bound.buf != 0).then(|| (bound.buf, (bound.size / 4) as usize * 4))
+    }
+
+    /// This draw's vertex uniforms as BYTES, exactly as the guest wrote them - the form the
+    /// GXP recompiler wants. See [`Self::current_vertex_uniform_src`].
+    fn current_vertex_uniform_bytes(
+        &mut self,
+        ctx: &GuestCtx,
+        blk: &crate::vita::gxmctx::Block<'_>,
+    ) -> Vec<u8> {
+        match self.current_vertex_uniform_src(ctx, blk) {
+            Some((addr, len)) => ctx.read_bytes(addr, len),
+            None => self.sa_bank_bytes(ctx),
+        }
+    }
+
+    #[allow(dead_code)]
     fn current_vertex_uniforms(
         &mut self,
         ctx: &GuestCtx,
@@ -8229,9 +8724,12 @@ impl VitaState {
         if bound.buf != 0 {
             let drawing =
                 self.vertex_program_header(blk.word(crate::vita::gxmctx::off::VERTEX_PROGRAM));
-            let needs = self
-                .reflected_uniform_size_bytes(ctx, drawing)
-                .max(default_uniform_buffer_bytes(ctx, drawing));
+            // Both halves come out of the ONE cached reflection: the header's own size field
+            // is memoised beside the reflected extent (see
+            // `ProgramReflection::default_uniform_bytes`), so this is a map lookup rather
+            // than a map lookup AND a guest word read on every draw.
+            let refl = self.reflect_program(ctx, drawing);
+            let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
             if self.stale_uniforms("vertex", bound.header, drawing, needs) {
                 return self.sa_bank_floats(ctx);
             }
@@ -8287,9 +8785,12 @@ impl VitaState {
             // How much SA bank the program ABOUT TO DRAW actually declares. Zero means it
             // reads none, and then a mismatched binding starves it of nothing - see
             // `stale_uniforms`.
-            let needs = self
-                .reflected_uniform_size_bytes(ctx, drawing)
-                .max(default_uniform_buffer_bytes(ctx, drawing));
+            // Both halves come out of the ONE cached reflection: the header's own size field
+            // is memoised beside the reflected extent (see
+            // `ProgramReflection::default_uniform_bytes`), so this is a map lookup rather
+            // than a map lookup AND a guest word read on every draw.
+            let refl = self.reflect_program(ctx, drawing);
+            let needs = refl.uniform_size_bytes.max(refl.default_uniform_bytes);
             if self.stale_uniforms("fragment", frag_uniform.header, drawing, needs) {
                 frag_uniform.buf = 0;
                 frag_uniform.size = 0;
@@ -8305,12 +8806,25 @@ impl VitaState {
         // attributes are rewritten below onto the single interleaved buffer this draw is
         // captured into, so what goes into the `Draw` is the REPACKED layout, not the
         // guest's.
-        let (mut attributes, streams) = match self.vertex_programs.get(&vhandle) {
-            Some(info) => {
-                let used = info.attributes.iter().map(|a| a.stream_index as usize).max().map(|m| m + 1).unwrap_or(0);
-                (info.attributes.clone(), (0..used).map(|i| info.stream(i)).collect::<Vec<_>>())
-            }
-            None => (Vec::new(), Vec::new()),
+        // >>> ALL OF IT PRECOMPUTED, at the moment the vertex program was created. See
+        // `VertexProgramInfo::packed_attributes`: the packed stride, the per-stream bases, the
+        // single-stream test and the rebased attribute list are constants of the PROGRAM, and
+        // building them per draw was four allocations and two loops on the hottest path here.
+        let (attributes, streams, base, stride, single_stream) = match self.vertex_programs.get(&vhandle) {
+            Some(info) => (
+                info.packed_attributes.clone(),
+                info.used_streams.clone(),
+                info.stream_base.clone(),
+                info.packed_stride,
+                info.single_stream,
+            ),
+            None => (
+                crate::capture::no_attributes(),
+                std::sync::Arc::from(&[][..]),
+                std::sync::Arc::from(&[][..]),
+                0,
+                false,
+            ),
         };
         // Index element size: U16 (0) is 2 bytes, U32 is 4.
         let index_elem = if index_format == 0 { 2 } else { 4 };
@@ -8338,13 +8852,6 @@ impl VitaState {
         // `instance` is 0: only the first instance of an instanced draw is captured (see
         // `sceGxmDrawInstanced`), so a per-instance stream contributes its row 0 to every
         // vertex, which is what instance 0 reads.
-        let mut base = Vec::with_capacity(streams.len());
-        let mut stride = 0u32;
-        for s in &streams {
-            base.push(stride);
-            stride += s.stride;
-        }
-        let single_stream = matches!(streams.as_slice(), [s] if !s.per_instance);
         let bound_streams = blk.streams();
         let snapshots = &mut self.texture_snapshots;
         let vertices: Arc<[u8]> = crate::perf::time(crate::perf::Phase::DrawVertices, || {
@@ -8396,10 +8903,6 @@ impl VitaState {
             crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
             Arc::from(vertices)
         });
-        for a in &mut attributes {
-            a.offset += base.get(a.stream_index as usize).copied().unwrap_or(0) as u16;
-            a.stream_index = 0;
-        }
         // Snapshot every bound fragment texture (decoded from its control words),
         // sorted by unit so unit 0 is first. `bound_textures` is already kept sorted by
         // unit as it is bound, so this reads it in place rather than cloning and
@@ -8440,7 +8943,8 @@ impl VitaState {
             }
             self.bound_binding_scratch = raw;
         }
-        // >>> THE WHOLE LIST IS SHARED WITHIN A SCENE. See `TextureSnapshots::snapshot_sets`.
+        // >>> THE WHOLE LIST IS SHARED ACROSS SCENES, RE-PROVEN PER SCENE. See
+        // `TextureSnapshots::snapshot_sets`.
         //
         // The key is what the list is a function of: the bindings, and the fragment program
         // header, which decides the albedo reorder below. The reorder is applied BEFORE the
@@ -8460,7 +8964,8 @@ impl VitaState {
             }
             h
         };
-        let cached_set = self.texture_snapshots.snapshot_sets.get(&set_key).cloned();
+        let cached_set =
+            self.texture_snapshots.set_validated(ctx, set_key, fheader as u64, &frag_binds);
         drop(bind_phase);
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
         let mut textures = match cached_set {
@@ -8505,7 +9010,7 @@ impl VitaState {
                     h ^= v;
                     h = h.wrapping_mul(0x0000_0100_0000_01b3);
                 };
-                mix(0x5645_5254_5845_5300); // "VERTEX" - the stage tag, mixed first
+                mix(VERTEX_STAGE_TAG); // "VERTEX" - the stage tag, mixed first
                 for b in &vert_binds {
                     mix(b.unit as u64);
                     for w in b.words {
@@ -8514,12 +9019,12 @@ impl VitaState {
                 }
                 h
             };
-            match self.texture_snapshots.snapshot_sets.get(&vkey) {
+            match self.texture_snapshots.set_validated(ctx, vkey, VERTEX_STAGE_TAG, &vert_binds) {
                 Some(set) => set.to_vec(),
                 None => {
                     let decoded = self.snapshot_bound_textures(ctx, &vert_binds);
                     let set: Arc<[crate::capture::BoundTexture]> = decoded.as_slice().into();
-                    self.texture_snapshots.snapshot_sets.insert(vkey, set);
+                    self.texture_snapshots.set_insert(vkey, VERTEX_STAGE_TAG, &vert_binds, set);
                     decoded
                 }
             }
@@ -8549,7 +9054,11 @@ impl VitaState {
                     }
                 }
                 let set: Arc<[crate::capture::BoundTexture]> = textures.into();
-                self.texture_snapshots.snapshot_sets.insert(set_key, set.clone());
+                // Taken and put back: `set_insert` needs the bindings that produced the
+                // list, and they were returned to `self.bound_textures` above.
+                let binds = std::mem::take(&mut self.bound_textures);
+                self.texture_snapshots.set_insert(set_key, fheader as u64, &binds, set.clone());
+                self.bound_textures = binds;
                 set
             }
         };
@@ -8581,16 +9090,27 @@ impl VitaState {
             }
         };
         let uniform_phase = crate::perf::scope(crate::perf::Phase::DrawUniforms);
-        let mut uniforms = self.current_vertex_uniforms(ctx, &blk);
-        // The RAW vertex default-uniform (SA bank) as the guest wrote it, BEFORE the composed
-        // MVP is stamped over lanes 0..16 below. This is what the recompiled vertex shader
-        // needs (it recomputes its own clip transform from the guest matrices), and unlike the
-        // raw `bound_vertex_uniform_buf` it also covers the direct `sceGxmSetUniformDataF`
-        // path (where that pointer is 0). Only materialised when the recompiler is enabled.
-        let vert_sa_raw: Vec<u8> = if gxp_live_capture() {
-            uniforms.iter().flat_map(|f| f.to_le_bytes()).collect()
+        // >>> THE VERTEX BANK IS READ ONCE, IN THE FORM THE GUEST WROTE IT.
+        //
+        // Two consumers want it: the transform reflection wants FLOATS, and the recompiler
+        // wants the RAW BYTES as the guest wrote them, BEFORE the composed MVP is stamped over
+        // lanes 0..16 below (`vert_sa_raw` also covers the direct `sceGxmSetUniformDataF`
+        // path, where the bound pointer is 0). It used to read floats and then serialise them
+        // back to bytes - a third buffer per draw holding what the read had already produced
+        // and thrown away, since a guest read is bytes to begin with.
+        //
+        // Off the recompiler path nothing wants the bytes, and there the float read stays as
+        // it was: on native it BORROWS guest memory and converts in place, so materialising a
+        // byte buffer there would be a cost with no reader.
+        let (mut uniforms, vert_sa_raw) = if gxp_live_capture() {
+            let raw = self.current_vertex_uniform_bytes(ctx, &blk);
+            let floats: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            (floats, raw)
         } else {
-            Vec::new()
+            (self.current_vertex_uniforms(ctx, &blk), Vec::new())
         };
         // The model-to-world matrix (for bringing the vertex normal into world space for
         // lighting). Read from the ORIGINAL uniforms, before `composed_mvp` below overwrites
@@ -8636,11 +9156,13 @@ impl VitaState {
             // The vertex SA is the pre-stamp raw uniforms captured above (covers both the bound
             // buffer and the direct sceGxmSetUniformDataF path).
             let vert_sa = vert_sa_raw;
-            let frag_sa = if frag_uniform.buf != 0 {
-                ctx.read_bytes(frag_uniform.buf, frag_uniform.size as usize)
-            } else {
-                Vec::new()
-            };
+            // >>> THE FRAGMENT BANK IS THE ONE ALREADY READ, NOT A SECOND READ OF THE SAME
+            // BYTES. It was read above for the material's nine floats, under the identical
+            // condition, and the guest cannot run between the two - so this used to copy the
+            // whole bank out of guest memory a SECOND time on every draw, which is a bulk read
+            // and an allocation per draw on the hottest path in the engine. The comment above
+            // that read already said "read once for the two readers"; this is the second
+            // reader actually taking it.
             (vprog, fprog, vert_sa, frag_sa)
         } else {
             (crate::capture::no_program(), crate::capture::no_program(), Vec::new(), Vec::new())
@@ -8648,6 +9170,11 @@ impl VitaState {
         // ...and WHERE the fragment bank came from, which the bytes cannot say. See
         // `capture::Draw::frag_sa_addr`.
         let frag_sa_addr = if gxp_live_capture() { frag_uniform.buf } else { 0 };
+        // The guest-memory window the vertex program's 0xE8 loads read through, snapshotted
+        // at draw time like every other guest input. One map lookup for a program without
+        // loads, which is every program of every other captured title.
+        let mem_window =
+            if gxp_live_capture() { self.capture_mem_window(ctx, &blk, vheader) } else { None };
         drop(gxp_phase);
         let record_phase = crate::perf::scope(crate::perf::Phase::DrawRecord);
         let draw = crate::capture::Draw {
@@ -8672,6 +9199,7 @@ impl VitaState {
             vert_sa,
             frag_sa,
             frag_sa_addr,
+            mem_window,
             shader_expanded: Self::reflected_shader_expanded(&vref),
         };
         match self.scene.as_mut() {
@@ -8708,6 +9236,65 @@ impl VitaState {
     pub fn invalidate_program_reflection(&mut self) {
         self.program_reflection.clear();
         self.program_blobs.clear();
+        self.mem_window_specs.clear();
+    }
+
+    /// The guest-memory window the VERTEX program at `header` needs snapshotted per draw,
+    /// if any (see `vitaslop_gxp_shader::mem_window_for_vertex_blob`). Memoised: the decode
+    /// behind it runs once per registered program, and the per-draw cost for the near-total
+    /// majority of programs that need no window is this one map lookup.
+    fn mem_window_spec(&mut self, ctx: &GuestCtx, header: u32) -> Option<vitaslop_gxp_shader::MemWindow> {
+        if header == 0 {
+            return None;
+        }
+        if let Some(spec) = self.mem_window_specs.get(&header) {
+            return *spec;
+        }
+        let blob = self.program_blob(ctx, header);
+        let spec = vitaslop_gxp_shader::mem_window_for_vertex_blob(&blob);
+        self.mem_window_specs.insert(header, spec);
+        spec
+    }
+
+    /// Snapshot the guest-memory window this draw's VERTEX program reads through its 0xE8
+    /// memory loads: `(window guest base address, the window's bytes)`.
+    ///
+    /// The bound address comes from the context block's own table - written by
+    /// `sceGxmSetVertexUniformBuffer` directly or by binding a precomputed vertex state -
+    /// and the extent is the program's own declared buffer size (see
+    /// `vitaslop_gxp_shader::MemWindow`). Snapshotted AT DRAW TIME like every other guest
+    /// input the capture carries, so the renderer later reads what the guest had bound now.
+    ///
+    /// Returns `None` (reported, throttled to once per program per run by the caller's
+    /// nature: an unbound buffer is a property of the title's call order, not of one draw)
+    /// when nothing is bound or the base is not 4-aligned - the renderer then DROPS the
+    /// draw with a report rather than feeding the loads fabricated bytes.
+    fn capture_mem_window(
+        &mut self,
+        ctx: &GuestCtx,
+        blk: &crate::vita::gxmctx::Block<'_>,
+        vheader: u32,
+    ) -> Option<(u32, Vec<u8>)> {
+        let spec = self.mem_window_spec(ctx, vheader)?;
+        let _g = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
+        let addr = blk.vertex_uniform_buffer(spec.buffer_index);
+        if addr == 0 || addr % 4 != 0 {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    vertex_program = format_args!("{vheader:#x}"),
+                    buffer_index = spec.buffer_index,
+                    addr = format_args!("{addr:#x}"),
+                    "a vertex program with MEMORY LOADS has no usable uniform buffer bound \
+                     (unbound, or a base the 32-bit loads cannot address) - its draws will \
+                     be DROPPED, not fed fabricated bytes"
+                );
+            }
+            return None;
+        }
+        Some((addr, ctx.read_bytes(addr, spec.bytes as usize)))
     }
 
     /// The raw `SceGxmProgram` container bytes at `header`, read out of guest memory once and
@@ -9634,6 +10221,7 @@ impl VitaState {
 /// the component count.
 fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
     let mut r = ProgramReflection::default();
+    r.default_uniform_bytes = default_uniform_buffer_bytes(ctx, header);
     let count = ctx.read_u32(header.wrapping_add(0x24));
     let base = header.wrapping_add(0x28).wrapping_add(ctx.read_u32(header.wrapping_add(0x28)));
     let mut max_regs = 0u32;
@@ -10238,7 +10826,8 @@ fn decode_texture(
         });
     }
 
-    // >>> THE WHOLE DECODE, INCLUDING THE PIXELS, IS DONE ONCE PER BINDING PER SCENE.
+    // >>> THE WHOLE DECODE, INCLUDING THE PIXELS, IS DONE ONCE PER BINDING - and then only
+    // RE-PROVEN, not redone, on the first use of each later scene (`decoded_validated`).
     //
     // [`TextureSnapshots::snapshot_sets`] already caches a whole draw's list by the SET of
     // bindings that produced it, and its doc comment says the hit rate is "essentially the
@@ -10261,11 +10850,17 @@ fn decode_texture(
     // at different addresses are not interchangeable. `unit` is NOT in the key - it is a
     // property of the binding, not of the texture - so it is stamped onto the clone.
     let key = (addr, binding.words);
-    let cached = match cache.decoded.get(&key) {
-        Some(d) => d.clone(),
+    let cached = match cache.decoded_validated(ctx, key) {
+        Some(d) => d,
         None => {
-            let d = decode_texture_pixels(ctx, cache, binding, exact_format);
-            cache.decoded.insert(key, d.clone());
+            let entry = decode_texture_pixels(ctx, cache, binding, exact_format);
+            let d = entry.res.clone();
+            // The count bound, now that the memo outlives scenes. A set whose per-binding
+            // entry vanishes here simply fails its next re-proof and rebuilds.
+            if cache.decoded.len() >= TextureSnapshots::DECODED_CAP {
+                cache.decoded.clear();
+            }
+            cache.decoded.insert(key, entry);
             d
         }
     };
@@ -10283,14 +10878,16 @@ fn decode_texture(
     };
 }
 
-/// The decode itself - everything [`decode_texture`] memoises. `Err(code)` is a binding the
-/// decode DROPS, carrying the drop code its caller reports.
+/// The decode itself - everything [`decode_texture`] memoises, returned with the facts the
+/// cross-scene re-proof needs ([`DecodedEntry::snap`] / [`DecodedEntry::degraded`]). An
+/// `Err(code)` result is a binding the decode DROPS, carrying the drop code its caller
+/// reports.
 fn decode_texture_pixels(
     ctx: &GuestCtx,
     cache: &mut TextureSnapshots,
     binding: &TextureBinding,
     exact_format: Option<u32>,
-) -> Result<crate::capture::BoundTexture, u8> {
+) -> DecodedEntry {
     let unit = binding.unit;
     // >>> EVERYTHING BELOW IS A PURE FUNCTION OF THE FOUR CONTROL WORDS, SO IT IS DONE ONCE.
     //
@@ -10304,16 +10901,23 @@ fn decode_texture_pixels(
             if cache.templates.len() >= TEXTURE_TEMPLATE_CAP {
                 cache.templates.clear();
                 cache.decoded.clear();
+                // The finished lists were built FROM these templates, and they now outlive
+                // the scene - so they die with them.
+                cache.snapshot_sets.clear();
             }
             cache.templates.insert(binding.words, t);
             t
         }
     };
+    let scene = cache.scene_seq;
+    let entry = move |res, snap, degraded| DecodedEntry { res, snap, degraded, valid_scene: scene };
     let Some(t) = template else {
-        return Err(1);
+        return entry(Err(1), None, false);
     };
     let mut levels = t.levels;
     let mut face_bytes = t.face_bytes;
+    let mut snap_len = t.read_len as usize;
+    let mut degraded = false;
     let mut pixels = {
         let _r = crate::perf::scope(crate::perf::Phase::DrawTexRead);
         cache.get_or_read(ctx, t.data_addr, t.read_len as usize)
@@ -10326,13 +10930,16 @@ fn decode_texture_pixels(
         report_mip_chain_unreadable(unit, t.base_format, t.data_addr, t.width, t.height, levels);
         levels = 1;
         face_bytes = t.level0_bytes;
+        snap_len = t.level0_read_len as usize;
+        degraded = true;
         pixels = cache.get_or_read(ctx, t.data_addr, t.level0_read_len as usize);
     }
     if pixels.is_empty() {
         report_unreadable_texture(unit, t.base_format, t.data_addr, t.read_len as usize, t.width, t.height);
-        return Err(2);
+        return entry(Err(2), None, false);
     }
-    return Ok(crate::capture::BoundTexture {
+    let snap = Some((t.data_addr, snap_len));
+    return entry(Ok(crate::capture::BoundTexture {
         unit,
         base_format: t.base_format,
         swizzle: t.swizzle,
@@ -10352,7 +10959,7 @@ fn decode_texture_pixels(
         mag_filter: t.mag_filter,
         gamma: t.gamma,
         mip_filter: t.mip_filter,
-    });
+    }), snap, degraded);
 }
 
 /// Derive everything a binding's four control words say about its texture. Called once per

@@ -326,6 +326,17 @@ impl Default for FragmentMaterial {
     }
 }
 
+/// No attribute layout: what a draw carries when nothing resolved the bound vertex program,
+/// and what a synthetic draw (a test, a probe) starts from.
+///
+/// One SHARED empty list, so it is a refcount bump rather than an allocation - the same reason
+/// [`no_program`] exists.
+pub fn no_attributes() -> std::sync::Arc<[VertexAttribute]> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<[VertexAttribute]>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| std::sync::Arc::from(&[][..])).clone()
+}
+
 /// No shader container: what [`Draw::vprog`] and [`Draw::fprog`] hold off the recompiler path,
 /// and what a synthetic draw (a test, a probe) carries.
 ///
@@ -358,7 +369,18 @@ pub struct Draw {
     /// from it (see the index expansion in `RenderSceneBuilder`).
     pub vertices: Arc<[u8]>,
     pub vertex_stride: u32,
-    pub attributes: Vec<VertexAttribute>,
+    /// The attribute layout of `vertices`, ALREADY rebased onto the single interleaved
+    /// buffer this draw was captured into (every `stream_index` is 0 and every `offset` is
+    /// measured from the start of a packed row).
+    ///
+    /// Shared, not owned, for the same reason `vertices` is - and here the sharing is with
+    /// the vertex PROGRAM rather than with the renderer: the repacked layout is a pure
+    /// function of the program's declared attributes and its streams' strides, both fixed when
+    /// `sceGxmShaderPatcherCreateVertexProgram` created it. Cloning the list and rewriting the
+    /// same offsets onto it was an allocation, a copy and a loop on EVERY draw of every frame
+    /// (983 a presented frame mid-race) to recompute a constant. It is built once now, in
+    /// `set_vertex_program`, and a draw takes a refcount.
+    pub attributes: Arc<[VertexAttribute]>,
     /// The index buffer bytes. `Arc` for the same reason as `vertices` above.
     pub indices: Arc<[u8]>,
     /// The vertex default uniform buffer contents the guest wrote for this draw
@@ -437,6 +459,13 @@ pub struct Draw {
     /// second case the address is stable enough to point `VITASLOP_WATCH_STORE_LOG` at, which
     /// is the one tool that names every guest writer of an address in a single run.
     pub frag_sa_addr: u32,
+    /// The guest-memory WINDOW this draw's recompiled vertex shader reads through its 0xE8
+    /// memory loads: `(window guest base address, the window's bytes at draw time)`. `None`
+    /// for the near-total majority of programs, which load no memory - and for a draw whose
+    /// program needs one but had nothing usable bound, which the renderer must DROP with a
+    /// report rather than feed fabricated bytes. See
+    /// `vitaslop_gxp_shader::module::MemWindow` and `VitaState::capture_mem_window`.
+    pub mem_window: Option<(u32, Vec<u8>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -1166,7 +1195,7 @@ mod extent_tests {
             index_count: 3,
             vertices: Arc::from(&[][..]),
             vertex_stride: 0,
-            attributes: Vec::new(),
+            attributes: no_attributes(),
             indices: Arc::from(&[][..]),
             uniforms: Vec::new(),
             textures: Arc::from(&[][..]),
@@ -1180,6 +1209,7 @@ mod extent_tests {
             vert_sa: Vec::new(),
             frag_sa: Vec::new(),
             frag_sa_addr: 0,
+            mem_window: None,
             shader_expanded: false,
         };
         Scene {

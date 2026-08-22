@@ -873,6 +873,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         self.inner.rounds_total()
     }
 
+    /// `(live, finished)` guest threads - see
+    /// [`vitaslop_runtime::sched::SchedCore::thread_census`].
+    pub fn thread_census(&self) -> (usize, usize) {
+        self.inner.thread_census()
+    }
+
     /// Who actually got the CPU - see
     /// [`vitaslop_runtime::sched::SchedCore::cpu_share_report`].
     pub fn cpu_share_report(&self) -> String {

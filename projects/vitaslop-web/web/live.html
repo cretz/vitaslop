@@ -399,6 +399,31 @@
       // The dump itself, built ONCE for both readers: the copy button below and the dev-server
       // sink. Two builders would drift, and the one that drifted would be the one nobody was
       // looking at when it mattered.
+      /// One line describing what the audio ring actually carried, in seconds rather
+      /// than frame counts - "3.2s of gaps" is a thing a person can act on, "153600" is
+      /// not. Ratios are against what the device consumed.
+      const audioLine = () => {
+        if (!window.__audioStats) return `audio: no ring on this page - the run is SILENT`;
+        const a = window.__audioStats();
+        const rate = a.sampleRate || 48000;
+        const s = (n) => (n / rate).toFixed(2);
+        const pct = (n) => (a.read ? ((100 * n) / a.read).toFixed(1) : "0.0");
+        const ms = (n) => ((1000 * n) / rate).toFixed(0);
+        return (
+          `audio: context=${a.state} peak=${(a.peak ?? 0).toFixed(4)}` +
+          `${a.peak > 0 ? "" : " (NOTHING was audible at any point)"} | ` +
+          `written ${s(a.written)}s, read ${s(a.read)}s | ` +
+          `UNDERRUN ${s(a.underrun)}s (${pct(a.underrun)}% - gaps the device filled with ` +
+          `silence, heard as clicks) | OVERRUN ${s(a.overrun)}s (${pct(a.overrun)}% - ` +
+          `samples dropped because the emulator ran ahead) | ` +
+          // Latency is what makes a sound arrive after the button that caused it, and it
+          // is a different complaint from crackling with a different fix, so it is
+          // reported separately rather than inferred from the counters above.
+          `LATENCY ${ms(a.fill ?? 0)}ms of backlog now, ${s(a.latencySkip ?? 0)}s skipped ` +
+          `to keep it bounded`
+        );
+      };
+
       const diagText = () =>
         [
           `vitaslop diagnostics`,
@@ -413,6 +438,18 @@
           `${$("adapter").textContent}`,
           `${$("fps").textContent}`,
           `${$("status").textContent}`,
+          // >>> AUDIO, AND IT IS THE LINE THAT DIAGNOSES CRACKLING.
+          //
+          // `peak` says whether anything was ever audible at all - the ring holds half a
+          // second, so its contents at any one moment prove nothing about a title that
+          // is mostly quiet. `underrun` and `overrun` say what kind of broken: underrun
+          // is the device's audio thread arriving to find nothing written and emitting
+          // silence, overrun is the emulator running AHEAD and having samples dropped.
+          // Both sound identical through a speaker - a discontinuity, i.e. a click - and
+          // they have opposite causes, so a report that merged them would be useless.
+          // Both being large at once means the producer is BURSTY rather than simply
+          // slow, which is a different fix again.
+          audioLine(),
           // A worker that died takes its console with it. Carrying the fatal error in every
           // later dump is what makes it reach disk at all: the sink's own POST races the
           // worker's death, and the tick that follows does not.
@@ -839,6 +876,7 @@ VITASLOP_LOG=warn</textarea>
           const audio = await startAudio();
           audioRing = audio.ring;
           window.__audioStats = audio.stats;
+          window.__audioSamples = audio.samples;
         } catch (err) {
           console.warn("[audio] could not start; this run will be SILENT:", err);
         }

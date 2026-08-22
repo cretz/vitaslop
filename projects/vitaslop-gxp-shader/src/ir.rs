@@ -380,6 +380,24 @@ pub enum Op {
     /// [`crate::usse::decode_shader`] when repeat-unrolling renumbers the instruction stream, so
     /// it is always a delta in the CURRENT stream.
     Branch { rel: i32 },
+    /// MEMORY LOAD (group 0xE8, opcode1 0x1d) in the ONE variant the corpus establishes:
+    /// `mode = 0, addr_mode = 0`, 32-bit elements, unconditional. Reads `elements`
+    /// consecutive 32-bit words of GUEST MEMORY starting at byte address
+    /// `srcs[0] + offset_bytes` (the operand's register holds a guest BYTE POINTER, and
+    /// `offset_bytes` folds the instruction's immediate src1/src2 element offsets, already
+    /// scaled by the element size), into `elements` consecutive destination registers from
+    /// `dest`.
+    ///
+    /// `elements` runs 1..=16, so [`Instr::write_mask`] CANNOT describe the written span -
+    /// it is left all-true and every consumer of this op must use `elements` instead. The
+    /// decoder only produces this op for the established variant (PA-bank pointer,
+    /// immediate offsets, load direction); every other combination stays blocked by name.
+    ///
+    /// The emitter translates it against the draw's bound MEMORY WINDOW - a storage of the
+    /// addressed guest bytes the host uploads per draw (see `module::MemWindow`) - because
+    /// WGSL has no raw pointers. A shader whose window cannot be established hard-fails at
+    /// link time rather than reading fabricated bytes.
+    MemLoad { elements: u8, offset_bytes: u32 },
     /// A documented operation that is not yet wired for WGSL emit (tex, pack, the u32
     /// bitwise ops, fx8/u8 integer ops, loads/stores, complex flow). Carries a static
     /// mnemonic so an emit attempt hard-fails naming exactly what to implement next. This
@@ -409,6 +427,7 @@ impl Op {
                 | Op::IntMad { .. }
                 | Op::LoadIndex { .. }
                 | Op::Test { .. } | Op::Kill | Op::DepthF
+                | Op::MemLoad { .. }
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
                 // bug in that pass and hard-fails there, naming itself.
@@ -446,6 +465,7 @@ impl Op {
             Op::PackToInt { .. } => "pack.int",
             Op::IntMad { .. } => "imad",
             Op::LoadIndex { .. } => "loadidx",
+            Op::MemLoad { .. } => "ldmem",
             Op::Bitwise { .. } => "bitwise",
             Op::Sop2 { .. } => "sop2.fx8",
             Op::Test { .. } => "vtst",

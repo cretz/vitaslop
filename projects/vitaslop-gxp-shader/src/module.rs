@@ -493,6 +493,104 @@ pub struct VertexAttribute {
     pub components: u32,
 }
 
+/// The guest-memory WINDOW a vertex program's 0xE8 memory loads read through: the one
+/// NON-DEFAULT uniform buffer the program declares, whose bound guest address the driver
+/// places in SA register [`MemWindow::base_sa`] and whose bytes the host must upload with
+/// every draw (WGSL has no raw pointers, so the shader's loads become subscripts of this
+/// window - see `wgsl::emit_mem_load`).
+///
+/// Built ONLY by [`resolve_mem_window`], which refuses (naming the reason) any program whose
+/// loads it cannot tie to exactly this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemWindow {
+    /// The uniform buffer's GXM index - what `sceGxmSetVertexUniformBuffer(ctx, index, data)`
+    /// binds, and what the host reads the bound address for at draw time.
+    pub buffer_index: u32,
+    /// The window's extent in BYTES: the `UniformBuffer` parameter's `array_size`, which is
+    /// in bytes - MEASURED by exact tiling on both corpus programs that declare one (6144 =
+    /// the 384-vec4 F32 member exactly; 32 = the container entry's own 8 registers exactly).
+    pub bytes: u32,
+    /// The SA register the driver writes the buffer's bound guest ADDRESS into
+    /// (`data_container.base_sa + binding.data_slot`); the module initialises it from the
+    /// window so the shader's own address arithmetic runs bit-exact.
+    pub base_sa: u32,
+}
+
+impl MemWindow {
+    /// Number of `vec4<u32>` elements the window's UNIFORM binding holds: one header vec4
+    /// (lane x = the window's guest base address) plus the window bytes.
+    pub fn vec4_count(&self) -> u32 {
+        1 + self.bytes.div_ceil(16)
+    }
+}
+
+/// Resolve whether (and how) a decoded VERTEX program's memory loads can be fed, per
+/// [`MemWindow`]. `Ok(None)` = the program loads no memory. `Err` names exactly what is
+/// unestablished - the caller must refuse to emit rather than let a load read fabricated
+/// bytes ([`crate::wgsl::emit_mem_load`] cannot be reached without this having succeeded).
+///
+/// The checks are what make the one-sample +0x78 reading safe to act on (see
+/// [`crate::container::UniformBufferBinding`]): a program where the reading is wrong cannot
+/// pass them by accident, because the slot must land inside the DATA container, collide with
+/// no literal and no texture-control word, and name an SA register the code actually reads.
+pub fn resolve_mem_window(
+    program: &Program,
+    shader: &Shader,
+) -> Result<Option<MemWindow>, &'static str> {
+    if !shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
+        return Ok(None);
+    }
+    // Exactly one declared non-default uniform buffer: with several, WHICH buffer a load
+    // chases is a dataflow question this resolver does not answer.
+    let ubs: Vec<&crate::container::Parameter> = program
+        .parameters
+        .iter()
+        .filter(|p| p.category == ParamCategory::UniformBuffer)
+        .collect();
+    let [ub] = ubs[..] else {
+        return Err("memory loads with other than exactly ONE declared UniformBuffer");
+    };
+    if ub.resource_index < 0 {
+        return Err("memory loads with a negative UniformBuffer index");
+    }
+    let buffer_index = ub.resource_index as u32;
+    if ub.array_size == 0 {
+        return Err("memory loads with a zero-sized UniformBuffer");
+    }
+    let [binding] = program.uniform_buffer_bindings[..] else {
+        return Err("memory loads with other than exactly ONE +0x78 buffer binding entry");
+    };
+    if u32::from(binding.buffer_index) != buffer_index {
+        return Err("the +0x78 binding entry names a different buffer than the parameter table");
+    }
+    let Some(data) = program.containers.iter().find(|c| c.index == 19) else {
+        return Err("memory loads with no DATA container to hold the buffer's address");
+    };
+    if binding.data_slot >= data.size_regs {
+        return Err("the buffer-address slot falls outside the DATA container");
+    }
+    let base_sa = u32::from(data.base_sa) + u32::from(binding.data_slot);
+    if program.literals.iter().any(|&(reg, _)| reg == base_sa)
+        || program.texture_control.iter().any(|&(reg, _)| reg == base_sa)
+    {
+        return Err("the buffer-address SA register collides with a literal or texture word");
+    }
+    // The program must actually READ the pointer register, or the whole reading is suspect.
+    let reads_base = shader.instrs.iter().flat_map(|i| i.srcs.iter()).any(|s| {
+        s.bank == crate::ir::Bank::SecondaryAttr && u32::from(s.index) == base_sa
+    });
+    if !reads_base {
+        return Err("no instruction reads the SA register the +0x78 binding names");
+    }
+    // The window binds as a UNIFORM buffer (present on every WebGPU tier); the guaranteed
+    // minimum for one binding is 64 KiB, header included.
+    let w = MemWindow { buffer_index, bytes: ub.array_size, base_sa };
+    if w.vec4_count() * 16 > 65536 {
+        return Err("the declared uniform buffer exceeds a 64 KiB uniform binding");
+    }
+    Ok(Some(w))
+}
+
 /// The concrete resources a [`VertexModule`] expects the renderer to bind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexBindingPlan {
@@ -509,6 +607,9 @@ pub struct VertexBindingPlan {
     /// program that samples is building its GEOMETRY from the texture, so an unbound one is a
     /// missing mesh rather than an untextured surface. Empty for the usual vertex program.
     pub samplers: Vec<crate::wgsl::TexBinding>,
+    /// The guest-memory window the program's 0xE8 loads read through, when it has any (see
+    /// [`MemWindow`]). The renderer must bind the window's bytes with every draw.
+    pub mem_window: Option<MemWindow>,
 }
 
 impl VertexBindingPlan {
@@ -587,7 +688,12 @@ pub fn plan_vertex_bindings(program: &Program, shader: &Shader) -> VertexBinding
     let varying_vec4s = extent.saturating_sub(4).div_ceil(4);
     let samplers = crate::wgsl::tex_units(shader, |u| program.sampler_is_cube(u as u32));
 
-    VertexBindingPlan { attributes, sa_lane_count, varying_vec4s, samplers }
+    // An Err here (memory loads whose window cannot be established) surfaces as a
+    // LinkError in `link_programs`, which re-runs the resolver to NAME the reason; a plan
+    // is a statement of what to bind, and there is nothing to bind for a refused program.
+    let mem_window = resolve_mem_window(program, shader).ok().flatten();
+
+    VertexBindingPlan { attributes, sa_lane_count, varying_vec4s, samplers, mem_window }
 }
 
 /// Assemble a complete, bindable WGSL vertex module from an emitted body + its binding plan.
@@ -603,6 +709,16 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
     if sa_vec4 > 0 {
         let _ = writeln!(m, "struct SaBuf {{ data: array<vec4<u32>, {sa_vec4}> }};");
         let _ = writeln!(m, "@group(0) @binding(0) var<uniform> sa_buf: SaBuf;");
+    }
+
+    // The guest-memory window the program's 0xE8 loads read through: vec4 0 lane x is the
+    // window's own guest base address, the window's words follow (see [`MemWindow`]).
+    if let Some(w) = &plan.mem_window {
+        let _ = writeln!(
+            m,
+            "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, {}>;",
+            w.vec4_count()
+        );
     }
 
     // Sampled textures + samplers at group 1, under the VERTEX stage's own names
@@ -665,6 +781,11 @@ pub fn build_vertex_module(body: &str, plan: &VertexBindingPlan) -> VertexModule
             "  for (var k: u32 = 0u; k < {}u; k = k + 1u) {{ sa[k] = sa_buf.data[k / 4u][k % 4u]; }}",
             plan.sa_lane_count
         );
+    }
+    // The driver-placed pointer register: the bound buffer's guest address, exactly as the
+    // hardware's PDS would leave it, so the body's address arithmetic runs bit-exact.
+    if let Some(w) = &plan.mem_window {
+        let _ = writeln!(m, "  sa[{}] = gxp_mem[0].x;", w.base_sa);
     }
 
     m.push_str(body);
@@ -857,6 +978,7 @@ mod tests {
             default_uniform_regs: 0,
             sa_base_from_container: true,
             containers: Vec::new(),
+            uniform_buffer_bindings: Vec::new(),
             secondary_code: Vec::new(),
             literals: Vec::new(),
             texture_control: Vec::new(),

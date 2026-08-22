@@ -166,6 +166,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // guest an ADDRESS rather than answering a question, so it is the one to fall back to if
     // a title's uniforms ever look wrong. Read at LINK time; set it before the run.
     "VITASLOP_NO_INLINE_RESERVE",
+    // The SCOPED switch for the constant-return STUBS (the NGS patch/volume calls and their
+    // neighbours, 32% of a race frame's host calls on one title). Reachable from the browser
+    // for the usual price-tag reason, and for a diagnostic one the other switches do not have:
+    // an inlined call leaves the call histogram, and the histogram is how "which unimplemented
+    // calls does this title make" is answered. Read at LINK time; set it before the run.
+    "VITASLOP_NO_INLINE_STUBS",
     // The SCOPED switch for the fragment-texture bind. Reachable from the browser because it
     // is not a perf question at all: the inline copy form replaced a handler that a title's
     // every texture bind went through, so if a texture goes MISSING on a device, this knob is

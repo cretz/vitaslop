@@ -1052,7 +1052,7 @@ impl Session {
             for (i, s) in cap.frame_scenes().iter().enumerate() {
                 let mut fmts: Vec<String> = Vec::new();
                 for d in &s.draws {
-                    for a in &d.attributes {
+                    for a in d.attributes.iter() {
                         let f = format!("fmt{}x{}@{}", a.format, a.component_count, a.offset);
                         if !fmts.contains(&f) {
                             fmts.push(f);

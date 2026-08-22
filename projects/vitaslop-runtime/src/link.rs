@@ -474,7 +474,7 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     // Which host imports the transpiler may emit inline. Derived from the finished
     // import table so the index a call site uses and the index carrying the inline op
     // are the same by construction.
-    let inline_imports = imports
+    let inline_imports: Vec<vitaslop_transpiler::InlineImport> = imports
         .iter()
         .enumerate()
         .filter_map(|(i, &(_, func_nid))| {
@@ -482,6 +482,34 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
                 .map(|op| vitaslop_transpiler::InlineImport { import: i as u32, op })
         })
         .collect();
+    // >>> WHICH CALLS WERE EMITTED AS A BARE CONSTANT, SAID ONCE, HERE.
+    //
+    // An inlined call never reaches the host, so it is absent from the call histogram and the
+    // host-call trace - and for a constant-return STUB that is the one place anyone would look
+    // to find out that a title depends on a call nothing implements. Every other inline form
+    // replaces a handler that computes the same answer; these replace a handler that computes
+    // nothing, which is exactly what someone auditing coverage wants to see. So the list is
+    // printed rather than left to be inferred from an empty count, and
+    // `VITASLOP_NO_INLINE_STUBS` puts them all back on the host.
+    let stubbed: Vec<&'static str> = {
+        let mut v: Vec<&'static str> = inline_imports
+            .iter()
+            .filter(|i| matches!(i.op, vitaslop_transpiler::InlineOp::RetConst { .. }))
+            .map(|i| crate::nid::name(imports[i.import as usize].1))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    if !stubbed.is_empty() {
+        tracing::info!(
+            target: "vitaslop::link",
+            "link: {} constant-return stub(s) emitted INLINE, so they will not appear in the \
+             host-call histogram or trace: {}",
+            stubbed.len(),
+            stubbed.join(", "),
+        );
+    }
 
     Ok(LinkedProgram {
         base: IMAGE_BASE,

@@ -318,10 +318,17 @@ fn report(
     // two engines' build cost is comparable without comparing two machines' clocks.
     println!("bench: {}", vitaslop_runtime::render::take_build_work().line(frame_ms.len() as u64));
 
+    // The thread TABLE size, beside the resume count, because every scheduler pass is a
+    // scan of it: a finished thread keeps its slot for the whole run (its index is stable
+    // and its exit code outlives it), so a title that spawns short-lived workers arrives at
+    // a gameplay frame with a table thousands of entries long and pays for it on every pick.
+    let (live_threads, finished_threads) = sched.thread_census();
     println!(
-        "bench: scheduler - {rounds} thread resumes ({:.0} per frame, one per {:.0} host calls)",
+        "bench: scheduler - {rounds} thread resumes ({:.0} per frame, one per {:.0} host calls), \
+         thread table {} slots ({live_threads} live, {finished_threads} finished)",
         rounds as f64 / frame_ms.len() as f64,
-        perf::snapshot().calls as f64 / rounds.max(1) as f64
+        perf::snapshot().calls as f64 / rounds.max(1) as f64,
+        live_threads + finished_threads,
     );
 
     let mut host_calls = 0u64;

@@ -286,6 +286,9 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         Op::Sop2 { .. } => {
             return Err("sop2.fx8 (this register file is one f32 per lane, not four bytes)")
         }
+        // A memory load reads GUEST MEMORY, which this register-file model does not hold; a
+        // fabricated value here would defeat the oracle's whole purpose.
+        Op::MemLoad { .. } => return Err("ldmem (no guest memory in this register-file model)"),
         _ => return Err("unmodeled"),
     })
 }

@@ -4570,12 +4570,23 @@ fn to_draw_space(space: &Space) -> DrawSpace {
 /// Two distinct buffers holding identical bytes get two entries. That is wasteful, never
 /// wrong, and the capture avoids it wherever it can tell.
 fn tex_key(t: &BoundTexture) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // >>> NINE ROUNDS, NOT SEVENTY-TWO. This ran FNV one BYTE at a time over nine 64-bit
+    // values, and it is called once per bound texture per draw - **4,632 times per presented
+    // frame** on a race, which is a third of a million xor-multiply rounds to look up a cache.
+    //
+    // The mixer is the crate's own ([[crate::fasthash]]): rotate, xor, multiply, a round per
+    // WORD. The rotate is what makes that admissible where a word-at-a-time FNV would not be -
+    // plain `h ^= word; h *= odd` is linear mod 2^64 and cannot diffuse bit 63, which is the
+    // flaw that made a geometry cache render another draw's mesh
+    // ([[vitaslop-content-hash-cache-must-verify]]). A finaliser avalanche follows, because
+    // this value is used as a cache KEY with no verification behind it, and the inputs here
+    // (an address, a format, two dimensions) differ in low bits far more often than high ones.
+    let mut st = crate::fasthash::FxHasher::default();
+    let mut h: u64 = 0;
     let mut mix = |v: u64| {
-        for b in v.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
-        }
+        use std::hash::Hasher;
+        st.write_u64(v);
+        h = st.finish();
     };
     mix(t.data_addr as u64);
     mix(t.base_format as u64);
@@ -4595,7 +4606,14 @@ fn tex_key(t: &BoundTexture) -> u64 {
     // The pixel buffer's identity - see this function's own note. The length is already
     // folded in above (with the stride); the address is what makes this exact.
     mix(t.pixels.as_ptr() as usize as u64);
-    h
+    // The avalanche. `splitmix64`'s finaliser: two xor-shift-multiply rounds, which is what
+    // turns a rotate-xor-multiply accumulator into a value whose every bit depends on every
+    // input bit. Three instructions' worth of insurance on a key nothing verifies.
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 /// A texture's IDENTITY as a bound resource - the guest address, format and shape, WITHOUT
@@ -5300,12 +5318,29 @@ impl RenderSceneBuilder {
             // bytes` was incremented by that number and eviction subtracts it, so re-pricing an
             // entry here would drift the running total against the entries it is meant to
             // describe. Falls back to the shape estimate only for an entry with no record.
-            let cost = self
-                .decode_used
-                .get(&key)
-                .map(|(_, b)| *b)
-                .unwrap_or_else(|| predicted_texture_bytes(g.width, g.height, g.faces, g.texel, g.compressed.as_ref()));
-            self.touch_decode(key, cost);
+            //
+            // >>> READ AND RE-STAMPED IN ONE MAP LOOKUP. This was a `get` followed by
+            // `touch_decode`'s `insert` - two probes of the same key, on a path taken once per
+            // bound texture per draw (4,632 times a presented frame on a race). Same
+            // arithmetic, same counters, one hash.
+            let epoch = self.decode_epoch;
+            let (cost, first_this_frame) = match self.decode_used.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (used, bytes) = *e.get();
+                    e.insert((epoch, bytes));
+                    (bytes, used != epoch)
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let bytes = predicted_texture_bytes(
+                        g.width, g.height, g.faces, g.texel, g.compressed.as_ref(),
+                    );
+                    e.insert((epoch, bytes));
+                    (bytes, true)
+                }
+            };
+            if first_this_frame {
+                self.decode_frame_bytes += cost;
+            }
             return g;
         }
         work.tex_decoded += 1;
@@ -5806,6 +5841,7 @@ impl RenderSceneBuilder {
                     vert_sa: d.vert_sa.clone(),
                     frag_sa: d.frag_sa.clone(),
                     frag_sa_addr: d.frag_sa_addr,
+                    mem_window: d.mem_window.clone(),
                     vertices: d.vertices.clone(),
                     vertex_stride: d.vertex_stride,
                     attributes,
@@ -5990,7 +6026,7 @@ mod geometry_tests {
             index_count: indices.len() as u32,
             vertices: Arc::from(&[][..]),
             vertex_stride: 1,
-            attributes: vec![],
+            attributes: vec![].into(),
             indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>().into(),
             uniforms: vec![],
             textures: vec![].into(),
@@ -6005,6 +6041,7 @@ mod geometry_tests {
             vert_sa: vec![],
             frag_sa: vec![],
             frag_sa_addr: 0,
+            mem_window: None,
             shader_expanded: false,
         }
     }
@@ -6038,7 +6075,7 @@ mod geometry_tests {
                 component_count: 4,
                 reg_index: 1,
             },
-        ];
+        ].into();
         d.uniforms = mvp.to_vec();
         d.world[12] = world[0];
         d.world[13] = world[1];
@@ -6316,8 +6353,13 @@ mod geometry_tests {
         // the colour and `interpret_draw` therefore does not skip the draw as having no
         // colour source. (`located_draw` predates the map and gets away with placeholder
         // codes because `locate_scene` never consults `DrawInterp::skip`.)
-        d.attributes[0].format = FORMAT_F32;
-        d.attributes[1].format = FORMAT_U8N;
+        // Through a fresh list rather than in place: the field is a shared `Arc` now (see
+        // `capture::Draw::attributes`), which is exactly the point - a draw does not own its
+        // layout, the vertex program does.
+        let mut attrs = d.attributes.to_vec();
+        attrs[0].format = FORMAT_F32;
+        attrs[1].format = FORMAT_U8N;
+        d.attributes = attrs.into();
         if !depth_write {
             d.render_state.front_depth_write = SCE_GXM_DEPTH_WRITE_DISABLED;
         }
@@ -6566,7 +6608,7 @@ mod geometry_tests {
             crate::capture::VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 3, reg_index: 0 },
             crate::capture::VertexAttribute { stream_index: 0, offset: 12, format: FORMAT_F32, component_count: 2, reg_index: 1 },
             crate::capture::VertexAttribute { stream_index: 0, offset: 16, format: FORMAT_U8N, component_count: 4, reg_index: 2 },
-        ];
+        ].into();
         // No uniforms: that is what makes this 2D rather than MVP, which is the whole point.
         d.uniforms = vec![];
         d.textures = [BoundTexture {
@@ -6933,13 +6975,13 @@ mod supersample_tests {
             attributes: vec![
                 VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
-            ],
+            ].into(),
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex].into(), vertex_textures: vec![], render_state: RenderState::default(),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
+            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, mem_window: None, shader_expanded: false,
         };
         let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -6990,13 +7032,13 @@ mod supersample_tests {
             attributes: vec![
                 VertexAttribute { stream_index: 0, offset: 0, format: FORMAT_F32, component_count: 2, reg_index: 0 },
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
-            ],
+            ].into(),
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
             uniforms: vec![], textures: vec![tex].into(), vertex_textures: vec![], render_state: RenderState::default(),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, shader_expanded: false,
+            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, mem_window: None, shader_expanded: false,
         };
         let s = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).

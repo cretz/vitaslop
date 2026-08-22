@@ -1212,6 +1212,11 @@ pub struct GxpRecompile {
     /// Guest address `frag_sa` was read from (0 = none). See `capture::Draw::frag_sa_addr`:
     /// the bytes say what the draw got, the address is what a store watch can be pointed at.
     pub frag_sa_addr: u32,
+    /// The guest-memory WINDOW the recompiled vertex shader's 0xE8 memory loads read
+    /// through: `(window guest base address, the window's bytes at draw time)`. `None` for
+    /// a program that loads no memory; a draw whose PIPELINE declares a window but carries
+    /// `None` here is DROPPED with a report rather than fed fabricated bytes.
+    pub mem_window: Option<(u32, Vec<u8>)>,
     /// Raw guest vertex stream bytes (stream 0) exactly as bound.
     ///
     /// Shared with the capture that snapshotted it rather than copied: this is the whole
@@ -3681,6 +3686,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         vsa_lanes: u32,
         /// Fragment SA scalar-lane count.
         fsa_lanes: u32,
+        /// Size in bytes of the vertex stage's guest-MEMORY-WINDOW uniform at group 0
+        /// binding 1 (one header vec4 + the window bytes - see
+        /// `vitaslop_gxp_shader::MemWindow::vec4_count`), or 0 when the pair's vertex
+        /// program loads no memory. A draw for a pipeline with a window must carry the
+        /// window's bytes or be DROPPED with a report.
+        mem_bind_bytes: u32,
         /// `(sampler unit, is_3d)` per group2 sampler, in binding order.
         samplers: Vec<(u8, SamplerDim)>,
         /// The VERTEX stage's sampler units, in group-4 binding order.
@@ -3729,9 +3740,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         i_resident: bool,
         index_count: u32,
         /// Byte offsets of this draw's vertex and fragment SA blocks inside the pass's uniform
-        /// arena, for the group0/group1 DYNAMIC offsets. The bind groups themselves belong to
-        /// the shader PAIR, not the draw ([`GxpLive::ubo_bgs`]).
-        u_off: [u32; 2],
+        /// arena, for the group0/group1 DYNAMIC offsets, plus the vertex stage's
+        /// guest-memory window block (third slot, meaningful only when the pipeline's
+        /// `mem_bind_bytes` is non-zero). The bind groups themselves belong to the shader
+        /// PAIR, not the draw ([`GxpLive::ubo_bgs`]).
+        u_off: [u32; 3],
         /// Bind groups for group2 (samplers) and group3 (the pass depth block).
         bg2: wgpu::BindGroup,
         bg3: wgpu::BindGroup,
@@ -4325,26 +4338,34 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     enc(&ENC.bind_groups_built, 1);
                     let layout = &pipe.layouts[group as usize];
-                    let bg = if lanes == 0 {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("gxp-ubo-empty"),
-                            layout,
-                            entries: &[],
-                        })
-                    } else {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("gxp-ubo-bind"),
-                            layout,
-                            entries: &[wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer,
-                                    offset: 0,
-                                    size: wgpu::BufferSize::new((lanes.div_ceil(4) as u64) * 16),
-                                }),
-                            }],
-                        })
-                    };
+                    let mut entries: Vec<wgpu::BindGroupEntry> = Vec::new();
+                    if lanes > 0 {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer,
+                                offset: 0,
+                                size: wgpu::BufferSize::new((lanes.div_ceil(4) as u64) * 16),
+                            }),
+                        });
+                    }
+                    // The vertex stage's guest-memory window rides in group 0 beside the SA
+                    // uniform, over the same arena with its own dynamic offset.
+                    if group == 0 && pipe.mem_bind_bytes > 0 {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(pipe.mem_bind_bytes as u64),
+                            }),
+                        });
+                    }
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(if entries.is_empty() { "gxp-ubo-empty" } else { "gxp-ubo-bind" }),
+                        layout,
+                        entries: &entries,
+                    });
                     self.ubo_bgs.insert((slot, key, format, samples, group), bg);
                 }
             }
@@ -4954,9 +4975,35 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let t_uni = split_start();
             let vert_sa = override_sa(key, 'v', &gxp.vert_sa);
             let frag_sa = override_sa(key, 'f', &gxp.frag_sa);
+            // The vertex stage's guest-memory window, when this pair's program loads memory:
+            // one header vec4 (lane x = the window's guest base address) + the window bytes,
+            // in the same dynamic-offset arena as the SA blocks. A draw that arrives WITHOUT
+            // the bytes its pipeline needs is dropped with a report - feeding the loads
+            // zeroes would render a wrong picture with nothing to say so.
+            let mem_off = if pipe.mem_bind_bytes > 0 {
+                let Some((base, bytes)) = gxp.mem_window.as_ref() else {
+                    static REPORTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            target: "vitaslop::gpu",
+                            key = format_args!("{key:016x}"),
+                            "a pipeline with a guest-memory window got a draw with no window \
+                             bytes - draw DROPPED"
+                        );
+                    }
+                    return None;
+                };
+                let off = push_mem_window(udata, pipe.mem_bind_bytes, *base, bytes, ubo_align);
+                split_add(&PREP.arena_bytes, pipe.mem_bind_bytes as u64);
+                off
+            } else {
+                0
+            };
             let u_off = [
                 push_sa(udata, pipe.vsa_lanes, &vert_sa, ubo_align),
                 push_sa(udata, pipe.fsa_lanes, &frag_sa, ubo_align),
+                mem_off,
             ];
             split_end(t_uni, &PREP.uni_ns);
             let t_samp = split_start();
@@ -5690,13 +5737,41 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if lanes == 0 {
             return 0;
         }
-        while udata.len() as u64 % align != 0 {
-            udata.push(0);
+        // >>> ALIGNED IN ONE `resize`, NOT ONE BYTE AT A TIME.
+        //
+        // `ubo_align` is the adapter's minimum uniform-buffer dynamic offset alignment - 256
+        // bytes on every desktop and mobile adapter this runs on - so the byte-at-a-time loop
+        // this replaces pushed up to 255 bytes through `Vec::push`, with its length and
+        // capacity check each, TWICE PER DRAW. On a race frame of ~990 draws that is a
+        // quarter of a million pushes per presented frame to write padding, and it is most of
+        // what `prepare split`'s `uniforms` line (0.52 ms/present) was timing.
+        let pad = udata.len() as u64 % align;
+        if pad != 0 {
+            udata.resize(udata.len() + (align - pad) as usize, 0);
         }
         let off = udata.len() as u32;
         let need = (lanes.div_ceil(4) as usize) * 16;
         let n = guest.len().min(need);
         udata.extend_from_slice(&guest[..n]);
+        udata.resize(off as usize + need, 0);
+        off
+    }
+
+    /// Append one draw's guest-MEMORY-WINDOW block to the pass's uniform arena at
+    /// dynamic-offset alignment: a header vec4 whose lane x is the window's guest base
+    /// address, then the window's bytes, padded to the pipeline's declared binding size
+    /// (`GxpPipeline::mem_bind_bytes`). The same arena discipline as [`push_sa`].
+    fn push_mem_window(udata: &mut Vec<u8>, bind_bytes: u32, base: u32, window: &[u8], align: u64) -> u32 {
+        let pad = udata.len() as u64 % align;
+        if pad != 0 {
+            udata.resize(udata.len() + (align - pad) as usize, 0);
+        }
+        let off = udata.len() as u32;
+        udata.extend_from_slice(&base.to_le_bytes());
+        udata.resize(off as usize + 16, 0);
+        let need = bind_bytes as usize;
+        let n = window.len().min(need - 16);
+        udata.extend_from_slice(&window[..n]);
         udata.resize(off as usize + need, 0);
         off
     }
@@ -7793,13 +7868,19 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // built on an unverified reading of a field is worse than no diagnostic: it produced
         // 200 lines of confident noise on one run. It stays out until someone reads the
         // container table and can say what the index means.
+        // A VERTEX program whose memory loads RESOLVED to a window is fed - the draw
+        // snapshots the bound buffer's bytes and the shader's loads read them - so it is no
+        // longer an unfed declaration. (A fragment program has no window path at all, and a
+        // vertex one that declares a buffer but never memory-loads still reads zeroes.)
+        let fed_by_window = stage == "vertex"
+            && vitaslop_gxp_shader::mem_window_for_vertex_blob(blob).is_some();
         let unfed: Vec<String> = program
             .parameters
             .iter()
             .filter(|p| matches!(p.category, ParamCategory::UniformBuffer))
             .map(|p| format!("{} (container {})", p.name, p.container_index))
             .collect();
-        if unfed.is_empty() {
+        if unfed.is_empty() || fed_by_window {
             return;
         }
         let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
@@ -8390,8 +8471,29 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let fsa_lanes = linked.fragment_bindings.sa_lane_count;
         let sa_bytes = |lanes: u32| (lanes.div_ceil(4) as u64) * 16;
         let (vsa_bytes, fsa_bytes) = (sa_bytes(vsa_lanes), sa_bytes(fsa_lanes));
-        let g0_entries: Vec<wgpu::BindGroupLayoutEntry> =
+        let mut g0_entries: Vec<wgpu::BindGroupLayoutEntry> =
             if vsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::VERTEX, vsa_bytes)] } else { vec![] };
+        // The vertex stage's guest-memory window at group 0 binding 1, when its program
+        // loads memory: the same dynamic-offset arena discipline as the SA blocks, with
+        // `min_binding_size` pinning the shader-visible extent to exactly the declared
+        // window (header vec4 included).
+        let mem_bind_bytes = linked
+            .vertex_bindings
+            .mem_window
+            .map(|w| w.vec4_count() as u64 * 16)
+            .unwrap_or(0);
+        if mem_bind_bytes > 0 {
+            g0_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(mem_bind_bytes),
+                },
+                count: None,
+            });
+        }
         let g1_entries: Vec<wgpu::BindGroupLayoutEntry> =
             if fsa_lanes > 0 { vec![uniform_entry(wgpu::ShaderStages::FRAGMENT, fsa_bytes)] } else { vec![] };
         let mut g2_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::new();
@@ -8612,7 +8714,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
         let pipeline = make();
         super::add_build_ms(&super::PIPE_CREATE_US, t_pipe.ms());
-        Some(GxpPipeline { pipeline, layouts, vsa_lanes, fsa_lanes, samplers, vertex_samplers, repack, packed_stride })
+        Some(GxpPipeline {
+            pipeline,
+            layouts,
+            vsa_lanes,
+            fsa_lanes,
+            mem_bind_bytes: mem_bind_bytes as u32,
+            samplers,
+            vertex_samplers,
+            repack,
+            packed_stride,
+        })
     }
 
     impl GxmRenderer {
@@ -9963,14 +10075,25 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if !budget_stopped
                     && g.get_or_insert_with(HashSet::new).insert((pairs.len(), self.gxp_precompiled))
                 {
+                    // >>> THE CUMULATIVE TOTAL FIRST, because `built` is this CALL's count and
+                    // the two read as one number. The old wording put them the other way round
+                    // ("{built} of {offered} ... ({total} total)"), so a healthy run that had
+                    // warmed 39 pairs and had nothing new to do printed "0 of 256 ... (39
+                    // total)" - which reads as "the mechanism did nothing", and was read that
+                    // way. An instrument whose steady state is indistinguishable from its own
+                    // failure is the defect this project keeps finding
+                    // [[vitaslop-instrument-failure-imitating-its-subject]].
                     report_warn!(
-                        "gxp precompile: {built} of {} candidate pairs compiled AHEAD of any draw \
-                         ({} total) - WGSL compile time that will not land in a gameplay frame. \
-                         The candidates are the pairs the shader patcher NAMED unless \
-                         VITASLOP_GXP_PRECOMPILE_CROSS is set, in which case they are a cross \
-                         product and most of this is speculative",
+                        "gxp precompile: {} shader modules compiled AHEAD of any draw, out of {} \
+                         candidate pairs offered ({built} new in this pass) - WGSL compile time \
+                         that will not land in a gameplay frame. NOTE this warms the shader \
+                         MODULE, not the render PIPELINE: a pipeline bakes the blend program and \
+                         the attachment formats too, so a pair whose module is warm still pays \
+                         `create_render_pipeline` at the draw. The candidates are the pairs the \
+                         shader patcher NAMED unless VITASLOP_GXP_PRECOMPILE_CROSS is set, in \
+                         which case they are a cross product and most of this is speculative",
+                        self.gxp_precompiled,
                         pairs.len(),
-                        self.gxp_precompiled
                     );
                 }
             }
@@ -10966,10 +11089,16 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             // into the pass's uniform arena; a stage with no uniforms has an
                             // empty bind group, which takes no dynamic offsets at all.
                             let dyn_off = |lanes: u32, off: u32| if lanes == 0 { Vec::new() } else { vec![off] };
+                            // group 0's dynamic offsets in BINDING order: the SA block, then
+                            // the guest-memory window when this pipeline declares one.
+                            let mut g0_offs = dyn_off(pipe.vsa_lanes, p.u_off[0]);
+                            if pipe.mem_bind_bytes > 0 {
+                                g0_offs.push(p.u_off[2]);
+                            }
                             pass.set_bind_group(
                                 0,
                                 self.gxp.ubo_bg(slot, p.key, p.format, p.samples, 0),
-                                &dyn_off(pipe.vsa_lanes, p.u_off[0]),
+                                &g0_offs,
                             );
                             pass.set_bind_group(
                                 1,

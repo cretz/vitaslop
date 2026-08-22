@@ -62,4 +62,7 @@ features = [
     # posting the request across). See `src/location.rs`.
     "Navigator", "Geolocation", "Position", "Coordinates", "PositionError",
     "DedicatedWorkerGlobalScope",
+    # The live loop's per-tick yield in a WORKER. `setTimeout(0)` is clamped to 4 ms once
+    # nested, and this loop is an unbroken chain of nested timeouts - see `next_tick`.
+    "MessageChannel", "MessagePort",
 ]

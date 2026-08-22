@@ -1094,7 +1094,7 @@ fn retail_boot_probe() {
                     d.primitive, d.index_format, d.index_count, d.vertex_stride,
                     d.vertices.len(), d.indices.len(), d.uniforms.len(), d.textures.len(),
                 );
-                for a in &d.attributes {
+                for a in d.attributes.iter() {
                     eprintln!(
                         "      attr: stream={} offset={} format={} components={} reg={}",
                         a.stream_index, a.offset, a.format, a.component_count, a.reg_index
@@ -1311,7 +1311,7 @@ fn retail_boot_probe() {
                             d.render_state.cull_mode, d.render_state.two_sided,
                             d.render_state.front_depth_write, d.render_state.front_depth_func
                         );
-                        for a in &d.attributes {
+                        for a in d.attributes.iter() {
                             eprintln!("   attr stream={} off={} fmt={} comps={} reg={}",
                                 a.stream_index, a.offset, a.format, a.component_count, a.reg_index);
                         }

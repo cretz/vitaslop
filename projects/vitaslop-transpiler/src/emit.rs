@@ -5483,6 +5483,11 @@ enum InlineLowering {
     /// address is a constant inside the module's own reserved page, so there is no
     /// out-of-range case to fall back for.
     Mirror { off: u64 },
+    /// Set r0 to a constant and return. No guard, because nothing is read and nothing is
+    /// written - see [`crate::InlineOp::RetConst`].
+    RetConst { value: u32 },
+    /// Emit nothing at all, r0 included - see [`crate::InlineOp::Nop`].
+    Nop,
     /// Read the 64-bit host-mirror value at this offset into r0/r1. No guard, same
     /// reason as [`InlineLowering::Mirror`].
     MirrorPair { off: u64 },
@@ -5504,6 +5509,15 @@ enum InlineLowering {
     /// `limit` is computed against the LAST element so an in-bounds index can never reach
     /// past the end of guest memory.
     ArgStoreIndexed { offset: u32, count: u32, limit: u32 },
+    /// Store the first `count` VFP single ARGUMENT registers' raw bits as a word run at
+    /// `r0 + offset`. Guarded on the pointer against the run's LAST word - see
+    /// [`crate::InlineOp::StoreVfpRun`].
+    VfpRun { offset: u32, count: u32, limit: u32 },
+    /// Store integer arguments 1..=`count` (r1..r3, then the guest stack) as a word run at
+    /// `r0 + offset`. Guarded on the pointer against the run's LAST word AND - when the run
+    /// reads past r3 - on `sp` against the last stack word read; `sp_limit` is `None` when
+    /// the run fits in registers. See [`crate::InlineOp::StoreArgRun`].
+    ArgRun { offset: u32, count: u32, limit: u32, sp_limit: Option<u32> },
     /// Copy `words` words from the pointer in r2 into the slot at `r0 + offset + r1 * stride`,
     /// stamping r2 itself ahead of them and a zero behind them. Guarded on BOTH pointers, on
     /// the index, and on r2 being non-null - see [`crate::InlineOp::CopyArgIndexed`].
@@ -5533,6 +5547,10 @@ enum InlineLowering {
     /// kinds) r1. Guarded on both pointers AND the length, since the length is what decides
     /// how far past a pointer the access reaches - see [`emit_bulk_guard`].
     Bulk { kind: BulkKind, mem_bytes: u32 },
+    /// Apply a precomputed state (r1) to the context block (r0): one `memory.copy` of the
+    /// arrays block plus the uniform record and (fragment) the program handle. Three
+    /// pointers, three bounds, two magics - see [`crate::InlineOp::BindPrecomputedState`].
+    BindState { layout: crate::BindStateLayout, ctx_limit: u32, st_limit: u32, blk_limit: u32 },
 }
 
 /// Which bulk operation an [`InlineLowering::Bulk`] performs. One enum rather than three
@@ -5583,6 +5601,8 @@ impl InlineImports {
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(offset)?;
                 Some(InlineLowering::GuestScaled { offset, max, shl, limit })
             }
+            crate::InlineOp::RetConst { value } => Some(InlineLowering::RetConst { value }),
+            crate::InlineOp::Nop => Some(InlineLowering::Nop),
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
@@ -5631,6 +5651,25 @@ impl InlineImports {
                 let limit = self.mem_bytes.checked_sub(4)?.checked_sub(last)?;
                 Some(InlineLowering::ArgStoreIndexed { offset, count, limit })
             }
+            crate::InlineOp::StoreVfpRun { offset, count } => {
+                // The run's LAST word decides the pointer bound, same as the indexed store.
+                let last = offset.checked_add(count.checked_sub(1)?.checked_mul(4)?)?;
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(last)?;
+                Some(InlineLowering::VfpRun { offset, count, limit })
+            }
+            crate::InlineOp::StoreArgRun { offset, count } => {
+                let last = offset.checked_add(count.checked_sub(1)?.checked_mul(4)?)?;
+                let limit = self.mem_bytes.checked_sub(4)?.checked_sub(last)?;
+                // Arguments 1..=count: the first three ride in r1..r3, the rest are read
+                // from the guest stack, whose last word decides sp's own bound.
+                let stack_words = count.saturating_sub(3);
+                let sp_limit = if stack_words == 0 {
+                    None
+                } else {
+                    Some(self.mem_bytes.checked_sub(4)?.checked_sub((stack_words - 1) * 4)?)
+                };
+                Some(InlineLowering::ArgRun { offset, count, limit, sp_limit })
+            }
             crate::InlineOp::CopyArgIndexed { offset, stride, count, words } => {
                 // The destination bound is computed against the LAST WORD of the LAST slot,
                 // for the same reason the indexed store's is: an index inside `count` still
@@ -5667,6 +5706,13 @@ impl InlineImports {
                 let prog_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.prog_top())?;
                 let out_limit = self.mem_bytes.checked_sub(4)?;
                 Some(InlineLowering::ReserveUniforms { layout, limit, prog_limit, out_limit })
+            }
+            crate::InlineOp::BindPrecomputedState { layout } => {
+                // Three pointers, three bounds, each against the LAST byte it reaches.
+                let ctx_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.ctx_top())?;
+                let st_limit = self.mem_bytes.checked_sub(4)?.checked_sub(layout.st_top())?;
+                let blk_limit = self.mem_bytes.checked_sub(layout.copy_bytes)?;
+                Some(InlineLowering::BindState { layout, ctx_limit, st_limit, blk_limit })
             }
             crate::InlineOp::SetUniformData { layout } => {
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
@@ -5807,6 +5853,19 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::Call(IMPORT_FUNC));
             return;
         }
+        Some(InlineLowering::RetConst { value }) => {
+            // The whole call: one constant into r0. Nothing is loaded, so there is no
+            // pointer to guard and no case that can fall back to the handler.
+            f.instruction(&W::I32Const(value as i32));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            return;
+        }
+        Some(InlineLowering::Nop) => {
+            // A void handler that observably does nothing: the call becomes no code at all,
+            // and r0 keeps the argument it was passed - which is exactly what the dispatcher
+            // left there.
+            return;
+        }
         Some(InlineLowering::Mirror { off }) => {
             // r0 = the mirror word. Address zero plus a constant `offset`, so the whole
             // read is one `i32.load` against a literal.
@@ -5913,6 +5972,74 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::I32Const(0));
             f.instruction(&W::GlobalSet(abi::reg_global(0)));
             f.instruction(&W::End); // the index guard's `if`
+            f.instruction(&W::End); // the pointer guard's `if`
+            return;
+        }
+        Some(InlineLowering::VfpRun { offset, count, limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // *(u32 *)(r0 + offset + 4*i) = raw bits of s_i, for i in 0..count. The bits
+            // are stored as they sit in the argument globals - no float op on either path,
+            // so there is nothing to round differently from the handler's `to_bits()`.
+            emit_watch_store_inline(f, base, L_T0, offset, count * 4, index);
+            for i in 0..count {
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::GlobalGet(abi::vfp_s_global(i as u8)));
+                f.instruction(&W::I32Store(MemArg {
+                    offset: (offset + i * 4) as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            // The handler returns 0, and the guarded path is the one it would have taken.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::End);
+            return;
+        }
+        Some(InlineLowering::ArgRun { offset, count, limit, sp_limit }) => {
+            emit_pointer_guard(f, base, limit, index);
+            // A run that reaches past r3 reads the guest stack, so sp gets the same guard
+            // the destination pointer gets: a thread with a garbage sp falls back to the
+            // handler (whose `read_u32` defines that case) instead of trapping here.
+            if let Some(sp_limit) = sp_limit {
+                f.instruction(&W::GlobalGet(abi::reg_global(abi::SP)));
+                f.instruction(&W::I32Const(base as i32));
+                f.instruction(&W::I32Sub);
+                f.instruction(&W::LocalTee(L_T1));
+                f.instruction(&W::I32Const(sp_limit as i32));
+                f.instruction(&W::I32GtU);
+                f.instruction(&W::If(BlockType::Empty));
+                f.instruction(&W::I32Const(index as i32));
+                f.instruction(&W::Call(IMPORT_FUNC));
+                f.instruction(&W::Else);
+            }
+            // *(u32 *)(r0 + offset + 4*i) = argument i+1: r1..r3, then the stack words the
+            // AAPCS spilled, read exactly where `GuestCtx::arg` reads them.
+            emit_watch_store_inline(f, base, L_T0, offset, count * 4, index);
+            for i in 0..count {
+                f.instruction(&W::LocalGet(L_T0));
+                let arg = i + 1;
+                if arg <= 3 {
+                    f.instruction(&W::GlobalGet(abi::reg_global(arg as usize)));
+                } else {
+                    f.instruction(&W::LocalGet(L_T1));
+                    f.instruction(&W::I32Load(MemArg {
+                        offset: ((arg - 4) * 4) as u64,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                }
+                f.instruction(&W::I32Store(MemArg {
+                    offset: (offset + i * 4) as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            if sp_limit.is_some() {
+                f.instruction(&W::End); // the sp guard's `if`
+            }
             f.instruction(&W::End); // the pointer guard's `if`
             return;
         }
@@ -6209,6 +6336,135 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::Call(IMPORT_FUNC));
             f.instruction(&W::End); // the handle/out-pointer guard
             f.instruction(&W::End); // the context pointer guard
+            return;
+        }
+        Some(InlineLowering::BindState { layout: l, ctx_limit, st_limit, blk_limit }) => {
+            emit_pointer_guard(f, base, ctx_limit, index);
+            // >>> THE NULL-STATE ARM FIRST, because on a real title it is most of the
+            // traffic: a race UNBINDS the precomputed state between draw batches, so the
+            // bind arrives with state = 0 twenty-plus times a frame. The handler's null
+            // arm is as pure as the copy: the fragment bind does NOTHING but return
+            // success, and the vertex bind zeroes the stage's table and record.
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Eqz);
+            f.instruction(&W::If(BlockType::Empty));
+            if l.has_prog {
+                // Fragment: the handler returns without touching the context at all.
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            } else {
+                // Vertex: the whole table and the record go to zero - but only through a
+                // context this engine stamped; anything else runs the handler, which owns
+                // the no-context report.
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Load(word_at(l.ctx_magic_at)));
+                f.instruction(&W::I32Const(l.ctx_magic as i32));
+                f.instruction(&W::I32Eq);
+                f.instruction(&W::If(BlockType::Empty));
+                emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Const(l.copy_dst as i32));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::I32Const(l.copy_bytes as i32));
+                f.instruction(&W::MemoryFill(0));
+                emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
+                for w in 0..3u32 {
+                    f.instruction(&W::LocalGet(L_T0));
+                    f.instruction(&W::I32Const(0));
+                    f.instruction(&W::I32Store(word_at(l.ctx_record + w * 4)));
+                }
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::GlobalSet(abi::reg_global(0)));
+                f.instruction(&W::Else);
+                f.instruction(&W::I32Const(index as i32));
+                f.instruction(&W::Call(IMPORT_FUNC));
+                f.instruction(&W::End); // the null arm's magic check
+            }
+            f.instruction(&W::Else);
+            // The STATE STRUCT pointer next: nothing may be read through it until it is
+            // bounded, and the arrays-block pointer lives inside it - hence a nested guard,
+            // exactly the reserve form's shape. t1 = r1 - base.
+            f.instruction(&W::GlobalGet(abi::reg_global(1)));
+            f.instruction(&W::I32Const(base as i32));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::LocalTee(L_T1));
+            f.instruction(&W::I32Const(st_limit as i32));
+            f.instruction(&W::I32GtU);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::Else);
+            // The predicate: this is a context block we laid out, a state struct this
+            // engine initialised (with this packing), and its arrays block is in range.
+            // Every term is a comparison, so the combining `and`s are bitwise-safe.
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Load(word_at(l.ctx_magic_at)));
+            f.instruction(&W::I32Const(l.ctx_magic as i32));
+            f.instruction(&W::I32Eq);
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Load(word_at(l.st_magic_at)));
+            f.instruction(&W::I32Const(l.st_magic as i32));
+            f.instruction(&W::I32Eq);
+            f.instruction(&W::I32And);
+            // t2 = the arrays block, rebased; its bound admits the whole copy.
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Load(word_at(l.st_block_at)));
+            f.instruction(&W::I32Const(base as i32));
+            f.instruction(&W::I32Sub);
+            f.instruction(&W::LocalTee(L_T2));
+            f.instruction(&W::I32Const(blk_limit as i32));
+            f.instruction(&W::I32LeU);
+            f.instruction(&W::I32And);
+            f.instruction(&W::If(BlockType::Empty));
+            // The bulk copy: the state's arrays block lands over the context's own table,
+            // wholesale - which is exactly the REPLACE semantics binding a precomputed
+            // state has (a unit or buffer the state does not declare must not survive from
+            // an earlier direct bind, and the block's unset slots are zero).
+            //
+            // No dirty-map stamp on any of these: like every other storing form, they
+            // write the guest's context block, which is never a texture's bytes - see
+            // `emit_dirty_range` for the rule.
+            emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::I32Const(l.copy_dst as i32));
+            f.instruction(&W::I32Add);
+            f.instruction(&W::LocalGet(L_T2));
+            f.instruction(&W::I32Const(l.copy_bytes as i32));
+            f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            // The stage's three-word uniform record: buffer, memoised size, program header.
+            emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Load(word_at(l.st_buf_at)));
+            f.instruction(&W::I32Store(word_at(l.ctx_record)));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Load(word_at(l.st_size_at)));
+            f.instruction(&W::I32Store(word_at(l.ctx_record + 4)));
+            f.instruction(&W::LocalGet(L_T0));
+            f.instruction(&W::LocalGet(L_T1));
+            f.instruction(&W::I32Load(word_at(l.st_header_at)));
+            f.instruction(&W::I32Store(word_at(l.ctx_record + 8)));
+            if l.has_prog {
+                // Binding a fragment state leaves the context bound to its program, so the
+                // handle goes where `sceGxmSetFragmentProgram` puts it.
+                emit_watch_store_inline(f, base, L_T0, l.ctx_prog, 4, index);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::LocalGet(L_T1));
+                f.instruction(&W::I32Load(word_at(l.st_handle_at)));
+                f.instruction(&W::I32Store(word_at(l.ctx_prog)));
+            }
+            // The handler returns 0, and the guarded path is the one it would have taken.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            f.instruction(&W::Else);
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FUNC));
+            f.instruction(&W::End); // the predicate's `if`
+            f.instruction(&W::End); // the state-pointer guard
+            f.instruction(&W::End); // the null-state arm's `if`
+            f.instruction(&W::End); // the context-pointer guard
             return;
         }
         Some(InlineLowering::SetUniformData { layout: l, bank_off, param_limit, sp_limit, mem_bytes }) => {

@@ -15,6 +15,7 @@ pub mod net;
 pub mod fios2;
 pub mod gxm;
 pub mod gxmctx;
+pub mod gxmstate;
 pub mod gxmprog;
 pub mod iofilemgr;
 pub mod jpeg;
@@ -83,6 +84,86 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
         .or_else(|| display::inline_op(func_nid))
         .or_else(|| libkernel::inline_op(func_nid))
         .or_else(|| (!no_inline_lwmutex()).then(|| lwsync::inline_op(func_nid)).flatten())
+        .or_else(|| (!no_inline_stubs()).then(|| stub_inline_op(func_nid)).flatten())
+}
+
+/// The calls whose handler is EXACTLY `ctx.ret(0)` - a constant return and nothing else -
+/// so the transpiler can emit the constant and never cross the boundary
+/// ([`vitaslop_transpiler::InlineOp::RetConst`]).
+///
+/// # Why this list is written out rather than derived
+/// "The handler currently returns 0" is not the admissibility test; "the handler is DEFINED
+/// as a constant return" is. A stub that grows a body later must lose its inline form in the
+/// same edit, and a list in one place is what makes that a visible edit rather than a silent
+/// divergence between a dispatch arm and the code emitted for it. `the_inlined_stubs_are_stubs`
+/// in `vitaslop-native/tests/inline_imports.rs` asserts each one still dispatches to a bare
+/// return.
+///
+/// # What these cost, which is why a no-op is worth inlining at all
+/// MEASURED in desktop Chrome on a retail racer's race: `sceNgsPatchGetInfo` and
+/// `sceNgsVoicePatchSetVolumesMatrix` are **198 calls per guest frame each**, together 32% of
+/// every host call the title makes, at ~1.14 us of pure crossing each. Nothing is computed on
+/// either side of that.
+///
+/// `sceKernelSetGPO` is here for the same reason and needs one extra word: its handler writes
+/// `VitaState::gpo`, which NOTHING reads - it is a devkit LED - and logs at `vitaslop::gpo`.
+/// It is withheld while that log target is selected, the same way the uniform forms are
+/// withheld while their diagnostics are on: an instrument that reports nothing because the
+/// call it watches was inlined imitates its own subject
+/// [[vitaslop-instrument-failure-imitating-its-subject]].
+fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::nid::{ctrl as c, ngs as n, sysmem as sm};
+    let is_stub = matches!(
+        func_nid,
+        n::SYSTEM_SET_FLAGS
+            | n::SYSTEM_RELEASE
+            | n::RACK_RELEASE
+            | n::VOICE_RESUME
+            | n::VOICE_SET_FINISHED_CALLBACK
+            | n::VOICE_SET_MODULE_CALLBACK
+            | n::VOICE_BYPASS_MODULE
+            | n::VOICE_GET_PARAMS_OUT_OF_RANGE
+            | n::VOICE_PATCH_SET_VOLUMES_MATRIX
+            | n::VOICE_PATCH_SET_VOLUME
+            | n::PATCH_GET_INFO
+            | n::PATCH_REMOVE_ROUTING
+            | n::SYSTEM_LOCK
+            | n::SYSTEM_UNLOCK
+            | n::AT9_GET_SECTION_DETAILS
+            | c::SET_SAMPLING_MODE
+    );
+    if is_stub {
+        return Some(vitaslop_transpiler::InlineOp::RetConst { value: 0 });
+    }
+    // `sceKernelSetGPO` returns VOID, so its handler leaves r0 holding the argument - which
+    // makes it a `Nop` and not a `RetConst { value: 0 }`. Handing back 0 where the call used
+    // to hand back its own argument is a different program, and `the_inlined_stubs_are_stubs`
+    // catches exactly that (it did).
+    (func_nid == sm::SET_GPO && !gpo_log_selected()).then_some(vitaslop_transpiler::InlineOp::Nop)
+}
+
+/// Whether the log filter names the `vitaslop::gpo` target, which WITHHOLDS the inline form
+/// for `sceKernelSetGPO`. See [`stub_inline_op`].
+fn gpo_log_selected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::log_filter().contains("gpo"))
+}
+
+/// `VITASLOP_NO_INLINE_STUBS`: route the constant-return stubs through the host, leaving
+/// every other inline form on.
+///
+/// A SCOPED A/B switch like the others, and here it is mostly a DIAGNOSTIC switch rather than
+/// a price tag: an inlined call is absent from the call histogram, and the histogram is how
+/// "which unimplemented calls does this title make" gets answered. Set this and every stub is
+/// back on the host and back in the counts. The link line that lists what was inlined says the
+/// same thing without a rerun.
+///
+/// Read through [`crate::knobs`] and listed in `OVERRIDABLE`, so a live page on a PHONE can
+/// throw it between two runs of one build - which is the machine where a crossing is ~20 us and
+/// this family is worth the most. Read at LINK time, so it must be set for the whole run.
+fn no_inline_stubs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_STUBS"))
 }
 
 /// The three NIDs [`no_inline_clib`] scopes over. Named here rather than tested against
@@ -953,16 +1034,16 @@ pub fn dispatch(
             cont!(gxm::precomputed_vertex_state_set_all_textures(ctx, st))
         }
         gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER => {
-            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "vertex", false))
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, st, "vertex", false))
         }
         gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER => {
-            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "fragment", false))
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, st, "fragment", false))
         }
         gxm_nid::PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS => {
-            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "vertex", true))
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, st, "vertex", true))
         }
         gxm_nid::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_UNIFORM_BUFFERS => {
-            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, "fragment", true))
+            cont!(gxm::precomputed_state_set_uniform_buffer(ctx, st, "fragment", true))
         }
         // Depth/stencil surface: the published struct is written in place, so a copy of
         // it carries its own state (no address-keyed side table).
@@ -1186,8 +1267,6 @@ pub fn dispatch(
         | ngs_nid::VOICE_SET_MODULE_CALLBACK
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
-        | ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX
-        | ngs_nid::VOICE_PATCH_SET_VOLUME
         | ngs_nid::PATCH_GET_INFO
         | ngs_nid::PATCH_REMOVE_ROUTING
         // System lock/unlock guard the mix graph; single-thread-of-control here, so
@@ -1196,6 +1275,12 @@ pub fn dispatch(
         | ngs_nid::SYSTEM_UNLOCK
         | ngs_nid::AT9_GET_SECTION_DETAILS => cont!(ctx.ret(0)),
         ngs_nid::VOICE_PLAY => cont!(ngs::voice_play(ctx, st)),
+        // The routing volumes: without these every voice mixes at unity and the sum
+        // clips. See `ngs::voice_patch_set_volume`.
+        ngs_nid::VOICE_PATCH_SET_VOLUME => cont!(ngs::voice_patch_set_volume(ctx, st)),
+        ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX => {
+            cont!(ngs::voice_patch_set_volumes_matrix(ctx, st))
+        }
         ngs_nid::VOICE_KEY_OFF | ngs_nid::VOICE_KILL | ngs_nid::VOICE_PAUSE => {
             cont!(ngs::voice_stop(ctx, st))
         }
@@ -1680,6 +1765,84 @@ mod frame_boundary_tests {
             SvcOutcome::ThreadExit => "ThreadExit",
             SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
         }
+    }
+
+    /// >>> EVERY NID [`stub_inline_op`] INLINES REALLY IS A BARE CONSTANT RETURN.
+    ///
+    /// The inline form emits `r0 = 0` and never reaches the host, so anything else its
+    /// handler did simply stops happening - silently, and only in a build that inlines. This
+    /// is the admissibility test written down: dispatch each one with poisoned registers over
+    /// poisoned memory and require that it CONTINUES, answers 0, and leaves guest memory
+    /// exactly as it found it. A stub that grows a body later fails here, in the same commit
+    /// that gives it one, rather than being quietly skipped in the browser.
+    #[test]
+    fn the_inlined_stubs_are_stubs() {
+        for nid_fn in [
+            ngs_nid::SYSTEM_SET_FLAGS,
+            ngs_nid::SYSTEM_RELEASE,
+            ngs_nid::RACK_RELEASE,
+            ngs_nid::VOICE_RESUME,
+            ngs_nid::VOICE_SET_FINISHED_CALLBACK,
+            ngs_nid::VOICE_SET_MODULE_CALLBACK,
+            ngs_nid::VOICE_BYPASS_MODULE,
+            ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
+            ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX,
+            ngs_nid::VOICE_PATCH_SET_VOLUME,
+            ngs_nid::PATCH_GET_INFO,
+            ngs_nid::PATCH_REMOVE_ROUTING,
+            ngs_nid::SYSTEM_LOCK,
+            ngs_nid::SYSTEM_UNLOCK,
+            ngs_nid::AT9_GET_SECTION_DETAILS,
+        ] {
+            assert!(
+                super::stub_inline_op(nid_fn).is_some(),
+                "{} is in the test's list but not in stub_inline_op's",
+                crate::nid::name(nid_fn),
+            );
+            let (outcome, r0, wrote) = stub_probe(crate::nid::lib::SCE_NGS, nid_fn);
+            assert_eq!(outcome, "Continue", "{} suspended", crate::nid::name(nid_fn));
+            assert_eq!(r0, 0, "{} answered something", crate::nid::name(nid_fn));
+            assert!(!wrote, "{} wrote guest memory", crate::nid::name(nid_fn));
+        }
+        let (outcome, r0, wrote) =
+            stub_probe(crate::nid::lib::SCE_CTRL, ctrl_nid::SET_SAMPLING_MODE);
+        assert_eq!((outcome, r0, wrote), ("Continue", 0, false));
+        // `sceKernelSetGPO` is the VOID one: it leaves r0 exactly as the guest passed it,
+        // which is why it is inlined as a `Nop` rather than as a constant return.
+        let (outcome, r0, wrote) = stub_probe(crate::nid::lib::SCE_SYSMEM, sm_nid::SET_GPO);
+        assert_eq!((outcome, r0, wrote), ("Continue", 0x40, false));
+        assert!(matches!(
+            super::stub_inline_op(sm_nid::SET_GPO),
+            None | Some(vitaslop_transpiler::InlineOp::Nop)
+        ));
+    }
+
+    /// Dispatch one NID with POISONED r0..r3 over POISONED memory, and report
+    /// `(outcome, r0, whether any guest byte changed)`. The poison is what makes the last
+    /// two mean anything: a handler that leaves r0 alone would pass an `r0 == 0` check on a
+    /// zeroed register file for the wrong reason.
+    fn stub_probe(nid_lib: u32, nid_fn: u32) -> (&'static str, u32, bool) {
+        let mut regs = [0xDEAD_BEEFu32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        // A pointer argument has to be IN RANGE, or a handler that writes through it would
+        // decline for that reason rather than because it writes nothing.
+        regs[..4].copy_from_slice(&[0x40, 0x80, 0xC0, 0x100]);
+        let before = vec![0xA5u8; 4096];
+        let mut bytes = before.clone();
+        let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+        st.set_preemptive(true);
+        let mut mem = SliceMemory(&mut bytes);
+        let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+        let outcome = match dispatch(nid_lib, nid_fn, &mut ctx, &mut st) {
+            SvcOutcome::Continue => "Continue",
+            SvcOutcome::Flip => "Flip",
+            SvcOutcome::Reschedule => "Reschedule",
+            SvcOutcome::Block => "Block",
+            SvcOutcome::Halt => "Halt",
+            SvcOutcome::ThreadExit => "ThreadExit",
+            SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
+        };
+        (outcome, regs[0], bytes != before)
     }
 
     /// A voluntary yield is NOT a display frame. `sceKernelDelayThread(0)` and

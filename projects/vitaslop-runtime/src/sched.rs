@@ -323,6 +323,25 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     /// thread consumes the token instead of parking. That is the same contract a condition
     /// variable's wakeup token has, and for the same reason.
     wake_tokens: std::collections::HashSet<i32>,
+    /// >>> THE SLOTS THAT ARE NOT FINISHED, ASCENDING. Every scheduler pass iterates THIS,
+    /// never `threads`.
+    ///
+    /// A finished thread keeps its slot for the whole run - the index is stable and the exit
+    /// code outlives the thread ([[vitaslop-finished-threads-must-be-released]]) - so the
+    /// table only ever grows. A title that spawns a short-lived worker per frame therefore
+    /// arrives at a gameplay frame with THOUSANDS of dead slots, and a pick that scans
+    /// `0..threads.len()` four times pays for every one of them.
+    ///
+    /// MEASURED on a retail racer's race, `bench --at 9700`: the table is **8,420 slots with
+    /// 13 live**, and `scheduler: pick` cost **17.3 us per pick** - 5.2% of a frame, growing
+    /// linearly with how long the title has been played. It is not a fixed overhead and it
+    /// cannot be seen in a short run.
+    ///
+    /// Kept ASCENDING so the round-robin rotation over it visits the same slots in the same
+    /// order the old `(cursor + k) % n` walk did: a finished slot is never runnable, so
+    /// skipping it changes nothing about WHICH thread is picked. That equality is the whole
+    /// safety argument - a scheduler that picks differently re-times every recipe in the tree.
+    live: Vec<usize>,
     /// Round-robin cursor: the index after the last thread resumed.
     cursor: usize,
     /// Frame boundaries (display flips) observed so far.
@@ -367,6 +386,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             engine,
             host,
             threads: vec![Slot::new(main, ThreadState::Runnable)],
+            live: vec![0],
             cursor: 0,
             frames: 0,
             runnable_hist: Vec::new(),
@@ -564,9 +584,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// looks identical to one that leaks them if only the creation count is visible -
     /// which is exactly how a per-thread engine allocation went unattributed.
     pub fn thread_census(&self) -> (usize, usize) {
-        let finished =
-            self.threads.iter().filter(|t| matches!(t.state, ThreadState::Finished(_))).count();
-        (self.threads.len() - finished, finished)
+        (self.live.len(), self.threads.len() - self.live.len())
     }
 
     /// Read shared guest memory at guest address `addr`; false if it is not mapped.
@@ -659,6 +677,29 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
     /// highest-priority runnable thread (lowest priority number), round-robin among
     /// threads sharing that priority. This is the real SceKernel discipline - a strict
     /// priority scheduler with round-robin within a level - and the ordering titles
+    /// The live slots in round-robin order: ascending from `cursor`, then wrapping to the
+    /// ones before it.
+    ///
+    /// Exactly the sequence `(0..n).map(|k| (cursor + k) % n)` produced, with the finished
+    /// slots - which are never runnable, so no filter downstream could have picked one -
+    /// left out. `live` is ascending, so the split point is a binary search.
+    fn rotation(live: &[usize], cursor: usize) -> impl Iterator<Item = usize> + '_ {
+        let start = live.partition_point(|&i| i < cursor);
+        live[start..].iter().chain(&live[..start]).copied()
+    }
+
+    /// Drop slot `idx` from the live list. Called the moment a thread is marked finished:
+    /// nothing brings it back, and every scheduler pass is shorter for it.
+    fn retire_slot(&mut self, idx: usize) {
+        if let Ok(at) = self.live.binary_search(&idx) {
+            self.live.remove(at);
+        }
+    }
+
+    /// The next thread to run, advancing the round-robin cursor past it: the
+    /// highest-priority runnable thread (lowest priority number), round-robin among
+    /// threads sharing that priority. This is the real SceKernel discipline - a strict
+    /// priority scheduler with round-robin within a level - and the ordering titles
     /// rely on (a higher-priority worker started by a lower-priority thread runs to its
     /// first block before the starter continues). `None` if nothing is runnable.
     pub fn pick_next(&mut self) -> Option<usize> {
@@ -668,7 +709,9 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // the cooldowns and start a fresh round. This keeps strict priority for the
         // normal case (cooperative threads never cool) while guaranteeing every runnable
         // thread makes progress, the way separate cores do on real hardware.
-        let n = self.threads.len();
+        // Every pass below walks [`SchedCore::live`], never `0..threads.len()`: the two visit
+        // the same slots in the same order, because a finished slot is never runnable, and the
+        // difference at a gameplay frame is 13 entries against 8,420.
         // DIAGNOSTIC (`VITASLOP_SCHED_CORES=<n>`): the cooldown below eventually admits EVERY
         // runnable thread regardless of priority, so a low-priority thread can hold the baton in
         // a quantum the hardware would never have given it - measured at 13.2% of quanta with
@@ -684,8 +727,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // Ties are broken by the round-robin cursor, so which of several equal-priority threads
         // is the one left out ROTATES, rather than one being starved for the whole run.
         let admitted: Option<Vec<usize>> = Self::sched_cores().map(|cores| {
-            let mut order: Vec<usize> = (0..n)
-                .map(|k| (self.cursor + k) % n)
+            let mut order: Vec<usize> = Self::rotation(&self.live, self.cursor)
                 .filter(|&i| self.threads[i].state == ThreadState::Runnable)
                 .collect();
             order.sort_by_key(|&i| self.threads[i].thread.priority());
@@ -695,14 +737,16 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // The cooldown clear has to look at the ADMITTED set, not at every runnable thread: a
         // capped-out thread that is uncooled would otherwise hold the clear off for ever, and
         // every admitted thread being cooled would then leave nothing pickable at all.
-        let admitted_uncooled = (0..n).any(|i| {
+        let admitted_uncooled = self.live.iter().any(|&i| {
             self.threads[i].state == ThreadState::Runnable
                 && !self.threads[i].cooled
                 && admitted.as_ref().is_none_or(|a| a.contains(&i))
         });
         if !admitted_uncooled {
-            for t in self.threads.iter_mut() {
-                t.cooled = false;
+            // Only the live slots: a finished thread's cooldown is never read again, since
+            // it can never become runnable.
+            for k in 0..self.live.len() {
+                self.threads[self.live[k]].cooled = false;
             }
         }
         let runnable = |i: usize, t: &Slot<E::Thread>| {
@@ -715,24 +759,31 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // depends on strict priority placing a whole frame of the top thread's work ahead of
         // the first instruction of a lower-priority thread woken by the SAME event.
         let best = if Self::sched_rr() {
-            (0..n).filter(|&i| runnable(i, &self.threads[i])).map(|i| self.threads[i].thread.priority()).min()?;
+            self.live
+                .iter()
+                .filter(|&&i| runnable(i, &self.threads[i]))
+                .map(|&i| self.threads[i].thread.priority())
+                .min()?;
             i32::MIN
         } else {
-            (0..n)
-                .filter(|&i| runnable(i, &self.threads[i]))
-                .map(|i| self.threads[i].thread.priority())
+            self.live
+                .iter()
+                .filter(|&&i| runnable(i, &self.threads[i]))
+                .map(|&i| self.threads[i].thread.priority())
                 .min()?
         };
-        let idx = (0..n).map(|k| (self.cursor + k) % n).find(|&i| {
+        let idx = Self::rotation(&self.live, self.cursor).find(|&i| {
             runnable(i, &self.threads[i])
                 && (best == i32::MIN || self.threads[i].thread.priority() == best)
         })?;
         self.cursor = idx + 1;
         self.threads[idx].picks += 1;
         if self.sched_trace_on() {
-            let runnable_now: Vec<i32> = (0..n)
-                .filter(|&i| self.threads[i].state == ThreadState::Runnable)
-                .map(|i| self.threads[i].thread.thid())
+            let runnable_now: Vec<i32> = self
+                .live
+                .iter()
+                .filter(|&&i| self.threads[i].state == ThreadState::Runnable)
+                .map(|&i| self.threads[i].thread.thid())
                 .collect();
             self.sched_trace(&format!(
                 "PICK t{:#x} prio={:#x} (runnable {runnable_now:x?})",
@@ -857,7 +908,10 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             self.fuel_idle += 1;
             return;
         }
-        let runnable = self.threads.iter().filter(|t| t.state == ThreadState::Runnable).count();
+        // Over the LIVE slots: this runs on every suspension, and a finished thread is not
+        // runnable, so scanning the whole table was thousands of loads per resume.
+        let runnable =
+            self.live.iter().filter(|&&i| self.threads[i].state == ThreadState::Runnable).count();
         if self.runnable_hist.len() <= runnable {
             self.runnable_hist.resize(runnable + 1, 0);
         }
@@ -913,11 +967,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             FiberEnd::ProcessHalt(c) => ("halted the process", *c),
             FiberEnd::Error(_) => ("TRAPPED", 0),
         };
-        let finished = self
-            .threads
-            .iter()
-            .filter(|t| matches!(t.state, ThreadState::Finished(_)))
-            .count();
+        let finished = self.threads.len() - self.live.len();
         tracing::info!(
             target: "vitaslop::thread",
             "thread {thid:#x} FINISHED at frame {}: {kind} (code {code:#x}) - {} of {} \
@@ -929,6 +979,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         match end {
             FiberEnd::Returned(code) | FiberEnd::ThreadExit(code) => {
                 self.threads[idx].state = ThreadState::Finished(code);
+                self.retire_slot(idx);
                 // Hand the engine's per-thread state back the moment the thread is
                 // recorded as finished. See [`ThreadHandle::release`]: on the browser
                 // this is a whole module instance, and holding one per thread for the
@@ -947,6 +998,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                         t.state = ThreadState::Finished(code);
                     }
                 }
+                self.live.clear();
                 // Every thread is finished now, so every engine allocation can go.
                 for t in self.threads.iter_mut() {
                     t.thread.release();
@@ -982,14 +1034,14 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // The thread is parked on nothing, no timer names it, and the run ends one frame
         // into a title that was about to render its title screen.
         self.drain();
-        if self.threads.iter().any(|t| t.state == ThreadState::Runnable) {
+        if self.live.iter().any(|&i| self.threads[i].state == ThreadState::Runnable) {
             return IdleStep::Continue;
         }
         let blocked: Vec<i32> = self
-            .threads
+            .live
             .iter()
-            .filter(|t| t.state == ThreadState::Blocked)
-            .map(|t| t.thread.thid())
+            .filter(|&&i| self.threads[i].state == ThreadState::Blocked)
+            .map(|&i| self.threads[i].thread.thid())
             .collect();
         if blocked.is_empty() {
             return IdleStep::Done(RunReport::Finished(self.main_exit_code()));
@@ -1136,6 +1188,8 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                         thread.priority(),
                         sp.entry
                     ));
+                    // A new slot is appended, so pushing its index keeps `live` ascending.
+                    self.live.push(self.threads.len());
                     self.threads.push(Slot::new(thread, ThreadState::Runnable))
                 }
                 // A spawn whose entry was not translated: record it as finished with
@@ -1144,11 +1198,14 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             }
         }
         for thid in wakes {
-            match self
-                .threads
-                .iter_mut()
-                .find(|t| t.thread.thid() == thid && t.state == ThreadState::Blocked)
-            {
+            // The LIVE slots only, and by index rather than by iterator: a wake is matched by
+            // thread id, and searching the whole table meant walking every thread the title
+            // has ever spawned to find one of the thirteen that still exist.
+            let found = self.live.iter().copied().find(|&i| {
+                self.threads[i].thread.thid() == thid
+                    && self.threads[i].state == ThreadState::Blocked
+            });
+            match found.map(|i| &mut self.threads[i]) {
                 Some(t) => {
                     t.state = ThreadState::Runnable;
                     // A freshly woken thread is immediately eligible: it did cooperative
@@ -1160,9 +1217,8 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // Not blocked yet - the wake raced ahead of the block. Keep it; the block
                 // that follows will consume it instead of parking. See `wake_tokens`.
                 None => {
-                    if self.threads.iter().any(|t| {
-                        t.thread.thid() == thid && !matches!(t.state, ThreadState::Finished(_))
-                    }) {
+                    // `live` IS "not finished", so this is the same test over 13 entries.
+                    if self.live.iter().any(|&i| self.threads[i].thread.thid() == thid) {
                         self.wake_tokens.insert(thid);
                     }
                 }
@@ -1267,6 +1323,11 @@ where
         self.core.frames()
     }
 
+    /// `(live, finished)` guest threads - see [`SchedCore::thread_census`].
+    pub fn thread_census(&self) -> (usize, usize) {
+        self.core.thread_census()
+    }
+
     /// Who actually got the CPU - see [`SchedCore::cpu_share_report`].
     pub fn cpu_share_report(&self) -> String {
         self.core.cpu_share_report()
@@ -1310,23 +1371,33 @@ where
 
             // The scheduler's own work is timed; the RESUME between them is not,
             // because resuming runs the guest (see `Phase::SchedOverhead`).
+            //
+            // >>> THE THREE PARTS ARE CHARGED SEPARATELY, AND THE BROWSER ALREADY DID IT THIS
+            // WAY. This loop used to charge the pick, the IDLE STEP and the DRAIN all to
+            // `SchedOverhead`, so the native "scheduler: pick" line was three unrelated costs
+            // added together - an idle round jumps the clock and wakes waiters, a drain takes
+            // two host locks and applies a wake queue, and a pick scans a thread table. The
+            // browser splits them (`SchedIdle`, `SchedBook`), so the two engines' rows did not
+            // mean the same thing either.
             let pick = crate::perf::scope(crate::perf::Phase::SchedOverhead);
-            let Some(idx) = self.core.pick_next() else {
+            let picked = self.core.pick_next();
+            drop(pick);
+            let Some(idx) = picked else {
+                let idle = crate::perf::scope(crate::perf::Phase::SchedIdle);
                 let step = self.core.handle_idle();
-                drop(pick);
+                drop(idle);
                 match step {
                     IdleStep::Done(report) => return report,
                     IdleStep::Continue => continue,
                 }
             };
-            drop(pick);
 
             if let Some(report) = self.core.resume_sync(idx, max_frames) {
                 return report;
             }
             // A host call in this resume may have asked to start threads or woken
             // parked ones; act on both before the next round.
-            let drain = crate::perf::scope(crate::perf::Phase::SchedOverhead);
+            let drain = crate::perf::scope(crate::perf::Phase::SchedBook);
             self.core.drain();
             drop(drain);
         }

@@ -419,6 +419,10 @@ pub struct Program {
     /// its literals and its texture control words" is the question a wrong SA base makes
     /// expensive, and it is not answerable from anything else in here.
     pub containers: Vec<Container>,
+    /// The +0x78 table mapping each NON-DEFAULT uniform buffer to the DATA-container slot
+    /// that receives its bound guest address (see [`UniformBufferBinding`]). Empty for the
+    /// overwhelming majority of programs.
+    pub uniform_buffer_bindings: Vec<UniformBufferBinding>,
     /// Stable content hash of the whole blob, for pipeline caching (FNV-1a).
     pub hash: u64,
 }
@@ -487,6 +491,33 @@ pub struct Container {
     pub index: u16,
     /// First SA register of the block.
     pub base_sa: u16,
+    /// The block's extent in 32-bit SA registers (the entry's own `size_in_f32` field).
+    pub size_regs: u16,
+}
+
+/// One entry of the header's +0x78 table, which maps a NON-DEFAULT uniform buffer to the
+/// DATA-container slot the driver writes that buffer's bound guest ADDRESS into:
+/// `sa_register = data_container.base_sa + data_slot` then holds the pointer the program's
+/// memory loads chase.
+///
+/// # Evidence, and why every use cross-checks
+/// Exactly ONE captured blob across every corpus carries this table (the skinning vertex
+/// program that also carries the only 0x1d memory loads), so the field layout rests on one
+/// entry: bytes 0..2 hold the buffer index its own parameter table declares (1), bytes 2..4
+/// hold 2, and `DATA.base_sa (22) + 2 = 24` is exactly the SA register the program's address
+/// arithmetic reads - two independent readings landing on one register. The entry's
+/// remaining bytes are unestablished and unread. Because one sample cannot pin a layout,
+/// [`crate::module::resolve_mem_window`] refuses (by name) any program where this reading
+/// fails its structural checks - the slot must lie inside the DATA container, collide with
+/// no literal and no texture-control word, and name an SA register the program actually
+/// reads - rather than ever placing a pointer somewhere plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformBufferBinding {
+    /// The uniform buffer's index (the `UniformBuffer` parameter's `resource_index`).
+    pub buffer_index: u16,
+    /// Slot within the DATA container whose SA register receives the buffer's bound
+    /// guest address.
+    pub data_slot: u16,
 }
 
 /// Parse the container table (header `container_count` at +0x90, self-relative
@@ -500,8 +531,34 @@ fn parse_containers(bytes: &[u8]) -> Vec<Container> {
     let base = OFF_CONTAINER_OFFSET.wrapping_add(rel as usize);
     for i in 0..count as usize {
         let e = base.wrapping_add(i * CONTAINER_ENTRY);
-        match (rd_u16(bytes, e), rd_u16(bytes, e + 4)) {
-            (Some(index), Some(base_sa)) => out.push(Container { index, base_sa }),
+        match (rd_u16(bytes, e), rd_u16(bytes, e + 4), rd_u16(bytes, e + 6)) {
+            (Some(index), Some(base_sa), Some(size_regs)) => {
+                out.push(Container { index, base_sa, size_regs })
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Parse the header's +0x78 uniform-buffer binding table (count at +0x78, self-relative
+/// offset at +0x7c). See [`UniformBufferBinding`] for the evidence behind the entry layout;
+/// the 16-byte stride is the observed extent of the one shipped entry before unrelated data
+/// and, like the field layout, is held to by the structural checks every consumer runs.
+fn parse_uniform_buffer_bindings(bytes: &[u8]) -> Vec<UniformBufferBinding> {
+    let mut out = Vec::new();
+    let (Some(count), Some(rel)) =
+        (rd_u32(bytes, OFF_UB_BINDING_COUNT), rd_u32(bytes, OFF_UB_BINDING_OFFSET))
+    else {
+        return out;
+    };
+    let base = OFF_UB_BINDING_OFFSET.wrapping_add(rel as usize);
+    for i in 0..count as usize {
+        let e = base.wrapping_add(i * UB_BINDING_ENTRY);
+        match (rd_u16(bytes, e), rd_u16(bytes, e + 2)) {
+            (Some(buffer_index), Some(data_slot)) => {
+                out.push(UniformBufferBinding { buffer_index, data_slot })
+            }
             _ => break,
         }
     }
@@ -634,6 +691,12 @@ const TEXTURE_ENTRY: usize = 4;
 /// Container table: how many entries, and where they are (self-relative to its own field, the
 /// same convention as every other table offset in this header).
 const OFF_CONTAINER_COUNT: usize = 0x90;
+/// Uniform-buffer binding table: count at +0x78, self-relative offset at +0x7c (see
+/// [`UniformBufferBinding`]).
+const OFF_UB_BINDING_COUNT: usize = 0x78;
+const OFF_UB_BINDING_OFFSET: usize = 0x7c;
+/// Observed stride of one +0x78 entry.
+const UB_BINDING_ENTRY: usize = 16;
 const OFF_CONTAINER_OFFSET: usize = 0x94;
 /// On-disk size of one container entry: four u16 - `index`, unused, `base_sa`, `size_in_f32`.
 const CONTAINER_ENTRY: usize = 8;
@@ -750,6 +813,7 @@ impl Program {
 
         let default_uniform_regs = rd_u32(bytes, OFF_DEFAULT_UNIFORM_REGS).unwrap_or(0);
         let containers = parse_containers(bytes);
+        let uniform_buffer_bindings = parse_uniform_buffer_bindings(bytes);
         let (literals, texture_control, sa_base_from_container) =
             parse_sa_tables(bytes, default_uniform_regs, &containers);
 
@@ -763,6 +827,7 @@ impl Program {
             texture_control,
             sa_base_from_container,
             containers,
+            uniform_buffer_bindings,
             primary_reg_count,
             secondary_reg_count,
             temp_reg_count,

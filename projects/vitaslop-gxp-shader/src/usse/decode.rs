@@ -275,6 +275,7 @@ pub fn decode(word: u64) -> Instr {
         0x14 => decode_grp_i16mad(word),
         0x15 => decode_grp_imad32(word),
         0x1c => decode_grp_tex(word),
+        0x1d => decode_grp_mem_load(word),
         0x1f => decode_grp_flow(word),
         _ => classified_stub(word, op1, hi, lo),
     }
@@ -2354,6 +2355,11 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         0x01 | 0x02 => Some(0), // 0x08/0x10 V32NMAD/V16NMAD - 47:44 is src2_swiz
         0x1c => Some(0),        // 0xE0 SMP
         0x1f => Some(0),        // 0xF8 complex flow
+        // 0xE8/0xF0 memory access: the 64-bit layout tiles exactly with no repeat_count
+        // field anywhere in it - `mask_count` at 47:44 is the ELEMENT count, which is the
+        // instruction's own multi-register transfer, not a repeat. See the distilled
+        // memory-access spec notes (the widths sum to 64 with no hole).
+        0x1d | 0x1e => Some(0),
         // 0x00/0x18 vector MAD/DP: no repeat_count field either. Every group whose grammar is
         // documented places `repeat_count` at bits 47:44, and in this group's own field table
         // those four bits are `abs_op2` plus the `op0_strange`/`swz_en_strange` pair - named
@@ -2681,6 +2687,126 @@ fn decode_grp_flow(word: u64) -> Instr {
     }
 }
 
+/// Decode a group-0xE8 MEMORY LOAD (opcode1 0x1d) - the load half of the 0x1d/0x1e
+/// memory-access format (see the distilled memory-access spec notes for the closed bit
+/// table; the store half, opcode1 0x1e, stays a classified stub).
+///
+/// | field | bits | | field | bits |
+/// |---|---|---|---|---|
+/// | group const `111` | 63:61 | | `mask_count` (elements - 1) | 47:44 |
+/// | direction (`01` load) | 60:59 | | `addr_mode` / `mode` | 43:42 / 41:40 |
+/// | `pred` | 58:56 | | `dest_bank` (1-bit: TEMP/PA) | 39 |
+/// | `skipinv` / `nosched` | 55 / 54 | | `range_enable` | 38 |
+/// | `moe_expand` / `sync_start` | 53 / 52 | | `data_type` / `inc_dec` | 37:36 / 35 |
+/// | `cache_ext` | 51 | | `src0_bank` (1-bit) | 34 |
+/// | src0/1/2 bank ext | 50 / 49 / 48 | | `cache_bypass12` / `drc_sel` | 33 / 32 |
+/// | `src1_bank` / `src2_bank` | 31:30 / 29:28 | | dest / src0 / src1 / src2 n | 27:21 / 20:14 / 13:7 / 6:0 |
+///
+/// The effective byte address is `src0 + src1 + src2`, where an IMMEDIATE offset counts
+/// ELEMENTS (scaled by the element size here), while a register-supplied offset would
+/// already be in bytes. No operand is double-register scaled.
+///
+/// # What is modelled, and the census that scopes it
+/// ONLY the variant every shipped instruction of this family uses (the corpus census over
+/// every captured blob): `mode = 0, addr_mode = 0`, 32-bit elements, unconditional, source
+/// pointer in the PA bank, both offsets IMMEDIATE. `mode`/`addr_mode` are the format's
+/// address-space selector in some arrangement that remains unestablished - but a field that
+/// is ZERO in every shipped instance does not need its other values established to decode
+/// the zero case. Every departure from the census blocks BY NAME below; none is guessed.
+fn decode_grp_mem_load(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    // First reason wins, matching the convention every other group decoder uses.
+    let set = |b: &mut Option<&'static str>, why: &'static str| *b = b.or(Some(why));
+
+    // The predicate field's table for this group is not established; every shipped
+    // instance is 0, and 0 is `Always` in every established table, so only 0 passes.
+    if bits(word, 58, 56) != 0 {
+        set(&mut blocked, "0xE8 memory-load predicate table not established");
+    }
+    if bits(word, 53, 53) != 0 {
+        set(&mut blocked, "0xE8 memory-load moe_expand interaction not established");
+    }
+    if bits(word, 52, 52) != 0 {
+        set(&mut blocked, "0xE8 memory-load sync_start semantics not established");
+    }
+    if bits(word, 43, 42) != 0 {
+        set(&mut blocked, "0xE8 memory-load addr_mode value not established (only 0 is)");
+    }
+    if bits(word, 41, 40) != 0 {
+        set(&mut blocked, "0xE8 memory-load mode value not established (only 0 is)");
+    }
+    if bits(word, 38, 38) != 0 {
+        set(&mut blocked, "0xE8 memory-load range_enable semantics not established");
+    }
+    if bits(word, 37, 36) != 0 {
+        set(&mut blocked, "0xE8 memory-load non-32-bit data_type not established");
+    }
+    if bits(word, 35, 35) != 0 {
+        set(&mut blocked, "0xE8 memory-load auto-increment (inc_dec) not established");
+    }
+    // `skipinv`/`nosched` are pipeline hints with no data-path effect, `cache_ext`/
+    // `cache_bypass12` steer the cache, and `drc_sel` names which dependent-read counter
+    // tracks the (asynchronous) access - none of them changes WHAT is loaded, and this
+    // model completes every load synchronously, which is exact or stronger. All ignored.
+
+    let elements = (bits(word, 47, 44) + 1) as u8;
+
+    // src0, the byte pointer: 1-bit bank at 34, extension at 50 (spec A.2 row). Only the
+    // PA bank is in the census - the pointer is per-vertex data (or per-vertex-derived, as
+    // in the skinning idiom that computes it into a PA register).
+    let src0 = {
+        let (ext, sel) = (bits(word, 50, 50), bits(word, 34, 34));
+        let bank = match (ext, sel) {
+            (0, 0) => Bank::Temp,
+            (0, _) => Bank::PrimaryAttr,
+            (_, 0) => Bank::Output,
+            (_, _) => Bank::SecondaryAttr,
+        };
+        if bank != Bank::PrimaryAttr {
+            set(&mut blocked, "0xE8 memory-load src0 outside the PA bank not in the census");
+        }
+        Operand::plain(bank, r7_reg_index(bits(word, 20, 14)), sel as u8)
+    };
+
+    // src1/src2, the offsets: 2-bit bank + extension, the shared row. The census holds
+    // IMMEDIATE only, where the 7-bit number is a count of ELEMENTS scaled by the element
+    // size (32-bit here). A register-supplied byte offset is spec'd but unobserved.
+    let mut imm_elements = 0u32;
+    for (bank_hi, bank_lo, ext_bit, n_hi, n_lo) in [(31u32, 30u32, 49u32, 13u32, 7u32), (29, 28, 48, 6, 0)] {
+        let (sel, ext) = (bits(word, bank_hi, bank_lo), bits(word, ext_bit, ext_bit));
+        if ext == 1 && sel == 2 {
+            imm_elements += bits(word, n_hi, n_lo);
+        } else {
+            set(&mut blocked, "0xE8 memory-load register-supplied offset not in the census");
+        }
+    }
+    let offset_bytes = imm_elements * 4;
+
+    // Destination: a 1-bit bank (TEMP / PRIMATTR), 7-bit direct number, `elements`
+    // CONSECUTIVE registers from it. The reserved internal-register encodings (TEMP
+    // 124..127) select internal registers, which no shipped load targets.
+    let dest_n = bits(word, 27, 21);
+    let dest_bank = if bits(word, 39, 39) == 0 { Bank::Temp } else { Bank::PrimaryAttr };
+    if dest_bank == Bank::Temp && dest_n + elements as u32 > 124 {
+        set(&mut blocked, "0xE8 memory-load destination reaches the reserved TEMP range");
+    }
+    let dest = Operand::plain(dest_bank, r7_reg_index(dest_n), bits(word, 39, 39) as u8);
+
+    Instr {
+        op: Op::MemLoad { elements, offset_bytes },
+        pred: Predicate::Always,
+        dest: Some(dest),
+        // NOT meaningful for this op: the written span is `elements` consecutive registers
+        // (up to 16), which four channel bits cannot carry. Consumers read `elements`.
+        write_mask: [true; 4],
+        srcs: vec![src0],
+        half_precision: false,
+        raw: word,
+        group: 0x1d,
+        blocked,
+    }
+}
+
 /// Classify an instruction whose operand decode is not yet wired: set its operation from
 /// the ISA opcode map (a fact) but leave operands empty so the emitter hard-fails naming
 /// the op. `hi`/`lo` are used only where a sub-opcode is needed to name the op.
@@ -2706,7 +2832,8 @@ fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
         0x14 | 0x15 | 0x1a => Op::Todo("mad (integer group)"),
         0x19 => Op::Todo("mad.u8"),
         0x1c => Op::Todo("tex"),               // 0xE0
-        0x1d => Op::Todo("lda32/ldl32/ldt32"), // 0xE8
+        // 0x1d (0xE8 loads) is handled in decode() with full operand decode for the
+        // established variant; only the STORE half of the memory-access format remains a stub.
         0x1e => Op::Todo("sta32/stl32/stt32"), // 0xF0
         0x1f => Op::Todo("flow (0xF8 complex)"),
         // 0x09/0x0f are the TEST group (VTST / VTSTMSK): a compare that writes a predicate
@@ -4081,13 +4208,21 @@ mod tests {
     #[test]
     fn stub_groups_classified_and_lossless() {
         // Every documented group classifies its operation (a fact) and preserves the raw
-        // word, even where operand decode is not yet wired. Loads (0xE8) remain a stub.
+        // word, even where operand decode is not yet wired. A load (0xE8) whose
+        // mode/addr_mode is outside the established zero variant decodes but BLOCKS by name.
         let load = decode(word(0xE800_0000 | 0x1234, 0xabcd_ef01));
         assert_eq!(load.group, 0x1d);
-        assert_eq!(load.op, Op::Todo("lda32/ldl32/ldt32"));
+        assert!(matches!(load.op, Op::MemLoad { .. }));
         assert_eq!(load.raw, word(0xE800_0000 | 0x1234, 0xabcd_ef01));
-        assert!(!load.is_supported(), "loads not wired for emit yet");
+        assert!(!load.is_supported(), "a non-zero mode selector is not established");
+        assert!(load.blocked.is_some_and(|b| b.contains("mode value not established")));
         assert!(load.is_classified(), "load operation is known");
+
+        // Stores (0xF0) remain a stub.
+        let store = decode(word(0xF000_0000, 0));
+        assert_eq!(store.group, 0x1e);
+        assert_eq!(store.op, Op::Todo("sta32/stl32/stt32"));
+        assert!(!store.is_supported(), "stores not wired for emit yet");
 
         // The TEST group (0x48 = opcode1 0x09 = VTST) decodes to a real test operation. This
         // all-zero word has both sub-tests disabled, which names no relation against zero, so
@@ -4102,5 +4237,47 @@ mod tests {
         let bad = decode(word(0xB000_0000, 0));
         assert_eq!(bad.op, Op::Illegal);
         assert!(!bad.is_classified());
+    }
+
+    /// The four memory loads of the shipped skinning vertex program that established this
+    /// group's decodable variant (the census: every 0x1d/0x1e instruction in every captured
+    /// blob is `mode = 0, addr_mode = 0`, 32-bit, PA-bank pointer, immediate offsets).
+    /// Field-by-field expectations from the closed bit table, checked against the idiom the
+    /// surrounding code spells out: a 12-word (4x3 matrix) fetch through the pointer in
+    /// pa[3], and three 4-word row fetches through pa[2] at element offsets 0 / 4 / 8.
+    #[test]
+    fn memory_load_established_variant_decodes() {
+        let cases: [(u64, u8, u32, Bank, u8, u8); 4] = [
+            // raw, elements, offset_bytes, dest bank, dest reg, src0 pa reg
+            (0xe883b004a000c000, 12, 0, Bank::Temp, 0, 3),
+            (0xe8833084a0808000, 4, 0, Bank::PrimaryAttr, 4, 2),
+            (0xe8833084a0808200, 4, 16, Bank::PrimaryAttr, 4, 2),
+            (0xe8833004a0808400, 4, 32, Bank::Temp, 4, 2),
+        ];
+        for (raw, elements, offset_bytes, dbank, dreg, s0reg) in cases {
+            let i = decode(raw);
+            assert_eq!(i.group, 0x1d, "{raw:#018x}");
+            assert_eq!(i.blocked, None, "{raw:#018x}");
+            assert_eq!(i.op, Op::MemLoad { elements, offset_bytes }, "{raw:#018x}");
+            let d = i.dest.expect("load has a register destination");
+            assert_eq!((d.bank, d.index), (dbank, dreg), "{raw:#018x}");
+            assert_eq!(i.srcs.len(), 1);
+            assert_eq!((i.srcs[0].bank, i.srcs[0].index), (Bank::PrimaryAttr, s0reg), "{raw:#018x}");
+            assert_eq!(i.pred, Predicate::Always);
+            // The group has no repeat field - the element count IS the transfer.
+            assert_eq!(repeat_extra_iterations(raw), Some(0));
+        }
+
+        // Departures from the census block BY NAME rather than decode loosely: flip
+        // addr_mode, the data type, and the src0 bank on the first real word.
+        let base = 0xe883b004a000c000u64;
+        let addr = base | (1 << 42);
+        assert!(decode(addr).blocked.is_some_and(|b| b.contains("addr_mode")));
+        let half = base | (1 << 36);
+        assert!(decode(half).blocked.is_some_and(|b| b.contains("data_type")));
+        let sa_ptr = base | (1 << 50); // ext=1, sel=1 -> SECATTR pointer
+        assert!(decode(sa_ptr).blocked.is_some_and(|b| b.contains("PA bank")));
+        let reg_off = base & !(1 << 49); // src1 ext cleared -> register offset row
+        assert!(decode(reg_off).blocked.is_some_and(|b| b.contains("register-supplied")));
     }
 }

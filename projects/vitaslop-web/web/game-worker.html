@@ -122,6 +122,8 @@
           const audio = await startAudio();
           audioRing = audio.ring;
           window.__audioStats = audio.stats;
+          // The sample probe, for a harness that has to PROVE the audio is not silence.
+          window.__audioSamples = audio.samples;
         } catch (err) {
           console.warn("[audio] could not start; this run will be SILENT:", err);
         }

@@ -89,7 +89,7 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         index_count: 6,
         vertices: v.into(),
         vertex_stride: 20,
-        attributes: pixel_attrs(),
+        attributes: pixel_attrs().into(),
         indices: indices.into(),
         uniforms: vec![],
         textures: tex.into_iter().collect(),
@@ -104,6 +104,7 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         vert_sa: Vec::new(),
         frag_sa: Vec::new(),
         frag_sa_addr: 0,
+        mem_window: None,
         shader_expanded: false,
     }
 }

@@ -213,6 +213,46 @@ pub enum InlineOp {
     /// configuration error, and callers are expected to reject it outright rather than
     /// let the guest read a stale word.
     LoadMirror { slot: u32 },
+    /// `r0 = value` - the whole call. For a handler that returns a constant and does
+    /// NOTHING else.
+    ///
+    /// # Why a no-op is worth emitting
+    /// It looks like the least valuable form here, and on the desktop it nearly is. In the
+    /// browser a host call is a boundary crossing whose cost is almost entirely marshalling
+    /// [[vitaslop-browser-host-call-cost]], so a call that computes nothing still costs the
+    /// full crossing - and a real title makes them in bulk. MEASURED on a retail racer's
+    /// race: `sceNgsPatchGetInfo` and `sceNgsVoicePatchSetVolumesMatrix` are **198 calls per
+    /// guest frame EACH** - 32% of everything the title calls - and each is 1.14 us of pure
+    /// crossing in desktop Chrome, ~1.0 ms per presented frame between them. On a phone, where
+    /// a crossing is ~20 us, the same pair is most of a frame.
+    ///
+    /// # Admissibility, which is narrower than it looks
+    /// The handler must be EXACTLY a constant return. Not "returns 0 today": a handler that
+    /// records a call, fills an out-parameter, or touches host state that anything reads is a
+    /// different program, and inlining it makes whatever it did stop happening silently. The
+    /// caller decides ([`vitaslop_runtime::vita::inline_op`]), because only the runtime knows
+    /// what a NID means.
+    ///
+    /// # What is given up
+    /// An inlined call never reaches the host, so the NID leaves the call histogram and the
+    /// host-call trace - and for a STUB that matters more than for the other forms, because
+    /// "which unimplemented calls does this title make" is a question the histogram is how
+    /// anyone answers. So the runtime prints the inlined stub list once at link time and keeps
+    /// a scoped switch to put them all back on the host.
+    RetConst { value: u32 },
+    /// Nothing at all - not even a write to r0.
+    ///
+    /// The twin of [`InlineOp::RetConst`] for a handler that returns VOID: one whose Rust
+    /// signature yields `()`, so the dispatcher leaves r0 holding whatever the guest passed
+    /// in it. `RetConst { value: 0 }` is NOT the same program for such a call - it would hand
+    /// back 0 where the call used to hand back its own first argument - and the difference is
+    /// invisible until a caller reads the result.
+    ///
+    /// `sceKernelSetGPO` is the case: it sets a devkit LED, its handler stores a word nothing
+    /// ever reads, and a retail title calls it **116 times per guest frame**. Admissible for
+    /// exactly the same reason `RetConst` is, and under the same rule - the handler must do
+    /// nothing that anything observes - with the extra requirement that it return void.
+    Nop,
     /// `r0 = u32_at(r0 + offset) << shl`, but ONLY when the loaded word is `<= max`;
     /// otherwise the real host call runs.
     ///
@@ -326,6 +366,51 @@ pub enum InlineOp {
     /// yield point, the admissibility rule that the handler must do this and nothing else -
     /// is exactly as [`InlineOp::StoreArgField`] states it.
     StoreArgFieldInPlace { offset: u32, mask: u32 },
+    /// `for i in 0..count: u32_at(r0 + offset + 4*i) = raw_bits(s_i); r0 = 0` - store the
+    /// first `count` VFP single-precision ARGUMENT registers, as raw bits, into a
+    /// contiguous word run at a fixed offset from the pointer argument, then return
+    /// success.
+    ///
+    /// # What this is for
+    /// The multi-float context setters. `sceGxmSetViewport(context, 6 floats)` is the one
+    /// that pays: its handler is exactly "store the six argument floats' bits into six
+    /// consecutive context words and return 0" - a hardfloat AAPCS call carries them in
+    /// s0..s5 - and it is called ~12 times a frame on a racing title, each one a full
+    /// crossing to move 24 bytes the emitted code already holds in globals.
+    ///
+    /// # Admissibility
+    /// Same rule as [`InlineOp::StoreArg`]: the handler must store its arguments AS PASSED,
+    /// contiguously, and do nothing else - no report, no host state, no derived value. The
+    /// bits are stored raw (`f32::to_bits` of what the guest put in s`i`), which is exactly
+    /// what the handler's `v.to_bits()` writes; no float operation happens on either path,
+    /// so there is no rounding to disagree about.
+    ///
+    /// Guarded like every pointer form, against the LAST word of the run.
+    StoreVfpRun { offset: u32, count: u32 },
+    /// `for i in 0..count: u32_at(r0 + offset + 4*i) = int_arg(i + 1); r0 = 0` - store the
+    /// call's integer arguments AFTER the pointer (`r1..r3`, then the guest stack at
+    /// `sp + 4*(n-4)` for argument `n`) as a contiguous word run at a fixed offset from the
+    /// pointer argument, then return success.
+    ///
+    /// # What this is for
+    /// The multi-word context setters whose values arrive in core registers.
+    /// `sceGxmSetRegionClip(context, mode, xMin, yMin, xMax, yMax)` is the one that pays:
+    /// its handler stores the five arguments into five consecutive context words
+    /// (`REGION_CLIP_MODE` then the four bounds) - and with six arguments the AAPCS puts
+    /// the last two on the GUEST STACK, so the run's tail is two plain loads from `sp`,
+    /// exactly the loads `GuestCtx::arg` performs on the host path.
+    ///
+    /// # Admissibility
+    /// Same rule as [`InlineOp::StoreArg`]: arguments stored AS PASSED, contiguously,
+    /// nothing else. A handler that masks an argument (`& 0xff`), reports, or touches host
+    /// state must not use this form.
+    ///
+    /// # Guards
+    /// The destination is guarded against the LAST word of the run, and - when the run
+    /// reaches past r3 - the STACK POINTER is guarded against the last stack word read, so
+    /// a thread with a garbage sp falls back to the handler (whose `read_u32` defines that
+    /// case) instead of trapping in emitted code.
+    StoreArgRun { offset: u32, count: u32 },
     /// `dst = r0 + offset + r1 * stride; dst[0] = r2; dst[1..=words] = *(r2 .. r2 + 4*words);
     /// dst[words + 1] = 0; r0 = 0` - copy N words THROUGH a second pointer into an indexed
     /// slot, recording where they came from.
@@ -475,6 +560,44 @@ pub enum InlineOp {
     ///   sort of case to leave in one place.
     /// - **No bank at all**, which is an arena that could not place one.
     SetUniformData { layout: UniformDataLayout },
+    /// Apply a precomputed vertex/fragment STATE (r1) to the context block (r0), when both
+    /// carry this engine's identity stamps - one bulk `memory.copy` of the state's arrays
+    /// block into the context, the stage's three-word uniform record, and (fragment only)
+    /// the program handle. Everything else runs the real host call.
+    ///
+    /// # Why a state bind can be inlined at all
+    /// `sceGxmSetPrecomputed{Vertex,Fragment}State` used to read a HOST-side table keyed by
+    /// the state's address, which forced the crossing AND could not follow a state the
+    /// guest `memcpy`s (the identical by-value defect the precomputed-DRAW family fixed by
+    /// moving into the guest block - see `vitaslop_runtime::vita::gxmstate`). With the
+    /// state living in guest memory - its struct words plus an arrays block laid out
+    /// exactly as the context block's own texture/uniform tables - the bind is a copy
+    /// between two guest structures, which is what the hardware's own bind is. The
+    /// reflected uniform size is memoised into the struct at INIT, the same "a fact fixed
+    /// at creation belongs in the handle" move `ReserveUniformBuffer` rests on.
+    ///
+    /// The two binds are **48 calls per frame** on one title's race - every remaining
+    /// non-draw GXM crossing it makes in steady gameplay.
+    ///
+    /// # The NULL-state arm, which on a real title is most of the traffic
+    /// A race UNBINDS the precomputed state between draw batches - `state == 0`, twenty-plus
+    /// times a frame - and the handler's null arm is as pure as the copy: the fragment bind
+    /// does nothing but return success, the vertex bind zeroes the stage's table and
+    /// record. Both are emitted inline (the vertex zeroing still behind the context magic).
+    ///
+    /// # Why each guard is there
+    /// - **The context magic** identifies r0 as a block this engine laid out.
+    /// - **The state magic** (stage-specific) identifies r1 as a state THIS engine
+    ///   initialised, with this packing; an uninitialised struct runs the handler, which
+    ///   defines that case (it clears / declines exactly as it did when the table missed).
+    /// - **All three pointers are bounds-checked** - context, struct, arrays block - each
+    ///   against the LAST byte it reaches.
+    ///
+    /// # No yield point
+    /// Loads, one `memory.copy` (or `memory.fill`) and a few stores; no loop, no call, so
+    /// neither engine can preempt inside it ([`InlineOp::LwMutexLock`] states the whole
+    /// argument).
+    BindPrecomputedState { layout: BindStateLayout },
     /// Take a recursive lock whose state lives in the guest WORK AREA pointed to by r0,
     /// when it is uncontended. Everything else runs the real host call.
     ///
@@ -649,6 +772,67 @@ pub struct LwMutexLayout {
 /// code and the host handler read one set of numbers rather than two copies that can drift.
 /// The `*_at` offsets are byte offsets from the pointer named in their prefix: `ctx_` from
 /// the context in r0, `prog_` from the bound program handle read out of it.
+/// Where an [`InlineOp::BindPrecomputedState`] finds everything it copies: the context
+/// block it writes (r0), the precomputed-state STRUCT it reads (r1), and the state's
+/// ARRAYS block, whose guest address sits in the struct.
+///
+/// One layout type serves both stages: the vertex bind copies the non-default
+/// uniform-buffer table and writes the vertex uniform record; the fragment bind copies the
+/// 16-unit texture-binding array, writes the fragment uniform record, and additionally
+/// stores the program HANDLE into the context (`has_prog`) - binding a fragment state
+/// leaves the context bound to its program, exactly as `sceGxmSetFragmentProgram` would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindStateLayout {
+    /// The context block's identity stamp, and the value it must hold.
+    pub ctx_magic_at: u32,
+    pub ctx_magic: u32,
+    /// The state STRUCT's identity stamp (stage-specific), and the value it must hold. A
+    /// struct without it - never initialised, or written by an engine version with a
+    /// different packing - runs the handler, which defines that case.
+    pub st_magic_at: u32,
+    pub st_magic: u32,
+    /// Where the state struct keeps the guest address of its ARRAYS block.
+    pub st_block_at: u32,
+    /// The state struct's default-uniform-buffer address, its memoised size in bytes, and
+    /// its `SceGxmProgram *` - the three words the stage's uniform record receives.
+    pub st_buf_at: u32,
+    pub st_size_at: u32,
+    pub st_header_at: u32,
+    /// The state struct's program HANDLE word (read only when `has_prog`).
+    pub st_handle_at: u32,
+    /// The stage's three-word uniform record in the context block.
+    pub ctx_record: u32,
+    /// The bulk copy: `copy_bytes` bytes from the arrays block to `ctx + copy_dst`.
+    pub copy_dst: u32,
+    pub copy_bytes: u32,
+    /// Context slot the program handle is stored to, when `has_prog`.
+    pub ctx_prog: u32,
+    pub has_prog: bool,
+}
+
+impl BindStateLayout {
+    /// The highest offset reached from the CONTEXT pointer - the guard admits the last
+    /// word, not the first.
+    pub fn ctx_top(self) -> u32 {
+        let mut top = self.ctx_magic_at.max(self.ctx_record + 8);
+        top = top.max(self.copy_dst + self.copy_bytes - 4);
+        if self.has_prog {
+            top = top.max(self.ctx_prog);
+        }
+        top
+    }
+
+    /// The highest offset reached from the STATE STRUCT pointer.
+    pub fn st_top(self) -> u32 {
+        let mut top =
+            self.st_magic_at.max(self.st_block_at).max(self.st_buf_at).max(self.st_size_at).max(self.st_header_at);
+        if self.has_prog {
+            top = top.max(self.st_handle_at);
+        }
+        top
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UniformRingLayout {
     /// Offset of the context block's identity stamp, and the value it must hold.
@@ -768,6 +952,10 @@ impl InlineOp {
             | InlineOp::StoreArgIndexed { .. }
             | InlineOp::StoreArgField { .. }
             | InlineOp::StoreArgFieldInPlace { .. } => 0,
+            // Void run setters: the guest gets the success code. What they WRITE is a run of
+            // argument words, which a one-word `eval` cannot express - the execution test in
+            // `vitaslop-native/tests/inline_imports.rs` holds both to their definition.
+            InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => 0,
             // A copy: what it writes comes from the SOURCE pointer, not from a loaded word,
             // so a one-word `eval` cannot express it. Its meaning is the layout it writes -
             // held against the handler by `the_texture_binding_layout_is_closed`.
@@ -786,6 +974,10 @@ impl InlineOp {
             // A successful uniform write returns 0; its meaning is two byte ranges, which
             // `eval`'s one-word signature cannot express any more than the copy form's.
             InlineOp::SetUniformData { .. } => 0,
+            // A successful bind returns 0; its meaning is a copy between two guest
+            // structures, held to its handler by the execution test and the runtime's
+            // layout equivalence tests.
+            InlineOp::BindPrecomputedState { .. } => 0,
             // A bulk form's meaning is a RANGE of memory, which a one-word `eval` cannot
             // express any more than it can express the copy form's. `MemCopy` and `MemFill`
             // return the destination they were handed, so 0 here is not their r0 - the
@@ -793,6 +985,13 @@ impl InlineOp {
             // `vitaslop-native/tests/inline_imports.rs` is what holds all three to their
             // handlers.
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => 0,
+            // The whole answer, and it does not depend on the word - there is no word. The
+            // constant IS the definition, so `eval` returning it is exact rather than a
+            // stand-in the way the zeros above are.
+            InlineOp::RetConst { value } => value,
+            // r0 is left ALONE, which a one-word `eval` cannot express any more than it can
+            // express a store form's range. Its meaning is that nothing happens.
+            InlineOp::Nop => 0,
         }
     }
 
@@ -841,6 +1040,8 @@ impl InlineOp {
             // offset.
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorPair { .. } => None,
+            // Take no pointer and read nothing.
+            InlineOp::RetConst { .. } | InlineOp::Nop => None,
             // Reads four words and writes two, so no single offset describes it.
             InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => None,
             // Reaches from the pointer itself for a length the guest supplies; there is no
@@ -851,6 +1052,10 @@ impl InlineOp {
             InlineOp::ReserveUniformBuffer { .. } => None,
             // Reads a record, a stack word and a source buffer, and writes two ranges.
             InlineOp::SetUniformData { .. } => None,
+            // Write-only runs; their offsets are store offsets.
+            InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
+            // Reads a struct and a block, writes the context; no single offset names it.
+            InlineOp::BindPrecomputedState { .. } => None,
         }
     }
 
@@ -881,6 +1086,7 @@ impl InlineOp {
             InlineOp::LoadShiftMask { .. } | InlineOp::LoadScaled { .. } => None,
             InlineOp::StoreArg { .. } | InlineOp::StoreArgIndexed { .. } => None,
             InlineOp::StoreArgField { .. } | InlineOp::StoreArgFieldInPlace { .. } => None,
+            InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
@@ -892,11 +1098,15 @@ impl InlineOp {
             InlineOp::LwMutexLock { thread_slot, .. }
             | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
+            // Read nothing at all, mirror included.
+            InlineOp::RetConst { .. } | InlineOp::Nop => None,
             // Everything it reads is in the two guest structures it is handed.
             InlineOp::ReserveUniformBuffer { .. } => None,
             // Reads the SA bank's ADDRESS out of the block - the one slot that is not a
             // value the guest asked for. See `vitaslop_runtime::vita::mirror::SLOT_SA_BANK`.
             InlineOp::SetUniformData { layout } => Some(layout.bank_slot),
+            // Everything it reads is in the guest structures it is handed.
+            InlineOp::BindPrecomputedState { .. } => None,
         }
     }
 

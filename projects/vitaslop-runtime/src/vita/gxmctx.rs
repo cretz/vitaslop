@@ -153,6 +153,13 @@ pub mod off {
     /// buffer was reserved for against what is about to be drawn (see
     /// `VitaState::stale_uniforms`).
     pub const VERTEX_UNIFORM: u32 = AFTER_BACK_STENCIL + 0x0c;
+    /// The guest addresses `sceGxmSetVertexUniformBuffer(context, index, data)` binds, one
+    /// word per buffer index 0..[`super::MAX_UNIFORM_BUFFERS`]. Sticky state exactly like
+    /// the streams: a draw whose vertex program declares a non-default uniform buffer reads
+    /// the bound address here to snapshot the buffer's bytes (the recompiled shader's
+    /// memory loads chase that pointer - see `vitaslop_gxp_shader::module::MemWindow`).
+    /// Placed AFTER both stages' uniform records so every pre-existing offset is unchanged.
+    pub const VERTEX_UNIFORM_BUFFERS: u32 = FRAGMENT_UNIFORM + super::uniform_record::BYTES;
     /// The FRAGMENT stage's, in the same three-word shape - which is what lets ONE inline
     /// form serve both stages with only the record's offset changing.
     pub const FRAGMENT_UNIFORM: u32 = AFTER_BACK_STENCIL + 0x18;
@@ -195,9 +202,14 @@ pub const TEXTURE_CONTROL_WORDS: u32 = 4;
 /// `SCE_GXM_MAX_VERTEX_STREAMS` (vitasdk `gxm.h`).
 pub const MAX_VERTEX_STREAMS: usize = 16;
 
+/// `SCE_GXM_MAX_UNIFORM_BUFFERS` (vitasdk `gxm.h`): non-default uniform buffer indices run
+/// 0..14 per stage - the same numbering the GXP container table's "ordinary uniform buffer"
+/// entries 0..13 use.
+pub const MAX_UNIFORM_BUFFERS: usize = 14;
+
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::FRAGMENT_UNIFORM + uniform_record::BYTES;
+pub const BYTES: u32 = off::VERTEX_UNIFORM_BUFFERS + (MAX_UNIFORM_BUFFERS as u32) * 4;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -235,6 +247,9 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
         for w in 0..uniform_record::BYTES / 4 {
             ctx.write_u32(context.wrapping_add(record + w * 4), 0);
         }
+    }
+    for i in 0..MAX_UNIFORM_BUFFERS as u32 {
+        ctx.write_u32(context.wrapping_add(off::VERTEX_UNIFORM_BUFFERS + i * 4), 0);
     }
     // Stamped LAST, so a partially written block is never mistaken for a complete one.
     ctx.write_u32(context.wrapping_add(off::MAGIC), MAGIC);
@@ -300,6 +315,31 @@ pub fn set_stream(ctx: &mut GuestCtx, context: u32, index: u32, addr: u32) {
         return;
     }
     set(ctx, context, off::STREAMS + index * 4, addr);
+}
+
+/// The guest address bound to VERTEX non-default uniform buffer `index`, or 0 for none
+/// (also 0 for an index GXM cannot produce).
+pub fn vertex_uniform_buffer(ctx: &GuestCtx, context: u32, index: u32) -> u32 {
+    if index as usize >= MAX_UNIFORM_BUFFERS {
+        return 0;
+    }
+    get(ctx, context, off::VERTEX_UNIFORM_BUFFERS + index * 4)
+}
+
+/// Bind `addr` to VERTEX non-default uniform buffer `index`
+/// (`sceGxmSetVertexUniformBuffer`). An index beyond [`MAX_UNIFORM_BUFFERS`] is not
+/// something GXM can produce, so it is reported rather than folded into a neighbour.
+pub fn set_vertex_uniform_buffer(ctx: &mut GuestCtx, context: u32, index: u32, addr: u32) {
+    if index as usize >= MAX_UNIFORM_BUFFERS {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            index,
+            data = format_args!("{addr:#x}"),
+            "setVertexUniformBuffer on an index beyond SCE_GXM_MAX_UNIFORM_BUFFERS - DROPPED"
+        );
+        return;
+    }
+    set(ctx, context, off::VERTEX_UNIFORM_BUFFERS + index * 4, addr);
 }
 
 /// One fragment sampler binding, as the block holds it.
@@ -623,6 +663,15 @@ impl<'a> Block<'a> {
         }
     }
 
+    /// The guest address bound to VERTEX non-default uniform buffer `index`. The
+    /// counterpart of [`vertex_uniform_buffer`].
+    pub fn vertex_uniform_buffer(&self, index: u32) -> u32 {
+        if index as usize >= MAX_UNIFORM_BUFFERS {
+            return 0;
+        }
+        self.word(off::VERTEX_UNIFORM_BUFFERS + index * 4)
+    }
+
     /// All [`MAX_VERTEX_STREAMS`] stream pointers. The counterpart of [`streams`].
     pub fn streams(&self) -> [u32; MAX_VERTEX_STREAMS] {
         std::array::from_fn(|i| self.word(off::STREAMS + i as u32 * 4))
@@ -782,6 +831,9 @@ mod tests {
             for w in 0..uniform_record::BYTES / 4 {
                 claimed.push((record + w * 4, "uniform_record"));
             }
+        }
+        for i in 0..MAX_UNIFORM_BUFFERS as u32 {
+            claimed.push((off::VERTEX_UNIFORM_BUFFERS + i * 4, "vertex_uniform_buffers"));
         }
         claimed.sort();
         for w in claimed.windows(2) {

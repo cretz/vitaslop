@@ -221,6 +221,43 @@ fn load_mirror_reads_the_block() {
     assert_eq!(vm.get_reg(0), op.eval(0x1234_5678));
 }
 
+/// The constant-return form answers in r0 and never crosses the boundary. Both halves
+/// matter and they are different claims: the value proves the guest sees what the handler
+/// would have returned, and the crossing count proves the call is GONE - which is the whole
+/// point of inlining a handler that computes nothing.
+#[test]
+fn ret_const_answers_without_reaching_the_host() {
+    let op = InlineOp::RetConst { value: 0 };
+    let mut vm = vm_with(op);
+    // A register the emitted code must overwrite, so "r0 happened to be 0" cannot pass.
+    vm.set_reg(0, 0xDEAD_BEEF);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a constant return never reaches the host");
+    assert_eq!(vm.get_reg(0), op.eval(0), "r0 is the constant");
+}
+
+/// ...and the constant is whatever the caller named, not a hard-wired zero.
+#[test]
+fn ret_const_carries_its_own_value() {
+    let op = InlineOp::RetConst { value: 0x0000_2A2A };
+    let mut vm = vm_with(op);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a constant return never reaches the host");
+    assert_eq!(vm.get_reg(0), 0x0000_2A2A);
+}
+
+/// The VOID twin emits no code at all, so r0 still holds what the caller passed. That is
+/// the whole difference from `RetConst { value: 0 }`, and it is the difference between
+/// reproducing a void handler and quietly changing what it answers.
+#[test]
+fn nop_leaves_r0_alone_and_never_reaches_the_host() {
+    let mut vm = vm_with(InlineOp::Nop);
+    vm.set_reg(0, 0xDEAD_BEEF);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a void no-op never reaches the host");
+    assert_eq!(vm.get_reg(0), 0xDEAD_BEEF, "r0 is untouched");
+}
+
 #[test]
 fn load_mirror_pair_fills_the_return_pair() {
     let op = InlineOp::LoadMirrorPair { slot: 0 };
@@ -396,6 +433,272 @@ fn store_arg_indexed_falls_back_on_a_null_pointer() {
     vm.set_reg(2, STORED);
     assert!(run(&mut vm), "a null pointer must reach the host");
     assert_only_wrote(&mut vm, 6, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+/// The six raw bit patterns the VFP-run tests store: a normal, a negative, a signalling
+/// NaN pattern, a denormal, a large value and negative zero. Bit-exactness or nothing -
+/// a form that round-tripped these through a float operation would quiet the NaN.
+const VFP_BITS: [u32; 6] =
+    [0x3f80_0000, 0xbf00_0000, 0x7fa0_0001, 0x0000_0001, 0x4479_c000, 0x8000_0000];
+
+#[test]
+fn store_vfp_run_writes_the_argument_registers_bits() {
+    let op = InlineOp::StoreVfpRun { offset: 8, count: 6 };
+    let mut vm = vm_with(op);
+    seed_sentinels(&mut vm, 10);
+    vm.set_reg(0, OUT_PTR);
+    for (i, &b) in VFP_BITS.iter().enumerate() {
+        vm.set_s(i as u8, f32::from_bits(b));
+    }
+    let crossed = run(&mut vm);
+    assert!(!crossed, "an in-range pointer must not reach the host");
+    for (i, &b) in VFP_BITS.iter().enumerate() {
+        let got = vm.read_mem(OUT_PTR + 8 + i as u32 * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, b, "run word {i} must be the raw bits of s{i}");
+    }
+    // The words around the run keep their sentinels: 8 bytes before, and beyond word 7.
+    for i in [0u32, 1, 8, 9] {
+        let got = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, SENTINEL_BASE | i, "word {i} must be UNTOUCHED");
+    }
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+#[test]
+fn store_vfp_run_falls_back_on_a_null_pointer() {
+    let mut vm = vm_with(InlineOp::StoreVfpRun { offset: 8, count: 6 });
+    seed_sentinels(&mut vm, 10);
+    vm.set_reg(0, 0);
+    for (i, &b) in VFP_BITS.iter().enumerate() {
+        vm.set_s(i as u8, f32::from_bits(b));
+    }
+    assert!(run(&mut vm), "a null pointer must reach the host");
+    assert_only_wrote(&mut vm, 10, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler's answer must survive");
+}
+
+/// Where the arg-run tests park the guest stack: far from the output buffer, so a store
+/// that confused the two would land on a sentinel.
+const SP_PTR: u32 = BASE + 0x4000;
+
+/// The five argument words an arg-run stores: r1..r3, then two AAPCS stack words.
+const RUN_ARGS: [u32; 5] = [0xAAAA_0001, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004, 0xEEEE_0005];
+
+fn seed_arg_run(vm: &mut Vm, sp: u32) {
+    seed_sentinels(vm, 8);
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, RUN_ARGS[0]);
+    vm.set_reg(2, RUN_ARGS[1]);
+    vm.set_reg(3, RUN_ARGS[2]);
+    vm.set_reg(13, sp);
+    let stack: Vec<u8> = RUN_ARGS[3..].iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(SP_PTR, &stack).expect("seed the stack words");
+}
+
+#[test]
+fn store_arg_run_writes_registers_then_stack_words() {
+    let op = InlineOp::StoreArgRun { offset: 4, count: 5 };
+    let mut vm = vm_with(op);
+    seed_arg_run(&mut vm, SP_PTR);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "in-range pointers must not reach the host");
+    for (i, &v) in RUN_ARGS.iter().enumerate() {
+        let got = vm.read_mem(OUT_PTR + 4 + i as u32 * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, v, "run word {i} must be argument {} as passed", i + 1);
+    }
+    for i in [0u32, 6, 7] {
+        let got = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, SENTINEL_BASE | i, "word {i} must be UNTOUCHED");
+    }
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+#[test]
+fn store_arg_run_falls_back_on_a_null_pointer() {
+    let mut vm = vm_with(InlineOp::StoreArgRun { offset: 4, count: 5 });
+    seed_arg_run(&mut vm, SP_PTR);
+    vm.set_reg(0, 0);
+    assert!(run(&mut vm), "a null pointer must reach the host");
+    assert_only_wrote(&mut vm, 8, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+/// A run that reads the guest stack must guard sp as a POINTER of its own: a garbage sp
+/// would otherwise become a wild load in emitted code, where the handler's `read_u32`
+/// defines the case. sp = 0 rebases to a wrap far past memory, which is exactly the
+/// garbage the guard exists for.
+#[test]
+fn store_arg_run_falls_back_on_a_garbage_sp() {
+    let mut vm = vm_with(InlineOp::StoreArgRun { offset: 4, count: 5 });
+    seed_arg_run(&mut vm, 0);
+    assert!(run(&mut vm), "a garbage sp must reach the host");
+    assert_only_wrote(&mut vm, 8, None);
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+/// ...and a run that FITS in registers must not care what sp holds: three argument words
+/// come from r1..r3, no stack word is read, and the sp guard must not have been emitted.
+#[test]
+fn store_arg_run_without_stack_words_ignores_sp() {
+    let mut vm = vm_with(InlineOp::StoreArgRun { offset: 4, count: 3 });
+    seed_arg_run(&mut vm, 0);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a register-only run must not consult sp");
+    for (i, &v) in RUN_ARGS[..3].iter().enumerate() {
+        let got = vm.read_mem(OUT_PTR + 4 + i as u32 * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, v, "run word {i} must be argument {} as passed", i + 1);
+    }
+    assert_eq!(vm.get_reg(0), 0);
+}
+
+/// A small synthetic [`BindStateLayout`]: a 3-word copy, magic checks on both structures,
+/// and the program-handle store on. The runtime's own layout is pinned against its
+/// handlers in the runtime crate; this test proves the EMITTER computes any layout.
+fn bind_layout() -> vitaslop_transpiler::BindStateLayout {
+    vitaslop_transpiler::BindStateLayout {
+        ctx_magic_at: 0,
+        ctx_magic: 0xC0DE_C7A0,
+        st_magic_at: 0,
+        st_magic: 0x57A7_E001,
+        st_block_at: 4,
+        st_buf_at: 8,
+        st_size_at: 12,
+        st_header_at: 16,
+        st_handle_at: 20,
+        ctx_record: 4,
+        copy_dst: 16,
+        copy_bytes: 12,
+        ctx_prog: 28,
+        has_prog: true,
+    }
+}
+
+/// Where the bind test parks the state struct and its arrays block.
+const ST_PTR: u32 = BASE + 0x5000;
+const BLK_PTR: u32 = BASE + 0x6000;
+
+fn seed_bind(vm: &mut Vm, ctx_magic: u32, st_magic: u32) {
+    let l = bind_layout();
+    // The context: magic, then sentinels over everything the bind writes (words 1..8).
+    seed_sentinels(vm, 8);
+    vm.write_mem(OUT_PTR, &ctx_magic.to_le_bytes()).expect("ctx magic");
+    // The state struct: magic, block, buf/size/header/handle.
+    let st: [u32; 6] = [st_magic, BLK_PTR, 0xB0F0_0001, 0x0512_E000, 0x0EAD_E400, 0xAA55_0001];
+    let bytes: Vec<u8> = st.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(ST_PTR, &bytes).expect("state struct");
+    // The arrays block: three distinctive words.
+    let blk: [u32; 3] = [0x0B10_C001, 0x0B10_C002, 0x0B10_C003];
+    let bytes: Vec<u8> = blk.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(BLK_PTR, &bytes).expect("arrays block");
+    vm.set_reg(0, OUT_PTR);
+    vm.set_reg(1, ST_PTR);
+    let _ = l;
+}
+
+#[test]
+fn bind_state_copies_the_block_record_and_program() {
+    let l = bind_layout();
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "both magics hold - the inline arm must serve this");
+    let word = |vm: &mut Vm, at: u32| {
+        let b = vm.read_mem(OUT_PTR + at, 4).expect("read back");
+        u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"))
+    };
+    // The record: buf, size, header from the struct - all three words, so a store that
+    // lands one slot over cannot pass.
+    assert_eq!(word(&mut vm, 4), 0xB0F0_0001, "record: buffer");
+    assert_eq!(word(&mut vm, 8), 0x0512_E000, "record: size");
+    assert_eq!(word(&mut vm, 12), 0x0EAD_E400, "record: header");
+    // The copy: the block's three words at copy_dst.
+    assert_eq!(word(&mut vm, 16), 0x0B10_C001, "copy word 0");
+    assert_eq!(word(&mut vm, 20), 0x0B10_C002, "copy word 1");
+    assert_eq!(word(&mut vm, 24), 0x0B10_C003, "copy word 2");
+    // The program handle.
+    assert_eq!(word(&mut vm, 28), 0xAA55_0001, "the program handle lands at ctx_prog");
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+#[test]
+fn bind_state_falls_back_when_either_magic_is_wrong() {
+    let l = bind_layout();
+    for (cm, sm) in [(0u32, l.st_magic), (l.ctx_magic, 0)] {
+        let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+        seed_bind(&mut vm, cm, sm);
+        assert!(run(&mut vm), "a wrong magic must reach the host (ctx={cm:#x} st={sm:#x})");
+        // Words 1..8 keep their sentinels - nothing of the bind may land.
+        for i in 1..8u32 {
+            let b = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+            let got = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+            assert_eq!(got, SENTINEL_BASE | i, "word {i} must be untouched");
+        }
+        assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+    }
+}
+
+#[test]
+fn bind_state_falls_back_on_a_null_context() {
+    let l = bind_layout();
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    vm.set_reg(0, 0);
+    assert!(run(&mut vm), "a null context must reach the host");
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
+}
+
+/// A NULL STATE is the unbind, and on a real title it is most of the traffic - so it is
+/// served inline. For a fragment-shaped layout (`has_prog`) the handler's null arm does
+/// NOTHING but return success; the emitted arm must match, touching no context word.
+#[test]
+fn bind_state_null_state_is_a_pure_success_for_the_fragment_shape() {
+    let l = bind_layout();
+    assert!(l.has_prog, "the fixture layout is the fragment shape");
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    vm.set_reg(1, 0);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "the null unbind must not reach the host");
+    for i in 1..8u32 {
+        let b = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+        assert_eq!(got, SENTINEL_BASE | i, "word {i}: a fragment null bind touches nothing");
+    }
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+/// The vertex shape's null arm ZEROES the table and the record - behind the context
+/// magic, whose failing side runs the handler.
+#[test]
+fn bind_state_null_state_zeroes_the_vertex_shape() {
+    let l = vitaslop_transpiler::BindStateLayout { has_prog: false, ..bind_layout() };
+    // Magic holds: the copy region (words 4..7) and record (words 1..3) go to zero, the
+    // rest keeps its sentinels.
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    vm.set_reg(1, 0);
+    assert!(!run(&mut vm), "the null unbind must not reach the host");
+    for i in 1..8u32 {
+        let b = vm.read_mem(OUT_PTR + i * 4, 4).expect("read back");
+        let got = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+        if (1..=6).contains(&i) {
+            assert_eq!(got, 0, "word {i} is table or record and must be ZERO");
+        } else {
+            assert_eq!(got, SENTINEL_BASE | i, "word {i} must be untouched");
+        }
+    }
+    assert_eq!(vm.get_reg(0), 0);
+    // Magic broken: the handler owns the case (it is the side that reports no-context).
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, 0, l.st_magic);
+    vm.set_reg(1, 0);
+    assert!(run(&mut vm), "a null bind through an unstamped context must reach the host");
     assert_eq!(vm.get_reg(0), HANDLER_SENTINEL);
 }
 

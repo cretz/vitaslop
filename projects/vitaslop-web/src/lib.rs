@@ -967,6 +967,20 @@ struct RenderSplit {
     work: vitaslop_runtime::render::BuildWork,
     /// What `encode_chain` DID over this window - see `vitaslop_platform::gpu::EncodeWork`.
     enc_work: vitaslop_platform::gpu::EncodeWork,
+    /// >>> WHERE `prepare` WENT, ON THE ENGINE THAT PAYS FOR IT.
+    ///
+    /// `VITASLOP_PREPARE_SPLIT` has always fed these counters on both engines, and only the
+    /// DESKTOP ever printed them - so the browser reported `encode 4.7 ms (prepare 3.6 ...)`
+    /// and nothing inside a phase whose candidates want opposite fixes (hashing a vertex
+    /// stream to key a cache, copying into a pass arena, building a bind group). The desktop's
+    /// answer does not transfer: after resident geometry its `prepare` is 0.6 ms while the
+    /// browser's is several, which is precisely a browser-only cost that the one engine
+    /// printing the split cannot see. Same defect class as the phase timers before
+    /// `perf::set_clock` existed.
+    ///
+    /// Empty and free unless the knob is on - the counters are clock reads on a path that
+    /// makes no WebGPU call, which is why they are the one instrument here that is asked for.
+    prep: vitaslop_platform::gpu::PrepareSplit,
 }
 
 /// Supersample factor for the live browser render (`VITASLOP_BROWSER_SUPERSAMPLE`).
@@ -1022,6 +1036,18 @@ fn fastforward_to() -> u64 {
 /// producing a number nobody can use.
 fn allow_software_gpu() -> bool {
     vitaslop_runtime::knobs::flag("VITASLOP_ALLOW_SOFTWARE_GPU")
+}
+
+/// Whether the per-window performance report is also written to the browser CONSOLE
+/// (`VITASLOP_PERF_CONSOLE`).
+///
+/// OFF by default. The report is eight multi-line sections per window; on the page a
+/// person actually plays on, that is a firehose that buries anything they might need to
+/// see, and this page is the product rather than the instrument. Nothing is lost by
+/// default: every section still reaches the on-screen diagnostics panel and the
+/// dev-server sink, which is where a measurement is read from anyway.
+fn perf_console() -> bool {
+    vitaslop_runtime::knobs::flag("VITASLOP_PERF_CONSOLE")
 }
 
 /// What the browser's WebGPU adapter actually IS, and whether it is a real GPU.
@@ -1702,6 +1728,10 @@ impl LivePlayback {
         }
         self.split.work.add_pub(&work);
         self.split.enc_work.add(&enc_work);
+        // Taken every present whether or not the knob is on: `take_prepare_split` is a handful
+        // of relaxed swaps, and taking it here keeps the window's tally over exactly the
+        // presents this window counted. Everything it holds is zero when the knob is off.
+        self.split.prep.add(&vitaslop_platform::gpu::take_prepare_split());
         self.split.build_ms += t1 - t0;
         self.split.encode_ms += t2 - t1;
         self.split.prepare_ms += ph.prepare_ms;
@@ -1788,10 +1818,25 @@ fn global_performance() -> Option<web_sys::Performance> {
 /// Yield to the event loop for one frame tick, resolving asynchronously. On the main
 /// thread this is `requestAnimationFrame` - it paces the live loop to the display
 /// refresh (so presented FPS reflects real cadence) and keeps input listeners
-/// responsive. In a Web Worker (no `requestAnimationFrame`) it falls back to a
-/// zero-delay `setTimeout`, which still returns control to the worker's event loop
-/// each frame (so posted input/messages are processed) but does not vsync-pace - the
-/// worker then runs near its true uncapped throughput.
+/// responsive.
+///
+/// # >>> IN A WORKER IT IS A `MessageChannel`, BECAUSE `setTimeout(0)` IS CLAMPED TO 4 ms
+/// A worker has no `requestAnimationFrame`, and the obvious fallback - `setTimeout(cb, 0)` -
+/// is not zero. Every browser clamps a NESTED timeout (one scheduled from inside a timeout
+/// callback, five deep) to a **4 ms minimum**, and this loop is an unbroken chain of exactly
+/// that: the tick's continuation schedules the next tick. So the live loop paid ~4 ms of pure
+/// waiting between every presented frame, on the engine that ships, and it was invisible in
+/// every split - `cpu` measures the guest half and `render` the present, and this sits
+/// between them where nothing was looking.
+///
+/// It matters more than its size suggests, because the race sits ON the vsync boundary: work
+/// per present is ~17 ms against a 16.7 ms interval, so 4 ms decides whether a present lands
+/// on one interval or two.
+///
+/// A `MessageChannel` message is a macrotask like a timeout - the event loop still turns, so
+/// posted input and messages are serviced exactly as before - and it is not clamped. The
+/// channel is built ONCE and reused: a fresh pair of ports per frame would trade the clamp
+/// for an allocation.
 async fn next_tick() {
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let cb = Closure::once_into_js(move |_t: JsValue| {
@@ -1799,20 +1844,34 @@ async fn next_tick() {
         });
         if let Some(window) = web_sys::window() {
             let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
-        } else {
-            // Worker: no rAF. `setTimeout(cb, 0)` off the global still yields a macrotask
-            // so incoming messages are serviced between frames.
-            let set_timeout =
-                js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
-                    .ok()
-                    .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
-            if let Some(set_timeout) = set_timeout {
-                let _ = set_timeout.call2(
-                    &JsValue::UNDEFINED,
-                    cb.as_ref().unchecked_ref(),
-                    &JsValue::from_f64(0.0),
-                );
-            }
+            return;
+        }
+        thread_local! {
+            static CHANNEL: Option<web_sys::MessageChannel> = web_sys::MessageChannel::new().ok();
+        }
+        let posted = CHANNEL.with(|ch| {
+            let Some(ch) = ch else { return false };
+            // The resolver rides ON the message, so the port needs no per-call handler
+            // registration: `port1.onmessage` is set here each time (a property write, not an
+            // allocation) and fires once for the message posted immediately after.
+            let f: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+            ch.port1().set_onmessage(Some(&f));
+            ch.port2().post_message(&JsValue::NULL).is_ok()
+        });
+        if posted {
+            return;
+        }
+        // No `MessageChannel` (or it refused): the clamped timeout is still correct, just
+        // slower, so it stays as the fallback rather than the run stopping.
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+        if let Some(set_timeout) = set_timeout {
+            let _ = set_timeout.call2(
+                &JsValue::UNDEFINED,
+                cb.as_ref().unchecked_ref(),
+                &JsValue::from_f64(0.0),
+            );
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -2545,6 +2604,23 @@ async fn live_loop(
     // window's own count is a difference rather than a running total that only grows.
     let mut epoch_wraps_at_window_start = 0u64;
     let mut epoch_rebases_at_window_start = 0u64;
+    // >>> THE MOST EXPENSIVE FRAMES OF THE WHOLE RUN, AND THE FRAME/PRESENT TOTALS.
+    //
+    // Every other instrument on this page describes a WINDOW - the last thirty presents - which
+    // is the right shape for a steady state and useless for the one question a user actually
+    // asks: "it hung from frame 1 to frame 600, what was it doing?" By the time the panel can be
+    // read, the window has moved past the thing that needs explaining, and the per-frame console
+    // lines (`VITASLOP_BROWSER_HEARTBEAT_MS=0`) are on a console a phone does not show.
+    //
+    // These are cumulative for the run, so ONE panel grabbed after the stall answers it: a
+    // single enormous frame, a few hundred merely slow ones, and presents being dropped are
+    // three different defects with three different fixes, and the top-N list plus the
+    // frames-against-presents ratio separates them. `(frame, guest ms, host calls)`, kept
+    // smallest-first so the cheapest is always at index 0.
+    const SLOWEST_KEPT: usize = 12;
+    let mut slowest: Vec<(u64, f64, u64)> = Vec::new();
+    let mut frames_total = 0u64;
+    let mut presents_total = 0u64;
 
     // How long a fast-forward tick may run before returning to the event loop. Long
     // enough that the fast-forward is CPU-bound rather than paced by the tick rate
@@ -2744,6 +2820,17 @@ async fn live_loop(
             let frame_hc_ms = hc_ms - last_hc_ms;
             last_hc_calls = hc_calls;
             last_hc_ms = hc_ms;
+            // The run's slowest frames, kept as they happen - see `slowest`. Counted from the
+            // FIRST frame, warmup included: the boot frame is the whole point of the list, and
+            // it is the one every other counter on this page deliberately excludes.
+            frames_total += 1;
+            if slowest.len() < SLOWEST_KEPT {
+                slowest.push((frames, c1 - c0, frame_calls));
+                slowest.sort_by(|a, b| a.1.total_cmp(&b.1));
+            } else if c1 - c0 > slowest[0].1 {
+                slowest[0] = (frames, c1 - c0, frame_calls);
+                slowest.sort_by(|a, b| a.1.total_cmp(&b.1));
+            }
             let status = format!(
                 "frame {frames}{} (live via WebGPU) | {:.0} ms, {frame_calls} host calls \
                  ({frame_hc_ms:.0} ms) | {report_step:?}",
@@ -2929,6 +3016,10 @@ async fn live_loop(
             // A present belongs to the iteration that produced it, so the pacing decision for the
             // NEXT tick sees the true cost of this one.
             last_iter_ms += r1 - r0;
+            // Counted from the first present, warmup included, for the same reason the frame
+            // total is: what this is read against is `frames_total`, and a ratio whose two
+            // halves start counting at different frames is not a ratio.
+            presents_total += 1;
             if sched.core.frames() > WARMUP_FRAMES {
                 render_ms += r1 - r0;
                 presents += 1;
@@ -3017,10 +3108,20 @@ async fn live_loop(
                 // window was uniform" is a fact about the run, and it is exactly what the repeated
                 // line was failing to convey. A window that is NOT uniform still prints both, which
                 // is when the second line earns its space.
+                // >>> THE CONSOLE IS NOT THE REPORT. Every one of these sections still
+                // goes into `diag`, which is what the panel shows and what the dev-server
+                // sink records - so nothing is lost. What is gated is the CONSOLE copy,
+                // because eight multi-line blocks per window turn a player's dev tools
+                // into a firehose, and this page is the product, not the instrument
+                // ([[vitaslop-web-is-the-product-not-the-tool]]). Set
+                // `VITASLOP_PERF_CONSOLE=1` to get them back while debugging.
+                let to_console = perf_console();
                 let mut line = |diag: &mut String, tag: &str, text: &str| {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[perf] frame {frame_no} | {tag} | {text}"
-                    )));
+                    if to_console {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[perf] frame {frame_no} | {tag} | {text}"
+                        )));
+                    }
                     diag.push_str(tag);
                     diag.push('\n');
                     diag.push_str(text);
@@ -3058,6 +3159,28 @@ async fn live_loop(
                     line(&mut diag, "PRESENTED SURFACE", &probe);
                 }
                 line(&mut diag, "RENDER SPLIT", &perf_line);
+                // >>> AND THE RUN'S OWN WORST FRAMES, WHICH NO WINDOW CAN SHOW. See `slowest`.
+                //
+                // Placed high in the panel, directly under the rate: when a user reports a
+                // stall, this is the first line that can answer it, and everything below
+                // describes a window that has already moved past the stall.
+                {
+                    let worst: Vec<String> = slowest
+                        .iter()
+                        .rev()
+                        .map(|(f, ms, calls)| format!("f{f} {ms:.0} ms ({calls} calls)"))
+                        .collect();
+                    line(
+                        &mut diag,
+                        "SLOWEST FRAMES, cumulative for the run",
+                        &format!(
+                            "{frames_total} guest frames, {presents_total} presented ({:.2} \
+                             frames per present) | worst: {}",
+                            frames_total as f64 / presents_total.max(1) as f64,
+                            worst.join(", "),
+                        ),
+                    );
+                }
                 // The surface's format, alpha mode and present mode. Every one is chosen from
                 // what the platform offers, so every one can differ between desktop and phone.
                 line(&mut diag, "SURFACE", playback.surface_line());
@@ -3082,6 +3205,10 @@ async fn live_loop(
                 // volume or per-call boundary overhead, which a millisecond never can.
                 let encode_mean = s.enc_work.line(s.presents.max(1));
                 line(&mut diag, "ENCODE, window mean", &encode_mean);
+                // ...and INSIDE `prepare`, when it was asked for. See `WindowSplit::prep`.
+                if !s.prep.is_empty() {
+                    line(&mut diag, "PREPARE SPLIT, window mean", &s.prep.line(s.presents.max(1)));
+                }
                 // >>> WHAT THE GUEST-CPU HALF MOVED, IN BYTES. The only phase instrument this
                 // engine can have.
                 //

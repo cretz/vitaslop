@@ -31,7 +31,8 @@ pub use container::{Parameter, ParamCategory, ParamType, Program, ProgramKind};
 pub use ir::{Instr, Op, Shader};
 pub use link::{link_programs, LinkError, LinkedProgram, MAX_VARYINGS};
 pub use module::{
-    BindingPlan, ColorOutput, ColorPrecision, FragmentModule, VertexAttribute, VertexBindingPlan, VertexModule,
+    BindingPlan, ColorOutput, ColorPrecision, FragmentModule, MemWindow, VertexAttribute,
+    VertexBindingPlan, VertexModule,
 };
 
 /// The maximum number of `@location` varying outputs a recompiled vertex module may declare.
@@ -244,6 +245,26 @@ pub fn recompile_vertex(bytes: &[u8]) -> Result<RecompiledVertex, RecompileError
     let wgsl_body = wgsl::emit_body(&shader)?;
     let hash = program.hash;
     Ok(RecompiledVertex { program, shader, wgsl_body, hash })
+}
+
+/// The guest-memory window a VERTEX blob's 0xE8 memory loads need at DRAW time, if any:
+/// which uniform buffer index to read the bound address for, and how many bytes to
+/// snapshot. `None` for a program with no memory loads AND for one whose window cannot be
+/// resolved - the latter refuses to link ([`LinkError::MemWindowUnresolved`] names why), so
+/// a capture that snapshots nothing for it changes nothing.
+///
+/// The opcode scan short-circuits before parsing operands: memory loads are one program in
+/// the whole captured corpus, and this runs once per registered program.
+pub fn mem_window_for_vertex_blob(bytes: &[u8]) -> Option<module::MemWindow> {
+    let program = Program::parse(bytes).ok()?;
+    if program.kind != ProgramKind::Vertex {
+        return None;
+    }
+    if !program.code.iter().any(|&w| usse::opcode1(w) == 0x1d) {
+        return None;
+    }
+    let shader = usse::decode_shader(&program);
+    module::resolve_mem_window(&program, &shader).ok().flatten()
 }
 
 /// Recompile a vertex shader blob all the way to a complete, bindable [`VertexModule`] (WGSL

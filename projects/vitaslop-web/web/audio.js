@@ -21,7 +21,17 @@ const CTL_OVERRUN = 3;
 const CTL_CAPACITY = 4;
 const CTL_CHANNELS = 5;
 const CTL_SAMPLE_RATE = 6;
-const CTL_HEADER_BYTES = 32;
+/// Loudest sample seen this run, as |sample| * 32767, written by the producer. The ring
+/// holds only the last half second, so this is the only whole-run evidence that anything
+/// was ever audible - see the note in `src/audio.rs`.
+const CTL_PEAK = 7;
+/// Frames the consumer skipped past to keep the backlog under its latency cap - see
+/// `audio-worklet.js`. Non-zero means the emulator produced audio faster than the device
+/// consumed it, and the OLDEST audio was dropped to keep sounds in time with the game.
+const CTL_LATENCY_SKIP = 8;
+/// Frames of backlog at the last block: the live output latency, in frames.
+const CTL_FILL = 9;
+const CTL_HEADER_BYTES = 64;
 
 /// Ring depth. Half a second is far more than a real backend needs, and that is
 /// deliberate: the emulator does not yet run at real time, so the producer arrives in
@@ -92,7 +102,40 @@ export async function startAudio() {
     underrun: Atomics.load(ctl, CTL_UNDERRUN),
     overrun: Atomics.load(ctl, CTL_OVERRUN),
     sampleRate: context.sampleRate,
+    /// Loudest sample of the whole run, 0..1. Zero means the run was SILENT no matter
+    /// what `written` says.
+    peak: Atomics.load(ctl, CTL_PEAK) / 32767,
+    /// Frames dropped to keep output latency bounded, and the live backlog in frames.
+    /// `fill` IS the latency a player hears between a sound being produced and heard.
+    latencySkip: Atomics.load(ctl, CTL_LATENCY_SKIP),
+    fill: Atomics.load(ctl, CTL_FILL),
   });
 
-  return { ring, context, node, stats };
+  /// A copy of the PCM currently sitting in the ring, as interleaved f32.
+  ///
+  /// >>> THIS IS THE ONLY THING THAT CAN TELL WORKING AUDIO FROM SILENT AUDIO.
+  /// `stats()` counts FRAMES, and a frame of zeroes counts exactly like a frame of
+  /// music: a defect that fed the ring perfectly-paced digital silence ran for a long
+  /// time with `written` and `read` both climbing and nothing audible. Anything
+  /// asserting that audio WORKS has to look at sample values, so this hands them over.
+  ///
+  /// The ring is half a second deep and circular, so this is the last ~0.5s and no
+  /// more; it is a probe, not a recording. Read in ring order (oldest first) so the
+  /// samples come out as a contiguous waveform - a raw copy of the backing store would
+  /// be spliced at the write cursor, which destroys exactly the sample-to-sample
+  /// continuity a caller is likely measuring.
+  const samples = () => {
+    const write = Atomics.load(ctl, CTL_WRITE);
+    const have = Math.min(write, capacity);
+    const out = new Float32Array(have * channels);
+    const data = new Float32Array(ring, CTL_HEADER_BYTES, capacity * channels);
+    const start = (write - have) % capacity;
+    for (let i = 0; i < have; i++) {
+      const src = ((start + i) % capacity) * channels;
+      for (let c = 0; c < channels; c++) out[i * channels + c] = data[src + c];
+    }
+    return out;
+  };
+
+  return { ring, context, node, stats, samples };
 }

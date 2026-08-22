@@ -145,6 +145,13 @@ pub enum LinkError {
     /// `available` for the texcoord that feeds it, so the missing coordinates would sample at an
     /// arbitrary position. Fall back.
     PrefetchCoordTooNarrow { unit: u8, needed: u32, available: u32 },
+    /// The VERTEX program's 0xE8 memory loads cannot be tied to a bindable guest-memory
+    /// window ([`crate::module::resolve_mem_window`] names the specific gap). Emitting anyway
+    /// would hand the loads fabricated bytes. Fall back.
+    MemWindowUnresolved { why: &'static str },
+    /// The FRAGMENT program carries a 0xE8 memory load; the memory-window binding is only
+    /// established for the vertex stage (no fragment in the census loads memory). Fall back.
+    FragmentMemLoad,
 }
 
 impl core::fmt::Display for LinkError {
@@ -220,6 +227,15 @@ impl core::fmt::Display for LinkError {
                 "the prefetched sample from texture unit {unit} needs {needed} coordinate \
                  components but its texcoord supplies only {available}"
             ),
+            LinkError::MemWindowUnresolved { why } => write!(
+                f,
+                "the vertex program's memory loads have no bindable guest-memory window: {why}"
+            ),
+            LinkError::FragmentMemLoad => write!(
+                f,
+                "the fragment program carries a 0xE8 memory load; the memory-window binding \
+                 is only established for the vertex stage"
+            ),
         }
     }
 }
@@ -251,6 +267,15 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
 
     let vrc = recompile_vertex(vbytes).map_err(LinkError::VertexRecompile)?;
     let frc = recompile_fragment(fbytes).map_err(LinkError::FragmentRecompile)?;
+
+    // Memory loads: a fragment one has no established binding at all; a vertex one must
+    // resolve to a window or the pair falls back NAMING the gap (the plan's own resolver
+    // call swallows the reason, because a plan has no error channel).
+    if frc.shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
+        return Err(LinkError::FragmentMemLoad);
+    }
+    crate::module::resolve_mem_window(&vprog, &vrc.shader)
+        .map_err(|why| LinkError::MemWindowUnresolved { why })?;
 
     let vplan = plan_vertex_bindings(&vprog, &vrc.shader);
     let mut fplan =
@@ -1487,9 +1512,15 @@ fn secondary_attr_init(
             }
         }
     }
+    // The mem-window base register is DRIVER data, not texture state: the module initialises
+    // it from the bound window's own header (see `MemWindow::base_sa`), so a read of it is fed.
+    let mem_base_sa = crate::module::resolve_mem_window(program, shader)
+        .ok()
+        .flatten()
+        .map(|w| w.base_sa);
     let mut literals = Vec::new();
     for reg in needed {
-        if reg < uniform_regs || written.contains(&reg) {
+        if reg < uniform_regs || written.contains(&reg) || Some(reg) == mem_base_sa {
             continue;
         }
         match program.literals.iter().find(|(r, _)| *r == reg) {
@@ -1606,6 +1637,17 @@ fn build_linked_module(
         let _ = writeln!(m, "@group(0) @binding(0) var<uniform> vs_sa: VsSa;");
     }
 
+    // ---- The vertex stage's guest-memory window, beside its uniform in group 0 ----
+    // Only present when the program's 0xE8 loads resolved to one (see `MemWindow`): vec4 0
+    // lane x is the window's own guest base address, the window's words follow.
+    if let Some(w) = &vplan.mem_window {
+        let _ = writeln!(
+            m,
+            "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, {}>;",
+            w.vec4_count()
+        );
+    }
+
     // ---- Fragment default-uniform buffer (SA bank) at group 1 ----
     let fsa_regs = fprog.default_uniform_regs;
     let fsa_vec4 = fsa_regs.div_ceil(4);
@@ -1667,6 +1709,13 @@ fn build_linked_module(
         crate::module::emit_attribute_load(&mut m, a);
     }
     emit_secondary_attrs(&mut m, "vs_sa", vsa_regs, vliterals);
+    // The driver-placed pointer register: the bound buffer's guest address, exactly as the
+    // hardware's PDS would leave it, so the body's address arithmetic runs bit-exact. After
+    // the SA-init marker and the literals, so `resolve_sa_init` sees it as a WRITE and keeps
+    // the register a compacted local slot.
+    if let Some(w) = &vplan.mem_window {
+        let _ = writeln!(m, "  sa[{}] = gxp_mem[0].x;", w.base_sa);
+    }
     m.push_str(vbody);
     let _ = writeln!(m, "  var out: VsOut;");
     let _ = writeln!(
@@ -2524,6 +2573,7 @@ mod tests {
             default_uniform_regs: 0,
             sa_base_from_container: true,
             containers: Vec::new(),
+            uniform_buffer_bindings: Vec::new(),
             secondary_code: Vec::new(),
             literals: Vec::new(),
             texture_control: Vec::new(),

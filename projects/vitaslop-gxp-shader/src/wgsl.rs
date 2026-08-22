@@ -885,6 +885,12 @@ pub fn wrap_module(body: &str, tex_units: &[TexBinding], kind: ProgramKind) -> S
 /// from the vertex attributes and sa from the uniform buffer instead of zeroing them.
 pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
     let mut m = String::new();
+    // A body with 0xE8 memory loads references the draw's memory window; here it is zeroed
+    // private storage (like pa/sa), sized minimally - this wrapper only validates syntax and
+    // typing, never runs.
+    if body.contains("gxp_mem") {
+        let _ = writeln!(m, "var<private> gxp_mem: array<vec4<u32>, 2>;");
+    }
     for bank in ["r", "pa", "sa", "o", "i"] {
         let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
     }
@@ -1043,6 +1049,25 @@ fn emit_instr(
             emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
         Op::IntMad { signed, bits } => emit_int_mad(s, instr, dest, signed, bits).ok_or_else(unmapped),
+        // MEMORY LOAD: `elements` consecutive 32-bit guest words from byte address
+        // `src0 + offset_bytes` into consecutive destination registers. WGSL has no raw
+        // pointers, so the read goes through the draw's bound MEMORY WINDOW: a uniform
+        // array of the addressed guest bytes whose vec4 0 lane x holds the window's own
+        // guest base address (see `module::MemWindow`). Only a VERTEX stage declares that
+        // binding - no fragment program in the census loads memory - so a fragment body
+        // carrying one hard-fails here instead of referencing an undeclared name.
+        Op::MemLoad { elements, offset_bytes } => {
+            if !matches!(kind, ProgramKind::Vertex) {
+                return Err(EmitError::Blocked {
+                    index,
+                    byte_offset,
+                    reason: "0xE8 memory load in a FRAGMENT program - the memory window \
+                             binding is only established for the vertex stage",
+                    raw: instr.raw,
+                });
+            }
+            emit_mem_load(s, instr, dest, elements, offset_bytes, index).ok_or_else(unmapped)
+        }
         Op::LoadIndex { addend } => emit_load_index(s, instr, dest, addend).ok_or_else(unmapped),
         Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
             emit_sop2(s, instr, dest, mask, color, alpha, (f1, f1_complement), (f2, f2_complement))
@@ -1188,6 +1213,54 @@ fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) 
         s1.index as u32
     )
     .ok();
+    Some(())
+}
+
+/// `elements` consecutive guest words from byte address `src0 + offset_bytes` into
+/// consecutive destination registers, through the draw's bound MEMORY WINDOW.
+///
+/// The window is `gxp_mem: array<vec4<u32>, N>` where vec4 0 lane x holds the window's own
+/// guest BASE ADDRESS and the window's words start at vec4 1 - so word `w` of the window is
+/// `gxp_mem[1 + w/4][w%4]`. The pointer register and the loaded values are raw 32-bit lanes
+/// (the pointer was computed by the integer pipeline; the data's type is whatever the guest
+/// stored), so everything here reads and writes the register file WITHOUT a float view.
+///
+/// The subtraction assumes the addressed bytes lie inside the window, which the LINKER
+/// established (the window IS the program's one declared uniform buffer, and the host
+/// uploads exactly its declared extent). An address outside it - a guest indexing past its
+/// own declared buffer - lands on WGSL's clamped out-of-bounds read rather than on whatever
+/// bytes happened to follow the buffer on the device; that is the one observable divergence,
+/// it requires the guest to read outside its own declaration, and it cannot read another
+/// draw's data. A byte address that is not 4-aligned truncates to its containing word; the
+/// host refuses the window (dropping the draw, reported) if the BASE is misaligned, and
+/// every in-shader offset is a multiple of the 4-byte element size.
+fn emit_mem_load(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    elements: u8,
+    offset_bytes: u32,
+    index: usize,
+) -> Option<()> {
+    let src0 = instr.srcs.first()?;
+    let ptr_bank = bank_prefix(src0.bank)?;
+    let dest_bank = bank_prefix(dest.bank)?;
+    // The window word index of the FIRST element. Named per instruction so two loads in one
+    // (unbraced) function body cannot collide.
+    writeln!(
+        body,
+        "  let gxp_w{index}: u32 = (({ptr_bank}[{}] + {offset_bytes}u) - gxp_mem[0].x) >> 2u;",
+        src0.index as u32
+    )
+    .ok()?;
+    for k in 0..elements as u32 {
+        writeln!(
+            body,
+            "  {dest_bank}[{}] = gxp_mem[1u + ((gxp_w{index} + {k}u) >> 2u)][(gxp_w{index} + {k}u) & 3u];",
+            dest.index as u32 + k
+        )
+        .ok()?;
+    }
     Some(())
 }
 

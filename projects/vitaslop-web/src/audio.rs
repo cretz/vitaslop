@@ -32,7 +32,17 @@ const CTL_OVERRUN: u32 = 3;
 const CTL_CAPACITY: u32 = 4;
 const CTL_CHANNELS: u32 = 5;
 const CTL_SAMPLE_RATE: u32 = 6;
-const CTL_HEADER_BYTES: u32 = 32;
+/// Loudest sample this run, as `|sample| * 32767`.
+///
+/// >>> THE ONLY WHOLE-RUN PROOF THAT ANYTHING WAS AUDIBLE. The ring itself is half a
+/// second deep and circular, so reading its contents at the end of a run samples the
+/// last 0.5s and nothing else - and a title whose audio is sparse (one measured front
+/// end is silent for 95% of its running time) will show an empty ring on a run that
+/// produced minutes of sound. A high-water mark cannot miss it.
+const CTL_PEAK: u32 = 7;
+/// Slots 8 and 9 belong to the consumer (latency skip, live backlog); the header is
+/// sized past them so the layout has room to grow without moving the PCM.
+const CTL_HEADER_BYTES: u32 = 64;
 
 /// A `sceAudioOut` port as this sink sees it: the format the guest opened it with, which
 /// is all that is needed to turn its grains into ring frames.
@@ -193,6 +203,11 @@ impl AudioSink for WebAudioSink {
 
         self.scratch.clear();
         self.scratch.reserve(out_frames * device_ch);
+        // The run's high-water mark is taken HERE, inside the conversion that already
+        // touches every sample, rather than in a pass of its own - this is the guest's
+        // audio thread at grain rate, and a second walk over the grain would be pure
+        // overhead for a diagnostic.
+        let mut peak = 0.0f32;
         for _ in 0..out_frames {
             let i = pos as usize;
             let frac = pos - i as f64;
@@ -202,9 +217,15 @@ impl AudioSink for WebAudioSink {
                 let a = pcm.get(i * src_ch + sc).copied().unwrap_or(0) as f32;
                 let b = pcm.get((i + 1) * src_ch + sc).copied().map_or(a, f32::from);
                 let s = a + (b - a) * frac as f32;
-                self.scratch.push(s / 32768.0 * gain[c.min(1)]);
+                let out = s / 32768.0 * gain[c.min(1)];
+                peak = peak.max(out.abs());
+                self.scratch.push(out);
             }
             pos += ratio;
+        }
+        let peak_i = (peak * 32767.0) as i32;
+        if peak_i > self.ctl.get_index(CTL_PEAK) {
+            let _ = js_sys::Atomics::store(&self.ctl, CTL_PEAK, peak_i);
         }
         // Carry the leftover fraction into the next grain - see `Port::resample_pos`.
         if let Some(p) = self.port(port) {
