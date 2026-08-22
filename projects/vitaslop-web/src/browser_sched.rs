@@ -789,10 +789,77 @@ impl GuestMemory for SharedView {
         self.bytes.length() as usize
     }
     fn read(&self, off: usize, buf: &mut [u8]) {
-        self.bytes.subarray(off as u32, (off + buf.len()) as u32).copy_to(buf);
+        // SAFETY: the view borrows this module's linear memory for the duration of the call
+        // below. `copy_range` is synchronous JS that cannot grow it, and nothing else holds a
+        // reference to `buf`.
+        unsafe {
+            let dst = js_sys::Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len());
+            copy_range(&self.bytes, off as u32, &dst);
+        }
     }
     fn write(&mut self, off: usize, bytes: &[u8]) {
-        self.bytes.subarray(off as u32, (off + bytes.len()) as u32).copy_from(bytes);
+        SharedView::write_at(self, off, bytes)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        SharedView::write_word(self, off, v)
+    }
+}
+
+// >>> AND THE SAME IMPL FOR A BORROW, WHICH IS WHAT A HOST CALL USES.
+//
+// `GuestMemory` is handed to `dispatch` as `&mut dyn`, so the browser used to CLONE the view
+// per call (`rt.view()`). The view is three `js_sys` typed-array handles, and cloning a
+// `JsValue`-backed handle is a call into the wasm-bindgen heap table - three crossings to make
+// it and three more to drop it, SIX per host call, ~630 times a frame on a race, for a
+// structure that is immutable and already lives on the thread
+// ([[vitaslop-count-calls-not-bytes-across-the-guest-boundary]]).
+//
+// Nothing in the impl mutates Rust state - every method reaches through a handle into the
+// `SharedArrayBuffer` - so a `&SharedView` is as capable as an owned one, and the call site
+// passes `&mut &rt.view`.
+impl GuestMemory for &'_ SharedView {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn read(&self, off: usize, buf: &mut [u8]) {
+        (**self).read(off, buf)
+    }
+    fn write(&mut self, off: usize, bytes: &[u8]) {
+        SharedView::write_at(self, off, bytes)
+    }
+    fn read_u32(&self, off: usize) -> u32 {
+        (**self).read_u32(off)
+    }
+    fn read_u16(&self, off: usize) -> u16 {
+        (**self).read_u16(off)
+    }
+    fn write_u32(&mut self, off: usize, v: u32) {
+        SharedView::write_word(self, off, v)
+    }
+    fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
+        (**self).dirty_since(off, len, stamp)
+    }
+    fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
+        (**self).rebase_dirty_epoch(floor)
+    }
+    fn bump_dirty_epoch(&self) -> Option<(u8, bool)> {
+        (**self).bump_dirty_epoch()
+    }
+    fn dirty_epoch(&self) -> Option<u8> {
+        (**self).dirty_epoch()
+    }
+    fn borrow(&self, off: usize, len: usize) -> Option<&[u8]> {
+        (**self).borrow(off, len)
+    }
+}
+
+impl SharedView {
+    fn write_at(&self, off: usize, bytes: &[u8]) {
+        // SAFETY: as in `read`.
+        unsafe {
+            let src = js_sys::Uint8Array::view(bytes);
+            write_range(&self.bytes, off as u32, &src);
+        }
         self.stamp_written(off, bytes.len());
     }
 
@@ -815,9 +882,9 @@ impl GuestMemory for SharedView {
         self.halves.get_index((off >> 1) as u32)
     }
 
-    fn write_u32(&mut self, off: usize, v: u32) {
+    fn write_word(&self, off: usize, v: u32) {
         if off & 3 != 0 {
-            self.write(off, &v.to_le_bytes());
+            self.write_at(off, &v.to_le_bytes());
             return;
         }
         self.words.set_index((off >> 2) as u32, v);
@@ -841,23 +908,19 @@ impl GuestMemory for SharedView {
         // region below it, so this clamp should never bite; it is here so that a bad
         // length reads a short range rather than the bytes above the map.
         let last = ((off + len - 1) >> shift).min(self.pages());
-        // >>> A REUSED SCRATCH BUFFER, NOT A FRESH `Vec` PER CALL. This is asked once per
-        // retained snapshot per scene - hundreds of times a presented frame - and a wasm
-        // allocation is dearer than the two boundary crossings around it. Thread-local
-        // because the trait method takes `&self` (see `GuestMemory::dirty_since` for why it
-        // must), and every engine thread has its own.
-        thread_local! {
-            static PAGES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        PAGES.with(|p| {
-            let mut pages = p.borrow_mut();
-            pages.clear();
-            pages.resize(last - first + 1, 0);
-            self.bytes
-                .subarray(self.stamp_at(block, first), self.stamp_at(block, last + 1))
-                .copy_to(&mut pages);
-            Some(pages.iter().any(|&s| s >= stamp))
-        })
+        // >>> THE SCAN RUNS WHERE THE MAP IS, so this is ONE crossing and no buffer at all.
+        //
+        // It used to copy the page range into a reused `Vec` - a `subarray` (a crossing that
+        // allocates a JS typed array), a `copy_to` (a second crossing) and a `resize` that
+        // zeroes the buffer first - and then test the bytes in Rust. Every one of those is
+        // work for an answer that is one bit, and the copy could not stop early at the first
+        // dirty page the way the loop on the JS side does.
+        Some(any_ge(
+            &self.bytes,
+            self.stamp_at(block, first),
+            self.stamp_at(block, last + 1),
+            stamp,
+        ))
     }
 
     fn dirty_epoch(&self) -> Option<u8> {
@@ -931,33 +994,87 @@ fn transpiler_dirty_map_off() -> u64 {
 // side of the boundary where the globals live, and the whole file crosses once, as one
 // `Float64Array`. `inline_js` (rather than `new Function`) so the helper is an ordinary
 // ES module wasm-bindgen emits, and a page with a strict CSP can still run it.
+//
+// # ...and why the buffer is a `Uint32Array` VIEW over the Rust array
+// The register file is 32 `u32`s. Carrying it as `f64` needed a staging `Float64Array` owned
+// by JS, a `copy_to`/`copy_from` of 256 bytes to get it into or out of Rust, and a 32-lane
+// conversion loop on each side - so the "one crossing" was really two plus a copy plus a
+// convert, each way. A `Uint32Array` VIEW over the Rust buffer is the same memory, so the JS
+// loop writes straight into the array the caller reads: ONE crossing, no copy, no conversion.
+//
+// `Global.value` on an `i32` global is a JS number and stores into a `Uint32Array` under
+// `ToUint32`, which is bit-exact both ways - the same round trip the `f64` form relied on.
 #[wasm_bindgen(inline_js = "
-export function save_globals(globals, out) {
-  for (let i = 0; i < globals.length; i++) out[i] = globals[i].value;
-}
-export function load_globals(globals, values) {
-  for (let i = 0; i < globals.length; i++) globals[i].value = values[i];
+export function save_some(globals, idxs, out) {
+  for (let k = 0; k < idxs.length; k++) { const i = idxs[k]; out[i] = globals[i].value; }
 }
 ")]
 extern "C" {
-    /// Copy every global's value into `out`, in order.
-    fn save_globals(globals: &Array, out: &js_sys::Float64Array);
-    /// Write `values` back into every global, in order.
-    fn load_globals(globals: &Array, values: &js_sys::Float64Array);
+    /// Copy just the globals named by `idxs` into `out`, at their own indices.
+    fn save_some(globals: &Array, idxs: &js_sys::Uint32Array, out: &js_sys::Uint32Array);
+}
+
+/// >>> THE REGISTERS A HOST CALL CAN ACTUALLY REACH.
+///
+/// AAPCS puts the arguments in r0..r3 and the return in r0; the stack arguments and the
+/// call-site attribution need sp and lr; a fault report wants pc; r12 is the intra-procedure
+/// scratch. **Every live `GuestCtx::regs` index in the workspace is one of these** - the only
+/// wider read is the thread-exit log, which says so where it prints.
+///
+/// The other 25 lanes of the file were read out of `WebAssembly.Global` getters and written
+/// straight back unchanged, ~630 times a frame on a race. They are r4..r11 (callee-saved, so a
+/// host call must not touch them) and the VFP argument file (which only a handler with a FLOAT
+/// parameter reads, and the GXM/kernel calls a race makes have none).
+const NARROW_REGS: [u32; 7] = [0, 1, 2, 3, abi::SP as u32, 14, 15];
+
+
+// >>> BULK GUEST-MEMORY MOVES AND THE DIRTY SCAN, EACH AS ONE CROSSING.
+//
+// `subarray(a, b).copy_to(buf)` reads as one operation and is two: `subarray` is a crossing
+// that ALLOCATES a JS typed array, and `copy_to` is a second crossing that copies through it.
+// Same for the write direction, and the dirty-page scan paid a third cost on top - it copied a
+// range of the map into a Rust buffer (which it first had to zero) only to test each byte.
+//
+// A race frame makes ~2,300 bulk guest reads and ~800 dirty queries, and the boundary is what
+// this engine is billed in ([[vitaslop-count-calls-not-bytes-across-the-guest-boundary]]) - so
+// each of these is one call now, with the loop or the copy on the side of the boundary the
+// memory lives on. `any_ge` also EARLY-EXITS, which the copy-then-scan could not.
+#[wasm_bindgen(inline_js = "
+export function copy_range(src, off, dst) {
+  dst.set(src.subarray(off, off + dst.length));
+}
+export function write_range(dst, off, src) {
+  dst.set(src, off);
+}
+export function any_ge(u8, from, to, stamp) {
+  for (let i = from; i < to; i++) if (u8[i] >= stamp) return true;
+  return false;
+}
+")]
+extern "C" {
+    /// `dst[..] = src[off .. off + dst.len()]`.
+    fn copy_range(src: &js_sys::Uint8Array, off: u32, dst: &js_sys::Uint8Array);
+    /// `dst[off .. off + src.len()] = src[..]`.
+    fn write_range(dst: &js_sys::Uint8Array, off: u32, src: &js_sys::Uint8Array);
+    /// Whether any byte of `u8[from..to]` is `>= stamp`.
+    fn any_ge(u8: &js_sys::Uint8Array, from: u32, to: u32, stamp: u8) -> bool;
 }
 
 /// A guest instance's mutable state the host reaches during a call: its 16 ARM
 /// register globals, its VFP single-precision argument globals, and the shared memory.
 struct ThreadRt {
-    /// The ARM register globals, for the few single-register accesses (a park's resume
-    /// code, an entry's seed values). Bulk transfer goes through [`ThreadRt::file`].
+    /// Every register global, ARM first then the VFP argument file - the same order as
+    /// [`ThreadRt::file`]. For the few single-register accesses (a park's resume code, an
+    /// entry's seed values) and for the write-back of a call that changed one or two lanes.
+    /// Bulk transfer goes through [`ThreadRt::file`].
     regs: Vec<WebAssembly::Global>,
     /// The same globals as one JS array - the 16 ARM registers followed by the VFP
     /// argument registers - so the whole file marshals in a single boundary crossing
-    /// through [`save_globals`] / [`load_globals`].
+    /// through [`save_some`], and back one lane at a time through [`ThreadRt::set_reg`].
     file: Array,
-    /// The staging buffer that array is copied through, allocated once per thread.
-    staging: js_sys::Float64Array,
+    /// [`NARROW_REGS`] as a `Uint32Array`, built once per thread so the per-call read does
+    /// not allocate one.
+    narrow: js_sys::Uint32Array,
     /// The whole shared memory as one typed array, built once. See [`SharedView`] for
     /// why caching it is both sound and load-bearing.
     view: SharedView,
@@ -974,31 +1091,73 @@ impl ThreadRt {
     /// every integer up to 2^53), so nothing is lost in the round trip - the per-register
     /// path this replaced used the same representation.
     fn read_file(&self) -> ([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]) {
-        save_globals(&self.file, &self.staging);
-        let mut buf = [0f64; FILE_LEN];
-        self.staging.copy_to(&mut buf);
+        let mut buf = [0u32; FILE_LEN];
+        // SAFETY: the view borrows this module's linear memory for the duration of the call
+        // below. `save_some` is synchronous JS that allocates nothing, so the memory cannot
+        // grow and the view cannot be detached while it is live, and nothing else holds a
+        // reference to `buf`.
+        //
+        // Only [`NARROW_REGS`] are read; every other lane stays zero and is written back only
+        // if the handler CHANGED it, which the write-back's diff already decides.
+        unsafe {
+            let view = js_sys::Uint32Array::view_mut_raw(buf.as_mut_ptr(), FILE_LEN);
+            save_some(&self.file, &self.narrow, &view);
+        }
         let mut regs = [0u32; abi::REG_COUNT];
         let mut vfp = [0u32; VFP_ARG_COUNT];
-        for (i, r) in regs.iter_mut().enumerate() {
-            *r = buf[i] as i64 as u32;
-        }
-        for (i, v) in vfp.iter_mut().enumerate() {
-            *v = buf[abi::REG_COUNT + i] as i64 as u32;
-        }
+        regs.copy_from_slice(&buf[..abi::REG_COUNT]);
+        vfp.copy_from_slice(&buf[abi::REG_COUNT..]);
         (regs, vfp)
     }
 
-    fn write_file(&self, regs: &[u32; abi::REG_COUNT], vfp: &[u32; VFP_ARG_COUNT]) {
-        let mut buf = [0f64; FILE_LEN];
+    /// Write back only the lanes the handler actually CHANGED.
+    ///
+    /// >>> THE FULL WRITE WAS 32 `WebAssembly.Global` SETTERS FOR AN AVERAGE OF ONE CHANGED
+    /// REGISTER. A host call takes its arguments in r0..r3 and returns in r0, so almost every
+    /// one of them leaves 31 of the 32 lanes exactly as it found them - and writing those back
+    /// is a JS setter each, on a path a retail race takes ~630 times a frame
+    /// ([[vitaslop-browser-host-call-cost]] is why the crossing, not the handler, is what a
+    /// count-based win buys back here).
+    ///
+    /// Comparing 32 words in Rust is free next to one boundary crossing, so the mask decides
+    /// the shape: nothing changed, write nothing; one or two lanes, set them individually and
+    /// send only those - which is also the only CORRECT shape once the read is narrow, since
+    /// the lanes the read skipped are zero here.
+    fn write_file_changed(
+        &self,
+        before: &([u32; abi::REG_COUNT], [u32; VFP_ARG_COUNT]),
+        regs: &[u32; abi::REG_COUNT],
+        vfp: &[u32; VFP_ARG_COUNT],
+    ) {
+        let mut mask: u32 = 0;
         for (i, r) in regs.iter().enumerate() {
-            buf[i] = *r as f64;
+            if *r != before.0[i] {
+                mask |= 1 << i;
+            }
         }
         for (i, v) in vfp.iter().enumerate() {
-            buf[abi::REG_COUNT + i] = *v as f64;
+            if *v != before.1[i] {
+                mask |= 1 << (abi::REG_COUNT + i);
+            }
         }
-        self.staging.copy_from(&buf);
-        load_globals(&self.file, &self.staging);
+        // >>> ALWAYS PER-LANE, NEVER THE BULK PATH.
+        //
+        // The bulk write sends all 32 lanes, and since the READ is narrow ([`NARROW_REGS`])
+        // the lanes it did not read are ZERO here - so falling back to it for a call that
+        // changed three registers would write zero over r4..r11 and the whole VFP file, which
+        // the guest is entitled to find exactly as it left them. A host call changes one or
+        // two lanes (the return, occasionally a 64-bit pair), so this loop is the fast path as
+        // well as the only correct one.
+        if mask != 0 {
+            for i in 0..FILE_LEN {
+                if mask & (1 << i) != 0 {
+                    let v = if i < abi::REG_COUNT { regs[i] } else { vfp[i - abi::REG_COUNT] };
+                    self.set_reg(i, v);
+                }
+            }
+        }
     }
+
 
     fn set_reg(&self, i: usize, v: u32) {
         self.regs[i].set_value(&JsValue::from_f64(v as f64));
@@ -1540,15 +1699,18 @@ impl BrowserEngine {
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
+                // What the guest handed in, so the write-back can send back only what moved.
+                let before = (regs, vfp);
                 let d0 = clock();
                 let outcome = {
-                    let mut mem = rt.view();
+                    // BORROWED, not cloned - see `impl GuestMemory for &SharedView`.
+                    let mut mem: &SharedView = &rt.view;
                     let mut host = host.lock().unwrap();
                     host.set_current_thread(thid);
                     host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
                 };
                 let d1 = clock();
-                rt.write_file(&regs, &vfp);
+                rt.write_file_changed(&before, &regs, &vfp);
                 // Split the call the way native's `perf` module does: the handler versus
                 // everything around it. The difference is register MARSHALLING - work the
                 // guest never asked for - and the two need completely different fixes.
@@ -1659,9 +1821,18 @@ impl BrowserEngine {
         for g in regs.iter().chain(vfp.iter()) {
             file.push(g);
         }
-        let staging = js_sys::Float64Array::new_with_length(FILE_LEN as u32);
-        let rt =
-            Rc::new(ThreadRt { regs, file, staging, view: self.view.clone(), base: self.base });
+        // One flat list in the same order as `file`, so a lane index means the same thing to
+        // the bulk path and to the single-lane path.
+        let globals: Vec<WebAssembly::Global> = regs.into_iter().chain(vfp).collect();
+        let narrow = js_sys::Uint32Array::new_with_length(NARROW_REGS.len() as u32);
+        narrow.copy_from(&NARROW_REGS);
+        let rt = Rc::new(ThreadRt {
+            regs: globals,
+            file,
+            narrow,
+            view: self.view.clone(),
+            base: self.base,
+        });
 
         // The module's own reset (see `abi::RESET_EXPORT`), resolved once here so
         // releasing a thread is a single call and cannot fail on a lookup.

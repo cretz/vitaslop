@@ -1837,13 +1837,93 @@ fn global_performance() -> Option<web_sys::Performance> {
 /// posted input and messages are serviced exactly as before - and it is not clamped. The
 /// channel is built ONCE and reused: a fresh pair of ports per frame would trade the clamp
 /// for an allocation.
+///
+/// >>> THE `window()` PROBE IS ASKED ONCE, AND THAT IS WORTH 20% OF THE WORKER THREAD.
+/// `web_sys::window()` is an `instanceof Window` test on the global, and in a WORKER the
+/// identifier `Window` does not exist at all - so the generated glue THROWS a `ReferenceError`
+/// and catches it, on every call. That is ~20 us each with a deep JSPI stack live, and this
+/// loop does not run once per frame: it spins on `next_tick` until wall time accrues, thousands
+/// of times a second. MEASURED with a V8 sampling profile of the worker during a paced race:
+/// `__wbg_instanceof_Window` was **17% of every sample on the thread**, the single largest
+/// entry ahead of all guest code. Which global this is cannot change while the thread lives,
+/// so it is one probe, cached.
+///
+/// It buys no frame rate on a machine that is already behind - a loop with no slack does not
+/// spin - and that is not why it is here. A fifth of a core burnt continuously is heat on a
+/// phone, contention with the GPU process, and battery, and thermal throttling is one of the
+/// few things that can take a device from 60 to 30 in the middle of a race.
+/// Wait until the next frame is DUE, rather than spinning until it is.
+///
+/// >>> THE SPIN WAS A TENTH OF THE WORKER THREAD, AND IT WAS WAITING.
+/// [`next_tick`] is not called once per frame - the live loop calls it, checks the clock, finds
+/// too little time has accrued to run a frame, and calls it again. A `MessageChannel` round
+/// trip is ~20-50 us, so on a machine with slack (this desktop runs a race frame in ~10 ms of
+/// a 16.7 ms budget) that is thousands of empty iterations a second. MEASURED with a V8
+/// sampling profile of the worker during a paced race: `postMessage` 5.7% of all samples,
+/// `JsFuture::from` + the per-tick closure another 3.3%, `set_onmessage` and `queueMicrotask`
+/// most of the rest - **roughly a tenth of the thread, spent asking "is it time yet"**.
+///
+/// So when the next frame is more than a few milliseconds away, wait with ONE timeout instead.
+/// The 4 ms nested-timeout clamp that made timeouts unusable for the tick itself is a FLOOR,
+/// not a rounding: a `setTimeout(9)` waits about 9 ms. The last few milliseconds are still
+/// approached on the channel, so the frame boundary keeps its old precision and a timer that
+/// fires late is absorbed by the accumulator exactly as a late tick always was.
+///
+/// A machine that is BEHIND asks for zero and gets the old path unchanged - there is no slack
+/// to sleep in, and that is the machine whose frame rate this must not touch. What it buys
+/// there is on the phone: a tenth of a core not burnt is heat not made, and thermal throttling
+/// is one of the few things that takes a device from 60 fps to 30 mid-race.
+async fn next_tick_in(ms: f64) {
+    // Below this, the channel is both cheaper and more precise than a timer.
+    const MIN_SLEEP_MS: f64 = 5.0;
+    // Wake this early and approach the boundary on the channel, so a coarse timer cannot
+    // make a frame LATE - only slightly early, which costs one cheap tick.
+    const SLACK_MS: f64 = 3.0;
+    if ms < MIN_SLEEP_MS {
+        next_tick().await;
+        return;
+    }
+    let delay = (ms - SLACK_MS).min(1000.0);
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb = Closure::once_into_js(move |_: JsValue| {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+        match set_timeout {
+            Some(f) => {
+                let _ = f.call2(
+                    &JsValue::UNDEFINED,
+                    cb.as_ref().unchecked_ref(),
+                    &JsValue::from_f64(delay),
+                );
+            }
+            // No `setTimeout` at all is not a thing any host does, but resolving immediately
+            // degrades to the old spin rather than hanging the run.
+            None => {
+                let _ = js_sys::Function::from(cb).call0(&JsValue::UNDEFINED);
+            }
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 async fn next_tick() {
+    // `None` = this thread has no `window` (a worker), which is the case the loop actually
+    // runs in. Asked once per thread and remembered.
+    thread_local! {
+        static WINDOW: Option<web_sys::Window> = web_sys::window();
+    }
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let cb = Closure::once_into_js(move |_t: JsValue| {
             let _ = resolve.call0(&JsValue::UNDEFINED);
         });
-        if let Some(window) = web_sys::window() {
-            let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
+        if WINDOW.with(|w| {
+            w.as_ref().map(|window| {
+                let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
+            })
+        }).is_some() {
             return;
         }
         thread_local! {
@@ -2067,6 +2147,19 @@ fn transpile_here(
     // desktop repeats put the wall-clock difference inside the noise. V8 on a phone is the
     // engine the answer belongs to. `=1` selects the OLD 64-bit carry.
     vitaslop_transpiler::set_flags_wide_c(vitaslop_runtime::knobs::flag("VITASLOP_FLAGS_WIDE_C"));
+    // And whether every FALLTHROUGH is routed through the function's `br_table` dispatch
+    // loop as well. This one is an ABLATION - it can only make the module slower - and it is
+    // here because it is the only way to price what a structured-control-flow emitter (a
+    // relooper) would be worth. The module carries one indirect branch per 10.5 guest
+    // instructions; whether that is 2% of a browser frame or 25% decides whether the
+    // relooper is the next big piece of work or a refuted idea, and neither the operator
+    // count nor the fuel figure can tell the difference.
+    vitaslop_transpiler::set_dispatch_all(vitaslop_runtime::knobs::flag("VITASLOP_DISPATCH_ALL"));
+    // And whether the module carries the guest-address name section. Browser-reachable for
+    // the profiler's sake: a V8 CPU profile of the worker is the only instrument that can rank
+    // the inside of a frame without taxing what it measures, and without this section every
+    // guest function in it is a bare `wasm-function[N]`.
+    vitaslop_transpiler::set_wasm_names(vitaslop_runtime::knobs::flag("VITASLOP_WASM_NAMES"));
     let t = perf.now();
     let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
     let ms = perf.now() - t;
@@ -2673,7 +2766,12 @@ async fn live_loop(
     }
 
     'run: loop {
-        next_tick().await;
+        // How long until a frame is actually DUE: the accumulator carries what has already
+        // accrued, so the wait is the rest of one frame's budget. Fast-forward asks for zero -
+        // it is deliberately unpaced - and so does a machine that is behind, whose `acc` is
+        // already at or over the budget. See [`next_tick_in`].
+        let due_in = if sched.core.frames() < ff_to { 0.0 } else { FRAME_MS - acc };
+        next_tick_in(due_in).await;
         let t = now();
         acc = (acc + (t - last)).min(MAX_CATCHUP_MS);
         last = t;
@@ -2902,13 +3000,18 @@ async fn live_loop(
                 // on this line can tell "this frame did an enormous amount of guest work" apart
                 // from "this frame suspended thousands of times and did none", and those are
                 // opposite bugs.
+                // Vblank wait loops parked rather than spun through. On the running line
+                // because that is the one a phone run is read from, and because a title
+                // whose spin guard never fires and a build where it is switched off look
+                // identical from every other number here.
+                let vparks = vitaslop_runtime::host::vblank_spin_parks();
                 let (fuel_total, fuel_samples, fuel_max) = sched.core.fuel_report();
                 let (raw_last, raw_min) = browser_sched::raw_fuel_stats();
                 let (unbilled_none, unbilled_idle) = sched.core.unbilled_report();
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[live] {status} | clock {:.2}s over {flips} flips ({quanta} quanta, \
                      {:.1} us/frame; {:.2}s quanta + {:.2}s idle) \
-                     | preempt {preempts} ({on_fuel} on fuel) \
+                     | preempt {preempts} ({on_fuel} on fuel, {vparks} vblank spins PARKED) \
                      | fuel {fuel_total} over {fuel_samples} (max {fuel_max}, \
                      raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | wasm heap {} MB \
                      | jspi {susp} susp, {starts} stacks, {abandoned} abandoned, \
@@ -3254,7 +3357,10 @@ async fn live_loop(
                     let timed: Vec<String> = vitaslop_runtime::perf::Phase::all()
                         .iter()
                         .map(|p| (p, vitaslop_runtime::perf::read(*p)))
-                        .filter(|(_, (ns, _, _))| *ns > 0)
+                        // A COUNT-ONLY phase (`perf::note_hit`) has no time and is still the
+                        // reading - filtering on `ns` alone dropped exactly the rows whose
+                        // point is a rate.
+                        .filter(|(_, (ns, hits, _))| *ns > 0 || *hits > 0)
                         .map(|(p, (ns, hits, _))| {
                             format!(
                                 "{} {:.2} ms/frame over {:.0} entries",
@@ -3299,9 +3405,24 @@ async fn live_loop(
                         "GUEST CPU, guest-memory accesses per frame",
                         &format!(
                             "{:.0} single-WORD reads, {:.0} bulk reads - a word count that \
-                             scales with DRAWS is a structure being read a word at a time",
+                             scales with DRAWS is a structure being read a word at a time{}",
                             words as f64 / draws,
                             bulk as f64 / draws,
+                            // >>> ...UNLESS THE PROFILER IS ON, IN WHICH CASE MOST OF THEM ARE
+                            // ITS OWN. `vita::dispatch`'s call-site attribution walks up to
+                            // FORTY words of the guest stack per host call to find the caller,
+                            // which on a race is ~31 word reads a draw - a clean, stable,
+                            // per-draw number that looks exactly like the defect this line
+                            // exists to name, and is the instrument
+                            // ([[vitaslop-instrument-failure-imitating-its-subject]]). Read
+                            // this line from a run WITHOUT debug capture.
+                            if debug_capture {
+                                " | DEBUG CAPTURE IS ON and the call-site profiler scans up to \
+                                 40 stack words per host call - most of this count is the \
+                                 INSTRUMENT, not the engine"
+                            } else {
+                                ""
+                            },
                         ),
                     );
                     // >>> AND HOW OFTEN THE GUEST-STORE EPOCH WRAPPED IN THIS WINDOW, because

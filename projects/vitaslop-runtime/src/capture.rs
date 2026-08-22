@@ -402,10 +402,20 @@ pub struct Draw {
     /// [`Self::textures`] because the two stages number their sampler units independently, and
     /// a vertex program that fetches a texture is building its GEOMETRY from it - so a draw
     /// that loses these renders no vertices, not an untextured surface.
-    pub vertex_textures: Vec<BoundTexture>,
+    ///
+    /// SHARED rather than owned, for the same reason [`Self::textures`] is and with the same
+    /// cache behind it: this title binds a vertex sampler on EVERY draw, so the finished list
+    /// was copied out of the shared entry into a fresh `Vec` 626 times a frame - an allocation
+    /// and a copy per draw to produce bytes the cache was already holding.
+    pub vertex_textures: std::sync::Arc<[BoundTexture]>,
     /// The fixed-function pipeline state (cull/depth/stencil/viewport/...) in effect
     /// for this draw, snapshotted from the sticky GXM context state. See [`RenderState`].
-    pub render_state: RenderState,
+    ///
+    /// SHARED rather than owned. It is ~240 bytes of the ~600-byte `Draw`, it is parsed out of
+    /// the context snapshot field by field, and a run of draws inside one pass carries the
+    /// IDENTICAL state - so both the parse and the copy were paid ~626 times a frame to
+    /// reproduce the previous draw's answer. See `VitaState::render_state_memo`.
+    pub render_state: std::sync::Arc<RenderState>,
     /// The blend equation baked into the bound fragment program - see [`BlendState`]. This is
     /// state, not a guess: GXM has no runtime blend setter, so this is the only source of it.
     pub blend: BlendState,
@@ -476,6 +486,22 @@ pub struct Draw {
     /// into geometry the game never draws. The software renderer skips such a draw and
     /// says so; the GXP recompiler runs the real vertex program and renders it properly.
     pub shader_expanded: bool,
+}
+
+impl Draw {
+    /// How many floats the draw's VERTEX uniform bank holds, whichever path captured it.
+    ///
+    /// [`Self::uniforms`] is only the whole bank on the FIXED-FUNCTION path; a recompiled draw
+    /// carries the guest's own bytes in [`Self::vert_sa`] and keeps just the sixteen lanes
+    /// `interpret_draw` classifies by. A diagnostic printing "N uniform floats" wants the bank
+    /// either way, and reading `uniforms.len()` on the recompiled path reports a constant 16.
+    pub fn uniform_bank_floats(&self) -> usize {
+        if self.vert_sa.is_empty() {
+            self.uniforms.len()
+        } else {
+            self.vert_sa.len() / 4
+        }
+    }
 }
 
 impl Draw {
@@ -1189,7 +1215,7 @@ mod extent_tests {
         render_state.viewport_enable = enable;
         let draw = Draw {
             fragment_program_header: 0,
-            vertex_textures: Vec::new(),
+            vertex_textures: std::sync::Arc::from(&[][..]),
             primitive: 0,
             index_format: 0,
             index_count: 3,
@@ -1199,7 +1225,7 @@ mod extent_tests {
             indices: Arc::from(&[][..]),
             uniforms: Vec::new(),
             textures: Arc::from(&[][..]),
-            render_state,
+            render_state: std::sync::Arc::new(render_state),
             blend: BlendState::default(),
             exposure: 1.0,
             material: FragmentMaterial::default(),

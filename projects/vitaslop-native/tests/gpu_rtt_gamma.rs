@@ -83,7 +83,7 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
     let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect();
     Draw {
         fragment_program_header: 0,
-        vertex_textures: Vec::new(),
+        vertex_textures: std::sync::Arc::from(&[][..]),
         primitive: 0,
         index_format: 0,
         index_count: 6,

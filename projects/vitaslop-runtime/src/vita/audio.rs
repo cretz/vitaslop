@@ -52,6 +52,19 @@ pub struct AudioState {
     /// `VITASLOP_AUDIO_RAW`), for headless verification. `None` = disabled.
     capture: Option<std::fs::File>,
     capture_inited: bool,
+    /// Scratch buffers for one grain of output, reused across calls.
+    ///
+    /// `sceAudioOutOutput` runs at the audio rate - thousands of times a minute, forever -
+    /// and it used to allocate THREE vectors per call (the i32 mix, its little-endian bytes,
+    /// and the i16 samples read back out of guest memory). MEASURED with a V8 worker profile
+    /// of one retail title's browser race, where audio is 46% of the thread: `out_output`'s own
+    /// body was **12% of every sample on the thread**, which for a function whose job is to
+    /// move one grain of PCM is all overhead. Taken out with `mem::take` and put back, the
+    /// way the texture-set re-proof borrows its dependency list - the guest cannot run
+    /// inside a host call, so an empty vector here is not a state anything can observe.
+    scratch_mix: Vec<i32>,
+    scratch_bytes: Vec<u8>,
+    scratch_pcm: Vec<i16>,
 }
 
 impl AudioState {
@@ -190,8 +203,17 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         // The Vita's NGS DSP would have mixed the playing AT9 voices into the master
         // buss that the title copies here. Our NGS is host-side, so we do that mix
         // now and write it into the (otherwise silent) output buffer.
-        if st.audio_state.at9.any_playing() && !no_ngs_mix() {
-            let mut mix = vec![0i32; grain * channels];
+        let samples = grain * channels;
+        // The i16 grain that will be submitted, whether it came from our own NGS mix or out
+        // of the guest's buffer. Held here so the mixed path does not have to read back what
+        // it just wrote.
+        let mut pcm = std::mem::take(&mut st.audio_state.scratch_pcm);
+        pcm.clear();
+        let mixed = st.audio_state.at9.any_playing() && !no_ngs_mix();
+        if mixed {
+            let mut mix = std::mem::take(&mut st.audio_state.scratch_mix);
+            mix.clear();
+            mix.resize(samples, 0);
             st.audio_state.at9.mix_grain(ctx, &mut mix, grain, channels, format.sample_rate);
             // How far past full scale the summed voices reach BEFORE the clamp. This is
             // the size of the missing master stage: the device does not clip here, so
@@ -210,18 +232,38 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
                     );
                 }
             }
-            let mut bytes = Vec::with_capacity(mix.len() * 2);
+            // >>> CLAMPED ONCE, INTO BOTH FORMS. The guest's buffer has to receive the mix
+            // (the title may read its own buffer back, and on the device the DSP would have
+            // written it), but the SUBMISSION does not have to come from there. It used to:
+            // this wrote the bytes into guest memory and then read the very same bytes out
+            // again - two full crossings of one grain, plus a per-sample `extend_from_slice`
+            // and a `chunks_exact().map().collect()` that allocated a third buffer to
+            // reconstruct what it had just had in hand.
+            let mut bytes = std::mem::take(&mut st.audio_state.scratch_bytes);
+            bytes.clear();
+            bytes.reserve(samples * 2);
+            pcm.reserve(samples);
             for &s in &mix {
-                bytes.extend_from_slice(&(s.clamp(-32768, 32767) as i16).to_le_bytes());
+                let v = s.clamp(-32768, 32767) as i16;
+                pcm.push(v);
+                bytes.extend_from_slice(&v.to_le_bytes());
             }
             ctx.write_bytes(buf, &bytes);
+            // The one case the two forms could differ: a `buf` the write cannot reach. The
+            // old read-back would then submit whatever was already in guest memory; this
+            // submits the grain we actually mixed, which is the one the device would have
+            // heard. Both are the same for every reachable buffer.
+            st.audio_state.scratch_bytes = bytes;
+            st.audio_state.scratch_mix = mix;
+        } else {
+            // Nothing of ours in it: the grain is whatever the title wrote, so it has to be
+            // read. One crossing, into the same reused buffer.
+            let raw = ctx.read_bytes(buf, samples * 2);
+            pcm.extend(raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
         }
-        let samples = grain * channels;
-        let raw = ctx.read_bytes(buf, samples * 2);
-        let pcm: Vec<i16> =
-            raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
         st.audio_state.capture_pcm(&pcm);
         st.audio.submit(backend_port, &pcm);
+        st.audio_state.scratch_pcm = pcm;
     }
     ctx.ret(0);
     // One grain plays for `grain / sample_rate` seconds.

@@ -641,6 +641,19 @@ impl<'a> Block<'a> {
         }
     }
 
+    /// A RAW span of the snapshot, for a caller that wants to COMPARE bytes rather than
+    /// parse them.
+    ///
+    /// The sampler block is the one region a draw derives an expensive answer from and the
+    /// one that usually does not change between two consecutive draws, so "are these the
+    /// same bytes the last draw decoded?" is a 384-byte `memcmp` against a decode, a fold
+    /// and a map probe. Returning the bytes rather than a hash is deliberate: a fold is not
+    /// a proof ([[vitaslop-content-hash-cache-must-verify]]), and here the exact material is
+    /// already in hand.
+    pub fn span(&self, offset: u32, len: usize) -> &[u8] {
+        &self.bytes()[offset as usize..offset as usize + len]
+    }
+
     /// One word of the snapshot. The counterpart of [`get`].
     pub fn word(&self, offset: u32) -> u32 {
         let b = self.bytes();

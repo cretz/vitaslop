@@ -105,8 +105,32 @@ pub const SLOT_THREAD_ID: u32 = 4;
 /// exact rather than merely safe.
 pub const SLOT_SA_BANK: u32 = 5;
 
+/// Slot 6: how many more times this thread may read [`SLOT_VCOUNT`] before it is parked
+/// on the vblank it is obviously waiting for.
+///
+/// The one slot the guest never reads as a VALUE - the emitted vblank read decrements it
+/// and calls the host when it hits zero
+/// ([`vitaslop_transpiler::InlineOp::LoadMirrorParking`]). It is in the block because the
+/// block is refreshed at exactly the right moment: once per resume, with no guest thread
+/// live. That is what makes the count mean "reads since this thread was scheduled", which
+/// is the count the proof needs - the mirror cannot change while guest code runs, so a
+/// thread that has taken [`SPIN_BUDGET`] reads of it inside one resume has read the same
+/// word every time and can only be spinning.
+///
+/// It qualifies for the block on the same terms as everything else here, trivially: only
+/// the host writes it, and only between resumes.
+pub const SLOT_SPIN_BUDGET: u32 = 6;
+
+/// Reads of the vblank counter, inside ONE resume, that mean "spinning".
+///
+/// Generous on purpose. A real spin takes hundreds of thousands - it runs until the clock
+/// its own fuel drags forward reaches the next vblank - so the budget costs it nothing,
+/// while a caller that reads the counter a handful of times per frame (checking for a
+/// dropped frame, timestamping) can never reach it and is never parked.
+pub const SPIN_BUDGET: u32 = 1024;
+
 /// How many slots the block has. The scheduler writes exactly this many.
-pub const SLOT_COUNT: usize = 6;
+pub const SLOT_COUNT: usize = 7;
 
 /// The current value of every mirror slot, in slot order.
 ///
@@ -122,6 +146,7 @@ pub fn snapshot(st: &VitaState) -> [u32; SLOT_COUNT] {
         st.current_thread() as u32,
         super::libkernel::thread_id(st) as u32,
         st.sa_bank(),
+        SPIN_BUDGET,
     ]
 }
 
@@ -164,8 +189,13 @@ mod tests {
             let words = snapshot(&st);
             let op = super::super::display::inline_op(d::GET_VCOUNT)
                 .expect("sceDisplayGetVcount has an inline form");
-            let InlineOp::LoadMirror { slot } = op else {
-                panic!("sceDisplayGetVcount must lower to a mirror read, got {op:?}");
+            // Either mirror form, because the SPIN GUARD is a default that an A/B arm can
+            // turn off - and the value both forms hand back has to be the handler's answer
+            // whichever one this build emits. The guard changes when the thread is parked,
+            // never what the read returns.
+            let slot = match op {
+                InlineOp::LoadMirror { slot } | InlineOp::LoadMirrorParking { slot, .. } => slot,
+                other => panic!("sceDisplayGetVcount must lower to a mirror read, got {other:?}"),
             };
             assert_eq!(
                 op.eval(words[slot as usize]),
@@ -209,7 +239,14 @@ mod tests {
     #[test]
     fn every_declared_slot_is_within_the_block() {
         assert_eq!(snapshot(&state_at(0)).len(), SLOT_COUNT, "snapshot fills every slot");
-        for slot in [SLOT_VCOUNT, SLOT_CLOCK_LO, SLOT_CLOCK_HI, SLOT_CURRENT_THREAD, SLOT_THREAD_ID] {
+        for slot in [
+            SLOT_VCOUNT,
+            SLOT_CLOCK_LO,
+            SLOT_CLOCK_HI,
+            SLOT_CURRENT_THREAD,
+            SLOT_THREAD_ID,
+            SLOT_SPIN_BUDGET,
+        ] {
             assert!((slot as usize) < SLOT_COUNT, "slot {slot} is outside the block");
         }
     }

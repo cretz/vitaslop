@@ -1798,7 +1798,9 @@ struct VertexStreamInfo {
 /// The sampler wrap modes, filters, LOD bias, gamma and mip count used to be a third such
 /// table and are now read out of `words` itself, which is what lets them survive the by-value
 /// copy an address-keyed table cannot follow.
-#[derive(Clone, Copy, Debug, Default)]
+// `PartialEq` so a rebind of the SAME texture can be told from a real change - see
+// `VitaState::vertex_texture_gen`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextureBinding {
     unit: u32,
     /// The guest `SceGxmTexture*` the binding came from. Identity only - never re-read for
@@ -2077,6 +2079,59 @@ struct TextureSnapshots {
     /// is re-proven - one [`Self::get_or_read`] per underlying snapshot and a pointer compare -
     /// before it is believed. See [`Self::begin_scene`].
     scene_seq: u64,
+    /// >>> THE PREVIOUS DRAW'S ANSWER, KEYED ON THE BYTES IT WAS DERIVED FROM.
+    ///
+    /// [`Self::snapshot_sets`] already stops the LIST being rebuilt, but every draw still
+    /// paid the gate in front of it: decode sixteen sampler slots out of the context
+    /// snapshot, fold them into a 64-bit key, probe the map, and verify the exact key
+    /// material the fold cannot prove. MEASURED in the browser at `draw: decode texture
+    /// bindings (EVERY draw)` **0.54 ms of a 9.7 ms race frame over 465 draws** - 1.16 us a
+    /// draw to re-derive an answer that, inside a batch of draws sharing a material, is the
+    /// same one every time.
+    ///
+    /// Consecutive draws are exactly where that redundancy lives, so this holds ONE entry:
+    /// the finished list and the raw sampler-block bytes behind it. A hit is a 384-byte
+    /// `memcmp` and an `Arc` clone.
+    ///
+    /// It is EXACT, not a heuristic, and its two guards are what make it so:
+    /// - the sampler bytes are the whole of what the bindings are (GXM copies a texture's
+    ///   control words BY VALUE at bind time, [[vitaslop-texture-binding-by-value]]), and
+    ///   the fragment program header is the other half of the key because the albedo
+    ///   REORDER is a function of its reflection;
+    /// - the entry is only believed inside the SCENE it was proven in. Across a scene the
+    ///   guest has run and the pixels behind the list have to be re-proven, which is
+    ///   [`Self::set_validated`]'s job; within one, `get_or_read` compares a texture at most
+    ///   once per scene, so the previous draw's proof is this draw's proof by construction.
+    last_set: Option<LastSet>,
+    /// The same shortcut for the VERTEX stage, keyed on [`VitaState::vertex_texture_gen`]
+    /// rather than on bytes: that list is host-side with one mutator, so a counter answers
+    /// "unchanged since the last draw" exactly and in one comparison.
+    last_vertex_set: Option<LastVertexSet>,
+}
+
+/// The previous draw's finished VERTEX-stage texture list. See
+/// [`TextureSnapshots::last_vertex_set`].
+struct LastVertexSet {
+    /// The binding-list generation the answer was decoded at.
+    generation: u64,
+    /// The [`TextureSnapshots::snapshot_sets`] entry it came from, re-probed on every hit for
+    /// the same reason [`LastSet::key`] is.
+    key: u64,
+    list: Arc<[crate::capture::BoundTexture]>,
+}
+
+/// The previous draw's finished fragment texture list. See [`TextureSnapshots::last_set`].
+struct LastSet {
+    /// The raw sampler block the list was decoded from - the exact key material.
+    span: Box<[u8]>,
+    /// The bound fragment program's header, which decides the albedo reorder.
+    fheader: u32,
+    /// The [`TextureSnapshots::snapshot_sets`] entry this answer came from. A hit re-probes
+    /// it, which is what makes this memo inherit every invalidation the set cache has rather
+    /// than needing its own copy of them - see [`TextureSnapshots::set_from_previous_draw`].
+    key: u64,
+    /// The answer.
+    list: Arc<[crate::capture::BoundTexture]>,
 }
 
 /// One decoded binding, kept across scenes. See [`TextureSnapshots::decoded`].
@@ -2808,18 +2863,19 @@ impl TextureSnapshots {
         ctx: &GuestCtx,
         key: (u32, [u32; 4]),
     ) -> Option<Result<crate::capture::BoundTexture, u8>> {
-        let (snap, degraded, valid_scene, pixels) = match self.decoded.get(&key) {
+        // >>> THE ALREADY-PROVEN CASE TAKES ONE PROBE AND TOUCHES NOTHING ELSE.
+        //
+        // This used to read the entry, clone the pixel `Arc` out of it, compare the scene, and
+        // then probe the map a SECOND time to clone the result - so the overwhelmingly common
+        // answer ("proven earlier in this scene") paid two hashes and a refcount pair it had no
+        // use for. It is called once per dependency of every set re-proven in a scene, which is
+        // ~1,150 times a frame on a race.
+        let (snap, degraded) = match self.decoded.get(&key) {
             None => return None,
-            Some(e) => (
-                e.snap,
-                e.degraded,
-                e.valid_scene,
-                e.res.as_ref().ok().map(|t| t.pixels.clone()),
-            ),
+            Some(e) if e.valid_scene == self.scene_seq => return Some(e.res.clone()),
+            Some(e) => (e.snap, e.degraded),
         };
-        if valid_scene == self.scene_seq {
-            return self.decoded.get(&key).map(|e| e.res.clone());
-        }
+        let pixels = self.decoded.get(&key).and_then(|e| e.res.as_ref().ok()).map(|t| t.pixels.clone());
         // A dropped or degraded decode is re-attempted each new scene, exactly as it was
         // when this memo died with its scene: a texture that becomes readable is picked up
         // at the next scene, not never.
@@ -2869,34 +2925,152 @@ impl TextureSnapshots {
         if entry.valid_scene == self.scene_seq {
             return Some(entry.list.clone());
         }
-        // Built with a dropped or degraded unit: it dies with its scene, so the drop is
-        // counted - and the read retried - exactly as often as before.
-        let Some(deps) = entry.deps.clone() else {
+        let _reproof = crate::perf::scope(crate::perf::Phase::DrawTexBindReproof);
+        // >>> THE DEPENDENCY LIST IS BORROWED OUT AND PUT BACK, NOT CLONED.
+        //
+        // The loop below needs `self` borrowed mutably while it walks the deps, and the old
+        // way to get that was to CLONE the list - an allocation plus a refcount pair per
+        // dependency, on a path that runs once per set per scene (~290 times a frame on a
+        // race, ~1,150 dependencies). Taking the `Vec` leaves an empty one behind, which is
+        // not a state anything can observe: the guest cannot run inside a host call, and every
+        // exit below either restores it or removes the entry outright.
+        let Some(mut deps) = self.snapshot_sets.get_mut(&key).and_then(|e| e.deps.take()) else {
+            // Built with a dropped or degraded unit: it dies with its scene, so the drop is
+            // counted - and the read retried - exactly as often as before.
             self.snapshot_sets.remove(&key);
             return None;
         };
-        let (list, null_drops) = (entry.list.clone(), entry.null_drops);
-        for (dep_key, held) in deps {
+        let (list, null_drops) = match self.snapshot_sets.get(&key) {
+            Some(e) => (e.list.clone(), e.null_drops),
+            None => return None,
+        };
+        let mut proven = true;
+        for (dep_key, held) in deps.iter() {
             // The pointer compare against the SET's own buffer is what makes this exact
             // even when the per-binding entry was independently rebuilt this scene: a
             // "valid" decode holding DIFFERENT bytes than this list must kill the list.
-            match self.decoded_validated(ctx, dep_key) {
-                Some(Ok(t)) if Arc::ptr_eq(&t.pixels, &held) => {}
+            match self.decoded_pixels_validated(ctx, *dep_key) {
+                Some(p) if Arc::ptr_eq(&p, held) => {}
                 _ => {
-                    self.snapshot_sets.remove(&key);
-                    return None;
+                    proven = false;
+                    break;
                 }
             }
+        }
+        if !proven {
+            self.snapshot_sets.remove(&key);
+            return None;
         }
         // The null-handle units' per-build drop notes, re-issued so keeping the set does
         // not quiet the counter that reports them.
         for _ in 0..null_drops {
             note_texture_drop(0);
         }
+        // `get_or_read` inside the loop can clear this whole map (its insert enforces the
+        // snapshot budget), so the entry may be gone - in which case there is nothing to
+        // restore and nothing to stamp, and the list this proved is still the right answer
+        // for THIS draw.
         if let Some(e) = self.snapshot_sets.get_mut(&key) {
+            e.deps = Some(std::mem::take(&mut deps));
             e.valid_scene = self.scene_seq;
         }
         Some(list)
+    }
+
+    /// Just the PIXELS of a memoised decode, proven current for this scene.
+    ///
+    /// The set re-proof compares pixel buffers by pointer and wants nothing else, so it does
+    /// not need [`Self::decoded_validated`]'s full [`crate::capture::BoundTexture`] clone -
+    /// which copies a dozen fields and a second `Arc` per dependency, ~1,150 times a frame.
+    fn decoded_pixels_validated(&mut self, ctx: &GuestCtx, key: (u32, [u32; 4])) -> Option<Arc<[u8]>> {
+        if let Some(e) = self.decoded.get(&key) {
+            if e.valid_scene == self.scene_seq {
+                return e.res.as_ref().ok().map(|t| t.pixels.clone());
+            }
+        }
+        match self.decoded_validated(ctx, key) {
+            Some(Ok(t)) => Some(t.pixels),
+            _ => None,
+        }
+    }
+
+    /// The PREVIOUS draw's finished fragment list, if this draw's sampler block is byte
+    /// identical to the one it was decoded from and the two draws are in the same scene and
+    /// bound the same fragment program. See [`Self::last_set`] for why that is exact.
+    fn set_from_previous_draw(
+        &self,
+        span: &[u8],
+        fheader: u32,
+    ) -> Option<Arc<[crate::capture::BoundTexture]>> {
+        let last = self.last_set.as_ref()?;
+        if last.fheader != fheader || &*last.span != span {
+            return None;
+        }
+        // >>> THE ENTRY IS RE-PROBED, AND THAT IS WHAT MAKES THIS SAFE TO ADD.
+        //
+        // The list is only believed while the set cache still holds it, still under the same
+        // key, still proven for THIS scene, and still the same buffer. Every invalidation
+        // this cache has - a new scene, a freed range, a re-initialised texture format, a
+        // budget clear, the `VITASLOP_TEX_MEMO_PER_SCENE` arm - drops or ages that entry, so
+        // each of them refuses this shortcut too, with nothing to remember to do here. A memo
+        // that carried its own scene number instead would have to be cleared at seven separate
+        // sites and silently serve a stale list the first time a new one was added.
+        let entry = self.snapshot_sets.get(&last.key)?;
+        (entry.valid_scene == self.scene_seq && Arc::ptr_eq(&entry.list, &last.list))
+            .then(|| last.list.clone())
+    }
+
+    /// Remember this draw's finished fragment list against the sampler bytes it came from.
+    fn remember_last_set(
+        &mut self,
+        span: &[u8],
+        fheader: u32,
+        key: u64,
+        list: Arc<[crate::capture::BoundTexture]>,
+    ) {
+        match &mut self.last_set {
+            // Reuse the box rather than allocate one per draw: the span is a fixed size, so
+            // this is a copy into memory that is already the right shape.
+            Some(last) if last.span.len() == span.len() => {
+                last.span.copy_from_slice(span);
+                last.fheader = fheader;
+                last.key = key;
+                last.list = list;
+            }
+            slot => {
+                *slot = Some(LastSet {
+                    span: span.to_vec().into_boxed_slice(),
+                    fheader,
+                    key,
+                    list,
+                })
+            }
+        }
+    }
+
+    /// The PREVIOUS draw's finished VERTEX-stage list, if nothing has rebound a vertex
+    /// sampler since and the set-cache entry it came from is still current for this scene.
+    fn vertex_set_from_previous_draw(
+        &self,
+        generation: u64,
+    ) -> Option<Arc<[crate::capture::BoundTexture]>> {
+        let last = self.last_vertex_set.as_ref()?;
+        if last.generation != generation {
+            return None;
+        }
+        let entry = self.snapshot_sets.get(&last.key)?;
+        (entry.valid_scene == self.scene_seq && Arc::ptr_eq(&entry.list, &last.list))
+            .then(|| last.list.clone())
+    }
+
+    /// Remember this draw's finished VERTEX-stage list against the generation it came from.
+    fn remember_last_vertex_set(
+        &mut self,
+        generation: u64,
+        key: u64,
+        list: Arc<[crate::capture::BoundTexture]>,
+    ) {
+        self.last_vertex_set = Some(LastVertexSet { generation, key, list });
     }
 
     /// Remember a finished list under its fold, with the exact key material and the
@@ -3789,6 +3963,29 @@ pub struct VitaState {
     /// unit, like [`Self::bound_textures`], and separate from it because the two stages number
     /// their units independently.
     bound_vertex_textures: Vec<TextureBinding>,
+    /// How many times [`Self::bind_vertex_texture`] has CHANGED the list above.
+    ///
+    /// The fragment stage's bindings live in guest memory, so "did they change?" is a byte
+    /// compare of the sampler block. This list lives on the host and has exactly one mutator,
+    /// so the same question is one counter - and it needs asking, because this title binds a
+    /// vertex sampler on every one of ~626 draws a frame and the answer is almost always no.
+    vertex_texture_gen: u64,
+    /// The previous draw's parsed fixed-function render state, with the two context-block
+    /// spans it was parsed from.
+    ///
+    /// The state is ~50 fields read one word at a time out of the snapshot and ~240 bytes of
+    /// the `Draw` it lands in, and a run of draws inside one pass carries the identical state.
+    /// Two `memcmp`s (132 + 24 bytes, the two contiguous regions the state occupies) answer
+    /// "the same as last time?", and a hit is an `Arc` clone instead of a parse and a copy.
+    render_state_memo: Option<(Box<[u8]>, Box<[u8]>, std::sync::Arc<crate::capture::RenderState>)>,
+    /// Scratch for decoding a draw's vertex uniform bank into floats.
+    ///
+    /// The bank is read as BYTES (that is what the recompiled shader wants) and the reflection
+    /// below wants floats, so every draw converted the whole thing into a fresh `Vec<f32>` -
+    /// an allocation and a free per draw, ~626 a frame, for a buffer whose only surviving
+    /// consumer on the recompiled path is the first sixteen lanes. Reused here and handed back
+    /// at the end of the draw.
+    uniform_float_scratch: Vec<f32>,
     /// Exact `SceGxmTextureFormat` last set on a guest `SceGxmTexture*` via
     /// `sceGxmTextureInit*`/`SetFormat`. The 16-byte control words alone lose the
     /// channel swizzle (only a 3-bit field survives), so we keep the full 32-bit
@@ -4082,6 +4279,9 @@ impl VitaState {
             shader_programs: Vec::new(),
             bound_textures: Vec::new(),
             bound_vertex_textures: Vec::new(),
+            vertex_texture_gen: 0,
+            render_state_memo: None,
+            uniform_float_scratch: Vec::new(),
             texture_formats: Default::default(),
             nearby_texture_cache: FxHashMap::default(),
             texture_unit_scratch: Vec::new(),
@@ -6153,6 +6353,11 @@ impl VitaState {
     /// period from wherever the guest happened to call over-waits by half a period on
     /// average and can never phase-lock, so a title that renders in 5 ms and waits for
     /// vblank ran at 5 + 16.67 ms (46 fps) instead of the 60 the hardware gives it.
+    /// Count one vblank-spin park - see [`report_vblank_spin_parks`].
+    pub fn note_vblank_spin_park(&mut self) {
+        VBLANK_SPIN_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn vblank_park(&mut self, n: u64, period: u64) -> u64 {
         if n == 0 {
             return 0;
@@ -7223,10 +7428,15 @@ impl VitaState {
     /// with different textures.
     pub fn bind_vertex_texture(&mut self, ctx: &GuestCtx, unit: u32, texture_addr: u32) {
         let binding = TextureBinding::read(ctx, unit, texture_addr, false);
+        // Bumped only on a REAL change, so a title that rebinds the same texture keeps the
+        // draw-side shortcut. See [`Self::vertex_texture_gen`].
+        let mut changed = true;
         match self.bound_vertex_textures.binary_search_by_key(&unit, |b| b.unit) {
             Ok(i) => {
                 if texture_addr == 0 {
                     self.bound_vertex_textures.remove(i);
+                } else if self.bound_vertex_textures[i] == binding {
+                    changed = false;
                 } else {
                     self.bound_vertex_textures[i] = binding;
                 }
@@ -7234,8 +7444,13 @@ impl VitaState {
             Err(i) => {
                 if texture_addr != 0 {
                     self.bound_vertex_textures.insert(i, binding);
+                } else {
+                    changed = false;
                 }
             }
+        }
+        if changed {
+            self.vertex_texture_gen += 1;
         }
     }
 
@@ -8769,7 +8984,10 @@ impl VitaState {
         // [`crate::vita::gxmctx::Block`]: a draw read that one 652-byte structure through a
         // dozen separate crossings into guest memory, and the guest cannot run during a host
         // call, so one copy answers all of them identically.
-        let blk = crate::vita::gxmctx::Block::read(ctx, self.gxm_context);
+        let blk = {
+            let _b = crate::perf::scope(crate::perf::Phase::DrawBlockRead);
+            crate::vita::gxmctx::Block::read(ctx, self.gxm_context)
+        };
         // Occlusion query: this draw contributes to whatever slot the front-face
         // visibility test currently names (no-op when no query is live).
         self.accumulate_visibility(&blk, index_count);
@@ -8778,6 +8996,7 @@ impl VitaState {
         // `current_vertex_uniforms`; the fragment stage has several independent readers
         // (material reflection, the recompiler's `frag_sa`, the draw dump), so clear it once
         // here and they all see the same truth.
+        let reflect_phase = crate::perf::scope(crate::perf::Phase::DrawReflect);
         let mut frag_uniform = blk.uniform_binding(crate::vita::gxmctx::off::FRAGMENT_UNIFORM);
         let fheader = self.fragment_program_header(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM));
         if frag_uniform.buf != 0 {
@@ -8826,6 +9045,7 @@ impl VitaState {
                 false,
             ),
         };
+        drop(reflect_phase);
         // Index element size: U16 (0) is 2 bytes, U32 is 4.
         let index_elem = if index_format == 0 { 2 } else { 4 };
         // Snapshot exactly the vertices this draw REFERENCES, not the whole prefix of the
@@ -8915,6 +9135,21 @@ impl VitaState {
         // them in one phase was hiding which of the two a fix would have to land on, and
         // the two fixes have nothing in common.
         let bind_phase = crate::perf::scope(crate::perf::Phase::DrawTextureBind);
+        // >>> THE PREVIOUS DRAW'S ANSWER, IF THIS DRAW BINDS THE SAME BYTES.
+        //
+        // Everything below - the sixteen-slot decode, the fold, the map probe and the exact
+        // verify - re-derives a list that a batch of draws sharing a material produces
+        // identically every time. One `memcmp` of the sampler block answers it instead. See
+        // `TextureSnapshots::last_set` for why a hit is exact rather than a guess, and why
+        // it is refused across a scene boundary.
+        let sampler_span = blk.span(
+            crate::vita::gxmctx::off::TEXTURES,
+            crate::vita::gxmctx::MAX_TEXTURE_UNITS * crate::vita::gxmctx::TEXTURE_STRIDE as usize,
+        );
+        let previous_set = self.texture_snapshots.set_from_previous_draw(sampler_span, fheader);
+        if previous_set.is_some() {
+            crate::perf::note_hit(crate::perf::Phase::DrawTexSetPrev);
+        }
         // The fragment bindings come from the CONTEXT BLOCK now, because that is where the
         // inlined `sceGxmSetFragmentTexture` writes them and the host no longer sees most
         // binds at all. Read in unit order, which is the order this list has always been in.
@@ -8924,48 +9159,66 @@ impl VitaState {
         // borrowed mutably while the bindings are borrowed - and keeping the allocation
         // avoids a Vec per draw on the hottest path in the engine.
         let mut frag_binds = std::mem::take(&mut self.bound_textures);
-        frag_binds.clear();
-        let context = self.gxm_context;
-        if context != 0 {
-            // ONE borrow of the whole sampler block, not forty `read_u32`s - each of those is
-            // a virtual call through `dyn GuestMemory`, and on this path (627 draws a frame)
-            // the calls were the cost rather than the bytes. See `gxmctx::texture_bindings`.
-            // The scratch list is reused for the same reason `bound_textures` is.
-            let mut raw = std::mem::take(&mut self.bound_binding_scratch);
-            blk.texture_bindings(&mut raw);
-            for (unit, b) in raw.iter() {
-                frag_binds.push(TextureBinding {
-                    unit: *unit,
-                    addr: b.addr,
-                    words: b.words,
-                    from_precomputed: b.from_precomputed,
-                });
-            }
-            self.bound_binding_scratch = raw;
-        }
-        // >>> THE WHOLE LIST IS SHARED ACROSS SCENES, RE-PROVEN PER SCENE. See
-        // `TextureSnapshots::snapshot_sets`.
-        //
-        // The key is what the list is a function of: the bindings, and the fragment program
-        // header, which decides the albedo reorder below. The reorder is applied BEFORE the
-        // entry is stored, so a hit is the finished list.
-        let set_key = {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            let mut mix = |v: u64| {
-                h ^= v;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            };
-            mix(fheader as u64);
-            for b in &frag_binds {
-                mix(b.unit as u64);
-                for w in b.words {
-                    mix(w as u64);
+        // On a previous-draw hit `frag_binds` is left EXACTLY as the last draw left it, which
+        // is the same list these identical bytes decode to - so the decode, the fold, the map
+        // probe and the exact verify are all skipped and nothing downstream can tell.
+        let (set_key, cached_set) = match &previous_set {
+            Some(list) => (0u64, Some(list.clone())),
+            None => {
+                frag_binds.clear();
+                let decode_phase = crate::perf::scope(crate::perf::Phase::DrawTexBindDecode);
+                let context = self.gxm_context;
+                if context != 0 {
+                    // ONE borrow of the whole sampler block, not forty `read_u32`s - each of
+                    // those is a virtual call through `dyn GuestMemory`, and on this path (627
+                    // draws a frame) the calls were the cost rather than the bytes. See
+                    // `gxmctx::texture_bindings`. The scratch list is reused for the same
+                    // reason `bound_textures` is.
+                    let mut raw = std::mem::take(&mut self.bound_binding_scratch);
+                    blk.texture_bindings(&mut raw);
+                    for (unit, b) in raw.iter() {
+                        frag_binds.push(TextureBinding {
+                            unit: *unit,
+                            addr: b.addr,
+                            words: b.words,
+                            from_precomputed: b.from_precomputed,
+                        });
+                    }
+                    self.bound_binding_scratch = raw;
                 }
+                drop(decode_phase);
+                // >>> THE WHOLE LIST IS SHARED ACROSS SCENES, RE-PROVEN PER SCENE. See
+                // `TextureSnapshots::snapshot_sets`.
+                //
+                // The key is what the list is a function of: the bindings, and the fragment
+                // program header, which decides the albedo reorder below. The reorder is
+                // applied BEFORE the entry is stored, so a hit is the finished list.
+                let set_key = {
+                    let _f = crate::perf::scope(crate::perf::Phase::DrawTexBindFold);
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    let mut mix = |v: u64| {
+                        h ^= v;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    };
+                    mix(fheader as u64);
+                    for b in &frag_binds {
+                        mix(b.unit as u64);
+                        for w in b.words {
+                            mix(w as u64);
+                        }
+                    }
+                    h
+                };
+                let _p = crate::perf::scope(crate::perf::Phase::DrawTexBindProbe);
+                let cached = self.texture_snapshots.set_validated(
+                    ctx,
+                    set_key,
+                    fheader as u64,
+                    &frag_binds,
+                );
+                (set_key, cached)
             }
-            h
         };
-        let cached_set =
-            self.texture_snapshots.set_validated(ctx, set_key, fheader as u64, &frag_binds);
         drop(bind_phase);
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
         let mut textures = match cached_set {
@@ -8991,17 +9244,23 @@ impl VitaState {
         // the shared map - the fragment key starts from the program header, which is not a
         // separation a vertex list could be relied on to reproduce.
         //
-        // The `to_vec` is deliberate and small: `capture::Draw` holds a `Vec` here (the
-        // fragment side holds an `Arc<[_]>`), a bound list is one or two units, and what this
-        // is buying back is the DECODE - which is where the texture-data snapshot and its
-        // memcmp live. Making the field an `Arc` too is the tidier follow-up.
+        // >>> SHARED, NOT COPIED, AND USUALLY NOT EVEN LOOKED UP.
+        //
+        // This used to `to_vec` the shared entry into a fresh `Vec` per draw because
+        // `capture::Draw` held one - "the tidier follow-up" the old note here named. It is an
+        // `Arc<[_]>` on both sides now, so a hit is a refcount bump. And in front of the fold
+        // and the probe sits the generation check: this title binds a vertex sampler on EVERY
+        // draw, so the phase ran 626 times a frame to re-derive an answer that changes only
+        // when the guest actually rebinds one.
+        let vert_gen = self.vertex_texture_gen;
         let vert_binds = std::mem::take(&mut self.bound_vertex_textures);
-        let vertex_textures: Vec<crate::capture::BoundTexture> = if vert_binds.is_empty() {
-            // The common case, and it needs neither a key nor an allocation: nothing bound
-            // decodes to nothing. An `Arc<[_]>` here would allocate a header on EVERY draw of
-            // every title that binds no vertex texture, which is most of them - measured as a
-            // regression when this branch built one.
-            Vec::new()
+        let vertex_textures: Arc<[crate::capture::BoundTexture]> = if vert_binds.is_empty() {
+            // The common case for every other title: nothing bound decodes to nothing, and an
+            // empty `Arc` slice allocates nothing.
+            Arc::from(&[][..])
+        } else if let Some(list) = self.texture_snapshots.vertex_set_from_previous_draw(vert_gen) {
+            crate::perf::note_hit(crate::perf::Phase::DrawTexSetPrev);
+            list
         } else {
             let _v = crate::perf::scope(crate::perf::Phase::DrawTexVertex);
             let vkey = {
@@ -9019,15 +9278,22 @@ impl VitaState {
                 }
                 h
             };
-            match self.texture_snapshots.set_validated(ctx, vkey, VERTEX_STAGE_TAG, &vert_binds) {
-                Some(set) => set.to_vec(),
+            let list = match self.texture_snapshots.set_validated(
+                ctx,
+                vkey,
+                VERTEX_STAGE_TAG,
+                &vert_binds,
+            ) {
+                Some(set) => set,
                 None => {
                     let decoded = self.snapshot_bound_textures(ctx, &vert_binds);
                     let set: Arc<[crate::capture::BoundTexture]> = decoded.as_slice().into();
-                    self.texture_snapshots.set_insert(vkey, VERTEX_STAGE_TAG, &vert_binds, set);
-                    decoded
+                    self.texture_snapshots.set_insert(vkey, VERTEX_STAGE_TAG, &vert_binds, set.clone());
+                    set
                 }
-            }
+            };
+            self.texture_snapshots.remember_last_vertex_set(vert_gen, vkey, list.clone());
+            list
         };
         self.bound_vertex_textures = vert_binds;
         drop(texture_phase);
@@ -9041,6 +9307,8 @@ impl VitaState {
         // ahead of the real albedo by unit number, and neither is indexed by surface UV. See
         // `Draw::albedo`, which drops a leading non-surface texture rather than stretch it.
         let textures: Arc<[crate::capture::BoundTexture]> = match cached_set {
+            // Already the previous draw's answer, or one just re-proven for this scene -
+            // either way the memo below is current and there is nothing to remember.
             Some(set) => set,
             None => {
                 if let Some(pos) =
@@ -9062,6 +9330,16 @@ impl VitaState {
                 set
             }
         };
+        // Remember it against the bytes it came from, so the NEXT draw of this batch can skip
+        // the gate entirely. Not on a previous-draw hit: that entry is this one.
+        if previous_set.is_none() {
+            self.texture_snapshots.remember_last_set(
+                sampler_span,
+                fheader,
+                set_key,
+                textures.clone(),
+            );
+        }
         if dump_fprog() {
             self.dump_fragment_program_samplers(ctx);
         }
@@ -9102,20 +9380,50 @@ impl VitaState {
         // Off the recompiler path nothing wants the bytes, and there the float read stays as
         // it was: on native it BORROWS guest memory and converts in place, so materialising a
         // byte buffer there would be a cost with no reader.
-        let (mut uniforms, vert_sa_raw) = if gxp_live_capture() {
+        // >>> THE WHOLE BANK IS CONVERTED, AND READING ONLY THE REFLECTED LANES WAS SLOWER.
+        //
+        // The recompiled shader reads the guest's BYTES, so the floats here serve only the
+        // three reflections below and `interpret_draw`'s sixteen - about fifty lanes at
+        // offsets the reflection already knows. Reading exactly those lanes out of the bytes
+        // and skipping this conversion is the obvious saving and it MEASURED AS A LOSS: two
+        // interleaved browser runs put the lane-reader at cpu p25 8.30 and 8.07 ms/frame
+        // against 7.68 for this. A bank is a few dozen floats, `chunks_exact(4)` vectorises,
+        // and fifty bounds-checked per-lane reads through a closure cost more than converting
+        // it. Do not re-try it without a measurement.
+        let want_fixed_function = fixed_function_wanted();
+        let mut uniforms = std::mem::take(&mut self.uniform_float_scratch);
+        uniforms.clear();
+        let vert_sa_raw = if gxp_live_capture() {
             let raw = self.current_vertex_uniform_bytes(ctx, &blk);
-            let floats: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            (floats, raw)
+            uniforms.extend(
+                raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+            raw
         } else {
-            (self.current_vertex_uniforms(ctx, &blk), Vec::new())
+            // The fixed-function path's float read BORROWS guest memory natively and converts
+            // in place, so it stays as it was; the extra copy into the scratch is one path's
+            // cost and that path is not the one that ships.
+            uniforms.extend_from_slice(&self.current_vertex_uniforms(ctx, &blk));
+            Vec::new()
         };
+        let lane = |i: usize| -> Option<f32> { uniforms.get(i).copied() };
         // The model-to-world matrix (for bringing the vertex normal into world space for
-        // lighting). Read from the ORIGINAL uniforms, before `composed_mvp` below overwrites
-        // uniforms[0..16] (which is exactly where `vsModelToWorldMatrix` usually sits).
-        let world = self.reflected_world_matrix(&vref, &uniforms);
+        // lighting). Read from the ORIGINAL bank, before the composed MVP is stamped over
+        // lanes 0..16 (which is exactly where `vsModelToWorldMatrix` usually sits).
+        // >>> STILL COMPUTED ON THE RECOMPILED PATH, AND DELIBERATELY.
+        // It is two 16-lane reads out of a bank already in hand, and it is not only the
+        // fixed-function pipeline's: `object_locations` reads the world matrix's translation
+        // and basis to say WHERE a mesh is, which is the whole of the `locate` tool and of
+        // every driving controller built on it. Handing those identity would not fail, it
+        // would answer the origin - see [[vitaslop-camera-not-address]].
+        // >>> READ ONCE, USED TWICE. The model->world matrix and the composed MVP are both
+        // functions of the SAME pair of reflected matrices, and each used to read the pair for
+        // itself - 32 lanes of the bank fetched twice per draw, ~626 draws a frame, for bytes
+        // the first read already had.
+        const IDENTITY_4X4: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let world_proj = Self::reflected_world_proj_by(&vref, lane);
+        let world = world_proj.map(|(w, _)| w).unwrap_or(IDENTITY_4X4);
         // Recover the true clip-space transform from the vertex program's reflected
         // uniforms. A 3D shader keeps a per-object model->world matrix and a shared
         // world->projection matrix as separate uniforms (named e.g. `vsModelToWorldMatrix`
@@ -9124,18 +9432,55 @@ impl VitaState {
         // first 16 floats, which the software/GPU paths read as the MVP. A shader with a
         // single combined transform (2D UI: `vsPrimRenderTransform` at offset 0) has no
         // projection matrix, so this leaves its MVP untouched.
-        if let Some(mvp) = self.composed_mvp(&vref, &uniforms) {
-            if uniforms.len() >= 16 {
-                uniforms[..16].copy_from_slice(&mvp);
-            }
-        }
+        let composed = match vref.mvp_off {
+            Some(off) => Self::lanes_by(&lane, off as usize),
+            None => world_proj.map(|(w, p)| Self::compose_mvp(&w, &p)),
+        };
         if dump_vprog() {
             self.dump_vertex_program_params(ctx);
         }
-        let exposure = Self::reflected_exposure(&vref, &uniforms);
+        // >>> WHAT THE `Draw` ACTUALLY CARRIES, WHICH ON THE RECOMPILED PATH IS SIXTEEN FLOATS.
+        //
+        // The whole bank is here only because the fixed-function pipeline reads it as its
+        // uniform block. A recompiled draw reads `vert_sa` - the guest's own bytes - and the
+        // ONLY consumer of this field is `interpret_draw`, which classifies the draw's
+        // coordinate space from lanes 0..16 (the MVP stamped just above, or the shader's own
+        // combined transform). Carrying the tail was an allocation and a copy per draw for
+        // bytes nothing downstream reads. A bank SHORTER than sixteen floats keeps its length,
+        // because that length is what says "this is not an MVP draw".
+        let bank_lanes = uniforms.len();
+        let mut draw_uniforms: Vec<f32> = if want_fixed_function {
+            uniforms.clone()
+        } else {
+            uniforms[..bank_lanes.min(16)].to_vec()
+        };
+        if let Some(mvp) = composed {
+            if draw_uniforms.len() >= 16 {
+                draw_uniforms[..16].copy_from_slice(&mvp);
+            }
+        }
+        // >>> READ AFTER THE STAMP, WHICH IS WHERE IT ALWAYS WAS.
+        //
+        // A shader whose reflected exposure lane sits inside 0..16 reads the composed MVP
+        // there rather than its own value. That is almost certainly not what the title means,
+        // but it is what this has always done and it is a fixed-function value - so the order
+        // is preserved rather than quietly corrected, and the recompiled path (where nothing
+        // reads it) takes the same lanes for the same reason.
+        let stamped = |i: usize| -> Option<f32> {
+            match &composed {
+                Some(mvp) if i < 16 && bank_lanes >= 16 => Some(mvp[i]),
+                _ => lane(i),
+            }
+        };
+        let exposure = Self::reflected_exposure_by(&vref, stamped);
         // The per-material fragment inputs (tint / directional light / ambient), reflected
         // from the fragment program's uniforms so the renderer reproduces the LIT colour.
-        let material = self.reflect_fragment_material(ctx, &fref, &textures, frag_uniform.buf, &frag_sa);
+        let material = if want_fixed_function {
+            self.reflect_fragment_material(ctx, &fref, &textures, frag_uniform.buf, &frag_sa)
+        } else {
+            // The neutral material - what this already reflects for a shader declaring none.
+            crate::capture::FragmentMaterial::default()
+        };
         drop(uniform_phase);
         // The per-draw diagnostic dump, after everything it reports has been computed
         // (it prints the reflected transform and material rather than recomputing them).
@@ -9176,6 +9521,30 @@ impl VitaState {
         let mem_window =
             if gxp_live_capture() { self.capture_mem_window(ctx, &blk, vheader) } else { None };
         drop(gxp_phase);
+        let render_state = {
+            let _r = crate::perf::scope(crate::perf::Phase::DrawRenderState);
+            use crate::vita::gxmctx::off;
+            // The two contiguous regions the fixed-function state occupies: the scalars,
+            // viewport and region clip below the program handles, and the back-face stencil
+            // block that sits past the sampler array.
+            const FRONT_LEN: usize = (off::FRONT_VISIBILITY_TEST_OP + 4 - off::CULL_MODE) as usize;
+            const BACK_LEN: usize = (off::AFTER_BACK_STENCIL - off::AFTER_TEXTURES) as usize;
+            let front = blk.span(off::CULL_MODE, FRONT_LEN);
+            let back = blk.span(off::AFTER_TEXTURES, BACK_LEN);
+            match &self.render_state_memo {
+                Some((f, b, rs)) if &**f == front && &**b == back => rs.clone(),
+                _ => {
+                    let rs = std::sync::Arc::new(blk.render_state());
+                    self.render_state_memo = Some((
+                        front.to_vec().into_boxed_slice(),
+                        back.to_vec().into_boxed_slice(),
+                        rs.clone(),
+                    ));
+                    rs
+                }
+            }
+        };
+        self.uniform_float_scratch = uniforms;
         let record_phase = crate::perf::scope(crate::perf::Phase::DrawRecord);
         let draw = crate::capture::Draw {
             primitive,
@@ -9186,9 +9555,9 @@ impl VitaState {
             attributes,
             vertex_textures,
             indices: indices.into(),
-            uniforms,
+            uniforms: draw_uniforms,
             textures,
-            render_state: blk.render_state(),
+            render_state,
             blend: self.fragment_program_blend(blk.word(crate::vita::gxmctx::off::FRAGMENT_PROGRAM)),
             fragment_program_header: fheader,
             exposure,
@@ -9537,16 +9906,49 @@ impl VitaState {
     /// offset-0 matrix as-is. Both matrices are column-major 4x4 float blocks at their
     /// reflected `resource_index` (in floats); the result is `projection * world`.
     fn composed_mvp(&self, r: &ProgramReflection, uniforms: &[f32]) -> Option<[f32; 16]> {
+        Self::composed_mvp_by(r, |i| uniforms.get(i).copied())
+    }
+
+    /// >>> THE THREE REFLECTIONS, OVER ANY SOURCE OF UNIFORM LANES.
+    ///
+    /// The bank is bytes in guest memory. The fixed-function pipeline wants the WHOLE thing as
+    /// floats and gets a `Vec`; a recompiled draw wants none of it - its shader reads the raw
+    /// bytes - and yet every draw converted the entire bank to floats so that these three could
+    /// index it. They read at most 33 lanes between them, all at offsets the reflection already
+    /// knows, so taking a lane READER instead of a slice lets the recompiled path pull those
+    /// lanes straight out of the guest's bytes and skip the conversion and the allocation.
+    fn lanes_by(lane: &impl Fn(usize) -> Option<f32>, off: usize) -> Option<[f32; 16]> {
+        let mut m = [0f32; 16];
+        for (k, v) in m.iter_mut().enumerate() {
+            *v = lane(off + k)?;
+        }
+        Some(m)
+    }
+
+    fn reflected_world_proj_by(
+        r: &ProgramReflection,
+        lane: impl Fn(usize) -> Option<f32>,
+    ) -> Option<([f32; 16], [f32; 16])> {
+        let (wo, po) = (r.world_off? as usize, r.proj_off? as usize);
+        Some((Self::lanes_by(&lane, wo)?, Self::lanes_by(&lane, po)?))
+    }
+
+    fn composed_mvp_by(
+        r: &ProgramReflection,
+        lane: impl Fn(usize) -> Option<f32>,
+    ) -> Option<[f32; 16]> {
         // A shader that keeps ONE combined matrix needs no composition - but it does
         // need to be found, because it is not always at offset 0 and the fallback
         // there would then read whatever else the program put first.
         if let Some(off) = r.mvp_off.map(|o| o as usize) {
-            let mut m = [0f32; 16];
-            m.copy_from_slice(uniforms.get(off..off + 16)?);
-            return Some(m);
+            return Self::lanes_by(&lane, off);
         }
-        let (world, proj) = Self::reflected_world_proj(r, uniforms)?;
-        // Column-major 4x4 multiply: out = proj * world.
+        let (world, proj) = Self::reflected_world_proj_by(r, lane)?;
+        Some(Self::compose_mvp(&world, &proj))
+    }
+
+    /// Column-major 4x4 multiply: `projection * world`.
+    fn compose_mvp(world: &[f32; 16], proj: &[f32; 16]) -> [f32; 16] {
         let mut out = [0f32; 16];
         for col in 0..4 {
             for row in 0..4 {
@@ -9557,17 +9959,25 @@ impl VitaState {
                 out[col * 4 + row] = s;
             }
         }
-        Some(out)
+        out
     }
 
     /// The model-to-world matrix reflected from the vertex program's `vsModelToWorldMatrix`
     /// (column-major 4x4), or identity if the shader declares no world matrix. Used to bring
     /// the object-space vertex normal into world space for lighting.
     fn reflected_world_matrix(&self, r: &ProgramReflection, uniforms: &[f32]) -> [f32; 16] {
+        Self::reflected_world_matrix_by(r, |i| uniforms.get(i).copied())
+    }
+
+    fn reflected_world_matrix_by(
+        r: &ProgramReflection,
+        lane: impl Fn(usize) -> Option<f32>,
+    ) -> [f32; 16] {
         const IDENTITY: [f32; 16] =
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        Self::reflected_world_proj(r, uniforms).map(|(w, _)| w).unwrap_or(IDENTITY)
+        Self::reflected_world_proj_by(r, lane).map(|(w, _)| w).unwrap_or(IDENTITY)
     }
+
 
     /// Pull the vertex program's model->world and world->projection 4x4 matrices out of
     /// this draw's `uniforms`, at the offsets [`ProgramReflection`] located by name.
@@ -9577,13 +9987,7 @@ impl VitaState {
         r: &ProgramReflection,
         uniforms: &[f32],
     ) -> Option<([f32; 16], [f32; 16])> {
-        let (wo, po) = (r.world_off? as usize, r.proj_off? as usize);
-        let read4x4 = |off: usize| -> Option<[f32; 16]> {
-            let mut m = [0f32; 16];
-            m.copy_from_slice(uniforms.get(off..off + 16)?);
-            Some(m)
-        };
-        Some((read4x4(wo)?, read4x4(po)?))
+        Self::reflected_world_proj_by(r, |i| uniforms.get(i).copied())
     }
 
     /// Does the bound vertex program SYNTHESIZE its primitive instead of reading it?
@@ -9609,9 +10013,13 @@ impl VitaState {
     /// `1.0` when the shader declares no exposure uniform (2D/UI shaders), or when the
     /// value is not a sane positive number, so it is a safe no-op there.
     fn reflected_exposure(r: &ProgramReflection, uniforms: &[f32]) -> f32 {
+        Self::reflected_exposure_by(r, |i| uniforms.get(i).copied())
+    }
+
+    fn reflected_exposure_by(r: &ProgramReflection, lane: impl Fn(usize) -> Option<f32>) -> f32 {
         let Some(off) = r.exposure_off else { return 1.0 };
-        match uniforms.get(off as usize) {
-            Some(&e) if e.is_finite() && e > 0.0 => e,
+        match lane(off as usize) {
+            Some(e) if e.is_finite() && e > 0.0 => e,
             _ => 1.0,
         }
     }
@@ -10463,6 +10871,30 @@ fn poison_uniform_buffer(ctx: &mut GuestCtx, buf: u32, size: u32) {
     }
 }
 
+/// Whether a captured draw's FIXED-FUNCTION representation will be used by anything.
+///
+/// It will not when the recompiler is live and fixed-function is not allowed as a fallback -
+/// which is the SHIPPING configuration, and `RenderSceneBuilder::gxp_only` is the same test on
+/// the other side of the capture. There the flag already skips the per-vertex walk; here it
+/// skips the per-draw MATERIAL reflection - tint, directional light and ambient, the last of
+/// which is the average of the bound irradiance map. A recompiled draw runs the guest's own
+/// shader and derives its lighting from the SA banks, so the material is computed, stored in
+/// the `Draw` and thrown away.
+///
+/// Two neighbours are deliberately NOT in this set. The MVP is still composed, because
+/// `interpret_draw` classifies a draw's coordinate space by it and that classification decides
+/// depth, culling and the opaque range on the recompiled path too. The model->world matrix is
+/// still reflected, because `object_locations` - the `locate` tool and every driving controller
+/// over it - reads it to say where a mesh IS, and identity there answers the origin rather than
+/// failing.
+fn fixed_function_wanted() -> bool {
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| {
+        !(gxp_live_capture() && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"))
+    })
+}
+
 /// Whether the GXP->WGSL recompiler capture path is enabled (env `VITASLOP_GXP_LIVE`).
 /// Checked once and cached, so the per-draw `record_draw` gate is a cheap load rather than
 /// an environment lookup per draw.
@@ -10594,6 +11026,36 @@ static TEXTURE_INITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// [`report_zero_texture_handle`].
 static ZERO_TEXTURE_ADDRS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
+
+/// Vblank spins parked, and the guest instructions that would otherwise have been spent
+/// spinning. Reported once per run rather than per park - a race parks once or twice a frame
+/// and a line each would bury everything else.
+static VBLANK_SPIN_PARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many vblank spins have been parked so far - see [`report_vblank_spin_parks`]. The
+/// browser reports it on its running status line rather than at run end, because a phone
+/// run is watched while it happens and may never reach an orderly end.
+pub fn vblank_spin_parks() -> u64 {
+    VBLANK_SPIN_PARKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One line saying the spin guard fired, and how often. Silent when it never did - which is
+/// itself the reading for a title that does not spin on the vblank counter.
+///
+/// It is NOT silent when it does fire, because this is a behaviour change: the guest's own
+/// wait loop is being cut short, and a run where that happens should say so rather than
+/// leave the next person to infer it from a frame time.
+pub fn report_vblank_spin_parks() {
+    let n = VBLANK_SPIN_PARKS.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    tracing::info!(
+        target: "vitaslop::perf",
+        "vblank spin: {n} wait loops PARKED on the next vblank after          {} reads of the counter inside one resume. Each one is a loop that could not have          observed a change (the mirror is frozen while guest code runs) and would otherwise          have run until its own fuel dragged the clock to the vblank edge",
+        crate::vita::mirror::SPIN_BUDGET,
+    );
+}
 
 fn note_texture_drop(cause: usize) {
     if let Ok(mut g) = TEXTURE_DROPS.lock() {
@@ -11380,6 +11842,31 @@ impl ImportDispatch for VitaEnv {
         if index == vitaslop_transpiler::abi::FUEL_SELECTOR {
             return SvcOutcome::Reschedule;
         }
+        // >>> THE VBLANK SPIN, PARKED. Also not a NID, and not recorded as a call.
+        //
+        // The emitted `sceDisplayGetVcount` has taken `mirror::SPIN_BUDGET` reads inside one
+        // resume. The mirror cannot change while guest code runs, so every one of those reads
+        // returned the same word: this thread is in a loop it cannot leave until the clock
+        // moves, and while it is runnable the scheduler will not move it - the loop's own
+        // fuel is what drags the clock to the next vblank. So do what the loop is asking for
+        // and park it there, which is the same wait `sceDisplayWaitVblankStart` performs.
+        //
+        // The budget needs no reset here: the block is refreshed before EVERY resume, which
+        // is the same contract that makes the mirror readable at all, so the thread comes
+        // back with a full budget by construction. A host that broke that contract would
+        // leave the counter running negative and simply stop parking - the behaviour this
+        // guard replaced, which is the right way for it to fail.
+        if index == vitaslop_transpiler::abi::VBLANK_PARK_SELECTOR {
+            // Same guard the real vblank wait carries: in the SINGLE-THREAD model there is
+            // nothing to yield to and the clock is host-driven, so a park would block on a
+            // wake nothing can deliver. There the spin is left exactly as it was.
+            if !self.state.is_preemptive() {
+                return SvcOutcome::Continue;
+            }
+            self.state.note_vblank_spin_park();
+            self.state.vblank_park(1, vita::display::VBLANK_US);
+            return SvcOutcome::Block;
+        }
         let (library_nid, func_nid) = self
             .imports
             .get(index as usize)
@@ -12061,6 +12548,81 @@ mod savedata_tests {
         assert!(st.savedata_slot_remove("", 3));
         assert!(!st.savedata_slot_remove("", 3)); // already gone
         assert!(!st.savedata_slot_exists("", 3));
+    }
+}
+
+#[cfg(test)]
+mod register_window_tests {
+    //! >>> THE HOST-CALL REGISTER WINDOW IS A CONTRACT, AND THIS IS WHAT ENFORCES IT.
+    //!
+    //! The browser marshals only the registers AAPCS lets a host call reach
+    //! (`browser_sched::NARROW_REGS`: r0..r3, sp, lr, pc). Reading r4..r11 through a live
+    //! `GuestCtx` would therefore hand back ZERO rather than the guest's value - a silent
+    //! wrong answer on the one engine that ships, and invisible on the desktop, which
+    //! marshals the whole file.
+    //!
+    //! A comment cannot hold that. This scans the workspace for the shape that would break
+    //! it, in the same way `knobs::a_knob_routed_through_this_module_is_reachable_from_the_browser`
+    //! scans for an unregistered knob - and for the same reason: the failure is silent, so it
+    //! has to be caught where it is written rather than where it shows.
+
+    /// Register indices a host call may read through a `GuestCtx`.
+    const WINDOW: &[usize] = &[0, 1, 2, 3, 13, 14, 15];
+
+    #[test]
+    fn a_host_handler_only_reads_registers_the_call_marshals() {
+        let root = crate::knobs::workspace_root();
+        let mut bad = Vec::new();
+        for path in crate::knobs::rust_sources(&root) {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // The browser scheduler owns the window and names it; the transpiler and the
+            // native engine hold whole register FILES of their own, which are not this.
+            if !rel.starts_with("vitaslop-runtime/src/vita/")
+                && !rel.ends_with("vitaslop-runtime/src/host.rs")
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for (i, line) in text.lines().enumerate() {
+                // `ctx.regs[N]` / `self.regs[N]` with a literal index. A non-literal index is
+                // either the AAPCS argument cursor (bounded to 0..4 where it is written) or a
+                // loop over a caller's OWN array, neither of which is a live-context read.
+                for m in line.match_indices(".regs[") {
+                    let rest = &line[m.0 + ".regs[".len()..];
+                    let digits: String =
+                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let Ok(n) = digits.parse::<usize>() else { continue };
+                    // A range (`regs[0..13]`) is spelt with a literal too; treat its start as
+                    // the index and let the end be caught by the same rule on the next scan.
+                    if !WINDOW.contains(&n) {
+                        bad.push(format!("{rel}:{} reads r{n}", i + 1));
+                    }
+                    if let Some(end) = rest.strip_prefix(&digits).and_then(|r| r.strip_prefix(".."))
+                    {
+                        let e: String = end.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(e) = e.parse::<usize>() {
+                            if (n..e).any(|k| !WINDOW.contains(&k)) {
+                                bad.push(format!("{rel}:{} reads r{n}..r{e}", i + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(
+            bad.is_empty(),
+            "these read a register the BROWSER does not marshal into a host call, so they \
+             would read ZERO there and the guest's value on the desktop:\n  {}\n\
+             Either use one of r{WINDOW:?}, or widen `browser_sched::NARROW_REGS` and this \
+             list together.",
+            bad.join("\n  ")
+        );
     }
 }
 

@@ -5183,7 +5183,7 @@ fn report_depth_range_reader(di: usize, d: &Draw) {
             triangle_count(d),
             d.vertex_stride,
             d.attributes.len(),
-            d.uniforms.len(),
+            d.uniform_bank_floats(),
             d.primitive,
         );
     });
@@ -5573,7 +5573,7 @@ impl RenderSceneBuilder {
                         },
                         d.vertex_stride,
                         d.attributes.len(),
-                        d.uniforms.len(),
+                        d.uniform_bank_floats(),
                         if d.vprog.is_empty() { "none" } else { "captured" },
                     );
                 }
@@ -6030,8 +6030,8 @@ mod geometry_tests {
             indices: indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>().into(),
             uniforms: vec![],
             textures: vec![].into(),
-            vertex_textures: vec![],
-            render_state: RenderState::default(),
+            vertex_textures: std::sync::Arc::from(&[][..]),
+            render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0,
             material: crate::capture::FragmentMaterial::default(),
@@ -6361,7 +6361,10 @@ mod geometry_tests {
         attrs[1].format = FORMAT_U8N;
         d.attributes = attrs.into();
         if !depth_write {
-            d.render_state.front_depth_write = SCE_GXM_DEPTH_WRITE_DISABLED;
+            // The state is shared now, so a test that wants a variant makes its own.
+            let mut rs = *d.render_state;
+            rs.front_depth_write = SCE_GXM_DEPTH_WRITE_DISABLED;
+            d.render_state = std::sync::Arc::new(rs);
         }
         d
     }
@@ -6977,7 +6980,7 @@ mod supersample_tests {
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
             ].into(),
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex].into(), vertex_textures: vec![], render_state: RenderState::default(),
+            uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
@@ -7034,7 +7037,7 @@ mod supersample_tests {
                 VertexAttribute { stream_index: 0, offset: 8, format: FORMAT_F32, component_count: 2, reg_index: 1 },
             ].into(),
             indices: [0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()).collect(),
-            uniforms: vec![], textures: vec![tex].into(), vertex_textures: vec![], render_state: RenderState::default(),
+            uniforms: vec![], textures: vec![tex].into(), vertex_textures: std::sync::Arc::from(&[][..]), render_state: std::sync::Arc::new(RenderState::default()),
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),

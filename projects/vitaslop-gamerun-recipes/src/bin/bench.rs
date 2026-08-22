@@ -399,7 +399,9 @@ fn report(
                 let (ns, hits, bytes) = vitaslop_runtime::perf::read(*p);
                 (p.label(), ns as f64 / 1e6, hits, bytes)
             })
-            .filter(|(_, ms, _, _)| *ms > 0.0)
+            // A COUNT-ONLY phase (`perf::note_hit`) has no time and is still the reading -
+            // filtering on milliseconds alone drops exactly the rows whose point is a rate.
+            .filter(|(_, ms, hits, _)| *ms > 0.0 || *hits > 0)
             .collect();
         if !phases.is_empty() {
             let frames = frame_ms.len() as f64;

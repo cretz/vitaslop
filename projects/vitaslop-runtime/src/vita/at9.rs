@@ -789,6 +789,45 @@ impl At9Voice {
     }
 }
 
+/// Grains mixed, voices walked, and voices that were AUDIBLE (a non-zero product of source
+/// level, voice gain and every buss level on the way out). Peak and total, so one line says
+/// both "how many at once" and "how much work over the run".
+static MIX_GRAINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIX_VOICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIX_AUDIBLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MIX_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_mix_grain(voices: usize, audible: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    MIX_GRAINS.fetch_add(1, Relaxed);
+    MIX_VOICES.fetch_add(voices as u64, Relaxed);
+    MIX_AUDIBLE.fetch_add(audible as u64, Relaxed);
+    MIX_PEAK.fetch_max(voices as u64, Relaxed);
+}
+
+/// One line on what the NGS mix carried. Silent when nothing ever played.
+///
+/// The number that matters is AUDIBLE against PLAYING: a voice at zero gain is mixed by
+/// nothing and decoded in full, because its source has to advance or it would resume from a
+/// stale position. If most playing voices are inaudible, that is where the decode time is
+/// going and the trade is worth measuring; if they are all audible, the decoder itself is.
+pub fn report_mix() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let grains = MIX_GRAINS.load(Relaxed);
+    if grains == 0 {
+        return;
+    }
+    let voices = MIX_VOICES.load(Relaxed);
+    let audible = MIX_AUDIBLE.load(Relaxed);
+    tracing::info!(
+        target: "vitaslop::perf",
+        "ngs mix: {grains} grains, {:.1} playing voices each (peak {}), of which {:.1} AUDIBLE          - an inaudible voice is decoded in full and mixed by nothing",
+        voices as f64 / grains as f64,
+        MIX_PEAK.load(Relaxed),
+        audible as f64 / grains as f64,
+    );
+}
+
 /// The bank of source voices, keyed by the NGS voice handle, plus the routing graph
 /// that says where each one's output goes.
 #[derive(Default)]
@@ -939,6 +978,13 @@ impl At9Bank {
             .filter(|(_, v)| v.playing)
             .map(|(&handle, _)| (handle, self.buss_gain(handle)))
             .collect();
+        // >>> WHAT THE MIX IS ACTUALLY CARRYING, because the cost of this path is per VOICE
+        // and nothing reported how many there were. MEASURED with a V8 worker profile of one
+        // title's browser race: ATRAC9 decode was **32% of the whole thread** and
+        // `sceAudioOutOutput` another 14%, on a run that was frame-limited at 32 fps. Whether
+        // that is "many voices" or "a slow decoder" is the first question anyone asks next,
+        // and it is one counter.
+        note_mix_grain(routed.len(), routed.iter().filter(|(_, g)| *g > 0.0).count());
         for (handle, buss_gain) in routed {
             let Some(v) = self.voices.get_mut(&handle) else { continue };
             let vc = v.channels.max(1) as usize;

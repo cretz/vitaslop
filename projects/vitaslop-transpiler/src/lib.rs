@@ -23,6 +23,13 @@ pub use emit::{promote_registers, set_promote_registers};
 /// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
 /// has no environment, so it selects the arm through the setter.
 pub use emit::{flags_wide_c, set_flags_wide_c};
+/// The ablation that prices a DISPATCH RE-ENTRY - see [`emit::dispatch_all`]. Selected
+/// through the setter for the same reason: the browser has no environment, and the browser
+/// is the engine whose indirect-branch cost is the question.
+pub use emit::{dispatch_all, set_dispatch_all};
+/// The guest-address wasm NAME SECTION - see [`emit::emit_wasm_names`]. Selected through the
+/// setter so a browser profile can name the guest functions it samples.
+pub use emit::{emit_wasm_names, set_wasm_names};
 /// The fuel interval modules emitted on this thread carry, so a HOST can read the
 /// software counter the emitted code maintains: the counter runs DOWN from this and
 /// reloads to it, so only a host that knows the interval can difference it.
@@ -213,6 +220,23 @@ pub enum InlineOp {
     /// configuration error, and callers are expected to reject it outright rather than
     /// let the guest read a stale word.
     LoadMirror { slot: u32 },
+    /// `r0 = mirror[slot]`, plus a countdown that PARKS the thread when the same word has
+    /// been read `mirror[budget]` times inside one resume.
+    ///
+    /// [`InlineOp::LoadMirror`] with a spin guard, and the guard is exact rather than
+    /// heuristic. The mirror contract is that a slot cannot change while guest code runs,
+    /// so every read inside one resume returns the SAME word - a thread that has taken
+    /// thousands of them is in a loop it cannot leave, and it will leave it only when the
+    /// clock reaches the next vblank, which its own spinning is what pays for.
+    ///
+    /// The budget lives in the block so the host refreshes it exactly where it refreshes
+    /// everything else: once per resume, at the one point that makes the count mean "reads
+    /// since this thread was scheduled". Nothing in the guard is TOLLED - it must not move
+    /// the fuel counter or the clock, or it would change the schedule it is measuring.
+    ///
+    /// See [`abi::VBLANK_PARK_SELECTOR`] for what the host does with it and what it is
+    /// worth. `budget` names a slot, not a count: the count is the word in it.
+    LoadMirrorParking { slot: u32, budget: u32 },
     /// `r0 = value` - the whole call. For a handler that returns a constant and does
     /// NOTHING else.
     ///
@@ -943,7 +967,7 @@ impl InlineOp {
                 ((word >> shift) & mask).wrapping_add(plus)
             }
             // The mirror word IS the answer; the host computed it.
-            InlineOp::LoadMirror { .. } => word,
+            InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorParking { .. } => word,
             InlineOp::LoadScaled { shl, .. } => word << shl,
             // The pair forms deliver the mirror words untouched, wherever they land.
             InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
@@ -1039,7 +1063,9 @@ impl InlineOp {
             // Reads through r2 and writes through r0, so neither pointer's offset is "the"
             // offset.
             InlineOp::CopyArgIndexed { .. } => None,
-            InlineOp::LoadMirror { .. } | InlineOp::LoadMirrorPair { .. } => None,
+            InlineOp::LoadMirror { .. }
+            | InlineOp::LoadMirrorParking { .. }
+            | InlineOp::LoadMirrorPair { .. } => None,
             // Take no pointer and read nothing.
             InlineOp::RetConst { .. } | InlineOp::Nop => None,
             // Reads four words and writes two, so no single offset describes it.
@@ -1089,6 +1115,9 @@ impl InlineOp {
             InlineOp::StoreVfpRun { .. } | InlineOp::StoreArgRun { .. } => None,
             InlineOp::CopyArgIndexed { .. } => None,
             InlineOp::LoadMirror { slot } => Some(slot),
+            // Names the VALUE slot; the budget slot is covered by `top_mirror_slot`, which
+            // is what the layout pass sizes the block from.
+            InlineOp::LoadMirrorParking { slot, .. } => Some(slot),
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot),
             // The lock forms read the mirror too - the CURRENT THREAD, which is the one
             // fact about the take that is not in the work area. Naming the slot here is
@@ -1118,6 +1147,9 @@ impl InlineOp {
     pub fn top_mirror_slot(self) -> Option<u32> {
         match self {
             InlineOp::StoreMirrorPair { slot } | InlineOp::LoadMirrorPair { slot } => Some(slot + 1),
+            // BOTH its slots have to be inside the block: the budget is written by the same
+            // snapshot and decremented by the emitted code.
+            InlineOp::LoadMirrorParking { slot, budget } => Some(slot.max(budget)),
             other => other.mirror_slot(),
         }
     }

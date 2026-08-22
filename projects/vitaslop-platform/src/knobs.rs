@@ -60,6 +60,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // is where outgrowing it costs the most: a wholesale clear there re-decodes hundreds of
     // textures inside one frame's `build`.
     "VITASLOP_DECODE_CACHE_MB",
+    // The dispatch ABLATION: route even a fallthrough through the function's `br_table`.
+    // Browser-reachable because the question it answers is a V8 branch-prediction question -
+    // the module carries one indirect branch per 10.5 guest instructions and nothing this
+    // project usually counts can price one.
+    "VITASLOP_DISPATCH_ALL",
     // The A/B arm for `emit_flags_add`'s carry and overflow forms. It is here because the
     // BROWSER is the engine that has to answer: `flags-add` was 39% of every operator the
     // transpiler emitted, the closed forms cut the module 5.3% and executed operators 8.7%,
@@ -87,6 +92,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // (`screenTintColour`) only ever appears there.
     "VITASLOP_GXM_UNIFORM_POISON",
     "VITASLOP_GXP_ALLOW_FIXED_FUNCTION",
+    // What an attribute lane the vertex stream does not supply is FILLED with. Browser-reachable
+    // because the fill value is a picture question and the phone is where wrong pictures are
+    // reported from.
+    "VITASLOP_GXP_ATTR_FILL",
     "VITASLOP_GXP_CULL",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
@@ -123,6 +132,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // For a title whose `sceGxmShaderPatcherCreateFragmentProgram` passes a NULL vertexProgram -
     // so the call names no shader PAIR and nothing can be prepared from it - offer the CROSS
     // PRODUCT of its created fragment and vertex programs and keep the ones that LINK.
+    // The shader PAIRS a run linked, one line each. Browser-reachable because a pair that links
+    // on the desktop and not on the device is exactly the failure this names.
+    "VITASLOP_GXP_PAIRS",
+    // Compile a title's shader pairs AHEAD of the draw that needs them. Browser-reachable
+    // because an in-frame shader compile costs the most there - it is the hitch itself.
+    "VITASLOP_GXP_PRECOMPILE",
     // Speculative work paid on a loading screen; how much of it is wasted is a per-title
     // measurement, which is what this exists to take. Reachable from the browser because that
     // is where an in-frame shader compile costs the most.
@@ -145,6 +160,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // them is a device question; and they are the only inline forms that write a range the
     // GUEST sizes and the only ones that stamp the guest-store dirty map, which is a path
     // that exists on the browser and nowhere else. Read at LINK time; set it before the run.
+    // Refuse BC texture formats and take the transcode path the phone's GPU forces. Browser-
+    // reachable because the phone has no BC at all ([[vitaslop-phone-gpu-has-no-bc]]), so this
+    // is how a desktop browser is made to render what the device renders.
+    "VITASLOP_NO_BC",
     "VITASLOP_NO_INLINE_CLIB",
     // The A/B switch for the whole inline-import mechanism. Reachable from the browser for the
     // same reason `VITASLOP_DBG_CALLSITES` is, and more sharply: inlining exists to stop paying
@@ -185,7 +204,18 @@ pub const OVERRIDABLE: &[&str] = &[
     // a wrong picture, and the phone is where wrong pictures have been reported from. Read
     // at LINK time; set it before the run.
     "VITASLOP_NO_INLINE_UNIFORM_DATA",
+    // The A/B arm that turns the NGS decode-and-mix OFF. Browser-reachable because that is
+    // where the audio path had to be priced - it decodes and mixes up to ~100 voices a grain,
+    // which is guest-CPU work on the machine that has the least of it.
+    "VITASLOP_NO_NGS_MIX",
     "VITASLOP_PERF",
+    // Whether the per-window performance report is ALSO written to the browser console. The
+    // panel and the sink always get it; this is the console copy, off by default because the
+    // page is the product and eight multi-line blocks a window is a firehose. Overridable
+    // because a HARNESS reads the console and nothing else - a browser measurement with this
+    // unset reports a frame rate and no breakdown, which is the sixth instance of this
+    // omission and cost a run to find.
+    "VITASLOP_PERF_CONSOLE",
     // Sample the PRESENTED surface every N presents and describe it in the diagnostics panel.
     // Reachable from the browser because it exists for a defect only the browser has: a blank
     // screen over a healthy set of render counters, where the fault is either a blank picture
@@ -231,6 +261,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // holds), and the cooldown it replaces is the anti-starvation mechanism. Answering the
     // question is worth a run that may hang; shipping it is not, until it has an escape hatch.
     "VITASLOP_SCHED_CORES",
+    // Round-robin the scheduler's pick instead of the priority discipline, and TRACE what it
+    // picked. Both browser-reachable because the scheduler behaves differently there (JSPI
+    // suspends, no fuel) and a scheduling question asked on the desktop answers about the
+    // desktop.
+    "VITASLOP_SCHED_RR",
+    "VITASLOP_SCHED_TRACE",
     // Fold the determinism signature on a browser recipe run that does NOT declare `@sig`.
     // The fold hashes every retired scene's vertices, indices and uniforms - about 3 MB a
     // frame on a race, MEASURED at 7.7% of the guest window - and the only consumer is an
@@ -254,10 +290,23 @@ pub const OVERRIDABLE: &[&str] = &[
     // never set. Browser-reachable because the A/B is only interesting on the device whose GPU
     // allocation fails at 274 MB and draws WHITE.
     "VITASLOP_TEX_COMPRESS",
+    // The A/B arm for the texture memos surviving a scene: `1` restores the per-scene clear.
+    // Browser-reachable because the desktop CANNOT see this win (0.28 ms/frame under a 5% noise
+    // floor) - the browser pays it as sceGxmDraw* handler time at wasm speed, which is the
+    // entire point of the change.
+    "VITASLOP_TEX_MEMO_PER_SCENE",
     // Names the guest code that WROTE a uniform, by parameter name, with its `lr`. Needed in
     // the browser because `screenTintColour` - the white-out - is written there and never on
     // the desktop.
     "VITASLOP_UNIFORM_WATCH",
+    // The A/B arm for the vblank SPIN GUARD (`=0` restores the bare mirror read). Here
+    // because the browser is where the spin costs the most - 26% of all translated guest
+    // code on a retail racer's race - and because a default that cannot be turned off on
+    // the machine that pays for it cannot be measured at all.
+    "VITASLOP_VBLANK_PARK",
+    // The guest-address name section. Browser-reachable so a V8 CPU profile taken in the
+    // browser can NAME the guest functions it samples instead of reporting `wasm-function[N]`.
+    "VITASLOP_WASM_NAMES",
 ];
 
 /// The override map, consulted by every reader in this module BEFORE the environment.

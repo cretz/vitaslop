@@ -113,13 +113,41 @@ pub(crate) fn vcount(st: &VitaState) -> u32 {
 /// the game clock - see [`crate::vita::mirror`] for the rule and why the two waits
 /// below can never join it (they block, which is behaviour, not a read).
 pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
-    use vitaslop_transpiler::InlineOp::LoadMirror;
+    use vitaslop_transpiler::InlineOp::{LoadMirror, LoadMirrorParking};
     match func_nid {
-        crate::nid::display::GET_VCOUNT => {
-            Some(LoadMirror { slot: crate::vita::mirror::SLOT_VCOUNT })
-        }
+        // >>> THE READ CARRIES A SPIN GUARD, AND THAT IS THE DEFAULT.
+        //
+        // The ordinary vblank wait is `do { v = sceDisplayGetVcount(); } while (v == last);`
+        // and the mirror made each turn of it one `i32.load` - which removed the host calls
+        // and left the SPIN. It ends only when the clock reaches the next vblank, and the
+        // only thing advancing the clock is the spin's own fuel, so the emulator executes
+        // however much guest code the clock model says fits in the rest of the frame.
+        // MEASURED in the browser on a retail racer's race: that single function is **26% of
+        // all translated guest code**, 1.6 ms of a 16.7 ms frame, the largest guest function
+        // in the profile by a factor of four.
+        //
+        // The guard parks the thread on the next vblank instead - the same wait
+        // `sceDisplayWaitVblankStart` performs, reached from the loop that is asking for it.
+        // `VITASLOP_VBLANK_PARK=0` is the A/B arm and restores the bare read.
+        crate::nid::display::GET_VCOUNT => Some(if vblank_park_spin() {
+            LoadMirrorParking {
+                slot: crate::vita::mirror::SLOT_VCOUNT,
+                budget: crate::vita::mirror::SLOT_SPIN_BUDGET,
+            }
+        } else {
+            LoadMirror { slot: crate::vita::mirror::SLOT_VCOUNT }
+        }),
         _ => None,
     }
+}
+
+/// Whether an inlined `sceDisplayGetVcount` carries the spin guard (`VITASLOP_VBLANK_PARK`,
+/// default ON; `=0` is the A/B arm that restores the bare mirror read).
+///
+/// VALUE-sensitive, and read through the knob seam rather than the environment because the
+/// browser is where the spin costs the most and the browser has no environment.
+fn vblank_park_spin() -> bool {
+    !matches!(crate::knobs::var("VITASLOP_VBLANK_PARK").as_deref(), Ok("0"))
 }
 
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)

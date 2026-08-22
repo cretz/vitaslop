@@ -108,10 +108,36 @@ pub enum Phase {
     /// display-queue callback as a guest thread spawns one PER FLIP, so this can be a
     /// per-frame cost hiding in what looks like guest execution.
     ThreadSpawn,
+    /// The previous draw's finished texture list, taken whole because this draw binds the
+    /// same sampler bytes ([`crate::host::TextureSnapshots::last_set`]). Timed AND counted:
+    /// the count against `DrawTextureBind`'s is the hit rate, and without it "the gate did
+    /// not get cheaper" cannot be told apart from "the gate is never skipped".
+    DrawTexSetPrev,
+    /// The one snapshot of the 652-byte GXM context block every draw reads
+    /// ([`crate::vita::gxmctx::Block::read`]). Free on an engine that can LEND guest memory
+    /// and a full copy on the browser, which is exactly why it is timed apart from the
+    /// readers that parse it.
+    DrawBlockRead,
+    /// Resolving the two bound program handles to headers, reflecting both, and the bound
+    /// vertex program's precomputed packed layout - the map lookups and `Arc` clones every
+    /// draw makes before it has looked at any guest data.
+    DrawReflect,
+    /// Parsing the ~40-field fixed-function render state out of the block snapshot.
+    DrawRenderState,
+    /// Inside [`Self::DrawTextureBind`]: walking the sampler block into a binding list.
+    DrawTexBindDecode,
+    /// Inside [`Self::DrawTextureBind`]: folding the binding list into the set key.
+    DrawTexBindFold,
+    /// Inside [`Self::DrawTextureBind`]: the set-cache probe and its exact verify.
+    DrawTexBindProbe,
+    /// Inside [`Self::DrawTexBindProbe`]: the cross-SCENE re-proof of a kept set - one
+    /// `get_or_read` per underlying snapshot and a pointer compare. Paid once per set per
+    /// scene by design; if it shows up per DRAW, something is failing its proof and rebuilding.
+    DrawTexBindReproof,
 }
 
 impl Phase {
-    const COUNT: usize = 20;
+    const COUNT: usize = 28;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -132,6 +158,14 @@ impl Phase {
             Phase::DrawTotal => 14,
             Phase::DrawTexRead => 15,
             Phase::SchedMirror => 19,
+            Phase::DrawTexSetPrev => 20,
+            Phase::DrawBlockRead => 21,
+            Phase::DrawReflect => 22,
+            Phase::DrawRenderState => 23,
+            Phase::DrawTexBindDecode => 24,
+            Phase::DrawTexBindFold => 25,
+            Phase::DrawTexBindProbe => 26,
+            Phase::DrawTexBindReproof => 27,
             Phase::SchedIdle => 16,
             Phase::SchedBook => 17,
             Phase::FrameBoundary => 18,
@@ -142,10 +176,18 @@ impl Phase {
     pub fn all() -> [Phase; Phase::COUNT] {
         [
             Phase::DrawTotal,
+            Phase::DrawBlockRead,
+            Phase::DrawReflect,
+            Phase::DrawRenderState,
             Phase::DrawIndices,
             Phase::DrawIndexScan,
             Phase::DrawVertices,
             Phase::DrawTextureBind,
+            Phase::DrawTexSetPrev,
+            Phase::DrawTexBindDecode,
+            Phase::DrawTexBindFold,
+            Phase::DrawTexBindProbe,
+            Phase::DrawTexBindReproof,
             Phase::DrawTextures,
             Phase::DrawTexFragMiss,
             Phase::DrawTexRead,
@@ -176,6 +218,14 @@ impl Phase {
             Phase::DrawTexRead => "draw:     ...of which get_or_read",
             Phase::DrawTexVertex => "draw:   ...vertex stage (hit+miss)",
             Phase::DrawTextureBind => "draw: decode texture bindings (EVERY draw)",
+            Phase::DrawTexSetPrev => "draw:   ...of which REUSED from the previous draw",
+            Phase::DrawBlockRead => "draw: read the context block",
+            Phase::DrawReflect => "draw: resolve + reflect both programs",
+            Phase::DrawRenderState => "draw: parse render state",
+            Phase::DrawTexBindDecode => "draw:   ...of which walk the sampler block",
+            Phase::DrawTexBindFold => "draw:   ...of which fold the set key",
+            Phase::DrawTexBindProbe => "draw:   ...of which probe + verify the set",
+            Phase::DrawTexBindReproof => "draw:     ...of which the cross-SCENE re-proof",
             Phase::DrawGxpCapture => "draw: gxp blob + SA bytes",
             Phase::DrawRecord => "draw: build record + push scene",
             Phase::DrawUniforms => "draw: uniforms + material",
@@ -309,6 +359,17 @@ pub fn word_reads(phase: Phase) -> u64 {
 /// A byte count needs no clock, and there are a handful of these calls per draw against thousands
 /// of operations, so it is counted unconditionally on every target. **Volume is a measurement in
 /// its own right** - the 105.8 MB would have named the defect on its own, with no timer at all.
+/// COUNT one occurrence of a phase without timing it.
+///
+/// For a phase whose whole point is a rate - how often a shortcut was taken - where the
+/// clock read would cost more than the thing being counted and would time a branch rather
+/// than any work. A reporter must therefore not filter these out on `ns == 0`.
+pub fn note_hit(phase: Phase) {
+    if enabled() {
+        HITS[phase.index()].fetch_add(1, Relaxed);
+    }
+}
+
 pub fn note_bytes(phase: Phase, n: usize) {
     BYTES[phase.index()].fetch_add(n as u64, Relaxed);
 }

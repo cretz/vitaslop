@@ -14,7 +14,7 @@ until a chosen display frame with `VITASLOP_ARM_AT_FRAME`, which is what
 makes a first-hit watchpoint usable deep inside a game instead of firing
 during boot.
 
-230 knobs.
+231 knobs.
 
 | knob | read in | what it does |
 |---|---|---|
@@ -27,8 +27,8 @@ during boot.
 | `VITASLOP_BLOCK_HIST_SEQ` | vitaslop-native/src/threaded.rs:1576 | Print the block-visit histogram gathered under `VITASLOP_BLOCK_HIST`: the `top` |
 | `VITASLOP_BROWSER_FASTFORWARD` | vitaslop-web/src/lib.rs:1009 | Frame to fast-forward the live loop to (`VITASLOP_BROWSER_FASTFORWARD`), unpaced. |
 | `VITASLOP_BROWSER_FUEL` | vitaslop-web/src/browser_sched.rs:641 | Guest work a thread may execute before the browser preempts it, in WASMTIME FUEL UNITS |
-| `VITASLOP_BROWSER_HEARTBEAT_MS` | vitaslop-web/src/lib.rs:2613 | - |
-| `VITASLOP_BROWSER_INSTANCE_POOL` | vitaslop-web/src/browser_sched.rs:1050 | Whether a finished thread's module instance may be REUSED by the next thread |
+| `VITASLOP_BROWSER_HEARTBEAT_MS` | vitaslop-web/src/lib.rs:2706 | - |
+| `VITASLOP_BROWSER_INSTANCE_POOL` | vitaslop-web/src/browser_sched.rs:1209 | Whether a finished thread's module instance may be REUSED by the next thread |
 | `VITASLOP_BROWSER_QUANTUM_CALLS` | vitaslop-web/src/browser_sched.rs:105 | Host calls one guest thread may make before the browser preempts it |
 | `VITASLOP_BROWSER_SUPERSAMPLE` | vitaslop-web/src/lib.rs:986 | Supersample factor for the live browser render (`VITASLOP_BROWSER_SUPERSAMPLE`). |
 | `VITASLOP_CALLSITES_WINDOW` | vitaslop-desktop/src/retail.rs:938 | - |
@@ -40,10 +40,10 @@ during boot.
 | `VITASLOP_CODE_RANGE` | vitaslop-runtime/src/vita/mod.rs:385 | The guest code range scanned for the game-level caller in [`dispatch`] (env |
 | `VITASLOP_CPU_SHARE` | vitaslop-native/src/recipe_runner.rs:104 | Who actually got the CPU over the run, when `VITASLOP_CPU_SHARE` is set - see |
 | `VITASLOP_DBG_CALLSITES` | vitaslop-runtime/src/vita/mod.rs:350 | Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls |
-| `VITASLOP_DEBUG_CAPTURE` | vitaslop-web/src/lib.rs:2661 | - |
+| `VITASLOP_DEBUG_CAPTURE` | vitaslop-web/src/lib.rs:2754 | - |
 | `VITASLOP_DECODE_CACHE_MB` | vitaslop-runtime/src/render.rs:5206 | Budget for the decode cache, in BYTES of decoded RGBA8, before it is cleared wholesale. |
 | `VITASLOP_DIRTY_PAGES` | vitaslop-native/src/threaded.rs:128 | Linear-memory offset of the guest-store dirty block, when this build was |
-| `VITASLOP_DISPATCH_ALL` | vitaslop-transpiler/src/emit.rs:1205 | The ablation arm that prices a dispatch re-entry: `VITASLOP_DISPATCH_ALL=1` sends even a |
+| `VITASLOP_DISPATCH_ALL` | vitaslop-transpiler/src/emit.rs:1220 | The ablation arm that prices a dispatch re-entry: `VITASLOP_DISPATCH_ALL=1` sends even a |
 | `VITASLOP_DRAW_ONLY` | vitaslop-runtime/src/render.rs:4131 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
 | `VITASLOP_DRAW_STATS` | vitaslop-runtime/src/render.rs:4120 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
 | `VITASLOP_DRV_KEY` | vitaslop-runtime/src/ingest/pfscrypt.rs:264 | `F00D(klicensee)` for the title, from `VITASLOP_DRV_KEY` (32 hex chars), or |
@@ -51,13 +51,13 @@ during boot.
 | `VITASLOP_DUMP_DRAW` | vitaslop-native/tests/retail_boot_probe.rs:1292 | - |
 | `VITASLOP_DUMP_DRAWS` | vitaslop-native/tests/retail_boot_probe.rs:1080 | - |
 | `VITASLOP_DUMP_DRAW_GXP` | vitaslop-gxp-shader/tests/oracle.rs:657 | Correlate each captured vertex<->fragment PAIR (from a real draw run) to establish the |
-| `VITASLOP_DUMP_DRAW_GXP_CAP` | vitaslop-runtime/src/host.rs:9924 | - |
-| `VITASLOP_DUMP_DRAW_GXP_FULL` | vitaslop-runtime/src/host.rs:10025 | - |
+| `VITASLOP_DUMP_DRAW_GXP_CAP` | vitaslop-runtime/src/host.rs:10332 | - |
+| `VITASLOP_DUMP_DRAW_GXP_FULL` | vitaslop-runtime/src/host.rs:10433 | - |
 | `VITASLOP_DUMP_EXPORTS` | vitaslop-runtime/src/link.rs:414 | - |
 | `VITASLOP_DUMP_FILES` | vitaslop-runtime/src/ingest/pipeline.rs:829 | Diagnostic: decrypt the container and write named plaintext files out to |
-| `VITASLOP_DUMP_FPROG` | vitaslop-runtime/src/host.rs:9812 | Diagnostic (VITASLOP_DUMP_FPROG): print the bound fragment program's sampler |
+| `VITASLOP_DUMP_FPROG` | vitaslop-runtime/src/host.rs:10220 | Diagnostic (VITASLOP_DUMP_FPROG): print the bound fragment program's sampler |
 | `VITASLOP_DUMP_FUNC` | vitaslop-native/tests/retail_boot_probe.rs:319 | - |
-| `VITASLOP_DUMP_GXP_BIN` | vitaslop-runtime/src/host.rs:9856 | `VITASLOP_DUMP_GXP_BIN=<dir>`: write the raw `SceGxmProgram` blobs (the whole container - |
+| `VITASLOP_DUMP_GXP_BIN` | vitaslop-runtime/src/host.rs:10264 | `VITASLOP_DUMP_GXP_BIN=<dir>`: write the raw `SceGxmProgram` blobs (the whole container - |
 | `VITASLOP_DUMP_IMAGE` | vitaslop-native/tests/retail_boot_probe.rs:33 | - |
 | `VITASLOP_DUMP_IMPORTS` | vitaslop-native/tests/retail_boot_probe.rs:355 | - |
 | `VITASLOP_DUMP_MAP` | vitaslop-native/tests/retail_boot_probe.rs:591 | - |
@@ -67,20 +67,20 @@ during boot.
 | `VITASLOP_DUMP_REGION_RANGE` | vitaslop-native/tests/retail_boot_probe.rs:531 | - |
 | `VITASLOP_DUMP_RENDERSCENE` | vitaslop-native/tests/retail_boot_probe.rs:1334 | - |
 | `VITASLOP_DUMP_SCENES` | vitaslop-desktop/src/retail.rs:279 | Step the guest one display frame. |
-| `VITASLOP_DUMP_STDOUT` | vitaslop-desktop/src/retail.rs:1160 | - |
+| `VITASLOP_DUMP_STDOUT` | vitaslop-desktop/src/retail.rs:1163 | - |
 | `VITASLOP_DUMP_STUBS` | vitaslop-native/tests/retail_boot_probe.rs:32 | - |
 | `VITASLOP_DUMP_TEX` | vitaslop-native/tests/retail_boot_probe.rs:1234 | - |
-| `VITASLOP_DUMP_TEX_DIR` | vitaslop-runtime/src/host.rs:10031 | - |
-| `VITASLOP_DUMP_TEX_MAX_TEXELS` | vitaslop-runtime/src/host.rs:10040 | - |
+| `VITASLOP_DUMP_TEX_DIR` | vitaslop-runtime/src/host.rs:10439 | - |
+| `VITASLOP_DUMP_TEX_MAX_TEXELS` | vitaslop-runtime/src/host.rs:10448 | - |
 | `VITASLOP_DUMP_TRIS` | vitaslop-runtime/src/render.rs:4138 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
-| `VITASLOP_DUMP_VPROG` | vitaslop-runtime/src/host.rs:9619 | Diagnostic (VITASLOP_DUMP_VPROG): reflect the bound vertex program's parameter |
+| `VITASLOP_DUMP_VPROG` | vitaslop-runtime/src/host.rs:10027 | Diagnostic (VITASLOP_DUMP_VPROG): reflect the bound vertex program's parameter |
 | `VITASLOP_FIND_WORD` | vitaslop-native/tests/retail_boot_probe.rs:63 | The span `VITASLOP_FIND_WORD` searches: from the image base up through the guest heap. |
-| `VITASLOP_FLAGS_WIDE_C` | vitaslop-transpiler/src/emit.rs:1178 | The A/B arm for [`emit_flags_add`]'s carry and overflow forms: `VITASLOP_FLAGS_WIDE_C=1` |
-| `VITASLOP_FLAG_POISON` | vitaslop-transpiler/src/emit.rs:1136 | `VITASLOP_FLAG_POISON=0/1` - the FALSIFIER for the flag-liveness pass |
+| `VITASLOP_FLAGS_WIDE_C` | vitaslop-transpiler/src/emit.rs:1193 | The A/B arm for [`emit_flags_add`]'s carry and overflow forms: `VITASLOP_FLAGS_WIDE_C=1` |
+| `VITASLOP_FLAG_POISON` | vitaslop-transpiler/src/emit.rs:1151 | `VITASLOP_FLAG_POISON=0/1` - the FALSIFIER for the flag-liveness pass |
 | `VITASLOP_FORCE_READY` | vitaslop-native/tests/retail_boot_probe.rs:738 | - |
 | `VITASLOP_FORCE_READY_V2` | vitaslop-native/tests/retail_boot_probe.rs:761 | - |
-| `VITASLOP_FORCE_RET` | vitaslop-transpiler/src/emit.rs:1455 | Diagnostic forced return. |
-| `VITASLOP_FRAME_TOPUP` | vitaslop-runtime/src/host.rs:3478 | The per-flip top-up ([`VitaState::advance_time_frame`]), off under |
+| `VITASLOP_FORCE_RET` | vitaslop-transpiler/src/emit.rs:1487 | Diagnostic forced return. |
+| `VITASLOP_FRAME_TOPUP` | vitaslop-runtime/src/host.rs:3652 | The per-flip top-up ([`VitaState::advance_time_frame`]), off under |
 | `VITASLOP_FUEL` | vitaslop-native/src/threaded.rs:147 | This thread's SOFTWARE fuel counter (`abi::FUEL_EXPORT`), present only when the |
 | `VITASLOP_GAME_DIR` | vitaslop-runtime/src/ingest/mod.rs:138 | Test-fixture access. |
 | `VITASLOP_GAME_ID` | vitaslop-gamerun-recipes/tests/conformance.rs:30 | - |
@@ -91,11 +91,11 @@ during boot.
 | `VITASLOP_GESTURE_TYPE_MASK` | vitaslop-runtime/src/vita/gesture.rs:308 | Recognizer types allowed to report events (`VITASLOP_GESTURE_TYPE_MASK`, a bitmask |
 | `VITASLOP_GPU` | vitaslop-native/tests/retail_boot_probe.rs:1398 | - |
 | `VITASLOP_GPU_CHAIN_DIR` | vitaslop-native/src/wgpu_render.rs:420 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
-| `VITASLOP_GUARD_REG` | vitaslop-transpiler/src/emit.rs:1348 | Diagnostic callee-saved-register guard. |
-| `VITASLOP_GUEST_CORES` | vitaslop-runtime/src/host.rs:11715 | CPU cores a Vita gives a GAME. |
+| `VITASLOP_GUARD_REG` | vitaslop-transpiler/src/emit.rs:1380 | Diagnostic callee-saved-register guard. |
+| `VITASLOP_GUEST_CORES` | vitaslop-runtime/src/host.rs:12202 | CPU cores a Vita gives a GAME. |
 | `VITASLOP_GXM_DEPTH_ENC` | vitaslop-platform/src/gpu.rs:2000 | Which value a later pass reads out of a render target's depth |
 | `VITASLOP_GXM_NO_MULTISAMPLE` | vitaslop-platform/src/gpu.rs:3564 | A/B instrument: force every pass to ONE sample, whatever the guest asked for. |
-| `VITASLOP_GXM_UNIFORM_POISON` | vitaslop-runtime/src/host.rs:10442 | Diagnostic (`VITASLOP_GXM_UNIFORM_POISON=1`): fill a freshly reserved default uniform buffer |
+| `VITASLOP_GXM_UNIFORM_POISON` | vitaslop-runtime/src/host.rs:10850 | Diagnostic (`VITASLOP_GXM_UNIFORM_POISON=1`): fill a freshly reserved default uniform buffer |
 | `VITASLOP_GXP_ALLOW_FIXED_FUNCTION` | vitaslop-platform/src/gpu.rs:7924 | Whether a shader pair the recompiler cannot translate may be drawn by the |
 | `VITASLOP_GXP_ATTR_FILL` | vitaslop-platform/src/gpu.rs:6899 | Repack a guest vertex stream into the tightly-packed `Float32xN` layout the recompiled |
 | `VITASLOP_GXP_BLOB` | vitaslop-gxp-shader/tests/corpus.rs:655 | Print one named blob's recompiled WGSL body and its container reflection. |
@@ -124,10 +124,10 @@ during boot.
 | `VITASLOP_GXP_PAIR` | vitaslop-gxp-shader/tests/corpus.rs:789 | Link one named (vertex, fragment) pair and print the COMPLETE WGSL module both stages become. |
 | `VITASLOP_GXP_PAIRS` | vitaslop-gxp-shader/tests/corpus.rs:2098 | >>> THE REFUTATION ABOVE WAS MEASURED OVER THE WRONG POPULATION. |
 | `VITASLOP_GXP_PRECOMPILE` | vitaslop-platform/src/gpu.rs:390 | Whether a shader pair the guest's patcher names is compiled AHEAD of the draw that binds it |
-| `VITASLOP_GXP_PRECOMPILE_CROSS` | vitaslop-runtime/src/host.rs:9379 | `VITASLOP_GXP_PRECOMPILE_CROSS`: for a title whose `sceGxmShaderPatcherCreateFragmentProgram` |
+| `VITASLOP_GXP_PRECOMPILE_CROSS` | vitaslop-runtime/src/host.rs:9748 | `VITASLOP_GXP_PRECOMPILE_CROSS`: for a title whose `sceGxmShaderPatcherCreateFragmentProgram` |
 | `VITASLOP_GXP_PROBE` | vitaslop-gxp-shader/src/module.rs:275 | The `vec4<f32>` expression that reads the final colour out of register-file array `bank`, |
 | `VITASLOP_GXP_REAL_PAIRS` | vitaslop-gxp-shader/tests/corpus.rs:2096 | >>> THE REFUTATION ABOVE WAS MEASURED OVER THE WRONG POPULATION. |
-| `VITASLOP_GXP_RECOMPILE` | vitaslop-runtime/src/host.rs:10069 | - |
+| `VITASLOP_GXP_RECOMPILE` | vitaslop-runtime/src/host.rs:10477 | - |
 | `VITASLOP_GXP_SA` | vitaslop-platform/src/gpu.rs:6337 | Diagnostic (`VITASLOP_GXP_SA=<key>:<v/f>:<reg>=<hexword>[,...]`): replace a default-uniform |
 | `VITASLOP_GXP_SA_DIRECT` | vitaslop-gxp-shader/src/link.rs:2208 | `0` restores the SA copy loop, `unroll` the constant-subscript copy - see [`resolve_sa_init`]. |
 | `VITASLOP_GXP_SIZE_BANKS` | vitaslop-gxp-shader/src/link.rs:2147 | `VITASLOP_GXP_SIZE_BANKS=0` restores the pre-2026-08-20b emission - every register bank |
@@ -168,7 +168,7 @@ during boot.
 | `VITASLOP_NO_INLINE_STUBS` | vitaslop-runtime/src/vita/mod.rs:152 | `VITASLOP_NO_INLINE_STUBS`: route the constant-return stubs through the host, leaving |
 | `VITASLOP_NO_INLINE_TEXTURE` | vitaslop-runtime/src/vita/mod.rs:300 | `VITASLOP_NO_INLINE_TEXTURE`: route `sceGxmSetFragmentTexture` through the host, |
 | `VITASLOP_NO_INLINE_UNIFORM_DATA` | vitaslop-runtime/src/vita/mod.rs:249 | `VITASLOP_NO_INLINE_UNIFORM_DATA`: route `sceGxmSetUniformDataF` through the host, |
-| `VITASLOP_NO_NGS_MIX` | vitaslop-runtime/src/vita/audio.rs:143 | `VITASLOP_NO_NGS_MIX`: skip the NGS decode-and-mix entirely, leaving the guest's |
+| `VITASLOP_NO_NGS_MIX` | vitaslop-runtime/src/vita/audio.rs:156 | `VITASLOP_NO_NGS_MIX`: skip the NGS decode-and-mix entirely, leaving the guest's |
 | `VITASLOP_PATCH_STUBS` | vitaslop-native/tests/retail_boot_probe.rs:468 | - |
 | `VITASLOP_PEEK` | vitaslop-desktop/src/retail.rs:381 | Guest memory at `addr`, for `VITASLOP_PEEK`. |
 | `VITASLOP_PERF` | vitaslop-native/src/perf.rs:43 | Is perf accounting on (`VITASLOP_PERF` set)? Read once and cached. |
@@ -180,10 +180,10 @@ during boot.
 | `VITASLOP_PREPARE_SPLIT` | vitaslop-platform/src/gpu.rs:3106 | Where the milliseconds INSIDE one `prepare` go, plus the bytes each phase moved. |
 | `VITASLOP_PREPOKE` | vitaslop-native/tests/retail_boot_probe.rs:491 | - |
 | `VITASLOP_PRESENT_PROBE` | vitaslop-web/src/lib.rs:490 | Reads back WHAT WE PRESENTED, when `VITASLOP_PRESENT_PROBE` asks for it. |
-| `VITASLOP_PROMOTE_POISON` | vitaslop-transpiler/src/emit.rs:2346 | `VITASLOP_PROMOTE_POISON=<n>` - the FALSIFIER for register promotion. |
+| `VITASLOP_PROMOTE_POISON` | vitaslop-transpiler/src/emit.rs:2388 | `VITASLOP_PROMOTE_POISON=<n>` - the FALSIFIER for register promotion. |
 | `VITASLOP_PROMOTE_REGS` | vitaslop-native/src/threaded.rs:2180 | A concise trap description (kind + message), matching the sync `Vm`'s detail. |
 | `VITASLOP_PVRTC_DECODE` | vitaslop-runtime/src/render.rs:5222 | Whether PVRTC decodes a whole face at a time (the default) or one texel at a time. |
-| `VITASLOP_QUANTUM_CPU_US` | vitaslop-runtime/src/host.rs:11670 | Game-clock time charged for one [`QUANTUM_ARM`] of guest execution, in microseconds. |
+| `VITASLOP_QUANTUM_CPU_US` | vitaslop-runtime/src/host.rs:12157 | Game-clock time charged for one [`QUANTUM_ARM`] of guest execution, in microseconds. |
 | `VITASLOP_QUANTUM_FUEL` | vitaslop-native/tests/retail_boot_probe.rs:427 | - |
 | `VITASLOP_REGTRACE` | vitaslop-native/src/threaded.rs:1310 | `VITASLOP_REGTRACE=<lo>-<hi>:<path>` - append the reg+flag file per block entry in |
 | `VITASLOP_REGTRACE_MAX` | vitaslop-native/src/threaded.rs:1470 | `VITASLOP_REGTRACE_MAX=<n>` caps the register trace at `n` lines (0 = unbounded). |
@@ -202,10 +202,10 @@ during boot.
 | `VITASLOP_SHOT_LAST` | vitaslop-native/tests/retail_boot_probe.rs:446 | - |
 | `VITASLOP_SIGNATURE` | vitaslop-native/src/recipe_runner.rs:94 | The determinism signature over the observable output (render stream + egress), |
 | `VITASLOP_SNAPSHOT` | vitaslop-native/src/threaded.rs:1296 | `VITASLOP_SNAPSHOT=<hexpc>:<path>` - dump full state on first entry to block `hexpc`. |
-| `VITASLOP_SNAPSHOT_BUDGET_MB` | vitaslop-runtime/src/host.rs:2285 | Byte budget for retained texture snapshots. |
+| `VITASLOP_SNAPSHOT_BUDGET_MB` | vitaslop-runtime/src/host.rs:2340 | Byte budget for retained texture snapshots. |
 | `VITASLOP_SNAPSHOT_DENSE` | vitaslop-native/src/threaded.rs:1406 | Dump the full guest state (all non-zero pages + r0..r15 + NZCV) to `path`, in the |
 | `VITASLOP_SNAPSHOT_SKIP` | vitaslop-native/src/threaded.rs:1358 | `VITASLOP_SNAPSHOT_SKIP=<n>` - skip the first `n` entries to the snapshot block before |
-| `VITASLOP_SOFTWARE` | vitaslop-desktop/src/retail.rs:1210 | - |
+| `VITASLOP_SOFTWARE` | vitaslop-desktop/src/retail.rs:1213 | - |
 | `VITASLOP_SSAA` | vitaslop-platform/src/gpu.rs:9181 | Set the supersample factor: 1 (default) renders the scene straight into the caller's |
 | `VITASLOP_STALL_CHUNK` | vitaslop-native/tests/retail_boot_probe.rs:545 | - |
 | `VITASLOP_STALL_WAKE` | vitaslop-native/tests/retail_boot_probe.rs:544 | - |
@@ -215,36 +215,37 @@ during boot.
 | `VITASLOP_SW_CHAIN` | vitaslop-native/src/wgpu_render.rs:423 | `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just |
 | `VITASLOP_SW_CHAIN_DIR` | vitaslop-runtime/src/render.rs:3933 | - |
 | `VITASLOP_SW_POST` | vitaslop-runtime/src/render.rs:3980 | - |
-| `VITASLOP_TEXTURE_CHECK` | vitaslop-runtime/src/host.rs:2209 | How a retained texture snapshot is re-validated (`VITASLOP_TEXTURE_CHECK`): `scene` |
+| `VITASLOP_TEXTURE_CHECK` | vitaslop-runtime/src/host.rs:2264 | How a retained texture snapshot is re-validated (`VITASLOP_TEXTURE_CHECK`): `scene` |
 | `VITASLOP_TEX_CACHE_MB` | vitaslop-platform/src/gpu.rs:353 | The texture-cache budget in bytes: [`GAME_RESIDENT_CEILING_MB`] unless |
 | `VITASLOP_TEX_COMPRESS` | vitaslop-runtime/src/render.rs:1007 | Whether compressed textures reach the GPU compressed at all. |
-| `VITASLOP_TEX_MEMO_PER_SCENE` | vitaslop-runtime/src/host.rs:2048 | A whole DRAW's worth of snapshotted textures, by the bindings that produced it - kept |
+| `VITASLOP_TEX_MEMO_PER_SCENE` | vitaslop-runtime/src/host.rs:2050 | A whole DRAW's worth of snapshotted textures, by the bindings that produced it - kept |
 | `VITASLOP_TRACE_BLOCKS` | vitaslop-native/src/threaded.rs:1222 | `VITASLOP_TRACE_FRAMES=<from>-<to>` (decimal display frames, inclusive) - print the |
 | `VITASLOP_TRACE_EXIT` | vitaslop-native/tests/retail_boot_probe.rs:37 | - |
 | `VITASLOP_TRACE_FILE` | vitaslop-runtime/src/vita/libkernel.rs:47 | Diagnostic (`RUST_LOG=vitaslop::exit=debug`): when the guest calls |
 | `VITASLOP_TRACE_FRAMES` | vitaslop-native/src/threaded.rs:1219 | `VITASLOP_TRACE_FRAMES=<from>-<to>` (decimal display frames, inclusive) - print the |
 | `VITASLOP_TRACE_FUNCS` | vitaslop-native/src/threaded.rs:1142 | Bind `env.svc`. |
-| `VITASLOP_TRACE_INDIRECT` | vitaslop-transpiler/src/emit.rs:1392 | Diagnostic indirect-call tracer. |
+| `VITASLOP_TRACE_INDIRECT` | vitaslop-transpiler/src/emit.rs:1424 | Diagnostic indirect-call tracer. |
 | `VITASLOP_TRACE_IO` | vitaslop-native/tests/retail_boot_probe.rs:34 | - |
 | `VITASLOP_TRACE_ORDER` | vitaslop-runtime/src/vita/mod.rs:419 | Ordered-timeline trace (env `VITASLOP_TRACE_ORDER`): print every *meaningful* |
 | `VITASLOP_TRACK_PC` | vitaslop-transpiler/src/abi.rs:192 | Exported name of the diagnostic guest-PC tracker global. |
 | `VITASLOP_TRANSPILE_REPORT` | vitaslop-native/tests/retail_boot_probe.rs:30 | - |
-| `VITASLOP_TRAP_HALT` | vitaslop-transpiler/src/emit.rs:1481 | When `VITASLOP_TRAP_HALT` is set, a `Term::Halt` (a block that ran off the end of decoded |
+| `VITASLOP_TRAP_HALT` | vitaslop-transpiler/src/emit.rs:1513 | When `VITASLOP_TRAP_HALT` is set, a `Term::Halt` (a block that ran off the end of decoded |
 | `VITASLOP_UNIFORM_WATCH` | vitaslop-runtime/src/vita/gxm.rs:1673 | `VITASLOP_UNIFORM_WATCH=<hex address>/<parameter name substring>[,...]`: report every |
 | `VITASLOP_UV_DEBUG` | vitaslop-runtime/src/render.rs:4126 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
+| `VITASLOP_VBLANK_PARK` | vitaslop-runtime/src/vita/display.rs:144 | Whether an inlined `sceDisplayGetVcount` carries the spin guard (`VITASLOP_VBLANK_PARK`, |
 | `VITASLOP_WASM_INDICES` | vitaslop-native/src/threaded.rs:2234 | Rewrite `<wasm function N>` in a trap backtrace to name the GUEST function it is. |
 | `VITASLOP_WASM_NAMES` | vitaslop-transpiler/src/emit.rs:1006 | When `VITASLOP_WASM_NAMES` is set, emit a wasm `name` custom section labelling |
-| `VITASLOP_WATCH_` | vitaslop-transpiler/src/emit.rs:1304 | Number of matching store-watchpoint hits to skip before trapping (`VITASLOP_WATCH_ |
+| `VITASLOP_WATCH_` | vitaslop-transpiler/src/emit.rs:1336 | Number of matching store-watchpoint hits to skip before trapping (`VITASLOP_WATCH_ |
 | `VITASLOP_WATCH_FROM` | vitaslop-native/tests/retail_boot_probe.rs:674 | - |
 | `VITASLOP_WATCH_MEM` | vitaslop-native/tests/retail_boot_probe.rs:141 | Parse `VITASLOP_WATCH_MEM=addr:type:label,addr:type:label,...` into watches. |
 | `VITASLOP_WATCH_READ` | vitaslop-transpiler/src/emit.rs:978 | Diagnostic read watchpoint. |
-| `VITASLOP_WATCH_READ_` | vitaslop-transpiler/src/emit.rs:1330 | Optional guest-PC EXCLUDE window for the read watchpoint (`VITASLOP_WATCH_READ_ |
-| `VITASLOP_WATCH_READ_NZ` | vitaslop-transpiler/src/emit.rs:2694 | Emit the read-watchpoint trap check. |
-| `VITASLOP_WATCH_READ_PC_EXCL` | vitaslop-transpiler/src/emit.rs:1340 | Optional guest-PC EXCLUDE window for the read watchpoint (`VITASLOP_WATCH_READ_ |
-| `VITASLOP_WATCH_READ_SKIP` | vitaslop-transpiler/src/emit.rs:1061 | WASM global index of the read-watchpoint match counter, appended after the guest-PC |
+| `VITASLOP_WATCH_READ_` | vitaslop-transpiler/src/emit.rs:1362 | Optional guest-PC EXCLUDE window for the read watchpoint (`VITASLOP_WATCH_READ_ |
+| `VITASLOP_WATCH_READ_NZ` | vitaslop-transpiler/src/emit.rs:2736 | Emit the read-watchpoint trap check. |
+| `VITASLOP_WATCH_READ_PC_EXCL` | vitaslop-transpiler/src/emit.rs:1372 | Optional guest-PC EXCLUDE window for the read watchpoint (`VITASLOP_WATCH_READ_ |
+| `VITASLOP_WATCH_READ_SKIP` | vitaslop-transpiler/src/emit.rs:1076 | WASM global index of the read-watchpoint match counter, appended after the guest-PC |
 | `VITASLOP_WATCH_STORE` | vitaslop-native/src/threaded.rs:1331 | `VITASLOP_REGTRACE_WATCH=<hex guest addr>[,<hex guest addr>...]` - append the WORD |
-| `VITASLOP_WATCH_STORE_ARM` | vitaslop-transpiler/src/emit.rs:1503 | Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`): |
-| `VITASLOP_WATCH_STORE_LOG` | vitaslop-runtime/src/capture.rs:459 | GUEST ADDRESS the bytes above were read from, or 0 when there is no bound buffer. |
-| `VITASLOP_WATCH_STORE_MODE` | vitaslop-transpiler/src/emit.rs:1496 | Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`): |
-| `VITASLOP_WATCH_STORE_NZ` | vitaslop-transpiler/src/emit.rs:1519 | `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing |
+| `VITASLOP_WATCH_STORE_ARM` | vitaslop-transpiler/src/emit.rs:1535 | Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`): |
+| `VITASLOP_WATCH_STORE_LOG` | vitaslop-runtime/src/capture.rs:469 | GUEST ADDRESS the bytes above were read from, or 0 when there is no bound buffer. |
+| `VITASLOP_WATCH_STORE_MODE` | vitaslop-transpiler/src/emit.rs:1528 | Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`): |
+| `VITASLOP_WATCH_STORE_NZ` | vitaslop-transpiler/src/emit.rs:1551 | `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing |
 | `VITASLOP_WATCH_STORE_SKIP` | vitaslop-transpiler/src/emit.rs:529 | Linear-memory byte offset of the store-watchpoint MATCH COUNTER, or 0 when this |

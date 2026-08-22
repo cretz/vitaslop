@@ -70,13 +70,18 @@ fn build_code() -> Vec<u8> {
 /// says - the runtime's own tests already hold the handler and `eval` together - but
 /// WHETHER the boundary was crossed at all.
 fn host_import(
-    _selector: u32,
+    selector: u32,
     regs: &mut [u32; REG_COUNT],
     mem: &mut [u8],
     base: u32,
     out: &mut Vec<u8>,
 ) -> SvcOutcome {
     out.push(b'H');
+    // The SELECTOR too, so a test can say WHICH call crossed. The reserved selectors are
+    // not import indices and mean something specific - a fuel yield, a vblank park - and a
+    // test that only knew "the host was reached" could not tell one of those apart from the
+    // ordinary fallback it is supposed to be distinguishing itself from.
+    out.extend_from_slice(&selector.to_le_bytes());
     let off = (HANDLER_ANSWER - base) as usize;
     regs[0] = u32::from_le_bytes(mem[off..off + 4].try_into().expect("4 bytes"));
     SvcOutcome::Continue
@@ -137,6 +142,61 @@ fn write_mirror(vm: &mut Vm, words: &[u32]) {
 fn run(vm: &mut Vm) -> bool {
     vm.call(ENTRY).expect("the guest returns");
     !vm.output().is_empty()
+}
+
+/// The selectors the guest crossed with, in order.
+fn selectors(vm: &Vm) -> Vec<u32> {
+    vm.output()
+        .chunks(5)
+        .filter(|c| c.len() == 5 && c[0] == b'H')
+        .map(|c| u32::from_le_bytes(c[1..5].try_into().expect("4 bytes")))
+        .collect()
+}
+
+/// The vblank SPIN GUARD, both arms.
+///
+/// The guard is a countdown in the mirror block: the read hands back the same word a bare
+/// [`InlineOp::LoadMirror`] would, and only when the budget reaches zero does it call the
+/// host with [`abi::VBLANK_PARK_SELECTOR`] so the thread can be parked on the vblank it is
+/// waiting for. Both arms are here because each is invisible from the other side: a guard
+/// that never fires leaves the spin exactly as it was, and a guard that fires EARLY parks a
+/// thread that had work to do.
+#[test]
+fn the_vblank_guard_does_not_fire_while_the_budget_lasts() {
+    let op = InlineOp::LoadMirrorParking { slot: 0, budget: 1 };
+    let mut vm = vm_with(op);
+    write_mirror(&mut vm, &[0x1234_5678, 5]);
+    let crossed = run(&mut vm);
+    assert!(!crossed, "a read with budget to spare never reaches the host");
+    assert_eq!(vm.get_reg(0), op.eval(0x1234_5678), "the read still answers from the block");
+    let off = vm.mirror_off().expect("a mirror op reserves the block") as u32;
+    let budget = vm.read_mem(BASE + off + 4, 4).expect("the budget word is in memory");
+    assert_eq!(
+        u32::from_le_bytes(budget.try_into().expect("4 bytes")),
+        4,
+        "one read spends exactly one unit of budget"
+    );
+}
+
+#[test]
+fn the_vblank_guard_parks_when_the_budget_runs_out() {
+    let op = InlineOp::LoadMirrorParking { slot: 0, budget: 1 };
+    let mut vm = vm_with(op);
+    // A budget of 1 means THIS read is the one that exhausts it.
+    write_mirror(&mut vm, &[0x1234_5678, 1]);
+    let crossed = run(&mut vm);
+    assert!(crossed, "the read that exhausts the budget must reach the host");
+    assert_eq!(
+        selectors(&vm),
+        vec![abi::VBLANK_PARK_SELECTOR],
+        "and it must arrive as the vblank-park selector, not as the import's own index"
+    );
+    // ORDERING: the park call comes AFTER the read, so this mock - which writes r0 on every
+    // crossing - is what r0 ends up holding. The real interception returns before it builds
+    // a `GuestCtx` and never touches r0, so the guest resumes holding the counter it read,
+    // takes one more turn of its loop, and sees the new value. What this asserts is that the
+    // guard cannot run BEFORE the read and hand the loop a value from the wrong side of it.
+    assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the park call is emitted after the read");
 }
 
 #[test]

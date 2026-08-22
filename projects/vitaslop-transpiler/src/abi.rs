@@ -321,6 +321,27 @@ pub const RESET_EXPORT: &str = "reset";
 /// mapping depends on. A reserved selector costs neither.
 pub const FUEL_SELECTOR: u32 = u32::MAX;
 
+/// Reserved [`IMPORT_NAME`] selector meaning "this thread is spinning on the vblank
+/// counter - park it until the counter can actually change".
+///
+/// # Why a spin on a mirrored word is a PROVABLE spin
+/// The host-mirror block's contract is that a slot cannot change while guest code is
+/// running (see `vitaslop_runtime::vita::mirror`). So a thread that reads the vblank
+/// counter thousands of times inside ONE resume has read the same value every time and
+/// cannot leave its loop until the scheduler runs - and the scheduler cannot run while
+/// the thread is runnable and spinning. The loop therefore ends only when the clock has
+/// been dragged to the next vblank by the spin's own fuel, which is a real cost paid for
+/// nothing: MEASURED on a retail racer's race in the browser, that one spin is **26% of
+/// all translated guest code**, the largest single guest function in the profile.
+///
+/// Emitted with a countdown so it fires only for a spin: the budget is refreshed by the
+/// same snapshot that refreshes the block, so it counts reads WITHIN ONE RESUME, and a
+/// caller that reads the counter a handful of times per frame never reaches it.
+///
+/// Rides `env.import` for exactly the reasons [`FUEL_SELECTOR`] does - it is the one call
+/// both engines already wrap for suspension, and this one has to be able to BLOCK.
+pub const VBLANK_PARK_SELECTOR: u32 = u32::MAX - 1;
+
 /// Import module every host function/memory comes from.
 pub const IMPORT_MODULE: &str = "env";
 /// Import name of the ARM `svc` host trap: `(i32 imm) -> ()`.

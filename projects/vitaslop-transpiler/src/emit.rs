@@ -1010,10 +1010,25 @@ fn watch_read_nonzero() -> bool {
 /// execution (zero runtime cost), but it grows the module by ~1.5% and adds a small
 /// per-instantiation parse, so it stays off for shipped builds. Cached once; the
 /// module is byte-identical to a normal build when unset.
-fn emit_wasm_names() -> bool {
+///
+/// >>> BROWSER-REACHABLE, because a V8 CPU PROFILE is the honest instrument for the inside
+/// of a frame and it reports a nameless guest function as `wasm-function[8719]`. With the
+/// section on, the same sample reads `g_812e9ac0` and the hot guest function can be
+/// disassembled. Without it the profiler can say a single guest function is 30% of all guest
+/// CPU and not say WHICH.
+pub fn emit_wasm_names() -> bool {
     use std::sync::OnceLock;
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WASM_NAMES").is_ok())
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    WASM_NAMES.with(|c| c.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| std::env::var("VITASLOP_WASM_NAMES").is_ok())
+    })
+}
+
+/// Emit the guest-address name section on this thread, overriding the knob above. See
+/// [`emit_wasm_names`] - the browser has no environment, and the browser is where the
+/// profile is taken.
+pub fn set_wasm_names(on: bool) {
+    WASM_NAMES.with(|c| c.set(Some(on)));
 }
 
 /// When `VITASLOP_TRACK_PC` is set, each basic block writes its own guest start
@@ -1206,10 +1221,27 @@ pub fn set_flags_wide_c(on: bool) {
 /// FALLTHROUGH through the function's `br_table` dispatch loop. See [`emit_term`].
 ///
 /// VALUE-sensitive, like every other arm here.
-fn dispatch_all() -> bool {
+///
+/// >>> IT IS BROWSER-REACHABLE, AND THAT IS THE WHOLE POINT OF IT.
+/// What this arm prices - an indirect branch through a `br_table` - is the one cost no
+/// operator count and no fuel figure can see, and the DESKTOP has already been shown unable
+/// to answer questions of that shape: an 8.7% cut in executed operators moved wasmtime's
+/// wall clock by nothing and the browser by 4.5% ([[vitaslop-operator-count-is-not-browser-time]]).
+/// V8 is the engine whose branch predictor is being asked about, so the arm has to be
+/// selectable where the transpile actually happens - in the browser's throwaway worker,
+/// which has no environment to read.
+pub fn dispatch_all() -> bool {
     use std::sync::OnceLock;
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| matches!(std::env::var("VITASLOP_DISPATCH_ALL").as_deref(), Ok("1")))
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    DISPATCH_ALL.with(|c| c.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| matches!(std::env::var("VITASLOP_DISPATCH_ALL").as_deref(), Ok("1")))
+    })
+}
+
+/// Route even a FALLTHROUGH through the dispatch loop on this thread, overriding the knob
+/// above. See [`dispatch_all`] for why the browser needs its own way to ask.
+pub fn set_dispatch_all(on: bool) {
+    DISPATCH_ALL.with(|c| c.set(Some(on)));
 }
 
 /// Store the poison value into `flag`, if this build is a falsifier build. Untolled, so
@@ -1547,7 +1579,13 @@ const L_GE: u32 = 5;
 /// inert and the engine drops it, and making the declaration conditional would make
 /// every index after it depend on a knob.
 const L_DIRTY: u32 = 6;
-const L_I32_COUNT: u32 = 7;
+/// The decremented vblank-spin budget, held between the store that writes it back and the
+/// test that reads it ([`crate::InlineOp::LoadMirrorParking`]). Its own local rather than
+/// one of the `L_T*` scratches for the same reason [`L_DIRTY`] is: those are live inside a
+/// single instruction's lowering, and nothing here should have to reason about which
+/// instruction an inlined import happens to sit next to.
+const L_PARK: u32 = 7;
+const L_I32_COUNT: u32 = 8;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
@@ -2316,6 +2354,10 @@ thread_local! {
     static PROMOTE_REGS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of the flag carry/overflow forms - see [`set_flags_wide_c`].
     static FLAGS_WIDE_C: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of the dispatch ablation - see [`set_dispatch_all`].
+    static DISPATCH_ALL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of the guest-address name section - see [`set_wasm_names`].
+    static WASM_NAMES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VITASLOP_PROMOTE_REGS=1` - hold the ARM register file in wasm LOCALS along each
@@ -5488,6 +5530,10 @@ enum InlineLowering {
     RetConst { value: u32 },
     /// Emit nothing at all, r0 included - see [`crate::InlineOp::Nop`].
     Nop,
+    /// Read the host-mirror word at `off` into r0, decrement the countdown word at
+    /// `budget_off`, and park the thread when it reaches zero - see
+    /// [`crate::InlineOp::LoadMirrorParking`].
+    MirrorParking { off: u64, budget_off: u64 },
     /// Read the 64-bit host-mirror value at this offset into r0/r1. No guard, same
     /// reason as [`InlineLowering::Mirror`].
     MirrorPair { off: u64 },
@@ -5609,6 +5655,13 @@ impl InlineImports {
                 // a condition to paper over with a host call.
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
                 Some(InlineLowering::Mirror { off: base + slot as u64 * 4 })
+            }
+            crate::InlineOp::LoadMirrorParking { slot, budget } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                Some(InlineLowering::MirrorParking {
+                    off: base + slot as u64 * 4,
+                    budget_off: base + budget as u64 * 4,
+                })
             }
             crate::InlineOp::LoadMirrorPair { slot } => {
                 let base = self.mirror_off.expect("mirror op emitted with no mirror block");
@@ -5864,6 +5917,40 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             // A void handler that observably does nothing: the call becomes no code at all,
             // and r0 keeps the argument it was passed - which is exactly what the dispatcher
             // left there.
+            return;
+        }
+        Some(InlineLowering::MirrorParking { off, budget_off }) => {
+            // The READ is the same three operators as `Mirror`, and they stay TOLLED: the
+            // guest really did execute this call, and the clock is charged for it exactly
+            // as before.
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: off, align: 0, memory_index: 0 }));
+            f.instruction(&W::GlobalSet(abi::reg_global(0)));
+            // The GUARD is untolled - it is the host's bookkeeping, not the guest's work,
+            // and a tolled guard would move the fuel counter and with it the very schedule
+            // the guard exists to correct.
+            //
+            //   if (--budget == 0) { park; }
+            //
+            // The budget word is refreshed by the same snapshot that refreshes the block,
+            // once per resume, so this counts reads SINCE THIS THREAD WAS SCHEDULED. The
+            // host resets it again when it parks, so a thread that is picked again without
+            // a fresh snapshot cannot fall straight back through the guard.
+            let mark = f.unbilled_mark();
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Const(0));
+            f.untolled(&W::I32Load(MemArg { offset: budget_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::I32Const(1));
+            f.untolled(&W::I32Sub);
+            f.untolled(&W::LocalTee(L_PARK));
+            f.untolled(&W::I32Store(MemArg { offset: budget_off, align: 0, memory_index: 0 }));
+            f.untolled(&W::LocalGet(L_PARK));
+            f.untolled(&W::I32Eqz);
+            f.untolled(&W::If(BlockType::Empty));
+            f.untolled(&W::I32Const(abi::VBLANK_PARK_SELECTOR as i32));
+            f.untolled(&W::Call(IMPORT_FUNC));
+            f.untolled(&W::End);
+            f.charge_unbilled_work(mark);
             return;
         }
         Some(InlineLowering::Mirror { off }) => {

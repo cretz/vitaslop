@@ -163,7 +163,7 @@ fn doc_at(lines: &[&str], at: usize) -> (String, String) {
 }
 
 /// Every `.rs` file under `root`, excluding build output.
-fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -275,25 +275,47 @@ mod tests {
         const EXEMPT: &[(&str, &str)] = &[];
         let root = workspace_root();
         let mut missing = Vec::new();
-        for k in scan_sources(&root) {
-            if OVERRIDABLE.contains(&k.name.as_str())
-                || EXEMPT.iter().any(|(n, _)| *n == k.name)
-            {
+        // >>> LOOK AT EVERY LINE OF EVERY SOURCE, NOT AT THE LINE THE INDEX RECORDED.
+        // `scan_sources` keeps ONE site per knob and prefers the best-DOCUMENTED one, which is
+        // usually the doc comment above the read rather than the read itself. Checking only
+        // that line asks "is this doc comment a call?", the answer is no for every well
+        // documented knob, and the check silently passes. That is how `VITASLOP_PERF_CONSOLE`
+        // - read on `vitaslop-web/src/lib.rs:1050`, indexed at its doc comment on 1042 - got
+        // through this test and then panicked the first browser run that set it, which is the
+        // SIXTH instance of the omission this test exists to catch.
+        for path in rust_sources(&root) {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // The override table itself names every routed knob as a bare literal.
+            if rel.ends_with("vitaslop-platform/src/knobs.rs") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(root.join(&k.file)) else { continue };
-            let Some(line) = text.lines().nth(k.line - 1) else { continue };
-            // The READ itself, not a mention: `knobs::var("NAME")` on one line. A doc comment
-            // that merely says the word "knobs" is not a read, which is why this looks for the
-            // call and the name together.
-            let routed = ["knobs::var(", "knobs::flag(", "knobs::var_os("]
-                .iter()
-                .any(|call| line.contains(call))
-                && line.contains(&k.name);
-            if routed {
-                missing.push(format!("{} ({}:{})", k.name, k.file, k.line));
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for (i, line) in text.lines().enumerate() {
+                // The READ itself, not a mention: `knobs::var("NAME")` on one line. A doc
+                // comment that merely says the word "knobs" is not a read, which is why this
+                // looks for the call and the name together.
+                if !["knobs::var(", "knobs::flag(", "knobs::var_os("]
+                    .iter()
+                    .any(|call| line.contains(call))
+                {
+                    continue;
+                }
+                for name in knob_names(line) {
+                    if OVERRIDABLE.contains(&name.as_str())
+                        || EXEMPT.iter().any(|(n, _)| *n == name)
+                    {
+                        continue;
+                    }
+                    missing.push(format!("{name} ({rel}:{})", i + 1));
+                }
             }
         }
+        missing.sort();
+        missing.dedup();
         assert!(
             missing.is_empty(),
             "these knobs are read through vitaslop_platform::knobs but are NOT in OVERRIDABLE, so \

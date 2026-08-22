@@ -64,7 +64,16 @@ pub(super) fn trace_exit(ctx: &mut GuestCtx, st: &VitaState) {
     let lr = ctx.regs[14];
     let sp = ctx.regs[13];
     exit_log!("code={r0:#x} (r0={} signed) lr={lr:#010x} sp={sp:#010x}", r0 as i32);
-    exit_log!("r0..r12: {:08x?}", &ctx.regs[0..13]);
+    // >>> r4..r12 ARE NOT MARSHALLED INTO A HOST CALL, so they are not printed as if they
+    // were. The browser reads only the registers AAPCS lets a host call reach (arguments,
+    // return, sp, lr, pc - see `NARROW_REGS`), and the callee-saved half stays in the guest's
+    // own globals where the call is required to leave it. Printing zeros for them here would
+    // read as a guest that had zeroed its saved registers, which is a different fault
+    // entirely. `r1..r3` are argument lanes and ARE current.
+    exit_log!(
+        "r1..r3: {:08x?} (r4..r12 are not marshalled into a host call and are not shown)",
+        &ctx.regs[1..4]
+    );
     // Print stack words; flag any that fall inside the loaded code image (a plausible
     // return address, Thumb or ARM) so the manual backtrace is quick. The image spans
     // [base, base + ~5 MiB); use a generous 8 MiB window to stay title-agnostic.

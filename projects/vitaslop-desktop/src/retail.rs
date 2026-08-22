@@ -1143,6 +1143,11 @@ pub fn headless_check(
     // dropped unit is why a recompiled shader falls back, and the per-cause reports are
     // deduped so only this says which cause is worth fixing first.
     vitaslop_runtime::host::report_texture_drops();
+    // How many vblank wait loops were parked rather than spun through. Silent when none
+    // were, which is the reading for a title that does not wait that way.
+    vitaslop_runtime::host::report_vblank_spin_parks();
+    // What the NGS mix carried, and how much of it was audible.
+    vitaslop_runtime::vita::at9::report_mix();
     // `VITASLOP_CPU_SHARE=1`: who got the CPU, and how many threads were READY when the
     // scheduler handed the baton on. The second half is what the game clock divides by
     // (the device runs three of them at once), so a clock that looks wrong on a loading
