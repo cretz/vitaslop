@@ -1425,7 +1425,11 @@ pub struct GxpRecompile {
     pub vertex_stride: u32,
     /// Guest vertex attributes: stream byte offset + raw GXM format + component count, keyed
     /// to the recompiler's vertex-input `@location` by `reg_index` (the attribute base lane).
-    pub attributes: Vec<GxpAttr>,
+    /// SHARED, not owned - and the sharing is with the vertex PROGRAM. The list is a pure
+    /// function of the guest's declared attributes, which are fixed when the vertex program is
+    /// created, so building a fresh `Vec` per draw allocated and copied a CONSTANT hundreds of
+    /// times a frame. See `RenderSceneBuilder::gxp_attributes`.
+    pub attributes: std::sync::Arc<[GxpAttr]>,
     /// The draw's index buffer, already expanded to a flat winding-normalized triangle-LIST
     /// of `u32`s. Shared, and CACHED by the builder against the guest index buffer it was
     /// expanded from: the guest's own index bytes do not change from frame to frame for
@@ -1438,12 +1442,19 @@ pub struct GxpRecompile {
     /// GXM primitive type word (drives the pipeline topology).
     pub primitive: u32,
     /// Decoded textures bound per fragment sampler unit.
-    pub textures: Vec<GxpTex>,
+    /// SHARED, not owned, for the same reason [`crate::gpu::GxmDraw`]'s capture-side list is
+    /// (`capture::Draw::textures`): for a fixed set of bindings every draw of a scene produces
+    /// a bitwise identical list, and the capture already hands those draws ONE `Arc`. Deriving
+    /// a fresh `Vec` from it per draw threw that away - **3,782 decode-cache lookups and 672
+    /// allocations a frame** on a retail sports title, to rebuild a list the previous draw had.
+    /// See `RenderSceneBuilder::gxp_textures`.
+    pub textures: std::sync::Arc<[GxpTex]>,
     /// Decoded textures bound per VERTEX sampler unit. Separate list, because the two stages
     /// number their units independently - and a vertex program that samples is building its
     /// geometry from what it reads, so binding the fragment's texture here draws a wrong mesh
     /// rather than shading a surface wrongly.
-    pub vertex_textures: Vec<GxpTex>,
+    /// Shared for the same reason [`Self::textures`] is, and out of the same per-set cache.
+    pub vertex_textures: std::sync::Arc<[GxpTex]>,
     /// Depth write enabled for this draw (GXM `front_depth_write != DISABLED`).
     pub depth_write: bool,
     /// GXM depth-compare function word (`SceGxmDepthFunc`).
@@ -1647,7 +1658,8 @@ pub use render::{CubeRenderer, DEPTH_FORMAT};
 
 #[cfg(feature = "gpu")]
 pub use gxm::{
-    take_encode_work, take_prepare_split, take_sampler_bg_counts, take_sampler_bg_prev,
+    take_encode_work, take_prepare_split, take_sampler_bg_counts, take_sampler_bg_pass,
+    take_sampler_bg_prev,
     wasm_clock_installed,
     EncodePhases, EncodeWork, PrepareSplit,
     GxmRenderer,
@@ -3388,13 +3400,38 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     ///
     /// A count, not a time: the browser has no `Instant` inside `encode`, and "how many GPU
     /// objects did this frame create" is the question either way. See `GxpLive::sampler_bgs`.
-    static SAMPLER_BG: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    /// >>> TWO ATOMICS, NOT A MUTEX. This is on the per-DRAW path - every draw of every
+    /// frame passes through `note_sampler_bg`, several hundred a frame - and a `Mutex` there
+    /// is a lock/unlock pair per draw to move a counter that is only ever added to. The two
+    /// halves are read together by `take_sampler_bg_counts`, which is a report boundary and
+    /// does not need them to be one atomic transaction: a count that lands in the next window
+    /// instead of this one is a rounding error in a diagnostic, where the lock was real work
+    /// on the hottest path in the renderer.
+    static SAMPLER_BG_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SAMPLER_BG_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Draws that took the PREVIOUS draw's group without resolving a single unit - see
     /// `make_sampler_bg`. Separate from the reuse count above, because the two say different
     /// things: that one is "the group already existed", this one is "the work that finds it did
     /// not run either", and only the second is what the fingerprint bought.
     static SAMPLER_BG_PREV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Draws answered from a group THIS PASS already decided, but not by the draw immediately
+    /// before - see `GxpLive::sampler_pre`. Counted apart from `SAMPLER_BG_PREV` because the
+    /// two measure different caches, and the whole reason the second exists is that the first
+    /// was measured to miss two draws in three.
+    static SAMPLER_BG_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Record one draw answered from the pass-wide fingerprint map, and count it as a reuse.
+    pub(crate) fn note_sampler_bg_pass() {
+        SAMPLER_BG_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_sampler_bg(true);
+    }
+
+    /// Take and reset [`SAMPLER_BG_PASS`]. The caller owns the window.
+    pub fn take_sampler_bg_pass() -> u64 {
+        SAMPLER_BG_PASS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
 
     /// Record one draw answered from the previous draw's group, and count it as a reuse too.
     pub(crate) fn note_sampler_bg_prev() {
@@ -3409,13 +3446,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Record one sampler bind group as reused (`hit`) or freshly built.
     pub(crate) fn note_sampler_bg(hit: bool) {
-        let mut g = SAMPLER_BG.lock().unwrap();
-        if hit {
-            g.0 += 1;
-        } else {
-            g.1 += 1;
-        }
-        drop(g);
+        let slot = if hit { &SAMPLER_BG_REUSED } else { &SAMPLER_BG_BUILT };
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Sampler groups are also bind groups, and the encode tally's job is to account for
         // EVERY GPU object the frame creates. Counted in both places on purpose: this pair has
         // its own line because group2 is the one a draw can accidentally make per draw.
@@ -3424,8 +3456,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Take and reset `(reused, built)` sampler bind-group counts.
     pub fn take_sampler_bg_counts() -> (u64, u64) {
-        let mut g = SAMPLER_BG.lock().unwrap();
-        std::mem::take(&mut *g)
+        (
+            SAMPLER_BG_REUSED.swap(0, std::sync::atomic::Ordering::Relaxed),
+            SAMPLER_BG_BUILT.swap(0, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// What one `encode_chain` DID, counted rather than timed.
@@ -3540,6 +3574,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// volume because the two have completely different fixes.
         buffers_created,
         buffer_bytes,
+        /// `queue.write_buffer` CALLS, which is the unit this cost is actually billed in -
+        /// see the write site in `ensure_gxp_arena`. Reported beside the byte count because a
+        /// frame cannot be diagnosed from either alone: 27 MB in three calls and 27 MB in six
+        /// hundred are the same bytes and, measured, nothing like the same milliseconds.
+        buffer_writes,
         /// Buffers explicitly `destroy()`ed (the previous frame's arenas, released at the start
         /// of the next one). Reported beside `buffers_created` on purpose: the two should track
         /// each other in a steady frame, and a persistent gap between them is the signature of
@@ -3766,7 +3805,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                  encodes refused, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
                  passes dropping {:.1} entries, {:.1} superseded in place, {:.2} WHOLESALE clears, {:.1} DESTROYED), bind groups {:.1} built \
                  / {:.1} reused, {:.2} pipelines built, buffers {:.1} created / {:.1} destroyed ({:.2} MB \
-                 written), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
+                 written in {:.1} write_buffer CALLS), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
                  conversions, {:.2} depth-bind-cache clears",
                 per(self.passes),
                 per(self.draw_calls),
@@ -3793,6 +3832,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 per(self.buffers_created),
                 per(self.buffers_destroyed),
                 mb(self.buffer_bytes),
+                per(self.buffer_writes),
                 per(self.rtt_created),
                 per(self.rtt_destroyed),
                 per(self.rtt_snapshots),
@@ -4734,6 +4774,31 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// it - see `make_sampler_bg`. Reset at every pass boundary, because the maps a unit
         /// resolves through (this frame's rendered targets) change there and nowhere else.
         last_sampler_bg: Option<(u64, wgpu::BindGroup)>,
+        /// >>> EVERY GROUP THIS PASS HAS ALREADY DECIDED, BY THE SAME FINGERPRINT
+        /// >>> `last_sampler_bg` MATCHES - `pre` -> the CONTENT key `sel` it resolved to.
+        ///
+        /// `last_sampler_bg` answers only "is this the draw immediately before me", which is
+        /// the wrong shape for a frame that interleaves materials. This catches the rest of the
+        /// repeats within a pass.
+        ///
+        /// >>> IT IS A SMALL WIN AND THE MEASUREMENT SAYS SO. On a retail sports title's
+        /// gameplay frame (browser, real GPU, 672 draws) it answers **32 draws a frame** on top
+        /// of the previous-draw slot's 190, and a CDP profile of the worker could not tell the
+        /// two builds apart. What it also established is worth more than the win: the pass
+        /// carries about **310 DISTINCT sampler fingerprints**, so the resolution loop is not
+        /// where `make_sampler_bg` spends its 10% of the thread - the ~2 TEXTURE UPLOADS a
+        /// frame it performs inside that loop are. Do not re-open the loop on the strength of
+        /// the function's total; look at the upload.
+        ///
+        /// It is sound on exactly the argument the one-slot cache is sound on, and no more:
+        /// everything the resolution consults besides the fingerprint is CONSTANT WITHIN A
+        /// PASS (this frame's rendered colour/depth/cube maps, the snapshot set, `rtt_epoch`),
+        /// and this is cleared at the pass boundary where those are rebuilt. Crucially it
+        /// stores the KEY and not the group, so a `sel` that has gone stale anyway - an
+        /// eviction drops the entry from `sampler_bgs`, which is the same map this then probes
+        /// - MISSES and falls through to the full loop. A wrong answer is not reachable
+        /// through a stale entry; only a wasted probe is.
+        sampler_pre: HashMap<u64, u64>,
         /// The GPU texture transcoder's compute pipelines ([`crate::texenc`]).
         ///
         /// Built on first use rather than in `new`, for the same reason `bc_supported` is asked
@@ -4950,6 +5015,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 depth_retired: Vec::new(),
                 sampler_bgs: HashMap::default(),
                 last_sampler_bg: None,
+                sampler_pre: HashMap::default(),
             }
         }
 
@@ -5398,7 +5464,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             };
             mix(gxp.vertex_stride as u64);
-            for a in &gxp.attributes {
+            for a in gxp.attributes.iter() {
                 mix(a.reg_index as u64);
                 mix(a.offset as u64);
                 mix(a.gxm_format as u64);
@@ -5622,6 +5688,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 resident,
                 sampler_bgs,
                 last_sampler_bg,
+                sampler_pre,
                 ..
             } = self;
             let resident = *resident;
@@ -5866,7 +5933,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 view_cache, view_slots, view_dead, view_cache_bytes, views_used, views_evicted, views_epoch,
                 views_frame_high, views_frame_bytes, samplers_by_mode, *force,
                 rendered, depth_rendered, depth_only, rendered_cubes, rtt_epoch, reads_snapshot,
-                sampler_bgs, last_sampler_bg, bc,
+                sampler_bgs, last_sampler_bg, sampler_pre, bc,
                 texenc.as_ref().expect("built at the top of this function"),
             );
             split_end(t_samp, &PREP.sampler_ns);
@@ -6098,6 +6165,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             sampler_bgs: &mut HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>)>,
             // The previous draw's answer - see `GxpLive::last_sampler_bg`.
             last_sampler_bg: &mut Option<(u64, wgpu::BindGroup)>,
+            // Every answer this PASS has produced, by the same fingerprint - see
+            // `GxpLive::sampler_pre`.
+            sampler_pre: &mut HashMap<u64, u64>,
             // Which block family this device accepts - resolved once per renderer by the caller.
             bc: BlockFamily,
             // The GPU transcoder's pipelines, built once per renderer by the caller.
@@ -6197,6 +6267,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let Some((last, bg)) = last_sampler_bg.as_ref() {
                 if *last == pre {
                     note_sampler_bg_prev();
+                    return Some(bg.clone());
+                }
+            }
+            // ...and, failing that, ANY draw of this pass that decided the same thing. The
+            // stored value is the CONTENT key, so the group still comes out of `sampler_bgs`
+            // and a key that has been invalidated since simply misses. See
+            // `GxpLive::sampler_pre`.
+            if let Some(&known) = sampler_pre.get(&pre) {
+                if let Some((bg, _)) = sampler_bgs.get(&(key, known)) {
+                    note_sampler_bg_pass();
+                    *last_sampler_bg = Some((pre, bg.clone()));
                     return Some(bg.clone());
                 }
             }
@@ -6607,6 +6688,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if let Some((bg, _)) = sampler_bgs.get(&(key, sel)) {
                     note_sampler_bg(true);
                     *last_sampler_bg = Some((pre, bg.clone()));
+                    remember_sampler_pre(sampler_pre, pre, sel);
                     return Some(bg.clone());
                 }
             }
@@ -6657,9 +6739,23 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 sampler_bgs.insert((key, sel), (bg.clone(), named_views));
                 *last_sampler_bg = Some((pre, bg.clone()));
+                remember_sampler_pre(sampler_pre, pre, sel);
             }
             Some(bg)
         }
+    }
+
+    /// Record that fingerprint `pre` resolved to content key `sel`, for the rest of this pass.
+    ///
+    /// Bounded like every other content-addressed cache here, and by the same argument: the
+    /// key is a fingerprint, dropping an entry costs a re-resolution and never an answer. The
+    /// bound is per PASS, and a pass with more distinct materials than this is not a pass this
+    /// cache can help anyway.
+    fn remember_sampler_pre(map: &mut HashMap<u64, u64>, pre: u64, sel: u64) {
+        if map.len() >= SAMPLER_BG_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(pre, sel);
     }
 
     /// What one sampler unit will bind, recorded by `make_sampler_bg`'s resolution loop so
@@ -7575,7 +7671,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // Fall back to the whole stream only when there is no index buffer to narrow it.
         let sample: Vec<usize> = if indexed.is_empty() { (0..nverts).collect() } else { indexed };
         let nverts = sample.len();
-        for a in &gxp.attributes {
+        for a in gxp.attributes.iter() {
             let name = vprogram
                 .parameters
                 .iter()
@@ -7765,7 +7861,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let stride = gxp.vertex_stride.max(1) as usize;
         let nverts = gxp.vertices.len() / stride;
         let mut cols: Vec<String> = Vec::new();
-        for a in &gxp.attributes {
+        for a in gxp.attributes.iter() {
             let comps = a.components.clamp(1, 4) as usize;
             let mut lo = [f32::INFINITY; 4];
             let mut hi = [f32::NEG_INFINITY; 4];
@@ -8789,7 +8885,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         };
         // Which PA lanes an attribute actually supplies (see the default fill below).
         let mut claimed = vec![false; base.pa.len()];
-        for a in &gxp.attributes {
+        for a in gxp.attributes.iter() {
             for c in 0..a.components as usize {
                 if let Some(slot) = claimed.get_mut(a.reg_index as usize + c) {
                     *slot = true;
@@ -8806,7 +8902,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let (mut wlo, mut whi) = (f32::MAX, f32::MIN);
         for v in (0..nverts).step_by(step) {
             let mut regs = base.clone();
-            for a in &gxp.attributes {
+            for a in gxp.attributes.iter() {
                 let vbase = v * stride + a.offset as usize;
                 // All FOUR lanes of the attribute's register, because that is what the pipeline
                 // feeds the real shader: the linked module reads `in.aN.xyzw`, and WebGPU fills
@@ -11484,11 +11580,24 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             *create_ms += t_grow.ms();
             let t_write = Stopwatch::start();
 
-            // One `write_buffer` per arena, over the padded length. An empty arena still gets
-            // its 4 zero bytes: a pass whose every stage declares no uniforms produces one,
-            // and a zero-length buffer is not legal.
+            // One `write_buffer` per NON-EMPTY arena, over the padded length.
+            //
+            // >>> AN EMPTY ARENA IS NOT WRITTEN AT ALL, and that is a call saved rather than
+            // four bytes. `queue.write_buffer` is a crossing into the browser's WebGPU
+            // implementation and its cost is dominated by the CALL, not the payload: the
+            // measured worst frame on a retail golf title's course load is **627 writes,
+            // 27.5 MB, 1,848 ms** - about 3 ms a call, which no byte count explains. A pass
+            // whose draws are all resident-geometry writes no vertices, one with no
+            // SA-resident uniforms writes none, and a frame that opens 209 passes was making
+            // three calls for each of them regardless. Nothing can read what is not written:
+            // a draw addresses an arena only through an offset the same pass produced, so an
+            // empty arena has no reader, and a newly created WebGPU buffer is already zeroed.
             let mut write = |buf: &wgpu::Buffer, data: &[u8], need: u64| {
+                if data.is_empty() {
+                    return;
+                }
                 enc(&ENC.buffer_bytes, need);
+                enc(&ENC.buffer_writes, 1);
                 if data.len() as u64 == need {
                     queue.write_buffer(buf, 0, data);
                 } else {
@@ -13083,6 +13192,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // unit resolves through are rebuilt HERE and nowhere else, so this is the one place
             // the fingerprint could go stale. See `GxpLive::last_sampler_bg`.
             self.gxp.last_sampler_bg = None;
+            self.gxp.sampler_pre.clear();
             // `VITASLOP_CHAIN_DRAWS=1`: describe every draw in this pass that samples a
             // target the frame rendered. A composite that shows none of the world has
             // either no such draw, or one whose blend/space/geometry throws it away, and

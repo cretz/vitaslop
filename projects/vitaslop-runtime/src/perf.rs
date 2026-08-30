@@ -44,6 +44,14 @@ pub enum Phase {
     /// remaining cost is reads that are already being skipped or reads that are not, and
     /// those are different changes. Its `entries` count IS the multi-stream draw count.
     DrawVertexGather,
+    /// Of the gathers above, the ones whose bound streams sat close enough together to be read
+    /// in ONE crossing instead of one per stream - see `TextureSnapshots::gather_span`.
+    ///
+    /// A HIT-ONLY phase, and it exists because the merge is otherwise INVISIBLE: it changes no
+    /// byte count and no output, so a build where it never fires is indistinguishable from one
+    /// where it always does, and the whole point of it is to remove ~800 boundary crossings a
+    /// frame. Its `entries` against `DrawVertexGather`'s is the fraction that merged.
+    DrawVertexGatherMerged,
     /// Snapshotting and decoding the draw's bound textures.
     DrawTextures,
     /// The FRAGMENT stage's miss path alone: `snapshot_bound_textures` for a binding list
@@ -160,7 +168,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    const COUNT: usize = 31;
+    const COUNT: usize = 32;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -168,6 +176,7 @@ impl Phase {
             Phase::DrawIndexScan => 1,
             Phase::DrawVertices => 2,
             Phase::DrawVertexGather => 30,
+            Phase::DrawVertexGatherMerged => 31,
             Phase::DrawTextures => 3,
             Phase::DrawUniforms => 4,
             Phase::SceneFold => 5,
@@ -209,6 +218,7 @@ impl Phase {
             Phase::DrawIndexScan,
             Phase::DrawVertices,
             Phase::DrawVertexGather,
+            Phase::DrawVertexGatherMerged,
             Phase::DrawTextureBind,
             Phase::DrawTexSetPrev,
             Phase::DrawTexBindDecode,
@@ -243,6 +253,7 @@ impl Phase {
             Phase::DrawIndexScan => "draw: scan/rebase indices",
             Phase::DrawVertices => "draw: read+interleave vertices",
             Phase::DrawVertexGather => "draw:   ...of which the MULTI-STREAM gather",
+            Phase::DrawVertexGatherMerged => "draw:     ...of which read in ONE crossing",
             Phase::DrawTextures => "draw: snapshot textures (miss path)",
             Phase::DrawTexFragMiss => "draw:   ...fragment MISS decode",
             Phase::DrawTexRead => "draw:     ...of which get_or_read",

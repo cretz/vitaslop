@@ -565,6 +565,37 @@ struct LivePlayback {
     /// diagnostics window - a probe cadence driven off that one restarts at zero each window,
     /// so it fires on the same relative frame forever and every report is labelled "frame 0".
     presents_total: u64,
+    /// Set by the device-lost callback installed in [`LivePlayback::new`]. `Some` means every
+    /// GPU object this renderer holds is invalid and the run is over - see that callback.
+    lost: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The surface's configuration, kept so a recoverable acquire failure can apply it again.
+    surface_config: wgpu::SurfaceConfiguration,
+    /// Consecutive presents that produced no surface texture. A handful is ordinary (a
+    /// reconfigure takes effect on the next frame, a tab is occluded); a run of them is a
+    /// swapchain that is never coming back, and continuing past it is the black screen this
+    /// whole mechanism exists to refuse.
+    acquire_failures: u32,
+    /// Whether the surface was occluded at the last acquire, so the report fires on the EDGE.
+    occluded: bool,
+}
+
+/// How far a call to [`LivePlayback::present`] got.
+///
+/// >>> IT IS A RETURN VALUE BECAUSE SKIPPING A FRAME AND LOSING THE DEVICE USED TO BE THE
+/// >>> SAME LINE OF CODE. `get_current_texture` was matched as "Success or Suboptimal, else
+/// `return`", which is right for a timeout and catastrophic for the other three: `Outdated`
+/// needs the surface configured again (it never recovers on its own, so the canvas stays
+/// black for the rest of the run), `Lost` needs the same or is fatal, and `Validation` is a
+/// bug in this renderer that nothing would ever have printed.
+#[derive(Debug, PartialEq, Eq)]
+enum PresentOutcome {
+    /// A frame was encoded, submitted and presented.
+    Presented,
+    /// No surface texture this frame, for a reason that legitimately passes: the tab is
+    /// occluded, the acquire timed out, or the surface was just reconfigured. Counted.
+    Skipped,
+    /// The renderer cannot draw again. The run must stop and say this.
+    Fatal(String),
 }
 
 /// Sample every OFFSCREEN TARGET of a frame and describe how bright each one is.
@@ -1556,6 +1587,40 @@ impl LivePlayback {
             })),
         }
 
+        // >>> A LOST DEVICE IS THE END OF THE RUN, AND NOTHING USED TO SAY SO.
+        //
+        // When a WebGPU device is lost every object made from it becomes invalid: the
+        // swapchain stops handing out textures, `get_current_texture` answers `Lost`, and
+        // every draw, buffer write and bind-group build is silently discarded. The emulator
+        // does not notice - the guest keeps executing, the capture keeps recording, the
+        // encoder keeps being fed - so the run continues at full cost, forever, against a
+        // BLACK CANVAS with no error anywhere. A player sees a hang; a log shows a healthy
+        // frame rate. That is the worst shape a failure can have here and it is the one this
+        // had [[vitaslop-fast-fail-no-silent-success]].
+        //
+        // The device is not re-obtained. Recovery would mean rebuilding the renderer and
+        // every GPU object the frame's caches hold (pipelines, views, bind groups, the
+        // resident geometry heap) from a state whose guest side has moved on, and a partial
+        // rebuild renders a wrong picture rather than none - so the honest answer is to stop
+        // and say why, in the copyable fatal box the device reports come out of.
+        let lost: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let sink = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                let text = format!("{reason:?}: {message}");
+                // Kept for `present` to turn into a fatal on the next frame. Reported HERE
+                // too, because the callback can fire while the run is between presents and
+                // the earliest possible word is the point.
+                tracing::error!(target: "vitaslop::gxm", "WebGPU DEVICE LOST - {text}");
+                if let Ok(mut slot) = sink.lock() {
+                    if slot.is_none() {
+                        *slot = Some(text);
+                    }
+                }
+            });
+        }
+
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
         // The GXM decode yields final display-ready (sRGB-encoded) byte values, matching
@@ -1597,20 +1662,22 @@ impl LivePlayback {
         } else {
             wgpu::TextureUsages::RENDER_ATTACHMENT
         };
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: surface_usage,
-                format,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                width: WIDTH,
-                height: HEIGHT,
-                present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode,
-                view_formats,
-                desired_maximum_frame_latency: 2,
-            },
-        );
+        // KEPT, not built inline: `present` has to be able to CONFIGURE THE SURFACE AGAIN
+        // when the browser hands back `Outdated` (the canvas or its compositing changed) or
+        // `Lost` (the swapchain died under a live device). Both are recoverable and both are
+        // permanently black if the frame is merely skipped - see `PresentOutcome`.
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: surface_usage,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: WIDTH,
+            height: HEIGHT,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode,
+            view_formats,
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
         // What the SURFACE actually is, on the page, next to the adapter.
         //
         // Every field here is chosen from what the platform offers, so every one of them can
@@ -1681,6 +1748,10 @@ impl LivePlayback {
             probe,
             last_probe: None,
             presents_total: 0,
+            lost,
+            surface_config,
+            acquire_failures: 0,
+            occluded: false,
         })
     }
 
@@ -1717,8 +1788,21 @@ impl LivePlayback {
     /// panel would put the whole picture in the top-left corner. The canvas is a fixed size
     /// and the surface stretches whatever is rendered into it, so passing the declared size
     /// here IS the hardware's upscale.
-    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) {
+    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) -> PresentOutcome {
         let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
+        // Asked BEFORE any work: once the device is lost, building scenes and encoding a
+        // command buffer is pure cost against a picture that cannot be drawn.
+        if let Some(why) = self.lost.lock().ok().and_then(|s| s.clone()) {
+            return PresentOutcome::Fatal(format!(
+                "THE WebGPU DEVICE WAS LOST and every GPU object built from it is invalid, so \
+                 nothing this run draws from here can reach the screen. The run is over.\n  \
+                 reason: {why}\n  {}\n  Reload the page to start again. If this repeats on the \
+                 same scene it is this renderer's fault, not the browser's: a device is lost \
+                 when a driver faults or the GPU process is reset, and the shader or the \
+                 allocation that did it is in the frame before this one.",
+                self.surface_line
+            ));
+        }
         let t0 = clock(&self.perf);
         // Tell the builder a new frame starts here. Its texture cache needs the boundary to
         // know what is in use right now and how big one frame's working set is; without it the
@@ -1727,9 +1811,74 @@ impl LivePlayback {
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
         let draws: usize = built.iter().map(|b| b.draws.len()).sum();
         let t1 = clock(&self.perf);
+        // >>> EVERY VARIANT IS ANSWERED, AND THREE OF THEM ARE NOT "SKIP THE FRAME".
+        //
+        // `Outdated` and `Lost` do not clear themselves: a surface in either state answers the
+        // same way for every subsequent frame, so a bare skip is a permanently black canvas
+        // that costs a full frame of guest and encode work to produce. Both are recoverable by
+        // configuring the surface again - which is why `surface_config` is kept - and the
+        // recovery is bounded: if a run of presents in a row cannot acquire, the swapchain is
+        // not coming back and continuing is the failure this refuses.
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => return,
+            wgpu::CurrentSurfaceTexture::Success(t) => {
+                self.acquire_failures = 0;
+                self.occluded = false;
+                t
+            }
+            // Acquired, but the texture no longer matches the surface. Render it - a slightly
+            // stale frame beats none - and reconfigure so the next one matches.
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                self.acquire_failures = 0;
+                self.occluded = false;
+                self.surface.configure(&self.device, &self.surface_config);
+                t
+            }
+            // >>> OCCLUDED IS THE ONE ARM THAT NEVER ESCALATES, and that is deliberate: a
+            // backgrounded tab is occluded for as long as the user is looking at something
+            // else, which is minutes, not frames. Counting it toward the give-up limit would
+            // end a healthy run for the crime of being in another tab. It is still reported,
+            // because "the emulator is running full tilt while nothing is on screen" is worth
+            // knowing, and the counter is left alone so a real failure is not masked by it.
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.note_occluded();
+                return PresentOutcome::Skipped;
+            }
+            // A transient that clears on its own - unless it does not, which is a swapchain
+            // that has stopped producing and a black screen for the rest of the run.
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.acquire_failures += 1;
+                if let Some(fatal) = self.acquire_gave_up("Timeout") {
+                    return fatal;
+                }
+                return PresentOutcome::Skipped;
+            }
+            // Recoverable, but only by acting: reconfigure and take the next frame.
+            other @ (wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost) => {
+                self.acquire_failures += 1;
+                if let Some(fatal) = self.acquire_gave_up(&format!("{other:?}")) {
+                    return fatal;
+                }
+                tracing::warn!(
+                    target: "vitaslop::gxm",
+                    "the surface came back {other:?} - configuring it again and skipping this \
+                     frame ({} in a row)",
+                    self.acquire_failures
+                );
+                self.surface.configure(&self.device, &self.surface_config);
+                return PresentOutcome::Skipped;
+            }
+            // A validation error INSIDE the acquire. That is this renderer's own bug (a
+            // surface configured with something the device will not take), it does not clear,
+            // and nothing else would ever print it.
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return PresentOutcome::Fatal(format!(
+                    "THE SURFACE REFUSED TO HAND OUT A TEXTURE with a VALIDATION error, which \
+                     means this renderer configured it with something this device will not \
+                     accept. Nothing can be drawn and the run is over.\n  {}",
+                    self.surface_line
+                ));
+            }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.render_format),
@@ -1846,6 +1995,46 @@ impl LivePlayback {
             self.last_probe = Some(s);
         }
         self.fps.tick();
+        PresentOutcome::Presented
+    }
+
+    /// How many presents in a row may fail to acquire a surface texture before the run is
+    /// declared over.
+    ///
+    /// Sized to be unmistakable rather than tight: a reconfigure takes effect on the next
+    /// frame and a tab can be occluded for as long as the user looks elsewhere, so the bar is
+    /// "this has not worked for several seconds of continuous attempts" - about four seconds
+    /// at the pace this loop runs. Anything that recovers resets the counter to zero, so a
+    /// healthy run can never reach it however long it plays.
+    const ACQUIRE_FAILURE_LIMIT: u32 = 240;
+
+    /// Say that the surface is occluded, once per occlusion rather than once per frame - the
+    /// state lasts as long as the tab is in the background, and a line a frame would be the
+    /// whole log.
+    fn note_occluded(&mut self) {
+        if !self.occluded {
+            self.occluded = true;
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                "the surface is OCCLUDED (the page is not being composited): the emulator is \
+                 still running the guest at full cost and nothing it renders is reaching the \
+                 screen. This clears by itself when the page is visible again."
+            );
+        }
+    }
+
+    /// `Some(fatal)` once the surface has refused for [`Self::ACQUIRE_FAILURE_LIMIT`] presents
+    /// in a row. Split out so both acquire arms escalate on exactly the same rule.
+    fn acquire_gave_up(&self, last: &str) -> Option<PresentOutcome> {
+        (self.acquire_failures >= Self::ACQUIRE_FAILURE_LIMIT).then(|| {
+            PresentOutcome::Fatal(format!(
+                "THE SURFACE HAS NOT PRODUCED A TEXTURE FOR {} PRESENTS IN A ROW (last answer: \
+                 {last}), so nothing this run has rendered since then reached the screen. \
+                 Continuing would keep the emulator at full cost against a black canvas, which \
+                 is indistinguishable from a hang, so the run stops here.\n  {}",
+                self.acquire_failures, self.surface_line
+            ))
+        })
     }
 
     /// The render split accumulated since the last read, and reset. Reported alongside the
@@ -3849,7 +4038,10 @@ async fn live_loop(
                     }
                     if let Some(scene) = &latest {
                         let display = sched.host.lock().unwrap().state.display_size();
-                        playback.present(scene, display);
+                        // The run is already ending on the line below, so this last frame's
+                        // outcome changes nothing - but `present` reports a lost device itself
+                        // before returning, so nothing is swallowed by ignoring it here.
+                        let _ = playback.present(scene, display);
                     }
                     break 'run;
                 }
@@ -3926,7 +4118,27 @@ async fn live_loop(
         if let Some(scene) = latest {
             let r0 = now();
             let display = sched.host.lock().unwrap().state.display_size();
-            playback.present(&scene, display);
+            // >>> A RENDERER THAT CANNOT DRAW ENDS THE RUN HERE.
+            //
+            // The alternative is what this used to do: keep executing the guest, keep
+            // capturing scenes, keep encoding command buffers, at full cost, against a canvas
+            // that will never change again. The fatal text goes to the copyable box a device
+            // report is taken from, because the one thing a black screen cannot do is say why
+            // it is black [[vitaslop-fast-fail-no-silent-success]].
+            if let PresentOutcome::Fatal(why) = playback.present(&scene, display) {
+                crate::logging::report_fatal(&format!(
+                    "RENDERER FAULT at frame {} - the run is over.\n{why}",
+                    sched.core.frames()
+                ));
+                report.emit_final(
+                    "status",
+                    &format!(
+                        "frame {} ENDED - the renderer cannot draw (live via WebGPU)",
+                        sched.core.frames()
+                    ),
+                );
+                break 'run;
+            }
             let r1 = now();
             // Counted from the first present, warmup included, for the same reason the frame
             // total is: what this is read against is `frames_total`, and a ratio whose two
@@ -4348,9 +4560,10 @@ async fn live_loop(
                     &mut diag,
                     "BUILD, window mean",
                     &format!(
-                        "{build_mean} | sampler bind groups {:.1} reused ({:.1} from the previous draw) / {:.1} BUILT",
+                        "{build_mean} | sampler bind groups {:.1} reused ({:.1} from the previous                          draw, {:.1} from earlier in the pass) / {:.1} BUILT",
                         bg_hit as f64 / np,
                         vitaslop_platform::gpu::take_sampler_bg_prev() as f64 / np,
+                        vitaslop_platform::gpu::take_sampler_bg_pass() as f64 / np,
                         bg_new as f64 / np,
                     ),
                 );

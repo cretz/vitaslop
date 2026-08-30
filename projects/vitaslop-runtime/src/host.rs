@@ -356,6 +356,17 @@ impl<'a> GuestCtx<'a> {
         }
     }
 
+    /// Does `addr` fall inside the guest's linear address space at all?
+    ///
+    /// Not "is the whole range readable" - [`Self::read_into`] already clamps and zero-fills
+    /// for that. This answers the one question a caller merging several reads into one has to
+    /// ask: an address BELOW the base maps to nothing, and a merged read starting there would
+    /// hand back zeros where the individual reads would have found data. See
+    /// `TextureSnapshots::gather_into_scratch`.
+    pub fn maps(&self, addr: u32) -> bool {
+        self.offset(addr).is_some()
+    }
+
     /// Read a little-endian u32 at guest address `addr` (0 if out of range).
     pub fn read_u32(&self, addr: u32) -> u32 {
         crate::perf::note_word_read();
@@ -2312,6 +2323,25 @@ struct TextureSnapshots {
     /// vertex rows here before they are interned, so the common case - the same geometry as
     /// last frame - costs no allocation at all. See [`Self::intern_vertices`].
     interleave_scratch: Vec<u8>,
+    /// The scratch ONE bound stream is read into before it is scattered into
+    /// [`Self::interleave_scratch`]. Reused across streams and across draws.
+    ///
+    /// # Why this is not a `read_bytes` per stream
+    /// It was, and on the title this path costs the most on that is **~1,500 fresh heap
+    /// allocations a frame** (671 multi-stream draws, two or three bound streams each) whose
+    /// contents are consumed and dropped a few microseconds later. Worse, `read_bytes`
+    /// allocates a ZEROED buffer and then reads over every byte of it, and the browser's guest
+    /// memory cannot be borrowed ([`GuestMemory::borrow`] is `None` on a `SharedArrayBuffer`),
+    /// so the read is already a full copy across the JS boundary - the memset is a second full
+    /// pass over megabytes a frame to produce bytes that are immediately overwritten.
+    /// A high-water buffer read into with [`GuestCtx::read_into`] pays neither.
+    ///
+    /// >>> AND IT IS BOUNDED, which is not optional here. A pooled buffer that only ever grows
+    /// is how the last render-side arena change went wrong: the wasm heap is SHARED with the
+    /// guest and can never give a page back, so one loading frame's peak stays resident
+    /// forever and tightens allocation for everything, guest included - a cost no allocator
+    /// profile and no pixel oracle can see. See [`GATHER_SCRATCH_CAP`].
+    gather_src: Vec<u8>,
     /// Bytes held by `vertex_entries`, against [`vertex_snapshot_budget`].
     vertex_bytes: usize,
     /// Entries already checked this FRAME. See [`Self::get_or_read`]: a texture that has
@@ -3308,6 +3338,61 @@ impl TextureSnapshots {
         made
     }
 
+    /// The most [`Self::gather_src`] keeps between draws.
+    ///
+    /// A single draw's stream is kilobytes; this is generous by orders of magnitude so a steady
+    /// frame never reallocates, and small enough that a one-off giant read cannot leave
+    /// megabytes pinned in a heap that has no way to return them.
+    const GATHER_SCRATCH_CAP: usize = 1 << 20;
+
+    /// How many bytes the union of a draw's bound streams may exceed their sum by before the
+    /// merged read stops being worth the crossing it saves.
+    ///
+    /// A boundary crossing is on the order of a microsecond; a `Uint8Array.set` moves several
+    /// gigabytes a second, so a microsecond buys a few kilobytes. This is that break-even,
+    /// rounded down - the merge exists to avoid a CALL, not to read a megabyte to save one.
+    const GATHER_SPAN_SLACK: usize = 4096;
+
+    /// The single guest range covering every bound stream of a draw, when reading it whole
+    /// beats reading the streams one at a time. `None` = read them separately.
+    ///
+    /// See the call site in [`Self::gather_into_scratch`] for why this is exactly equivalent
+    /// and what the two guards are for.
+    fn gather_span(
+        &self,
+        ctx: &GuestCtx,
+        streams: &[VertexStreamInfo],
+        bound_streams: &[u32],
+        first_vertex: u32,
+        vertex_count: u32,
+    ) -> Option<(u32, usize)> {
+        let (mut lo, mut hi, mut sum) = (u32::MAX, 0u32, 0usize);
+        let mut live = 0usize;
+        for (si, st) in streams.iter().enumerate() {
+            if st.stride == 0 {
+                continue;
+            }
+            let buf = bound_streams.get(si).copied().unwrap_or(0);
+            let (addr, want) = if st.per_instance {
+                (buf, st.stride as usize)
+            } else {
+                (buf.checked_add(first_vertex.checked_mul(st.stride)?)?, (vertex_count as usize).checked_mul(st.stride as usize)?)
+            };
+            let end = addr.checked_add(u32::try_from(want).ok()?)?;
+            lo = lo.min(addr);
+            hi = hi.max(end);
+            sum = sum.checked_add(want)?;
+            live += 1;
+        }
+        // One stream is already one read, and none is no read at all.
+        if live < 2 {
+            return None;
+        }
+        let span = (hi - lo) as usize;
+        // The union has to be worth it, and its base has to map - see the call site.
+        (span <= sum + Self::GATHER_SPAN_SLACK && ctx.maps(lo)).then_some((lo, span))
+    }
+
     /// Read every bound stream and scatter its rows into the interleaved scratch. Returns
     /// the scratch by value; the caller puts it back (see [`Self::interleave_scratch`]).
     #[allow(clippy::too_many_arguments)]
@@ -3322,33 +3407,127 @@ impl TextureSnapshots {
         vertex_count: u32,
     ) -> Vec<u8> {
         let mut vertices = std::mem::take(&mut self.interleave_scratch);
-        vertices.clear();
-        vertices.resize(vertex_count as usize * stride as usize, 0);
+        let stride_us = stride as usize;
+        if stride_us == 0 {
+            // Every used stream has stride 0, so there is nothing to gather and no row to
+            // gather it into. Guarded because `chunks_exact_mut(0)` panics.
+            vertices.clear();
+            return vertices;
+        }
+        let need = vertex_count as usize * stride_us;
+        // >>> NO WHOLE-BUFFER MEMSET, AND THAT IS AN INVARIANT RATHER THAN A GAMBLE.
+        //
+        // This was `clear()` then `resize(need, 0)`, which zeroes EVERY byte - several
+        // megabytes a frame on a title that gathers 671 draws - immediately before the scatter
+        // below writes every one of them again. Two properties make the fill dead work, and
+        // both are enforced elsewhere in this file rather than assumed here:
+        //
+        //   * the streams TILE the packed row exactly. `set_vertex_program` builds
+        //     `stream_base` as the running sum of the used streams' strides and `packed_stride`
+        //     as their total, so the columns abut with no gap and no overlap.
+        //   * `read_into` DEFINES every byte of its buffer - what guest memory does not cover
+        //     it zeroes - so a short (or entirely out-of-range) guest buffer scatters zeros
+        //     rather than leaving its rows untouched. That is the same output the old
+        //     whole-buffer fill produced for that case, which is why this is a rewrite of the
+        //     cost and not of the answer.
+        //
+        // So growth is the only case that needs a fill, and `truncate` writes nothing at all.
+        if vertices.len() < need {
+            vertices.resize(need, 0);
+        } else {
+            vertices.truncate(need);
+        }
+        let mut src = std::mem::take(&mut self.gather_src);
+        // >>> ONE CROSSING FOR THE WHOLE DRAW WHEN THE STREAMS SIT TOGETHER.
+        //
+        // Every guest read here is a call OUT of wasm and into JS: the browser's guest memory
+        // is a `SharedArrayBuffer` the module cannot borrow, so `read` is
+        // `dst.set(guest.subarray(..))` across the boundary. The BYTES are a memcpy and cheap;
+        // the CALL is not [[vitaslop-count-calls-not-bytes-across-the-guest-boundary]], and a
+        // two- or three-stream draw paid one per stream - ~1,500 crossings a frame on a retail
+        // sports title that gathers 671 draws.
+        //
+        // A title that rebuilds its geometry into a rotating arena writes those streams next to
+        // each other, so their union is usually barely larger than their sum. Reading the union
+        // ONCE and slicing each stream out of it is exactly equivalent - the guest address space
+        // is one contiguous mapping (`GuestCtx::offset` is `addr - base`), so a byte at a given
+        // address lands at the same relative place either way, and `read_into` zero-fills
+        // whatever falls past the end for the span exactly as it would per stream.
+        //
+        // Guarded on both sides of the trade. It is only taken when the union costs less than
+        // the crossing it saves (`GATHER_SPAN_SLACK`, a few KB - the point is to avoid a call,
+        // never to read a megabyte to save one), and only when the LOWEST address actually
+        // maps: below the base a merged read is all zeros where the per-stream reads would
+        // have found data, which is the one way this could differ.
+        let span = self.gather_span(ctx, streams, bound_streams, first_vertex, vertex_count);
+        if let Some((span_start, span_len)) = span {
+            // Counted, because a merge that never fires changes nothing observable and would
+            // look exactly like one that always does. See `Phase::DrawVertexGatherMerged`.
+            crate::perf::note_hit(crate::perf::Phase::DrawVertexGatherMerged);
+            if src.len() < span_len {
+                src.resize(span_len, 0);
+            }
+            ctx.read_into(span_start, &mut src[..span_len]);
+        }
         for (si, st) in streams.iter().enumerate() {
             if st.stride == 0 {
                 continue;
             }
+            let row_len = st.stride as usize;
+            let dst_base = base.get(si).copied().unwrap_or(0) as usize;
+            debug_assert!(
+                dst_base + row_len <= stride_us,
+                "stream {si} column [{dst_base}, {}) does not fit the packed row of {stride_us} \
+                 - `stream_base`/`packed_stride` disagree (see set_vertex_program)",
+                dst_base + row_len
+            );
             let buf = bound_streams.get(si).copied().unwrap_or(0);
             // A per-instance stream is stepped by instance, not by vertex, so instance 0
             // reads row 0 for every vertex; a per-vertex stream's rows are contiguous.
             // Either way this is ONE guest read, then a scatter into the interleaved buffer.
-            let (src, repeat) = if st.per_instance {
-                (ctx.read_bytes(buf, st.stride as usize), true)
+            let (addr, want, repeat) = if st.per_instance {
+                (buf, row_len, true)
             } else {
-                let start = buf.wrapping_add(first_vertex * st.stride);
-                (ctx.read_bytes(start, (vertex_count * st.stride) as usize), false)
+                (buf.wrapping_add(first_vertex * st.stride), vertex_count as usize * row_len, false)
             };
-            let row_len = st.stride as usize;
-            let dst_base = base.get(si).copied().unwrap_or(0) as usize;
-            for v in 0..vertex_count as usize {
-                let from = if repeat { 0 } else { v * row_len };
-                let Some(row) = src.get(from..from + row_len) else {
-                    break; // the guest buffer ended short of the indices; keep what we have
-                };
-                let dst = v * stride as usize + dst_base;
-                vertices[dst..dst + row_len].copy_from_slice(row);
+            let rows = match span {
+                // Already in hand: this stream's bytes are at its offset within the span.
+                Some((span_start, _)) => {
+                    let at = addr.wrapping_sub(span_start) as usize;
+                    &src[at..at + want]
+                }
+                None => {
+                    // High-water: grown when a bigger stream turns up and never shrunk, so a
+                    // steady frame reads into the same allocation every time.
+                    if src.len() < want {
+                        src.resize(want, 0);
+                    }
+                    ctx.read_into(addr, &mut src[..want]);
+                    &src[..want]
+                }
+            };
+            // The row index is walked by `chunks_exact_mut` rather than recomputed per
+            // vertex, and the source bound is checked once (by `want`) rather than per row.
+            if repeat {
+                let row = &rows[..row_len];
+                for dst in vertices.chunks_exact_mut(stride_us) {
+                    dst[dst_base..dst_base + row_len].copy_from_slice(row);
+                }
+            } else {
+                for (v, dst) in vertices.chunks_exact_mut(stride_us).enumerate() {
+                    let from = v * row_len;
+                    dst[dst_base..dst_base + row_len]
+                        .copy_from_slice(&rows[from..from + row_len]);
+                }
             }
         }
+        // Give an outsized read's buffer back rather than pinning it for the rest of the run -
+        // see the field's own note. A steady frame's streams are far below the cap, so the
+        // ordinary path keeps its allocation and this never fires.
+        if src.capacity() > Self::GATHER_SCRATCH_CAP {
+            src = Vec::new();
+        }
+        self.gather_src = src;
         vertices
     }
 
@@ -4480,6 +4659,120 @@ mod texture_snapshot_stamp_tests {
     /// inside one scene is exactly how dynamic geometry works, so the vertex path deliberately
     /// takes no once-a-scene shortcut. If it ever did, UI text and particles would render one
     /// draw stale and the symptom would be geometry a frame behind itself.
+    /// >>> THE MULTI-STREAM GATHER, PINNED AGAINST THE THREE THINGS ITS REWRITE RELIES ON.
+    ///
+    /// `gather_into_scratch` no longer zeroes the whole interleaved buffer before scattering
+    /// into it, on the ground that the streams TILE the packed row and `read_into` defines
+    /// every source byte. That is the largest single item in the capture (4.5 ms/frame,
+    /// 53% of `record_draw`, on a retail sports title), and getting it wrong shows up as
+    /// GARBAGE GEOMETRY from a previous draw rather than as an error - so the properties are
+    /// asserted rather than argued:
+    ///
+    ///   1. two per-vertex streams interleave into the packed row in `stream_base` order;
+    ///   2. a PER-INSTANCE stream repeats its row 0 into every vertex;
+    ///   3. a stream whose guest buffer runs SHORT contributes ZEROS past the end - and does
+    ///      so over a REUSED scratch that is still holding a longer previous draw's bytes,
+    ///      which is exactly the case a missing fill would leak.
+    #[test]
+    fn the_multi_stream_gather_tiles_the_packed_row_and_zero_fills_a_short_stream() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        // Stream 0: 4 bytes a vertex, at page 12. Stream 1: 2 bytes a vertex, at page 13.
+        let (a0, a1) = (12 * PAGE as u32, 13 * PAGE as u32);
+        for v in 0..8usize {
+            for b in 0..4 {
+                mem.bytes[12 * PAGE + v * 4 + b] = (0x10 + v * 4 + b) as u8;
+            }
+            for b in 0..2 {
+                mem.bytes[13 * PAGE + v * 2 + b] = (0xa0 + v * 2 + b) as u8;
+            }
+        }
+        let streams = [
+            VertexStreamInfo { stride: 4, per_instance: false },
+            VertexStreamInfo { stride: 2, per_instance: false },
+        ];
+        let base = [0u32, 4];
+        // A LONG draw first, so the scratch is left holding its bytes for the short one below.
+        let long = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.gather_into_scratch(&ctx, &streams, &[a0, a1], &base, 6, 0, 8)
+        };
+        assert_eq!(long.len(), 48);
+        let expected = long.clone();
+        for v in 0..8usize {
+            assert_eq!(&long[v * 6..v * 6 + 4], &mem.bytes[12 * PAGE + v * 4..][..4], "row {v} stream 0");
+            assert_eq!(&long[v * 6 + 4..v * 6 + 6], &mem.bytes[13 * PAGE + v * 2..][..2], "row {v} stream 1");
+        }
+        snaps.interleave_scratch = long;
+
+        // PER-INSTANCE: stream 1 now steps by instance, so every vertex reads its row 0.
+        let per_instance = [
+            VertexStreamInfo { stride: 4, per_instance: false },
+            VertexStreamInfo { stride: 2, per_instance: true },
+        ];
+        let inst = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.gather_into_scratch(&ctx, &per_instance, &[a0, a1], &base, 6, 0, 4)
+        };
+        for v in 0..4usize {
+            assert_eq!(&inst[v * 6 + 4..v * 6 + 6], &mem.bytes[13 * PAGE..][..2], "row {v} is instance 0");
+        }
+        snaps.interleave_scratch = inst;
+
+        // SHORT: stream 1 is bound past the end of guest memory, so its column must read as
+        // zeros for every row - not as whatever the two longer draws above left in the scratch.
+        let past_end = mem.bytes.len() as u32;
+        let short = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.gather_into_scratch(&ctx, &streams, &[a0, past_end], &base, 6, 0, 4)
+        };
+        for v in 0..4usize {
+            assert_eq!(&short[v * 6..v * 6 + 4], &mem.bytes[12 * PAGE + v * 4..][..4], "row {v} stream 0");
+            assert_eq!(
+                &short[v * 6 + 4..v * 6 + 6],
+                &[0, 0],
+                "row {v}: an unreadable stream must contribute ZEROS, not the last draw's bytes"
+            );
+        }
+        snaps.interleave_scratch = short;
+
+        // >>> AND THE MERGED READ AGREES WITH THE SEPARATE ONE.
+        //
+        // The three draws above are a PAGE apart, so `gather_span` declines them and they
+        // exercise the per-stream path. A title that rebuilds its geometry into a rotating
+        // arena writes its streams back to back, which is the case the merge exists for - so
+        // the same two streams are laid out adjacently here and asserted to produce the same
+        // interleaving. Without this the merge could be silently dead, or silently wrong.
+        let adj0 = 20 * PAGE as u32;
+        let adj1 = adj0 + 8 * 4; // immediately after stream 0's eight 4-byte rows
+        for v in 0..8usize {
+            for b in 0..4 {
+                mem.bytes[20 * PAGE + v * 4 + b] = (0x10 + v * 4 + b) as u8;
+            }
+            for b in 0..2 {
+                mem.bytes[20 * PAGE + 32 + v * 2 + b] = (0xa0 + v * 2 + b) as u8;
+            }
+        }
+        assert_eq!(
+            snaps.gather_span(
+                &ctx_over(&mut regs, &mut vfp, &mut mem),
+                &streams,
+                &[adj0, adj1],
+                0,
+                8
+            ),
+            Some((adj0, 48)),
+            "adjacent streams are exactly the case the merged read is for"
+        );
+        let merged = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.gather_into_scratch(&ctx, &streams, &[adj0, adj1], &base, 6, 0, 8)
+        };
+        assert_eq!(merged, expected, "one read of the union must interleave exactly as two reads do");
+    }
+
     #[test]
     fn vertices_rewritten_within_one_scene_are_seen_immediately() {
         let c = Counters::default();
@@ -5878,13 +6171,13 @@ impl VitaState {
 
     /// The same bank as BYTES - see [`Self::current_vertex_uniform_bytes`] for why both forms
     /// exist and why neither is derived from the other.
-    fn sa_bank_bytes(&self, ctx: &GuestCtx) -> Vec<u8> {
+    fn sa_bank_bytes(&self, ctx: &GuestCtx) -> Arc<[u8]> {
         let bank = self.sa_bank;
         if bank == 0 {
-            return Vec::new();
+            return Arc::from(&[][..]);
         }
         let len = ctx.read_u32(bank).min(MAX_DEFAULT_UNIFORM_REGS) as usize;
-        ctx.read_bytes(bank + SA_BANK_DATA, len * 4)
+        ctx.read_bytes_arc(bank + SA_BANK_DATA, len * 4)
     }
 
     // --- SceIoFilemgr virtual filesystem ---
@@ -10758,9 +11051,14 @@ impl VitaState {
         &mut self,
         ctx: &GuestCtx,
         blk: &crate::vita::gxmctx::Block<'_>,
-    ) -> Vec<u8> {
+    ) -> Arc<[u8]> {
+        // >>> STRAIGHT INTO THE `Arc`, because the ONLY consumer wants one. This returned a
+        // `Vec` that `record_draw` handed to `sa_uniform_image` and then converted with
+        // `Arc::<[u8]>::from`, which allocates AGAIN and copies the whole bank - an extra
+        // allocation, copy and free per draw per stage (~1,350 a frame on a retail title) for
+        // bytes nobody mutates. See `read_bytes_arc`.
         match self.current_vertex_uniform_src(ctx, blk) {
-            Some((addr, len)) => ctx.read_bytes(addr, len),
+            Some((addr, len)) => ctx.read_bytes_arc(addr, len),
             None => self.sa_bank_bytes(ctx),
         }
     }
@@ -11205,12 +11503,13 @@ impl VitaState {
         // Empty when the recompiler is off (the fixed-function path does not want the bank,
         // and reading it there would be pure cost) or when nothing is bound - and
         // `reflect_fragment_material` falls back to the per-word read for exactly that case.
-        let frag_sa: Vec<u8> = {
+        let frag_sa: Arc<[u8]> = {
             let _g = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
             if gxp_live_capture() && frag_uniform.buf != 0 {
-                ctx.read_bytes(frag_uniform.buf, frag_uniform.size as usize)
+                // Into the `Arc`'s own allocation, not a `Vec` that is copied into one below.
+                ctx.read_bytes_arc(frag_uniform.buf, frag_uniform.size as usize)
             } else {
-                Vec::new()
+                Arc::from(&[][..])
             }
         };
         let uniform_phase = crate::perf::scope(crate::perf::Phase::DrawUniforms);
@@ -11250,7 +11549,7 @@ impl VitaState {
             // in place, so it stays as it was; the extra copy into the scratch is one path's
             // cost and that path is not the one that ships.
             uniforms.extend_from_slice(&self.current_vertex_uniforms(ctx, &blk));
-            Vec::new()
+            Arc::from(&[][..])
         };
         let lane = |i: usize| -> Option<f32> { uniforms.get(i).copied() };
         // The model-to-world matrix (for bringing the vertex normal into world space for
@@ -11367,7 +11666,7 @@ impl VitaState {
             // Into an `Arc` HERE, once, at the only place these are produced - see
             // `capture::Draw::vert_sa`. From here to the renderer they are shared, so the
             // clone `RenderSceneBuilder::build` makes is a refcount bump.
-            (vprog, fprog, Arc::<[u8]>::from(vert_sa), Arc::<[u8]>::from(frag_sa))
+            (vprog, fprog, vert_sa, frag_sa)
         } else {
             (
                 crate::capture::no_program(),
@@ -11558,11 +11857,13 @@ impl VitaState {
         blk: &crate::vita::gxmctx::Block<'_>,
         header: u32,
         stage: UniformStage,
-        default_bytes: Vec<u8>,
-    ) -> Vec<u8> {
+        default_bytes: Arc<[u8]>,
+    ) -> Arc<[u8]> {
         let layout = self.sa_uniform_layout(ctx, header);
         // The overwhelming majority of programs: the default buffer at register 0 and nothing
-        // else SA-resident. The bytes ARE the image, with no copy and no allocation.
+        // else SA-resident. The bytes ARE the image, with no copy and no allocation - and now
+        // no conversion either: the caller's `Arc` comes straight back, where it used to be
+        // rebuilt from a `Vec` one line later.
         if layout.buffers.is_empty() && layout.default_base == 0 {
             return default_bytes;
         }
@@ -11590,7 +11891,9 @@ impl VitaState {
             let bytes = ctx.read_bytes(addr, b.size_regs as usize * 4);
             put(&mut image, b.base_sa, &bytes);
         }
-        image
+        // The SA-resident path assembles a fresh image, so this one conversion is unavoidable
+        // - and it is the rare arm, taken only by a program that declares SA-resident buffers.
+        image.into()
     }
 
     /// The buffer index a +0x78 entry gives the DEFAULT uniform buffer. Its address does not

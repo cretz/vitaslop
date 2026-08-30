@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vitaslop_native::{RunReport, ThreadedScheduler};
+use crate::gfx::{acquire, ACQUIRE_FAILURE_LIMIT};
 use vitaslop_platform::gpu::{GxmRenderer, DEPTH_FORMAT};
 use vitaslop_runtime::capture::Scene;
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
@@ -589,6 +590,12 @@ struct RetailGfx {
     builder: RenderSceneBuilder,
     depth: wgpu::TextureView,
     render_format: wgpu::TextureFormat,
+    /// Presents in a row that produced no surface texture - see [`acquire`], which is where
+    /// this stops being a transient and becomes a black window nobody is told about.
+    acquire_failures: u32,
+    /// Set by the device-lost callback installed in `new`. `Some` means every GPU object this
+    /// renderer holds is invalid and the run is over.
+    lost: Arc<Mutex<Option<String>>>,
     adapter_name: String,
 }
 
@@ -619,6 +626,26 @@ impl RetailGfx {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| format!("request_device: {e}"))?;
+
+        // >>> A LOST DEVICE IS THE END OF THE RUN, AND IT SAYS SO IMMEDIATELY.
+        //
+        // The swapchain would eventually answer `Lost` and `acquire` would give up on that -
+        // but only after seconds of rendering nothing, and with no word about WHY. Every object
+        // built from a lost device is invalid, so there is nothing to salvage and nothing to
+        // re-obtain without rebuilding the whole renderer against a guest that has moved on.
+        // Checked at the top of `present` rather than panicking in the callback, which runs on
+        // whatever thread the backend chose.
+        let lost: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        {
+            let sink = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                if let Ok(mut slot) = sink.lock() {
+                    if slot.is_none() {
+                        *slot = Some(format!("{reason:?}: {message}"));
+                    }
+                }
+            });
+        }
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -663,7 +690,19 @@ impl RetailGfx {
         let ssaa = std::env::var("VITASLOP_SSAA").ok().and_then(|s| s.parse::<u32>().ok()).filter(|&n| n >= 1).unwrap_or(1);
         gxm.set_supersample(ssaa);
         let depth = make_depth(&device, w, h);
-        Ok(RetailGfx { surface, device, queue, config, gxm, builder: RenderSceneBuilder::new(), depth, render_format, adapter_name })
+        Ok(RetailGfx {
+            surface,
+            device,
+            queue,
+            config,
+            gxm,
+            builder: RenderSceneBuilder::new(),
+            depth,
+            render_format,
+            acquire_failures: 0,
+            lost,
+            adapter_name,
+        })
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -679,10 +718,22 @@ impl RetailGfx {
     /// `display` is the size the GUEST declared to `sceDisplaySetFrameBuf`, which is what
     /// the frame is projected against. See the `encode_chain` call below.
     fn present(&mut self, scenes: &[Scene], display: (u32, u32)) {
+        // Asked BEFORE any work: once the device is lost, building scenes and encoding a
+        // command buffer is pure cost against a picture that cannot be drawn.
+        if let Some(why) = self.lost.lock().ok().and_then(|s| s.clone()) {
+            panic!(
+                "the WebGPU device was LOST and every GPU object built from it is invalid, so                  nothing this run draws from here can reach the screen ({why})"
+            );
+        }
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => return,
+        let Some(frame) = acquire(
+            &self.surface,
+            &self.device,
+            &self.config,
+            &mut self.acquire_failures,
+            ACQUIRE_FAILURE_LIMIT,
+        ) else {
+            return;
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.render_format),
@@ -1727,3 +1778,4 @@ impl RetailApp {
         ));
     }
 }
+

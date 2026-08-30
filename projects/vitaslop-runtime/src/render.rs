@@ -1855,6 +1855,101 @@ pub(crate) fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) 
     [rgb[0], rgb[1], rgb[2], a]
 }
 
+/// Decode a whole BC1/BC2/BC3 block to its sixteen RGBA8 texels at once.
+///
+/// >>> THE ENDPOINTS ARE A PROPERTY OF THE BLOCK AND WERE BEING DERIVED PER TEXEL.
+///
+/// [`decode_bc_texel`] re-reads both 565 endpoints, re-expands them, re-decides the
+/// punch-through mode and re-interpolates the palette entry it needs - and for BC3 re-reads
+/// the two alpha endpoints as well - for EVERY ONE of a block's sixteen texels. The block
+/// walker called it sixteen times per block, so all of that ran sixteen times to produce four
+/// colours and eight alphas that do not change inside a block.
+///
+/// It matters most on the device that needs it most: a phone GPU with no BC support decodes
+/// every compressed guest texture on the CPU [[vitaslop-phone-gpu-has-no-bc]], and MEASURED on
+/// a retail golf title under that rig (`VITASLOP_NO_BC=1`) the BC families are **95.9 MB of
+/// the run's 270.5 MB of texture decode**.
+///
+/// The per-texel entry point stays: it is what a single-texel sampler read
+/// ([`texel_rgba_face`], [`texture_mean_rgb`]) uses, and it is the oracle this is asserted
+/// against by `the_block_decoder_matches_the_per_texel_one`.
+fn decode_bc_block(block: &[u8], base_format: u32) -> [[u8; 4]; 16] {
+    let color_off = if base_format == 0x85 { 0 } else { 8 };
+    let g = |i: usize| -> u8 { *block.get(i).unwrap_or(&0) };
+    let c0 = u16::from_le_bytes([g(color_off), g(color_off + 1)]);
+    let c1 = u16::from_le_bytes([g(color_off + 2), g(color_off + 3)]);
+    let (e0, e1) = (rgb565(c0), rgb565(c1));
+    let punchthrough = base_format == 0x85 && c0 <= c1;
+    let mix = |a: [u8; 3], b: [u8; 3], na: u32, nb: u32, d: u32| -> [u8; 3] {
+        [
+            ((a[0] as u32 * na + b[0] as u32 * nb) / d) as u8,
+            ((a[1] as u32 * na + b[1] as u32 * nb) / d) as u8,
+            ((a[2] as u32 * na + b[2] as u32 * nb) / d) as u8,
+        ]
+    };
+    // The four colour entries, in index order, exactly as the per-texel `match idx` picks
+    // them - including the 3-colour mode's black fourth entry.
+    let palette: [[u8; 3]; 4] = if punchthrough {
+        [e0, e1, mix(e0, e1, 1, 1, 2), [0, 0, 0]]
+    } else {
+        [e0, e1, mix(e0, e1, 2, 1, 3), mix(e0, e1, 1, 2, 3)]
+    };
+    // ...and the eight BC3 alpha entries, on the same terms.
+    let (a0, a1) = (g(0), g(1));
+    let (a0i, a1i) = (a0 as u32, a1 as u32);
+    let alpha: [u8; 8] = if a0 > a1 {
+        [
+            a0,
+            a1,
+            ((6 * a0i + a1i) / 7) as u8,
+            ((5 * a0i + 2 * a1i) / 7) as u8,
+            ((4 * a0i + 3 * a1i) / 7) as u8,
+            ((3 * a0i + 4 * a1i) / 7) as u8,
+            ((2 * a0i + 5 * a1i) / 7) as u8,
+            ((a0i + 6 * a1i) / 7) as u8,
+        ]
+    } else {
+        [
+            a0,
+            a1,
+            ((4 * a0i + a1i) / 5) as u8,
+            ((3 * a0i + 2 * a1i) / 5) as u8,
+            ((2 * a0i + 3 * a1i) / 5) as u8,
+            ((a0i + 4 * a1i) / 5) as u8,
+            0,
+            255,
+        ]
+    };
+    let mut out = [[0u8; 4]; 16];
+    for (t, texel) in out.iter_mut().enumerate() {
+        let idx = ((g(color_off + 4 + t / 4) >> ((t % 4) * 2)) & 0x3) as usize;
+        let rgb = palette[idx];
+        let a = match base_format {
+            0x85 => {
+                if punchthrough && idx == 3 {
+                    0
+                } else {
+                    255
+                }
+            }
+            0x86 => {
+                let byte = g(t / 2);
+                let a4 = if t % 2 == 0 { byte & 0xf } else { byte >> 4 };
+                (a4 as u32 * 255 / 15) as u8
+            }
+            0x87 => {
+                let bit = t * 3;
+                let byte = 2 + bit / 8;
+                let raw = (g(byte) as u32) | ((g(byte + 1) as u32) << 8);
+                alpha[((raw >> (bit % 8)) & 0x7) as usize]
+            }
+            _ => 255,
+        };
+        *texel = [rgb[0], rgb[1], rgb[2], a];
+    }
+    out
+}
+
 /// Decode the interpolated alpha of texel `t` from a BC3 (DXT5) 16-byte block.
 fn bc3_alpha(block: &[u8], t: usize) -> u8 {
     let a0 = *block.first().unwrap_or(&0);
@@ -2360,6 +2455,61 @@ fn decode_texture_rgba16f(
     (t.width, t.height, out, TexelSeam::Rgba16Float)
 }
 
+/// A texture whose texel is ONE channel, and how that channel reduces to the shared RGBA8
+/// seam. Resolved once per face by [`SingleChannel::of`].
+///
+/// >>> THE FORMAT IS A CONSTANT OF THE FACE AND WAS BEING RE-DECIDED PER TEXEL.
+///
+/// `decode_uncompressed_at` opens with a fifteen-arm `match t.base_format` and re-reads the
+/// swizzle field, and the fast walk called it once per texel - so a 1024x1024 face ran that
+/// dispatch a million times to reach the same arm every time. Single-channel formats are the
+/// bulk of what a real title decodes here: MEASURED on a retail golf title, the 16-bit
+/// single-channel family alone is **151.9 MB of the run's 270.5 MB**, with 8-bit single
+/// channel (font atlases and coverage masks) another 10.1 MB.
+///
+/// Only families whose lane is a pure function of its own bytes are listed. Anything else
+/// falls back to the general per-texel decode, unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleChannel {
+    /// U8 / S8 - the byte IS the lane.
+    Bits8,
+    /// U16, reduced by [`unorm16_to_u8`].
+    Unorm16,
+    /// S16, reduced by [`snorm16_to_u8`].
+    Snorm16,
+    /// F16, which is not a fixed-point range and keeps the float reduction.
+    Half16,
+}
+
+impl SingleChannel {
+    fn of(base_format: u32) -> Option<SingleChannel> {
+        match base_format {
+            0x00 | 0x01 => Some(SingleChannel::Bits8),
+            0x09 => Some(SingleChannel::Unorm16),
+            0x0a => Some(SingleChannel::Snorm16),
+            0x0b => Some(SingleChannel::Half16),
+            _ => None,
+        }
+    }
+
+    /// The lane at `off`, reading zeros past the end of the buffer exactly as
+    /// `decode_uncompressed_at`'s bounds-checked `byte` helper does.
+    #[inline]
+    fn lane(self, px: &[u8], off: usize) -> u8 {
+        let byte = |i: usize| -> u8 { px.get(off + i).copied().unwrap_or(0) };
+        match self {
+            SingleChannel::Bits8 => byte(0),
+            SingleChannel::Unorm16 => unorm16_to_u8(u16::from_le_bytes([byte(0), byte(1)])),
+            SingleChannel::Snorm16 => snorm16_to_u8(u16::from_le_bytes([byte(0), byte(1)])),
+            SingleChannel::Half16 => {
+                let v = half_to_f32(u16::from_le_bytes([byte(0), byte(1)]));
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+        }
+    }
+}
+
+
 /// Decode one face of a BLOCK-COMPRESSED texture a block at a time, into `out`. Returns
 /// false for anything this path does not cover, leaving the caller on the per-texel path.
 ///
@@ -2409,6 +2559,10 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
     // family is 2.11 MB of the 3.83 MB decoded, i.e. the larger half.
     if block_w == 1 && block_h == 1 {
         let face_base = (face * t.face_bytes) as usize;
+        // Both constants of the FACE - see `SingleChannel`, and `decode_uncompressed_at` for
+        // the fifteen-arm dispatch this is hoisting out of the texel loop.
+        let single = SingleChannel::of(t.base_format);
+        let swz = (t.swizzle >> 12) & 0x7;
         if swizzled_type(t.tex_type) {
             // The interleave once per row and once per column instead of once per texel - see
             // `morton_tables`, which is asserted to be the same function as `morton_index`.
@@ -2426,7 +2580,11 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
                     let off = face_base + ((xs[x as usize] + yb) * block_bytes) as usize;
                     match (identity32, t.pixels.get(off..off + 4)) {
                         (true, Some(src)) => out[o..o + 4].copy_from_slice(src),
-                        _ => out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off)),
+                        _ => match single {
+                            Some(k) => out[o..o + 4]
+                                .copy_from_slice(&swizzle1(k.lane(&t.pixels, off), swz)),
+                            None => out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off)),
+                        },
                     }
                     o += 4;
                 }
@@ -2468,6 +2626,17 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
                     o += n;
                     continue;
                 }
+                // The single-channel walk is split out rather than branched inside the
+                // loop so the reduction and the SWIZZLE1 routing are each decided once for
+                // the whole row instead of once per texel.
+                if let Some(k) = single {
+                    for x in 0..t.width {
+                        let off = row + (x * block_bytes) as usize;
+                        out[o..o + 4].copy_from_slice(&swizzle1(k.lane(&t.pixels, off), swz));
+                        o += 4;
+                    }
+                    continue;
+                }
                 for x in 0..t.width {
                     let off = row + (x * block_bytes) as usize;
                     out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off));
@@ -2499,6 +2668,8 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
             };
             let off = face_base + (block_index * block_bytes) as usize;
             let block = t.pixels.get(off..off + block_bytes as usize).unwrap_or(&[]);
+            // ONE palette per block - see `decode_bc_block`.
+            let texels = decode_bc_block(block, t.base_format);
             // The trailing blocks of a non-multiple-of-4 texture are partly outside the
             // image; only the texels inside it are written, exactly as the per-texel loop
             // (which never asks for the others) would.
@@ -2506,7 +2677,7 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
                 let y = by * block_h + py;
                 for px in 0..block_w.min(t.width - bx * block_w) {
                     let x = bx * block_w + px;
-                    let c = decode_bc_texel(block, t.base_format, px, py);
+                    let c = texels[(py * 4 + px) as usize];
                     let o = ((y * t.width + x) * 4) as usize;
                     out[o..o + 4].copy_from_slice(&swizzle4(c[0], c[1], c[2], c[3], swizzle));
                 }
@@ -2755,12 +2926,14 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         // seam and routed by SWIZZLE1 exactly as the 8-bit single-channel case below.
         0x09 | 0x0a | 0x0b => {
             let raw = u16::from_le_bytes([byte(0), byte(1)]);
-            let v = match t.base_format {
-                0x09 => raw as f32 / 65535.0,
-                0x0a => ((raw as i16) as f32 / 32767.0).max(0.0),
-                _ => half_to_f32(raw),
+            let lane = match t.base_format {
+                0x09 => unorm16_to_u8(raw),
+                0x0a => snorm16_to_u8(raw),
+                // F16 is not a fixed-point range, so it keeps the float reduction. It is also
+                // not the family this costs anything on - see `unorm16_to_u8`.
+                _ => (half_to_f32(raw).clamp(0.0, 1.0) * 255.0).round() as u8,
             };
-            swizzle1((v.clamp(0.0, 1.0) * 255.0).round() as u8, swizzle)
+            swizzle1(lane, swizzle)
         }
         // Two-channel 32-bit lanes (F32F32 / U32U32), 64 bits total. SWIZZLE2.
         0x1e | 0x1f => {
@@ -2813,12 +2986,11 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         0x1b | 0x1c | 0x1d => {
             let lane = |i: usize| -> u8 {
                 let raw = u16::from_le_bytes([byte(i * 2), byte(i * 2 + 1)]);
-                let v = match t.base_format {
-                    0x1b => half_to_f32(raw),
-                    0x1c => raw as f32 / 65535.0,
-                    _ => ((raw as i16) as f32 / 32767.0).max(0.0),
-                };
-                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+                match t.base_format {
+                    0x1b => (half_to_f32(raw).clamp(0.0, 1.0) * 255.0).round() as u8,
+                    0x1c => unorm16_to_u8(raw),
+                    _ => snorm16_to_u8(raw),
+                }
             };
             swizzle4(lane(0), lane(1), lane(2), lane(3), swizzle)
         }
@@ -2858,6 +3030,40 @@ pub(crate) fn report_undecodable_texture_format(base_format: u32, tex_type: u32)
          every draw sampling it is painted MAGENTA"
     );
 }
+
+/// A 16-bit UNORM lane reduced to the shared RGBA8 seam, in integers.
+///
+/// >>> THIS IS THE SAME NUMBER `(raw as f32 / 65535.0 * 255.0).round()` PRODUCES, and it is
+/// >>> asserted to be over all 65,536 inputs by
+/// >>> `the_integer_sixteen_bit_reductions_match_the_float_ones`.
+///
+/// Exactly, not nearly: the float form can only differ where the true value lands on a half,
+/// which needs `510 * raw == (2k+1) * 65535`; 65535 and 510 share the factor 255, so that
+/// reduces to `2 * raw == (2k+1) * 257` - an even number equal to an odd one, which has no
+/// solution. So round-to-nearest is unambiguous and the integer form is it.
+///
+/// # Why it is worth having at all
+/// The float form is a divide, a clamp, a multiply and a call to `roundf` - a libm call in
+/// wasm - PER TEXEL. MEASURED on a retail golf title, browser, real GPU: the single-channel
+/// 16-bit family is **151.9 MB of the run's 270.5 MB of texture decode**, the largest of any
+/// format, and `decode_uncompressed_at` was 2.4% of the whole worker thread in a GAMEPLAY
+/// window where it decodes half a megabyte a frame. A load decodes hundreds of times that.
+#[inline]
+fn unorm16_to_u8(raw: u16) -> u8 {
+    ((raw as u32 * 255 + 32767) / 65535) as u8
+}
+
+/// A 16-bit SNORM lane reduced the same way: negatives clamp to zero (the seam is unsigned),
+/// and the positive half divides by 32767. Pinned by the same test, over all 65,536 inputs.
+#[inline]
+fn snorm16_to_u8(raw: u16) -> u8 {
+    let v = raw as i16;
+    if v <= 0 {
+        return 0;
+    }
+    ((v as u32 * 255 + 16383) / 32767) as u8
+}
+
 
 /// Route a single-channel (U8/S8) texel to straight RGBA per its GXM `SWIZZLE1`
 /// selector (already reduced to `(format >> 12) & 0x7` by the caller, exactly as
@@ -5330,6 +5536,31 @@ fn tex_binding_key(t: &BoundTexture) -> u64 {
 /// by [`tex_key`] so an unchanged atlas is decoded once and thereafter only its
 /// shared `Arc` is handed back; persist one builder across a run's frames to keep the
 /// cache warm.
+/// One frame's derived `GxpTex` list for a captured binding set, and the set it came from.
+/// See [`RenderSceneBuilder::gxp_tex_sets`].
+struct GxpTexSet {
+    /// The capture's own list, held so its ADDRESS stays a valid identity.
+    src: Arc<[BoundTexture]>,
+    out: Arc<[vitaslop_platform::gpu::GxpTex]>,
+    /// The `decode_epoch` this was derived in. A hit is refused across frames so the stamping
+    /// `texture()` does is paid once per frame, exactly as it was before this cache existed.
+    epoch: u64,
+}
+
+/// One derived `GxpAttr` list, and the attribute list it came from.
+/// See [`RenderSceneBuilder::gxp_attr_sets`].
+struct GxpAttrSet {
+    src: Arc<[crate::capture::VertexAttribute]>,
+    out: Arc<[vitaslop_platform::gpu::GxpAttr]>,
+}
+
+/// How many derived sets either cache holds before dropping the lot.
+///
+/// A frame binds a couple of dozen distinct sets; this is generous by two orders of magnitude
+/// so a title that cycles materials never thrashes, and dropping an entry costs a re-derivation
+/// and never an answer.
+const GXP_SET_CACHE_CAP: usize = 2048;
+
 pub struct RenderSceneBuilder {
     /// Whether a draw carrying a shader payload can SKIP its fixed-function representation.
     ///
@@ -5386,6 +5617,32 @@ pub struct RenderSceneBuilder {
     /// Bumped by [`RenderSceneBuilder::begin_frame`]. Entries stamped with it are in use by
     /// the frame being built and are not eviction candidates at any budget.
     decode_epoch: u64,
+    /// >>> THE FINISHED `GxpTex` LIST FOR ONE CAPTURED BINDING SET, PER FRAME.
+    ///
+    /// Keyed by the IDENTITY of the capture's `Arc<[BoundTexture]>` (its pointer and length,
+    /// with the source held strongly so a freed address cannot be recycled into a stale hit -
+    /// the same discipline as `tex_key` [[vitaslop-an-address-is-not-an-identity]]).
+    ///
+    /// # Why it is exactly equivalent, which is the only thing that makes it admissible
+    /// The capture hands every draw with the same bindings ONE `Arc`
+    /// (`TextureSnapshots::snapshot_sets`), and `texture()` is a pure function of each
+    /// `BoundTexture` apart from two SIDE EFFECTS: the `decode_used` stamp that keeps an entry
+    /// out of this frame's eviction, and the `decode_frame_bytes` tally. Both are PER FRAME and
+    /// idempotent within one - the stamp writes the current epoch, and the tally adds only on
+    /// the first sighting in a frame. So re-deriving the list once per frame per set performs
+    /// every effect the per-draw derivation did, and the draws after the first in that frame
+    /// were paying a hash and two map probes per bound unit to reproduce a list byte for byte.
+    /// MEASURED on a retail sports title: **3,782 of those lookups a frame** over 672 draws,
+    /// for about a dozen distinct sets.
+    ///
+    /// The epoch is part of the entry rather than the key so a set that survives into the next
+    /// frame is REBUILT there (paying the stamp) instead of hit stale.
+    gxp_tex_sets: crate::fasthash::FxHashMap<(usize, usize), GxpTexSet>,
+    /// The same, for the `GxpAttr` list - which has no side effects at all, being a pure
+    /// rewrite of the vertex PROGRAM's own declared attributes. The capture already shares
+    /// those (`capture::Draw::attributes`), so this holds the derived form against the same
+    /// identity and no epoch is needed.
+    gxp_attr_sets: crate::fasthash::FxHashMap<(usize, usize), GxpAttrSet>,
     /// The largest ONE-FRAME decode working set seen, and the floor the budget is raised to.
     ///
     /// A cache that cannot hold one frame is worse than none: every entry it drops mid-frame
@@ -5481,6 +5738,12 @@ pub struct BuildWork {
     /// Textures DECODED (a cache miss) and textures served from the decode cache.
     pub tex_decoded: u64,
     pub tex_cached: u64,
+    /// Draws served a whole `GxpTex` list from [`RenderSceneBuilder::gxp_tex_sets`] - i.e.
+    /// draws that did NOT look a single bound texture up. Counted apart from `tex_cached`
+    /// because the two answer different questions: that one is "the decode was cached", this
+    /// one is "the lookup did not happen either", and the second is what the per-set cache
+    /// bought. `tex_cached` falling while this rises is the fix working, not work vanishing.
+    pub tex_set_reused: u64,
     /// Cache misses whose texels were actually EXPANDED to RGBA8, and the bytes that expansion
     /// produced.
     ///
@@ -5568,6 +5831,7 @@ impl BuildWork {
         self.indices_scanned += o.indices_scanned;
         self.tex_decoded += o.tex_decoded;
         self.tex_cached += o.tex_cached;
+        self.tex_set_reused += o.tex_set_reused;
         self.tex_expanded += o.tex_expanded;
         self.tex_expanded_bytes += o.tex_expanded_bytes;
         self.tex_bytes += o.tex_bytes;
@@ -5593,7 +5857,7 @@ impl BuildWork {
         format!(
             "build work/frame: {:.0} draws ({:.0} fixed-function), {:.0} vertices walked \
              (+{:.0} deferred depth-range), {:.0} indices scanned, textures {:.1} built \
-             / {:.1} cached over {:.2} MB of guest bytes, {:.1} EXPANDED to RGBA8 \
+             / {:.1} cached / {:.1} whole SETS reused over {:.2} MB of guest bytes, {:.1} EXPANDED to RGBA8 \
              ({:.2} MB: {:.2} MB fast-path + {:.2} MB per-texel), \
              {:.2} evict passes dropping {:.1} entries, {:.1} RE-decoded after eviction, \
              {:.1} superseded in place, indices {:.1} expanded \
@@ -5606,6 +5870,7 @@ impl BuildWork {
             self.indices_scanned as f64 / n,
             self.tex_decoded as f64 / n,
             self.tex_cached as f64 / n,
+            self.tex_set_reused as f64 / n,
             self.tex_bytes as f64 / n / (1024.0 * 1024.0),
             self.tex_expanded as f64 / n,
             self.tex_expanded_bytes as f64 / n / (1024.0 * 1024.0),
@@ -5631,6 +5896,7 @@ static BUILD_WORK: std::sync::Mutex<BuildWork> = std::sync::Mutex::new(BuildWork
     indices_scanned: 0,
     tex_decoded: 0,
     tex_cached: 0,
+    tex_set_reused: 0,
     tex_expanded: 0,
     tex_expanded_bytes: 0,
     tex_bytes: 0,
@@ -6006,6 +6272,8 @@ impl RenderSceneBuilder {
             decode_cache_bytes: 0,
             decode_used: Default::default(),
             decode_epoch: 0,
+            gxp_tex_sets: Default::default(),
+            gxp_attr_sets: Default::default(),
             decode_frame_high: 0,
             decode_frame_bytes: 0,
             decode_evicted: Default::default(),
@@ -6037,6 +6305,86 @@ impl RenderSceneBuilder {
             .max(self.decode_frame_high - self.decode_frame_high / 16);
         self.decode_frame_bytes = 0;
         self.decode_epoch = self.decode_epoch.wrapping_add(1);
+        // >>> THE PER-SET CACHES ARE DROPPED AT THE FRAME BOUNDARY, AND THAT IS A BOUND, NOT
+        // >>> TIDINESS.
+        //
+        // A `GxpTexSet` holds `GxmTexture`s, and a `GxmTexture` holds its PIXELS. Keeping them
+        // across frames would pin texture bytes outside `decode_cache`'s budget - a second,
+        // unbudgeted copy of the working set in a wasm heap that can never hand a page back,
+        // which is precisely the shape of the last pooling change that cost the user frame
+        // rate. Cleared here, the caches can hold at most what THIS frame binds, which
+        // `decode_cache` is already holding anyway, so they add no resident bytes at all - and
+        // an entry could not be used across frames regardless, because a hit requires the
+        // current epoch (see `gxp_tex_sets`).
+        self.gxp_tex_sets.clear();
+        // The attribute lists carry no pixels, only a handful of `u16`s per attribute, so they
+        // are kept - they are a function of the vertex PROGRAM and are the same every frame.
+    }
+
+    /// The recompiler's `GxpTex` list for a captured binding set, derived once per frame per
+    /// set. See [`RenderSceneBuilder::gxp_tex_sets`] for why once per frame is exactly what the
+    /// per-draw derivation did.
+    fn gxp_textures(
+        &mut self,
+        src: &Arc<[BoundTexture]>,
+        work: &mut BuildWork,
+    ) -> Arc<[vitaslop_platform::gpu::GxpTex]> {
+        if src.is_empty() {
+            return Arc::from(&[][..]);
+        }
+        let key = (Arc::as_ptr(src) as *const BoundTexture as usize, src.len());
+        let epoch = self.decode_epoch;
+        if let Some(e) = self.gxp_tex_sets.get(&key) {
+            // The pointer alone is not the identity: hold the source and compare it, so a
+            // freed set whose address was handed to a different one cannot answer here.
+            if e.epoch == epoch && Arc::ptr_eq(&e.src, src) {
+                work.tex_set_reused += 1;
+                return e.out.clone();
+            }
+        }
+        let out: Arc<[vitaslop_platform::gpu::GxpTex]> = src
+            .iter()
+            .map(|t| vitaslop_platform::gpu::GxpTex {
+                unit: t.unit as u8,
+                tex: self.texture(t, work),
+            })
+            .collect();
+        if self.gxp_tex_sets.len() >= GXP_SET_CACHE_CAP {
+            self.gxp_tex_sets.clear();
+        }
+        self.gxp_tex_sets.insert(key, GxpTexSet { src: src.clone(), out: out.clone(), epoch });
+        out
+    }
+
+    /// The recompiler's `GxpAttr` list for a vertex program's attributes, derived once per
+    /// distinct attribute list. See [`RenderSceneBuilder::gxp_attr_sets`].
+    fn gxp_attributes(
+        &mut self,
+        src: &Arc<[crate::capture::VertexAttribute]>,
+    ) -> Arc<[vitaslop_platform::gpu::GxpAttr]> {
+        if src.is_empty() {
+            return Arc::from(&[][..]);
+        }
+        let key = (Arc::as_ptr(src) as *const crate::capture::VertexAttribute as usize, src.len());
+        if let Some(e) = self.gxp_attr_sets.get(&key) {
+            if Arc::ptr_eq(&e.src, src) {
+                return e.out.clone();
+            }
+        }
+        let out: Arc<[vitaslop_platform::gpu::GxpAttr]> = src
+            .iter()
+            .map(|a| vitaslop_platform::gpu::GxpAttr {
+                reg_index: a.reg_index,
+                offset: a.offset,
+                gxm_format: a.format,
+                components: a.component_count,
+            })
+            .collect();
+        if self.gxp_attr_sets.len() >= GXP_SET_CACHE_CAP {
+            self.gxp_attr_sets.clear();
+        }
+        self.gxp_attr_sets.insert(key, GxpAttrSet { src: src.clone(), out: out.clone() });
+        out
     }
 
     /// Decode (or reuse a cached) GPU-ready texture for `t`.
@@ -6564,35 +6912,16 @@ impl RenderSceneBuilder {
             // vertex/index buffers (not the culled canonical ones) so the recompiled pipeline
             // does its own attribute fetch + facing cull.
             let gxp = if !d.vprog.is_empty() {
-                let attributes = d
-                    .attributes
-                    .iter()
-                    .map(|a| vitaslop_platform::gpu::GxpAttr {
-                        reg_index: a.reg_index,
-                        offset: a.offset,
-                        gxm_format: a.format,
-                        components: a.component_count,
-                    })
-                    .collect();
-                let textures = d
-                    .textures
-                    .iter()
-                    .map(|t| vitaslop_platform::gpu::GxpTex {
-                        unit: t.unit as u8,
-                        tex: self.texture(t, &mut work),
-                    })
-                    .collect();
+                // All three lists are DERIVED ONCE per distinct source and shared thereafter -
+                // see `gxp_attributes` and `gxp_textures`. The capture already hands every
+                // draw with the same bindings one `Arc`; rebuilding a `Vec` from it per draw
+                // threw that sharing away one layer down.
+                let attributes = self.gxp_attributes(&d.attributes);
+                let textures = self.gxp_textures(&d.textures, &mut work);
                 // The VERTEX stage's own bindings, uploaded the same way. A vertex program that
                 // samples builds its geometry from the fetch, so these decide whether the draw
                 // has a mesh at all.
-                let vertex_textures = d
-                    .vertex_textures
-                    .iter()
-                    .map(|t| vitaslop_platform::gpu::GxpTex {
-                        unit: t.unit as u8,
-                        tex: self.texture(t, &mut work),
-                    })
-                    .collect();
+                let vertex_textures = self.gxp_textures(&d.vertex_textures, &mut work);
                 // Expand the guest topology into a flat, winding-normalized triangle-LIST u32
                 // index buffer (NO CPU cull - the recompiled pipeline culls on the GPU via the
                 // guest cull mode, using its own real-shader projection). Indexes into the RAW
@@ -8040,6 +8369,79 @@ mod texture_tests {
     /// formats - which are the LARGER half of what a mid-race frame decodes. Covers every
     /// lane width the decoder distinguishes (8/16/24/32/64-bit), both addressing modes, and
     /// non-power-of-two sizes, where a swizzled texture's padding is not the image.
+    /// The integer 16-bit reductions are the float ones, over every input there is.
+    ///
+    /// Not a spot check: both are total functions of a `u16`, so the whole domain is 65,536
+    /// cases and costs microseconds to enumerate. This is what makes the substitution a
+    /// REWRITE OF THE COST rather than of the answer [[vitaslop-identical-output-is-evidence]]
+    /// - the largest texture family a retail title decodes goes through it, and a
+    /// one-in-65,536 disagreement would show up as a single wrong texel nobody could find.
+    #[test]
+    fn the_integer_sixteen_bit_reductions_match_the_float_ones() {
+        for raw in 0..=u16::MAX {
+            let unorm = ((raw as f32 / 65535.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+            assert_eq!(unorm16_to_u8(raw), unorm, "U16 raw {raw}");
+            let snorm =
+                ((((raw as i16) as f32 / 32767.0).max(0.0)).clamp(0.0, 1.0) * 255.0).round() as u8;
+            assert_eq!(snorm16_to_u8(raw), snorm, "S16 raw {raw}");
+        }
+    }
+
+    /// The block decoder is the per-texel one, for every BC family and every block.
+    ///
+    /// The per-texel path is the ORACLE: it is what a single sampler read still goes through,
+    /// and it is the code the block decoder hoists work out of. So this enumerates blocks
+    /// rather than arguing - including the two modes that are decided by the ENDPOINT ORDER
+    /// (BC1's punch-through when `c0 <= c1`, and BC3's six-entry alpha ramp when `a0 <= a1`),
+    /// which are exactly the branches a hoist can get backwards.
+    #[test]
+    fn the_block_decoder_matches_the_per_texel_one() {
+        // A deterministic spread: a counter run through a cheap mixer, so the endpoints land
+        // on both sides of both order tests and the index bits take every value.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for fmt in [0x85u32, 0x86, 0x87] {
+            for case in 0..2000 {
+                let mut block = [0u8; 16];
+                for b in block.iter_mut() {
+                    *b = (next() >> 24) as u8;
+                }
+                // Force both endpoint orders to be exercised rather than left to chance.
+                if case % 2 == 0 {
+                    block[1] = 0x00;
+                    block[3] = 0xff;
+                    block[9] = 0x00;
+                }
+                let whole = decode_bc_block(&block, fmt);
+                for t in 0..16usize {
+                    let (px, py) = ((t % 4) as u32, (t / 4) as u32);
+                    assert_eq!(
+                        whole[t],
+                        decode_bc_texel(&block, fmt, px, py),
+                        "format {fmt:#x} case {case} texel {t} of {block:02x?}"
+                    );
+                }
+                // A SHORT block: both paths read zeros past the end, and the walker hands one
+                // in whenever the guest buffer ends inside the last row of blocks.
+                let short = &block[..5];
+                let whole_short = decode_bc_block(short, fmt);
+                for t in 0..16usize {
+                    let (px, py) = ((t % 4) as u32, (t / 4) as u32);
+                    assert_eq!(
+                        whole_short[t],
+                        decode_bc_texel(short, fmt, px, py),
+                        "format {fmt:#x} short block texel {t}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn uncompressed_fast_path_matches_per_texel() {
         // One format from each width family the match arms distinguish.
