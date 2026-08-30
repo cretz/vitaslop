@@ -10,6 +10,7 @@
 import init, {
   run_game_worker,
   set_knob,
+  set_system_font,
   worker_input_key,
   worker_input_pointer,
   worker_input_stick,
@@ -19,6 +20,34 @@ import init, {
   worker_location_note,
 } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
+
+// >>> THE SYSTEM FONT, IF THE DEPLOYMENT SUPPLIES ONE.
+//
+// `sceFontOpen`/`scePvfOpen` open one of the console's own installed fonts. Those are the
+// vendor's assets and are not shipped here, so the open is refused - and a title that renders
+// its strings through the system font then draws them all from an EMPTY GLYPH ATLAS, which
+// reaches the screen as blank or black areas where its dynamic text belongs. On the golf title
+// that was an opaque black rectangle over the club list and black bars over half of the
+// course-settings screen.
+//
+// The desktop can probe a host font path. A browser can do neither, so the bytes have to come
+// from the page: drop any TTF/OTF at `web/system-font.ttf` and it is used. A 404 is a NORMAL
+// outcome, not an error - the run then reports the refusal and shows no dynamic text, exactly
+// as a device with no font installed would.
+async function loadSystemFont() {
+  try {
+    const res = await fetch("./system-font.ttf", { cache: "force-cache" });
+    if (!res.ok) {
+      console.log("[font] no web/system-font.ttf - the title's dynamic text will be BLANK");
+      return;
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    set_system_font(bytes);
+    console.log(`[font] system-font substitute loaded, ${bytes.length} bytes`);
+  } catch (err) {
+    console.log(`[font] system-font substitute not loaded (${err}); dynamic text will be BLANK`);
+  }
+}
 
 // >>> FALL BACK TO A COMPATIBILITY-MODE ADAPTER WHEN THE NORMAL ONE IS BLOCKLISTED.
 //
@@ -177,6 +206,7 @@ self.onmessage = async (e) => {
     await ready;
     // A worker is its own wasm instance, so it needs the knobs set here, not on the page.
     for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
+    await loadSystemFont();
     // Forward each (id, text) metric the run publishes to the page.
     const report = (id, text) => self.postMessage({ type: "report", id, text });
     // Sync access handles can only be opened here (Workers only) and only

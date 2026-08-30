@@ -212,7 +212,7 @@ pub fn recompile_fragment_module(bytes: &[u8]) -> Result<(RecompiledFragment, Fr
     if module::writes_no_color_register(&rc.shader) {
         return Err(RecompileError::ColorRegisterNeverWritten);
     }
-    let plan = module::plan_bindings(&rc.shader, rc.program.default_uniform_regs, |o| {
+    let plan = module::plan_bindings(&rc.shader, rc.program.sa_carried_extent(), |o| {
         rc.program.sampler_is_cube(o as u32)
     });
     let writes_depth = rc.shader.instrs.iter().any(|i| i.op == ir::Op::DepthF);
@@ -247,24 +247,24 @@ pub fn recompile_vertex(bytes: &[u8]) -> Result<RecompiledVertex, RecompileError
     Ok(RecompiledVertex { program, shader, wgsl_body, hash })
 }
 
-/// The guest-memory window a VERTEX blob's 0xE8 memory loads need at DRAW time, if any:
-/// which uniform buffer index to read the bound address for, and how many bytes to
-/// snapshot. `None` for a program with no memory loads AND for one whose window cannot be
+/// The guest-memory windows a VERTEX blob's 0xE8 memory loads need at DRAW time, if any: for
+/// each, which uniform buffer index to read the bound address for and how many bytes to
+/// snapshot. EMPTY for a program with no memory loads AND for one whose windows cannot be
 /// resolved - the latter refuses to link ([`LinkError::MemWindowUnresolved`] names why), so
 /// a capture that snapshots nothing for it changes nothing.
 ///
-/// The opcode scan short-circuits before parsing operands: memory loads are one program in
-/// the whole captured corpus, and this runs once per registered program.
-pub fn mem_window_for_vertex_blob(bytes: &[u8]) -> Option<module::MemWindow> {
-    let program = Program::parse(bytes).ok()?;
+/// The opcode scan short-circuits before parsing operands: memory loads are a handful of
+/// programs in the whole captured corpus, and this runs once per registered program.
+pub fn mem_windows_for_vertex_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    let Ok(program) = Program::parse(bytes) else { return Vec::new() };
     if program.kind != ProgramKind::Vertex {
-        return None;
+        return Vec::new();
     }
     if !program.code.iter().any(|&w| usse::opcode1(w) == 0x1d) {
-        return None;
+        return Vec::new();
     }
     let shader = usse::decode_shader(&program);
-    module::resolve_mem_window(&program, &shader).ok().flatten()
+    module::resolve_mem_windows(&program, &shader).unwrap_or_default()
 }
 
 /// Recompile a vertex shader blob all the way to a complete, bindable [`VertexModule`] (WGSL

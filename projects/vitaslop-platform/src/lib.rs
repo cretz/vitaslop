@@ -28,3 +28,11 @@ pub mod knobs;
 /// wgpu.
 #[cfg(feature = "gpu")]
 pub mod texenc;
+// The video seam's TYPES are always compiled - the engine holds a `dyn VideoDecode` and
+// must not link a decoder to do it. Only the H.264-backed implementation is behind the
+// feature, which the front-ends enable.
+pub mod video;
+// The AUDIO seam, on the same terms as the video one above: the types are always
+// compiled because the engine holds a `dyn AudioDecode`, and only the AAC-backed
+// implementation is behind a feature.
+pub mod audio_dec;

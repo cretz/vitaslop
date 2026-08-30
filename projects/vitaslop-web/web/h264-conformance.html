@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop H.264 conformance - browser decoder</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 2rem; }
+      pre { white-space: pre-wrap; }
+      .pass { color: #0a0; font-weight: bold; }
+      .fail { color: #c00; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <h1>vitaslop H.264 conformance - browser decoder</h1>
+    <p>
+      The same suite <code>cargo test -p vitaslop-h264</code> runs, executed here against
+      the browser's own <code>WebCodecs VideoDecoder</code> - the one backend a native test
+      cannot reach. The stream is synthesised from <code>I_PCM</code> macroblocks, so the
+      correct pixels are knowable from the bitstream itself: no reference decoder, no
+      checked-in sample file, and byte equality is a legitimate assertion.
+    </p>
+    <p>
+      A browser with no <code>VideoDecoder</code> reports that and passes. That is a real
+      configuration, not a defect.
+    </p>
+    <div id="summary">Running...</div>
+    <pre id="report"></pre>
+    <script type="module">
+      import init, { run_h264_conformance } from "./pkg/vitaslop_web.js";
+
+      const summary = document.getElementById("summary");
+      const report = document.getElementById("report");
+
+      async function main() {
+        try {
+          await init();
+          const text = await run_h264_conformance();
+          window.__H264__ = { ok: true, text };
+          summary.className = "pass";
+          summary.textContent = "PASS";
+          report.textContent = text;
+        } catch (e) {
+          const text = e && e.message ? e.message : String(e);
+          window.__H264__ = { ok: false, text };
+          summary.className = "fail";
+          summary.textContent = "FAIL";
+          report.textContent = text;
+        }
+      }
+      main();
+    </script>
+  </body>
+</html>

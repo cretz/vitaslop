@@ -24,6 +24,8 @@ pub use wgpu_render::{GeneralRenderer, RenderSplit, WgpuRenderer};
 
 pub mod observe;
 
+pub mod watchdog;
+
 pub mod perf;
 
 pub mod recipe_runner;

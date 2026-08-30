@@ -48,7 +48,7 @@ use core::fmt::Write as _;
 use crate::container::{
     OutputVarying, ParseError, Program, ProgramKind, VaryingOrder, VaryingUsage,
 };
-use crate::ir::{Bank, Op, Shader};
+use crate::ir::{Bank, Op, Predicate, Shader};
 use crate::module::{plan_bindings, plan_vertex_bindings, BindingPlan, ColorOutput, VertexBindingPlan};
 use crate::wgsl::{emit_body, EmitError, TexBinding, BANK_REGS};
 use crate::{recompile_fragment, recompile_vertex, RecompileError};
@@ -274,12 +274,12 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     if frc.shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
         return Err(LinkError::FragmentMemLoad);
     }
-    crate::module::resolve_mem_window(&vprog, &vrc.shader)
+    crate::module::resolve_mem_windows(&vprog, &vrc.shader)
         .map_err(|why| LinkError::MemWindowUnresolved { why })?;
 
     let vplan = plan_vertex_bindings(&vprog, &vrc.shader);
     let mut fplan =
-        plan_bindings(&frc.shader, fprog.default_uniform_regs, |u| fprog.sampler_is_cube(u as u32));
+        plan_bindings(&frc.shader, fprog.sa_carried_extent(), |u| fprog.sampler_is_cube(u as u32));
 
     // The vertex must place clip POSITION in o0..o3 (what the rasteriser consumes) and its
     // varyings block must have VALIDATED - otherwise its varying placement is unknown.
@@ -415,10 +415,37 @@ fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
             let n = (components as usize).clamp(1, 4);
             [0 < n, 1 < n, 2 < n, 3 < n]
         }
-        Op::Tex { coords, .. } => {
+        Op::Tex { coords, .. } | Op::TexGather { coords, .. } => {
             let n = (coords as usize).clamp(1, 4);
             [0 < n, 1 < n, 2 < n, 3 < n]
         }
+        // A memory load's only source is a scalar ADDRESS - one lane, whatever its
+        // destination spans. Its write mask is explicitly not meaningful (the written span is
+        // `elements` consecutive registers), so taking the mask as the read count claims the
+        // three registers ABOVE the pointer are read too. That is how a pointer sitting near
+        // the top of the SA bank made a program look like it read past its uniform buffer.
+        Op::MemLoad { .. } => [true, false, false, false],
+        // A PREDICATE-ONLY test (`write_back = false`) has an all-false write mask, and taking
+        // the mask as the read set therefore says it reads NOTHING. It reads two operands and
+        // compares them; what it does not do is write a register.
+        //
+        // That is not a tidy-up. The registers a test reads are exactly the ones this file's two
+        // callers have to know about - the SA literals a stage needs an initialiser for, and the
+        // PA registers a varying has to be routed into - so a test's operands were invisible to
+        // both. MEASURED on a retail title's world material: its shadow-split cascade compares a
+        // uniform against the program's own literal `sa[30] = 100.0`, that literal got no
+        // initialiser, the compare read ZERO instead, and every pixel of the course took the
+        // wrong cascade branch. The pair links, every draw renders, and the course is black.
+        //
+        // The channels are the ones the REDUCTION consults: one for `Channel(n)`, all four for
+        // an AND/OR over the vector.
+        Op::Test { reduce: crate::ir::TestReduce::Channel(n), .. } => {
+            let n = (n as usize).min(3);
+            [n == 0, n == 1, n == 2, n == 3]
+        }
+        // An AND/OR over the vector, and `TestMask`, which produces a per-channel mask: both
+        // consult every channel.
+        Op::Test { .. } | Op::TestMask { .. } => [true; 4],
         _ => instr.write_mask,
     }
 }
@@ -450,12 +477,71 @@ fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
 /// which the hardware leaves undefined too - real programs do it on lanes whose result is dead
 /// (`frag_872e7aa0` computes a 4-channel MAD over a 3-channel product and discards the fourth),
 /// and failing the link over one would refuse a shader that is perfectly translatable.
+/// Which instructions are NOT guaranteed to run - the ones whose writes therefore cannot kill a
+/// later read.
+///
+/// # Why the linear reading was wrong, and what it cost
+/// The read-before-write analysis above walked the stream in order, so a write ANYWHERE earlier
+/// counted as defining the register. In an if/else that is exactly backwards: the two arms are
+/// mutually exclusive, so a write in one arm defines nothing for a read in the other. A retail
+/// title's world material is that shape -
+///
+/// ```text
+///   [1] test p0 = (g_CloudShadowAlpha > 0)
+///   [2] br  p0 -> 6            ; skip the cheap arm
+///   [3] pa[4] = pa[0]          ; cheap arm: no shadow lookup
+///   [4] pa[5] = pa[1]
+///   [5] br      -> 11          ; over the else arm
+///   [6] pa[4] = sample(unit 13, coord = pa[4..5])   ; <-- reads the varying
+/// ```
+///
+/// - and the writes at [3]/[4] made the linker treat `pa[4..5]` as the shader's own scratch. It
+/// then routed no varying into them, so the shadow lookup sampled at a coordinate of ZERO on
+/// every pixel. That is silent: the pair links, every draw renders, and the picture is wrong
+/// only where the branch is taken - which is why this title's front end looked perfect and its
+/// courses rendered black.
+///
+/// The rule is the ordinary dominance one, computed structurally because these programs are
+/// forward skips and loops rather than an arbitrary graph: an instruction is conditional if it
+/// carries a predicate, if some forward branch jumps over it, or if it sits in a loop body. Only
+/// the writes of the rest may kill. This is CONSERVATIVE in the safe direction - it can only
+/// make the linker route MORE of what a fragment declares, never less.
+fn conditionally_executed(shader: &Shader) -> Vec<bool> {
+    let n = shader.instrs.len();
+    let mut conditional = vec![false; n];
+    for (i, instr) in shader.instrs.iter().enumerate() {
+        if instr.pred != Predicate::Always {
+            conditional[i] = true;
+        }
+        let Op::Branch { rel } = instr.op else { continue };
+        let target = i as i64 + rel as i64;
+        let (lo, hi) = if rel > 0 {
+            // The words the branch jumps over run only when it is NOT taken.
+            (i + 1, target.min(n as i64) as usize)
+        } else {
+            // A back edge: everything from the loop head to the edge runs a number of times the
+            // stream does not fix, so none of it is guaranteed to have run at the exit.
+            (target.max(0) as usize, i + 1)
+        };
+        for c in conditional.iter_mut().take(hi).skip(lo) {
+            *c = true;
+        }
+    }
+    conditional
+}
+
 fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
     // Two entries per register: index `2*r + h` is half `h`. An F32 access covers both halves.
+    // `written` is the LINEAR answer (any earlier write in stream order) and feeds the strict
+    // `untouched` result; `written_must` counts only writes that are on EVERY path to a later
+    // instruction, and is what decides which registers have to be routed - see
+    // [`conditionally_executed`].
     let mut written = vec![false; BANK_REGS * 2];
+    let mut written_must = vec![false; BANK_REGS * 2];
     let mut inputs = vec![false; BANK_REGS];
     let mut untouched = vec![false; BANK_REGS];
-    for instr in &shader.instrs {
+    let conditional = conditionally_executed(shader);
+    for (index, instr) in shader.instrs.iter().enumerate() {
         // Sources and destination can be at DIFFERENT widths (a format convert), so each side
         // resolves its own registers - see [`crate::ir::Instr::source_half_precision`].
         let src_half = instr.source_half_precision();
@@ -481,7 +567,7 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                 if reg >= BANK_REGS {
                     continue;
                 }
-                if halves.clone().any(|h| !written[reg * 2 + h]) {
+                if halves.clone().any(|h| !written_must[reg * 2 + h]) {
                     inputs[reg] = true;
                 }
                 if !written[reg * 2] && !written[reg * 2 + 1] {
@@ -502,6 +588,9 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                     }
                     for h in halves {
                         written[reg * 2 + h] = true;
+                        if !conditional[index] {
+                            written_must[reg * 2 + h] = true;
+                        }
                     }
                 }
             }
@@ -778,14 +867,27 @@ fn written_output_lanes(vshader: &Shader) -> Vec<bool> {
 /// have to explain that hole. Across that program's siblings this hole falls where the
 /// convention says every time, which is why that title renders correctly under it.
 ///
-/// So: accept the convention when the code does not contradict it. The test is that every
-/// lane the code writes falls INSIDE some declared varying's span (or the clip position),
-/// and that each declared varying's FIRST lane is written - a varying whose run begins on a
-/// lane the program never wrote is a run that is not there.
+/// So: accept the convention when the code does not CONTRADICT it, using the same verdict the
+/// corpus test `assumed_varying_orders_the_vertex_code_contradicts` established and asserts on
+/// across 261 assumed-order programs of four titles - only one of the three things a layout can
+/// be measured against refutes it:
+///
+/// * a lane the code writes that no declared run covers and that lies BELOW the top of the
+///   layout REFUTES it. Only a wrong layout can produce one, because a wrong width or a wrong
+///   position shifts every run after it and the writes then land in the gaps.
+/// * a lane written at or ABOVE the top of the layout is not evidence about the order at all.
+///   The output bank's top holds things that are not varyings - clip planes, point size, and
+///   the reserved lane a varyings block can declare above its texcoords - and no run is placed
+///   there for a permutation to get wrong.
+/// * a declared run the program never STARTS is not evidence either. The hardware allows a
+///   declared varying to go unproduced, and that is exactly what the corpus test's UNWRITTEN
+///   verdict names; requiring every run to be started refuses a program for something the
+///   layout does not claim. (This gate did require it, which is what refused a golf title's
+///   three world vertex programs: each declares ten texture coordinates and fills eight.)
 ///
 /// Trailing lanes of a run may legitimately be unwritten (a three-component colour in a
-/// four-lane slot, a one-component fog in its two-lane slot), so absence inside a run is not
-/// evidence against it; a written lane OUTSIDE every run is.
+/// four-lane slot, a one-component fog in its two-lane slot), and those HOLES are the
+/// convention's own corroboration where they fall exactly where it says.
 fn convention_agrees_with_the_code(vout: &[OutputVarying], vshader: &Shader) -> bool {
     let written = written_output_lanes(vshader);
     let in_a_run = |lane: usize| {
@@ -796,10 +898,12 @@ fn convention_agrees_with_the_code(vout: &[OutputVarying], vshader: &Shader) -> 
                 lane >= lo && lane < lo + v.components as usize
             })
     };
-    if written.iter().enumerate().any(|(lane, &w)| w && !in_a_run(lane)) {
-        return false;
-    }
-    vout.iter().all(|v| written.get(v.base_lane as usize).copied().unwrap_or(false))
+    let top = vout
+        .iter()
+        .map(|v| v.base_lane as usize + v.components as usize)
+        .max()
+        .unwrap_or(0);
+    !written.iter().enumerate().any(|(lane, &w)| w && lane < top && !in_a_run(lane))
 }
 
 /// The vertex lane order the paired FRAGMENT's declaration implies, or `None` when the two
@@ -1019,15 +1123,41 @@ fn layout_from_forwarding_claims(
     // which is exactly what happened on the family this was written for: `In.VColor` fills lanes
     // 12..14, no width arrangement puts a four-lane `Color0` there, and demanding it refused the
     // `TexCoord(0)@8` the same program states plainly.
+    // The SLOT each usage occupies, taken from the convention's own layout rather than from its
+    // component count - because the two are NOT the same and the difference is a whole lane.
+    //
+    // A one-component Fog sits in a TWO-lane slot (the second lane is reserved and the program
+    // never writes it, which is the hole `convention_agrees_with_the_code` reads as the
+    // convention's own corroboration). Re-walking the lanes at `lane += components` closes that
+    // hole and shifts EVERY varying after it down by one, which is a width change - the one
+    // thing this resolver's contract says it never makes. MEASURED on a golf title's
+    // full-screen composite: the convention places `Fog@8x1 TexCoord(0)@10x4` and the walk
+    // produced `Fog@8x1 TexCoord(0)@9x4`, so the passthrough fragment read its colour from
+    // `o[9..12]` - one lane below the four the vertex writes - and the whole 960x544 world
+    // scene came out BLACK behind an opaque quad whose alpha came from a lane nothing wrote.
+    let mut stride: Vec<u32> = Vec::with_capacity(vout.len());
+    for (i, v) in vout.iter().enumerate() {
+        match vout.get(i + 1).map(|n| n.base_lane) {
+            // The last run has no successor to measure against, so its own components are all
+            // that is known; nothing is placed after it either way.
+            None => stride.push(v.components),
+            Some(n) if n >= v.base_lane + v.components => stride.push(n - v.base_lane),
+            // Overlapping or descending runs are not a layout this can re-walk at all, and a
+            // walk over one would invent lane numbers. Refuse instead.
+            Some(_) => return None,
+        }
+    }
     let origin = vout.iter().map(|v| v.base_lane).min().unwrap_or(0);
     let mut placed = vec![false; vout.len()];
     let mut out: Vec<OutputVarying> = Vec::with_capacity(vout.len());
     let mut lane = origin;
+    let mut satisfied = false;
     while out.len() < vout.len() {
         let claimed = want
             .iter()
             .find(|(l, _)| *l == lane)
             .and_then(|(_, u)| vout.iter().position(|v| v.usage == *u).filter(|&i| !placed[i]));
+        satisfied |= claimed.is_some();
         let i = claimed.or_else(|| (0..vout.len()).find(|&i| !placed[i]))?;
         placed[i] = true;
         out.push(OutputVarying {
@@ -1035,13 +1165,15 @@ fn layout_from_forwarding_claims(
             base_lane: lane,
             components: vout[i].components,
         });
-        lane += vout[i].components;
+        lane += stride[i];
     }
-    // A walk that lands back on the convention has resolved nothing - report no resolution rather
-    // than a layout that changed no lane. (The claims are only consulted at all when
-    // `forwarding_contradicts` has already fired, so this is the case where the contradiction is
-    // real but the evidence cannot reach the lane that would fix it.)
-    (out != vout).then_some(out)
+    // A walk that satisfied no claim has resolved NOTHING, whatever it did to the lanes: the
+    // claims are the entire evidence this function acts on, and a layout that answers none of
+    // them is a re-ordering with no witness behind it. A walk that lands back on the convention
+    // has likewise resolved nothing. (The claims are only consulted at all when
+    // `forwarding_contradicts` has already fired, so both are the case where the contradiction
+    // is real but the evidence cannot reach the lane that would fix it.)
+    (satisfied && out != vout).then_some(out)
 }
 
 /// Say, once per distinct contradiction, that a vertex program's own forwarding moves refuse the
@@ -1466,7 +1598,11 @@ fn secondary_attr_init(
     shader: &Shader,
     program: &Program,
 ) -> Result<Vec<(u32, u32)>, LinkError> {
-    let uniform_regs = program.default_uniform_regs;
+    // Every SA register the BINDING carries: the default uniform buffer plus any non-default
+    // uniform buffer the driver copies into the register file. Reading `default_uniform_regs`
+    // alone refused a program whose whole uniform block is a bound container-0 buffer, with a
+    // message naming its "0-register default uniform buffer" - which was true and not the point.
+    let uniform_regs = program.sa_carried_extent();
     // Registers the secondary program computes. These are legitimate sources for the primary
     // even above the uniform buffer - that is the point of a secondary program - so they must
     // not be mistaken for reads of the texture-control region.
@@ -1497,7 +1633,7 @@ fn secondary_attr_init(
             // texture-control table at decode, so those registers are never read as uniforms -
             // counting them makes a shader look like it reads past its buffer, and the read
             // channels here are the COORDINATE's count, which says nothing about the sampler.
-            if matches!(instr.op, Op::Tex { .. }) && i == 1 {
+            if matches!(instr.op, Op::Tex { .. } | Op::TexGather { .. }) && i == 1 {
                 continue;
             }
             for c in 0..4 {
@@ -1514,13 +1650,14 @@ fn secondary_attr_init(
     }
     // The mem-window base register is DRIVER data, not texture state: the module initialises
     // it from the bound window's own header (see `MemWindow::base_sa`), so a read of it is fed.
-    let mem_base_sa = crate::module::resolve_mem_window(program, shader)
-        .ok()
-        .flatten()
-        .map(|w| w.base_sa);
+    let mem_base_sa: Vec<u32> = crate::module::resolve_mem_windows(program, shader)
+        .unwrap_or_default()
+        .iter()
+        .map(|w| w.base_sa)
+        .collect();
     let mut literals = Vec::new();
     for reg in needed {
-        if reg < uniform_regs || written.contains(&reg) || Some(reg) == mem_base_sa {
+        if reg < uniform_regs || written.contains(&reg) || mem_base_sa.contains(&reg) {
             continue;
         }
         match program.literals.iter().find(|(r, _)| *r == reg) {
@@ -1550,7 +1687,13 @@ fn comp(c: u32) -> char {
 /// texture, and a fragment reading its own POSITION.z reads it here. If those two ever disagree
 /// the comparison a soft particle makes is between two different quantities - which renders as a
 /// fade that is stuck at 0 or 1 with nothing to point at.
-pub(crate) const GXP_DEPTH_DECL: &str = r#"struct GxpDepth { range: vec4<f32>, fit: vec4<f32> };
+///
+/// `vp.x` is the guest viewport's VERTICAL SENSE, +1 or -1. GXM maps ndc y to the framebuffer
+/// as `screen = yOffset + yScale * ndc`, and a pass that sets `yScale > 0` therefore puts ndc
+/// `+1` at the BOTTOM of its rectangle. A wgpu viewport requires a positive height and cannot
+/// express that, so the flip is done here instead - which is the only place it can be done at
+/// all, and it has to be per DRAW because the guest sets a viewport per draw.
+pub(crate) const GXP_DEPTH_DECL: &str = r#"struct GxpDepth { range: vec4<f32>, fit: vec4<f32>, vp: vec4<f32> };
 @group(3) @binding(0) var<uniform> gxp_depth: GxpDepth;
 
 // The value the GUEST's depth buffer holds for a fragment at clip `w`. A projection makes clip
@@ -1630,7 +1773,7 @@ fn build_linked_module(
     // The buffer is the guest's raw default-uniform-buffer bytes: a run of 32-bit registers,
     // NOT an array of floats, because a register may hold two packed F16 halves. It is bound
     // as `vec4<u32>` and copied verbatim into the register file.
-    let vsa_regs = vprog.default_uniform_regs;
+    let vsa_regs = vprog.sa_carried_extent();
     let vsa_vec4 = vsa_regs.div_ceil(4);
     if vsa_vec4 > 0 {
         let _ = writeln!(m, "struct VsSa {{ data: array<vec4<u32>, {vsa_vec4}> }};");
@@ -1640,16 +1783,17 @@ fn build_linked_module(
     // ---- The vertex stage's guest-memory window, beside its uniform in group 0 ----
     // Only present when the program's 0xE8 loads resolved to one (see `MemWindow`): vec4 0
     // lane x is the window's own guest base address, the window's words follow.
-    if let Some(w) = &vplan.mem_window {
+    if !vplan.mem_windows.is_empty() {
         let _ = writeln!(
             m,
             "@group(0) @binding(1) var<uniform> gxp_mem: array<vec4<u32>, {}>;",
-            w.vec4_count()
+            crate::module::mem_window_vec4_count(&vplan.mem_windows)
         );
+        m.push_str(&crate::module::mem_window_helper(&vplan.mem_windows));
     }
 
     // ---- Fragment default-uniform buffer (SA bank) at group 1 ----
-    let fsa_regs = fprog.default_uniform_regs;
+    let fsa_regs = fprog.sa_carried_extent();
     let fsa_vec4 = fsa_regs.div_ceil(4);
     if fsa_vec4 > 0 {
         let _ = writeln!(m, "struct FsSa {{ data: array<vec4<u32>, {fsa_vec4}> }};");
@@ -1699,6 +1843,7 @@ fn build_linked_module(
 
     // ---- Vertex entry point ----
     if has_inputs {
+        m.push_str(&crate::module::probe_globals());
         let _ = writeln!(m, "\n@vertex\nfn vs_main(in: VsIn) -> VsOut {{");
     } else {
         let _ = writeln!(m, "\n@vertex\nfn vs_main() -> VsOut {{");
@@ -1713,8 +1858,8 @@ fn build_linked_module(
     // hardware's PDS would leave it, so the body's address arithmetic runs bit-exact. After
     // the SA-init marker and the literals, so `resolve_sa_init` sees it as a WRITE and keeps
     // the register a compacted local slot.
-    if let Some(w) = &vplan.mem_window {
-        let _ = writeln!(m, "  sa[{}] = gxp_mem[0].x;", w.base_sa);
+    for (i, w) in vplan.mem_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = gxp_mem[{i}u].x;", w.base_sa);
     }
     m.push_str(vbody);
     let _ = writeln!(m, "  var out: VsOut;");
@@ -2152,7 +2297,7 @@ fn sa_uses(body: &str) -> Option<Vec<SaUse>> {
 /// to scratch, which is worth **10.13 -> 4.08 ms** of warm GPU render on one title's
 /// on-track run here and is a bigger and less predictable number on a phone; a session that
 /// measures a device needs to be able to take both arms without rebuilding.
-fn arm_on(name: &str) -> bool {
+pub(crate) fn arm_on(name: &str) -> bool {
     arm(name).map(|v| v != "0").unwrap_or(true)
 }
 

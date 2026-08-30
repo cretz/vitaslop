@@ -839,6 +839,15 @@ impl GuestMemory for &'_ SharedView {
     fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
         (**self).dirty_since(off, len, stamp)
     }
+    fn dirty_runs_since(
+        &self,
+        off: usize,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
+        (**self).dirty_runs_since(off, len, stamp, out)
+    }
     fn rebase_dirty_epoch(&self, floor: u8) -> Option<u8> {
         (**self).rebase_dirty_epoch(floor)
     }
@@ -921,6 +930,65 @@ impl SharedView {
             self.stamp_at(block, last + 1),
             stamp,
         ))
+    }
+
+    /// See [`GuestMemory::dirty_runs_since`]. ONE crossing: the page map for this range is a
+    /// byte per 4 KB, so a 0.75 MB texture asks about 192 bytes - against re-reading the
+    /// texture itself, which is what the answer avoids.
+    fn dirty_runs_since(
+        &self,
+        off: usize,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
+        let block = self.dirty_off?;
+        if len == 0 {
+            return Some(());
+        }
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let page_bytes = 1usize << shift;
+        let first = off >> shift;
+        let last = (off + len - 1) >> shift;
+        if last >= self.pages() {
+            return None;
+        }
+        // The page BELOW as well - a store stamped against it can reach into the first page
+        // of this range. It is read as part of the same crossing and folded into page 0.
+        let below = first.saturating_sub(1);
+        let map = self.stamp_at(block, below);
+        let end = map + (last - below + 1) as u32;
+        if end > self.bytes.length() {
+            return None;
+        }
+        let mut pages = vec![0u8; (end - map) as usize];
+        self.bytes.subarray(map, end).copy_to(&mut pages);
+        // `pages[0]` is the page below when there is one, so the range's own pages start at
+        // `skip`, and the overhang makes page 0 of the range dirty if that one is.
+        let skip = (first - below) as usize;
+        let overhang = skip == 1 && pages[0] >= stamp;
+        let mut run: Option<(usize, usize)> = None;
+        for (i, &p) in pages[skip..].iter().enumerate() {
+            let dirty = p >= stamp || (i == 0 && overhang);
+            if !dirty {
+                if let Some(r) = run.take() {
+                    out.push(r);
+                }
+                continue;
+            }
+            // Page i of the range, clipped to the range itself: the first page starts part
+            // way in and the last one ends part way through.
+            let page_start = ((first + i) << shift).max(off) - off;
+            let page_end = (((first + i) << shift) + page_bytes).min(off + len) - off;
+            match run.as_mut() {
+                Some(r) => r.1 = page_end,
+                None => run = Some((page_start, page_end)),
+            }
+        }
+        if let Some(r) = run {
+            out.push(r);
+        }
+        Some(())
     }
 
     fn dirty_epoch(&self) -> Option<u8> {
@@ -1924,6 +1992,74 @@ fn suspend(
     park.into()
 }
 
+/// >>> GIVE THE HOST'S EVENT LOOP A TURN. THE IDLE PATH HAD NO WAY TO.
+///
+/// A resume awaits a Promise that JSPI resolves, and a resolved Promise is a MICROTASK - the
+/// microtask checkpoint drains without ever running a task. So the whole of this scheduler
+/// loop, including the idle path, executes inside one task: `handle_idle` is synchronous, an
+/// idle round `continue`s, and the worker can spin for the entire length of a frame without
+/// the event loop turning over once.
+///
+/// Which is fine until the emulator is waiting for something only the event loop can deliver.
+/// `VideoDecoder` hands its pictures back through an output callback, and that callback is a
+/// TASK. So the movie thread parks for 2 ms of guest time, the scheduler finds nothing
+/// runnable, spins the idle path until the park expires, resumes the thread, asks the decoder
+/// again - and the decoder has still not been given a single moment in which to answer.
+///
+/// MEASURED: **120 access units submitted and no pictures at all** on a device, and 91 ms to
+/// the first picture on this machine. The park was added to fix exactly this and could not,
+/// because parking a guest THREAD is not the same as yielding the WORKER.
+///
+/// A `MessageChannel` message is the cheapest real task there is - unlike `setTimeout(0)`,
+/// which a worker clamps to 4 ms ([[vitaslop-worker-settimeout-is-clamped]]).
+async fn event_loop_turn() {
+    EVENT_LOOP_TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    thread_local! {
+        static CHANNEL: Option<web_sys::MessageChannel> = web_sys::MessageChannel::new().ok();
+    }
+    let promise = Promise::new(&mut |resolve, _reject| {
+        let posted = CHANNEL.with(|ch| {
+            let Some(ch) = ch else { return false };
+            let cb = Closure::once_into_js(move |_: JsValue| {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            });
+            ch.port1().set_onmessage(Some(cb.as_ref().unchecked_ref()));
+            ch.port2().post_message(&JsValue::NULL).is_ok()
+        });
+        if !posted {
+            // No channel is not a thing a worker does, but resolving immediately degrades to
+            // the old always-spin behaviour rather than hanging the run.
+            let cb = Closure::once_into_js(move |_: JsValue| {});
+            let _ = js_sys::Function::from(cb).call0(&JsValue::UNDEFINED);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// How many turns the worker's event loop has been given from INSIDE a frame.
+///
+/// The tick loop returns to the event loop once per tick whatever happens, so a host reply
+/// that needs a task always gets at least that. This counts the EXTRA turns the idle path
+/// hands out - and a run where it reads zero is a run where a callback-driven decoder was
+/// offered exactly one chance per displayed frame to answer, which for a 30 fps movie on a
+/// 60 Hz display is already the whole of its budget.
+static EVENT_LOOP_TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many turns the idle path has handed the event loop so far this run.
+pub fn event_loop_turns() -> u64 {
+    EVENT_LOOP_TURNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many CONSECUTIVE idle rounds may pass before the loop hands the event loop a turn.
+///
+/// Not every idle round: a turn is a real task dispatch, and the idle path can run thousands
+/// of rounds in a frame while the virtual clock walks to the next deadline - paying a task
+/// for each would make idling cost more than running. Not never, either, for the reason
+/// above. A run of idle rounds means the emulator has nothing to do, which is exactly when
+/// an outstanding host reply is the thing it is waiting for, and the counter resets the
+/// moment any thread becomes runnable - so a busy frame never reaches it at all.
+const IDLE_ROUNDS_PER_EVENT_LOOP_TURN: u64 = 64;
+
 /// A Promise that never resolves - a finished thread's stack parks here forever (it is
 /// never resumed), the browser analog of a fiber that has returned.
 fn never() -> JsValue {
@@ -2100,11 +2236,37 @@ pub async fn run_frames(
     // idle path from a guest being resumed and immediately blocking again, and those have
     // nothing in common but the symptom.
     let (mut idle_rounds, mut n_quantum, mut n_blocked, mut n_flip) = (0u64, 0u64, 0u64, 0u64);
+    // Idle rounds since the last time a thread was runnable - see `event_loop_turn`.
+    let mut consecutive_idle = 0u64;
+    // >>> A LONG WORK SLICE HANDS THE EVENT LOOP A TURN ON WALL CLOCK, RUNNABLE OR NOT.
+    //
+    // The idle-path turns above fire only when nothing is runnable - and a heavy frame is
+    // exactly when something always is. On the device that shipped this: a boot frame ran
+    // 1,077 ms and a course-load frame 261 ms inside ONE task, so for that whole stretch
+    // the worker's event loop never turned - the video decoder's output callback (a TASK)
+    // could not deliver a picture, the input port's messages queued, and the page read as
+    // hung. The movie panel's `7 still owed` and the user's "browser hangs during loads"
+    // are the same starvation seen from two sides.
+    //
+    // This is deliberately GENERAL, not a boot special case: ANY slice that runs longer
+    // than the budget yields once, wherever it happens - boot, course load, a pathological
+    // in-round frame. The clock is read every TURN_CHECK_ROUNDS rounds rather than every
+    // round because `performance.now()` is a JS call and a busy frame runs tens of
+    // thousands of rounds; at 64 that is a few hundred reads across the longest frame ever
+    // seen. The turn itself is the same MessageChannel task the idle path uses - real
+    // enough to run queued tasks, cheap enough to take twenty times in a long load.
+    const TURN_CHECK_ROUNDS: u64 = 64;
+    const SLICE_BUDGET_MS: f64 = 20.0;
+    let mut slice_start = perf_clock();
     loop {
         if rounds >= max_rounds {
             return RunReport::RoundLimit;
         }
         rounds += 1;
+        if rounds % TURN_CHECK_ROUNDS == 0 && perf_clock() - slice_start > SLICE_BUDGET_MS {
+            event_loop_turn().await;
+            slice_start = perf_clock();
+        }
         // `rounds == 1` as well as the window: a frame that blocks on its FIRST call would
         // otherwise say nothing at all, and "frame N in progress: 1 round" against a frozen
         // clock is the whole diagnosis.
@@ -2154,14 +2316,51 @@ pub async fn run_frames(
         drop(pick);
         let Some(idx) = picked else {
             idle_rounds += 1;
+            consecutive_idle += 1;
             let idle = vitaslop_runtime::perf::scope(vitaslop_runtime::perf::Phase::SchedIdle);
             let step = core.handle_idle();
             drop(idle);
             match step {
                 IdleStep::Done(report) => return report,
-                IdleStep::Continue => continue,
+                IdleStep::Continue => {
+                    // Nothing is runnable, so let the host deliver whatever it owes us before
+                    // asking again. See `event_loop_turn`.
+                    //
+                    // >>> AND WHEN A DECODER OWES PICTURES, SIXTY-FOUR ROUNDS IS A CEILING IT
+                    // >>> MAY NEVER REACH.
+                    //
+                    // The flat threshold assumes a long idle stretch is what an outstanding
+                    // host reply looks like. On a title with many live threads it is not:
+                    // MEASURED through the shipping page, a title's front end read `event loop:
+                    // 0 extra turns from the idle path` for a whole run - the scheduler never
+                    // saw sixty-four CONSECUTIVE idle rounds, because something always became
+                    // runnable first - while its movie read `10 access units submitted, 0
+                    // pictures delivered, 100% of calls empty`. The decoder's entire budget was
+                    // the one turn the tick gives per displayed frame, and delivering a picture
+                    // takes two (the output callback, then the async copy out of the frame).
+                    //
+                    // So while pictures are owed, the turns come on a POWER-OF-TWO cadence:
+                    // immediately when idling starts, which is exactly when the decoder needs
+                    // one, and thinning out to the old rate over a long stretch. That bounds
+                    // the extra turns to ~log2(rounds) per idle run, which is what keeps the
+                    // "a task per idle round costs more than running" objection from applying.
+                    let owed = vitaslop_runtime::vita::avcdec::pictures_owed() > 0;
+                    let turn = if owed {
+                        consecutive_idle.is_power_of_two()
+                    } else {
+                        consecutive_idle % IDLE_ROUNDS_PER_EVENT_LOOP_TURN == 0
+                    };
+                    if turn {
+                        event_loop_turn().await;
+                        // The slice clock measures time since the event loop last turned,
+                        // whatever caused the turn.
+                        slice_start = perf_clock();
+                    }
+                    continue;
+                }
             }
         };
+        consecutive_idle = 0;
 
         // A resume is the only AWAIT in this loop, so a resume that never comes back stops
         // the run with no other trace: the round counter stops, no fuel is burned, no host

@@ -134,10 +134,21 @@ pub enum Phase {
     /// `get_or_read` per underlying snapshot and a pointer compare. Paid once per set per
     /// scene by design; if it shows up per DRAW, something is failing its proof and rebuilding.
     DrawTexBindReproof,
+    /// >>> ONE GRAIN OF NGS MIXING, everything below nests in it.
+    ///
+    /// The audio path had NO phase at all, so the only way anyone ever learned what it costs
+    /// was a V8 worker profile of a browser run - which said **ATRAC9 decode 32% of the thread
+    /// and `sceAudioOutOutput` another 14%** on one title's race, and which a phone cannot
+    /// produce. A cost that can only be seen with a profiler is a cost nobody checks after
+    /// they change something, and the phase table is what a device run prints for free.
+    AudioMix,
+    /// Inside [`Self::AudioMix`]: decoding a source into PCM (ATRAC9 superframes, PCM/ADPCM
+    /// reads and resampling). The half that is per SOURCE BYTE rather than per voice.
+    AudioDecode,
 }
 
 impl Phase {
-    const COUNT: usize = 28;
+    const COUNT: usize = 30;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -166,6 +177,8 @@ impl Phase {
             Phase::DrawTexBindFold => 25,
             Phase::DrawTexBindProbe => 26,
             Phase::DrawTexBindReproof => 27,
+            Phase::AudioMix => 28,
+            Phase::AudioDecode => 29,
             Phase::SchedIdle => 16,
             Phase::SchedBook => 17,
             Phase::FrameBoundary => 18,
@@ -203,6 +216,8 @@ impl Phase {
             Phase::SchedBook,
             Phase::FrameBoundary,
             Phase::ThreadSpawn,
+            Phase::AudioMix,
+            Phase::AudioDecode,
         ]
     }
 
@@ -226,6 +241,8 @@ impl Phase {
             Phase::DrawTexBindFold => "draw:   ...of which fold the set key",
             Phase::DrawTexBindProbe => "draw:   ...of which probe + verify the set",
             Phase::DrawTexBindReproof => "draw:     ...of which the cross-SCENE re-proof",
+            Phase::AudioMix => "audio: mix one grain (every playing voice)",
+            Phase::AudioDecode => "audio:   ...of which decode a source",
             Phase::DrawGxpCapture => "draw: gxp blob + SA bytes",
             Phase::DrawRecord => "draw: build record + push scene",
             Phase::DrawUniforms => "draw: uniforms + material",

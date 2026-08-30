@@ -83,11 +83,43 @@ pub(super) fn set_resolution(st: &mut VitaState, lib: u32, h_resolution: f32, v_
 /// rather than hand back a font id with no backing face. Titles that render their own
 /// text ship a font and use `scePvfOpenUserFile` instead.
 #[hostcall]
-pub(super) fn open(ctx: &mut GuestCtx, _st: &mut VitaState, _lib: u32, _font_index: i32, _mode: u32, error_code: Ptr) -> u32 {
-    if !error_code.is_null() {
-        ctx.write_u32(error_code.addr(), SCE_PVF_ERROR_NOFILE as u32);
+pub(super) fn open(ctx: &mut GuestCtx, st: &mut VitaState, lib: u32, font_index: i32, _mode: u32, error_code: Ptr) -> u32 {
+    let font = crate::font::system::bytes()
+        .and_then(|bytes| {
+            st.fonts.open_system_substitute(lib, &bytes, crate::font::system::SUBSTITUTE_PX)
+        })
+        .inspect(|_| super::pgf::report_substitute_font(font_index));
+    match font {
+        Some(font) => {
+            if !error_code.is_null() {
+                ctx.write_u32(error_code.addr(), 0);
+            }
+            font
+        }
+        None => {
+            report_no_system_font(font_index);
+            if !error_code.is_null() {
+                ctx.write_u32(error_code.addr(), SCE_PVF_ERROR_NOFILE as u32);
+            }
+            0
+        }
     }
-    0
+}
+
+/// Say, once, that a SYSTEM font was asked for and refused. See the ScePgf twin
+/// (`crate::vita::pgf`) for why a silent refusal here is the expensive kind of silence.
+fn report_no_system_font(index: i32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::warn!(
+            target: "vitaslop::cb",
+            font_index = index,
+            "scePvfOpen: the title asked for a SYSTEM font, and this host ships none - they are \
+             the console vendor's assets. The open is refused, so every string the title renders \
+             through this library comes out EMPTY: expect blank or black areas where dynamic text \
+             belongs. A title that ships its own font reaches scePvfOpenUserFile instead."
+        );
+    });
 }
 
 /// ScePvfFontId scePvfOpenUserFile(ScePvfLibId libID, ScePvfPointer filename,
@@ -386,8 +418,16 @@ fn glyph_image_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, ch: u32, 
         return 0; // Nothing to draw (e.g. whitespace) - a valid, empty result.
     }
 
-    // The pen origin (26.6) is the glyph baseline origin in the destination buffer; the
+    // The pen origin (26.6) is the glyph BASELINE origin in the destination buffer; the
     // bitmap sits at pen + (bitmap_left, -bitmap_top).
+    //
+    // >>> THIS IS THE OPPOSITE OF `pgf::glyph_image`, AND BOTH ARE MEASURED - DO NOT
+    // "UNIFY" THEM. The PGF library's pen is the bitmap's TOP-LEFT (PCSA00009's glyph-cache
+    // quads sample exactly `[pen, pen+size)`). This PVF library's pen is the BASELINE:
+    // PCSA00027 opens a TTF through `scePvfOpenUserFile` and its control-hint text renders
+    // correctly under this convention - switching it to top-left (tried 2026-08-28c) pushed
+    // every glyph one ascent DOWN and the text vanished under the panel that follows it.
+    // Two libraries, two conventions, one title proving each.
     let dst_x0 = (x_pos64 >> 6) + left;
     let dst_y0 = (y_pos64 >> 6) - top;
 

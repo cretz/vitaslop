@@ -473,6 +473,134 @@ impl Program {
                 && p.resource_index as u32 == unit
         })
     }
+
+    /// Every NON-DEFAULT uniform buffer this program reads DIRECTLY out of the SA register
+    /// file, as `(buffer index, first SA register, extent in SA registers)`.
+    ///
+    /// # Two ways a program reads a bound uniform buffer, and they need opposite plumbing
+    /// GXM binds a buffer with `sceGxmSet{Vertex,Fragment}UniformBuffer(ctx, index, data)`.
+    /// What the SHADER then does with it is one of two things, and the blob says which:
+    ///
+    /// * The +0x78 table names the buffer, which means the driver writes its bound guest
+    ///   ADDRESS into a DATA-container slot and the program CHASES that pointer with 0x1d
+    ///   memory loads. That is [`UniformBufferBinding`] and
+    ///   [`crate::module::resolve_mem_window`]; those buffers are excluded here.
+    /// * The CONTAINER table carries an entry whose `index` IS the buffer index, which means
+    ///   the driver copies the buffer's bytes into the SA register file at that container's
+    ///   own `base_sa` before the program runs - exactly as it does for the DEFAULT uniform
+    ///   buffer (container 14), which every existing path already models. The program then
+    ///   reads `sa[base_sa + k]` with no load at all. That is what this returns.
+    ///
+    /// A program in the second shape whose buffer is not fed reads ZEROES for every uniform it
+    /// declares - including its transform - which is a black frame with no fallback, no
+    /// WebGPU error and nothing in any log. One retail title puts its WHOLE vertex uniform
+    /// block (a 320-byte container 0 holding `WorldViewProjection` first) there and declares
+    /// `default_uniform_regs = 0`.
+    ///
+    /// # Every entry is cross-checked, and a mismatch is dropped rather than trusted
+    /// The parameter table declares the buffer's SIZE IN BYTES (an `Aggregate` parameter whose
+    /// `array_size` is the byte count) and the container declares its extent in registers. An
+    /// entry is returned only when the container is at least as large as the declared bytes -
+    /// two independent readings of one fact, and a disagreement means one of them is being
+    /// read wrong, which is not a thing to paper over by taking the bigger.
+    pub fn sa_uniform_buffers(&self) -> Vec<SaUniformBuffer> {
+        let mut out = Vec::new();
+        for p in self.parameters.iter().filter(|p| p.category == ParamCategory::UniformBuffer) {
+            if p.resource_index < 0 {
+                continue;
+            }
+            let buffer_index = p.resource_index as u32;
+            // The pointer-chasing shape, handled by the memory-window path instead.
+            if self.uniform_buffer_bindings.iter().any(|b| u32::from(b.buffer_index) == buffer_index) {
+                continue;
+            }
+            // Only the ORDINARY uniform-buffer container numbers (0..13) can be one of these;
+            // 14 upward are the default buffer and the driver's own blocks.
+            if buffer_index >= 14 {
+                continue;
+            }
+            let Some(c) = self.containers.iter().find(|c| u32::from(c.index) == buffer_index) else {
+                continue;
+            };
+            let declared_regs = (p.array_size / 4).max(1);
+            if u32::from(c.size_regs) < declared_regs {
+                continue;
+            }
+            out.push(SaUniformBuffer {
+                buffer_index,
+                base_sa: u32::from(c.base_sa),
+                size_regs: u32::from(c.size_regs),
+            });
+        }
+        out.sort_by_key(|b| b.base_sa);
+        out
+    }
+
+    /// The DEFAULT uniform buffer's home in the SA register file: `(first SA register,
+    /// extent in SA registers)`.
+    ///
+    /// # The base is STORED, and assuming zero is wrong the moment another buffer is
+    /// SA-resident
+    /// Everything here used to take the default buffer as living at SA register 0, which is
+    /// true of every title whose container table declares container 14 at base 0 - and that is
+    /// every title captured before this one. A title that also puts a NON-default buffer in the
+    /// SA file lays container 0 at base 0 and pushes container 14 above it (one retail title:
+    /// container 0 at sa[0] x80, container 2 at sa[80] x8, container 14 at sa[88] x16, DATA at
+    /// sa[104] x11 - contiguous, and its literals land inside that DATA span, which is the
+    /// independent check that these bases mean what they say). Writing the default buffer at
+    /// sa[0] there would land it ON TOP of the transform.
+    ///
+    /// So the base is read from the container when the table declares one, exactly as
+    /// [`parse_sa_tables`] reads it for literals and texture-control words, and falls back to
+    /// zero only when there is no container 14 to read.
+    ///
+    /// # What is NOT established, stated rather than papered over
+    /// For those same vertex programs the header's `default_uniform_regs` (30, 28) EXCEEDS the
+    /// container's own extent (16, 14), and the container extent is the reading the layout
+    /// corroborates - taking the header's would run the default buffer over the DATA container
+    /// that holds its literals. How a 30-register parameter group is served by a 16-register
+    /// container is not established here. The extent returned is the container's; see
+    /// [`Self::default_uniform_overflows_its_container`], which is what lets a caller SAY the
+    /// tail is not carried rather than leave it to be inferred from a wrong colour.
+    pub fn default_uniform_sa_span(&self) -> (u32, u32) {
+        match self.containers.iter().find(|c| c.index == CONTAINER_DEFAULT_UNIFORM) {
+            Some(c) => (u32::from(c.base_sa), u32::from(c.size_regs)),
+            None => (0, self.default_uniform_regs),
+        }
+    }
+
+    /// How many default-uniform registers the parameter table declares beyond what the
+    /// container table gives the buffer room for - see [`Self::default_uniform_sa_span`]. Zero
+    /// for every program whose two readings agree, which is every program of every title
+    /// captured before the one that raised the question.
+    pub fn default_uniform_overflows_its_container(&self) -> u32 {
+        let (_, regs) = self.default_uniform_sa_span();
+        self.default_uniform_regs.saturating_sub(regs)
+    }
+
+    /// The first SA register past every block the SA binding must CARRY: the default uniform
+    /// buffer plus every [`Self::sa_uniform_buffers`] block. Literals and texture-control
+    /// words live in the SA file too but are baked into the recompiled shader, so they are
+    /// deliberately not counted.
+    pub fn sa_carried_extent(&self) -> u32 {
+        let (base, regs) = self.default_uniform_sa_span();
+        self.sa_uniform_buffers()
+            .iter()
+            .map(|b| b.base_sa + b.size_regs)
+            .fold(base + regs, u32::max)
+    }
+}
+
+/// A non-default uniform buffer the driver copies into the SA register file - see
+/// [`Program::sa_uniform_buffers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaUniformBuffer {
+    /// The buffer's GXM index - what `sceGxmSet{Vertex,Fragment}UniformBuffer` binds.
+    pub buffer_index: u32,
+    /// First SA register the buffer's bytes land on.
+    pub base_sa: u32,
+    /// The block's extent in 32-bit SA registers.
+    pub size_regs: u32,
 }
 
 /// A container-table entry: which SA-resident block it describes, where that block starts in
@@ -500,17 +628,32 @@ pub struct Container {
 /// `sa_register = data_container.base_sa + data_slot` then holds the pointer the program's
 /// memory loads chase.
 ///
-/// # Evidence, and why every use cross-checks
-/// Exactly ONE captured blob across every corpus carries this table (the skinning vertex
-/// program that also carries the only 0x1d memory loads), so the field layout rests on one
-/// entry: bytes 0..2 hold the buffer index its own parameter table declares (1), bytes 2..4
-/// hold 2, and `DATA.base_sa (22) + 2 = 24` is exactly the SA register the program's address
-/// arithmetic reads - two independent readings landing on one register. The entry's
-/// remaining bytes are unestablished and unread. Because one sample cannot pin a layout,
-/// [`crate::module::resolve_mem_window`] refuses (by name) any program where this reading
-/// fails its structural checks - the slot must lie inside the DATA container, collide with
-/// no literal and no texture-control word, and name an SA register the program actually
-/// reads - rather than ever placing a pointer somewhere plausible.
+/// # Evidence, including the STRIDE, which one entry could not settle
+/// The field layout was established on a single-entry table (a racing title's skinning vertex
+/// program): bytes 0..2 hold the buffer index its own parameter table declares (1), bytes 2..4
+/// hold 2, and `DATA.base_sa (22) + 2 = 24` is exactly the SA register that program's address
+/// arithmetic reads - two independent readings landing on one register.
+///
+/// The STRIDE needed a table with more than one entry, and a golf title's three world vertex
+/// programs have one (three entries each). It is EIGHT bytes, and what says so is where the
+/// table ENDS: the parameter table follows it immediately, and reading the first parameter at
+/// `base + 8 * count` yields `IN.position`, an F32x4 ATTRIBUTE at resource index 0 - which is
+/// exactly what those programs declare first. At a sixteen-byte stride the table would swallow
+/// the first two parameters and the entries themselves read as garbage (a "buffer index" of 4
+/// paired with a slot the DATA container does not have). The same reading leaves the
+/// single-entry blob untouched.
+///
+/// Each entry is then corroborated by the program that carries it: every slot lands inside the
+/// DATA container, and every slot whose buffer the program actually declares names an SA
+/// register the code reads as a POINTER - `sa[104]` by a memory load, `sa[105]` and `sa[106]`
+/// by the address arithmetic feeding one. An entry for a buffer the program does not declare
+/// is inert and its register is never read.
+///
+/// Because the layout still rests on few samples, [`crate::module::resolve_mem_windows`]
+/// refuses (by name) any program where this reading fails its structural checks - every slot
+/// must lie inside the DATA container and collide with no literal and no texture-control word,
+/// and every DATA-container register the program reads as a pointer must be covered by an
+/// entry - rather than ever placing a pointer somewhere plausible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UniformBufferBinding {
     /// The uniform buffer's index (the `UniformBuffer` parameter's `resource_index`).
@@ -542,9 +685,8 @@ fn parse_containers(bytes: &[u8]) -> Vec<Container> {
 }
 
 /// Parse the header's +0x78 uniform-buffer binding table (count at +0x78, self-relative
-/// offset at +0x7c). See [`UniformBufferBinding`] for the evidence behind the entry layout;
-/// the 16-byte stride is the observed extent of the one shipped entry before unrelated data
-/// and, like the field layout, is held to by the structural checks every consumer runs.
+/// offset at +0x7c). See [`UniformBufferBinding`] for the evidence behind the entry layout
+/// and the stride.
 fn parse_uniform_buffer_bindings(bytes: &[u8]) -> Vec<UniformBufferBinding> {
     let mut out = Vec::new();
     let (Some(count), Some(rel)) =
@@ -569,6 +711,8 @@ fn parse_uniform_buffer_bindings(bytes: &[u8]) -> Vec<UniformBufferBinding> {
 /// placed against.
 const CONTAINER_LITERAL: u16 = 16;
 const CONTAINER_DATA: u16 = 19;
+/// Container index of the DEFAULT uniform buffer.
+const CONTAINER_DEFAULT_UNIFORM: u16 = 14;
 
 /// Parse the SA-resident constant/texture tables.
 ///
@@ -696,7 +840,7 @@ const OFF_CONTAINER_COUNT: usize = 0x90;
 const OFF_UB_BINDING_COUNT: usize = 0x78;
 const OFF_UB_BINDING_OFFSET: usize = 0x7c;
 /// Observed stride of one +0x78 entry.
-const UB_BINDING_ENTRY: usize = 16;
+const UB_BINDING_ENTRY: usize = 8;
 const OFF_CONTAINER_OFFSET: usize = 0x94;
 /// On-disk size of one container entry: four u16 - `index`, unused, `base_sa`, `size_in_f32`.
 const CONTAINER_ENTRY: usize = 8;
@@ -1131,6 +1275,39 @@ const POSITION_PRESENT_BIT: u32 = 0x1000;
 /// the block's total but are not varyings and are not emitted as such.
 const CLIP_PLANE_MASK: u32 = 0x000f;
 
+/// A further ONE-LANE output at the top of the bank, above the texture coordinates - counted in
+/// the block's own total, never routed as a varying.
+///
+/// # Established by closure over 421 vertex programs of six titles
+/// Group the corpus by `vo1`'s present-bits and ask how far the decoded lanes fall short of the
+/// block's declared total:
+///
+/// ```text
+///   0x1000  280 programs   short 0
+///   0x1200   72 programs   short 0
+///   0x1800   55 programs   short 0
+///   0x1c00    8 programs   short 0
+///   0x1b00    3 programs   short 1
+///   0x1f00    3 programs   short 1
+/// ```
+///
+/// Every mask WITHOUT this bit closes exactly; every mask WITH it is short by exactly one,
+/// never two. So the bit is worth one lane, and that is not a reading anything else in the
+/// block could produce.
+///
+/// # And it sits ABOVE the texcoords, which is the part that decides where every varying lands
+/// Its bit position (immediately below FOG, in a field whose bits DESCEND through the canonical
+/// order) would put it between fog and the texture coordinates. It does not sit there. The three
+/// programs that carry it and declare COLOR0 + FOG + ten 4-wide texcoords write output lanes
+/// `4..8` (colour), `10..14` and `26..34` - every one of them exactly on a group boundary under
+/// "position, colour, fog, texcoords, then this lane", and every one of them one lane off under
+/// "…fog, this lane, texcoords". A misplacement here is not a missing output, it is every
+/// texture coordinate in the program shifted by one register.
+///
+/// What the lane MEANS is not established and does not need to be: like a clip plane it is
+/// consumed before the fragment stage, so no fragment declares it and nothing routes it.
+const TOP_RESERVED_LANE_BIT: u32 = 0x0100;
+
 /// Decode a VERTEX program's interpolated outputs from its varyings block.
 ///
 /// The block (header +0x2C, self-relative) carries two words the vertex side needs:
@@ -1263,7 +1440,10 @@ fn parse_vertex_output_varyings(
     for &(k, components) in &widths {
         declared.push((VaryingUsage::TexCoord(k), components, components));
     }
-    let clip_lanes = (vo1 & CLIP_PLANE_MASK).count_ones();
+    // Lanes the block accounts for but no varying ever claims: the clip planes at the top of
+    // the bank, plus [`TOP_RESERVED_LANE_BIT`]'s single lane above them.
+    let clip_lanes =
+        (vo1 & CLIP_PLANE_MASK).count_ones() + u32::from(vo1 & TOP_RESERVED_LANE_BIT != 0);
 
     // The attribute evidence. A passthrough vertex program's outputs ARE its inputs, so when
     // every declared varying is matched by an ATTRIBUTE carrying that semantic, the attributes'

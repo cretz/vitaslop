@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Playwright/Chrome browser tests for vitaslop-web: run the cube (and later the conformance corpus) on a real browser WebAssembly + WebGPU stack.",
   "scripts": {
-    "test": "node run.mjs && node conformance.mjs",
+    "test": "node run.mjs && node conformance.mjs && node h264-conformance.mjs",
     "test:cube": "node run.mjs",
     "test:conformance": "node conformance.mjs"
   },

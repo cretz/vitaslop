@@ -17,6 +17,14 @@
     <!-- What the worker's WebGPU adapter actually is; see the note in game.html. -->
     <div id="adapter">adapter: --</div>
     <pre id="status">loading...</pre>
+    <!-- The run's own DIAGNOSTICS PANEL, the same `diag` report the shipping page shows.
+         The worker addresses reports BY ELEMENT ID, so without this element the headless
+         page silently drops the one channel that carries blocked threads, guest heaps, idle
+         attribution and the movie counters - and a harness run then has to be repeated by
+         hand on `live.html` to ask anything about a stall. Kept out of the way rather than
+         hidden: `display:none` still yields textContent, but a screenshot of this page is
+         also a diagnostic and the panel does not belong on top of the frame. -->
+    <pre id="diag" style="position:absolute;left:-9999px;top:0;white-space:pre-wrap"></pre>
     <script type="module">
       import { forwardInput } from "./worker-input.js";
       import { importTitle, isImported } from "./opfs.js";

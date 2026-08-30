@@ -32,6 +32,22 @@ pub struct Mspace {
     /// larger than the requested size (alignment padding is folded into it) so that
     /// freeing gives every byte back.
     used: HashMap<u32, u32>,
+    /// >>> IS THE GUEST DRAINING THIS POOL, OR ONLY FILLING IT?
+    ///
+    /// A full mspace returning NULL is a normal outcome the title handles, and the warning
+    /// for it says so - but it then SPECULATES that "a run that does it constantly is a pool
+    /// the guest is filling faster than it drains", which nothing measured. Those are very
+    /// different situations: ordinary churn against a pool the title sized tightly is the
+    /// title's business, whereas allocations that are never freed are usually OURS - a
+    /// release path the guest takes that this engine does not implement, so the guest thinks
+    /// it freed and the pool disagrees.
+    ///
+    /// Four counters answer it, and `frees` against `allocs` is the whole reading. MEASURED
+    /// on one racer's race: see the `mspace:` line at the end of a run.
+    allocs: u64,
+    frees: u64,
+    failures: u64,
+    peak_used: u32,
 }
 
 impl Mspace {
@@ -43,6 +59,10 @@ impl Mspace {
             free_by_addr: BTreeMap::new(),
             free_by_size: BTreeSet::new(),
             used: HashMap::new(),
+            allocs: 0,
+            frees: 0,
+            failures: 0,
+            peak_used: 0,
         };
         if capacity > 0 {
             m.insert_free(base, capacity);
@@ -116,7 +136,33 @@ impl Mspace {
         let end = ptr + size;
         self.insert_free(end, start + len - end);
         self.used.insert(ptr, size);
+        self.allocs += 1;
+        self.peak_used = self.peak_used.max(self.used_bytes());
         Some(ptr)
+    }
+
+    /// One line on what this space has done: whether it is churning or only filling.
+    /// See the counter fields for why the distinction is the whole point.
+    pub fn report(&self) -> String {
+        format!(
+            "mspace {:#010x}: {} of {} bytes live (peak {}), {} live blocks | {} allocs, \
+             {} frees, {} REFUSED for want of room | {} free runs, largest {}",
+            self.base,
+            self.used_bytes(),
+            self.capacity,
+            self.peak_used,
+            self.used.len(),
+            self.allocs,
+            self.frees,
+            self.failures,
+            self.free_by_addr.len(),
+            self.free_by_size.iter().next_back().map_or(0, |&(len, _)| len),
+        )
+    }
+
+    /// Record that an allocation could not be served. See [`Mspace::report`].
+    pub fn note_failure(&mut self) {
+        self.failures += 1;
     }
 
     /// Free a pointer this space handed out. Returns false for a pointer it did not -
@@ -126,6 +172,7 @@ impl Mspace {
         let Some(len) = self.used.remove(&ptr) else {
             return false;
         };
+        self.frees += 1;
         let mut start = ptr;
         let mut len = len;
         // Coalesce with the run ending here.
@@ -162,6 +209,13 @@ impl Mspace {
 #[derive(Debug, Default)]
 pub struct MspaceStore {
     spaces: BTreeMap<u32, Mspace>,
+    /// What each DESTROYED space did, kept as its finished report line.
+    ///
+    /// Without this the end-of-run report is silent for a title that tidies up after itself,
+    /// which is the well-behaved case - and the first run of this instrument hit exactly
+    /// that: a race that had already reported an exhausted pool printed nothing at all,
+    /// because the pool no longer existed by the time anyone asked.
+    retired: Vec<String>,
 }
 
 impl MspaceStore {
@@ -176,7 +230,17 @@ impl MspaceStore {
     }
 
     pub fn destroy(&mut self, handle: u32) -> bool {
-        self.spaces.remove(&handle).is_some()
+        match self.spaces.remove(&handle) {
+            Some(space) => {
+                // Keep only spaces that did something worth reporting; a title that creates
+                // and drops scratch pools would otherwise bury the one that matters.
+                if space.allocs > 0 {
+                    self.retired.push(format!("{} [DESTROYED]", space.report()));
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn get_mut(&mut self, handle: u32) -> Option<&mut Mspace> {
@@ -185,6 +249,11 @@ impl MspaceStore {
 
     pub fn get(&self, handle: u32) -> Option<&Mspace> {
         self.spaces.get(&handle)
+    }
+
+    /// Every live space's [`Mspace::report`], for the end of a run.
+    pub fn report(&self) -> Vec<String> {
+        self.retired.iter().cloned().chain(self.spaces.values().map(Mspace::report)).collect()
     }
 }
 

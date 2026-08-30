@@ -105,6 +105,17 @@ pub struct NeonType {
 pub enum NeonBin {
     Add,
     Sub,
+    /// `vqadd`/`vqsub`: add/subtract with SATURATION into the element's range instead of
+    /// wrapping. A mixer that wraps turns its loudest peak into a sample of the opposite
+    /// sign, which is a click, so these are never folded into `Add`/`Sub`.
+    QAdd,
+    QSub,
+    /// `vhadd`/`vhsub`: `(a +- b) >> 1`, and `vrhadd`: `(a + b + 1) >> 1`. The halving
+    /// happens in a WIDER intermediate, so the sum cannot overflow the element - which is
+    /// exactly why a title averages this way instead of adding and shifting itself.
+    HAdd,
+    HSub,
+    RHAdd,
     Mul,
     Max,
     Min,
@@ -199,9 +210,11 @@ pub enum NeonStmt {
     /// Absolute-value f32 compare (`vacge`/`vacgt`): `dst` lane is all-ones when
     /// `|a| >= |b|` (`ge = true`) or `|a| > |b|` (`ge = false`), zero otherwise.
     CmpAbs { ge: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
-    /// Pairwise f32 max/min (`vpmax`/`vpmin`): adjacent element pairs within the
+    /// Pairwise max/min (`vpmax`/`vpmin`): adjacent element pairs within the
     /// concatenation `a : b` are reduced (`min` picks min over max). Doubleword only.
-    PairMinMax { min: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// `ty` carries the element size and whether it is the f32 or the integer form -
+    /// the integer forms also carry the signedness that decides the comparison.
+    PairMinMax { ty: NeonType, min: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
     /// Reverse the order of the `esize`-bit elements within each `container`-bit group
     /// (`vrev16`/`vrev32`/`vrev64`). `container` is 16/32/64 and is a multiple of `esize`.
     Rev { esize: u8, container: u8, dst: NeonReg, src: NeonReg },
@@ -212,9 +225,51 @@ pub enum NeonStmt {
     /// Bitwise test (`vtst`): each `ty.bits`-bit lane of `dst` is all-ones when
     /// `a AND b` is nonzero in that lane, and zero otherwise.
     Test { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Bitwise NOT (`vmvn`) - element-size agnostic, so no type rides with it.
+    Not { dst: NeonReg, src: NeonReg },
+    /// Saturating absolute value (`vqabs`) or negate (`vqneg`). They differ from the plain
+    /// forms at exactly ONE input - the element's minimum, whose true magnitude is one past
+    /// the maximum - and that input is the one a signal at full scale produces.
+    SatAbsNeg { ty: NeonType, neg: bool, dst: NeonReg, src: NeonReg },
+    /// Narrowing right shift (`vshrn`/`vrshrn`/`vqshrn`/`vqrshrn`/`vqshrun`/`vqrshrun`):
+    /// shift each `2*esize`-bit element of the `Qm` source right by `shift`, then write
+    /// `esize` bits of each to the `Dd` result.
+    ///
+    /// The six forms differ in two independent bits, which is why they are one node:
+    /// `round` adds the half-ulp before the shift discards it, and `sat` - when present -
+    /// clamps on the way down instead of truncating, carrying `(source signed, result
+    /// signed)` because `vqshrun` narrows a SIGNED source into an UNSIGNED result.
+    NarrowShift {
+        esize: u8,
+        dst: NeonReg,
+        src: NeonReg,
+        shift: u8,
+        round: bool,
+        sat: Option<(bool, bool)>,
+    },
+    /// Widening left shift (`vshll`): widen each `esize`-bit element of the `Dm` source
+    /// to `2*esize` bits (sign- or zero-extending per `signed`) and shift it left by
+    /// `shift`. `vmovl` is the `shift == 0` case and has its own node.
+    WidenShift { esize: u8, dst: NeonReg, src: NeonReg, shift: u8, signed: bool },
     /// Narrowing move (`vmovn`): truncate each `2*esize`-bit element of the `Qm`
     /// source `src` to its low `esize` bits and write the `Dd` result `dst`.
     Narrow { esize: u8, dst: NeonReg, src: NeonReg },
+    /// Saturating narrowing move (`vqmovn`/`vqmovun`): CLAMP each `2*esize`-bit element
+    /// of the `Qm` source `src` into `esize` bits and write the `Dd` result `dst`.
+    ///
+    /// The three encodings differ only in which range each end is clamped to, which is
+    /// exactly what the two signedness flags carry: `vqmovn.sNN` is signed -> signed,
+    /// `vqmovn.uNN` unsigned -> unsigned, and `vqmovun.sNN` signed -> unsigned. Clamping
+    /// is the whole point of the instruction - a title uses it where truncation would
+    /// wrap a loud sample into a quiet one of the opposite sign - so this is deliberately
+    /// NOT folded into [`NeonStmt::Narrow`].
+    NarrowSat { esize: u8, dst: NeonReg, src: NeonReg, src_signed: bool, dst_signed: bool },
+    /// Byte table lookup (`vtbl`/`vtbx`): each byte of the D register `index` selects a
+    /// byte from the table of `len` consecutive D registers starting at `table`, and the
+    /// result goes to the D register `dst`. An index at or past the table's `8 * len`
+    /// bytes writes zero (`vtbl`) or leaves that destination byte alone (`vtbx`, which is
+    /// what `extend` selects).
+    TableLookup { dst: u8, table: u8, len: u8, index: u8, extend: bool },
     /// Whole-register bitwise logical op (the 3-same logical family): `vand`,
     /// `vorr`, `veor`, `vbic`, `vorn`, and the insert/select forms `vbsl`/`vbit`/
     /// `vbif` (which also read `dst`). Element-size agnostic.
@@ -296,6 +351,13 @@ pub enum NeonShift {
     Sli,
     /// `vsri`: shift right and insert - the high `n` bits of `dst` are preserved.
     Sri,
+    /// `vrshr`: right shift with ROUNDING - half an ulp is added before the discarded
+    /// bits go. Not a cosmetic difference from [`Shr`](Self::Shr): truncation biases
+    /// every sample toward zero, which over a signal is a DC offset, and that is exactly
+    /// why a codec reaches for this form.
+    Rshr,
+    /// `vrsra`: the rounding right shift, accumulated into `dst`.
+    Rsra,
 }
 
 /// Floating-point binary operators (single precision).

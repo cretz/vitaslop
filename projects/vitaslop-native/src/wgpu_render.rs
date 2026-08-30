@@ -363,6 +363,10 @@ impl GeneralRenderer {
             &built,
             width,
             height,
+            // The headless target IS the guest resolution here: `color_tex` above is created at
+            // exactly `width x height`, so the framebuffer extent and the surface extent agree.
+            width,
+            height,
             clear,
         );
         let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;

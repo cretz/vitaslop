@@ -41,6 +41,12 @@ use vitaslop_runtime::render;
 
 use crate::observe;
 use crate::observe::{format_f64, sample_watch, signature, write_shot};
+
+/// The background a session shot clears to, and the panel size it is written at - the same
+/// two constants the desktop's headless shots use, so the two are comparable images.
+const SHOT_CLEAR: [u8; 4] = [16, 16, 24, 255];
+const SHOT_PANEL_W: u32 = 960;
+const SHOT_PANEL_H: u32 = 544;
 use crate::recipe_runner::boot_retail;
 use crate::{RunReport, ThreadedScheduler};
 
@@ -127,6 +133,25 @@ pub struct Session {
     /// How many reports have contributed to `drift_origin`, so a caller can judge how
     /// much accumulated estimate error is in it.
     drift_updates: u32,
+    /// >>> THE REAL GPU, KEPT ALIVE FOR THE WHOLE SESSION, BECAUSE THE ALTERNATIVE WAS A
+    /// >>> TWELVE-MINUTE REPLAY PER SCREENSHOT.
+    ///
+    /// A session's `shot` used to go through the SOFTWARE rasteriser only, which cannot run
+    /// a recompiled fragment program - so on a title whose picture is its shaders, every
+    /// session shot was a black frame and the only way to SEE the state a session had
+    /// reached was to `save` a recipe and replay the whole thing under
+    /// `vitaslop-desktop --headless`. On the golf title, at 34,000 frames deep in a round,
+    /// that is twelve minutes per look, and it is the dominant cost of authoring a recipe.
+    ///
+    /// The session already holds the frame's scenes. This renders them where the desktop
+    /// does, in about a second, and only builds the device the first time a shot is asked
+    /// for - a session that never screenshots pays nothing.
+    ///
+    /// `None` after a failed attempt is remembered in `gpu_refused` so a machine with no
+    /// adapter is not asked once per shot.
+    gpu: Option<crate::wgpu_render::GeneralRenderer>,
+    /// Whether building the GPU renderer has already failed once; see [`Session::gpu`].
+    gpu_refused: bool,
 }
 
 /// Options shared by `route` and `navigate --plan`: everything that describes the
@@ -271,6 +296,8 @@ impl Session {
             last_sprites: None,
             drift_origin: [0.0; 3],
             drift_updates: 0,
+            gpu: None,
+            gpu_refused: false,
         };
         s.reset_watch_csv();
         Ok(s)
@@ -953,9 +980,52 @@ impl Session {
     }
 
     /// Render the current frame and record it in the recipe being authored.
+    ///
+    /// The GPU path first, because it is the one that draws what the title actually draws;
+    /// the software rasteriser is the fallback for a host with no adapter, and it says so.
     fn take_shot(&mut self, name: &str) -> Option<PathBuf> {
-        let path = write_shot(&self.sched, self.opts.shot_dir.as_deref(), name)?;
+        let path = self
+            .take_gpu_shot(name)
+            .or_else(|| write_shot(&self.sched, self.opts.shot_dir.as_deref(), name))?;
         self.recipe.shots.push(ShotDecl { frame: self.frame(), name: name.to_string() });
+        Some(path)
+    }
+
+    /// Render this frame's scenes through the real GPU and write the PNG, or `None` if
+    /// there is no shot directory, no scene yet, or no adapter on this host.
+    ///
+    /// Written at PANEL size whatever the guest declared, exactly as the desktop's headless
+    /// shots are, so a session shot and a headless shot of the same frame are comparable
+    /// images rather than two different croppings.
+    fn take_gpu_shot(&mut self, name: &str) -> Option<PathBuf> {
+        let dir = self.opts.shot_dir.as_deref()?;
+        let scenes: Vec<_> = {
+            let host = self.sched.host();
+            host.state.capture.frame_scenes().to_vec()
+        };
+        if scenes.is_empty() {
+            return None;
+        }
+        if self.gpu.is_none() {
+            if self.gpu_refused {
+                return None;
+            }
+            self.gpu = crate::wgpu_render::GeneralRenderer::new();
+            if self.gpu.is_none() {
+                self.gpu_refused = true;
+                eprintln!(
+                    "session: no GPU adapter, so `shot` falls back to the SOFTWARE                      rasteriser - which cannot run a recompiled fragment program, so on a                      shader-driven title the image will be missing everything the guest's                      own shaders draw."
+                );
+                return None;
+            }
+        }
+        let (dw, dh) = self.sched.host().state.display_size();
+        let renderer = self.gpu.as_mut()?;
+        let fb = renderer.render_frame(&scenes, dw, dh, SHOT_CLEAR);
+        let fb = fb.scaled_to(SHOT_PANEL_W, SHOT_PANEL_H);
+        std::fs::create_dir_all(dir).ok()?;
+        let path = dir.join(format!("{name}.png"));
+        std::fs::write(&path, fb.to_png()).ok()?;
         Some(path)
     }
 

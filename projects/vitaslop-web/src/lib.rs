@@ -159,6 +159,16 @@ struct FpsMeter {
     window_frames: u32,
     /// Last published rate, so callers (and a headless test) can read it back.
     last_fps: f64,
+    /// Guest display flips retired in this window, which is a DIFFERENT rate from the
+    /// presented one whenever the loop runs more than one frame per present. See
+    /// [`FpsMeter::note_guest_frames`].
+    window_guest_frames: u32,
+    /// Last published guest-flip rate, i.e. the emulated speed's numerator.
+    last_guest_fps: f64,
+    /// The emulated game clock, in microseconds, at the start of this window and at the
+    /// last frame - the numerator of the SPEED percentage. See [`FpsMeter::note_clock`].
+    window_clock_us: u64,
+    last_clock_us: u64,
     /// While set, the meter publishes what it is doing INSTEAD of a rate. A fast-forward
     /// presents once per event-loop tick rather than once per guest frame, so the rate it
     /// would compute describes the tick cadence and nothing about how fast the emulator
@@ -170,14 +180,6 @@ struct FpsMeter {
 /// long enough to average out per-frame jitter.
 const FPS_WINDOW_MS: f64 = 500.0;
 
-/// The console's display rate, and so the reference for "full speed". The live loop
-/// advances the guest exactly one display flip per presented frame, so the presented
-/// rate IS the emulated rate and dividing by this gives the speed the title is running
-/// at. Worth showing next to the raw number: on the main thread the loop is paced by
-/// `requestAnimationFrame`, so the rate is capped at the display refresh and a healthy
-/// run reads a flat 60 whether it has 2x headroom or none - the percentage is what says
-/// "keeping up" and, in a Worker (uncapped), how much room is left.
-const GUEST_DISPLAY_HZ: f64 = 60.0;
 
 /// A sink for the small status/FPS/perf strings the run publishes to the page. On the
 /// main thread it writes DOM elements by id; in a Web Worker (which has no DOM) it
@@ -266,7 +268,38 @@ const REPORT_MIN_INTERVAL_MS: f64 = 100.0;
 impl FpsMeter {
     fn new(perf: web_sys::Performance, report: Report) -> FpsMeter {
         let now = perf.now();
-        FpsMeter { perf, report, window_start: now, window_frames: 0, last_fps: 0.0, paused: false }
+        FpsMeter {
+            perf,
+            report,
+            window_start: now,
+            window_frames: 0,
+            last_fps: 0.0,
+            window_guest_frames: 0,
+            last_guest_fps: 0.0,
+            window_clock_us: 0,
+            last_clock_us: 0,
+            paused: false,
+        }
+    }
+
+    /// Record `n` retired guest display flips. Called by the live loop for every frame it
+    /// runs, presented or not.
+    ///
+    /// # Why the presented rate is not the emulated speed
+    /// The percentage this meter publishes used to be `presents / 60`, and that is only the
+    /// emulated speed when the loop presents every frame it runs. It does not: it presents
+    /// at most the newest scene per tick, so a tick that ran two frames showed one. A device
+    /// capture read `fps 37 (61% speed)` alongside `1.5 guest frames per present` - the
+    /// guest was retiring 56 flips a second, i.e. running at 93% of console speed, and the
+    /// headline number understated it by the exact frames-per-present ratio.
+    ///
+    /// That is not a cosmetic error. It says the emulator is CPU-bound when the real defect
+    /// is that it is discarding finished pictures, and those two have nothing in common: one
+    /// is a month of guest-CPU work and the other is the pacing policy twenty lines below.
+    /// Both numbers are published now, because both are real and they answer different
+    /// questions - "is the world running at the right speed" and "how much of it can I see".
+    fn note_guest_frames(&mut self, n: u32) {
+        self.window_guest_frames += n;
     }
 
     /// Drop the in-flight window and start a fresh one.
@@ -278,6 +311,18 @@ impl FpsMeter {
         self.window_start = self.perf.now();
         self.window_frames = 0;
         self.last_fps = 0.0;
+        self.window_guest_frames = 0;
+        self.last_guest_fps = 0.0;
+        self.window_clock_us = self.last_clock_us;
+    }
+
+    /// Record the emulated game clock. See [`FpsMeter::note_clock`] for why the speed is
+    /// computed from this and not from the flip rate.
+    fn note_clock(&mut self, clock_us: u64) {
+        if self.window_clock_us == 0 {
+            self.window_clock_us = clock_us;
+        }
+        self.last_clock_us = clock_us;
     }
 
     /// Suspend or resume rate publishing. See [`FpsMeter::paused`].
@@ -299,16 +344,39 @@ impl FpsMeter {
         let dt = now - self.window_start;
         if dt >= FPS_WINDOW_MS {
             self.last_fps = self.window_frames as f64 * 1000.0 / dt;
-            self.report.emit(
-                "fps",
-                &format!(
-                    "fps: {:.0} ({:.0}% speed)",
+            self.last_guest_fps = self.window_guest_frames as f64 * 1000.0 / dt;
+            // >>> SPEED IS EMULATED SECONDS PER REAL SECOND, NOT FLIPS OVER 60.
+            //
+            // The old percentage was `guest flips / 60`, which assumes every title presents
+            // sixty times a second. A 30 fps title does not, ON HARDWARE, so that reading
+            // called a perfectly-paced run "50% speed" - and it is the headline number a
+            // device capture is read from. MEASURED on one retail title's round in a browser:
+            // 31 flips a second, `50% speed` by the old rule, while its emulated clock ran at
+            // 1.01x real time - i.e. exactly console speed.
+            //
+            // The clock IS the guest's own experience of time (its timers, its animation
+            // rates and its audio are all billed in it), so its rate against the wall is what
+            // "how fast is this running" means, at any frame rate. The flip rate is still
+            // published beside it: that is what a player SEES, and the two answer different
+            // questions.
+            let speed = (self.last_clock_us.saturating_sub(self.window_clock_us)) as f64
+                / (dt * 1000.0)
+                * 100.0;
+            let text = if self.last_guest_fps > self.last_fps + 0.5 {
+                format!(
+                    "fps: {:.0} shown of {:.0} run ({speed:.0}% speed - {:.0}% of the frames                      the emulator computed were DISCARDED unpresented)",
                     self.last_fps,
-                    self.last_fps / GUEST_DISPLAY_HZ * 100.0
-                ),
-            );
+                    self.last_guest_fps,
+                    100.0 * (1.0 - self.last_fps / self.last_guest_fps),
+                )
+            } else {
+                format!("fps: {:.0} ({speed:.0}% speed)", self.last_fps)
+            };
+            self.report.emit("fps", &text);
             self.window_start = now;
             self.window_frames = 0;
+            self.window_guest_frames = 0;
+            self.window_clock_us = self.last_clock_us;
         }
     }
 }
@@ -1636,7 +1704,13 @@ impl LivePlayback {
     /// [[vitaslop-browser-host-call-cost]]. Timed unconditionally - the clock is already
     /// read either side of `present` for the perf window, so this is three more reads on a
     /// path that costs tens of milliseconds.
-    fn present(&mut self, scenes: &[Scene]) {
+    /// `display` is the `(width, height)` the guest declared to `sceDisplaySetFrameBuf`, which
+    /// is what the frame is projected against. A title may declare a buffer SMALLER than the
+    /// panel and let the display controller stretch it; projecting such a frame against the
+    /// panel would put the whole picture in the top-left corner. The canvas is a fixed size
+    /// and the surface stretches whatever is rendered into it, so passing the declared size
+    /// here IS the hardware's upscale.
+    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) {
         let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
         let t0 = clock(&self.perf);
         // Tell the builder a new frame starts here. Its texture cache needs the boundary to
@@ -1664,8 +1738,10 @@ impl LivePlayback {
             &view,
             &self.depth,
             &built,
-            WIDTH,
-            HEIGHT,
+            display.0,
+            display.1,
+            frame.texture.width(),
+            frame.texture.height(),
             CLEAR,
         );
         let t2 = clock(&self.perf);
@@ -1879,11 +1955,88 @@ async fn next_tick_in(ms: f64) {
     // Wake this early and approach the boundary on the channel, so a coarse timer cannot
     // make a frame LATE - only slightly early, which costs one cheap tick.
     const SLACK_MS: f64 = 3.0;
+    // >>> ONE EVENT-LOOP TURN PER TICK, AND THE REST OF THE WAIT COSTS NOTHING.
+    //
+    // Where `Atomics.wait` is available this is the whole function: sleep the wait out on it,
+    // keep a millisecond back, and spend that millisecond on the ONE channel turn the tick owes
+    // the event loop. That turn is not optional - a `VideoDecoder` answers on a TASK, and a
+    // worker that never returns to its event loop starves the movie it is waiting for
+    // ([[vitaslop-a-host-call-that-never-yields-starves-the-browser]]) - but ONE is enough, and
+    // the loop was taking about fifteen.
+    //
+    // MEASURED before this, V8 profile of the worker during a race: `postMessage` 9.18% of all
+    // samples, with `__wbindgen_cast` 3.37% + 2.05%, `_wbg_cb_unref` 1.56%, `queueMicrotask`
+    // 1.30% and `set_onmessage` 0.77% behind it - roughly a sixth of the thread spent asking
+    // "is it time yet". The timer path below is what a host without `Atomics.wait` gets.
+    const YIELD_RESERVE_MS: f64 = 1.0;
+    if ms > YIELD_RESERVE_MS {
+        let deadline = now_ms().map(|t| t + ms);
+        if precise_sleep(ms - YIELD_RESERVE_MS) {
+            // The turn the event loop is owed, taken while there is still time in hand for it.
+            next_tick().await;
+            // Whatever the turn did not use. Landing ON the deadline matters: returning early
+            // puts the caller straight back here with a sub-millisecond wait, which is the spin
+            // this function exists to avoid.
+            if let (Some(deadline), Some(now)) = (deadline, now_ms()) {
+                if deadline > now {
+                    precise_sleep(deadline - now);
+                }
+            }
+            return;
+        }
+    }
     if ms < MIN_SLEEP_MS {
         next_tick().await;
         return;
     }
-    let delay = (ms - SLACK_MS).min(1000.0);
+    // >>> THE APPROACH THE DOC ABOVE PROMISES, WHICH THE CODE DID NOT MAKE.
+    //
+    // Sleeping `ms - SLACK` and returning leaves the wake-up wherever the host's timer put
+    // it. A worker's timer is coarse - the 4 ms clamp is a FLOOR and the jitter above it is
+    // the host's business - so the loop woke LATE, ran its one frame late, and presented
+    // late, every tick. Under one-guest-frame-per-tick that is not a wobble that averages
+    // out: the guest advances by exactly one frame whether the tick took 16.7 ms or 19.5,
+    // so every millisecond of lateness is emulated time the run never gets back. A device
+    // measured `period 19.5 ms` where the work was 10.2 - 86% speed out of a machine with
+    // 40% headroom.
+    //
+    // So the timer only gets the loop CLOSE, and the last few milliseconds are walked on
+    // the channel (~20-50 us a turn), which is what the comment above always claimed. The
+    // spin that cost a tenth of the worker thread was the OUTER loop asking "is it time
+    // yet" for the whole sleep; three or four turns at the end of one is not that.
+    //
+    // >>> AND THE SLACK IS LEARNED, BECAUSE A FIXED 3 ms IS A GUESS ABOUT A HOST.
+    //
+    // The walk repairs a timer that fires EARLY. It can do nothing about one that fires LATE,
+    // and late is what a phone's worker does: Android Chrome coalesces and throttles timers in
+    // a busy renderer, and a device measured 9.3 ms of sleep on ticks where this function was
+    // asked for less than that - the walk cannot give back time already spent. So the timer's
+    // own error is measured and subtracted from the next request. A host that returns on time
+    // keeps a 3 ms slack and one channel turn; a host that runs 15 ms late is asked for 15 ms
+    // less until it lands, and in the limit stops being asked at all and the wait becomes the
+    // walk. It costs one f64 per thread and it needs no knob, because the number it wants is a
+    // property of the host and cannot be known here.
+    let deadline = now_ms().map(|t| t + ms);
+    let delay = (ms - SLACK_MS - timer_overshoot_ms()).clamp(0.0, 1000.0);
+    // Below the host's own timer floor there is nothing to ask for: a worker clamps a nested
+    // `setTimeout` to about 4 ms, so a 1 ms request comes back in 4 and the measurement below
+    // would read that as the host running 3 ms late - a correction that feeds itself. Walk
+    // instead, which is what the remaining time is short enough for anyway.
+    const MIN_TIMER_MS: f64 = 4.0;
+    if delay < MIN_TIMER_MS {
+        let Some(deadline) = deadline else { return };
+        let mut turns = 0u32;
+        while turns < MAX_APPROACH_TURNS {
+            let Some(left) = now_ms().map(|t| deadline - t).filter(|&l| l > 0.0) else { return };
+            if precise_sleep(left) {
+                return;
+            }
+            turns += 1;
+            next_tick().await;
+        }
+        return;
+    }
+    let asked_at = now_ms();
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let cb = Closure::once_into_js(move |_: JsValue| {
             let _ = resolve.call0(&JsValue::UNDEFINED);
@@ -1907,6 +2060,119 @@ async fn next_tick_in(ms: f64) {
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    if let (Some(t0), Some(t1)) = (asked_at, now_ms()) {
+        note_timer_overshoot(t1 - t0 - delay);
+    }
+    // Walk the rest of the way, on the CHEAPEST wait this thread has - see `precise_sleep`.
+    let Some(deadline) = deadline else { return };
+    let mut turns = 0u32;
+    while turns < MAX_APPROACH_TURNS {
+        let Some(left) = now_ms().map(|t| deadline - t).filter(|&l| l > 0.0) else { break };
+        if precise_sleep(left) {
+            break;
+        }
+        turns += 1;
+        next_tick().await;
+    }
+}
+
+/// Block this thread for `ms` on `Atomics.wait`, returning whether it did.
+///
+/// >>> THE TICK'S OWN WAIT WAS A TENTH OF THE WORKER THREAD.
+///
+/// MEASURED with a V8 profile of the worker during a race: `postMessage` **9.18%** of all
+/// samples, plus `__wbindgen_cast` 3.37% + 2.05%, `_wbg_cb_unref` 1.56%, `queueMicrotask`
+/// 1.30% and `set_onmessage` 0.77% - the closure churn around it. Every one of those is the
+/// `MessageChannel` round trip this loop uses to wait, and it uses it because a worker's timer
+/// is clamped to 4 ms and the last few milliseconds of a frame have to come from somewhere.
+///
+/// A worker has a better primitive. `Atomics.wait` blocks the thread for a precise duration
+/// with no task, no closure and no allocation - it is the one wait in the platform that costs
+/// nothing to take. It is forbidden on the main thread, which is why this is guarded and falls
+/// back to the channel: the same live loop runs there in the non-worker mode.
+///
+/// What it gives up is the event loop for the duration, which is exactly what a loop with
+/// nothing to do wants to give up. The audio ring is serviced by the worklet on its own thread
+/// out of the same `SharedArrayBuffer`, so a sleep here is not a gap in the sound.
+fn precise_sleep(ms: f64) -> bool {
+    if ms <= 0.0 {
+        return true;
+    }
+    thread_local! {
+        /// A one-word shared array to wait on. Its value is never changed, so the wait always
+        /// runs to its timeout - this is a sleep, not a handshake. `None` where
+        /// `SharedArrayBuffer` or `Atomics.wait` is unavailable (the main thread, or a page
+        /// that is not cross-origin isolated).
+        static SLEEPER: Option<js_sys::Int32Array> = {
+            let ok = js_sys::global()
+                .dyn_ref::<web_sys::DedicatedWorkerGlobalScope>()
+                .is_some();
+            ok.then(|| js_sys::Int32Array::new(&js_sys::SharedArrayBuffer::new(4).into()))
+                .filter(|a| js_sys::Atomics::wait_with_timeout(a, 0, 1, 0.0).is_ok())
+        };
+    }
+    // `Atomics.wait` sleeps only while the stored word EQUALS the value asked for, and returns
+    // "not-equal" immediately otherwise. The word is zero and stays zero, so asking for 0 is
+    // what makes this a sleep - and asking for 1, as the capability probe above does, is what
+    // makes that probe return at once instead of blocking for its timeout.
+    SLEEPER.with(|s| match s {
+        Some(a) => js_sys::Atomics::wait_with_timeout(a, 0, 0, ms).is_ok(),
+        None => false,
+    })
+}
+
+/// How many channel turns `next_tick_in` will spend walking up to a deadline before it gives
+/// up and returns late anyway. A turn is tens of microseconds and the timer lands within a
+/// few milliseconds of its target, so the loop below normally runs a handful of times; the
+/// bound exists so a host whose clock or channel misbehaves cannot turn pacing into a spin.
+const MAX_APPROACH_TURNS: u32 = 200;
+
+thread_local! {
+    /// How late this host's timer has been running, in milliseconds - an EMA of
+    /// `(actual - requested)` over the sleeps [`next_tick_in`] has taken. Subtracted from the
+    /// next request so the wake-up lands on the frame boundary instead of past it.
+    static TIMER_OVERSHOOT_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// The learned timer error, never negative: a host whose timer returns EARLY is already handled
+/// by the channel walk, and asking it for MORE than the wait would make the loop late on
+/// purpose.
+fn timer_overshoot_ms() -> f64 {
+    TIMER_OVERSHOOT_MS.with(|c| c.get())
+}
+
+/// Fold one sleep's error into the estimate.
+///
+/// Rises fast and falls slow (1/4 up, 1/32 down). Being late costs emulated time every tick it
+/// happens, and being early costs one channel turn - so the estimate should chase a host that
+/// starts running late and let go of it reluctantly. Clamped to a frame: an outlier from a
+/// hitch or a backgrounded tab must not make the next sleep zero for the rest of the run.
+fn note_timer_overshoot(error_ms: f64) {
+    TIMER_OVERSHOOT_MS.with(|c| {
+        let prev = c.get();
+        let next = if error_ms > prev {
+            prev + (error_ms - prev) * 0.25
+        } else {
+            prev + (error_ms - prev) / 32.0
+        };
+        c.set(next.clamp(0.0, 1000.0 / 60.0));
+    });
+}
+
+/// `performance.now()` from whatever global this thread has, or `None` if there is none.
+///
+/// The live loop holds a `Performance` already; this is for the free functions that do not,
+/// and it is looked up once per thread rather than per call.
+fn now_ms() -> Option<f64> {
+    thread_local! {
+        static PERF: Option<web_sys::Performance> = js_sys::Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("performance"),
+        )
+        .ok()
+        .and_then(|p| p.dyn_into::<web_sys::Performance>().ok());
+    }
+    PERF.with(|p| p.as_ref().map(|p| p.now()))
 }
 
 async fn next_tick() {
@@ -2403,6 +2669,12 @@ async fn setup_game(
     // shared ring its AudioWorklet drains; without one the default `NullSink` stands and
     // the run is silent. Say which, because a silent run has two very different causes -
     // no sink, or a guest producing nothing - and they need opposite investigations.
+    // Movie playback goes through WebCodecs, reached by the same platform seam the desktop
+    // uses for Media Foundation. A browser without WebCodecs reports "no decoder" when a
+    // title opens a movie, and the title skips it - the run does not fail over a movie.
+    env.state.video = Box::new(vitaslop_platform::video::H264Factory);
+    env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
+
     match audio::WebAudioSink::new(audio_ring) {
         Some(sink) => {
             env.state.audio = Box::new(sink);
@@ -2511,6 +2783,26 @@ pub fn opfs_verify(reader: JsValue, prefix: &str) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn set_knob(name: &str, value: &str) {
     vitaslop_runtime::knobs::set_override(name, value);
+}
+
+/// Supply the font that STANDS IN for the console's system font.
+///
+/// `sceFontOpen` / `scePvfOpen` open one of the console's own installed fonts by index. Those
+/// are the vendor's assets and are not shipped here, so the open is refused - and a title that
+/// renders its strings through the system font then draws them all from an empty glyph atlas,
+/// which reaches the screen as BLANK OR BLACK areas where its dynamic text belongs (measured on
+/// the golf title: an opaque black rectangle over the club list and black bars over half the
+/// course-settings screen).
+///
+/// The desktop can probe a host font path for a substitute. The browser has no filesystem and
+/// no environment, so the bytes have to come in from the page - which is what this is. Call it
+/// BEFORE `run_game`/`run_game_worker`; the resolution latches on first use.
+///
+/// Not calling it is a supported state, not a failure: the refusal is then reported and the
+/// title runs with no dynamic text, exactly as on a device with no font installed.
+#[wasm_bindgen]
+pub fn set_system_font(bytes: &[u8]) {
+    vitaslop_runtime::font::system::set_bytes(bytes.to_vec());
 }
 
 /// Boot the REAL retail title LIVE on the MAIN THREAD: decrypt + link + transpile, then
@@ -2674,6 +2966,18 @@ async fn live_loop(
         && (recipe.as_ref().and_then(|r| r.meta.sig).is_some()
             || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
     sched.host.lock().unwrap().state.capture.set_signature_wanted(want_sig);
+    // `VITASLOP_SIGNATURE_EVERY=<n>`: how often the running signature is printed, mirroring the
+    // desktop knob of the same name. 0 (the default) prints none.
+    let sig_every: u64 = vitaslop_runtime::knobs::var("VITASLOP_SIGNATURE_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    // The one frame whose per-SCENE digests are printed, if any. See the print site.
+    // `<frame>` or `<frame>:<draw>` - split BEFORE parsing, or the two-part form silently
+    // disables the whole diagnostic.
+    let frame_digest_at: Option<u64> = vitaslop_runtime::knobs::var("VITASLOP_FRAME_DIGEST")
+        .ok()
+        .and_then(|v| v.split(':').next().and_then(|n| n.trim().parse().ok()));
     let perf = global_performance();
 
     // Real-time pacing: advance the guest at 60 Hz of WALL-CLOCK time, not as fast as
@@ -2693,6 +2997,60 @@ async fn live_loop(
     let mut cpu_frames = 0u32;
     let mut render_ms = 0.0f64;
     let mut presents = 0u32;
+    // >>> THE LAST PUBLISHED RENDER SPLIT, SO THE HEARTBEAT CARRIES IT TOO.
+    //
+    // The split is recomputed every `PERF_WINDOW` presents and written to the PAGE, where it
+    // overwrites its predecessor - so a run's cost is only ever readable as "what it is now",
+    // and a run that starts fast and ends slow reads exactly like a run that was always slow.
+    // The heartbeat is the one line that goes to the CONSOLE on a cadence, so a run's cost over
+    // TIME is a thing the log has only if the split rides along on it.
+    let mut last_perf = String::new();
+    // >>> WHERE THE WALL CLOCK WENT, WHICH NO OTHER COUNTER ON THIS PAGE ACCOUNTS FOR.
+    //
+    // `cpu` is per GUEST FRAME and `render` is per PRESENT, and when the loop runs more than
+    // one frame per present neither of them - nor their sum - is a second of wall clock. A
+    // race window here measured 11.6 ms of cpu and 2.8 of render at 28 fps and 2.0 frames per
+    // present: 728 ms of the second is described and 272 ms is not, and "27% of the run is
+    // somewhere else" is not a thing any existing line could have said.
+    //
+    // So the pacing accounts for ITSELF: ticks, the sleep it asked for, the sleep it actually
+    // got, and how many guest frames each tick ran. That last one is the whole pacing policy
+    // in one number - a loop that runs two frames and presents once is throwing away half the
+    // pictures it computed, and it does so silently.
+    let mut ticks = 0u32;
+    let mut sleep_ms = 0.0f64;
+    // What the loop ASKED to wait, against `sleep_ms` which is what it got. The difference is
+    // the pacing error, and with one guest frame per tick every millisecond of it is emulated
+    // time the run never gets back: the tick period becomes `work + sleep + overshoot` while
+    // the guest advances by exactly one frame either way.
+    let mut sleep_asked_ms = 0.0f64;
+    // The movie counters as of the last panel report, so the panel can publish a RATE over the
+    // window rather than an average over a run the movie was not playing for all of.
+    let mut last_movie = (0u64, 0u64, 0u64, 0u64);
+    // Artificial per-frame guest cost, for exercising the behind-the-clock branch of this loop
+    // on a machine that is not behind. See where it is spent, below.
+    let slow_frame_us: f64 = vitaslop_runtime::knobs::var("VITASLOP_SLOW_FRAME_US")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
+    let mut tick_span_ms = 0.0f64;
+    let mut acc_at_tick_ms = 0.0f64;
+    let mut saturated_ticks = 0u32;
+    // Guest frames run by the tick loop itself, and the largest number any one tick ran.
+    //
+    // Counted rather than derived from `cpu_frames / ticks`: that ratio read 2.00 in a build
+    // whose loop is HARD-CAPPED at one frame per tick, which is not a number the code can
+    // produce - so one of the two counters is measuring something other than what its name
+    // says, and a ratio cannot say which. This pair can.
+    let mut tick_frames = 0u64;
+    let mut tick_frames_max = 0u32;
+    // Emulated time charged to the wall-clock budget, summed over the frames the tick loop
+    // ran. Divided by those frames it is the title's own frame period in GAME time - 16.7 ms
+    // for a 60 Hz title, 33.3 for a 30 Hz one - which is the number the pacing now spends
+    // against the wall clock, so a run that is going too fast or too slow can be read here
+    // rather than inferred from the frame rate.
+    let mut charged_ms = 0.0f64;
+    let mut idle_ticks = 0u32;
     // Cumulative guest-store epoch wraps at the start of the current perf window, so the
     // window's own count is a difference rather than a running total that only grows.
     let mut epoch_wraps_at_window_start = 0u64;
@@ -2714,6 +3072,9 @@ async fn live_loop(
     let mut slowest: Vec<(u64, f64, u64)> = Vec::new();
     let mut frames_total = 0u64;
     let mut presents_total = 0u64;
+    // The display-flip count when real-time pacing began, so the movie report's
+    // per-displayed-frame ratio has the same window its numerator does.
+    let mut frames_at_pace_start = 0u64;
 
     // How long a fast-forward tick may run before returning to the event loop. Long
     // enough that the fast-forward is CPU-bound rather than paced by the tick rate
@@ -2742,15 +3103,6 @@ async fn live_loop(
     let mut acc = 0.0f64;
     let mut last = now();
     let mut last_console = 0.0f64;
-    // What the previous whole ITERATION cost - one guest frame plus the render that followed it.
-    //
-    // The pacing decision needs to know whether this machine is keeping up, and the guest half
-    // alone answers a different question. On the desktop the guest frame is 14.7 ms, inside a
-    // 16.7 ms budget, while the render adds 6.5 - so by the guest figure it is keeping up and by
-    // the real one it is not, and it spent the difference dropping presents that bought it
-    // nothing. Starts at 0 so the first tick is free to catch up: the boot frame is enormous and
-    // would otherwise pin the loop to one frame per tick for the rest of the run.
-    let mut last_iter_ms = 0.0f64;
     // Whether this run was started with debug capture on (`VITASLOP_DEBUG_CAPTURE`). Read ONCE,
     // here: it decides whether the expensive instruments record for the whole run, and a run that
     // changed its own instrumentation part-way would publish two incomparable halves.
@@ -2771,9 +3123,22 @@ async fn live_loop(
         // it is deliberately unpaced - and so does a machine that is behind, whose `acc` is
         // already at or over the budget. See [`next_tick_in`].
         let due_in = if sched.core.frames() < ff_to { 0.0 } else { FRAME_MS - acc };
+        let sleep_from = now();
         next_tick_in(due_in).await;
         let t = now();
-        acc = (acc + (t - last)).min(MAX_CATCHUP_MS);
+        // The pacing's own accounting, before `acc` is consumed by the frames below - see
+        // the declarations. `due_in` is what was ASKED for and `t - sleep_from` what the
+        // host gave, and the gap between them is the tick floor this loop cannot go under.
+        ticks += 1;
+        sleep_ms += t - sleep_from;
+        sleep_asked_ms += due_in.max(0.0);
+        tick_span_ms += t - last;
+        let acc_raw = acc + (t - last);
+        acc_at_tick_ms += acc_raw;
+        if acc_raw >= MAX_CATCHUP_MS {
+            saturated_ticks += 1;
+        }
+        acc = acc_raw.min(MAX_CATCHUP_MS);
         last = t;
 
         // Fast-forward while below the target frame: ignore the wall clock and run as
@@ -2791,40 +3156,106 @@ async fn live_loop(
             render_ms = 0.0;
             presents = 0;
             acc = 0.0;
+            // The movie decoder's counters describe PACED play only - see
+            // `avcdec::reset_movie_counters`. A fast-forward never returns to the JS event
+            // loop, so a callback-driven decoder cannot answer during one and its whole
+            // backlog would otherwise be charged to the frames that follow.
+            vitaslop_runtime::vita::avcdec::reset_movie_counters();
+            frames_at_pace_start = sched.core.frames();
         }
         was_fast = fast;
 
-        // Advance as many whole 60 Hz frames as wall time has accrued (usually one),
-        // keeping only the newest scene to present - so the GPU present rate follows the
-        // display/tick rate, not the catch-up count.
+        // >>> ONE GUEST FRAME PER TICK, AND THEREFORE ONE PRESENT PER GUEST FRAME.
         //
-        // # Catch-up is only catch-up when the guest can keep up
-        // Running N frames per tick and presenting once trades visible frame rate for guest
-        // progress, and that trade is only available to a machine that is AHEAD. On one that is
-        // behind, `acc` saturates at `MAX_CATCHUP_MS` every single tick, so the loop
-        // permanently runs the maximum number of frames and permanently discards all but one
-        // present - it never catches up, because there is nothing to catch up to.
+        // This tick presents at most the newest scene, so every frame beyond the first is a
+        // picture computed and thrown away. The rule used to be "catch up freely unless the
+        // last iteration overran its 16.7 ms budget", and it cost about half the frame rate
+        // on every machine measured, INCLUDING ones with headroom.
+        //
+        // MEASURED here (headed Chrome, desktop GPU, one title's race, 452 draws):
+        //   fps 31 shown of 60 run - 100% emulated speed, 48% of frames DISCARDED
+        //   period 33.2 ms, of which slept 9.9 | 2.00 guest frames/tick, 1.00 presents/tick
+        //   acc 37.4 ms at tick, 0 saturated
+        // A guest frame was 11.8 ms and its present 2.4, so ONE of each is 14.2 ms inside a
+        // 16.7 ms budget - the machine had headroom and was still showing half the frames.
+        //
+        // # Why the old rule produced that, and why no threshold fixes it
+        // `acc` is a wall-clock accumulator: it says "33.2 ms passed, two frames are owed".
+        // That is true, and it is true BECAUSE the tick ran two frames. The loop therefore has
+        // a stable fixed point at every N: at N=2 it produces exactly 60 guest frames a second,
+        // so `acc` never drains and nothing pushes it back to N=1. One hitch (the boot frame,
+        // leaving the fast-forward) settles it into N=2 and it stays there for the whole run,
+        // with `saturated` reading 0 the entire time - the old comment's "acc pins at the cap"
+        // diagnosis describes a different failure from the one that actually happens.
+        //
+        // The degeneracy is the bug, so the fix is to remove the choice rather than to tune a
+        // threshold: N=1 is the lowest fixed point and it is never worse. If a frame plus its
+        // present fits in 16.7 ms, N=1 sustains full speed and N=2 is pure loss.
+        //
+        // If it does not fit, catching up cannot help either, and that is now MEASURED here
+        // rather than argued - see below.
+        //
+        // >>> CATCH-UP WAS RE-TRIED, WITH A DEVICE'S NUMBERS, AND IT IS STILL WRONG. DO NOT
+        // >>> RE-TRY IT A THIRD TIME.
+        //
+        // A phone reported `fps 39 (65% speed)` on this title's race with `acc` pinned at the
+        // 67 ms ceiling, 17 of 30 ticks saturated - which reads exactly like a loop forbidden
+        // to catch up, and the user's report ("my car simply can't catch up with the others")
+        // is what 65% speed feels like from the inside. So N=2-while-saturated was written, and
+        // then run against `VITASLOP_SLOW_FRAME_US=15000`, which reproduces that device's frame
+        // cost on this desktop:
+        //
+        //   N=2  cpu 20.7 ms/frame | period 44.7 ms | 2.00 frames/tick, 1.00 presents/tick
+        //        23 fps shown of 45 run, 75% speed, 30 of 30 ticks saturated
+        //   N=1  cpu 20.7 ms/frame | period 22.4 ms | 1.00 frames/tick, 1.00 presents/tick
+        //        44 fps shown of 45 run, 75% speed
+        //
+        // **The same 75%, at half the frame rate.** And the arithmetic says it will always come
+        // out this way. With a guest frame costing C and a present costing R, a tick that runs N
+        // frames and presents once takes `N*C + R`, so
+        //
+        //     speed  ∝  N / (N*C + R)      rises with N, towards a ceiling of 1/C
+        //     fps    =  1 / (N*C + R)      falls with N, in proportion
+        //
+        // Every point of speed catch-up buys is bought by amortising ONE present over more
+        // frames, so the most it can ever return is R/C - and it charges half the frame rate to
+        // return it. Here R/C is 1.6/20.8: N=2 offered 2% of speed for 46% of the frame rate.
+        // On a phone, where R is a much larger share (a device measured 7.6 ms of texture upload
+        // inside a 19.2 ms encode), the offer improves to perhaps 15% for the same 46% - still
+        // the wrong side of the trade, and now with a reason rather than a reading.
+        //
+        // The lever that actually moves speed is C and R themselves. There is no pacing rule
+        // that makes a slow frame fast.
+        //
+        // Which also relocates the phone's missing speed. Its work was 10.2 ms against a 19.5 ms
+        // period on the front end - it had 40% headroom and was still at 86% - so what it lost
+        // was not frames it was forbidden to run, but time spent inside the tick's own wait.
+        // That is what `slept` against `asked` on the PACING line now names, and what the
+        // deadline walk in `next_tick_in` is for.
         //
         // MEASURED on a phone (PowerVR D-series, one title's main screen): 72.8 ms of guest CPU
         // per frame against a 13.2 ms render. Four frames per tick made that 4 presents/s while
         // the guest advanced at 14 - so skipping three presents bought 11% of guest speed and
         // cost three quarters of the frame rate the user could see. One frame per tick shows all
-        // 14. So the catch-up count is capped by whether the last frame FIT in its budget: a
-        // fast machine still catches up after a hitch, a slow one stops paying for a catch-up it
-        // cannot have.
+        // 14.
+        //
+        // What is given up: a machine that is momentarily behind no longer sprints to catch the
+        // wall clock. It cannot - a sprint is only available to a machine with spare time, and
+        // one with spare time does not need it. `acc` still carries the deficit (capped at
+        // `MAX_CATCHUP_MS`) so the emulated clock does not silently lose the hitch.
         //
         // Fast-forward is exempt: it presents NOTHING by design, so there is no frame rate to
         // protect and running as many frames per tick as the budget allows is its entire job.
         let mut latest = None;
         let mut frames_this_tick = 0u32;
-        // `1` is not a special case - it is what this evaluates to whenever the guest is slower
-        // than real time, which is the whole point. Named `_per_tick` because the run's own
-        // frame LIMIT is also called `max_frames` in this scope, and shadowing it here would
-        // silently end the run at the first tick.
-        let max_frames_per_tick = if fast || last_iter_ms <= FRAME_MS { u32::MAX } else { 1 };
+        // Named `_per_tick` because the run's own frame LIMIT is also called `max_frames` in
+        // this scope, and shadowing it here would silently end the run at the first tick.
+        let max_frames_per_tick = if fast { u32::MAX } else { 1 };
         while acc >= FRAME_MS && frames_this_tick < max_frames_per_tick {
-            acc -= FRAME_MS;
             frames_this_tick += 1;
+            // >>> WHAT A FRAME COSTS THE ACCUMULATOR IS THE EMULATED TIME IT ADVANCES, NOT
+            // >>> ONE DISPLAY PERIOD. See where it is subtracted, below the run.
+            let clock_before_us = { sched.host.lock().unwrap().state.now_us() };
             // Run to exactly one more display flip (the frame counter is cumulative
             // across calls, so `frames + 1` advances by a single frame).
             let target = sched.core.frames() + 1;
@@ -2862,7 +3293,63 @@ async fn live_loop(
                 &mut { report_progress },
             )
             .await;
+            // >>> A SLOW DEVICE, ON THIS MACHINE (`VITASLOP_SLOW_FRAME_US`).
+            //
+            // Every pacing question here is a question about a machine that CANNOT hold 60, and
+            // this desktop always can: a race frame costs 5.4 ms of a 16.7 ms budget, so the
+            // accumulator never saturates and the whole behind-the-clock branch of this loop is
+            // dead code locally. The answers therefore came from a phone, one panel dump at a
+            // time, with the person holding it in the loop - and a pacing rule shipped on that
+            // basis made the game run at 65% speed for a week.
+            //
+            // Chrome's own `Emulation.setCPUThrottlingRate` was tried first and does NOT reach a
+            // dedicated worker: 4x throttling left `cpu 5.6 ms/frame` against an unthrottled
+            // 5.4. This burns the time inside the frame's own measurement window instead, so it
+            // lands in `cpu` exactly as guest work would and the pacing loop cannot tell the
+            // difference. A phone measured ~20 ms a frame where this machine measures 5.4, so
+            // `VITASLOP_SLOW_FRAME_US=15000` is roughly that device.
+            //
+            // It is a spin, deliberately: a sleep would return to the event loop and change the
+            // very thing under test.
+            // Not during a fast-forward: that runs unpaced and presents nothing, so slowing it
+            // tests no pacing and only makes the run take longer to reach the part that does.
+            if slow_frame_us > 0.0 && !fast {
+                let until = now() + slow_frame_us / 1000.0;
+                while now() < until {}
+            }
             let c1 = now();
+
+            // >>> A FRAME COSTS THE WALL-CLOCK BUDGET THE EMULATED TIME IT ADVANCED, AND ON A
+            // >>> 30 Hz TITLE THAT IS TWO DISPLAY PERIODS, NOT ONE.
+            //
+            // This used to charge a flat `FRAME_MS` per frame, i.e. it paced ONE GUEST FLIP
+            // per 16.7 ms of wall clock. That is only right for a title whose frame is one
+            // display period. A title that waits for TWO vblanks a frame - the console's other
+            // characteristic rate, and what this engine's own `pace_flip` models - advances
+            // 33.3 ms of game clock per flip, so a flip every 16.7 ms ran it at TWICE real
+            // time. MEASURED on a retail 30 fps sports title's opening, in the browser:
+            // `fps 53 (177% speed)`, `2.04 display periods per displayed frame`, and audio
+            // produced at the same 1.8x - `overrun 2,166,784` frames (45 s of sound the ring
+            // could not take) beside `underrun 260,224`, which is heard as the hiccup it is.
+            // Nothing on the guest side was wrong: the clock per frame was the whole number it
+            // should be, and the loop simply ran that clock too fast against the wall.
+            //
+            // So the budget is spent in GAME TIME. `now_us` is the emulated clock, one frame
+            // advances it by however many display periods the title's own limiter waits for,
+            // and subtracting that keeps the emulated clock tracking the wall clock 1:1 at any
+            // title frame rate - which is what `% speed` measures and what the audio ring is
+            // filled at.
+            //
+            // The deficit is floored at the same `MAX_CATCHUP_MS` that caps the surplus: the
+            // boot frame advances the clock by whole seconds, and without a floor the loop
+            // would then sit idle for those seconds "waiting for the wall to catch up" with a
+            // blank canvas. Neither direction is allowed to bank more than four frames.
+            let advanced_ms = {
+                let after = sched.host.lock().unwrap().state.now_us();
+                after.saturating_sub(clock_before_us) as f64 / 1000.0
+            };
+            charged_ms += advanced_ms.max(FRAME_MS);
+            acc = (acc - advanced_ms.max(FRAME_MS)).max(-MAX_CATCHUP_MS);
 
             // Take the scene presented this frame and drop the rest (render-to-texture
             // intermediates); clearing the per-frame capture vectors bounds the capture's
@@ -2875,7 +3362,64 @@ async fn live_loop(
             let frame_scenes = {
                 let mut host = sched.host.lock().unwrap();
                 let cap = &mut host.state.capture;
-                let scenes = core::mem::take(&mut cap.scenes);
+                // THROUGH the capture, not around it: a raw `mem::take` here walks the
+                // frame's scenes past the determinism fold, and the run then reports the
+                // EMPTY-fold hash as though it were a real one. See `Capture::take_frame_scenes`.
+                // `VITASLOP_FRAME_DIGEST=<frame>`: at ONE frame, a digest per scene, printed
+                // BEFORE the drain - after it there are no scenes left to describe. The
+                // desktop prints the same line from `recipe_runner`, so the two logs diff.
+                if frame_digest_at == Some(sched.core.frames()) {
+                    // `VITASLOP_FRAME_DIGEST=<frame>:<draw>` also dumps that draw's vertex
+                    // FLOATS - the end of the bisect, where the question stops being "which
+                    // draw" and becomes "which number". See `Capture::draw_vertex_floats`.
+                    let want_draw: Option<usize> = vitaslop_runtime::knobs::var("VITASLOP_FRAME_DIGEST")
+                        .ok()
+                        .and_then(|v| v.split(':').nth(1).and_then(|d| d.trim().parse().ok()));
+                    let shapes = cap.frame_scene_shapes();
+                    let d: Vec<String> = cap
+                        .frame_scene_digests()
+                        .iter()
+                        .zip(shapes.iter())
+                        .map(|(h, (n, a, fmt))| format!("{h:#018x}/draws={n}/surf={a:#x}:{fmt}"))
+                        .collect();
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "framedigest f{} [{}]",
+                        sched.core.frames(),
+                        d.join(" ")
+                    )));
+                    // ...and the LAST held scene draw by draw - which DRAW of the pass,
+                    // and which of its three inputs. See `Capture::scene_draw_digests`.
+                    let last = d.len().saturating_sub(1);
+                    if let Some(di) = want_draw {
+                        if let Some((lanes, hs)) = cap.draw_lane_hashes(last, di) {
+                            let l: Vec<String> = hs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, h)| format!("{i}:{h:#010x}"))
+                                .collect();
+                            web_sys::console::log_1(&JsValue::from_str(&format!(
+                                "lanehash f{} s{last} d{di} lanes={lanes} {}",
+                                sched.core.frames(),
+                                l.join(" ")
+                            )));
+                        }
+                        if let Some((stride, len, vals)) = cap.draw_vertex_floats(last, di, 64) {
+                            web_sys::console::log_1(&JsValue::from_str(&format!(
+                                "drawbytes f{} s{last} d{di} stride={stride} len={len} {vals:?}",
+                                sched.core.frames()
+                            )));
+                        }
+                    }
+                    if let Some(draws) = cap.scene_draw_digests(last) {
+                        for (i, (hv, hc, hi, hu, nu)) in draws.iter().enumerate() {
+                            web_sys::console::log_1(&JsValue::from_str(&format!(
+                                "drawdigest f{} s{last} d{i} verts={hv:#018x} vertsNaNc={hc:#018x} idx={hi:#018x} unis={hu:#018x} nunis={nu}",
+                                sched.core.frames()
+                            )));
+                        }
+                    }
+                }
+                let scenes = cap.take_frame_scenes();
                 cap.trace.clear();
                 cap.trace_thid.clear();
                 cap.presents.clear();
@@ -2903,9 +3447,31 @@ async fn live_loop(
                         "[shot] {name} at frame {frames}"
                     )));
                 }
+                // >>> THE RUNNING SIGNATURE, the browser half of the desktop's
+                // `VITASLOP_SIGNATURE_EVERY` (`recipe_runner::signature_trace_interval`).
+                //
+                // Two engines that disagree at the END disagree from some FIRST frame onward,
+                // and the end-of-run number cannot say which. The desktop has printed this for
+                // a while; without the same line here a browser-only divergence can only be
+                // bisected by re-running the pair, which on this title is half an hour a
+                // halving. Same text (`sigtrace f<frame> <hash>`) so the two logs diff directly.
+                //
+                // Inert unless a signature is actually being folded: `Capture::signature`
+                // refuses a partial hash, and printing a number nothing folded is how an EMPTY
+                // fold (the FNV basis) gets read as a DIFFERENT fold.
+                if want_sig && sig_every > 0 && frames % sig_every == 0 {
+                    // The COUNTS ride along with the hash - see `Capture::stream_counts` for
+                    // why a differing signature is only half an answer without them.
+                    let (sig, scenes, egress, calls) = {
+                        let host = sched.host.lock().unwrap();
+                        let (sc, eg, ca) = host.state.capture.stream_counts();
+                        (host.state.capture.signature(), sc, eg, ca)
+                    };
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "sigtrace f{frames} {sig:#018x} scenes={scenes} egress={egress} calls={calls}"
+                    )));
+                }
             }
-            // The guest half now; the render this iteration pays is added after `present` below.
-            last_iter_ms = c1 - c0;
             if frames > WARMUP_FRAMES {
                 cpu_ms += c1 - c0;
                 cpu_frames += 1;
@@ -2922,6 +3488,12 @@ async fn live_loop(
             // FIRST frame, warmup included: the boot frame is the whole point of the list, and
             // it is the one every other counter on this page deliberately excludes.
             frames_total += 1;
+            // The rate meter counts presents; tell it about the flips too, so the speed it
+            // publishes is the emulated one. See `FpsMeter::note_guest_frames`.
+            playback.fps.note_guest_frames(1);
+            // ...and the emulated clock, which is what the SPEED percentage is made of - see
+            // `FpsMeter::note_clock`.
+            playback.fps.note_clock(sched.host.lock().unwrap().state.now_us());
             if slowest.len() < SLOWEST_KEPT {
                 slowest.push((frames, c1 - c0, frame_calls));
                 slowest.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -3016,12 +3588,14 @@ async fn live_loop(
                      raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | wasm heap {} MB \
                      | jspi {susp} susp, {starts} stacks, {abandoned} abandoned, \
                      {released} released | instances {inst_new} new, {inst_reused} reused \
-                     | threads {live_threads} live, {finished_threads} finished",
+                     | threads {live_threads} live, {finished_threads} finished \
+                     | texture working set {} MB | {last_perf}",
                     clock_us as f64 / 1e6,
                     if flips > 0 { clock_us as f64 / flips as f64 } else { 0.0 },
                     clk_q as f64 / 1e6,
                     clk_idle as f64 / 1e6,
-                    wasm_heap_mb()
+                    wasm_heap_mb(),
+                    vitaslop_platform::gpu::texture_working_set_bytes() / (1024 * 1024)
                 )));
             }
             // Keep spending this tick's budget while the fast-forward target is still
@@ -3094,11 +3668,20 @@ async fn live_loop(
                         }
                     }
                     if let Some(scene) = &latest {
-                        playback.present(scene);
+                        let display = sched.host.lock().unwrap().state.display_size();
+                        playback.present(scene, display);
                     }
                     break 'run;
                 }
             }
+        }
+
+        // What this tick actually ran, counted at the one place that knows - see the
+        // declarations for why this is not derived from the per-frame counters.
+        tick_frames += frames_this_tick as u64;
+        tick_frames_max = tick_frames_max.max(frames_this_tick);
+        if frames_this_tick == 0 {
+            idle_ticks += 1;
         }
 
         // Present at most one (the newest) frame per tick, and fold its render time into
@@ -3114,11 +3697,9 @@ async fn live_loop(
         }
         if let Some(scene) = latest {
             let r0 = now();
-            playback.present(&scene);
+            let display = sched.host.lock().unwrap().state.display_size();
+            playback.present(&scene, display);
             let r1 = now();
-            // A present belongs to the iteration that produced it, so the pacing decision for the
-            // NEXT tick sees the true cost of this one.
-            last_iter_ms += r1 - r0;
             // Counted from the first present, warmup included, for the same reason the frame
             // total is: what this is read against is `frames_total`, and a ratio whose two
             // halves start counting at different frames is not a ratio.
@@ -3179,6 +3760,7 @@ async fn live_loop(
                     s.fixed_draws as f64 / np,
                 );
                 report.emit("perf", &perf_line);
+                last_perf = perf_line.clone();
                 // Everything below also goes to a `diag` element on the PAGE, not only to the
                 // console.
                 //
@@ -3262,6 +3844,217 @@ async fn live_loop(
                     line(&mut diag, "PRESENTED SURFACE", &probe);
                 }
                 line(&mut diag, "RENDER SPLIT", &perf_line);
+                // >>> AND THE PACING, WHICH IS WHAT DECIDES HOW MANY OF THOSE FRAMES ANYONE SEES.
+                //
+                // `frames/tick` above 1.0 is the loop computing pictures and discarding them:
+                // every tick presents at most the newest scene, so a tick that ran two frames
+                // threw one away. `saturated` is how often the wall-time accumulator was pinned
+                // at its catch-up cap, which is the state in which that happens forever - a
+                // machine that is behind never catches up, it just stops showing half its work.
+                // `slept` against `asked` is the tick floor: when the loop asks for 2 ms and
+                // gets 6, the difference is the host's, not the emulator's, and no amount of
+                // guest optimisation moves it.
+                {
+                    let nt = ticks.max(1) as f64;
+                    let pacing = format!(
+                        "{ticks} ticks | period {:.1} ms, of which slept {:.1} ms \
+                         (asked for {:.1}) | \
+                         {:.2} guest frames/tick (worst {tick_frames_max}, {idle_ticks} idle), \
+                         {:.2} presents/tick | charged {:.1} ms of game time per frame | \
+                         acc {:.1} ms at tick \
+                         ({saturated_ticks} saturated at {MAX_CATCHUP_MS:.0} ms) | \
+                         unaccounted {:.1} ms/tick | host timer runs {:.1} ms late (learned)",
+                        tick_span_ms / nt,
+                        sleep_ms / nt,
+                        sleep_asked_ms / nt,
+                        tick_frames as f64 / nt,
+                        presents as f64 / nt,
+                        charged_ms / tick_frames.max(1) as f64,
+                        acc_at_tick_ms / nt,
+                        (tick_span_ms - sleep_ms - cpu_ms - render_ms) / nt,
+                        timer_overshoot_ms(),
+                    );
+                    line(&mut diag, "PACING", &pacing);
+                }
+                // >>> WHAT THE NGS MIX CARRIED, AND WHETHER IT CLIPPED.
+                //
+                // These counters existed and were printed by the DESKTOP binary's shutdown
+                // only, so the host where audio already works could read them and the phone -
+                // which has no console, whose only report is this panel, and which is the one
+                // a user reports crackling on - could not. The clipping half was additionally
+                // behind a `debug` tracing gate, so "does the mix clip" had no answer anyone
+                // could get at without flooding the panel it would have been printed into.
+                {
+                    let mix = vitaslop_runtime::vita::at9::mix_report();
+                    if !mix.is_empty() {
+                        line(&mut diag, "NGS MIX", &mix.join("\n"));
+                    }
+                }
+                // >>> THE TWO NUMBERS THAT SAY WHETHER THE RING COUNTERS ABOVE ARE AN AUDIO
+                // >>> PROBLEM AT ALL, AND THEY MEAN DIFFERENT THINGS.
+                //
+                // A capture reading `UNDERRUN 25%` beside `OVERRUN 50%` looks like a broken
+                // backend and is not one: it is a RATE fault, and the ring's own counters
+                // cannot name it because they all describe the ring.
+                //
+                // `sceAudioOutOutput` parks one grain of VIRTUAL time, so SOUND / CLOCK is
+                // 1.00 on a healthy path at any frame rate - and it stays 1.00 when the CLOCK
+                // is the thing that is wrong. What catches that is the CLOCK PER DISPLAYED
+                // FRAME in display periods: it is the title's own vblank divisor, so a whole
+                // number (1 = 60 fps, 2 = 30). One retail title read 0.985 sound/clock while
+                // charging 2.99 periods a frame for a limiter that waits for two, and that
+                // extra period is what made it produce 1.7 s of audio per second of real time
+                // on a phone - filling the ring, dropping a third of it, and starving on the
+                // next hitch.
+                {
+                    let (produced, flips, clock_us) = {
+                        let host = sched.host.lock().unwrap();
+                        (
+                            host.state.audio_produced_seconds(),
+                            host.state.flip_count(),
+                            host.state.now_us(),
+                        )
+                    };
+                    let clock_s = clock_us as f64 / 1.0e6;
+                    if flips > 0 && clock_s > 0.0 {
+                        line(
+                            &mut diag,
+                            "CLOCK vs PICTURE vs SOUND",
+                            &format!(
+                                "the clock advanced {:.2} display periods per displayed frame - the title's own vblank divisor, so a WHOLE number (1 = 60 fps, 2 = 30); a fraction, or one period more than its limiter waits for, is game time no frame accounted for and is what fills the audio ring. Sound {produced:.1}s against {clock_s:.1}s of clock ({:.2}x) - audio is billed in clock time, so THAT one is 1.00 at any frame rate and does not move when the clock is wrong.",
+                                clock_s * 60.0 / flips as f64,
+                                if clock_s > 0.0 { produced / clock_s } else { 0.0 },
+                            ),
+                        );
+                    }
+                }
+                // >>> HOW FAST THE MOVIE DECODER IS ACTUALLY DELIVERING PICTURES.
+                //
+                // A device reported the title-screen movie as "frame, black, frame" and
+                // nothing on this panel could say what rate it was arriving at - see
+                // `avcdec::movie_report`. Silent unless a movie was decoded.
+                {
+                    let paced_frames = sched.core.frames().saturating_sub(frames_at_pace_start);
+                    let mut movie = vitaslop_runtime::vita::avcdec::movie_report(paced_frames);
+                    if !movie.is_empty() {
+                        // A callback-driven decoder can only answer on a TASK, so its ceiling
+                        // is how often this worker reaches the event loop at all. The tick
+                        // gives it one turn a displayed frame; this is what the idle path adds
+                        // on top, and at zero the decoder's whole budget is that one turn.
+                        // >>> THE RATE, OVER THIS WINDOW, BECAUSE THE RUN AVERAGE IS A LIE
+                        // >>> WHENEVER THE MOVIE STARTS PART WAY THROUGH.
+                        //
+                        // The cumulative figure above divides by every frame since the pacing
+                        // meters reset. This title's front end starts its movie around frame
+                        // 1300 of a run counting from 900, which reads as 0.34 pictures a frame
+                        // where the title is asking for exactly ONE - a factor of three, in the
+                        // direction that makes a healthy decoder look starved. That is how long
+                        // a movie diagnosis can be spent on a denominator.
+                        let (sub, del, calls, empty) =
+                            vitaslop_runtime::vita::avcdec::movie_counters();
+                        let win_frames = (tick_frames as f64).max(1.0);
+                        movie.push(format!(
+                            "movie this window: {:.2} access units and {:.2} pictures per \
+                             displayed frame over {tick_frames} frames, {} of {} calls empty. \
+                             This is the RATE; the line above is the run average",
+                            (sub - last_movie.0) as f64 / win_frames,
+                            (del - last_movie.1) as f64 / win_frames,
+                            empty - last_movie.3,
+                            calls - last_movie.2,
+                        ));
+                        last_movie = (sub, del, calls, empty);
+                        let turns = browser_sched::event_loop_turns();
+                        let per_frame =
+                            if paced_frames > 0 { turns as f64 / paced_frames as f64 } else { 0.0 };
+                        movie.push(format!(
+                            "event loop: {turns} extra turns from the idle path \
+                             ({per_frame:.2} per displayed frame, on top of the one the tick \
+                             always gives). A decoder answers on a TASK, so this is the \
+                             ceiling on how often it CAN answer"
+                        ));
+                        line(&mut diag, "MOVIE", &movie.join("\n"));
+                    }
+                }
+                // >>> THE GUEST'S OWN HEAPS, AND WHETHER THE TITLE IS DRAINING THEM.
+                //
+                // A device reported thousands of `sceClibMspaceMemalign` failures, and nothing
+                // could tell an ordinary tight pool from a release path this engine does not
+                // implement. `allocs` against `frees` is exactly that distinction, and it
+                // belongs on the panel because the device is where the report came from and
+                // the console there does not exist.
+                {
+                    let spaces = sched.host.lock().unwrap().state.mspace_report();
+                    if !spaces.is_empty() {
+                        line(&mut diag, "GUEST HEAPS", &spaces.join("\n"));
+                    }
+                }
+                // >>> WHERE THE IDLE CLOCK WENT, BY (wait kind, thread) - the instrument
+                // that names a PARKED thread. It found the display-wait double-charge on
+                // the desktop, and the browser is the one engine where a thread parks
+                // forever with everything else healthy (a movie loop stalled at its fifth
+                // frame while the game runs on) - which no other counter on this panel can
+                // name. Largest owner first, the same shape the desktop prints at shutdown.
+                {
+                    let idle = sched.host.lock().unwrap().state.idle_attribution();
+                    if !idle.is_empty() {
+                        let total: u64 = idle.iter().map(|(_, us, _)| us).sum();
+                        let mut s = format!("idle clock {:.1}s bought by:\n", total as f64 / 1e6);
+                        for (owner, us, jumps) in idle.iter().take(8) {
+                            s.push_str(&format!(
+                                "  {:>8.3}s over {jumps:>8} jump(s) - {} on thread {:#x}\n",
+                                *us as f64 / 1e6,
+                                owner.kind.name(),
+                                owner.thid,
+                            ));
+                        }
+                        line(&mut diag, "IDLE ATTRIBUTION", &s);
+                    }
+                }
+                // >>> AND WHICH THREADS ARE PARKED RIGHT NOW, AND IN WHAT.
+                //
+                // IDLE ATTRIBUTION above is a TIMED-wait instrument: it accounts for the clock
+                // a park BOUGHT, so a thread parked on something with no deadline - a signal
+                // wait, a join, a mutex nobody releases - buys nothing and never appears there.
+                // That is precisely the shape of a hang, and the browser-only stall this panel
+                // exists for (a movie loop that stops after its fifth access unit while the
+                // game runs on) is exactly that shape. So the panel needs the other question:
+                // for every LIVE thread, is it parked, and on which object.
+                //
+                // Per THREAD rather than per object, and parked threads only: the page keeps a
+                // bounded number of DISTINCT lines (`logging::PAGE_LOG_CAP`) and the
+                // whole-machine sync dump the desktop watchdog prints
+                // (`VitaState::debug_sync_dump`) would fill it by itself.
+                {
+                    let blocked = sched.host.lock().unwrap().state.blocked_threads();
+                    if !blocked.is_empty() {
+                        let mut s = format!("{} parked thread(s):
+", blocked.len());
+                        // A retail title runs on the order of 20 threads, so this prints them
+                        // ALL rather than a head: the one that matters in a stall is exactly
+                        // the one an arbitrary cut would drop, and it cost a run to find that
+                        // out. The section is a single panel entry with embedded newlines, so
+                        // its length does not eat the page's distinct-line budget.
+                        for (thid, name, state) in blocked.iter().take(48) {
+                            s.push_str(&format!("  thid {thid:#x} {name:?}: {state}
+"));
+                        }
+                        if blocked.len() > 16 {
+                            s.push_str(&format!("  ... and {} more
+", blocked.len() - 16));
+                        }
+                        line(&mut diag, "BLOCKED THREADS", &s);
+                    }
+                }
+                ticks = 0;
+                tick_frames = 0;
+                charged_ms = 0.0;
+                tick_frames_max = 0;
+                idle_ticks = 0;
+                sleep_ms = 0.0;
+                sleep_asked_ms = 0.0;
+                tick_span_ms = 0.0;
+                acc_at_tick_ms = 0.0;
+                saturated_ticks = 0;
                 // >>> AND THE RUN'S OWN WORST FRAMES, WHICH NO WINDOW CAN SHOW. See `slowest`.
                 //
                 // Placed high in the panel, directly under the rate: when a user reports a
@@ -3297,8 +4090,9 @@ async fn live_loop(
                     &mut diag,
                     "BUILD, window mean",
                     &format!(
-                        "{build_mean} | sampler bind groups {:.1} reused / {:.1} BUILT",
+                        "{build_mean} | sampler bind groups {:.1} reused ({:.1} from the previous draw) / {:.1} BUILT",
                         bg_hit as f64 / np,
+                        vitaslop_platform::gpu::take_sampler_bg_prev() as f64 / np,
                         bg_new as f64 / np,
                     ),
                 );

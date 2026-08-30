@@ -185,6 +185,17 @@ pub fn boot_retail(
         .collect::<Result<_, _>>()?;
     let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
+    // >>> EVERY NATIVE TOOL DECODES VIDEO, because the one that did not could not SEE the
+    // movie path at all.
+    //
+    // Only the desktop front-end installed this, so `bench`, `session`, `play`, `explore` and
+    // the boot probe all ran with no decoder. That is not a missing feature in a measurement
+    // tool, it is a measurement tool that answers the wrong question: `bench` exists to say
+    // where a frame's guest CPU goes, and on a movie screen it reported the cost of a title
+    // spinning against a decoder that had refused to be created. The refusal was a `warn` in a
+    // log nobody reads when they are reading a phase table.
+    env.state.video = Box::new(vitaslop_platform::video::H264Factory);
+    env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
     env.state.set_alloc_base(linked.alloc_base);
     env.state.set_process_param(linked.process_param);
     env.state.set_modules(linked.loaded_modules.clone());
@@ -255,6 +266,8 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
 
     let mut shots_out: Vec<ShotOutcome> = Vec::new();
 
+    let sig_every = if want_sig { signature_trace_interval() } else { 0 };
+
     // A guest that trapped or halted DURING the fast-forward prefix is finished, and
     // stepping it further resumes an already-completed fiber (a host panic). Report
     // what happened instead: the verdict is the whole point of the run, and it must
@@ -275,6 +288,62 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
         for name in shots {
             let path = write_shot(&sched, opts.shot_dir.as_deref(), &name);
             shots_out.push(ShotOutcome { frame: f, name, path });
+        }
+
+        if sig_every != 0 && f % sig_every == 0 {
+            // The COUNTS ride along with the hash, and they are the whole difference
+            // between "these two engines disagree at f943" and a next question - see
+            // `Capture::stream_counts`. Same text the browser prints, so the two logs
+            // still diff line for line.
+            let cap = &sched.host().state.capture;
+            let (scenes, egress, calls) = cap.stream_counts();
+            let s = signature(cap);
+            println!("sigtrace f{f} {s:#018x} scenes={scenes} egress={egress} calls={calls}");
+            // `VITASLOP_FRAME_DIGEST=<frame>`: at ONE frame, also print a digest per scene, so
+            // a cross-engine difference can be attributed to a PASS rather than to the frame.
+            // `<frame>` or `<frame>:<draw>` - split BEFORE parsing, or the two-part form
+            // silently disables the whole diagnostic (it did, for one run).
+            if std::env::var("VITASLOP_FRAME_DIGEST")
+                .ok()
+                .and_then(|v| v.split(':').next().and_then(|n| n.trim().parse::<u64>().ok()))
+                == Some(f)
+            {
+                let d: Vec<String> =
+                    cap.frame_scene_digests().iter().map(|h| format!("{h:#018x}")).collect();
+                let shapes = cap.frame_scene_shapes();
+                let d: Vec<String> = d
+                    .iter()
+                    .zip(shapes.iter())
+                    .map(|(h, (n, a, fmt))| format!("{h}/draws={n}/surf={a:#x}:{fmt}"))
+                    .collect();
+                println!("framedigest f{f} [{}]", d.join(" "));
+                // ...and the LAST held scene draw by draw. The scene digests say which PASS
+                // differs; these say which DRAW of it, and which of the three inputs.
+                // `VITASLOP_FRAME_DIGEST=<frame>:<draw>` also dumps that draw's vertex FLOATS.
+                let want_draw: Option<usize> = std::env::var("VITASLOP_FRAME_DIGEST")
+                    .ok()
+                    .and_then(|v| v.split(':').nth(1).and_then(|d| d.trim().parse().ok()));
+                let last = cap.frame_scene_digests().len().saturating_sub(1);
+                if let Some(di) = want_draw {
+                    if let Some((lanes, hs)) = cap.draw_lane_hashes(last, di) {
+                        let l: Vec<String> =
+                            hs.iter().enumerate().map(|(i, h)| format!("{i}:{h:#010x}")).collect();
+                        println!("lanehash f{f} s{last} d{di} lanes={lanes} {}", l.join(" "));
+                    }
+                    if let Some((stride, len, vals)) = cap.draw_vertex_floats(last, di, 64) {
+                        println!(
+                            "drawbytes f{f} s{last} d{di} stride={stride} len={len} {vals:?}"
+                        );
+                    }
+                }
+                if let Some(draws) = cap.scene_draw_digests(last) {
+                    for (i, (hv, hc, hi, hu, nu)) in draws.iter().enumerate() {
+                        println!(
+                            "drawdigest f{f} s{last} d{i} verts={hv:#018x} vertsNaNc={hc:#018x} idx={hi:#018x} unis={hu:#018x} nunis={nu}"
+                        );
+                    }
+                }
+            }
         }
 
         // Stop early if the guest finished or trapped (not just a flip).
@@ -335,4 +404,22 @@ impl vitaslop_runtime::recipe_eval::GuestRead for SchedRead<'_> {
     fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
         self.0.read_guest_into(addr, out)
     }
+}
+
+/// `VITASLOP_SIGNATURE_EVERY=<n>`: print the RUNNING determinism signature every `n` stepped
+/// frames, as `sigtrace f<frame> <hash>`.
+///
+/// # Why a running signature and not another end-of-run one
+/// Two runs that disagree at the end disagree from some FIRST frame onwards, and the
+/// end-of-run number cannot say which. Finding it by bisection costs a full PAIR of runs per
+/// halving - on a title whose divergence window sits two thousand frames into a round, that is
+/// hours of replay to locate a frame this prints for free. The fold is already running when a
+/// signature was asked for, so this only reads the accumulator; it is inert without
+/// `VITASLOP_SIGNATURE=1` or an `@sig` recipe, because there is no honest number to read.
+///
+/// Sampling happens on STEPPED frames only, so pair it with `--observe-from` below the window
+/// of interest: the fast-forward prefix runs as one batch and has no per-frame boundary to
+/// sample at.
+fn signature_trace_interval() -> u64 {
+    std::env::var("VITASLOP_SIGNATURE_EVERY").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }

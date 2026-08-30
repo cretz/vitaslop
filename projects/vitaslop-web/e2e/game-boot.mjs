@@ -33,14 +33,17 @@
 //                    environment, and some defects are only reported across that boundary
 import { chromium } from "playwright";
 import { createServer } from "node:http";
-import { readFile, readdir, stat, mkdir } from "node:fs/promises";
+import { readFile, readdir, stat, mkdir, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { join, extname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startProcMon } from "./procmon.mjs";
 
 const here = join(fileURLToPath(import.meta.url), "..");
-const webDir = join(here, "..", "web");
+// The bundle to SERVE. Normally this crate's own `web/`, but an A/B against another build
+// needs the two bundles served by ONE harness: installing playwright into a second worktree
+// makes the harness itself a variable, and the harness is what publishes the number.
+const webDir = process.env.WEB_DIR || join(here, "..", "web");
 const gameDir = process.env.GAME_DIR || process.env.VITASLOP_GAME_DIR || "";
 // Live run: render frame-by-frame through the real GXM->WebGPU renderer, driven by a
 // scripted recipe that navigates the touch front-end to the Tutorial level. Run past
@@ -255,6 +258,17 @@ async function main() {
   let liveFrame = -1;
   let liveStatus = "";
   let liveAt = 0;
+  // Distinct WebGPU errors the page reported. Any at all fails the run - see the console
+  // handler below for why they cannot be left as log noise.
+  const gpuErrors = [];
+  // REQUIRE_LOG: a substring that MUST appear on the page's console before the run passes.
+  //
+  // Reaching a frame proves the engine ran; it does not prove that the thing being tested
+  // happened. A movie that silently decodes nothing still reaches frame 1400 and still
+  // screenshots something plausible - which is how a broken video path passed a browser run
+  // three times in a row. Naming the landmark turns "it ran" into "it did the thing".
+  const requireLog = process.env.REQUIRE_LOG || "";
+  let sawRequired = false;
   let ended = false;
   // Every heartbeat's frame number against the wall clock, so the per-process memory
   // samples can be joined to FRAMES. "Did memory climb between frame 580 and 585" is not
@@ -269,6 +283,19 @@ async function main() {
   page.on("console", (m) => {
     const text = m.text();
     consoleLog.write(`${Date.now()} ${m.type()} ${text}\n`);
+    if (requireLog && text.includes(requireLog)) sawRequired = true;
+    // >>> A WebGPU VALIDATION ERROR FAILS THE RUN.
+    //
+    // The browser is stricter than native wgpu, and the ways it is stricter are SILENT: a
+    // rejected command buffer simply does nothing, so the frame is missing whatever that
+    // buffer would have drawn. MEASURED: a bind group that aliased one buffer across two
+    // writable slots passed native validation, produced a BIT-IDENTICAL desktop frame, and
+    // rendered black video in Chrome - and the only evidence was a console line nobody was
+    // reading. The line was always there; this is what makes it count.
+    if (text.includes("GPUValidationError") || text.includes("GPUOutOfMemoryError")) {
+      const key = text.slice(0, 120);
+      if (!gpuErrors.some((e) => e.slice(0, 120) === key)) gpuErrors.push(text);
+    }
     if (text.startsWith("[live] ")) {
       liveStatus = text.slice(7);
       const f = Number((liveStatus.match(/frame (\d+)/) || [])[1] ?? liveFrame);
@@ -319,6 +346,33 @@ async function main() {
       if (!runFinished) console.log("[game] WORKER CLOSED EARLY (the emulator's thread is gone)");
     });
   });
+
+  // >>> A SLOW DEVICE, ON THIS MACHINE. `CPU_THROTTLE=4` RUNS THE EMULATOR AT A QUARTER SPEED.
+  //
+  // Every pacing question this project has had for weeks - is the loop keeping up, does the
+  // accumulator saturate, does catching up buy speed or cost frame rate - is a question about a
+  // machine that CANNOT hold 60, and this desktop always could. The answers therefore came from
+  // a phone, one dump at a time, with the person holding it in the loop.
+  //
+  // `Emulation.setCPUThrottlingRate` is the renderer-wide multiplier Chrome's own device
+  // emulation uses, and a dedicated worker is in that renderer - so the emulator thread slows
+  // with it. A phone measured ~3.7x this desktop's guest-CPU cost on the same race (5.4 ms a
+  // frame here against 20 there, same texture path via VITASLOP_NO_BC=1), so 4 is roughly that
+  // device and 2 is a machine that is only just behind.
+  //
+  // What it is NOT: a model of the phone's GPU, its memory, or its thermal behaviour. It slows
+  // the CPU and nothing else. Use it for the pacing loop's BEHAVIOUR, never as a device
+  // performance number.
+  const cpuThrottle = Number(process.env.CPU_THROTTLE || 0);
+  if (cpuThrottle > 1) {
+    const cdp = await page.context().newCDPSession(page).catch(() => null);
+    if (cdp) {
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuThrottle });
+      console.log(`[game] CPU THROTTLE ${cpuThrottle}x - this run models a slow device's CPU only`);
+    } else {
+      console.log(`[game] CPU_THROTTLE=${cpuThrottle} asked for but no CDP session - NOT throttled`);
+    }
+  }
 
   let ok = false;
   try {
@@ -534,12 +588,26 @@ async function main() {
     // device's audio thread actually pulled it, and `underrun`/`overrun` say which side
     // is the slow one. A run with written=0 is a guest that emitted nothing, which is a
     // completely different problem from a ring nobody drains.
+    // The page's own DIAGNOSTICS PANEL, written next to the screenshot. It is the only
+    // channel a phone has, and half of what it carries (blocked threads, guest heaps, idle
+    // attribution, movie counters) exists nowhere else - a headless run that throws it away
+    // is asking the same questions again by hand later.
+    const diagText = await page.locator("#diag").textContent().catch(() => "");
+    if (diagText) {
+      await writeFile(join(shotDir, "diag.txt"), diagText, "utf8").catch(() => {});
+      console.log(`[game] diagnostics panel -> ${join(shotDir, "diag.txt")} (${diagText.length} chars)`);
+    }
     const audio = await page.evaluate(() => (window.__audioStats ? window.__audioStats() : null)).catch(() => null);
     if (audio) {
       const secs = (n) => (n / (audio.sampleRate || 48000)).toFixed(1);
       console.log(
         `[audio] context=${audio.state} written=${audio.written} (${secs(audio.written)}s) ` +
-          `read=${audio.read} (${secs(audio.read)}s) underrun=${audio.underrun} overrun=${audio.overrun}`
+          `read=${audio.read} (${secs(audio.read)}s) underrun=${audio.underrun} overrun=${audio.overrun}` +
+          // The two the ring's own consumer keeps, and they answer different complaints:
+          // `latencySkip` is sound the worklet threw away to stop the backlog growing (heard
+          // as a skip), `fill` is the backlog still standing at the end (heard as delay
+          // between a button and its sound). Underrun and overrun cannot distinguish either.
+          ` latencySkip=${audio.latencySkip ?? 0} fill=${audio.fill ?? 0}`
       );
       // >>> COUNTERS CANNOT TELL MUSIC FROM SILENCE. A frame of zeroes is written and
       // read exactly like a frame of music, and an engine that produced nothing but
@@ -608,6 +676,17 @@ async function main() {
     );
     console.log(`[game] live render ${fps} | ${perf} | ${status} -> screenshot ${shot}`);
     ok = liveFrame >= targetFrame;
+    if (requireLog && !sawRequired) {
+      console.log(`[game] the run never logged ${JSON.stringify(requireLog)} - REQUIRE_LOG not met`);
+      ok = false;
+    }
+    if (gpuErrors.length) {
+      console.log(
+        `[game] ${gpuErrors.length} DISTINCT WebGPU error(s) - the run FAILS whatever it rendered:`
+      );
+      for (const e of gpuErrors) console.log(`[game]   ${e.slice(0, 300)}`);
+      ok = false;
+    }
   } catch (e) {
     console.error("[game] error:", e.message);
     console.error("[game] last status:", await page.locator("#status").textContent().catch(() => "?"));

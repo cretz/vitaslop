@@ -167,6 +167,15 @@ pub enum TestAlu {
     /// lane as an F32 register turns the byte pattern 0x00000001 into a denormal, which
     /// compares equal to zero and silently disables the alpha test the corpus uses this for.
     Fx8Sub,
+    /// `src1' - src2` in the INTEGER pipeline (the INT16 family), on the raw 32-bit lane bit
+    /// pattern rather than through a float view.
+    ///
+    /// It is a distinct member for the same reason [`Self::Fx8Sub`] is: the ALU FAMILY decides
+    /// how the operands are READ. The instruction that needs it tests the result of a bitwise
+    /// AND - a small integer mask - and reading `0x00000008` as an f32 makes it a denormal.
+    /// That happens to survive a `!= 0` test and would not survive a `< 0` one, which is
+    /// exactly the kind of near-miss this codebase refuses to leave in.
+    IntSub,
 }
 
 /// One term's coefficient in the 8-bit sum-of-products combiner ([`Op::Sop2`]). The field
@@ -329,6 +338,20 @@ pub enum Op {
     /// opcode: the two groups carry different field layouts, and reading one through the
     /// other's table is how a "similar" group silently addresses the wrong registers.
     IntMad { signed: bool, bits: u8 },
+    /// One STEP of a 32-bit integer multiply-add (group 0x1a, the second 32-bit form):
+    /// `dest = half(src0) * src1 + src2`, where `high_half` selects which 16-bit half of
+    /// `src0` feeds the multiplier and whether its product is shifted back up:
+    ///
+    /// ```text
+    ///   high_half = false:  dest = (src0 & 0xffff) * src1 + src2
+    ///   high_half = true:   dest = ((src0 >> 16) * src1) << 16 + src2
+    /// ```
+    ///
+    /// The two steps therefore SUM to the full `src0 * src1 + src2` in 32-bit wrapping
+    /// arithmetic, which is how the hardware's 16x32 multiplier builds a 32x32 product. See
+    /// the decoder for why this reading rather than one of its rivals, and for the pairing
+    /// rule that makes the result independent of the remaining ambiguity.
+    IntMadStep { signed: bool, high_half: bool },
     /// Load an INDEX register (group 0x14, I16MAD, in the one encoding the corpus establishes):
     /// `i[dest] = src + addend`, as a 16-bit integer.
     ///
@@ -349,12 +372,32 @@ pub enum Op {
     /// `lod` selects the sample variant; for `Bias`/`Level` the scalar level operand is
     /// `srcs[1]`.
     Tex { unit: u8, coords: u8, coord_half: bool, lod: TexLod },
+    /// GATHER4 with bilinear coefficients (group 0xE0 SMP, `sb_mode == 3`): one 2x2 texel
+    /// footprint of the bound texture, plus the two fractional weights that a bilinear filter
+    /// of the same footprint would use.
+    ///
+    /// It writes SIX registers where an ordinary sample writes four - `dest + 0..3` are the
+    /// four gathered texels at the instruction's result precision, and `dest + 4..5` hold four
+    /// F16 coefficients - which is why it is its own operation rather than a flag on
+    /// [`Op::Tex`]: the destination extent is part of what the opcode means.
+    ///
+    /// Only the ONE-component form is decoded (the decoder checks the bound sampler and blocks
+    /// otherwise), so the four gathered values are four texels of a single channel.
+    TexGather { unit: u8, coords: u8, coord_half: bool },
     /// Test -> predicate (VTST, group 0x48): evaluate `alu(src1', src2)` per channel, compare
     /// the result against zero with `cmp`, reduce the four booleans with `reduce`, and write
     /// the single bit to predicate register `pdst`. `write_back` mirrors the encoding's
     /// `test_wben`: when set the raw ALU result is ALSO written to the destination register,
     /// so the instruction doubles as an ALU op. Sources are `[src1, src2]`.
     Test { alu: TestAlu, cmp: TestCmp, reduce: TestReduce, pdst: u8, write_back: bool },
+    /// Test -> per-channel MASK (VTSTMSK, group 0x78): the same `alu(src1, src2)` compared
+    /// against zero as [`Op::Test`], but instead of reducing the four booleans into one
+    /// predicate bit it writes ONE VALUE PER CHANNEL into a general register.
+    ///
+    /// Only the NUMERIC mask form is decoded - each channel becomes `1.0` or `0.0` at the ALU's
+    /// own precision - because that is the only `tst_mask_type` the corpus carries and the
+    /// other two encode a bit pattern whose width rule is not established.
+    TestMask { alu: TestAlu, cmp: TestCmp },
     /// Fragment discard (group 0xF8 KILL). Ends the fragment with no colour written; the
     /// emitter maps it to WGSL `discard`.
     Kill,
@@ -421,12 +464,13 @@ impl Op {
             Op::Mad | Op::Mul | Op::Add | Op::Frc | Op::Dsx | Op::Dsy | Op::Min | Op::Max
                 | Op::Dot { .. }
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
-                | Op::Nop | Op::Tex { .. }
+                | Op::Nop | Op::Tex { .. } | Op::TexGather { .. }
                 | Op::Pack { .. } | Op::PackToInt { .. } | Op::Bitwise { .. }
                 | Op::Sop2 { .. }
                 | Op::IntMad { .. }
+                | Op::IntMadStep { .. }
                 | Op::LoadIndex { .. }
-                | Op::Test { .. } | Op::Kill | Op::DepthF
+                | Op::Test { .. } | Op::TestMask { .. } | Op::Kill | Op::DepthF
                 | Op::MemLoad { .. }
                 // A branch is translated by the emitter's STRUCTURING pass rather than by
                 // `emit_instr`, so it counts as wired here. Reaching `emit_instr` with one is a
@@ -461,14 +505,23 @@ impl Op {
             Op::Cmov { .. } => "cmov",
             Op::Nop => "nop",
             Op::Tex { .. } => "tex",
+            Op::TexGather { .. } => "tex.gather4",
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
             Op::IntMad { .. } => "imad",
+            Op::IntMadStep { high_half, .. } => {
+                if high_half {
+                    "imad.step1"
+                } else {
+                    "imad.step0"
+                }
+            }
             Op::LoadIndex { .. } => "loadidx",
             Op::MemLoad { .. } => "ldmem",
             Op::Bitwise { .. } => "bitwise",
             Op::Sop2 { .. } => "sop2.fx8",
             Op::Test { .. } => "vtst",
+            Op::TestMask { .. } => "vtstmsk",
             Op::Kill => "kill",
             Op::DepthF => "depthf",
             Op::Branch { .. } => "br",

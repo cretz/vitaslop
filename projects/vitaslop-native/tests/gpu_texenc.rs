@@ -297,6 +297,9 @@ fn bc_texture(
 ) -> vitaslop_runtime::capture::BoundTexture {
     let ll = vitaslop_runtime::render::level_layout(base_format, tex_type, w, h, 0).unwrap();
     vitaslop_runtime::capture::BoundTexture {
+        // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+        // one id would collide in every cache keyed on it.
+        pixels_id: vitaslop_runtime::capture::next_pixels_id(),
         unit: 0,
         base_format,
         swizzle: 0,
@@ -734,4 +737,317 @@ fn gpu_eac_order_matches_the_cpu() {
             "table {table}'s ascending order is not the one texenc.wgsl hard-codes"
         );
     }
+}
+
+/// >>> THE VIDEO PATH HAD NO TEST, AND THAT IS HOW IT WENT BLACK.
+///
+/// `convert_yuv420p2` is the one transcode that runs every frame a movie is on screen, and it
+/// was the only one with no test here. A rewrite of it - moving the output from a storage
+/// buffer into a storage TEXTURE, to save a 2 MB buffer and a 2 MB copy per picture - produced
+/// a black movie with no validation error anywhere, on a title whose decoded picture in guest
+/// memory was demonstrably correct. The only evidence was a screenshot, and a screenshot of a
+/// movie is not a repeatable oracle ([[the movie frame a run lands on is not deterministic]]).
+///
+/// So: one picture, converted on the GPU, read back, and compared against the same BT.601
+/// arithmetic done here in Rust. Content-free - the picture is generated below - and it skips
+/// cleanly with no adapter.
+#[test]
+fn gpu_yuv_conversion_matches_the_cpu() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let (w, h) = (64u32, 32u32);
+    let (luma_stride, chroma_stride) = (w, w);
+    let chroma_offset = luma_stride * h;
+    // Structure, not noise: a luma ramp in x, chroma ramps in y, so a plane read at the wrong
+    // offset or a chroma pair read in the wrong order cannot come out looking right.
+    let mut data = vec![0u8; (chroma_offset + chroma_stride * h.div_ceil(2)) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            data[(y * luma_stride + x) as usize] = (16 + (x * 219 / (w - 1))) as u8;
+        }
+    }
+    for cy in 0..h.div_ceil(2) {
+        for cx in 0..w.div_ceil(2) {
+            let at = (chroma_offset + cy * chroma_stride + cx * 2) as usize;
+            data[at] = (16 + cy * 8) as u8;
+            data[at + 1] = (240 - cx * 3) as u8;
+        }
+    }
+
+    let enc = Transcoder::new(&device);
+    for swap_chroma in [false, true] {
+        let planes = vitaslop_platform::texenc::PlanarYuv {
+            width: w,
+            height: h,
+            luma_stride,
+            chroma_stride,
+            chroma_offset,
+            swap_chroma,
+            data: &data,
+        };
+        let tex = enc
+            .convert_yuv420p2(&device, &queue, &planes)
+            .expect("this shape is inside what the shader covers");
+        let got = read_back_rgba8(&device, &queue, &tex, w, h);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let luma = data[y * luma_stride as usize + x] as i32;
+                let c = chroma_offset as usize
+                    + (y / 2) * chroma_stride as usize
+                    + (x / 2) * 2;
+                let (a, b) = (data[c] as i32, data[c + 1] as i32);
+                let (cb, cr) = if swap_chroma { (b, a) } else { (a, b) };
+                let want = yuv_to_rgb_reference(luma, cb, cr);
+                let at = (y * w as usize + x) * 4;
+                assert_eq!(
+                    &got[at..at + 4],
+                    &want[..],
+                    "swap_chroma={swap_chroma} at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+/// BT.601 studio swing, integer, the same arithmetic `yuv_to_rgb` in `texenc.wgsl` does and the
+/// same one `vitaslop_runtime::vita::avcdec` uses on the way back.
+fn yuv_to_rgb_reference(y: i32, cb: i32, cr: i32) -> [u8; 4] {
+    let yt = (y - 16) * 76309;
+    let (u, v) = (cb - 128, cr - 128);
+    [
+        ((yt + 104597 * v + 32768) >> 16).clamp(0, 255) as u8,
+        ((yt - 25675 * u - 53279 * v + 32768) >> 16).clamp(0, 255) as u8,
+        ((yt + 132201 * u + 32768) >> 16).clamp(0, 255) as u8,
+        255,
+    ]
+}
+
+/// Read an RGBA8 texture's level 0 back, unpadding the 256-byte-aligned rows.
+fn read_back_rgba8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let row = (width * 4).div_ceil(256) * 256;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rgba-readback"),
+        size: (row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    let view = slice.get_mapped_range().expect("the poll above waited for the map");
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let start = (y * row) as usize;
+        out.extend_from_slice(&view[start..start + (width * 4) as usize]);
+    }
+    drop(view);
+    buf.unmap();
+    out
+}
+
+/// >>> THE UN-SWIZZLE ON THE GPU IS THE SAME BYTES AS THE UN-SWIZZLE ON THE CPU, level for
+/// >>> level, for every addressing mode and every channel order.
+///
+/// `expand_rgba8` exists to take the largest single item on the target device off its CPU: that
+/// device's own report reads `texture decode by format: 2988.8 MB total - 0x0c raw 2964.5 MB`,
+/// and all of it is this - a Morton un-interleave plus a channel permutation, one texel at a
+/// time, while its GPU is idle.
+///
+/// Being a permutation, it *cannot* differ, which is exactly why this test exists. Every claim
+/// of that shape in this project that went unchecked turned out to differ somewhere: a level
+/// whose padded grid is computed one way here and another way there, a channel order read from
+/// the wrong field, a chain whose second level is filtered from the wrong source. The comparison
+/// is EXACT - not a mean error, not a PSNR - because the two paths are supposed to produce
+/// identical bytes and anything else is a defect, not a tolerance.
+///
+/// The chain rides along: `expand_rgba8` box-filters levels past the guest's own with the same
+/// filter `build_mip_chain` uses, so a level-by-level compare catches an error in the filter
+/// that a level-0 compare would hide.
+#[test]
+fn gpu_raw_expand_matches_the_cpu_decoder() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter - skipping");
+        return;
+    };
+    let enc = Transcoder::new(&device);
+    // Every combination that changes the ADDRESSING or the channel order, plus a
+    // non-power-of-two shape, where the padded Morton grid and the real extent differ.
+    for (w, h) in [(32u32, 32u32), (64, 16), (24, 40)] {
+        for swizzled in [false, true] {
+            for sel in 0..4u32 {
+                // SWIZZLED / LINEAR `SceGxmTextureType` selectors.
+                let tex_type: u32 = if swizzled { 0 } else { 3 };
+                let base_format: u32 = 0x0c; // U8U8U8U8
+                // The guest's bytes for level 0. A swizzled level occupies its POWER-OF-TWO
+                // padded grid, which for a non-power-of-two extent is larger than the extent.
+                let src_texels = if swizzled {
+                    (w.next_power_of_two() as usize) * (h.next_power_of_two() as usize)
+                } else {
+                    (w as usize) * (h as usize)
+                };
+                let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                let bytes: Vec<u8> = (0..src_texels * 4)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (seed >> 33) as u8
+                    })
+                    .collect();
+
+                let tex = vitaslop_runtime::capture::BoundTexture {
+                    unit: 0,
+                    base_format,
+                    // The channel order lives in bits 12..14 of the format word.
+                    swizzle: sel << 12,
+                    tex_type,
+                    width: w,
+                    height: h,
+                    stride: w * 4,
+                    faces: 1,
+                    face_bytes: (src_texels * 4) as u32,
+                    levels: 1,
+                    data_addr: 0,
+                    pixels: bytes.clone().into(),
+                    pixels_id: vitaslop_runtime::capture::next_pixels_id(),
+                    u_addr_mode: 0,
+                    v_addr_mode: 0,
+                    lod_bias: 0,
+                    min_filter: 0,
+                    mag_filter: 0,
+                    mip_filter: 0,
+                    gamma: 0,
+                };
+
+                let Some(plan) = vitaslop_runtime::render::raw_source(&tex) else {
+                    panic!("{w}x{h} swizzled={swizzled} sel={sel}: the plan was refused");
+                };
+                // Run it TWICE into the same texture on the second pass, so the reuse path - the one
+                // that writes over a texture the previous contents went into - is what the
+                // comparison below actually checks. A fresh-texture-only test would leave the
+                // path the running engine takes on almost every frame unexercised.
+                let Some(first) = enc.expand_rgba8(&device, &queue, &plan, false, None) else {
+                    panic!("{w}x{h} swizzled={swizzled} sel={sel}: the expansion was refused");
+                };
+                let Some(got) = enc.expand_rgba8(&device, &queue, &plan, false, Some(first)) else {
+                    panic!("{w}x{h} swizzled={swizzled} sel={sel}: the expansion was refused");
+                };
+
+                // The CPU reference: the same decoder the uploader falls back to, then the same
+                // box filter `build_mip_chain` applies - so this compares the two PATHS, not two
+                // spellings of one of them.
+                let (_, _, level0) = vitaslop_runtime::render::decode_texture_rgba8(&tex);
+                let mut want = level0;
+                let (mut sw, mut sh) = (w, h);
+                for level in 0..plan.levels {
+                    if level > 0 {
+                        let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
+                        let mut dst = vec![0u8; (dw * dh * 4) as usize];
+                        for y in 0..dh as usize {
+                            for x in 0..dw as usize {
+                                for c in 0..4usize {
+                                    let x0 = (2 * x).min(sw as usize - 1);
+                                    let x1 = (2 * x + 1).min(sw as usize - 1);
+                                    let y0 = (2 * y).min(sh as usize - 1);
+                                    let y1 = (2 * y + 1).min(sh as usize - 1);
+                                    let at = |xx: usize, yy: usize| {
+                                        want[(yy * sw as usize + xx) * 4 + c] as u32
+                                    };
+                                    dst[(y * dw as usize + x) * 4 + c] =
+                                        ((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2)
+                                            / 4) as u8;
+                                }
+                            }
+                        }
+                        want = dst;
+                        sw = dw;
+                        sh = dh;
+                    }
+                    let mine = read_back_rgba8_level(&device, &queue, &got, level, sw, sh);
+                    assert_eq!(
+                        mine, want,
+                        "{w}x{h} swizzled={swizzled} sel={sel} level {level} ({sw}x{sh}): the GPU \
+                         un-swizzle and the CPU decoder disagree, and a permutation cannot",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`read_back_rgba8`] for one MIP LEVEL. The chain is the half of this that a level-0-only
+/// comparison would not check, and the filter is where an off-by-one hides.
+fn read_back_rgba8_level(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    level: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let row = (width * 4).div_ceil(256) * 256;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback-level"),
+        size: (row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    let view = slice.get_mapped_range().expect("the poll above waited for the map");
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let start = (y * row) as usize;
+        out.extend_from_slice(&view[start..start + (width * 4) as usize]);
+    }
+    drop(view);
+    buf.unmap();
+    out
 }

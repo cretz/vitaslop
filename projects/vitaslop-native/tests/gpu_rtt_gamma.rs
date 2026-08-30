@@ -101,10 +101,10 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         // Fixed-function parity path: no recompiled GXP payload.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         shader_expanded: false,
     }
 }
@@ -120,6 +120,9 @@ fn texture_naming_target() -> BoundTexture {
         pixels.extend_from_slice(&[255, 0, 255, 255]);
     }
     BoundTexture {
+        // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+        // one id would collide in every cache keyed on it.
+        pixels_id: vitaslop_runtime::capture::next_pixels_id(),
         unit: 0,
         base_format: 0x0c,
         swizzle: 0,

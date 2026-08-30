@@ -4,6 +4,7 @@
 
 pub mod at9;
 pub mod audio;
+pub mod audioin;
 pub mod camera;
 pub mod cfmt;
 pub mod ctrl;
@@ -17,31 +18,39 @@ pub mod gxm;
 pub mod gxmctx;
 pub mod gxmstate;
 pub mod gxmprog;
+pub mod http;
 pub mod iofilemgr;
 pub mod jpeg;
 pub mod jpegenc;
 pub mod libkernel;
+pub mod livearea;
 pub mod location;
 pub mod lwsync;
 pub mod lwwork;
 pub mod mirror;
 pub mod ngs;
 pub mod processmgr;
+pub mod pgf;
 pub mod pvf;
+pub mod sce_xml;
 pub mod services;
 pub mod sync;
 pub mod sysmem;
 pub mod threadmgr;
 pub mod touch;
+pub mod audiodec;
+pub mod avcdec;
 pub mod video;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
-    audio as audio_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
+    audio as audio_nid, audiodec as ad_nid, ctrl as ctrl_nid, dbg as dbg_nid, display as display_nid,
     fiber as fiber_nid, fios2 as fios2_nid, gxm as gxm_nid,
-    iofilemgr as io_nid, libkernel as lk_nid, lwsync as lw_nid, net as net_nid, ngs as ngs_nid,
+    audioin as audioin_nid, http as http_nid, iofilemgr as io_nid, libkernel as lk_nid,
+    livearea as livearea_nid, lwsync as lw_nid, pgf as pgf_nid, xml as xml_nid,
+    net as net_nid, ngs as ngs_nid,
     processmgr as pm_nid, pvf as pvf_nid, services as sv_nid, sync as sync_nid,
-    sysmem as sm_nid, threadmgr as tm_nid,
+    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid,
 };
 use crate::{nid, SvcOutcome};
 
@@ -374,6 +383,13 @@ pub fn set_callsite_profiling(on: bool) {
     DBG_CALLSITES_SAMPLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the profiler is recording right now, for an observer OUTSIDE the run - a watchdog
+/// that reports nothing has to be able to say whether that is "nothing happened" or "nothing
+/// was being recorded", and those are opposite readings.
+pub fn callsite_profiling_on() -> bool {
+    callsite_profiling()
+}
+
 /// Whether the profiler is recording right now - the knob forces it on permanently, and a
 /// frontend can sample it on top of that.
 #[inline]
@@ -507,6 +523,28 @@ fn describe_call_args(ctx: &mut crate::host::GuestCtx) -> String {
     s
 }
 
+/// The plausible RETURN ADDRESSES on the calling thread's stack, innermost first.
+///
+/// A host call has no guest backtrace: the guest's frames are wasm frames the host cannot
+/// walk, and `lr` names only the immediate caller. What the stack DOES hold is every
+/// frame's saved `lr`, and a Thumb return address is recognisable - it is in the loaded
+/// image and odd. That is not a real unwind (a saved data word can look like one), but it
+/// is enough to name the code path that made a call, which is the whole question when a
+/// title asks for something absurd.
+pub fn guest_return_trail(ctx: &crate::host::GuestCtx, words: u32) -> String {
+    let sp = ctx.regs[13];
+    let lo = ctx.base;
+    let hi = ctx.base.saturating_add(0x0200_0000);
+    let mut out = Vec::new();
+    for i in 0..words {
+        let v = ctx.read_u32(sp.wrapping_add(i * 4));
+        if v & 1 == 1 && (lo..hi).contains(&v) {
+            out.push(format!("{:#010x}", v & !1));
+        }
+    }
+    out.join(" <- ")
+}
+
 /// Print the hottest call sites (by count) gathered when `VITASLOP_DBG_CALLSITES` is
 /// set. Call from a probe after the run to localize a spin.
 pub fn dump_call_sites(top: usize) {
@@ -525,6 +563,58 @@ pub fn dump_call_sites(top: usize) {
 /// the cheap one.
 pub fn reset_call_sites() {
     CALLSITE_HIST.lock().unwrap().clear();
+}
+
+/// The call-site tally as it stands right now, for DIFFERENCING two samples taken while the
+/// run is still going.
+///
+/// [`reset_call_sites`] gives a window to anything that can call it at both ends. A run that
+/// HANGS cannot: the frame that would close the window never arrives, so the only reading
+/// available is the cumulative one, and a cumulative tally on a hung run is mostly the boot
+/// that got there. Two snapshots seconds apart are a window that needs no cooperation from
+/// the guest at all, which is what a watchdog observing from outside has to work with.
+pub fn call_sites_snapshot() -> BTreeMap<(u32, u32), u64> {
+    CALLSITE_HIST.lock().unwrap().clone()
+}
+
+/// The calls made SINCE `before`, hottest first - the same shape as [`call_sites_report`] but
+/// over a window rather than from boot.
+///
+/// Returns `None` when nothing at all was called in the window, which is a real reading and
+/// not an empty report: it says the guest is burning CPU in code that makes no host calls, and
+/// that is a different instrument's question ([`crate::vita::dump_call_sites`] cannot see it).
+pub fn call_sites_delta_report(before: &BTreeMap<(u32, u32), u64>, top: usize) -> Option<String> {
+    use std::fmt::Write;
+    let after = call_sites_snapshot();
+    let mut delta: BTreeMap<(u32, u32), u64> = BTreeMap::new();
+    for (k, n) in after.iter() {
+        let d = n.saturating_sub(*before.get(k).unwrap_or(&0));
+        if d > 0 {
+            delta.insert(*k, d);
+        }
+    }
+    if delta.is_empty() {
+        return None;
+    }
+    let mut per_nid: BTreeMap<u32, u64> = BTreeMap::new();
+    for ((nid_, _), n) in delta.iter() {
+        *per_nid.entry(*nid_).or_default() += n;
+    }
+    let total: u64 = delta.values().sum();
+    let mut byn: Vec<_> = per_nid.iter().collect();
+    byn.sort_by(|a, b| b.1.cmp(a.1));
+    let mut v: Vec<_> = delta.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let mut s = format!("--- calls IN THE WINDOW by NID: count ({total} total) ---
+");
+    for (nid_, n) in byn.into_iter().take(top) {
+        let _ = writeln!(s, "  {n:>12}  {}", nid::name(*nid_));
+    }
+    let _ = writeln!(s, "--- hottest call sites IN THE WINDOW (nid, caller lr): count ---");
+    for ((nid_, lr), n) in v.into_iter().take(top) {
+        let _ = writeln!(s, "  {n:>12}  {} @ lr={lr:#010x}", nid::name(*nid_));
+    }
+    Some(s)
 }
 
 /// The hottest call sites as text, so a live session can print them too rather than only
@@ -737,7 +827,10 @@ pub fn dispatch(
         // --- sync: heavyweight mutex / sema / cond / event flag -----------------
         sync_nid::CREATE_MUTEX => cont!(sync::create_mutex(ctx, st)),
         // Lock and wait can block under the preemptive scheduler (Block parks).
-        sync_nid::LOCK_MUTEX => sync::lock_mutex(ctx, st, false),
+        // The `CB` spelling shares the handler, for the reason given at the display
+        // waits: this engine delivers callbacks at host-call boundaries, so every wait is
+        // already a delivery point and the distinction hardware draws does not exist here.
+        sync_nid::LOCK_MUTEX | sync_nid::LOCK_MUTEX_CB => sync::lock_mutex(ctx, st, false),
         sync_nid::TRY_LOCK_MUTEX => sync::lock_mutex(ctx, st, true),
         sync_nid::UNLOCK_MUTEX => cont!(sync::unlock_mutex(ctx, st)),
         sync_nid::DELETE_MUTEX => cont!(sync::delete_object(ctx, st)),
@@ -831,6 +924,95 @@ pub fn dispatch(
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
 
         // --- net: BSD sockets, modelled OFFLINE (see `vita::net`) ---------------
+        // --- SceMotion: a device AT REST, flat. The two sampling switches are real
+        // state because the getter reads them back; the poses are what "at rest" is.
+        sv_nid::MOTION_GET_SENSOR_STATE => cont!(services::motion_get_sensor_state(ctx, st)),
+        sv_nid::MOTION_GET_MAGNETOMETER_STATE => {
+            cont!(services::motion_get_magnetometer_state(ctx, st))
+        }
+        sv_nid::MOTION_MAGNETOMETER_ON => cont!(services::motion_magnetometer_set(ctx, st, true)),
+        sv_nid::MOTION_MAGNETOMETER_OFF => cont!(services::motion_magnetometer_set(ctx, st, false)),
+        sv_nid::MOTION_RESET => cont!(services::motion_reset(ctx, st)),
+
+        // --- SceLibXml (DOM): a real parser over a host-side node arena. See
+        // `sce_xml` for how the C++ object layouts were established and why the
+        // node ids are global.
+        xml_nid::MEM_ALLOCATOR_CTOR => cont!(sce_xml::mem_allocator_ctor(ctx, st)),
+        xml_nid::MEM_ALLOCATOR_DTOR => cont!(sce_xml::mem_allocator_dtor(ctx, st)),
+        xml_nid::INITIALIZER_CTOR => cont!(sce_xml::initializer_ctor(ctx, st)),
+        xml_nid::INITIALIZER_DTOR => cont!(sce_xml::initializer_dtor(ctx, st)),
+        xml_nid::INITIALIZER_INITIALIZE => cont!(sce_xml::initializer_initialize(ctx, st)),
+        xml_nid::BUILDER_CTOR => cont!(sce_xml::builder_ctor(ctx, st)),
+        xml_nid::BUILDER_DTOR => cont!(sce_xml::builder_dtor(ctx, st)),
+        xml_nid::BUILDER_INITIALIZE => cont!(sce_xml::builder_initialize(ctx, st)),
+        xml_nid::BUILDER_GET_DOCUMENT => cont!(sce_xml::builder_get_document(ctx, st)),
+        // The three parser switches share one body; see there for what each would have
+        // changed and why none of them changes anything here.
+        xml_nid::BUILDER_SET_RESOLVE_ENTITY
+        | xml_nid::BUILDER_SET_SKIP_IGNORABLE_TEXT
+        | xml_nid::BUILDER_SET_SKIP_IGNORABLE_WHITESPACE => {
+            cont!(sce_xml::builder_set_flag(ctx, st))
+        }
+        xml_nid::BUILDER_PARSE => cont!(sce_xml::builder_parse(ctx, st)),
+        xml_nid::DOCUMENT_DTOR => cont!(sce_xml::document_dtor(ctx, st)),
+        xml_nid::DOCUMENT_GET_ROOT => cont!(sce_xml::document_get_root(ctx, st)),
+        xml_nid::DOCUMENT_GET_FIRST_CHILD => cont!(sce_xml::document_get_first_child(ctx, st)),
+        xml_nid::DOCUMENT_GET_SIBLING => cont!(sce_xml::document_get_sibling(ctx, st)),
+        xml_nid::DOCUMENT_GET_FIRST_ATTR => cont!(sce_xml::document_get_first_attr(ctx, st)),
+        xml_nid::DOCUMENT_GET_NODE_NAME => cont!(sce_xml::document_get_node_name(ctx, st)),
+        xml_nid::DOCUMENT_GET_NODE_TYPE => cont!(sce_xml::document_get_node_type(ctx, st)),
+        xml_nid::DOCUMENT_GET_TEXT => cont!(sce_xml::document_get_text(ctx, st)),
+        xml_nid::NODE_CTOR => cont!(sce_xml::node_ctor(ctx, st)),
+        xml_nid::NODE_DTOR => cont!(sce_xml::node_dtor(ctx, st)),
+        xml_nid::NODE_GET_NODE_NAME => cont!(sce_xml::node_get_node_name(ctx, st)),
+        xml_nid::NODE_GET_NODE_VALUE => cont!(sce_xml::node_get_node_value(ctx, st)),
+        xml_nid::STRING_CTOR => cont!(sce_xml::string_ctor(ctx, st)),
+
+        // --- ScePgf: the PSP-compatible font API, on the same engine as ScePvf.
+        pgf_nid::NEW_LIB => cont!(pgf::new_lib(ctx, st)),
+        pgf_nid::DONE_LIB => cont!(pgf::done_lib(ctx, st)),
+        pgf_nid::OPEN => cont!(pgf::open(ctx, st)),
+        pgf_nid::OPEN_USER_MEMORY => cont!(pgf::open_user_memory(ctx, st)),
+        pgf_nid::CLOSE => cont!(pgf::close(ctx, st)),
+        pgf_nid::GET_CHAR_INFO => cont!(pgf::get_char_info(ctx, st)),
+        pgf_nid::GET_FONT_INFO => cont!(pgf::get_font_info(ctx, st)),
+        pgf_nid::GET_CHAR_GLYPH_IMAGE => cont!(pgf::get_char_glyph_image(ctx, st)),
+
+        // --- SceAudioIn: the microphone, muted. `Input` PARKS for the grain it
+        // reports, so a capture loop runs at the input's rate instead of spinning.
+        audioin_nid::OPEN_PORT => cont!(audioin::in_open_port(ctx, st)),
+        audioin_nid::RELEASE_PORT => cont!(audioin::in_release_port(ctx, st)),
+        audioin_nid::INPUT => audioin::in_input(ctx, st),
+        audioin_nid::GET_ADOPT => cont!(audioin::in_get_adopt(ctx, st)),
+        audioin_nid::GET_STATUS => cont!(audioin::in_get_status(ctx, st)),
+
+        // --- SceLiveAreaUtil: the gate the title's own package declares. -----------
+        livearea_nid::GET_FRAME_REVISION => cont!(livearea::get_frame_revision(ctx, st)),
+        livearea_nid::GET_FRAME_USER_DATA => cont!(livearea::get_frame_user_data(ctx, st)),
+
+        // --- SceHttp, offline: a real local object graph, and one call that reports
+        // the link being down. See `http` for why the send is the one that fails.
+        http_nid::CREATE_TEMPLATE => cont!(http::create_template(ctx, st)),
+        http_nid::DELETE_TEMPLATE => cont!(http::delete_template(ctx, st)),
+        http_nid::CREATE_CONNECTION_WITH_URL => cont!(http::create_connection_with_url(ctx, st)),
+        http_nid::DELETE_CONNECTION => cont!(http::delete_connection(ctx, st)),
+        http_nid::CREATE_REQUEST_WITH_URL => cont!(http::create_request_with_url(ctx, st)),
+        http_nid::DELETE_REQUEST => cont!(http::delete_request(ctx, st)),
+        // The timeout slot is named by the ARM, not read from the guest: the three NIDs
+        // differ only in which of the three values they set.
+        http_nid::SET_CONNECT_TIMEOUT => cont!(http::set_timeout(ctx, st, 0)),
+        http_nid::SET_SEND_TIMEOUT => cont!(http::set_timeout(ctx, st, 1)),
+        http_nid::SET_RECV_TIMEOUT => cont!(http::set_timeout(ctx, st, 2)),
+        http_nid::ADD_REQUEST_HEADER => cont!(http::add_request_header(ctx, st)),
+        http_nid::SEND_REQUEST => cont!(http::send_request(ctx, st)),
+        http_nid::ABORT_REQUEST => cont!(http::abort_request(ctx, st)),
+        http_nid::GET_STATUS_CODE => cont!(http::get_status_code(ctx, st)),
+        http_nid::GET_RESPONSE_CONTENT_LENGTH => cont!(http::get_response_content_length(ctx, st)),
+        http_nid::READ_DATA => cont!(http::read_data(ctx, st)),
+        http_nid::SSL_LOAD_CERT => cont!(http::ssl_load_cert(ctx, st)),
+        http_nid::SSL_SET_SSL_CALLBACK => cont!(http::ssl_set_ssl_callback(ctx, st)),
+        http_nid::SSL_GET_SSL_ERROR => cont!(http::ssl_get_ssl_error(ctx, st)),
+
         net_nid::SOCKET => cont!(net::socket(ctx, st)),
         net_nid::SOCKET_CLOSE => cont!(net::socket_close(ctx, st)),
         net_nid::BIND => cont!(net::bind(ctx, st)),
@@ -1081,11 +1263,13 @@ pub fn dispatch(
             cont!(gxm::texture_init(ctx, st, gxm::TYPE_CUBE_ARBITRARY))
         }
         gxm_nid::TEXTURE_SET_PALETTE => cont!(gxm::texture_set_palette(ctx, st)),
+        gxm_nid::TEXTURE_GET_PALETTE => cont!(gxm::texture_get_palette(ctx, st)),
         // Fixed-function pipeline state: record into the sticky render state that is
         // snapshotted per draw (see `capture::RenderState`).
         gxm_nid::SET_CULL_MODE => cont!(gxm::set_cull_mode(ctx, st)),
         gxm_nid::SET_TWO_SIDED_ENABLE => cont!(gxm::set_two_sided_enable(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_FUNC => cont!(gxm::set_front_depth_func(ctx, st)),
+        gxm_nid::SET_FRONT_DEPTH_BIAS => cont!(gxm::set_front_depth_bias(ctx, st)),
         gxm_nid::SET_BACK_DEPTH_FUNC => cont!(gxm::set_back_depth_func(ctx, st)),
         gxm_nid::SET_FRONT_DEPTH_WRITE_ENABLE => cont!(gxm::set_front_depth_write_enable(ctx, st)),
         gxm_nid::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => {
@@ -1219,16 +1403,32 @@ pub fn dispatch(
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
         // A real timed vblank wait (parks under the preemptive scheduler).
-        display_nid::WAIT_VBLANK_START_MULTI => display::wait_vblank_start_multi(ctx, st),
-        display_nid::WAIT_VBLANK_START => display::wait_vblank_start(ctx, st),
-        display_nid::WAIT_SET_FRAME_BUF => display::wait_set_frame_buf(ctx, st),
+        //
+        // The `CB` spellings share each handler. A `CB` wait additionally runs the
+        // calling thread's pending callbacks, and here that is already true of every
+        // wait: this engine delivers callbacks at host-call boundaries, which is where
+        // a parked thread resumes. So the difference hardware draws - whether THIS wait
+        // is a delivery point - does not exist for us, and folding them is exact rather
+        // than an approximation.
+        display_nid::WAIT_VBLANK_START_MULTI | display_nid::WAIT_VBLANK_START_MULTI_CB => {
+            display::wait_vblank_start_multi(ctx, st)
+        }
+        display_nid::WAIT_VBLANK_START | display_nid::WAIT_VBLANK_START_CB => {
+            display::wait_vblank_start(ctx, st)
+        }
+        display_nid::WAIT_SET_FRAME_BUF | display_nid::WAIT_SET_FRAME_BUF_CB => {
+            display::wait_set_frame_buf(ctx, st)
+        }
+        display_nid::WAIT_SET_FRAME_BUF_MULTI | display_nid::WAIT_SET_FRAME_BUF_MULTI_CB => {
+            display::wait_set_frame_buf_multi(ctx, st)
+        }
         display_nid::GET_VCOUNT => cont!(display::get_vcount(ctx, st)),
 
         // --- ctrl: input --------------------------------------------------------
         ctrl_nid::PEEK_BUFFER_POSITIVE => cont!(ctrl::peek_buffer_positive(ctx, st)),
-        ctrl_nid::READ_BUFFER_POSITIVE => cont!(ctrl::read_buffer_positive(ctx, st)),
+        ctrl_nid::READ_BUFFER_POSITIVE => ctrl::read_buffer_positive(ctx, st),
         ctrl_nid::PEEK_BUFFER_NEGATIVE => cont!(ctrl::peek_buffer_negative(ctx, st)),
-        ctrl_nid::READ_BUFFER_NEGATIVE => cont!(ctrl::read_buffer_negative(ctx, st)),
+        ctrl_nid::READ_BUFFER_NEGATIVE => ctrl::read_buffer_negative(ctx, st),
         ctrl_nid::SET_SAMPLING_MODE => cont!(ctx.ret(0)),
 
         // --- ngs / audio --------------------------------------------------------
@@ -1250,7 +1450,13 @@ pub fn dispatch(
         | ngs_nid::VOICE_DEF_GET_DISTORTION_BUSS
         | ngs_nid::VOICE_DEF_GET_COMPRESSOR_SIDE_CHAIN_BUSS
         | ngs_nid::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE
-        | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE => cont!(ngs::voice_def_get(ctx, st)),
+        | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE => {
+            // One blob per definition, keyed by the NID this call arrived on - the pointer
+            // is the only thing a rack description says about what it is made of.
+            let addr = ngs::voice_def_get_for(st, func_nid);
+            ctx.ret(addr);
+            SvcOutcome::Continue
+        }
         ngs_nid::PATCH_CREATE_ROUTING => cont!(ngs::patch_create_routing(ctx, st)),
         // The remaining NGS calls are state transitions / per-frame pumps that
         // succeed silently: update/flags/release, voice play/keyoff/kill/pause/
@@ -1381,6 +1587,7 @@ pub fn dispatch(
             cont!(services::rtc_get_current_clock_local_time(ctx, st))
         }
         sv_nid::RTC_GET_CURRENT_TICK => cont!(services::rtc_get_current_tick(ctx, st)),
+        sv_nid::RTC_GET_TICK_RESOLUTION => cont!(services::rtc_get_tick_resolution(ctx, st)),
         sv_nid::RTC_CONVERT_UTC_TO_LOCAL_TIME | sv_nid::RTC_CONVERT_LOCAL_TIME_TO_UTC => {
             cont!(services::rtc_convert_time_zone(ctx, st))
         }
@@ -1452,6 +1659,60 @@ pub fn dispatch(
         sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
         sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
         sv_nid::MP4_RELEASE_BUFFER_7B4832FE => cont!(video::mp4_release_buffer(ctx, st)),
+        sv_nid::MP4_GET_NEXT_UNIT_8BE0E3D3 => cont!(video::mp4_get_next_unit(ctx, st)),
+        sv_nid::MP4_ENABLE_STREAM_609E57AD => cont!(video::mp4_enable_stream(ctx, st)),
+        // NOT `cont!`: a unit that is not due yet parks the caller briefly rather than being
+        // refused into a spin. See `video::mp4_get_next_unit_info`.
+        sv_nid::MP4_GET_NEXT_UNIT => video::mp4_get_next_unit_info(ctx, st),
+        sv_nid::MP4_RESET_40351E1A => cont!(video::mp4_reset(ctx, st)),
+        // NOT `cont!`: reading a unit is a STORAGE read on the device and is paced like
+        // one, or the demuxer outruns the decoder. See `video::mp4_get_next_unit_data`.
+        sv_nid::MP4_GET_NEXT_UNIT_DATA => video::mp4_get_next_unit_data(ctx, st),
+        // SceVideodec / SceAvcdec: the guest decodes the movie itself.
+        vd_nid::VIDEODEC_QUERY_MEM_SIZE => cont!(avcdec::videodec_query_mem_size(ctx, st)),
+        vd_nid::VIDEODEC_INIT_LIBRARY_WITH_UNMAP_MEM => {
+            cont!(avcdec::videodec_init_library_with_unmap_mem(ctx, st))
+        }
+        vd_nid::VIDEODEC_TERM_LIBRARY => cont!(avcdec::videodec_term_library(ctx, st)),
+        vd_nid::AVCDEC_QUERY_DECODER_MEM_SIZE => {
+            cont!(avcdec::avcdec_query_decoder_mem_size(ctx, st))
+        }
+        vd_nid::AVCDEC_CREATE_DECODER => cont!(avcdec::avcdec_create_decoder(ctx, st)),
+        vd_nid::AVCDEC_DELETE_DECODER => cont!(avcdec::avcdec_delete_decoder(ctx, st)),
+        // NOT `cont!`: a decode that produced nothing parks its caller, which is what lets
+        // a browser's decoder answer at all. See `avcdec::avcdec_decode`.
+        vd_nid::AVCDEC_DECODE => avcdec::avcdec_decode(ctx, st),
+        vd_nid::AVCDEC_DECODE_STOP => cont!(avcdec::avcdec_decode_stop(ctx, st)),
+        vd_nid::AVCDEC_DECODE_FLUSH => cont!(avcdec::avcdec_decode_flush(ctx, st)),
+        // SceAudiodec: a movie's sound. Every one of these is synchronous - the decoding
+        // itself happened when the demuxer handed the unit over, so nothing here waits.
+        ad_nid::GET_CONTEXT_SIZE => cont!(audiodec::audiodec_get_context_size(ctx, st)),
+        ad_nid::CREATE_DECODER_EXTERNAL => {
+            cont!(audiodec::audiodec_create_decoder_external(ctx, st))
+        }
+        ad_nid::DECODE => cont!(audiodec::audiodec_decode(ctx, st)),
+        // The AT9 family: the title's own stream, decoded synchronously in the call.
+        ad_nid::INIT_LIBRARY => cont!(audiodec::audiodec_init_library(ctx, st)),
+        ad_nid::TERM_LIBRARY => cont!(audiodec::audiodec_term_library(ctx, st)),
+        ad_nid::CREATE_DECODER => cont!(audiodec::audiodec_create_decoder(ctx, st)),
+        ad_nid::DELETE_DECODER => cont!(audiodec::audiodec_delete_decoder(ctx, st)),
+        ad_nid::CLEAR_CONTEXT => cont!(audiodec::audiodec_clear_context(ctx, st)),
+        ad_nid::GET_INTERNAL_ERROR => cont!(audiodec::audiodec_get_internal_error(ctx, st)),
+        ad_nid::DELETE_DECODER_EXTERNAL => {
+            cont!(audiodec::audiodec_delete_decoder_external(ctx, st))
+        }
+        vd_nid::CODEC_ENGINE_OPEN_UNMAP_MEM_BLOCK => {
+            cont!(avcdec::codec_engine_open_unmap_mem_block(ctx, st))
+        }
+        vd_nid::CODEC_ENGINE_CLOSE_UNMAP_MEM_BLOCK => {
+            cont!(avcdec::codec_engine_close_unmap_mem_block(ctx, st))
+        }
+        vd_nid::CODEC_ENGINE_ALLOC_MEMORY_FROM_UNMAP_MEM_BLOCK => {
+            cont!(avcdec::codec_engine_alloc_memory_from_unmap_mem_block(ctx, st))
+        }
+        vd_nid::CODEC_ENGINE_FREE_MEMORY_FROM_UNMAP_MEM_BLOCK => {
+            cont!(avcdec::codec_engine_free_memory_from_unmap_mem_block(ctx, st))
+        }
         sv_nid::NP_TROPHY_CREATE_CONTEXT => cont!(services::np_trophy_create_context(ctx, st)),
         sv_nid::NP_TROPHY_DESTROY_CONTEXT => cont!(services::np_trophy_destroy_context(ctx, st)),
         sv_nid::NP_TROPHY_CREATE_HANDLE => cont!(services::np_trophy_create_handle(ctx, st)),
@@ -1486,6 +1747,15 @@ pub fn dispatch(
         }
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => {
             cont!(gesture::get_touch_event_by_index(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_RECOGNIZER_INFORMATION => {
+            cont!(gesture::get_touch_recognizer_information(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_RESET_TOUCH_RECOGNIZER => {
+            cont!(gesture::reset_touch_recognizer(ctx, st))
+        }
+        sv_nid::SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENT_BY_PRIMITIVE_ID => {
+            cont!(gesture::get_primitive_touch_event_by_primitive_id(ctx, st))
         }
         // SceCamera: no camera is attached to this host, and every entry point says so
         // with the API's own SCE_CAMERA_ERROR_NOT_MOUNTED / _NOT_OPEN. See `vita::camera`.
@@ -1625,11 +1895,13 @@ pub fn dispatch(
         // Device services: motion sampling, ad-hoc power/config. LOCATION_INIT moved
         // out of this group when SceLibLocation got a real implementation - it now has
         // a dedicated arm above, alongside the rest of its family.
+        // Motion sampling: the enable is a statement, not a query, and this engine's
+        // motion state is the same at-rest pose whether sampling is on or not.
+        // MOTION_MAGNETOMETER_ON/OFF moved OUT of this group when
+        // `sceMotionGetMagnetometerState` arrived: once something reads the bit back, an
+        // accepted no-op stops being harmless and starts being a contradiction.
         | sv_nid::MOTION_START_SAMPLING
-        // Turning the magnetometer on succeeds for the same reason sampling does: the
-        // enable is a statement, not a query, and nothing here reads a compass - a title
-        // that then asks for a heading gets the API's own "could not determine".
-        | sv_nid::MOTION_MAGNETOMETER_ON
+        | sv_nid::MOTION_STOP_SAMPLING
         | sv_nid::POWER_SET_CONFIGURATION_MODE
         // Shared dialog config accepted for every family.
         | sv_nid::COMMON_DIALOG_SET_CONFIG_PARAM
@@ -1643,6 +1915,38 @@ pub fn dispatch(
         | lk_nid::UNKNOWN_023EAA62 => cont!(ctx.ret(0)),
 
         // --- SceCommonDialog: system dialogs complete instantly offline ---------
+        // The NP profile card and the photo picker. Both are pure UI over something
+        // this host does not have - an account and a network for one, a photo library
+        // for the other - so both open, complete immediately having shown nothing, and
+        // report a result of "nothing chosen". That is the same shape every other family
+        // here takes, and it is a path the title already handles: a user can always
+        // dismiss either dialog without picking anything.
+        sv_nid::NP_PROFILE_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::NpProfile))
+        }
+        sv_nid::NP_PROFILE_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpProfile))
+        }
+        sv_nid::NP_PROFILE_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpProfile))
+        }
+        sv_nid::PHOTO_IMPORT_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::PhotoImport))
+        }
+        sv_nid::PHOTO_IMPORT_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::PhotoImport))
+        }
+        sv_nid::PHOTO_IMPORT_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::PhotoImport))
+        }
+        // Their result reads, and the trophy-setup one, all write a zeroed result -
+        // which for each of these families is "completed, nothing selected".
+        sv_nid::NP_PROFILE_DIALOG_GET_RESULT | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT => {
+            cont!(services::dialog_ok(ctx, st))
+        }
+        // Aborting a dialog that has already completed, and closing one the title put
+        // up itself, both genuinely succeed: there is nothing left running to stop.
+        sv_nid::NP_PROFILE_DIALOG_ABORT | sv_nid::MSG_DIALOG_CLOSE => cont!(ctx.ret(0)),
         sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),
@@ -1710,9 +2014,13 @@ pub fn dispatch(
             // points at (a work-area size, a struct's leading fields). Cheap - it runs
             // once, on the way to stopping the run.
             let arg_dump = describe_call_args(ctx);
+            // ...and WHO called it. `lr` names only the immediate caller, which for a
+            // library reached through a table of one-line thunks is always the thunk -
+            // the useful frame is the one above it. See [`guest_return_trail`].
+            let trail = guest_return_trail(ctx, 96);
             return SvcOutcome::Fatal(format!(
-                "unimplemented NID {name} (lib={library_nid:#010x} nid={func_nid:#010x}) \
-                 called by thread {:#x}; implement it (no silent stub)\n{arg_dump}",
+                "unimplemented NID {name} (lib={library_nid:#010x} nid={func_nid:#010x})                  called by thread {:#x}; implement it (no silent stub)
+{arg_dump}                   return trail: {trail}",
                 st.current_thread(),
             ));
         }

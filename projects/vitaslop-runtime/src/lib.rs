@@ -19,6 +19,7 @@ extern crate self as vitaslop_runtime;
 pub mod audio;
 pub mod bcenc;
 pub mod etcenc;
+pub mod capsule;
 pub mod capture;
 /// The shared fast hasher, re-exported so this crate's own modules can say `crate::fasthash`.
 /// It lives in `vitaslop-platform` because the renderer's per-draw maps want it just as much as

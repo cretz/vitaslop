@@ -75,11 +75,23 @@ pub const VERTEX_BLOCK_TEXTURES: u32 = super::gxmctx::MAX_UNIFORM_BUFFERS as u32
 /// old host table recorded these too, and the vertex BIND has never applied them (only the
 /// fragment bind rebinds textures), so the bind's inline copy covers the table alone and
 /// the recorded textures keep exactly their old, unread fate.
-pub const VERTEX_BLOCK_BYTES: u32 = VERTEX_BLOCK_TEXTURES + FRAGMENT_BLOCK_BYTES;
-/// Bytes of the fragment state's arrays block: the 16-unit texture-binding array, in the
-/// context block's own layout ([`super::gxmctx::TEXTURE_STRIDE`] each).
-pub const FRAGMENT_BLOCK_BYTES: u32 =
+pub const VERTEX_BLOCK_BYTES: u32 = VERTEX_BLOCK_TEXTURES + TEXTURE_ARRAY_BYTES;
+/// A 16-unit texture-binding array in the context block's own slot layout
+/// ([`super::gxmctx::TEXTURE_STRIDE`] each). This is exactly what the bind's WHOLESALE copy
+/// moves onto the context's texture block, so it is its own constant rather than "the whole
+/// fragment block" - the fragment block no longer ends there.
+pub const TEXTURE_ARRAY_BYTES: u32 =
     super::gxmctx::MAX_TEXTURE_UNITS as u32 * super::gxmctx::TEXTURE_STRIDE;
+/// Byte offset of the fragment block's non-default uniform-buffer table, one word per index
+/// in the context block's own layout. It sits AFTER the texture array so the bind's wholesale
+/// texture copy ([`TEXTURE_ARRAY_BYTES`] from offset 0, the inline form's `copy_bytes`) keeps
+/// exactly the shape it had; the table is applied by its own short loop, because its
+/// destination in the context block is nowhere near the texture block.
+pub const FRAGMENT_BLOCK_UNIFORM_BUFFERS: u32 = TEXTURE_ARRAY_BYTES;
+/// Bytes of the fragment state's arrays block: the texture array, then the uniform-buffer
+/// table.
+pub const FRAGMENT_BLOCK_BYTES: u32 =
+    FRAGMENT_BLOCK_UNIFORM_BUFFERS + super::gxmctx::MAX_UNIFORM_BUFFERS as u32 * 4;
 
 /// Write texture-binding slot `unit` of a state's texture ARRAY at `array` (the fragment
 /// block's base, or the vertex block's [`VERTEX_BLOCK_TEXTURES`]), in exactly the context

@@ -165,7 +165,32 @@ pub(super) fn create_touch_recognizer(
         // A null work area is the caller's error, not a state to model.
         SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
     } else {
-        let r = (!rect.is_null()).then(|| Rect::read(ctx, rect.addr()));
+        let r = if rect.is_null() {
+            // >>> A NULL RECTANGLE IS "THE WHOLE PANEL", NOT "NOWHERE".
+            //
+            // This argument is optional and a second retail title passes it as 0 for
+            // every one of its ten recognizers. Mapping that to an empty rectangle makes
+            // every recognizer report nothing for the whole run, which on that title is
+            // its entire front end: its menus are touch-driven and no tap anywhere can
+            // ever land inside a 0x0 region.
+            //
+            // EVIDENCE for reading it as the full panel rather than as an error: the
+            // OTHER title that sets this argument builds the rectangle explicitly and
+            // passes exactly `(0, 0, 1919, 1087)`, the front panel's own active extent as
+            // `sceTouchGetPanelInfo` reports it - i.e. the value a caller writes when it
+            // wants the whole panel. An optional region argument whose one observed
+            // explicit value is the full extent, omitted by a title that must be
+            // listening panel-wide to be playable, is a default, not a request for an
+            // empty region. The extent comes from `touch` so the two cannot drift.
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: super::touch::MAX_ACTIVE_X,
+                height: super::touch::max_active_y(port),
+            })
+        } else {
+            Some(Rect::read(ctx, rect.addr()))
+        };
         // The identity goes in the guest's own work area: magic, type, port, and the
         // rectangle it watches, so a later Update/Get call on this area (or on a copy of
         // it) can recover what it is without a host address table.
@@ -183,10 +208,26 @@ pub(super) fn create_touch_recognizer(
         // knowing when a scripted tap "has an effect but does not do anything".
         eprintln!(
             "sceSystemGesture: recognizer #{} type={kind} port={port} rect=({x},{y} {w}x{h}) \
-             at {:#010x}",
+             from rect_ptr={:#010x} at {:#010x}",
             RECOGNIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            rect.addr(),
             recognizer.addr(),
         );
+        // A recognizer with an EMPTY rectangle can never contain a touch point, so it can
+        // never report an event - the title is listening nowhere and every scripted tap
+        // will read as "the input did nothing". That is exactly the silent failure this
+        // module refuses to have, so say it out loud rather than let a caller conclude the
+        // touch panel is unwired.
+        if w == 0 || h == 0 {
+            report_once(
+                "gesture-empty-rect",
+                "sceSystemGesture: a recognizer was created with an EMPTY rectangle, so no \
+                 touch point can ever be inside it and this recognizer will report NO \
+                 events for the whole run. Either the title really asked for an empty \
+                 region, or the rectangle argument is not where this handler reads it - \
+                 see the `rect_ptr` in the recognizer lines above.",
+            );
+        }
         0
     }
 }
@@ -232,6 +273,12 @@ pub(super) fn update_primitive_touch_recognizer(
             reported += ctx.read_u32(addr + TOUCH_DATA_REPORT_NUM_OFF);
         }
     }
+    // The primitive layer advances ONCE per frame, here - the title reads both panels and
+    // hands the samples over before it polls any recognizer. That makes this the one place
+    // that can see a frame BOUNDARY, which is what turns a set of points into transitions:
+    // a point present last frame and gone this frame is a finger that LIFTED. See
+    // [`released_points`].
+    advance_frame(st);
     let world = st.world.poll_touch(0).active().len() + st.world.poll_touch(1).active().len();
     if reported as usize != world {
         report_once(
@@ -299,11 +346,67 @@ pub(super) fn update_touch_recognizer(
 const EVENT_X_OFF: u32 = 26;
 const EVENT_Y_OFF: u32 = 28;
 
-/// Bytes of the event struct this writes. The two established fields end at byte 30, so
-/// the struct is at least that big and writing 30 bytes cannot run past it - which
-/// matters, because the buffer is a stack slot in the CALLER's frame and overrunning it
-/// would corrupt the caller's locals.
-const EVENT_WRITE_BYTES: u32 = 30;
+/// Byte offset, within `SceSystemGestureTouchEvent`, of the word a caller MASKS the event
+/// with before it will look at the event at all.
+///
+/// EVIDENCE, read off a second retail title's consumer (the golf title at `0x812fba88`),
+/// which is a generic "poll one recognizer" helper its per-frame update calls once per
+/// recognizer with a different constant in its fourth argument:
+///
+/// ```text
+///   r0 = recognizer, r1 = index, r2 = sp+0xc0   BLX -> GetTouchEventByIndex
+///   LDR  r1, [sp, #0x210]        ; the helper's 4th argument - 1 or 2 at its call sites
+///   LDR  r2, [sp, #0xc8]         ; <- event + 0x08
+///   ANDS r0, r2, r1              ; the event's own bits AND the bits this call wants
+///   BEQ  <next event>            ; no overlap: this event is not for this caller
+/// ```
+///
+/// So the field at +8 is a BITMASK of what the event is, in the same bit space as the
+/// constants the caller passes. Nothing in the code names the bits; what the sweep in
+/// [`EVENT_STATE_BITS`] establishes is which value makes a tap-driven UI act.
+const EVENT_STATE_OFF: u32 = 8;
+
+/// Byte offset, within `SceSystemGestureTouchEvent`, of the PRIMITIVE ID - the handle the
+/// consumer hands straight back to
+/// [`get_primitive_touch_event_by_primitive_id`] to fetch the raw touch behind the
+/// gesture, and which it also copies into the UI event it dispatches.
+///
+/// EVIDENCE, from the same consumer (golf title, event buffer at `sp+0xc0`), on BOTH of
+/// its event paths:
+///
+/// ```text
+///   LDRH r0, [sp, #0xd8]     ; event + 0x18, a HALFWORD
+///   BLX  -> sceSystemGestureGetPrimitiveTouchEventByPrimitiveID(r0, <out buffer>)
+///   ...
+///   LDRH r0, [sp, #0xd8]     ; the same field again
+///   STR  r0, [sp, #0x168]    ; into the UI event it is about to dispatch
+/// ```
+const EVENT_PRIMITIVE_ID_OFF: u32 = 0x18;
+
+/// The bits written into [`EVENT_STATE_OFF`].
+const EVENT_STATE_BITS_DEFAULT: u32 = 0;
+
+fn event_state_bits() -> u32 {
+    static CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_GESTURE_EVENT_STATE")
+            .ok()
+            .and_then(|s| {
+                let s = s.trim();
+                match s.strip_prefix("0x") {
+                    Some(h) => u32::from_str_radix(h, 16).ok(),
+                    None => s.parse().ok(),
+                }
+            })
+            .unwrap_or(EVENT_STATE_BITS_DEFAULT)
+    })
+}
+
+/// Bytes of the event struct this writes. The established fields end at byte 31 (the kind
+/// byte at [`EVENT_KIND_OFF`] is the last of them), so the struct is at least that big and
+/// writing 31 bytes cannot run past it - which matters, because the buffer is a stack slot
+/// in the CALLER's frame and overrunning it would corrupt the caller's locals.
+const EVENT_WRITE_BYTES: u32 = 31;
 
 /// Recognizer types allowed to report events (`VITASLOP_GESTURE_TYPE_MASK`, a bitmask
 /// over the type values).
@@ -371,7 +474,11 @@ fn note_type_mask(kind: u32) {
 /// state of the RE - the type values are known, their meanings are not - and
 /// [`note_position_only_event`] says so at runtime rather than letting the screen imply
 /// otherwise. `VITASLOP_GESTURE_TYPE_MASK` narrows it for an experiment.
-fn recognizer_events(ctx: &mut GuestCtx, st: &mut VitaState, recognizer: u32) -> Vec<(i16, i16)> {
+fn recognizer_events(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    recognizer: u32,
+) -> Vec<(u8, i16, i16)> {
     if recognizer == 0 || ctx.read_u32(recognizer) != RECOGNIZER_MAGIC {
         return Vec::new();
     }
@@ -390,11 +497,17 @@ fn recognizer_events(ctx: &mut GuestCtx, st: &mut VitaState, recognizer: u32) ->
     let (x1, y1) = (x0 + w as i32, y0 + h as i32);
     let mut out = Vec::new();
     let frame = st.world.poll_touch(port);
-    let points = frame.active();
+    let released;
+    let points: &[crate::world::TouchPoint] = if tap_on_release() {
+        released = released_points(st, port);
+        &released
+    } else {
+        frame.active()
+    };
     for p in points.iter() {
         let (px, py) = (p.x as i32, p.y as i32);
         if (x0..=x1).contains(&px) && (y0..=y1).contains(&py) {
-            out.push((px as i16, py as i16));
+            out.push((p.id, px as i16, py as i16));
         }
     }
     // Diagnostic (`RUST_LOG=vitaslop::input=trace`): the recognizer's rectangle, the
@@ -444,6 +557,80 @@ pub(super) fn get_touch_events_count(
     }
 }
 
+/// `int sceSystemGestureResetTouchRecognizer(SceSystemGestureTouchRecognizer *recognizer)`
+///
+/// EVIDENCE for the one-argument shape: the caller sets only `r0` (the recognizer work
+/// area) before the branch - `r2` still holds `0xffffffff` and `r3` a pointer from the
+/// surrounding code, neither of which this could be using.
+///
+/// Discards whatever gesture is IN PROGRESS on that recognizer, so the next update starts
+/// clean - what a title calls when it takes the touch panel away from one screen and gives
+/// it to another, so a drag begun on the old screen does not finish on the new one.
+///
+/// This engine keeps no in-progress gesture at all: a recognizer reports the touch points
+/// that are down inside its rectangle THIS frame and nothing carries between frames (see
+/// [`recognizer_events`]). So there is genuinely nothing to discard - not work skipped,
+/// but a state that does not exist to be reset. The recognizer is still validated, so a
+/// reset of something that was never created is refused rather than silently accepted.
+#[hostcall]
+pub(super) fn reset_touch_recognizer(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    recognizer: Ptr,
+) -> i32 {
+    if recognizer.is_null() || ctx.read_u32(recognizer.addr()) != RECOGNIZER_MAGIC {
+        SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
+    } else {
+        0
+    }
+}
+
+/// `int sceSystemGestureGetTouchRecognizerInformation(
+///        const SceSystemGestureTouchRecognizer *recognizer,
+///        SceSystemGestureTouchRecognizerInformation *information)`
+///
+/// EVIDENCE for the two-argument shape (title at `0x812fb7ec`): the setup function that
+/// creates this title's recognizers calls this FIVE times in a row, once per recognizer
+/// it just created, setting only `r0 = <recognizer>` and `r1 = <one shared stack
+/// buffer>` before each branch - `r2`/`r3` still hold the values the create calls left,
+/// which the hard-fail dump confirms (both 0 there, where the creates set `r2 = 1`).
+///
+/// **THE CALLER READS NOTHING BACK, and that is the load-bearing observation.** All five
+/// calls target the SAME buffer, there is no load from it between them, and the block
+/// ends by returning - so nothing the library writes there is ever consumed. The five
+/// calls are the title confirming its recognizers exist, not fetching a description.
+///
+/// So this validates the recognizer and reports success, and **deliberately leaves the
+/// information struct untouched**: its layout is not established by anything - no
+/// header, no wiki page, and this caller's use gives no offsets - and writing our type,
+/// port and rectangle at guessed offsets would be inventing a struct, not reporting one.
+/// The buffer keeps whatever the caller had in it, which for a title that DID read it
+/// would present a type of 0 - a value no recognizer here is ever created with, so it
+/// reads as "nothing", not as a plausible wrong gesture. [`note_information_not_filled`]
+/// says all of this out loud the first time the call is made.
+#[hostcall]
+pub(super) fn get_touch_recognizer_information(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    recognizer: Ptr,
+    _information: Ptr,
+) -> i32 {
+    note_information_not_filled();
+    if recognizer.is_null() || ctx.read_u32(recognizer.addr()) != RECOGNIZER_MAGIC {
+        SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
+    } else {
+        0
+    }
+}
+
+/// Report, once, that the recognizer-information struct is left as the caller had it.
+fn note_information_not_filled() {
+    report_once(
+        "gesture-information-not-filled",
+        "sceSystemGestureGetTouchRecognizerInformation: the recognizer is validated and          success is reported, but the SceSystemGestureTouchRecognizerInformation struct is          LEFT UNTOUCHED - its field layout is published nowhere and the calling title never          reads the buffer back, so there is no evidence to write from. A title that DOES          read it will see whatever it passed in.",
+    );
+}
+
 /// `int sceSystemGestureGetTouchEventByIndex(const SceSystemGestureTouchRecognizer *r,
 ///                                          SceUInt32 index, SceSystemGestureTouchEvent *ev)`
 ///
@@ -465,17 +652,170 @@ pub(super) fn get_touch_event_by_index(
     let events = recognizer_events(ctx, st, recognizer.addr());
     match events.get(index as usize) {
         None => SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT,
-        Some(&(x, y)) if event.is_null() => {
-            let _ = (x, y);
+        Some(&(id, x, y)) if event.is_null() => {
+            let _ = (id, x, y);
             SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
         }
-        Some(&(x, y)) => {
+        Some(&(id, x, y)) => {
             note_position_only_event();
             // Zero only as far as the established fields reach - see EVENT_WRITE_BYTES.
             ctx.write_bytes(event.addr(), &[0u8; EVENT_WRITE_BYTES as usize]);
+            let state = event_state_bits();
+            if state != 0 {
+                ctx.write_bytes(event.addr() + EVENT_STATE_OFF, &state.to_le_bytes());
+            }
+            ctx.write_bytes(event.addr() + EVENT_PRIMITIVE_ID_OFF, &(id as u16).to_le_bytes());
+            if let Some(k) = event_kind() {
+                ctx.write_bytes(event.addr() + EVENT_KIND_OFF, &[k]);
+            }
             ctx.write_bytes(event.addr() + EVENT_X_OFF, &x.to_le_bytes());
             ctx.write_bytes(event.addr() + EVENT_Y_OFF, &y.to_le_bytes());
             0
         }
     }
+}
+
+/// `int sceSystemGestureGetPrimitiveTouchEventByPrimitiveID(
+///        SceUInt32 primitiveID, SceSystemGesturePrimitiveTouchEvent *event)`
+///
+/// EVIDENCE for the shape, from the golf title's consumer and from the argument dump the
+/// unimplemented-NID hard-fail printed the first time the tap path reached this call
+/// (`r0=0x00000000 r1=0xa0effaa8 r2=0x00000001 r3=...`, `lr=0x812fbfd1`): `r0` is the
+/// halfword the title just loaded out of [`EVENT_PRIMITIVE_ID_OFF`], and `r1` is a buffer
+/// in the caller's own frame that it reads back afterwards - on the tap path at `+0x0a`,
+/// on the drag path (buffer `sp+0x60`) at `+0x0a` and `+0x10`. The return value is tested
+/// against zero and only a ZERO return makes the title read the buffer at all:
+///
+/// ```text
+///   LDRH  r0, [sp, #0xd8]         ; event + 0x18
+///   BLX   -> HERE
+///   MOVS  lr, r0                  ; the return
+///   BNE   +6                      ; non-zero: skip the load below
+///   LDRSH r4, [sp, #0xa]          ; r1 + 0x0a - only read when this returned 0
+/// ```
+///
+/// **THE PRIMITIVE EVENT'S FIELD LAYOUT IS NOT ESTABLISHED, so this deliberately leaves
+/// the buffer as the caller had it** - the same choice, for the same reason, as
+/// [`get_touch_recognizer_information`]. Two `LDRSH` offsets are all the consumer gives,
+/// nothing names them, and writing a position or a status at a guessed offset would be
+/// inventing the struct. What IS established is that the call must SUCCEED: a non-zero
+/// return makes the title dispatch a UI event carrying an uninitialized register. The
+/// primitive id is validated against the touch points actually down, so an id no finger
+/// owns is refused rather than silently reported as a live primitive.
+#[hostcall]
+pub(super) fn get_primitive_touch_event_by_primitive_id(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    primitive_id: u32,
+    event: Ptr,
+) -> i32 {
+    note_primitive_event_not_filled();
+    if let (Some(v), false) = (primitive_state(), event.is_null()) {
+        ctx.write_bytes(event.addr() + PRIMITIVE_STATE_OFF, &v.to_le_bytes());
+    }
+    let live = (0..2).any(|port| {
+        st.world
+            .poll_touch(port)
+            .active()
+            .iter()
+            .any(|p| p.id as u32 == primitive_id)
+    });
+    if live {
+        0
+    } else {
+        SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
+    }
+}
+
+/// Report, once, that the primitive touch event struct is left as the caller had it.
+fn note_primitive_event_not_filled() {
+    report_once(
+        "gesture-primitive-event-not-filled",
+        "sceSystemGestureGetPrimitiveTouchEventByPrimitiveID: success is reported for a \
+         primitive id that a touch point really owns, but the \
+         SceSystemGesturePrimitiveTouchEvent buffer is LEFT UNTOUCHED - its field layout \
+         is established by nothing, and the two offsets the calling title reads back \
+         (+0x0a, +0x10) are not named by anything. The title will read whatever it had \
+         there, which for a freshly used stack slot is zero.",
+    );
+}
+
+/// Byte offset, within `SceSystemGesturePrimitiveTouchEvent`, of the halfword the golf
+/// title reads back on BOTH paths (`LDRSH r4, [r1, #0x0a]` on the tap path,
+/// `LDRSH r4, [sp, #0x6a]` off the `sp+0x60` buffer on the drag path) and then stores as
+/// a single BYTE into the UI event it dispatches. A small enumerated per-touch value; what
+/// its values mean is established by nothing, which is why it is only written when asked.
+const PRIMITIVE_STATE_OFF: u32 = 0x0a;
+
+/// `VITASLOP_GESTURE_PRIMITIVE_STATE`: write this halfword at [`PRIMITIVE_STATE_OFF`].
+/// Unset leaves the buffer as the caller had it, which is what the handler documents.
+fn primitive_state() -> Option<i16> {
+    static CELL: std::sync::OnceLock<Option<i16>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_GESTURE_PRIMITIVE_STATE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
+}
+
+/// Byte offset, within `SceSystemGestureTouchEvent`, of a BYTE the golf title's consumer
+/// tests as `> 1` before it will dispatch its second kind of UI event
+/// (`LDRB lr, [sp, #0xde]` off the `sp+0xc0` event buffer, then `CMP lr, #1 / BGT`). Only
+/// the poll site that passes 2 as its fifth argument looks at it. What its values mean is
+/// established by nothing, so it is only written when asked.
+const EVENT_KIND_OFF: u32 = 0x1e;
+
+/// `VITASLOP_GESTURE_EVENT_KIND`: write this byte at [`EVENT_KIND_OFF`].
+fn event_kind() -> Option<u8> {
+    static CELL: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("VITASLOP_GESTURE_EVENT_KIND")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
+}
+
+/// The points that were down on each port at the PREVIOUS primitive-layer update.
+///
+/// A tap is a press followed by a RELEASE, and the release is the half a per-frame "which
+/// points are down" sample cannot express on its own. Keeping one frame of history is the
+/// smallest state that can: a point in here and absent from the world now is a finger that
+/// lifted between the two updates.
+static PREV_POINTS: std::sync::Mutex<Option<[Vec<crate::world::TouchPoint>; 2]>> =
+    std::sync::Mutex::new(None);
+
+/// Roll this frame's touch points into [`PREV_POINTS`]. Called once per frame from
+/// [`update_primitive_touch_recognizer`], which is the primitive layer's own per-frame
+/// advance - never from a recognizer poll, which happens several times a frame.
+fn advance_frame(st: &mut VitaState) {
+    let now = [
+        st.world.poll_touch(0).active().to_vec(),
+        st.world.poll_touch(1).active().to_vec(),
+    ];
+    *PREV_POINTS.lock().unwrap() = Some(now);
+}
+
+/// The points on `port` that were down at the previous frame's primitive update and are
+/// not down now: the fingers that LIFTED this frame, reported at their last position.
+fn released_points(st: &mut VitaState, port: u32) -> Vec<crate::world::TouchPoint> {
+    let guard = PREV_POINTS.lock().unwrap();
+    let Some(prev) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let Some(prev) = prev.get(port as usize) else {
+        return Vec::new();
+    };
+    let prev = prev.clone();
+    drop(guard);
+    let now = st.world.poll_touch(port);
+    prev.into_iter()
+        .filter(|p| !now.active().iter().any(|q| q.id == p.id))
+        .collect()
+}
+
+/// `VITASLOP_GESTURE_TAP_ON_RELEASE`: report a type-1 recognizer's event on the frame the
+/// finger LIFTS instead of on every frame it is down.
+fn tap_on_release() -> bool {
+    static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| std::env::var("VITASLOP_GESTURE_TAP_ON_RELEASE").is_ok())
 }

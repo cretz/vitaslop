@@ -270,10 +270,12 @@ pub fn decode(word: u64) -> Instr {
         0x07 => decode_grp_38(word, hi, lo),
         0x08 => decode_grp_pack(word),
         0x09 => decode_grp_test(word),
+        0x0f => decode_grp_test_mask(word),
         0x0a | 0x0b | 0x0c | 0x0d => decode_grp_bitwise(word, op1),
         0x12 => decode_grp_sop2m(word),
         0x14 => decode_grp_i16mad(word),
         0x15 => decode_grp_imad32(word),
+        0x1a => decode_grp_imad32_step(word),
         0x1c => decode_grp_tex(word),
         0x1d => decode_grp_mem_load(word),
         0x1f => decode_grp_flow(word),
@@ -466,6 +468,47 @@ fn decode_grp_test(word: u64) -> Instr {
         // the corpus's alpha-test macro takes, always as the subtract that turns a comparison
         // into a test against zero.
         (2, 8) => (TestAlu::Fx8Sub, false, false),
+        // The INT16 family (`alu_sel` 1) at its two HIGH op numbers. The reference states that
+        // the integer families "reuse the family's integer add/sub/mul/etc. op numbering (e.g.
+        // a signed 32-bit subtract at the high alu_op values)", and 14 is VSUB in the FLOAT
+        // family's own table - so the two high values are the family's subtract pair. Which of
+        // the two is which (signed/unsigned, or the two widths `prec` also selects between) is
+        // NOT established and is deliberately not claimed: both are emitted as an integer
+        // subtract, which is the same expression either way.
+        //
+        // Every occurrence in the corpus is the same idiom - a bitwise AND of a uniform's
+        // branch bits, then this test for NOT-ZERO against the program's own literal-zero
+        // register - where the subtract's sign and operand order cannot change the answer at
+        // all. A future case where they could is one this comment is here to make visible.
+        (1, 14 | 15) => (TestAlu::IntSub, false, false),
+        // The INT16 family at op 10, which is where a THIRD title's whole lit-material family
+        // sits - `frag_81f43190` and fourteen siblings, the shaders that draw its terrain,
+        // characters and props. Every one of them is the same two-instruction idiom and nothing
+        // else:
+        //
+        //   vtst  <- GLOBAL[16], SA[k]   cmp EQ   -> p0     ; then a `mov IfNotP(0)`
+        //   vtst  <- GLOBAL[16], SA[k]   cmp NE   -> p0     ; then a `mov IfNotP(0)`
+        //
+        // - a two-sided select on the FACING bit. Two facts close it inside that domain without
+        // establishing the integer family's op numbering, which no source we hold states:
+        //
+        // * `GLOBAL[16]` is the front-facing bit and the emitter materialises it as `select(0u,
+        //   1u, front_facing)`, so src1 is 0 or 1 and NEVER negative.
+        // * `SA[k]` is the program's own literal ZERO (`frag_81f43190`: `literal SA[39] =
+        //   0x00000000`). The operand prints as `SA[78]` under a float decode only because that
+        //   decode doubles the register number; this family is not double-register.
+        //
+        // On {0,1} against zero, `a - b`, `a + b` and `max(a, b)` all test the same predicate,
+        // and 10 is VMAX in the FLOAT family's own numbering that the reference says the integer
+        // families reuse - so every reading that numbering allows gives the same answer here.
+        // What would REFUTE it: an instance of `(1, 10)` whose src2 is not the literal zero, or
+        // whose src1 is not the facing bit. That is a case this arm must not silently absorb, so
+        // it is named here rather than left to a future reader to notice.
+        //
+        // Leaving it blocked is not the safe option it looks like. The pair then falls back to
+        // the fixed-function approximation, which paints this title's world FLAT - a black
+        // course at address and a flat green one at the ball - with no error anywhere.
+        (1, 10) => (TestAlu::IntSub, false, false),
         _ => {
             blocked = blocked.or(Some("0x48 VTST ALU family/op not modeled"));
             (TestAlu::Sub, prec == 0, true)
@@ -564,6 +607,149 @@ fn decode_grp_test(word: u64) -> Instr {
         half_precision,
         raw: word,
         group: 0x09,
+        blocked,
+    }
+}
+
+/// Decode a group-0x78 VTSTMSK (test -> per-channel MASK). The layout is the TEST group's,
+/// with two slots swapped, and it is a fact from the same distilled TEST-group spec that
+/// established [`decode_grp_test`] (section T.2):
+///
+/// | field | bits | | field | bits |
+/// |---|---|---|---|---|
+/// | `pred` | 58:56 | | `tst_mask_type` | 37:36 |
+/// | `test_flag_2` | 50 | | `dest_bank` | 33:32 |
+/// | `src1_ext` / `src2_ext` | 49 / 48 | | `src1_bank` / `src2_bank` | 31:30 / 29:28 |
+/// | `prec` | 47 | | `dest_n` | 27:21 |
+/// | `src2_vscomp` | 46 | | `test_wben` | 20 |
+/// | `rpt_count` | 45:44 | | `alu_sel` / `alu_op` | 19:18 / 17:14 |
+/// | `sign_test` / `zero_test` | 43:42 / 41:40 | | `src1_n` / `src2_n` | 13:7 / 6:0 |
+/// | `test_crcomb_and` | 39 | | | |
+///
+/// It computes the same `alu(src1, src2)` per channel and the same test against zero as its
+/// VTST sibling, and differs only in where the four booleans go: VTST reduces them to one
+/// predicate bit, this writes one value per channel into a general register. There is no
+/// `chan_cc` and no `pdst_n`.
+///
+/// # What the corpus establishes, and what is therefore refused
+/// Group 0x78 occurs THREE times in the whole corpus and every occurrence is the same word - a
+/// shadow filter's per-texel depth comparison in three of a golf title's world fragment
+/// programs. So the encoding this decodes is exactly one point in the space, and every field
+/// value away from it is BLOCKED rather than extrapolated:
+///
+/// * `tst_mask_type` other than NUMERIC. The numeric form writes `1.0` / `0.0` per channel,
+///   which is what the consumer needs (the very next instruction dots the mask against the
+///   sample's four bilinear coefficients, i.e. averages the four comparisons). The 8-bit and
+///   precision-width mask forms write a BIT PATTERN whose width rule is not established, and a
+///   wrong one there is a shadow that is either always on or always off.
+/// * `test_flag_2` (bit 50) set. VTST puts `src1_neg` there and this group does not; what the
+///   flag feeds is explicitly open in the reference.
+/// * `test_wben` clear. With no predicate destination and the write-back disabled the
+///   instruction would write nothing at all, which is not a thing a compiler emits - so a clear
+///   bit means the field means something this does not model.
+///
+/// Note what `test_wben` does NOT decide here: the register write itself. Both readings of the
+/// bit that survive - "enable the destination write" and VTST's "ALSO write the raw ALU result"
+/// - agree that the destination is written when it is set, and the corpus's consumer requires
+/// the MASK to be what lands there.
+fn decode_grp_test_mask(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    let predicate_raw = bits(word, 58, 56);
+    let pred = ext_predicate(predicate_raw);
+    if matches!(pred, Predicate::Raw(_)) {
+        blocked = blocked.or(Some("PN (per-instance) predicate depends on repeat state - not modeled"));
+    }
+    if bits(word, 37, 36) != 2 {
+        blocked = blocked.or(Some(
+            "0x78 VTSTMSK mask type other than NUMERIC: the bit-pattern mask forms' width rule \
+             is not established",
+        ));
+    }
+    if bits(word, 50, 50) != 0 {
+        blocked = blocked.or(Some("0x78 VTSTMSK test_flag_2 set - what it feeds is not established"));
+    }
+    if bits(word, 20, 20) == 0 {
+        blocked = blocked.or(Some(
+            "0x78 VTSTMSK with test_wben clear: the instruction would write neither a predicate \
+             nor a register",
+        ));
+    }
+
+    // The ALU whose result is tested, and the relation it is tested by: the same two tables
+    // VTST reads, from the same fields.
+    let alu_sel = bits(word, 19, 18);
+    let alu_op = bits(word, 17, 14);
+    let prec = bits(word, 47, 47);
+    let (alu, half_precision, float_ty) = match (alu_sel, alu_op) {
+        (0, 2) => (TestAlu::Add, prec == 0, true),
+        (0, 13) => (TestAlu::Mul, prec == 0, true),
+        (0, 14) => (TestAlu::Sub, prec == 0, true),
+        _ => {
+            blocked = blocked.or(Some("0x78 VTSTMSK ALU family/op not modeled"));
+            (TestAlu::Sub, prec == 0, true)
+        }
+    };
+    let cmp = match (bits(word, 43, 42), bits(word, 41, 40), bits(word, 39, 39)) {
+        (0, 1, _) => TestCmp::Eq,
+        (0, 2, _) => TestCmp::Ne,
+        (1, 0, _) => TestCmp::Lt,
+        (2, 0, _) => TestCmp::Gt,
+        (1, 1, 0) => TestCmp::Le,
+        (2, 1, 0) => TestCmp::Ge,
+        (1, 2, 1) => TestCmp::Lt,
+        (2, 2, 1) => TestCmp::Gt,
+        _ => {
+            blocked = blocked.or(Some("0x78 VTSTMSK sign/zero sub-test combination not modeled"));
+            TestCmp::Ne
+        }
+    };
+
+    let mut source = |bank_sel: u8, field_val: u32, ext: bool| -> Operand {
+        if ext {
+            if bank_sel & 3 == 2 {
+                return Operand::plain(Bank::Immediate, (field_val & 0x7f) as u8, bank_sel);
+            }
+            match ext_source(bank_sel, field_val, false) {
+                Ok(o) => return o,
+                Err(why) => {
+                    blocked = blocked.or(Some(why));
+                    return Operand::plain(Bank::Temp, 0, bank_sel);
+                }
+            }
+        }
+        let (bank, index) = if float_ty {
+            source_bank_index(bank_sel, field_val, 124, |v| (v as u8).wrapping_mul(2))
+        } else {
+            r7_source_bank_index(bank_sel, field_val)
+        };
+        Operand::plain(bank, index, bank_sel)
+    };
+    let s1 = source(bits(word, 31, 30) as u8, bits(word, 13, 7), bits(word, 49, 49) != 0);
+    let mut s2 = source(bits(word, 29, 28) as u8, bits(word, 6, 0), bits(word, 48, 48) != 0);
+    if bits(word, 46, 46) != 0 {
+        s2.swizzle = [0; 4];
+    }
+
+    let dest_sel = bits(word, 33, 32) as u8;
+    let dest = match r7_dest_bank_index(dest_sel, bits(word, 27, 21)) {
+        Some((b, i)) => Some(Operand::plain(b, i, dest_sel)),
+        None => {
+            blocked = blocked.or(Some("0x78 VTSTMSK destination in index mode"));
+            None
+        }
+    };
+
+    Instr {
+        op: Op::TestMask { alu, cmp },
+        pred,
+        dest,
+        // A mask is per-CHANNEL and the group carries no write-mask field, so all four are
+        // written - which is also what makes the four gathered comparisons distinguishable.
+        write_mask: [true; 4],
+        srcs: vec![s1, s2],
+        half_precision,
+        raw: word,
+        group: 0x0f,
         blocked,
     }
 }
@@ -1243,11 +1429,15 @@ fn decode_grp_18_dot(word: u64, hi: u32, lo: u32) -> Instr {
     if matches!(ext_vec_predicate(predicate_raw), Predicate::Raw(_)) {
         blocked = blocked.or(Some("PN (per-instance) predicate depends on repeat state - not modeled"));
     }
-    // The strange bits force a single-channel masking override we do not model exactly.
-    if field(hi, high, "swz_en_strange0") != 0 || field(hi, high, "swz_en_strange1") != 0 {
-        blocked = blocked.or(Some("dot swz_en_strange single-channel override not modeled"));
-    }
-
+    // The `swz_en_strange` pair is this group's REPEAT COUNT - see
+    // [`repeat_extra_iterations`], which is where the census behind that reading lives. It is
+    // consumed there, not here; what stays here is the one shape the unroller cannot express:
+    // a repeated DP steps its destination by one CHANNEL per iteration, so the mask it starts
+    // from has to name exactly one channel. Every observed occurrence does (the reference
+    // calls the bits a "single channel" override for that reason), and anything else is a
+    // shape this model has not seen and must not guess at.
+    let dot_repeat = dot_repeat_extra(word);
+    
     let c3_en = field(hi, high, "c3_en") != 0;
     let components: u8 = if c3_en { 4 } else { 3 };
 
@@ -1293,6 +1483,19 @@ fn decode_grp_18_dot(word: u64, hi: u32, lo: u32) -> Instr {
         field(hi, high, "swz_mask1"),
         field(hi, high, "swz_en"),
     );
+    match dot_repeat {
+        None => {
+            blocked = blocked.or(Some(
+                "dot repeat field 47:44 outside the census (only 8 = once, and 1..3 = that                  many extra iterations, are observed)",
+            ))
+        }
+        Some(n) if n > 0 && write_mask.iter().filter(|w| **w).count() != 1 => {
+            blocked = blocked.or(Some(
+                "a repeating dot whose destination mask names other than ONE channel - the                  per-iteration channel step is only established for the single-channel form",
+            ))
+        }
+        Some(_) => {}
+    }
 
     Instr {
         op: Op::Dot { components },
@@ -1795,11 +1998,32 @@ fn decode_grp_bitwise(word: u64, op1: u8) -> Instr {
         }
     };
 
-    // Source 1: 2-bit bank + R7 number, channel 0 only. With the extension bit set the
-    // selector names the extension row instead (FPCONSTANT / GLOBAL / immediate / indexed);
-    // a bitwise move of a hardware constant is the case that occurs here.
+    // >>> EITHER SOURCE CAN BE THE IMMEDIATE, and the low bits come from that source's OWN
+    // register field.
+    //
+    // The 16-bit immediate is assembled from three fields: the naming operand's 7-bit register
+    // number, a 7-bit field at 20:14, and two bits at 37:36. So `src2 = #imm` takes its low
+    // seven from `src2_n` (6:0) and `src1 = #imm` takes them from `src1_n` (13:7) - which is
+    // what makes it possible for the OTHER operand to still be a register, as it is in the case
+    // that found this: `and dest, #8, sa[80]` in three vertex programs of a retail title, where
+    // 8 is a one-bit mask and SA register 80 is exactly where that program's container table
+    // puts its `g_BranchBits` uniform buffer. Two independent readings landing on one
+    // instruction. The 20:14 and 37:36 halves are shared and read the same way either way.
+    let assemble_imm = |low: u32| -> u32 {
+        let raw_imm = low | (bits(word, 20, 14) << 7) | (bits(word, 37, 36) << 14);
+        let mut v = raw_imm & lane_mask;
+        if rot != 0 {
+            v = ((v << rot) | (v >> ((if width16 { 16 } else { 32 }) - rot))) & lane_mask;
+        }
+        if invert {
+            v = !v & lane_mask;
+        }
+        v
+    };
     let src1_sel = bits(word, 31, 30) as u8;
-    let s1 = if bits(word, 49, 49) != 0 {
+    let src1_ext = bits(word, 49, 49) != 0;
+    let src1_imm = (src1_ext && src1_sel & 3 == 2).then(|| assemble_imm(bits(word, 13, 7)));
+    let s1 = if src1_ext && src1_imm.is_none() {
         match ext_source(src1_sel, bits(word, 13, 7), true) {
             Ok(o) => o,
             Err(why) => {
@@ -1816,18 +2040,31 @@ fn decode_grp_bitwise(word: u64, op1: u8) -> Instr {
     // a plain register (rotate/invert on a register operand are not wired -> block).
     let src2_sel = bits(word, 29, 28);
     let src2_ext = bits(word, 48, 48) != 0;
-    let mut srcs = vec![s1];
-    let imm = if src2_ext && src2_sel == 2 {
-        let raw_imm = bits(word, 6, 0) | (bits(word, 20, 14) << 7) | (bits(word, 37, 36) << 14);
-        let mut v = raw_imm & lane_mask;
-        if rot != 0 {
-            v = ((v << rot) | (v >> ((if width16 { 16 } else { 32 }) - rot))) & lane_mask;
+    let src2_imm = src2_ext && src2_sel == 2;
+    if src1_imm.is_some() && src2_imm {
+        blocked = blocked.or(Some("0x50 with BOTH sources immediate - the two would assemble                                    different values out of one shared field pair"));
+    }
+    // The emitter puts `srcs[0]` on the LEFT and the immediate on the right, so a `src1`
+    // immediate can only be expressed by swapping - which is exact for the commutative members
+    // and wrong for a shift. A shift whose SHIFTED value is the immediate is not observed and
+    // is blocked rather than silently reversed.
+    if src1_imm.is_some() && !matches!(kind, And | Or | Xor) {
+        blocked = blocked.or(Some("0x50 non-commutative member (shift/rotate) with an                                    IMMEDIATE first source - operand order not established"));
+    }
+    let mut srcs = Vec::new();
+    let imm = if let Some(v) = src1_imm {
+        // The register operand becomes the left-hand side; the immediate is the right.
+        if src2_ext {
+            blocked = blocked.or(Some("0x50 src2 extended bank (special/indexed) not modeled"));
         }
-        if invert {
-            v = !v & lane_mask;
-        }
+        let (b2, i2) = r7_source_bank_index(src2_sel as u8, bits(word, 6, 0));
+        srcs.push(Operand::plain(b2, i2, src2_sel as u8));
         Some(v)
+    } else if src2_imm {
+        srcs.push(s1);
+        Some(assemble_imm(bits(word, 6, 0)))
     } else {
+        srcs.push(s1);
         if src2_ext {
             blocked = blocked.or(Some("0x50 src2 extended bank (special/indexed) not modeled"));
         }
@@ -2050,6 +2287,182 @@ fn decode_grp_imad32(word: u64) -> Instr {
     }
 }
 
+/// The bank a group-0x1a `src0` names: a ONE-bit selector at 34 widened by this group's own
+/// extension bit at 47.
+///
+/// | ext | sel 0 | sel 1 |
+/// |---|---|---|
+/// | 0 | TEMP | PRIMATTR |
+/// | 1 | OUTPUT | SECATTR |
+///
+/// Group 0x15 has the unextended row and no extension bit at all (its bit 47 is a reserved
+/// zero); 0x1a is the only member of the integer multiply-add family that carries one, which is
+/// what lets its `src0` reach the SECATTR bank where a uniform POINTER lives.
+fn imad_step_src0_bank(ext: bool, sel: u32) -> Bank {
+    match (ext, sel & 1) {
+        (false, 0) => Bank::Temp,
+        (false, _) => Bank::PrimaryAttr,
+        (true, 0) => Bank::Output,
+        (true, _) => Bank::SecondaryAttr,
+    }
+}
+
+/// Decode a group-0x1a instruction: ONE STEP of a 32-bit integer multiply-add.
+///
+/// # The layout
+/// ```text
+///   63:59 opcode1 = 0x1a   58:56 pred (extended, 3 bits)   55 don't care   54 nosched
+///   53:52 sn (step selector)  51 dest_ext  50 end  49 src1_ext  48 src2_ext  47 src0_ext
+///   46:44 repeat  43:42 =0  41 signed  40 neg_src1  39 neg_src2  38:35 =0
+///   34 src0_bank  33:32 dest_bank  31:30 src1_bank  29:28 src2_bank
+///   27:21 dest_n  20:14 src0_n  13:7 src1_n  6:0 src2_n        (all numbers DIRECT)
+/// ```
+/// Two independent references agree on it: the opcode-map wiki's own encoding table for this
+/// group (which gives the 5-bit opcode, the 3-bit predicate at 58:56, "bit 53 set produces an
+/// invalid instruction", the step selector at 52 with its two values `s0`/`s1`, and the
+/// signedness at 41), and the distilled integer-multiply-add field spec, which additionally
+/// names the bank/number fields and the extension bits. Every bit of every word in the corpus
+/// is accounted for by it, with all four reserved-zero groups reading zero.
+///
+/// # What `sn` selects, and why this reading rather than its rivals
+/// Group 0x1a always appears as an ADJACENT PAIR - `sn = 0` then `sn = 1` - and never alone:
+/// nine pairs, eighteen words, three vertex programs. In every pair the two words carry the
+/// SAME `src0` and `src1`, and the second's `src2` is the first's DESTINATION. Read as the two
+/// halves of a 16x32 multiplier building a 32x32 product,
+///
+/// ```text
+///   sn = 0:  dest = (src0 & 0xffff) * src1 + src2
+///   sn = 1:  dest = ((src0 >> 16) * src1) << 16 + src2
+/// ```
+///
+/// the pair sums to exactly `src0 * src1 + src2`, and every instruction in it does real work.
+///
+/// Two rival readings were considered and one of them is REFUTED outright:
+///
+/// * "`sn` selects the low / HIGH 32 bits of a 64-bit product" is refuted by the corpus. One
+///   pair's two words share a destination that the very next instruction uses as a memory
+///   ADDRESS, so the second write cannot be the (zero) high word; another pair's `sn = 1`
+///   writes the loop counter its own `sn = 0` read, so a high word there would zero the counter
+///   and the loop would never terminate.
+/// * "`sn = 1` simply delivers `src2` to the destination" survives arithmetically - it gives the
+///   same final value on every word here - but it cannot explain the encoding the compiler
+///   chose. Where the pair's destination is ALSO its `src0` (the loop-counter increment), the
+///   first step writes a scratch register and only the second writes the counter; where the
+///   destination and `src0` are different registers, both steps write the destination directly.
+///   That is precisely the constraint the two-halves reading imposes - step 1 still needs the
+///   unmodified `src0`, so step 0 may not clobber it - and it is no constraint at all under the
+///   "deliver src2" reading, which would also make one of the two words in every pair a no-op
+///   the compiler had no reason to emit.
+///
+/// The residual ambiguity is confined to the value the FIRST step leaves behind, and the
+/// pairing check in [`crate::usse`] is what keeps it confined: a group-0x1a instruction that is
+/// not part of a well-formed pair is BLOCKED, so the only shape this decoder ever emits is the
+/// one on which every surviving reading agrees.
+///
+/// # What is blocked
+/// Named individually, because each is a field this corpus establishes the position of and not
+/// the meaning of: a SIGNED step (which half carries the sign is not established, and the
+/// corpus is entirely unsigned), a negated source, an index-mode destination, `sn` values 2 and
+/// 3 (the wiki calls a set bit 53 an invalid instruction), and any word that sets one of the
+/// reserved-zero groups.
+fn decode_grp_imad32_step(word: u64) -> Instr {
+    let mut blocked = None;
+    let mut block = |reason: &'static str| {
+        if blocked.is_none() {
+            blocked = Some(reason);
+        }
+    };
+
+    if bits(word, 43, 42) != 0 || bits(word, 38, 35) != 0 {
+        block(
+            "0x1a IMAD32-STEP: a bit this group's layout requires to be zero is set, so this is \
+             a different encoding and its fields are not established",
+        );
+    }
+    if bits(word, 53, 53) != 0 {
+        block("0x1a IMAD32-STEP: bit 53 is set - the reference calls that an invalid instruction");
+    }
+    if bits(word, 46, 44) != 0 {
+        block(
+            "0x1a IMAD32-STEP: a repeat count above zero - which operands a repeat increments is \
+             not established for this group",
+        );
+    }
+    let signed = bits(word, 41, 41) != 0;
+    if signed {
+        block(
+            "0x1a IMAD32-STEP: the SIGNED form - which of the two steps carries the sign of src0 \
+             is not established, and no word in the corpus is signed",
+        );
+    }
+    if bits(word, 40, 40) != 0 || bits(word, 39, 39) != 0 {
+        block(
+            "0x1a IMAD32-STEP: a negated source operand - the field is established but its \
+             interaction with the half-selected step is not",
+        );
+    }
+    let high_half = bits(word, 52, 52) != 0;
+
+    // Destination: a 2-bit bank plus its extension. Only the unextended row is established
+    // here, exactly as in the sibling group.
+    let dest = if bits(word, 51, 51) != 0 {
+        block("0x1a IMAD32-STEP: an extended destination bank");
+        None
+    } else {
+        match r7_dest_bank_index(bits(word, 33, 32) as u8, bits(word, 27, 21)) {
+            Some((bank, index)) => Some(Operand::plain(bank, index, bits(word, 33, 32) as u8)),
+            None => {
+                block("0x1a IMAD32-STEP: an index-mode destination");
+                None
+            }
+        }
+    };
+
+    // src0: a one-bit bank selector WITH an extension bit, which group 0x15 does not have.
+    let src0_sel = bits(word, 34, 34);
+    let src0_bank = imad_step_src0_bank(bits(word, 47, 47) != 0, src0_sel);
+    let src0_n = bits(word, 20, 14);
+    let src0 = if matches!(src0_bank, Bank::Temp) && (124..=127).contains(&src0_n) {
+        Operand::plain(Bank::Internal, internal_base(src0_n - 124), src0_sel as u8)
+    } else {
+        Operand::plain(src0_bank, r7_reg_index(src0_n), src0_sel as u8)
+    };
+
+    // src1 / src2: a 2-bit bank selector plus an extension bit each, the same rows the sibling
+    // group reads, including the inline-literal one.
+    let mut source = |ext: bool, sel: u8, field: u32| -> Operand {
+        if !ext {
+            let (bank, index) = r7_source_bank_index(sel, field);
+            return Operand::plain(bank, index, sel);
+        }
+        if sel & 3 == 2 {
+            return Operand::plain(Bank::Immediate, (field & 0x7f) as u8, sel);
+        }
+        match ext_source(sel, field, true) {
+            Ok(o) => o,
+            Err(reason) => {
+                block(reason);
+                Operand::plain(Bank::Temp, 0, sel)
+            }
+        }
+    };
+    let src1 = source(bits(word, 49, 49) != 0, bits(word, 31, 30) as u8, bits(word, 13, 7));
+    let src2 = source(bits(word, 48, 48) != 0, bits(word, 29, 28) as u8, bits(word, 6, 0));
+
+    Instr {
+        op: Op::IntMadStep { signed, high_half },
+        pred: ext_predicate(bits(word, 58, 56)),
+        dest,
+        // Scalar: this group carries no write mask, so it writes the one word it names.
+        write_mask: [true, false, false, false],
+        srcs: vec![src0, src1, src2],
+        half_precision: false,
+        raw: word,
+        group: 0x1a,
+        blocked,
+    }
+}
+
 /// Decode a group-0x40 VPCK (pack / unpack / format-convert). The encoding is a fact from
 /// the SGX543 ISA reference (group VPCK): `src_fmt`
 /// (bits 43:41) and `dest_fmt` (40:38) pick source/dest formats (0=U8 1=S8 2=O8 3=U16
@@ -2166,8 +2579,15 @@ fn decode_grp_tex(word: u64) -> Instr {
     if matches!(ext_predicate(predicate_raw), Predicate::Raw(_)) {
         blocked = blocked.or(Some("PN (per-instance) predicate depends on repeat state - not modeled"));
     }
-    if bits(word, 38, 37) != 0 {
-        blocked = blocked.or(Some("0xE0 tex gather4/info sub-behaviour not yet wired"));
+    // `sb_mode` (E0.6) picks the sample SUB-BEHAVIOUR. 0 is the ordinary sample and 3 is the
+    // gather-with-coefficients form below; 1 (a bare gather4) and 2 (the u-frac/v-frac/lod
+    // query) occur nowhere in the corpus, so their destination layouts have nothing to close
+    // against and they stay blocked, each naming itself.
+    let sb_mode = bits(word, 38, 37);
+    match sb_mode {
+        0 | 3 => {}
+        1 => blocked = blocked.or(Some("0xE0 tex sb_mode 1 (gather4 without coefficients)")),
+        _ => blocked = blocked.or(Some("0xE0 tex sb_mode 2 (texture info / query)")),
     }
     // `lod_mode` (E0.4) selects where the mip level comes from. Bias and explicit-LOD each
     // read one scalar from src2 and map onto a WGSL sample variant exactly; the GRADIENT form
@@ -2303,6 +2723,46 @@ fn decode_grp_tex(word: u64) -> Instr {
         tex_srcs.push(Operand::plain(b2, i2, src2_sel));
     }
 
+    // The GATHER form is a different operation with a different destination extent, so it is a
+    // different op. Everything the corpus does not establish about it is refused here rather
+    // than folded into the ordinary sample: a gather is 2D only (the footprint is a 2x2 of
+    // texels, and what a 1D or 3D one gathers is not stated), its result is the full-precision
+    // one every occurrence asks for, and it reads no LOD operand.
+    if sb_mode == 3 {
+        if coords != 2 {
+            blocked = blocked.or(Some(
+                "0xE0 tex gather4 with a non-2D coordinate: the gathered footprint is not \
+                 established for that dimensionality",
+            ));
+        }
+        if !matches!(lod, TexLod::Implicit) {
+            blocked = blocked.or(Some("0xE0 tex gather4 with an explicit LOD / bias / gradient"));
+        }
+        if result_f16 {
+            blocked = blocked.or(Some(
+                "0xE0 tex gather4 with an F16 result: where the four F16 coefficients land \
+                 relative to a half-width gather is not established",
+            ));
+        }
+        if matches!(dbank, Bank::Internal) {
+            blocked = blocked.or(Some(
+                "0xE0 tex gather4 into an internal register: the six-register result does not \
+                 fit one",
+            ));
+        }
+        return Instr {
+            op: Op::TexGather { unit, coords, coord_half },
+            pred: ext_predicate(predicate_raw),
+            dest: Some(Operand::plain(dbank, didx, 0)),
+            write_mask: [true; 4],
+            srcs: tex_srcs,
+            half_precision: result_f16,
+            raw: word,
+            group: 0x1c,
+            blocked,
+        };
+    }
+
     Instr {
         op: Op::Tex { unit, coords, coord_half, lod },
         pred: ext_predicate(predicate_raw),
@@ -2346,6 +2806,41 @@ fn decode_grp_tex(word: u64) -> Instr {
 /// outside the declared interface, which is precisely what
 /// `vertex_written_lanes_close_against_declared_total` would report. The strictness was
 /// therefore not buying safety - it was only refusing SMLSIs whose repeats are elsewhere.
+/// Extra iterations of a group-0x18 DOT, from its bits 47:44 - or `None` when the field holds
+/// a value this corpus has never shown and the answer therefore cannot be stated.
+///
+/// # The field the reference names `unk7 / abs_op2 / swz_en_strange1 / swz_en_strange0`
+/// Bits 47:44 are where every USSE group with a documented `repeat_count` puts it. This
+/// group's own field table names them otherwise, and the reference says of the two low bits
+/// only that they "force override swizzle masking with single channel" - a description of an
+/// EFFECT with no encoding behind it.
+///
+/// # The census that settles it (766 blobs, six titles)
+/// Over every 0x18 DOT in the corpus the field takes exactly four values: `0x8` (365
+/// occurrences), `0x1` (3), `0x2` (6), `0x3` (5). Never `0x0`, and never any value with bit 47
+/// set *and* a low bit set. That perfect anti-correlation is what says bit 47 is part of the
+/// same field rather than an independent flag: an orthogonal bit would show `0x9`/`0xa`/`0xb`
+/// somewhere in 379 samples. So `0x8` is the "runs once" encoding and `1..3` are extra
+/// iterations - and reading the four bits as a plain count instead would make 365 instructions
+/// repeat eight times, which the destination-closure oracle would report immediately.
+///
+/// # What a repeated DP does, and why it is not the generic operand step
+/// A DP writes a SCALAR. Repeating it walks the destination one CHANNEL per iteration (which
+/// is precisely the "single channel" the reference saw) while the vector source advances by a
+/// whole vector, so `n = 3` over a 4-channel DP is a 4x4 matrix transform written into the four
+/// lanes of clip position - the idiom a vertex program's very first arithmetic is. One retail
+/// title's world vertex programs contain exactly one DOT each, with `n = 3`, sourced from a
+/// `WorldViewProjection` uniform declared `F32[4]` x 4 at register 0, writing the four position
+/// lanes nothing else in the program writes. Read as running once, those programs emit a single
+/// scalar for a whole clip position and the title renders a BLACK FRAME.
+fn dot_repeat_extra(word: u64) -> Option<u32> {
+    match bits(word, 47, 44) {
+        0x8 => Some(0),
+        n @ 1..=3 => Some(n as u32),
+        _ => None,
+    }
+}
+
 pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
     match opcode1(word) {
         // Established repeat_count fields.
@@ -2360,14 +2855,17 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // instruction's own multi-register transfer, not a repeat. See the distilled
         // memory-access spec notes (the widths sum to 64 with no hole).
         0x1d | 0x1e => Some(0),
-        // 0x00/0x18 vector MAD/DP: no repeat_count field either. Every group whose grammar is
-        // documented places `repeat_count` at bits 47:44, and in this group's own field table
-        // those four bits are `abs_op2` plus the `op0_strange`/`swz_en_strange` pair - named
-        // operand-modifier bits the decoder already reads, and already blocks on where their
-        // effect is undocumented. A repeat count cannot also live there. The remaining `unk`
-        // bits in this group are scattered singles, not a contiguous field at any position a
-        // repeat count occupies elsewhere.
-        0x00 | 0x03 => Some(0),
+        // 0x00 vector MAD: no repeat_count field. The remaining `unk` bits in that group are
+        // scattered singles, not a contiguous field at any position a repeat count occupies
+        // elsewhere, and its whole corpus closes against the declared output interface under
+        // the reading that a MAD executes once.
+        0x00 => Some(0),
+        // 0x18: the MAD form has no repeat field either, for the same reason and with the same
+        // corroboration. The DOT form's bits 47:44 ARE one - see [`dot_repeat_extra`] for the
+        // census, and note that reading the MAD form's identically-positioned bits the same way
+        // would repeat several hundred instructions that demonstrably run once.
+        0x03 if bits(word, 53, 53) == 1 => Some(0),
+        0x03 => dot_repeat_extra(word),
         // 0x90 SOP2M: no repeat_count field either, and the field table accounts for every bit
         // - the four bits at 47:44, where every group that HAS a repeat count puts it, are the
         // second complement bit plus the top three bits of the write mask. Both are read by
@@ -2391,6 +2889,11 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // repeat ITERATES over in this group is not, so a non-zero count is `None` (blocked)
         // rather than an unroll count - the same stance `decode_grp_imad32` takes.
         0x15 if bits(word, 46, 44) == 0 => Some(0),
+        // 0x1a IMAD32-STEP: the same three-bit repeat count at 46:44, with bit 47 taken by
+        // this group's own src0 bank EXTENSION rather than by a reserved zero or the top of the
+        // count. Same stance as 0x15: the position is established, what an iteration steps is
+        // not, so a non-zero count blocks instead of unrolling.
+        0x1a if bits(word, 46, 44) == 0 => Some(0),
         _ => None,
     }
 }
@@ -2471,8 +2974,12 @@ pub(crate) const DEFAULT_REPEAT_STATE: [SmlsiSlot; 4] = [SmlsiSlot::Increment(1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RepeatOperand {
     /// Slot, indexed exactly as [`decode_smlsi`] indexes its result: 0 dest, 1 src0, 2 src1,
-    /// 3 src2.
+    /// 3 src2. Ignored when `moe` is false.
     pub slot: usize,
+    /// Whether this operand's advance is governed by the MOE state at all. False means the
+    /// advance is INTRINSIC to the instruction - it steps by `stride` every iteration whatever
+    /// the SMLSI last programmed. See the DP destination in [`repeat_operands`].
+    pub moe: bool,
     /// Registers advanced per unit of increment. This is NOT a free parameter: an operand's
     /// register field is either SIX bits, which the hardware scales by two ([`reg_index`]), or
     /// SEVEN bits, which it uses directly ([`r7_reg_index`]). A repeat steps the encoded FIELD,
@@ -2501,7 +3008,9 @@ pub(crate) struct RepeatOperand {
 /// another, and 79 -> 78 on a corpus that is otherwise CLEAN under this order. A reading that
 /// breaks a corpus with nothing left to explain is the wrong reading.
 pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
-    let op = |slot, stride| RepeatOperand { slot, stride };
+    let op = |slot, stride| RepeatOperand { slot, stride, moe: true };
+    // An operand whose per-iteration advance is the instruction's own, not the MOE's.
+    let fixed = |stride| RepeatOperand { slot: 0, stride, moe: false };
     match opcode1(word) {
         // 0x38 VMOV (`decode_grp_38`). Every operand is a SIX-bit field: dest `dest_n` (23:18),
         // src1 `src1_n` (11:6), src2 `src2_n` (5:0), src0 `src0_n` (17:12) - so all stride 2.
@@ -2533,6 +3042,50 @@ pub(crate) fn repeat_operands(word: u64) -> Option<Vec<RepeatOperand>> {
         // folded into the op at decode and is not an IR source, so the list is dest, src1, and
         // src2 only when it is a register; a shorter `srcs` simply consumes fewer entries.
         0x0a..=0x0d => Some(vec![op(0, 1), op(2, 1), op(3, 1)]),
+        // 0x18 DOT (`decode_grp_18_dot`), and it is the one group whose repeat is not a plain
+        // register walk - see [`dot_repeat_extra`]:
+        //
+        // * the DESTINATION advances one LANE per iteration, because a DP writes a scalar into
+        //   one channel and the next iteration writes the next channel. In this IR a masked
+        //   destination writes lane `index + channel`, so a single-channel mask plus a stride
+        //   of ONE lane expresses that exactly (`decode_grp_18_dot` refuses any other mask).
+        //
+        //   >>> AND THAT ADVANCE IS INTRINSIC, NOT MOE-GOVERNED. It used to be routed through
+        //   the SMLSI destination byte, which is invisible while the state is its default
+        //   `Increment(1)` - every repeating DP in four corpora runs under exactly that - and
+        //   wrong the moment a program programs the state. A golf lit-material vertex program
+        //   opens `SMLSI [7, 7, 1, 1]` and then transforms its position with a three-iteration
+        //   DP: the source byte 1 walks the matrix rows correctly (stride 4 -> sa[0], sa[4],
+        //   sa[8]) while the destination byte 7 sent the three results to `o[0]`, `o[7]` and
+        //   `o[14]` - two varying lanes - leaving clip `y` and `z` unwritten, which is what
+        //   `[o0 -1 -2 o3]` was. Under the intrinsic advance they land in `o[0..3]` beside the
+        //   `w` the next instruction copies, and the program's clip position closes. The
+        //   channel walk is the DP's own; the MOE has nothing to step it with.
+        // * op1, the R6 vector source, advances by a whole VECTOR - `c3_en` channels - which is
+        //   what makes four iterations read the four rows of a 4x4 matrix laid out at
+        //   consecutive registers.
+        // * op2 is an INTERNAL register (RI2, a 2-bit selector, not a register field). It is
+        //   the vector being transformed and it does not move; a 2-bit selector has nowhere to
+        //   step to in any case.
+        0x03 if bits(word, 53, 53) == 0 => {
+            // >>> THE VECTOR SOURCE STEPS A WHOLE FOUR-REGISTER SLOT, NOT `c3_en` CHANNELS.
+            // This used to advance by the number of channels the DP SUMS (3 or 4 from bit 52),
+            // which is right for a 4-component DP and wrong for a 3-component one - and a
+            // 3-component DP over a matrix is exactly how a program transforms a NORMAL.
+            // PCSA00009's world material opens with a three-iteration 3-component DP whose
+            // source is `PrimaryAttr[28]`; its rows are the `modelWorldX/Y/Z` attributes, which
+            // the container declares at lanes 28, 32 and 36 - FOUR apart, because each is a
+            // declared float4. Stepping by three read `pa[28]`, `pa[31]`, `pa[34]`: row 0
+            // correct, row 1 straddling `modelWorldX.w`, row 2 straddling `modelWorldY.zw`.
+            // The world normal came out wrong, `dot(normal, g.Light.position)` came out
+            // non-positive over the whole course, `max(N.L, 0)` killed the diffuse term and the
+            // terrain rendered BLACK. Stride 4 fits both widths at once: the 4-component DPs
+            // that walk a 4x4 matrix at consecutive registers are unchanged, because their
+            // rows are four apart too. `c3_en` says how many channels are SUMMED; it does not
+            // say how far the next iteration's operand slot begins.
+            let _ = bits(word, 52, 52);
+            Some(vec![fixed(1), op(2, 4), op(3, 0)])
+        }
         _ => None,
     }
 }
@@ -2723,8 +3276,27 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     if bits(word, 58, 56) != 0 {
         set(&mut blocked, "0xE8 memory-load predicate table not established");
     }
-    if bits(word, 53, 53) != 0 {
-        set(&mut blocked, "0xE8 memory-load moe_expand interaction not established");
+    // `moe_expand` (bit 53) puts the instruction's operands under the MULTIPLE-OPERAND
+    // EXPANSION state - the per-iteration register/address stepping an SMLSI programs, which
+    // this decoder already models as [`SmlsiSlot`] with a default of `Increment(1)`.
+    //
+    // >>> WHY THE SET CASE IS ALLOWED FOR A SINGLE ELEMENT, and only for it. The census over
+    // every captured corpus (`usse_memory_group_field_census`, 322 memory-access instructions
+    // across six titles) splits perfectly complementarily:
+    //
+    //   moe_expand = 1 -> elements = 1, always (4 instances, one golf lit-material vertex
+    //                     program in four variants), and NO SMLSI has executed earlier in any
+    //                     of those programs, so the state in force is the default.
+    //   moe_expand = 0 -> elements 2, 3, 4, 8 or 12 - never 1 (318 instances).
+    //
+    // Expansion is a stepping rule between ITERATIONS. With one element there is no second
+    // iteration to step to, and the first is at step zero under every reading of the field, so
+    // on this domain the bit cannot change which address is read or which register is written.
+    // What the bit means when a burst is expanded stays unestablished and stays blocked - and
+    // the second half of the guard, that the MOE state is still its default, is enforced in
+    // `unroll_repeats`, which is where the state is actually walked.
+    if bits(word, 53, 53) != 0 && bits(word, 47, 44) != 0 {
+        set(&mut blocked, "0xE8 memory-load moe_expand over a MULTI-ELEMENT burst not established");
     }
     if bits(word, 52, 52) != 0 {
         set(&mut blocked, "0xE8 memory-load sync_start semantics not established");
@@ -2751,9 +3323,20 @@ fn decode_grp_mem_load(word: u64) -> Instr {
 
     let elements = (bits(word, 47, 44) + 1) as u8;
 
-    // src0, the byte pointer: 1-bit bank at 34, extension at 50 (spec A.2 row). Only the
-    // PA bank is in the census - the pointer is per-vertex data (or per-vertex-derived, as
-    // in the skinning idiom that computes it into a PA register).
+    // src0, the byte pointer: 1-bit bank at 34, extension at 50 (spec A.2 row). Two banks are
+    // in the census, and they are the two ways a program gets hold of a buffer address:
+    //
+    // * PRIMATTR - per-vertex data, or per-vertex-derived, as in the skinning idiom that
+    //   computes the pointer into a PA register first.
+    // * SECONDARY-ATTR - the buffer's bound address as the DRIVER left it, in the SA register
+    //   the container's +0x78 binding table names. That is the shape
+    //   [`crate::module::resolve_mem_window`] was written around (it REQUIRES an instruction to
+    //   read exactly that register, and `link` initialises it from the bound window's own
+    //   header), so blocking it here refused the one form the rest of the pipeline is built to
+    //   serve. Three vertex programs of a retail title load through it.
+    //
+    // TEMP and OUTPUT stay out: neither is observed, and a pointer read out of a register the
+    // program computed for something else is not a thing to guess at.
     let src0 = {
         let (ext, sel) = (bits(word, 50, 50), bits(word, 34, 34));
         let bank = match (ext, sel) {
@@ -2762,8 +3345,8 @@ fn decode_grp_mem_load(word: u64) -> Instr {
             (_, 0) => Bank::Output,
             (_, _) => Bank::SecondaryAttr,
         };
-        if bank != Bank::PrimaryAttr {
-            set(&mut blocked, "0xE8 memory-load src0 outside the PA bank not in the census");
+        if !matches!(bank, Bank::PrimaryAttr | Bank::SecondaryAttr) {
+            set(&mut blocked, "0xE8 memory-load src0 outside the PA/SA banks not in the census");
         }
         Operand::plain(bank, r7_reg_index(bits(word, 20, 14)), sel as u8)
     };
@@ -2810,6 +3393,32 @@ fn decode_grp_mem_load(word: u64) -> Instr {
 /// Classify an instruction whose operand decode is not yet wired: set its operation from
 /// the ISA opcode map (a fact) but leave operands empty so the emitter hard-fails naming
 /// the op. `hi`/`lo` are used only where a sub-opcode is needed to name the op.
+/// Why one stub group is blocked, where saying more than "not yet wired" would send the next
+/// reader somewhere useful.
+fn stub_reason(op1: u8) -> &'static str {
+    match op1 {
+        // The last group in the whole captured corpus that stops a shader recompiling, and it
+        // is worth knowing WHY it is not simply the next grind item.
+        //
+        // 0x80 is SOP2, the 8-bit sum-of-products combiner WITHOUT a write mask; its sibling
+        // 0x90 (SOP2M, "+ wmask") is fully decoded here. The two cannot share a table: SOP2M
+        // spends bits 46:43 on the mask and SOP2 does not, so SOP2's freed bits carry
+        // something else and one word cannot say what. And the corpus carries exactly ONE
+        // group-0x80 word, in ONE program - a two-instruction fragment (a PHAS and this),
+        // whose neighbours therefore constrain nothing. Reading it through SOP2M's table
+        // yields a defensible-looking `dest = sub(a * src1, (1-a) * src2)` with no way to
+        // check any of it, and a guessed combiner COEFFICIENT scales a whole term.
+        //
+        // What would settle it: a second program carrying the group (so the varying bits name
+        // the fields), or an operand-level reference for the SOP family - the distilled core
+        // spec lists SOP2/SOP2M/SOP3 as explicitly out of its scope.
+        0x10 => "0x80 SOP2 (sum-of-products, no write mask): its operand layout differs from \
+                 the decoded 0x90 SOP2M exactly where that group puts its write mask, and the \
+                 corpus carries ONE word of it in ONE program - see `stub_reason`",
+        _ => "operand decode not yet wired for this group",
+    }
+}
+
 fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
     let op = match op1 {
         0x00 => Op::Mad,                       // 0x00 mad (handled in decode)
@@ -2829,7 +3438,7 @@ fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
         0x11 => Op::Todo("add/sub.fx8"),
         0x12 => Op::Todo("add/sub/min/max.fx8"),
         0x13 => Op::Todo("mad.u8"),
-        0x14 | 0x15 | 0x1a => Op::Todo("mad (integer group)"),
+        0x14 | 0x15 => Op::Todo("mad (integer group)"),
         0x19 => Op::Todo("mad.u8"),
         0x1c => Op::Todo("tex"),               // 0xE0
         // 0x1d (0xE8 loads) is handled in decode() with full operand decode for the
@@ -2843,7 +3452,6 @@ fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
         // named Todo (hard-fail) until GLOBAL register semantics are established, rather than
         // guessing a value. See the distilled VTST/VTSTMSK spec notes.
         0x09 => Op::Todo("vtst (test->predicate; reads GLOBAL special reg, not modeled)"),
-        0x0f => Op::Todo("vtstmsk (test->mask)"),
         // 0x16, 0x17, 0x18, 0x1b: documented illegal groups.
         0x16 | 0x17 | 0x18 | 0x1b => Op::Illegal,
         _ => Op::Unsupported { group: op1 },
@@ -2859,8 +3467,9 @@ fn classified_stub(word: u64, op1: u8, _hi: u32, lo: u32) -> Instr {
         group: op1,
         // Operands are not decoded for stub groups, so even an emittable op (e.g. 0x18
         // dot) must be blocked until its operand layout is wired - the emitter then hard-
-        // fails naming this, rather than emitting with missing operands.
-        blocked: Some("operand decode not yet wired for this group"),
+        // fails naming this, rather than emitting with missing operands. A group whose
+        // specific wall is worth naming says so instead of using the generic line.
+        blocked: Some(stub_reason(op1)),
     }
 }
 
@@ -3044,6 +3653,151 @@ mod tests {
         assert!(idx.blocked.is_some(), "src1 ext index1 mode must stay blocked");
     }
 
+    /// The group-0x1a IMAD32-STEP layout, checked against the two shapes the corpus carries -
+    /// a golf title's world vertex programs, where every one of its eighteen words is one of
+    /// these four.
+    ///
+    /// SHAPE 1 is the ADDRESS computation: `pa[0] += sa[107]`, done as the two halves of a
+    /// 16x32 multiplier with the immediate 1. Its `src0` reaches the SECATTR bank through this
+    /// group's own extension bit, which is where the driver put the bound buffer's pointer.
+    ///
+    /// SHAPE 2 is the LOOP-COUNTER increment: `pa[17] += 1`, whose two steps must use a scratch
+    /// register because the destination is also `src0`.
+    #[test]
+    fn group_1a_imad32_step_closes_on_the_corpus_words() {
+        // Shape 1, step 0 and step 1: identical but for the step selector.
+        for (word, high) in [(0xd092_8006_a01a_c080u64, true), (0xd082_8006_a01a_c080, false)] {
+            let instr = decode(word);
+            assert_eq!(instr.group, 0x1a);
+            assert_eq!(instr.op, Op::IntMadStep { signed: false, high_half: high });
+            assert_eq!(instr.pred, Predicate::Always);
+            assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
+            let dest = instr.dest.expect("a decoded destination");
+            assert_eq!((dest.bank, dest.index), (Bank::PrimaryAttr, 0));
+            // src0 is the driver-placed POINTER, in SECATTR - reachable only through bit 47.
+            assert_eq!((instr.srcs[0].bank, instr.srcs[0].index), (Bank::SecondaryAttr, 107));
+            assert_eq!((instr.srcs[1].bank, instr.srcs[1].index), (Bank::Immediate, 1));
+            assert_eq!((instr.srcs[2].bank, instr.srcs[2].index), (Bank::PrimaryAttr, 0));
+            assert_eq!(instr.write_mask, [true, false, false, false]);
+            assert_eq!(repeat_extra_iterations(word), Some(0));
+        }
+        // Shape 2: the counter increment. Step 0 writes a scratch and adds the literal 1;
+        // step 1 writes the counter and adds the scratch.
+        let lo = decode(0xd083_0006_a004_4081);
+        assert_eq!(lo.op, Op::IntMadStep { signed: false, high_half: false });
+        assert_eq!(lo.blocked, None);
+        assert_eq!(lo.dest.map(|d| (d.bank, d.index)), Some((Bank::PrimaryAttr, 0)));
+        assert_eq!((lo.srcs[0].bank, lo.srcs[0].index), (Bank::PrimaryAttr, 17));
+        assert_eq!((lo.srcs[1].bank, lo.srcs[1].index), (Bank::Immediate, 1));
+        assert_eq!((lo.srcs[2].bank, lo.srcs[2].index), (Bank::Immediate, 1));
+        let hi = decode(0xd092_0006_a224_4080);
+        assert_eq!(hi.op, Op::IntMadStep { signed: false, high_half: true });
+        assert_eq!(hi.blocked, None);
+        assert_eq!(hi.dest.map(|d| (d.bank, d.index)), Some((Bank::PrimaryAttr, 17)));
+        assert_eq!((hi.srcs[0].bank, hi.srcs[0].index), (Bank::PrimaryAttr, 17));
+        assert_eq!((hi.srcs[1].bank, hi.srcs[1].index), (Bank::Immediate, 1));
+        assert_eq!((hi.srcs[2].bank, hi.srcs[2].index), (Bank::PrimaryAttr, 0));
+    }
+
+    /// Every group-0x1a form whose FIELD the corpus establishes but whose MEANING it does not
+    /// must hard-fail rather than decode through a table fitted to the unsigned, unrepeated,
+    /// unnegated one.
+    #[test]
+    fn group_1a_blocks_what_it_cannot_establish() {
+        let base: u64 = 0xd082_8006_a01a_c080;
+        for (name, word) in [
+            ("reserved bits 43:42", base | 1 << 42),
+            ("reserved bits 38:35", base | 1 << 35),
+            ("sn value 2 (bit 53)", base | 1 << 53),
+            ("a repeat count", base | 1 << 44),
+            ("the signed form", base | 1 << 41),
+            ("a negated src1", base | 1 << 40),
+            ("a negated src2", base | 1 << 39),
+            ("an extended destination bank", base | 1 << 51),
+        ] {
+            assert!(
+                decode(word).blocked.is_some(),
+                "{name} must block rather than decode through this layout"
+            );
+        }
+    }
+
+    /// The group-0x78 VTSTMSK layout, checked against the ONE word the whole corpus carries -
+    /// the per-texel depth comparison of a golf title's shadow filter, which appears in three
+    /// of its world fragment programs and nowhere else.
+    ///
+    /// The reading is `i0[c] = (r[c] - i0[c]) > 0 ? 1 : 0` for all four channels: the four
+    /// gathered shadow-map depths against the reference depth a `mov` broadcast into `i0`,
+    /// written back as a numeric mask the next instruction dots against the sample's bilinear
+    /// coefficients.
+    #[test]
+    fn group_78_vtstmsk_closes_on_the_word_that_established_it() {
+        let instr = decode(0x78c0_8aa0_0f93_807c);
+        assert_eq!(instr.group, 0x0f);
+        assert_eq!(instr.op, Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt });
+        assert_eq!(instr.pred, Predicate::Always);
+        assert_eq!(instr.blocked, None, "the layout must close with nothing blocked");
+        // Destination and src2 are the SAME internal register: the reference depth goes in and
+        // the mask comes back out.
+        let dest = instr.dest.expect("a decoded destination");
+        assert_eq!((dest.bank, dest.index), (Bank::Internal, 0));
+        assert_eq!((instr.srcs[0].bank, instr.srcs[0].index), (Bank::Temp, 0));
+        assert_eq!((instr.srcs[1].bank, instr.srcs[1].index), (Bank::Internal, 0));
+        // A mask is per-channel, so all four are written.
+        assert_eq!(instr.write_mask, [true; 4]);
+        assert_eq!(repeat_extra_iterations(0x78c0_8aa0_0f93_807c), Some(0));
+    }
+
+    /// The VTSTMSK forms the corpus does not establish stay blocked - the two bit-pattern mask
+    /// types, the second test flag, and a write-back-disabled word that would write nothing.
+    #[test]
+    fn group_78_vtstmsk_blocks_what_it_cannot_establish() {
+        let base: u64 = 0x78c0_8aa0_0f93_807c;
+        for (name, word) in [
+            ("the 8-bit mask type", base & !(0b11 << 36)),
+            ("the precision mask type", (base & !(0b11 << 36)) | (1 << 36)),
+            ("test_flag_2", base | 1 << 50),
+            ("test_wben clear", base & !(1 << 20)),
+        ] {
+            assert!(decode(word).blocked.is_some(), "{name} must block");
+        }
+    }
+
+    /// The group-0xE0 GATHER form, on the word a golf title's shadow filter uses: a 2D
+    /// implicit-LOD gather into `r0`, whose four F16 bilinear coefficients follow at `r4`.
+    #[test]
+    fn group_e0_gather4_decodes_the_corpus_word() {
+        let instr = decode(0xe001_c464_e001_0580);
+        assert_eq!(instr.group, 0x1c);
+        // The sampler ORDINAL is what the raw word carries; `decode_shader` resolves it to a
+        // GXM texture unit against the container's own table.
+        assert_eq!(instr.op, Op::TexGather { unit: 11, coords: 2, coord_half: false });
+        assert_eq!(instr.blocked, None, "the gather form must decode");
+        assert_eq!(instr.dest.map(|d| (d.bank, d.index)), Some((Bank::Temp, 0)));
+        assert!(!instr.half_precision, "this title's gather asks for the F32 result");
+    }
+
+    /// The gather sub-forms with no corpus instance, and the gather features whose layout is
+    /// not established, stay blocked by name.
+    #[test]
+    fn group_e0_blocks_the_gather_forms_it_cannot_establish() {
+        let base: u64 = 0xe001_c464_e001_0580;
+        // sb_mode 1 (a bare gather4) and 2 (the texture-info query).
+        let sb = |v: u64| (base & !(0b11 << 37)) | (v << 37);
+        assert!(decode(sb(1)).blocked.is_some(), "sb_mode 1 must block");
+        assert!(decode(sb(2)).blocked.is_some(), "sb_mode 2 must block");
+        // A gather with an explicit LOD, and one with a non-2D coordinate.
+        assert!(decode(base | (2 << 40)).blocked.is_some(), "an explicit-LOD gather must block");
+        assert!(
+            decode((base & !(0b11 << 42)) | (2 << 42)).blocked.is_some(),
+            "a 3D gather must block"
+        );
+        // An F16 result: where the coefficients land beside a half-width gather is not known.
+        assert!(
+            decode((base & !(0b11 << 46)) | (2 << 46)).blocked.is_some(),
+            "an F16-result gather must block"
+        );
+    }
     /// The group-0x15 IMAD32 layout, checked against the one real word that established it -
     /// instruction #3 of a shipped vertex program, at code byte 0x18.
     ///
@@ -3141,7 +3895,9 @@ mod tests {
         // register i1 (op2i=1) with 4ch swizzle table[0] = xxxx; full write mask.
         let hi = encode(
             G18_DOT_HIGH,
-            &[("opcode1", 0x03), ("opcode2", 0), ("c3_en", 1), ("predicate", 0),
+            // `unk7` is the top bit of the repeat field at 47:44 and its "runs once" value is
+            // 1 - see `dot_repeat_extra`. Every real DOT in the corpus sets it.
+            &[("opcode1", 0x03), ("opcode2", 0), ("c3_en", 1), ("predicate", 0), ("unk7", 1),
               ("swz_mask3", 1), ("swz_mask2", 1), ("swz_mask1", 1), ("swz_en", 1),
               ("opt0", 0b00) /* dest r */],
         );
@@ -3165,10 +3921,47 @@ mod tests {
         assert_eq!(ins.write_mask, [true, true, true, true]);
     }
 
+    /// A DOT whose repeat field says four iterations is a 4x4 matrix transform: the four
+    /// executions write four consecutive destination LANES from four consecutive source
+    /// VECTORS, with the internal-register operand standing still. This is the real word out
+    /// of a retail title's world vertex program - `WorldViewProjection * position` into clip
+    /// position - and the whole title renders black if it is emitted once. See
+    /// [`dot_repeat_extra`].
+    #[test]
+    fn a_repeating_dot_walks_lanes_and_vectors() {
+        let word = 0x18903081c011a200u64;
+        let ins = decode(word);
+        assert_eq!(ins.op, Op::Dot { components: 4 });
+        assert!(ins.blocked.is_none(), "{:?}", ins.blocked);
+        assert_eq!(repeat_extra_iterations(word), Some(3));
+        // Single-channel destination mask: the per-iteration step is a channel, so the form
+        // is only modelled when exactly one channel is named.
+        assert_eq!(ins.write_mask, [true, false, false, false]);
+        let d = ins.dest.unwrap();
+        assert_eq!((d.bank, d.index), (Bank::Output, 0));
+        assert_eq!((ins.srcs[0].bank, ins.srcs[0].index), (Bank::SecondaryAttr, 0));
+        assert_eq!((ins.srcs[1].bank, ins.srcs[1].index), (Bank::Internal, 0));
+        // dest one lane, op1 one four-component vector, the internal operand still.
+        let ops = repeat_operands(word).expect("dot repeat operands");
+        assert_eq!(ops.len(), 3);
+        assert_eq!((ops[0].slot, ops[0].stride), (0, 1));
+        assert_eq!((ops[1].slot, ops[1].stride), (2, 4));
+        assert_eq!((ops[2].slot, ops[2].stride), (3, 0));
+    }
+
+    /// The value the census never shows must BLOCK rather than pick a plausible count.
+    #[test]
+    fn a_dot_repeat_field_outside_the_census_blocks() {
+        // Bit 47 set AND a low bit set - never observed in 379 real DOTs.
+        let word = 0x18903081c011a200u64 | (1 << 47);
+        assert_eq!(repeat_extra_iterations(word), None);
+        assert!(decode(word).blocked.is_some());
+    }
+
     #[test]
     fn dot_18_three_channel_and_reserved_internal_src() {
         // c3_en=0 -> 3 channels, op2 swizzle from the 3ch table[4] = xyz.
-        let hi = encode(G18_DOT_HIGH, &[("opcode1", 0x03), ("opcode2", 0), ("c3_en", 0)]);
+        let hi = encode(G18_DOT_HIGH, &[("opcode1", 0x03), ("opcode2", 0), ("c3_en", 0), ("unk7", 1)]);
         let lo = encode(
             G18_DOT_LOW,
             &[("op0", 1), ("opt1", 0b00) /* r */, ("op1", 60) /* reserved -> i0 */,
@@ -3952,8 +4745,8 @@ mod tests {
         assert_eq!(
             repeat_operands(MOV_REPEAT_3),
             Some(vec![
-                RepeatOperand { slot: 0, stride: 2 },
-                RepeatOperand { slot: 2, stride: 2 },
+                RepeatOperand { slot: 0, stride: 2, moe: true },
+                RepeatOperand { slot: 2, stride: 2, moe: true },
             ])
         );
         // The conditional form gains src2 and src0, in the order `decode_grp_38` pushes them.
@@ -3961,10 +4754,10 @@ mod tests {
         assert_eq!(
             repeat_operands(cond),
             Some(vec![
-                RepeatOperand { slot: 0, stride: 2 },
-                RepeatOperand { slot: 2, stride: 2 },
-                RepeatOperand { slot: 3, stride: 2 },
-                RepeatOperand { slot: 1, stride: 2 },
+                RepeatOperand { slot: 0, stride: 2, moe: true },
+                RepeatOperand { slot: 2, stride: 2, moe: true },
+                RepeatOperand { slot: 3, stride: 2, moe: true },
+                RepeatOperand { slot: 1, stride: 2, moe: true },
             ])
         );
 
@@ -3979,8 +4772,8 @@ mod tests {
         assert_eq!(
             repeat_operands(vpck),
             Some(vec![
-                RepeatOperand { slot: 0, stride: 1 },
-                RepeatOperand { slot: 1, stride: 2 },
+                RepeatOperand { slot: 0, stride: 1, moe: true },
+                RepeatOperand { slot: 1, stride: 2, moe: true },
             ])
         );
 
@@ -3988,6 +4781,21 @@ mod tests {
         let vbw = 0x50u64 << 56;
         assert_eq!(opcode1(vbw), 0x0a);
         assert!(repeat_operands(vbw).unwrap().iter().all(|o| o.stride == 1));
+
+        // 0x18 DP: the destination's channel walk is the instruction's OWN, so it carries
+        // `moe: false` and steps one lane whatever the SMLSI programmed - see the match arm.
+        // The vector source IS MOE-governed, and its stride is a whole vector.
+        let dp = (0x18u64 << 56) | (1 << 52) | (2 << 44);
+        assert_eq!(opcode1(dp), 0x03);
+        assert_eq!(bits(dp, 53, 53), 0, "the DOT form, not the MAD form");
+        assert_eq!(
+            repeat_operands(dp),
+            Some(vec![
+                RepeatOperand { slot: 0, stride: 1, moe: false },
+                RepeatOperand { slot: 2, stride: 4, moe: true },
+                RepeatOperand { slot: 3, stride: 0, moe: true },
+            ])
+        );
 
         // A group with no established operand grammar must answer "unknown", never a default.
         assert_eq!(repeat_operands(0xa000_0000_0000_0000), None);
@@ -4275,8 +5083,15 @@ mod tests {
         assert!(decode(addr).blocked.is_some_and(|b| b.contains("addr_mode")));
         let half = base | (1 << 36);
         assert!(decode(half).blocked.is_some_and(|b| b.contains("data_type")));
+        // An SA pointer is the second census shape (the driver's own buffer address, in the
+        // register the +0x78 binding table names) and DECODES.
         let sa_ptr = base | (1 << 50); // ext=1, sel=1 -> SECATTR pointer
-        assert!(decode(sa_ptr).blocked.is_some_and(|b| b.contains("PA bank")));
+        let sa_i = decode(sa_ptr);
+        assert_eq!(sa_i.blocked, None, "{sa_ptr:#018x}");
+        assert_eq!(sa_i.srcs[0].bank, Bank::SecondaryAttr);
+        // A TEMP pointer is in neither, and still blocks by name.
+        let temp_ptr = base & !(1 << 34); // ext=0, sel=0 -> TEMP pointer
+        assert!(decode(temp_ptr).blocked.is_some_and(|b| b.contains("PA/SA banks")));
         let reg_off = base & !(1 << 49); // src1 ext cleared -> register offset row
         assert!(decode(reg_off).blocked.is_some_and(|b| b.contains("register-supplied")));
     }

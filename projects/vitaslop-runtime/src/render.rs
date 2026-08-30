@@ -70,6 +70,56 @@ impl Framebuffer {
         Framebuffer { width: ow, height: oh, rgba }
     }
 
+    /// Bilinearly scale to `(w, h)` - what the display controller does to a framebuffer
+    /// smaller than the panel.
+    ///
+    /// A title is free to render its front end at a fraction of the panel and declare that
+    /// smaller buffer to `sceDisplaySetFrameBuf`; the hardware stretches it. Returning the
+    /// image unscaled puts the whole screen in a corner, so this is not a refinement, it is
+    /// the difference between the picture and a corner of it.
+    ///
+    /// Bilinear rather than nearest because the hardware filters: a nearest-neighbour 1.5x
+    /// of a 640-wide image doubles every other column, which is a visible comb on text and
+    /// is not what the device shows. Same size in and out returns a copy and touches
+    /// nothing, so every title that already declares the panel is unaffected.
+    pub fn scaled_to(&self, w: u32, h: u32) -> Framebuffer {
+        if (w, h) == (self.width, self.height) {
+            return Framebuffer { width: w, height: h, rgba: self.rgba.clone() };
+        }
+        assert!(w > 0 && h > 0 && self.width > 0 && self.height > 0, "empty framebuffer scale");
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        // Sample at pixel CENTRES, so the scale does not shift the image by half a texel -
+        // a half-pixel offset on a 2D front end is a visibly soft edge on every glyph.
+        let sx = self.width as f32 / w as f32;
+        let sy = self.height as f32 / h as f32;
+        for oy in 0..h {
+            let fy = ((oy as f32 + 0.5) * sy - 0.5).max(0.0);
+            let y0 = fy as u32;
+            let y1 = (y0 + 1).min(self.height - 1);
+            let ty = fy - y0 as f32;
+            for ox in 0..w {
+                let fx = ((ox as f32 + 0.5) * sx - 0.5).max(0.0);
+                let x0 = fx as u32;
+                let x1 = (x0 + 1).min(self.width - 1);
+                let tx = fx - x0 as f32;
+                let (a, b, c, d) = (
+                    self.pixel(x0, y0),
+                    self.pixel(x1, y0),
+                    self.pixel(x0, y1),
+                    self.pixel(x1, y1),
+                );
+                let mut out = [0u8; 4];
+                for k in 0..4 {
+                    let top = a[k] as f32 + (b[k] as f32 - a[k] as f32) * tx;
+                    let bot = c[k] as f32 + (d[k] as f32 - c[k] as f32) * tx;
+                    out[k] = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8;
+                }
+                rgba.extend_from_slice(&out);
+            }
+        }
+        Framebuffer { width: w, height: h, rgba }
+    }
+
     /// The RGBA color at `(x, y)`.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
@@ -609,10 +659,55 @@ fn project(v: &Vertex, space: &Space, width: u32, height: u32, ssaa: f32) -> Opt
 }
 
 /// SceGxmPrimitiveType selectors (the high-bit-encoded enum, gxm.h): triangle list,
-/// strip and fan all rasterize to triangles; lines/points/edges are not drawn.
+/// strip and fan all rasterize to triangles. Lines and points rasterize to neither, and
+/// the SOFTWARE path has no representation for them - but the recompiled GPU path does
+/// (`gpu::gxm_topology`), so they are carried through rather than dropped.
 const PRIM_TRIANGLES: u32 = 0x0000_0000;
+const PRIM_LINES: u32 = 0x0400_0000;
+const PRIM_POINTS: u32 = 0x0800_0000;
 const PRIM_TRIANGLE_STRIP: u32 = 0x0C00_0000;
 const PRIM_TRIANGLE_FAN: u32 = 0x1000_0000;
+/// `SCE_GXM_PRIMITIVE_TRIANGLE_EDGES` - the sixth value of the enum. It rasterises the
+/// EDGES of a triangle list, with `SceGxmEdgeEnableFlags` choosing which of the three
+/// (0x100 / 0x200 / 0x400 for edges 01 / 12 / 20). The enum above stopped at five values,
+/// so this arrived as an unnamed constant in a dropped-draw report on a phone.
+///
+/// # Where the flags live - MEASURED, not read from a header
+/// No header we have says whether the edge flags are packed into the index words or carried
+/// out of band, so the drop report printed the raw indices - and the guest's own buffer
+/// answered: `[0x0, 0x1, 0x2, 0x700, 0x3, 0x4, 0x5, 0x500, 0x6, 0x7, 0x8, 0x300, ...]`.
+/// Groups of FOUR words: three vertex indices, then a word carrying ONLY
+/// `SceGxmEdgeEnableFlags` bits. So an edge list is expanded here into the LINE segments
+/// its flags enable, and drawn as a `LineList` (`gpu::gxm_topology`). A draw whose fourth
+/// words carry anything outside the three flag bits does not match that reading and is
+/// still dropped - and reported with its words, exactly as the one above was.
+const PRIM_TRIANGLE_EDGES: u32 = 0x1400_0000;
+
+/// The three `SceGxmEdgeEnableFlags` bits, as they appear in an edge list's per-triangle
+/// flags word: edge 01, edge 12, edge 20.
+const EDGE_FLAG_BITS: u32 = 0x100 | 0x200 | 0x400;
+
+/// Does this edge-list draw match the measured encoding - groups of four index words whose
+/// fourth carries only `SceGxmEdgeEnableFlags` bits? A draw that does not is dropped and
+/// reported rather than drawn under a reading its own buffer contradicts.
+fn edge_list_matches_packed_reading(d: &Draw) -> bool {
+    let groups = d.index_count as usize / 4;
+    (0..groups).all(|g| index_at(d, g * 4 + 3) as u32 & !EDGE_FLAG_BITS == 0)
+}
+
+/// How many raw index words an edge-list drop prints. Enough to see the pattern of a few
+/// triangles - the whole point is to read the flag bits, not to transcribe the buffer.
+const EDGE_LIST_INDEX_DUMP: usize = 24;
+
+/// Vertices per primitive for a topology the GPU can draw directly from the guest's own
+/// index list, or `None` for one this renderer expands into triangles first.
+fn direct_topology_stride(primitive: u32) -> Option<usize> {
+    match primitive {
+        PRIM_LINES => Some(2),
+        PRIM_POINTS => Some(1),
+        _ => None,
+    }
+}
 
 /// SceGxmCullMode: which screen-space winding the GPU discards. NONE draws both
 /// faces; CW/CCW discard clockwise/counter-clockwise triangles respectively.
@@ -695,10 +790,70 @@ fn index_at(d: &Draw, i: usize) -> usize {
 /// texel blocks; the BC/DXT family is 4x4 blocks of 8 bytes (BC1/BC4) or 16 bytes
 /// (BC2/BC3/BC5). Shared with the host-side snapshot so both agree on the byte
 /// layout; `None` for a format whose size we do not know.
+/// `SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P2 >> 24` - see the definition for what it is. The
+/// uploader needs the same constant, so it is defined once, on the side both can reach.
+pub use vitaslop_platform::gpu::GXM_BASE_FORMAT_YUV420P2 as YUV420P2;
+
+/// `SCE_GXM_TEXTURE_BASE_FORMAT_P4 >> 24` - four-bit paletted, two texels per byte.
+pub const P4: u32 = 0x94;
+/// `SCE_GXM_TEXTURE_BASE_FORMAT_P8 >> 24` - eight-bit paletted, one index per texel.
+pub const P8: u32 = 0x95;
+/// `SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8 >> 24` - what a paletted texture becomes once its
+/// indices have been looked up through its colour table (see `expand_paletted_texture`). A
+/// palette ENTRY is a 32-bit texel in the texture's own declared swizzle, so the expansion
+/// copies entries verbatim and the swizzle rides along unchanged.
+pub const U8U8U8U8: u32 = 0x0c;
+
+/// How many entries a paletted base format's colour table holds, or `None` when the format is
+/// not paletted.
+pub fn palette_entries(base_format: u32) -> Option<u32> {
+    match base_format {
+        P4 => Some(16),
+        P8 => Some(256),
+        _ => None,
+    }
+}
+
+/// Byte offset of texel `(x, y)` within one stored LEVEL, as a `(byte, nibble)` pair - the
+/// nibble is `1` for the high half of the byte and only ever non-zero for a 4-bit format.
+///
+/// Shared by the palette expansion's source walk and its destination walk so the two cannot
+/// address a level differently. `bits` is 4, 8 or 32.
+pub fn texel_element(
+    tex_type: u32,
+    l: &LevelLayout,
+    bits: u32,
+    x: u32,
+    y: u32,
+) -> (usize, u32) {
+    if swizzled_type(tex_type) {
+        // Morton order over the TEXEL grid, power-of-two padded. Every width here is a whole
+        // number of texels per element or a whole number of elements per texel, so the texel
+        // index is the addressing unit for all three.
+        let pw = l.width.next_power_of_two();
+        let ph = l.height.next_power_of_two();
+        let m = morton_index(x, y, pw, ph) as usize;
+        return match bits {
+            4 => (m / 2, (m % 2) as u32),
+            _ => (m * (bits as usize / 8), 0),
+        };
+    }
+    let row = (y * l.stride) as usize;
+    match bits {
+        4 => (row + (x / 2) as usize, x % 2),
+        _ => (row + (x as usize) * (bits as usize / 8), 0),
+    }
+}
+
 pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
     Some(match base_format {
-        // 8-bit single channel (U8/S8) and 8-bit paletted (P8).
+        // 8-bit single channel (U8/S8) and 8-bit paletted (P8 - one INDEX per texel).
         0x00 | 0x01 | 0x95 => (1, 1, 1),
+        // P4: four-bit paletted, so a "block" is the two texels that share one byte. The
+        // capture EXPANDS both paletted formats through their colour table before anything
+        // downstream sees them (`expand_paletted_texture`), so this geometry only ever has to
+        // size and address the INDEX data.
+        0x94 => (2, 1, 1),
         // 16-bit packed (U4U4U4U4, U1U5U5U5, U5U6U5, ...).
         0x02..=0x0b => (1, 1, 2),
         // 24-bit three-channel (U8U8U8, S8S8S8).
@@ -721,6 +876,11 @@ pub fn block_layout(base_format: u32) -> Option<(u32, u32, u32)> {
         0x85 | 0x88 | 0x89 => (4, 4, 8),
         // BC2 (DXT3), BC3 (DXT5), BC5 (both signs): 16-byte 4x4 blocks.
         0x86 | 0x87 | 0x8a | 0x8b => (4, 4, 16),
+        // YUV420P2: two PLANES, not one surface. What is reported here is the geometry of the
+        // luma plane alone - one byte per texel - because that is what stride and addressing
+        // are in terms of. The second plane is accounted for in [`level_layout`], which is the
+        // only place that has to know the whole thing's size.
+        YUV420P2 => (1, 1, 1),
         _ => return None,
     })
 }
@@ -745,6 +905,24 @@ pub fn level_layout(base_format: u32, tex_type: u32, width: u32, height: u32, le
     let (block_w, block_h, block_bytes) = block_layout(base_format)?;
     let w = (width >> level).max(1);
     let h = (height >> level).max(1);
+    if base_format == YUV420P2 {
+        // Two planes, each laid out linearly with GXM's 8-texel row alignment: `h` rows of
+        // luma at one byte a texel, then `h/2` rows of interleaved Cb/Cr at two bytes per
+        // chroma sample. `stride` stays the LUMA stride, because that is what addressing a
+        // texel is in terms of; only `bytes` has to cover both planes, and it is what decides
+        // how much guest memory is snapshotted - too little and the chroma half of every
+        // frame is whatever was in the buffer before.
+        let luma_stride = align_up_to(w, 8);
+        let chroma_stride = align_up_to(w.div_ceil(2), 8) * 2;
+        return Some(LevelLayout {
+            width: w,
+            height: h,
+            blocks_x: w,
+            blocks_y: h,
+            stride: luma_stride,
+            bytes: luma_stride * h + chroma_stride * h.div_ceil(2),
+        });
+    }
     let blocks_x = w.div_ceil(block_w);
     let blocks_y = h.div_ceil(block_h);
     let (stride, bytes) = if swizzled_type(tex_type) {
@@ -1003,6 +1181,83 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     })
 }
 
+/// The guest's bytes and layout for a texture the GPU can expand itself, or `None` when this
+/// format or shape is not one the shader covers.
+///
+/// # Which formats, and why the list is short on purpose
+/// Only the 32-bit four-channel family whose entire decode is `swizzle4` over the four memory
+/// bytes - `0x0c` and the three siblings that reach the same arm of
+/// [`decode_uncompressed_at`]. Every other uncompressed format does arithmetic (a 10-bit lane
+/// normalised, a half float widened, a signed lane biased), and porting those one at a time
+/// would trade a provable equality for a set of measured ones.
+///
+/// `0x0c` alone is what matters: the target device's own report reads `texture decode by
+/// format: 2988.8 MB total - 0x0c raw 2964.5 MB`.
+///
+/// # What the shader is given
+/// The same addressing the CPU uses, from the same functions - `level_offset`/`level_layout`
+/// and the power-of-two padding a swizzled level's Morton order runs over. A second
+/// implementation of that addressing is exactly the kind of duplicate that drifts, and its
+/// failure mode is a texture read plausibly out of the wrong bytes.
+pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpand> {
+    // Byte-permutation formats only. These are the arms `decode_uncompressed_at` answers with a
+    // bare `swizzle4(byte(0), byte(1), byte(2), byte(3), swizzle)` - the specials inside the
+    // same numeric range (two-lane 16-bit, packed floats, depth+stencil) are matched ahead of it
+    // there and must be matched ahead of it here.
+    if !matches!(t.base_format, 0x0c | 0x0d | 0x14 | 0x16) {
+        return None;
+    }
+    // One face only, like the transcode: a cube map's six chains' interleaving is not
+    // established, and the CPU path refuses them for the same reason.
+    if t.faces != 1 {
+        return None;
+    }
+    let (w, h) = (t.width.max(1), t.height.max(1));
+    let swizzled = swizzled_type(t.tex_type);
+    let mut src_levels = Vec::new();
+    // >>> LEVEL 0 ONLY, BECAUSE THE CPU PATH THIS REPLACES USES LEVEL 0 ONLY.
+    //
+    // `build_mip_chain` box-filters the whole chain down from the decoded level 0 and never
+    // looks at the guest's own levels; the GPU `halve` shader is that same filter, arithmetic
+    // for arithmetic. Feeding the guest's levels in here instead would produce a DIFFERENT
+    // picture - probably a more faithful one, since the hardware samples exactly those - but
+    // this change is a cost change and has to be bit-identical to be judged as one. The guest's
+    // own mips are a separate question with its own evidence to gather.
+    for level in 0..1u32.min(t.levels.max(1)) {
+        let l = level_layout(t.base_format, t.tex_type, w, h, level)?;
+        let off = level_offset(t.base_format, t.tex_type, w, h, level)?;
+        // A level the guest's allocation does not actually reach is not a level - the CPU path
+        // discovers this through `level_view` returning `None` and box-filters from the level
+        // above instead, and stopping here is the same rule.
+        if (off as usize).saturating_add(l.bytes as usize) > t.pixels.len() {
+            break;
+        }
+        src_levels.push(vitaslop_platform::gpu::SrcLevel {
+            byte_offset: off,
+            width: l.width,
+            height: l.height,
+            // For an uncompressed level the "block" is one texel, so this carries the ROW
+            // STRIDE IN TEXELS, which is what a LINEAR level addresses through.
+            blocks_x: if level == 0 { t.stride / 4 } else { l.width },
+            blocks_y: l.height,
+            padded_x: if swizzled { l.width.next_power_of_two() } else { l.width },
+            padded_y: if swizzled { l.height.next_power_of_two() } else { l.height },
+            swizzled,
+        });
+    }
+    if src_levels.is_empty() {
+        return None;
+    }
+    Some(vitaslop_platform::gpu::GpuRawExpand {
+        src: t.pixels.clone(),
+        width: w,
+        height: h,
+        levels: max_mip_levels(w, h),
+        swizzle: (t.swizzle >> 12) & 0x7,
+        src_levels,
+    })
+}
+
 /// Whether compressed textures reach the GPU compressed at all. ON, and the only reason to set
 /// `VITASLOP_TEX_COMPRESS=0` is to A/B against the plain decode.
 ///
@@ -1085,18 +1340,41 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
         return Some(plan);
     }
 
-    // >>> A FORMAT WITH A WebGPU EQUIVALENT IS ONLY RE-ENCODED UNDER MEMORY PRESSURE.
+    // >>> NO COMPRESSED FORMAT IS RE-ENCODED UNLESS THE BUDGET IS ACTUALLY TIGHT, AND THAT
+    // >>> NOW INCLUDES PVRTC.
     //
-    // PVRTC has no WebGPU format on any adapter, so a transcode is the only thing standing
-    // between it and an eight-fold expansion - it is always worth the CPU. `UBC1/2/3` are a
-    // different case: they ARE BC1/2/3, they pass through untouched on any desktop, and on an
-    // ETC2-only adapter re-encoding them ON THE CPU is the most expensive path there is (decode
-    // the blocks to RGBA8, then encode ETC2 *with* an EAC alpha block).
+    // `UBC1/2/3` ARE BC1/2/3: they pass through untouched on any desktop, and on an ETC2-only
+    // adapter re-encoding them ON THE CPU is the most expensive path there is (decode the blocks
+    // to RGBA8, then encode ETC2 *with* an EAC alpha block).
     //
     // MEASURED on the device once the PVRTC half landed: the race frame's working set fell to
     // **82 MB against a 256 MB budget**, of which 82 MB WAS those BC textures sitting as RGBA8.
     // They already fit. Spending the scarcest resource on this machine to shrink something that
     // fits is the trade backwards, so it is made only while the budget is actually tight.
+    //
+    // >>> PVRTC IS EXEMPT FROM THAT TEST, AND EXTENDING THE TEST TO IT WAS TRIED AND MEASURED
+    // >>> AND IS WRONG. DO NOT RE-PROPOSE IT.
+    //
+    // The argument for extending it looks airtight on paper, which is why it is written out
+    // here rather than left to be re-derived. It runs: PVRTC's exemption rests on "its only
+    // alternative is an eight-fold expansion", but BC1 expands by the same 8x; both fallbacks
+    // are lossless with respect to the guest's asset; and the re-encode is a SECOND lossy step
+    // on an already-lossy one, which the GPU-encoder gate 150 lines below refuses in as many
+    // words ("a cheap encoder is a reason to spend CPU, never a reason to spend QUALITY").
+    // Every one of those statements is true.
+    //
+    // **MEASURED 2026-08-28b on PCSA00015's campaign race, and the trade is not close:
+    // one frame's texture working set went 62 MB -> 207 MB, 3.3x.** The picture did improve -
+    // 48% of pixels at max delta 15 across the whole front end, which is exactly the BC1
+    // re-encode error disappearing - but a delta of 15 is not worth 145 MB on a device where
+    // going over the budget is not a slow frame, it is unbounded GPU memory and a worker the
+    // browser kills with no error, no crash event and no log line (see
+    // `report_texture_budget_exceeded`).
+    //
+    // **The asymmetry the original wording asserted loosely is real and QUANTITATIVE**: titles
+    // use PVRTC for nearly everything (this race binds 99 PVRTC textures against 8 BC ones), so
+    // "the same 8x" applies to a completely different share of the working set. That is what
+    // makes the BC case affordable and this one not.
     if block_format_for(t.base_format).is_some() && !vitaslop_platform::gpu::texture_budget_pressure() {
         return why(
             "it is a BC format that already fits the texture budget as RGBA8, and re-encoding it \
@@ -1469,6 +1747,53 @@ pub(crate) fn morton_index(mut x: u32, mut y: u32, pw: u32, ph: u32) -> u32 {
     }
 }
 
+/// Split [`morton_index`] into a per-COLUMN and a per-ROW table, so that
+/// `morton_index(x, y, pw, ph) == xs[x] + ys[y]` exactly for every `x < pw`, `y < ph`.
+///
+/// # Why this is exact rather than an approximation
+/// Both halves of the index are separable, and both compose by OR over DISJOINT bits, which is
+/// addition:
+/// * the interleaved low half puts `x`'s bits at odd positions and `y`'s at even ones, so the
+///   two never collide;
+/// * the leftover-tiling high half is `((y_hi * cols) + x_hi) << 2*min_log` (or the transpose),
+///   which is a sum of one term in `x` and one in `y`, and sits entirely above the low bits.
+///
+/// # Why it is worth a table
+/// `morton_index` runs a loop over `min_log` bits - about ten iterations for a 1024-wide level -
+/// and the callers that matter run it ONCE PER TEXEL, twice for a paletted expand (source and
+/// destination). MEASURED with a V8 sampling profile of the browser worker on the golf title:
+/// `texel_element` alone was **30.5% of the whole thread** and the iterator inside it another
+/// **31.9%**, against 4.6 ms of actual rendering. With the tables the interleave is paid once
+/// per row and once per column instead of once per texel.
+pub(crate) fn morton_tables(pw: u32, ph: u32, w: u32, h: u32) -> (Vec<u32>, Vec<u32>) {
+    let min_log = pw.min(ph).trailing_zeros();
+    let wide = pw >= ph;
+    // Columns of the leftover strip, in whole squares - the same `pw >> min_log` /
+    // `ph >> min_log` the scalar form multiplies by.
+    let step = if wide { pw >> min_log } else { ph >> min_log };
+    let mut xs = Vec::with_capacity(w as usize);
+    for x in 0..w {
+        let mut v = 0u32;
+        for i in 0..min_log {
+            v |= ((x >> i) & 1) << (2 * i + 1);
+        }
+        let hi = x >> min_log;
+        v |= (if wide { hi } else { hi * step }) << (2 * min_log);
+        xs.push(v);
+    }
+    let mut ys = Vec::with_capacity(h as usize);
+    for y in 0..h {
+        let mut v = 0u32;
+        for i in 0..min_log {
+            v |= ((y >> i) & 1) << (2 * i);
+        }
+        let hi = y >> min_log;
+        v |= (if wide { hi * step } else { hi }) << (2 * min_log);
+        ys.push(v);
+    }
+    (xs, ys)
+}
+
 /// Expand a 16-bit 5:6:5 color to RGB8.
 fn rgb565(c: u16) -> [u8; 3] {
     let r = ((c >> 11) & 0x1f) as u32;
@@ -1760,6 +2085,9 @@ fn decode_texture_rgba8_counted(
     if seam == TexelSeam::Rgba16Float {
         return decode_texture_rgba16f(t, work);
     }
+    if t.base_format == YUV420P2 {
+        return decode_texture_yuv420p2(t, work);
+    }
     // A cube map decodes to its six faces stacked in `BoundTexture::faces` order, which is the
     // layer order the GPU binds them in.
     let faces = t.faces.max(1);
@@ -1782,6 +2110,214 @@ fn decode_texture_rgba8_counted(
         }
     }
     (t.width, t.height, rgba, TexelSeam::Rgba8)
+}
+
+/// Decode a two-plane 4:2:0 texture - a decoded video frame - to RGBA8.
+///
+/// # Why the conversion happens HERE rather than in a shader
+///
+/// The hardware sampler converts YUV to RGB on the way to the fragment program: the guest's
+/// shader reads ordinary colour and knows nothing about planes. Converting on upload puts
+/// the conversion in exactly that place, so no shader, bind-group layout or sampler
+/// declaration has to change - a two-plane texture arrives at the recompiler as the same
+/// `Two`-dimensional RGBA texture as everything else.
+///
+/// # What the matrix is, and what is assumed
+///
+/// The swizzle field selects the channel order (YUV or YVU) and WHICH of two conversion
+/// profiles applies (`CSC0`/`CSC1`); the profiles themselves are set per context by
+/// `sceGxmSetYuvProfile`. A title that never calls it - and this one does not - leaves both
+/// at the default, `SCE_GXM_YUV_PROFILE_BT601_STANDARD`: BT.601 coefficients over the
+/// studio-swing ranges (luma 16..235, chroma 16..240). That default is the ASSUMPTION here,
+/// and it is reported once; the channel order is read, not assumed.
+fn decode_texture_yuv420p2(
+    t: &BoundTexture,
+    work: &mut BuildWork,
+) -> (u32, u32, Vec<u8>, TexelSeam) {
+    let (w, h) = (t.width, t.height);
+    let luma_stride = align_up_to(w, 8) as usize;
+    let chroma_stride = align_up_to(w.div_ceil(2), 8) as usize * 2;
+    let chroma_base = luma_stride * h as usize;
+    // Bits 12..13 of the format word: bit 12 swaps Cb and Cr, bit 13 selects the second
+    // conversion profile. Only the swap changes anything here - see the doc comment.
+    let swizzle = (t.swizzle >> 12) & 0x3;
+    let swapped = swizzle & 1 != 0;
+    report_yuv_profile_assumed(t.swizzle);
+
+    let (w_us, h_us) = (w as usize, h as usize);
+    let mut rgba = vec![0u8; w_us * h_us * 4];
+    let px = &t.pixels[..];
+    // The FAST path: this walks whole rows through slices, and the counter has to say so or
+    // the working-set report keeps calling the most expensive texture in the frame cheap.
+    work.tex_out_blockwise += (w_us * h_us * 4) as u64;
+    DECODE_BY_FORMAT.lock().unwrap()[YUV420P2 as usize] += (w_us * h_us * 4) as u64;
+
+    // >>> TWO ROWS AND TWO COLUMNS AT A TIME, THROUGH SLICES.
+    //
+    // A video frame is re-decoded EVERY frame - its content changes, so no cache can help -
+    // which makes this the one texture conversion whose cost is paid sixty times a second.
+    // MEASURED on a phone, when this was a per-pixel loop with a bounds-checked read per
+    // sample: 336 MB of conversion over one run and 7.7 ms in the worst frame's `prepare`,
+    // which was the single largest render cost on the device.
+    //
+    // Each chroma sample serves a 2x2 group, so the group is the unit: the chroma pair is
+    // read and converted ONCE and applied to four luma samples, and the row slices are taken
+    // outside the inner loop so the bounds checks are hoisted out of it.
+    let tables = &*BT601_TABLES;
+    for cy in 0..h_us.div_ceil(2) {
+        let chroma = chroma_base + cy * chroma_stride;
+        let Some(chroma_row) = px.get(chroma..chroma + (w_us.div_ceil(2)) * 2) else {
+            break;
+        };
+        for dy in 0..2 {
+            let y = cy * 2 + dy;
+            if y >= h_us {
+                break;
+            }
+            let Some(luma_row) = px.get(y * luma_stride..y * luma_stride + w_us) else {
+                break;
+            };
+            let out_row = &mut rgba[y * w_us * 4..(y + 1) * w_us * 4];
+            for cx in 0..w_us.div_ceil(2) {
+                let (a, b) = (chroma_row[cx * 2], chroma_row[cx * 2 + 1]);
+                let (cb, cr) = if swapped { (b, a) } else { (a, b) };
+                // The three chroma contributions, per chroma sample rather than per pixel.
+                let (r_off, g_off, b_off) = (
+                    tables.cr_r[cr as usize],
+                    tables.cb_g[cb as usize] + tables.cr_g[cr as usize],
+                    tables.cb_b[cb as usize],
+                );
+                for dx in 0..2 {
+                    let x = cx * 2 + dx;
+                    if x >= w_us {
+                        break;
+                    }
+                    let y_term = tables.luma[luma_row[x] as usize];
+                    let px_out = &mut out_row[x * 4..x * 4 + 4];
+                    px_out[0] = clamp8(y_term + r_off);
+                    px_out[1] = clamp8(y_term + g_off);
+                    px_out[2] = clamp8(y_term + b_off);
+                    px_out[3] = 255;
+                }
+            }
+        }
+    }
+    (w, h, rgba, TexelSeam::Rgba8)
+}
+
+/// The BT.601 studio-swing conversion, precomputed per input byte.
+///
+/// Every term is a function of ONE sample, so all of them fit in 256-entry tables and the
+/// per-pixel work becomes three adds and three clamps. Built once.
+struct Bt601Tables {
+    /// `(y - 16) * 255/219`, in 16.16.
+    luma: [i32; 256],
+    cr_r: [i32; 256],
+    cr_g: [i32; 256],
+    cb_g: [i32; 256],
+    cb_b: [i32; 256],
+}
+
+static BT601_TABLES: std::sync::LazyLock<Bt601Tables> = std::sync::LazyLock::new(|| {
+    let mut t = Bt601Tables {
+        luma: [0; 256],
+        cr_r: [0; 256],
+        cr_g: [0; 256],
+        cb_g: [0; 256],
+        cb_b: [0; 256],
+    };
+    for i in 0..256usize {
+        t.luma[i] = (i as i32 - 16) * 76309;
+        let c = i as i32 - 128;
+        t.cr_r[i] = 104597 * c;
+        t.cr_g[i] = -53279 * c;
+        t.cb_g[i] = -25675 * c;
+        t.cb_b[i] = 132201 * c;
+    }
+    t
+});
+
+/// Round a 16.16 fixed-point channel to a byte.
+fn clamp8(v: i32) -> u8 {
+    ((v + 32768) >> 16).clamp(0, 255) as u8
+}
+
+/// BT.601 studio-swing YUV to full-range RGB, the `SCE_GXM_YUV_PROFILE_BT601_STANDARD`
+/// conversion. Integer arithmetic in 16.16, which is exact enough that no channel differs
+/// from the float form by more than one step.
+///
+/// The bulk path uses [`BT601_TABLES`]; this is the same arithmetic written out, and the
+/// test below holds the two together.
+fn bt601_studio_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let y = (y as i32 - 16) * 76309;
+    let u = cb as i32 - 128;
+    let v = cr as i32 - 128;
+    let clamp = |v: i32| ((v + 32768) >> 16).clamp(0, 255) as u8;
+    [
+        clamp(y + 104597 * v),
+        clamp(y - 25675 * u - 53279 * v),
+        clamp(y + 132201 * u),
+    ]
+}
+
+#[cfg(test)]
+mod yuv_tests {
+    use super::*;
+
+    /// The table-driven bulk path and the written-out reference must agree EXACTLY.
+    ///
+    /// The bulk path exists because a video frame is re-converted every frame and the naive
+    /// loop was the largest render cost on a phone. A faster path that is not the same
+    /// arithmetic is a different picture, and the difference would be a colour shift nobody
+    /// would trace back to a lookup table.
+    #[test]
+    fn the_fast_path_matches_the_reference_conversion() {
+        let tables = &*BT601_TABLES;
+        for y in (0..=255u8).step_by(5) {
+            for cb in (0..=255u8).step_by(17) {
+                for cr in (0..=255u8).step_by(17) {
+                    let want = bt601_studio_to_rgb(y, cb, cr);
+                    let luma = tables.luma[y as usize];
+                    let got = [
+                        clamp8(luma + tables.cr_r[cr as usize]),
+                        clamp8(luma + tables.cb_g[cb as usize] + tables.cr_g[cr as usize]),
+                        clamp8(luma + tables.cb_b[cb as usize]),
+                    ];
+                    assert_eq!(got, want, "y={y} cb={cb} cr={cr}");
+                }
+            }
+        }
+    }
+
+    /// Studio swing: video black is 16 and video white is 235, not 0 and 255.
+    #[test]
+    fn studio_swing_endpoints_map_to_full_range() {
+        assert_eq!(bt601_studio_to_rgb(16, 128, 128), [0, 0, 0]);
+        assert_eq!(bt601_studio_to_rgb(235, 128, 128), [255, 255, 255]);
+    }
+}
+
+/// Say, once per swizzle, that a YUV texture's conversion profile is the DEFAULT rather than
+/// one the title chose.
+///
+/// `sceGxmSetYuvProfile` is what picks between BT.601 and BT.709 and between studio and full
+/// range, and it is per context, so nothing about the texture itself records which applies.
+/// A title that never sets one gets the default - but a title that DOES set one and is
+/// converted with the default here comes out with washed-out or over-saturated video that
+/// looks like a decoder problem and is not.
+fn report_yuv_profile_assumed(swizzle: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((swizzle >> 12) & 0x3) {
+        return;
+    }
+    let csc = if (swizzle >> 13) & 1 == 0 { "CSC0" } else { "CSC1" };
+    let order = if (swizzle >> 12) & 1 == 0 { "YUV" } else { "YVU" };
+    eprintln!(
+        "gxm texture: a two-plane 4:2:0 (video) texture is bound as {order}/{csc}. The channel          order is read from the format; the CONVERSION is BT.601 studio-swing, which is the          GXM default profile - if the title ever calls sceGxmSetYuvProfile, this run is          converting with the wrong one and the picture's colour is an assumption."
+    );
 }
 
 /// Decode an F16F16F16F16 texture onto the HALF seam, lane for lane.
@@ -1874,19 +2410,64 @@ fn decode_face_fast(t: &BoundTexture, face: u32, out: &mut [u8]) -> bool {
     if block_w == 1 && block_h == 1 {
         let face_base = (face * t.face_bytes) as usize;
         if swizzled_type(t.tex_type) {
+            // The interleave once per row and once per column instead of once per texel - see
+            // `morton_tables`, which is asserted to be the same function as `morton_index`.
             let (pw, ph) = (t.width.next_power_of_two(), t.height.next_power_of_two());
+            let (xs, ys) = morton_tables(pw, ph, t.width, t.height);
+            // The same identity as the linear branch below: a swizzled `U8U8U8U8` in swizzle 0
+            // still decodes to its own four bytes, so only the ADDRESSING is Morton. Worth
+            // splitting because this is the other half of the paletted working set.
+            let identity32 =
+                block_bytes == 4 && t.base_format == U8U8U8U8 && ((t.swizzle >> 12) & 0x7) == 0;
             let mut o = 0usize;
             for y in 0..t.height {
+                let yb = ys[y as usize];
                 for x in 0..t.width {
-                    let off = face_base + (morton_index(x, y, pw, ph) * block_bytes) as usize;
-                    out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off));
+                    let off = face_base + ((xs[x as usize] + yb) * block_bytes) as usize;
+                    match (identity32, t.pixels.get(off..off + 4)) {
+                        (true, Some(src)) => out[o..o + 4].copy_from_slice(src),
+                        _ => out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off)),
+                    }
                     o += 4;
                 }
             }
         } else {
+            // >>> A LINEAR U8U8U8U8 IN THE IDENTITY SWIZZLE IS A ROW COPY.
+            // SWIZZLE4 selector 0 (ABGR) is the identity permutation, so
+            // `decode_uncompressed_at` returns the four memory bytes unchanged - the row is
+            // already the RGBA8 this function is producing. This is the shape a PALETTED
+            // texture arrives in after `expand_paletted_texture` (which writes `U8U8U8U8` and
+            // keeps the guest's swizzle), and that is the golf title's whole texture working
+            // set: 608 MB of the run's 618 MB of decode. Walking it per texel through a format
+            // match was 15% of the browser worker on top of the addressing above.
+            //
+            // ONLY `U8U8U8U8`, deliberately. `0x0c..=0x1a` is the arm that catches the 32-bit
+            // four-channel family, but it is a FALLTHROUGH: `0x0e`, `0x0f..=0x11`, `0x12/0x13`,
+            // `0x15`, `0x17/0x18` are all inside that range and are decoded by their own arms
+            // above it. Taking the range at face value made `0x0e` (U2U10U10U10) copy its raw
+            // bytes, which `uncompressed_fast_path_matches_per_texel` caught immediately.
+            let identity32 =
+                block_bytes == 4 && t.base_format == U8U8U8U8 && ((t.swizzle >> 12) & 0x7) == 0;
             let mut o = 0usize;
             for y in 0..t.height {
                 let row = face_base + (y * t.stride) as usize;
+                let n = (t.width * 4) as usize;
+                if identity32 {
+                    match t.pixels.get(row..row + n) {
+                        Some(src) => out[o..o + n].copy_from_slice(src),
+                        // Short source: fall back to the per-texel walk for THIS row, which
+                        // zero-fills past the end exactly as it always did.
+                        None => {
+                            for x in 0..t.width {
+                                let off = row + (x * block_bytes) as usize;
+                                out[o + (x * 4) as usize..o + (x * 4) as usize + 4]
+                                    .copy_from_slice(&decode_uncompressed_at(t, off));
+                            }
+                        }
+                    }
+                    o += n;
+                    continue;
+                }
                 for x in 0..t.width {
                     let off = row + (x * block_bytes) as usize;
                     out[o..o + 4].copy_from_slice(&decode_uncompressed_at(t, off));
@@ -2060,6 +2641,33 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         0x0e => {
             let w = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
             let ten = |sh: u32| ((((w >> sh) & 0x3ff) as f32 / 1023.0) * 255.0).round() as u8;
+            let a = (((w >> 30) & 0x3) as f32 / 3.0 * 255.0).round() as u8;
+            match swizzle {
+                1 => [ten(20), ten(10), ten(0), a], // ARGB
+                _ => [ten(0), ten(10), ten(20), a], // ABGR
+            }
+        }
+        // U2F10F10F10: three unsigned packed 10-bit FLOATS under a 2-bit unorm alpha - the
+        // float sibling of U2U10U10U10 above, and it shares that format's lane order (the
+        // 2-bit lane at the top, in the alpha role, so SWIZZLE4 applies unchanged). Each
+        // 10-bit lane is 5 bits of exponent over 5 of mantissa, bias 15, no sign - the same
+        // encoding as F11F11F10's third lane.
+        //
+        // Without this arm every draw sampling one was painted MAGENTA, which is what a golf
+        // title's club shaft was.
+        0x9a => {
+            let w = u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let ten = |sh: u32| -> u8 {
+                let bits = (w >> sh) & 0x3ff;
+                let (exp, mant) = (bits >> 5, bits & 0x1f);
+                let v = if exp == 0 {
+                    // Denormal: no implicit leading one.
+                    mant as f32 / 32.0 * 2f32.powi(-14)
+                } else {
+                    (1.0 + mant as f32 / 32.0) * 2f32.powi(exp as i32 - 15)
+                };
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
             let a = (((w >> 30) & 0x3) as f32 / 3.0 * 255.0).round() as u8;
             match swizzle {
                 1 => [ten(20), ten(10), ten(0), a], // ARGB
@@ -2253,20 +2861,50 @@ pub(crate) fn report_undecodable_texture_format(base_format: u32, tex_type: u32)
 
 /// Route a single-channel (U8/S8) texel to straight RGBA per its GXM `SWIZZLE1`
 /// selector (already reduced to `(format >> 12) & 0x7` by the caller, exactly as
-/// `swizzle4` receives its selector). Each output channel is either the channel byte
-/// `r`, constant 0, or constant 255 (`1`), in the order the selector names RGBA (e.g.
-/// `111R` = white RGB with the byte as alpha, `RRRR` = the byte in all four).
-/// `SWIZZLE1_R` (0) maps to R in red, opaque.
+/// `swizzle4` receives its selector).
+///
+/// # THE SELECTOR NAMES ITS COMPONENTS HIGH-TO-LOW, i.e. ALPHA FIRST AND RED LAST
+///
+/// `SceGxmTextureSwizzle1Mode` gives the eight modes as `R`, `000R`, `111R`, `RRRR`, `0RRR`,
+/// `1RRR`, `R000`, `R111`. The header names them and nothing more, and the four-letter names
+/// read equally well in either direction - `R111` is "the byte in red, ones elsewhere" if the
+/// name runs R,G,B,A, and "ones in rgb, the byte in ALPHA" if it runs A,B,G,R. The two readings
+/// are exact mirrors of each other (`000R` <-> `R000`, `111R` <-> `R111`, `0RRR` <-> `RRR0`),
+/// so no amount of re-reading the header settles it. **This used to take the first reading, and
+/// it was wrong.**
+///
+/// MEASURED on PCSA00009, which is the only kind of evidence there is here. Its single-channel
+/// textures use exactly three of the eight modes - `1RRR` x485, `R000` x1052 and `R111` x5 in
+/// one frame - and under the low-to-high reading those decode to `[1,r,r,r]`, `[r,0,0,0]` and
+/// `[r,1,1,1]`: one of them opaque with the byte in three channels, one of them **alpha zero on
+/// a thousand bindings**, and one of them a texture whose only varying channel is RED. The last
+/// is the title's GLYPH ATLAS, and its fragment program is a flat `texel * vertex_colour` on all
+/// four channels, so that reading paints every string as a CYAN BOX with pale letters - which is
+/// exactly what the screen showed.
+///
+/// Under the high-to-low reading the same three modes are `1RRR` = opaque greyscale, `R000` =
+/// black with the byte as coverage, `R111` = white with the byte as coverage: the three roles a
+/// single-channel texture actually has (a luminance/detail map, a dark mask, a font atlas). The
+/// glyph atlas then composites as `vertex_colour` with `alpha = coverage`, and the text renders.
+///
+/// `RRRR` is identical either way, and no title in any captured corpus uses `000R`, `111R` or
+/// `0RRR` - so the mirrored pair below is pinned by the modes that ARE used and left consistent
+/// for the ones that are not.
+///
+/// `SWIZZLE2` carries the same ambiguity and is NOT changed here: it has no measurement behind
+/// it yet, and flipping a convention on a hunch is how the first reading got in.
 fn swizzle1(r: u8, swizzle: u32) -> [u8; 4] {
     match swizzle {
+        // A one-letter name says only which channel is defined, so it reads the same way round:
+        // the byte in red, opaque.
         0 => [r, 0, 0, 255],     // R
-        1 => [0, 0, 0, r],       // 000R
-        2 => [255, 255, 255, r], // 111R
+        1 => [r, 0, 0, 0],       // 000R
+        2 => [r, 255, 255, 255], // 111R
         3 => [r, r, r, r],       // RRRR
-        4 => [0, r, r, r],       // 0RRR
-        5 => [255, r, r, r],     // 1RRR
-        6 => [r, 0, 0, 0],       // R000
-        _ => [r, 255, 255, 255], // R111 (7)
+        4 => [r, r, r, 0],       // 0RRR
+        5 => [r, r, r, 255],     // 1RRR - opaque greyscale
+        6 => [0, 0, 0, r],       // R000 - black, the byte as coverage
+        _ => [255, 255, 255, r], // R111 (7) - white, the byte as coverage: a font atlas
     }
 }
 
@@ -4051,6 +4689,10 @@ pub fn render_frame_chain(
 fn rtt_substitute(image: &Framebuffer, proto: &BoundTexture) -> BoundTexture {
     BoundTexture {
         unit: proto.unit,
+        // A buffer built HERE, from this frame's rendered image, so it is a new one every
+        // time it is built and gets an identity of its own. Inheriting the prototype's would
+        // hand two different rendered images one cache entry.
+        pixels_id: crate::capture::next_pixels_id(),
         // 0x0c is the 32-bit four-channel family and swizzle 0 (ABGR) is the identity
         // permutation over memory bytes, so `b0,b1,b2,b3` decode as `R,G,B,A` - exactly
         // the order a `Framebuffer` stores. `tex_type` 3 is LINEAR: a rendered image is
@@ -4603,9 +5245,24 @@ fn tex_key(t: &BoundTexture) -> u64 {
     // changes the FORMAT they are uploaded through (sRGB decodes on fetch), so two bindings of
     // one image differing only in gamma must not share a cache entry.
     mix(t.gamma as u64);
-    // The pixel buffer's identity - see this function's own note. The length is already
-    // folded in above (with the stride); the address is what makes this exact.
-    mix(t.pixels.as_ptr() as usize as u64);
+    // >>> THE PIXEL BUFFER'S IDENTITY, WHICH IS A MINTED NUMBER AND NOT ITS ADDRESS.
+    //
+    // This folded `pixels.as_ptr()`, and an address is only an identity while the buffer is
+    // ALIVE. It is not: the snapshot layer frees a texture's buffer and allocates a new one
+    // the moment the guest rewrites that texture, and an allocator that hands the freed
+    // address straight back gives the NEW contents the SAME key as the old - so this cache
+    // returns the previous upload for bytes that have changed, with nothing to report it.
+    //
+    // MEASURED: a change that moved nothing but allocation addresses took the frame's texture
+    // expansions from 1.25-1.54 MB to 4.31-4.72 MB over the same draws and the same textures
+    // built. Work does not appear from nowhere - what moved was how often an address was
+    // recycled, which is the one input a cache key must not depend on.
+    //
+    // `pixels_id` is minted once per buffer and never reused in a run, so two different
+    // buffers cannot collide here however the allocator behaves, and two snapshots that share
+    // an `Arc` - which is exactly when the snapshot layer has PROVEN the bytes identical -
+    // share an id and keep hitting. See [`crate::capture::BoundTexture::pixels_id`].
+    mix(t.pixels_id);
     // The avalanche. `splitmix64`'s finaliser: two xor-shift-multiply rounds, which is what
     // turns a rotate-xor-multiply accumulator into a value whose every bit depends on every
     // input bit. Three instructions' worth of insurance on a key nothing verifies.
@@ -4627,6 +5284,27 @@ fn tex_key(t: &BoundTexture) -> u64 {
 /// disabled `scroll_drift` and `sprite_motion` - the two things a 2D title is driven by -
 /// and it is the kind of break that looks like the game moving, not like a bug.
 ///
+/// The SLOT a decode belongs to: everything [`tex_key`] folds except the pixel buffer's
+/// address, which is exactly "the same guest texture, bound the same way".
+///
+/// Two decodes with the same slot key differ only in their contents, so the newer one has
+/// replaced the older - see [`RenderSceneBuilder::decode_slots`]. The sampler state is in
+/// here for the same reason it is in [`tex_key`]: two bindings of one image that differ only
+/// in filter or gamma are two legitimate entries, and calling them one slot would make each
+/// draw evict the other's.
+fn tex_slot_key(t: &BoundTexture) -> u64 {
+    let mut h = tex_binding_key(t);
+    for v in [
+        (t.mag_filter as u64) << 32 | t.min_filter as u64,
+        (t.u_addr_mode as u64) << 32 | t.v_addr_mode as u64,
+        t.gamma as u64,
+    ] {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
 /// So this is what a SPRITE folds: what the guest bound, not what we copied out of it.
 fn tex_binding_key(t: &BoundTexture) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -4689,6 +5367,22 @@ pub struct RenderSceneBuilder {
     /// used, and the budget is floored at one frame's working set - see
     /// [`RenderSceneBuilder::decode_frame_high`].
     decode_used: crate::fasthash::FxHashMap<u64, (u64, usize)>,
+    /// >>> WHICH DECODE IS THE CURRENT ONE FOR A GIVEN GUEST TEXTURE: [`tex_slot_key`] ->
+    /// [`tex_key`].
+    ///
+    /// The decode key folds the SOURCE BUFFER's address, because that is what makes it exact
+    /// ("are these the same decoded bytes"). The consequence is that a texture the guest -
+    /// or the engine, for a video picture - rewrites produces a BRAND NEW entry every time
+    /// it changes, and the entry holding the previous contents stays until the budget
+    /// notices it. On a movie that is a 0.75 MB picture arriving 30 times a second and an
+    /// eviction pass nearly every frame, evicting whatever happened to be oldest.
+    ///
+    /// A slot is the same guest texture - same address, same format, same shape, same
+    /// sampler state - so a new entry in a slot SUPERSEDES the one it displaces: the bytes
+    /// it held are gone from guest memory and nothing can ask for them again. Dropping it
+    /// there is not a policy but bookkeeping, and it is what keeps a video texture out of a
+    /// budget it would otherwise churn.
+    decode_slots: crate::fasthash::FxHashMap<u64, u64>,
     /// Bumped by [`RenderSceneBuilder::begin_frame`]. Entries stamped with it are in use by
     /// the frame being built and are not eviction candidates at any budget.
     decode_epoch: u64,
@@ -4837,6 +5531,11 @@ pub struct BuildWork {
     /// "the cache is doing its job" from "the cache is a re-decode loop with extra steps",
     /// which is the distinction a pass count cannot make in either direction.
     pub tex_redecoded_after_evict: u64,
+    /// Decodes DROPPED because a newer decode took their slot - the same guest texture with
+    /// new contents. Not evictions: the bytes they held are gone from guest memory, so this
+    /// is the cache staying the size of what is reachable rather than the size of the run.
+    /// A movie is 30 of these a second and they used to be eviction pressure.
+    pub tex_superseded: u64,
     /// Draws built, and how many of them ran their fixed-function representation.
     pub draws: u64,
     pub draws_fixed_function: u64,
@@ -4877,6 +5576,7 @@ impl BuildWork {
         self.tex_evict_passes += o.tex_evict_passes;
         self.tex_evicted += o.tex_evicted;
         self.tex_redecoded_after_evict += o.tex_redecoded_after_evict;
+        self.tex_superseded += o.tex_superseded;
         self.draws += o.draws;
         self.draws_fixed_function += o.draws_fixed_function;
         self.gxp_vertex_bytes += o.gxp_vertex_bytes;
@@ -4896,7 +5596,7 @@ impl BuildWork {
              / {:.1} cached over {:.2} MB of guest bytes, {:.1} EXPANDED to RGBA8 \
              ({:.2} MB: {:.2} MB fast-path + {:.2} MB per-texel), \
              {:.2} evict passes dropping {:.1} entries, {:.1} RE-decoded after eviction, \
-             indices {:.1} expanded \
+             {:.1} superseded in place, indices {:.1} expanded \
              / {:.1} cached ({:.2} clears), gxp shares {:.2} MB vertices, copies {:.2} MB \
              indices + {:.2} MB uniforms",
             self.draws as f64 / n,
@@ -4914,6 +5614,7 @@ impl BuildWork {
             self.tex_evict_passes as f64 / n,
             self.tex_evicted as f64 / n,
             self.tex_redecoded_after_evict as f64 / n,
+            self.tex_superseded as f64 / n,
             self.index_expanded as f64 / n,
             self.index_expand_cached as f64 / n,
             self.index_cache_clears as f64 / n,
@@ -4938,6 +5639,7 @@ static BUILD_WORK: std::sync::Mutex<BuildWork> = std::sync::Mutex::new(BuildWork
     tex_evict_passes: 0,
     tex_evicted: 0,
     tex_redecoded_after_evict: 0,
+    tex_superseded: 0,
     draws: 0,
     draws_fixed_function: 0,
     gxp_vertex_bytes: 0,
@@ -5115,10 +5817,38 @@ fn strict_draws() -> bool {
 /// draw, why, and whether it had the guest's real shaders attached (a drop that did is one
 /// the recompiler could have drawn exactly, so it is the expensive kind to lose).
 fn report_drop(kind: DropKind, di: usize, d: &Draw, tri_count: usize) {
+    // The PRIMITIVE and the INDEX COUNT ride the topology drop, and they are not
+    // decoration: "not a triangle topology" names a family, and lines, points and packed
+    // edge lists are now DRAWN, so a drop that survives is either an edge list whose words
+    // REFUSE the packed reading, a shaderless line/point draw, or a draw with too few
+    // indices to make one primitive. Without these numbers those are indistinguishable,
+    // which cost a re-run.
+    // >>> AN EDGE-LIST DROP STILL CARRIES ITS RAW INDICES. The packed-flags encoding was
+    // established by exactly this dump (see `PRIM_TRIANGLE_EDGES`); a draw that lands here
+    // now is one whose fourth words carry something OTHER than the three flag bits, and its
+    // words are the evidence the next reading starts from. Guessing instead would be an
+    // approximation, and this project does not ship one
+    // ([[vitaslop-no-approximation-no-omission]]).
+    let edges = if d.primitive == PRIM_TRIANGLE_EDGES {
+        let n = (d.index_count as usize).min(EDGE_LIST_INDEX_DUMP);
+        let vals: Vec<String> = (0..n).map(|i| format!("{:#x}", index_at(d, i))).collect();
+        format!(
+            " EDGE LIST - the first {n} of {} index words, {}-bit, are [{}]; bits 0x100/0x200/0x400 \
+             on these are SceGxmEdgeEnableFlags if they are packed here at all.",
+            d.index_count,
+            if d.index_format == 0 { 16 } else { 32 },
+            vals.join(", ")
+        )
+    } else {
+        String::new()
+    };
     let detail = format!(
-        "render: DROPPED draw {di} - {}. tris={tri_count}, stride={}, {} attributes, \
-         shaders={}. This draw is MISSING from the frame; the guest asked for it.",
+        "render: DROPPED draw {di} - {}. primitive={:#010x}, indices={}, tris={tri_count}, \
+         stride={}, {} attributes, shaders={}. This draw is MISSING from the frame; the \
+         guest asked for it.{edges}",
         kind.describe(),
+        d.primitive,
+        d.index_count,
         d.vertex_stride,
         d.attributes.len(),
         if d.vprog.is_empty() { "none" } else { "yes (the recompiler could draw this)" },
@@ -5272,6 +6002,7 @@ impl RenderSceneBuilder {
             gxp_only: crate::knobs::flag("VITASLOP_GXP_LIVE")
                 && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"),
             decode_cache: Default::default(),
+            decode_slots: Default::default(),
             decode_cache_bytes: 0,
             decode_used: Default::default(),
             decode_epoch: 0,
@@ -5447,6 +6178,24 @@ impl RenderSceneBuilder {
                 rgba
             }),
             texel,
+            // The guest's own planes for a video frame, so the uploader can convert on the
+            // GPU instead of expanding to RGBA here. `rgba` above is still built lazily and
+            // is still the fallback - see `GxmTexture::planar_yuv`.
+            planar_yuv: (t.base_format == YUV420P2).then(|| {
+                vitaslop_platform::gpu::PlanarYuvSource {
+                    width: t.width,
+                    height: t.height,
+                    luma_stride: align_up_to(t.width, 8),
+                    chroma_stride: align_up_to(t.width.div_ceil(2), 8) * 2,
+                    chroma_offset: align_up_to(t.width, 8) * t.height,
+                    swap_chroma: (t.swizzle >> 12) & 1 != 0,
+                    data: t.pixels.clone(),
+                }
+            }),
+            // The guest's own mip declaration, so the uploader can read it rather than assume a
+            // chain - see `GxmTexture::levels`.
+            levels: t.levels,
+            mip_filter: t.mip_filter,
             base_format: t.base_format,
             swizzle: t.swizzle,
             filter_linear,
@@ -5454,7 +6203,35 @@ impl RenderSceneBuilder {
             addr_mode_v: t.v_addr_mode,
             gamma: t.gamma != 0,
             compressed,
+            // The guest's own bytes for a texture whose decode is a permutation, so the
+            // uploader can do it on the GPU instead of expanding it here. `rgba` above is still
+            // built lazily and is still the fallback.
+            raw: raw_source(t),
         };
+        // >>> THE PREVIOUS DECODE OF THIS SAME GUEST TEXTURE IS DROPPED HERE, and the choice
+        // between dropping it and merely marking it for eviction was MEASURED, both ways, on
+        // the same screen of the same title with a movie playing:
+        //
+        // | policy | evict passes/frame | re-decoded after evict | GPU uploads/frame |
+        // |---|---|---|---|
+        // | neither (the budget finds it) | 1.05 | 0.0 | 2.8 (2.17 MB) |
+        // | marked, evicted first | 1.73 | 0.6 | 2.9 (2.22 MB) |
+        // | DROPPED here | **0.00** | **0.0** | **0.6 (0.51 MB)** |
+        //
+        // Marking does not free the bytes, so the budget is still met every frame and an
+        // eviction pass still runs - and an eviction invalidates the GPU-side entry keyed on
+        // this decode, which is why upload traffic tracks it. Dropping keeps the cache the
+        // size of what the guest can still ask for, and the eviction pass stops running at
+        // all. The re-decode column is what says the "content comes back" worry does not
+        // happen HERE, on the CPU side; the same experiment on the GPU-side view cache says
+        // the opposite, and that cache marks instead (see `GxpLive::view_dead`).
+        if let Some(stale) = self.decode_slots.insert(tex_slot_key(t), key) {
+            if stale != key && self.decode_cache.remove(&stale).is_some() {
+                let bytes = self.decode_used.remove(&stale).map_or(0, |(_, b)| b);
+                self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
+                work.tex_superseded += 1;
+            }
+        }
         self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
         self.touch_decode(key, cost);
         g
@@ -5527,10 +6304,32 @@ impl RenderSceneBuilder {
         let mut range_has_reader = zfix_range;
         let mut tally = DropTally { total: scene.draws.len(), ..Default::default() };
         for (di, d) in scene.draws.iter().enumerate() {
-            // A list emits idx/3 triangles; a strip or fan emits idx-2. Any other topology
-            // (lines/points) emits none and is skipped.
+            // A list emits idx/3 triangles; a strip or fan emits idx-2.
             let tri_count = triangle_count(d);
-            if tri_count == 0 {
+            // >>> A LINE OR POINT LIST IS NOT A DRAW THIS RENDERER GETS TO SKIP.
+            //
+            // It emits no triangles, so the software rasteriser and the fixed-function
+            // packing genuinely have nothing to do with it - but the RECOMPILED path draws
+            // it exactly, with the guest's own shaders, once the pipeline is given the
+            // matching topology (`gpu::gxm_topology`). Dropping it here is what made one
+            // retail title report, every frame, `DROPPED draw N - not a triangle topology
+            // ... shaders=yes (the recompiler could draw this)` - a draw the guest asked
+            // for, that this renderer had everything it needed to produce, missing from the
+            // frame and saying so in its own log.
+            //
+            // A line or point list with NO shader payload is still dropped: there is no
+            // second path for it and the report is the honest answer.
+            let direct = direct_topology_stride(d.primitive)
+                .filter(|&n| !d.vprog.is_empty() && d.index_count as usize >= n);
+            // An edge list draws by the same recompiled-only rule as lines and points, but
+            // only under the encoding its own index words confirm - see
+            // `PRIM_TRIANGLE_EDGES`. One that does not confirm falls through to the drop
+            // report, which prints the words that refused it.
+            let edge_list = d.primitive == PRIM_TRIANGLE_EDGES
+                && !d.vprog.is_empty()
+                && d.index_count >= 4
+                && edge_list_matches_packed_reading(d);
+            if tri_count == 0 && direct.is_none() && !edge_list {
                 tally.topology += 1;
                 tally.with_shaders += !d.vprog.is_empty() as usize;
                 report_drop(DropKind::Topology, di, d, tri_count);
@@ -5816,9 +6615,50 @@ impl RenderSceneBuilder {
                             self.index_cache.clear();
                         }
                         let mut out = Vec::with_capacity(tri_count * 3 * 4);
-                        for t in 0..tri_count {
-                            for k in tri_indices(d, t) {
-                                out.extend_from_slice(&(k as u32).to_le_bytes());
+                        match direct {
+                            // A line or point list needs no expansion at all - the guest's
+                            // own index order IS the primitive order, and the pipeline is
+                            // built with the matching topology. Widened to u32 like every
+                            // other stream so one index format serves the whole frame, and
+                            // TRUNCATED to whole primitives: wgpu draws what the count says,
+                            // and a trailing half-line would read a vertex the guest did not
+                            // name.
+                            Some(n) => {
+                                let whole = (d.index_count as usize / n) * n;
+                                for i in 0..whole {
+                                    out.extend_from_slice(&(index_at(d, i) as u32).to_le_bytes());
+                                }
+                            }
+                            // An edge list: groups of four words - three vertex indices
+                            // and a flags word - expanded into the LINE segments the flags
+                            // enable. See `PRIM_TRIANGLE_EDGES` for the measurement that
+                            // established this encoding; `edge_list` above already
+                            // confirmed it holds for this draw. Truncated to whole groups
+                            // for the same reason `Some(n)` truncates to whole primitives.
+                            None if edge_list => {
+                                for g in 0..d.index_count as usize / 4 {
+                                    let [i0, i1, i2] = [
+                                        index_at(d, g * 4) as u32,
+                                        index_at(d, g * 4 + 1) as u32,
+                                        index_at(d, g * 4 + 2) as u32,
+                                    ];
+                                    let flags = index_at(d, g * 4 + 3) as u32;
+                                    for (bit, a, b) in
+                                        [(0x100, i0, i1), (0x200, i1, i2), (0x400, i2, i0)]
+                                    {
+                                        if flags & bit != 0 {
+                                            out.extend_from_slice(&a.to_le_bytes());
+                                            out.extend_from_slice(&b.to_le_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                for t in 0..tri_count {
+                                    for k in tri_indices(d, t) {
+                                        out.extend_from_slice(&(k as u32).to_le_bytes());
+                                    }
+                                }
                             }
                         }
                         let out: Arc<[u8]> = out.into();
@@ -5835,13 +6675,17 @@ impl RenderSceneBuilder {
                 let gxp_index_count = (gxp_indices.len() / 4) as u32;
                 work.gxp_vertex_bytes += d.vertices.len() as u64;
                 work.gxp_sa_bytes += (d.vert_sa.len() + d.frag_sa.len()) as u64;
+                // Diagnostic (`VITASLOP_GXP_CAPSULE`): the one place a finished `Draw` and its
+                // guest programs are both in hand, which is what a capsule needs. Free when the
+                // knob is unset - see `maybe_capture`.
+                crate::capsule::maybe_capture(d);
                 Some(vitaslop_platform::gpu::GxpRecompile {
                     vprog: d.vprog.clone(),
                     fprog: d.fprog.clone(),
                     vert_sa: d.vert_sa.clone(),
                     frag_sa: d.frag_sa.clone(),
                     frag_sa_addr: d.frag_sa_addr,
-                    mem_window: d.mem_window.clone(),
+                    mem_windows: d.mem_windows.clone(),
                     vertices: d.vertices.clone(),
                     vertex_stride: d.vertex_stride,
                     attributes,
@@ -5853,6 +6697,10 @@ impl RenderSceneBuilder {
                     vertex_textures,
                     depth_write: d.render_state.front_depth_write != SCE_GXM_DEPTH_WRITE_DISABLED,
                     depth_func: d.render_state.front_depth_func,
+                    depth_bias: (
+                        d.render_state.front_depth_bias_factor,
+                        d.render_state.front_depth_bias_units,
+                    ),
                     cull_mode: d.render_state.cull_mode,
                     fragment_program_enabled: d.render_state.front_fragment_program_enable
                         != SCE_GXM_FRAGMENT_PROGRAM_DISABLED,
@@ -6038,10 +6886,10 @@ mod geometry_tests {
             world: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             vprog: crate::capture::no_program(),
             fprog: crate::capture::no_program(),
-            vert_sa: vec![],
-            frag_sa: vec![],
+            vert_sa: std::sync::Arc::from(&[][..]),
+            frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
-            mem_window: None,
+            mem_windows: Vec::new(),
             shader_expanded: false,
         }
     }
@@ -6223,8 +7071,57 @@ mod geometry_tests {
         d.primitive = PRIM_TRIANGLES;
         d.index_count = 6;
         assert_eq!(triangle_count(&d), 2); // list: idx / 3
-        d.primitive = 0x0400_0000; // lines: not drawn
-        assert_eq!(triangle_count(&d), 0);
+        d.primitive = PRIM_LINES;
+        assert_eq!(triangle_count(&d), 0, "a line list emits no TRIANGLES");
+    }
+
+    /// A line or point list emits no triangles, and used to be dropped for it. It is now
+    /// carried to the recompiled path with the guest's OWN index order and the matching
+    /// wgpu topology - see `direct_topology_stride` and `gpu::gxm_topology`.
+    ///
+    /// The truncation half is the one that would fail silently: wgpu draws exactly the
+    /// index count it is given, so a trailing half-line would make it read a vertex the
+    /// guest never named.
+    #[test]
+    fn a_line_or_point_list_is_carried_through_at_its_own_stride() {
+        assert_eq!(direct_topology_stride(PRIM_LINES), Some(2));
+        assert_eq!(direct_topology_stride(PRIM_POINTS), Some(1));
+        for p in [PRIM_TRIANGLES, PRIM_TRIANGLE_STRIP, PRIM_TRIANGLE_FAN] {
+            assert_eq!(
+                direct_topology_stride(p),
+                None,
+                "a triangle topology is EXPANDED, not passed through"
+            );
+        }
+        // Five indices of a line list are two whole lines and a leftover; the leftover is
+        // dropped rather than read as half of a line that has no second vertex.
+        let d = strip_draw(&[0, 1, 2, 3, 4]);
+        let n = direct_topology_stride(PRIM_LINES).expect("lines have a stride");
+        assert_eq!((d.index_count as usize / n) * n, 4);
+    }
+
+    /// The edge-list encoding is groups of four index words - three vertex indices and a
+    /// `SceGxmEdgeEnableFlags` word (see `PRIM_TRIANGLE_EDGES` for the measurement). The
+    /// validity test is what keeps a buffer that CONTRADICTS that reading from being drawn
+    /// under it.
+    #[test]
+    fn an_edge_list_is_validated_against_the_packed_reading() {
+        // The measured buffer shape: [i0, i1, i2, flags] x groups, flags in {0x100..0x700}.
+        let mut d = strip_draw(&[0, 1, 2, 0x700, 3, 4, 5, 0x500, 6, 7, 8, 0x300]);
+        d.primitive = PRIM_TRIANGLE_EDGES;
+        assert!(edge_list_matches_packed_reading(&d));
+        // A fourth word with a bit outside the three flag bits refuses the reading.
+        let mut bad = strip_draw(&[0, 1, 2, 0x701]);
+        bad.primitive = PRIM_TRIANGLE_EDGES;
+        assert!(!edge_list_matches_packed_reading(&bad));
+        // Flags of ZERO are a valid (empty) triangle, not a refusal.
+        let mut none = strip_draw(&[0, 1, 2, 0]);
+        none.primitive = PRIM_TRIANGLE_EDGES;
+        assert!(edge_list_matches_packed_reading(&none));
+        // A trailing partial group is outside the whole-group count and does not refuse.
+        let mut tail = strip_draw(&[0, 1, 2, 0x700, 9, 9]);
+        tail.primitive = PRIM_TRIANGLE_EDGES;
+        assert!(edge_list_matches_packed_reading(&tail));
     }
 
     /// A screen triangle (Y-down, as `project` emits) with a chosen facing. `[a,b,c]` here
@@ -6615,6 +7512,9 @@ mod geometry_tests {
         // No uniforms: that is what makes this 2D rather than MVP, which is the whole point.
         d.uniforms = vec![];
         d.textures = [BoundTexture {
+            // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+            // one id would collide in every cache keyed on it.
+            pixels_id: crate::capture::next_pixels_id(),
             unit: 0,
             base_format: 0x0c,
             swizzle: 0,
@@ -6966,6 +7866,9 @@ mod supersample_tests {
             }
         }
         let tex = BoundTexture {
+            // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+            // one id would collide in every cache keyed on it.
+            pixels_id: crate::capture::next_pixels_id(),
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 1, height: 1, stride: 4,
             faces: 1, face_bytes: 4, levels: 1,
             pixels: vec![200, 100, 50, 255].into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0,
@@ -6984,7 +7887,7 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, mem_window: None, shader_expanded: false,
+            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), shader_expanded: false,
         };
         let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -7015,6 +7918,9 @@ mod supersample_tests {
             }
         }
         let tex = BoundTexture {
+            // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+            // one id would collide in every cache keyed on it.
+            pixels_id: crate::capture::next_pixels_id(),
             unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: tw, height: th, stride: tw * 4,
             faces: 1, face_bytes: tw * th * 4, levels: 1,
             pixels: pixels.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0,
@@ -7041,7 +7947,7 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: vec![], frag_sa: vec![], frag_sa_addr: 0, mem_window: None, shader_expanded: false,
+            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), shader_expanded: false,
         };
         let s = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
@@ -7073,6 +7979,9 @@ mod texture_tests {
 
     fn tex(base_format: u32, swizzle: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         BoundTexture {
+            // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+            // one id would collide in every cache keyed on it.
+            pixels_id: crate::capture::next_pixels_id(),
             unit: 0,
             base_format,
             // sample_texture reads bits 12..14; pass the swizzle in that field.
@@ -7101,6 +8010,30 @@ mod texture_tests {
         (i as f32 + 0.5) / w as f32
     }
 
+    /// U2F10F10F10 (base format 0x9a): three unsigned 10-bit FLOATS under a 2-bit unorm
+    /// alpha. Until this was decoded, every draw sampling one was painted the magenta
+    /// missing-format marker - a golf title's club shaft, on every frame.
+    ///
+    /// Pinned on exact values rather than "not magenta": a 10-bit float is five bits of
+    /// exponent over five of mantissa at bias 15, and getting the split wrong still produces
+    /// a plausible colour.
+    #[test]
+    fn u2f10f10f10_decodes_its_three_packed_floats_and_two_bit_alpha() {
+        // Lane at bit 20 = 1.0 (exp 15, mant 0), at bit 10 = 0.5 (exp 14), at bit 0 = 0.0,
+        // alpha = 3 (full).
+        let w: u32 = (3 << 30) | (0x1e0 << 20) | (0x1c0 << 10);
+        let px = w.to_le_bytes().to_vec();
+        // swizzle 1 is ARGB: the top colour lane first.
+        let t = tex(0x9a, 1, 1, 1, 4, px.clone());
+        assert_eq!(texel_rgba_face(&t, 0, 0, 0), [255, 128, 0, 255]);
+        // swizzle 0 is ABGR: the same three lanes in the opposite order.
+        let t = tex(0x9a, 0, 1, 1, 4, px);
+        assert_eq!(texel_rgba_face(&t, 0, 0, 0), [0, 128, 255, 255]);
+        // A zero word is transparent black, not magenta - the marker must be gone.
+        let t = tex(0x9a, 1, 1, 1, 4, vec![0, 0, 0, 0]);
+        assert_eq!(texel_rgba_face(&t, 0, 0, 0), [0, 0, 0, 0]);
+    }
+
     /// The UNCOMPRESSED fast path must produce EXACTLY what the per-texel path produces.
     ///
     /// Same contract as the block-compressed case below, over the one-texel-per-block
@@ -7116,6 +8049,7 @@ mod texture_tests {
             0x09, 0x0a, 0x0b, // 16-bit single channel
             0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x15, 0x17, 0x18, 0x19, 0x1a, // 32-bit
             0x1b, 0x1c, 0x1d, 0x1e, 0x1f, // 64-bit
+            0x9a, // 32-bit packed float + 2-bit alpha
             0x98, 0x99, // 24-bit
         ];
         for fmt in formats {
@@ -7586,17 +8520,27 @@ mod texture_tests {
         // Regression guard: the selector must be read once (not double-shifted), or a
         // font atlas's RRRR coverage would decode to red [r,0,0,255] instead of grey.
         let c = 200u8;
-        // RRRR (3): the byte in all four channels - a coverage mask carrying its own
-        // alpha (what this title's UI font uses); must NOT come out red.
+        // The three modes retail titles are MEASURED to use, and the roles that make them
+        // meaningful. These are what pin the high-to-low reading of the selector name; see
+        // `swizzle1`'s own doc for the measurement and for why the header cannot settle it.
+        //
+        // R111 (7): white RGB with the byte as ALPHA - a glyph atlas. Decoding this as
+        // `[c,255,255,255]` is what painted PCSA00009's every string as a cyan box.
+        let t = tex(0x00, 7, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [255, 255, 255, c]);
+        // R000 (6): black with the byte as alpha - a mask. The mirror of R111, and the mode
+        // this title binds a thousand times a frame; the other reading makes every one of
+        // those bindings alpha-zero.
+        let t = tex(0x00, 6, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [0, 0, 0, c]);
+        // 1RRR (5): opaque greyscale - a luminance/detail map.
+        let t = tex(0x00, 5, 1, 1, 1, vec![c]);
+        assert_eq!(sample_texture(&t, 0.5, 0.5), [c, c, c, 255]);
+        // RRRR (3): the byte in all four channels. Symmetric - it reads the same either way
+        // round, which is why it could never have caught the mirrored table.
         let t = tex(0x00, 3, 1, 1, 1, vec![c]);
         assert_eq!(sample_texture(&t, 0.5, 0.5), [c, c, c, c]);
-        // 111R (2): white RGB, coverage in alpha.
-        let t = tex(0x00, 2, 1, 1, 1, vec![c]);
-        assert_eq!(sample_texture(&t, 0.5, 0.5), [255, 255, 255, c]);
-        // 000R (1): coverage in alpha only.
-        let t = tex(0x00, 1, 1, 1, 1, vec![c]);
-        assert_eq!(sample_texture(&t, 0.5, 0.5), [0, 0, 0, c]);
-        // R (0): the byte in red, opaque.
+        // R (0): one named channel, so also direction-free - the byte in red, opaque.
         let t = tex(0x00, 0, 1, 1, 1, vec![c]);
         assert_eq!(sample_texture(&t, 0.5, 0.5), [c, 0, 0, 255]);
     }
@@ -7635,7 +8579,7 @@ mod texture_tests {
     // SWIZZLED = 0), so the block-compressed / swizzled paths can be exercised.
     fn tex_typed(base_format: u32, tex_type: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8>) -> BoundTexture {
         let face_bytes = pixels.len() as u32;
-        BoundTexture { unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
+        BoundTexture { pixels_id: crate::capture::next_pixels_id(), unit: 0, base_format, swizzle: 0, tex_type, width: w, height: h, stride, faces: 1, face_bytes, levels: 1, data_addr: 0, pixels: pixels.into(), u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0, min_filter: 0, mag_filter: 0, mip_filter: 0, gamma: 0 }
     }
 
     #[test]
@@ -7735,6 +8679,44 @@ mod texture_tests {
         px[((1 * w + 2) * 4) as usize] = 0xFF;
         let t = tex_typed(0x0c, 3, w, h, w * 4, px); // LINEAR
         assert_eq!(sample_texture(&t, u_of(2, 8), u_of(1, 8))[0], 0xFF);
+    }
+}
+
+#[cfg(test)]
+mod morton_table_tests {
+    use super::*;
+
+    /// The tables are an OPTIMISATION of `morton_index`, so the only thing worth asserting is
+    /// that they are the SAME FUNCTION - over both leftover-tiling branches (wider-than-tall
+    /// and taller-than-wide), the square case, and non-power-of-two extents where the padded
+    /// grid is larger than the level.
+    #[test]
+    fn morton_tables_reproduce_morton_index_exactly() {
+        for &(w, h) in &[
+            (1u32, 1u32),
+            (8, 8),
+            (16, 4),
+            (4, 16),
+            (32, 8),
+            (5, 3),
+            (13, 27),
+            (64, 64),
+            (128, 32),
+            (7, 1),
+            (1, 7),
+        ] {
+            let (pw, ph) = (w.next_power_of_two(), h.next_power_of_two());
+            let (xs, ys) = morton_tables(pw, ph, w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        xs[x as usize] + ys[y as usize],
+                        morton_index(x, y, pw, ph),
+                        "level {w}x{h} (padded {pw}x{ph}) at ({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 }
 

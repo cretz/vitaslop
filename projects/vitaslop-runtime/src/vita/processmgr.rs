@@ -43,7 +43,7 @@ pub(super) fn get_stderr(_st: &mut VitaState) -> i32 {
 /// world), written through `tloc` when non-NULL and also returned.
 #[hostcall]
 pub(super) fn libc_time(ctx: &mut GuestCtx, st: &mut VitaState, tloc: Ptr) -> i32 {
-    let secs = (st.world.wall_us() / 1_000_000) as i32;
+    let secs = (st.guest_wall_us() / 1_000_000) as i32;
     if !tloc.is_null() {
         ctx.write_u32(tloc.addr(), secs as u32);
     }
@@ -59,7 +59,7 @@ pub(super) fn libc_time(ctx: &mut GuestCtx, st: &mut VitaState, tloc: Ptr) -> i3
 /// untouched would let it read its own stack as a timezone offset.
 #[hostcall]
 pub(super) fn libc_gettimeofday(ctx: &mut GuestCtx, st: &mut VitaState, tv: Ptr, tz: Ptr) -> i32 {
-    let now_us = st.world.wall_us();
+    let now_us = st.guest_wall_us();
     if !tv.is_null() {
         ctx.write_u32(tv.addr(), (now_us / 1_000_000) as u32);
         ctx.write_u32(tv.addr() + 4, (now_us % 1_000_000) as u32);
@@ -92,5 +92,5 @@ pub(super) fn call_abort_handler(_ctx: &mut GuestCtx, _st: &mut VitaState) -> Sv
 /// frame for its delta-time, so a constant 0 freezes its animations.
 #[hostcall]
 pub(super) fn libc_clock(st: &mut VitaState) -> u32 {
-    st.world.monotonic_us() as u32
+    st.guest_mono_us() as u32
 }

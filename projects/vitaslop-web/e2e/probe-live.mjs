@@ -6,19 +6,34 @@
 import { chromium } from "playwright";
 
 const url = process.env.URL || "https://localhost:8443/";
-const browser = await chromium.launch({
-  // The installed Chrome, the same one `game-boot.mjs` drives - the bundled headless shell
-  // is not present here and is not what a device runs anyway.
-  channel: process.env.PWCHANNEL || "chrome",
-  headless: !process.env.HEADED,
-  args: [
-    "--ignore-certificate-errors",
-    "--enable-unsafe-webgpu",
-    "--autoplay-policy=no-user-gesture-required",
-  ],
-});
-const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
-const page = await ctx.newPage();
+const launchArgs = [
+  "--ignore-certificate-errors",
+  "--enable-unsafe-webgpu",
+  "--autoplay-policy=no-user-gesture-required",
+];
+// PROFILE_DIR keeps the OPFS copy of the title between runs. Without it every run
+// re-imports the whole container - hundreds of megabytes - which makes iterating on the
+// page that SHIPS so slow that it does not get done, which is how a break reaches a device
+// first. Pass the SAME directory every time; OPFS is keyed by ORIGIN, so keep the port
+// fixed too.
+const profileDir = process.env.PROFILE_DIR;
+const ctx = profileDir
+  ? await chromium.launchPersistentContext(profileDir, {
+      channel: process.env.PWCHANNEL || "chrome",
+      headless: !process.env.HEADED,
+      args: launchArgs,
+      ignoreHTTPSErrors: true,
+    })
+  : await (
+      await chromium.launch({
+        // The installed Chrome, the same one `game-boot.mjs` drives - the bundled headless
+        // shell is not present here and is not what a device runs anyway.
+        channel: process.env.PWCHANNEL || "chrome",
+        headless: !process.env.HEADED,
+        args: launchArgs,
+      })
+    ).newContext({ ignoreHTTPSErrors: true });
+const page = ctx.pages()[0] || (await ctx.newPage());
 
 // Every line carries milliseconds since the probe started. Without it there is no way to
 // price the fast-forward - the one part of a live run that does a FIXED amount of guest
@@ -108,7 +123,11 @@ if (shot) {
 const fatalText = (await page.textContent("#fatal").catch(() => "")) || "";
 console.log("--- fatal box ---");
 console.log(fatalText || "(empty - nothing fatal reported)");
+// The HEADLINE, which is what a device capture is actually read from and which the panel
+// does not carry: the presented rate and the emulated speed beside it.
+console.log("--- rate ---");
+console.log((await page.textContent("#fps").catch(() => "")) || "(empty)");
 console.log("--- diagnostics panel ---");
 console.log((await page.textContent("#diag").catch(() => "")) || "(empty)");
 console.log("--- done");
-await browser.close();
+await ctx.close();

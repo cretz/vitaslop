@@ -111,6 +111,38 @@ pub fn run_conformance() -> Result<String, JsValue> {
     serde_json::to_string(&summary).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Run the H.264 crate's own conformance suite HERE, in the browser, against WebCodecs.
+///
+/// # Why this exists
+///
+/// `vitaslop-h264` is a platform-decoder crate with four backends, and until this entry
+/// point the only one that was ever tested was the one `cargo test` could reach. The
+/// WebCodecs backend shipped having never executed; its first three runs in a browser
+/// found three separate defects, each invisible on a desktop. This is the same suite, in
+/// the place that could not run it.
+///
+/// It needs no assets: the stream is synthesised from `I_PCM` macroblocks whose decoded
+/// pixels are knowable from the bitstream, which is what makes byte equality a legitimate
+/// assertion against a decoder nobody here wrote.
+///
+/// Returns the report as text. A browser with no `VideoDecoder` reports that and passes -
+/// it is a real configuration, not a defect.
+#[wasm_bindgen]
+pub async fn run_h264_conformance() -> Result<String, JsValue> {
+    crate::logging::install_panic_hook();
+    match vitaslop_h264::conformance::run().await {
+        Ok(report) => {
+            let text = report.text();
+            if report.ok() {
+                Ok(text)
+            } else {
+                Err(JsValue::from_str(&text))
+            }
+        }
+        Err(e) => Err(JsValue::from_str(&format!("the suite could not run: {e}"))),
+    }
+}
+
 /// Render a `JsValue` error as a short string for a case-run failure message.
 fn jsval_str(e: &JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))

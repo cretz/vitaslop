@@ -117,6 +117,49 @@ pub struct Track {
 }
 
 impl Track {
+    /// >>> THE `AudioSpecificConfig` INSIDE AN `esds`, which is what a decoder is
+    /// configured from and is NOT the box's own bytes.
+    ///
+    /// [`Track::codec_config`] holds the whole `esds` payload for an audio track, and that
+    /// is a nest of MPEG-4 descriptors: an `ES_Descriptor` (tag 3) holding a
+    /// `DecoderConfigDescriptor` (tag 4) holding a `DecoderSpecificInfo` (tag 5), whose
+    /// payload IS the config. Each descriptor's length is a variable-length integer with a
+    /// continuation bit, which is the part that makes this worth writing once.
+    ///
+    /// Empty when the track carries no such descriptor - a caller then has the channel
+    /// count and sample rate from the container and nothing else, which is enough to
+    /// synthesise one for plain AAC-LC.
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        // version + flags, then the ES_Descriptor.
+        let mut at = 4usize;
+        let d = &self.codec_config;
+        // ES_Descriptor
+        let Some((body, next)) = descriptor(d, at, 0x03) else { return Vec::new() };
+        let _ = next;
+        // ES_ID (2) + a flags byte, whose bits say which optional fields follow.
+        let mut inner = body.0 + 3;
+        let flags = d.get(body.0 + 2).copied().unwrap_or(0);
+        if flags & 0x80 != 0 {
+            // streamDependenceFlag: a 16-bit dependsOn_ES_ID.
+            inner += 2;
+        }
+        if flags & 0x40 != 0 {
+            // URL_Flag: a length-prefixed URL.
+            let len = d.get(inner).copied().unwrap_or(0) as usize;
+            inner += 1 + len;
+        }
+        if flags & 0x20 != 0 {
+            // OCRstreamFlag: a 16-bit OCR_ES_ID.
+            inner += 2;
+        }
+        at = inner;
+        // DecoderConfigDescriptor: objectTypeIndication, streamType, bufferSize (3),
+        // maxBitrate (4), avgBitrate (4) - 13 bytes - then the specific info.
+        let Some((cfg, _)) = descriptor(d, at, 0x04) else { return Vec::new() };
+        let Some((asc, _)) = descriptor(d, cfg.0 + 13, 0x05) else { return Vec::new() };
+        d.get(asc.0..asc.1).map(|b| b.to_vec()).unwrap_or_default()
+    }
+
     /// Duration in microseconds.
     pub fn duration_us(&self) -> u64 {
         if self.timescale == 0 {
@@ -153,6 +196,18 @@ impl Mp4 {
     /// only the tables - so this is cheap even for a file that is mostly video.
     pub fn parse(data: &[u8]) -> Result<Mp4, Mp4Error> {
         let moov = find_box(data, *b"moov")?.ok_or(Mp4Error::NoTracks)?;
+        Mp4::parse_moov(moov)
+    }
+
+    /// Parse from the `moov` box's payload alone.
+    ///
+    /// This is the entry point for a caller that is STREAMING the file rather than
+    /// holding it: the header is a few hundred kilobytes at the front or the back, and
+    /// everything else is sample data to be read on demand. It matters most where reads
+    /// are not free - a browser serving the container out of storage a range at a time -
+    /// because the alternative is pulling tens of megabytes through that path before the
+    /// first frame can be shown.
+    pub fn parse_moov(moov: &[u8]) -> Result<Mp4, Mp4Error> {
         let mvhd = find_box(moov, *b"mvhd")?.ok_or(Mp4Error::MissingBox("mvhd"))?;
         let (timescale, duration) = parse_mvhd(mvhd)?;
 
@@ -211,6 +266,48 @@ fn find_box(data: &[u8], want: [u8; 4]) -> Result<Option<&[u8]>, Mp4Error> {
     Ok(None)
 }
 
+/// Where the `moov` box lives in a file, as `(offset of its PAYLOAD, payload length)`,
+/// found by walking only the top-level box headers.
+///
+/// A caller that cannot hold the whole file uses this to read the header and nothing else.
+/// `read_at(offset, len)` supplies bytes; it may return fewer than asked for at the end of
+/// the file, and returning nothing ends the walk.
+///
+/// `moov` is at the FRONT of some files and the BACK of others - both appear among one
+/// title's own movies - so neither end can be assumed and the walk is the only answer that
+/// works for both.
+pub fn find_moov(
+    file_len: u64,
+    mut read_at: impl FnMut(u64, usize) -> Vec<u8>,
+) -> Result<(u64, u64), Mp4Error> {
+    let mut off = 0u64;
+    while off + 8 <= file_len {
+        let header = read_at(off, 16);
+        if header.len() < 8 {
+            break;
+        }
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let kind = [header[4], header[5], header[6], header[7]];
+        // 1 means the real size is a 64-bit field after the type; 0 means "to end of file".
+        let (size, header_len) = match size {
+            1 => {
+                if header.len() < 16 {
+                    break;
+                }
+                (be_u64(&header, 8)?, 16u64)
+            }
+            0 => (file_len - off, 8),
+            n if n < 8 => return Err(Mp4Error::BadBoxSize { kind, size: n }),
+            n => (n, 8),
+        };
+        if kind == *b"moov" {
+            return Ok((off + header_len, size.saturating_sub(header_len)));
+        }
+        off = off.checked_add(size).ok_or(Mp4Error::Truncated("box chain"))?;
+    }
+    Err(Mp4Error::NoTracks)
+}
+
 /// Follow a path of nested box types, e.g. `["mdia", "minf", "stbl"]`.
 fn find_path<'a>(mut data: &'a [u8], path: &[[u8; 4]]) -> Result<Option<&'a [u8]>, Mp4Error> {
     for step in path {
@@ -252,6 +349,11 @@ fn read_box(data: &[u8], off: usize) -> Result<([u8; 4], &[u8], usize), Mp4Error
 fn be_u32(d: &[u8], at: usize) -> Result<u32, Mp4Error> {
     let b = d.get(at..at + 4).ok_or(Mp4Error::Truncated("u32"))?;
     Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn be_u16(d: &[u8], at: usize) -> Result<u16, Mp4Error> {
+    let b = d.get(at..at + 2).ok_or(Mp4Error::Truncated("u16"))?;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
 }
 
 fn be_u64(d: &[u8], at: usize) -> Result<u64, Mp4Error> {
@@ -336,6 +438,31 @@ fn parse_stsd(d: &[u8], kind: TrackKind) -> Result<([u8; 4], Vec<u8>), Mp4Error>
         None => Vec::new(),
     };
     Ok((codec, config))
+}
+
+
+/// One MPEG-4 descriptor at `at`, if it carries `tag`: its payload range and the offset
+/// just past it. The length is 1 to 4 bytes, each carrying 7 bits with the top bit meaning
+/// "another byte follows".
+fn descriptor(d: &[u8], at: usize, tag: u8) -> Option<((usize, usize), usize)> {
+    if d.get(at).copied()? != tag {
+        return None;
+    }
+    let mut len = 0usize;
+    let mut cursor = at + 1;
+    for _ in 0..4 {
+        let byte = d.get(cursor).copied()?;
+        cursor += 1;
+        len = (len << 7) | usize::from(byte & 0x7F);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let end = cursor.checked_add(len)?;
+    if end > d.len() {
+        return None;
+    }
+    Some(((cursor, end), end))
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +654,102 @@ fn parse_u32_table(d: &[u8]) -> Result<Vec<u32>, Mp4Error> {
         out.push(be_u32(d, 8 + 4 * i)?);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// avcC -> Annex B
+// ---------------------------------------------------------------------------
+
+/// The parameter sets and NAL length size an `avcC` record carries.
+///
+/// An MP4's H.264 samples are length-prefixed and carry no SPS/PPS: those live once, in
+/// the sample entry. A decoder handed only the samples has nothing to configure itself
+/// with - so a caller that must produce a self-describing ELEMENTARY STREAM (which is what
+/// a video-decode API is given; it knows nothing about containers) needs both halves.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AvcC {
+    /// 1, 2 or 4 - the width of each sample's NAL length prefixes.
+    pub length_size: usize,
+    /// Sequence parameter sets, each a bare NAL with no prefix.
+    pub sps: Vec<Vec<u8>>,
+    /// Picture parameter sets, same form.
+    pub pps: Vec<Vec<u8>>,
+}
+
+impl AvcC {
+    /// Parse an `avcC` record (ISO/IEC 14496-15 5.2.4.1).
+    pub fn parse(d: &[u8]) -> Result<AvcC, Mp4Error> {
+        if d.len() < 7 {
+            return Err(Mp4Error::Truncated("avcC record"));
+        }
+        let mut out = AvcC { length_size: (d[4] & 0x03) as usize + 1, ..AvcC::default() };
+        let mut off = 5usize;
+        let read_set = |off: &mut usize, into: &mut Vec<Vec<u8>>, count: usize| {
+            for _ in 0..count {
+                let len = be_u16(d, *off)? as usize;
+                *off += 2;
+                let end = off.checked_add(len).ok_or(Mp4Error::Truncated("avcC parameter set"))?;
+                if end > d.len() {
+                    return Err(Mp4Error::Truncated("avcC parameter set"));
+                }
+                into.push(d[*off..end].to_vec());
+                *off = end;
+            }
+            Ok::<(), Mp4Error>(())
+        };
+        let sps_count = (d[off] & 0x1f) as usize;
+        off += 1;
+        let mut sps = Vec::new();
+        read_set(&mut off, &mut sps, sps_count)?;
+        if off >= d.len() {
+            return Err(Mp4Error::Truncated("avcC picture parameter set count"));
+        }
+        let pps_count = d[off] as usize;
+        off += 1;
+        let mut pps = Vec::new();
+        read_set(&mut off, &mut pps, pps_count)?;
+        out.sps = sps;
+        out.pps = pps;
+        Ok(out)
+    }
+
+    /// The parameter sets as Annex B NALs, ready to precede a keyframe.
+    pub fn annex_b_parameter_sets(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in self.sps.iter().chain(self.pps.iter()) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    /// Rewrite one length-prefixed sample into Annex B, appending to `out`.
+    ///
+    /// Fails rather than guessing on a prefix that runs past the end: a sample table and a
+    /// length prefix disagreeing means the file was mis-parsed, and a decoder handed the
+    /// remains of that would fail somewhere much less informative.
+    pub fn sample_to_annex_b(&self, sample: &[u8], out: &mut Vec<u8>) -> Result<(), Mp4Error> {
+        let n = self.length_size;
+        let mut off = 0usize;
+        while off < sample.len() {
+            if off + n > sample.len() {
+                return Err(Mp4Error::Truncated("NAL length prefix"));
+            }
+            let mut len = 0usize;
+            for i in 0..n {
+                len = (len << 8) | sample[off + i] as usize;
+            }
+            off += n;
+            let end = off.checked_add(len).ok_or(Mp4Error::Truncated("NAL payload"))?;
+            if end > sample.len() {
+                return Err(Mp4Error::Truncated("NAL payload"));
+            }
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&sample[off..end]);
+            off = end;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,68 @@
+[package]
+name = "vitaslop-h264"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Platform-native H.264 video decoding for Windows, macOS, Linux and the browser"
+
+# NOT a Vita crate. It carries the workspace prefix because it lives here, but it
+# knows nothing about the Vita, about guest memory, or about any other vitaslop
+# crate - it depends on NONE of them, and that is deliberate: this is the one crate
+# here that could be lifted out into a standalone public repo unchanged. Keep it
+# that way. Anything Vita-shaped (sceAvcdec's frame headers, guest buffers, the
+# NV12 the guest expects) belongs in the caller, not here.
+
+[features]
+default = ["mp4", "synth"]
+# Minimal ISO-BMFF (MP4) reader: enough to pull an H.264 track's avcC and its
+# samples out of a file so a caller - or the conformance test - can feed this
+# decoder from an .mp4 without a demuxer dependency. Pure Rust, no I/O of its own.
+mp4 = []
+# The synthetic-bitstream generator the conformance test rests on: an all-I_PCM
+# stream whose decoded pixels are known EXACTLY, which is what makes a
+# cross-platform byte-equality assertion possible at all. ON by default so that a
+# plain `cargo test` runs the conformance suite - a test that only runs when
+# somebody remembers a feature flag is a test that stops running. It is a few
+# hundred lines of pure code and a caller who never calls it pays nothing.
+synth = []
+
+[dependencies]
+
+# --- Windows: Media Foundation -----------------------------------------------
+# The H.264 decoder is an MFT (Media Foundation Transform) reached through COM.
+# Pinned to the same `windows` release the rest of the workspace already resolves
+# through wgpu, so this crate adds no second copy of the metadata crates.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    # `ICodecAPI::SetValue` takes a VARIANT, which is how a decoder is asked for
+    # low-latency output.
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+]
+
+# --- Linux: VA-API ------------------------------------------------------------
+# libva is loaded at RUN time with dlopen(3), never linked: a binary that would
+# otherwise not start on a machine without libva installed instead reports "no
+# decoder" and lets the caller fall back. libc is here for dlopen/dlsym/open/close
+# on the DRM render node.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# --- Web: WebCodecs -----------------------------------------------------------
+# `VideoDecoder` is declared by hand in `backend/web.rs` rather than taken from
+# web-sys: the WebCodecs bindings there sit behind `--cfg=web_sys_unstable_apis`,
+# a build-wide flag every consumer of this crate would then have to set.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

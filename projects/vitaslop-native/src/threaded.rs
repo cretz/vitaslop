@@ -784,6 +784,19 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         let arg_len = arg_block.len() as u32;
 
         let host = Arc::new(Mutex::new(host));
+        // Let the stall watchdog read the sync state from outside the run. Registered here
+        // rather than on the raw-image path because this is the retail one - the only one a
+        // title can hang in. Costs nothing when no watchdog is armed.
+        {
+            let h = host.clone();
+            crate::watchdog::register_sync_dump(Box::new(move || match h.try_lock() {
+                Ok(g) => Ok(g.sync_dump()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err("the host lock was held by a thread inside a host call")
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => Err("the host lock is poisoned"),
+            }));
+        }
         let engine = WasmtimeEngine {
             engine,
             module,
@@ -810,6 +823,64 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
             vitaslop_runtime::host::DEFAULT_THREAD_PRIORITY,
         )?;
 
+        // >>> EVERY DECODE GAP INSIDE A LIFTED FUNCTION, REPORTED UNCONDITIONALLY.
+        //
+        // A stub is loud (calling it traps), but a gap INSIDE a function that otherwise
+        // lifted is silent: the block is cut at the bad instruction and the rest of the
+        // loop simply never runs. On one title that was two undecodable NEON ops in an
+        // audio mixer, and the symptom was a null dereference several calls away with
+        // nothing anywhere naming the cause. `VITASLOP_TRANSPILE_REPORT` cannot cover
+        // this - it walks the call graph, and these functions are reached only through
+        // vtables - so the list is printed here, from the build that actually runs.
+        if !built.decode_gaps.is_empty() {
+            // >>> THE LIST IS MOSTLY NOISE, AND SAYING SO IS WHAT MAKES IT USABLE.
+            //
+            // Tentative discovery - the stored-pointer scan and the prologue sweep -
+            // proposes addresses that turn out to be DATA, and an address halfway
+            // through a real instruction "fails to decode" too. On one title that is
+            // ~1500 entries of which about 30 are real, and an undifferentiated list
+            // that long is one nobody reads. So the ones in the Advanced-SIMD / VFP
+            // coprocessor space are listed FIRST and the rest are given as a count:
+            // a genuine hole in our ISA coverage is overwhelmingly a NEON or VFP
+            // encoding, because that is the part of ARMv7 this decoder implements on
+            // demand. [[vitaslop-a-decode-gap-is-silent]]
+            let hw = |addr: u32| -> (u16, u16) {
+                let off = addr.wrapping_sub(linked.base) as usize;
+                if off + 4 <= linked.image.len() {
+                    (
+                        u16::from_le_bytes([linked.image[off], linked.image[off + 1]]),
+                        u16::from_le_bytes([linked.image[off + 2], linked.image[off + 3]]),
+                    )
+                } else {
+                    (0, 0)
+                }
+            };
+            // Thumb-2 coprocessor / Advanced-SIMD space: `1110 1111 ...` and
+            // `1111 11xx ...` cover the NEON data-processing, NEON load/store and VFP
+            // encodings.
+            let simd = |hw1: u16| hw1 == 0xef00 || (hw1 & 0xff00) == 0xef00 || (hw1 & 0xfc00) == 0xfc00;
+            let (mut likely, mut rest) = (Vec::new(), 0usize);
+            for &addr in &built.decode_gaps {
+                let (hw1, hw2) = hw(addr);
+                if simd(hw1) {
+                    likely.push((addr, hw1, hw2));
+                } else {
+                    rest += 1;
+                }
+            }
+            tracing::warn!(
+                target: "vitaslop::perf",
+                simd_space = likely.len(),
+                other = rest,
+                "decode gaps INSIDE lifted functions. Each one TRAPS if its path runs, so a                  gap here is a hole in ISA coverage, not a crash waiting to happen. The                  SIMD/VFP-space ones are listed below and are the ones worth implementing;                  the rest are overwhelmingly tentative discovery walking into data. Confirm                  each against the decoder at its real alignment before implementing it -                  several will already decode."
+            );
+            for (addr, hw1, hw2) in likely {
+                tracing::warn!(
+                    target: "vitaslop::perf",
+                    "  decode gap @ {addr:#010x}: hw1={hw1:#06x} hw2={hw2:#06x}"
+                );
+            }
+        }
         let stubs = built
             .stubbed
             .iter()
@@ -2119,6 +2190,52 @@ impl vitaslop_runtime::GuestMemory for SharedView {
         // `max(first)` so a clamped range is a single page rather than a reversed slice.
         let last = ((off + len - 1) >> shift).min(map.len().saturating_sub(1)).max(first);
         Some(map[first..=last].iter().any(|&s| s >= stamp))
+    }
+
+    /// See `GuestMemory::dirty_runs_since`. Same map, same overhang rule, reading the pages
+    /// instead of folding them to one bit.
+    fn dirty_runs_since(
+        &self,
+        off: usize,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
+        if len == 0 {
+            return Some(());
+        }
+        // SAFETY: see `dirty_block`.
+        let block = unsafe { self.dirty_block()? };
+        let map = &block[vitaslop_transpiler::DIRTY_MAP_OFF as usize..];
+        let shift = vitaslop_transpiler::DIRTY_SHIFT;
+        let page_bytes = 1usize << shift;
+        let first = off >> shift;
+        let last = (off + len - 1) >> shift;
+        if last >= map.len() {
+            return None;
+        }
+        // A store stamped against the page BELOW can reach into this range's first page.
+        let overhang = first > 0 && map[first - 1] >= stamp;
+        let mut run: Option<(usize, usize)> = None;
+        for page in first..=last {
+            let dirty = map[page] >= stamp || (page == first && overhang);
+            if !dirty {
+                if let Some(r) = run.take() {
+                    out.push(r);
+                }
+                continue;
+            }
+            let start = (page << shift).max(off) - off;
+            let end = ((page << shift) + page_bytes).min(off + len) - off;
+            match run.as_mut() {
+                Some(r) => r.1 = end,
+                None => run = Some((start, end)),
+            }
+        }
+        if let Some(r) = run {
+            out.push(r);
+        }
+        Some(())
     }
 
     fn dirty_epoch(&self) -> Option<u8> {

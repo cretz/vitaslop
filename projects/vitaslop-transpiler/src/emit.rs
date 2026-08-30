@@ -792,12 +792,19 @@ fn emit_dirty_range(f: &mut Body, addr_local: u32, len_local: u32) {
 /// writes - or fails to write - a specific object field (e.g. a NULL vtable slot).
 /// Cached once; parsing happens at emit time only, never at guest runtime.
 ///
-/// **IT DOES NOT COVER EVERY STORE, AND THAT IS WHY [`warn_watch_store_blind_spot`]
-/// EXISTS.** The check is emitted around [`crate::ir::Stmt::Store`] only. VFP and NEON
-/// stores are their own statements (`Stmt::VfpMem`, the NEON element form) and pass it
-/// UNSEEN, so a region written by `vstr` / `vstm` / `vst1` / `vpush` is written
-/// invisibly. A memset or a table initialiser is exactly the kind of code a compiler
-/// vectorises, so this is not a corner case.
+/// **WHAT IT COVERS, because its silence is evidence and a stale list makes that evidence
+/// wrong.** Scalar [`crate::ir::Stmt::Store`]; VFP single and double stores
+/// (`Stmt::VfpMem`, [`emit_vfp_mem`]); NEON element stores (`NeonStmt::ElemMem`); the
+/// inlined bulk primitives `sceClibMemcpy` / `sceClibMemset`, which become `memory.copy` /
+/// `memory.fill` ([`emit_watch_store_extent`]); and every inline host lowering that writes
+/// guest memory ([`emit_watch_store_inline`]). The vector forms used to pass UNSEEN and no
+/// longer do - a comment saying otherwise sends a reader hunting a blind spot that was closed,
+/// which is its own kind of wrong answer.
+///
+/// What is still NOT here is a write made by a HOST CALL, which never becomes guest code at
+/// all: that is `VITASLOP_HOST_WRITE_WATCH`'s half. **A silent run of this watchpoint means
+/// no GUEST instruction wrote the address - it does NOT mean nothing did.** Run both before
+/// concluding an address is never written.
 ///
 /// **The failure mode is the dangerous one**: a silent watchpoint reads as "nothing ever
 /// wrote this address", which is indistinguishable from the LOST STORE such a watchpoint
@@ -3837,6 +3844,29 @@ fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
     }
 }
 
+/// Push a 16-byte `vtbl` table half: the low 8 bytes of D`lo` followed by the low 8
+/// bytes of D`lo+1`, or by ZEROS when the table does not have that second register.
+///
+/// The zero padding is not a convenience - it is what makes one `i8x16.swizzle` produce
+/// vtbl's out-of-range rule for an odd-length table: an index of 8..15 into a
+/// one-register table must read zero, and it does, because those bytes ARE zero.
+fn neon_table_half(f: &mut Body, lo: u8, has_hi: bool) {
+    neon_get(f, crate::ir::NeonReg::D(lo));
+    if has_hi {
+        neon_get(f, crate::ir::NeonReg::D(lo + 1));
+    } else {
+        f.instruction(&W::V128Const(0));
+    }
+    // `neon_get(D)` splats the doubleword across both halves, so byte i of each source
+    // sits at index i; take 0..7 of the first and 0..7 of the second.
+    let mut mask = [0u8; 16];
+    for i in 0..8u8 {
+        mask[i as usize] = i;
+        mask[i as usize + 8] = 16 + i;
+    }
+    f.instruction(&W::I8x16Shuffle(mask));
+}
+
 /// Store the `v128` on the stack into NEON register `reg`. A `Q` writes all 128
 /// bits; a `D` writes only the low 64 (leaving the sibling half of an upper-bank
 /// quad intact). Uses the `L_V128A` scratch to fan a low-bank quad out to its S
@@ -4124,6 +4154,28 @@ fn emit_shift_imm(
             f.instruction(&simd_shr(bits, ty.signed));
         }
     };
+    // `(x + 2^(n-1)) >> n`, but computed as `(x >> n) + bit(n-1 of x)`.
+    //
+    // The two are equal - the rounding term depends only on the top DISCARDED bit - and
+    // the second form CANNOT OVERFLOW, where the first can: at n == 1, adding 1 to a lane
+    // already at its maximum wraps to the minimum and the "rounded" result comes out with
+    // the wrong sign. ARM computes the sum in a wider intermediate; wasm has no wider
+    // lane here, so the identity is how the width is avoided rather than papered over.
+    let push_rounded_src = |f: &mut Body| {
+        if amt == 0 {
+            neon_get(f, src);
+            return;
+        }
+        neon_get(f, src);
+        f.instruction(&W::I32Const(amt.min(bits as u32 - 1) as i32));
+        f.instruction(&simd_shr(bits, ty.signed));
+        neon_get(f, src);
+        f.instruction(&W::I32Const((amt - 1).min(bits as u32 - 1) as i32));
+        f.instruction(&simd_shr(bits, false));
+        f.instruction(&W::V128Const(splat_lane_mask(bits, 1)));
+        f.instruction(&W::V128And);
+        f.instruction(&simd_add(bits));
+    };
     match op {
         Shr => {
             push_shifted_src(f);
@@ -4132,6 +4184,16 @@ fn emit_shift_imm(
         Sra => {
             neon_get(f, dst);
             push_shifted_src(f);
+            f.instruction(&simd_add(bits));
+            neon_set(f, dst);
+        }
+        Rshr => {
+            push_rounded_src(f);
+            neon_set(f, dst);
+        }
+        Rsra => {
+            neon_get(f, dst);
+            push_rounded_src(f);
             f.instruction(&simd_add(bits));
             neon_set(f, dst);
         }
@@ -4204,6 +4266,75 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
                         (true, false) => simd_max(ty.bits, ty.signed),
                         (false, false) => simd_min(ty.bits, ty.signed),
                     });
+                    neon_set(f, *dst);
+                }
+                QAdd | QSub => {
+                    // wasm has the saturating add/sub directly, for 8- and 16-bit lanes,
+                    // in both signednesses - which is the whole of these instructions.
+                    neon_get(f, *a);
+                    neon_get(f, *b);
+                    f.instruction(&match (matches!(bop, QAdd), ty.bits, ty.signed) {
+                        (true, 8, true) => W::I8x16AddSatS,
+                        (true, 8, false) => W::I8x16AddSatU,
+                        (true, _, true) => W::I16x8AddSatS,
+                        (true, _, false) => W::I16x8AddSatU,
+                        (false, 8, true) => W::I8x16SubSatS,
+                        (false, 8, false) => W::I8x16SubSatU,
+                        (false, _, true) => W::I16x8SubSatS,
+                        (false, _, false) => W::I16x8SubSatU,
+                    });
+                    neon_set(f, *dst);
+                }
+                HAdd | HSub | RHAdd => {
+                    // `(a +- b) >> 1`, and the rounding form `(a + b + 1) >> 1`.
+                    //
+                    // The sum MUST NOT be formed in the element's own width: two lanes
+                    // near full scale overflow it, and the halving exists precisely so
+                    // that cannot happen. wasm has no widening add across a whole vector,
+                    // so the identity below does it in-lane instead:
+                    //
+                    //   (a + b) >> 1  ==  (a >> 1) + (b >> 1) + (a & b & 1)
+                    //   (a + b + 1) >> 1 == (a >> 1) + (b >> 1) + ((a | b) & 1)
+                    //   (a - b) >> 1  ==  (a >> 1) - (b >> 1) - (~a & b & 1)
+                    //
+                    // Each term fits, so nothing overflows on the way. The shifts are
+                    // arithmetic for a signed element and logical for an unsigned one,
+                    // which is what carries the sign through the halving.
+                    let bits = ty.bits;
+                    neon_get(f, *a);
+                    f.instruction(&W::LocalSet(L_V128A));
+                    neon_get(f, *b);
+                    f.instruction(&W::LocalSet(L_V128B));
+                    let half = |f: &mut Body, local: u32| {
+                        f.instruction(&W::LocalGet(local));
+                        f.instruction(&W::I32Const(1));
+                        f.instruction(&simd_shr(bits, ty.signed));
+                    };
+                    half(f, L_V128A);
+                    half(f, L_V128B);
+                    f.instruction(&if matches!(bop, HSub) { simd_sub(bits) } else { simd_add(bits) });
+                    // The carry/borrow term, from the two low bits.
+                    match bop {
+                        HSub => {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::V128Not);
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::V128And);
+                        }
+                        RHAdd => {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::V128Or);
+                        }
+                        _ => {
+                            f.instruction(&W::LocalGet(L_V128A));
+                            f.instruction(&W::LocalGet(L_V128B));
+                            f.instruction(&W::V128And);
+                        }
+                    }
+                    f.instruction(&W::V128Const(splat_lane_mask(bits, 1)));
+                    f.instruction(&W::V128And);
+                    f.instruction(&if matches!(bop, HSub) { simd_sub(bits) } else { simd_add(bits) });
                     neon_set(f, *dst);
                 }
                 Abd => {
@@ -4569,21 +4700,25 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&if *ge { W::F32x4Ge } else { W::F32x4Gt });
             neon_set(f, *dst);
         }
-        PairMinMax { min, dst, a, b } => {
-            // f32 pairwise max/min, doubleword only: gather the even/odd f32 lanes of the
+        PairMinMax { ty, min, dst, a, b } => {
+            // Pairwise max/min, doubleword only: gather the even and odd elements of the
             // concatenation `a : b` (a is bytes 0..16, b is 16..32) with two shuffles, then
-            // reduce. Mirrors `PairAdd` for the two-lane f32 case.
+            // reduce. The gather is the SAME one `PairAdd` builds, and it has to be
+            // element-size driven rather than fixed at 4 bytes: the integer forms of these
+            // instructions exist at 8, 16 and 32 bits, and a 4-byte gather applied to a
+            // `.u8` operand reduces the wrong pairs in every lane.
+            let ebytes = (ty.bits / 8) as usize;
+            let cnt = 8 / ebytes; // result elements (a D register's worth)
             let mut xmask = [0u8; 16];
             let mut ymask = [0u8; 16];
-            // Two D registers -> two source elements each. Output lane 0/1 <- pairs of `a`,
-            // output lane... only the low two lanes are meaningful for a D result.
-            for k in 0..2usize {
-                let (src_base, within) = if k < 1 { (0usize, k) } else { (16usize, k - 1) };
-                let even = src_base + (2 * within) * 4;
-                let odd = src_base + (2 * within + 1) * 4;
-                for j in 0..4 {
-                    xmask[k * 4 + j] = (even + j) as u8;
-                    ymask[k * 4 + j] = (odd + j) as u8;
+            for k in 0..cnt {
+                let (src_base, within) =
+                    if k < cnt / 2 { (0usize, k) } else { (16usize, k - cnt / 2) };
+                let even = src_base + (2 * within) * ebytes;
+                let odd = src_base + (2 * within + 1) * ebytes;
+                for j in 0..ebytes {
+                    xmask[k * ebytes + j] = (even + j) as u8;
+                    ymask[k * ebytes + j] = (odd + j) as u8;
                 }
             }
             neon_get(f, *a);
@@ -4596,7 +4731,12 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::LocalGet(L_V128A));
             f.instruction(&W::LocalGet(L_V128B));
             f.instruction(&W::I8x16Shuffle(ymask));
-            f.instruction(&if *min { W::F32x4Min } else { W::F32x4Max });
+            f.instruction(&match (ty.float, *min) {
+                (true, true) => simd_fmin(ty.bits),
+                (true, false) => simd_fmax(ty.bits),
+                (false, true) => simd_min(ty.bits, ty.signed),
+                (false, false) => simd_max(ty.bits, ty.signed),
+            });
             neon_set(f, *dst);
         }
         Rev { esize, container, dst, src } => {
@@ -4734,6 +4874,116 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::V128Not);
             neon_set(f, *dst);
         }
+        NarrowShift { esize, dst, src, shift, round, sat } => {
+            // Shift the 2*esize source lanes, then narrow exactly as `Narrow` /
+            // `NarrowSat` do. The shift is emitted here rather than composed out of a
+            // `ShiftImm` node because that node would have to write a real NEON register
+            // to hand the value on, and there is no scratch NEON register to spend.
+            let wide = *esize * 2;
+            let src_signed = sat.map_or(true, |(s, _)| s);
+            // The rounding identity, as in `emit_shift_imm`: `(x >> n) + bit(n-1 of x)`.
+            neon_get(f, *src);
+            f.instruction(&W::I32Const(*shift as i32));
+            f.instruction(&simd_shr(wide, src_signed));
+            if *round && *shift > 0 {
+                neon_get(f, *src);
+                f.instruction(&W::I32Const((*shift - 1) as i32));
+                f.instruction(&simd_shr(wide, false));
+                f.instruction(&W::V128Const(splat_lane_mask(wide, 1)));
+                f.instruction(&W::V128And);
+                f.instruction(&simd_add(wide));
+            }
+            f.instruction(&W::LocalSet(L_V128A));
+            match sat {
+                None => {
+                    // Truncating: a pure byte gather of each lane's low `esize` bits into
+                    // the low 8 bytes. The arithmetic-vs-logical question does not arise -
+                    // the shift's sign-extension lands entirely above bit `esize-1`,
+                    // which this gather discards.
+                    let rbytes = (*esize / 8) as usize;
+                    let n = 8 / rbytes;
+                    let mut mask = [0u8; 16];
+                    for i in 0..n {
+                        for j in 0..rbytes {
+                            mask[i * rbytes + j] = (i * 2 * rbytes + j) as u8;
+                        }
+                    }
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::I8x16Shuffle(mask));
+                }
+                Some((s_signed, d_signed)) => {
+                    // Saturating: wasm's `narrow` pair, which reads its input as SIGNED -
+                    // so an unsigned source is clamped to the result maximum first, for
+                    // the same reason as in `NarrowSat`.
+                    if !*s_signed {
+                        let max = ((1u32 << *esize) - 1) as i32;
+                        f.instruction(&W::LocalGet(L_V128A));
+                        f.instruction(&W::I32Const(max));
+                        f.instruction(&if *esize == 8 { W::I16x8Splat } else { W::I32x4Splat });
+                        f.instruction(&if *esize == 8 { W::I16x8MinU } else { W::I32x4MinU });
+                        f.instruction(&W::LocalSet(L_V128A));
+                    }
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&W::LocalGet(L_V128A));
+                    f.instruction(&match (*esize, *d_signed) {
+                        (8, true) => W::I8x16NarrowI16x8S,
+                        (8, false) => W::I8x16NarrowI16x8U,
+                        (_, true) => W::I16x8NarrowI32x4S,
+                        (_, false) => W::I16x8NarrowI32x4U,
+                    });
+                }
+            }
+            neon_set(f, *dst);
+        }
+        WidenShift { esize, dst, src, shift, signed } => {
+            // Widen the low half of the source, then shift left in the WIDE lane - the
+            // order matters: shifting first would throw away exactly the bits the widening
+            // exists to make room for.
+            neon_get(f, *src);
+            f.instruction(&simd_extend_low(*esize, *signed));
+            if *shift > 0 {
+                f.instruction(&W::I32Const(*shift as i32));
+                f.instruction(&simd_shl(*esize * 2));
+            }
+            neon_set(f, *dst);
+        }
+        Not { dst, src } => {
+            neon_get(f, *src);
+            f.instruction(&W::V128Not);
+            neon_set(f, *dst);
+        }
+        SatAbsNeg { ty, neg, dst, src } => {
+            // `vqabs`/`vqneg` differ from the plain forms at ONE input: the element's
+            // minimum, whose true magnitude is one past the maximum. So compute the plain
+            // result and then clamp that single case with a select - which is cheaper and
+            // clearer than a widen, and exact.
+            //
+            // The plain results are `max(x, 0 - x)` for abs and `0 - x` for negate; the
+            // wrong-at-minimum case is exactly `x == MIN`, and there the answer is MAX.
+            let bits = ty.bits;
+            let min = 1u64 << (bits as u32 - 1);
+            let max = min - 1;
+            neon_get(f, *src);
+            f.instruction(&W::LocalSet(L_V128A));
+            // `v128.bitselect` takes (whenSet, whenClear, mask), so MAX - the value the
+            // clamped lanes want - has to be pushed FIRST, under the plain result.
+            f.instruction(&W::V128Const(splat_lane_mask(bits, max)));
+            // The plain (wrapping) result: `0 - x`, and for abs the larger of that and x.
+            f.instruction(&W::V128Const(0));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&simd_sub(bits));
+            if !*neg {
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&simd_max(bits, true));
+            }
+            // The mask: set exactly in the lanes where the source was MIN.
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::V128Const(splat_lane_mask(bits, min)));
+            f.instruction(&simd_cmp_eq(bits));
+            f.instruction(&W::V128Bitselect);
+            neon_set(f, *dst);
+        }
         Narrow { esize, dst, src } => {
             // Truncate each `2*esize`-bit source element to its low `esize` bits, packing the results
             // into the low 8 bytes (the `D` result). A pure byte gather from the source.
@@ -4751,6 +5001,73 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             f.instruction(&W::LocalGet(L_V128A));
             f.instruction(&W::I8x16Shuffle(mask));
             neon_set(f, *dst);
+        }
+        NarrowSat { esize, dst, src, src_signed, dst_signed } => {
+            // wasm's `narrow` ops take TWO vectors and pack both halves, so pushing the
+            // source twice puts the wanted `esize`-bit results in the low 8 bytes - which
+            // is exactly the `D` destination this writes.
+            //
+            // They read their input as SIGNED. That is right for the two signed-source
+            // forms, and WRONG for `vqmovn.uNN`, whose source above `i32::MAX` would read
+            // as negative and narrow to 0 instead of to the maximum - silence where the
+            // instruction means "as loud as this can go". So the unsigned-source form is
+            // clamped to the result's maximum first, after which every value is small and
+            // positive and the signed reading agrees.
+            neon_get(f, *src);
+            if !src_signed {
+                let max = ((1u32 << *esize) - 1) as i32;
+                f.instruction(&W::I32Const(max));
+                f.instruction(&if *esize == 8 { W::I16x8Splat } else { W::I32x4Splat });
+                f.instruction(&if *esize == 8 { W::I16x8MinU } else { W::I32x4MinU });
+            }
+            f.instruction(&W::LocalSet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&match (*esize, *dst_signed) {
+                (8, true) => W::I8x16NarrowI16x8S,
+                (8, false) => W::I8x16NarrowI16x8U,
+                (_, true) => W::I16x8NarrowI32x4S,
+                (_, false) => W::I16x8NarrowI32x4U,
+            });
+            neon_set(f, *dst);
+        }
+        TableLookup { dst, table, len, index, extend } => {
+            // `i8x16.swizzle(table, idx)` IS vtbl's rule for a 16-byte table: it takes the
+            // byte at `idx` and yields ZERO for any index at or past the table - which is
+            // exactly what vtbl does past `8 * len`. So a 1- or 2-register table is one
+            // swizzle over a 16-byte vector zero-padded to length, and a 3- or 4-register
+            // table is two: the second over `idx - 16`, which wraps every index below 16
+            // up past the end and so contributes zero there. The two halves never both
+            // hit, so OR is the join.
+            neon_get(f, crate::ir::NeonReg::D(*index));
+            f.instruction(&W::LocalSet(L_V128A));
+            neon_table_half(f, *table, *len >= 2);
+            f.instruction(&W::LocalGet(L_V128A));
+            f.instruction(&W::I8x16Swizzle);
+            if *len > 2 {
+                neon_table_half(f, *table + 2, *len >= 4);
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&W::I32Const(16));
+                f.instruction(&W::I8x16Splat);
+                f.instruction(&W::I8x16Sub);
+                f.instruction(&W::I8x16Swizzle);
+                f.instruction(&W::V128Or);
+            }
+            if *extend {
+                // vtbx leaves the destination byte alone where the index is out of range.
+                // The compare is UNSIGNED because an index is a byte in 0..=255 while
+                // `8 * len` is at most 32 - a signed compare would call 0x80..0xff "less"
+                // and take the lookup's zero for bytes vtbx must not touch.
+                f.instruction(&W::LocalSet(L_V128C));
+                f.instruction(&W::LocalGet(L_V128C));
+                neon_get(f, crate::ir::NeonReg::D(*dst));
+                f.instruction(&W::LocalGet(L_V128A));
+                f.instruction(&W::I32Const((8 * *len) as i32));
+                f.instruction(&W::I8x16Splat);
+                f.instruction(&W::I8x16LtU);
+                f.instruction(&W::V128Bitselect);
+            }
+            neon_set(f, crate::ir::NeonReg::D(*dst));
         }
         MulScalar { ty, dst, a, src, lane, acc, sub } => {
             // dst = [dst -/+] a * broadcast(D[src].lane). Push the accumulator first (if any) so it

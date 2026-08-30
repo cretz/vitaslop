@@ -2966,6 +2966,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vitaslop-aac"
+version = "0.0.0"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "windows",
+]
+
+[[package]]
 name = "vitaslop-atrac9"
 version = "0.0.0"
 
@@ -3024,6 +3033,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vitaslop-h264"
+version = "0.0.0"
+dependencies = [
+ "js-sys",
+ "libc",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "windows",
+]
+
+[[package]]
 name = "vitaslop-hostcall"
 version = "0.0.0"
 dependencies = [
@@ -3060,7 +3080,9 @@ name = "vitaslop-platform"
 version = "0.0.0"
 dependencies = [
  "tracing",
+ "vitaslop-aac",
  "vitaslop-gxp-shader",
+ "vitaslop-h264",
  "wgpu",
 ]
 
@@ -3085,6 +3107,8 @@ dependencies = [
  "vitaslop-platform",
  "vitaslop-transpiler",
  "wasmparser 0.253.0",
+ "yaxpeax-arch",
+ "yaxpeax-arm",
  "zeno",
 ]
 
@@ -3109,6 +3133,7 @@ dependencies = [
  "tracing-subscriber",
  "vitaslop-conformance-harness",
  "vitaslop-conformance-suite-arm",
+ "vitaslop-h264",
  "vitaslop-loader",
  "vitaslop-platform",
  "vitaslop-runtime",

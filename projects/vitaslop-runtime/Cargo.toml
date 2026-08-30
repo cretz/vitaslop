@@ -44,6 +44,30 @@ miniz_oxide = "0.8"
 skrifa = "0.45.0"
 zeno = "0.3.3"
 
+[features]
+# >>> A DIAGNOSTIC BUILD, NOT A SHIPPING ONE. Marks a handful of audio-path functions
+# `inline(never)` so a SAMPLING PROFILER can attribute them separately.
+#
+# `out_output` reads as 3.65% of a browser worker's whole thread, and everything the audio
+# path does is inlined into it - the mix, the per-voice fill, the resampler - so the profile
+# says "audio is expensive" and cannot say which half. Turning off inlining for those five
+# functions costs a little speed and buys the attribution; the phase timers cannot substitute,
+# because they cost a sixth of the frame at this call rate.
+#
+# Off by default: an inlining barrier left in a shipping build is a permanent tax paid for a
+# question that was answered once.
+profile-symbols = []
+
 [dev-dependencies]
+# The AAC seam, for the movie-audio test only: it drives the guest's own SceMp4 and
+# SceAudiodec calls end to end, and without a real decoder behind them the test would
+# assert on silence. Features unify per build, so this does not put a decoder in the
+# engine's own dependency graph.
+vitaslop-platform = { path = "../vitaslop-platform", features = ["aac"] }
+
+# Dev-only: the `disasm` example prints guest instructions when recovering an
+# undocumented library from its call sites. The transpiler already decodes with this.
+yaxpeax-arm = { path = "../../../yaxpeax-arm", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arch = { version = "0.3.1", default-features = false }
 # Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.
 wasmparser = "0.253"

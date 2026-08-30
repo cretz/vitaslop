@@ -325,22 +325,7 @@ fn assumed_varying_orders_the_vertex_code_contradicts() {
         checked += 1;
 
         let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
-        let mut written: Vec<bool> = Vec::new();
-        for instr in &shader.instrs {
-            let Some(d) = instr.dest.as_ref() else { continue };
-            if d.bank != Bank::Output {
-                continue;
-            }
-            for c in 0..4 {
-                if instr.write_mask[c] {
-                    let lane = d.index as usize + c;
-                    if written.len() <= lane {
-                        written.resize(lane + 1, false);
-                    }
-                    written[lane] = true;
-                }
-            }
-        }
+        let written = vitaslop_gxp_shader::usse::written_output_lanes(&shader);
         let in_a_run = |lane: usize| {
             lane < POSITION_LANES
                 || p.output_varyings.iter().any(|v| {
@@ -688,7 +673,7 @@ fn print_one_blob() {
             let list: Vec<String> = p
                 .containers
                 .iter()
-                .map(|c| format!("{}{} @ sa[{}]", c.index, names(c.index), c.base_sa))
+                .map(|c| format!("{}{} @ sa[{}] x{}", c.index, names(c.index), c.base_sa, c.size_regs))
                 .collect();
             println!("  CONTAINERS {}", list.join(", "));
         } else {
@@ -729,14 +714,25 @@ fn print_one_blob() {
         // only thing that says WHICH varying a `Output[n] <- PrimaryAttr[n]` copy carries.
         for prm in &p.parameters {
             println!(
-                "  PARAM {:<24} category={:?} type={:?} components={} array={} resource_index={} \
-                 semantic={}.{}",
+                "  PARAM {:<24} category={:?} type={:?} components={} array={} container={} \
+                 resource_index={}{} semantic={}.{}",
                 prm.name,
                 prm.category,
                 prm.ptype,
                 prm.component_count,
                 prm.array_size,
+                prm.container_index,
                 prm.resource_index,
+                // A uniform's `resource_index` is an offset within ITS OWN container, and the
+                // container's `base_sa` is what turns it into the SA register the USSE code
+                // actually addresses. Printing the sum is the whole point: reading a param list
+                // beside a disassembly means doing this addition by hand on every line, and
+                // getting it wrong is indistinguishable from a decode bug.
+                p.containers
+                    .iter()
+                    .find(|c| u16::from(prm.container_index) == c.index)
+                    .map(|c| format!(" (sa[{}])", c.base_sa as i64 + prm.resource_index as i64))
+                    .unwrap_or_default(),
                 prm.semantic,
                 prm.semantic_index
             );
@@ -1493,11 +1489,24 @@ fn every_declared_uniform_fits_the_size_we_report_to_the_guest() {
     let Some(dir) = corpus_dir() else { return };
     let mut over = 0usize;
     let mut total = 0usize;
+    let mut elsewhere = std::collections::BTreeMap::<u8, usize>::new();
     for (name, bytes) in blobs(&dir) {
         let Ok(p) = Program::parse(&bytes) else { continue };
         total += 1;
         for prm in &p.parameters {
             if prm.category != vitaslop_gxp_shader::container::ParamCategory::Uniform {
+                continue;
+            }
+            // >>> A UNIFORM IS NOT NECESSARILY IN THE DEFAULT BUFFER, and this test used to
+            // assume it was. `Parameter::container_index` says which block it lives in, and its
+            // `resource_index` is an offset within THAT block - so measuring a buffer-3
+            // parameter against the DEFAULT buffer's declared size compares two different
+            // address spaces. It made the report unreadable: one program's `g_BoneMatrix` is
+            // `F32[2160]`, which "overruns" a 28-register default buffer by 2,132 registers and
+            // is not in it at all. Counted by container instead, so the ones that ARE in the
+            // default buffer stand out.
+            if prm.container_index != DEFAULT_UNIFORM_CONTAINER {
+                *elsewhere.entry(prm.container_index).or_default() += 1;
                 continue;
             }
             let Some(cb) = prm.ptype.component_bytes() else { continue };
@@ -1526,7 +1535,16 @@ fn every_declared_uniform_fits_the_size_we_report_to_the_guest() {
         }
     }
     println!("\n-- {over} declared uniforms lie past the reported size, over {total} programs --");
+    println!(
+        "-- and {} uniforms are NOT in the default buffer at all, by container: {elsewhere:?} \
+         (their resource_index is an offset in their own block and says nothing about this) --",
+        elsewhere.values().sum::<usize>(),
+    );
 }
+
+/// The container index the DEFAULT uniform buffer occupies - see [`Container::index`], where
+/// 0..13 are the ordinary uniform buffers and 14 is the default one.
+const DEFAULT_UNIFORM_CONTAINER: u8 = 14;
 
 /// >>> How does a `SMP`'s sampler FIELD address the texture-control table? Ask the whole corpus.
 ///
@@ -2390,11 +2408,21 @@ fn usse_memory_group_field_census() {
     // one example name.
     let mut rows: BTreeMap<(u32, u32, u32, u32, u32, u32), (usize, String)> = BTreeMap::new();
     let mut programs = 0usize;
+    // Second table, for the ONE field that still blocks this group on a shipped title:
+    // `moe_expand` (bit 53) against the element count, and against whether ANY SMLSI has
+    // executed earlier in the same program. "Expansion" can only be the identity while the
+    // MOE state is its default `Increment(1)` and there is a single element to expand, so
+    // those two columns are what decide whether the blocked case needs a semantics at all.
+    let mut moe: BTreeMap<(u32, u32, u32, bool), (usize, String)> = BTreeMap::new();
     for (name, bytes) in blobs(&dir) {
         let Ok(p) = Program::parse(&bytes) else { continue };
         let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
         let mut hit = false;
+        let mut smlsi_seen = false;
         for instr in &shader.instrs {
+            if vitaslop_gxp_shader::usse::decode::is_smlsi(instr.raw) {
+                smlsi_seen = true;
+            }
             if instr.group != 0x1d && instr.group != 0x1e {
                 continue;
             }
@@ -2409,6 +2437,9 @@ fn usse_memory_group_field_census() {
                 f(w, 47, 44) + 1,                  // elements
             );
             let e = rows.entry(key).or_insert((0, name.clone()));
+            e.0 += 1;
+            let mk = (f(w, 60, 59), f(w, 53, 53), f(w, 47, 44) + 1, smlsi_seen);
+            let e = moe.entry(mk).or_insert((0, name.clone()));
             e.0 += 1;
         }
         if hit {
@@ -2436,4 +2467,715 @@ fn usse_memory_group_field_census() {
             "  {dirn}  {mode}    {addr_mode}    {ty}    {bank:<9}       {elems:<5}  {n:<5}  {example}"
         );
     }
+    println!("
+-- moe_expand (bit 53) x elements x SMLSI-earlier-in-program --");
+    println!("  dir  moe_expand  elems  smlsi_before  count  example");
+    for ((dir_, m, elems, smlsi), (n, example)) in &moe {
+        let dirn = match dir_ {
+            1 => "LD",
+            2 => "ST",
+            _ => "??",
+        };
+        println!("  {dirn}   {m}           {elems:<5}  {smlsi:<12}  {n:<5}  {example}");
+    }
+}
+
+/// Census of the 0x18 DOT group's bits 47:44 - the four bits every group with a documented
+/// `repeat_count` puts it at, and which this group's own field table names `unk7`, `abs_op2`,
+/// `swz_en_strange1`, `swz_en_strange0`.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn dot_repeat_field_census() {
+    use std::collections::BTreeMap;
+    let Some(dir) = corpus_dir() else { return };
+    let mut hist: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut blobs_with: BTreeMap<String, Vec<(usize, u64)>> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (i, w) in p.code.iter().chain(p.secondary_code.iter()).enumerate() {
+            if (w >> 59) & 0x1f != 0x03 {
+                continue;
+            }
+            // opcode2 (word bit 53) splits DOT (0) from MAD (1).
+            if (w >> 53) & 1 != 0 {
+                continue;
+            }
+            let f = (w >> 44) & 0xf;
+            *hist.entry(f).or_default() += 1;
+            if f != 0 {
+                blobs_with.entry(name.clone()).or_default().push((i, *w));
+            }
+        }
+    }
+    println!("0x18 DOT bits 47:44 histogram:");
+    for (v, n) in &hist {
+        println!("  {v:#03x} (unk7={} abs_op2={} strange1={} strange0={}): {n}", v >> 3, (v >> 2) & 1, (v >> 1) & 1, v & 1);
+    }
+    println!("blobs with a non-zero field: {}", blobs_with.len());
+    for (name, ws) in blobs_with.iter().take(20) {
+        let list: Vec<String> = ws.iter().map(|(i, w)| format!("#{i}={w:#018x}")).collect();
+        println!("  {name}: {}", list.join(" "));
+    }
+}
+
+/// Census of the 0xD0 `mad` group (opcode1 = 0x1a): every word in the corpus, every bit
+/// position's set-count, and the distinct words with the programs they appear in.
+///
+/// The wiki gives this group's opcode1, its 3-bit predicate (58:56), a reserved-zero at bit 53,
+/// a `modifier` at 52 (`s0`/`s1`) and a `data_format` at 41 (u32/i32) - and marks EVERY operand
+/// byte "?". This is the raw material for settling the rest.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn group_d0_word_census() {
+    let Some(dir) = corpus_dir() else { return };
+    let mut hist: BTreeMap<u64, Vec<(String, usize)>> = BTreeMap::new();
+    let mut bit_set = [0usize; 64];
+    let mut total = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (i, w) in p.code.iter().chain(p.secondary_code.iter()).enumerate() {
+            if (w >> 59) & 0x1f != 0x1a {
+                continue;
+            }
+            total += 1;
+            for b in 0..64 {
+                if (w >> b) & 1 != 0 {
+                    bit_set[b] += 1;
+                }
+            }
+            hist.entry(*w).or_default().push((name.clone(), i));
+        }
+    }
+    println!("\n-- 0xD0 group: {total} words, {} distinct --", hist.len());
+    println!("bit set-counts (bit: count/total):");
+    for b in (0..64).rev() {
+        let c = bit_set[b];
+        let tag = if c == 0 { "ZERO" } else if c == total { "ONE " } else { "vary" };
+        println!("  bit {b:>2}: {c:>4}/{total}  {tag}");
+    }
+    println!("\ndistinct words:");
+    for (w, uses) in &hist {
+        let names: Vec<String> =
+            uses.iter().take(6).map(|(n, i)| format!("{n}#{i}")).collect();
+        println!("  {w:#018x}  x{:<4} {}", uses.len(), names.join(" "));
+    }
+}
+
+/// Census of INTERNAL-REGISTER def-use across the corpus, split by the PRECISION of the
+/// instruction that writes and the one that reads.
+///
+/// The emitter reads every bank at the instruction's own precision, so an F16 instruction
+/// reading `i0` takes two 32-bit registers as four packed halves while an F32 one takes four
+/// registers as four floats. If a single internal register is routinely written at one
+/// precision and read at the other, that model cannot be what the hardware does - the two
+/// readings do not even touch the same registers.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn internal_register_def_use_precision_census() {
+    use vitaslop_gxp_shader::ir::{Bank, Op};
+    let Some(dir) = corpus_dir() else { return };
+    // (writer half, reader half) -> (uses, one example)
+    let mut pairs: BTreeMap<(bool, bool), (usize, String)> = BTreeMap::new();
+    let mut mixed_programs = 0usize;
+    let mut programs = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for shader in [
+            vitaslop_gxp_shader::usse::decode_shader(&p),
+            vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
+        ] {
+            if shader.instrs.is_empty() {
+                continue;
+            }
+            programs += 1;
+            // The precision the last writer of each internal LANE used, or `None` if no
+            // instruction has written it yet in stream order.
+            let mut wrote: [Option<bool>; 16] = [None; 16];
+            let mut mixed_here = false;
+            for instr in &shader.instrs {
+                if matches!(instr.op, Op::Branch { .. } | Op::Nop) {
+                    continue;
+                }
+                for src in &instr.srcs {
+                    if !matches!(src.bank, Bank::Internal) {
+                        continue;
+                    }
+                    // Every lane this read touches under the CURRENT model, so the tally is
+                    // about the model actually in the emitter and not an idealised one.
+                    for c in 0..4usize {
+                        if !instr.write_mask[c] {
+                            continue;
+                        }
+                        let half = instr.source_half_precision();
+                        let lane = src.index as usize
+                            + if half { c >> 1 } else { c };
+                        let Some(Some(w)) = wrote.get(lane).copied() else { continue };
+                        let e = pairs.entry((w, half)).or_insert((0, name.clone()));
+                        e.0 += 1;
+                        if w != half {
+                            mixed_here = true;
+                        }
+                    }
+                }
+                let Some(d) = instr.dest else { continue };
+                if !matches!(d.bank, Bank::Internal) {
+                    continue;
+                }
+                for c in 0..4usize {
+                    if !instr.write_mask[c] {
+                        continue;
+                    }
+                    let lane = d.index as usize
+                        + if instr.half_precision { c >> 1 } else { c };
+                    if let Some(slot) = wrote.get_mut(lane) {
+                        *slot = Some(instr.half_precision);
+                    }
+                }
+            }
+            if mixed_here {
+                mixed_programs += 1;
+            }
+        }
+    }
+    println!(
+        "\n-- internal-register def-use precision over {programs} programs \
+         ({mixed_programs} mix precisions on one lane) --"
+    );
+    for ((w, r), (n, example)) in &pairs {
+        let name = |h: &bool| if *h { "f16" } else { "f32" };
+        println!("  written {} -> read {}: {n:<6} e.g. {example}", name(w), name(r));
+    }
+}
+
+/// Every instruction that touches an internal register, in the programs that read one at a
+/// DIFFERENT precision from the one that wrote it - the whole evidence for what an internal
+/// register's storage format is.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn internal_register_mixed_precision_programs() {
+    use vitaslop_gxp_shader::ir::{Bank, Op};
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let touches = |i: &vitaslop_gxp_shader::ir::Instr| {
+            i.dest.is_some_and(|d| matches!(d.bank, Bank::Internal))
+                || i.srcs.iter().any(|s| matches!(s.bank, Bank::Internal))
+        };
+        let halves: Vec<bool> = shader
+            .instrs
+            .iter()
+            .filter(|i| touches(i) && !matches!(i.op, Op::Branch { .. } | Op::Nop))
+            .map(|i| i.half_precision)
+            .collect();
+        if halves.iter().any(|&h| h) && halves.iter().any(|&h| !h) {
+            println!("\n== {name}");
+            for (at, instr) in shader.instrs.iter().enumerate() {
+                if !touches(instr) {
+                    continue;
+                }
+                println!(
+                    "  #{at:<3} {:<10} half={} mask={:?} dst={:?} srcs={:?}",
+                    instr.op.mnemonic(),
+                    instr.half_precision,
+                    instr.write_mask,
+                    instr.dest.map(|d| (d.bank, d.index)),
+                    instr
+                        .srcs
+                        .iter()
+                        .map(|s| (s.bank, s.index, s.swizzle))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+/// A digest of every blob's recompiled WGSL, so an emitter change can be diffed over the whole
+/// corpus at once: run it before and after, and the blobs whose line differs are exactly the
+/// ones the change touched.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn digest_every_blob_wgsl() {
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else {
+            println!("{name} PARSE-FAIL");
+            continue;
+        };
+        let body = match p.kind {
+            ProgramKind::Vertex => recompile_vertex(&bytes).map(|m| m.wgsl_body),
+            _ => recompile_fragment(&bytes).map(|m| m.wgsl_body),
+        };
+        match body {
+            Ok(w) => {
+                // FNV-1a over the emitted text: stable, dependency-free, and enough to say
+                // "this blob's output changed".
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in w.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                println!("{name} {h:016x} {}", w.len());
+            }
+            Err(e) => println!("{name} BLOCKED {e}"),
+        }
+    }
+}
+
+/// Every distinct word of one opcode group across the corpus, with the programs it appears in.
+/// Set `VITASLOP_GXP_GROUP` to the 5-bit `opcode1` value in hex (e.g. `0f` for VTSTMSK).
+///
+/// Reads the parsed CODE region rather than the file, so string tables and parameter data
+/// cannot masquerade as instructions - which a raw byte scan for a top-five-bit pattern
+/// otherwise does, in quantity.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS and VITASLOP_GXP_GROUP"]
+fn group_word_census() {
+    let Some(dir) = corpus_dir() else { return };
+    let Some(group) = std::env::var("VITASLOP_GXP_GROUP")
+        .ok()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    else {
+        eprintln!("set VITASLOP_GXP_GROUP=<opcode1 in hex>");
+        return;
+    };
+    let mut hist: BTreeMap<u64, Vec<(String, usize)>> = BTreeMap::new();
+    let mut bit_set = [0usize; 64];
+    let mut total = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (i, w) in p.code.iter().chain(p.secondary_code.iter()).enumerate() {
+            if (w >> 59) & 0x1f != group {
+                continue;
+            }
+            total += 1;
+            for (b, slot) in bit_set.iter_mut().enumerate() {
+                if (w >> b) & 1 != 0 {
+                    *slot += 1;
+                }
+            }
+            hist.entry(*w).or_default().push((name.clone(), i));
+        }
+    }
+    println!("\n-- group {group:#04x}: {total} words, {} distinct --", hist.len());
+    let varying: Vec<usize> =
+        (0..64).rev().filter(|&b| bit_set[b] != 0 && bit_set[b] != total).collect();
+    let ones: Vec<usize> = (0..64).rev().filter(|&b| bit_set[b] == total && total > 0).collect();
+    println!("  always set: {ones:?}");
+    println!("  varying:    {varying:?}");
+    for (w, uses) in &hist {
+        let names: Vec<String> = uses.iter().take(6).map(|(n, i)| format!("{n}#{i}")).collect();
+        println!("  {w:#018x}  x{:<4} {}", uses.len(), names.join(" "));
+    }
+}
+
+/// Every program that carries a 0xE8 memory load, with the uniform-buffer shape the memory
+/// window resolves against - or the reason it does not.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn memory_window_resolution_census() {
+    use vitaslop_gxp_shader::container::ParamCategory;
+    use vitaslop_gxp_shader::ir::Op;
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        if !shader.instrs.iter().any(|i| matches!(i.op, Op::MemLoad { .. })) {
+            continue;
+        }
+        let sa_resident = p.sa_uniform_buffers();
+        println!("\n== {name} ({:?})", p.kind);
+        println!("  window: {:?}", vitaslop_gxp_shader::module::resolve_mem_windows(&p, &shader));
+        println!("  sa-resident buffers: {sa_resident:?}");
+        println!("  +0x78 bindings: {:?}", p.uniform_buffer_bindings);
+        for c in &p.containers {
+            println!("    CONTAINER {} @ sa[{}] x{}", c.index, c.base_sa, c.size_regs);
+        }
+        for par in &p.parameters {
+            if par.category != ParamCategory::UniformBuffer {
+                continue;
+            }
+            println!(
+                "    UB param name={:?} resource_index={} array_size={} container={}",
+                par.name, par.resource_index, par.array_size, par.container_index
+            );
+        }
+    }
+}
+
+/// For every program with a 0xE8 memory load: which SA registers at or above the DATA
+/// container it READS, and which instruction reads each. The +0x78 table places a bound
+/// buffer's guest ADDRESS in one of those registers, so this is what says whether a table
+/// entry is live.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn data_container_sa_reads_census() {
+    use vitaslop_gxp_shader::ir::{Bank, Op};
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        if !shader.instrs.iter().any(|i| matches!(i.op, Op::MemLoad { .. })) {
+            continue;
+        }
+        let Some(data) = p.containers.iter().find(|c| c.index == 19) else { continue };
+        println!("\n== {name}: DATA @ sa[{}] x{}", data.base_sa, data.size_regs);
+        let lo = u32::from(data.base_sa);
+        let hi = lo + u32::from(data.size_regs);
+        let mut seen: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for (at, instr) in shader.instrs.iter().enumerate() {
+            for src in &instr.srcs {
+                if src.bank != Bank::SecondaryAttr {
+                    continue;
+                }
+                let r = u32::from(src.index);
+                if r < lo || r >= hi {
+                    continue;
+                }
+                seen.entry(r).or_default().push(format!("#{at} {}", instr.op.mnemonic()));
+            }
+        }
+        for (r, who) in &seen {
+            let lit = p.literals.iter().find(|(reg, _)| *reg == *r).map(|(_, v)| *v);
+            println!("  sa[{r}] slot {} literal={lit:?} read by {}", r - lo, who.join(", "));
+        }
+    }
+}
+
+/// Every AMBIGUOUS-order vertex program with the two verdicts the linker's convention gate can
+/// return: the STRICT one it uses today (every written lane inside a run AND every run's first
+/// lane written) and the one `assumed_varying_orders_the_vertex_code_contradicts` established
+/// (only a write BELOW the top of the layout that no run covers refutes a layout).
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn ambiguous_order_convention_gate_census() {
+    use vitaslop_gxp_shader::container::VaryingOrder;
+    use vitaslop_gxp_shader::ir::Bank;
+    const POSITION_LANES: usize = 4;
+    let Some(dir) = corpus_dir() else { return };
+    let (mut n, mut both, mut relaxed_only, mut neither) = (0usize, 0usize, 0usize, 0usize);
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Vertex || p.output_order != VaryingOrder::Ambiguous {
+            continue;
+        }
+        n += 1;
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let written = vitaslop_gxp_shader::usse::written_output_lanes(&shader);
+        let in_a_run = |lane: usize| {
+            lane < POSITION_LANES
+                || p.output_varyings.iter().any(|v| {
+                    let lo = v.base_lane as usize;
+                    lane >= lo && lane < lo + v.components as usize
+                })
+        };
+        let top = p
+            .output_varyings
+            .iter()
+            .map(|v| v.base_lane as usize + v.components as usize)
+            .max()
+            .unwrap_or(0);
+        let stray: Vec<usize> =
+            written.iter().enumerate().filter(|&(l, &w)| w && !in_a_run(l)).map(|(l, _)| l).collect();
+        let inside: Vec<usize> = stray.iter().copied().filter(|&l| l < top).collect();
+        let above: Vec<usize> = stray.iter().copied().filter(|&l| l >= top).collect();
+        let unstarted: Vec<String> = p
+            .output_varyings
+            .iter()
+            .filter(|v| !written.get(v.base_lane as usize).copied().unwrap_or(false))
+            .map(|v| format!("{:?}@{}", v.usage, v.base_lane))
+            .collect();
+        let strict = stray.is_empty() && unstarted.is_empty();
+        let relaxed = inside.is_empty();
+        match (strict, relaxed) {
+            (true, _) => both += 1,
+            (false, true) => relaxed_only += 1,
+            (false, false) => neither += 1,
+        }
+        println!(
+            "{name}: varyings={} strict={strict} relaxed={relaxed} inside={inside:?} \
+             above={above:?} unstarted=[{}]",
+            p.output_varyings.len(),
+            unstarted.join(" ")
+        );
+    }
+    println!(
+        "\nambiguous-order vertex programs: {n}; {both} pass both gates, {relaxed_only} pass only \
+         the established (relaxed) one, {neither} pass neither"
+    );
+}
+
+/// The closure behind the group-0x1a reading: EVERY group-0x1a instruction in the corpus is
+/// part of a well-formed multiply-add pair, so the step semantics are only ever used where the
+/// pair's net result is the same under every reading of `sn` that survives (see
+/// `decode_grp_imad32_step`).
+///
+/// This is the statement that would break first if a new title used the group differently, and
+/// it is the one that makes the decode safe rather than merely plausible - so it ASSERTS.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn every_imad_step_is_part_of_a_pair() {
+    use vitaslop_gxp_shader::ir::Op;
+    let Some(dir) = corpus_dir() else { return };
+    let (mut steps, mut programs) = (0usize, 0usize);
+    let mut lone: Vec<String> = Vec::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let mut here = 0usize;
+        for (at, instr) in shader.instrs.iter().enumerate() {
+            if !matches!(instr.op, Op::IntMadStep { .. }) {
+                continue;
+            }
+            here += 1;
+            steps += 1;
+            if let Some(why) = instr.blocked {
+                lone.push(format!("{name}#{at}: {why}"));
+            }
+        }
+        if here > 0 {
+            programs += 1;
+        }
+    }
+    println!("group 0x1a: {steps} steps over {programs} programs, {} not in a pair", lone.len());
+    assert!(lone.is_empty(), "a group-0x1a step outside a well-formed pair:\n{}", lone.join("\n"));
+}
+
+/// The closure behind the group-0xE0 GATHER reading: every gather in the corpus samples a
+/// ONE-component texture, which is what fixes where its four bilinear coefficients land
+/// (`dest + 4`, after the four gathered texels). A wider sampler would put them somewhere this
+/// decode cannot name, so the day one appears is the day this fails and says so.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn every_gather4_samples_a_single_component_texture() {
+    use vitaslop_gxp_shader::ir::Op;
+    let Some(dir) = corpus_dir() else { return };
+    let mut found = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        for (at, instr) in shader.instrs.iter().enumerate() {
+            let Op::TexGather { unit, .. } = instr.op else { continue };
+            found += 1;
+            let comps = p.sampler_at(u32::from(unit)).map_or(0, |s| s.component_count);
+            if comps != 1 || instr.blocked.is_some() {
+                wrong.push(format!("{name}#{at}: unit {unit} has {comps} component(s), blocked={:?}", instr.blocked));
+            }
+        }
+    }
+    println!("group 0xE0 gather4: {found} instructions, {} outside the established shape", wrong.len());
+    assert!(wrong.is_empty(), "a gather4 outside the established shape:\n{}", wrong.join("\n"));
+}
+
+/// Every program that declares a uniform BUFFER neither path feeds: not SA-resident (the
+/// driver copies it into the register file) and not a memory window (the program chases its
+/// address). Such a program reads ZEROES where the guest put data, silently.
+///
+/// This is the offline form of the renderer's `report_unfed_uniforms`, so the same question
+/// can be answered over the whole corpus instead of one run's pairs.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn uniform_buffers_neither_path_feeds() {
+    use vitaslop_gxp_shader::container::ParamCategory;
+    let Some(dir) = corpus_dir() else { return };
+    let (mut declared, mut unfed_programs) = (0usize, 0usize);
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let bufs: Vec<&vitaslop_gxp_shader::container::Parameter> = p
+            .parameters
+            .iter()
+            .filter(|q| q.category == ParamCategory::UniformBuffer)
+            .collect();
+        if bufs.is_empty() {
+            continue;
+        }
+        declared += 1;
+        let resident = p.sa_uniform_buffers();
+        let windows = vitaslop_gxp_shader::mem_windows_for_vertex_blob(&bytes);
+        let unfed: Vec<String> = bufs
+            .iter()
+            .filter(|q| {
+                q.resource_index < 0
+                    || !(resident.iter().any(|b| b.buffer_index == q.resource_index as u32)
+                        || windows.iter().any(|w| w.buffer_index == q.resource_index as u32))
+            })
+            .map(|q| format!("buffer {} ({} bytes, container {})", q.resource_index, q.array_size, q.container_index))
+            .collect();
+        if !unfed.is_empty() {
+            unfed_programs += 1;
+            println!("{name} ({:?}): {}", p.kind, unfed.join(", "));
+        }
+    }
+    println!(
+        "\n{declared} programs declare a uniform buffer; {unfed_programs} declare one neither \
+         path feeds"
+    );
+}
+
+/// The DEFAULT uniform buffer's SA container ends exactly on a PARAMETER boundary, over every
+/// blob in the corpus that has both a container 14 and a pointer to the same buffer.
+///
+/// This is the oracle for [`MemWindow::base_offset`]. The reading it pins is that the driver
+/// copies `container 14`'s `size_regs` into the SA file and points the DATA slot at the FIRST
+/// REGISTER IT DID NOT COPY, so a program reaches its overflow parameters at small offsets from
+/// that pointer. If that is right, the cut must fall between two parameters and never through
+/// one - a container ending mid-`float4` would leave half a parameter in each address space and
+/// no offset could name it.
+///
+/// It is what turns two hand-checked programs into a corpus statement. The two:
+/// `vert_820d6730` carries 31 of 34 registers and its leftover is exactly `sunColor` (reg 31,
+/// 3 components); `vert_81d72040` carries 14 of 28 and its leftover is exactly
+/// `g_DiffuseRange` + `g_Material.{diffuse,fresnel,ambient}` (regs 14..28).
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn the_default_uniform_container_ends_on_a_parameter_boundary() {
+    use vitaslop_gxp_shader::container::ParamCategory;
+    let Some(dir) = corpus_dir() else { return };
+    let mut checked = 0usize;
+    let mut reached = 0usize;
+    let mut fully_carried_with_a_pointer: Vec<String> = Vec::new();
+    let mut straddled: Vec<String> = Vec::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let Some(c) = p.containers.iter().find(|c| c.index == 14) else { continue };
+        let carried = u32::from(c.size_regs);
+        // Only programs that actually reach past the copy - otherwise the boundary is the end
+        // of the buffer and says nothing.
+        //
+        // But COUNT the other case, because it is where this change could newly REFUSE a
+        // program that used to link: with nothing left past the copy the window is zero bytes,
+        // and `resolve_mem_windows` treats a zero-size buffer whose pointer register is READ as
+        // unestablished rather than guessing. If any program in a shipped title is that shape,
+        // the fix would drop it to fixed-function and the sweep would have to catch it.
+        if carried >= p.default_uniform_regs {
+            let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+            let points_at_default = p
+                .uniform_buffer_bindings
+                .iter()
+                .any(|b| b.buffer_index == 14);
+            let loads = shader
+                .instrs
+                .iter()
+                .any(|i| matches!(i.op, vitaslop_gxp_shader::ir::Op::MemLoad { .. }));
+            if points_at_default && loads {
+                fully_carried_with_a_pointer.push(name.clone());
+            }
+            continue;
+        }
+        checked += 1;
+        // A parameter STRADDLES the cut when it starts before `carried` and ends after it. Its
+        // extent is components x array, in the register units `resource_index` is expressed in
+        // for an F32 uniform - the only type any of these declare.
+        let straddling: Vec<String> = p
+            .parameters
+            .iter()
+            .filter(|q| {
+                q.category == ParamCategory::Uniform
+                    && q.container_index == 14
+                    && q.resource_index >= 0
+            })
+            .filter_map(|q| {
+                let start = q.resource_index as u32;
+                // The extent in REGISTERS, not components: an F16 uniform packs TWO components
+                // into one 32-bit register, so `float4` there is 2 registers and not 4. Counting
+                // components reported two of this corpus's fragment programs as straddling a cut
+                // that in fact falls exactly at the end of their only parameter.
+                // [[vitaslop-uniform-extent-is-registers-not-components]]
+                let width = u32::from(q.ptype.component_bytes().unwrap_or(4));
+                let regs = (u32::from(q.component_count.max(1)) * q.array_size.max(1) * width)
+                    .div_ceil(4);
+                (start < carried && start + regs > carried)
+                    .then(|| format!("{} at reg {start} x{regs}", q.name))
+            })
+            .collect();
+        // Whether the offset actually REACHES this program - i.e. whether it resolves a window
+        // for buffer 14 at all. A program with a partly-carried buffer but no memory load never
+        // chases the pointer, so the boundary above is true of it and inert for it, and the
+        // no-regression claim for the other titles rests on this column rather than on a sweep.
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let window = vitaslop_gxp_shader::module::resolve_mem_windows(&p, &shader)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| w.buffer_index == 14);
+        if window.is_some() {
+            reached += 1;
+        }
+        println!(
+            "{name}: container 14 carries {carried} of {} declared registers - {}{}",
+            p.default_uniform_regs,
+            match &window {
+                Some(w) => format!("pointer at +{} over {} bytes", w.base_offset, w.bytes),
+                None => "NO window (it never chases the pointer)".to_string(),
+            },
+            if straddling.is_empty() { String::new() } else { format!("  STRADDLED BY {}", straddling.join(", ")) }
+        );
+        if !straddling.is_empty() {
+            straddled.push(format!("{name}: {}", straddling.join(", ")));
+        }
+    }
+    println!(
+        "
+{checked} programs keep part of their default uniform buffer past container 14;          {reached} of them actually chase the pointer, and only those are affected by          `MemWindow::base_offset`"
+    );
+    assert!(
+        fully_carried_with_a_pointer.is_empty(),
+        "these programs carry their WHOLE default uniform buffer in container 14 yet still take a          pointer to it and load memory - nothing is left past the copy, so `base_offset` would          make their window zero bytes and `resolve_mem_windows` would refuse them: {:#?}",
+        fully_carried_with_a_pointer
+    );
+    assert!(
+        straddled.is_empty(),
+        "the default uniform container cuts THROUGH a parameter, so the pointer's offset cannot          name it and `MemWindow::base_offset` is the wrong reading: {straddled:#?}"
+    );
+}
+
+/// Every blob whose decoded stream contains a BACKWARD branch - i.e. every blob whose recompile
+/// depends on the loop reconstruction rather than on the straight-line skip structuring.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn blobs_with_a_backward_branch() {
+    use vitaslop_gxp_shader::ir::Op;
+    let Some(dir) = corpus_dir() else { return };
+    let mut n = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let back: Vec<usize> = shader
+            .instrs
+            .iter()
+            .enumerate()
+            .filter(|(at, i)| matches!(i.op, Op::Branch { rel } if *at as i64 + rel as i64 <= *at as i64))
+            .map(|(at, _)| at)
+            .collect();
+        if !back.is_empty() {
+            n += 1;
+            println!("{name} ({:?}): backward branches at {back:?}", p.kind);
+        }
+    }
+    println!("
+{n} blob(s) carry a backward branch");
+}
+
+/// Every blob whose +0x78 uniform-buffer binding table has more than ONE entry - the only
+/// blobs whose parse can differ between an 8-byte and a 16-byte entry stride - with the
+/// SA-RESIDENT buffer list that table filters.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn multi_entry_uniform_buffer_binding_tables() {
+    let Some(dir) = corpus_dir() else { return };
+    let mut n = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.uniform_buffer_bindings.len() < 2 {
+            continue;
+        }
+        n += 1;
+        println!(
+            "{name} ({:?}): {:?} | sa-resident {:?}",
+            p.kind, p.uniform_buffer_bindings, p.sa_uniform_buffers()
+        );
+    }
+    println!("
+{n} blob(s) have more than one +0x78 entry");
 }

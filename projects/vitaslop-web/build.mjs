@@ -29,6 +29,13 @@ function run(cmd, args) {
 }
 
 console.log(`Building vitaslop-web (${profile}) for wasm32...`);
+// `PROFILE_SYMBOLS=1` builds the diagnostic variant: a few audio-path functions are kept
+// out of line so a V8 worker profile can attribute them separately. See the
+// `profile-symbols` feature in vitaslop-runtime/Cargo.toml. Never use it for a timing A/B -
+// it is slower by construction; it is for finding out WHERE the time goes, not how much.
+const features = process.env.PROFILE_SYMBOLS
+  ? ["--features", "vitaslop-runtime/profile-symbols"]
+  : [];
 run("cargo", [
   "build",
   "--manifest-path",
@@ -39,6 +46,7 @@ run("cargo", [
   "wasm32-unknown-unknown",
   "--profile",
   profile,
+  ...features,
 ]);
 
 const wasm = join(projects, "target", "wasm32-unknown-unknown", profileDir, "vitaslop_web.wasm");

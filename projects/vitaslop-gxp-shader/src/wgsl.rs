@@ -323,6 +323,35 @@ impl Prec {
     }
 }
 
+/// The precision an operand in `bank` is really addressed at.
+///
+/// Every ordinary bank stores what the instruction's precision says: an F16 instruction reads
+/// and writes a register as two packed halves, an F32 one as a single float. The INTERNAL
+/// registers do not - they are the pipeline's UNPACKED accumulators, four 32-bit lanes each,
+/// whatever precision the instruction that touches them runs at.
+///
+/// MEASURED, on the shadow filter of a golf title's three world fragment programs, where the
+/// def-use closes only under this reading. One `mov.f32` broadcasts the reference depth into
+/// all four lanes of `i0`; a VTSTMSK (an F32 test) compares the four gathered depths against
+/// those lanes and writes its four-channel mask back into `i0`; and the very next instruction
+/// is an **F16** `dot4` that reads `i0` with the swizzle `[3,2,1,0]` against the sample's four
+/// bilinear coefficients. Under the packed reading that dot reads `i0`'s four selectors as
+/// `i[1].hi, i[1].lo, i[0].hi, i[0].lo` - two registers holding F32 bit patterns, read as four
+/// halves - and the instruction before and the instruction after both address the same register
+/// as four floats. Four distinct mask values cannot live in two packed registers that an F32
+/// test wrote.
+///
+/// This is also what the emitter's own undefined-internal-lane guard has always assumed: it
+/// marks and checks lane `index + selector`, the four-lane layout, with no precision term in
+/// it. The two were simply inconsistent, and the guard is the half that was right.
+fn bank_prec(bank: Bank, prec: Prec) -> Prec {
+    if matches!(bank, Bank::Internal) {
+        Prec::F32
+    } else {
+        prec
+    }
+}
+
 /// The WGSL rvalue reading channel-selector `sel` (0..3) of the register file at `base`.
 fn read_lane(prefix: &str, base: u32, sel: u32, prec: Prec) -> String {
     match prec {
@@ -390,6 +419,7 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
     }
     let prefix = bank_prefix(op.bank)?;
     let sel = op.swizzle[c];
+    let prec = bank_prec(op.bank, prec);
     let mut e = match sel {
         0..=3 => read_lane(prefix, op.index as u32, sel as u32, prec),
         4 => "0.0".to_string(),
@@ -412,6 +442,7 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
 /// paired channel keeps its value - exactly how the hardware packs two halves per register.
 fn store_stmt(op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<String> {
     let prefix = bank_prefix(op.bank)?;
+    let prec = bank_prec(op.bank, prec);
     Some(match prec {
         Prec::F32 => {
             format!("  {prefix}[{}] = bitcast<u32>({expr});\n", op.index as u32 + c as u32)
@@ -478,14 +509,32 @@ impl std::fmt::Write for Dest<'_> {
 impl Dest<'_> {
     /// Emit (or stage) the store of `expr` into destination channel `c`.
     fn store(&mut self, op: &Operand, c: usize, expr: &str, prec: Prec) -> Option<()> {
+        self.store_in_slot(op, c, c, expr, prec)
+    }
+
+    /// [`Self::store`] with the staging temporary named by `slot` rather than by the channel.
+    ///
+    /// Every ordinary instruction writes ONE destination operand, so naming the temporary after
+    /// the channel gives four distinct names and the enclosing block keeps them off every other
+    /// instruction's. A GATHER breaks that: it writes the four texels AND, four registers
+    /// higher, the four bilinear coefficients - eight stores from one instruction. Both groups
+    /// asked for `g0..g3` in one block, which is a WGSL `redefinition of g0` and therefore a
+    /// pipeline the device REFUSES, dropping every draw that uses it. It only bit when the
+    /// gather's destination happened to alias its coordinate operand (staging is off otherwise),
+    /// which is why one title's shadow filter compiled and another title's did not.
+    fn store_in_slot(
+        &mut self,
+        op: &Operand,
+        c: usize,
+        slot: usize,
+        expr: &str,
+        prec: Prec,
+    ) -> Option<()> {
         if !self.stage {
             self.body.push_str(&store_stmt(op, c, expr, prec)?);
             return Some(());
         }
-        // Named by the channel, so the four possible temporaries of one instruction cannot
-        // collide - and the whole instruction is wrapped in a block, so they cannot collide
-        // with another instruction's either.
-        let tmp = format!("g{c}");
+        let tmp = format!("g{slot}");
         let stmt = store_stmt(op, c, &tmp, prec)?;
         let _ = writeln!(self.body, "  let {tmp} = {expr};");
         self.deferred.push(stmt);
@@ -537,6 +586,27 @@ fn dest_aliases_source(instr: &Instr) -> bool {
 /// How many consecutive registers one operand can name: a four-channel F32 vector.
 const OPERAND_REGISTER_SPAN: i32 = 4;
 
+/// Emit the `VITASLOP_GXP_PROBE=<bank><idx>@<instr>` snapshot, if this is that instruction.
+///
+/// Copying the register into locals - rather than having the return expression read the bank
+/// array at the end - is the whole point: every interesting intermediate in a lit material is
+/// written again further down, so the end value answers a different question than the one asked.
+fn emit_probe_snapshot(body: &mut String, index: usize, depth: usize) {
+    let Some(spec) = crate::module::probe_spec() else { return };
+    if spec.at != Some(index) {
+        return;
+    }
+    let pad = "  ".repeat(depth);
+    let (bank, i) = (spec.bank.as_str(), spec.index);
+    let _ = writeln!(
+        body,
+        "{pad}_probe0 = {bank}[{i}]; _probe1 = {bank}[{}]; _probe2 = {bank}[{}];          _probe3 = {bank}[{}];",
+        i + 1,
+        i + 2,
+        i + 3
+    );
+}
+
 /// Emit a WGSL body from a fully-supported IR - the historical fragment entry point. The
 /// USSE arithmetic core is identical for vertex and fragment programs, so this simply
 /// delegates to [`emit_body`]; only the surrounding module I/O wrapper differs by kind.
@@ -573,6 +643,7 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         shader.instrs.len(),
         guard_internal_reads,
         &mut internal_written,
+        None,
         1,
     )?;
     Ok(body)
@@ -623,10 +694,41 @@ fn emit_range(
     exit: usize,
     guard_internal_reads: bool,
     internal_written: &mut [bool; INTERNAL_LANES],
+    open_loop: Option<usize>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let mut index = start;
     while index < end {
+        // A loop is recognised by its BACK EDGE, and the instruction the back edge lands on is
+        // this one - so the check belongs here, before the instruction is emitted as ordinary
+        // straight-line code.
+        // `open_loop` names the back edge of the loop this range is already the body of, and a
+        // back edge points at its own head - so finding it here means `index` is that head and
+        // the loop is already open. Anything else is a new loop starting here.
+        match back_edge_to(shader, index).filter(|&tail| Some(tail) != open_loop) {
+            Some(tail) if tail >= end => {
+                return Err(EmitError::Blocked {
+                    index: tail,
+                    byte_offset: tail * 8,
+                    reason: "0xF8 BR: a loop body extends past its enclosing block",
+                    raw: shader.instrs[tail].raw,
+                });
+            }
+            Some(tail) => {
+                emit_loop(
+                    body,
+                    shader,
+                    index,
+                    tail,
+                    guard_internal_reads,
+                    internal_written,
+                    depth,
+                )?;
+                index = tail + 1;
+                continue;
+            }
+            None => {}
+        }
         let instr = &shader.instrs[index];
         let byte_offset = index * 8;
         if let Some(reason) = instr.blocked {
@@ -637,6 +739,7 @@ fn emit_range(
                 check_internal_reads(instr, index, byte_offset, internal_written)?;
             }
             emit_instr(body, instr, index, byte_offset, shader.kind)?;
+            emit_probe_snapshot(body, index, depth);
             record_internal_writes(instr, internal_written);
             index += 1;
             continue;
@@ -645,6 +748,37 @@ fn emit_range(
         let target = index as i64 + rel as i64;
         if target <= index as i64 {
             return blocked("0xF8 BR jumps backward - a USSE loop is not reconstructed");
+        }
+        // A forward branch to the instruction after the innermost loop's back edge is a BREAK.
+        // It is only reachable here when it leaves the current range - every range inside a loop
+        // body ends at or before the back edge - so this never re-reads a target the ordinary
+        // skip already expresses.
+        if open_loop.is_some_and(|tail| target as usize == tail + 1) && target > end as i64 {
+            // The branch's own predicate is the condition under which it is TAKEN, which is the
+            // condition under which the loop is left - the opposite polarity from the skip form
+            // below, where the guarded range is what runs when the branch is not taken.
+            let taken = match instr.pred {
+                Predicate::Always => None,
+                Predicate::IfP(n) => Some(format!("p[{n}]")),
+                Predicate::IfNotP(n) => Some(format!("!p[{n}]")),
+                Predicate::Raw(_) => {
+                    return blocked("0xF8 BR carries an unresolved predicate encoding")
+                }
+            };
+            let pad = "  ".repeat(depth);
+            match taken {
+                Some(c) => {
+                    let _ = writeln!(body, "{pad}if ({c}) {{ break; }}");
+                    index += 1;
+                }
+                None => {
+                    // Unconditional: everything after it in this range is unreachable, so
+                    // emitting nothing for it is exact rather than a dropped instruction.
+                    let _ = writeln!(body, "{pad}break;");
+                    index = end;
+                }
+            }
+            continue;
         }
         // A branch to this range's own exit point stops the range, which `end` already is.
         // See the `exit` note above: this is a re-indexing of the same control flow, not a
@@ -683,16 +817,38 @@ fn emit_range(
         // retail title's menu fragment programs are this shape.
         // An early exit has no else-arm to recover: its `target - 1` is just the last word of
         // the arm being cut short, not a compiler's jump over an alternative.
+        //
+        // THE MERGE CAN LIE OUTSIDE THIS RANGE, and refusing that is what blocked a whole
+        // title's world. An if / else-if CHAIN compiles to arms that each end in a jump to the
+        // chain's ONE merge point, so the inner arms' jumps target a word past their own
+        // enclosing range's end:
+        //
+        //   28: br !p -> 64     30: br p -> 58     32: br p -> 51     34: br p -> 44
+        //   36: br !p -> 64   37..42: arm A   43: br -> 64
+        //   44..49: arm B     50: br -> 64
+        //   51..56: arm C     57: br -> 64      58..63: arm D      64: the merge
+        //
+        // `e` is that merge and it is this range's own `exit`, which is the same statement as
+        // "control leaves this range and arrives there" - so the arm is structurable after all.
+        // What the range can CONTAIN still stops at `end`, so the else-arm's text is clamped to
+        // it while its exit stays the true merge: ending the range IS the jump. Without this the
+        // chain read as an arm jumping out of its block, the pair fell back to fixed-function,
+        // and the title's terrain, characters and props were painted flat.
         let else_arm = (!early_exit && target > index + 1)
             .then(|| &shader.instrs[target - 1])
             .and_then(|last| match (last.op, last.pred) {
                 (Op::Branch { rel: r }, Predicate::Always) => {
                     let e = (target - 1) as i64 + r as i64;
-                    (e > target as i64 && e <= end as i64 && last.blocked.is_none())
-                        .then_some(e as usize)
+                    (e > target as i64
+                        && (e <= end as i64 || e == exit as i64)
+                        && last.blocked.is_none())
+                    .then_some(e as usize)
                 }
                 _ => None,
             });
+        // Where the else-arm's TEXT stops (never past this range), as against where control
+        // goes when it runs off that text (`else_arm`, the merge).
+        let else_end = else_arm.map(|e| e.min(end));
         match cond {
             // An unconditional branch always skips its range: that range is unreachable and
             // emitting nothing for it is exact, not a dropped instruction.
@@ -713,6 +869,7 @@ fn emit_range(
                     then_exit,
                     guard_internal_reads,
                     internal_written,
+                    open_loop,
                     depth + 1,
                 )?;
                 match else_arm {
@@ -725,10 +882,11 @@ fn emit_range(
                             body,
                             shader,
                             target,
-                            e,
+                            else_end.unwrap_or(e),
                             e,
                             guard_internal_reads,
                             internal_written,
+                            open_loop,
                             depth + 1,
                         )?;
                         let _ = writeln!(body, "{pad}}}");
@@ -738,11 +896,127 @@ fn emit_range(
         }
         // An unconditional branch consumes only its own skip; a conditional one that recovered
         // an else-arm has emitted through to the merge point.
-        index = match (conditional, else_arm) {
+        index = match (conditional, else_end) {
             (true, Some(e)) => e,
             _ => target,
         };
     }
+    Ok(())
+}
+
+/// The back edge of a loop whose HEAD is `head`: the index of a branch that jumps back to
+/// exactly `head`.
+///
+/// The search covers the WHOLE instruction stream rather than the range being emitted, because
+/// a back edge that lands outside that range still makes `head` a loop head - one whose body
+/// leaves the enclosing block, which is irreducible. Finding it here is what lets the caller
+/// say so; searching only the range would meet the same branch later as a bare backward jump
+/// and report the wrong cause.
+///
+/// When more than one branch targets `head` the LAST is taken as the back edge, so a `continue`
+/// earlier in the body falls inside the loop region rather than cutting it short. [`emit_loop`]
+/// then checks that what it found really is a single-entry, single-exit region, and hard-fails
+/// if it is not - this only proposes the region.
+fn back_edge_to(shader: &Shader, head: usize) -> Option<usize> {
+    (head..shader.instrs.len()).rev().find(|&t| {
+        matches!(shader.instrs[t].op, Op::Branch { rel } if t as i64 + rel as i64 == head as i64)
+    })
+}
+
+/// Emit `[head, tail]` - a USSE loop whose back edge is the branch at `tail` - as a WGSL `loop`.
+///
+/// # What the hardware does and what this writes
+/// The compiler lays a loop out as a body ending in a branch back to its first word, with the
+/// exit as a forward branch out of the body:
+///
+/// ```text
+///   head:   the test that computes the loop condition
+///   head+1: br !cond -> tail+1        (leave)
+///   ...     the body
+///   tail:   br       -> head          (go round again)
+///   tail+1: the instruction after the loop
+/// ```
+///
+/// which is exactly a WGSL `loop { ... }` whose exit branches become `break`. Nothing is
+/// reordered and no condition is re-derived: the body is emitted by the same [`emit_range`]
+/// that emits straight-line code, with `open_loop` set to this back edge so a branch to the
+/// instruction after it becomes the `break` it already is.
+///
+/// A CONDITIONAL back edge (`br cond -> head`) means "go round again if cond", so falling out
+/// of the WGSL body must break when it does not hold - the negated form, written after the
+/// body.
+///
+/// # What is checked, and why each check is not optional
+/// A `loop` is only equivalent to the original control flow if the region is single-entry and
+/// its only way out is the exit. All three are verified over the WHOLE instruction stream
+/// rather than the enclosing range, because a branch from outside the range can reach into it
+/// just as easily as one inside:
+///
+///  * exactly ONE branch in the region jumps backward, the back edge itself. A second one is a
+///    second loop sharing this body, which a single `loop` cannot express.
+///  * every branch in the region targets `[head, tail + 1]`. A jump anywhere else leaves the
+///    loop for somewhere that is not its exit, which `break` does not mean.
+///  * no branch from OUTSIDE the region targets STRICTLY INSIDE it. A jump into the middle of
+///    a loop body is a second entry, and a `loop` has one.
+///
+/// Every failure hard-fails naming itself rather than emitting the body straight-line - running
+/// a loop once is the plausible-looking wrong picture this recompiler exists to refuse.
+fn emit_loop(
+    body: &mut String,
+    shader: &Shader,
+    head: usize,
+    tail: usize,
+    guard_internal_reads: bool,
+    internal_written: &mut [bool; INTERNAL_LANES],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let back = &shader.instrs[tail];
+    let blocked = |reason| {
+        Err(EmitError::Blocked { index: tail, byte_offset: tail * 8, reason, raw: back.raw })
+    };
+    if let Some(reason) = back.blocked {
+        return Err(EmitError::Blocked { index: tail, byte_offset: tail * 8, reason, raw: back.raw });
+    }
+    for (at, instr) in shader.instrs.iter().enumerate() {
+        let Op::Branch { rel } = instr.op else { continue };
+        let target = at as i64 + rel as i64;
+        if (head..=tail).contains(&at) {
+            if target <= at as i64 && at != tail {
+                return blocked("0xF8 BR: a second backward branch inside a loop body");
+            }
+            if target < head as i64 || target > tail as i64 + 1 {
+                return blocked("0xF8 BR: a loop body branches somewhere that is neither inside \
+                                the loop nor its exit");
+            }
+        } else if target > head as i64 && target <= tail as i64 {
+            return blocked("0xF8 BR: a branch from outside jumps into the middle of a loop body");
+        }
+    }
+    // The condition under which the back edge is TAKEN - i.e. the loop goes round again - so
+    // the WGSL body breaks on its negation.
+    let repeat = match back.pred {
+        Predicate::Always => None,
+        Predicate::IfP(n) => Some(format!("!p[{n}]")),
+        Predicate::IfNotP(n) => Some(format!("p[{n}]")),
+        Predicate::Raw(_) => return blocked("0xF8 BR carries an unresolved predicate encoding"),
+    };
+    let pad = "  ".repeat(depth);
+    let _ = writeln!(body, "{pad}loop {{");
+    emit_range(
+        body,
+        shader,
+        head,
+        tail,
+        tail,
+        guard_internal_reads,
+        internal_written,
+        Some(tail),
+        depth + 1,
+    )?;
+    if let Some(c) = repeat {
+        let _ = writeln!(body, "{pad}  if ({c}) {{ break; }}");
+    }
+    let _ = writeln!(body, "{pad}}}");
     Ok(())
 }
 
@@ -757,10 +1031,16 @@ fn read_channels(instr: &Instr) -> [bool; 4] {
         }
         // A texture sample reads only its coordinate components (not the full write mask,
         // which covers the 4-channel RESULT), so the internal-read guard checks only those.
-        Op::Tex { coords, .. } => {
+        Op::Tex { coords, .. } | Op::TexGather { coords, .. } => {
             let n = (coords as usize).clamp(1, 4);
             [0 < n, 1 < n, 2 < n, 3 < n]
         }
+        // A memory load's only source is a scalar ADDRESS - one lane, whatever its
+        // destination spans. Its write mask is explicitly not meaningful (the written span is
+        // `elements` consecutive registers), so taking the mask as the read count claims the
+        // three registers ABOVE the pointer are read too. That is how a pointer sitting near
+        // the top of the SA bank made a program look like it read past its uniform buffer.
+        Op::MemLoad { .. } => [true, false, false, false],
         _ => instr.write_mask,
     }
 }
@@ -889,7 +1169,15 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
     // private storage (like pa/sa), sized minimally - this wrapper only validates syntax and
     // typing, never runs.
     if body.contains("gxp_mem") {
+        // A stand-in for the real binding, in the ONE-window shape (header vec4 + 16 bytes)
+        // so a body emitted for a program with a window is still a complete module here.
         let _ = writeln!(m, "var<private> gxp_mem: array<vec4<u32>, 2>;");
+        let _ = m.write_str(&crate::module::mem_window_helper(&[crate::module::MemWindow {
+            buffer_index: 0,
+            bytes: 16,
+            base_sa: 0,
+            base_offset: 0,
+        }]));
     }
     for bank in ["r", "pa", "sa", "o", "i"] {
         let _ = writeln!(m, "var<private> {bank}: array<u32, {BANK_REGS}>;");
@@ -961,10 +1249,17 @@ fn emit_instr(
     // A GLOBAL (SPECIAL hardware register) operand is decoded structurally but has no value
     // until its index's meaning is established. Report it by INDEX, ahead of the generic
     // unmapped-operand path, so the failure says which register to go and establish. The one
-    // established register ([`global_u32_expr`]) is exempt, and only inside the one operation
-    // that reads it as raw bits - a bitwise test. Any other op reading even that register is
-    // outside what the corpus establishes, so it still hard-fails by index.
-    let global_ok = matches!(instr.op, Op::Test { alu: TestAlu::BitAnd, .. });
+    // established register ([`global_u32_expr`]) is exempt, and only inside the operations that
+    // read it as RAW BITS - the bitwise test and the integer one, which share the emitter's
+    // raw-u32 operand path. Any other op reading even that register is outside what the corpus
+    // establishes, so it still hard-fails by index.
+    //
+    // The integer arm is what a third title's lit materials use: `vtst <- GLOBAL[16], SA[zero]`
+    // with EQ and then NE, the two-sided select on the facing bit (see the `(1, 10)` arm in the
+    // VTST decoder). It reads the same 0-or-1 the bitwise form does, through the same
+    // expression; refusing it here would leave those fifteen shaders on the fixed-function
+    // fallback, which is what painted this title's whole world flat.
+    let global_ok = matches!(instr.op, Op::Test { alu: TestAlu::BitAnd | TestAlu::IntSub, .. });
     if let Some(g) = instr
         .srcs
         .iter()
@@ -991,6 +1286,12 @@ fn emit_instr(
     if let Op::Test { alu, cmp, reduce, pdst, write_back } = instr.op {
         emit_test(s, instr, instr.dest.as_ref(), alu, cmp, reduce, pdst, write_back, kind)
             .ok_or_else(unmapped)?;
+        s.flush();
+        return finish_predicated(body, instr, &block(&stmts, staged), index);
+    }
+    if let Op::TestMask { alu, cmp } = instr.op {
+        let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
+        emit_test_mask(s, instr, dest, alu, cmp).ok_or_else(unmapped)?;
         s.flush();
         return finish_predicated(body, instr, &block(&stmts, staged), index);
     }
@@ -1039,6 +1340,10 @@ fn emit_instr(
             emit_unary(s, instr, dest, mask, &|a| a.to_string()).ok_or_else(unmapped)
         }
         Op::Cmov { test } => emit_cmov(s, instr, dest, mask, test).ok_or_else(unmapped),
+        Op::TexGather { unit, coords, coord_half } => {
+            emit_tex_gather(s, instr, dest, unit, coords, coord_half, index, kind)
+                .ok_or_else(unmapped)
+        }
         Op::Tex { unit, coords, coord_half, lod } => {
             emit_tex(s, instr, dest, unit, coords, coord_half, lod, index, kind).ok_or_else(unmapped)
         }
@@ -1049,6 +1354,9 @@ fn emit_instr(
             emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
         Op::IntMad { signed, bits } => emit_int_mad(s, instr, dest, signed, bits).ok_or_else(unmapped),
+        Op::IntMadStep { signed, high_half } => {
+            emit_int_mad_step(s, instr, dest, signed, high_half).ok_or_else(unmapped)
+        }
         // MEMORY LOAD: `elements` consecutive 32-bit guest words from byte address
         // `src0 + offset_bytes` into consecutive destination registers. WGSL has no raw
         // pointers, so the read goes through the draw's bound MEMORY WINDOW: a uniform
@@ -1219,21 +1527,16 @@ fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) 
 /// `elements` consecutive guest words from byte address `src0 + offset_bytes` into
 /// consecutive destination registers, through the draw's bound MEMORY WINDOW.
 ///
-/// The window is `gxp_mem: array<vec4<u32>, N>` where vec4 0 lane x holds the window's own
-/// guest BASE ADDRESS and the window's words start at vec4 1 - so word `w` of the window is
-/// `gxp_mem[1 + w/4][w%4]`. The pointer register and the loaded values are raw 32-bit lanes
-/// (the pointer was computed by the integer pipeline; the data's type is whatever the guest
+/// The windows are bound as one `gxp_mem: array<vec4<u32>, N>` and resolved by ADDRESS
+/// through the `gxp_mem_word` helper the module wrapper emits - see
+/// [`crate::module::mem_window_helper`], which is where the layout and the address dispatch
+/// are documented. The pointer register and the loaded values are raw 32-bit lanes (the
+/// pointer was computed by the integer pipeline; the data's type is whatever the guest
 /// stored), so everything here reads and writes the register file WITHOUT a float view.
 ///
-/// The subtraction assumes the addressed bytes lie inside the window, which the LINKER
-/// established (the window IS the program's one declared uniform buffer, and the host
-/// uploads exactly its declared extent). An address outside it - a guest indexing past its
-/// own declared buffer - lands on WGSL's clamped out-of-bounds read rather than on whatever
-/// bytes happened to follow the buffer on the device; that is the one observable divergence,
-/// it requires the guest to read outside its own declaration, and it cannot read another
-/// draw's data. A byte address that is not 4-aligned truncates to its containing word; the
-/// host refuses the window (dropping the draw, reported) if the BASE is misaligned, and
-/// every in-shader offset is a multiple of the 4-byte element size.
+/// A byte address that is not 4-aligned truncates to its containing word; the host refuses a
+/// window (dropping the draw, reported) if its BASE is misaligned, and every in-shader offset
+/// is a multiple of the 4-byte element size.
 fn emit_mem_load(
     body: &mut Dest,
     instr: &Instr,
@@ -1245,19 +1548,20 @@ fn emit_mem_load(
     let src0 = instr.srcs.first()?;
     let ptr_bank = bank_prefix(src0.bank)?;
     let dest_bank = bank_prefix(dest.bank)?;
-    // The window word index of the FIRST element. Named per instruction so two loads in one
+    // The GUEST address of the first element. Named per instruction so two loads in one
     // (unbraced) function body cannot collide.
     writeln!(
         body,
-        "  let gxp_w{index}: u32 = (({ptr_bank}[{}] + {offset_bytes}u) - gxp_mem[0].x) >> 2u;",
+        "  let gxp_a{index}: u32 = {ptr_bank}[{}] + {offset_bytes}u;",
         src0.index as u32
     )
     .ok()?;
     for k in 0..elements as u32 {
         writeln!(
             body,
-            "  {dest_bank}[{}] = gxp_mem[1u + ((gxp_w{index} + {k}u) >> 2u)][(gxp_w{index} + {k}u) & 3u];",
-            dest.index as u32 + k
+            "  {dest_bank}[{}] = gxp_mem_word(gxp_a{index} + {}u);",
+            dest.index as u32 + k,
+            k * 4
         )
         .ok()?;
     }
@@ -1412,6 +1716,17 @@ fn emit_test(
             bools.push(format!("(({} & {}) {op} 0u)", raw(s1)?, raw(s2)?));
             continue;
         }
+        // The INTEGER family reads its operands as the raw 32-bit lane, signed, exactly as the
+        // 8-bit family reads its as four unorm bytes - see `TestAlu::IntSub`. Parenthesised for
+        // the same precedence reason the bitwise arm is.
+        if matches!(alu, TestAlu::IntSub) {
+            bools.push(format!(
+                "((bitcast<i32>({}) - bitcast<i32>({})) {op} 0)",
+                raw(s1)?,
+                raw(s2)?
+            ));
+            continue;
+        }
         // The 8-bit family reads its operands as four unorm BYTES of one register, not as a
         // float lane. Taking the instruction's own precision here instead would read the flag
         // register 0x00000001 as an f32 denormal, compare it equal to zero, and turn the alpha
@@ -1422,8 +1737,10 @@ fn emit_test(
             TestAlu::Add => format!("({a} + {b})"),
             TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
             TestAlu::Mul => format!("({a} * {b})"),
-            // Resolved above - the raw-lane path never reaches here.
-            TestAlu::BitAnd => unreachable!("bitwise test resolved before the float path"),
+            // Resolved above - the raw-lane paths never reach here.
+            TestAlu::BitAnd | TestAlu::IntSub => {
+                unreachable!("raw-lane test resolved before the float path")
+            }
         };
         bools.push(format!("({value} {op} 0.0)"));
     }
@@ -1448,12 +1765,135 @@ fn emit_test(
                 TestAlu::Add => format!("({a} + {b})"),
                 TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
                 TestAlu::Mul => format!("({a} * {b})"),
-                // A bitwise write-back is not modelled in the float store path; the corpus has
-                // no such instruction, so refusing is exact rather than restrictive.
-                TestAlu::BitAnd => return None,
+                // A raw-lane write-back is not modelled in the float store path; the corpus
+                // has no such instruction, so refusing is exact rather than restrictive.
+                TestAlu::BitAnd | TestAlu::IntSub => return None,
             };
             body.store(dest, c, &value, wp)?;
         }
+    }
+    Some(())
+}
+
+
+/// GATHER4 with bilinear coefficients ([`Op::TexGather`], group 0xE0 `sb_mode == 3`).
+///
+/// The instruction produces SIX registers from one 2x2 texel footprint:
+///
+/// ```text
+///   dest + 0 .. 3   the four gathered texels, in the platform's own gather order
+///   dest + 4 .. 5   four F16 bilinear coefficients, packed two per register
+/// ```
+///
+/// # Where the coefficient base comes from
+/// The reference states only that the coefficients follow "at `dest.num + component_size`".
+/// The corpus fixes the number: the golf title's shadow filter gathers a ONE-component depth
+/// map into `r0` and the instruction two later dots the coefficients out of `r4` - so the four
+/// gathered texels occupy four registers and the coefficients start after them. That is the
+/// only sampler width this is decoded for (see `decode_shader`), so the two candidate readings
+/// of "component_size" cannot disagree here.
+///
+/// # Which coefficient weights which texel
+/// `textureGather` returns the footprint in the platform's order - the texels at `(x0,y1)`,
+/// `(x1,y1)`, `(x1,y0)`, `(x0,y0)` relative to the same 2x2 a bilinear filter would take - and
+/// `fract(uv * dims - 0.5)` is that filter's own pair of fractions, so the four bilinear
+/// weights are determined once the pairing is.
+///
+/// The pairing is the one thing the instruction does not state, and the corpus's only consumer
+/// is what settles it: the shadow filter reduces the gathered comparisons with
+/// `dot(mask.wzyx, coeff.xyzw)`, i.e. it pairs coefficient `k` with gathered texel `3 - k`. A
+/// compiler that emitted that swizzle knew the hardware's coefficient order is the REVERSE of
+/// its gather order, so the coefficients are written in reverse footprint order below. Both
+/// halves are emitted here from the same footprint, so the pairing is self-consistent whatever
+/// absolute order the platform's gather uses - what the swizzle fixes is which weight goes with
+/// which texel, and getting that wrong would mis-weight the filter within a single texel rather
+/// than change what it samples.
+#[allow(clippy::too_many_arguments)]
+fn emit_tex_gather(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    unit: u8,
+    coords: u8,
+    coord_half: bool,
+    index: usize,
+    kind: ProgramKind,
+) -> Option<()> {
+    // The decoder refuses every other dimensionality; this keeps the emitter honest if that
+    // ever changes without a footprint rule to go with it.
+    if coords != 2 {
+        return None;
+    }
+    let (tex, samp) = sampler_names(kind, unit);
+    let coord = instr.srcs.first()?;
+    let cp = if coord_half { Prec::F16 } else { Prec::F32 };
+    let (cx, cy) = (src_channel(coord, 0, cp)?, src_channel(coord, 1, cp)?);
+    let uv = format!("_guv{index}");
+    let g = format!("_g{index}");
+    let f = format!("_gf{index}");
+    writeln!(body, "  let {uv} = vec2<f32>({cx}, {cy});").ok();
+    writeln!(body, "  let {g} = textureGather(0u, {tex}, {samp}, {uv});").ok();
+    writeln!(
+        body,
+        "  let {f} = fract({uv} * vec2<f32>(textureDimensions({tex}, 0u)) - vec2<f32>(0.5));"
+    )
+    .ok();
+    const COMP: [&str; 4] = ["x", "y", "z", "w"];
+    for c in 0..4 {
+        body.store(dest, c, &format!("{g}.{}", COMP[c]), Prec::F32)?;
+    }
+    // The coefficients live four registers past the gathered texels, and they are F16 - two to
+    // a register - which is how four of them fit in the two the consumer reads as one vec4.
+    let coeff = Operand::plain(dest.bank, dest.index.checked_add(4)?, dest.bank_sel);
+    let weights = [
+        format!("((1.0 - {f}.x) * (1.0 - {f}.y))"),
+        format!("({f}.x * (1.0 - {f}.y))"),
+        format!("({f}.x * {f}.y)"),
+        format!("((1.0 - {f}.x) * {f}.y)"),
+    ];
+    for (c, w) in weights.iter().enumerate() {
+        // Slots 4..8: this is the SECOND group of stores from one instruction, and the first
+        // four already hold `g0..g3` - see `Dest::store_in_slot`.
+        body.store_in_slot(&coeff, c, c + 4, w, Prec::F16)?;
+    }
+    Some(())
+}
+
+/// VTSTMSK ([`Op::TestMask`]): the same per-channel `alu(src1, src2)` compared against zero as
+/// [`emit_test`], written out as one NUMERIC value per channel instead of reduced to a
+/// predicate bit.
+///
+/// Only the float ALU families reach here - the decoder blocks the integer and bitwise ones,
+/// which have no corpus instance in this group - so every channel is a float comparison and the
+/// mask value is `1.0` or `0.0` at the instruction's own precision.
+fn emit_test_mask(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    alu: TestAlu,
+    cmp: TestCmp,
+) -> Option<()> {
+    let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
+    let p = Prec::of(instr);
+    let op = match cmp {
+        TestCmp::Eq => "==",
+        TestCmp::Ne => "!=",
+        TestCmp::Lt => "<",
+        TestCmp::Le => "<=",
+        TestCmp::Gt => ">",
+        TestCmp::Ge => ">=",
+    };
+    for c in 0..4 {
+        let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
+        let value = match alu {
+            TestAlu::Add => format!("({a} + {b})"),
+            TestAlu::Sub => format!("({a} - {b})"),
+            TestAlu::Mul => format!("({a} * {b})"),
+            // The decoder does not produce these for this group; refusing keeps the emitter
+            // from inventing a raw-lane mask if that ever changes.
+            TestAlu::Fx8Sub | TestAlu::BitAnd | TestAlu::IntSub => return None,
+        };
+        body.store(dest, c, &format!("select(0.0, 1.0, ({value} {op} 0.0))"), p)?;
     }
     Some(())
 }
@@ -1645,6 +2085,46 @@ fn emit_int_mad(
     Some(())
 }
 
+/// One STEP of the group-0x1a 32-bit integer multiply-add: `dest = half(src0) * src1 + src2`.
+///
+/// All three operands and the result are 32-bit lanes read as unsigned bit patterns, and WGSL's
+/// `u32` arithmetic wraps, which is what makes the two steps sum to the whole product: the low
+/// step keeps the bits below 2^32 and the high step's `<< 16` drops exactly the ones the 32-bit
+/// result never had. Writing this as a widening 64-bit multiply would keep bits the hardware
+/// discards.
+fn emit_int_mad_step(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    signed: bool,
+    high_half: bool,
+) -> Option<()> {
+    // The decoder blocks the signed form by name; this keeps the emitter honest if that ever
+    // changes without the sign rule for the two halves being established first.
+    if signed {
+        return None;
+    }
+    let raw = |o: &Operand| -> Option<String> {
+        if matches!(o.bank, Bank::Immediate) {
+            return Some(format!("{}u", o.index as u32));
+        }
+        if matches!(o.bank, Bank::Indexed) {
+            return indexed_element(o, 0);
+        }
+        Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
+    };
+    let a = raw(instr.srcs.first()?)?;
+    let b = raw(instr.srcs.get(1)?)?;
+    let c = raw(instr.srcs.get(2)?)?;
+    let expr = if high_half {
+        format!("((({a} >> 16u) * {b}) << 16u) + {c}")
+    } else {
+        format!("(({a} & 0xffffu) * {b}) + {c}")
+    };
+    writeln!(body, "  {}[{}] = {};", bank_prefix(dest.bank)?, dest.index as u32, expr).ok();
+    Some(())
+}
+
 fn emit_bitwise(
     body: &mut Dest,
     instr: &Instr,
@@ -1777,7 +2257,13 @@ pub fn sampler_names(kind: ProgramKind, unit: u8) -> (String, String) {
 pub fn tex_units(shader: &Shader, is_cube: impl Fn(u8) -> bool) -> Vec<TexBinding> {
     let mut out: Vec<TexBinding> = Vec::new();
     for i in &shader.instrs {
-        if let Op::Tex { unit, coords, .. } = i.op {
+        let sampled = match i.op {
+            Op::Tex { unit, coords, .. } | Op::TexGather { unit, coords, .. } => {
+                Some((unit, coords))
+            }
+            _ => None,
+        };
+        if let Some((unit, coords)) = sampled {
             match out.iter_mut().find(|b| b.unit == unit) {
                 Some(b) => b.coords = b.coords.max(coords),
                 None => out.push(TexBinding { unit, coords, cube: is_cube(unit) }),
@@ -1827,6 +2313,103 @@ mod tests {
         format!("{bank}[{reg}] = bitcast<u32>({expr});")
     }
 
+    /// A GATHER whose destination ALIASES its coordinate operand is emitted through the
+    /// staging path, and that path names its temporary after the CHANNEL - which gave the four
+    /// texel stores and the four coefficient stores the same four names in one block. WGSL
+    /// rejects the redefinition, wgpu then refuses the pipeline, and the renderer DROPS every
+    /// draw that pair ever makes: a whole shadow-filtered material family vanishes from the
+    /// frame over a name collision. Two of a retail title's pairs did exactly that.
+    ///
+    /// Pinned by asserting no `let` name is declared twice, rather than by naming `g4`: what
+    /// has to hold is uniqueness, not a particular spelling.
+    #[test]
+    fn a_gather_that_aliases_its_coordinate_declares_each_temporary_once() {
+        // Destination within OPERAND_REGISTER_SPAN of the source, which is what turns staging
+        // on - the condition the shipping failure needed and the plain test above does not meet.
+        let d = Operand::plain(Bank::PrimaryAttr, 6, 2);
+        let coord = Operand::plain(Bank::PrimaryAttr, 4, 2);
+        let wgsl = emit_fragment(&shader(vec![instr(
+            Op::TexGather { unit: 3, coords: 2, coord_half: false },
+            Some(d),
+            vec![coord],
+        )]))
+        .unwrap();
+        assert!(wgsl.contains("let g0 ="), "the staging path must be the one under test:
+{wgsl}");
+        let mut seen = std::collections::BTreeSet::new();
+        for line in wgsl.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("let ") else { continue };
+            let name = rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap();
+            assert!(seen.insert(name.to_string()), "`{name}` is declared twice:
+{wgsl}");
+        }
+        // And all eight stores still happen: four texels and four coefficients.
+        assert_eq!(wgsl.matches("let g").count(), 8, "got:
+{wgsl}");
+    }
+
+    /// GATHER4 writes SIX registers from one footprint: four gathered texels at `dest + 0..3`
+    /// and four F16 bilinear coefficients at `dest + 4..5`. The COEFFICIENT ORDER is the
+    /// reverse of the gather order, which is what the only consumer in the corpus asks for -
+    /// it reduces the two with `dot(gathered.wzyx, coeff.xyzw)` - so `coeff[k]` must be the
+    /// weight of `gathered[3 - k]`. Getting that backwards mis-weights the filter inside a
+    /// texel with nothing to say so, which is why it is pinned here.
+    #[test]
+    fn gather4_writes_its_texels_then_its_reversed_coefficients() {
+        let d = Operand::plain(Bank::Temp, 0, 0);
+        let coord = Operand::plain(Bank::PrimaryAttr, 8, 2);
+        let wgsl = emit_fragment(&shader(vec![instr(
+            Op::TexGather { unit: 3, coords: 2, coord_half: false },
+            Some(d),
+            vec![coord],
+        )]))
+        .unwrap();
+        assert!(wgsl.contains("textureGather(0u, t3, s3,"), "got:\n{wgsl}");
+        // The fractional position of the same 2x2 a bilinear filter would take.
+        assert!(wgsl.contains("fract("), "the coefficients need the bilinear fractions:\n{wgsl}");
+        assert!(wgsl.contains("textureDimensions(t3, 0u)"), "got:\n{wgsl}");
+        for (c, lane) in ["x", "y", "z", "w"].iter().enumerate() {
+            assert!(
+                wgsl.contains(&format!("r[{c}] = bitcast<u32>(_g0.{lane});")),
+                "gathered texel {c} must land at r[{c}]:\n{wgsl}"
+            );
+        }
+        // coeff[0] weights gathered[3] = the (x0,y0) texel, coeff[3] weights gathered[0].
+        assert!(wgsl.contains("(1.0 - _gf0.x) * (1.0 - _gf0.y)"), "got:\n{wgsl}");
+        assert!(wgsl.contains("(1.0 - _gf0.x) * _gf0.y"), "got:\n{wgsl}");
+        // Four F16 coefficients occupy TWO registers past the four gathered texels.
+        assert!(wgsl.contains("r[4] = (r[4] &"), "coefficients start at dest + 4:\n{wgsl}");
+        assert!(wgsl.contains("r[5] = (r[5] &"), "coefficients span two registers:\n{wgsl}");
+        assert!(!wgsl.contains("r[6]"), "a gather writes six registers, not more:\n{wgsl}");
+    }
+
+    /// VTSTMSK writes ONE VALUE PER CHANNEL rather than reducing to a predicate bit, and the
+    /// numeric mask is `1.0` where the test holds.
+    #[test]
+    fn vtstmsk_writes_a_numeric_mask_on_every_channel() {
+        let d = Operand::plain(Bank::Internal, 0, 0);
+        let a = Operand::plain(Bank::Temp, 0, 0);
+        let b = Operand::plain(Bank::Internal, 0, 0);
+        // The real program broadcasts a reference value into i0 first, and the fragment
+        // internal-read guard requires it: an unwritten internal lane is unmodelled input.
+        let wgsl = emit_fragment(&shader(vec![
+            instr(Op::Mov, Some(d), vec![Operand::plain(Bank::PrimaryAttr, 4, 2)]),
+            instr(Op::TestMask { alu: TestAlu::Sub, cmp: TestCmp::Gt }, Some(d), vec![a, b]),
+        ]))
+        .unwrap();
+        assert!(!wgsl.contains("p[0] ="), "a mask writes no predicate:\n{wgsl}");
+        for c in 0..4u32 {
+            assert!(
+                wgsl.contains(&format!("i[{c}] = bitcast<u32>(g{c});")),
+                "channel {c} must be written:\n{wgsl}"
+            );
+        }
+        assert!(wgsl.contains("select(0.0, 1.0,"), "the mask is numeric:\n{wgsl}");
+        // The internal registers are four F32 lanes whatever the precision, so a four-channel
+        // mask lands on i[0..3] rather than on two packed registers.
+        assert!(wgsl.contains("i[3] ="), "the fourth channel needs a fourth lane:\n{wgsl}");
+    }
     #[test]
     fn emits_scalarised_mul_over_channels() {
         // o[base..] = r[..] * sa[..], full mask -> 4 statements, one per channel.
@@ -2289,16 +2872,123 @@ mod tests {
         assert!(wgsl.contains("r[2] ="), "the target must be emitted:\n{wgsl}");
     }
 
-    /// A BACKWARD branch is a loop. Emitting its body once would look plausible and be wrong,
-    /// so it hard-fails naming itself.
+    /// A BACKWARD branch is a loop, and its CONDITION is the condition to go round AGAIN - so
+    /// the WGSL body breaks on the negation. Getting that polarity backwards runs the loop
+    /// exactly once or never, which is the plausible-looking wrong picture rather than a
+    /// failure, so it is pinned.
     #[test]
-    fn backward_branch_hard_fails_as_a_loop() {
-        let err = emit_fragment(&shader(vec![mov(0), mov(2), branch(-2, Predicate::IfP(0))]))
-            .unwrap_err();
+    fn backward_branch_becomes_a_loop_breaking_on_the_negated_condition() {
+        // 0: mov r0
+        // 1: mov r2
+        // 2: br if p0 -> 0      (go round again while p0)
+        let wgsl =
+            emit_fragment(&shader(vec![mov(0), mov(2), branch(-2, Predicate::IfP(0))])).unwrap();
+        assert!(wgsl.contains("loop {"), "got:\n{wgsl}");
+        let inside = wgsl.split("loop {").nth(1).unwrap();
+        assert!(inside.contains("r[0] ="), "the body is inside the loop:\n{wgsl}");
+        assert!(inside.contains("r[2] ="), "the body is inside the loop:\n{wgsl}");
+        assert!(inside.contains("if (!p[0]) { break; }"), "got:\n{wgsl}");
+    }
+
+    /// The shape a compiler actually emits: a guarded exit at the top of the body and an
+    /// UNCONDITIONAL back edge at the bottom. The exit branch becomes a `break` on the
+    /// condition under which it is TAKEN - the opposite polarity from a forward skip, because
+    /// what it guards is leaving the loop rather than a range that runs when it is not taken.
+    #[test]
+    fn a_loop_exit_branch_becomes_a_break_on_the_taken_condition() {
+        // 0: br if p0 -> 4      (leave)
+        // 1: mov r0
+        // 2: mov r2
+        // 3: br       -> 0      (go round again)
+        // 4: mov r4
+        let wgsl = emit_fragment(&shader(vec![
+            branch(4, Predicate::IfP(0)),
+            mov(0),
+            mov(2),
+            branch(-3, Predicate::Always),
+            mov(4),
+        ]))
+        .unwrap();
+        let (before, inside) = wgsl.split_once("loop {").expect(&format!("got:\n{wgsl}"));
+        assert!(!before.contains("r[0] ="), "the body belongs to the loop:\n{wgsl}");
+        assert!(inside.contains("if (p[0]) { break; }"), "got:\n{wgsl}");
+        assert!(inside.contains("r[0] ="), "got:\n{wgsl}");
+        // An unconditional back edge repeats by falling off the end of the WGSL body, so there
+        // is no trailing break to write.
+        assert!(!inside.contains("if (!p[0]) { break; }"), "got:\n{wgsl}");
+        let after = inside.rsplit_once("}").unwrap().1;
+        assert!(after.contains("r[4] ="), "the instruction after the loop follows it:\n{wgsl}");
+    }
+
+    /// A second backward branch inside a loop body is a second loop sharing that body, which one
+    /// `loop` cannot express - so it hard-fails rather than emitting one of the two.
+    #[test]
+    fn a_second_backward_branch_inside_a_loop_hard_fails() {
+        // 0: mov r0
+        // 1: br if p0 -> 0      (an inner back edge to the same head)
+        // 2: mov r2
+        // 3: br if p1 -> 0
+        let err = emit_fragment(&shader(vec![
+            mov(0),
+            branch(-1, Predicate::IfP(0)),
+            mov(2),
+            branch(-3, Predicate::IfP(1)),
+        ]))
+        .unwrap_err();
         match err {
-            EmitError::Blocked { reason, index, .. } => {
-                assert_eq!(index, 2);
-                assert!(reason.contains("backward"), "{reason}");
+            EmitError::Blocked { reason, .. } => {
+                assert!(reason.contains("second backward branch"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// A jump into the MIDDLE of a loop body is a second entry, and a `loop` has one - so the
+    /// region is not a loop and must not be emitted as one.
+    #[test]
+    fn a_branch_into_a_loop_body_hard_fails() {
+        // 0: mov r0             <- loop head
+        // 1: mov r2
+        // 2: br       -> 0      (the back edge)
+        // 3: br if p0 -> 1      (a second entry, into the middle)
+        let err = emit_fragment(&shader(vec![
+            mov(0),
+            mov(2),
+            branch(-2, Predicate::Always),
+            branch(-2, Predicate::IfP(0)),
+        ]))
+        .unwrap_err();
+        match err {
+            EmitError::Blocked { reason, .. } => {
+                assert!(reason.contains("into the middle of a loop body"), "{reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// A branch out of a loop body to somewhere that is NOT the instruction after the back edge
+    /// is not a `break`, and there is no other statement that means it.
+    #[test]
+    fn a_loop_body_branch_past_the_exit_hard_fails() {
+        // 0: br if p0 -> 4      (past the loop's own exit at 3)
+        // 1: mov r0
+        // 2: br       -> 0
+        // 3: mov r2
+        // 4: mov r4
+        let err = emit_fragment(&shader(vec![
+            branch(4, Predicate::IfP(0)),
+            mov(0),
+            branch(-2, Predicate::Always),
+            mov(2),
+            mov(4),
+        ]))
+        .unwrap_err();
+        match err {
+            EmitError::Blocked { reason, .. } => {
+                assert!(
+                    reason.contains("neither inside the loop nor its exit"),
+                    "{reason}"
+                );
             }
             other => panic!("expected Blocked, got {other:?}"),
         }

@@ -59,6 +59,11 @@ pub struct RenderState {
     pub cull_mode: u32,
     pub two_sided: u32,
     pub front_depth_func: u32,
+    /// `sceGxmSetFrontDepthBias(context, factor, units)`: the polygon-offset pair, which
+    /// a title uses to lift a decal off the surface it is drawn on. Signed, and zero -
+    /// the default - means no bias at all.
+    pub front_depth_bias_factor: i32,
+    pub front_depth_bias_units: i32,
     pub back_depth_func: u32,
     pub front_depth_write: u32,
     pub back_depth_write: u32,
@@ -103,6 +108,8 @@ impl Default for RenderState {
             cull_mode: 0x0000_0000,               // SCE_GXM_CULL_NONE
             two_sided: 0x0000_0000,               // SCE_GXM_TWO_SIDED_DISABLED
             front_depth_func: 0x00C0_0000,        // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
+            front_depth_bias_factor: 0,           // no polygon offset
+            front_depth_bias_units: 0,
             back_depth_func: 0x00C0_0000,         // SCE_GXM_DEPTH_FUNC_LESS_EQUAL
             front_depth_write: 0x0000_0000,       // SCE_GXM_DEPTH_WRITE_ENABLED
             back_depth_write: 0x0000_0000,        // SCE_GXM_DEPTH_WRITE_ENABLED
@@ -207,6 +214,22 @@ impl BlendState {
     }
 }
 
+/// The next never-before-used identity for a texture's pixel buffer - see
+/// [`BoundTexture::pixels_id`].
+///
+/// Monotonic and process-wide. Not an address, not a hash: an address can be recycled and a
+/// hash can collide, and both failure modes here are the SAME picture bug (a cache serving one
+/// texture's texels for another's) with no report, which is the class this project treats as
+/// worse than any amount of cost ([[vitaslop-content-hash-cache-must-verify]]).
+///
+/// `0` is reserved for buffers that are a single shared constant for the whole run (the
+/// zero-texel substitute), where one identity is the correct answer.
+pub fn next_pixels_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A texture bound to a fragment sampler unit at draw time. Decoded from the
 /// guest's 16-byte `SceGxmTexture` control words (format, dimensions, memory
 /// layout, data address) with a snapshot of the referenced pixel bytes, so a
@@ -256,6 +279,27 @@ pub struct BoundTexture {
     /// frame. Sharing also gives consumers a cheap identity key (the pointer) for caching
     /// GPU uploads, so an unchanged texture is uploaded once per frame rather than per draw.
     pub pixels: Arc<[u8]>,
+    /// >>> AN IDENTITY FOR [`Self::pixels`] THAT AN ALLOCATOR CANNOT RECYCLE.
+    ///
+    /// Consumers key their decode and upload caches on "are these the same bytes", and the
+    /// cheap answer used to be `pixels.as_ptr()` - see `render::tex_key`, which folded it into
+    /// a 64-bit key nothing verifies. That is only sound while the buffer is ALIVE. It is not
+    /// alive: the snapshot layer frees a texture's buffer and allocates a new one the moment
+    /// the guest rewrites that texture, and an allocator handing the freed address straight
+    /// back - which is exactly what a tight alloc/free loop does - gives the NEW contents the
+    /// SAME key as the old. The cache then serves the old GPU texture for new bytes, silently.
+    ///
+    /// MEASURED: a change that only moved allocation addresses (nothing else) took this
+    /// title's texture expansions from 1.25-1.54 MB a frame to 4.31-4.72 MB, on the same 672
+    /// draws building the same 21.1 textures. Work does not appear from nowhere - what moved
+    /// was how often the allocator recycled an address, which is the one input a correct cache
+    /// key must not have.
+    ///
+    /// So identity is MINTED, never inferred: [`next_pixels_id`] hands out a number that is
+    /// never reused within a run, and it travels with the buffer for as long as that buffer is
+    /// the answer. Two snapshots of one texture share an id exactly when they share an `Arc`,
+    /// which is precisely when the snapshot layer has proven the bytes identical.
+    pub pixels_id: u64,
     /// Sampler wrap modes (`SceGxmTextureAddrMode`, 0 = REPEAT) and LOD bias set on
     /// this texture via `sceGxmTextureSet{U,V}AddrMode[Safe]` / `SetLodBias`.
     pub u_addr_mode: u32,
@@ -456,10 +500,20 @@ pub struct Draw {
     /// Raw vertex default-uniform-buffer (SA bank) bytes exactly as the guest wrote them -
     /// the recompiled vertex shader reads these directly, NOT the MVP-stamped `uniforms`
     /// above (which the fixed-function path needs but the real shader recomputes itself).
-    pub vert_sa: Vec<u8>,
+///
+/// >>> SHARED (`Arc<[u8]>`), NOT OWNED: THIS BANK WAS COPIED TWICE PER DRAW.
+/// It is read out of guest memory in `record_draw` and CLONED again when
+/// `RenderSceneBuilder::build` turns the captured draw into a render draw, so a 525-draw
+/// race frame at 60 fps made ~126,000 heap allocations a second for byte ranges nobody
+/// mutates - a V8 worker profile put 1.0% of the whole thread in `malloc` under
+/// `record_draw` alone. Every reader wants `&[u8]` (hash it, walk it in `chunks_exact(4)`,
+/// ask its length), so sharing costs them nothing and the clone becomes a refcount bump.
+/// The program blobs beside it are already carried this way.
+    pub vert_sa: std::sync::Arc<[u8]>,
     /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
     /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
-    pub frag_sa: Vec<u8>,
+    /// Shared for the same reason as [`Draw::vert_sa`].
+    pub frag_sa: std::sync::Arc<[u8]>,
     /// GUEST ADDRESS the bytes above were read from, or 0 when there is no bound buffer.
     ///
     /// The bytes alone answer "what did this draw get"; only the address answers "who put it
@@ -469,13 +523,14 @@ pub struct Draw {
     /// second case the address is stable enough to point `VITASLOP_WATCH_STORE_LOG` at, which
     /// is the one tool that names every guest writer of an address in a single run.
     pub frag_sa_addr: u32,
-    /// The guest-memory WINDOW this draw's recompiled vertex shader reads through its 0xE8
-    /// memory loads: `(window guest base address, the window's bytes at draw time)`. `None`
-    /// for the near-total majority of programs, which load no memory - and for a draw whose
-    /// program needs one but had nothing usable bound, which the renderer must DROP with a
-    /// report rather than feed fabricated bytes. See
-    /// `vitaslop_gxp_shader::module::MemWindow` and `VitaState::capture_mem_window`.
-    pub mem_window: Option<(u32, Vec<u8>)>,
+    /// The guest-memory WINDOWS this draw's recompiled vertex shader reads through its 0xE8
+    /// memory loads, in the order the shader's `gxp_mem` binding lays them out:
+    /// `(window guest base address, the window's bytes at draw time)` each. EMPTY for the
+    /// near-total majority of programs, which load no memory - and for a draw whose program
+    /// needs windows but had nothing usable bound, which the renderer must DROP with a report
+    /// rather than feed fabricated bytes. See `vitaslop_gxp_shader::module::MemWindow` and
+    /// `VitaState::capture_mem_windows`.
+    pub mem_windows: Vec<(u32, Vec<u8>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -973,6 +1028,205 @@ impl Capture {
         }
     }
 
+    /// One digest per scene the CURRENT frame has captured, in submission order.
+    ///
+    /// The per-frame signature says two engines' frames differ; this says WHICH PASS of that
+    /// frame does. A golf frame here is three scenes, a race frame is a dozen, and the
+    /// difference between "f943 differs" and "f943's second pass differs" is the difference
+    /// between reading a whole frame's inputs and reading one pass's.
+    ///
+    /// Folded with the same `fold_scene` the signature uses, so a scene that folds equal here
+    /// contributes equally there - the two instruments cannot disagree.
+    /// One hash per f32 LANE of a draw's vertex stride, taken down the whole vertex array.
+    ///
+    /// The last step of the cross-engine bisect, and the one that names a MEANING rather than
+    /// an offset: a stride is a struct - position, normal, uv, colour - so "lane 22 of 36
+    /// differs" points at one attribute, while "some byte among 18,432 differs" points at
+    /// nothing. NaNs are canonicalised here for the same reason `scene_draw_digests` carries a
+    /// canonical hash: a lane that is NaN on both engines must not be reported as a difference.
+    ///
+    /// Returns `(lane count, hash per lane)`. `None` if the stride is not a multiple of four,
+    /// where "lane" would be a fiction.
+    pub fn draw_lane_hashes(&self, scene_ix: usize, draw_ix: usize) -> Option<(usize, Vec<u64>)> {
+        let d = self.scenes.get(scene_ix)?.draws.get(draw_ix)?;
+        let stride = d.vertex_stride as usize;
+        if stride == 0 || stride % 4 != 0 {
+            return None;
+        }
+        let lanes = stride / 4;
+        let mut hs = vec![FNV_OFFSET; lanes];
+        for v in d.vertices.chunks_exact(stride) {
+            for (l, c) in v.chunks_exact(4).enumerate() {
+                let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let bits = if f.is_nan() { f32::NAN.to_bits() } else { f.to_bits() };
+                fnv_bulk(&mut hs[l], &bits.to_le_bytes());
+            }
+        }
+        Some((lanes, hs))
+    }
+
+    /// One draw's VERTEX bytes, as the floats a `f32`-lane reader would see, with the stride
+    /// and attribute layout that say how to group them.
+    ///
+    /// The end of the cross-engine bisect: the digests narrow a divergence to a frame, a pass
+    /// and a draw, and then the only question left is what the NUMBERS are. Two lanes that
+    /// differ in the last bits are arithmetic; a lane that is NaN on one side is a division or
+    /// a sqrt; a whole vertex shifted is a different transform. None of those can be told apart
+    /// from a hash.
+    ///
+    /// Capped at `max_floats` because a draw can carry thousands of vertices and this is read
+    /// by a human out of a log.
+    pub fn draw_vertex_floats(
+        &self,
+        scene_ix: usize,
+        draw_ix: usize,
+        max_floats: usize,
+    ) -> Option<(u32, usize, Vec<f32>)> {
+        let d = self.scenes.get(scene_ix)?.draws.get(draw_ix)?;
+        let floats: Vec<f32> = d
+            .vertices
+            .chunks_exact(4)
+            .take(max_floats)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some((d.vertex_stride, d.vertices.len(), floats))
+    }
+
+    /// The SHAPE behind each of [`frame_scene_digests`](Self::frame_scene_digests): how many
+    /// draws the scene holds and which colour surface it names, in the same order.
+    ///
+    /// A digest that differs with the draw count EQUAL and the surface DIFFERENT is not a
+    /// rendering difference at all - it is the two engines describing a different target - and
+    /// a digest that differs on a scene with ZERO draws can only be the surface, because that
+    /// is the whole of what `fold_scene` folds before the draw loop. Printing the shape beside
+    /// the digest is what stops "the last pass differs" from being read as "the last pass drew
+    /// something different".
+    pub fn frame_scene_shapes(&self) -> Vec<(usize, u32, u32)> {
+        self.scenes
+            .iter()
+            .map(|s| {
+                let (addr, fmt) = s.color.as_ref().map(|c| (c.data_addr, c.format)).unwrap_or((0, 0));
+                (s.draws.len(), addr, fmt)
+            })
+            .collect()
+    }
+
+    pub fn frame_scene_digests(&self) -> Vec<u64> {
+        self.scenes
+            .iter()
+            .map(|s| {
+                let mut h = FNV_OFFSET;
+                fold_scene(&mut h, s);
+                h
+            })
+            .collect()
+    }
+
+    /// Per-DRAW digests of one held scene, split into the three things a draw carries:
+    /// vertices, indices and uniforms.
+    ///
+    /// The step after [`frame_scene_digests`](Self::frame_scene_digests): that says which PASS
+    /// of a frame two engines disagree on, this says which DRAW of that pass and - because the
+    /// three components are hashed separately - which KIND of input differs. Uniforms differing
+    /// while vertices match is a value the guest computed (a matrix, a fade, a clock read);
+    /// vertices differing while uniforms match is geometry it built. The two questions have
+    /// nothing in common as bugs, and one line tells them apart.
+    ///
+    /// `None` when the index is past the held scenes. Diagnostic only: it allocates per draw
+    /// and is called for ONE frame of a run.
+    pub fn scene_draw_digests(&self, scene_ix: usize) -> Option<Vec<(u64, u64, u64, u64, usize)>> {
+        let s = self.scenes.get(scene_ix)?;
+        Some(
+            s.draws
+                .iter()
+                .map(|d| {
+                    let mut hv = FNV_OFFSET;
+                    fnv_bulk(&mut hv, &d.vertices);
+                    // The SAME vertices hashed as f32 lanes with every NaN CANONICALISED.
+                    //
+                    // WebAssembly does not pin the payload bits of a NaN an arithmetic op
+                    // produces, so two engines can hold the same VALUE with different BYTES.
+                    // A byte hash then reports a divergence that no shader and no picture can
+                    // see - and this title's f943 draw 31 is exactly that shape: identical
+                    // floats when printed, different `verts`. When `verts` differs and this
+                    // agrees, the difference is payload bits and nothing else.
+                    let mut hc = FNV_OFFSET;
+                    let mut cbuf = Vec::with_capacity(d.vertices.len());
+                    for c in d.vertices.chunks_exact(4) {
+                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        let bits = if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+                        cbuf.extend_from_slice(&bits.to_le_bytes());
+                    }
+                    fnv_bulk(&mut hc, &cbuf);
+                    let mut hi = FNV_OFFSET;
+                    fnv_bulk(&mut hi, &d.indices);
+                    let mut hu = FNV_OFFSET;
+                    let mut buf = Vec::with_capacity(d.uniforms.len() * 4);
+                    for u in &d.uniforms {
+                        buf.extend_from_slice(&u.to_le_bytes());
+                    }
+                    fnv_bulk(&mut hu, &buf);
+                    (hv, hc, hi, hu, d.uniforms.len())
+                })
+                .collect(),
+        )
+    }
+
+    /// The two COUNTS behind the determinism signature: scenes folded so far (retired plus
+    /// still-held) and egress events recorded so far.
+    ///
+    /// # Why a hash needs its counts beside it
+    /// A signature that differs between two engines says only THAT they differ. These say
+    /// WHICH HALF: a different scene count is a pass one engine ran and the other did not, a
+    /// different egress count is an OS-visible act (a save write, a system call the ledger
+    /// records) that happened on one side only, and both-equal-yet-hash-differs is CONTENT -
+    /// the vertices, indices or uniforms of the same passes. Cheap enough to print on every
+    /// `sigtrace` line, and without them the first divergent frame is a number with no next
+    /// question attached.
+    ///
+    /// The third count is SERVICED HOST CALLS, and it splits the content case again: the same
+    /// number of calls into the same number of passes means the guest ran the same code and
+    /// the difference is in VALUES (what a call returned, or arithmetic the two wasm engines
+    /// did differently), while a different count means it took a different PATH earlier in
+    /// that same frame. Cumulative on both engines, so the two logs subtract.
+    pub fn stream_counts(&self) -> (u64, usize, u64) {
+        (self.retired_scenes + self.scenes.len() as u64, self.egress.len(), self.call_count)
+    }
+
+    /// Take every scene captured so far, folding each into the determinism digest on the way
+    /// out - the same accounting the eviction above does.
+    ///
+    /// # Why a method rather than the caller taking `scenes` itself
+    /// The browser's live loop drains the frame's scenes every frame to bound memory, and did
+    /// it with a plain `mem::take`. That walks them straight past the fold: nothing reaches
+    /// `retired_digest`, and - worse - nothing records that anything was skipped, so
+    /// [`signature`](Self::signature) has no reason to refuse and returns the FNV BASIS. That is
+    /// a number which looks exactly like a real hash and compares unequal for a reason nothing
+    /// records, i.e. precisely the failure `signature` documents as the worst one available.
+    ///
+    /// MEASURED before the fix: every `sigtrace` line of a browser run of a golf recipe read
+    /// `0xcbf29ce484222325` - the empty fold - and the recipe's `@sig` assertion "FAILED" for
+    /// that reason rather than for any divergence, which is exactly the wrong diagnosis to hand
+    /// someone chasing a browser-only bug.
+    pub fn take_frame_scenes(&mut self) -> Vec<Scene> {
+        let taken = core::mem::take(&mut self.scenes);
+        for old in &taken {
+            if self.fold_disabled {
+                self.signature_incomplete = true;
+                self.retired_scenes += 1;
+                continue;
+            }
+            if self.retired_scenes == 0 && self.retired_digest == 0 {
+                self.retired_digest = FNV_OFFSET;
+            }
+            let mut h = self.retired_digest;
+            crate::perf::time(crate::perf::Phase::SceneFold, || fold_scene(&mut h, old));
+            self.retired_digest = h;
+            self.retired_scenes += 1;
+        }
+        taken
+    }
+
     /// Whether this run will ever be asked for its determinism [`signature`](Self::signature).
     ///
     /// ON by default, so every existing tool - `explore`, `memdiff`, the recipe runner, the
@@ -1232,10 +1486,10 @@ mod extent_tests {
             world: [0.0; 16],
             vprog: no_program(),
             fprog: no_program(),
-            vert_sa: Vec::new(),
-            frag_sa: Vec::new(),
+            vert_sa: std::sync::Arc::from(&[][..]),
+            frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
-            mem_window: None,
+            mem_windows: Vec::new(),
             shader_expanded: false,
         };
         Scene {

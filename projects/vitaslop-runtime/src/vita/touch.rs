@@ -38,7 +38,7 @@ const MAX_BUFS: u32 = 64;
 /// `sceTouchPeek` are documented to return.
 fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbufs: u32) -> i32 {
     let n = nbufs.clamp(1, MAX_BUFS);
-    let ts = st.world.monotonic_us();
+    let ts = st.guest_mono_us();
     let touch = st.world.poll_touch(port);
     let points = touch.active();
     // Diagnostic (`RUST_LOG=vitaslop::input=trace`, `VITASLOP_LOG` in the browser): the
@@ -84,6 +84,21 @@ fn fill_touch(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, data: u32, nbuf
 /// Front-panel port (SCE_TOUCH_PORT_FRONT). The back panel is port 1.
 const PORT_FRONT: u32 = 0;
 
+/// The inclusive maximum active-area Y for `port`. The panels differ only here: X runs
+/// 0..1919 on both, the front panel is the full 0..1087 and the smaller back panel stops
+/// at 889. Shared with [`super::gesture`], which needs the same extent to spell "the
+/// whole panel" for a recognizer created without a rectangle.
+pub(super) fn max_active_y(port: u32) -> i16 {
+    if port == PORT_FRONT {
+        1087
+    } else {
+        889
+    }
+}
+
+/// The inclusive maximum active-area X, the same for both panels.
+pub(super) const MAX_ACTIVE_X: i16 = 1919;
+
 /// Fill one `SceTouchPanelInfo` (0x30 bytes) for `port`.
 ///
 /// The active-area range we report is deliberately the SAME coordinate space our
@@ -96,12 +111,12 @@ const PORT_FRONT: u32 = 0;
 /// this is filled explicitly rather than left to the default `ret(0)`.
 fn panel_info_bytes(port: u32) -> [u8; PANEL_INFO_SIZE] {
     // Active-area Y extent differs per panel; X and the display extent match.
-    let max_aa_y: i16 = if port == PORT_FRONT { 1087 } else { 889 };
+    let max_aa_y: i16 = max_active_y(port);
     let mut buf = [0u8; PANEL_INFO_SIZE];
     let mut put = |off: usize, v: i16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
     put(0x00, 0); // minAaX
     put(0x02, 0); // minAaY
-    put(0x04, 1919); // maxAaX
+    put(0x04, MAX_ACTIVE_X); // maxAaX
     put(0x06, max_aa_y); // maxAaY
     put(0x08, 0); // minDispX
     put(0x0a, 0); // minDispY

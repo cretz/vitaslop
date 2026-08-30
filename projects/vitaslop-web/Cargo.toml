@@ -15,7 +15,11 @@ crate-type = ["cdylib", "rlib"]
 # `cargo build --target wasm32-unknown-unknown -p vitaslop-web` pulls the stack.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
-vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
+vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video", "aac"] }
+# Direct, for `run_h264_conformance` only: the decoder crate's own suite has to run in a
+# BROWSER, which is the one place `cargo test` cannot reach and the one place its WebCodecs
+# backend exists. `synth` is what makes that suite assetless.
+vitaslop-h264 = { path = "../vitaslop-h264", default-features = false, features = ["synth"] }
 vitaslop-loader = { path = "../vitaslop-loader" }
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 # The engine-agnostic conformance runner + the embedded ARM corpus, so the browser

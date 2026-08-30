@@ -122,7 +122,7 @@ const DEFAULT_PARK_THRESHOLD_US: u64 = 2_000;
 /// Accumulating instead keeps the aggregate rate exactly as modelled (no time is discarded -
 /// the debt is only deferred, then paid in full) while making the number of parks
 /// proportional to bytes moved rather than to reads issued.
-fn charge_read(st: &mut VitaState, bytes: usize) -> SvcOutcome {
+pub(super) fn charge_read(st: &mut VitaState, bytes: usize) -> SvcOutcome {
     let Some(us) = read_latency_us(bytes) else { return SvcOutcome::Continue };
     if !st.is_preemptive() {
         // Cooperative hosts cannot park a thread at all; keep instant reads there.
@@ -189,6 +189,18 @@ pub(super) fn io_read(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
     let (ret, got) = match st.io_read(fd, size as usize) {
         Some(data) => {
             ctx.write_bytes(buf, &data);
+            // The DESTINATION, which the read trace in `host.rs` cannot see - it knows the
+            // path and the length but not where the bytes landed. Without it, "this asset is
+            // read in full and its contents never reach the table they belong in" is a dead
+            // end: the buffer is heap, so the only way to aim the READ WATCHPOINT at it (the
+            // watchpoint that names whoever CONSUMES a region) is to be told the address here.
+            tracing::trace!(
+                target: "vitaslop::io",
+                fd,
+                buf = format_args!("{buf:#x}"),
+                got = data.len(),
+                "read_into"
+            );
             (data.len() as i32, data.len())
         }
         None => (EBADF, 0),

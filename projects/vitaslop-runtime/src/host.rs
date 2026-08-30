@@ -163,6 +163,31 @@ pub trait GuestMemory {
         None
     }
 
+    /// >>> WHICH PARTS of `[off, off + len)` the guest may have stored into since `stamp`,
+    /// as byte ranges RELATIVE TO `off`, appended to `out`. `None` from a backing that
+    /// tracks no stores - which is not "clean" and not "all dirty", it is no answer.
+    ///
+    /// [`dirty_since`](Self::dirty_since) answers one bit for a whole range, so a texture is
+    /// re-read in full whenever any page of it was written. CENSUSED on a browser run of one
+    /// title (`VITASLOP_TEX_DIRTY_CENSUS`): across 1,600 re-read ranges covering 22,801 pages,
+    /// **1,611 pages were dirty - 7.1%, and under 2% for the large textures** that dominate
+    /// the bytes. The rest of every one of those reads was work done to re-establish bytes the
+    /// map already knew had not changed.
+    ///
+    /// The same one-page overhang applies as in `dirty_since`: a store is stamped against the
+    /// page it STARTS in and the largest translated store is 8 bytes, so an implementation
+    /// must treat this range's first page as dirty whenever the page below it is.
+    fn dirty_runs_since(
+        &self,
+        off: usize,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
+        let _ = (off, len, stamp, out);
+        None
+    }
+
     /// Advance the guest-store epoch and return `(the stamp to record, whether the
     /// epoch WRAPPED)`. `None` when this backing tracks no stores.
     ///
@@ -371,6 +396,39 @@ impl<'a> GuestCtx<'a> {
         }
     }
 
+    /// Read `len` bytes at guest address `addr` straight into a shared buffer (short read
+    /// clamped to range, exactly as [`read_bytes`](Self::read_bytes)).
+    ///
+    /// # Why this exists beside `read_bytes`
+    /// Every snapshot path used to do `read_bytes` (guest bytes -> `Vec`) and then
+    /// `Arc::from(vec)` - which COPIES again, because an `Arc<[u8]>`'s layout is not a
+    /// `Vec`'s. On the engine that can lend its bytes that was two passes where one
+    /// suffices; on the browser - which cannot lend, so the read itself is a crossing into
+    /// a zeroed staging buffer - it was three. The snapshot paths move megabytes a frame
+    /// (`draw: read+interleave vertices` alone is ~6 MB on a retail sports title), so the
+    /// extra pass is real. This reads once into the `Arc`'s own allocation.
+    pub fn read_bytes_arc(&self, addr: u32, len: usize) -> Arc<[u8]> {
+        crate::perf::note_bulk_read();
+        let Some(o) = self.offset(addr) else { return Arc::from(&[][..]) };
+        let n = (o + len).min(self.mem.len()) - o;
+        if let Some(s) = self.mem.borrow(o, n) {
+            // One copy: straight from the lent slice into the Arc's allocation.
+            return Arc::from(s);
+        }
+        // Zeroed rather than uninit so `assume_init` below is unconditionally sound for
+        // `u8`; the memset is a fraction of the boundary copy it precedes.
+        let arc = Arc::<[u8]>::from(unsafe {
+            // SAFETY: a zeroed byte is an initialised byte.
+            std::sync::Arc::<[std::mem::MaybeUninit<u8>]>::assume_init(
+                std::sync::Arc::new_zeroed_slice(n),
+            )
+        });
+        let mut arc = arc;
+        let buf = Arc::get_mut(&mut arc).expect("freshly created, uniquely owned");
+        self.mem.read(o, buf);
+        arc
+    }
+
     /// Read guest memory at `addr` into `buf`, filling the tail with zeros if the
     /// range runs past the provisioned region. The allocation-free counterpart of
     /// [`read_bytes`](Self::read_bytes), for a caller with a buffer to reuse - which is
@@ -426,6 +484,18 @@ impl<'a> GuestCtx<'a> {
     /// see [`GuestMemory::dirty_since`], which this forwards to.
     pub fn dirty_since(&self, addr: u32, len: usize, stamp: u8) -> Option<bool> {
         self.mem.dirty_since(self.offset(addr)?, len, stamp)
+    }
+
+    /// Which parts of `[addr, addr + len)` the guest may have stored into since `stamp`,
+    /// as byte offsets relative to `addr` - see [`GuestMemory::dirty_runs_since`].
+    pub fn dirty_runs_since(
+        &self,
+        addr: u32,
+        len: usize,
+        stamp: u8,
+        out: &mut Vec<(usize, usize)>,
+    ) -> Option<()> {
+        self.mem.dirty_runs_since(self.offset(addr)?, len, stamp, out)
     }
 
     /// Advance the guest-store epoch - see [`GuestMemory::bump_dirty_epoch`].
@@ -524,6 +594,23 @@ fn report_host_write(ctx: &GuestCtx, addr: u32, len: u32, bytes: &[u8]) {
     if addrs.is_empty() && vals.is_empty() {
         return;
     }
+    // SAY THAT IT ARMED. A silent run is this watchpoint's output both when no host call ever
+    // writes the address AND when the knob never parsed - and those two readings send an
+    // investigation in opposite directions. The store watchpoint on the other side of this
+    // pair has said so since it was written; this one relied on its silence being trusted,
+    // which is the failure mode the whole family exists to avoid.
+    // [[vitaslop-instrument-failure-imitating-its-subject]]
+    {
+        use std::sync::OnceLock;
+        static SAID: OnceLock<()> = OnceLock::new();
+        SAID.get_or_init(|| {
+            eprintln!(
+                "host write watch: ARMED on {} address(es) and {} value(s) - a run with no                  further `host write watch` line means NO HOST CALL wrote them. That says                  nothing about the guest's own stores; VITASLOP_WATCH_STORE is that half.",
+                addrs.len(),
+                vals.len()
+            );
+        });
+    }
     let end = addr.wrapping_add(len.max(1)).wrapping_sub(1);
     let hit = addrs.iter().copied().find(|&a| a >= addr && a <= end).or_else(|| {
         (!vals.is_empty())
@@ -554,6 +641,14 @@ fn report_host_write(ctx: &GuestCtx, addr: u32, len: u32, bytes: &[u8]) {
 /// so it never collides with a real guest address, and nonzero so guest NULL
 /// checks pass. The guest treats these as opaque and never dereferences them.
 pub const HANDLE_BASE: u32 = 0x4000_0000;
+
+/// The wall-clock instant the guest boots at, in microseconds since the Unix epoch.
+///
+/// A fixed epoch rather than the host's clock, because every run must be reproducible and
+/// a title keying a save or a trophy timestamp off it must see the same value twice. The
+/// same number the worlds have always used as their epoch; it lives here now because
+/// [`VitaState::guest_wall_us`] is what serves it to the guest.
+pub const GUEST_WALL_EPOCH_US: u64 = 1_500_000_000_000_000;
 
 /// A GPU memory block the guest allocated: its SceUID, guest base address, and
 /// size. Backed by real guest memory so the guest can read and write it.
@@ -734,6 +829,47 @@ struct NetSocket {
 const NET_FD_BASE: i32 = 0x1000;
 const NET_RESOLVER_BASE: i32 = 0x2000;
 const NET_EPOLL_BASE: i32 = 0x3000;
+
+/// Which SceHttp object an id names. The three form a strict hierarchy - a connection
+/// belongs to a template, a request to a connection - and the kind is what lets a call
+/// refuse an id from the wrong level instead of acting on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HttpKind {
+    Template,
+    Connection,
+    Request,
+}
+
+/// One object in the offline SceHttp graph. Like [`NetSocket`], everything recorded is
+/// LOCAL state the guest itself supplied; nothing here was learned from a server,
+/// because no request is ever sent. See `vita::http`.
+struct HttpObject {
+    id: i32,
+    kind: HttpKind,
+    /// The template a connection hangs off, or the connection a request hangs off; 0
+    /// for a template. Kept so a delete can be reasoned about and a trace can show the
+    /// graph the title built.
+    parent: i32,
+    /// A template's user agent, or a connection's/request's URL - whatever the guest
+    /// named the object with.
+    label: String,
+    /// The `SceHttpMethods` value a request was created with; 0 for the other kinds.
+    method: i32,
+    /// Every header the guest added, in order, as `(name, value)`.
+    headers: Vec<(String, String)>,
+    /// Connect/send/receive timeouts in microseconds, as the guest set them. The
+    /// library's own defaults until it does.
+    timeouts: [u32; 3],
+    deleted: bool,
+}
+
+/// SceHttp id ranges, one per kind and disjoint from each other and from the SceNet
+/// ranges above - so an id used at the wrong level is REFUSED rather than silently
+/// naming another object. Ids start at 1 within a range because `SCE_HTTP_INVALID_ID`
+/// is 0 and a valid id must never collide with it.
+const HTTP_TEMPLATE_BASE: i32 = 0x4000;
+const HTTP_CONNECTION_BASE: i32 = 0x5000;
+const HTTP_REQUEST_BASE: i32 = 0x6000;
 
 /// The stack pointer a fiber starts at: the top of its context buffer, 8-byte aligned
 /// as AAPCS requires at a public call. A fiber with no context yet yields 0, which the
@@ -1923,6 +2059,18 @@ struct PrecomputedDraw {
 #[derive(Default)]
 struct TextureSnapshots {
     entries: FxHashMap<(u32, usize), Arc<[u8]>>,
+    /// The identity minted for each entry's buffer - see
+    /// [`crate::capture::BoundTexture::pixels_id`] for why an address will not do. Written
+    /// only by [`Self::insert`], which is reached only when a NEW buffer is established.
+    pixel_ids: FxHashMap<(u32, usize), u64>,
+    /// The RGBA8 a paletted texture expanded to, and the identity minted for THAT buffer -
+    /// see [`Self::expanded_palette`]. Keyed by the index buffer's guest range, so one
+    /// paletted texture holds one expansion.
+    palette_expanded: FxHashMap<(u32, usize), PaletteExpansion>,
+    /// Bytes held by `palette_expanded`, against [`palette_memo_budget`]. An expansion is four
+    /// times its indices and this map PINS it, so it needs a bound of its own - the decode
+    /// cache's budget does not reach it.
+    palette_bytes: usize,
     /// The guest-store epoch each entry's bytes were established at, on an engine that
     /// stamps stores. Absent for an entry means "no proof available" and costs a
     /// compare, which is why a wrapped epoch can simply drop the whole map.
@@ -1960,6 +2108,37 @@ struct TextureSnapshots {
     vertex_entries: FxHashMap<(u32, usize), Arc<[u8]>>,
     /// Epoch each vertex snapshot's bytes were established at. Same contract as `stamps`.
     vertex_stamps: FxHashMap<(u32, usize), u8>,
+    /// >>> THE SAME GEOMETRY, REBUILT AT A NEW ADDRESS, RECOGNISED AS THE BUFFER ALREADY HELD.
+    ///
+    /// `vertex_entries` is keyed by ADDRESS, which is the right key for a title that keeps its
+    /// meshes where it built them. It is the wrong key for one that writes its geometry into a
+    /// rotating per-frame arena: the address is new every frame, so the entry above never
+    /// matches, a fresh `Arc` is handed out for byte-identical geometry, and every cache
+    /// downstream that keys on that buffer's IDENTITY misses.
+    ///
+    /// MEASURED on a golf title's gameplay frame, which does exactly that: the renderer's
+    /// allocation-keyed packed-vertex cache served **1 draw in 492**, so essentially every draw
+    /// fell through to `GxpLive::pack_vertices` and hashed its whole stream to find the packed
+    /// bytes by CONTENT - **7.03 MB hashed per frame**, and then a full memcmp to verify the
+    /// hit. A V8 profile of the worker put `fnv64` at 2.7% and that verify's `memcmp` at 6.2%
+    /// of all busy time, for geometry that had not changed since the level loaded.
+    ///
+    /// So the identity is re-established HERE, once, where the bytes have just been read
+    /// anyway: a cheap fingerprint finds the candidate and a full comparison proves it, exactly
+    /// as the same-address path above does. Downstream then sees the buffer it already holds
+    /// and every identity-keyed cache hits - including the resident geometry heap, which is the
+    /// one that stops the bytes being uploaded again.
+    ///
+    /// The fingerprint is NEVER trusted on its own ([[vitaslop-content-hash-cache-must-verify]]):
+    /// a collision costs a comparison that fails and a fresh entry, never a wrong mesh.
+    vertex_by_content: FxHashMap<(usize, u64), Arc<[u8]>>,
+    /// Bytes held by `vertex_by_content` alone - the interned buffers that are NOT also in
+    /// `vertex_entries` are held by nothing else, so they need their own budget.
+    vertex_content_bytes: usize,
+    /// The interleave scratch, reused across draws. A multi-stream draw builds its packed
+    /// vertex rows here before they are interned, so the common case - the same geometry as
+    /// last frame - costs no allocation at all. See [`Self::intern_vertices`].
+    interleave_scratch: Vec<u8>,
     /// Bytes held by `vertex_entries`, against [`vertex_snapshot_budget`].
     vertex_bytes: usize,
     /// Entries already checked this FRAME. See [`Self::get_or_read`]: a texture that has
@@ -2107,6 +2286,18 @@ struct TextureSnapshots {
     /// rather than on bytes: that list is host-side with one mutator, so a counter answers
     /// "unchanged since the last draw" exactly and in one comparison.
     last_vertex_set: Option<LastVertexSet>,
+    /// Reused buffer for the dirty-page runs of one re-read - see
+    /// [`TextureSnapshots::reread_dirty_runs`], which runs per texture per scene.
+    run_scratch: Vec<(usize, usize)>,
+}
+
+/// What a page-granular re-read established. See [`TextureSnapshots::reread_dirty_runs`].
+enum Reread {
+    /// Every dirty page still holds the bytes the retained buffer has, so the texture is
+    /// unchanged and consumers keep the buffer identity they cached against.
+    Unchanged(Arc<[u8]>),
+    /// The current contents: the retained buffer with the dirty pages replaced.
+    Changed(Arc<[u8]>),
 }
 
 /// The previous draw's finished VERTEX-stage texture list. See
@@ -2183,6 +2374,10 @@ const VERTEX_STAGE_TAG: u64 = 0x5645_5254_5845_5300;
 #[derive(Clone, Copy)]
 struct TextureTemplate {
     base_format: u32,
+    /// Guest address of a PALETTED texture's colour table, from control word 3's own field
+    /// (bits 25:0, scaled by 64 - the palette is 64-byte aligned). Zero for every other format,
+    /// and zero for a paletted texture whose guest never pointed it at one.
+    palette_addr: u32,
     swizzle: u32,
     tex_type: u32,
     width: u32,
@@ -2211,6 +2406,97 @@ struct TextureTemplate {
 /// textures; this is a bound on a pathological case, not a working limit. Cleared whole when hit,
 /// which costs re-derivation and never correctness - the key IS the input.
 const TEXTURE_TEMPLATE_CAP: usize = 4096;
+
+/// Distinct vertex streams the content index will hold - see
+/// [`TextureSnapshots::vertex_by_content`]. A frame binds under a thousand; this bounds a title
+/// that streams genuinely new geometry every frame, where the index cannot help and must not be
+/// allowed to grow. Cleared whole when hit: the key is derived from the bytes and every hit is
+/// proven by comparison, so a clear costs a re-read and never correctness.
+const VERTEX_CONTENT_INDEX_CAP: usize = 8192;
+
+/// A cheap, allocation-free fingerprint of a vertex stream, for [`TextureSnapshots::
+/// vertex_by_content`]'s lookup ONLY.
+///
+/// # It reads a sample, not the stream, and that is the whole point
+/// The thing it replaces read every byte: the renderer hashed each stream in full to key its
+/// packed-vertex cache, 7.03 MB a frame on a golf title's gameplay frame, and then compared the
+/// hit in full as well. Two passes over the same megabytes to answer one question.
+///
+/// A fingerprint may be as weak as it likes here because it decides only WHICH candidate to
+/// compare - the comparison is what decides. So this reads at most 64 evenly spaced words plus
+/// both ends, which is O(1) in the stream's size, and a collision costs one failed comparison.
+///
+/// The ends are included deliberately: a vertex stream's first and last vertices are the two
+/// most likely to differ between two meshes that share a middle (an index-rebased window of one
+/// larger buffer), and a purely strided sample can step straight over both.
+/// Whether a built vertex stream is given the identity of the byte-identical buffer already
+/// held - see [`TextureSnapshots::intern_vertices`].
+///
+/// >>> IT WAS MEASURED AS A LOSS, AND THAT VERDICT WAS AN ARTEFACT OF TWO BROKEN KEYS.
+///
+/// The first reading (`render 17.1/17.5` ON against `13.3/11.2` OFF) was taken while the
+/// renderer's texture cache was keyed on an allocator ADDRESS: interning moves allocations, so
+/// the whole apparent cost was that cache reacting to addresses it should never have depended
+/// on. With that key exact and the paletted expansion no longer minting a fresh identity per
+/// decode, the SAME A/B on the SAME screen reverses - one build, four alternated arms, golf
+/// gameplay, `NO_BC=1`:
+///
+/// | arm | render | prepare | vertices hashed |
+/// |---|---|---|---|
+/// | intern ON | **7.7 / 7.0 ms** | **5.0 / 4.6 ms** | **1.02 MB** |
+/// | intern OFF | 10.3 / 9.7 ms | 7.7 / 7.3 ms | 7.03 MB |
+///
+/// The frame is BIT-IDENTICAL in every arm. `VITASLOP_VERTEX_INTERN=0` is the arm back.
+/// Read once: per-draw path.
+fn vertex_intern_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_VERTEX_INTERN").ok().as_deref() != Some("0"))
+}
+
+/// Whether a draw decodes only the texture units its fragment program DECLARES - see
+/// [`ProgramReflection::sampler_units`].
+///
+/// MEASURED and now the DEFAULT, one build, two arms, golf's menu in a headless browser on the
+/// real GPU: texture resolutions **2,063 -> 1,293 a frame** over the same 258 draws, `cpu 6.1 ->
+/// 5.7 ms`. The count is the number that matters - it is what a slower device pays more for -
+/// and the frame is BIT-IDENTICAL, which is what says the narrowed units were never sampled.
+/// `VITASLOP_SAMPLER_NARROW=0` is the arm back to every bound slot.
+fn sampler_narrow_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_SAMPLER_NARROW").ok().as_deref() != Some("0"))
+}
+
+fn vertex_fingerprint(bytes: &[u8]) -> u64 {
+    const SAMPLES: usize = 64;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(bytes.len() as u64);
+    let word = |at: usize| -> u64 {
+        let mut w = [0u8; 8];
+        let n = 8.min(bytes.len().saturating_sub(at));
+        w[..n].copy_from_slice(&bytes[at..at + n]);
+        u64::from_le_bytes(w)
+    };
+    if bytes.len() <= SAMPLES * 8 {
+        // Small enough that the "sample" would be the whole thing anyway - read it all, so a
+        // short stream's fingerprint is exact and its candidate list is never crowded.
+        for at in (0..bytes.len()).step_by(8) {
+            mix(word(at));
+        }
+        return h;
+    }
+    let last = bytes.len() - 8;
+    let step = last / (SAMPLES - 1);
+    for i in 0..SAMPLES {
+        mix(word((i * step).min(last)));
+    }
+    h
+}
 
 /// Is the snapshot check allowed to run once per FRAME instead of once per SCENE? The one
 /// inexact cadence, and the only one that has to be asked for - see [`texture_check`].
@@ -2349,6 +2635,93 @@ fn texture_snapshot_budget() -> usize {
     })
 }
 
+/// What [`TextureSnapshots::palette_expanded`] may hold, in bytes.
+///
+/// Half the snapshot budget: an expansion is four times the indices it came from, and the
+/// working set of paletted art a title has on screen is a fraction of the textures it holds. A
+/// title whose paletted set is genuinely larger than this pays a re-expansion rather than a
+/// wrong picture, and the clear reports itself.
+fn palette_memo_budget() -> usize {
+    texture_snapshot_budget() / 2
+}
+
+/// >>> HOW MUCH OF A TEXTURE THE GUEST ACTUALLY TOUCHED, when the dirty map says it touched
+/// SOMETHING (`VITASLOP_TEX_DIRTY_CENSUS=1`).
+///
+/// The map answers one bit for a whole range, so a texture is re-read in full whenever any
+/// page of it was written - and in a browser that read is a copy of the whole texture across
+/// the guest boundary. MEASURED on a movie screen in Chrome: `draw: texture snapshot compare`
+/// still moves 0.5 MB a frame while nothing new is uploaded, i.e. the bytes come back
+/// IDENTICAL every time.
+///
+/// Two explanations fit that, and they call for opposite things: the guest rewrites the whole
+/// texture with the same bytes (nothing to save - the read is the price of exactness), or one
+/// or two pages of it are hot, or merely ADJACENT (the map is read with a one-page overhang,
+/// so a store below the texture marks it), in which case re-reading only the dirty pages would
+/// answer the same question for a fraction of the bytes. This counts pages so the next change
+/// is chosen rather than guessed.
+///
+/// It is a diagnostic and it is expensive - one map probe per 4 KB page - so it is off unless
+/// asked for, and it reports on a ladder rather than per texture.
+fn dirty_page_census(
+    ctx: &GuestCtx,
+    addr: u32,
+    len: usize,
+    stamps: &FxHashMap<(u32, usize), u8>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_TEX_DIRTY_CENSUS")) {
+        return;
+    }
+    let Some(&stamp) = stamps.get(&(addr, len)) else { return };
+    const PAGE: usize = 4096;
+    let pages = len.div_ceil(PAGE);
+    let mut dirty = 0usize;
+    for p in 0..pages {
+        let at = addr.wrapping_add((p * PAGE) as u32);
+        // One page at a time, and only the page itself: `dirty_since` widens by one page
+        // BELOW its range, so asking about page p alone still includes p-1 - which is
+        // exactly the overhang this census exists to expose, and it is counted as dirty
+        // for page p because that is what the whole-range answer does too.
+        if ctx.dirty_since(at, 1, stamp) != Some(false) {
+            dirty += 1;
+        }
+    }
+    static RANGES: AtomicU64 = AtomicU64::new(0);
+    static PAGES: AtomicU64 = AtomicU64::new(0);
+    static DIRTY: AtomicU64 = AtomicU64::new(0);
+    let n = RANGES.fetch_add(1, Relaxed) + 1;
+    let total = PAGES.fetch_add(pages as u64, Relaxed) + pages as u64;
+    let hot = DIRTY.fetch_add(dirty as u64, Relaxed) + dirty as u64;
+    if n % 200 == 0 {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            ranges = n,
+            pages = total,
+            dirty_pages = hot,
+            share = format_args!("{:.1}%", hot as f64 * 100.0 / total.max(1) as f64),
+            "texture compare: how much of a re-read range the guest had actually written"
+        );
+    }
+}
+
+/// One paletted texture's expansion, against the inputs it is a function of - see
+/// [`TextureSnapshots::expanded_palette`].
+struct PaletteExpansion {
+    /// The identity of the INDEX buffer that was expanded, as the snapshot layer minted it.
+    src: u64,
+    /// A hash of the palette's bytes. The palette is a second guest allocation that can be
+    /// rewritten under a texture whose own bytes never move, so it belongs in the key.
+    pal: u64,
+    /// The expanded RGBA8, and the identity minted for IT, once.
+    pixels: Arc<[u8]>,
+    id: u64,
+    /// The shape the expansion produced, which the caller would otherwise have to re-derive.
+    stride: u32,
+    face_bytes: u32,
+}
+
 impl TextureSnapshots {
     fn new() -> Self {
         Self::default()
@@ -2363,7 +2736,12 @@ impl TextureSnapshots {
         // The retained buffer, kept past the borrow below so the re-read at the bottom can
         // hand back the SAME `Arc` when the bytes turn out to be identical - see there.
         let mut retained: Option<Arc<[u8]>> = None;
-        if let Some(p) = self.entries.get(&(addr, len)) {
+        // CLONED out of the map rather than borrowed from it: the page-granular re-read below
+        // needs `&mut self` (it keeps a scratch buffer and re-stamps), and an `Arc` clone is a
+        // refcount where holding the borrow is a restructuring of everything under it.
+        let existing = self.entries.get(&(addr, len)).cloned();
+        if let Some(p) = existing {
+            let p = &p;
             retained = Some(p.clone());
             // Already compared this scene: the guest cannot have run since (a host
             // call is not preemptible), so nothing can have changed.
@@ -2424,6 +2802,35 @@ impl TextureSnapshots {
                 self.restamp(addr, len);
                 return current;
             }
+            dirty_page_census(ctx, addr, len, &self.stamps);
+            // >>> RE-READ ONLY THE PAGES THE GUEST WROTE, when the engine can name them.
+            //
+            // The map has just said this range was written; it can also say WHERE, and the
+            // pages it does not name provably still hold the bytes in `retained`. CENSUSED
+            // in a browser over 1,600 re-read ranges: 7.1% of their pages were dirty, under
+            // 2% for the large textures. So the whole-texture copy below was re-establishing
+            // bytes the map already knew, and in a browser that copy crosses the guest
+            // boundary.
+            //
+            // The answer is the same answer: pages outside the runs cannot have changed, so
+            // comparing the runs decides the whole texture, and a texture that HAS changed is
+            // rebuilt as `retained` with those runs overwritten - which is what guest memory
+            // now holds, byte for byte.
+            if let Some(current) = self.reread_dirty_runs(ctx, addr, len, retained.as_ref()) {
+                match current {
+                    Reread::Unchanged(p) => {
+                        self.restamp(addr, len);
+                        return p;
+                    }
+                    Reread::Changed(bytes) => {
+                        self.mutable.insert((addr, len));
+                        crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
+                        self.insert(addr, len, bytes.clone());
+                        self.restamp(addr, len);
+                        return bytes;
+                    }
+                }
+            }
             // Timed and COUNTED separately (see `Phase::DrawTextureCompare`): this is a
             // memcmp of the whole texture, and it is charged to the snapshot phase while
             // moving no bytes through `note_bytes` - so the phase reported "0.0 MB/frame"
@@ -2472,7 +2879,9 @@ impl TextureSnapshots {
         // had actually changed, so the one engine that pays it reported 0.0 MB for it.
         // [[vitaslop-count-bytes-when-there-is-no-clock]]: a volume only one engine pays is
         // exactly the volume that needs a counter.
-        let raw = ctx.read_bytes(addr, len);
+        // Straight into an `Arc` - see `read_bytes_arc` for the pass this saves on a path
+        // that, on the browser, copies whole textures across the guest boundary every scene.
+        let raw = ctx.read_bytes_arc(addr, len);
         if retained.is_some() {
             crate::perf::note_bytes(crate::perf::Phase::DrawTextureCompare, raw.len());
         }
@@ -2488,7 +2897,7 @@ impl TextureSnapshots {
                 return p;
             }
         }
-        let bytes: Arc<[u8]> = raw.into();
+        let bytes: Arc<[u8]> = raw;
         crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
         self.insert(addr, len, bytes.clone());
         self.restamp(addr, len);
@@ -2530,9 +2939,136 @@ impl TextureSnapshots {
     /// here, and `>=` reports it dirty - so sharing one stamp across a scene stays exact in the
     /// direction that matters. It is conservative only for a page written earlier in the same
     /// scene, which costs one compare and then re-stamps clean.
+    /// Re-establish a retained texture by reading only the pages the guest stored into.
+    /// `None` when the engine cannot name them (no dirty map, or a range it will not answer
+    /// for), which leaves the caller on the whole-texture path exactly as before.
+    ///
+    /// See the call site for the census that motivates it. The bytes charged to
+    /// `DrawTextureCompare` are the ones actually moved, which is the point.
+    fn reread_dirty_runs(
+        &mut self,
+        ctx: &GuestCtx,
+        addr: u32,
+        len: usize,
+        retained: Option<&Arc<[u8]>>,
+    ) -> Option<Reread> {
+        let retained = retained?;
+        if retained.len() != len {
+            return None;
+        }
+        // >>> THE A/B ARM. `VITASLOP_TEX_PAGE_READ=0` puts every re-read back on the whole-
+        // texture path, which is the one thing that can separate "the picture is wrong because
+        // a page was believed clean" from any other cause - on a device, where a bisect costs a
+        // run each. The exactness argument is a proof and there is a test for it, so this is
+        // not a default anyone is expected to change; it is the falsifier.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(crate::knobs::var("VITASLOP_TEX_PAGE_READ").as_deref(), Ok("0"))
+        }) {
+            return None;
+        }
+        let mut runs = std::mem::take(&mut self.run_scratch);
+        runs.clear();
+        let answered = {
+            let _t = crate::perf::scope(crate::perf::Phase::DrawTextureCompare);
+            ctx.dirty_runs_since(addr, len, *self.stamps.get(&(addr, len))?, &mut runs)
+        };
+        if answered.is_none() {
+            self.run_scratch = runs;
+            return None;
+        }
+        // >>> A RANGE THE GUEST WROTE ALMOST ALL OF GOES BACK ON THE WHOLE-TEXTURE PATH.
+        //
+        // When the content HAS changed, this path owes a copy of the retained buffer to build
+        // the new one on, so a texture that is dirty end to end would read everything AND
+        // clone it - more traffic than the plain re-read, not less. The census says that is
+        // rare (large textures came back under 2% dirty), and this makes it cost nothing when
+        // it happens instead of costing double.
+        let dirty_bytes: usize = runs.iter().map(|&(a, b)| b - a).sum();
+        if dirty_bytes * 4 > len * 3 {
+            self.run_scratch = runs;
+            return None;
+        }
+        // Every page clean: the shortcut above should have caught this, but a map that says
+        // so here says the same thing, and the answer is the retained buffer.
+        let mut changed = false;
+        let mut fresh: Vec<u8> = Vec::new();
+        for &(start, end) in runs.iter() {
+            let _t = crate::perf::scope(crate::perf::Phase::DrawTextureCompare);
+            let piece = ctx.read_bytes(addr + start as u32, end - start);
+            crate::perf::note_bytes(crate::perf::Phase::DrawTextureCompare, piece.len());
+            if piece.len() != end - start {
+                // A short read means the range is not fully backed; fall back to the whole
+                // path rather than inventing the tail.
+                self.run_scratch = runs;
+                return None;
+            }
+            if !changed && piece[..] != retained[start..end] {
+                changed = true;
+                fresh = retained.to_vec();
+            }
+            if changed {
+                fresh[start..end].copy_from_slice(&piece);
+            }
+        }
+        self.run_scratch = runs;
+        Some(if changed { Reread::Changed(fresh.into()) } else { Reread::Unchanged(retained.clone()) })
+    }
+
     fn restamp(&mut self, addr: u32, len: usize) {
         if self.scene_stamp != 0 {
             self.stamps.insert((addr, len), self.scene_stamp);
+        }
+    }
+
+    /// >>> THE HOST JUST WROTE THIS TEXTURE, SO NOBODY HAS TO FIND OUT WHETHER IT CHANGED.
+    ///
+    /// A decoded video picture is the one texture in a frame whose bytes are authored by the
+    /// ENGINE rather than by the guest: [`crate::vita::avcdec`] converts a decoder's output
+    /// into the layout the title asked for and writes it into the title's own buffer. Without
+    /// this the draw that binds it then goes the whole way round the ordinary ladder to
+    /// rediscover what the engine already knows - the dirty map says "written", the compare
+    /// runs over the whole picture, the browser (which cannot lend its bytes) copies the
+    /// picture across the guest boundary purely to compare it, and a third buffer is
+    /// allocated to hold the answer.
+    ///
+    /// MEASURED on a phone during the movie: `draw: snapshot textures (miss path) 0.82 MB` +
+    /// `draw: texture snapshot compare 2.24 MB` per frame, or ~3 MB/frame of memory traffic
+    /// spent establishing that a video frame changed.
+    ///
+    /// So the writer hands the bytes it wrote straight to the cache. `bytes` MUST be exactly
+    /// what guest memory now holds at `[addr, addr + bytes.len())` - it is handed to draws as
+    /// the texture's contents, so anything else is a lie about guest memory, not a cache
+    /// policy. The one epoch spent here is per PICTURE (~30 a second) against the one per
+    /// scene the ordinary path spends (~330 a second), and taking it AFTER the write is what
+    /// makes the stamp exact: our own stores carry the older epoch, a later guest store
+    /// carries this one, and `dirty_since` tells them apart.
+    fn author(&mut self, ctx: &GuestCtx, addr: u32, bytes: Arc<[u8]>) {
+        let len = bytes.len();
+        if len == 0 {
+            return;
+        }
+        self.insert(addr, len, bytes);
+        // It demonstrably changes, so it must stay on the per-scene cadence: the opt-in
+        // per-FRAME shortcut in `get_or_read` deliberately does not apply to a mutable
+        // texture, and a video picture is the definition of one.
+        self.mutable.insert((addr, len));
+        // The set and per-binding memos hold the PREVIOUS picture and are re-proven by
+        // pointer identity against `entries`, so they reject themselves on their next use.
+        // Nothing to clear here.
+        match ctx.bump_dirty_epoch() {
+            Some((stamp, wrapped)) => {
+                if wrapped {
+                    crate::perf::note_epoch_wrap();
+                    self.stamps.clear();
+                    self.vertex_stamps.clear();
+                    self.index_stamps.clear();
+                }
+                self.stamps.insert((addr, len), stamp);
+            }
+            // An engine that tracks no stores has no fast path to arm; the entry is still
+            // the right bytes, and the ordinary compare will confirm it and cost one pass.
+            None => {}
         }
     }
 
@@ -2552,6 +3088,53 @@ impl TextureSnapshots {
     /// Returning the SAME `Arc` matters beyond the copy: the renderer's packed-vertex cache keys
     /// on this buffer's identity, so an equal-but-different buffer misses it
     /// ([[vitaslop-content-hash-cache-must-verify]]).
+    /// The shared buffer holding exactly `bytes`, for a vertex stream this engine BUILT rather
+    /// than read - the interleave of a multi-stream draw.
+    ///
+    /// # Why the built buffer needs an identity too
+    /// `get_or_read_vertices` gives a single-stream draw a stable `Arc` across frames, and every
+    /// cache downstream keys on that identity. A MULTI-stream draw had none: its rows are
+    /// gathered from several guest buffers into a fresh allocation, so byte-identical geometry
+    /// arrived as a different buffer every frame.
+    ///
+    /// MEASURED on a golf title, whose vertex programs are multi-stream throughout: the
+    /// renderer's allocation-keyed packed-vertex cache missed on essentially every draw and fell
+    /// through to hashing each stream in full - **7.03 MB hashed per frame**, then a full memcmp
+    /// to verify the hit, together 8.9% of all busy time in a V8 profile of the worker. The
+    /// hashes were finding what this interning establishes once: 463 of 671 streams were
+    /// byte-identical to one already held.
+    ///
+    /// The comparison is what decides, exactly as everywhere else here - the fingerprint only
+    /// picks the candidate ([[vitaslop-content-hash-cache-must-verify]]). A miss costs one
+    /// allocation, which is what the caller would have paid unconditionally before.
+    fn intern_vertices(&mut self, bytes: &[u8]) -> Arc<[u8]> {
+        // `VITASLOP_VERTEX_INTERN=0` is the NEGATIVE CONTROL: a fresh buffer per draw, which is
+        // what this path did before. An A/B arm rather than a mode - the two arms must differ in
+        // one thing and be reachable from ONE build, or the comparison is between two binaries
+        // ([[vitaslop-browser-ab-needs-a-negative-control]]).
+        if !vertex_intern_enabled() {
+            return Arc::from(bytes);
+        }
+        let fp = vertex_fingerprint(bytes);
+        if let Some(p) = self.vertex_by_content.get(&(bytes.len(), fp)) {
+            if bytes == &p[..] {
+                return p.clone();
+            }
+        }
+        let made: Arc<[u8]> = Arc::from(bytes);
+        // Bounded by BYTES as well as entries: an interned buffer is held by this map alone,
+        // where an entry that is also in `vertex_entries` is covered by that map's budget.
+        if self.vertex_content_bytes + made.len() > vertex_snapshot_budget()
+            || self.vertex_by_content.len() >= VERTEX_CONTENT_INDEX_CAP
+        {
+            self.vertex_by_content.clear();
+            self.vertex_content_bytes = 0;
+        }
+        self.vertex_content_bytes += made.len();
+        self.vertex_by_content.insert((made.len(), fp), made.clone());
+        made
+    }
+
     fn get_or_read_vertices(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
         if len == 0 {
             return Arc::from(&[][..]);
@@ -2567,7 +3150,9 @@ impl TextureSnapshots {
                 return p.clone();
             }
         }
-        let raw = ctx.read_bytes(addr, len);
+        // Straight into an `Arc` - see `read_bytes_arc` for the pass this saves on a path
+        // that moves megabytes a frame.
+        let raw = ctx.read_bytes_arc(addr, len);
         crate::perf::note_bytes(crate::perf::Phase::DrawVertices, raw.len());
         // Same bytes as last time? Hand back the SAME buffer. The guest may have rewritten the
         // page with identical contents (a rebuilt-every-frame buffer whose contents are static
@@ -2580,19 +3165,58 @@ impl TextureSnapshots {
                 return same;
             }
         }
-        let bytes: Arc<[u8]> = raw.into();
+        // ...and the same bytes held under a DIFFERENT address, which is what a title that
+        // rebuilds its geometry into a rotating arena produces every frame. See
+        // `vertex_by_content`. Proven by comparison, never by the fingerprint.
+        //
+        // >>> BEHIND THE SAME ARM AS THE INTERNING, because it changes the same thing: whether
+        // a buffer's IDENTITY may outlive the address it was read from. A freed range must not
+        // keep its old identity - `a_freed_range_drops_its_vertex_snapshot` pins that, and it
+        // is what stops a later allocation at the same address inheriting the previous
+        // geometry's downstream cache entries. The content index is sound about CONTENT and
+        // says nothing about that, so it is off with the rest of the feature.
+        let fp = vertex_fingerprint(&raw);
+        if vertex_intern_enabled() {
+        if let Some(p) = self.vertex_by_content.get(&(len, fp)) {
+            if raw[..] == p[..] {
+                let same = p.clone();
+                // NOT also recorded in `vertex_entries`: that map's byte accounting is per
+                // ENTRY, and a rotating arena would file one shared buffer under a new address
+                // every frame - counting the same megabytes N times and clearing the budget
+                // early. The address entry buys nothing here anyway, because the next frame's
+                // address is different again.
+                self.stamp_vertices(addr, len);
+                return same;
+            }
+        }
+        }
+        let bytes: Arc<[u8]> = raw;
         // A budget, cleared whole when exceeded. The keys are (address, length) rather than
         // content, so a clear costs re-reads and never correctness - and geometry turns over
         // with the level, so a level change should not leave the previous one's meshes resident.
         if self.vertex_bytes + bytes.len() > vertex_snapshot_budget() {
             self.vertex_entries.clear();
             self.vertex_stamps.clear();
+            // The content index holds `Arc` clones of exactly these buffers, so it is what
+            // would keep them alive past the clear that exists to release them.
+            self.vertex_by_content.clear();
+            self.vertex_content_bytes = 0;
             self.vertex_bytes = 0;
         }
         if let Some(old) = self.vertex_entries.insert((addr, len), bytes.clone()) {
             self.vertex_bytes -= old.len();
         }
         self.vertex_bytes += bytes.len();
+        // Index it by content as well, so the next frame recognises it wherever the guest
+        // rebuilds it. Bounded by entry count and cleared whole: the key is derived from the
+        // bytes and every hit is proven by comparison, so a clear costs a repack and can never
+        // change what is answered.
+        if vertex_intern_enabled() {
+            if self.vertex_by_content.len() >= VERTEX_CONTENT_INDEX_CAP {
+                self.vertex_by_content.clear();
+            }
+            self.vertex_by_content.insert((len, fp), bytes.clone());
+        }
         self.stamp_vertices(addr, len);
         bytes
     }
@@ -2800,6 +3424,10 @@ impl TextureSnapshots {
                  set. Raise VITASLOP_SNAPSHOT_BUDGET_MB if this repeats."
             );
             self.entries.clear();
+            self.pixel_ids.clear();
+            // The expansions name index buffers that no longer exist here.
+            self.palette_expanded.clear();
+            self.palette_bytes = 0;
             // The cadence sets and the stamps describe entries that no longer exist.
             self.mutable.clear();
             self.checked_this_scene.clear();
@@ -2816,7 +3444,76 @@ impl TextureSnapshots {
         if let Some(old) = self.entries.insert((addr, len), bytes.clone()) {
             self.bytes -= old.len();
         }
+        // A NEW buffer is a new identity, and this is the only place one is established - see
+        // `BoundTexture::pixels_id`. `insert` is reached exactly when the bytes were proven to
+        // have CHANGED (or were read for the first time); the unchanged paths return the
+        // retained `Arc` without coming here, so an unchanged texture keeps its id and every
+        // cache keyed on it keeps hitting.
+        self.pixel_ids.insert((addr, len), crate::capture::next_pixels_id());
         self.bytes += bytes.len();
+    }
+
+    /// >>> THE EXPANSION OF A PALETTED TEXTURE, AND THE IDENTITY THAT GOES WITH IT.
+    ///
+    /// A P8/P4 texture is turned into an ordinary `U8U8U8U8` image before anything downstream
+    /// sees it (see `expand_paletted_texture`), and that expansion is a HOST-BUILT buffer, so
+    /// it cannot inherit the snapshot layer's identity - the same indices under a different
+    /// palette are different texels. It used to MINT a fresh id on every decode instead.
+    ///
+    /// That is a cache key that changes when nothing has changed. MEASURED on this title's
+    /// menu, one browser frame: **20 textures re-expanded and re-uploaded every frame, 8.90 MB
+    /// of them**, against `draw: snapshot textures (miss path)` of 0.00 MB - the snapshot layer
+    /// was proving every one of them unchanged and the expansion was throwing that proof away.
+    /// [[vitaslop-an-address-is-not-an-identity]] is the same lesson from the other side: an
+    /// identity must be a function of the CONTENTS, and a fresh number is not.
+    ///
+    /// So the expansion is remembered against the two things it is a function of - the identity
+    /// of the index buffer it read (`src`, which the snapshot layer already mints exactly) and
+    /// the palette's own bytes (`pal`, hashed; it is at most 1 KB and it can change under a
+    /// texture that did not). Same inputs, same buffer, same id, and every cache keyed on that
+    /// id keeps hitting.
+    fn expanded_palette(&self, addr: u32, len: usize, src: u64, pal: u64) -> Option<&PaletteExpansion> {
+        self.palette_expanded.get(&(addr, len)).filter(|e| e.src == src && e.pal == pal)
+    }
+
+    /// Record an expansion against its inputs - see [`Self::expanded_palette`]. One entry per
+    /// paletted texture: a re-expansion replaces the entry it supersedes, so this is bounded by
+    /// the working set rather than by the run.
+    fn remember_palette(&mut self, addr: u32, len: usize, e: PaletteExpansion) {
+        // >>> BOUNDED, AND LOUDLY, because this map PINS buffers nothing else would keep. An
+        // expansion is four times its indices, one entry per paletted texture, and a title that
+        // reaches new paletted art all run would otherwise grow it to the run. Clearing whole is
+        // safe - every entry is re-derivable from guest memory - and costs one re-expansion of
+        // the working set, which is exactly the work this memo exists to avoid, so it says so.
+        if self.palette_bytes + e.pixels.len() > palette_memo_budget() {
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                held_mb = self.palette_bytes >> 20,
+                entries = self.palette_expanded.len(),
+                "paletted-texture expansions over budget - CLEARED WHOLE. Every paletted                  texture in the next frame is expanded and re-uploaded again."
+            );
+            self.palette_expanded.clear();
+            self.palette_bytes = 0;
+        }
+        self.palette_bytes += e.pixels.len();
+        if let Some(old) = self.palette_expanded.insert((addr, len), e) {
+            self.palette_bytes = self.palette_bytes.saturating_sub(old.pixels.len());
+        }
+    }
+
+    /// The identity of the buffer currently held for `(addr, len)` - see
+    /// [`crate::capture::BoundTexture::pixels_id`]. `0` when nothing is held, which is the
+    /// same id the shared zero-texel buffer carries and is correct for both: neither names a
+    /// distinct snapshot.
+    fn pixels_id(&self, addr: u32, len: usize) -> u64 {
+        self.pixel_ids.get(&(addr, len)).copied().unwrap_or(0)
+    }
+
+    /// Clear the per-scene stamp so the next snapshot takes a fresh epoch, which is what
+    /// `begin_scene` plus the next scene's first snapshot do together. Tests only.
+    #[cfg(test)]
+    fn end_scene_for_test(&mut self) {
+        self.scene_stamp = 0;
     }
 
     /// Start a new scene: every retained entry becomes due for one comparison again, and the
@@ -3158,6 +3855,12 @@ impl TextureSnapshots {
         // which is the one thing this function exists to stop.
         self.snapshot_sets.clear();
         self.decoded.clear();
+        // The content index is keyed by BYTES, not by address, so nothing in it can be located
+        // by the range being freed - and a buffer it still holds would keep handing its
+        // identity to a later allocation that happens to contain the same geometry. Dropped
+        // whole: it is a pure accelerator, so losing it costs a re-read and never an answer.
+        self.vertex_by_content.clear();
+        self.vertex_content_bytes = 0;
         let end = addr as u64 + len as u64;
         let mut freed = 0usize;
         self.entries.retain(|&(a, l), bytes| {
@@ -3270,6 +3973,43 @@ mod texture_snapshot_stamp_tests {
             self.c.borrows.set(self.c.borrows.get() + 1);
             self.bytes.get(off..off.checked_add(len)?)
         }
+        fn dirty_runs_since(
+            &self,
+            off: usize,
+            len: usize,
+            stamp: u8,
+            out: &mut Vec<(usize, usize)>,
+        ) -> Option<()> {
+            if len == 0 {
+                return Some(());
+            }
+            let first = off >> 12;
+            let last = (off + len - 1) >> 12;
+            if last >= self.map.len() {
+                return None;
+            }
+            let overhang = first > 0 && self.map[first - 1].get() >= stamp;
+            let mut run: Option<(usize, usize)> = None;
+            for page in first..=last {
+                let dirty = self.map[page].get() >= stamp || (page == first && overhang);
+                if !dirty {
+                    if let Some(r) = run.take() {
+                        out.push(r);
+                    }
+                    continue;
+                }
+                let start = (page << 12).max(off) - off;
+                let end = ((page << 12) + PAGE).min(off + len) - off;
+                match run.as_mut() {
+                    Some(r) => r.1 = end,
+                    None => run = Some((start, end)),
+                }
+            }
+            if let Some(r) = run {
+                out.push(r);
+            }
+            Some(())
+        }
         fn dirty_since(&self, off: usize, len: usize, stamp: u8) -> Option<bool> {
             if len == 0 {
                 return Some(false);
@@ -3314,6 +4054,83 @@ mod texture_snapshot_stamp_tests {
         mem: &'a mut StampedMemory,
     ) -> GuestCtx<'a> {
         GuestCtx::new(regs, vfp, mem, 0)
+    }
+
+    /// >>> A RE-READ THAT TOUCHES ONLY THE DIRTY PAGES MUST ANSWER WHAT A FULL RE-READ WOULD.
+    ///
+    /// `get_or_read` now asks the engine WHICH pages of a texture were stored into and reads
+    /// only those, because a browser census found 7.1% of the pages of a re-read range dirty
+    /// (under 2% for the large ones) - the rest of every such read was re-establishing bytes
+    /// the map already knew. That is only admissible if the answer is identical, so this
+    /// checks the three outcomes that matter on a multi-page texture:
+    ///
+    /// - a page written with the SAME bytes: unchanged, and the caller keeps the buffer
+    ///   IDENTITY its decode and upload caches are keyed on;
+    /// - a page written with different bytes: the new contents, with every untouched page
+    ///   carried over exactly;
+    /// - nothing written at all: the existing stamps shortcut, with no read.
+    #[test]
+    fn a_dirty_page_reread_answers_what_a_full_reread_would() {
+        let c = Counters::default();
+        // Three pages, so there is something to leave alone.
+        let len = 3 * PAGE;
+        let mut mem = StampedMemory::new(len + PAGE, c.clone());
+        for (i, b) in mem.bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut regs = [0u32; REG_COUNT];
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let mut snaps = TextureSnapshots::new();
+
+        // Scene 1: establish the texture.
+        let first = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.get_or_read(&ctx, 0, len)
+        };
+        assert_eq!(first.len(), len);
+
+        // Scene 2: the guest rewrites ONE page with the bytes it already held.
+        snaps.begin_scene();
+        snaps.end_scene_for_test();
+        let same = mem.bytes[PAGE];
+        mem.guest_store(PAGE, same);
+        let second = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.get_or_read(&ctx, 0, len)
+        };
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a page rewritten with the same bytes must not produce a new buffer - every \
+             decode and upload cache downstream is keyed on this identity"
+        );
+
+        // Scene 3: the guest changes one byte of the middle page.
+        snaps.begin_scene();
+        snaps.end_scene_for_test();
+        mem.guest_store(PAGE + 7, 0xAB);
+        let third = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.get_or_read(&ctx, 0, len)
+        };
+        assert!(!Arc::ptr_eq(&first, &third), "changed bytes are a new buffer");
+        assert_eq!(third[PAGE + 7], 0xAB, "the changed byte is the guest's");
+        assert_eq!(&third[..PAGE], &mem.bytes[..PAGE], "the untouched page is carried over");
+        assert_eq!(
+            &third[2 * PAGE..len],
+            &mem.bytes[2 * PAGE..len],
+            "and so is the page after it"
+        );
+        // The whole buffer is exactly guest memory, which is the only claim that matters.
+        assert_eq!(&third[..], &mem.bytes[..len]);
+
+        // Scene 4: nothing written. The stamps shortcut answers with no read at all.
+        snaps.begin_scene();
+        snaps.end_scene_for_test();
+        let fourth = {
+            let ctx = ctx_over(&mut regs, &mut vfp, &mut mem);
+            snaps.get_or_read(&ctx, 0, len)
+        };
+        assert!(Arc::ptr_eq(&third, &fourth), "an untouched texture is the same buffer");
     }
 
     /// >>> THE REGRESSION THIS EXISTS FOR: one epoch per SCENE, not one per snapshot.
@@ -3495,6 +4312,68 @@ mod texture_snapshot_stamp_tests {
         assert!(Arc::ptr_eq(&first, &again), "identical bytes must keep the same buffer");
     }
 
+    /// >>> AN UNCHANGED PALETTED TEXTURE MUST KEEP ONE EXPANSION AND ONE IDENTITY.
+    ///
+    /// A P8 texture is expanded through its palette into an ordinary RGBA8 image before
+    /// anything downstream sees it, and that buffer is host-built, so it cannot inherit the
+    /// snapshot layer's identity. It used to MINT a fresh one on every decode - which is a
+    /// cache key that changes when nothing has: measured on this title's menu, 20 textures
+    /// re-expanded and re-uploaded every frame over bytes the snapshot layer had just proved
+    /// unchanged.
+    ///
+    /// The three properties, all here because they are one mechanism: unchanged indices and an
+    /// unchanged palette keep the SAME buffer and the same id; a rewritten PALETTE is different
+    /// texels and must produce a new one; and rewritten INDICES must too.
+    #[test]
+    fn an_unchanged_paletted_texture_keeps_its_expansion() {
+        let c = Counters::default();
+        let mut mem = StampedMemory::new(64 * PAGE, c.clone());
+        let (mut regs, mut vfp) = ([0u32; REG_COUNT], [0u32; VFP_ARG_COUNT]);
+        let mut snaps = TextureSnapshots::new();
+        // A 4x4 P8 image (16 indices) and its 256-entry table, in separate pages.
+        let (tex, pal) = (12 * PAGE as u32, 13 * PAGE as u32);
+        for i in 0..16usize {
+            mem.guest_store(tex as usize + i, (i % 4) as u8);
+        }
+        for e in 0..4usize {
+            for (b, v) in [(0u8, 10u8), (1, 20), (2, 30), (3, 255)] {
+                mem.guest_store(pal as usize + e * 4 + b as usize, v.wrapping_add(e as u8));
+            }
+        }
+        // LINEAR (tex_type 3), 4x4, data at `tex`, palette in word 3 as the 64-byte-aligned
+        // field vitasdk declares. The exact format is handed in, which is what the runtime does
+        // whenever the guest's own `sceGxmTextureInitP8` call was seen.
+        let words = [0u32, (3 << 29) | (3 << 12) | 3, tex, pal >> 6];
+        let binding = TextureBinding { unit: 0, addr: 0x1000, words, from_precomputed: false };
+        let fmt = Some(crate::render::P8 << 24);
+
+        let mut decode = |snaps: &mut TextureSnapshots,
+                          mem: &mut StampedMemory,
+                          regs: &mut [u32; REG_COUNT],
+                          vfp: &mut [u32; VFP_ARG_COUNT]| {
+            let ctx = ctx_over(regs, vfp, mem);
+            snaps.begin_scene();
+            decode_texture(&ctx, snaps, &binding, fmt, None).expect("a P8 texture decodes")
+        };
+
+        let first = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
+        let again = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
+        assert_eq!(first.base_format, crate::render::U8U8U8U8, "expanded to RGBA8");
+        assert_eq!(first.pixels_id, again.pixels_id, "an unchanged expansion keeps its identity");
+        assert!(Arc::ptr_eq(&first.pixels, &again.pixels), "and its buffer");
+
+        // The PALETTE moves under a texture whose own bytes never do.
+        mem.guest_store(pal as usize + 1, 99);
+        let repalette = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
+        assert_ne!(first.pixels_id, repalette.pixels_id, "new colours are a new buffer");
+        assert_ne!(&first.pixels[..], &repalette.pixels[..], "and they are actually different");
+
+        // And the INDICES move.
+        mem.guest_store(tex as usize + 5, 3);
+        let reindex = decode(&mut snaps, &mut mem, &mut regs, &mut vfp);
+        assert_ne!(repalette.pixels_id, reindex.pixels_id, "new indices are a new buffer");
+    }
+
     /// Freed guest memory must not keep serving its old geometry.
     #[test]
     fn a_freed_range_drops_its_vertex_snapshot() {
@@ -3639,6 +4518,115 @@ struct ProgramReflection {
     /// resource index). This is the length of the texture array the whole-array
     /// setter `sceGxmPrecomputed*StateSetAllTextures` is given.
     texture_unit_count: u32,
+    /// >>> WHICH texture units this program's samplers DECLARE, one bit per unit.
+    ///
+    /// GXM's context block carries 16 fragment texture slots and a title leaves whatever it
+    /// last bound in the ones the current program does not read. Those slots are state no
+    /// draw of this program can sample - a program reads the samplers it declares and there
+    /// is no other path to a texture unit - so decoding them is work for bytes that cannot
+    /// reach a pixel.
+    ///
+    /// MEASURED on a golf title's gameplay frame: **7,366 texture resolutions across 672
+    /// draws** - eleven per draw - against fragment programs that declare a handful. That is
+    /// `host::decode_texture` at 10.5% of all busy time in a V8 profile of the worker, and it
+    /// is also why the whole-set memo almost never hits: the key folds every bound slot, so a
+    /// stale binding in a slot nobody samples makes two otherwise identical draws two
+    /// different sets.
+    ///
+    /// Zero means "declares no samplers", which is a real answer (a program that samples
+    /// nothing) - and also what an unreadable parameter table produces, which is why the
+    /// narrowing is applied only when the mask is non-zero.
+    sampler_units: u32,
+}
+
+/// Which stage's uniform-buffer table a lookup reads. The two are separate arrays in the
+/// context block because GXM numbers them independently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UniformStage {
+    Vertex,
+    Fragment,
+}
+
+impl UniformStage {
+    fn name(self) -> &'static str {
+        match self {
+            UniformStage::Vertex => "vertex",
+            UniformStage::Fragment => "fragment",
+        }
+    }
+}
+
+/// Where one program's uniform BUFFERS live in the SA register file - see
+/// [`VitaState::sa_uniform_image`].
+#[derive(Default)]
+struct SaUniformLayout {
+    /// First SA register of the DEFAULT uniform buffer, and its extent, from the program's
+    /// own container table (0 and the header's declared size when it declares no container).
+    default_base: u32,
+    default_regs: u32,
+    /// Every NON-default uniform buffer the driver copies into the register file.
+    buffers: Vec<vitaslop_gxp_shader::container::SaUniformBuffer>,
+}
+
+impl SaUniformLayout {
+    /// The shared empty layout, so the `header == 0` path allocates nothing.
+    fn none() -> std::sync::Arc<Self> {
+        use std::sync::{Arc, OnceLock};
+        static NONE: OnceLock<Arc<SaUniformLayout>> = OnceLock::new();
+        NONE.get_or_init(|| Arc::new(SaUniformLayout::default())).clone()
+    }
+}
+
+/// Say - once per program - that a draw's program declares an SA-resident uniform buffer the
+/// guest has not bound, so those registers read ZERO.
+///
+/// This is the half of the story the renderer's `report_unfed_uniforms` cannot tell: that one
+/// names a program whose buffer nothing FEEDS, and is silent once feeding exists. This names
+/// the case where the feeding exists and the guest simply has not bound the buffer at this
+/// draw - which renders with zeros just the same, and needs the opposite investigation (a call
+/// order, not a missing mechanism).
+fn report_unbound_sa_uniform_buffer(header: u32, stage: UniformStage, index: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((header, index)) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        program = format_args!("{header:#x}"),
+        stage = stage.name(),
+        index,
+        "the program reads uniform buffer {index} out of the SA register file, but the guest          has NOT bound it at this draw - those registers read ZERO"
+    );
+}
+
+/// Say - once per program - that the header's declared default-uniform size exceeds the
+/// extent its own container table gives that buffer, so the tail is not carried.
+///
+/// Both numbers are read from the blob and they disagree on one retail title's vertex
+/// programs (30 declared against a 16-register container, 28 against 14). The container's is
+/// the one the layout corroborates - it is contiguous with the DATA container that holds the
+/// program's literals, and taking the header's would run the buffer over them - so that is
+/// what is used, and the difference is stated here rather than left to be inferred from a
+/// wrong colour.
+fn report_default_uniform_container_short(header: u32, container_regs: u32, short: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(header) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        program = format_args!("{header:#x}"),
+        container_regs,
+        short,
+        "the program's DEFAULT uniform buffer is declared {} registers in the header but its          container table gives it only {container_regs} - the container's extent is used          (it is contiguous with the DATA container holding this program's literals, so the          larger reading would run over them) and the last {short} register(s) of the declared          parameter block are NOT carried",
+        container_regs + short,
+    );
 }
 
 /// All host state for one run: the guest allocator, handle tables, the capture
@@ -3654,6 +4642,41 @@ enum ClockSource {
     /// The scheduler's idle path jumping to the earliest pending deadline - and the
     /// default, so an advance from an untagged path is attributed rather than lost.
     Idle,
+}
+
+/// The kind of timed wait that OWNED the deadline an idle jump landed on, plus the thread
+/// waiting on it. See [`VitaState::idle_attribution`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IdleOwner {
+    pub kind: IdleKind,
+    pub thid: i32,
+}
+
+/// Which timed-wait family an [`IdleOwner`] belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdleKind {
+    /// `sceKernelDelayThread` and the `sceAudioOutOutput` grain park - a pure sleep.
+    Sleep,
+    /// A timed `sceKernelWaitLwCond`.
+    LwCond,
+    /// A timed `sceKernelWaitCond`.
+    Cond,
+    /// A timed `sceKernelWaitSema`.
+    Sema,
+    /// A timed `sceKernelWaitEventFlag`.
+    EventFlag,
+}
+
+impl IdleKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            IdleKind::Sleep => "sleep/delay",
+            IdleKind::LwCond => "lwcond",
+            IdleKind::Cond => "cond",
+            IdleKind::Sema => "sema",
+            IdleKind::EventFlag => "evf",
+        }
+    }
 }
 
 pub struct VitaState {
@@ -3709,10 +4732,32 @@ pub struct VitaState {
     /// Earliest game-clock time the display may latch the NEXT frame - the vsync floor.
     /// See [`VitaState::pace_flip`].
     next_flip_us: u64,
+    /// Latch times, in game-clock microseconds, of the frames the guest has queued and the
+    /// scanout has not yet shown. The DEPTH of this is what a title is allowed to run ahead
+    /// by; see [`VitaState::pace_flip`].
+    display_latches: std::collections::VecDeque<u64>,
+    /// `SceGxmInitializeParams::displayQueueMaxPendingCount`, as the guest declared it.
+    /// Zero until `sceGxmInitialize` is seen, which [`VitaState::pace_flip`] reads as one.
+    display_queue_max_pending: u32,
+    /// Whether a frame has been presented since the last `sceDisplayWaitSetFrameBuf`.
+    /// See [`VitaState::take_present_since_wait`].
+    present_since_wait: bool,
     /// The `sync` argument of the most recent `sceDisplaySetFrameBuf`, which is what
     /// decides whether a present waits for the scanout. See
     /// [`VitaState::set_display_sync`].
     display_sync: u32,
+    /// The `(width, height)` of the buffer the guest last handed `sceDisplaySetFrameBuf`.
+    ///
+    /// >>> A TITLE MAY PRESENT A BUFFER SMALLER THAN THE PANEL AND LET THE HARDWARE SCALE IT.
+    /// The display controller stretches whatever this struct describes onto the 960x544 panel,
+    /// so a front end that wants the frame rate more than the pixels renders 640x368 and
+    /// declares it. Composing that pass at the size it rasterised and stopping there puts the
+    /// whole screen in the top-left corner with black around it - MEASURED on one title's
+    /// menus. Every frontend that presents has to ask for this and scale.
+    ///
+    /// Starts at the panel size, which is what every title that renders today declares, so a
+    /// run that never calls the setter behaves as it always did.
+    display_size: (u32, u32),
     /// Whether the guest has called `sceDisplaySetFrameBuf` at all, so the diagnostic can
     /// tell "asked for the default" from "never asked".
     display_sync_seen: bool,
@@ -3737,12 +4782,17 @@ pub struct VitaState {
     /// Raw `SceGxmProgram` container bytes by header address - see [`VitaState::program_blob`].
     /// Cleared alongside `program_reflection`, and for the same reason.
     program_blobs: FxHashMap<u32, std::sync::Arc<[u8]>>,
-    /// Whether (and how) each VERTEX program's 0xE8 memory loads need a guest-memory window
-    /// snapshotted at draw time - `vitaslop_gxp_shader::mem_window_for_vertex_blob`, memoised
-    /// by header address. `None` for the overwhelming majority of programs, so the per-draw
+    /// Whether (and how) each VERTEX program's 0xE8 memory loads need guest-memory windows
+    /// snapshotted at draw time - `vitaslop_gxp_shader::mem_windows_for_vertex_blob`, memoised
+    /// by header address. EMPTY for the overwhelming majority of programs, so the per-draw
     /// cost of this feature on every other title is one map lookup. Cleared alongside
     /// `program_reflection`, and for the same reason.
-    mem_window_specs: FxHashMap<u32, Option<vitaslop_gxp_shader::MemWindow>>,
+    mem_window_specs: FxHashMap<u32, std::sync::Arc<[vitaslop_gxp_shader::MemWindow]>>,
+    /// Per registered program: the non-default uniform buffers the driver copies into the SA
+    /// register file, and where the DEFAULT buffer's own block starts. Memoised beside
+    /// [`Self::mem_window_specs`] and cleared with it, for the same reason: the decode behind
+    /// it runs once per program, and the per-draw cost for a program with none is one lookup.
+    sa_uniform_specs: FxHashMap<u32, std::sync::Arc<SaUniformLayout>>,
     /// Shader PAIRS the guest's patcher has named but the renderer has not been told about yet
     /// - see [`VitaState::queue_shader_precompile`]. Drained onto the next scene handed to the
     /// renderer, which compiles them before it encodes anything.
@@ -3809,6 +4859,19 @@ pub struct VitaState {
     /// Whether "video playback is not implemented" has been reported (once per run).
     /// See `vita::video`.
     pub(crate) reported_no_video: bool,
+    /// Whether the "stream properties are placeholders" line has been said this run.
+    pub(crate) reported_stream_properties: bool,
+    /// Whether the "the unit layout is partly inferred" line has been said this run.
+    pub(crate) reported_unit_layout: bool,
+    /// The movie session `SceMp4` is playing, if any. One at a time: the call surface has
+    /// a single handle and a title plays one movie at a time.
+    pub(crate) movie: Option<crate::vita::video::MovieSession>,
+    /// The guest's own H.264 decoders and the codec engine's memory bookkeeping.
+    /// See [`crate::vita::avcdec`].
+    pub(crate) avcdec: crate::vita::avcdec::AvcdecState,
+    /// Memory spaces that have reported an exhausted allocation, so the report is once per
+    /// space rather than once per failure - see `vita::libkernel::mspace_alloc`.
+    pub(crate) mspace_exhausted: std::collections::HashSet<u32>,
     pending_reentry: Option<Reentry>,
     // Synchronization objects. Bring-up model: one thread of control (workers run
     // synchronously to completion), so nothing ever actually blocks; a semaphore's
@@ -3920,8 +4983,24 @@ pub struct VitaState {
     /// (silent), replaced by a host that wants real playback (native device / Web
     /// Audio). See [`crate::audio`].
     pub audio: Box<dyn crate::audio::AudioSink + Send>,
+    /// Opens video decoders for movie playback. `NoVideo` by default - which is what a
+    /// host that never set one gets, and it reports "no decoder" rather than pretending a
+    /// movie played. The front-ends install a real one (`H264Factory`), which reaches
+    /// Media Foundation / Video Toolbox / VA-API / WebCodecs depending on where this runs.
+    ///
+    /// The engine links no decoder itself: this is a port, exactly like `audio` and
+    /// `world`, so the browser blob does not carry a native decoder and vice versa.
+    pub video: Box<dyn vitaslop_platform::video::VideoDecodeFactory>,
+    /// Opens AUDIO decoders for a movie's sound track, on the same terms as `video` above:
+    /// `NoAudioDecode` by default, a real one installed by the front-ends. A movie whose
+    /// pictures decode and whose sound does not is a movie playing silently, and this is
+    /// what the engine says so with rather than guessing.
+    pub audio_dec: Box<dyn vitaslop_platform::audio_dec::AudioDecodeFactory>,
     /// Opened NGS/audio port and handle bookkeeping (see `vita::ngs` / `vita::audio`).
     pub(crate) audio_state: crate::vita::audio::AudioState,
+    /// `SceAudiodec` decoders the title created for a movie's sound - see
+    /// [`crate::vita::audiodec`].
+    pub(crate) audiodec: crate::vita::audiodec::AudiodecState,
     /// SceLibLocation handles and permission-dialog state (see `vita::location`). The
     /// position itself is never stored here - it is read from [`World`] at each call, so
     /// a fix cannot go stale behind the guest's back.
@@ -4099,6 +5178,15 @@ pub struct VitaState {
     net_resolvers: Vec<(i32, i32)>,
     net_epolls: Vec<(i32, Vec<i32>)>,
     net_errno: Vec<(i32, u32)>,
+    /// The offline SceHttp object graph: templates, connections and requests. See
+    /// `vita::http` for what is real in it and what reports the link being down.
+    http_objects: Vec<HttpObject>,
+    /// Whether `sceMotionMagnetometerOn` has been called and not turned off again. The
+    /// guest's own state, read back by `sceMotionGetMagnetometerState`.
+    pub motion_magnetometer: bool,
+    /// The `sce::Xml` DOM: the node arena every parsed document lives in, plus the
+    /// interned guest copies of the strings handed back. See `vita::sce_xml`.
+    pub xml: crate::vita::sce_xml::XmlState,
     /// Every `SceFiber` the guest has initialised (see [`FiberRec`]).
     fibers: Vec<FiberRec>,
     /// Per THREAD that called `sceFiberRun`, the `argOnRun` out-pointer to fill when
@@ -4146,6 +5234,9 @@ pub struct VitaState {
     clock_from_quanta_us: u64,
     clock_from_topup_us: u64,
     clock_from_idle_us: u64,
+    /// WHO the idle jumps were made for: microseconds and jump count, per
+    /// `(wait kind, thread id)`. See [`VitaState::idle_attribution`].
+    idle_by_owner: Vec<(IdleOwner, u64, u64)>,
     /// The current display-frame index, updated each flip by the scheduler
     /// (`on_frame_boundary`). Frame-tags egress-ledger events so a recipe can assert
     /// roughly when a milestone occurred, not only that it did.
@@ -4184,6 +5275,13 @@ enum ProgramStage {
 }
 
 impl VitaState {
+    /// Tell the texture cache that the ENGINE just wrote `bytes` into guest memory at `addr`,
+    /// so no draw has to discover it. See [`TextureSnapshots::author`] - the contract is that
+    /// `bytes` is exactly what guest memory now holds there.
+    pub(crate) fn author_texture_bytes(&mut self, ctx: &GuestCtx, addr: u32, bytes: Arc<[u8]>) {
+        self.texture_snapshots.author(ctx, addr, bytes);
+    }
+
     /// New state for a run over `[base, base + mem_bytes)`. Allocations start
     /// above the image (at base + 1 MiB) and grow up, well below the stack that
     /// starts at the top of the region.
@@ -4202,7 +5300,11 @@ impl VitaState {
             charge_rem: (0, 0),
             cpu_charged_since_flip: 0,
             next_flip_us: 0,
+            display_latches: std::collections::VecDeque::new(),
+            display_queue_max_pending: 0,
+            present_since_wait: false,
             display_sync: Self::SETBUF_NEXTFRAME,
+            display_size: (Self::PANEL_W, Self::PANEL_H),
             display_sync_seen: false,
             quantum_count: 0,
             flip_count: 0,
@@ -4211,6 +5313,7 @@ impl VitaState {
             program_reflection: FxHashMap::default(),
             program_blobs: FxHashMap::default(),
             mem_window_specs: FxHashMap::default(),
+            sa_uniform_specs: FxHashMap::default(),
             pending_precompile: Default::default(),
             precompiled_pairs: std::collections::HashSet::new(),
             created_vertex_headers: Vec::new(),
@@ -4229,6 +5332,11 @@ impl VitaState {
             free_stacks: Vec::new(),
             runaway_threads_reported: false,
             reported_no_video: false,
+            reported_stream_properties: false,
+            reported_unit_layout: false,
+            movie: None,
+            avcdec: crate::vita::avcdec::AvcdecState::default(),
+            mspace_exhausted: std::collections::HashSet::new(),
             pending_reentry: None,
             semaphores: Vec::new(),
             event_flags: Vec::new(),
@@ -4268,7 +5376,10 @@ impl VitaState {
             capture: Capture::new(),
             world,
             audio: Box::new(crate::audio::NullSink::default()),
+            video: Box::new(vitaslop_platform::video::NoVideo),
+            audio_dec: Box::new(vitaslop_platform::audio_dec::NoAudioDecode),
             audio_state: crate::vita::audio::AudioState::default(),
+            audiodec: crate::vita::audiodec::AudiodecState::default(),
             location: crate::vita::location::LocationState::default(),
             halt_on_terminate: false,
             process_param: 0,
@@ -4305,6 +5416,9 @@ impl VitaState {
             photo_exports: 0,
             net_sockets: Vec::new(),
             net_resolvers: Vec::new(),
+            http_objects: Vec::new(),
+            motion_magnetometer: false,
+            xml: Default::default(),
             net_epolls: Vec::new(),
             net_errno: Vec::new(),
             fibers: Vec::new(),
@@ -4317,6 +5431,7 @@ impl VitaState {
             clock_from_quanta_us: 0,
             clock_from_topup_us: 0,
             clock_from_idle_us: 0,
+            idle_by_owner: Vec::new(),
             cur_frame: 0,
         }
     }
@@ -5530,11 +6645,40 @@ impl VitaState {
     /// join completes (at wake time, via [`take_stat_writes`](Self::take_stat_writes)).
     pub fn join_block(&mut self, target: i32, stat: u32) -> bool {
         if self.thread_finished(target) {
-            true
-        } else {
-            self.join_waiters.push((self.current, target, stat));
-            false
+            return true;
         }
+        // >>> A JOIN ON A THREAD THAT CANNOT END IS A PERMANENT PARK, AND IT IS SILENT.
+        //
+        // The waiter list is drained only by `thread_exited`, so a target that no thread
+        // will ever exit under - the caller itself, or an id that names no thread at all -
+        // parks the caller for the rest of the process. Nothing reports it: the scheduler's
+        // deadlock check does not fire while any OTHER thread is still runnable (a sound
+        // thread on its own timer is enough), so the run does not fail, it just stops
+        // producing frames. MEASURED on one title: the main thread parked joining thid 0
+        // and the run spun for forty minutes with no output but sound calls.
+        //
+        // Both shapes are refused rather than parked on, because the kernel refuses them
+        // too - a thread id it does not know is an error return, not a wait. The caller
+        // continues with the exit code 0 that `wait_thread_end` writes, which is the same
+        // thing it would see for a thread that had already finished.
+        if target == self.current {
+            tracing::warn!(
+                target: "vitaslop::sched",
+                thid = format_args!("{target:#x}"),
+                "sceKernelWaitThreadEnd: a thread asked to JOIN ITSELF. That can never                  complete, so it is refused rather than parked on. The id the guest passed is                  almost certainly not the one it meant."
+            );
+            return true;
+        }
+        if !self.threads.iter().any(|t| t.uid == target) && target != MAIN_THID {
+            tracing::warn!(
+                target: "vitaslop::sched",
+                thid = format_args!("{target:#x}"),
+                "sceKernelWaitThreadEnd: JOIN ON AN UNKNOWN THREAD ID - no thread with this                  id was ever created, so nothing can ever end it. Refused rather than parked                  on. If the id looks plausible, the create that should have recorded it is                  the bug."
+            );
+            return true;
+        }
+        self.join_waiters.push((self.current, target, stat));
+        false
     }
 
     /// Take the queued joiner `stat` writes (`(stat_ptr, exit_code)`) so the scheduler
@@ -5943,6 +7087,53 @@ impl VitaState {
         self.virtual_us
     }
 
+    /// >>> THE CLOCK EVERY GUEST-VISIBLE TIME CALL MUST READ, AND THERE USED TO BE TWO.
+    ///
+    /// `World::monotonic_us`/`World::wall_us` are stamped `frame * 16666` by every world
+    /// that drives a retail run, so they are CONSTANT for the whole duration of a display
+    /// frame and step once at the flip. That is not a clock, it is the frame counter in
+    /// microsecond clothing, and a title that paces itself off one cannot be paced by it.
+    ///
+    /// MEASURED on a retail racer's race, 100 display frames of a headless run: the title's
+    /// update loop - `sceCtrlReadBufferPositive`, `sceRtcGetCurrentTick`, `sceMotionGetState`
+    /// and its two network callbacks, all at exactly the same count - ran **12.85 times per
+    /// rendered frame**, while `sceGxmBeginScene`/`EndScene`/`Draw` ran exactly ONCE per
+    /// frame's worth. The loop is `t0 = sceKernelLibcClock(); do { step(); } while
+    /// (sceKernelLibcClock() - t0 < one frame);` and that condition cannot become false
+    /// inside a frame when the clock only moves AT a frame - so it spun, stepping the
+    /// simulation every time round. The game's own lap timer advanced 12.4x real
+    /// ([[vitaslop-game-clock-runs-12-8x-the-emulated-clock]] measured the ratio without
+    /// naming the cause), which is what "the race is way sped up" is.
+    ///
+    /// [`now_us`](Self::now_us) is the clock the scheduler actually advances - by charged
+    /// quanta, by the idle jump, and by the vblank floor at a flip - so it moves WHILE guest
+    /// code runs and a self-timing loop terminates against it. `sceKernelGetProcessTimeWide`
+    /// and `sceDisplayGetVcount` were already on it; these are the calls that were not.
+    ///
+    /// The run-to-completion host has no scheduler and therefore no such clock (nothing
+    /// charges quanta and nothing paces a flip), so there the world's frame-stamped value is
+    /// still the only thing that moves and is still what it gets.
+    pub fn guest_mono_us(&mut self) -> u64 {
+        if self.is_preemptive() {
+            self.virtual_us
+        } else {
+            self.world.monotonic_us()
+        }
+    }
+
+    /// The guest's WALL clock: a fixed epoch plus [`guest_mono_us`](Self::guest_mono_us).
+    ///
+    /// Same argument as that function - a wall clock that only ticks at a display flip is
+    /// no more usable for a delta than a monotonic one, and this title reads
+    /// `sceRtcGetCurrentTick` once per update iteration alongside `sceKernelLibcClock`.
+    pub fn guest_wall_us(&mut self) -> u64 {
+        if self.is_preemptive() {
+            GUEST_WALL_EPOCH_US.wrapping_add(self.virtual_us)
+        } else {
+            self.world.wall_us()
+        }
+    }
+
     /// Record a lightweight condition variable's associated lightweight mutex at
     /// `sceKernelCreateLwCond(cond_work, .., mutex_work, ..)`, so a later
     /// `sceKernelWaitLwCond` on `cond_work` knows which mutex to release and re-acquire.
@@ -6111,6 +7302,13 @@ impl VitaState {
     /// bucket differs: a smaller `quanta` bucket means the preemption rate is wrong,
     /// while a smaller `idle` bucket means the run never goes idle - some thread is
     /// still runnable - and no amount of re-calibrating the quantum will touch it.
+    /// Seconds of sound the guest has submitted through `sceAudioOut`. See
+    /// [`crate::vita::audio::AudioState::produced_seconds`] for why this belongs next to the
+    /// clock split and not in the audio backend's own counters.
+    pub fn audio_produced_seconds(&self) -> f64 {
+        self.audio_state.produced_seconds()
+    }
+
     pub fn clock_sources(&self) -> (u64, u64, u64) {
         (self.clock_from_quanta_us, self.clock_from_topup_us, self.clock_from_idle_us)
     }
@@ -6263,20 +7461,92 @@ impl VitaState {
     ///
     /// Returns the microseconds parked, for the caller's diagnostics.
     pub fn pace_flip(&mut self, frame_us: u64) -> u64 {
-        // SCE_DISPLAY_SETBUF_IMMEDIATE: the title asked for the buffer change to take
-        // effect at once rather than at a vblank, which on hardware tears and does NOT
-        // pace. Honouring it means no floor at all - and clearing the reservation too,
-        // or a floor left over from an earlier NEXTFRAME phase would go on pacing a
-        // title that has explicitly asked not to be. See [`Self::set_display_sync`].
-        // A queue depth of one vblank: the caller may not run ahead of the scanout. GXM's
-        // `displayQueueMaxPendingCount` would allow a title to be a frame or two ahead,
-        // which raises throughput but cannot raise the LATCH rate above the panel - and
-        // the latch rate is what the frame count and the game clock are made of.
-        let latch = Self::at_or_after_vblank(self.next_flip_us.max(self.virtual_us), frame_us);
-        self.next_flip_us = latch.saturating_add(frame_us);
-        let park = latch.saturating_sub(self.virtual_us);
+        // Retire the entries the scanout has already shown.
+        while self.display_latches.front().is_some_and(|&t| t <= self.virtual_us) {
+            self.display_latches.pop_front();
+        }
+        // >>> THE QUEUE HAS THE DEPTH THE GUEST ASKED FOR, AND THAT IS NOT A THROUGHPUT
+        // >>> TUNABLE - IT IS A WHOLE FRAME OF GAME CLOCK PER FRAME.
+        //
+        // This used to park the caller until the next vblank on EVERY call, on the
+        // reasoning that `displayQueueMaxPendingCount` only raises throughput and cannot
+        // raise the latch rate above the panel, so the depth could not matter to the frame
+        // count or the clock. The first half is true and the second does not follow.
+        //
+        // MEASURED on a retail sports title, which sets a depth of three and paces itself:
+        // its main loop waits on `sceDisplayGetVcount` for its own target rate (a 100 us
+        // poll loop, disassembled), THEN queues the frame. With a forced depth of one, the
+        // queue call parked it for a further whole vblank that hardware would have spent
+        // scanning out in parallel - so a frame cost THREE display periods where the title
+        // asked for two, and the guest's clock ran **3.01x its displayed frames, dead
+        // steady**. That is not a throughput loss. The clock is what a title's own timers
+        // and its AUDIO are billed in: the same run produced **232 s of sound against 78 s
+        // of picture (2.96x)**, which on a device fills the audio ring, drops the excess,
+        // and then starves - reported as a broken audio backend and caused here.
+        //
+        // So the guest may be `displayQueueMaxPendingCount` frames ahead of the scanout,
+        // exactly as GXM promises, and parks only when the queue is genuinely full. What
+        // the floor still guarantees is the thing it was written for: latches land ON the
+        // vblank grid and never closer together than one period, so a title that queues as
+        // fast as it can draw still latches at 60 Hz and no faster (the 216 fps case).
+        let depth = self.display_queue_max_pending.clamp(1, 8) as usize;
+        let mut park = 0;
+        if self.display_latches.len() >= depth {
+            // Full: wait for the oldest outstanding frame to reach the panel.
+            if let Some(oldest) = self.display_latches.pop_front() {
+                park = oldest.saturating_sub(self.virtual_us);
+            }
+        }
+        // >>> ALWAYS PARK, EVEN FOR ZERO. The scheduler BLOCKS the flipping thread at
+        // `Stop::Flip` unconditionally (that is what stops a title flipping as fast as it
+        // can draw), so the sleep waiter registered here is the only thing that will ever
+        // make it runnable again. Registering it only on the full-queue path deadlocked the
+        // first frame of a title with a deeper queue: the guest queued, the scheduler
+        // blocked it, and nothing named a wake.
         self.sleep_park(park);
+        // Where the clock will be when this thread resumes - the park is scheduled, not
+        // taken, so `virtual_us` has not moved yet.
+        let resumed = self.virtual_us.saturating_add(park);
+        let latch = Self::at_or_after_vblank(self.next_flip_us.max(resumed), frame_us);
+        self.next_flip_us = latch.saturating_add(frame_us);
+        self.display_latches.push_back(latch);
         park
+    }
+
+    /// Take the "a frame has been presented since the last display wait" flag.
+    ///
+    /// # What it is for, and the measurement behind it
+    /// `sceDisplayWaitSetFrameBuf` waits for the buffer the last `sceDisplaySetFrameBuf`
+    /// named to reach the panel. In THIS engine a frame reaches the panel synchronously,
+    /// inside `sceGxmDisplayQueueAddEntry` (`present`), and the panel's latch RATE is
+    /// already enforced there, on the queueing thread, by [`pace_flip`](Self::pace_flip).
+    /// So a wait that follows a present has nothing left to wait for, and parking it a full
+    /// vblank anyway charges the title a second display period for one frame.
+    ///
+    /// MEASURED on a retail sports title whose display-queue callback is the GXM sample
+    /// pattern (`sceDisplaySetFrameBuf`, then wait): that second period went into EVERY
+    /// frame, on top of the two its own 30 Hz limiter asks for. Its game clock ran **2.99x
+    /// its displayed frames**, dead steady, and it produced **2.95 seconds of sound for
+    /// every second of picture** - which on a device fills the audio ring, drops a third of
+    /// what the guest made, and starves on the next hitch, reading as a broken audio
+    /// backend. Not parking after a present gives **1.99x** on both, i.e. exactly the two
+    /// periods a 30 fps title spends, and cuts the run's scheduler suspends by 4.8x.
+    ///
+    /// A wait with NO present behind it still parks a vblank, and that is the case the
+    /// unconditional park was really defending: a title that SPINS on this call livelocked
+    /// when it returned at once (frame 3, 34.3 million thread resumes).
+    pub fn take_present_since_wait(&mut self) -> bool {
+        core::mem::take(&mut self.present_since_wait)
+    }
+
+    /// Record `SceGxmInitializeParams::displayQueueMaxPendingCount`. See [`Self::pace_flip`].
+    pub fn set_display_queue_depth(&mut self, count: u32) {
+        self.display_queue_max_pending = count;
+        tracing::debug!(
+            target: "vitaslop::gxm",
+            count,
+            "sceGxmInitialize: displayQueueMaxPendingCount - how many frames the guest may              run ahead of the scanout"
+        );
     }
 
     /// `SceDisplaySetBufSync`: the buffer change takes effect immediately (and tears).
@@ -6308,6 +7578,25 @@ impl VitaState {
     ///
     /// So it is kept as a diagnostic: it says what the title asked for, which is worth
     /// knowing and was previously invisible.
+    /// The Vita's panel, which is what the display controller scales a smaller buffer onto.
+    pub const PANEL_W: u32 = 960;
+    pub const PANEL_H: u32 = 544;
+
+    /// Record the geometry the guest declared to `sceDisplaySetFrameBuf`. A zero in either
+    /// axis is ignored rather than stored: it describes no buffer, and storing it would
+    /// present nothing.
+    pub fn set_display_geometry(&mut self, w: u32, h: u32) {
+        if w != 0 && h != 0 {
+            self.display_size = (w, h);
+        }
+    }
+
+    /// The geometry the guest last declared. Render a frame at THIS size and scale it to
+    /// [`Self::PANEL_W`] x [`Self::PANEL_H`] to present, which is what the hardware does.
+    pub fn display_size(&self) -> (u32, u32) {
+        self.display_size
+    }
+
     pub fn set_display_sync(&mut self, sync: u32) {
         // Report the first call as well as every change, not changes alone. A run that
         // never logs is otherwise ambiguous between "the title asks for the default" and
@@ -6521,12 +7810,56 @@ impl VitaState {
     /// an infinite park (it could never wake by timeout), so every timed-wait kind
     /// must contribute its deadline.
     pub fn earliest_lwcond_deadline(&self) -> Option<u64> {
-        let lw = self.lwcond_waiters.iter().filter_map(|&(_, _, d)| d);
-        let sl = self.sleep_waiters.iter().map(|&(_, d)| d);
-        let ev = self.evf_waiters.iter().filter_map(|w| w.deadline);
-        let sem = self.sema_waiters.iter().filter_map(|w| w.deadline);
-        let cnd = self.conds.iter().flat_map(|c| c.waiters.iter().filter_map(|w| w.deadline));
-        lw.chain(sl).chain(ev).chain(sem).chain(cnd).min()
+        self.earliest_deadline_owner().map(|(d, _)| d)
+    }
+
+    /// The earliest pending timed-wake deadline AND who is waiting on it.
+    ///
+    /// The owner is what [`idle_attribution`](Self::idle_attribution) is built on: an idle
+    /// jump is game time nobody executed for, and a total alone cannot say which of a
+    /// title's threads bought it.
+    pub fn earliest_deadline_owner(&self) -> Option<(u64, IdleOwner)> {
+        let own = |kind: IdleKind, thid: i32| IdleOwner { kind, thid };
+        let lw = self
+            .lwcond_waiters
+            .iter()
+            .filter_map(|&(t, _, d)| d.map(|d| (d, own(IdleKind::LwCond, t))));
+        let sl = self.sleep_waiters.iter().map(|&(t, d)| (d, own(IdleKind::Sleep, t)));
+        let ev = self.evf_waiters.iter().filter_map(|w| {
+            w.deadline.map(|d| (d, own(IdleKind::EventFlag, w.thid)))
+        });
+        let sem = self
+            .sema_waiters
+            .iter()
+            .filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::Sema, w.thid))));
+        let cnd = self.conds.iter().flat_map(|c| {
+            c.waiters.iter().filter_map(|w| w.deadline.map(|d| (d, own(IdleKind::Cond, w.thid))))
+        });
+        // `min_by_key` on the deadline alone: two waits can share a deadline and either is a
+        // correct answer for the JUMP, but only one may be credited for the time or the
+        // attribution double-counts.
+        lw.chain(sl).chain(ev).chain(sem).chain(cnd).min_by_key(|&(d, _)| d)
+    }
+
+    /// Where the idle-path clock time went, as `(owner, microseconds, jumps)`, largest first.
+    ///
+    /// # Why this exists
+    /// `clock_sources` splits the game clock into quanta / top-up / idle, and on one retail
+    /// title **the idle bucket is 80% of the clock**: 4.0 s of idle against 1.0 s of quanta
+    /// per 100 displayed frames, for frames worth 1.67 s. The clock therefore ran 3.0x the
+    /// display, dead steady - which is what a title paces its AUDIO off, so it produced three
+    /// times as much sound as the picture called for and the phone's ring both overran and
+    /// starved. The split named the PATH and stopped there; nothing said which wait was
+    /// buying the time, and "the scheduler jumped to the earliest deadline" is true of every
+    /// healthy run as well.
+    ///
+    /// An idle jump is the one kind of game time no guest instruction was executed for, so
+    /// it is also the one kind that can be wrong without any guest code being wrong. Naming
+    /// the waiting thread and the wait FAMILY turns that from an inference into a lookup.
+    pub fn idle_attribution(&self) -> Vec<(IdleOwner, u64, u64)> {
+        let mut v = self.idle_by_owner.clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
     }
 
     /// Take the `r0` value owed to thread `thid` when it resumes from a block (a timed
@@ -6555,7 +7888,22 @@ impl VitaState {
         match self.clock_source {
             ClockSource::Quantum => self.clock_from_quanta_us += gained,
             ClockSource::FrameTopup => self.clock_from_topup_us += gained,
-            ClockSource::Idle => self.clock_from_idle_us += gained,
+            ClockSource::Idle => {
+                self.clock_from_idle_us += gained;
+                // ...and WHO it was gained for. The owner is looked up before the deadline
+                // lists are drained below, because draining is what removes it.
+                if let Some((_, owner)) = self.earliest_deadline_owner() {
+                    match self.idle_by_owner.iter_mut().find(|(o, _, _)| *o == owner) {
+                        Some(slot) => {
+                            slot.1 += gained;
+                            slot.2 += 1;
+                        }
+                        // Bounded by (wait kinds) x (live threads), which is tens - a title
+                        // that somehow exceeds that would be reporting a thread leak anyway.
+                        None => self.idle_by_owner.push((owner, gained, 1)),
+                    }
+                }
+            }
         }
         // Back to the default immediately: the tag describes THIS call only, and letting
         // it persist would credit the next untagged advance to whichever path happened to
@@ -6960,6 +8308,114 @@ impl VitaState {
         if addr != 0 {
             self.pending_stat_writes.push((addr, code as u32));
         }
+    }
+
+    // --- SceHttp: the offline object graph -----------------------------------
+    //
+    // Real objects and real local state, no host connections. See `vita::http`.
+
+    /// Allocate a template/connection/request. The caller has already checked that
+    /// `parent` is a live object of the level above, so this only allocates.
+    pub fn http_create(&mut self, kind: HttpKind, parent: i32, label: &str, method: i32) -> i32 {
+        let base = match kind {
+            HttpKind::Template => HTTP_TEMPLATE_BASE,
+            HttpKind::Connection => HTTP_CONNECTION_BASE,
+            HttpKind::Request => HTTP_REQUEST_BASE,
+        };
+        // Count objects of THIS kind, deleted ones included, so an id is never reused
+        // within a run: a title that keeps a stale id must see it refused, not find it
+        // pointing at somebody else's object.
+        let n = self.http_objects.iter().filter(|o| o.kind == kind).count() as i32;
+        let id = base + 1 + n;
+        self.http_objects.push(HttpObject {
+            id,
+            kind,
+            parent,
+            label: label.to_string(),
+            method,
+            headers: Vec::new(),
+            timeouts: [0; 3],
+            deleted: false,
+        });
+        id
+    }
+
+    fn http_object_mut(&mut self, id: i32) -> Option<&mut HttpObject> {
+        self.http_objects.iter_mut().find(|o| o.id == id && !o.deleted)
+    }
+
+    /// Is `id` a live object at all, of any kind?
+    pub fn http_exists(&self, id: i32) -> bool {
+        self.http_objects.iter().any(|o| o.id == id && !o.deleted)
+    }
+
+    /// Is `id` a live object of exactly `kind`?
+    pub fn http_is(&self, id: i32, kind: HttpKind) -> bool {
+        self.http_objects.iter().any(|o| o.id == id && o.kind == kind && !o.deleted)
+    }
+
+    /// Free `id`. Deleting a template or connection also frees everything under it,
+    /// which is what the library does - the children cannot outlive the object that
+    /// owns their settings, and leaving them live would let a request survive its
+    /// connection and report a different error than hardware gives.
+    pub fn http_delete(&mut self, id: i32) -> bool {
+        let Some(o) = self.http_object_mut(id) else { return false };
+        o.deleted = true;
+        let mut doomed = vec![id];
+        while let Some(parent) = doomed.pop() {
+            let kids: Vec<i32> =
+                self.http_objects.iter().filter(|o| o.parent == parent && !o.deleted).map(|o| o.id).collect();
+            for k in kids {
+                if let Some(o) = self.http_object_mut(k) {
+                    o.deleted = true;
+                }
+                doomed.push(k);
+            }
+        }
+        true
+    }
+
+    /// Record a connect/send/receive timeout (`which` is 0/1/2) against a live object.
+    pub fn http_set_timeout(&mut self, id: i32, which: usize, usec: u32) -> bool {
+        match self.http_object_mut(id) {
+            Some(o) if which < 3 => {
+                o.timeouts[which] = usec;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record a request header against a live object.
+    pub fn http_add_header(&mut self, id: i32, name: &str, value: &str) -> bool {
+        match self.http_object_mut(id) {
+            Some(o) => {
+                o.headers.push((name.to_string(), value.to_string()));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// One line per live SceHttp object, for a shutdown report or a trace: the graph
+    /// the title built, and what it asked for over it.
+    pub fn http_report(&self) -> Vec<String> {
+        self.http_objects
+            .iter()
+            .filter(|o| !o.deleted)
+            .map(|o| {
+                format!(
+                    "{:?} {:#x} parent={:#x} method={} timeouts={:?} headers={} label={:?}",
+                    o.kind,
+                    o.id,
+                    o.parent,
+                    o.method,
+                    o.timeouts,
+                    o.headers.len(),
+                    o.label
+                )
+            })
+            .collect()
     }
 
     pub fn net_resolver_create(&mut self) -> i32 {
@@ -8100,22 +9556,33 @@ impl VitaState {
         ctx.write_u32(state.wrapping_add(off::BUF), buffer);
     }
 
-    /// `sceGxmPrecomputedVertexStateSetUniformBuffer(state, bufferIndex, bufferData)`: store
-    /// the NON-default uniform buffer binding, applied to the context block's table when the
-    /// state is bound (the same table the direct `sceGxmSetVertexUniformBuffer` writes).
-    pub fn precomputed_vertex_state_set_nondefault_uniform_buffer(
+    /// `sceGxmPrecomputed{Vertex,Fragment}StateSetUniformBuffer(state, bufferIndex,
+    /// bufferData)`: store the NON-default uniform buffer binding, applied to the context
+    /// block's table when the state is bound (the same table the direct
+    /// `sceGxmSet{Vertex,Fragment}UniformBuffer` writes).
+    pub fn precomputed_state_set_nondefault_uniform_buffer(
         &mut self,
         ctx: &mut GuestCtx,
         state: u32,
+        stage: &str,
         index: u32,
         buffer: u32,
     ) {
         use crate::vita::gxmstate::{self};
-        if (index as usize) < crate::vita::gxmctx::MAX_UNIFORM_BUFFERS {
-            let block =
-                self.ensure_state_block(ctx, state, gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES);
-            ctx.write_u32(block.wrapping_add(index * 4), buffer);
+        if (index as usize) >= crate::vita::gxmctx::MAX_UNIFORM_BUFFERS {
+            return;
         }
+        let (magic, bytes, table) = if stage == "vertex" {
+            (gxmstate::MAGIC_VERTEX, gxmstate::VERTEX_BLOCK_BYTES, 0)
+        } else {
+            (
+                gxmstate::MAGIC_FRAGMENT,
+                gxmstate::FRAGMENT_BLOCK_BYTES,
+                gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS,
+            )
+        };
+        let block = self.ensure_state_block(ctx, state, magic, bytes);
+        ctx.write_u32(block.wrapping_add(table + index * 4), buffer);
     }
 
     /// `sceGxmPrecomputed{Vertex,Fragment}StateGetDefaultUniformBuffer(state)`: the pointer
@@ -8304,9 +9771,18 @@ impl VitaState {
         // pointer or magic the emitted guard declines - and it writes exactly the words
         // the inline form writes.
         let block = ctx.read_u32(state.wrapping_add(gxmstate::off::BLOCK));
-        for w in 0..gxmstate::FRAGMENT_BLOCK_BYTES / 4 {
+        for w in 0..gxmstate::TEXTURE_ARRAY_BYTES / 4 {
             let v = if block != 0 { ctx.read_u32(block.wrapping_add(w * 4)) } else { 0 };
             gxmctx::set(ctx, context, gxmctx::off::TEXTURES + w * 4, v);
+        }
+        // The non-default uniform-buffer table, replace-not-merge for the same reason the
+        // texture array is: a buffer bound by an earlier direct call must not survive into a
+        // state that does not declare it. Its destination is nowhere near the texture block,
+        // so it is its own loop rather than part of the copy above.
+        for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+            let at = gxmstate::FRAGMENT_BLOCK_UNIFORM_BUFFERS + i * 4;
+            let addr = if block != 0 { ctx.read_u32(block.wrapping_add(at)) } else { 0 };
+            gxmctx::set_fragment_uniform_buffer(ctx, context, i, addr);
         }
         // Binding a precomputed fragment state leaves the context bound to its program, so it
         // goes where `sceGxmSetFragmentProgram` puts it. The blend equation follows from the
@@ -8700,7 +10176,57 @@ impl VitaState {
         if let Some((_, target, _)) = self.join_waiters.iter().find(|(t, _, _)| *t == thid) {
             return format!("joining thid={target:#x}");
         }
+        // `sceKernelWaitSignal` is UNTIMED: it buys no idle clock, so
+        // [`idle_attribution`](Self::idle_attribution) cannot see it, and a thread parked here
+        // read as RUNNABLE in this dump - the one report whose job is to say which thread is
+        // stopped. A wait with no deadline is exactly the shape that hangs forever, so it is
+        // the last one that should be invisible.
+        if self.signal_waiters.contains(&thid) {
+            return "blocked on sceKernelWaitSignal (UNTIMED - only another thread can wake it)"
+                .to_string();
+        }
         "RUNNABLE".to_string()
+    }
+
+    /// Every LIVE thread that is parked, with the wait it is parked in - the report a stall
+    /// needs, small enough for a phone's diagnostics panel.
+    ///
+    /// # Why this exists next to [`debug_sync_dump`](Self::debug_sync_dump)
+    /// That dump prints every primitive's whole waiter list and runs to hundreds of lines: it
+    /// is a file to read, and the browser panel keeps a bounded number of DISTINCT lines
+    /// (`vitaslop_web::logging::PAGE_LOG_CAP`), so pasting it there would evict every other
+    /// finding. This is the same question asked the other way round - per THREAD rather than
+    /// per object - and answers "who is stopped, and on what" in as many lines as there are
+    /// parked threads.
+    ///
+    /// Runnable threads are omitted deliberately: on a healthy frame nearly every thread is
+    /// parked in something ordinary, and it is the empty-vs-not that matters when a title
+    /// stops making progress. A thread absent from BOTH this list and the runnable set does
+    /// not exist; a thread that is runnable and getting nowhere is spinning in guest code,
+    /// which is a different instrument's question (`VITASLOP_BLOCK_HIST`).
+    pub fn blocked_threads(&self) -> Vec<(i32, String, String)> {
+        let mut out = Vec::new();
+        let mut push = |thid: i32, name: String, state: String| {
+            if state != "RUNNABLE" {
+                out.push((thid, name, state));
+            }
+        };
+        push(MAIN_THID, "main".to_string(), self.thread_wait_state(MAIN_THID));
+        for t in &self.threads {
+            if t.exit_code.is_some() {
+                continue;
+            }
+            let name = if t.name.is_empty() { "-".to_string() } else { t.name.clone() };
+            // A thread the guest created but never started is not blocked on anything; saying
+            // so is the difference between "waiting for a signal" and "never launched".
+            let state = if t.started {
+                self.thread_wait_state(t.uid)
+            } else {
+                "DORMANT (created, never started)".to_string()
+            };
+            push(t.uid, name, state);
+        }
+        out
     }
 
     /// Human-readable dump of every preemptive sync primitive's ownership/waiter state
@@ -9089,7 +10615,13 @@ impl VitaState {
                     (vertex_count * stride) as usize,
                 );
             }
-            let mut vertices = vec![0u8; (vertex_count * stride) as usize];
+            // Built in a REUSED buffer, not a fresh one: this path runs for every draw of every
+            // frame on a title whose vertex programs are multi-stream, and the allocation alone
+            // was a measurable share of the draw handler. The result is interned below, so the
+            // scratch is never handed out.
+            let mut vertices = std::mem::take(&mut snapshots.interleave_scratch);
+            vertices.clear();
+            vertices.resize((vertex_count * stride) as usize, 0);
             for (si, s) in streams.iter().enumerate() {
                 if s.stride == 0 {
                     continue;
@@ -9115,13 +10647,19 @@ impl VitaState {
                     vertices[dst..dst + row_len].copy_from_slice(row);
                 }
             }
-            // The multi-stream path is NOT snapshotted: its result is an interleave of several
-            // guest buffers, so a snapshot key would have to fold every stream's address, length
-            // and stride, and its validity would rest on all of them at once. It is also the
-            // uncommon case. Left as the plain read it always was, rather than given a cache
-            // whose invalidation is harder to argue than the copy it saves.
+            // >>> NOT SNAPSHOTTED - INTERNED, WHICH NEEDS NO KEY AT ALL.
+            //
+            // A snapshot here was rejected because the key would have to fold every stream's
+            // address, length and stride and its validity would rest on all of them at once.
+            // That argument is sound and this is not that: the rows are gathered exactly as
+            // before, from guest memory, every draw - nothing is skipped and no validity is
+            // assumed. Only the RESULT's identity is shared with the byte-identical buffer
+            // already held, so the caches downstream that key on identity can hit. See
+            // `intern_vertices`.
             crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
-            Arc::from(vertices)
+            let interned = snapshots.intern_vertices(&vertices);
+            snapshots.interleave_scratch = vertices;
+            interned
         });
         // Snapshot every bound fragment texture (decoded from its control words),
         // sorted by unit so unit 0 is first. `bound_textures` is already kept sorted by
@@ -9176,7 +10714,20 @@ impl VitaState {
                     // reason `bound_textures` is.
                     let mut raw = std::mem::take(&mut self.bound_binding_scratch);
                     blk.texture_bindings(&mut raw);
+                    // >>> ONLY THE UNITS THIS PROGRAM SAMPLES. See
+                    // `ProgramReflection::sampler_units` for the measurement and for why a
+                    // slot the program does not declare cannot reach a pixel.
+                    //
+                    // `VITASLOP_SAMPLER_NARROW=0` is the A/B arm: every bound slot, which is
+                    // what this did before. A zero mask means the table said nothing, and then
+                    // nothing is narrowed - a program that genuinely declares no samplers
+                    // produces an empty list either way.
+                    let want = fref.sampler_units;
+                    let narrow = want != 0 && sampler_narrow_enabled();
                     for (unit, b) in raw.iter() {
+                        if narrow && (*unit >= 32 || want & (1u32 << *unit) == 0) {
+                            continue;
+                        }
                         frag_binds.push(TextureBinding {
                             unit: *unit,
                             addr: b.addr,
@@ -9498,9 +11049,19 @@ impl VitaState {
         let (vprog, fprog, vert_sa, frag_sa) = if gxp_live_capture() {
             let vprog = self.program_blob(ctx, vheader);
             let fprog = self.program_blob(ctx, fheader);
-            // The vertex SA is the pre-stamp raw uniforms captured above (covers both the bound
-            // buffer and the direct sceGxmSetUniformDataF path).
-            let vert_sa = vert_sa_raw;
+            // >>> THE SA BANK A RECOMPILED SHADER READS IS THE REGISTER FILE, NOT ONE BUFFER.
+            //
+            // The bytes captured above are the DEFAULT uniform buffer - the pre-stamp raw
+            // uniforms, covering both the bound buffer and the direct `sceGxmSetUniformDataF`
+            // path - and that is what the reflections above index, from zero. The emitted WGSL
+            // does not: it indexes `sa[k]` by absolute SA register, and a program can have the
+            // default buffer somewhere other than register 0 with another bound buffer resident
+            // below it. `sa_uniform_image` lays both stages out the way the driver does; for a
+            // program with the usual layout it hands the same bytes straight back.
+            let vert_sa =
+                self.sa_uniform_image(ctx, &blk, vheader, UniformStage::Vertex, vert_sa_raw);
+            let frag_sa =
+                self.sa_uniform_image(ctx, &blk, fheader, UniformStage::Fragment, frag_sa);
             // >>> THE FRAGMENT BANK IS THE ONE ALREADY READ, NOT A SECOND READ OF THE SAME
             // BYTES. It was read above for the material's nine floats, under the identical
             // condition, and the guest cannot run between the two - so this used to copy the
@@ -9508,9 +11069,17 @@ impl VitaState {
             // and an allocation per draw on the hottest path in the engine. The comment above
             // that read already said "read once for the two readers"; this is the second
             // reader actually taking it.
-            (vprog, fprog, vert_sa, frag_sa)
+            // Into an `Arc` HERE, once, at the only place these are produced - see
+            // `capture::Draw::vert_sa`. From here to the renderer they are shared, so the
+            // clone `RenderSceneBuilder::build` makes is a refcount bump.
+            (vprog, fprog, Arc::<[u8]>::from(vert_sa), Arc::<[u8]>::from(frag_sa))
         } else {
-            (crate::capture::no_program(), crate::capture::no_program(), Vec::new(), Vec::new())
+            (
+                crate::capture::no_program(),
+                crate::capture::no_program(),
+                Arc::<[u8]>::from(&[][..]),
+                Arc::<[u8]>::from(&[][..]),
+            )
         };
         // ...and WHERE the fragment bank came from, which the bytes cannot say. See
         // `capture::Draw::frag_sa_addr`.
@@ -9518,8 +11087,11 @@ impl VitaState {
         // The guest-memory window the vertex program's 0xE8 loads read through, snapshotted
         // at draw time like every other guest input. One map lookup for a program without
         // loads, which is every program of every other captured title.
-        let mem_window =
-            if gxp_live_capture() { self.capture_mem_window(ctx, &blk, vheader) } else { None };
+        let mem_windows = if gxp_live_capture() {
+            self.capture_mem_windows(ctx, &blk, vheader)
+        } else {
+            Vec::new()
+        };
         drop(gxp_phase);
         let render_state = {
             let _r = crate::perf::scope(crate::perf::Phase::DrawRenderState);
@@ -9568,7 +11140,7 @@ impl VitaState {
             vert_sa,
             frag_sa,
             frag_sa_addr,
-            mem_window,
+            mem_windows,
             shader_expanded: Self::reflected_shader_expanded(&vref),
         };
         match self.scene.as_mut() {
@@ -9606,64 +11178,192 @@ impl VitaState {
         self.program_reflection.clear();
         self.program_blobs.clear();
         self.mem_window_specs.clear();
+        self.sa_uniform_specs.clear();
     }
 
-    /// The guest-memory window the VERTEX program at `header` needs snapshotted per draw,
-    /// if any (see `vitaslop_gxp_shader::mem_window_for_vertex_blob`). Memoised: the decode
+    /// The guest-memory windows the VERTEX program at `header` needs snapshotted per draw,
+    /// if any (see `vitaslop_gxp_shader::mem_windows_for_vertex_blob`). Memoised: the decode
     /// behind it runs once per registered program, and the per-draw cost for the near-total
     /// majority of programs that need no window is this one map lookup.
-    fn mem_window_spec(&mut self, ctx: &GuestCtx, header: u32) -> Option<vitaslop_gxp_shader::MemWindow> {
+    fn mem_window_spec(
+        &mut self,
+        ctx: &GuestCtx,
+        header: u32,
+    ) -> std::sync::Arc<[vitaslop_gxp_shader::MemWindow]> {
         if header == 0 {
-            return None;
+            return std::sync::Arc::from(&[][..]);
         }
         if let Some(spec) = self.mem_window_specs.get(&header) {
-            return *spec;
+            return spec.clone();
         }
         let blob = self.program_blob(ctx, header);
-        let spec = vitaslop_gxp_shader::mem_window_for_vertex_blob(&blob);
-        self.mem_window_specs.insert(header, spec);
+        let spec: std::sync::Arc<[vitaslop_gxp_shader::MemWindow]> =
+            std::sync::Arc::from(vitaslop_gxp_shader::mem_windows_for_vertex_blob(&blob));
+        self.mem_window_specs.insert(header, spec.clone());
         spec
     }
 
-    /// Snapshot the guest-memory window this draw's VERTEX program reads through its 0xE8
-    /// memory loads: `(window guest base address, the window's bytes)`.
+    /// The SA-register layout of one program's uniform BUFFERS - see [`SaUniformLayout`].
+    /// Memoised per registered program beside [`Self::mem_window_spec`].
+    fn sa_uniform_layout(&mut self, ctx: &GuestCtx, header: u32) -> std::sync::Arc<SaUniformLayout> {
+        if header == 0 {
+            return SaUniformLayout::none();
+        }
+        if let Some(l) = self.sa_uniform_specs.get(&header) {
+            return l.clone();
+        }
+        let blob = self.program_blob(ctx, header);
+        let layout = std::sync::Arc::new(match vitaslop_gxp_shader::Program::parse(&blob) {
+            Ok(p) => {
+                let (default_base, default_regs) = p.default_uniform_sa_span();
+                let short = p.default_uniform_overflows_its_container();
+                if short > 0 {
+                    // ...unless the program can reach the tail by POINTER. A +0x78 binding
+                    // entry naming buffer 14 is the driver leaving the default uniform
+                    // buffer's ADDRESS in a DATA slot: the copy into the SA file carries the
+                    // head and the program loads the rest through that pointer, which is
+                    // exactly what a header declaring more than its own container holds has
+                    // been describing. Reporting those as short is a false alarm, and a
+                    // warning that is wrong for the ordinary case trains its reader to skip it.
+                    if !p.uniform_buffer_bindings.iter().any(|b| b.buffer_index == 14) {
+                        report_default_uniform_container_short(header, default_regs, short);
+                    }
+                }
+                SaUniformLayout {
+                    default_base,
+                    default_regs,
+                    buffers: p.sa_uniform_buffers(),
+                }
+            }
+            Err(_) => SaUniformLayout::default(),
+        });
+        self.sa_uniform_specs.insert(header, layout.clone());
+        layout
+    }
+
+    /// Lay this draw's uniform bytes out the way the DRIVER lays them out in the SA register
+    /// file, and return the whole image: the default uniform buffer at its own container's
+    /// base, and every non-default buffer the program declares an SA block for at its.
     ///
-    /// The bound address comes from the context block's own table - written by
+    /// # This is what a recompiled shader reads, and it used to be one buffer at register 0
+    /// The emitted WGSL indexes `sa[k]` by ABSOLUTE SA register, so the bytes bound to it have
+    /// to BE the register file, not one of the blocks that lives in it. That distinction is
+    /// invisible on every title whose container table puts the default buffer at register 0
+    /// with nothing else resident - which is every title captured before this one - and it is
+    /// the difference between a picture and a black frame on a title that keeps its transform
+    /// in container 0 and declares a default buffer of size zero.
+    ///
+    /// A buffer the guest has not bound contributes nothing and leaves its registers zero,
+    /// which is what they read as today. That is not silently fine, so it is REPORTED - once
+    /// per program - by the caller's own diagnostic (`report_unfed_uniforms` on the renderer
+    /// side names the program; this names the draw's missing bind).
+    fn sa_uniform_image(
+        &mut self,
+        ctx: &GuestCtx,
+        blk: &crate::vita::gxmctx::Block<'_>,
+        header: u32,
+        stage: UniformStage,
+        default_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let layout = self.sa_uniform_layout(ctx, header);
+        // The overwhelming majority of programs: the default buffer at register 0 and nothing
+        // else SA-resident. The bytes ARE the image, with no copy and no allocation.
+        if layout.buffers.is_empty() && layout.default_base == 0 {
+            return default_bytes;
+        }
+        let extent_regs = layout
+            .buffers
+            .iter()
+            .map(|b| b.base_sa + b.size_regs)
+            .fold(layout.default_base + layout.default_regs, u32::max);
+        let mut image = vec![0u8; extent_regs as usize * 4];
+        let put = |image: &mut Vec<u8>, base_reg: u32, bytes: &[u8]| {
+            let at = base_reg as usize * 4;
+            let n = bytes.len().min(image.len().saturating_sub(at));
+            image[at..at + n].copy_from_slice(&bytes[..n]);
+        };
+        put(&mut image, layout.default_base, &default_bytes);
+        for b in layout.buffers.iter() {
+            let addr = match stage {
+                UniformStage::Vertex => blk.vertex_uniform_buffer(b.buffer_index),
+                UniformStage::Fragment => blk.fragment_uniform_buffer(b.buffer_index),
+            };
+            if addr == 0 {
+                report_unbound_sa_uniform_buffer(header, stage, b.buffer_index);
+                continue;
+            }
+            let bytes = ctx.read_bytes(addr, b.size_regs as usize * 4);
+            put(&mut image, b.base_sa, &bytes);
+        }
+        image
+    }
+
+    /// The buffer index a +0x78 entry gives the DEFAULT uniform buffer. Its address does not
+    /// live in the context block's non-default table - it is what the stage's own
+    /// `sceGxmReserve*DefaultUniformBuffer` handed back.
+    const DEFAULT_UNIFORM_BUFFER_INDEX: u32 = 14;
+
+    /// Snapshot the guest-memory windows this draw's VERTEX program reads through its 0xE8
+    /// memory loads: `(window guest base address, the window's bytes)` each, in the order the
+    /// shader's `gxp_mem` binding lays them out.
+    ///
+    /// A bound address comes from the context block's own table - written by
     /// `sceGxmSetVertexUniformBuffer` directly or by binding a precomputed vertex state -
-    /// and the extent is the program's own declared buffer size (see
+    /// except for the DEFAULT uniform buffer, whose address is the one the stage's reserve
+    /// handed back. The extent is the program's own declared buffer size (see
     /// `vitaslop_gxp_shader::MemWindow`). Snapshotted AT DRAW TIME like every other guest
     /// input the capture carries, so the renderer later reads what the guest had bound now.
     ///
-    /// Returns `None` (reported, throttled to once per program per run by the caller's
-    /// nature: an unbound buffer is a property of the title's call order, not of one draw)
-    /// when nothing is bound or the base is not 4-aligned - the renderer then DROPS the
-    /// draw with a report rather than feeding the loads fabricated bytes.
-    fn capture_mem_window(
+    /// Returns EMPTY (reported, throttled to once per run) when any window has nothing bound
+    /// or a base that is not 4-aligned - the renderer then DROPS the draw with a report rather
+    /// than feeding the loads fabricated bytes. All or nothing: a draw with some of its
+    /// windows fed would read zeroes through the rest with nothing to say so.
+    fn capture_mem_windows(
         &mut self,
         ctx: &GuestCtx,
         blk: &crate::vita::gxmctx::Block<'_>,
         vheader: u32,
-    ) -> Option<(u32, Vec<u8>)> {
-        let spec = self.mem_window_spec(ctx, vheader)?;
-        let _g = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
-        let addr = blk.vertex_uniform_buffer(spec.buffer_index);
-        if addr == 0 || addr % 4 != 0 {
-            static REPORTED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    target: "vitaslop::gxm",
-                    vertex_program = format_args!("{vheader:#x}"),
-                    buffer_index = spec.buffer_index,
-                    addr = format_args!("{addr:#x}"),
-                    "a vertex program with MEMORY LOADS has no usable uniform buffer bound \
-                     (unbound, or a base the 32-bit loads cannot address) - its draws will \
-                     be DROPPED, not fed fabricated bytes"
-                );
-            }
-            return None;
+    ) -> Vec<(u32, Vec<u8>)> {
+        let spec = self.mem_window_spec(ctx, vheader);
+        if spec.is_empty() {
+            return Vec::new();
         }
-        Some((addr, ctx.read_bytes(addr, spec.bytes as usize)))
+        let _g = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
+        let mut out = Vec::with_capacity(spec.len());
+        for w in spec.iter() {
+            let addr = if w.buffer_index == Self::DEFAULT_UNIFORM_BUFFER_INDEX {
+                blk.uniform_binding(crate::vita::gxmctx::off::VERTEX_UNIFORM).buf
+            } else {
+                blk.vertex_uniform_buffer(w.buffer_index)
+            };
+            // UNBOUND is a property of the BOUND address, tested before the offset is added -
+            // adding one to zero produces a small non-zero pointer, which would turn "nothing is
+            // bound" into "read guest address 124" and feed the draw exactly the fabricated
+            // bytes this check exists to refuse.
+            if addr == 0 || addr % 4 != 0 {
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "vitaslop::gxm",
+                        vertex_program = format_args!("{vheader:#x}"),
+                        buffer_index = w.buffer_index,
+                        addr = format_args!("{addr:#x}"),
+                        "a vertex program with MEMORY LOADS has no usable uniform buffer bound \
+                         (unbound, or a base the 32-bit loads cannot address) - its draws will \
+                         be DROPPED, not fed fabricated bytes"
+                    );
+                }
+                return Vec::new();
+            }
+            // The pointer the DRIVER places, which for the default uniform buffer is NOT the
+            // buffer's base - it names the first register the driver did not copy into the SA
+            // file. See `MemWindow::base_offset` for the corpus closure that establishes it and
+            // for the red sky it explains. Zero for every other buffer, so this is inert there.
+            let at = addr.wrapping_add(w.base_offset);
+            out.push((at, ctx.read_bytes(at, w.bytes as usize)));
+        }
+        out
     }
 
     /// The raw `SceGxmProgram` container bytes at `header`, read out of guest memory once and
@@ -10425,9 +12125,14 @@ impl VitaState {
             } else {
                 t.pixels.iter().filter(|&&b| b != 0).count() as f32 / t.pixels.len() as f32
             };
+            // The guest DATA ADDRESS is printed with the rest, because an all-zero texture is
+            // only half an answer: what decides whether it is a missing render pass or a buffer
+            // the guest genuinely left empty is WHICH address it is, and that is the join to
+            // `VITASLOP_PEEK`, the `refs` tool and the scene-target list.
             eprintln!(
-                "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} nonzero={nonzero:.3} sampler={:?}",
-                t.unit, t.width, t.height, t.base_format, t.swizzle, t.tex_type, sampler_name(t.unit)
+                "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} addr={:#010x} stride={} nonzero={nonzero:.3} sampler={:?}",
+                t.unit, t.width, t.height, t.base_format, t.swizzle, t.tex_type, t.data_addr,
+                t.stride, sampler_name(t.unit)
             );
         }
         if std::env::var("VITASLOP_DUMP_DRAW_GXP_FULL").is_ok() {
@@ -10607,6 +12312,7 @@ impl VitaState {
 
     pub fn present(&mut self, buffer_addr: u32) {
         self.capture.presents.push(buffer_addr);
+        self.present_since_wait = true;
     }
 
     /// Append bytes the guest printed to the debug console (sceClibPrintf).
@@ -10734,6 +12440,12 @@ fn reflect_program_uncached(ctx: &GuestCtx, header: u32) -> ProgramReflection {
                 // the program occupies is one past the highest - which is the length of
                 // the array `sceGxmPrecomputed*StateSetAllTextures` is handed.
                 r.texture_unit_count = r.texture_unit_count.max(res.wrapping_add(1));
+                // ...and WHICH units, not just how many. A program samples the units it
+                // DECLARES and no others, so every other slot of the guest's 16-unit binding
+                // block is state this draw cannot read. See `ProgramReflection::sampler_units`.
+                if res < 32 {
+                    r.sampler_units |= 1u32 << res;
+                }
                 let score = albedo_name_score(&name);
                 if score > 0 && best_albedo.map(|(s, _)| score > s).unwrap_or(true) {
                     best_albedo = Some((score, res));
@@ -11006,14 +12718,16 @@ fn report_mip_chain_unreadable(unit: u32, base_format: u32, data_addr: u32, widt
 /// about scale - and scale is what decides which cause to fix first. One unsized format on
 /// four units and a zero handle on three read identically in the log while costing wildly
 /// different numbers of draws. Counted here, printed by [`report_texture_drops`].
-static TEXTURE_DROPS: std::sync::Mutex<[u64; 4]> = std::sync::Mutex::new([0; 4]);
+static TEXTURE_DROPS: std::sync::Mutex<[u64; 6]> = std::sync::Mutex::new([0; 6]);
 
 /// Drop causes, in [`TEXTURE_DROPS`] order.
-const DROP_CAUSES: [&str; 4] = [
+const DROP_CAUSES: [&str; 6] = [
     "zero control words (null data pointer - bound to a 1x1 zero texel, not dropped)",
     "unsized format",
     "pixels not readable",
     "undecodable base format",
+    "a PALETTED texture with no readable colour table",
+    "a PALETTED texture whose index data does not cover its declared levels",
 ];
 
 /// How many times a `sceGxmTextureInit*` / `SetFormat` recorded a format for an address. A zero
@@ -11045,6 +12759,17 @@ pub fn vblank_spin_parks() -> u64 {
 /// It is NOT silent when it does fire, because this is a behaviour change: the guest's own
 /// wait loop is being cut short, and a run where that happens should say so rather than
 /// leave the next person to infer it from a frame time.
+/// One line per live guest memory space: how full it is, and - the reading that matters -
+/// how many allocations it served against how many frees it saw. See `mspace::Mspace`.
+///
+/// On `VitaState` rather than a free function because the spaces are per-run state, not a
+/// process-wide counter.
+impl VitaState {
+    pub fn mspace_report(&self) -> Vec<String> {
+        self.mspaces.report()
+    }
+}
+
 pub fn report_vblank_spin_parks() {
     let n = VBLANK_SPIN_PARKS.load(std::sync::atomic::Ordering::Relaxed);
     if n == 0 {
@@ -11276,6 +13001,8 @@ fn decode_texture(
             // fresh allocation per draw would miss every time and churn a 512-entry decode
             // cache on a unit whose contents are four constant zero bytes.
             pixels: zero_texel(),
+            // ONE identity for the one shared zero buffer - see `next_pixels_id`.
+            pixels_id: 0,
             // A zeroed handle's control words are zero, so every one of these is the GXM
             // default by construction - which is what the hardware would sample with too.
             u_addr_mode: 0,
@@ -11384,6 +13111,10 @@ fn decode_texture_pixels(
         let _r = crate::perf::scope(crate::perf::Phase::DrawTexRead);
         cache.get_or_read(ctx, t.data_addr, t.read_len as usize)
     };
+    // The identity of the buffer just handed back, taken from the layer that MINTED it - see
+    // `BoundTexture::pixels_id`. Read here rather than derived downstream, because only this
+    // layer knows whether the bytes are the ones it already held or a fresh read.
+    let mut pixels_id = cache.pixels_id(t.data_addr, t.read_len as usize);
     // >>> THE CHAIN READ CAN FAIL, AND FALLING BACK IS NOT SILENT. A texture whose allocation
     // really does end after level 0 (a render target sampled as a texture, say - it has no
     // mips whatever its control word says) makes the fuller read unmappable. That is a fact
@@ -11395,25 +13126,119 @@ fn decode_texture_pixels(
         snap_len = t.level0_read_len as usize;
         degraded = true;
         pixels = cache.get_or_read(ctx, t.data_addr, t.level0_read_len as usize);
+        pixels_id = cache.pixels_id(t.data_addr, t.level0_read_len as usize);
     }
     if pixels.is_empty() {
         report_unreadable_texture(unit, t.base_format, t.data_addr, t.read_len as usize, t.width, t.height);
         return entry(Err(2), None, false);
     }
     let snap = Some((t.data_addr, snap_len));
+    // >>> A PALETTED TEXTURE IS EXPANDED HERE, ONCE, RATHER THAN AT EVERY TEXEL FETCH.
+    //
+    // Both consumers of a `BoundTexture` - the software rasteriser and the GPU uploader - read
+    // texels through `render::texel_rgba_face` / `decode_face_fast`, and neither has anywhere
+    // to put a colour table: it is a second guest allocation, at an address only the control
+    // words know. Threading it through both would mean two more places that can disagree, on
+    // the hottest loop in the engine. Turning the indices into their colours right here means
+    // everything downstream sees an ordinary 32-bit texture and cannot tell the difference -
+    // which is also exactly what the hardware's sampler presents.
+    let (base_format, stride, face_bytes, levels, pixels) =
+        match crate::render::palette_entries(t.base_format) {
+            None => (t.base_format, t.stride, face_bytes, levels, pixels),
+            Some(entries) => {
+                let pal_len = entries as usize * 4;
+                let palette = if t.palette_addr == 0 {
+                    Vec::new()
+                } else {
+                    ctx.read_bytes(t.palette_addr, pal_len)
+                };
+                if palette.len() < pal_len {
+                    report_missing_palette(unit, t.base_format, t.palette_addr, palette.len(), pal_len);
+                    return entry(Err(4), None, false);
+                }
+                // >>> THE EXPANSION IS REMEMBERED AGAINST ITS INPUTS, and the identity with
+                // it. See `TextureSnapshots::expanded_palette` for the measurement: minting a
+                // fresh id here re-expanded and re-uploaded every paletted texture in the
+                // frame, every frame, over bytes the snapshot layer had just proved unchanged.
+                let pal_key = {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    let mut mix = |v: u64| {
+                        h ^= v;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    };
+                    for b in &palette {
+                        mix(*b as u64);
+                    }
+                    // THE SHAPE TOO, because the expansion is a function of it and the entry is
+                    // keyed by the index buffer's guest range: the same range bound as two
+                    // different textures (a re-initialised control word, a smaller mip view)
+                    // expands differently, and handing one the other's buffer would be the
+                    // address-is-not-an-identity defect again in a new place.
+                    for v in [
+                        t.base_format as u64,
+                        t.tex_type as u64,
+                        (t.width as u64) << 32 | t.height as u64,
+                        (t.stride as u64) << 32 | t.faces as u64,
+                        (levels as u64) << 32 | face_bytes as u64,
+                    ] {
+                        mix(v);
+                    }
+                    h
+                };
+                let src_id = pixels_id;
+                let held = cache
+                    .expanded_palette(t.data_addr, pixels.len(), src_id, pal_key)
+                    .map(|e| (e.pixels.clone(), e.id, e.stride, e.face_bytes));
+                match held {
+                    Some((px, id, stride, fb)) => {
+                        pixels_id = id;
+                        (crate::render::U8U8U8U8, stride, fb, levels, px)
+                    }
+                    None => match expand_paletted_texture(&t, &pixels, &palette, levels, face_bytes) {
+                        Some((px, stride, fb)) => {
+                            // A DIFFERENT buffer than the one the snapshot layer holds - the
+                            // indices expanded through the palette - so it carries an identity
+                            // of its own. Minted here rather than inherited: the same indices
+                            // under a different palette are different texels, and inheriting
+                            // would give them one cache entry.
+                            let px: std::sync::Arc<[u8]> = std::sync::Arc::from(px);
+                            pixels_id = crate::capture::next_pixels_id();
+                            cache.remember_palette(
+                                t.data_addr,
+                                pixels.len(),
+                                PaletteExpansion {
+                                    src: src_id,
+                                    pal: pal_key,
+                                    pixels: px.clone(),
+                                    id: pixels_id,
+                                    stride,
+                                    face_bytes: fb,
+                                },
+                            );
+                            (crate::render::U8U8U8U8, stride, fb, levels, px)
+                        }
+                        None => {
+                            report_unexpandable_palette(unit, t.base_format, t.tex_type, t.width, t.height);
+                            return entry(Err(5), None, false);
+                        }
+                    },
+                }
+            }
+        };
     return entry(Ok(crate::capture::BoundTexture {
         unit,
-        base_format: t.base_format,
+        base_format,
         swizzle: t.swizzle,
         tex_type: t.tex_type,
         width: t.width,
         height: t.height,
-        stride: t.stride,
+        stride,
         faces: t.faces,
         face_bytes,
         levels,
         data_addr: t.data_addr,
         pixels,
+        pixels_id,
         u_addr_mode: t.u_addr_mode,
         v_addr_mode: t.v_addr_mode,
         lod_bias: t.lod_bias,
@@ -11422,6 +13247,155 @@ fn decode_texture_pixels(
         gamma: t.gamma,
         mip_filter: t.mip_filter,
     }), snap, degraded);
+}
+
+/// Turn a paletted texture's INDICES into the colours its table names, level by level and face
+/// by face, producing an ordinary `U8U8U8U8` image with the same dimensions, the same layout
+/// rule (Morton or linear) and the same mip chain.
+///
+/// Returns `(pixels, level-0 stride, bytes per face)`, or `None` when the source or the
+/// destination cannot be laid out - which is a refusal, never a partial image.
+///
+/// # The entry is copied VERBATIM, and that is the whole reason the swizzle needs no thought
+/// A palette entry is a 32-bit texel in the texture's own declared swizzle - that is what the
+/// swizzle FIELD of a paletted format describes, since the indices themselves have no channels.
+/// So the four bytes go across untouched and the `BoundTexture` keeps its swizzle, and every
+/// downstream reader applies it exactly as it would to any other 32-bit texel.
+fn expand_paletted_texture(
+    t: &TextureTemplate,
+    pixels: &[u8],
+    palette: &[u8],
+    levels: u32,
+    src_face_bytes: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    use crate::render::{level_layout, texel_element, P4, U8U8U8U8};
+    let bits = if t.base_format == P4 { 4u32 } else { 8 };
+    let index_mask = if bits == 4 { 0x0fu32 } else { 0xff };
+    let entries = crate::render::palette_entries(t.base_format)?;
+
+    // Where each destination level starts inside one expanded face, and how big a face is.
+    let mut dst_level_off = Vec::with_capacity(levels as usize);
+    let mut dst_face_bytes = 0u32;
+    for l in 0..levels {
+        dst_level_off.push(dst_face_bytes);
+        dst_face_bytes += level_layout(U8U8U8U8, t.tex_type, t.width, t.height, l)?.bytes;
+    }
+    let dst_stride = level_layout(U8U8U8U8, t.tex_type, t.width, t.height, 0)?.stride;
+
+    let mut src_level_off = Vec::with_capacity(levels as usize);
+    let mut acc = 0u32;
+    for l in 0..levels {
+        src_level_off.push(acc);
+        acc += level_layout(t.base_format, t.tex_type, t.width, t.height, l)?.bytes;
+    }
+
+    let mut out = vec![0u8; (dst_face_bytes as usize).checked_mul(t.faces as usize)?];
+    for face in 0..t.faces {
+        let src_face = (face * src_face_bytes) as usize;
+        let dst_face = (face * dst_face_bytes) as usize;
+        for l in 0..levels {
+            let src_l = level_layout(t.base_format, t.tex_type, t.width, t.height, l)?;
+            let dst_l = level_layout(U8U8U8U8, t.tex_type, t.width, t.height, l)?;
+            let src_base = src_face + src_level_off[l as usize] as usize;
+            let dst_base = dst_face + dst_level_off[l as usize] as usize;
+            // >>> THE ADDRESSING IS HOISTED OUT OF THE TEXEL LOOP.
+            // This used to call `texel_element` TWICE per texel, and in the swizzled case that
+            // recomputes two `next_power_of_two`s and runs `morton_index`'s per-bit loop - about
+            // ten iterations - each time. MEASURED with a V8 sampling profile of the browser
+            // worker on the golf title, whose textures are paletted: `texel_element` was 30.5%
+            // of the whole thread and the iterator inside it another 31.9%, against 4.6 ms of
+            // actual rendering. The output is unchanged by construction - see
+            // `morton_tables`, which is asserted to be the same function as `morton_index`.
+            let swizzled = crate::render::swizzled_type(t.tex_type);
+            let (sxs, sys) = if swizzled {
+                let (pw, ph) = (src_l.width.next_power_of_two(), src_l.height.next_power_of_two());
+                crate::render::morton_tables(pw, ph, src_l.width, src_l.height)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let (dxs, dys) = if swizzled {
+                let (pw, ph) = (dst_l.width.next_power_of_two(), dst_l.height.next_power_of_two());
+                crate::render::morton_tables(pw, ph, dst_l.width, dst_l.height)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            for y in 0..src_l.height {
+                let srow = (y * src_l.stride) as usize;
+                let drow = (y * dst_l.stride) as usize;
+                for x in 0..src_l.width {
+                    let (soff, nib) = if swizzled {
+                        let m = (sxs[x as usize] + sys[y as usize]) as usize;
+                        if bits == 4 { (m / 2, (m % 2) as u32) } else { (m, 0) }
+                    } else if bits == 4 {
+                        (srow + (x / 2) as usize, x % 2)
+                    } else {
+                        (srow + x as usize, 0)
+                    };
+                    let byte = *pixels.get(src_base + soff)? as u32;
+                    let index = ((byte >> (nib * 4)) & index_mask).min(entries - 1) as usize;
+                    let doff = if swizzled {
+                        (dxs[x as usize] + dys[y as usize]) as usize * 4
+                    } else {
+                        drow + x as usize * 4
+                    };
+                    let d = dst_base + doff;
+                    out.get_mut(d..d + 4)?
+                        .copy_from_slice(palette.get(index * 4..index * 4 + 4)?);
+                }
+            }
+        }
+    }
+    Some((out, dst_stride, dst_face_bytes))
+}
+
+/// Report - once per (unit, format) - that a paletted texture has no readable colour table, so
+/// the binding is DROPPED rather than sampled as raw indices.
+///
+/// Sampling the indices is what this path used to do, and it is the failure shape this project
+/// exists to avoid: an index of 3 in an 8-bit lane reads as a colour value of 3, so the whole
+/// texture comes out very nearly black and looks like a lighting bug.
+fn report_missing_palette(unit: u32, base_format: u32, addr: u32, got: usize, want: usize) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        unit,
+        base_format = format_args!("{base_format:#04x}"),
+        palette = format_args!("{addr:#010x}"),
+        got,
+        want,
+        "a PALETTED texture's colour table could not be read - every draw binding this format \
+         to this unit is DROPPED. A zero address means the guest never pointed the texture at \
+         a palette (or did it through a path this does not see); a short read means the \
+         address is wrong."
+    );
+}
+
+/// Report - once per (unit, format) - that a paletted texture's LAYOUT could not be walked, so
+/// the binding is dropped.
+fn report_unexpandable_palette(unit: u32, base_format: u32, tex_type: u32, width: u32, height: u32) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((unit, base_format)) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        unit,
+        base_format = format_args!("{base_format:#04x}"),
+        tex_type,
+        width,
+        height,
+        "a PALETTED texture could not be laid out for expansion (its index data does not \
+         cover its declared levels) - the binding is DROPPED rather than half-expanded"
+    );
 }
 
 /// Derive everything a binding's four control words say about its texture. Called once per
@@ -11526,6 +13500,17 @@ fn build_texture_template(
         .unwrap_or(level0);
     Some(TextureTemplate {
         base_format,
+        // >>> THE PALETTE POINTER IS IN THE CONTROL WORDS, and reading it there is what makes a
+        // COPIED texture work. `sceGxmTextureSetPalette`'s own handler keeps a host-side map
+        // keyed by the `SceGxmTexture *`, which is exactly the shape that cannot follow a
+        // struct copy - and a copy is how the title that needed this binds every one of its
+        // paletted textures (`report_texture_resolved_from_control_words` fires on all of
+        // them). vitasdk's `SceGxmTexture` declares `palette_addr : 26` as control word 3's
+        // low field, and `sceGxmTextureGetPalette` shifts it left by six; the address really is
+        // 64-byte aligned in the one run that could be checked. Only ever consulted for a
+        // paletted base format.
+        palette_addr: crate::render::palette_entries(base_format)
+            .map_or(0, |_| (w3 & 0x03ff_ffff) << 6),
         swizzle,
         tex_type,
         width,
@@ -12676,6 +14661,13 @@ mod preemptive_tests {
         deadline.saturating_sub(st.now_us())
     }
 
+    /// The LATCH times a run of flips schedules, which is what the vblank floor is about -
+    /// they land on the grid and never closer together than one period, whatever the guest
+    /// does in between.
+    fn latches(st: &VitaState) -> Vec<u64> {
+        st.display_latches.iter().copied().collect()
+    }
+
     #[test]
     fn a_flip_latches_on_a_vblank_edge_not_a_period_after_the_request() {
         const FRAME_US: u64 = 1_000_000 / 60;
@@ -12685,13 +14677,46 @@ mod preemptive_tests {
         // whole period later. That is what phase-locks a cheap frame to 60 Hz instead
         // of letting it drift by its own render time every frame.
         st.advance_time_to(5_000);
-        assert_eq!(st.pace_flip(FRAME_US), FRAME_US - 5_000);
-        assert_eq!(parked_us(&st, 1), FRAME_US - 5_000);
+        st.pace_flip(FRAME_US);
+        assert_eq!(latches(&st), vec![FRAME_US], "the latch is ON the edge");
         // A frame that overruns its period MISSES the vblank and waits for the next
         // one, so it costs two whole periods - the console's 60/30 quantisation, not a
         // continuum. Here the guest lands 1 ms past the 2nd edge and latches at the 3rd.
         st.advance_time_to(2 * FRAME_US + 1_000);
-        assert_eq!(st.pace_flip(FRAME_US), 3 * FRAME_US - (2 * FRAME_US + 1_000));
+        st.pace_flip(FRAME_US);
+        assert_eq!(*latches(&st).last().expect("a latch"), 3 * FRAME_US);
+    }
+
+    /// The queue is as DEEP as the guest declared, and the caller parks only when it is
+    /// full - see `pace_flip` for the display period that a forced depth of one put into
+    /// every frame of a self-pacing title.
+    #[test]
+    fn a_flip_parks_only_when_the_display_queue_is_full() {
+        const FRAME_US: u64 = 1_000_000 / 60;
+        let mut st = state();
+        st.set_current(1);
+        st.set_display_queue_depth(3);
+        // Start off the grid, so "the next vblank" is a real wait and not the zero-length
+        // one a clock sitting exactly on an edge produces.
+        st.advance_time_to(1_000);
+        // Three frames may be in flight, so the first three queue without waiting - and
+        // each one still reserves its own vblank, so the LATCHES are a period apart.
+        for i in 1..=3u64 {
+            assert_eq!(st.pace_flip(FRAME_US), 0, "frame {i} fits in a queue of three");
+            assert_eq!(*latches(&st).last().expect("a latch"), i * FRAME_US);
+        }
+        // The fourth is one too many: it waits for the OLDEST to reach the panel, which
+        // is the first frame's latch, and no longer.
+        assert_eq!(st.pace_flip(FRAME_US), FRAME_US - 1_000, "the queue is full");
+        assert_eq!(parked_us(&st, 1), FRAME_US - 1_000);
+        // A guest that never declares a depth gets one: ONE frame in flight, so the second
+        // flip waits for the first to latch - and not, as this used to, for the vblank
+        // after that.
+        let mut one = state();
+        one.set_current(1);
+        one.advance_time_to(1_000);
+        assert_eq!(one.pace_flip(FRAME_US), 0);
+        assert_eq!(one.pace_flip(FRAME_US), FRAME_US - 1_000);
     }
 
     #[test]
@@ -12701,8 +14726,7 @@ mod preemptive_tests {
         st.set_current(1);
         assert_eq!(st.display_sync(), VitaState::SETBUF_NEXTFRAME, "the safe default");
         st.advance_time_to(5_000);
-        let paced = st.pace_flip(FRAME_US);
-        assert!(paced > 0);
+        st.pace_flip(FRAME_US);
         // IMMEDIATE decides whether the scanout's pointer changes MID-SCAN, which tears.
         // It is not a swap interval and it does not let a title present faster, so the
         // vblank floor is unchanged by it. Both readings that said otherwise were tried
@@ -12710,10 +14734,25 @@ mod preemptive_tests {
         st.set_display_sync(VitaState::SETBUF_IMMEDIATE);
         assert_eq!(st.display_sync(), VitaState::SETBUF_IMMEDIATE, "recorded");
         // The second flip is reserved for the vblank after the first, and asking for
-        // IMMEDIATE does not release it: the floor is the panel, not the mode.
+        // IMMEDIATE does not release it: the floor is the panel, not the mode. With a
+        // queue of one the caller waits for the FIRST frame to reach the panel, and the
+        // second is then scheduled for the vblank after that.
         st.advance_time_to(10_000);
-        assert_eq!(st.pace_flip(FRAME_US), 2 * FRAME_US - 10_000);
-        let _ = paced;
+        assert_eq!(st.pace_flip(FRAME_US), FRAME_US - 10_000);
+        assert_eq!(*latches(&st).last().expect("a latch"), 2 * FRAME_US);
+    }
+
+    /// A display wait that follows a PRESENT has nothing left to wait for in this engine -
+    /// the frame reached the panel inside `sceGxmDisplayQueueAddEntry` and `pace_flip` has
+    /// already held the queueing thread to the panel's rate. Parking it a second time is
+    /// the whole display period that made one 30 fps title's clock run 2.99x its flips.
+    #[test]
+    fn a_present_satisfies_exactly_one_display_wait() {
+        let mut st = state();
+        assert!(!st.take_present_since_wait(), "nothing presented yet");
+        st.present(0x1000);
+        assert!(st.take_present_since_wait(), "the wait after a present is satisfied");
+        assert!(!st.take_present_since_wait(), "and only the FIRST one is");
     }
 
     #[test]

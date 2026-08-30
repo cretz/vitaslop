@@ -941,9 +941,22 @@ fn disasm_one() {
         for (i, ins) in sec.instrs.iter().enumerate() {
             line(i, ins, ins.raw);
         }
-        println!("  -- primary program ({} instrs) --", program.code.len());
-        for (i, &w) in program.code.iter().enumerate() {
-            line(i, &decode(w), w);
+        // The RESOLVED stream, not the raw per-word decode. A sample instruction's `unit`
+        // field carries the raw sampler ORDINAL until `decode_shader` looks it up through the
+        // container's texture-control words, so a raw decode prints `unit: 13` for the very
+        // gather the emitter binds to texture unit 12 - ordinal 13 is SA register 26, and
+        // `texctl SA[26] -> texture unit 12` above says what that resolves to. Printing the
+        // raw value under the same field name read as two code paths disagreeing about a
+        // sampler, and cost a session chasing a defect that was not there. A disassembly that
+        // does not agree with the emitter is worse than no disassembly.
+        let resolved = vitaslop_gxp_shader::usse::decode_shader(&program);
+        // The RESOLVED count, not `program.code.len()`: decoding expands the wide bitwise
+        // form into one instruction per register, so the two differ - and the index printed
+        // here is the one `VITASLOP_GXP_PROBE=<bank><idx>@<instr>` takes.
+        println!("  -- primary program ({} instrs, samplers resolved to GXM units) --",
+            resolved.instrs.len());
+        for (i, ins) in resolved.instrs.iter().enumerate() {
+            line(i, ins, ins.raw);
         }
     }
 }
@@ -1386,21 +1399,11 @@ fn vertex_written_lanes_close_against_declared_total() {
             }
             continue;
         }
-        let mut written = vec![false; 256];
-        for instr in &shader.instrs {
-            let Some(d) = instr.dest.as_ref() else { continue };
-            if d.bank != Bank::Output {
-                continue;
-            }
-            for c in 0..4 {
-                if instr.write_mask[c] {
-                    let lane = d.index as usize + c;
-                    if lane < written.len() {
-                        written[lane] = true;
-                    }
-                }
-            }
-        }
+        // Through the library's own rule, not an open-coded `base + c`: an F16 instruction's
+        // channels are HALVES of a register pair, and counting them as lanes doubles the span
+        // of every half-precision write. See `usse::written_output_lanes`.
+        let mut written = vitaslop_gxp_shader::usse::written_output_lanes(&shader);
+        written.resize(256.max(written.len()), false);
         // The lanes the recompiler actually ROUTES: clip position, plus every varying the
         // container declares. This is the set correctness depends on, and it is the right
         // comparison rather than a dense `0..total` - a reserved region can legitimately hold

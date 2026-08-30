@@ -3,3 +3,8 @@ node_modules/
 dist/
 pkg/
 *.log
+
+# The stand-in for the console system font, if a deployment supplies one. Never
+# committed: whichever face is dropped here belongs to whoever licensed it, and the
+# project ships no font of its own. See vitaslop-runtime/src/font/system.rs.
+projects/vitaslop-web/web/system-font.ttf

@@ -1,12 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "vitaslop-aac",
     "vitaslop-atrac9",
     "vitaslop-conformance-harness",
     "vitaslop-conformance-suite-arm",
     "vitaslop-desktop",
     "vitaslop-gamerun-recipes",
     "vitaslop-gxp-shader",
+    "vitaslop-h264",
     "vitaslop-hostcall",
     "vitaslop-loader",
     "vitaslop-native",

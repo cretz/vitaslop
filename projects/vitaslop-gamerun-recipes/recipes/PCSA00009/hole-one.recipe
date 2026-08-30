@@ -1,0 +1,594 @@
+@title  PCSA00009 - HOLE 1 of Maple Leaf Golf Club, boot to the cup
+@game   PCSA00009
+@shot-every 600
+
+# WHAT THIS RECIPE PROVES
+# ----------------------
+# The title boots, clears its autosave dialog, walks its whole front end, loads a course, and
+# plays HOLE 1 into the cup. Every input below was found by playing, and the frames are the
+# frames it was played at. The front end replays bit-identically; the ROUND does not - see the
+# determinism note below, which is the most important thing in this file.
+#
+# THE BUG THIS RECIPE EXISTS BECAUSE OF, so nobody re-walks it: this title's input manager calls
+# sceCtrlPeekBufferPositive with count = 0x20 and reads the TIMESTAMP of buf[31] - the oldest-
+# first ring of the last 32 pad samples. Filling only buf[0] (correct for every title that asks
+# for one sample) left buf[31] as uninitialised stack, so every press was read and DISCARDED and
+# the whole front end was inert while `vitaslop::input=trace` cheerfully logged the pad being
+# read. The count is a request for pad HISTORY. See vita::ctrl::fill_ctrl.
+#
+# WHAT WAS TRIED AND DOES NOT WORK, so it is not tried again:
+#   * TOUCH. It reaches the title screen (a tap moves 6,519 bytes of guest state) but no menu
+#     acts on it. The menus are pad-driven.
+#   * A press held fewer frames than the gap between two pad samples: the guest samples once per
+#     display frame, so a press that spans no sample is never observed at all. Every press below
+#     is held at least 4 frames for that reason.
+#
+# HOW TO REPLAY IT:
+#
+#   VITASLOP_SIGNATURE=1 play --game <app> --recipe .../hole-one.recipe \
+#       --shots <scratch> --max-frames 28800
+#
+# Both flags matter. `play` stops at 4000 frames unless told otherwise, and it computes no
+# signature at all without VITASLOP_SIGNATURE=1 (it prints "sig=(not folded - no reader)"). The
+# signature covers the frames that actually RAN, so a different --max-frames is a different
+# number.
+#
+# >>> THERE IS DELIBERATELY NO @sig, AND THAT IS A FINDING, NOT AN OMISSION.
+# Two replays of THIS FILE on the SAME BINARY gave sig=0x3b321b0a4814ffa3 and
+# sig=0xc541cb13fe75338b. The same pair of runs truncated at f4700 - the whole front end, up to
+# the tee - gave the SAME signature (0xeca9be1bdea4cf82) twice. So the boot and the menus replay
+# bit-identically and something in the ROUND does not. A pinned @sig would therefore fail on a
+# clean replay, which is worse than none.
+#
+# Note what that means for METHOD, because it is bigger than this recipe: `explore` and the
+# two-run memdiff both rest on the engine being bit-deterministic across processes (the crate
+# README says so in as many words, and a control variant diffing to 0 bytes is the check). That
+# holds here through f4700 and does not hold through f28800. Bisecting the frame count is the
+# way in.
+#
+# DO NOT JUDGE THE PICTURE FROM THIS RECIPE'S SHOTS. `play` renders in software, which cannot
+# run a recompiled fragment program, so on this title every one of them is a flat green
+# rectangle. For pictures use the headless path:
+#
+#   VITASLOP_HEADLESS_RECIPE=<this file> VITASLOP_HEADLESS_FRAMES=28800 \
+#   VITASLOP_HEADLESS_SHOT_EVERY=20 VITASLOP_HEADLESS_SHOT_FROM=28600 \
+#   vitaslop-desktop --game <app> --headless <dir>
+#
+# WHAT IS NOT ASSERTED, AND WHY (see the @todo at the end): no address is known for the stroke
+# count or the remaining distance. `scan` for the stroke counter (u32 == 21 then == 22) and for
+# the remaining distance (f32) both narrowed to ZERO candidates, so neither is stored the way
+# the HUD prints it. With no signature to lean on either (above), the outcome is judged from the
+# SHOTS for now - `hole1-holed-out` at f28760 shows the "+22" banner - and finding an address to
+# assert on is the open task.
+
+
+# The title opens on an AUTOSAVE dialog. Four presses clear it: cross, circle, cross,
+# circle. Each is held ~4 frames, which is enough because the guest samples the pad once
+# per display frame and this menu polls every frame. The presses are timed against the
+# dialog's own fade-in. Whether an earlier press would also work was never tested - this
+# is the sequence that was measured to clear it, and it clears it every replay.
+420: @section autosave
+420: cross
+424:
+440: circle
+444:
+460: cross
+464:
+480: circle
+484:
+
+# MENUS ARE PAD-DRIVEN, NOT TOUCH. Measured: a tap moves 6,519 bytes of guest state on the
+# title screen and the UI never acts on it, while up/down/cross drive every screen. Do not
+# rewrite these as touches.
+# cross on the main menu = New Game.
+900: @section new-game
+900: cross
+904:
+1200: @shot front-end-main-menu
+
+# cross = Single Player.
+1300: @section single-player
+1300: cross
+1312:
+
+# down then cross = the round mode.
+1462: down
+1474:
+1514: cross
+1526:
+
+# cross = the course. The round that follows is at Maple Leaf Golf Club.
+1726: cross
+1738:
+
+# cross = the character.
+1938: cross
+1950:
+
+# square toggles HANDEDNESS. It is pressed twice - 2200 and 2512 - so the setting ends
+# where it started; the pair is kept because it is what the played run did and the frame
+# budget between them is what the screen needs to settle.
+# start = Confirm All.
+2200: @section course-settings
+2200: square
+2212:
+2512: square
+2524:
+2584: start
+2596:
+
+# cross = Go to Course.
+2996: cross
+3008:
+
+# cross = Start Round. The tee of HOLE 1 (par 4, 109y) is reached at about f4200.
+3608: @section start-round
+3608: cross
+3620:
+4000: @shot hole1-tee
+
+# FROM HERE ON IT IS ONE HOLE OF GOLF, PLAYED BADLY: about 25 strokes on a par 4. The
+# sequence is a proof that the title is playable end to end, not a good round.
+#
+# THE SHOT IS A THREE-PRESS GAUGE: cross starts the swing, cross sets the power, cross
+# sets the impact. After the ball lands a banner appears ('Nice Approach!'), which needs
+# its OWN cross, and only THEN does the Next Shot menu (Keep Hitting / Retry Shot / Change
+# Wind and Retry / Restart / Hole Out) appear and take another cross. Getting that off by
+# one press is what sent an earlier loop's club presses into the menu instead.
+#
+# rtrigger cycles the CLUB, and the club RESETS between shots - so every putt has to select
+# the putter again (three presses: AW -> ... -> PT).
+#
+# POWER vs the delay between the first and second cross is CLUB-DEPENDENT and is not
+# modelled: on the putter +12 frames gave 15% and +20 gave 24%, while on a wedge +12 gave
+# 85%. That is why the delays below are not uniform.
+4320: @section hole1-shots
+4320: cross
+4332:
+4600: @shot hole1-address
+4632: cross
+4640:
+4698: cross
+4706:
+4728: cross
+4736:
+5300: cross
+5308:
+5358: cross
+5366:
+5388: cross
+5396:
+5796: cross
+5804:
+5854: cross
+5862:
+5884: cross
+5892:
+6292: cross
+6300:
+6350: cross
+6358:
+6380: cross
+6388:
+6848: cross
+6856:
+6906: cross
+6914:
+6936: cross
+6944:
+7364: cross
+7372:
+7422: cross
+7430:
+7452: cross
+7460:
+7880: cross
+7888:
+7938: cross
+7946:
+7968: cross
+7976:
+8396: cross
+8404:
+8454: cross
+8462:
+8484: cross
+8492:
+8912: cross
+8920:
+8970: cross
+8978:
+9000: cross
+9008:
+9428: cross
+9436:
+9486: cross
+9494:
+9516: cross
+9524:
+9944: cross
+9952:
+10002: cross
+10010:
+10032: cross
+10040:
+10460: cross
+10468:
+10518: cross
+10526:
+10548: cross
+10556:
+10976: cross
+10984:
+11034: cross
+11042:
+11064: cross
+11072:
+11492: cross
+11500:
+11550: cross
+11558:
+11678: cross
+11686:
+11744: cross
+11752:
+11900: cross
+11908:
+11948: cross
+11956:
+12014: cross
+12022:
+12044: cross
+12052:
+12472: cross
+12480:
+12520: cross
+12528:
+12586: cross
+12594:
+12616: cross
+12624:
+13044: cross
+13052:
+13092: cross
+13100:
+13158: cross
+13166:
+13188: cross
+13196:
+13616: cross
+13624:
+13664: cross
+13672:
+13730: cross
+13738:
+13760: cross
+13768:
+14188: cross
+14196:
+14236: cross
+14244:
+14302: cross
+14310:
+14332: cross
+14340:
+14760: cross
+14768:
+14808: cross
+14816:
+14874: cross
+14882:
+14904: cross
+14912:
+15332: cross
+15340:
+15380: cross
+15388:
+15446: cross
+15454:
+15476: cross
+15484:
+15904: cross
+15912:
+15952: cross
+15960:
+16018: cross
+16026:
+16048: cross
+16056:
+16476: cross
+16484:
+16524: cross
+16532:
+16590: cross
+16598:
+16620: cross
+16628:
+17048: cross
+17056:
+17096: cross
+17104:
+17162: cross
+17170:
+17192: cross
+17200:
+17620: cross
+17628:
+17668: cross
+17676:
+17686: cross
+17694:
+17708: cross
+17716:
+18056: cross
+18064:
+18104: cross
+18112:
+18122: cross
+18130:
+18144: cross
+18152:
+18492: cross
+18500:
+18540: cross
+18548:
+18558: cross
+18566:
+18580: cross
+18588:
+18928: cross
+18936:
+18976: cross
+18984:
+18994: cross
+19002:
+19016: cross
+19024:
+19364: cross
+19372:
+19412: cross
+19420:
+19430: cross
+19438:
+19452: cross
+19460:
+19800: cross
+19808:
+19848: cross
+19856:
+19866: cross
+19874:
+19888: cross
+19896:
+20236: cross
+20244:
+
+# right x4 aims the shot; this is the only aiming input in the whole run.
+20284: right
+20294:
+20304: right
+20314:
+20324: right
+20334:
+20344: right
+20354:
+20384: cross
+20392:
+20442: rtrigger
+20452:
+20467: rtrigger
+20477:
+20492: rtrigger
+20502:
+20532: cross
+20540:
+20552: cross
+20560:
+20572: cross
+20580:
+20980: cross
+20988:
+21028: cross
+21036:
+21040: cross
+21048:
+21060: cross
+21068:
+21408: cross
+21416:
+21456: cross
+21464:
+21468: cross
+21476:
+21488: cross
+21496:
+21836: cross
+21844:
+21884: cross
+21892:
+21896: cross
+21904:
+21916: cross
+21924:
+22264: cross
+22272:
+22312: cross
+22320:
+22324: cross
+22332:
+22344: cross
+22352:
+22692: cross
+22700:
+22740: cross
+22748:
+22752: cross
+22760:
+22772: cross
+22780:
+23120: cross
+23128:
+23168: cross
+23176:
+23180: cross
+23188:
+23200: cross
+23208:
+23548: cross
+23556:
+23596: rtrigger
+23606:
+23618: rtrigger
+23628:
+23640: rtrigger
+23650:
+23662: rtrigger
+23672:
+23684: rtrigger
+23694:
+23706: rtrigger
+23716:
+23748: cross
+23756:
+23768: cross
+23776:
+23788: cross
+23796:
+24136: rtrigger
+24146:
+24160: rtrigger
+24170:
+24184: rtrigger
+24194:
+24219: cross
+24227:
+24347: rtrigger
+24357:
+24371: rtrigger
+24381:
+24395: rtrigger
+24405:
+24425: cross
+24433:
+24445: cross
+24453:
+24465: cross
+24473:
+24813: cross
+24821:
+24941: rtrigger
+24951:
+24965: rtrigger
+24975:
+24989: rtrigger
+24999:
+25019: cross
+25027:
+25039: cross
+25047:
+25059: cross
+25067:
+25407: cross
+25415:
+25535: rtrigger
+25545:
+25559: rtrigger
+25569:
+25583: rtrigger
+25593:
+25613: cross
+25621:
+25633: cross
+25641:
+25653: cross
+25661:
+26001: cross
+26009:
+26129: rtrigger
+26139:
+26153: rtrigger
+26163:
+26177: rtrigger
+26187:
+26207: cross
+26215:
+26227: cross
+26235:
+26247: cross
+26255:
+26595: cross
+26603:
+26723: rtrigger
+26733:
+26747: rtrigger
+26757:
+26771: rtrigger
+26781:
+26801: cross
+26809:
+26821: cross
+26829:
+26841: cross
+26849:
+27189: cross
+27197:
+27317: rtrigger
+27327:
+27341: rtrigger
+27351:
+27365: rtrigger
+27375:
+27395: cross
+27403:
+27415: cross
+27423:
+27435: cross
+27443:
+27783: cross
+27791:
+27851: cross
+27859:
+27919: rtrigger
+27929:
+27945: rtrigger
+27955:
+27971: rtrigger
+27981:
+28005: cross
+28013:
+28033: cross
+28041:
+28053: cross
+28061:
+28300: @shot hole1-nice-approach
+
+# The last stroke. The ball is 1.4 ft from the cup at f28320 and drops between f28680 and
+# f28720, where the '+22' hole-out banner comes up and stays up to about f28920.
+28401: @section hole-out
+28401: cross
+28409:
+28469: cross
+28477:
+28537: rtrigger
+28547:
+28563: rtrigger
+28573:
+28589: rtrigger
+28599:
+28623: cross
+28631:
+28651: cross
+28659:
+28671: cross
+28679:
+28760: @shot hole1-holed-out
+
+# The frames after this point in the played run go on to HOLE 2 (the run reaches 'HOLE2 PAR3' by
+# f29600). They are cut here: this recipe's claim is one hole, and a longer replay costs the
+# conformance suite time it buys nothing with.
+28800: @note HOLE 1 is holed out - the '+22' banner is on screen from f28720 to about f28920.
+28800: @todo Find an address for the stroke count or the remaining distance and turn the shot at
+28800: @todo f28760 into a real @assert. Two `scan` passes over u32 and f32 found no candidate,
+28800: @todo so the value is derived or packed; a memdiff of two runs across one stroke is the
+28800: @todo instrument that has not been tried.
+

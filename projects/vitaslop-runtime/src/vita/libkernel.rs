@@ -791,16 +791,32 @@ fn mspace_alloc(st: &mut VitaState, msp: Ptr, size: u32, align: u32, what: &str)
     match space.alloc(size, align) {
         Some(p) => p,
         None => {
+            // >>> REPORTED ONCE PER SPACE, NOT ONCE PER FAILURE.
+            //
+            // A full mspace returning NULL is a NORMAL outcome that the guest handles: a
+            // title that queues work into a fixed pool allocates until the pool is full and
+            // retries, which is its own back-pressure. Logging every one of those at `warn`
+            // produced thousands of identical lines on a device - enough that the on-screen
+            // diagnostics panel reported "855 earlier DISTINCT line(s) dropped" and pushed
+            // every real finding out of the one report a person can actually read.
+            //
+            // The first failure is worth saying: it is where a pool that is too small, or a
+            // leak, first shows. After that the COUNT is the only new information, and it
+            // is folded into the same line at the end of a run rather than repeated.
+            space.note_failure();
             let (used, capacity) = (space.used_bytes(), space.capacity());
-            tracing::warn!(
-                target: "vitaslop::err",
-                msp = format_args!("{:#x}", msp.addr()),
-                size,
-                align,
-                used,
-                capacity,
-                "{what}: memory space exhausted -> NULL"
-            );
+            let first = st.mspace_exhausted.insert(msp.addr());
+            if first {
+                tracing::warn!(
+                    target: "vitaslop::err",
+                    msp = format_args!("{:#x}", msp.addr()),
+                    size,
+                    align,
+                    used,
+                    capacity,
+                    "{what}: memory space exhausted -> NULL. This is the guest's OWN pool                      and a NULL is an outcome it handles, so this says it ONCE per space;                      a run that does it constantly is a pool the guest is filling faster                      than it drains, which shows as guest CPU, not as an error."
+                );
+            }
             0
         }
     }

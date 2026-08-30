@@ -15,6 +15,10 @@ use crate::audio::AudioFormat;
 use crate::host::{GuestCtx, VitaState};
 use crate::{hostcall, SvcOutcome};
 
+/// Where `sceAudioIn` port ids start. Deliberately above anything `sceAudioOutOpenPort`
+/// hands out, so the two families cannot be confused for each other.
+const IN_PORT_BASE: i32 = 0x100;
+
 /// One guest-visible audio port: the format it was opened with and the backend
 /// port id the sink handed back.
 struct AudioPort {
@@ -26,6 +30,10 @@ struct AudioPort {
     /// Tracked so `sceAudioOutGetAdopt` can report whether a type is in use.
     ty: i32,
     format: AudioFormat,
+    /// Per-channel output volume from `sceAudioOutSetVolume`, 0..=1 (the Vita range is
+    /// 0..=32768). Held HERE, in the mixer, rather than in the sink - see
+    /// [`out_output`] for why the order matters.
+    gain: [f32; 2],
 }
 
 /// Audio-output and NGS bookkeeping owned by [`VitaState`](crate::host::VitaState):
@@ -35,13 +43,25 @@ struct AudioPort {
 pub struct AudioState {
     ports: Vec<AudioPort>,
     next_guest_port: i32,
-    /// One shared, zeroed guest blob returned for every NGS voice-definition getter
-    /// (the title treats these as opaque tokens). Lazily allocated; 0 = not yet.
-    pub(crate) ngs_def_blob: u32,
+    /// Open `sceAudioIn` (microphone) ports; see [`AudioInPort`].
+    in_ports: Vec<AudioInPort>,
+    /// One zeroed guest blob per NGS voice-definition getter, as `(func nid, address)`.
+    ///
+    /// The title treats these as opaque tokens, so ONE shared blob served them all - and that
+    /// threw away the only thing a rack description says about itself. A rack names its
+    /// definition by pointer, so with one pointer for every definition there is no way to
+    /// tell a rack of sample players from a rack of COMPRESSOR busses, which is exactly the
+    /// distinction an unaccounted-for attenuation in a mix turns on. One blob per getter
+    /// costs a few allocations for a whole run and makes the rack readable.
+    pub(crate) ngs_defs: Vec<(u32, u32)>,
     /// Per-`(voice, module, param)` params buffer handed back by
     /// `sceNgsVoiceLockParams`. Cached so the per-frame lock/unlock cycle reuses one
     /// buffer instead of leaking a fresh allocation every frame.
     pub(crate) ngs_param_bufs: Vec<((u32, u32, u32), u32)>,
+    /// The voice handle for each `(rack, index)` a title has asked about. A rack is a fixed
+    /// array of voices and this is a LOOKUP - see `ngs::rack_get_voice_handle` for what
+    /// allocating a fresh handle per query did to the mixer.
+    pub(crate) ngs_voice_handles: Vec<((u32, u32), u32)>,
     /// AT9 source voices, decoded and mixed into the output at `sceAudioOutOutput`.
     pub(crate) at9: super::at9::At9Bank,
     /// Which source voice each NGS patch handle carries, from
@@ -65,14 +85,91 @@ pub struct AudioState {
     scratch_mix: Vec<i32>,
     scratch_bytes: Vec<u8>,
     scratch_pcm: Vec<i16>,
+    /// Output frames the guest has submitted through `sceAudioOutOutput`, and the port rate
+    /// they were submitted at. See [`AudioState::produced_seconds`].
+    submitted_frames: u64,
+    submitted_rate: u32,
 }
 
 impl AudioState {
+    /// SECONDS OF SOUND THE GUEST HAS PRODUCED, to be read against the EMULATED CLOCK.
+    ///
+    /// # The two ratios this feeds, and which one means what
+    /// `sceAudioOutOutput` parks the audio thread for one grain of VIRTUAL time, so audio is
+    /// billed in game clock. Two different things can therefore be wrong, and a device's ring
+    /// counters (`written` / `read` / `underrun` / `overrun`) cannot tell them apart because
+    /// they describe the RING:
+    ///
+    /// * **sound / emulated clock** is 1.00 on a healthy path WHATEVER the frame rate. It
+    ///   does not move with the display, and it is what says the audio path itself tracks the
+    ///   clock it is paced on. Measured 0.95-0.99 on all five titles.
+    /// * **clock per displayed frame, in display periods** is the title's own vblank divisor
+    ///   - a WHOLE number (1 for 60 fps, 2 for 30). That is the one that catches a clock
+    ///   running fast, and it is NOT visible in the ratio above: PCSA00009 read 0.985 sound /
+    ///   clock while charging **2.99 periods a frame for a limiter that asks for two**, and
+    ///   that extra period is what made the guest produce 1.7 s of audio per second of real
+    ///   time on a phone, fill the ring, drop a third of it, and starve on the next hitch.
+    ///
+    /// So a device capture showing `UNDERRUN 24.7%` beside `OVERRUN 49.5%` is a RATE problem,
+    /// not a buffer one, and the period count is where to look for it.
+    pub fn produced_seconds(&self) -> f64 {
+        if self.submitted_rate == 0 {
+            return 0.0;
+        }
+        self.submitted_frames as f64 / f64::from(self.submitted_rate)
+    }
+}
+
+/// One open `sceAudioIn` port. There is no backend behind it - see `vita::audioin` for
+/// why a muted microphone is the honest model - so all that is recorded is what the
+/// guest opened it with, which is what paces its reads.
+struct AudioInPort {
+    port: i32,
+    ty: i32,
+    grain: u32,
+    freq: u32,
+}
+
+impl AudioState {
+    /// `sceAudioInOpenPort`: allocate an input port. Ids start at 1, disjoint from the
+    /// OUTPUT port numbering, so an input id handed to `sceAudioOutOutput` (or the
+    /// reverse) is refused instead of naming somebody else's port.
+    pub(crate) fn in_open(&mut self, ty: i32, grain: u32, freq: u32) -> i32 {
+        let port = IN_PORT_BASE + self.in_ports.len() as i32;
+        self.in_ports.push(AudioInPort { port, ty, grain, freq });
+        port
+    }
+
+    /// `sceAudioInReleasePort`.
+    pub(crate) fn in_close(&mut self, port: i32) -> bool {
+        let before = self.in_ports.len();
+        self.in_ports.retain(|p| p.port != port);
+        self.in_ports.len() != before
+    }
+
+    /// `(grain, freq)` of an open input port.
+    pub(crate) fn in_format(&self, port: i32) -> Option<(u32, u32)> {
+        self.in_ports.iter().find(|p| p.port == port).map(|p| (p.grain, p.freq))
+    }
+
+    /// Whether a port of `ty` is open (`sceAudioInGetAdopt`).
+    pub(crate) fn in_adopted(&self, ty: i32) -> bool {
+        self.in_ports.iter().any(|p| p.ty == ty)
+    }
+
     fn format_of(&self, guest_port: i32) -> Option<(i32, AudioFormat)> {
         self.ports
             .iter()
             .find(|p| p.guest_port == guest_port)
             .map(|p| (p.backend_port, p.format))
+    }
+
+    /// The output volume the title set on `guest_port`, or unity if it never set one.
+    fn gain_of(&self, guest_port: i32) -> [f32; 2] {
+        self.ports
+            .iter()
+            .find(|p| p.guest_port == guest_port)
+            .map_or([1.0, 1.0], |p| p.gain)
     }
 
     /// Route a patch's routing volume to the voice that patch carries.
@@ -148,7 +245,13 @@ pub(super) fn out_open_port(_ctx: &mut GuestCtx, st: &mut VitaState, ty: i32, le
     } else {
         let guest_port = st.audio_state.next_guest_port;
         st.audio_state.next_guest_port += 1;
-        st.audio_state.ports.push(AudioPort { guest_port, backend_port, ty, format });
+        st.audio_state.ports.push(AudioPort {
+            guest_port,
+            backend_port,
+            ty,
+            format,
+            gain: [1.0, 1.0],
+        });
         guest_port
     }
 }
@@ -196,6 +299,24 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         }
         Some(x) => x,
     };
+    // >>> THE OUTPUT PORT'S OWN VOLUME, APPLIED BEFORE THE CLAMP AND NOT AFTER.
+    //
+    // MEASURED on one racer's race: the NGS mix reaches **4.944x full scale** and **49.8% of
+    // all grains clip**, hundreds of thousands of samples squared off. The port volume that
+    // was supposed to bring that down is `11626/32768 = 0.355`, and it was applied in the
+    // SINK - i.e. after this function had already clamped the mix into i16. Clamping to 1.0
+    // and then scaling by 0.355 discards everything above full scale and then makes the
+    // wreckage quiet; scaling by 0.355 and then clamping keeps it.
+    //
+    // This is also the order the hardware runs in: the mix is a sum the DSP holds at more
+    // than 16 bits of headroom and `sceAudioOut` attenuates on the way out. Applying a
+    // downstream gain upstream of a saturating conversion is not an optimisation, it is the
+    // difference between the signal and a distorted copy of it.
+    //
+    // The GUEST's own buffer still receives the UNSCALED clamped mix below: on hardware the
+    // port volume is downstream of that buffer, and a title that reads its own output back
+    // must see what the DSP wrote, not what the speaker got.
+    let port_gain = st.audio_state.gain_of(port);
     // A null buffer means "drain/stop" on real hardware; nothing to submit.
     if buf != 0 {
         let grain = format.grain as usize;
@@ -215,23 +336,6 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             mix.clear();
             mix.resize(samples, 0);
             st.audio_state.at9.mix_grain(ctx, &mut mix, grain, channels, format.sample_rate);
-            // How far past full scale the summed voices reach BEFORE the clamp. This is
-            // the size of the missing master stage: the device does not clip here, so
-            // whatever it applies must bring this back under 1.0. Reported as a
-            // high-water mark so one number describes the whole run.
-            if tracing::enabled!(target: "vitaslop::at9", tracing::Level::DEBUG) {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static PEAK_PERMILLE: AtomicU32 = AtomicU32::new(0);
-                let peak = mix.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                let permille = (peak as u64 * 1000 / 32768) as u32;
-                if permille > PEAK_PERMILLE.fetch_max(permille, Ordering::Relaxed) {
-                    tracing::debug!(
-                        target: "vitaslop::at9",
-                        headroom_needed = format_args!("{:.3}x full scale", permille as f32 / 1000.0),
-                        "mix peak before clamp (new high)"
-                    );
-                }
-            }
             // >>> CLAMPED ONCE, INTO BOTH FORMS. The guest's buffer has to receive the mix
             // (the title may read its own buffer back, and on the device the DSP would have
             // written it), but the SUBMISSION does not have to come from there. It used to:
@@ -240,14 +344,47 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             // and a `chunks_exact().map().collect()` that allocated a third buffer to
             // reconstruct what it had just had in hand.
             let mut bytes = std::mem::take(&mut st.audio_state.scratch_bytes);
+            // >>> SIZED ONCE AND WRITTEN THROUGH SLICES, NOT GROWN A SAMPLE AT A TIME.
+            //
+            // A V8 worker profile of a browser race put **4.21% of the whole thread** in this
+            // function's own body - the largest single named engine function in the profile,
+            // for something whose job is to move one grain of PCM. The body was a `push` and
+            // a two-byte `extend_from_slice` per sample, i.e. a capacity check and a
+            // slow-path branch per sample, ~245,000 samples a second.
+            //
+            // `resize` then `chunks_exact_mut(2).zip(...)` gives the compiler three walks it
+            // can prove are in bounds and equal in length, so the per-sample bookkeeping goes
+            // away entirely. The arithmetic is unchanged.
             bytes.clear();
-            bytes.reserve(samples * 2);
-            pcm.reserve(samples);
-            for &s in &mix {
-                let v = s.clamp(-32768, 32767) as i16;
-                pcm.push(v);
-                bytes.extend_from_slice(&v.to_le_bytes());
+            bytes.resize(samples * 2, 0);
+            pcm.clear();
+            pcm.resize(samples, 0);
+            // The pre-clamp peak and the clip count ride the loop that was already walking
+            // every sample, so measuring the headroom costs a compare and a branch rather
+            // than the second pass the old debug-gated version made. See
+            // `at9::note_mix_headroom` for why this is no longer behind a tracing gate.
+            let mut peak = 0i32;
+            let mut clipped = 0u64;
+            // Stereo is the case that matters and its gain alternates L,R,L,R; a mono port
+            // uses one gain throughout. Hoisted out of the loop so the common path has no
+            // remainder in it.
+            let (g0, g1) = (port_gain[0], if channels > 1 { port_gain[1] } else { port_gain[0] });
+            for (i, ((b, p), &s)) in
+                bytes.chunks_exact_mut(2).zip(pcm.iter_mut()).zip(mix.iter()).enumerate()
+            {
+                peak = peak.max(s.saturating_abs());
+                // The guest's buffer gets the mix as the DSP would have written it; the
+                // SUBMITTED sample is the same value through the port's volume. See the
+                // note where `port_gain` is read.
+                let unscaled = s.clamp(-32768, 32767) as i16;
+                b.copy_from_slice(&unscaled.to_le_bytes());
+                let g = if i & 1 == 0 { g0 } else { g1 };
+                let scaled = (s as f32 * g) as i32;
+                let v = scaled.clamp(-32768, 32767) as i16;
+                clipped += u64::from(i32::from(v) != scaled);
+                *p = v;
             }
+            super::at9::note_mix_headroom(peak, clipped, port_gain[0].min(port_gain[1]));
             ctx.write_bytes(buf, &bytes);
             // The one case the two forms could differ: a `buf` the write cannot reach. The
             // old read-back would then submit whatever was already in guest memory; this
@@ -257,11 +394,31 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
             st.audio_state.scratch_mix = mix;
         } else {
             // Nothing of ours in it: the grain is whatever the title wrote, so it has to be
-            // read. One crossing, into the same reused buffer.
-            let raw = ctx.read_bytes(buf, samples * 2);
-            pcm.extend(raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+            // read. One crossing, into the same reused buffer - `read_bytes` would allocate a
+            // grain-sized `Vec` per call on a path that runs at the audio rate forever, which
+            // is the allocation this scratch exists to remove.
+            let mut bytes = std::mem::take(&mut st.audio_state.scratch_bytes);
+            bytes.clear();
+            bytes.resize(samples * 2, 0);
+            ctx.read_into(buf, &mut bytes);
+            // The port volume applies to a guest-authored grain too - it is a property of the
+            // OUTPUT, not of our mixer. There is no clipping to avoid here (the source is
+            // already i16 and the gain is <= 1), so this is arithmetically what the sink used
+            // to do; it lives here so there is ONE place the port volume is applied. Sized
+            // and zipped for the same reason as the mixed path above.
+            let (g0, g1) = (port_gain[0], if channels > 1 { port_gain[1] } else { port_gain[0] });
+            pcm.resize(samples, 0);
+            for (i, (p, c)) in pcm.iter_mut().zip(bytes.chunks_exact(2)).enumerate() {
+                let s = i16::from_le_bytes([c[0], c[1]]);
+                *p = (f32::from(s) * if i & 1 == 0 { g0 } else { g1 }) as i16;
+            }
+            st.audio_state.scratch_bytes = bytes;
         }
         st.audio_state.capture_pcm(&pcm);
+        // Counted where the grain is SUBMITTED, so it measures what the guest actually
+        // handed the device rather than what it mixed - see `produced_seconds`.
+        st.audio_state.submitted_frames += grain as u64;
+        st.audio_state.submitted_rate = format.sample_rate;
         st.audio.submit(backend_port, &pcm);
         st.audio_state.scratch_pcm = pcm;
     }
@@ -294,10 +451,6 @@ pub(super) fn out_set_volume(ctx: &mut GuestCtx, st: &mut VitaState, port: i32, 
             if vol.addr() != 0 && count > 0 {
                 let vols: Vec<i32> =
                     (0..count).map(|i| ctx.read_u32(vol.addr() + (i as u32) * 4) as i32).collect();
-                // What the title asks the PORT for, against the 32768 full-scale point.
-                // It matters for reading a mix that clips: the grain is clamped to i16
-                // before this is applied, so a title running the port well below full
-                // scale still loses everything the clamp took.
                 tracing::debug!(
                     target: "vitaslop::at9",
                     port,
@@ -305,6 +458,25 @@ pub(super) fn out_set_volume(ctx: &mut GuestCtx, st: &mut VitaState, port: i32, 
                     full_scale = 32768,
                     "sceAudioOutSetVolume"
                 );
+                // >>> KEPT HERE, NOT PUSHED TO THE SINK. See `out_output`: the port volume
+                // has to be applied to the mix BEFORE it is clamped to i16, and the sink
+                // only ever sees the clamped grain. Still handed to the sink as well, for
+                // backends that mix the guest's own untouched PCM - `WebAudioSink` ignores
+                // it now precisely so this is not applied twice.
+                for (c, v) in vols.iter().enumerate().take(2) {
+                    let g = (*v as f32 / 32768.0).clamp(0.0, 1.0);
+                    if let Some(p) =
+                        st.audio_state.ports.iter_mut().find(|p| p.guest_port == port)
+                    {
+                        p.gain[c] = g;
+                        // A one-channel set on a stereo port applies to both, which is what
+                        // the mask form of `sceAudioOutSetVolume` means when a title sets
+                        // only the left.
+                        if vols.len() == 1 {
+                            p.gain[1] = g;
+                        }
+                    }
+                }
                 st.audio.set_volume(backend_port, &vols);
             }
             0

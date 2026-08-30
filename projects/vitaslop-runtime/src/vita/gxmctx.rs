@@ -163,6 +163,22 @@ pub mod off {
     /// The FRAGMENT stage's, in the same three-word shape - which is what lets ONE inline
     /// form serve both stages with only the record's offset changing.
     pub const FRAGMENT_UNIFORM: u32 = AFTER_BACK_STENCIL + 0x18;
+    /// `sceGxmSetFrontDepthBias(context, factor, units)`: the polygon-offset pair, as SIGNED
+    /// words. Appended after the uniform-buffer array for the same reason the back-stencil
+    /// block was appended after the textures - every offset before it keeps its value.
+    pub const FRONT_DEPTH_BIAS_FACTOR: u32 =
+        VERTEX_UNIFORM_BUFFERS + (super::MAX_UNIFORM_BUFFERS as u32) * 4;
+    pub const FRONT_DEPTH_BIAS_UNITS: u32 = FRONT_DEPTH_BIAS_FACTOR + 4;
+    /// The FRAGMENT stage's non-default uniform buffer addresses, the counterpart of
+    /// [`VERTEX_UNIFORM_BUFFERS`] and in exactly the same shape.
+    ///
+    /// It exists because a fragment program can read a bound buffer WITHOUT any memory load:
+    /// when the container table gives that buffer its own SA-register block the driver copies
+    /// the bytes into the register file, and the shader reads `sa[k]`
+    /// (`Program::sa_uniform_buffers`). One retail title's fragment programs do exactly that -
+    /// their fog and material block is container 0 at sa[0] - and its bind was previously only
+    /// warned about and dropped. Appended last so every pre-existing offset keeps its value.
+    pub const FRAGMENT_UNIFORM_BUFFERS: u32 = FRONT_DEPTH_BIAS_UNITS + 4;
 }
 
 /// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
@@ -209,7 +225,7 @@ pub const MAX_UNIFORM_BUFFERS: usize = 14;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::VERTEX_UNIFORM_BUFFERS + (MAX_UNIFORM_BUFFERS as u32) * 4;
+pub const BYTES: u32 = off::FRAGMENT_UNIFORM_BUFFERS + (MAX_UNIFORM_BUFFERS as u32) * 4;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -250,6 +266,7 @@ pub fn init(ctx: &mut GuestCtx, context: u32) {
     }
     for i in 0..MAX_UNIFORM_BUFFERS as u32 {
         ctx.write_u32(context.wrapping_add(off::VERTEX_UNIFORM_BUFFERS + i * 4), 0);
+        ctx.write_u32(context.wrapping_add(off::FRAGMENT_UNIFORM_BUFFERS + i * 4), 0);
     }
     // Stamped LAST, so a partially written block is never mistaken for a complete one.
     ctx.write_u32(context.wrapping_add(off::MAGIC), MAGIC);
@@ -340,6 +357,22 @@ pub fn set_vertex_uniform_buffer(ctx: &mut GuestCtx, context: u32, index: u32, a
         return;
     }
     set(ctx, context, off::VERTEX_UNIFORM_BUFFERS + index * 4, addr);
+}
+
+/// Bind `addr` to FRAGMENT non-default uniform buffer `index`
+/// (`sceGxmSetFragmentUniformBuffer`) - the exact counterpart of
+/// [`set_vertex_uniform_buffer`], see [`off::FRAGMENT_UNIFORM_BUFFERS`].
+pub fn set_fragment_uniform_buffer(ctx: &mut GuestCtx, context: u32, index: u32, addr: u32) {
+    if index as usize >= MAX_UNIFORM_BUFFERS {
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            index,
+            data = format_args!("{addr:#x}"),
+            "setFragmentUniformBuffer on an index beyond SCE_GXM_MAX_UNIFORM_BUFFERS - DROPPED"
+        );
+        return;
+    }
+    set(ctx, context, off::FRAGMENT_UNIFORM_BUFFERS + index * 4, addr);
 }
 
 /// One fragment sampler binding, as the block holds it.
@@ -546,6 +579,8 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     w(off::CULL_MODE, rs.cull_mode);
     w(off::TWO_SIDED, rs.two_sided);
     w(off::FRONT_DEPTH_FUNC, rs.front_depth_func);
+    w(off::FRONT_DEPTH_BIAS_FACTOR, rs.front_depth_bias_factor as u32);
+    w(off::FRONT_DEPTH_BIAS_UNITS, rs.front_depth_bias_units as u32);
     w(off::BACK_DEPTH_FUNC, rs.back_depth_func);
     w(off::FRONT_DEPTH_WRITE, rs.front_depth_write);
     w(off::BACK_DEPTH_WRITE, rs.back_depth_write);
@@ -685,6 +720,14 @@ impl<'a> Block<'a> {
         self.word(off::VERTEX_UNIFORM_BUFFERS + index * 4)
     }
 
+    /// The guest address bound to FRAGMENT non-default uniform buffer `index`.
+    pub fn fragment_uniform_buffer(&self, index: u32) -> u32 {
+        if index as usize >= MAX_UNIFORM_BUFFERS {
+            return 0;
+        }
+        self.word(off::FRAGMENT_UNIFORM_BUFFERS + index * 4)
+    }
+
     /// All [`MAX_VERTEX_STREAMS`] stream pointers. The counterpart of [`streams`].
     pub fn streams(&self) -> [u32; MAX_VERTEX_STREAMS] {
         std::array::from_fn(|i| self.word(off::STREAMS + i as u32 * 4))
@@ -732,6 +775,8 @@ impl<'a> Block<'a> {
         cull_mode: r(off::CULL_MODE),
         two_sided: r(off::TWO_SIDED),
         front_depth_func: r(off::FRONT_DEPTH_FUNC),
+        front_depth_bias_factor: r(off::FRONT_DEPTH_BIAS_FACTOR) as i32,
+        front_depth_bias_units: r(off::FRONT_DEPTH_BIAS_UNITS) as i32,
         back_depth_func: r(off::BACK_DEPTH_FUNC),
         front_depth_write: r(off::FRONT_DEPTH_WRITE),
         back_depth_write: r(off::BACK_DEPTH_WRITE),
@@ -745,14 +790,18 @@ impl<'a> Block<'a> {
         front_stencil_op_fail: r(off::FRONT_STENCIL_OP_FAIL),
         front_stencil_op_depth_fail: r(off::FRONT_STENCIL_OP_DEPTH_FAIL),
         front_stencil_op_depth_pass: r(off::FRONT_STENCIL_OP_DEPTH_PASS),
-        front_stencil_compare_mask: r(off::FRONT_STENCIL_COMPARE_MASK),
-        front_stencil_write_mask: r(off::FRONT_STENCIL_WRITE_MASK),
+        // The stencil masks are `unsigned char` in the GXM prototype. The setters store
+        // their argument words AS PASSED - that is what lets them lower to a plain argument
+        // run (`InlineOp::StoreArgRun`) that writes exactly what the handler writes - so the
+        // byte narrowing lives HERE, on the one path every consumer reads through.
+        front_stencil_compare_mask: r(off::FRONT_STENCIL_COMPARE_MASK) & 0xff,
+        front_stencil_write_mask: r(off::FRONT_STENCIL_WRITE_MASK) & 0xff,
         back_stencil_func: r(off::BACK_STENCIL_FUNC),
         back_stencil_op_fail: r(off::BACK_STENCIL_OP_FAIL),
         back_stencil_op_depth_fail: r(off::BACK_STENCIL_OP_DEPTH_FAIL),
         back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
-        back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK),
-        back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK),
+        back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK) & 0xff,
+        back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK) & 0xff,
         viewport_enable: r(off::VIEWPORT_ENABLE),
         viewport,
         region_clip_mode: r(off::REGION_CLIP_MODE),
@@ -772,6 +821,8 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::CULL_MODE, "cull_mode"),
     (off::TWO_SIDED, "two_sided"),
     (off::FRONT_DEPTH_FUNC, "front_depth_func"),
+    (off::FRONT_DEPTH_BIAS_FACTOR, "front_depth_bias_factor"),
+    (off::FRONT_DEPTH_BIAS_UNITS, "front_depth_bias_units"),
     (off::BACK_DEPTH_FUNC, "back_depth_func"),
     (off::FRONT_DEPTH_WRITE, "front_depth_write"),
     (off::BACK_DEPTH_WRITE, "back_depth_write"),
@@ -847,6 +898,7 @@ mod tests {
         }
         for i in 0..MAX_UNIFORM_BUFFERS as u32 {
             claimed.push((off::VERTEX_UNIFORM_BUFFERS + i * 4, "vertex_uniform_buffers"));
+            claimed.push((off::FRAGMENT_UNIFORM_BUFFERS + i * 4, "fragment_uniform_buffers"));
         }
         claimed.sort();
         for w in claimed.windows(2) {

@@ -74,7 +74,50 @@ pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcO
     if !st.is_preemptive() {
         return SvcOutcome::Continue;
     }
-    st.vblank_park(1, VBLANK_US);
+    // The LATCH the display queue already scheduled for the frame in flight - which may be
+    // now, if this caller arrived after it. Parking a whole vblank regardless is what put a
+    // third display period into every frame of a 30 fps title; see
+    // [`VitaState::park_until_latched`] for the measurement.
+    //
+    // With NOTHING queued there is no latch to name, and the old behaviour stands: one
+    // vblank. That is the case the unconditional park was really defending - a title that
+    // SPINS on this call with no present outstanding livelocked when it returned at once
+    // (frame 3, 34.3 million thread resumes), and a spin still costs a vblank an iteration.
+    // A frame reached the panel inside `sceGxmDisplayQueueAddEntry`, and `pace_flip` has
+    // already held that queueing thread to the panel's latch rate. Parking here as well
+    // charges the title a SECOND display period for one frame - see
+    // [`VitaState::take_present_since_wait`] for the 2.99x that measured.
+    if !st.take_present_since_wait() {
+        st.vblank_park(1, VBLANK_US);
+        return SvcOutcome::Block;
+    }
+    SvcOutcome::Reschedule
+}
+
+/// int sceDisplayWaitSetFrameBufMulti(SceUInt vcount)
+///
+/// The multi-vblank form of [`wait_set_frame_buf`]: wait until `vcount` vblanks after the
+/// queued buffer is latched, which is how a title asks for a 30 Hz (or slower) cadence
+/// without doing the arithmetic itself.
+///
+/// A `vcount` of 0 is a plain yield, exactly as in [`wait_vblank_start_multi`] - it asks
+/// for no wait, so it must not park a whole period, and it must not count a frame.
+pub(super) fn wait_set_frame_buf_multi(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
+    let vcount = ctx.arg(0);
+    ctx.ret(0);
+    if !st.is_preemptive() {
+        return SvcOutcome::Continue;
+    }
+    if vcount == 0 {
+        return SvcOutcome::Reschedule;
+    }
+    // `vcount` counts vblanks AFTER the latch. The latch itself has already happened when a
+    // present is outstanding (see [`wait_set_frame_buf`]), so only the remainder is a wait.
+    let after_latch = if st.take_present_since_wait() { vcount as u64 - 1 } else { vcount as u64 };
+    if after_latch == 0 {
+        return SvcOutcome::Reschedule;
+    }
+    st.vblank_park(after_latch, VBLANK_US);
     SvcOutcome::Block
 }
 
@@ -150,6 +193,26 @@ fn vblank_park_spin() -> bool {
     !matches!(crate::knobs::var("VITASLOP_VBLANK_PARK").as_deref(), Ok("0"))
 }
 
+/// Report a distinct display-buffer shape once. Unconditional: an approximation the screen
+/// cannot distinguish from a faithful result has to announce itself.
+fn report_geometry_once(pitch: u32, fmt: u32, w: u32, h: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::BTreeSet<(u32, u32, u32, u32)>>> =
+        OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    if !seen.lock().unwrap().insert((pitch, fmt, w, h)) {
+        return;
+    }
+    let note = if w == crate::host::VitaState::PANEL_W && h == crate::host::VitaState::PANEL_H {
+        "the full panel, so nothing is scaled"
+    } else {
+        "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is          rendered at this size and scaled up to present. Everything in it, text included,          carries only this much detail"
+    };
+    eprintln!(
+        "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format          {fmt:#x}) - {note}."
+    );
+}
+
 /// int sceDisplaySetFrameBuf(const SceDisplayFrameBuf *pParam, int sync)
 /// SceDisplayFrameBuf: { SceSize size; void *base; uint32 pitch; uint32 fmt;
 ///                       uint32 width; uint32 height; } (0x18 bytes).
@@ -169,6 +232,28 @@ fn vblank_park_spin() -> bool {
 pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, sync: i32) -> i32 {
     st.set_display_sync(sync as u32);
     let base = ctx.read_u32(param.addr() + 4);
+    // >>> THE GEOMETRY THE GUEST DECLARES, reported once per distinct shape.
+    //
+    // The Vita's display controller SCALES what this struct describes onto the 960x544
+    // panel, so a title is free to hand it a smaller buffer. Everything downstream of here
+    // ignores the width and height and composites each pass at the size it rasterised, which
+    // is right only while every title declares the full panel - and one does not: a front end
+    // that renders 640x368 comes out letterboxed into the top-left corner of the frame.
+    //
+    // Reported rather than acted on here, because acting on it is a change to how EVERY
+    // title's frame is composed and the first thing that needs establishing is which titles
+    // declare what. Deduped on the whole shape, so a title that never changes it costs one
+    // line for a whole run.
+    {
+        let (pitch, fmt, w, h) = (
+            ctx.read_u32(param.addr() + 8),
+            ctx.read_u32(param.addr() + 12),
+            ctx.read_u32(param.addr() + 16),
+            ctx.read_u32(param.addr() + 20),
+        );
+        report_geometry_once(pitch, fmt, w, h);
+        st.set_display_geometry(w, h);
+    }
     if base != 0 {
         st.present(base);
     }

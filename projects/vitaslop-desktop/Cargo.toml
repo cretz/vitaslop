@@ -16,7 +16,7 @@ vitaslop-runtime = { path = "../vitaslop-runtime" }
 # The shared cube pipeline (WGSL + per-draw encoding). The `gpu` feature pulls the
 # wgpu-backed CubeRenderer this window presents through, the same one the browser
 # canvas and the native headless oracle use.
-vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu"] }
+vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video", "aac"] }
 # Installs the fmt/EnvFilter subscriber so the runtime's `tracing` diagnostics
 # surface via RUST_LOG (e.g. vitaslop::io=trace).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

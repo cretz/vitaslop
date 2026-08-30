@@ -65,10 +65,10 @@ fn quad(vertices: Vec<u8>, attrs: Vec<VertexAttribute>, textures: Vec<BoundTextu
         // probes exercise.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
         // vertex program would expand into quads.
         shader_expanded: false,
@@ -84,6 +84,9 @@ fn solid_texture(size: u32, rgba: [u8; 4]) -> BoundTexture {
         pixels.extend_from_slice(&rgba);
     }
     BoundTexture {
+        // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+        // one id would collide in every cache keyed on it.
+        pixels_id: vitaslop_runtime::capture::next_pixels_id(),
         unit: 0,
         base_format: 0x0c,
         swizzle: 0,
@@ -236,10 +239,10 @@ fn mvp_quad(
         // probes exercise.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         // These probes hand the renderer real triangles, not point-sprite records a
         // vertex program would expand into quads.
         shader_expanded: false,
@@ -317,10 +320,10 @@ color: None,
         // probes exercise.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
@@ -426,6 +429,9 @@ color: None,
             /* (1,1) */ 40, 40, 220, 255,
         ];
         let mut tex = BoundTexture {
+            // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+            // one id would collide in every cache keyed on it.
+            pixels_id: vitaslop_runtime::capture::next_pixels_id(),
             unit: 0,
             base_format: 0x0c,
             swizzle: 0,
@@ -499,10 +505,10 @@ color: None,
         // probes exercise.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
         };
@@ -550,10 +556,10 @@ color: None,
         // probes exercise.
         vprog: vitaslop_runtime::capture::no_program(),
         fprog: vitaslop_runtime::capture::no_program(),
-        vert_sa: Vec::new(),
-        frag_sa: Vec::new(),
+        vert_sa: std::sync::Arc::from(&[][..]),
+        frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
-        mem_window: None,
+        mem_windows: Vec::new(),
         // Real triangles, not point-sprite records the vertex program expands.
         shader_expanded: false,
             };
@@ -627,6 +633,9 @@ fn general_renderer_supersample_matches_software() {
         b
     };
     let tex = BoundTexture {
+        // A fixture: a DISTINCT buffer, so a distinct identity - two fixtures sharing
+        // one id would collide in every cache keyed on it.
+        pixels_id: vitaslop_runtime::capture::next_pixels_id(),
         unit: 0, base_format: 0x0c, swizzle: 0, tex_type: 0, width: 2, height: 2, stride: 8,
         faces: 1, face_bytes: 16, levels: 1,
         pixels: checker.into(), data_addr: 0, u_addr_mode: 0, v_addr_mode: 0, lod_bias: 0,

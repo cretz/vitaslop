@@ -69,7 +69,15 @@ pub const OVERRIDABLE: &[&str] = &[
     // BROWSER is the engine that has to answer: `flags-add` was 39% of every operator the
     // transpiler emitted, the closed forms cut the module 5.3% and executed operators 8.7%,
     // and three interleaved desktop repeats put the wall-clock difference inside the noise.
+    // Encode only draws `lo..=hi` of every pass. Browser-reachable because the question it
+    // answers - "which draw put this on screen, and which one covered it" - is asked of a
+    // PICTURE, and the pictures that need it are the ones only a device or a browser produces.
+    // `VITASLOP_CHAIN_LIMIT` bisects by PASS and cannot touch a title whose frame is one pass.
+    "VITASLOP_DRAW_RANGE",
     "VITASLOP_FLAGS_WIDE_C",
+    // The one frame whose per-SCENE digests are printed, so a cross-engine difference lands on
+    // a PASS instead of on a whole frame.
+    "VITASLOP_FRAME_DIGEST",
     "VITASLOP_FRAME_TOPUP",
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
@@ -96,6 +104,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // because the fill value is a picture question and the phone is where wrong pictures are
     // reported from.
     "VITASLOP_GXP_ATTR_FILL",
+    // The capsule capture. Reachable from the browser like every other knob here, but the
+    // WRITE will fail there - a browser worker has no filesystem to put a capsule on - and the
+    // capture reports that failure by name rather than dropping the draw in silence.
+    "VITASLOP_GXP_CAPSULE",
+    "VITASLOP_GXP_CAPSULE_MIN_INDICES",
+    "VITASLOP_GXP_CAPSULE_SKIP",
     "VITASLOP_GXP_CULL",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
@@ -142,6 +156,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // measurement, which is what this exists to take. Reachable from the browser because that
     // is where an in-frame shader compile costs the most.
     "VITASLOP_GXP_PRECOMPILE_CROSS",
+    // Every SUBMISSION of one pair that lands in a screen-space box, with its full vertex
+    // record. The per-DRAW half `..._INPUTS_VERTS` cannot be: that dump dedupes by input
+    // set, so a UI pair submitted a thousand times a frame almost never prints the element
+    // under investigation. Browser-reachable for the same reason the other input dumps are.
+    "VITASLOP_GXP_QUADS",
     "VITASLOP_GXP_SA",
     // The SHADER EMITTER's two arms, forwarded into `vitaslop_gxp_shader::link` by
     // `set_override` below rather than read through `var` - that crate has no dependencies by
@@ -163,6 +182,26 @@ pub const OVERRIDABLE: &[&str] = &[
     // Refuse BC texture formats and take the transcode path the phone's GPU forces. Browser-
     // reachable because the phone has no BC at all ([[vitaslop-phone-gpu-has-no-bc]]), so this
     // is how a desktop browser is made to render what the device renders.
+    // The movie diagnostics, and they belong here more than most: the phone is where a movie
+    // has looked wrong, the phone has no environment, and a rendered frame is not an oracle
+    // for a movie (which picture a run lands on is decided by the host's decoder).
+    // `..._PICTURE_HASH` says which picture reached guest memory and what its mean luma was;
+    // `..._DUMP_DIR` writes the picture out, which separates "the decoder produced black"
+    // from "the conversion is wrong" from "the draw never sampled it".
+    "VITASLOP_MOVIE_DUMP_DIR",
+    "VITASLOP_MOVIE_DUMP_EVERY",
+    "VITASLOP_MOVIE_PICTURE_HASH",
+    // Withholds a movie's AUDIO units from the title: the A/B arm for any title whose
+    // own demux behaves differently once a movie turns out to have a second stream.
+    // Opens a different movie than the title asked for. The one way to exercise the movie
+    // AUDIO path without first playing most of a game: a front-screen movie may have no
+    // audio track while the ones that do are behind thousands of frames of menus.
+    "VITASLOP_MOVIE_SUBSTITUTE",
+    "VITASLOP_MP4_AUDIO",
+    // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
+    // voice allocates a fresh handle again, which is what left 8,138 voices in the bank and
+    // 318 of them playing every grain. It is here so a device can price the difference.
+    "VITASLOP_NGS_VOICE_HANDLE_MEMO",
     "VITASLOP_NO_BC",
     "VITASLOP_NO_INLINE_CLIB",
     // The A/B switch for the whole inline-import mechanism. Reachable from the browser for the
@@ -260,6 +299,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // inversion (a high-priority thread spinning on a lock a capped-out low-priority thread
     // holds), and the cooldown it replaces is the anti-starvation mechanism. Answering the
     // question is worth a run that may hang; shipping it is not, until it has an escape hatch.
+    // The negative control for narrowing a draw's texture decode to the units its fragment
+    // program DECLARES. Browser-reachable because the cost it removes - a decode per bound slot
+    // per draw - is only large where the engine runs at wasm speed.
+    "VITASLOP_SAMPLER_NARROW",
     "VITASLOP_SCHED_CORES",
     // Round-robin the scheduler's pick instead of the priority discipline, and TRACE what it
     // picked. Both browser-reachable because the scheduler behaves differently there (JSPI
@@ -273,9 +316,21 @@ pub const OVERRIDABLE: &[&str] = &[
     // `@sig` assertion, so a recipe without one pays for a number nothing compares. Set this
     // when the point of the run is to LEARN the signature and bless it into a recipe.
     "VITASLOP_SIGNATURE",
+    // How often the RUNNING signature is printed (`sigtrace f<frame> <hash>`), so a
+    // browser-only divergence can be bisected against the desktop's identical line instead of
+    // by re-running the pair per halving.
+    "VITASLOP_SIGNATURE_EVERY",
+    // Microseconds of artificial cost added to every guest frame, so a machine with headroom
+    // can exercise the live loop's behind-the-clock pacing. Browser-reachable because the loop
+    // it tests only exists there, and because the device this models has no console.
+    "VITASLOP_SLOW_FRAME_US",
     // Byte budget for retained texture snapshots. Reachable from the browser because
     // exceeding it there costs a full re-decode of the working set in one frame.
     "VITASLOP_SNAPSHOT_BUDGET_MB",
+    // Path of the font that STANDS IN for the console's system font, which is not shipped.
+    // Listed here so the name is not a browser-boot panic, though the browser cannot open a
+    // path: there it supplies the bytes directly instead (`font::system::set_bytes`).
+    "VITASLOP_SYSTEM_FONT",
     // How often a retained texture snapshot is re-checked against guest memory: `scene`
     // (the default, exact) or `frame` (faster, one scene of staleness the first time a
     // texture changes). Reachable from the browser because that is where the check costs
@@ -294,10 +349,14 @@ pub const OVERRIDABLE: &[&str] = &[
     // Browser-reachable because the desktop CANNOT see this win (0.28 ms/frame under a 5% noise
     // floor) - the browser pays it as sceGxmDraw* handler time at wasm speed, which is the
     // entire point of the change.
+    // How much of a re-read texture the guest had actually written, and the falsifier for
+    // the page-granular re-read that census motivated.
+    "VITASLOP_TEX_DIRTY_CENSUS",
     "VITASLOP_TEX_MEMO_PER_SCENE",
     // Names the guest code that WROTE a uniform, by parameter name, with its `lr`. Needed in
     // the browser because `screenTintColour` - the white-out - is written there and never on
     // the desktop.
+    "VITASLOP_TEX_PAGE_READ",
     "VITASLOP_UNIFORM_WATCH",
     // The A/B arm for the vblank SPIN GUARD (`=0` restores the bare mirror read). Here
     // because the browser is where the spin costs the most - 26% of all translated guest
@@ -306,6 +365,11 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_VBLANK_PARK",
     // The guest-address name section. Browser-reachable so a V8 CPU profile taken in the
     // browser can NAME the guest functions it samples instead of reporting `wasm-function[N]`.
+    // The arm for vertex interning: giving a rebuilt-but-identical vertex stream the identity
+    // of the buffer already held. Browser-reachable because what it buys is identity-keyed
+    // caches hitting instead of a whole-stream hash and memcmp per draw, which only costs where
+    // the engine runs at wasm speed.
+    "VITASLOP_VERTEX_INTERN",
     "VITASLOP_WASM_NAMES",
 ];
 

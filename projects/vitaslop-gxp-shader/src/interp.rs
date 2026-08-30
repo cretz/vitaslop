@@ -18,7 +18,7 @@
 //! never interprets an unestablished op - it returns [`InterpError`] naming it, mirroring
 //! the emitter's hard-fail contract so the interpreter can never fabricate a value.
 
-use crate::ir::{Bank, Instr, Op, Operand, Predicate, Shader};
+use crate::ir::{Bank, Instr, Op, Operand, Predicate, Shader, TestReduce};
 use crate::wgsl::cnst6_value;
 
 /// A register file of 32-bit lanes for one shader invocation. Banks are addressed by scalar
@@ -262,6 +262,31 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             f32::from_bits(r)
         }
+        // Group 0x1a, ONE STEP of a 32-bit integer multiply-add. Same lane representation as
+        // the sibling group above - the lane holds the integer's bit pattern - and the same
+        // rule for an inline literal. `high_half` picks which 16-bit half of src0 the
+        // multiplier sees and whether its product is shifted back up; the two steps of a pair
+        // sum to the whole product in wrapping 32-bit arithmetic, which is what the emitter
+        // writes and what this must therefore agree with.
+        Op::IntMadStep { signed, high_half } => {
+            if signed {
+                return Err("imad step (only the unsigned form is established)");
+            }
+            let raw = |n: usize| -> Result<u32, &'static str> {
+                let o = instr.srcs.get(n).ok_or("operand")?;
+                if matches!(o.bank, Bank::Immediate) {
+                    return Ok(o.index as u32);
+                }
+                Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
+            };
+            let (a, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            let part = if high_half {
+                (a >> 16).wrapping_mul(b) << 16
+            } else {
+                (a & 0xffff).wrapping_mul(b)
+            };
+            f32::from_bits(part.wrapping_add(d))
+        }
         // A truncating float->integer convert whose result is the integer's BIT PATTERN in the
         // lane - which is what the integer ops above then read. Matching `emit_pack_to_int`,
         // including its clamp: the source can be a NaN or a huge float, and an unclamped
@@ -288,7 +313,43 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         }
         // A memory load reads GUEST MEMORY, which this register-file model does not hold; a
         // fabricated value here would defeat the oracle's whole purpose.
-        Op::MemLoad { .. } => return Err("ldmem (no guest memory in this register-file model)"),
+        Op::MemLoad { .. } => return Err("ldmem (resolved before the per-channel evaluator)"),
+        // A TEST with write-back also stores its raw ALU result; the predicate itself was
+        // written before this point. Only the float families reach here - the raw-lane ones
+        // have no float result to store and the emitter refuses them too.
+        Op::Test { alu, .. } => {
+            let (a, b) = (s(0, c)?, s(1, c)?);
+            match alu {
+                crate::ir::TestAlu::Add => a + b,
+                crate::ir::TestAlu::Sub => a - b,
+                crate::ir::TestAlu::Mul => a * b,
+                _ => return Err("vtst write-back on a raw-lane family"),
+            }
+        }
+        // VTSTMSK: the same compare, written out as one NUMERIC value per channel.
+        Op::TestMask { alu, cmp } => {
+            use crate::ir::{TestAlu, TestCmp};
+            let (a, b) = (s(0, c)?, s(1, c)?);
+            let v = match alu {
+                TestAlu::Add => a + b,
+                TestAlu::Sub => a - b,
+                TestAlu::Mul => a * b,
+                _ => return Err("vtstmsk on a raw-lane family"),
+            };
+            let held = match cmp {
+                TestCmp::Eq => v == 0.0,
+                TestCmp::Ne => v != 0.0,
+                TestCmp::Lt => v < 0.0,
+                TestCmp::Le => v <= 0.0,
+                TestCmp::Gt => v > 0.0,
+                TestCmp::Ge => v >= 0.0,
+            };
+            if held {
+                1.0
+            } else {
+                0.0
+            }
+        }
         _ => return Err("unmodeled"),
     })
 }
@@ -312,6 +373,18 @@ pub type TexFetch<'a> = &'a dyn Fn(u8, [f32; 4]) -> Option<[f32; 4]>;
 fn no_textures(_unit: u8, _coord: [f32; 4]) -> Option<[f32; 4]> {
     None
 }
+
+/// How the interpreter reads GUEST MEMORY for a 0xE8 load: `address -> the 32-bit word there`.
+///
+/// The caller supplies the same WINDOWS the shader is bound (see
+/// `vitaslop_gxp_shader::module::MemWindow`), so an address inside one reads the bytes the draw
+/// carried and an address outside every one reads ZERO - which is what the emitted
+/// `gxp_mem_word` helper does, and an oracle may not disagree with the code that ships.
+///
+/// A caller that supplies NONE leaves a program with memory loads uninterpretable, naming
+/// itself, rather than reading zeroes it was never given: those zeroes would be a fabricated
+/// vertex position, and the whole point of this interpreter is that it never fabricates one.
+pub type MemFetch<'a> = &'a dyn Fn(u32) -> u32;
 
 /// Where a shader first produced a value that is not finite.
 #[derive(Debug, Clone)]
@@ -357,8 +430,42 @@ pub fn run_watching_for_nan_with_textures(
     regs: &mut RegFile,
     tex: TexFetch<'_>,
 ) -> Result<Option<NanSite>, InterpError> {
+    run_watching_for_nan_with_env(shader, regs, tex, None)
+}
+
+/// [`run_watching_for_nan_with_textures`], with the draw's GUEST-MEMORY WINDOWS available too.
+///
+/// A vertex program that chases a bound uniform buffer with 0xE8 loads builds its geometry out
+/// of what it reads, so without this the interpreter cannot run one at all - and everything
+/// that depends on interpreting a vertex program goes blind on exactly those draws: the clip-`w`
+/// sign measurement, the depth fit, the NaN hunt. On a golf title that blindness decided a whole
+/// 960x544 world pass's projection from the two 2D overlay quads that DID interpret, left the
+/// negative-projection correction off, and WebGPU clipped every one of the world's 241 draws
+/// away - a black frame with no fallback and nothing in any log.
+pub fn run_watching_for_nan_with_env(
+    shader: &Shader,
+    regs: &mut RegFile,
+    tex: TexFetch<'_>,
+    mem: Option<MemFetch<'_>>,
+) -> Result<Option<NanSite>, InterpError> {
     let mut site: Option<NanSite> = None;
-    for (index, instr) in shader.instrs.iter().enumerate() {
+    let mut index = 0usize;
+    // A BOUNDED walk. The stream carries real loops (a golf title's world programs run a
+    // four-light loop around a memory load), so a straight-line walk would run each body once
+    // and a PC-driven one can in principle not terminate at all - on a register file the caller
+    // filled from a live draw, which is exactly where a wrong loop bound would come from. The
+    // budget is far past any shipped program's dynamic length and turns a runaway into a named
+    // failure instead of a hung render thread.
+    let mut steps = 0u32;
+    const MAX_STEPS: u32 = 1 << 20;
+    while let Some(instr) = shader.instrs.get(index) {
+        steps += 1;
+        if steps > MAX_STEPS {
+            return Err(InterpError::UnsupportedOp {
+                index,
+                op: "a loop that did not terminate within the interpreter's step budget",
+            });
+        }
         if let Some(reason) = instr.blocked {
             return Err(InterpError::Blocked { index, reason });
         }
@@ -367,6 +474,7 @@ pub fn run_watching_for_nan_with_textures(
         }
         // A no-op (phase declaration / NOP) has no register effect.
         if matches!(instr.op, Op::Nop) {
+            index += 1;
             continue;
         }
         // A predicated instruction executes only when its predicate register holds.
@@ -374,8 +482,42 @@ pub fn run_watching_for_nan_with_textures(
             Predicate::Always => {}
             Predicate::IfP(n) if regs.p[(n & 3) as usize] => {}
             Predicate::IfNotP(n) if !regs.p[(n & 3) as usize] => {}
-            Predicate::IfP(_) | Predicate::IfNotP(_) => continue,
+            Predicate::IfP(_) | Predicate::IfNotP(_) => {
+                index += 1;
+                continue;
+            }
             Predicate::Raw(_) => return Err(InterpError::Blocked { index, reason: "unresolved predicate encoding" }),
+        }
+        // BRANCHES ARE FOLLOWED, so the reference executes the control flow the emitted shader
+        // executes. A straight-line walk is not a cheaper approximation of this - it runs the
+        // bodies of skipped `if`s and runs a loop once - and the values it leaves behind are
+        // then a program the frame never ran.
+        //
+        // `rel` is already in the UNROLLED stream's numbering (`remap_branch_targets`), and the
+        // predicate above has already decided whether this branch is taken at all.
+        if let Op::Branch { rel } = instr.op {
+            let target = index as i64 + rel as i64;
+            if target < 0 {
+                return Err(InterpError::OutOfRange { index });
+            }
+            index = target as usize;
+            continue;
+        }
+        // The TEST group writes a PREDICATE, not a register, so it comes before the destination
+        // is required - and a predicate-only VTST has no destination at all. Without this the
+        // interpreter refused every program with a conditional in it, which on this corpus is
+        // every world vertex program of a golf title.
+        if let Op::Test { alu, cmp, reduce, pdst, write_back } = instr.op {
+            let bools = test_channels(regs, instr, alu, cmp, index)?;
+            regs.p[(pdst & 3) as usize] = match reduce {
+                TestReduce::Channel(c) => bools[(c as usize).min(3)],
+                TestReduce::AndAll => bools.iter().all(|&b| b),
+                TestReduce::OrAll => bools.iter().any(|&b| b),
+            };
+            if !write_back {
+                index += 1;
+                continue;
+            }
         }
         let Some(dest) = instr.dest.as_ref() else {
             return Err(InterpError::OutOfRange { index });
@@ -390,11 +532,48 @@ pub fn run_watching_for_nan_with_textures(
             let bank = regs.bank(s1.bank).ok_or(InterpError::OutOfRange { index })?;
             let raw = bank.get(s1.index as usize).ok_or(InterpError::OutOfRange { index })?.to_bits();
             regs.idx[(dest.index & 1) as usize] = (raw & 0xffff) as i32 + addend;
+            index += 1;
             continue;
         }
         // A texture sample produces four components from ONE fetch, so it cannot go through
         // the per-channel evaluator below. The result lands in `dest.index + 0..4`, matching
         // the decoder's direct destination rule.
+        // A memory load reads `elements` consecutive guest WORDS through the draw's bound
+        // windows into consecutive destination registers, exactly as `emit_mem_load` does. The
+        // pointer register and the loaded values are raw 32-bit lanes, so both go through the
+        // lane's bit pattern rather than through a float view.
+        if let Op::MemLoad { elements, offset_bytes } = instr.op {
+            let Some(mem) = mem else {
+                return Err(InterpError::UnsupportedOp {
+                    index,
+                    op: "ldmem (no guest-memory window supplied to this interpretation)",
+                });
+            };
+            let src = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
+            let ptr = read_channel(regs, src, 0).ok_or(InterpError::OutOfRange { index })?;
+            let addr = ptr.to_bits().wrapping_add(offset_bytes);
+            let base = dest.index as usize;
+            let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
+            for k in 0..elements as u32 {
+                let word = mem(addr.wrapping_add(k * 4));
+                match bank.get_mut(base + k as usize) {
+                    Some(slot) => *slot = f32::from_bits(word),
+                    None => return Err(InterpError::OutOfRange { index }),
+                }
+            }
+            index += 1;
+            continue;
+        }
+        // A GATHER needs four individual TEXELS, and this reference's texture access is one
+        // filtered fetch per coordinate - there is no texel-level read to build a footprint
+        // from. Refusing names it rather than substituting four copies of a filtered sample,
+        // which would make a shadow filter look like it worked.
+        if matches!(instr.op, Op::TexGather { .. }) {
+            return Err(InterpError::UnsupportedOp {
+                index,
+                op: "tex.gather4 (the reference has no texel-level fetch)",
+            });
+        }
         if let Op::Tex { unit, coords, .. } = instr.op {
             // The result goes to four CONSECUTIVE lanes whatever the precision. On the hardware
             // an F16 sample lands as two packed pairs, but this register file has no packing
@@ -417,6 +596,7 @@ pub fn run_watching_for_nan_with_textures(
                     None => return Err(InterpError::OutOfRange { index }),
                 }
             }
+            index += 1;
             continue;
         }
         // Compute every masked channel from the CURRENT register state first, so an in-place
@@ -461,8 +641,92 @@ pub fn run_watching_for_nan_with_textures(
                 *bank.get_mut(base + c).ok_or(InterpError::OutOfRange { index })? = out[c];
             }
         }
+        index += 1;
     }
     Ok(site)
+}
+
+/// The four per-channel booleans a TEST instruction produces: `alu(src1, src2)` compared
+/// against zero, exactly as [`crate::wgsl`]'s `emit_test` writes it.
+///
+/// The FLOAT families read their operands as lanes and the two RAW-LANE families (bitwise AND
+/// and the integer subtract) read them as the lane's bit pattern - the same split the emitter
+/// makes, for the same reason: an integer flag register read as an `f32` is a denormal, and
+/// comparing that against zero answers a different question.
+///
+/// The 8-bit family is REFUSED rather than approximated: its operands are four unorm BYTES of
+/// one register and this register file has no byte packing anywhere, so any answer here would
+/// be about a value the shader never sees.
+fn test_channels(
+    regs: &RegFile,
+    instr: &Instr,
+    alu: crate::ir::TestAlu,
+    cmp: crate::ir::TestCmp,
+    index: usize,
+) -> Result<[bool; 4], InterpError> {
+    use crate::ir::{TestAlu, TestCmp};
+    let (s1, s2) = (
+        instr.srcs.first().ok_or(InterpError::OutOfRange { index })?,
+        instr.srcs.get(1).ok_or(InterpError::OutOfRange { index })?,
+    );
+    // An immediate's number IS the integer it spells, which is how the emitter materialises it.
+    let raw = |o: &Operand| -> Result<u32, InterpError> {
+        if matches!(o.bank, Bank::Immediate) {
+            return Ok(o.index as u32);
+        }
+        Ok(read_channel(regs, o, 0).ok_or(InterpError::OutOfRange { index })?.to_bits())
+    };
+    let mut out = [false; 4];
+    for (c, slot) in out.iter_mut().enumerate() {
+        *slot = match alu {
+            TestAlu::BitAnd => {
+                let v = raw(s1)? & raw(s2)?;
+                match cmp {
+                    TestCmp::Eq => v == 0,
+                    TestCmp::Ne => v != 0,
+                    TestCmp::Lt => (v as i32) < 0,
+                    TestCmp::Le => (v as i32) <= 0,
+                    TestCmp::Gt => (v as i32) > 0,
+                    TestCmp::Ge => (v as i32) >= 0,
+                }
+            }
+            TestAlu::IntSub => {
+                let v = (raw(s1)? as i32).wrapping_sub(raw(s2)? as i32);
+                match cmp {
+                    TestCmp::Eq => v == 0,
+                    TestCmp::Ne => v != 0,
+                    TestCmp::Lt => v < 0,
+                    TestCmp::Le => v <= 0,
+                    TestCmp::Gt => v > 0,
+                    TestCmp::Ge => v >= 0,
+                }
+            }
+            TestAlu::Fx8Sub => {
+                return Err(InterpError::UnsupportedOp {
+                    index,
+                    op: "vtst on the 8-bit family (this register file has no byte packing)",
+                })
+            }
+            TestAlu::Add | TestAlu::Sub | TestAlu::Mul => {
+                let a = read_channel(regs, s1, c).ok_or(InterpError::OutOfRange { index })?;
+                let b = read_channel(regs, s2, c).ok_or(InterpError::OutOfRange { index })?;
+                let v = match alu {
+                    TestAlu::Add => a + b,
+                    TestAlu::Sub => a - b,
+                    _ => a * b,
+                };
+                match cmp {
+                    TestCmp::Eq => v == 0.0,
+                    TestCmp::Ne => v != 0.0,
+                    TestCmp::Lt => v < 0.0,
+                    TestCmp::Le => v <= 0.0,
+                    TestCmp::Gt => v > 0.0,
+                    TestCmp::Ge => v >= 0.0,
+                }
+            }
+        };
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

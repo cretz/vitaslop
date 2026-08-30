@@ -16,6 +16,7 @@
 //! engine's 26.6 fixed-point (`*64`) struct fields.
 
 pub mod skrifa_backend;
+pub mod system;
 
 use std::collections::HashMap;
 
@@ -127,6 +128,10 @@ struct FontState {
     lib: u32,
     face: FaceId,
     size: PixelSize,
+    /// Whether this handle is the STAND-IN for a console system font rather than a face the
+    /// title supplied. It changes only what [`FontLibrary::face_metrics`] reports as the
+    /// maximum glyph box - see there for why, and why it is not a lie about the face.
+    substitute: bool,
 }
 
 /// Cached rasterization keyed by face + size + character.
@@ -155,7 +160,36 @@ pub struct FontLibrary {
     /// Monotonic handle counter shared by lib and font ids so the two id spaces never
     /// collide (a stale font id can never be mistaken for a live lib id).
     next_handle: u32,
+    /// Per (face, size) ink ascender/descender for a SUBSTITUTE. See
+    /// [`FontLibrary::substitute_ink_extent`].
+    ink: HashMap<(FaceId, (u32, u32)), (f32, f32)>,
 }
+
+/// The probe repertoire as code points.
+fn probe_chars() -> impl Iterator<Item = u32> {
+    FILL_PROBE_ASCII.chars().map(|c| c as u32).chain(FILL_PROBE_EXTRA.iter().copied())
+}
+
+/// The characters the substitute's ink box is measured over.
+///
+/// The printable ASCII repertoire, plus the tallest and deepest shapes a Latin UI actually
+/// draws that ASCII does not carry - the accented capital and the guillemet. That is what
+/// bounds a cell: a scale taken from `Sx` alone would let `(`, `j` and an accent spill into
+/// their neighbours in the title's own glyph atlas, while a scale taken from the FACE's
+/// global bounding box gets nothing at all, because a TTF's box covers glyphs no UI ever
+/// asks for.
+const FILL_PROBE_ASCII: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'()*+,-./:;<=>?@[]^_`{|}~";
+
+/// Code points beyond ASCII that the probe also measures. Written as escapes rather than as
+/// literal characters so this file stays ASCII.
+const FILL_PROBE_EXTRA: &[u32] = &[
+    0x00C1, // A with acute - the tallest common accented capital
+    0x00C4, // A with diaeresis
+    0x00C7, // C with cedilla - the deepest common capital
+    0x00AB, // left guillemet
+    0x00B0, // degree sign
+];
 
 impl Default for FontLibrary {
     fn default() -> Self {
@@ -173,6 +207,7 @@ impl FontLibrary {
             // Start above zero (a null handle is the ScePvf error sentinel) and in a
             // high range so an opaque handle never looks like a small array index.
             next_handle: 0x0001_0000,
+            ink: HashMap::new(),
         }
     }
 
@@ -252,7 +287,7 @@ impl FontLibrary {
         let h = self.alloc_handle();
         // Default to a 16px em until the title sets a size, so an immediate metrics
         // query does not divide by zero.
-        self.fonts.insert(h, FontState { lib, face, size: PixelSize { h: 16.0, v: 16.0 } });
+        self.fonts.insert(h, FontState { lib, face, size: PixelSize { h: 16.0, v: 16.0 }, substitute: false });
         Some(h)
     }
 
@@ -266,6 +301,21 @@ impl FontLibrary {
     /// themselves, which a path-based open cannot reach at all.
     pub fn open_user_memory(&mut self, lib: u32, bytes: &[u8]) -> Option<u32> {
         self.open_user_file(lib, bytes)
+    }
+
+    /// Open the STAND-IN for a console system font (`sceFontOpen` / `scePvfOpen`).
+    ///
+    /// The same open as [`Self::open_user_file`], marked so [`Self::face_metrics`] reports the
+    /// em square as the maximum glyph rather than the face's own `advanceWidthMax`. See there
+    /// for the measurement that makes the difference visible - it is the whole reason this is a
+    /// separate entry point instead of a flag the callers could forget.
+    pub fn open_system_substitute(&mut self, lib: u32, bytes: &[u8], size: f32) -> Option<u32> {
+        let font = self.open_user_file(lib, bytes)?;
+        if let Some(f) = self.fonts.get_mut(&font) {
+            f.substitute = true;
+            f.size = PixelSize { h: size, v: size };
+        }
+        Some(font)
     }
 
     /// `scePvfClose`: drop a font handle.
@@ -318,9 +368,74 @@ impl FontLibrary {
     }
 
     /// `scePvfGetFontInfo`: face-wide metrics at the font's current size.
-    pub fn face_metrics(&self, font: u32) -> Option<FaceMetrics> {
-        let f = self.fonts.get(&font)?;
-        self.backend.face_metrics(f.face, f.size)
+    pub fn face_metrics(&mut self, font: u32) -> Option<FaceMetrics> {
+        let (face, size, substitute) = {
+            let f = self.fonts.get(&font)?;
+            (f.face, f.size, f.substitute)
+        };
+        let mut m = self.backend.face_metrics(face, size)?;
+        // >>> A SYSTEM-FONT STAND-IN REPORTS THE EM SQUARE AS ITS MAXIMUM GLYPH, NOT
+        // >>> `advanceWidthMax`.
+        //
+        // `sceFontGetFontInfo`'s maxima are not decoration: a title sizes its glyph-cache CELLS
+        // from them. MEASURED on PCSA00009 - it lays glyphs out on a fixed pen grid whose pitch
+        // is exactly what these maxima say, 36 px for a 16 px face and 68 px for a 32 px one, and
+        // it then draws each cell into a fixed on-screen box. So a face that overstates its
+        // maximum glyph gets cells about twice the size of the letters in them, and every string
+        // renders at HALF SCALE inside its box however the size is chosen - which is exactly what
+        // a desktop TTF does here, because `hhea.advanceWidthMax` is a font-wide worst case set
+        // by whatever the widest glyph in the face happens to be.
+        //
+        // A console system font does not have that gap: it is a full-width CJK face, so its
+        // widest glyph IS the em square and its maxima and its letters agree. Reporting the em
+        // square for the stand-in is therefore not a fudge of the face's numbers - it is part of
+        // standing IN for that font, and it is applied ONLY to the substitute. A title that
+        // ships its own face still gets that face's own metrics, exactly.
+        // >>> AND THE SAME IS TRUE OF ITS HEIGHT, WHICH THIS USED TO LEAVE ALONE.
+        //
+        // `ascent` and `descent` are LINE metrics: they carry the leading a text engine needs
+        // to stack rows, and no letter reaches either edge of them. MEASURED on the shipped
+        // stand-in at a 16 px nominal size, `ascent - descent` is 21.3 px while the tallest
+        // shape a Latin UI draws inks about 17 - so the cell the title builds is a fifth
+        // taller than anything that goes in it, and every string the system font draws lands
+        // that much smaller inside its on-screen box. Exactly the defect the width half of
+        // this function was written for, on the other axis, left undone.
+        //
+        // The console's face has no gap here either: a fixed-cell font's box IS its em, so
+        // reporting the stand-in's real INK box is again part of standing in rather than a
+        // fudge of the numbers. Measured over [`FILL_PROBE_ASCII`] plus the accented capitals
+        // and the deep shapes ASCII does not carry, so a title that draws `Á`, `(` or `j`
+        // still gets a cell those fit in.
+        if substitute {
+            m.max_advance = size.h.max(1.0);
+            let (asc, desc) = self.substitute_ink_extent(face, size);
+            if asc > desc {
+                m.ascender = asc;
+                m.descender = desc;
+                m.height = asc - desc;
+            }
+        }
+        Some(m)
+    }
+
+    /// The substitute's ink ascender and descender at `size`, over [`FILL_PROBE_ASCII`] and
+    /// [`FILL_PROBE_EXTRA`]. Cached per (face, size); see [`face_metrics`](Self::face_metrics).
+    fn substitute_ink_extent(&mut self, face: FaceId, size: PixelSize) -> (f32, f32) {
+        if let Some(&v) = self.ink.get(&(face, size.key())) {
+            return v;
+        }
+        let (mut asc, mut desc) = (0.0f32, 0.0f32);
+        for ch in probe_chars() {
+            if let Some((_, g)) = self.backend.rasterize(face, size, ch) {
+                // A blank glyph has no ink and must not drag the box to zero.
+                if g.ascender > g.descender {
+                    asc = asc.max(g.ascender);
+                    desc = desc.min(g.descender);
+                }
+            }
+        }
+        self.ink.insert((face, size.key()), (asc, desc));
+        (asc, desc)
     }
 
     /// The cached (rasterizing on first use) glyph for `scePvfGetCharInfo`,

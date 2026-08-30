@@ -67,14 +67,20 @@ pub(super) fn voice_unlock_params(ctx: &mut GuestCtx, st: &mut VitaState) {
             // An unrecognised non-source module. Dumped rather than dropped: one of
             // these turned out to carry the master level, and it was identified from
             // exactly this report.
+            let id = ctx.read_u32(addr);
+            let bytes = ctx.read_bytes(addr, 48);
             tracing::debug!(
                 target: "vitaslop::at9",
                 voice = format_args!("{voice:#x}"),
                 module,
-                id = format_args!("{:#010x}", ctx.read_u32(addr)),
-                "non-source module params, not interpreted: {:02x?}",
-                ctx.read_bytes(addr, 48)
+                id = format_args!("{id:#010x}"),
+                "non-source module params, not interpreted: {bytes:02x?}"
             );
+            // ...and COUNTED, split by whether this voice is a buss. The debug line above is
+            // one per write (millions in a race) and off by default, so the shape of what is
+            // missing was only ever visible to whoever thought to turn it on.
+            let is_buss = st.audio_state.at9.is_buss(voice);
+            crate::vita::at9::note_unknown_module(id, module, is_buss, bytes);
         }
     }
     ctx.ret(0);
@@ -96,6 +102,15 @@ pub(super) fn voice_play(ctx: &mut GuestCtx, st: &mut VitaState) {
 /// pretending otherwise would put state in the mixer that no sample ever passes through.
 pub(super) fn voice_init(ctx: &mut GuestCtx, st: &mut VitaState) {
     let voice = ctx.arg(0);
+    // >>> IS A PRESET HOW THE SILENT VOICES GET THEIR SOURCE?
+    //
+    // A race plays 11 voices (77 on a device) that never locked module-0 params through
+    // EITHER of the two paths that carry them, so they decode nothing and are silent. A
+    // preset is the remaining candidate: it configures module parameters, this handler
+    // ignores it, and if a source can arrive that way then ignoring it IS the missing sound.
+    // Counted rather than assumed - if no title ever passes one, the candidate is dead and
+    // the next session should not re-walk it.
+    super::at9::note_voice_init(ctx.arg(1) != 0);
     st.audio_state.at9.stop(voice);
     ctx.ret(0);
 }
@@ -192,20 +207,85 @@ pub(super) fn rack_get_required_memory_size(ctx: &mut GuestCtx, _st: &mut VitaSt
 /// `SceNgsBufferInfo` is `{ void *data; SceUInt32 size; }`; the rack handle is that
 /// data pointer (or a fresh block if the title supplied none).
 #[hostcall]
-pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, rack_buffer: Ptr, _desc: Ptr, handle: Ptr) -> i32 {
+pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, rack_buffer: Ptr, desc: Ptr, handle: Ptr) -> i32 {
     let data = if rack_buffer.addr() != 0 { ctx.read_u32(rack_buffer.addr()) } else { 0 };
     let rack = if data != 0 { data } else { st.galloc(NGS_WORK_SIZE, 16) };
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), rack);
     }
+    // >>> WHAT THIS RACK IS MADE OF, reported once per rack.
+    //
+    // The description was ignored entirely, so nothing in a run said whether a title's mix
+    // passes through a MASTER or COMPRESSOR buss - and an unexplained attenuation the device
+    // applies and we do not is precisely a question about which busses exist. Reporting it
+    // is not implementing it: a buss named here is still a buss this engine does not run, and
+    // the line says so rather than letting the name imply otherwise.
+    //
+    // `SceNgsRackDescription`: definition pointer, voice count, channels per voice, max
+    // patches per input, patches per output, user release data.
+    if !desc.is_null() {
+        let d = desc.addr();
+        let (defn, voices, channels, per_in, per_out) = (
+            ctx.read_u32(d),
+            ctx.read_u32(d + 4),
+            ctx.read_u32(d + 8),
+            ctx.read_u32(d + 12),
+            ctx.read_u32(d + 16),
+        );
+        let name = match voice_def_name(st, defn) {
+            Some(n) => n.to_string(),
+            // A definition pointer this run never handed out means the title got it from
+            // somewhere we do not model. Say the address rather than a name we do not have.
+            None => format!("an unrecognised definition at {defn:#010x}"),
+        };
+        tracing::warn!(
+            target: "vitaslop::at9",
+            rack = format_args!("{rack:#x}"),
+            "sceNgsRackInit: a rack of {voices} voice(s) x {channels} channel(s) of {name}              (max {per_in} patches per input, {per_out} per output). The MIX this engine              performs is a sum of source voices scaled by their routing volumes; any              processing a buss definition implies - compression, EQ, delay - is NOT run."
+        );
+    }
     0
 }
 
 /// SceInt32 sceNgsRackGetVoiceHandle(SceNgsHRack rack, SceUInt32 index, SceNgsHVoice *handle)
-/// Hand back a distinct, valid block per voice so the title can hold and pass it.
+///
+/// >>> THE SAME (RACK, INDEX) IS THE SAME VOICE. THIS IS A LOOKUP, NOT AN ALLOCATION, AND
+/// >>> GETTING THAT WRONG IS WHAT MADE ONE TITLE'S RACE 44% AUDIO.
+///
+/// A rack is a fixed array of voices; this hands back the handle of one of them, and a
+/// title asks for it whenever it wants to play something. The first version allocated a
+/// fresh block on every call, so every query for the same voice produced a DIFFERENT
+/// handle - and the consequences are not subtle:
+///
+/// - the mixer's voice bank grew without bound, one entry per query;
+/// - a voice the title later stopped was stopped by handle, and the handle it used was a
+///   NEW one, so the voice actually playing was never stopped by anything;
+/// - so every sound ever started kept playing, kept being decoded in full, and kept being
+///   mixed, for the rest of the run.
+///
+/// MEASURED on a retail racer's race, 11,321 grains: **8,124 voices started, 217 stopped by
+/// the title, 8,138 in the bank, 318 playing every grain with a peak of 843** - against a
+/// console whose rack holds tens. With the handle memoised the same title's race is a
+/// handful of voices, which is what a browser profile blaming ATRAC9 decode for a third of
+/// its thread was really measuring.
 #[hostcall]
-pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, _rack: u32, _index: u32, handle: Ptr) -> i32 {
-    let voice = st.galloc(NGS_BLOCK_SIZE, 16);
+pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack: u32, index: u32, handle: Ptr) -> i32 {
+    // The A/B arm: `VITASLOP_NGS_VOICE_HANDLE_MEMO=0` restores the fresh-handle-per-call
+    // behaviour, which is the one way to put a number on what it costs on any title.
+    let memo = !matches!(crate::knobs::var("VITASLOP_NGS_VOICE_HANDLE_MEMO").as_deref(), Ok("0"));
+    let found = if memo {
+        st.audio_state.ngs_voice_handles.iter().find(|(k, _)| *k == (rack, index)).copied()
+    } else {
+        None
+    };
+    let voice = match found.as_ref() {
+        Some((_, v)) => *v,
+        None => {
+            let v = st.galloc(NGS_BLOCK_SIZE, 16);
+            st.audio_state.ngs_voice_handles.push(((rack, index), v));
+            v
+        }
+    };
     if handle.addr() != 0 {
         ctx.write_u32(handle.addr(), voice);
     }
@@ -293,14 +373,30 @@ pub(super) fn voice_lock_params(ctx: &mut GuestCtx, st: &mut VitaState, voice: u
 }
 
 /// The voice-definition getters (`sceNgsVoiceDefGet*`) each return a
-/// `const SceNgsVoiceDefinition *` the title embeds in a rack description. It is an
-/// opaque token to the guest, so one shared zeroed blob serves them all.
-#[hostcall]
-pub(super) fn voice_def_get(_ctx: &mut GuestCtx, st: &mut VitaState) -> u32 {
-    if st.audio_state.ngs_def_blob == 0 {
-        st.audio_state.ngs_def_blob = st.galloc(NGS_BLOCK_SIZE, 16);
+/// `const SceNgsVoiceDefinition *` the title embeds in a rack description. It is an opaque
+/// token to the guest, so a zeroed blob serves - but a DISTINCT one per getter, because the
+/// pointer is the only thing that says what kind of voice a rack is made of. See
+/// [`crate::vita::audio::AudioState::ngs_defs`]; `rack_init` is the reader.
+///
+/// Not `#[hostcall]`: the handler needs the NID it was reached by, which the macro does not
+/// pass. The dispatch arm calls it directly.
+pub(super) fn voice_def_get_for(st: &mut VitaState, func_nid: u32) -> u32 {
+    if let Some((_, addr)) = st.audio_state.ngs_defs.iter().find(|(n, _)| *n == func_nid) {
+        return *addr;
     }
-    st.audio_state.ngs_def_blob
+    let addr = st.galloc(NGS_BLOCK_SIZE, 16);
+    st.audio_state.ngs_defs.push((func_nid, addr));
+    addr
+}
+
+/// Which voice definition a rack description points at, by name, or `None` if the pointer is
+/// not one this run handed out.
+fn voice_def_name(st: &VitaState, addr: u32) -> Option<&'static str> {
+    st.audio_state
+        .ngs_defs
+        .iter()
+        .find(|(_, a)| *a == addr)
+        .map(|(nid, _)| crate::nid::name(*nid))
 }
 
 /// SceInt32 sceNgsPatchCreateRouting(const SceNgsPatchSetupInfo *info, SceNgsHPatch *handle)

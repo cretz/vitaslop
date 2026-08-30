@@ -1142,3 +1142,185 @@ fn encode_etc2(@builtin(global_invocation_id) gid: vec3<u32>) {
         outb[o + 1u] = c.y;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// YUV 4:2:0 (two-plane) -> RGBA
+// ---------------------------------------------------------------------------------------------
+//
+// A decoded video frame is the one texture whose content changes EVERY frame, so no cache can
+// spare its conversion and the cost is paid sixty times a second. On the CPU that was measured
+// at 336 MB of conversion over one run on a phone and the largest single item in that device's
+// render time; here it is a dispatch over 2x2 groups, and the upload shrinks with it because
+// what crosses to the GPU is the guest's own 4:2:0 bytes rather than the RGBA they expand to.
+//
+// Field meanings for this entry point, reusing the shared `Params`:
+//   width/height  visible size in texels
+//   src_word      LUMA stride in bytes
+//   rgba_word     CHROMA stride in bytes
+//   out_word      byte offset of the chroma plane within `src`
+//   out_row_words words per output row (= width)
+//   flags         FLAG_SWAP_CHROMA when the format's swizzle says YVU rather than YUV
+//
+// The matrix is BT.601 studio swing, which is GXM's default YUV profile - the same conversion
+// the CPU path applies, and the two are held together by a test on the CPU side.
+
+const FLAG_SWAP_CHROMA: u32 = 16u;
+
+fn src_byte_at(i: u32) -> u32 {
+    return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+fn yuv_to_rgb(y: i32, cb: i32, cr: i32) -> vec4<u32> {
+    let yt = (y - 16) * 76309;
+    let u = cb - 128;
+    let v = cr - 128;
+    let r = (yt + 104597 * v + 32768) >> 16u;
+    let g = (yt - 25675 * u - 53279 * v + 32768) >> 16u;
+    let b = (yt + 132201 * u + 32768) >> 16u;
+    return vec4<u32>(
+        u32(clamp(r, 0, 255)),
+        u32(clamp(g, 0, 255)),
+        u32(clamp(b, 0, 255)),
+        255u,
+    );
+}
+
+// >>> THE SAME CONVERSION, WRITING STRAIGHT INTO THE TEXTURE.
+//
+// `convert_yuv420p2` below writes packed words into a storage BUFFER, which the host then
+// copies into a texture - 2 MB of GPU-side copying for a 960x544 picture, every frame, on top
+// of the buffer that has to exist to hold it. A write-only storage texture removes both. The
+// arithmetic is identical and shared (`yuv_to_rgb`), so the two entry points cannot drift into
+// two different pictures; the buffer one is kept because a storage TEXTURE binding is not
+// available for every format this file writes.
+@group(0) @binding(4) var out_tex: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn convert_yuv420p2_tex(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let cx = gid.x;
+    let cy = gid.y;
+    let cw = (P.width + 1u) / 2u;
+    let ch = (P.height + 1u) / 2u;
+    if (cx >= cw || cy >= ch) {
+        return;
+    }
+    let chroma_at = P.out_word + cy * P.rgba_word + cx * 2u;
+    let a = src_byte_at(chroma_at);
+    let b = src_byte_at(chroma_at + 1u);
+    var cb = a;
+    var cr = b;
+    if (flag(FLAG_SWAP_CHROMA)) {
+        cb = b;
+        cr = a;
+    }
+    for (var dy = 0u; dy < 2u; dy = dy + 1u) {
+        let y = cy * 2u + dy;
+        if (y >= P.height) {
+            break;
+        }
+        for (var dx = 0u; dx < 2u; dx = dx + 1u) {
+            let x = cx * 2u + dx;
+            if (x >= P.width) {
+                break;
+            }
+            let luma = src_byte_at(y * P.src_word + x);
+            let rgb = yuv_to_rgb(i32(luma), i32(cb), i32(cr));
+            textureStore(out_tex, vec2<u32>(x, y), vec4<f32>(rgb) / 255.0);
+        }
+    }
+}
+
+// One invocation per CHROMA sample, i.e. per 2x2 group of pixels: the chroma pair is read and
+// converted once and applied to four luma samples, which is the same grouping the CPU path uses.
+@compute @workgroup_size(8, 8, 1)
+fn convert_yuv420p2(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let cx = gid.x;
+    let cy = gid.y;
+    let cw = (P.width + 1u) / 2u;
+    let ch = (P.height + 1u) / 2u;
+    if (cx >= cw || cy >= ch) {
+        return;
+    }
+    let chroma_at = P.out_word + cy * P.rgba_word + cx * 2u;
+    let a = src_byte_at(chroma_at);
+    let b = src_byte_at(chroma_at + 1u);
+    var cb = a;
+    var cr = b;
+    if (flag(FLAG_SWAP_CHROMA)) {
+        cb = b;
+        cr = a;
+    }
+    for (var dy = 0u; dy < 2u; dy = dy + 1u) {
+        let y = cy * 2u + dy;
+        if (y >= P.height) {
+            break;
+        }
+        for (var dx = 0u; dx < 2u; dx = dx + 1u) {
+            let x = cx * 2u + dx;
+            if (x >= P.width) {
+                break;
+            }
+            let luma = src_byte_at(y * P.src_word + x);
+            outb[y * P.out_row_words + x] = pack_rgba(yuv_to_rgb(i32(luma), i32(cb), i32(cr)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// UNCOMPRESSED 32-bit four-channel guest formats, un-swizzled and channel-permuted on the GPU.
+//
+// # Why this one is not a trade of any kind
+// Every other decoder in this file reconstructs texels from a lossy block format, so "does it
+// match the CPU" is a real question with a real answer (the `gpu_*_matches_the_cpu_*` tests).
+// This one is a PERMUTATION: the guest's texel is already four 8-bit channels, and the whole
+// decode is (a) undoing the Morton interleave that decides WHERE the texel is, and (b) the
+// SWIZZLE4 channel order. No arithmetic, no rounding, nothing to lose - so bit-exactness here
+// is a property of the code rather than a measurement of it.
+//
+// # And it is the largest single item on the target device
+// MEASURED on the user's phone across a whole run: `texture decode by format: 2988.8 MB total -
+// 0x0c raw 2964.5 MB`. Essentially all of that device's texture decode is THIS, done one texel
+// at a time on the CPU it has least of, while its GPU sits idle. The same run's frame spends 17
+// of 25 ms in `samplers`, which is where the decode and the upload both land.
+//
+// `blocks_x` carries the source row stride in TEXELS for a LINEAR texture (the guest's `stride`
+// divided by four); a swizzled one addresses through `morton_index` and ignores it.
+@compute @workgroup_size(8, 8, 1)
+fn decode_raw(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= P.width || y >= P.height) { return; }
+    var index: u32;
+    if (flag(FLAG_SWIZZLED)) {
+        index = morton_index(x, y, P.padded_x, P.padded_y);
+    } else {
+        index = y * P.blocks_x + x;
+    }
+    let w = src[P.src_word + index];
+    let b0 = w & 0xffu;
+    let b1 = (w >> 8u) & 0xffu;
+    let b2 = (w >> 16u) & 0xffu;
+    let b3 = (w >> 24u) & 0xffu;
+    // `render::swizzle4`, arm for arm. The selector names CHANNELS, and the default arm
+    // (ABGR, field 0) is the identity over memory bytes.
+    var out: vec4<u32>;
+    switch (P.src_format) {
+        case 1u: { out = vec4<u32>(b2, b1, b0, b3); }  // ARGB
+        case 2u: { out = vec4<u32>(b3, b2, b1, b0); }  // RGBA
+        case 3u: { out = vec4<u32>(b1, b2, b3, b0); }  // BGRA
+        default: { out = vec4<u32>(b0, b1, b2, b3); }  // ABGR
+    }
+    rgba[P.rgba_word + y * P.width + x] = pack_rgba(out);
+}
+
+// One RGBA8 level, copied from the packed scratch into `outb` with the 256-byte-aligned rows
+// `copyBufferToTexture` requires. The decode and the box filter both work in PACKED rows -
+// `halve` reads its source that way - so the padding is applied once at the end rather than
+// threaded through every stage.
+@compute @workgroup_size(8, 8, 1)
+fn copy_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= P.width || y >= P.height) { return; }
+    outb[P.out_word + y * P.out_row_words + x] = rgba[P.rgba_word + y * P.width + x];
+}

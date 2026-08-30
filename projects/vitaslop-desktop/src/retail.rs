@@ -237,6 +237,11 @@ impl RetailGuest {
             None => Box::new(DesktopWorld::new(input)),
         };
         let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
+        // Movie playback decodes on this machine's own H.264 decoder. Installing the port
+        // here rather than inside the engine is what keeps the engine free of a decoder:
+        // the browser build installs the WebCodecs-backed one through the same seam.
+        env.state.video = Box::new(vitaslop_platform::video::H264Factory);
+        env.state.audio_dec = Box::new(vitaslop_platform::audio_dec::AacFactory);
         env.state.set_alloc_base(linked.alloc_base);
         env.state.set_process_param(linked.process_param);
         env.state.set_modules(linked.loaded_modules.clone());
@@ -342,6 +347,53 @@ impl RetailGuest {
         self.sched.host().state.clock_sources()
     }
 
+    /// Seconds of sound the guest has submitted through `sceAudioOutOutput`.
+    pub fn audio_produced_seconds(&mut self) -> f64 {
+        self.sched.host().state.audio_produced_seconds()
+    }
+
+    /// Every LIVE thread that is parked at the end of the run, with the wait it is parked in.
+    ///
+    /// The counterpart of [`idle_attribution`](Self::idle_attribution), which accounts only for
+    /// waits that BOUGHT clock: a thread parked on something untimed buys none, so it is absent
+    /// there and present here. Printed beside it so a desktop run and a browser run - whose
+    /// panel prints the same list from the same runtime function - can be diffed thread for
+    /// thread, which is how a browser-ONLY stall gets named.
+    pub fn blocked_threads(&mut self) -> String {
+        let v = self.sched.host().state.blocked_threads();
+        if v.is_empty() {
+            return String::new();
+        }
+        let mut s = format!("headless: {} thread(s) parked at the end of the run:
+", v.len());
+        for (thid, name, state) in &v {
+            s.push_str(&format!("  thid {thid:#x} {name:?}: {state}
+"));
+        }
+        s
+    }
+
+    /// Where the IDLE part of the game clock went, largest owner first. See
+    /// `VitaState::idle_attribution` for why a total is not enough.
+    pub fn idle_attribution(&mut self) -> String {
+        let v = self.sched.host().state.idle_attribution();
+        if v.is_empty() {
+            return String::new();
+        }
+        let total: u64 = v.iter().map(|(_, us, _)| us).sum();
+        let mut s = format!("headless: the idle clock ({:.1}s) was bought by:\n", total as f64 / 1e6);
+        for (owner, us, jumps) in v.iter().take(8) {
+            s.push_str(&format!(
+                "  {:>8.3}s over {jumps:>8} jump(s), mean {:>7.1}us - {} on thread {:#x}\n",
+                *us as f64 / 1e6,
+                *us as f64 / jumps.max(&1).to_owned() as f64,
+                owner.kind.name(),
+                owner.thid,
+            ));
+        }
+        s
+    }
+
     /// Who got the CPU, and how much of the device's parallelism the run used. The two
     /// belong together: a lopsided share is only a problem if the starved threads were
     /// READY, and the second report is what says so.
@@ -349,8 +401,22 @@ impl RetailGuest {
         format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
 
+    /// One line per guest memory space (`sceClibMspace*`): how full it is and whether the
+    /// title is DRAINING it. See `vitaslop_runtime::mspace::Mspace`.
+    pub fn mspace_report(&mut self) -> Vec<String> {
+        self.sched.host().state.mspace_report()
+    }
+
     pub fn guest_stdout(&mut self) -> Vec<u8> {
         self.sched.host().state.capture.stdout.clone()
+    }
+
+    /// The size of the buffer the guest last handed `sceDisplaySetFrameBuf`, which is what a
+    /// frame must be RENDERED at. It is not always the panel: a title may render its front
+    /// end smaller and let the display controller stretch it, and composing such a frame at
+    /// the panel size puts the picture in a corner. See `VitaState::display_size`.
+    pub fn display_size(&mut self) -> (u32, u32) {
+        self.sched.host().state.display_size()
     }
 
     /// The newest presented frame's scenes, in submission order; empty until the guest
@@ -555,7 +621,9 @@ impl RetailGfx {
         self.depth = make_depth(&self.device, w, h);
     }
 
-    fn present(&mut self, scenes: &[Scene]) {
+    /// `display` is the size the GUEST declared to `sceDisplaySetFrameBuf`, which is what
+    /// the frame is projected against. See the `encode_chain` call below.
+    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) {
         let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -566,10 +634,14 @@ impl RetailGfx {
             ..Default::default()
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        // Project against the 960x544 GAME resolution (not the window size), so pixel-
-        // space 2D coords map correctly; the window-sized framebuffer stretches the
-        // resolution-independent clip output to fill the window.
-        self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, GAME_W, GAME_H, CLEAR);
+        // Project against the resolution the GUEST declared (not the window size), so
+        // pixel-space 2D coords map correctly; the window-sized framebuffer stretches the
+        // resolution-independent clip output to fill the window. That stretch is also what
+        // makes a title presenting a buffer SMALLER than the panel come out full-screen -
+        // the hardware's own upscale, for free, on this path.
+        let (dw, dh) = display;
+        let (fw, fh) = (frame.texture.width(), frame.texture.height());
+        self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
     }
@@ -884,6 +956,28 @@ pub fn headless_check(
         .unwrap_or(180);
     println!("headless: loaded (build {:.0} ms), running to frame {target}...", guest.build_ms);
 
+    // >>> THE STALL WATCHDOG (`VITASLOP_STALL_WATCHDOG=<seconds>`).
+    //
+    // Armed AFTER the load, because the load is legitimately tens of seconds (13 s of build on
+    // one title) and no display frame flips during it - a watchdog armed before it would fire
+    // on the transpiler every time. Everything from here on is supposed to be producing frames.
+    //
+    // Said out loud either way: "the run is under a 120 s watchdog" and "the run is not" are
+    // both things the reader of a log needs, and only one of them is visible from an absence.
+    match vitaslop_native::watchdog::spawn(&format!("{} / {}", dir.display(), match &recipe {
+        Some(_) => "recipe",
+        None => "built-in taps",
+    }))? {
+        true => println!(
+            "headless: STALL WATCHDOG armed at {} s - if no frame flips for that long the run              dumps what the guest is calling and stops with exit {}.",
+            vitaslop_native::watchdog::budget_secs()?.unwrap_or(0),
+            vitaslop_native::watchdog::STALL_EXIT_CODE
+        ),
+        false => println!(
+            "headless: no stall watchdog (set VITASLOP_STALL_WATCHDOG=<seconds> to arm one;              without it a guest that spins hangs this run forever)."
+        ),
+    }
+
     // The built-in Tutorial tap script (title menu navigation): used only when no
     // recipe is given and taps are not disabled. (active_from, active_until, x, y) - a
     // sticky tap held across a few frames then released.
@@ -1015,6 +1109,10 @@ pub fn headless_check(
             }
         }
         let in_shot_window = f >= shot_from && f <= shot_to;
+        // The size the guest declared for THIS frame. It is read per frame rather than once
+        // because a title changes it: one front end presents 640x368 and its world 960x544,
+        // through the same three buffers.
+        let display = guest.display_size();
         // >>> RENDER EVERY FRAME IN THE WINDOW, WRITE ONLY THE SAMPLED ONES.
         //
         // # A sampled render is not a faithful picture, and the way it fails is invisible
@@ -1043,7 +1141,7 @@ pub fn headless_check(
             if !scenes.is_empty() {
                 frame_shape = (scenes.len(), scenes.iter().map(|s| s.draws.len()).sum());
                 let t = std::time::Instant::now();
-                let _ = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+                let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
             }
         }
@@ -1074,9 +1172,13 @@ pub fn headless_check(
             frame_shape = (scene_count, draw_count);
             if !scenes.is_empty() {
                 let t = std::time::Instant::now();
-                let fb = r.render_frame(scenes, GAME_W, GAME_H, CLEAR);
+                let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
                 let path = shot_dir.join(format!("f{f:06}.png"));
+                // Written at PANEL size whatever the guest declared, so a shot sequence is
+                // comparable frame to frame and against the browser. `scaled_to` is a copy
+                // when the two already agree, which is every title but one.
+                let fb = fb.scaled_to(GAME_W, GAME_H);
                 std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
             }
             // The guest clock beside the frame, so its LOCAL rate is visible. A run-total
@@ -1148,6 +1250,13 @@ pub fn headless_check(
     vitaslop_runtime::host::report_vblank_spin_parks();
     // What the NGS mix carried, and how much of it was audible.
     vitaslop_runtime::vita::at9::report_mix();
+    // Each guest memory space, and above all its allocs against its frees - a pool that only
+    // ever fills is a release path this engine does not implement, and one that churns is the
+    // title's own business. The warning on a failed allocation guesses between those two; this
+    // is the measurement.
+    for line in guest.mspace_report() {
+        println!("{line}");
+    }
     // `VITASLOP_CPU_SHARE=1`: who got the CPU, and how many threads were READY when the
     // scheduler handed the baton on. The second half is what the game clock divides by
     // (the device runs three of them at once), so a clock that looks wrong on a loading
@@ -1187,7 +1296,8 @@ pub fn headless_check(
 
     let mut renderer = vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?;
     let render_t = std::time::Instant::now();
-    let fb = renderer.render_frame(&scenes, GAME_W, GAME_H, CLEAR);
+    let display = guest.display_size();
+    let fb = renderer.render_frame(&scenes, display.0, display.1, CLEAR);
     let cold_render_ms = render_t.elapsed().as_secs_f64() * 1000.0;
     if timing {
         // Re-render the SAME scene to separate one-off cost from per-frame cost. The first
@@ -1198,7 +1308,7 @@ pub fn headless_check(
         let mut warm: Vec<f64> = Vec::new();
         for _ in 0..WARM_RENDER_SAMPLES {
             let t = std::time::Instant::now();
-            let _ = renderer.render_frame(&scenes, GAME_W, GAME_H, CLEAR);
+            let _ = renderer.render_frame(&scenes, display.0, display.1, CLEAR);
             warm.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         report_frame_timing(&frame_ms, cold_render_ms, &warm, renderer.last_split(), &enc_total);
@@ -1211,6 +1321,8 @@ pub fn headless_check(
     }
     std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
     let path = shot_dir.join("desktop.png");
+    // Panel size, whatever the guest declared - see the sampled-shot write above.
+    let fb = fb.scaled_to(GAME_W, GAME_H);
     std::fs::write(&path, fb.to_png()).map_err(|e| format!("write png: {e}"))?;
     // Diagnostic (VITASLOP_SOFTWARE=1): also render the frame's FINAL scene through the
     // software rasterizer and write it beside the GPU shot. The two paths share the scene
@@ -1232,11 +1344,23 @@ pub fn headless_check(
         );
     }
     println!(
-        "headless: reached frame {frames}, wrote {} (guest clock {clock_s:.1}s = {:.2}x the {:.1}s those frames are worth)",
+        "headless: reached frame {frames}, wrote {} (guest clock {clock_s:.1}s over {frames} displayed frames = {:.2} display periods each). THAT COUNT IS THE TITLE'S OWN VBLANK DIVISOR and should be a WHOLE number: 1.00 for a 60 fps title, 2.00 for a 30 fps one. A fraction, or one more period than the title's own limiter waits for, is game time no displayed frame accounted for - and since audio is billed in clock time, on a device that is what fills the audio ring and drops the excess.",
         path.display(),
-        clock_s / (frames.max(1) as f64 / 60.0),
-        frames as f64 / 60.0,
+        clock_s * 60.0 / frames.max(1) as f64,
     );
+    print!("{}", guest.idle_attribution());
+    print!("{}", guest.blocked_threads());
+    // AUDIO AGAINST THE CLOCK IT IS PACED ON. `sceAudioOutOutput` parks one grain of
+    // VIRTUAL time, so this is 1.00 on a healthy path whatever the frame rate - and it stays
+    // 1.00 when the CLOCK itself is wrong, which is why the period count above is the other
+    // half of the pair. See `AudioState::produced_seconds`.
+    let audio_s = guest.audio_produced_seconds();
+    if audio_s > 0.0 && clock_s > 0.0 {
+        println!(
+            "headless: the guest produced {audio_s:.1}s of SOUND against {clock_s:.1}s of emulated clock ({:.2}x). Audio is billed in clock time, so this is 1.00 on a healthy path at any frame rate; it is the PERIODS-PER-FRAME figure above, not this one, that catches a clock running fast.",
+            audio_s / clock_s,
+        );
+    }
     // The fuel accounting's own totals, next to the clock they price. A mean burn near the
     // preemption interval means most suspends really are full slices; a mean far below it
     // with a huge total means the clock is being driven by the NUMBER of suspends, which is
@@ -1444,11 +1568,25 @@ impl RetailApp {
             if self.guest.current().is_empty() {
                 self.guest.advance(); // bootstrap the first frame (runs the whole boot)
             }
-            // Cap catch-up so a long boot frame does not spiral.
-            let mut budget = 4;
-            while self.acc >= FRAME_DT && budget > 0 {
+            // >>> ONE GUEST FRAME PER REDRAW, SO EVERY FRAME COMPUTED IS A FRAME SHOWN.
+            //
+            // This used to allow four, and present once - so three of the four were computed
+            // and discarded. The budget looks like a safety cap and behaves like a frame-rate
+            // halver, because the loop has a stable fixed point at EVERY count: at two frames
+            // per redraw the redraw takes twice as long, so `acc` arrives at twice the size,
+            // so it runs two again. Nothing pushes it back down, and one hitch is enough to
+            // settle it there for the rest of the run.
+            //
+            // MEASURED in the browser, whose loop had the identical shape (see `live_loop` in
+            // vitaslop-web): a race at 100% emulated speed was showing 31 of the 60 frames a
+            // second it computed, on a machine with headroom. One frame per tick showed 60.
+            //
+            // Catch-up is not lost, it is recognised as unavailable: sprinting through extra
+            // frames is only possible for a machine with spare time, and a machine with spare
+            // time is already keeping up. `acc` still carries the deficit, and the clamp below
+            // still drops it when a boot frame makes it absurd.
+            if self.acc >= FRAME_DT {
                 self.acc -= FRAME_DT;
-                budget -= 1;
                 self.guest.advance();
             }
             if self.acc > FRAME_DT * 4 {
@@ -1464,10 +1602,12 @@ impl RetailApp {
             }
         }
 
+        // Read before the renderer is borrowed: both live on `self`.
+        let display = self.guest.display_size();
         if let Some(gfx) = self.gfx.as_mut() {
             let scenes = self.guest.current();
             if !scenes.is_empty() {
-                gfx.present(scenes);
+                gfx.present(scenes, display);
             }
         }
         self.update_title(now);

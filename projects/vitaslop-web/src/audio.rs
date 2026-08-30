@@ -49,8 +49,6 @@ const CTL_HEADER_BYTES: u32 = 64;
 struct Port {
     id: i32,
     format: AudioFormat,
-    /// Per-channel gain in 0..=1, from `sceAudioOutSetVolume` (Vita range 0..=32768).
-    gain: [f32; 2],
     /// Fractional read position into the source grain, carried ACROSS grains when the
     /// port's rate differs from the device's. Resetting it per grain would drop or
     /// duplicate a sample at every grain boundary, which is a periodic click at the
@@ -58,6 +56,11 @@ struct Port {
     resample_pos: f64,
     /// Whether the rate mismatch has been reported. Once is enough; it cannot change.
     reported_rate: bool,
+    /// Where this port's next grain belongs in the ring, as an absolute frame count in the
+    /// same monotonic space as `CTL_WRITE` / `CTL_READ`. See [`WebAudioSink::publish_at`]:
+    /// ports play at the same time and are SUMMED, so each needs its own position rather
+    /// than sharing one append cursor.
+    cursor: u32,
 }
 
 /// Writes guest PCM into the page's shared audio ring.
@@ -72,6 +75,9 @@ pub struct WebAudioSink {
     /// Scratch for one grain of device-rate interleaved f32, reused across submits so a
     /// call at grain rate allocates nothing.
     scratch: Vec<f32>,
+    /// Scratch for the ring's own samples where a grain overlaps another port's, so the sum
+    /// in [`WebAudioSink::publish_at`] allocates nothing either.
+    mixbuf: Vec<f32>,
 }
 
 impl WebAudioSink {
@@ -104,6 +110,7 @@ impl WebAudioSink {
             ports: Vec::new(),
             next_port: 0,
             scratch: Vec::new(),
+            mixbuf: Vec::new(),
         })
     }
 
@@ -111,38 +118,112 @@ impl WebAudioSink {
         self.ports.iter_mut().find(|p| p.id == id)
     }
 
-    /// Publish `frames` of interleaved device-rate f32 from `self.scratch`, dropping
-    /// whatever will not fit and counting the drop.
+    /// Copy `src` into the ring at absolute frame `start`, wrapping at the end.
+    fn write_range(&self, start: u32, src: &[f32]) {
+        let ch = self.channels;
+        let frames = (src.len() / ch as usize) as u32;
+        let at = start % self.capacity;
+        let first = frames.min(self.capacity - at);
+        self.data
+            .subarray(at * ch, (at + first) * ch)
+            .copy_from(&src[..(first * ch) as usize]);
+        if first < frames {
+            self.data
+                .subarray(0, (frames - first) * ch)
+                .copy_from(&src[(first * ch) as usize..]);
+        }
+    }
+
+    /// Read the ring's own samples at absolute frame `start` into `out`, wrapping.
+    fn read_range(&self, start: u32, out: &mut [f32]) {
+        let ch = self.channels;
+        let frames = (out.len() / ch as usize) as u32;
+        let at = start % self.capacity;
+        let first = frames.min(self.capacity - at);
+        self.data
+            .subarray(at * ch, (at + first) * ch)
+            .copy_to(&mut out[..(first * ch) as usize]);
+        if first < frames {
+            self.data
+                .subarray(0, (frames - first) * ch)
+                .copy_to(&mut out[(first * ch) as usize..]);
+        }
+    }
+
+    /// Publish `frames` of interleaved device-rate f32 from `self.scratch` at the PORT's own
+    /// position in the ring, SUMMING with whatever another port has already put there.
+    /// Returns the port's new position.
     ///
-    /// Single producer, single consumer, monotonic counters: the write index is only
-    /// advanced by this, the read index only by the worklet, so the free space is a plain
-    /// subtraction and no lock is needed. The data goes in BEFORE the index is published,
-    /// which is the whole ordering requirement.
-    fn publish(&mut self, frames: u32) {
+    /// # Why a port has a position at all, and why appending was wrong
+    /// Every open `sceAudioOut` port plays SIMULTANEOUSLY on hardware - the console's audio
+    /// block sums them into one stereo stream. This sink used to append each grain at a single
+    /// shared write cursor, so two live ports did not mix: they took turns, each pushing its
+    /// own grains into the same timeline. MEASURED on a retail sports title's opening, which
+    /// keeps two 48 kHz stereo ports open (grain 256 and grain 1024): the ring was fed roughly
+    /// TWICE real time, `overrun 2,166,784` frames, and what the device played was alternating
+    /// blocks of two different streams - a hiccup and a stutter, from a decoder and a mixer
+    /// that were both working correctly.
+    ///
+    /// So each port carries an absolute frame position, and a grain is ADDED where it belongs
+    /// in time rather than appended. Frames past the shared frontier are stale ring memory and
+    /// are overwritten; frames before it hold another port's audio and are summed with it.
+    ///
+    /// The sum is deliberately NOT clamped here. A port can still submit into this window, and
+    /// clamping now would throw away headroom a later grain could have cancelled; the device
+    /// is the thing that clips, exactly as the console's DAC is.
+    ///
+    /// Single producer, single consumer: the write index is only advanced here and the read
+    /// index only by the worklet, so the free space is a plain subtraction and no lock is
+    /// needed. The data goes in BEFORE the index is published, which is the whole ordering
+    /// requirement.
+    fn publish_at(&mut self, cursor: u32, frames: u32) -> u32 {
         let write = self.ctl.get_index(CTL_WRITE) as u32;
         let read = js_sys::Atomics::load(&self.ctl, CTL_READ).unwrap_or(0) as u32;
-        let free = self.capacity.saturating_sub(write.wrapping_sub(read));
+        // A port that has fallen behind the consumer - it stopped submitting for a while, or
+        // it is new - joins at the read cursor rather than writing into frames already played.
+        let mut at = if read.wrapping_sub(cursor) as i32 > 0 { read } else { cursor };
+        let free = self.capacity.saturating_sub(at.wrapping_sub(read));
         let take = frames.min(free);
         if take < frames {
             let _ = js_sys::Atomics::add(&self.ctl, CTL_OVERRUN, (frames - take) as i32);
         }
-        if take == 0 {
-            return;
+        if take > 0 {
+            let ch = self.channels as usize;
+            // The part that lands before the frontier already holds another port's audio.
+            let overlap = if write.wrapping_sub(at) as i32 > 0 {
+                take.min(write.wrapping_sub(at))
+            } else {
+                0
+            };
+            if overlap > 0 {
+                let n = overlap as usize * ch;
+                self.mixbuf.clear();
+                self.mixbuf.resize(n, 0.0);
+                let mut held = std::mem::take(&mut self.mixbuf);
+                self.read_range(at, &mut held);
+                for (h, s) in held.iter_mut().zip(self.scratch[..n].iter()) {
+                    *h += *s;
+                }
+                self.write_range(at, &held);
+                self.mixbuf = held;
+            }
+            if take > overlap {
+                let from = overlap as usize * ch;
+                let to = take as usize * ch;
+                let src = std::mem::take(&mut self.scratch);
+                self.write_range(at.wrapping_add(overlap), &src[from..to]);
+                self.scratch = src;
+            }
+            let end = at.wrapping_add(take);
+            if end.wrapping_sub(write) as i32 > 0 {
+                let _ = js_sys::Atomics::store(&self.ctl, CTL_WRITE, end as i32);
+            }
         }
-        // The ring wraps, so at most two contiguous runs.
-        let start = write % self.capacity;
-        let first = take.min(self.capacity - start);
-        let ch = self.channels;
-        self.data
-            .subarray(start * ch, (start + first) * ch)
-            .copy_from(&self.scratch[..(first * ch) as usize]);
-        if first < take {
-            let rest = take - first;
-            self.data
-                .subarray(0, rest * ch)
-                .copy_from(&self.scratch[(first * ch) as usize..(take * ch) as usize]);
-        }
-        let _ = js_sys::Atomics::store(&self.ctl, CTL_WRITE, write.wrapping_add(take) as i32);
+        // Advance by the WHOLE grain even where the ring refused it: the port's position is
+        // where its sound belongs in time, and a producer running ahead of the device drops
+        // audio without shifting everything that follows.
+        at = at.wrapping_add(frames);
+        at
     }
 }
 
@@ -154,12 +235,15 @@ impl AudioSink for WebAudioSink {
             "[audio] guest opened a port: {} ch, {} Hz, grain {} (device {} Hz, {} ch)",
             format.channels, format.sample_rate, format.grain, self.sample_rate, self.channels
         )));
+        // A new port joins at the frontier: whatever is already queued belongs to the ports
+        // that queued it, and this one's first grain is the next sound to be heard.
+        let cursor = self.ctl.get_index(CTL_WRITE) as u32;
         self.ports.push(Port {
             id,
             format,
-            gain: [1.0, 1.0],
             resample_pos: 0.0,
             reported_rate: false,
+            cursor,
         });
         id
     }
@@ -170,14 +254,14 @@ impl AudioSink for WebAudioSink {
         // Read everything needed off the port and DROP the borrow: the conversion below
         // fills `self.scratch`, which is a sibling field, and the resample cursor is
         // written back once at the end.
-        let (src_ch, src_rate, gain, pos0, report_rate) = {
+        let (src_ch, src_rate, pos0, report_rate, cursor) = {
             let Some(p) = self.port(port) else { return };
             let src_rate = p.format.sample_rate;
             let report = src_rate != device_rate && !p.reported_rate;
             if report {
                 p.reported_rate = true;
             }
-            (p.format.channels.max(1) as usize, src_rate, p.gain, p.resample_pos, report)
+            (p.format.channels.max(1) as usize, src_rate, p.resample_pos, report, p.cursor)
         };
         if src_rate == 0 || pcm.len() < src_ch {
             return;
@@ -217,7 +301,7 @@ impl AudioSink for WebAudioSink {
                 let a = pcm.get(i * src_ch + sc).copied().unwrap_or(0) as f32;
                 let b = pcm.get((i + 1) * src_ch + sc).copied().map_or(a, f32::from);
                 let s = a + (b - a) * frac as f32;
-                let out = s / 32768.0 * gain[c.min(1)];
+                let out = s / 32768.0;
                 peak = peak.max(out.abs());
                 self.scratch.push(out);
             }
@@ -231,20 +315,23 @@ impl AudioSink for WebAudioSink {
         if let Some(p) = self.port(port) {
             p.resample_pos = pos - src_frames as f64;
         }
-        self.publish(out_frames as u32);
+        let next = self.publish_at(cursor, out_frames as u32);
+        if let Some(p) = self.port(port) {
+            p.cursor = next;
+        }
     }
 
+    /// >>> DELIBERATELY IGNORED. The port volume is applied by the MIXER now, not here.
+    ///
+    /// This sink only ever sees a grain that has already been clamped to i16, so a volume
+    /// applied here scales a signal the clamp has already destroyed: one racer's mix reaches
+    /// 4.94x full scale and the volume the title sets is 0.355, so clamping first threw away
+    /// everything above 1.0 and then made the remainder quiet. `vita::audio::out_output`
+    /// applies it to the pre-clamp mix instead, which is both the audible fix and the order
+    /// the hardware runs in. Left as an explicit no-op rather than removed from the trait so
+    /// that a sink which DOES have pre-clamp samples can still take it.
     fn set_volume(&mut self, port: i32, vols: &[i32]) {
-        let Some(p) = self.port(port) else { return };
-        for (c, v) in vols.iter().enumerate().take(2) {
-            // The Vita range is 0..=32768, full scale at the top.
-            p.gain[c] = (*v as f32 / 32768.0).clamp(0.0, 1.0);
-        }
-        // A one-channel set on a stereo port applies to both, which is what the mask form
-        // of `sceAudioOutSetVolume` means when a title sets only the left.
-        if vols.len() == 1 {
-            p.gain[1] = p.gain[0];
-        }
+        let _ = (port, vols);
     }
 
     fn close_port(&mut self, port: i32) {

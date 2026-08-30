@@ -93,6 +93,25 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
             continue;
         }
 
+        // The other half of the `moe_expand` guard in [`decode::decode_grp_mem_load`]: that
+        // decoder allows a single-element memory access with bit 53 set because expansion
+        // cannot step anything on a domain of one iteration - but that argument also needs the
+        // MOE state to be its DEFAULT, and the state is only walkable here. Every captured
+        // instance is in a program with no SMLSI at all; one that ran under a programmed
+        // stride would be outside the census and must not be decoded on its strength.
+        if matches!(decode::opcode1(word), 0x1d | 0x1e)
+            && (word >> 53) & 1 == 1
+            && state != decode::DEFAULT_REPEAT_STATE
+        {
+            out.push(crate::ir::Instr {
+                blocked: Some(
+                    "0xE8 memory access with moe_expand under a PROGRAMMED MOE state (an SMLSI                      is in force) is outside the census the single-element case rests on",
+                ),
+                ..instr
+            });
+            continue;
+        }
+
         let Some(extra) = decode::repeat_extra_iterations(word) else {
             // An instruction whose GROUP is not decoded at all reaches here too, and its own
             // reason is the more useful one: "repeat_count encoding not established" sends
@@ -122,9 +141,11 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
         };
         let steps: Result<Vec<i32>, &'static str> = operands
             .iter()
-            .map(|o| match state[o.slot] {
-                decode::SmlsiSlot::Increment(n) => Ok(i32::from(n) * o.stride as i32),
-                decode::SmlsiSlot::Swizzle(_) => {
+            .map(|o| match (o.moe, state[o.slot]) {
+                // An intrinsic advance - the DP's channel walk - is not the MOE's to program.
+                (false, _) => Ok(o.stride as i32),
+                (true, decode::SmlsiSlot::Increment(n)) => Ok(i32::from(n) * o.stride as i32),
+                (true, decode::SmlsiSlot::Swizzle(_)) => {
                     Err("0xF8 SMLSI per-iteration SWIZZLE stepping not modeled")
                 }
             })
@@ -209,6 +230,71 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
     }
 }
 
+/// Block every group-0x1a step that is not part of a well-formed 32-bit multiply-add PAIR.
+///
+/// `Op::IntMadStep` is one half of a two-instruction idiom - see `decode_grp_imad32_step` for
+/// the layout and for why `sn` reads as a 16-bit half selector. The reading that survives the
+/// corpus is not the only one that fits it arithmetically, and the rivals differ ONLY in the
+/// value the first step leaves in its destination. This is what makes that difference
+/// unobservable: a step is emitted only inside a pair whose net effect - `dest = src0 * src1 +
+/// src2` - every surviving reading agrees on, and anything else hard-fails naming itself.
+///
+/// The four conditions, all required:
+///  * a `sn = 0` step is immediately followed by a `sn = 1` step, and vice versa;
+///  * the two carry the same `src0` and the same `src1` (bank AND number: an immediate literal
+///    is carried in the operand's index, so this compares literals too);
+///  * the second's `src2` is exactly the first's DESTINATION, which is what chains the two
+///    partial products into one sum;
+///  * neither is predicated differently from the other, since a pair split by a predicate is
+///    not a pair.
+fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
+    use crate::ir::{Instr, Op, Operand};
+
+    let step = |i: &Instr| match i.op {
+        Op::IntMadStep { high_half, .. } => Some(high_half),
+        _ => None,
+    };
+    // Bank and number together: two operands naming different banks are different operands even
+    // when their numbers agree, and an inline literal is carried as an index in the IMMEDIATE
+    // bank so this compares literals by value too.
+    let same = |a: &Operand, b: &Operand| a.bank == b.bank && a.index == b.index;
+
+    let mut blocked_at: Vec<(usize, &'static str)> = Vec::new();
+    for at in 0..instrs.len() {
+        let Some(high) = step(&instrs[at]) else { continue };
+        // Look at the partner this step's own half implies, and let the OTHER end of the pair
+        // report its own failure - so a lone step is named once from each side rather than
+        // silently half-decoded.
+        let partner = if high { at.checked_sub(1) } else { at.checked_add(1) };
+        let ok = partner
+            .and_then(|q| instrs.get(q).map(|other| (other, step(other))))
+            .is_some_and(|(other, other_half)| {
+                let (lo, hi) = if high { (other, &instrs[at]) } else { (&instrs[at], other) };
+                other_half == Some(!high)
+                    && lo.pred == hi.pred
+                    && lo.blocked.is_none()
+                    && hi.blocked.is_none()
+                    && lo.srcs.len() == 3
+                    && hi.srcs.len() == 3
+                    && same(&lo.srcs[0], &hi.srcs[0])
+                    && same(&lo.srcs[1], &hi.srcs[1])
+                    && lo.dest.is_some_and(|d| same(&d, &hi.srcs[2]))
+            });
+        if !ok {
+            blocked_at.push((
+                at,
+                "0x1a IMAD32-STEP: this step is not part of a well-formed multiply-add pair \
+                 (an adjacent sn=0 / sn=1 with the same src0 and src1, the second's src2 being \
+                 the first's destination). Only the pair's net result is established, so a step \
+                 outside one is not emitted",
+            ));
+        }
+    }
+    for (at, why) in blocked_at {
+        instrs[at].blocked = instrs[at].blocked.or(Some(why));
+    }
+}
+
 /// Decode a parsed program's USSE code stream into the shader IR.
 ///
 /// A `SMP` instruction addresses its sampler by a REGISTER field, not by texture unit: the
@@ -217,13 +303,79 @@ fn remap_branch_targets(instrs: &mut [crate::ir::Instr], starts: &[usize]) {
 /// so `Op::Tex::unit` is a real texture unit everywhere downstream - the same namespace a
 /// PDS-prefetched sample names directly, and the one the renderer binds by. A field the table
 /// does not describe blocks the instruction rather than naming an arbitrary unit.
+
+/// Which OUTPUT-bank lanes a decoded program writes, as a bitmap indexed by lane.
+///
+/// # >>> AN F16 INSTRUCTION'S CHANNELS ARE HALVES, NOT LANES
+/// Channel `c` of a half-precision instruction is half `c & 1` of register `base + (c >> 1)` -
+/// the emitter's own rule, documented at `wgsl::emit_body` and pinned by
+/// `f16_instruction_addresses_half_lanes_of_a_register_pair`. Counting it as `base + c`
+/// DOUBLES the span of every half-precision write.
+///
+/// This lives here, in the library, because THREE separate corpus oracles had each open-coded
+/// `base + c` and all three were wrong in the same way. One of them
+/// (`assumed_varying_orders_the_vertex_code_contradicts`) turned that into its strongest
+/// verdict - CONTRADICTED, meaning "the layout is wrong and every varying past it is read from
+/// the wrong register" - against the golf title's sky program, whose four-channel F16 write at
+/// output 6 covers lanes 6..7 and was recorded as 6..9. Lane 9 is the padding between `Fog`
+/// (one lane, at 8) and `TexCoord(0)` (at 10), so the phantom lane fell outside every declared
+/// run. A false CONTRADICTED is worse than a missing one: it is the noise a later real one has
+/// to be told apart from.
+pub fn written_output_lanes(shader: &Shader) -> Vec<bool> {
+    use crate::ir::Bank;
+    let mut written: Vec<bool> = Vec::new();
+    for instr in &shader.instrs {
+        let Some(d) = instr.dest.as_ref() else { continue };
+        if d.bank != Bank::Output {
+            continue;
+        }
+        for c in 0..4 {
+            if !instr.write_mask[c] {
+                continue;
+            }
+            let lane = d.index as usize + if instr.half_precision { c >> 1 } else { c };
+            if written.len() <= lane {
+                written.resize(lane + 1, false);
+            }
+            written[lane] = true;
+        }
+    }
+    written
+}
 pub fn decode_shader(program: &Program) -> Shader {
     let mut instrs: Vec<_> = program.code.iter().map(|&w| decode(w)).collect();
     for instr in &mut instrs {
-        let Op::Tex { unit: ordinal, coords, coord_half, lod } = instr.op else { continue };
+        let ordinal = match instr.op {
+            Op::Tex { unit, .. } | Op::TexGather { unit, .. } => unit,
+            _ => continue,
+        };
         match program.sampler_unit_at(2 * ordinal as u32) {
             Some(unit) if unit <= u8::MAX as u32 => {
-                instr.op = Op::Tex { unit: unit as u8, coords, coord_half, lod };
+                match instr.op {
+                    Op::Tex { coords, coord_half, lod, .. } => {
+                        instr.op = Op::Tex { unit: unit as u8, coords, coord_half, lod };
+                    }
+                    Op::TexGather { coords, coord_half, .. } => {
+                        instr.op = Op::TexGather { unit: unit as u8, coords, coord_half };
+                        // A gather writes four TEXELS of ONE component, and where its four F16
+                        // coefficients land is fixed by how many registers those texels take.
+                        // With a single-component sampler that is four, which is what the
+                        // corpus's only consumer reads - it dots the coefficients out of
+                        // `dest + 4`. A wider sampler would gather four texels of EACH
+                        // component and push the coefficients somewhere this cannot name, so it
+                        // is refused rather than assumed to land in the same place.
+                        let components =
+                            program.sampler_at(unit).map_or(0, |p| p.component_count);
+                        if components != 1 {
+                            instr.blocked = instr.blocked.or(Some(
+                                "0xE0 tex gather4 on a sampler with more than one component: \
+                                 where the bilinear coefficients land is established only for \
+                                 the single-component form",
+                            ));
+                        }
+                    }
+                    _ => unreachable!("only the two sample ops reach here"),
+                }
             }
             _ => {
                 // Name the CAUSE when the container can see it. An odd control-word base is
@@ -240,6 +392,7 @@ pub fn decode_shader(program: &Program) -> Shader {
             }
         }
     }
+    validate_imad_step_pairs(&mut instrs);
     // Last, so every pass above still sees one instruction per code word.
     let (mut instrs, starts) = unroll_repeats(&program.code, instrs);
     remap_branch_targets(&mut instrs, &starts);
@@ -279,7 +432,63 @@ pub fn decode_secondary_shader(program: &Program) -> Shader {
             }
         }
     }
+    validate_imad_step_pairs(&mut instrs);
     let (mut instrs, starts) = unroll_repeats(&program.secondary_code, instrs);
     remap_branch_targets(&mut instrs, &starts);
     Shader { kind: program.kind, instrs }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Bank, Instr, Operand};
+
+    /// The two words of a golf title's address computation, which are a well-formed pair.
+    const STEP0: u64 = 0xd082_8006_a01a_c080;
+    const STEP1: u64 = 0xd092_8006_a01a_c080;
+
+    fn validated(words: &[u64]) -> Vec<Instr> {
+        let mut instrs: Vec<Instr> = words.iter().map(|&w| decode(w)).collect();
+        validate_imad_step_pairs(&mut instrs);
+        instrs
+    }
+
+    /// A well-formed pair decodes; each half on its own does not. What a single step leaves in
+    /// its destination is the one thing the corpus does not pin down (see
+    /// `decode_grp_imad32_step`), so a step outside the pair whose NET result is
+    /// reading-independent must not be emitted.
+    #[test]
+    fn a_well_formed_step_pair_survives_and_a_lone_step_does_not() {
+        let pair = validated(&[STEP0, STEP1]);
+        assert_eq!(pair[0].blocked, None, "the low step of a real pair must decode");
+        assert_eq!(pair[1].blocked, None, "the high step of a real pair must decode");
+
+        for lone in [STEP0, STEP1] {
+            let one = validated(&[lone]);
+            assert!(
+                one[0].blocked.is_some_and(|w| w.contains("well-formed multiply-add pair")),
+                "a lone step must block: {:?}",
+                one[0].blocked
+            );
+        }
+    }
+
+    /// A pair whose second step does not CHAIN through the first's destination is not the idiom
+    /// - its net result is not `src0 * src1 + src2` under every reading - so it blocks too.
+    #[test]
+    fn a_step_pair_that_does_not_chain_blocks() {
+        let mut instrs: Vec<Instr> = [STEP0, STEP1].iter().map(|&w| decode(w)).collect();
+        // Point the high step's src2 somewhere the low step did not write.
+        instrs[1].srcs[2] = Operand::plain(Bank::PrimaryAttr, 9, 2);
+        validate_imad_step_pairs(&mut instrs);
+        assert!(instrs[0].blocked.is_some(), "the low step of a broken pair must block");
+        assert!(instrs[1].blocked.is_some(), "the high step of a broken pair must block");
+    }
+
+    /// Two low steps in a row are not a pair either, whichever way they are read.
+    #[test]
+    fn two_low_steps_are_not_a_pair() {
+        let instrs = validated(&[STEP0, STEP0]);
+        assert!(instrs.iter().all(|i| i.blocked.is_some()), "neither step may decode");
+    }
 }

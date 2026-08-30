@@ -12,7 +12,16 @@ use crate::hostcall;
 /// SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
 ///                               SceSize size, SceKernelAllocMemBlockOpt *opt)
 #[hostcall]
-pub(super) fn alloc_mem_block(st: &mut VitaState, _name: Ptr, _ty: u32, size: u32, _opt: Ptr) -> i32 {
+pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, _ty: u32, size: u32, _opt: Ptr) -> i32 {
+    // The block's NAME is what the guest calls it, and on the failure path below it is the
+    // only thing that says which subsystem asked - worth the read exactly there.
+    let named = || {
+        if name.is_null() {
+            String::from("<unnamed>")
+        } else {
+            ctx.read_cstr(name.addr(), 64)
+        }
+    };
     // CDRAM aligns to 256 KiB, other blocks to 4 KiB. The guest already rounds
     // size; align the base to match hardware granularity.
     match st.alloc_memblock(size, 256 * 1024) {
@@ -23,8 +32,13 @@ pub(super) fn alloc_mem_block(st: &mut VitaState, _name: Ptr, _ty: u32, size: u3
             // as a write through a null pointer with nothing left pointing at the cause.
             tracing::error!(
                 target: "vitaslop::err",
-                size,
+                size, name = %named(), caller = format_args!("{:#010x}", ctx.regs[14]),
                 "sceKernelAllocMemBlock: no guest memory left - reporting NO_MEMORY"
+            );
+            tracing::error!(
+                target: "vitaslop::err",
+                trail = %crate::vita::guest_return_trail(ctx, 64),
+                "  ...and the guest return addresses above it"
             );
             SCE_KERNEL_ERROR_NO_MEMORY
         }

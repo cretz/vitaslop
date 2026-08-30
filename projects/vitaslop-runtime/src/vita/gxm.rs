@@ -12,7 +12,9 @@ use crate::render::f32_to_half;
 use vitaslop_gxp_shader::ParamType;
 use crate::hostcall;
 
-/// SceGxmInitializeParams: displayQueueCallback at offset 8, its data size at 12.
+/// SceGxmInitializeParams: `flags` at 0, `displayQueueMaxPendingCount` at 4,
+/// `displayQueueCallback` at 8, its data size at 12.
+const INIT_MAX_PENDING_OFFSET: u32 = 4;
 const INIT_CB_OFFSET: u32 = 8;
 const INIT_CB_DATA_SIZE_OFFSET: u32 = 12;
 
@@ -249,6 +251,10 @@ pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut VitaState) {
     let params = ctx.arg(0);
     st.display_queue_cb = ctx.read_u32(params + INIT_CB_OFFSET);
     st.display_queue_cb_data_size = ctx.read_u32(params + INIT_CB_DATA_SIZE_OFFSET);
+    // How many frames the title may have in flight. Ignoring it forced every title to a
+    // depth of one, which costs a self-pacing title a whole display period per frame -
+    // see `VitaState::pace_flip`.
+    st.set_display_queue_depth(ctx.read_u32(params + INIT_MAX_PENDING_OFFSET));
     ctx.ret(0);
 }
 
@@ -478,6 +484,53 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // arguments ride the guest stack, which the run form reads exactly where
         // `GuestCtx::arg` does. Another ~12 calls per frame from the same draw loop.
         g::SET_REGION_CLIP => StoreArgRun { offset: ctxoff::REGION_CLIP_MODE, count: 5 },
+        // `sceGxmSetFrontDepthBias(context, factor, units)`: two argument words stored as
+        // passed into two consecutive context words. The handler casts each `i32 as u32`,
+        // which is the identity on the bits the register already holds, so the run form
+        // stores exactly what it stores.
+        //
+        // MEASURED on a retail sports title, 100 display frames of live play: **271 calls a
+        // frame**, the second-hottest host call it makes after `sceGxmDraw` itself, 18,971
+        // of them from a single call site in its draw loop. On the browser a host call is
+        // 91% marshalling ([[vitaslop-browser-host-call-cost]]), so this is 271 crossings a
+        // frame to move eight bytes into the guest's own context block.
+        g::SET_FRONT_DEPTH_BIAS => StoreArgRun { offset: ctxoff::FRONT_DEPTH_BIAS_FACTOR, count: 2 },
+        // `sceGxmSet{Front,Back}StencilFunc(context, func, fail, depthFail, depthPass,
+        // compareMask, writeMask)`: six argument words stored as passed into six consecutive
+        // context words (the last three ride the guest stack, which the run form reads
+        // exactly where `GuestCtx::arg` does). These used to sit on `NOT_INLINABLE` because
+        // the handler masked the two `unsigned char` words; the narrowing moved to the
+        // READ-BACK (`gxmctx::render_state`), so the handler now stores as passed and the
+        // run form is exact. MEASURED on a retail sports title's round in a browser:
+        // sceGxmSetFrontStencilFunc is its third-hottest host call, ~35 a frame.
+        g::SET_FRONT_STENCIL_FUNC => StoreArgRun { offset: ctxoff::FRONT_STENCIL_FUNC, count: 6 },
+        g::SET_BACK_STENCIL_FUNC => StoreArgRun { offset: ctxoff::BACK_STENCIL_FUNC, count: 6 },
+        // `sceGxmSet{Vertex,Fragment}UniformBuffer(context, index, data)`: a bounded indexed
+        // pointer store, exactly the `SET_VERTEX_STREAM` shape - in range the store IS the
+        // whole call, and an index past `SCE_GXM_MAX_UNIFORM_BUFFERS` falls back to the
+        // handler, which is where the report of it lives. MEASURED on the same round: the
+        // vertex form is the second-hottest host call, ~46 a frame.
+        g::SET_VERTEX_UNIFORM_BUFFER => StoreArgIndexed {
+            offset: ctxoff::VERTEX_UNIFORM_BUFFERS,
+            count: gxmctx::MAX_UNIFORM_BUFFERS as u32,
+        },
+        g::SET_FRAGMENT_UNIFORM_BUFFER => StoreArgIndexed {
+            offset: ctxoff::FRAGMENT_UNIFORM_BUFFERS,
+            count: gxmctx::MAX_UNIFORM_BUFFERS as u32,
+        },
+        // `sceGxmDepthStencilSurfaceSetForce{Load,Store}Mode(surface, mode)`: an in-place
+        // masked field update of the surface's own `zlsControl` word - the argument is the
+        // pre-positioned enum bit, so the store needs no shift, which is the
+        // `StoreArgFieldInPlace` shape exactly (same as `sceGxmTextureSetData`). The
+        // surface struct lives in guest memory, so the store IS the whole call.
+        g::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE => StoreArgFieldInPlace {
+            offset: DS_ZLS_CONTROL,
+            mask: DS_FORCE_LOAD_MASK,
+        },
+        g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE => StoreArgFieldInPlace {
+            offset: DS_ZLS_CONTROL,
+            mask: DS_FORCE_STORE_MASK,
+        },
         // The two per-draw-loop state binds: a copy between two guest structures now that
         // the precomputed state lives in guest memory (`vita::gxmstate`). 24 calls per
         // frame EACH on a racing title's race - the last non-draw GXM crossings it makes.
@@ -517,8 +570,8 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         // 601 on another, at ~1.4 us of browser marshalling each.
         g::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => reserve(ctxoff::VERTEX_UNIFORM),
         g::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => reserve(ctxoff::FRAGMENT_UNIFORM),
-        // ...and the call that is left once those are gone: **1,106 a frame on Ridge
-        // Racer's race, 58% of every host call it still makes.** Two byte copies - into the
+        // ...and the call that is left once those are gone: **1,106 a frame on one retail
+        // racer's race, 58% of every host call it still makes.** Two byte copies - into the
         // buffer the guest names and into the fallback SA bank - over a parameter record the
         // guest already holds. See [`vitaslop_transpiler::InlineOp::SetUniformData`] for what
         // it refuses (F16, an unreadable record, a write past the bank) and why each refusal
@@ -604,7 +657,10 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
         ctx_record: if fragment { gxmctx::off::FRAGMENT_UNIFORM } else { gxmctx::off::VERTEX_UNIFORM },
         copy_dst: if fragment { gxmctx::off::TEXTURES } else { gxmctx::off::VERTEX_UNIFORM_BUFFERS },
         copy_bytes: if fragment {
-            gxmstate::FRAGMENT_BLOCK_BYTES
+            // The TEXTURE array alone. The fragment block's uniform-buffer table sits behind
+            // it and goes somewhere else entirely in the context block, so it is applied by
+            // the handler's own loop rather than by this copy.
+            gxmstate::TEXTURE_ARRAY_BYTES
         } else {
             // The vertex block's TABLE half only - the recorded (never-applied) textures
             // behind it stay behind, see `gxmstate::VERTEX_BLOCK_BYTES`.
@@ -619,12 +675,14 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
 /// so a future reader adding one has to answer the same question, and so `only_pure_setters_
 /// are_inlined` can walk the list.
 ///
-/// Three reasons, and only the first is about effort:
-/// - **More than one value word.** `sceGxmSetViewport` takes six floats,
-///   `sceGxmSetRegionClip` five, `sceGxmSetFrontStencilFunc` six. A store form writes one
-///   word. They still keep their state in the context block; they just cross to do it.
+/// One reason survives:
 /// - **The handler does something else.** `sceGxmSetVisibilityBuffer` clears the accumulated
 ///   occlusion counts. Inlining silently deletes that, because the handler simply never runs.
+///
+/// "**More than one value word**" used to head this list (`sceGxmSetViewport` six floats,
+/// `sceGxmSetRegionClip` five, `sceGxmSet*StencilFunc` six) - a fact about the FORMS
+/// available, not about the calls, and the run forms (`StoreVfpRun` / `StoreArgRun`) closed
+/// every one of them.
 ///
 /// `sceGxmReserve*DefaultUniformBuffer` used to be on this list, under a third reason that
 /// read "the call is not a store at all - it allocates and sizes a buffer from the bound
@@ -647,10 +705,10 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
     // `SET_VIEWPORT` and `SET_REGION_CLIP` used to sit here under "six value words" /
     // "five value words" - which was a fact about the FORMS available, not about the
     // calls, and the run forms (`StoreVfpRun` / `StoreArgRun`) closed it.
-    (
-        crate::nid::gxm::SET_FRONT_STENCIL_FUNC,
-        "masks two of its six value words (`& 0xff`), which a run form stores as passed",
-    ),
+    // `SET_FRONT_STENCIL_FUNC` used to sit here too, under "masks two of its six value
+    // words (`& 0xff`), which a run form stores as passed" - a fact about WHERE the
+    // narrowing lived, not about the call. It lives at the read-back now
+    // (`gxmctx::render_state`), the handler stores as passed, and the run form is exact.
     (crate::nid::gxm::SET_VISIBILITY_BUFFER, "clears the occlusion counters"),
 ];
 
@@ -1651,7 +1709,7 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
             ctx.write_u32(uniform_buffer + component * 4, v.to_bits());
         }
     }
-    report_uniform_write(ctx, uniform_buffer, parameter, base, component_offset, half, &values);
+    report_uniform_write(ctx, uniform_buffer, parameter, base, component_offset, half, &values, source);
     tracing::trace!(
         target: "vitaslop::gxm",
         buffer = format_args!("{uniform_buffer:#x}"),
@@ -1693,6 +1751,11 @@ fn report_uniform_write(
     component_offset: u32,
     half: bool,
     values: &[f32],
+    // The guest address the values were READ FROM, which is where the next question goes: a
+    // uniform whose VALUE is wrong was handed that value by whoever filled this struct, and a
+    // store watch cannot be pointed at it without the address. The write DESTINATION is already
+    // on the line and is a different address entirely.
+    source: u32,
 ) {
     use std::sync::OnceLock;
     static WATCH: OnceLock<(Vec<u32>, Vec<String>)> = OnceLock::new();
@@ -1743,7 +1806,8 @@ fn report_uniform_write(
     tracing::warn!(
         target: "vitaslop::gxm",
         "gxm uniform watch: sceGxmSetUniformDataF wrote {name} ({}) into {lo:#x}..={hi:#x} of \
-         buffer {buffer:#x} - reg {base}, component offset {component_offset}, values {values:?}, \
+         buffer {buffer:#x} - reg {base}, component offset {component_offset}, values {values:?} \
+         READ FROM {source:#x}, \
          leaving {:08x} at {lo:#x}, from lr={:#010x}",
         if half { "F16" } else { "F32" },
         ctx.read_u32(lo),
@@ -1973,6 +2037,23 @@ pub(super) fn set_front_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, cont
     0
 }
 
+/// void sceGxmSetFrontDepthBias(SceGxmContext *context, int factor, int units)
+///
+/// The polygon offset applied to front faces: the depth of every fragment is nudged by
+/// `factor` times the primitive's depth slope plus `units` times the depth buffer's own
+/// resolution unit. A title sets it to lift a decal - a skid mark, a shadow blob - off the
+/// surface it lies on, so that the two do not z-fight.
+///
+/// Recorded as SIGNED words: a negative bias (pull toward the viewer) is the common case
+/// and reading it unsigned would turn a small negative offset into an enormous positive
+/// one.
+#[hostcall]
+pub(super) fn set_front_depth_bias(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, factor: i32, units: i32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_BIAS_FACTOR, factor as u32);
+    gxmctx::set(ctx, context, gxmctx::off::FRONT_DEPTH_BIAS_UNITS, units as u32);
+    0
+}
+
 /// void sceGxmSetBackDepthFunc(SceGxmContext *context, SceGxmDepthFunc depthFunc)
 #[hostcall]
 pub(super) fn set_back_depth_func(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, func: u32) -> i32 {
@@ -2038,12 +2119,18 @@ pub(super) fn set_front_stencil_func(
     write_mask: u32,
 ) -> i32 {
     use gxmctx::off;
+    // The two mask words are stored AS PASSED, not `& 0xff` as they used to be: the byte
+    // narrowing lives at the READ-BACK (`gxmctx::render_state`) instead, so the inline run
+    // form (`StoreArgRun`, below in `inline_op`) and this handler write identical words.
+    // AAPCS already zero-extends an `unsigned char` argument at the call site, so the
+    // narrowing is belt-and-braces either way - but it has to live on ONE side, and the
+    // read side covers both paths.
     gxmctx::set(ctx, context, off::FRONT_STENCIL_FUNC, func);
     gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_FAIL, stencil_fail);
     gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_DEPTH_FAIL, depth_fail);
     gxmctx::set(ctx, context, off::FRONT_STENCIL_OP_DEPTH_PASS, depth_pass);
-    gxmctx::set(ctx, context, off::FRONT_STENCIL_COMPARE_MASK, compare_mask & 0xff);
-    gxmctx::set(ctx, context, off::FRONT_STENCIL_WRITE_MASK, write_mask & 0xff);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_COMPARE_MASK, compare_mask);
+    gxmctx::set(ctx, context, off::FRONT_STENCIL_WRITE_MASK, write_mask);
     0
 }
 
@@ -2068,14 +2155,14 @@ pub(super) fn set_back_stencil_func(
     write_mask: u32,
 ) -> i32 {
     use gxmctx::off;
+    // Stored AS PASSED, masks included - the byte narrowing lives at the read-back so this
+    // handler and the inline run form write identical words. See `set_front_stencil_func`.
     gxmctx::set(ctx, context, off::BACK_STENCIL_FUNC, func);
     gxmctx::set(ctx, context, off::BACK_STENCIL_OP_FAIL, stencil_fail);
     gxmctx::set(ctx, context, off::BACK_STENCIL_OP_DEPTH_FAIL, depth_fail);
     gxmctx::set(ctx, context, off::BACK_STENCIL_OP_DEPTH_PASS, depth_pass);
-    // The masks are `unsigned char` in the prototype; the AAPCS passes them in full
-    // registers, so the high bytes are whatever the caller had there.
-    gxmctx::set(ctx, context, off::BACK_STENCIL_COMPARE_MASK, compare_mask & 0xff);
-    gxmctx::set(ctx, context, off::BACK_STENCIL_WRITE_MASK, write_mask & 0xff);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_COMPARE_MASK, compare_mask);
+    gxmctx::set(ctx, context, off::BACK_STENCIL_WRITE_MASK, write_mask);
     0
 }
 
@@ -2404,32 +2491,25 @@ pub(super) fn texture_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState) {
 ///
 /// Binds a NON-default uniform buffer for the given stage.
 ///
-/// The VERTEX binding is sticky context state exactly like a stream pointer, and a draw
-/// whose vertex program declares a non-default uniform buffer reads it back to snapshot
-/// the buffer's bytes for the recompiled shader's MEMORY LOADS (see
-/// `VitaState::capture_mem_window`). The FRAGMENT side has no consumer - no captured
-/// fragment program loads memory, and one that did would refuse to link
-/// (`LinkError::FragmentMemLoad`) - so its binding is not recorded, and that gap is stated
-/// once rather than the call quietly succeeding.
+/// BOTH stages' bindings are sticky context state, exactly like a stream pointer, and a draw
+/// whose program declares a non-default uniform buffer reads the address back to snapshot the
+/// buffer's bytes. There are two ways a program then reads them, and the blob says which:
+/// through MEMORY LOADS chasing the bound pointer (`VitaState::capture_mem_window`), or out of
+/// the SA register file the driver copies the buffer into (`Program::sa_uniform_buffers`).
+///
+/// The fragment side used to be dropped with a warning, on the reading that a fragment program
+/// reading a bound buffer must be doing it with a memory load and would refuse to link
+/// (`LinkError::FragmentMemLoad`). That reading was incomplete: the SA-resident shape needs no
+/// load at all, and one retail title's fragment programs keep their whole fog/material block
+/// there. Recording the address costs one guest word and is what lets such a draw be fed.
 pub(super) fn set_uniform_buffer(ctx: &mut GuestCtx, stage: &'static str) {
     let context = ctx.arg(0);
     let index = ctx.arg(1);
     let data = ctx.arg(2);
     if stage == "vertex" {
         gxmctx::set_vertex_uniform_buffer(ctx, context, index, data);
-        ctx.ret(0);
-        return;
-    }
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            target: "vitaslop::gxm",
-            stage,
-            index,
-            data = format_args!("{data:#x}"),
-            "a non-default FRAGMENT uniform buffer was bound; fragment memory loads are not \
-             wired, so a fragment program reading this buffer falls back at link"
-        );
+    } else {
+        gxmctx::set_fragment_uniform_buffer(ctx, context, index, data);
     }
     ctx.ret(0);
 }
@@ -3086,28 +3166,65 @@ pub(super) fn set_vertex_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
 
 /// int sceGxmTextureSetPalette(SceGxmTexture *texture, const void *paletteData)
 ///
-/// Points a paletted (P8/P4) texture at its colour table. The palette's position within
-/// the 16-byte control words is not published, so it is kept beside them rather than
-/// packed into a field whose neighbours ARE understood - guessing the packing would
-/// corrupt the format and dimension fields that decode correctly today.
+/// Points a paletted (P8/P4) texture at its colour table.
 ///
-/// The capture's sampler does not expand palette indices to colours, so a paletted
-/// texture still samples its INDEX as if it were a value. That is a real gap, and it
-/// says so once rather than rendering wrong quietly.
+/// # The pointer is written into CONTROL WORD 3, where the hardware keeps it
+/// vitasdk's `SceGxmTexture` declares control word 3's low field as `palette_addr : 26` and
+/// its `sceGxmTextureGetPalette` shifts that field left by six - the palette is 64-byte
+/// aligned, so the six bits are not lost. Keeping the pointer ONLY in a host-side map keyed by
+/// the `SceGxmTexture *` was the shape that could not follow a struct COPY, and copying the
+/// struct is how the title that needed this binds every one of its paletted textures: the
+/// capture then saw a paletted format with no table and dropped the binding.
+///
+/// The host map is kept beside it, because it is what a `Get` can answer for a texture whose
+/// words were never ours to write.
 #[hostcall]
-pub(super) fn texture_set_palette(st: &mut VitaState, texture: u32, palette: u32) -> i32 {
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            target: "vitaslop::gxm",
-            texture = format_args!("{texture:#x}"),
-            palette = format_args!("{palette:#x}"),
-            "a texture palette was bound; the capture samples paletted formats as raw \
-             indices, so this texture's colours are wrong until palette expansion lands"
-        );
+pub(super) fn texture_set_palette(ctx: &mut GuestCtx, st: &mut VitaState, texture: u32, palette: u32) -> i32 {
+    report_unaligned_palette(texture, palette);
+    if texture != 0 {
+        let w3 = ctx.read_u32(texture.wrapping_add(12));
+        let field = (palette >> 6) & 0x03ff_ffff;
+        ctx.write_u32(texture.wrapping_add(12), (w3 & !0x03ff_ffffu32) | field);
     }
     st.set_texture_palette(texture, palette);
     0
+}
+
+/// `void *sceGxmTextureGetPalette(const SceGxmTexture *texture)`
+///
+/// The inverse of [`texture_set_palette`], and it reads the same two places that one
+/// writes, in the same order of trust: the host-side map first, because it holds the
+/// pointer EXACTLY as the guest gave it, and control word 3 otherwise, because a texture
+/// whose words the guest wrote itself (or COPIED from another struct) was never in the map.
+/// The word's field is `palette_addr : 26` for a 64-byte-aligned table, so recovering the
+/// address is a shift back up by six - which is why an unaligned pointer is reported when
+/// it is SET rather than silently rounded here.
+#[hostcall]
+pub(super) fn texture_get_palette(ctx: &mut GuestCtx, st: &mut VitaState, texture: u32) -> u32 {
+    let recorded = st.texture_palette(texture);
+    if recorded != 0 {
+        recorded
+    } else if texture != 0 {
+        (ctx.read_u32(texture.wrapping_add(12)) & 0x03ff_ffff) << 6
+    } else {
+        0
+    }
+}
+
+/// Say - once - that a palette pointer is not 64-byte aligned, so control word 3's 26-bit
+/// field cannot carry it exactly. GXM requires the alignment; a title that broke it would have
+/// its low bits silently dropped, which is worth a line rather than a wrong table.
+fn report_unaligned_palette(texture: u32, palette: u32) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if palette % 64 == 0 || REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        texture = format_args!("{texture:#x}"),
+        palette = format_args!("{palette:#x}"),
+        "sceGxmTextureSetPalette was given a palette that is NOT 64-byte aligned - control          word 3's 26-bit field cannot represent its low six bits, so a copy of this texture          will read a palette up to 63 bytes below the one that was set"
+    );
 }
 
 // --- Precomputed: whole-array setters and non-default uniform buffers ---------
@@ -3163,52 +3280,22 @@ pub(super) fn precomputed_state_set_uniform_buffer(
     stage: &'static str,
     all: bool,
 ) {
-    // The VERTEX bindings are recorded and applied at bind time, because a recompiled
-    // vertex program's MEMORY LOADS chase them (see `VitaState::capture_mem_window`). The
-    // ALL form reads one pointer per possible index; a slot the guest's (shorter) array did
-    // not cover is only ever consumed if the program declares that buffer index, in which
-    // case the array covered it.
-    if stage == "vertex" {
-        let state = ctx.arg(0);
-        if all {
-            let array = ctx.arg(1);
-            for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
-                let data = ctx.read_u32(array.wrapping_add(i * 4));
-                st.precomputed_vertex_state_set_nondefault_uniform_buffer(ctx, state, i, data);
-            }
-        } else {
-            let (index, data) = (ctx.arg(1), ctx.arg(2));
-            st.precomputed_vertex_state_set_nondefault_uniform_buffer(ctx, state, index, data);
+    // Both stages' bindings are recorded and applied at bind time, because a recompiled
+    // program reads them either through MEMORY LOADS chasing the pointer
+    // (`VitaState::capture_mem_window`) or straight out of the SA register file the driver
+    // copies the buffer into (`Program::sa_uniform_buffers`). The ALL form reads one pointer
+    // per possible index; a slot the guest's (shorter) array did not cover is only ever
+    // consumed if the program declares that buffer index, in which case the array covered it.
+    let state = ctx.arg(0);
+    if all {
+        let array = ctx.arg(1);
+        for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+            let data = ctx.read_u32(array.wrapping_add(i * 4));
+            st.precomputed_state_set_nondefault_uniform_buffer(ctx, state, stage, i, data);
         }
-        ctx.ret(0);
-        return;
-    }
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        // >>> `debug`, BECAUSE THIS SITE CANNOT KNOW WHETHER IT MATTERS - and the site that
-        // can already warns.
-        //
-        // Binding a non-default uniform buffer is only a defect if some shader READS one, and
-        // a guest may bind buffers no program declares. It does here: measured on a retail title,
-        // ZERO of its programs declare a `UniformBuffer` parameter, so this fired every run to
-        // announce a gap that starved nothing. `GxpLive::report_unfed_uniforms` makes exactly
-        // that check on the recompiler side - once per pair, against the parsed program - and
-        // warns only when a program really does declare one. That is the warning; this is the
-        // trace of the call.
-        //
-        // The general rule this is an instance of: **a report whose own site cannot tell
-        // whether the thing is wrong belongs at the site that can.** Warning from both means
-        // the noisy one drowns the true one, and the browser panel keeps 96 lines.
-        tracing::debug!(
-            target: "vitaslop::gxm",
-            stage,
-            all,
-            state = format_args!("{:#x}", ctx.arg(0)),
-            "a precomputed state bound a non-default uniform buffer; the capture records \
-             only the DEFAULT uniform buffer, so a shader reading that buffer index gets \
-             nothing. Whether that starves anything is decided per PROGRAM - see \
-             `report_unfed_uniforms`, which warns when one actually declares a UniformBuffer"
-        );
+    } else {
+        let (index, data) = (ctx.arg(1), ctx.arg(2));
+        st.precomputed_state_set_nondefault_uniform_buffer(ctx, state, stage, index, data);
     }
     ctx.ret(0);
 }
@@ -3813,6 +3900,192 @@ mod run_setter_tests {
         assert_eq!(regs[0], 0, "the handler returns success");
         assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
     }
+
+    /// The depth-bias handler stores its two argument words AS PASSED into two consecutive
+    /// context words. Both are SIGNED on the guest side and the handler casts them, so the
+    /// values below are chosen NEGATIVE - a form that sign-extended, masked or clamped
+    /// either one would disagree with the run form here and nowhere else.
+    #[test]
+    fn set_front_depth_bias_stores_its_two_argument_words_as_passed() {
+        assert_eq!(
+            gxmctx::off::FRONT_DEPTH_BIAS_UNITS,
+            gxmctx::off::FRONT_DEPTH_BIAS_FACTOR + 4,
+            "the run form stores factor + units as ONE contiguous run"
+        );
+        let op = inline_op(g::SET_FRONT_DEPTH_BIAS).expect("has an inline form");
+        assert_eq!(
+            op,
+            InlineOp::StoreArgRun { offset: gxmctx::off::FRONT_DEPTH_BIAS_FACTOR, count: 2 },
+            "sceGxmSetFrontDepthBias lowers to the two-word argument run at the factor word"
+        );
+        let args = [(-3i32) as u32, (-129i32) as u32];
+        let mut regs = [0u32; REG_COUNT];
+        regs[0] = CTX;
+        regs[1] = args[0]; // factor
+        regs[2] = args[1]; // units
+        let mut vfp = [0u32; VFP_ARG_COUNT];
+        let bytes = dispatch_over(g::SET_FRONT_DEPTH_BIAS, &mut regs, &mut vfp, &[]);
+        for (i, &v) in args.iter().enumerate() {
+            assert_eq!(
+                word(&bytes, CTX + gxmctx::off::FRONT_DEPTH_BIAS_FACTOR + i as u32 * 4),
+                v,
+                "depth-bias word {i} must be argument {} as passed",
+                i + 1
+            );
+        }
+        assert_eq!(regs[0], 0, "the handler returns success");
+        assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+    }
+
+    /// The two stencil-func handlers store their six argument words AS PASSED - the last
+    /// three off the guest stack - into six consecutive context words. The mask words are
+    /// deliberately WIDER than a byte here: the `& 0xff` narrowing lives at the read-back
+    /// (`gxmctx::render_state`), so a handler that masked on the store path would disagree
+    /// with the run form and this test is what would say so.
+    #[test]
+    fn the_stencil_funcs_store_their_six_argument_words_as_passed() {
+        for (nid, base, name) in [
+            (g::SET_FRONT_STENCIL_FUNC, gxmctx::off::FRONT_STENCIL_FUNC, "front"),
+            (g::SET_BACK_STENCIL_FUNC, gxmctx::off::BACK_STENCIL_FUNC, "back"),
+        ] {
+            for k in 1..6 {
+                assert_eq!(
+                    base + k * 4,
+                    [
+                        base,
+                        base + 4,
+                        base + 8,
+                        base + 12,
+                        base + 16,
+                        base + 20
+                    ][k as usize],
+                    "the six {name}-stencil words are ONE contiguous run"
+                );
+            }
+            let op = inline_op(nid).expect("has an inline form");
+            assert_eq!(
+                op,
+                InlineOp::StoreArgRun { offset: base, count: 6 },
+                "sceGxmSet{name}StencilFunc lowers to the six-word argument run"
+            );
+            let args =
+                [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004, 0xEEEE_01FE, 0xFFFF_02FD];
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = CTX;
+            regs[1] = args[0]; // func
+            regs[2] = args[1]; // stencilFail
+            regs[3] = args[2]; // depthFail
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            // depthPass, compareMask and writeMask are AAPCS stack arguments.
+            let bytes = dispatch_over(nid, &mut regs, &mut vfp, &args[3..]);
+            for (i, &v) in args.iter().enumerate() {
+                assert_eq!(
+                    word(&bytes, CTX + base + i as u32 * 4),
+                    v,
+                    "{name}-stencil word {i} must be argument {} as passed",
+                    i + 1
+                );
+            }
+            assert_eq!(regs[0], 0, "the handler returns success");
+            assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        }
+    }
+
+    /// The two depth-stencil force-mode setters against their handlers: an in-place masked
+    /// field update of the surface's `zlsControl` word, preserving every other bit. The
+    /// argument sweep includes a value with dirty bits outside the mask, so a form that
+    /// stored it unmasked - or masked the wrong bit - would show.
+    #[test]
+    fn the_force_modes_update_their_zls_bit_in_place() {
+        for (nid, mask, name) in [
+            (g::DEPTH_STENCIL_SURFACE_SET_FORCE_LOAD_MODE, super::DS_FORCE_LOAD_MASK, "load"),
+            (g::DEPTH_STENCIL_SURFACE_SET_FORCE_STORE_MODE, super::DS_FORCE_STORE_MASK, "store"),
+        ] {
+            let op = inline_op(nid).expect("has an inline form");
+            assert_eq!(
+                op,
+                InlineOp::StoreArgFieldInPlace { offset: super::DS_ZLS_CONTROL, mask },
+                "force-{name} lowers to the in-place field store of its zlsControl bit"
+            );
+            for value in [0u32, mask, 0xFFFF_FFFF] {
+                let before = 0xA5A5_A5A9u32;
+                let mut regs = [0u32; REG_COUNT];
+                regs[0] = CTX;
+                regs[1] = value;
+                let mut vfp = [0u32; VFP_ARG_COUNT];
+                let mut bytes = vec![0u8; 4096];
+                let zls_at = (CTX + super::DS_ZLS_CONTROL) as usize;
+                bytes[zls_at..zls_at + 4].copy_from_slice(&before.to_le_bytes());
+                let mut st = VitaState::new(0, 4096, Box::new(DeterministicWorld::default()));
+                let mut mem = SliceMemory(&mut bytes);
+                {
+                    let mut ctx = crate::host::GuestCtx::new(&mut regs, &mut vfp, &mut mem, 0);
+                    crate::vita::dispatch(crate::nid::lib::SCE_GXM, nid, &mut ctx, &mut st);
+                }
+                let after = u32::from_le_bytes(bytes[zls_at..zls_at + 4].try_into().unwrap());
+                assert_eq!(
+                    after,
+                    (before & !mask) | (value & mask),
+                    "force-{name} with argument {value:#x} must move ONLY its bit"
+                );
+                assert_eq!(regs[0], 0, "the handler returns success");
+            }
+            assert_eq!(op.eval(0), 0, "the inline form returns the same success code");
+        }
+    }
+
+    /// The two uniform-buffer binds, over every index in range and one past the end -
+    /// the `SET_VERTEX_STREAM` obligations, held for the two setters that share its shape.
+    /// The out-of-range index is the arm the inline form hands BACK to the handler, which
+    /// declines to write and reports.
+    #[test]
+    fn the_uniform_buffer_binds_write_the_slot_their_inline_forms_claim() {
+        for (nid, base, name) in [
+            (g::SET_VERTEX_UNIFORM_BUFFER, gxmctx::off::VERTEX_UNIFORM_BUFFERS, "vertex"),
+            (g::SET_FRAGMENT_UNIFORM_BUFFER, gxmctx::off::FRAGMENT_UNIFORM_BUFFERS, "fragment"),
+        ] {
+            let op = inline_op(nid).expect("has an inline form");
+            assert_eq!(
+                op,
+                InlineOp::StoreArgIndexed {
+                    offset: base,
+                    count: gxmctx::MAX_UNIFORM_BUFFERS as u32
+                },
+                "sceGxmSet{name}UniformBuffer lowers to the bounded indexed store"
+            );
+            const ADDR: u32 = 0xA5A5_1234;
+            for index in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
+                assert!(!op.falls_back_on_index(index), "index {index} is in range");
+                let mut regs = [0u32; REG_COUNT];
+                regs[0] = CTX;
+                regs[1] = index;
+                regs[2] = ADDR;
+                let mut vfp = [0u32; VFP_ARG_COUNT];
+                let bytes = dispatch_over(nid, &mut regs, &mut vfp, &[]);
+                assert_eq!(
+                    word(&bytes, CTX + base + index * 4),
+                    ADDR,
+                    "{name} uniform buffer {index}"
+                );
+            }
+            let past = gxmctx::MAX_UNIFORM_BUFFERS as u32;
+            assert!(
+                op.falls_back_on_index(past),
+                "index {past} must fall back to the handler"
+            );
+            let mut regs = [0u32; REG_COUNT];
+            regs[0] = CTX;
+            regs[1] = past;
+            regs[2] = ADDR;
+            let mut vfp = [0u32; VFP_ARG_COUNT];
+            let bytes = dispatch_over(nid, &mut regs, &mut vfp, &[]);
+            assert_eq!(
+                word(&bytes, CTX + base + past * 4),
+                0,
+                "an out-of-range {name} index must write NOTHING, not the word past the array"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3986,7 +4259,7 @@ mod precomputed_state_binds {
             if fragment {
                 assert_eq!(l.st_magic, gxmstate::MAGIC_FRAGMENT);
                 assert_eq!(l.copy_dst, gxmctx::off::TEXTURES);
-                assert_eq!(l.copy_bytes, gxmstate::FRAGMENT_BLOCK_BYTES);
+                assert_eq!(l.copy_bytes, gxmstate::TEXTURE_ARRAY_BYTES);
                 assert!(l.has_prog, "the fragment bind stores the program handle");
                 assert_eq!(l.ctx_prog, gxmctx::off::FRAGMENT_PROGRAM);
                 assert_eq!(l.ctx_record, gxmctx::off::FRAGMENT_UNIFORM);

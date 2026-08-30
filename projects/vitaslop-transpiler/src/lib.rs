@@ -1531,6 +1531,18 @@ pub struct LenientArtifact {
     /// so a runtime `unreachable` trap backtrace ("wasm function N") can be told
     /// apart from a genuine miscompile - a stub is expected, anything else is a bug.
     pub stub_wasm_indices: Vec<u32>,
+    /// Guest addresses INSIDE lifted functions where an instruction did not decode, so
+    /// the block was cut there and a trapping block put in its place.
+    ///
+    /// **This is the decode-gap list that matters, and it is not the diagnostic report's.**
+    /// [`transpile_report`] walks the call graph from the entry points, so it never
+    /// reaches a function whose only caller is a vtable slot - and a C++ engine keeps its
+    /// hot per-object work exactly there. Those functions are lifted here anyway (the
+    /// pointer scan finds them), gaps and all, so this is the only place their gaps
+    /// appear. A gap on a hot path does not look like a gap at runtime: the block simply
+    /// ends early, the rest of the loop never runs, and the failure surfaces as a wild
+    /// pointer somewhere else entirely.
+    pub decode_gaps: Vec<u32>,
 }
 
 /// Transpile like [`transpile`], but never abort: a function that fails to lower
@@ -1552,6 +1564,8 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
 
     let mut funcs: BTreeMap<u32, ir::Func> = BTreeMap::new();
     let mut stubbed = Vec::new();
+    // Decode gaps inside functions that DID lift; see `LenientArtifact::decode_gaps`.
+    let mut decode_gaps: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut work = seed_worklist(program);
     // A redirect's target is an ordinary guest function, and it is reachable even when no
     // direct call to its stub exists - a vtable slot can hold the stub's address alone.
@@ -1612,6 +1626,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
                 Ok(found) => {
                     let callee: fn(u32, bool) -> WorkItem =
                         if tentative { WorkItem::tentative } else { WorkItem::hard };
+                    decode_gaps.extend(found.trap_leaders.iter().copied());
                     work.extend(found.callees.into_iter().map(|(a, t)| callee(a, t)));
                     work.extend(found.code_pointers.into_iter().map(|a| WorkItem::tentative(a, true)));
                     work.extend(found.arm_code_pointers.into_iter().map(|a| WorkItem::tentative(a, false)));
@@ -1671,6 +1686,7 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         artifact: Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion },
         stubbed,
         stub_wasm_indices,
+        decode_gaps: decode_gaps.into_iter().collect(),
     }
 }
 

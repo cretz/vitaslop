@@ -284,6 +284,12 @@ pub(super) enum DialogFamily {
     StoreCheckout = 5,
     NpSnsFacebook = 6,
     Ime = 7,
+    /// The NP profile card - "show me this player" - which needs an account and a
+    /// network. Both are absent, so it opens and closes without showing anything.
+    NpProfile = 8,
+    /// The photo picker. It browses the console's own photo library, which does not
+    /// exist here, so it likewise completes with nothing chosen.
+    PhotoImport = 9,
 }
 
 /// `SceImeDialogButton`: which button dismissed the text-entry dialog.
@@ -376,11 +382,22 @@ const RTC_UNIX_EPOCH_TICKS: u64 = 719_162 * 86_400 * 1_000_000;
 #[hostcall]
 pub(super) fn rtc_get_current_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick: Ptr) -> i32 {
     if !tick.is_null() {
-        let t = RTC_UNIX_EPOCH_TICKS + st.world.wall_us();
+        let t = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
         ctx.write_u32(tick.addr(), t as u32);
         ctx.write_u32(tick.addr() + 4, (t >> 32) as u32);
     }
     0
+}
+
+/// unsigned int sceRtcGetTickResolution(void)
+/// Ticks per second in the unit the whole SceRtc family speaks. A title divides a
+/// tick delta by this to get seconds, so the ONLY defensible value is the one our own
+/// [`rtc_get_current_tick`] counts in - microseconds. Hardware reports the same
+/// 1,000,000; a mismatch would not fail loudly, it would silently scale every
+/// wall-time delta the title computes.
+#[hostcall]
+pub(super) fn rtc_get_tick_resolution(_ctx: &mut GuestCtx, _st: &mut VitaState) -> u32 {
+    1_000_000
 }
 
 /// int sceRtcGetCurrentNetworkTick(SceRtcTick *tick)
@@ -395,7 +412,7 @@ pub(super) fn rtc_get_current_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick:
 #[hostcall]
 pub(super) fn rtc_get_current_network_tick(ctx: &mut GuestCtx, st: &mut VitaState, tick: Ptr) -> i32 {
     if !tick.is_null() {
-        let t = RTC_UNIX_EPOCH_TICKS + st.world.wall_us();
+        let t = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
         ctx.write_u32(tick.addr(), t as u32);
         ctx.write_u32(tick.addr() + 4, (t >> 32) as u32);
     }
@@ -740,7 +757,7 @@ const MOTION_STATE_SIZE: usize = 0xF8;
 #[hostcall]
 pub(super) fn motion_get_state(ctx: &mut GuestCtx, st: &mut VitaState, state: Ptr) -> i32 {
     if !state.is_null() {
-        let now = st.world.monotonic_us();
+        let now = st.guest_mono_us();
         let mut buf = [0u8; MOTION_STATE_SIZE];
         buf[0..4].copy_from_slice(&(now as u32).to_le_bytes()); // timestamp
         let one = 1.0f32.to_le_bytes();
@@ -758,7 +775,83 @@ pub(super) fn motion_get_state(ctx: &mut GuestCtx, st: &mut VitaState, state: Pt
     0
 }
 
-/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no
+/// Size of `SceMotionSensorState` (vitasdk asserts 0x40).
+const MOTION_SENSOR_STATE_SIZE: usize = 0x40;
+
+/// int sceMotionGetSensorState(SceMotionSensorState *sensorState, int numRecords)
+///
+/// The RAW sensors, as opposed to the fused pose [`motion_get_state`] reports. A title
+/// asks for `numRecords` of history at once and walks the array, so every record is
+/// written - a short fill would leave the tail as whatever the buffer held.
+///
+/// **The accelerometer reads 1 g, not zero.** A device at rest still measures the
+/// reaction to gravity; zero is FREE FALL, which is not a resting state and which a title
+/// that normalizes the vector divides by. The magnitude is therefore established. The AXIS
+/// is taken from the one statement in `psp2/motion.h` that fixes the frame - `SceMotionDeviceLocation`
+/// says +z is perpendicular through the screen "as if the device were laying on a flat
+/// surface, oled/lcd side facing upwards" - so a device lying face-up reads +1 on z. The
+/// gyro reads zero, which needs no convention: nothing is rotating.
+#[hostcall]
+pub(super) fn motion_get_sensor_state(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    state: Ptr,
+    num_records: i32,
+) -> i32 {
+    if state.is_null() || num_records <= 0 {
+        // Nothing asked for is nothing to write, and that is a success on hardware too.
+        0
+    } else {
+        write_sensor_records(ctx, st, state.addr(), num_records as usize)
+    }
+}
+
+/// The body of [`motion_get_sensor_state`], split out so it can use early returns.
+fn write_sensor_records(ctx: &mut GuestCtx, st: &mut VitaState, state: u32, num_records: usize) -> i32 {
+    let now = st.guest_mono_us();
+    let mut buf = vec![0u8; MOTION_SENSOR_STATE_SIZE * num_records];
+    for i in 0..num_records {
+        let b = i * MOTION_SENSOR_STATE_SIZE;
+        // accelerometer.z = 1.0 g (x, y and the whole gyro stay 0).
+        buf[b + 8..b + 12].copy_from_slice(&1.0f32.to_le_bytes());
+        buf[b + 36..b + 40].copy_from_slice(&(now as u32).to_le_bytes()); // timestamp
+        buf[b + 40..b + 44].copy_from_slice(&(i as u32).to_le_bytes()); // counter
+        buf[b + 48..b + 56].copy_from_slice(&now.to_le_bytes()); // hostTimestamp
+    }
+    ctx.write_bytes(state, &buf);
+    0
+}
+
+/// int sceMotionMagnetometerOn(void) / int sceMotionMagnetometerOff(void)
+///
+/// Really flips the sampling bit, because [`motion_get_magnetometer_state`] reads it back
+/// and a title that turns the magnetometer on and then finds it off has been told two
+/// different things. `on` selects which way.
+pub(super) fn motion_magnetometer_set(ctx: &mut GuestCtx, st: &mut VitaState, on: bool) {
+    st.motion_magnetometer = on;
+    ctx.ret(0);
+}
+
+/// int sceMotionGetMagnetometerState(void)
+/// 1 if magnetometer sampling is enabled, 0 if not - read off the bit the two calls above
+/// set. This is the guest's own state, so it is exact.
+#[hostcall]
+pub(super) fn motion_get_magnetometer_state(_ctx: &mut GuestCtx, st: &mut VitaState) -> i32 {
+    i32::from(st.motion_magnetometer)
+}
+
+/// int sceMotionReset(void)
+///
+/// Re-references the fused orientation to the device's current pose. Ours is already the
+/// identity at rest ([`motion_get_state`]), so re-referencing it to the current pose
+/// leaves it the identity - this genuinely has nothing to do, rather than having work
+/// skipped.
+#[hostcall]
+pub(super) fn motion_reset(_ctx: &mut GuestCtx, _st: &mut VitaState) -> i32 {
+    0
+}
+
+/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no/// SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: the queried additional content has no
 /// license on this device.
 const SCE_APPUTIL_ERROR_DRM_NO_ENTITLEMENT: i32 = 0x8010_0660u32 as i32;
 
@@ -1701,7 +1794,7 @@ fn unlock_trophy(ctx: &mut GuestCtx, st: &mut VitaState, context: u32, trophy_id
     let platinum = set.trophies.iter().find(|t| t.grade == crate::trophy::Grade::Platinum).map(|p| p.id);
     let rest: Vec<u32> = set.trophies.iter().map(|t| t.id).filter(|id| Some(*id) != platinum).collect();
 
-    let tick = RTC_UNIX_EPOCH_TICKS + st.world.wall_us();
+    let tick = RTC_UNIX_EPOCH_TICKS + st.guest_wall_us();
     st.trophies.unlock(&comm_id, trophy_id, tick);
 
     let awarded = match platinum {

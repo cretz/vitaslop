@@ -12,8 +12,21 @@ publish.workspace = true
 # for the neutral seam types without dragging in a GPU stack. The frontends
 # (vitaslop-native, vitaslop-web) enable it.
 gpu = ["dep:wgpu", "dep:vitaslop-gxp-shader"]
+# The H.264 seam (`video`). On by default: a movie the engine cannot decode is a hole in
+# what a title shows, and the crate behind it adds nothing on a host with no decoder - it
+# reports one is missing and the caller carries on.
+video = ["dep:vitaslop-h264"]
+# The AAC seam (`audio_dec`). On by default for the same reason `video` is: a movie whose
+# sound the engine cannot decode is a hole in what a title PLAYS, and on a host with no
+# decoder the crate behind it reports one is missing and the caller carries on silently.
+aac = ["dep:vitaslop-aac"]
 
 [dependencies]
+# Platform-native H.264, for the `video` seam. Knows nothing about the Vita; it reaches
+# Media Foundation / Video Toolbox / VA-API / WebCodecs behind one API.
+vitaslop-h264 = { path = "../vitaslop-h264", optional = true, default-features = false, features = ["synth"] }
+# Platform-native AAC, for the `audio_dec` seam. Same rule: it knows nothing about the Vita.
+vitaslop-aac = { path = "../vitaslop-aac", optional = true }
 # Every renderer diagnostic goes through `tracing`, not `eprintln!`. On wasm32 stderr
 # is a no-op sink, so an `eprintln!` here is invisible in the browser - which meant the
 # recompiler's own fallback report, the one thing that says whether a frame was really

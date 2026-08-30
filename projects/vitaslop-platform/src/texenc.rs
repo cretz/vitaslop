@@ -45,13 +45,193 @@ const UNIFORM_SLOT: u64 = 256;
 /// the driver's own rounding.
 const MAX_SCRATCH_BYTES: u64 = 96 << 20;
 
+/// >>> WHAT THE RGBA8 EXPANSION MAY HOLD RESIDENT, ACROSS ALL THREE OF ITS BUFFERS.
+///
+/// [`MAX_SCRATCH_BYTES`] bounds a TRANSIENT allocation: `run` sizes its buffers per texture and
+/// destroys them, so 96 MB is a peak that exists for one submit. [`RawScratch`] is the opposite
+/// - it is KEPT, grown to the largest texture ever seen and never shrunk - so the same number
+/// there is 96 MB of RGBA scratch plus as much again of output plus the source, held for the
+/// life of the run.
+///
+/// On a desktop that is invisible. On the target phone it is the whole device: a run took
+/// **three GPU buffers sized for the largest texture of the session and then failed a
+/// FORTY-EIGHT BYTE `createBuffer`**, which is what a WebGPU device with nothing left looks
+/// like - and the panic named an innocent caller that happened to allocate next.
+///
+/// A texture that does not fit is REFUSED and takes the CPU decode, which is slower and
+/// completely correct. That is the trade this codebase already makes everywhere else on this
+/// path: the picture is never the variable, the cost is.
+const RAW_SCRATCH_BUDGET: u64 = 24 << 20;
+
 /// The compute pipelines, built once per device.
 pub struct Transcoder {
     layout: wgpu::BindGroupLayout,
+    /// The YUV path's own layout and pipeline: it writes its texels straight into a storage
+    /// TEXTURE, where every other entry point writes into a storage buffer that is then copied
+    /// into one. See [`Transcoder::convert_yuv420p2`].
+    yuv_layout: wgpu::BindGroupLayout,
+    yuv_to_texture: wgpu::ComputePipeline,
+    /// The buffers the YUV path reuses across pictures - see [`YuvScratch`].
+    yuv_scratch: std::cell::RefCell<Option<YuvScratch>>,
+    /// The buffers the RGBA8 expansion reuses across textures - see [`RawScratch`].
+    raw_scratch: std::cell::RefCell<Option<RawScratch>>,
     decode_pvrtc: wgpu::ComputePipeline,
     decode_bc: wgpu::ComputePipeline,
+    /// The UNCOMPRESSED path: a Morton un-swizzle plus a channel permutation, which is the
+    /// whole "decode" for the guest's 32-bit four-channel formats and the largest single item
+    /// in the target device's texture work. See `decode_raw` in the shader.
+    decode_raw: wgpu::ComputePipeline,
+    /// Packed RGBA8 rows -> the 256-byte-aligned rows `copyBufferToTexture` requires.
+    copy_rows: wgpu::ComputePipeline,
     halve: wgpu::ComputePipeline,
     encode_etc2: wgpu::ComputePipeline,
+    convert_yuv: wgpu::ComputePipeline,
+}
+
+/// A two-plane 4:2:0 surface in the GUEST's own bytes: a full-resolution luma plane, then one
+/// of interleaved chroma at half resolution in both axes.
+///
+/// The strides are the guest's, not ours - a texture is laid out however the title's decoder
+/// wrote it, and normalising here would mean a copy of exactly the size this path exists to
+/// avoid.
+pub struct PlanarYuv<'a> {
+    /// Visible size in texels.
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row of the luma plane.
+    pub luma_stride: u32,
+    /// Bytes per row of the interleaved chroma plane.
+    pub chroma_stride: u32,
+    /// Byte offset of the chroma plane within `data`.
+    pub chroma_offset: u32,
+    /// The format's swizzle says the pair is Cr,Cb rather than Cb,Cr.
+    pub swap_chroma: bool,
+    /// The guest's bytes, both planes.
+    pub data: &'a [u8],
+}
+
+/// The two buffers the video path keeps between pictures: the picture itself, and the 64
+/// bytes of parameters that describe it.
+///
+/// A movie's pictures are all one shape, so these are allocated on the first one and reused
+/// for the rest of the film. The source buffer only ever grows, because a shrink would mean
+/// re-allocating on a size that came back.
+struct YuvScratch {
+    /// Capacity, in bytes, of [`YuvScratch::src`].
+    src_bytes: u64,
+    src: wgpu::Buffer,
+    params: wgpu::Buffer,
+}
+
+impl YuvScratch {
+    fn new(device: &wgpu::Device, src_bytes: u64) -> Self {
+        YuvScratch {
+            src_bytes,
+            src: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("yuv-src"),
+                size: src_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            params: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("yuv-params"),
+                size: UNIFORM_SLOT,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        }
+    }
+}
+
+/// The buffers [`Transcoder::expand_rgba8`] reuses across textures and across frames.
+///
+/// # Why this is not a micro-optimisation on this path
+/// The expansion runs for every guest texture the title rewrites - MEASURED on the user's
+/// device at **26.7 a frame**. Without this each one created four `GPUBuffer`s and a bind
+/// group, then destroyed them, and copied the guest's bytes into a temporary `Vec` purely to
+/// pad the length to a multiple of four. That is over a hundred GPU object lifetimes and
+/// megabytes of pointless `memcpy` per frame, on the engine where allocation is most expensive.
+///
+/// Grown, never shrunk, exactly as [`YuvScratch`] is: a title's texture sizes settle within the
+/// first frames of a screen, and a re-allocation here is the thing this exists to avoid.
+struct RawScratch {
+    src_bytes: u64,
+    rgba_bytes: u64,
+    out_bytes: u64,
+    src: wgpu::Buffer,
+    rgba: wgpu::Buffer,
+    out: wgpu::Buffer,
+    params: wgpu::Buffer,
+    /// Built once per set of buffers rather than per texture: the bind group names the four
+    /// buffers and nothing else, and the per-level parameters ride in through a dynamic offset.
+    bind: wgpu::BindGroup,
+}
+
+impl RawScratch {
+    /// Bytes of parameter slots: two dispatches per level, and a chain is at most 14 levels
+    /// (a 8192-texel side). Fixed rather than grown - it is a few kilobytes.
+    const PARAM_BYTES: u64 = UNIFORM_SLOT * 32;
+
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        src_bytes: u64,
+        rgba_bytes: u64,
+        out_bytes: u64,
+    ) -> Self {
+        let mk = |size: u64, usage: wgpu::BufferUsages, label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(4),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let src = mk(
+            src_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "texraw-src",
+        );
+        let rgba = mk(rgba_bytes, wgpu::BufferUsages::STORAGE, "texraw-rgba");
+        let out = mk(
+            out_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "texraw-out",
+        );
+        let params = mk(
+            Self::PARAM_BYTES,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "texraw-params",
+        );
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("texraw-bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &params,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(Params::BYTES as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rgba.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+            ],
+        });
+        RawScratch { src_bytes, rgba_bytes, out_bytes, src, rgba, out, params, bind }
+    }
+
+    /// Release the GPU memory NOW, rather than leaving four `GPUBuffer`s to the JavaScript
+    /// collector - see `expand_rgba8`'s note on what dropping a handle in a browser does. Called
+    /// when the scratch is REPLACED by a larger one, which is the only time it is discarded.
+    fn destroy(self) {
+        self.src.destroy();
+        self.rgba.destroy();
+        self.out.destroy();
+        self.params.destroy();
+    }
 }
 
 /// One level of the finished chain, and where its bytes live in the scratch buffers.
@@ -68,6 +248,24 @@ struct Level {
     out_row_bytes: u32,
     blocks_x: u32,
     blocks_y: u32,
+}
+
+/// One RGBA8 level of an [`Transcoder::expand_rgba8`] chain: where its texels sit in the packed
+/// scratch, and where its ALIGNED rows sit in the buffer the copy reads.
+///
+/// Separate from [`Level`] because that one counts BLOCKS - its copy extent is `blocks * 4` -
+/// and an RGBA8 level's extent is its texels. Sharing the struct would mean a field that means
+/// two different things depending on the caller, which is how a copy extent reached a phone
+/// wrong once already.
+struct RgbaLevel {
+    width: u32,
+    height: u32,
+    /// Word offset of this level's texels in the packed scratch buffer.
+    rgba_word: u32,
+    /// Byte offset of this level's aligned rows in the output buffer.
+    out_byte: u32,
+    /// Padded bytes per row - what `copyBufferToTexture` is given.
+    out_row_bytes: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,6 +326,8 @@ const FLAG_SWIZZLED: u32 = 1;
 const FLAG_PVRTC2: u32 = 2;
 const FLAG_4BPP: u32 = 4;
 const FLAG_ALPHA: u32 = 8;
+/// `convert_yuv420p2` only: the format's swizzle says the chroma pair is Cr,Cb not Cb,Cr.
+const FLAG_SWAP_CHROMA: u32 = 16;
 
 fn align_up(v: u32, to: u32) -> u32 {
     v.div_ceil(to) * to
@@ -174,14 +374,191 @@ impl Transcoder {
                 cache: None,
             })
         };
+        let yuv_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("texenc-yuv-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(Params::BYTES as u64),
+                    },
+                    count: None,
+                },
+                storage_entry(1, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let yuv_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("texenc-yuv-pl"),
+            bind_group_layouts: &[Some(&yuv_layout)],
+            immediate_size: 0,
+        });
+        let yuv_to_texture = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("convert_yuv420p2_tex"),
+            layout: Some(&yuv_pl),
+            module: &module,
+            entry_point: Some("convert_yuv420p2_tex"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         Self {
+            yuv_layout,
+            yuv_to_texture,
+            yuv_scratch: std::cell::RefCell::new(None),
+            raw_scratch: std::cell::RefCell::new(None),
             decode_pvrtc: make("decode_pvrtc"),
             decode_bc: make("decode_bc"),
+            decode_raw: make("decode_raw"),
+            copy_rows: make("copy_rows"),
             halve: make("halve"),
             encode_etc2: make("encode_etc2"),
+            convert_yuv: make("convert_yuv420p2"),
             layout,
         }
     }
+
+    /// Convert a two-plane 4:2:0 (video) surface to an RGBA texture ON THE GPU.
+    ///
+    /// `None` when the shape is outside what the shader covers, in which case the caller
+    /// falls back to the CPU conversion, which produces the same picture and only costs
+    /// more. See the entry point in `texenc.wgsl` for why this is worth doing at all: a
+    /// decoded video frame is the one texture whose content changes every frame, so its
+    /// conversion is paid per frame and no cache can help.
+    ///
+    /// # >>> WHAT A PER-FRAME PATH MUST NOT DO, and this one used to do all of it
+    ///
+    /// Everything here happens thirty times a second for as long as a movie runs, so an
+    /// allocation is not a one-off cost, it is a rate. The first version copied the picture
+    /// (`to_vec`, to pad it to a multiple of four), created a storage buffer from that copy,
+    /// created a second buffer the size of the RGBA output, created a third for a binding the
+    /// entry point never reads, created a fourth for 64 bytes of parameters, and then copied
+    /// the output buffer into a texture - so a 0.75 MB picture cost two CPU copies of itself,
+    /// four buffer allocations, and 2 MB of GPU-side copying, per frame.
+    ///
+    /// Now: the source is written straight into a buffer kept from the last picture
+    /// ([`YuvScratch`]), the parameters into another, and the shader writes its texels
+    /// directly into the destination texture through a write-only storage binding, which is
+    /// what removes the output buffer and the copy after it. Nothing is allocated per picture
+    /// except the destination texture itself, which is what the caller asked for.
+    pub fn convert_yuv420p2(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        planes: &PlanarYuv,
+    ) -> Option<wgpu::Texture> {
+        let (w, h) = (planes.width, planes.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        if w as u64 * h as u64 * 4 > MAX_SCRATCH_BYTES {
+            return None;
+        }
+        // The chroma plane's last row must be inside the bytes we were given, or the shader
+        // would address past the buffer. Refusing is not a fallback for a defect - a short
+        // snapshot is a legitimate outcome when a guest allocation ends early.
+        let need = planes.chroma_offset as u64
+            + planes.chroma_stride as u64 * (h.div_ceil(2) - 1) as u64
+            + w.div_ceil(2) as u64 * 2;
+        if (planes.data.len() as u64) < need {
+            return None;
+        }
+
+        let src_bytes = align_up(planes.data.len() as u32, 4) as u64;
+        let mut held = self.yuv_scratch.borrow_mut();
+        let scratch = match held.as_ref() {
+            // Grown, never shrunk: a movie's pictures are all one size, and a re-allocation
+            // here is the thing this exists to avoid.
+            Some(s) if s.src_bytes >= src_bytes => held.as_ref().expect("just matched"),
+            _ => {
+                *held = Some(YuvScratch::new(device, src_bytes));
+                held.as_ref().expect("just set")
+            }
+        };
+
+        // >>> THE PICTURE IS WRITTEN, NOT COPIED THEN WRITTEN. `write_buffer` wants a length
+        // that is a multiple of four; the last few bytes of an odd-length picture go through a
+        // padded tail rather than through a copy of the whole thing.
+        let whole = planes.data.len() & !3;
+        queue.write_buffer(&scratch.src, 0, &planes.data[..whole]);
+        if whole < planes.data.len() {
+            let mut tail = [0u8; 4];
+            tail[..planes.data.len() - whole].copy_from_slice(&planes.data[whole..]);
+            queue.write_buffer(&scratch.src, whole as u64, &tail);
+        }
+        let params = Params {
+            width: w,
+            height: h,
+            src_word: planes.luma_stride,
+            rgba_word: planes.chroma_stride,
+            out_word: planes.chroma_offset,
+            out_row_words: w,
+            flags: if planes.swap_chroma { FLAG_SWAP_CHROMA } else { 0 },
+            ..Params::default()
+        };
+        queue.write_buffer(&scratch.params, 0, &params.to_bytes());
+
+        crate::gpu::note_texture_created();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gxp-tex-yuv"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            // COPY_SRC so the picture can be read back: `gpu_yuv_conversion_matches_the_cpu`
+            // is the only thing standing between this path and another silently black movie.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuv-bg"),
+            layout: &self.yuv_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &scratch.params,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(Params::BYTES as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: scratch.src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("yuv-convert"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv-convert"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.yuv_to_texture);
+            pass.set_bind_group(0, &bg, &[0]);
+            pass.dispatch_workgroups(w.div_ceil(2).div_ceil(8), h.div_ceil(2).div_ceil(8), 1);
+        }
+        queue.submit([enc.finish()]);
+        Some(texture)
+    }
+
 
     /// Build the finished compressed texture for `plan`, or `None` if this adapter or this
     /// texture is outside what the shaders cover - in which case the caller falls back to the
@@ -243,14 +620,17 @@ impl Transcoder {
         while src_bytes.len() % 4 != 0 {
             src_bytes.push(0);
         }
-        let src_buf = wgpu::util::DeviceExt::create_buffer_init(
-            device,
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("texenc-src"),
-                contents: &src_bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            },
-        );
+        // `create_buffer_init` is `mappedAtCreation` on the web backend and every call takes a
+        // renderer-side staging region; this path runs per transcoded texture, which on a screen
+        // transition is a hundred of them. See the note in `gxm`'s depth cache for the crash
+        // that shape produces and why the message blames the wrong allocation.
+        let src_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texenc-src"),
+            size: src_bytes.len().max(4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&src_buf, 0, &src_bytes);
         let rgba_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("texenc-rgba"),
             size: (rgba_words * 4).max(4),
@@ -319,14 +699,13 @@ impl Transcoder {
                 ..Default::default()
             });
         }
-        let params_buf = wgpu::util::DeviceExt::create_buffer_init(
-            device,
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("texenc-params"),
-                contents: &slots,
-                usage: wgpu::BufferUsages::UNIFORM,
-            },
-        );
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texenc-params"),
+            size: slots.len().max(4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, &slots);
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("texenc-bg"),
             layout: &self.layout,
@@ -345,6 +724,7 @@ impl Transcoder {
             ],
         });
 
+        crate::gpu::note_texture_created();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gxp-tex-gpu"),
             size: wgpu::Extent3d {
@@ -417,6 +797,293 @@ impl Transcoder {
         rgba_buf.destroy();
         out_buf.destroy();
         params_buf.destroy();
+        Some(texture)
+    }
+
+    /// Build a finished RGBA8 texture, with its whole mip chain, WITHOUT the CPU touching a
+    /// texel - for the guest's uncompressed 32-bit four-channel formats.
+    ///
+    /// # What this replaces, and why it is the biggest item on the target device
+    /// The CPU path expands one of these texel by texel (`render::decode_uncompressed_at` plus
+    /// the Morton tables), box-filters a chain in RGBA8, and hands the whole expansion to
+    /// `writeTexture`. MEASURED on the user's device over a run: **2,964 MB of its 2,989 MB of
+    /// texture decode is this one format**, and on a gameplay frame the decode and the upload
+    /// together are 17 ms of a 25 ms render.
+    ///
+    /// Through here the CPU writes the guest's own bytes into a buffer and issues the
+    /// dispatches. Nothing crosses back, so there is no stall to schedule around.
+    ///
+    /// # It is not a quality question, unlike every other shader in this file
+    /// The others reconstruct texels from a lossy block format, so "does it match the CPU" is a
+    /// real question with a real answer. This is a PERMUTATION - the Morton un-interleave and
+    /// the SWIZZLE4 channel order - so equality is a property of the code. There is a test
+    /// against the CPU decoder as the oracle anyway, because "it cannot differ" is exactly the
+    /// kind of claim that turns out to differ.
+    ///
+    /// `None` is never a failure: every shape declined here is one the CPU decode handles
+    /// correctly, so the picture is the same either way and only the cost differs.
+    ///
+    /// `into` is a texture of the SAME shape and format to write into instead of creating one -
+    /// see the caller for why a guest texture the title rewrites must not get a new GPU object
+    /// every frame.
+    pub fn expand_rgba8(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        plan: &crate::gpu::GpuRawExpand,
+        gamma: bool,
+        into: Option<wgpu::Texture>,
+    ) -> Option<wgpu::Texture> {
+        // >>> ANYTHING HANDED IN AND NOT USED IS DESTROYED, NEVER DROPPED.
+        //
+        // The caller has already taken this texture OUT of its cache, so this function owns the
+        // only handle. In the browser a `wgpu::Texture` is a `GPUTexture` living in JavaScript
+        // and dropping the Rust handle only makes it COLLECTABLE - the GPU memory comes back
+        // whenever the collector next feels like it. On a path that supersedes twenty-odd
+        // textures a frame that is not a schedule anything can rely on: it is a leak measured in
+        // megabytes per second, and it ends as a device with nothing left, where even a 48-byte
+        // `createBuffer` fails and the worker dies with no frame of its own to blame.
+        let mut spare = into;
+        let mut give_up = |spare: Option<wgpu::Texture>| {
+            if let Some(t) = spare {
+                t.destroy();
+            }
+            None::<wgpu::Texture>
+        };
+        let (w0, h0) = (plan.width.max(1), plan.height.max(1));
+        if plan.src_levels.is_empty() || plan.levels == 0 {
+            return give_up(spare);
+        }
+        let mut levels: Vec<RgbaLevel> = Vec::with_capacity(plan.levels as usize);
+        let (mut rgba_word, mut out_byte) = (0u32, 0u32);
+        for i in 0..plan.levels {
+            let width = (w0 >> i).max(1);
+            let height = (h0 >> i).max(1);
+            let out_row_bytes = align_up(width * 4, COPY_ROW_ALIGN);
+            levels.push(RgbaLevel { width, height, rgba_word, out_byte, out_row_bytes });
+            let Some(rw) = rgba_word.checked_add(width.checked_mul(height).unwrap_or(u32::MAX))
+            else {
+                return give_up(spare);
+            };
+            let Some(ob) =
+                out_byte.checked_add(out_row_bytes.checked_mul(height).unwrap_or(u32::MAX))
+            else {
+                return give_up(spare);
+            };
+            rgba_word = rw;
+            out_byte = ob;
+        }
+        // Judged against what may be KEPT, not against the transient peak - see
+        // `RAW_SCRATCH_BUDGET`. Checked here so an oversized texture is refused before any
+        // buffer is sized for it.
+        if (rgba_word as u64) * 4 > RAW_SCRATCH_BUDGET {
+            return give_up(spare);
+        }
+        // Every guest level must be fully inside the bytes we were given, or a dispatch would
+        // address past the buffer. A short snapshot is a legitimate outcome (an allocation that
+        // ends early), so this refuses rather than reads.
+        for (i, sl) in plan.src_levels.iter().enumerate() {
+            let Some(l) = levels.get(i) else {
+                return give_up(spare);
+            };
+            let texels = if sl.swizzled {
+                (sl.padded_x as u64) * (sl.padded_y as u64)
+            } else {
+                (sl.blocks_x as u64) * (l.height as u64)
+            };
+            if sl.byte_offset as u64 + texels * 4 > plan.src.len() as u64 {
+                return give_up(spare);
+            }
+        }
+
+        // The scratch, grown to fit and then kept - see `RawScratch`.
+        let need_src = align_up(plan.src.len() as u32, 4) as u64;
+        let (need_rgba, need_out) = ((rgba_word as u64) * 4, out_byte as u64);
+        let mut held = self.raw_scratch.borrow_mut();
+        let fits = held.as_ref().is_some_and(|k| {
+            k.src_bytes >= need_src && k.rgba_bytes >= need_rgba && k.out_bytes >= need_out
+        });
+        if !fits {
+            // Grown to the LARGEST seen so far in every axis, so a small texture after a large
+            // one does not re-allocate its way back down and then up again.
+            let (s0, r0, o0) = held
+                .as_ref()
+                .map_or((0, 0, 0), |k| (k.src_bytes, k.rgba_bytes, k.out_bytes));
+            let (want_src, want_rgba, want_out) =
+                (need_src.max(s0), need_rgba.max(r0), need_out.max(o0));
+            // The kept scratch is bounded, and the bound is over the SUM - three buffers each
+            // individually reasonable still add up to a device.
+            if want_src + want_rgba + want_out > RAW_SCRATCH_BUDGET {
+                return give_up(spare);
+            }
+            // DESTROYED, not dropped: the scratch being replaced holds four `GPUBuffer`s, and
+            // leaving them to the collector leaks the previous size every time this grows.
+            if let Some(old) = held.take() {
+                old.destroy();
+            }
+            *held = Some(RawScratch::new(device, &self.layout, want_src, want_rgba, want_out));
+        }
+        let scratch = held.as_ref().expect("just set");
+
+        // >>> WRITTEN, NOT COPIED THEN WRITTEN. `write_buffer` wants a length that is a
+        // multiple of four; the last few bytes of an odd-length texture go through a padded
+        // tail rather than through a copy of the whole thing - which for this path is
+        // megabytes a frame.
+        let whole = plan.src.len() & !3;
+        queue.write_buffer(&scratch.src, 0, &plan.src[..whole]);
+        if whole < plan.src.len() {
+            let mut tail = [0u8; 4];
+            tail[..plan.src.len() - whole].copy_from_slice(&plan.src[whole..]);
+            queue.write_buffer(&scratch.src, whole as u64, &tail);
+        }
+
+        let mut slots: Vec<u8> = Vec::new();
+        let mut push = |p: Params| {
+            slots.extend_from_slice(&p.to_bytes());
+            slots.resize(align_up(slots.len() as u32, UNIFORM_SLOT as u32) as usize, 0);
+        };
+        // Phase 1: decode the guest's own levels, box-filter the rest. Dispatches in one pass
+        // are ordered and their writes are visible to the next, which is what lets the filter
+        // read the level the dispatch before it wrote.
+        for (i, l) in levels.iter().enumerate() {
+            match plan.src_levels.get(i) {
+                Some(sl) => push(Params {
+                    width: l.width,
+                    height: l.height,
+                    blocks_x: sl.blocks_x,
+                    blocks_y: sl.blocks_y,
+                    padded_x: sl.padded_x,
+                    padded_y: sl.padded_y,
+                    src_word: sl.byte_offset / 4,
+                    rgba_word: l.rgba_word,
+                    flags: u32::from(sl.swizzled) * FLAG_SWIZZLED,
+                    // The shader reads the SWIZZLE4 selector here; there is no block format.
+                    src_format: plan.swizzle,
+                    ..Default::default()
+                }),
+                None => {
+                    let prev = &levels[i - 1];
+                    push(Params {
+                        width: l.width,
+                        height: l.height,
+                        rgba_word: l.rgba_word,
+                        src_word: prev.rgba_word,
+                        src_width: prev.width,
+                        src_height: prev.height,
+                        ..Default::default()
+                    })
+                }
+            }
+        }
+        // Phase 2: lay each level out with the aligned rows `copyBufferToTexture` requires.
+        for l in &levels {
+            push(Params {
+                width: l.width,
+                height: l.height,
+                rgba_word: l.rgba_word,
+                out_word: l.out_byte / 4,
+                out_row_words: l.out_row_bytes / 4,
+                ..Default::default()
+            });
+        }
+        // A chain deeper than the fixed parameter buffer holds is refused rather than
+        // truncated: the CPU decode handles it correctly and only costs more.
+        if slots.len() as u64 > RawScratch::PARAM_BYTES {
+            return give_up(spare);
+        }
+        queue.write_buffer(&scratch.params, 0, &slots);
+        let bg = &scratch.bind;
+
+        let format = if gamma {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        // >>> WRITTEN INTO, NOT REPLACED, when the caller has the right texture already.
+        //
+        // The shape is re-checked here rather than trusted: a copy into a texture of the wrong
+        // extent or mip count is a validation failure, and the caller's own test is a hash of
+        // guest state rather than a look at the GPU object.
+        let reusable = spare.as_ref().is_some_and(|t| {
+            t.width() == w0
+                && t.height() == h0
+                && t.mip_level_count() == levels.len() as u32
+                && t.format() == format
+        });
+        let texture = match spare.take() {
+            Some(t) if reusable => t,
+            other => {
+                // The wrong shape is still OUR handle to release.
+                if let Some(t) = other {
+                    t.destroy();
+                }
+                crate::gpu::note_texture_created();
+                device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gxp-tex-raw"),
+            size: wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // COPY_SRC for the reason the transcode's texture carries it: the test that holds
+            // this to the CPU decoder drives THIS function and reads THIS texture, rather than a
+            // test-only path that would not be the thing that ships.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+                })
+            }
+        };
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("texraw"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("texraw-pass"),
+                timestamp_writes: None,
+            });
+            for (i, l) in levels.iter().enumerate() {
+                let off = ((i as u64) * UNIFORM_SLOT) as u32;
+                if plan.src_levels.get(i).is_some() {
+                    pass.set_pipeline(&self.decode_raw);
+                } else {
+                    pass.set_pipeline(&self.halve);
+                }
+                pass.set_bind_group(0, bg, &[off]);
+                pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
+            }
+            pass.set_pipeline(&self.copy_rows);
+            for (i, l) in levels.iter().enumerate() {
+                let off = (((levels.len() + i) as u64) * UNIFORM_SLOT) as u32;
+                pass.set_bind_group(0, bg, &[off]);
+                pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
+            }
+        }
+        for (i, l) in levels.iter().enumerate() {
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &scratch.out,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: l.out_byte as u64,
+                        bytes_per_row: Some(l.out_row_bytes),
+                        rows_per_image: Some(l.height),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: i as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: 1 },
+            );
+        }
+        queue.submit([enc.finish()]);
+        // Nothing to destroy: the buffers are the scratch and outlive this call. That is the
+        // point - `run` has to destroy its own because it sizes them per texture, and doing
+        // that here was over a hundred GPU object lifetimes a frame.
         Some(texture)
     }
 

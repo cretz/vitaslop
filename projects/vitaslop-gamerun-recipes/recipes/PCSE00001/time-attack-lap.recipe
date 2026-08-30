@@ -1,10 +1,35 @@
-@title Time Attack - drive two complete laps of the circuit
+@title Time Attack - reach a live Time Attack lap, then drive (the line is STALE)
 @game  PCSE00001
 @shot-every 200
 
 # ============================================================================
-# WHAT THIS RECIPE DOES
-# Walks the mandatory first-run wizard, enters Lap Time Attack, and then DRIVES
+# >>> THE DRIVING LINE NO LONGER DRIVES THE LAP. MEASURED 2026-08-24.
+# The boot ladder below is CORRECT and still is: the run reaches Lap Time Attack
+# with the car on the start line at about f12000 (HUD `LAP 1/30`, `000 mph`,
+# TOTAL TIME blank), and drives cleanly from there - f13000 is 069 mph on the
+# racing line at 00:12.583, f14000 is 078 mph through the tunnel at 00:29.250,
+# both with the minimap marker advancing.
+#
+# It comes apart between f14000 and f14500: at f14500 the car is sideways
+# against a barrier at 00:37.583, and by f15000 the HUD reads `WRONG WAY!!` with
+# the car stopped in scenery. NO LAP IS COMPLETED, and the two-lap claim this
+# header used to make is simply false now - it is stated here rather than left
+# for the next reader to discover from a screenshot.
+#
+# The line is OPEN LOOP - a recorded response, not a controller - so any change
+# to how much simulation a counted frame buys makes it drift, and drift only has
+# to win once. What to do about it, and why it is not a small edit: the line was
+# authored by `working-area/drive.py`, a greedy 34-candidate search through
+# `explore` with a 150-frame window, resumable from `working-area/race-line.json`.
+# Every candidate replays the whole prefix, so a step near f14000 costs about
+# three batches of a 14,000-frame boot - roughly a quarter of an hour - and the
+# remaining ~32 steps to f19000 are the better part of a day of wall clock. It
+# needs to be STARTED and left, not squeezed into a session.
+#
+# The frame to resume from is f14150: the last window that is still clean.
+#
+# WHAT THIS RECIPE DID WHEN IT WAS AUTHORED
+# Walked the mandatory first-run wizard, entered Lap Time Attack, and then DROVE
 # the circuit: two complete laps, confirmed by the game's own HUD reading
 # `LAP 3/30` with two finished lap times listed at the end of the run.
 #
@@ -22,9 +47,14 @@
 #   car is pointing backwards, a direction-agnostic controller aims at the start
 #   straight and drives a fast lap the WRONG WAY, which looks like progress to
 #   every measurement except the game's own lap counter.
-# - A COUNTED FRAME IS NOT 1/60 s OF GAME TIME here: the guest advances about
-#   5.3 frames of simulation per frame this recipe counts. Frame-keyed timings
-#   below are on the counted clock; do not convert them to seconds.
+# - A COUNTED FRAME IS NOT 1/60 s OF GAME TIME here - but the RATIO HAS MOVED,
+#   which is the whole reason the driving line above is stale. When the line was
+#   recorded the guest advanced about 5.3 frames of simulation per frame this
+#   recipe counts. MEASURED 2026-08-24 off the game's own TOTAL TIME (00:12.583
+#   at f13000, 00:29.250 at f14000): a thousand counted frames now buy 16.667
+#   seconds, which is a thousand simulation frames - a ratio of ONE. Frame-keyed
+#   timings below are on the counted clock; do not convert them to seconds, and
+#   do not trust a converted figure written before this line.
 #
 # WHAT IS NOT ASSERTED, and why
 # There is no @assert, because the lap counter's address is not yet found. Do
@@ -40,12 +70,15 @@
 # The reliable next move is `@watch` on a candidate plus a driven lap boundary,
 # reading the HUD from a shot at the same frame.
 #
-# KNOWN RENDER DEFECTS visible in this run (all shader-recompiler gaps, all
-# reported by name at run time - grep the run for "FALLS BACK"):
-#   * the player's car draws as saturated red/black blobs
-#   * large trackside objects draw as untextured white boxes
-#   * RGB fringing over the whole frame when the camera is close to geometry,
-#     on the GPU path only - the software path renders the same moment clean
+# RENDER DEFECTS: NONE LEFT IN THIS RUN, as of 2026-08-24.
+# This block used to list three - the player's car as saturated red/black blobs,
+# large trackside objects as untextured white boxes, and RGB fringing whenever
+# the camera came close to geometry. All three are GONE: the f12000 start-line
+# frame renders the car's paint, decals and glass correctly, the trackside
+# signage is textured, and the run reports ZERO shader fallbacks (`grep "FALLS
+# BACK"` finds nothing over 19,500 frames). A defect list that outlives its
+# defects reads as a known-bad renderer and stops people looking, so it is
+# emptied here rather than left standing.
 # ============================================================================
 
 0: @section boot

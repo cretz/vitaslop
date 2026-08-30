@@ -1,0 +1,42 @@
+[package]
+name = "vitaslop-aac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Platform-native AAC audio decoding for Windows, macOS, Linux and the browser"
+
+# NOT a Vita crate, and the same rule `vitaslop-h264` states applies here: it carries
+# the workspace prefix because it lives here, it knows nothing about the Vita or about
+# any other crate in this workspace, and it depends on none of them. Anything
+# Vita-shaped - `SceAudiodecCtrl`, guest buffers, the NGS mixer's sample format -
+# belongs in the caller.
+#
+# Why the host's decoder rather than a decoder written here: AAC-LC decoding is a
+# solved, patent-encumbered, well-optimised thing that every one of these platforms
+# already ships in native code (and, on a phone, sometimes in hardware). The engine's
+# job is to REACH it. The seam is submit/poll for the same reason the video one is:
+# in a browser the answer arrives on a callback, and no synchronous API can be honest
+# about that.
+
+[dependencies]
+
+# --- Windows: Media Foundation -----------------------------------------------
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+]
+
+# --- Web: WebCodecs -----------------------------------------------------------
+# `AudioDecoder` is declared by hand rather than taken from web-sys for the same
+# reason the video crate declares `VideoDecoder` by hand: those bindings sit behind
+# `--cfg=web_sys_unstable_apis`, which every consumer would then have to set.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"
+js-sys = "0.3"

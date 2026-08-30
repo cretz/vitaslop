@@ -77,6 +77,18 @@ impl<'a> Imports<'a> {
 /// direct-call closure alone would never reach).
 pub struct Discovered {
     pub func: Func,
+    /// Addresses where an instruction failed to DECODE and the lenient build isolated it
+    /// into a trapping block (empty in the strict build, which fails the whole function
+    /// instead).
+    ///
+    /// These are collected because they are the gaps the strict diagnostic pass CANNOT
+    /// see. That pass walks from the entry points and follows DIRECT calls, so a function
+    /// reached only through a vtable - which is where a C++ engine keeps its hot
+    /// per-object work - is never visited by it, and its decode gaps go unlisted while
+    /// the runtime lifts the function around them. That blind spot is expensive: two
+    /// undecodable NEON instructions in one title's audio mixer truncated its inner loop,
+    /// and the only visible symptom was a null dereference several calls away.
+    pub trap_leaders: Vec<u32>,
     /// Direct callees as `(address, thumb)`: the mode to decode each in. A `blx
     /// <label>` interworks, so a callee's mode is NOT always the caller's.
     pub callees: Vec<(u32, bool)>,
@@ -1325,6 +1337,33 @@ pub fn discover(
         let mut arm_count = 0u32;
         let term = loop {
             let Some((inst, len, applied, in_it)) = decoded.get(&cursor) else {
+                // >>> RUNNING STRAIGHT INTO AN INSTRUCTION THAT DID NOT DECODE MUST TRAP,
+                // >>> NOT RETURN. This is the single most expensive bug shape this file
+                // >>> has produced, so it is spelled out.
+                //
+                // Pass 1 records an undecodable address as a TRAP LEADER and a block is
+                // built for it above (`Term::Unreachable`), on the reasoning that a
+                // branch to it stays well-formed and faults when taken. But the common
+                // way to reach one is not a branch - it is the PRECEDING INSTRUCTION
+                // falling through. That path used to land here, find nothing in
+                // `decoded`, and end the block with `Term::Halt`, which emits a plain
+                // `return`. So the trap block was never jumped to at all, and the real
+                // behaviour was: run the block's valid prefix, then RETURN OUT OF THE
+                // FUNCTION with half its work done and its registers half-updated.
+                //
+                // MEASURED (2026-08-24): two undecodable NEON ops in one title's audio
+                // mixer cut its unrolled inner loop after four instructions. The mixer
+                // returned early every grain, and the failure surfaced as a null
+                // dereference several calls away, in a different function, with nothing
+                // anywhere naming the cause. It cost most of a session.
+                //
+                // A gap reached by fallthrough is exactly as unrunnable as one reached by
+                // a branch, so it gets the same answer. `Term::Halt` is kept for the
+                // OTHER way to get here - walking off the end of the decoded region -
+                // because that is not a decode gap and has no trap leader.
+                if trap_leaders.contains(&cursor) {
+                    break Term::Unreachable;
+                }
                 // Fell through to code that was never decoded (off image or
                 // unreachable): stop the function here.
                 break Term::Halt;
@@ -1454,6 +1493,7 @@ pub fn discover(
 
     Ok(Discovered {
         func,
+        trap_leaders: trap_leaders.into_iter().collect(),
         callees: callees.into_iter().collect(),
         code_pointers: code_pointers.into_iter().collect(),
         arm_code_pointers: arm_code_pointers.into_iter().collect(),
@@ -2277,6 +2317,74 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         }
         // Bitfield extract: ubfx rd, rn, #lsb, #width (zero-extended); sbfx
         // (sign-extended).
+        SSAT | USAT => {
+            // `ssat Rd, #n, Rm{, shift}` / `usat Rd, #n, Rm{, shift}`: clamp the (already
+            // shifted) source into an n-bit signed or unsigned range. The source is read as
+            // SIGNED in both cases - `usat` of a negative value is 0, not a huge unsigned.
+            //
+            // Emitted BRANCHLESS, because this IR has no select and no min/max, and because
+            // the whole point of the instruction in a codec is that it is one cheap step in
+            // an inner loop. The two identities used:
+            //
+            //   * "does it fit" is `sign_extend_n(x) == x`, and a difference `d` becomes an
+            //     all-ones mask with `(d | -d) >> 31` (arithmetic), 0 exactly when d == 0.
+            //   * the clamped value for `ssat` is `(x >> 31) ^ max`: 0 ^ max = max for a
+            //     positive x, and ~max = min for a negative one. No compare needed.
+            //
+            // **The Q flag is NOT set.** ARM makes saturation sticky in APSR.Q, and this
+            // engine models only N/Z/C/V, so a title that reads Q back (via `mrs`) would
+            // see it clear. That is a real gap rather than a silent approximation of the
+            // RESULT, which is exact; nothing observed so far reads Q, and modelling it
+            // means a fifth flag global.
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let n = imm(&ops[1]).ok_or_else(err)?;
+            let x = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            // `(a | (0 - a)) >> 31` - all ones iff `a` is nonzero.
+            let nonzero_mask = |a: Value| {
+                bin(
+                    BinOp::Asr,
+                    bin(BinOp::Or, a.clone(), bin(BinOp::Sub, Value::Imm(0), a)),
+                    Value::Imm(31),
+                )
+            };
+            let result = if inst.opcode == SSAT {
+                // n is 1..=32 for ssat; the range is [-(2^(n-1)), 2^(n-1) - 1].
+                let spare = 32u32.saturating_sub(n);
+                let max = if n >= 32 { i32::MAX as u32 } else { (1u32 << (n - 1)) - 1 };
+                // sign_extend_n(x): up to the top and arithmetically back down.
+                let sat = if spare == 0 {
+                    x.clone()
+                } else {
+                    bin(
+                        BinOp::Asr,
+                        bin(BinOp::Shl, x.clone(), Value::Imm(spare)),
+                        Value::Imm(spare),
+                    )
+                };
+                let over = nonzero_mask(bin(BinOp::Xor, sat, x.clone()));
+                let clamped = bin(BinOp::Xor, bin(BinOp::Asr, x.clone(), Value::Imm(31)), Value::Imm(max));
+                bin(
+                    BinOp::Or,
+                    bin(BinOp::And, x, Value::Not(Box::new(over.clone()))),
+                    bin(BinOp::And, clamped, over),
+                )
+            } else {
+                // n is 0..=31 for usat; the range is [0, 2^n - 1]. A negative source clamps
+                // to 0 and anything with a bit at or above n clamps to the maximum, so the
+                // two conditions are independent and are applied as two masks.
+                let max = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+                let neg = bin(BinOp::Asr, x.clone(), Value::Imm(31));
+                let over = nonzero_mask(bin(BinOp::Lsr, x.clone(), Value::Imm(n.min(31))));
+                let picked = bin(
+                    BinOp::Or,
+                    bin(BinOp::And, x, Value::Not(Box::new(over.clone()))),
+                    bin(BinOp::And, Value::Imm(max), over),
+                );
+                bin(BinOp::And, picked, Value::Not(Box::new(neg)))
+            };
+            out.push(Stmt::SetReg(rd, result));
+        }
+
         UBFX | SBFX => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
@@ -3229,6 +3337,14 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
             Some((src, lane)) => NeonStmt::MulScalar { ty, dst: r(0)?, a: r(1)?, src, lane, acc: false, sub: false },
             None => NeonStmt::Bin { op: NeonBin::Mul, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         },
+        VQADD => NeonStmt::Bin { op: NeonBin::QAdd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VQSUB => NeonStmt::Bin { op: NeonBin::QSub, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VHADD => NeonStmt::Bin { op: NeonBin::HAdd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VHSUB => NeonStmt::Bin { op: NeonBin::HSub, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VRHADD => NeonStmt::Bin { op: NeonBin::RHAdd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VMVN => NeonStmt::Not { dst: r(0)?, src: r(1)? },
+        VQABS => NeonStmt::SatAbsNeg { ty, neg: false, dst: r(0)?, src: r(1)? },
+        VQNEG => NeonStmt::SatAbsNeg { ty, neg: true, dst: r(0)?, src: r(1)? },
         VMAX => NeonStmt::Bin { op: NeonBin::Max, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VMIN => NeonStmt::Bin { op: NeonBin::Min, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         VABD => NeonStmt::Bin { op: NeonBin::Abd, ty, dst: r(0)?, a: r(1)?, b: r(2)? },
@@ -3287,13 +3403,15 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
             NeonStmt::ShiftReg { sat: false, ty, dst: r(0)?, src: r(1)?, amt: r(2)? }
         }
         VQSHL => NeonStmt::ShiftReg { sat: true, ty, dst: r(0)?, src: r(1)?, amt: r(2)? },
-        VSHR | VSRA | VSHL | VSLI | VSRI => {
+        VSHR | VSRA | VSHL | VSLI | VSRI | VRSHR | VRSRA => {
             use crate::ir::NeonShift;
             let sop = match op {
                 VSHR => NeonShift::Shr,
                 VSRA => NeonShift::Sra,
                 VSHL => NeonShift::Shl,
                 VSLI => NeonShift::Sli,
+                VRSHR => NeonShift::Rshr,
+                VRSRA => NeonShift::Rsra,
                 _ => NeonShift::Sri,
             };
             let amount = match ops[2] {
@@ -3332,8 +3450,8 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VCLT => NeonStmt::CmpZero { op: crate::ir::NeonCmp::Lt, ty, dst: r(0)?, src: r(1)? },
         VACGE => NeonStmt::CmpAbs { ge: true, dst: r(0)?, a: r(1)?, b: r(2)? },
         VACGT => NeonStmt::CmpAbs { ge: false, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VPMAX => NeonStmt::PairMinMax { min: false, dst: r(0)?, a: r(1)?, b: r(2)? },
-        VPMIN => NeonStmt::PairMinMax { min: true, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VPMAX => NeonStmt::PairMinMax { ty, min: false, dst: r(0)?, a: r(1)?, b: r(2)? },
+        VPMIN => NeonStmt::PairMinMax { ty, min: true, dst: r(0)?, a: r(1)?, b: r(2)? },
         VREV16 => NeonStmt::Rev { esize: ty.bits, container: 16, dst: r(0)?, src: r(1)? },
         VREV32 => NeonStmt::Rev { esize: ty.bits, container: 32, dst: r(0)?, src: r(1)? },
         VREV64 => NeonStmt::Rev { esize: ty.bits, container: 64, dst: r(0)?, src: r(1)? },
@@ -3348,6 +3466,71 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
         VTST => NeonStmt::Test { ty, dst: r(0)?, a: r(1)?, b: r(2)? },
         // VMOVN result element is half the encoded (source) size.
         VMOVN => NeonStmt::Narrow { esize: ty.bits / 2, dst: r(0)?, src: r(1)? },
+        // The narrowing right shifts. `dt` names the SOURCE element and its signedness,
+        // so the result element is half it - the same convention as VMOVN.
+        VSHRN | VRSHRN | VQSHRN | VQRSHRN | VQSHRUN | VQRSHRUN => {
+            let Operand::Imm(shift) = ops[2] else { return None };
+            let sat = match op {
+                VSHRN | VRSHRN => None,
+                // vqshrun narrows a SIGNED source into an UNSIGNED result; the plain
+                // vqshrn keeps whatever signedness the source has.
+                VQSHRUN | VQRSHRUN => Some((true, false)),
+                _ => Some((ty.signed, ty.signed)),
+            };
+            NeonStmt::NarrowShift {
+                esize: ty.bits / 2,
+                dst: r(0)?,
+                src: r(1)?,
+                shift: shift as u8,
+                round: matches!(op, VRSHRN | VQRSHRN | VQRSHRUN),
+                sat,
+            }
+        }
+        // VSHLL's `dt` names the SOURCE element, and the result is twice it.
+        VSHLL => {
+            let Operand::Imm(shift) = ops[2] else { return None };
+            NeonStmt::WidenShift {
+                esize: ty.bits,
+                dst: r(0)?,
+                src: r(1)?,
+                shift: shift as u8,
+                signed: ty.signed,
+            }
+        }
+        // The saturating narrows, same shape as VMOVN. `dt` names the SOURCE element and
+        // its signedness; the destination's signedness is the opcode's.
+        VQMOVN => NeonStmt::NarrowSat {
+            esize: ty.bits / 2,
+            dst: r(0)?,
+            src: r(1)?,
+            src_signed: ty.signed,
+            dst_signed: ty.signed,
+        },
+        VQMOVUN => NeonStmt::NarrowSat {
+            esize: ty.bits / 2,
+            dst: r(0)?,
+            src: r(1)?,
+            src_signed: true,
+            dst_signed: false,
+        },
+        // `vtbl`/`vtbx`: ops are [Dd, {Dn..} run, Dm]. The table arrives as the same
+        // register-run operand a `vld1` list uses, so it is read with `simd_points`'
+        // shape rather than as a plain register.
+        VTBL | VTBX => {
+            let (first, count, stride, element) = match ops[1] {
+                Operand::SIMDRegPoints { first, count, stride, element } => {
+                    (first.num, count, stride, element)
+                }
+                _ => return None,
+            };
+            // A strided or element-wise run is not a table; refuse rather than read it
+            // as one (the encoding cannot produce either, so this is a decoder check).
+            if stride != 1 || !matches!(element, SIMDElement::Whole) || count == 0 || count > 4 {
+                return None;
+            }
+            let (NeonReg::D(dst), NeonReg::D(index)) = (r(0)?, r(2)?) else { return None };
+            NeonStmt::TableLookup { dst, table: first, len: count, index, extend: op == VTBX }
+        }
         // VSWP is decoded but not lifted yet (it would land here as a permute swap).
         VSWP => return None,
     };
@@ -3385,16 +3568,48 @@ fn neon_emittable(s: &NeonStmt) -> bool {
             // `abd` (|a-b|) is emitted from integer min/max/sub only.
             NeonBin::Abd => !ty.float && ty.bits != 64,
             NeonBin::Add | NeonBin::Sub => true,
+            // wasm's saturating add/sub exist for 8- and 16-bit lanes only.
+            NeonBin::QAdd | NeonBin::QSub => !ty.float && (ty.bits == 8 || ty.bits == 16),
+            // The halving forms are emitted through a widening extend, which covers
+            // 8/16/32-bit sources.
+            NeonBin::HAdd | NeonBin::HSub | NeonBin::RHAdd => !ty.float && ty.bits != 64,
         },
         // `vpadd` gathers even/odd lanes with shuffles then adds; the float form (f32x4.add)
         // is emittable at 32-bit, the F16 form has no wasm primitive.
         NeonStmt::PairAdd { ty, .. } => !ty.float || ty.bits == 32,
+        // The pairwise min/max gather the same way; float is f32 only, and wasm has no
+        // 64-bit lanewise integer min/max (the encoding does not produce one either).
+        NeonStmt::PairMinMax { ty, .. } => {
+            if ty.float {
+                ty.bits == 32
+            } else {
+                ty.bits != 64
+            }
+        }
         NeonStmt::MulAcc { ty, .. } => ty.float || ty.bits != 8,
         // by-scalar multiply is decoded only for 16/32-bit elements (f32 or integer), all of which
         // have a wasm lane-multiply; the 8-bit form does not exist in this encoding class.
         NeonStmt::MulScalar { ty, .. } => ty.float || ty.bits != 8,
         // `extadd_pairwise` widens only 8->16 and 16->32.
         NeonStmt::PairLong { ty, .. } => ty.bits == 8 || ty.bits == 16,
+        // The saturating abs/negate need a lanewise compare and negate, which wasm has for
+        // 8/16/32-bit lanes; the encoding does not produce a 64-bit element anyway.
+        NeonStmt::SatAbsNeg { ty, .. } => ty.bits != 64,
+        // The saturating narrows use wasm's `narrow` pair, which exists only for
+        // 16->8 and 32->16. A 64->32 `vqmovn` (a 32-bit result element) has no wasm
+        // primitive, so it is refused at lift and reported rather than approximated.
+        NeonStmt::NarrowSat { esize, .. } => *esize == 8 || *esize == 16,
+        // The narrowing shifts share that `narrow` pair when they saturate, and the
+        // shift itself needs a lanewise shift of the 2*esize source - which wasm has for
+        // 16/32/64-bit lanes. So an 8-bit result (16-bit source) up to a 32-bit result
+        // (64-bit source) is fine for the truncating forms, while a saturating 32-bit
+        // result has no `narrow` and is refused.
+        NeonStmt::NarrowShift { esize, sat, .. } => match sat {
+            Some(_) => *esize == 8 || *esize == 16,
+            None => *esize == 8 || *esize == 16 || *esize == 32,
+        },
+        // VSHLL widens with wasm's `extend_low`, which covers 8->16, 16->32 and 32->64.
+        NeonStmt::WidenShift { esize, .. } => *esize == 8 || *esize == 16 || *esize == 32,
         // the widened `|a-b|` needs 16/32-bit min/max, so the source is 8/16-bit.
         NeonStmt::WideAbd { ty, .. } => ty.bits == 8 || ty.bits == 16,
         // Float compares are f32x4 only; wasm has no unsigned 64-bit lane compare, so

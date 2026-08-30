@@ -102,6 +102,7 @@ pub mod gxm {
     pub const SET_CULL_MODE: u32 = 0xE1CA_72AE;
     pub const SET_TWO_SIDED_ENABLE: u32 = 0x0DE9_AEB7;
     pub const SET_FRONT_DEPTH_FUNC: u32 = 0x14BD_831F;
+    pub const SET_FRONT_DEPTH_BIAS: u32 = 0xAAA9_7F81;
     pub const SET_BACK_DEPTH_FUNC: u32 = 0xB042_A4D2;
     pub const SET_FRONT_DEPTH_WRITE_ENABLE: u32 = 0xF32C_BF34;
     pub const SET_FRONT_FRAGMENT_PROGRAM_ENABLE: u32 = 0x5759_58A8;
@@ -203,6 +204,7 @@ pub mod gxm {
     pub const SET_VERTEX_TEXTURE: u32 = 0x16C9_D339;
     pub const TEXTURE_INIT_CUBE_ARBITRARY: u32 = 0xE3DF_5E3B;
     pub const TEXTURE_SET_PALETTE: u32 = 0xDD6A_ABFA;
+    pub const TEXTURE_GET_PALETTE: u32 = 0x0D18_9C30;
     // Precomputed: the whole-array setters and the non-default uniform-buffer slots.
     pub const PRECOMPUTED_DRAW_SET_ALL_VERTEX_STREAMS: u32 = 0xB6C6_F571;
     pub const PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES: u32 = 0xC383_DE39;
@@ -223,6 +225,14 @@ pub mod display {
     /// `sceDisplayWaitSetFrameBuf` (SceDisplay, lib 0x5ED8F994): block until the
     /// frame buffer queued by `sceDisplaySetFrameBuf` has been latched at vblank.
     pub const WAIT_SET_FRAME_BUF: u32 = 0x9423_560C;
+    /// The `...Multi` and `...CB` spellings of the two waits above. `Multi` takes a vblank
+    /// COUNT; `CB` additionally runs the calling thread's pending callbacks while it waits.
+    /// Separate NIDs, so a title that links only one of them must not hard-fail on it.
+    pub const WAIT_SET_FRAME_BUF_MULTI: u32 = 0x7D98_64A8;
+    pub const WAIT_SET_FRAME_BUF_CB: u32 = 0x814C_90AF;
+    pub const WAIT_SET_FRAME_BUF_MULTI_CB: u32 = 0x3E79_6EF5;
+    pub const WAIT_VBLANK_START_CB: u32 = 0x78B4_1B92;
+    pub const WAIT_VBLANK_START_MULTI_CB: u32 = 0x05F2_7764;
     pub const GET_VCOUNT: u32 = 0xB6FD_E0BA;
 }
 
@@ -394,6 +404,102 @@ pub mod net {
     pub const EPOLL_WAIT: u32 = 0x45CE_337D;
 }
 
+/// SceHttp: the HTTP client surface, modelled OFFLINE (see [`crate::vita::http`]).
+/// Every value here is from `vita-headers/db/360/SceLibHttp.yml`, library `SceHttp`
+/// (`0xE8F1_5CDE`).
+pub mod http {
+    pub const CREATE_TEMPLATE: u32 = 0x6224_1DAB;
+    pub const DELETE_TEMPLATE: u32 = 0xEC85_ECFB;
+    pub const CREATE_CONNECTION_WITH_URL: u32 = 0xC616_C200;
+    pub const DELETE_CONNECTION: u32 = 0xF0F6_5C15;
+    pub const CREATE_REQUEST_WITH_URL: u32 = 0xBD5D_A1D0;
+    pub const DELETE_REQUEST: u32 = 0x3D3D_29AD;
+    pub const SET_CONNECT_TIMEOUT: u32 = 0x237C_A86E;
+    pub const SET_SEND_TIMEOUT: u32 = 0x8AE3_F008;
+    pub const SET_RECV_TIMEOUT: u32 = 0x94BF_196E;
+    pub const ADD_REQUEST_HEADER: u32 = 0x7B51_B122;
+    pub const SEND_REQUEST: u32 = 0x9CA5_8B99;
+    pub const ABORT_REQUEST: u32 = 0xEA61_662F;
+    pub const GET_STATUS_CODE: u32 = 0x2707_1691;
+    pub const GET_RESPONSE_CONTENT_LENGTH: u32 = 0xF580_D304;
+    pub const READ_DATA: u32 = 0x7EDE_3979;
+    pub const SSL_LOAD_CERT: u32 = 0xAE8D_7C33;
+    pub const SSL_SET_SSL_CALLBACK: u32 = 0xA092_6037;
+    pub const SSL_GET_SSL_ERROR: u32 = 0x2B79_BDE0;
+}
+
+/// SceLiveAreaUtil: the title's own LiveArea gate (see [`crate::vita::livearea`]).
+/// From `vita-headers/db/360/SceLiveAreaUtil.yml`, library `SceLiveAreaUtil`
+/// (`0x5303_CB07`) - the db has the NIDs even though nothing published has the
+/// interface.
+pub mod livearea {
+    pub const GET_FRAME_REVISION: u32 = 0xD6EE_2214;
+    pub const GET_FRAME_USER_DATA: u32 = 0xD6FD_367F;
+}
+
+/// SceAudioIn: the microphone, modelled as MUTED (see [`crate::vita::audioin`]).
+/// From `vita-headers/db/360/SceAudioin.yml`, library `SceAudioIn` (`0xF8DC_61A3`).
+pub mod audioin {
+    pub const OPEN_PORT: u32 = 0x39B5_0DC1;
+    pub const RELEASE_PORT: u32 = 0x3A61_B8C4;
+    pub const INPUT: u32 = 0x638A_DD2D;
+    pub const GET_ADOPT: u32 = 0x566A_C433;
+    pub const GET_STATUS: u32 = 0x2F94_0377;
+}
+
+/// ScePgf: the PSP-compatible font API (see [`crate::vita::pgf`]). From
+/// `vita-headers/db/360/SceLibPgf.yml`, library `ScePgf` (`0x9F35_04F2`).
+pub mod pgf {
+    pub const NEW_LIB: u32 = 0x1055_ABA3;
+    pub const DONE_LIB: u32 = 0x07EE_1733;
+    pub const OPEN: u32 = 0xBD2D_FCFF;
+    pub const OPEN_USER_MEMORY: u32 = 0xB23E_D47C;
+    pub const CLOSE: u32 = 0x4A72_93E9;
+    pub const GET_CHAR_INFO: u32 = 0x6FD1_BA65;
+    pub const GET_FONT_INFO: u32 = 0xF941_4FA2;
+    pub const GET_CHAR_GLYPH_IMAGE: u32 = 0xAB45_AAD3;
+}
+
+/// `SceLibXml`: the C++ XML library (see [`crate::vita::sce_xml`]). Every name here is
+/// the DEMANGLED form of the symbol the NID belongs to, so the constant's name carries
+/// the signature: `..._EY` takes an `unsigned long long`, `..._EPKNS0_6StringEb` a
+/// `const String*` and a `bool`. From `vita-headers/db/360/SceLibXml.yml`, library
+/// `SceLibXml` (`0xC2B2_2E99`).
+pub mod xml {
+    /// `sce::Xml::MemAllocator::MemAllocator()` / `~MemAllocator()`
+    pub const MEM_ALLOCATOR_CTOR: u32 = 0xE982_E681;
+    pub const MEM_ALLOCATOR_DTOR: u32 = 0x1BE0_22EA;
+    /// `sce::Xml::Initializer::Initializer()` / `~Initializer()` / `initialize(const InitParameter*)`
+    pub const INITIALIZER_CTOR: u32 = 0xBF13_FDE6;
+    pub const INITIALIZER_DTOR: u32 = 0xB454_7C88;
+    pub const INITIALIZER_INITIALIZE: u32 = 0xECFA_6A2A;
+    /// `sce::Xml::Dom::DocumentBuilder::...`
+    pub const BUILDER_CTOR: u32 = 0x7024_92EA;
+    pub const BUILDER_DTOR: u32 = 0x19D0_E024;
+    pub const BUILDER_INITIALIZE: u32 = 0xBBAC_FE87;
+    pub const BUILDER_GET_DOCUMENT: u32 = 0x1A29_526B;
+    pub const BUILDER_SET_RESOLVE_ENTITY: u32 = 0xA243_1C2B;
+    pub const BUILDER_SET_SKIP_IGNORABLE_TEXT: u32 = 0xB8C4_D13C;
+    pub const BUILDER_SET_SKIP_IGNORABLE_WHITESPACE: u32 = 0xF351_D753;
+    pub const BUILDER_PARSE: u32 = 0x7744_DD14;
+    /// `sce::Xml::Dom::Document::...`
+    pub const DOCUMENT_DTOR: u32 = 0xFB20_7925;
+    pub const DOCUMENT_GET_ROOT: u32 = 0xB34D_9672;
+    pub const DOCUMENT_GET_FIRST_CHILD: u32 = 0x3028_E05D;
+    pub const DOCUMENT_GET_SIBLING: u32 = 0xE3D0_A78A;
+    pub const DOCUMENT_GET_FIRST_ATTR: u32 = 0xEC85_6072;
+    pub const DOCUMENT_GET_NODE_NAME: u32 = 0x471A_22E8;
+    pub const DOCUMENT_GET_NODE_TYPE: u32 = 0x62D3_CB44;
+    pub const DOCUMENT_GET_TEXT: u32 = 0x36AC_FF5E;
+    /// `sce::Xml::Dom::Node::...`
+    pub const NODE_CTOR: u32 = 0x088C_100E;
+    pub const NODE_DTOR: u32 = 0x8F2E_B967;
+    pub const NODE_GET_NODE_NAME: u32 = 0xE126_9956;
+    pub const NODE_GET_NODE_VALUE: u32 = 0x4F2D_5541;
+    /// `sce::Xml::String::String()`
+    pub const STRING_CTOR: u32 = 0xA175_02C1;
+}
+
 /// SceLibDbg: the title's own assertion and logging handlers.
 pub mod dbg {
     pub const ASSERTION_HANDLER: u32 = 0x1AF3_678B;
@@ -446,6 +552,9 @@ pub mod services {
     pub const RTC_GET_CURRENT_CLOCK: u32 = 0x70FD_E8F1;
     pub const RTC_GET_CURRENT_CLOCK_LOCAL_TIME: u32 = 0x0572_EDDC;
     pub const RTC_GET_CURRENT_TICK: u32 = 0x23F7_9274;
+    /// `sceRtcGetTickResolution`: ticks per second in the unit every other SceRtc
+    /// entry point speaks. Ours must agree with what `RTC_GET_CURRENT_TICK` writes.
+    pub const RTC_GET_TICK_RESOLUTION: u32 = 0x8113_13B3;
     pub const RTC_GET_TICK: u32 = 0xF2B2_38E2;
     pub const RTC_GET_TIME64_T: u32 = 0xC995_DE02;
     /// `sceRtcGetTime_t`: the 32-bit `time_t` sibling of `RTC_GET_TIME64_T`.
@@ -551,6 +660,17 @@ pub mod services {
     pub const MSG_DIALOG_GET_STATUS: u32 = 0x4107_019E;
     pub const MSG_DIALOG_GET_RESULT: u32 = 0xBB3B_FC89;
     pub const MSG_DIALOG_TERM: u32 = 0x81AC_F695;
+    /// `sceMsgDialogClose`: dismiss a running message dialog from the title's own side.
+    pub const MSG_DIALOG_CLOSE: u32 = 0xC296_D396;
+    pub const NP_PROFILE_DIALOG_INIT: u32 = 0x5E0A_FDF8;
+    pub const NP_PROFILE_DIALOG_GET_STATUS: u32 = 0xFDFE_6042;
+    pub const NP_PROFILE_DIALOG_GET_RESULT: u32 = 0x749C_AFFC;
+    pub const NP_PROFILE_DIALOG_ABORT: u32 = 0x2B02_BE3F;
+    pub const NP_PROFILE_DIALOG_TERM: u32 = 0x04B6_3D6F;
+    pub const PHOTO_IMPORT_DIALOG_INIT: u32 = 0x73EE_7C9C;
+    pub const PHOTO_IMPORT_DIALOG_GET_STATUS: u32 = 0x0322_06D8;
+    pub const PHOTO_IMPORT_DIALOG_GET_RESULT: u32 = 0xD855_414C;
+    pub const PHOTO_IMPORT_DIALOG_TERM: u32 = 0x7FE5_BD77;
     pub const NET_CHECK_DIALOG_INIT: u32 = 0xA38A_4A0D;
     pub const NET_CHECK_DIALOG_GET_STATUS: u32 = 0x8027_292A;
     pub const NET_CHECK_DIALOG_GET_RESULT: u32 = 0xB05F_CE9E;
@@ -646,6 +766,9 @@ pub mod services {
     pub const SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER: u32 = 0x851F_B144;
     pub const SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT: u32 = 0x13AD_2218;
     pub const SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX: u32 = 0x7472_4147;
+    pub const SYSTEM_GESTURE_GET_TOUCH_RECOGNIZER_INFORMATION: u32 = 0xF0DB_1AE5;
+    pub const SYSTEM_GESTURE_RESET_TOUCH_RECOGNIZER: u32 = 0x0D94_1B90;
+    pub const SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENT_BY_PRIMITIVE_ID: u32 = 0x4805_64C9;
     // SceSysmodule load: off-console the requested module is already linked in, so a
     // load request just reports success.
     pub const SYSMODULE_LOAD_MODULE: u32 = 0x79A0_160A;
@@ -728,6 +851,11 @@ pub mod services {
     /// `sceMotionMagnetometerOn`: enable magnetometer sampling. Accepted like
     /// `MOTION_START_SAMPLING` - see the group it dispatches with.
     pub const MOTION_MAGNETOMETER_ON: u32 = 0x122A_79F8;
+    pub const MOTION_MAGNETOMETER_OFF: u32 = 0xC1A7_395A;
+    pub const MOTION_GET_MAGNETOMETER_STATE: u32 = 0x3D48_13AE;
+    pub const MOTION_GET_SENSOR_STATE: u32 = 0x47D6_79EA;
+    pub const MOTION_RESET: u32 = 0x0FD2_CDA2;
+    pub const MOTION_STOP_SAMPLING: u32 = 0xAF32_CB1D;
     pub const NETCTL_ADHOC_DISCONNECT: u32 = 0xED43_B79A;
     pub const POWER_SET_CONFIGURATION_MODE: u32 = 0x3CE1_87B6;
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
@@ -749,6 +877,30 @@ pub mod services {
     /// a buffer release - the 0.945 name list has a `sceMp4ReleaseBuffer` with no 3.60 NID
     /// beside it, which fits, but the mapping is inference so the constant is named by NID.
     pub const MP4_RELEASE_BUFFER_7B4832FE: u32 = 0x7B48_32FE;
+    /// SceMp4, unnamed on the henkaku wiki's 3.60 NID list. ROLE recovered from its one
+    /// call site: the caller zeroes a 0x158-byte struct, passes it as the third argument,
+    /// and branches on the first two words - it is the FRAME FETCH. See
+    /// `vita::video::mp4_get_next_unit` for the field map and what in it is inferred.
+    pub const MP4_GET_NEXT_UNIT_8BE0E3D3: u32 = 0x8BE0_E3D3;
+    /// SceMp4, unnamed on the henkaku wiki's 3.60 NID list, but the 0.945 NAME list has a
+    /// `sceMp4EnableStream` with no 3.60 NID beside it and the call sites fit it exactly:
+    /// two one-line thunks that differ only in a trailing `1` and `0` over
+    /// `f(handle, stream, flag)`.
+    pub const MP4_ENABLE_STREAM_609E57AD: u32 = 0x609E_57AD;
+    /// SceMp4, unnamed on the henkaku wiki's 3.60 NID list. The 0.945 NAME list has a
+    /// `sceMp4Reset` with no 3.60 NID beside it, and the call site fits: the demux thread
+    /// logs "Looping back to start of the file", calls this, and asks for the next unit
+    /// again - so it rewinds the stream.
+    pub const MP4_RESET_40351E1A: u32 = 0x4035_1E1A;
+    /// SceMp4. Names and NIDs for these come from the henkaku wiki's `SceMp4` page.
+    pub const MP4_GET_NEXT_UNIT: u32 = 0x20A0_1112;
+    pub const MP4_GET_NEXT_UNIT_DATA: u32 = 0xD092_A066;
+    pub const MP4_GET_NEXT_SYNC_UNIT: u32 = 0x32A1_5788;
+    pub const MP4_GET_PREV_SYNC_UNIT: u32 = 0x40C6_4DC0;
+    pub const MP4_JUMP_PTS: u32 = 0x9667_6BA0;
+    pub const MP4_FLUSH_FILE_READER: u32 = 0xD287_1F1C;
+    pub const MP4_GET_AVAILABLE_BW: u32 = 0xEFE2_99C9;
+    pub const MP4_SET_AVAILABLE_BW: u32 = 0x94E1_305D;
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
@@ -858,6 +1010,9 @@ pub mod iofilemgr {
 pub mod sync {
     pub const CREATE_MUTEX: u32 = 0xED53_334A;
     pub const LOCK_MUTEX: u32 = 0x1D8D_7945;
+    /// `sceKernelLockMutexCB`: the same lock, additionally a callback-delivery point.
+    /// A separate NID, so a title that links only this spelling must not hard-fail.
+    pub const LOCK_MUTEX_CB: u32 = 0x2BDA_A524;
     pub const TRY_LOCK_MUTEX: u32 = 0x72FC_1F54;
     pub const UNLOCK_MUTEX: u32 = 0x1A37_2EC8;
     pub const DELETE_MUTEX: u32 = 0xCB78_710D;
@@ -994,6 +1149,40 @@ pub mod audio {
     pub const OUT_GET_ADOPT: u32 = 0x12FB_1767;
 }
 
+/// SceVideodec / SceAvcdec (library `0x163C3727`) and SceCodecEngine (`0x469AB062`):
+/// the guest's own H.264 decoder and the memory it works in. Every NID here is from the
+/// MIT vita-headers database (`db/360/SceAvcodecUser.yml`).
+pub mod videodec {
+    pub const VIDEODEC_QUERY_MEM_SIZE: u32 = 0x6731_BB2D;
+    pub const VIDEODEC_INIT_LIBRARY_WITH_UNMAP_MEM: u32 = 0x230A_78FF;
+    pub const VIDEODEC_TERM_LIBRARY: u32 = 0x3A5F_4924;
+    pub const AVCDEC_QUERY_DECODER_MEM_SIZE: u32 = 0x97E9_5EDB;
+    pub const AVCDEC_CREATE_DECODER: u32 = 0xE82B_B69B;
+    pub const AVCDEC_DELETE_DECODER: u32 = 0x8A0E_359E;
+    pub const AVCDEC_DECODE: u32 = 0xD619_0A06;
+    pub const AVCDEC_DECODE_STOP: u32 = 0x9648_D853;
+    pub const AVCDEC_DECODE_FLUSH: u32 = 0x25F3_1020;
+    pub const CODEC_ENGINE_OPEN_UNMAP_MEM_BLOCK: u32 = 0xF0B4_C892;
+    pub const CODEC_ENGINE_CLOSE_UNMAP_MEM_BLOCK: u32 = 0x95EA_3B3E;
+    pub const CODEC_ENGINE_ALLOC_MEMORY_FROM_UNMAP_MEM_BLOCK: u32 = 0x1A3A_53E5;
+    pub const CODEC_ENGINE_FREE_MEMORY_FROM_UNMAP_MEM_BLOCK: u32 = 0x6A31_831D;
+}
+
+/// SceAudiodec (library `0x2AA62046`): the guest's own audio decoder. A movie's sound
+/// track goes through this. NIDs from `db/360/SceAvcodecUser.yml`.
+pub mod audiodec {
+    pub const INIT_LIBRARY: u32 = 0x445C_2CEF;
+    pub const TERM_LIBRARY: u32 = 0x4571_9B9D;
+    pub const CREATE_DECODER: u32 = 0x4DFD_3AAA;
+    pub const DELETE_DECODER: u32 = 0xE7A2_4E16;
+    pub const CLEAR_CONTEXT: u32 = 0xF72F_9B64;
+    pub const GET_INTERNAL_ERROR: u32 = 0x883B_0CF5;
+    pub const GET_CONTEXT_SIZE: u32 = 0xDB71_2ABC;
+    pub const CREATE_DECODER_EXTERNAL: u32 = 0x5608_5DFB;
+    pub const DELETE_DECODER_EXTERNAL: u32 = 0xE4EA_05BB;
+    pub const DECODE: u32 = 0xCCDA_BA04;
+}
+
 /// What [`name`] returns for a NID it does not know. A NID gets its name in the same
 /// change that gives it a handler, so link-time import coverage is checked against this
 /// (see `link`), which turns "one missing NID revealed per boot" into one list.
@@ -1003,11 +1192,41 @@ pub const UNKNOWN_NAME: &str = "<unknown>";
 /// the unimplemented-call report. Falls back to the raw NIDs.
 pub fn name(func_nid: u32) -> &'static str {
     use {
-        audio as au, ctrl as c, display as d, fiber as fb, gxm as g, iofilemgr as io,
+        audio as au, audiodec as ad, audioin, ctrl as c, display as d, fiber as fb, gxm as g, http,
+        iofilemgr as io, livearea, pgf, xml,
         libkernel as lk, lwsync as lw, net as nt, ngs as ng, processmgr as pm, pvf as pv, services as sv,
-        sync as sy, sysmem as s, threadmgr as tm,
+        sync as sy, sysmem as s, threadmgr as tm, videodec as vd,
     };
     match func_nid {
+        // SceVideodec / SceAvcdec, and the codec engine's memory.
+        vd::VIDEODEC_QUERY_MEM_SIZE => "sceVideodecQueryMemSize",
+        vd::VIDEODEC_INIT_LIBRARY_WITH_UNMAP_MEM => "sceVideodecInitLibraryWithUnmapMem",
+        vd::VIDEODEC_TERM_LIBRARY => "sceVideodecTermLibrary",
+        vd::AVCDEC_QUERY_DECODER_MEM_SIZE => "sceAvcdecQueryDecoderMemSize",
+        vd::AVCDEC_CREATE_DECODER => "sceAvcdecCreateDecoder",
+        vd::AVCDEC_DELETE_DECODER => "sceAvcdecDeleteDecoder",
+        vd::AVCDEC_DECODE => "sceAvcdecDecode",
+        vd::AVCDEC_DECODE_STOP => "sceAvcdecDecodeStop",
+        vd::AVCDEC_DECODE_FLUSH => "sceAvcdecDecodeFlush",
+        vd::CODEC_ENGINE_OPEN_UNMAP_MEM_BLOCK => "sceCodecEngineOpenUnmapMemBlock",
+        vd::CODEC_ENGINE_CLOSE_UNMAP_MEM_BLOCK => "sceCodecEngineCloseUnmapMemBlock",
+        vd::CODEC_ENGINE_ALLOC_MEMORY_FROM_UNMAP_MEM_BLOCK => {
+            "sceCodecEngineAllocMemoryFromUnmapMemBlock"
+        }
+        vd::CODEC_ENGINE_FREE_MEMORY_FROM_UNMAP_MEM_BLOCK => {
+            "sceCodecEngineFreeMemoryFromUnmapMemBlock"
+        }
+        // SceAudiodec.
+        ad::GET_CONTEXT_SIZE => "sceAudiodecGetContextSize",
+        ad::CREATE_DECODER_EXTERNAL => "sceAudiodecCreateDecoderExternal",
+        ad::DELETE_DECODER_EXTERNAL => "sceAudiodecDeleteDecoderExternal",
+        ad::DECODE => "sceAudiodecDecode",
+        ad::INIT_LIBRARY => "sceAudiodecInitLibrary",
+        ad::TERM_LIBRARY => "sceAudiodecTermLibrary",
+        ad::CREATE_DECODER => "sceAudiodecCreateDecoder",
+        ad::DELETE_DECODER => "sceAudiodecDeleteDecoder",
+        ad::CLEAR_CONTEXT => "sceAudiodecClearContext",
+        ad::GET_INTERNAL_ERROR => "sceAudiodecGetInternalError",
         // SceNet, offline.
         nt::SOCKET => "sceNetSocket",
         nt::SOCKET_CLOSE => "sceNetSocketClose",
@@ -1206,6 +1425,67 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NET_CTL_INET_GET_INFO => "sceNetCtlInetGetInfo",
         sv::NET_CTL_INET_REGISTER_CALLBACK => "sceNetCtlInetRegisterCallback",
         sv::HTTP_INIT => "sceHttpInit",
+        xml::MEM_ALLOCATOR_CTOR => "sce::Xml::MemAllocator::MemAllocator",
+        xml::MEM_ALLOCATOR_DTOR => "sce::Xml::MemAllocator::~MemAllocator",
+        xml::INITIALIZER_CTOR => "sce::Xml::Initializer::Initializer",
+        xml::INITIALIZER_DTOR => "sce::Xml::Initializer::~Initializer",
+        xml::INITIALIZER_INITIALIZE => "sce::Xml::Initializer::initialize",
+        xml::BUILDER_CTOR => "sce::Xml::Dom::DocumentBuilder::DocumentBuilder",
+        xml::BUILDER_DTOR => "sce::Xml::Dom::DocumentBuilder::~DocumentBuilder",
+        xml::BUILDER_INITIALIZE => "sce::Xml::Dom::DocumentBuilder::initialize",
+        xml::BUILDER_GET_DOCUMENT => "sce::Xml::Dom::DocumentBuilder::getDocument",
+        xml::BUILDER_SET_RESOLVE_ENTITY => "sce::Xml::Dom::DocumentBuilder::setResolveEntity",
+        xml::BUILDER_SET_SKIP_IGNORABLE_TEXT => "sce::Xml::Dom::DocumentBuilder::setSkipIgnorableText",
+        xml::BUILDER_SET_SKIP_IGNORABLE_WHITESPACE => {
+            "sce::Xml::Dom::DocumentBuilder::setSkipIgnorableWhiteSpace"
+        }
+        xml::BUILDER_PARSE => "sce::Xml::Dom::DocumentBuilder::parse",
+        xml::DOCUMENT_DTOR => "sce::Xml::Dom::Document::~Document",
+        xml::DOCUMENT_GET_ROOT => "sce::Xml::Dom::Document::getRoot",
+        xml::DOCUMENT_GET_FIRST_CHILD => "sce::Xml::Dom::Document::getFirstChild",
+        xml::DOCUMENT_GET_SIBLING => "sce::Xml::Dom::Document::getSibling",
+        xml::DOCUMENT_GET_FIRST_ATTR => "sce::Xml::Dom::Document::getFirstAttr",
+        xml::DOCUMENT_GET_NODE_NAME => "sce::Xml::Dom::Document::getNodeName",
+        xml::DOCUMENT_GET_NODE_TYPE => "sce::Xml::Dom::Document::getNodeType",
+        xml::DOCUMENT_GET_TEXT => "sce::Xml::Dom::Document::getText",
+        xml::NODE_CTOR => "sce::Xml::Dom::Node::Node",
+        xml::NODE_DTOR => "sce::Xml::Dom::Node::~Node",
+        xml::NODE_GET_NODE_NAME => "sce::Xml::Dom::Node::getNodeName",
+        xml::NODE_GET_NODE_VALUE => "sce::Xml::Dom::Node::getNodeValue",
+        xml::STRING_CTOR => "sce::Xml::String::String",
+        pgf::NEW_LIB => "sceFontNewLib",
+        pgf::DONE_LIB => "sceFontDoneLib",
+        pgf::OPEN => "sceFontOpen",
+        pgf::OPEN_USER_MEMORY => "sceFontOpenUserMemory",
+        pgf::CLOSE => "sceFontClose",
+        pgf::GET_CHAR_INFO => "sceFontGetCharInfo",
+        pgf::GET_FONT_INFO => "sceFontGetFontInfo",
+        pgf::GET_CHAR_GLYPH_IMAGE => "sceFontGetCharGlyphImage",
+        audioin::OPEN_PORT => "sceAudioInOpenPort",
+        audioin::RELEASE_PORT => "sceAudioInReleasePort",
+        audioin::INPUT => "sceAudioInInput",
+        audioin::GET_ADOPT => "sceAudioInGetAdopt",
+        audioin::GET_STATUS => "sceAudioInGetStatus",
+        livearea::GET_FRAME_REVISION => "sceLiveAreaGetFrameRevision",
+        livearea::GET_FRAME_USER_DATA => "sceLiveAreaGetFrameUserData",
+        http::CREATE_TEMPLATE => "sceHttpCreateTemplate",
+        http::DELETE_TEMPLATE => "sceHttpDeleteTemplate",
+        http::CREATE_CONNECTION_WITH_URL => "sceHttpCreateConnectionWithURL",
+        http::DELETE_CONNECTION => "sceHttpDeleteConnection",
+        http::CREATE_REQUEST_WITH_URL => "sceHttpCreateRequestWithURL",
+        http::DELETE_REQUEST => "sceHttpDeleteRequest",
+        http::SET_CONNECT_TIMEOUT => "sceHttpSetConnectTimeOut",
+        http::SET_SEND_TIMEOUT => "sceHttpSetSendTimeOut",
+        http::SET_RECV_TIMEOUT => "sceHttpSetRecvTimeOut",
+        http::ADD_REQUEST_HEADER => "sceHttpAddRequestHeader",
+        http::SEND_REQUEST => "sceHttpSendRequest",
+        http::ABORT_REQUEST => "sceHttpAbortRequest",
+        http::GET_STATUS_CODE => "sceHttpGetStatusCode",
+        http::GET_RESPONSE_CONTENT_LENGTH => "sceHttpGetResponseContentLength",
+        http::READ_DATA => "sceHttpReadData",
+        http::SSL_LOAD_CERT => "sceHttpsLoadCert",
+        http::SSL_SET_SSL_CALLBACK => "sceHttpsSetSslCallback",
+        http::SSL_GET_SSL_ERROR => "sceHttpsGetSslError",
         sv::SSL_INIT => "sceSslInit",
         sv::NP_INIT => "sceNpInit",
         sv::NP_REGISTER_SERVICE_STATE_CALLBACK => "sceNpRegisterServiceStateCallback",
@@ -1215,6 +1495,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_BASIC_GET_FRIEND_LIST_ENTRY_COUNT => "sceNpBasicGetFriendListEntryCount",
         sv::RTC_GET_CURRENT_CLOCK => "sceRtcGetCurrentClock",
         sv::RTC_GET_CURRENT_TICK => "sceRtcGetCurrentTick",
+        sv::RTC_GET_TICK_RESOLUTION => "sceRtcGetTickResolution",
         sv::RTC_SET_TIME64_T => "sceRtcSetTime64_t",
         sv::APPUTIL_SAVEDATA_DATA_REMOVE => "sceAppUtilSaveDataDataRemove",
         sv::APPUTIL_SAVEDATA_GET_QUOTA => "sceAppUtilSaveDataGetQuota",
@@ -1347,6 +1628,13 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER => "sceSystemGestureUpdateTouchRecognizer",
         sv::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT => "sceSystemGestureGetTouchEventsCount",
         sv::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => "sceSystemGestureGetTouchEventByIndex",
+        sv::SYSTEM_GESTURE_GET_TOUCH_RECOGNIZER_INFORMATION => {
+            "sceSystemGestureGetTouchRecognizerInformation"
+        }
+        sv::SYSTEM_GESTURE_RESET_TOUCH_RECOGNIZER => "sceSystemGestureResetTouchRecognizer",
+        sv::SYSTEM_GESTURE_GET_PRIMITIVE_TOUCH_EVENT_BY_PRIMITIVE_ID => {
+            "sceSystemGestureGetPrimitiveTouchEventByPrimitiveID"
+        }
         sv::TOUCH_ENABLE_TOUCH_FORCE => "sceTouchEnableTouchForce",
         sv::SYSMODULE_LOAD_MODULE => "sceSysmoduleLoadModule",
         sv::APPUTIL_SYSTEM_PARAM_GET_STRING => "sceAppUtilSystemParamGetString",
@@ -1389,6 +1677,7 @@ pub fn name(func_nid: u32) -> &'static str {
         tm::EXIT_THREAD => "sceKernelExitThread",
         sy::CREATE_MUTEX => "sceKernelCreateMutex",
         sy::LOCK_MUTEX => "sceKernelLockMutex",
+        sy::LOCK_MUTEX_CB => "sceKernelLockMutexCB",
         sy::TRY_LOCK_MUTEX => "sceKernelTryLockMutex",
         sy::UNLOCK_MUTEX => "sceKernelUnlockMutex",
         sy::DELETE_MUTEX => "sceKernelDeleteMutex",
@@ -1423,6 +1712,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_CULL_MODE => "sceGxmSetCullMode",
         g::SET_TWO_SIDED_ENABLE => "sceGxmSetTwoSidedEnable",
         g::SET_FRONT_DEPTH_FUNC => "sceGxmSetFrontDepthFunc",
+        g::SET_FRONT_DEPTH_BIAS => "sceGxmSetFrontDepthBias",
         g::SET_BACK_DEPTH_FUNC => "sceGxmSetBackDepthFunc",
         g::SET_FRONT_DEPTH_WRITE_ENABLE => "sceGxmSetFrontDepthWriteEnable",
         g::SET_FRONT_FRAGMENT_PROGRAM_ENABLE => "sceGxmSetFrontFragmentProgramEnable",
@@ -1501,6 +1791,7 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SET_VERTEX_TEXTURE => "_sceGxmSetVertexTexture",
         g::TEXTURE_INIT_CUBE_ARBITRARY => "sceGxmTextureInitCubeArbitrary",
         g::TEXTURE_SET_PALETTE => "sceGxmTextureSetPalette",
+        g::TEXTURE_GET_PALETTE => "sceGxmTextureGetPalette",
         g::PRECOMPUTED_DRAW_SET_ALL_VERTEX_STREAMS => "sceGxmPrecomputedDrawSetAllVertexStreams",
         g::PRECOMPUTED_FRAGMENT_STATE_SET_ALL_TEXTURES => "sceGxmPrecomputedFragmentStateSetAllTextures",
         g::PRECOMPUTED_VERTEX_STATE_SET_ALL_TEXTURES => "sceGxmPrecomputedVertexStateSetAllTextures",
@@ -1547,6 +1838,11 @@ pub fn name(func_nid: u32) -> &'static str {
         d::WAIT_VBLANK_START_MULTI => "sceDisplayWaitVblankStartMulti",
         d::WAIT_VBLANK_START => "sceDisplayWaitVblankStart",
         d::WAIT_SET_FRAME_BUF => "sceDisplayWaitSetFrameBuf",
+        d::WAIT_SET_FRAME_BUF_MULTI => "sceDisplayWaitSetFrameBufMulti",
+        d::WAIT_SET_FRAME_BUF_CB => "sceDisplayWaitSetFrameBufCB",
+        d::WAIT_SET_FRAME_BUF_MULTI_CB => "sceDisplayWaitSetFrameBufMultiCB",
+        d::WAIT_VBLANK_START_CB => "sceDisplayWaitVblankStartCB",
+        d::WAIT_VBLANK_START_MULTI_CB => "sceDisplayWaitVblankStartMultiCB",
         lk::UNKNOWN_023EAA62 => "SceLibKernel_023EAA62",
         // Offline services: screenshot, trophy, Np inits, location/motion/power/net.
         sv::SCREENSHOT_DISABLE => "sceScreenShotDisable",
@@ -1578,6 +1874,17 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::MP4_START_FILE_STREAMING => "sceMp4StartFileStreaming",
         sv::MP4_CLOSE_FILE => "sceMp4CloseFile",
         sv::MP4_RELEASE_BUFFER_7B4832FE => "sceMp4(unnamed 0x7b4832fe, buffer release)",
+        sv::MP4_GET_NEXT_UNIT_8BE0E3D3 => "sceMp4(unnamed 0x8be0e3d3, next unit)",
+        sv::MP4_ENABLE_STREAM_609E57AD => "sceMp4(unnamed 0x609e57ad, enable stream)",
+        sv::MP4_RESET_40351E1A => "sceMp4(unnamed 0x40351e1a, reset)",
+        sv::MP4_GET_NEXT_UNIT => "sceMp4GetNextUnit",
+        sv::MP4_GET_NEXT_UNIT_DATA => "sceMp4GetNextUnitData",
+        sv::MP4_GET_NEXT_SYNC_UNIT => "sceMp4GetNextSyncUnit",
+        sv::MP4_GET_PREV_SYNC_UNIT => "sceMp4GetPrevSyncUnit",
+        sv::MP4_JUMP_PTS => "sceMp4JumpPTS",
+        sv::MP4_FLUSH_FILE_READER => "sceMp4FlushFileReader",
+        sv::MP4_GET_AVAILABLE_BW => "sceMp4GetAvailableBW",
+        sv::MP4_SET_AVAILABLE_BW => "sceMp4SetAvailableBW",
         sv::NP_TERM => "sceNpTerm",
         sv::NP_UNREGISTER_SERVICE_STATE_CALLBACK => "sceNpUnregisterServiceStateCallback",
         sv::NP_BASIC_TERM => "sceNpBasicTerm",
@@ -1603,6 +1910,11 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::LOCATION_INIT => "sceLocationInit",
         sv::MOTION_START_SAMPLING => "sceMotionStartSampling",
         sv::MOTION_MAGNETOMETER_ON => "sceMotionMagnetometerOn",
+        sv::MOTION_MAGNETOMETER_OFF => "sceMotionMagnetometerOff",
+        sv::MOTION_GET_MAGNETOMETER_STATE => "sceMotionGetMagnetometerState",
+        sv::MOTION_GET_SENSOR_STATE => "sceMotionGetSensorState",
+        sv::MOTION_RESET => "sceMotionReset",
+        sv::MOTION_STOP_SAMPLING => "sceMotionStopSampling",
         sv::NETCTL_ADHOC_REGISTER_CALLBACK => "sceNetCtlAdhocRegisterCallback",
         sv::NETCTL_ADHOC_GET_IN_ADDR => "sceNetCtlAdhocGetInAddr",
         sv::NETCTL_ADHOC_GET_STATE => "sceNetCtlAdhocGetState",
@@ -1616,6 +1928,16 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::COMMON_DIALOG_UPDATE => "sceCommonDialogUpdate",
         sv::MSG_DIALOG_INIT => "sceMsgDialogInit",
         sv::MSG_DIALOG_GET_STATUS => "sceMsgDialogGetStatus",
+        sv::MSG_DIALOG_CLOSE => "sceMsgDialogClose",
+        sv::NP_PROFILE_DIALOG_INIT => "sceNpProfileDialogInit",
+        sv::NP_PROFILE_DIALOG_GET_STATUS => "sceNpProfileDialogGetStatus",
+        sv::NP_PROFILE_DIALOG_GET_RESULT => "sceNpProfileDialogGetResult",
+        sv::NP_PROFILE_DIALOG_ABORT => "sceNpProfileDialogAbort",
+        sv::NP_PROFILE_DIALOG_TERM => "sceNpProfileDialogTerm",
+        sv::PHOTO_IMPORT_DIALOG_INIT => "scePhotoImportDialogInit",
+        sv::PHOTO_IMPORT_DIALOG_GET_STATUS => "scePhotoImportDialogGetStatus",
+        sv::PHOTO_IMPORT_DIALOG_GET_RESULT => "scePhotoImportDialogGetResult",
+        sv::PHOTO_IMPORT_DIALOG_TERM => "scePhotoImportDialogTerm",
         sv::MSG_DIALOG_GET_RESULT => "sceMsgDialogGetResult",
         sv::MSG_DIALOG_ABORT => "sceMsgDialogAbort",
         sv::MSG_DIALOG_TERM => "sceMsgDialogTerm",

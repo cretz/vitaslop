@@ -573,12 +573,33 @@ fn find_process_param(image: &[u8], image_base: u32, m: &Module) -> Option<u32> 
 
 /// Copy a segment's file-backed bytes into the combined image at its rebased
 /// address (the `.bss` tail past `data.len()` stays zero).
+///
+/// # >>> A SEGMENT THAT DOES NOT FIT IS REPORTED, NOT DROPPED
+/// The bounds test used to be a bare `if`, so a segment landing outside the image was skipped
+/// in silence and every byte it carried read back as ZERO - which is indistinguishable from
+/// `.bss`, from a static the title never initialises, and from a field some later code was
+/// meant to fill. That ambiguity cost real time here: a title whose sky renders black reads its
+/// colours from a static that nothing ever writes, and "the loader dropped the segment holding
+/// its initialiser" had to be ruled out by reasoning because no line anywhere would have said
+/// so. The image is sized from the modules' own extents, so this cannot fire on a well-formed
+/// title - which is exactly why it must be loud when it does.
 fn blit(image: &mut [u8], image_base: u32, seg: &Segment) {
     let off = seg.vaddr.wrapping_sub(image_base) as usize;
     let end = off + seg.data.len();
     if end <= image.len() {
         image[off..end].copy_from_slice(&seg.data);
+        return;
     }
+    tracing::error!(
+        target: "vitaslop::link",
+        vaddr = format_args!("{:#x}", seg.vaddr),
+        file_bytes = seg.data.len(),
+        image_base = format_args!("{image_base:#x}"),
+        image_bytes = image.len(),
+        "a module SEGMENT does not fit the combined image and was NOT loaded - everything it \
+         carries will read as zero, which looks exactly like uninitialised data. This is a \
+         loader defect, not a title defect"
+    );
 }
 
 /// Apply one variable import's fixup blob, binding every listed site to the

@@ -25,3 +25,8 @@ region = "NTSC"
 id = "PCSA00015"
 name = "WipEout 2048"
 region = "NTSC"
+
+[[game]]
+id = "PCSA00009"
+name = "Hot Shots Golf: World Invitational"
+region = "NTSC"
