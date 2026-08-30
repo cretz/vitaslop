@@ -102,11 +102,209 @@ fn find_eocd(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
+/// Write a ZIP archive from `(name, bytes)` entries, in the order given.
+///
+/// # Why this crate writes its own
+/// The reader above already exists for the ROM path, so the format is understood here and
+/// the alternative is a whole archiver crate in a wasm binary that ships to a phone. What
+/// is emitted is a plain, single-disk archive with Stored and Deflate entries and no
+/// extensions - the subset every archiver on every platform reads, which is the point: a
+/// game-data export is a file the USER handles, so it has to open in Explorer, in Finder,
+/// and in whatever the phone offers.
+///
+/// # STORED, not deflated, and that was MEASURED rather than assumed
+/// Every entry is written uncompressed. Linking miniz_oxide's COMPRESSOR - the reader only
+/// ever needed its inflate half - cost **113 KB of the shipped wasm (5,667,665 ->
+/// 5,783,872 bytes, +2.0%)**, which every user downloads on every cold load, and the
+/// deflate itself runs on the frame that exports the save, where tens of milliseconds are
+/// a visible hitch. What it would have bought is a smaller copy of a file that is
+/// kilobytes to a few megabytes and is transferred by hand, occasionally. That is the
+/// wrong side of the trade in both directions at once.
+///
+/// The READER still takes Deflate (it always did, for the ROM path), so a user who unpacks
+/// one of these and re-zips it with an ordinary archiver can still upload the result.
+///
+/// No Zip64: the guest data this carries is a savedata mount, kilobytes to a few
+/// megabytes, and an entry over 4 GB cannot arise from one.
+pub fn write_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // (local header offset, name, crc, compressed size, uncompressed size, method)
+    let mut central: Vec<(u32, &str, u32, u32, u32, u16)> = Vec::new();
+
+    for (name, data) in entries {
+        let crc = crc32(data);
+        let (method, payload): (u16, &[u8]) = (0, data);
+        let local_off = out.len() as u32;
+
+        out.extend_from_slice(&LOCAL_SIG.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&method.to_le_bytes());
+        // A FIXED timestamp, and that is deliberate: the same game data must produce the
+        // same bytes twice. A clock in here would make every export differ from the last
+        // one, which defeats comparing two of them and makes a test that round-trips the
+        // bytes impossible to write. 1980-01-01, the zero of the DOS epoch.
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x0021u16.to_le_bytes()); // mod date (1980-01-01)
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(payload);
+
+        central.push((local_off, name, crc, payload.len() as u32, data.len() as u32, method));
+    }
+
+    let cd_start = out.len() as u32;
+    for (local_off, name, crc, comp, uncomp, method) in &central {
+        out.extend_from_slice(&CDIR_SIG.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&method.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x0021u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&comp.to_le_bytes());
+        out.extend_from_slice(&uncomp.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&local_off.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    let cd_len = out.len() as u32 - cd_start;
+
+    let n = central.len() as u16;
+    out.extend_from_slice(&EOCD_SIG.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk with cd
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&cd_len.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    out
+}
+
+/// CRC-32 (the ZIP entry checksum), table-free.
+///
+/// An archiver that reads one of these VERIFIES it, so a wrong value here does not make a
+/// slightly-off file - it makes one every tool refuses to open, and the guest data inside
+/// unreachable. Bit-for-bit the same polynomial the PNG writer in `render.rs` uses; kept
+/// separate because that one is a streaming struct for chunk-at-a-time hashing and this is
+/// a whole buffer at once.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut v = 0xFFFF_FFFFu32;
+    for &byte in data {
+        v ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (v & 1).wrapping_neg();
+            v = (v >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::vfs::Vfs;
     use crate::ingest::testfix;
+
+    #[test]
+    fn written_archives_read_back_through_both_methods() {
+        // The writer emits Stored (see `write_zip` for why), so the round trip covers that
+        // arm; the DEFLATE arm of the reader is what an ordinary archiver produces when a
+        // user re-zips an export by hand, and it is exercised below.
+        let squishy = vec![b'a'; 10_000];
+        let random: Vec<u8> = (0..2000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let entries = vec![
+            ("empty".to_string(), Vec::new()),
+            ("squishy".to_string(), squishy.clone()),
+            ("dir/random.bin".to_string(), random.clone()),
+        ];
+        let zip = write_zip(&entries);
+        let vfs = read_zip(&zip).expect("read back what we wrote");
+        assert_eq!(vfs.read("empty").unwrap(), Vec::<u8>::new());
+        assert_eq!(vfs.read("squishy").unwrap(), squishy);
+        assert_eq!(vfs.read("dir/random.bin").unwrap(), random);
+    }
+
+    #[test]
+    fn a_deflated_entry_still_reads_back() {
+        // The path a user takes without knowing it: unpack an export, change something,
+        // re-zip with the archiver their OS ships. Almost every one of those deflates, and
+        // this crate no longer writes an archive of that shape - so the arm has to be
+        // exercised deliberately or it ships untested.
+        let data = vec![b'z'; 5_000];
+        let comp = miniz_oxide::deflate::compress_to_vec(&data, 6);
+        let name = b"hand-rezipped.bin";
+        let mut z = Vec::new();
+        let mut local = Vec::new();
+        local.extend_from_slice(&LOCAL_SIG.to_le_bytes());
+        local.extend_from_slice(&20u16.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(&8u16.to_le_bytes()); // Deflate
+        local.extend_from_slice(&0u32.to_le_bytes()); // time+date
+        local.extend_from_slice(&crc32(&data).to_le_bytes());
+        local.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes());
+        local.extend_from_slice(name);
+        local.extend_from_slice(&comp);
+        z.extend_from_slice(&local);
+        let cd_start = z.len() as u32;
+        z.extend_from_slice(&CDIR_SIG.to_le_bytes());
+        z.extend_from_slice(&20u16.to_le_bytes());
+        z.extend_from_slice(&20u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&8u16.to_le_bytes());
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&crc32(&data).to_le_bytes());
+        z.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(&0u32.to_le_bytes());
+        z.extend_from_slice(name);
+        let cd_len = z.len() as u32 - cd_start;
+        z.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&1u16.to_le_bytes());
+        z.extend_from_slice(&1u16.to_le_bytes());
+        z.extend_from_slice(&cd_len.to_le_bytes());
+        z.extend_from_slice(&cd_start.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        assert!(comp.len() < data.len(), "the fixture must really be deflated");
+        let vfs = read_zip(&z).expect("read a hand-deflated archive");
+        assert_eq!(vfs.read("hand-rezipped.bin").unwrap(), data);
+    }
+
+    #[test]
+    fn the_entry_checksum_is_the_one_archivers_verify() {
+        // A wrong CRC does not make a slightly-off archive, it makes one every tool
+        // refuses - so the value is pinned against the published check vector rather
+        // than against this implementation's own output.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
 
     #[test]
     fn reads_fixture_zip() {

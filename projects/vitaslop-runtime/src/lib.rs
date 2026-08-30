@@ -26,6 +26,7 @@ pub mod capture;
 /// the capture's do.
 pub use vitaslop_platform::fasthash;
 pub mod font;
+pub mod gamedata;
 pub mod host;
 pub mod ingest;
 pub mod link;

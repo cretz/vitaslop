@@ -1161,12 +1161,18 @@ pub struct FileTable {
     /// synthesized" (a plain readable regular file); present means the guest set it,
     /// and a later `sceIoGetstat` must report what was set.
     stats: std::collections::HashMap<String, FileStatOverride>,
+    /// Whether anything on a PERSISTED mount has changed since the flag was last
+    /// cleared - see [`FileTable::touch`]. This is the whole "does the save need
+    /// writing out?" question, answered by a bool rather than by hashing the save every
+    /// frame, and it is the reason a run that never writes costs a persistence layer
+    /// nothing at all.
+    dirty: bool,
 }
 
 /// The `sceIoChstat`-settable parts of a file's status. Each is `Option` because
 /// chstat takes a bit mask of WHICH fields to apply, so a call that sets only the
 /// times must not also reset the mode.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct FileStatOverride {
     pub mode: Option<u32>,
     pub attr: Option<u32>,
@@ -1186,6 +1192,9 @@ pub struct SaveDataStore {
     /// (mount name, slot id) -> the exact SceAppUtilSaveDataSlotParam bytes the title
     /// wrote at create/set time, echoed back verbatim on get.
     slots: std::collections::HashMap<(String, u32), Vec<u8>>,
+    /// Whether a slot changed since this was last cleared - the same "needs writing out"
+    /// flag `FileTable` carries, for the same reason. See [`FileTable::touch`].
+    dirty: bool,
 }
 
 impl SaveDataStore {
@@ -1199,14 +1208,34 @@ impl SaveDataStore {
     /// Store (create or overwrite) a slot's param blob.
     pub fn put(&mut self, mount: &str, slot_id: u32, param: Vec<u8>) {
         self.slots.insert(Self::key(mount, slot_id), param);
+        self.dirty = true;
     }
+
+    /// Every slot, ordered by (mount, id) so an export is a function of the state alone.
+    pub fn all(&self) -> Vec<(String, u32, Vec<u8>)> {
+        let mut out: Vec<(String, u32, Vec<u8>)> =
+            self.slots.iter().map(|((m, i), p)| (m.clone(), *i, p.clone())).collect();
+        out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        out
+    }
+    /// Whether a slot changed since [`clear_dirty`](Self::clear_dirty).
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
     /// The stored param blob for a slot, or `None` if it was never created.
     pub fn get(&self, mount: &str, slot_id: u32) -> Option<&[u8]> {
         self.slots.get(&Self::key(mount, slot_id)).map(Vec::as_slice)
     }
     /// Remove a slot; returns whether it existed.
     pub fn remove(&mut self, mount: &str, slot_id: u32) -> bool {
-        self.slots.remove(&Self::key(mount, slot_id)).is_some()
+        let had = self.slots.remove(&Self::key(mount, slot_id)).is_some();
+        self.dirty |= had;
+        had
     }
 }
 
@@ -1320,7 +1349,14 @@ fn strip_app0(path: &str) -> &str {
 /// card). A write-then-close on one of these is game-authored persistent state, so
 /// the egress ledger records it. `app0:` (read-only game data) never qualifies, and
 /// is stripped by `vfs_key` anyway.
-fn is_persisted_mount(key: &str) -> bool {
+///
+/// # This is also the boundary the game-data container is defined by
+/// [`crate::gamedata`] exports exactly the keys this answers `true` for, and REFUSES to
+/// import any other - which is what makes an imported container incapable of touching the
+/// installed title. Widening this widens both, so it is one definition on purpose: the
+/// set the ledger calls "the game persisted state" and the set that survives a reload are
+/// the same set, and a third spelling of it would eventually disagree with the other two.
+pub fn is_persisted_mount(key: &str) -> bool {
     key.starts_with("savedata") || key.starts_with("ux0:")
 }
 
@@ -1359,6 +1395,26 @@ impl FileTable {
             self.backed.insert(key, n);
         }
         self.backing = Some(backing);
+    }
+
+    /// Mark the persisted set as changed, if `key` is part of it.
+    ///
+    /// Called from every mutating path below. Gated on the mount so the ordinary case -
+    /// a title faulting one of its own read-only assets resident because it wrote to it -
+    /// does not make a save look dirty; only what [`crate::gamedata`] would export can.
+    fn touch(&mut self, key: &str) {
+        if is_persisted_mount(key) {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether anything exportable has changed since [`clear_dirty`](Self::clear_dirty).
+    fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 
     /// Whether `key` exists at all - resident or served by the backing.
@@ -1428,6 +1484,7 @@ impl FileTable {
         if !exists {
             if flags & SCE_O_CREAT != 0 {
                 self.files.insert(path.clone(), Vec::new());
+                self.touch(&path);
             } else {
                 return SCE_ERROR_ERRNO_ENOENT;
             }
@@ -1436,6 +1493,7 @@ impl FileTable {
             // just drop the backing's claim on the key and start empty.
             self.backed.remove(&path);
             self.files.insert(path.clone(), Vec::new());
+            self.touch(&path);
         }
 
         // Append seeks to end; every other open starts at the beginning.
@@ -1490,6 +1548,7 @@ impl FileTable {
             data.resize(end, 0);
         }
         data[offset as usize..end].copy_from_slice(bytes);
+        self.touch(&path);
         Some(bytes.len())
     }
 
@@ -1511,6 +1570,7 @@ impl FileTable {
         }
         data[cursor..end].copy_from_slice(bytes);
         self.open.get_mut(&fd)?.cursor = end;
+        self.touch(&path);
         Some(bytes.len())
     }
 
@@ -1677,6 +1737,7 @@ impl FileTable {
             return SCE_ERROR_ERRNO_EEXIST;
         }
         self.originals.insert(key.clone(), path.trim_end_matches('/').to_string());
+        self.touch(&key);
         self.dirs.insert(key);
         0
     }
@@ -1698,6 +1759,7 @@ impl FileTable {
         self.dirs.remove(&key);
         self.originals.remove(&key);
         self.stats.remove(&key);
+        self.touch(&key);
         0
     }
 
@@ -1718,6 +1780,7 @@ impl FileTable {
         self.backed.remove(&key);
         self.originals.remove(&key);
         self.stats.remove(&key);
+        self.touch(&key);
         0
     }
 
@@ -1752,8 +1815,13 @@ impl FileTable {
             self.originals.remove(&from);
             self.originals.insert(to.clone(), new_orig);
             if let Some(s) = self.stats.remove(&from) {
-                self.stats.insert(to, s);
+                self.stats.insert(to.clone(), s);
             }
+            // BOTH ends: a move OFF a persisted mount changes the save just as much as a
+            // move onto one, and marking only the destination would leave the departure
+            // unflushed.
+            self.touch(&from);
+            self.touch(&to);
             return 0;
         }
         if !self.is_dir(&from) {
@@ -1788,6 +1856,8 @@ impl FileTable {
             self.dirs.insert(rekey(&d));
         }
         self.originals.remove(&from);
+        self.touch(&from);
+        self.touch(&to);
         self.originals.insert(to, new_orig);
         0
     }
@@ -1801,6 +1871,7 @@ impl FileTable {
         if !self.has(&key) && !self.is_dir(&key) {
             return SCE_ERROR_ERRNO_ENOENT;
         }
+        self.touch(&key);
         let e = self.stats.entry(key).or_default();
         if over.mode.is_some() {
             e.mode = over.mode;
@@ -1848,6 +1919,76 @@ impl FileTable {
     fn size_of_fd(&self, fd: i32) -> Option<u64> {
         let of = self.open.get(&fd)?;
         self.byte_len(&of.path).map(|n| n as u64)
+    }
+
+    /// Everything on a persisted mount, for [`crate::gamedata`].
+    ///
+    /// RESIDENT files only, and that is the whole point rather than a shortcut: a backed
+    /// file is one the installed title shipped and this must never carry a byte of those.
+    /// A guest write faults its subject resident (see [`make_resident`](Self::make_resident)),
+    /// so anything the guest actually wrote IS here.
+    ///
+    /// Sorted, so two exports of an unchanged run are byte-identical.
+    fn collect_game_data(&self) -> crate::gamedata::GameData {
+        let mut out = crate::gamedata::GameData::default();
+        for (key, data) in &self.files {
+            if is_persisted_mount(key) {
+                out.files.push((key.clone(), data.clone()));
+            }
+        }
+        out.files.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dirs = self.dirs.iter().filter(|k| is_persisted_mount(k)).cloned().collect();
+        out.dirs.sort();
+        out.originals = self
+            .originals
+            .iter()
+            .filter(|(k, _)| is_persisted_mount(k))
+            .map(|(k, o)| (k.clone(), o.clone()))
+            .collect();
+        out.originals.sort();
+        out.stats = self
+            .stats
+            .iter()
+            .filter(|(k, _)| is_persisted_mount(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.stats.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Put a container's file half back. Keys are re-checked here even though
+    /// [`crate::gamedata::GameData::from_zip`] already refused everything else - this is
+    /// the function that actually touches the table, so it is the one that must hold the
+    /// invariant even if it is ever called from somewhere new.
+    ///
+    /// Inserts DIRECTLY rather than through `open`/`write`: going through the guest-facing
+    /// path would mark the table dirty and provoke a write-back of what was just read in.
+    fn restore_game_data(&mut self, data: &crate::gamedata::GameData) -> usize {
+        let mut n = 0;
+        for (key, bytes) in &data.files {
+            if !is_persisted_mount(key) {
+                continue;
+            }
+            self.backed.remove(key);
+            self.files.insert(key.clone(), bytes.clone());
+            n += 1;
+        }
+        for key in &data.dirs {
+            if is_persisted_mount(key) {
+                self.dirs.insert(key.clone());
+            }
+        }
+        for (key, orig) in &data.originals {
+            if is_persisted_mount(key) {
+                self.originals.insert(key.clone(), orig.clone());
+            }
+        }
+        for (key, over) in &data.stats {
+            if is_persisted_mount(key) {
+                self.stats.insert(key.clone(), over.clone());
+            }
+        }
+        n
     }
 }
 
@@ -3133,6 +3274,50 @@ impl TextureSnapshots {
         self.vertex_content_bytes += made.len();
         self.vertex_by_content.insert((made.len(), fp), made.clone());
         made
+    }
+
+    /// Read every bound stream and scatter its rows into the interleaved scratch. Returns
+    /// the scratch by value; the caller puts it back (see [`Self::interleave_scratch`]).
+    #[allow(clippy::too_many_arguments)]
+    fn gather_into_scratch(
+        &mut self,
+        ctx: &GuestCtx,
+        streams: &[VertexStreamInfo],
+        bound_streams: &[u32],
+        base: &[u32],
+        stride: u32,
+        first_vertex: u32,
+        vertex_count: u32,
+    ) -> Vec<u8> {
+        let mut vertices = std::mem::take(&mut self.interleave_scratch);
+        vertices.clear();
+        vertices.resize(vertex_count as usize * stride as usize, 0);
+        for (si, st) in streams.iter().enumerate() {
+            if st.stride == 0 {
+                continue;
+            }
+            let buf = bound_streams.get(si).copied().unwrap_or(0);
+            // A per-instance stream is stepped by instance, not by vertex, so instance 0
+            // reads row 0 for every vertex; a per-vertex stream's rows are contiguous.
+            // Either way this is ONE guest read, then a scatter into the interleaved buffer.
+            let (src, repeat) = if st.per_instance {
+                (ctx.read_bytes(buf, st.stride as usize), true)
+            } else {
+                let start = buf.wrapping_add(first_vertex * st.stride);
+                (ctx.read_bytes(start, (vertex_count * st.stride) as usize), false)
+            };
+            let row_len = st.stride as usize;
+            let dst_base = base.get(si).copied().unwrap_or(0) as usize;
+            for v in 0..vertex_count as usize {
+                let from = if repeat { 0 } else { v * row_len };
+                let Some(row) = src.get(from..from + row_len) else {
+                    break; // the guest buffer ended short of the indices; keep what we have
+                };
+                let dst = v * stride as usize + dst_base;
+                vertices[dst..dst + row_len].copy_from_slice(row);
+            }
+        }
+        vertices
     }
 
     fn get_or_read_vertices(&mut self, ctx: &GuestCtx, addr: u32, len: usize) -> Arc<[u8]> {
@@ -5559,7 +5744,16 @@ impl VitaState {
     pub fn remove_file(&mut self, path: &str) -> bool {
         let key = vfs_key(path);
         self.fs.originals.remove(&key);
-        self.fs.files.remove(&key).is_some()
+        let gone = self.fs.files.remove(&key).is_some();
+        // A DELETION is a change to the save, and it is the one that suffers most from
+        // being missed: an unwritten write is progress the guest can make again, while an
+        // unwritten delete leaves the old container on disk and the file the title just
+        // removed comes back at the next reload. `sceAppUtilSaveDataDataRemove` is the
+        // guest path here. Gated on the mount like every other site.
+        if gone {
+            self.fs.touch(&key);
+        }
+        gone
     }
 
     /// Total bytes the virtual filesystem holds under a mount (e.g. `savedata0:`),
@@ -5663,12 +5857,23 @@ impl VitaState {
 
     // --- SceIoFilemgr virtual filesystem ---
 
-    /// Preload a read-only file into the virtual filesystem before a run (e.g. a
-    /// title's data file). The guest can then `sceIoOpen`/`sceIoRead` it.
+    /// Put a whole file into the virtual filesystem at once. The guest can then
+    /// `sceIoOpen`/`sceIoRead` it.
+    ///
+    /// Two callers, and the second is why this marks the save dirty. The first is the
+    /// LOADER preloading a title's own read-only data before a run - `app0:`, which
+    /// [`is_persisted_mount`] rejects, so `touch` is a no-op there. The second is a
+    /// GUEST SAVE: `sceAppUtilSaveDataDataSave` writes a whole file per entry and lands
+    /// here, and that is the API a title's autosave uses rather than
+    /// `sceIoOpen`/`Write`/`Close`. Without the `touch` it wrote into the file table
+    /// while [`VitaState::game_data_dirty`] stayed false, so the container was never
+    /// written and the run's progress was gone at the next reload - the file was there,
+    /// the whole time, and nothing asked for it to be saved.
     pub fn add_file(&mut self, path: &str, bytes: Vec<u8>) {
         let key = vfs_key(path);
         self.fs.originals.insert(key.clone(), strip_app0(path).trim_start_matches('/').to_string());
-        self.fs.files.insert(key, bytes);
+        self.fs.files.insert(key.clone(), bytes);
+        self.fs.touch(&key);
     }
 
     /// Serve the guest's read-only files from `backing` instead of loading them.
@@ -5765,6 +5970,86 @@ impl VitaState {
             }
         }
         self.fs.close(fd)
+    }
+
+    /// Record a [`SaveWrite`](crate::capture::EgressKind::SaveWrite) for a file the guest
+    /// wrote WHOLE, rather than through `open`/`write`/`close`.
+    ///
+    /// `io_close` is the commit point for the descriptor path and cannot see this one:
+    /// `sceAppUtilSaveDataDataSave` hands over a buffer per file and never opens anything,
+    /// so a title whose autosave uses it wrote its progress with the ledger recording
+    /// nothing - and the ledger is what `@assert egress SaveWrite` reads, so a conformance
+    /// recipe for such a title could not assert that it saved at all.
+    ///
+    /// Gated on the mount, like every other exportable-state site: a title rewriting one of
+    /// its own shipped assets is not a save.
+    pub fn record_save_write(&mut self, path: &str) {
+        let key = vfs_key(path);
+        if !is_persisted_mount(&key) {
+            return;
+        }
+        let Some(data) = self.fs.files.get(&key) else { return };
+        let ev = crate::capture::EgressEvent {
+            frame: self.cur_frame,
+            kind: crate::capture::EgressKind::SaveWrite {
+                path: key,
+                bytes: data.len(),
+                ascii: crate::capture::ascii_preview(data, 96),
+            },
+        };
+        self.capture.egress.push(ev);
+    }
+
+    // --- the guest's own saved state ------------------------------------------
+
+    /// Whether the guest has changed anything that would survive a restart, since the
+    /// flag was last cleared. One bool over three stores, so a persistence layer can ask
+    /// every frame and pay nothing on the frames where the answer is no.
+    pub fn game_data_dirty(&self) -> bool {
+        self.fs.dirty() || self.savedata.dirty() || self.trophies.dirty()
+    }
+
+    /// Clear the flag - call after the container has actually been written out, never
+    /// before, or a flush that fails takes the record of the change with it.
+    pub fn clear_game_data_dirty(&mut self) {
+        self.fs.clear_dirty();
+        self.savedata.clear_dirty();
+        self.trophies.clear_dirty();
+    }
+
+    /// Everything this run has saved, as a portable container's worth of state.
+    ///
+    /// The installed title is NOT in here and cannot be: see
+    /// [`FileTable::collect_game_data`] and [`is_persisted_mount`].
+    pub fn game_data(&self) -> crate::gamedata::GameData {
+        let mut data = self.fs.collect_game_data();
+        data.slots = self.savedata.all();
+        data.trophies = self.trophies.all_unlocked();
+        data
+    }
+
+    /// Put a previously exported container back, BEFORE the guest runs.
+    ///
+    /// Returns a one-line report of what landed. Applying this to a running guest would
+    /// change files it may already hold descriptors on, so the caller is expected to do it
+    /// at setup; nothing here enforces that, because there is no point at which this crate
+    /// can tell.
+    pub fn restore_game_data(&mut self, data: &crate::gamedata::GameData) -> String {
+        let files = self.fs.restore_game_data(data);
+        for (mount, id, param) in &data.slots {
+            self.savedata.put(mount, *id, param.clone());
+        }
+        let trophies = self.trophies.restore_unlocked(&data.trophies);
+        // A restore is not a change TO be saved - what was just read in is already in the
+        // container it came from - so the dirty flags the puts above set are cleared here.
+        // Leaving them set would make the first tick of every run rewrite storage.
+        self.clear_game_data_dirty();
+        format!(
+            "restored {files} file(s) ({} bytes), {} dir(s), {} slot(s), {trophies} trophy/ies",
+            data.bytes(),
+            data.dirs.len(),
+            data.slots.len()
+        )
     }
 
     /// sceIoDopen: open a directory listing; a new fd or a negative errno.
@@ -10615,48 +10900,26 @@ impl VitaState {
                     (vertex_count * stride) as usize,
                 );
             }
-            // Built in a REUSED buffer, not a fresh one: this path runs for every draw of every
-            // frame on a title whose vertex programs are multi-stream, and the allocation alone
-            // was a measurable share of the draw handler. The result is interned below, so the
-            // scratch is never handed out.
-            let mut vertices = std::mem::take(&mut snapshots.interleave_scratch);
-            vertices.clear();
-            vertices.resize((vertex_count * stride) as usize, 0);
-            for (si, s) in streams.iter().enumerate() {
-                if s.stride == 0 {
-                    continue;
-                }
-                let buf = bound_streams.get(si).copied().unwrap_or(0);
-                // A per-instance stream is stepped by instance, not by vertex, so instance 0
-                // reads row 0 for every vertex; a per-vertex stream's rows are contiguous.
-                // Either way this is ONE guest read, then a scatter into the interleaved
-                // buffer.
-                let (src, repeat) = if s.per_instance {
-                    (ctx.read_bytes(buf, s.stride as usize), true)
-                } else {
-                    let start = buf.wrapping_add(first_vertex * s.stride);
-                    (ctx.read_bytes(start, (vertex_count * s.stride) as usize), false)
-                };
-                let row_len = s.stride as usize;
-                for v in 0..vertex_count as usize {
-                    let from = if repeat { 0 } else { v * row_len };
-                    let Some(row) = src.get(from..from + row_len) else {
-                        break; // the guest buffer ended short of the indices; keep what we have
-                    };
-                    let dst = v * stride as usize + base[si] as usize;
-                    vertices[dst..dst + row_len].copy_from_slice(row);
-                }
-            }
-            // >>> NOT SNAPSHOTTED - INTERNED, WHICH NEEDS NO KEY AT ALL.
-            //
-            // A snapshot here was rejected because the key would have to fold every stream's
-            // address, length and stride and its validity would rest on all of them at once.
-            // That argument is sound and this is not that: the rows are gathered exactly as
-            // before, from guest memory, every draw - nothing is skipped and no validity is
-            // assumed. Only the RESULT's identity is shared with the byte-identical buffer
-            // already held, so the caches downstream that key on identity can hit. See
-            // `intern_vertices`.
+            let _gather = crate::perf::scope(crate::perf::Phase::DrawVertexGather);
+            // >>> NOT SNAPSHOTTED, AND THAT WAS MEASURED RATHER THAN ASSUMED. A memo over this
+            // gather - the description stored and compared, validity an AND over one dirty-map
+            // question per stream - was written, proved correct on a real run, and REFUTED on
+            // cost: it hit almost never and cost 4 ms a window, because this title rebuilds its
+            // geometry into a ROTATING ARENA and the addresses are new every frame. That is the
+            // same property `vertex_by_content` exists for. The bytes here are genuinely new
+            // work every frame; the win is not in skipping them. See the 2026-08-30a notes.
+            let vertices = snapshots.gather_into_scratch(
+                ctx,
+                &streams,
+                &bound_streams,
+                &base,
+                stride,
+                first_vertex,
+                vertex_count,
+            );
             crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
+            // Only the RESULT's identity is shared with the byte-identical buffer already held,
+            // so the caches downstream that key on identity can hit. See `intern_vertices`.
             let interned = snapshots.intern_vertices(&vertices);
             snapshots.interleave_scratch = vertices;
             interned
@@ -15572,5 +15835,231 @@ mod filesystem_tests {
         assert_eq!(st.file_bytes("ux0:/save.bin"), Some(&[0, 0, 0, 0, 0, 0, b'A', b'B'][..]));
         // The cursor is untouched, so a sequential read still starts at 0.
         assert_eq!(st.io_read(fd, 2).as_deref(), Some(&[0, 0][..]));
+    }
+}
+
+#[cfg(test)]
+mod game_data_tests {
+    //! Persistence, through the guest-facing API rather than around it: a title writes a
+    //! save the way a title does (`sceIoOpen`/`sceIoWrite`/`sceIoClose`), the run is
+    //! exported to a container, a FRESH state imports it, and the title reads its save
+    //! back. That is the whole product claim, and none of it is provable from the pieces
+    //! alone - a collect that reads the right map and a restore that writes it can both be
+    //! right while the guest still sees nothing.
+    use super::*;
+    use crate::gamedata::GameData;
+    use crate::world::DeterministicWorld;
+
+    const CREAT_WRITE: u32 = SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC;
+
+    fn state() -> VitaState {
+        VitaState::new(0, 64, Box::new(DeterministicWorld::default()))
+    }
+
+    /// Write a whole file the way a guest does.
+    fn guest_write(st: &mut VitaState, path: &str, bytes: &[u8]) {
+        let fd = st.io_open(path, CREAT_WRITE);
+        assert!(fd > 0, "open {path} failed: {fd}");
+        assert_eq!(st.io_write(fd, bytes), Some(bytes.len()));
+        assert_eq!(st.io_close(fd), 0);
+    }
+
+    /// Read a whole file the way a guest does, or `None` if it is not there.
+    fn guest_read(st: &mut VitaState, path: &str) -> Option<Vec<u8>> {
+        let fd = st.io_open(path, SCE_O_RDONLY);
+        if fd < 0 {
+            return None;
+        }
+        let out = st.io_read(fd, 4096);
+        st.io_close(fd);
+        out
+    }
+
+    #[test]
+    fn a_save_survives_a_restart_through_the_container() {
+        let mut first = state();
+        guest_write(&mut first, "savedata0:/DATA.BIN", b"holes in one: 3");
+        first.savedata_slot_put("savedata0:", 1, vec![0xAB; 16]);
+        first.trophies.unlock("NPWR00001_00", 7, 0x1234);
+        let zip = first.game_data().to_zip("PCSA00000");
+
+        // A DIFFERENT state, as a reload is: nothing carried over but the container.
+        let mut second = state();
+        assert_eq!(guest_read(&mut second, "savedata0:/DATA.BIN"), None);
+        let (data, refused) = GameData::from_zip(&zip).expect("read the container");
+        assert!(refused.is_empty(), "{refused:?}");
+        second.restore_game_data(&data);
+
+        assert_eq!(guest_read(&mut second, "savedata0:/DATA.BIN").as_deref(), Some(&b"holes in one: 3"[..]));
+        assert_eq!(second.savedata_slot_get("savedata0:", 1), Some(vec![0xAB; 16]));
+        assert!(second.trophies.is_unlocked("NPWR00001_00", 7));
+        assert_eq!(second.trophies.unlocked_at("NPWR00001_00", 7), Some(0x1234));
+    }
+
+    #[test]
+    fn the_installed_title_is_never_in_the_container() {
+        // The guest writing over one of its OWN shipped assets makes that file resident,
+        // which is the one way game bytes could get into an export. They must not.
+        let mut st = state();
+        guest_write(&mut st, "app0:/data/level.gxt", b"not yours to carry");
+        guest_write(&mut st, "savedata0:/ok", b"mine");
+        let data = st.game_data();
+        assert_eq!(data.files.len(), 1);
+        assert_eq!(data.files[0].0, "savedata0:/ok");
+    }
+
+    #[test]
+    fn a_run_that_saves_nothing_is_never_dirty() {
+        // The flush check runs every tick, so "the guest did not save" has to be free and
+        // has to stay false - a persistence layer that rewrites storage on a run that
+        // never saved is a battery cost with no purpose.
+        let mut st = state();
+        assert!(!st.game_data_dirty());
+        guest_write(&mut st, "app0:/data/level.gxt", b"an asset, not a save");
+        assert!(!st.game_data_dirty(), "writing a game asset is not saved state");
+        assert!(guest_read(&mut st, "app0:/data/level.gxt").is_some());
+        assert!(!st.game_data_dirty(), "reading is not saving");
+    }
+
+    #[test]
+    fn every_way_a_guest_changes_its_save_raises_the_flag() {
+        // One missed site here is a save that is silently never written out, which the
+        // user discovers as lost progress - so each mutating call is checked by name.
+        //
+        // >>> THE LIST IS OVER MUTATING PATHS, NOT OVER THE `sceIo*` API, and getting that
+        // wrong is how two sites were missed for real. The first version of this test
+        // enumerated the file-descriptor calls, which felt exhaustive and was not: a title
+        // whose autosave goes through `sceAppUtilSaveDataDataSave` never opens a descriptor
+        // at all, and it wrote 806 KB into the file table every boot with the flag reading
+        // false and the container never written. Its delete counterpart was missed the same
+        // way. So the question to ask of a new entry is not "is there a call for it" but
+        // "can this reach `fs.files`, `fs.dirs`, `fs.stats`, the savedata slots or the
+        // trophy ledger" - and every path that can, ends at `FileTable::touch`.
+        let each: Vec<(&str, Box<dyn Fn(&mut VitaState)>)> = vec![
+            ("write", Box::new(|st: &mut VitaState| guest_write(st, "savedata0:/a", b"x"))),
+            ("mkdir", Box::new(|st: &mut VitaState| assert_eq!(st.io_mkdir("savedata0:/d"), 0))),
+            (
+                "pwrite",
+                Box::new(|st: &mut VitaState| {
+                    let fd = st.io_open("savedata0:/p", CREAT_WRITE);
+                    assert_eq!(st.io_pwrite(fd, 4, b"z"), Some(1));
+                    st.io_close(fd);
+                }),
+            ),
+            (
+                "remove",
+                Box::new(|st: &mut VitaState| {
+                    guest_write(st, "savedata0:/gone", b"x");
+                    st.clear_game_data_dirty();
+                    assert_eq!(st.io_remove("savedata0:/gone"), 0);
+                }),
+            ),
+            (
+                "rename",
+                Box::new(|st: &mut VitaState| {
+                    guest_write(st, "savedata0:/from", b"x");
+                    st.clear_game_data_dirty();
+                    assert_eq!(st.io_rename("savedata0:/from", "savedata0:/to"), 0);
+                }),
+            ),
+            (
+                "chstat",
+                Box::new(|st: &mut VitaState| {
+                    guest_write(st, "savedata0:/s", b"x");
+                    st.clear_game_data_dirty();
+                    let over = FileStatOverride { mode: Some(0x21b6), ..Default::default() };
+                    assert_eq!(st.io_chstat("savedata0:/s", over), 0);
+                }),
+            ),
+            (
+                "slot",
+                Box::new(|st: &mut VitaState| st.savedata_slot_put("savedata0:", 0, vec![1])),
+            ),
+            // The ninth site, and the one that was missed: `sceAppUtilSaveDataDataSave`
+            // writes a whole file per entry through `add_file`, NOT through
+            // `open`/`write`/`close`. A title whose autosave uses that API - which is the
+            // common shape - saved into the file table with the flag still false, so
+            // nothing ever wrote the container. The path is the real autosave's.
+            (
+                "apputil savedata save",
+                Box::new(|st: &mut VitaState| {
+                    st.add_file("savedata0:/-AUTO-/DATA.BIN", b"progress".to_vec())
+                }),
+            ),
+            // And its counterpart, `sceAppUtilSaveDataDataRemove`. A missed DELETE is worse
+            // than a missed write: the stale container stays and the deletion is undone at
+            // the next load, so the title deletes the same save for ever.
+            (
+                "apputil savedata remove",
+                Box::new(|st: &mut VitaState| {
+                    st.add_file("savedata0:/gone.bin", b"x".to_vec());
+                    st.clear_game_data_dirty();
+                    assert!(st.remove_file("savedata0:/gone.bin"));
+                }),
+            ),
+            (
+                "trophy",
+                Box::new(|st: &mut VitaState| {
+                    st.trophies.unlock("NPWR00001_00", 1, 9);
+                }),
+            ),
+        ];
+        for (name, act) in each {
+            let mut st = state();
+            st.clear_game_data_dirty();
+            act(&mut st);
+            assert!(st.game_data_dirty(), "{name} left the save looking unchanged");
+        }
+    }
+
+    /// The whole-file save path end to end: what `sceAppUtilSaveDataDataSave` leaves
+    /// behind must both raise the flag AND survive the container - and the loader
+    /// preloading the title's own shipped assets through the same function must do
+    /// neither, or every run would flush on its first tick and carry game bytes.
+    #[test]
+    fn a_whole_file_save_survives_the_container_and_a_preload_does_not() {
+        let mut first = state();
+        first.add_file("app0:/usrdir/course.dat", vec![7; 16]);
+        assert!(!first.game_data_dirty(), "preloading a shipped asset is not a save");
+        first.add_file("savedata0:/-AUTO-/DATA.BIN", b"progress".to_vec());
+        assert!(first.game_data_dirty(), "a whole-file save left the save looking unchanged");
+
+        let (data, _) = GameData::from_zip(&first.game_data().to_zip("X")).expect("read");
+        assert_eq!(
+            data.files,
+            vec![("savedata0:/-auto-/data.bin".to_string(), b"progress".to_vec())],
+            "the container carries the save and nothing the title shipped",
+        );
+        let mut second = state();
+        second.restore_game_data(&data);
+        assert_eq!(second.read_file("savedata0:/-AUTO-/DATA.BIN").as_deref(), Some(&b"progress"[..]));
+    }
+
+    #[test]
+    fn a_restore_does_not_ask_to_be_saved_straight_back_out() {
+        let mut first = state();
+        guest_write(&mut first, "savedata0:/a", b"x");
+        let (data, _) = GameData::from_zip(&first.game_data().to_zip("X")).expect("read");
+        let mut second = state();
+        second.restore_game_data(&data);
+        assert!(!second.game_data_dirty());
+        // And what it restored is what a second export produces, byte for byte - so a
+        // reload cycle is a fixed point rather than something that drifts each run.
+        assert_eq!(second.game_data().to_zip("X"), first.game_data().to_zip("X"));
+    }
+
+    #[test]
+    fn a_restored_empty_directory_is_still_there() {
+        // A directory holding nothing is unrepresentable in a flat path map, so it is the
+        // piece of state most likely to be lost across a container - and a title that
+        // mkdirs its save folder before writing into it notices.
+        let mut first = state();
+        assert_eq!(first.io_mkdir("savedata0:/EMPTY"), 0);
+        let (data, _) = GameData::from_zip(&first.game_data().to_zip("X")).expect("read");
+        let mut second = state();
+        second.restore_game_data(&data);
+        assert!(second.io_is_dir("savedata0:/EMPTY"));
+        // ...under the spelling the title used, which is what its own globbing matches.
+        assert_eq!(second.io_mkdir("savedata0:/empty"), SCE_ERROR_ERRNO_EEXIST);
     }
 }

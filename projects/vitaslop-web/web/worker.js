@@ -18,8 +18,10 @@ import init, {
   worker_location_error,
   worker_location_unavailable,
   worker_location_note,
+  flush_game_data,
 } from "./pkg/vitaslop_web.js";
 import { openTitleSync, syncReader } from "./opfs.js";
+import * as gamedata from "./gamedata.js";
 
 // >>> THE SYSTEM FONT, IF THE DEPLOYMENT SUPPLIES ONE.
 //
@@ -122,6 +124,11 @@ globalThis.__vitaslopPanic = (text) => {
 // Start loading the wasm module immediately; the first message awaits it.
 const ready = init();
 
+// Where this run's saves go, once the start message names a title. Held at module scope so
+// the page's `flush-game-data` message can reach it - that arrives on the way out, long
+// after the start message has returned.
+let saveSink = null;
+
 // The live loop runs as a DETACHED future (`spawn_local`), so nothing it throws reaches
 // the try/catch around the start message - it surfaces as an unhandled rejection, or as a
 // worker-level error, and by default neither is reported anywhere. A worker that dies
@@ -191,6 +198,23 @@ self.onmessage = async (e) => {
     return;
   }
 
+  // >>> THE PAGE IS GOING AWAY: GET THE SAVE OUT NOW.
+  //
+  // The run writes the save on a 3-second floor, so a tab closed just after the guest saved
+  // would otherwise lose that write. `flush_game_data` returns the container only if there
+  // is something unwritten AND the guest is not mid-host-call, so this is a no-op on the
+  // common path and cannot block the worker on the way out.
+  if (d.type === "flush-game-data") {
+    if (!saveSink) return;
+    try {
+      const bytes = flush_game_data();
+      if (bytes) saveSink(bytes);
+    } catch (err) {
+      self.postMessage({ type: "error", message: `game data flush failed: ${err}` });
+    }
+    return;
+  }
+
   // Otherwise this is the start message:
   // { offscreen, titleId | files, recipe, maxFrames, knobs }.
   //
@@ -221,6 +245,31 @@ self.onmessage = async (e) => {
     } else {
       throw new Error("start message names neither titleId (OPFS) nor files (in-memory)");
     }
+    // >>> THE GUEST'S OWN SAVED STATE, READ BACK BEFORE IT RUNS.
+    //
+    // Read here, asynchronously, for the same reason the title's handles are opened here:
+    // by the time guest code executes there is no await left to take. The emulator is
+    // handed the bytes and hands back new ones; only this file knows where they live
+    // (`gamedata/<titleId>/`, which is not where the title lives - see gamedata.js).
+    //
+    // Only for an OPFS run. The in-memory `files` path is the e2e fixture path and has no
+    // title id to key storage by, so it plays without persistence rather than guessing one.
+    let persist;
+    if (titleId) {
+      const stored = await gamedata.read(titleId);
+      if (stored) console.log(`[gamedata] restoring ${stored.length} bytes for ${titleId}`);
+      saveSink = gamedata.sink(titleId, (err) => {
+        // The emulator reports the failure on the diagnostics panel; this reaches the page's
+        // status line as well, because losing progress is not a console-only event.
+        self.postMessage({
+          type: "error",
+          message:
+            `this title's save could not be written to this browser's storage (${err}). ` +
+            `Play continues, but progress from here will be lost when the tab closes.`,
+        });
+      });
+      persist = { data: stored ?? null, save: saveSink, titleId };
+    }
     // `prebuilt` is the module the throwaway transpile worker already produced. Running
     // against it keeps this worker's heap at the mounted-and-linked size (~24 MB) instead
     // of the transpiled size (~487 MB) it could never give back.
@@ -231,7 +280,8 @@ self.onmessage = async (e) => {
       maxFrames,
       report,
       prebuilt ?? undefined,
-      audioRing ?? undefined
+      audioRing ?? undefined,
+      persist
     );
     self.postMessage({ type: "setup", status });
   } catch (err) {

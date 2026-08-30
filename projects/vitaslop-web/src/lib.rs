@@ -2817,6 +2817,106 @@ pub fn set_system_font(bytes: &[u8]) {
 /// Note: instantiating the title's (large) transpiled module synchronously mid-run
 /// needs the `WebAssemblyUnlimitedSyncCompilation` flag on the main thread; the worker
 /// entry ([`run_game_worker`]) is the flag-free production home.
+// ===========================================================================
+// THE GUEST'S OWN SAVED STATE
+// ===========================================================================
+//
+// >>> THE EMULATOR NEVER TOUCHES STORAGE HERE. It produces a container's bytes and
+// consumes them, and JS puts them somewhere (`web/gamedata.js`, an OPFS directory that is
+// not the one the title lives in). That split is deliberate: writing a save is
+// ASYNCHRONOUS in a browser, and a guest frame cannot await, so the only way the two can
+// meet is for the frame to hand over finished bytes and let the event loop do the rest.
+//
+// It also means the rule about WHAT may be persisted lives in exactly one place -
+// `vitaslop_runtime::gamedata`, which refuses anything that is not on the guest's writable
+// mounts - rather than being restated in JS where it could drift away from the Rust.
+
+/// How the run reaches the page's storage: what to restore before the guest starts, and
+/// where to hand each later export.
+struct Persist {
+    /// The container stored for this title, if there is one.
+    restore: Option<Vec<u8>>,
+    /// Called with a `Uint8Array` of the whole container whenever the save has changed.
+    /// The JS side owns the write, including coalescing writes that arrive while one is
+    /// still in flight.
+    save: Option<js_sys::Function>,
+    /// The title id, for the container's README only.
+    title: String,
+}
+
+impl Persist {
+    /// Read the `{ data, save, titleId }` object the worker passes, or an empty one for a
+    /// run with no persistence (the main-thread page, the e2e fixtures).
+    fn from_js(v: &JsValue) -> Persist {
+        if v.is_undefined() || v.is_null() {
+            return Persist { restore: None, save: None, title: String::new() };
+        }
+        let get = |k: &str| js_sys::Reflect::get(v, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+        let data = get("data");
+        let restore = (!data.is_undefined() && !data.is_null())
+            .then(|| js_sys::Uint8Array::new(&data).to_vec());
+        let save = get("save").dyn_into::<js_sys::Function>().ok();
+        let title = get("titleId").as_string().unwrap_or_default();
+        Persist { restore, save, title }
+    }
+}
+
+// The live run's host, kept so an out-of-band flush (the page going away) can reach it.
+//
+// A `try_lock`, never a `lock`: the guest can be suspended inside a host call with the
+// mutex held, and a page-hide handler that BLOCKED there would hang the worker on the way
+// out. A refused flush is at worst the last few seconds of play, and it says so.
+thread_local! {
+    static PERSIST_HOST: RefCell<Option<Arc<Mutex<VitaEnv>>>> = const { RefCell::new(None) };
+    static PERSIST_TITLE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Export the run's game data RIGHT NOW, for the page to write before it goes away.
+/// Returns the container as a `Uint8Array`, or `null` when there is no run, nothing has
+/// changed, or the guest is mid-host-call and the host cannot be borrowed.
+#[wasm_bindgen]
+pub fn flush_game_data() -> JsValue {
+    let title = PERSIST_TITLE.with(|t| t.borrow().clone());
+    PERSIST_HOST.with(|h| {
+        let borrowed = h.borrow();
+        let Some(host) = borrowed.as_ref() else { return JsValue::NULL };
+        let Ok(mut guard) = host.try_lock() else {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "[gamedata] could not flush now - the guest is inside a host call. The last \
+                 periodic flush stands; nothing is lost beyond what was saved since it.",
+            ));
+            return JsValue::NULL;
+        };
+        if !guard.state.game_data_dirty() {
+            return JsValue::NULL;
+        }
+        let bytes = guard.state.game_data().to_zip(&title);
+        guard.state.clear_game_data_dirty();
+        js_sys::Uint8Array::from(&bytes[..]).into()
+    })
+}
+
+/// Describe a container without running anything, for the page's upload confirmation.
+///
+/// The point is that the answer comes from the SAME parser the run uses, refusals and all,
+/// so what the user is told at upload time is what will actually be restored. A second
+/// implementation in JS would eventually say something the run does not do.
+#[wasm_bindgen]
+pub fn game_data_describe(zip: &[u8]) -> Result<String, JsValue> {
+    let (data, refused) = vitaslop_runtime::gamedata::GameData::from_zip(zip)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let mut out = data.summary();
+    if !refused.is_empty() {
+        out.push_str(&format!(
+            " - and {} entr(y/ies) that name something outside the guest's saved state, \
+             which will be REFUSED: {}",
+            refused.len(),
+            refused.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
 #[wasm_bindgen]
 pub async fn run_game(
     canvas: JsValue,
@@ -2845,12 +2945,18 @@ pub async fn run_game(
 
     let status = setup.status("main thread");
     web_sys::console::log_1(&JsValue::from_str(&status));
+    // NO PERSISTENCE ON THIS PATH, deliberately. This is the harness page (`game.html`),
+    // which is handed a file map rather than a stored title and so has no title id to key
+    // a save by - and a scripted boot that silently wrote a save would make the NEXT run of
+    // the same fixture start from a different state, which is the one thing a boot probe
+    // must not do. The product path is `run_game_worker`.
     wasm_bindgen_futures::spawn_local(live_loop(
         setup.sched,
         playback,
         report,
         max_frames as u64,
         setup.recipe,
+        None,
     ));
     Ok(status)
 }
@@ -2872,6 +2978,7 @@ pub async fn run_game_worker(
     report_fn: js_sys::Function,
     prebuilt: JsValue,
     audio_ring: JsValue,
+    persist: JsValue,
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
     logging::init();
@@ -2896,6 +3003,48 @@ pub async fn run_game_worker(
     let setup =
         setup_game(files, &recipe, live, Prebuilt::from_js(&prebuilt)?, &audio_ring).await?;
 
+    // >>> THE SAVE GOES BACK IN BEFORE THE GUEST RUNS, AND THERE IS NO SECOND CHANCE.
+    //
+    // `setup_game` mounts, links and compiles; no guest instruction has executed yet, and
+    // the title's first frame is where it opens its savedata. Restoring any later would
+    // hand a running title a filesystem that changed under descriptors it already holds.
+    let persist = Persist::from_js(&persist);
+    if let Some(bytes) = persist.restore.as_ref() {
+        match vitaslop_runtime::gamedata::GameData::from_zip(bytes) {
+            Ok((data, refused)) => {
+                let report = setup.sched.host.lock().unwrap().state.restore_game_data(&data);
+                web_sys::console::log_1(&JsValue::from_str(&format!("[gamedata] {report}")));
+                if !refused.is_empty() {
+                    // Loud, not swallowed: an entry outside the guest's own saved state is
+                    // either a corrupted container or one that was built to reach the
+                    // installed title, and both are worth saying out loud.
+                    tracing::warn!(
+                        target: "vitaslop::gamedata",
+                        refused = refused.len(),
+                        first = refused[0].as_str(),
+                        "this title's stored game data names path(s) outside the guest's own \
+                         saved state. They were REFUSED - nothing outside a savedata mount \
+                         is ever written - and the rest of the container was restored."
+                    );
+                }
+            }
+            // A save that will not parse must not take the run down: the title boots with a
+            // fresh profile, which is what a console does with a corrupt save, and the
+            // reason is on the page rather than in a console nobody is holding.
+            Err(e) => tracing::warn!(
+                target: "vitaslop::gamedata",
+                error = %e,
+                "this title's stored game data could not be read, so the run starts with \
+                 NOTHING restored. The stored container is left alone - download it from \
+                 the launcher if you want to keep it - and this run will overwrite it when \
+                 the title next saves."
+            ),
+        }
+    }
+    // Reachable from `flush_game_data`, for the flush the page asks for on its way out.
+    PERSIST_HOST.with(|h| *h.borrow_mut() = Some(setup.sched.host.clone()));
+    PERSIST_TITLE.with(|t| *t.borrow_mut() = persist.title.clone());
+
     let offscreen: web_sys::OffscreenCanvas = offscreen.dyn_into()?;
     offscreen.set_width(WIDTH);
     offscreen.set_height(HEIGHT);
@@ -2911,6 +3060,7 @@ pub async fn run_game_worker(
         report,
         max_frames as u64,
         setup.recipe,
+        Some(persist),
     ));
     Ok(status)
 }
@@ -2942,6 +3092,7 @@ async fn live_loop(
     report: Report,
     max_frames: u64,
     recipe: Option<vitaslop_runtime::recipe::Recipe>,
+    persist: Option<Persist>,
 ) {
     let mut eval = recipe.as_ref().map(|r| vitaslop_runtime::recipe_eval::RecipeEval::new(r, None));
     // >>> ONLY FOLD THE DETERMINISM SIGNATURE WHEN SOMETHING WILL READ IT.
@@ -3098,6 +3249,24 @@ async fn live_loop(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(5_000.0);
+
+    // >>> THE GAME'S OWN SAVE, WRITTEN OUT WHILE IT PLAYS.
+    //
+    // Checked once a tick and answered by ONE BOOL on a run that is not saving (see
+    // `VitaState::game_data_dirty`), so a title that never writes pays a comparison per
+    // frame and nothing else.
+    //
+    // The interval is a floor on how often the container is REBUILT, not a delay before
+    // the first write: a title that saves and is closed a second later loses nothing,
+    // because the page flushes on its way out too. What it bounds is a title that rewrites
+    // its save every frame - an autosave in a menu loop is exactly that - turning every
+    // frame into a zip.
+    const SAVE_MIN_MS: f64 = 3_000.0;
+    let mut last_save_at = f64::NEG_INFINITY;
+    let mut saves = 0u32;
+    let mut save_ms = 0.0f64;
+    let mut save_bytes = 0usize;
+    let mut save_error: Option<String> = None;
 
     let now = || perf.as_ref().map(|p| p.now()).unwrap_or(0.0);
     let mut acc = 0.0f64;
@@ -3687,6 +3856,54 @@ async fn live_loop(
         // Present at most one (the newest) frame per tick, and fold its render time into
         // the rolling perf report.
         //
+        // >>> WRITE THE SAVE OUT, IF THE GUEST CHANGED IT.
+        //
+        // Here rather than inside the frame loop: this is a point where no lock is held and
+        // the guest is between frames, so the export sees a filesystem no host call is
+        // half-way through changing. Skipped during a fast-forward, which is not play and
+        // whose whole point is to reach a later frame quickly.
+        if let Some(p) = persist.as_ref().filter(|p| p.save.is_some() && !fast) {
+            if t - last_save_at >= SAVE_MIN_MS {
+                let dirty = { sched.host.lock().unwrap().state.game_data_dirty() };
+                if dirty {
+                    last_save_at = t;
+                    let s0 = now();
+                    let bytes = {
+                        let mut host = sched.host.lock().unwrap();
+                        let zip = host.state.game_data().to_zip(&p.title);
+                        // Cleared once the bytes EXIST, not once JS has stored them: the flag
+                        // records that the guest changed something, and this container now
+                        // holds that change whatever happens to it downstream.
+                        host.state.clear_game_data_dirty();
+                        zip
+                    };
+                    let arr = js_sys::Uint8Array::from(&bytes[..]);
+                    match p.save.as_ref().expect("filtered above").call1(&JsValue::UNDEFINED, &arr) {
+                        Ok(_) => {
+                            saves += 1;
+                            save_bytes = bytes.len();
+                            save_ms += now() - s0;
+                        }
+                        // A storage failure is the one thing in this loop the user MUST be
+                        // told about - it is their progress - and it is otherwise completely
+                        // silent (a full quota, an evicted origin). It goes to the panel as
+                        // well as the console, because a phone has no console.
+                        Err(e) => {
+                            let text = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+                            tracing::error!(
+                                target: "vitaslop::gamedata",
+                                error = %text,
+                                "THIS TITLE'S SAVE COULD NOT BE WRITTEN TO THIS BROWSER'S \
+                                 STORAGE. Play continues, but progress from here will be \
+                                 lost when the tab closes."
+                            );
+                            save_error = Some(text);
+                        }
+                    }
+                }
+            }
+        }
+
         // NOT while fast-forwarding: nobody is watching a fast-forward, and every present
         // is a full GXM->WebGPU encode of a scene that is discarded a moment later. It is
         // pure cost on the one path whose entire purpose is to reach a later frame
@@ -3987,6 +4204,32 @@ async fn live_loop(
                     if !spaces.is_empty() {
                         line(&mut diag, "GUEST HEAPS", &spaces.join("\n"));
                     }
+                }
+                // >>> WHETHER THE SAVE IS ACTUALLY REACHING STORAGE.
+                //
+                // "did my progress get kept?" cannot be answered by looking at the screen,
+                // and it is answered wrongly by silence - which is what this said before it
+                // existed. A count, the container's size and what each rebuild cost the
+                // frame, so a save that is written is visible and one that FAILED says so
+                // in the panel the user can copy.
+                if persist.is_some() {
+                    let text = match &save_error {
+                        Some(e) => format!(
+                            "WRITING THIS TITLE'S SAVE TO THIS BROWSER FAILED: {e}. Progress \
+                             from here will be lost when the tab closes. {saves} write(s) \
+                             succeeded before that."
+                        ),
+                        None if saves == 0 => "the game has not saved anything this run \
+                             (nothing to write - this is normal until it does)"
+                            .to_string(),
+                        None => format!(
+                            "{saves} write(s), container now {:.1} KB, {:.1} ms of frame time \
+                             spent building them in total",
+                            save_bytes as f64 / 1024.0,
+                            save_ms
+                        ),
+                    };
+                    line(&mut diag, "GAME DATA (the guest's own save)", &text);
                 }
                 // >>> WHERE THE IDLE CLOCK WENT, BY (wait kind, thread) - the instrument
                 // that names a PARKED thread. It found the display-wait double-charge on

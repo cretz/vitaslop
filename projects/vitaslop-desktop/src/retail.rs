@@ -203,6 +203,11 @@ pub struct RetailGuest {
     /// read as a clock pathology and worked around three times before anyone asked what
     /// actually ended it.
     ended_by: Option<String>,
+    /// The guest's own saved state on disk, when the caller asked for it with
+    /// [`persist_to`](RetailGuest::persist_to). `None` means this run does not persist -
+    /// which is the default, because a measurement run must not silently start from a
+    /// different saved state than the run it is compared against.
+    save: Option<vitaslop_native::SaveStore>,
     /// Decrypt + link + transpile + instantiate time, measured once at construction.
     pub build_ms: f64,
 }
@@ -267,7 +272,53 @@ impl RetailGuest {
             .capture
             .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, ended_by: None, build_ms })
+        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms })
+    }
+
+    /// Keep this title's saved state under `root`, and put back whatever a previous run
+    /// left there.
+    ///
+    /// >>> CALL BEFORE THE FIRST [`advance`](RetailGuest::advance), and nothing here can
+    /// check that you did. Restoring replaces files the title may already hold open
+    /// descriptors on, so doing it mid-run corrupts exactly the state it is trying to keep.
+    /// Construction has just returned and the guest has not been stepped, which is why this
+    /// is a separate call taken immediately rather than a fourth argument to `new`.
+    pub fn persist_to(&mut self, root: &Path, game_dir: &Path) -> Result<(), String> {
+        // Asked of the container, not of the path - see `SaveStore::title_for`.
+        let sfo = self.sched.host().state.read_file("app0:/sce_sys/param.sfo");
+        let (title, from_container) =
+            vitaslop_native::SaveStore::title_for(&game_dir.to_string_lossy(), sfo.as_deref());
+        if !from_container {
+            println!(
+                "[gamedata] this container names no title id; saves are filed under {title:?}                  (its directory name), which another title extracted the same way would share"
+            );
+        }
+        let mut store = vitaslop_native::SaveStore::new(root, &title);
+        match store.restore(&mut self.sched.host().state) {
+            Ok(Some(report)) => println!("[gamedata] restored from {}: {report}", store.path().display()),
+            Ok(None) => println!("[gamedata] no saved state at {} yet", store.path().display()),
+            // A container that exists and does not parse fails the run. Starting fresh over
+            // the top of it is how a save gets silently played past and then overwritten.
+            Err(e) => return Err(format!("game data: {e}")),
+        }
+        self.save = Some(store);
+        Ok(())
+    }
+
+    /// Write the guest's saved state out if it has changed. `force` skips the rate floor;
+    /// take it at the end of a run, or the last few seconds of play are lost every time.
+    ///
+    /// A failure is REPORTED and the run continues: the state is still in memory and the
+    /// next attempt three seconds later may well succeed, whereas ending a session over a
+    /// transient write error throws away the very thing being saved. It repeats until it
+    /// works or the run ends, so it cannot go unnoticed.
+    pub fn flush_save(&mut self, force: bool) {
+        let Some(store) = self.save.as_mut() else { return };
+        match store.flush(&mut self.sched.host().state, force) {
+            Ok(Some(n)) => println!("[gamedata] wrote {n} bytes to {}", store.path().display()),
+            Ok(None) => {}
+            Err(e) => eprintln!("[gamedata] WRITING {} FAILED: {e}", store.path().display()),
+        }
     }
 
     /// Step the guest one display frame. Keeps the newest captured scene and drops the
@@ -321,6 +372,10 @@ impl RetailGuest {
                 self.ended_by = Some(format!("{other:?}"));
             }
         }
+        // The frame that ENDS the run is the one whose save would otherwise be lost, so it
+        // is written past the rate floor. Every other frame pays one bool.
+        let ending = self.finished;
+        self.flush_save(ending);
     }
 
     /// The guest's OWN diagnostic output: everything it has written to fd 1/2 this run.
@@ -928,6 +983,10 @@ pub fn headless_check(
     // used to be parsed by `main` and then never passed, which is silent and unfalsifiable
     // (see the comment at its parse site).
     flag_recipe: Option<String>,
+    // `--save-dir <root>`: keep the guest's own saved state across runs, under
+    // `<root>/<title>/`. OFF by default here on purpose - a headless run is the render and
+    // timing oracle, and a save read back in changes what the title draws.
+    save_dir: Option<PathBuf>,
 ) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
     let env_recipe = std::env::var("VITASLOP_HEADLESS_RECIPE")
@@ -950,6 +1009,9 @@ pub fn headless_check(
         if recipe.is_some() { "a RECIPE" } else { "the built-in tap script (no recipe given)" }
     );
     let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    if let Some(root) = save_dir.as_deref() {
+        guest.persist_to(root, &dir)?;
+    }
     let target: u64 = std::env::var("VITASLOP_HEADLESS_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1397,9 +1459,12 @@ pub fn headless_check(
 /// Run the retail title in `dir` in a live window until the window closes or the guest
 /// exits. Blocks until the event loop ends. With `recipe` set, a scripted playthrough
 /// replays in the window (live keyboard/mouse still nudges it).
-pub fn run(dir: PathBuf, recipe: Option<String>) -> Result<(), String> {
+pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> Result<(), String> {
     let input: SharedInput = Arc::new(Mutex::new(DesktopInput::default()));
-    let guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    let mut guest = RetailGuest::new(&dir, input.clone(), recipe.as_deref())?;
+    if let Some(root) = save_dir.as_deref() {
+        guest.persist_to(root, &dir)?;
+    }
     println!("loaded {} (decrypt + link + transpile {:.0} ms)", dir.display(), guest.build_ms);
     if recipe.is_some() {
         println!("replaying scripted recipe (keyboard/mouse still nudge live)");
@@ -1430,7 +1495,12 @@ pub fn run(dir: PathBuf, recipe: Option<String>) -> Result<(), String> {
         guest_fps: 0.0,
         reported_exit: false,
     };
-    event_loop.run_app(&mut app).map_err(|e| format!("run event loop: {e}"))?;
+    let ended = event_loop.run_app(&mut app);
+    // The window closing is the OTHER way a session ends, and `advance` never sees it -
+    // the guest is still running, so nothing forced a write. Without this, quitting a
+    // session throws away everything saved since the last three-second flush.
+    app.guest.flush_save(true);
+    ended.map_err(|e| format!("run event loop: {e}"))?;
     Ok(())
 }
 

@@ -3207,6 +3207,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// `rtt_rendered` at the top of each frame; `rtt_cubes` itself is NOT, because the
         /// texture has to survive the frames between the guest's refreshes.
         cubes_done: HashSet<u32>,
+        /// The target `report_world_not_on_display` found orphaned on the PREVIOUS frame, so
+        /// it can require the same answer twice before reporting. See that function for why
+        /// one frame is not enough to ask the question on.
+        orphan_candidate: Option<u32>,
         /// Addresses whose entry in `rtt_rendered` is currently the snapshot rather than
         /// the live target (the pass being encoded draws into that address).
         rtt_reads_snapshot: HashSet<u32>,
@@ -3930,20 +3934,42 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // from their renders at all: face 5 of PCSA00009's environment cube carries 356 draws,
         // the most of any pass in the frame, and only face 0 shares the cube's address.
         cube_faces: &HashSet<u32>,
+        // The answer this function reached on the PREVIOUS frame, and it is load-bearing.
+        // `cube_faces` comes from `rtt_cubes`, which is filled BETWEEN passes - i.e. after
+        // this runs - so on the first frame of a scene it is empty and every cube face looks
+        // orphaned. This report fires once and never again, so firing it there pins a false
+        // alarm for the whole run: PCSA00009's course reported its 423-draw environment-cube
+        // face as "MISSING from the picture" in the same dump whose next line assembled that
+        // cube. Requiring the same address twice costs one frame of latency and closes the
+        // window, because a cube known on frame N is known on every frame after it.
+        previous: &mut Option<u32>,
     ) {
         use std::sync::atomic::{AtomicBool, Ordering};
         static REPORTED: AtomicBool = AtomicBool::new(false);
         // NOT named `display`: `tracing`'s macros bring their own `display()` helper into
         // scope, so a local of that name is shadowed inside the format string and the error
         // it produces names a trait bound, not a shadowing.
-        let Some(display_addr) = display else { return };
-        let Some(biggest) = scenes.iter().max_by_key(|s| s.draws.len()) else { return };
-        let Some(t) = biggest.target else { return };
+        let Some(display_addr) = display else {
+            *previous = None;
+            return;
+        };
+        let Some(biggest) = scenes.iter().max_by_key(|s| s.draws.len()) else {
+            *previous = None;
+            return;
+        };
+        let Some(t) = biggest.target else {
+            *previous = None;
+            return;
+        };
         if t.data_addr == display_addr
             || sampled.contains(&t.data_addr)
             || cube_faces.contains(&t.data_addr)
             || biggest.draws.len() < 2
         {
+            *previous = None;
+            return;
+        }
+        if previous.replace(t.data_addr) != Some(t.data_addr) {
             return;
         }
         if REPORTED.swap(true, Ordering::Relaxed) {
@@ -10981,6 +11007,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 display_images: HashMap::default(),
                 rtt_binds: HashMap::default(),
                 rtt_cubes: HashMap::default(),
+                orphan_candidate: None,
                 cubes_done: HashSet::default(),
                 rtt_reads_snapshot: HashSet::default(),
                 rtt_depth_rendered: HashMap::default(),
@@ -12296,7 +12323,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 .iter()
                 .flat_map(|(base, c)| (0..CUBE_FACES).map(move |k| base.wrapping_add(c.stride * k)))
                 .collect();
-            report_world_not_on_display(scenes, display, &sampled, &cube_faces);
+            report_world_not_on_display(scenes, display, &sampled, &cube_faces, &mut self.orphan_candidate);
             let ss = self.ss_scale > 1;
             if ss {
                 self.ensure_ss_target(device, queue, surf_w, surf_h);

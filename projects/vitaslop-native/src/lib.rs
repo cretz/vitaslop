@@ -28,6 +28,12 @@ pub mod watchdog;
 
 pub mod perf;
 
+/// The disk backend for the guest's own saved state. The browser's is OPFS; both go
+/// through `vitaslop_runtime::gamedata`, which is the only thing that decides what a save
+/// contains.
+pub mod gamedata_disk;
+pub use gamedata_disk::SaveStore;
+
 pub mod recipe_runner;
 pub use recipe_runner::{boot_retail, run_recipe, RecipeReport, RunOpts};
 

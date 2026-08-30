@@ -32,6 +32,7 @@ pub mod pipeline;
 pub mod pkg;
 pub mod rif;
 pub mod self2elf;
+pub mod sfo;
 pub mod unicv;
 pub mod vfs;
 pub mod zip;

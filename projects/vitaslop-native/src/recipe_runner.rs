@@ -52,6 +52,12 @@ pub struct RunOpts {
     /// 4000-frame run of a real 3D title retaining all of them costs gigabytes.
     /// Raise it only for a tool that genuinely inspects a window of past frames.
     pub scene_limit: Option<usize>,
+    /// Where the guest's OWN saved state lives across runs, as
+    /// `<save_dir>/<game dir name>/gamedata.zip`. `None` = do not persist, which is what a
+    /// measurement or a determinism run wants: a save read back in changes what the title
+    /// does, so a run whose point is to be comparable to another must not silently start
+    /// from a different place than the run it is compared against.
+    pub save_dir: Option<PathBuf>,
 }
 
 impl Default for RunOpts {
@@ -65,6 +71,7 @@ impl Default for RunOpts {
             shot_dir: None,
             shot_every: None,
             scene_limit: Some(1),
+            save_dir: None,
         }
     }
 }
@@ -235,6 +242,31 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     let want_sig = recipe.meta.sig.is_some() || vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE");
     sched.host().state.capture.set_signature_wanted(want_sig);
 
+    // The guest's own saved state, BEFORE a single guest instruction runs: `restore_game_data`
+    // replaces files the title may otherwise already hold descriptors on. A container that
+    // exists but cannot be read fails the run rather than starting fresh over the top of it.
+    let mut save = opts.save_dir.as_deref().map(|root| {
+        // The title's OWN id, read out of the container it just booted from - the guest
+        // filesystem already holds it, so this costs nothing and no plumbing. See
+        // `SaveStore::title_for` for why the directory name will not do.
+        let sfo = sched.host().state.read_file("app0:/sce_sys/param.sfo");
+        let (title, from_container) =
+            crate::gamedata_disk::SaveStore::title_for(game_dir, sfo.as_deref());
+        if !from_container {
+            println!(
+                "[gamedata] this container names no title id; saves are filed under {title:?}                  (its directory name), which another title extracted the same way would share"
+            );
+        }
+        crate::gamedata_disk::SaveStore::new(root, &title)
+    });
+    if let Some(store) = save.as_mut() {
+        match store.restore(&mut sched.host().state) {
+            Ok(Some(report)) => println!("[gamedata] restored from {}: {report}", store.path().display()),
+            Ok(None) => println!("[gamedata] no saved state at {} yet", store.path().display()),
+            Err(e) => return Err(format!("game data: {e}")),
+        }
+    }
+
     // Auto-pick the observation start: full log when watching, else just before the
     // first assert/shot so a deep-level run does not step thousands of idle frames.
     let has_watch = !recipe.watches.is_empty();
@@ -346,9 +378,33 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
             }
         }
 
+        // Write the save out while the run is still going, on the same rate floor the
+        // browser uses. A run killed by `--max-frames`, a watchdog or the user then still
+        // has everything up to the last few seconds, instead of nothing.
+        if let Some(store) = save.as_mut() {
+            match store.flush(&mut sched.host().state, false) {
+                Ok(Some(n)) => println!("[gamedata] f{f}: wrote {n} bytes"),
+                Ok(None) => {}
+                Err(e) => return Err(format!("game data: writing {}: {e}", store.path().display())),
+            }
+        }
+
         // Stop early if the guest finished or trapped (not just a flip).
         if !matches!(last, RunReport::FramesReached(_)) {
             break;
+        }
+    }
+
+    // The commit point of the run. Forced past the rate floor, because the alternative is
+    // losing whatever the title saved in the last three seconds of every run.
+    if let Some(store) = save.as_mut() {
+        match store.flush(&mut sched.host().state, true) {
+            Ok(Some(n)) => println!("[gamedata] wrote {n} bytes to {}", store.path().display()),
+            // NOT "the game saved nothing": the usual reason there is nothing left to write
+            // is that it was already written, seconds ago, by the in-run flush above.
+            Ok(None) if store.has_written() => println!("[gamedata] saved state is up to date at {}", store.path().display()),
+            Ok(None) => println!("[gamedata] the game saved nothing this run"),
+            Err(e) => return Err(format!("game data: writing {}: {e}", store.path().display())),
         }
     }
 

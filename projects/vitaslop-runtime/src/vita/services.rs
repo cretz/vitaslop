@@ -1096,6 +1096,11 @@ pub(super) fn apputil_savedata_data_save(
         }
         cur[offset as usize..end].copy_from_slice(&data);
         st.add_file(&full, cur);
+        // The egress ledger's commit point for THIS path. `io_close` cannot see it - nothing
+        // was ever opened - so without this a title that autosaves through this API persists
+        // state with the ledger reporting none, and `@assert egress SaveWrite` can never
+        // fire for it. See `VitaState::record_save_write`.
+        st.record_save_write(&full);
     }
     if !required_kib.is_null() {
         ctx.write_u32(required_kib.addr(), 0);

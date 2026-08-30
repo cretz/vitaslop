@@ -53,7 +53,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--game" || a == "-g") {
         let Some(dir) = args.get(i + 1).cloned() else {
-            eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>]");
+            eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>] [--save-dir <dir>]");
             std::process::exit(2);
         };
         // `--recipe <file>` replays a scripted TAS recipe. In the live window it drives input
@@ -80,15 +80,25 @@ fn main() {
         });
         // `--headless <dir>` validates the retail path without opening a window (drive
         // the tutorial + render one frame to a PNG); useful on a display-less box.
+        // `--save-dir <root>` keeps the guest's OWN saved state across runs, under
+        // `<root>/<title>/gamedata.zip` - the same container the browser stores in OPFS.
+        // Off unless asked for: a headless run is this project's render and timing oracle,
+        // and a title that starts from a save draws a different frame than one that does
+        // not, so persistence must never arrive by default in a measurement.
+        let save_dir = args
+            .iter()
+            .position(|a| a == "--save-dir")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
         let result = match args.iter().position(|a| a == "--headless") {
             Some(h) => match args.get(h + 1) {
-                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe),
+                Some(shot) => retail::headless_check(dir.into(), shot.into(), recipe, save_dir),
                 None => {
                     eprintln!("--headless requires a shot directory");
                     std::process::exit(2);
                 }
             },
-            None => retail::run(dir.into(), recipe),
+            None => retail::run(dir.into(), recipe, save_dir),
         };
         if let Err(e) = result {
             eprintln!("error: {e}");

@@ -58,6 +58,10 @@ fn main() -> ExitCode {
             "--game" => game = next(),
             "--recipe" => recipe_path = next(),
             "--shots" => shots = next().map(PathBuf::from),
+            // OFF unless asked for. A recipe run is normally a MEASUREMENT, and a save read
+            // back in changes what the title does - two runs meant to be compared must not
+            // silently start from different saved states. See `RunOpts::save_dir`.
+            "--save-dir" => opts.save_dir = next().map(PathBuf::from),
             "--max-frames" => opts.max_frames = next().and_then(|s| s.parse().ok()).unwrap_or(opts.max_frames),
             "--max-rounds" => opts.max_rounds = next().and_then(|s| s.parse().ok()).unwrap_or(opts.max_rounds),
             "--quantum-fuel" => {
@@ -73,7 +77,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-h" | "--help" => {
-                eprintln!("usage: play --game <dir> --recipe <file> [--shots <dir>] [--max-frames N] [--observe-from N]");
+                eprintln!("usage: play --game <dir> --recipe <file> [--shots <dir>] [--save-dir <dir>] [--max-frames N] [--observe-from N]");
                 return ExitCode::from(2);
             }
             other => {

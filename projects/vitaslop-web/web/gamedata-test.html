@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>vitaslop - game data storage test</title>
+  </head>
+  <body>
+    <pre id="out">ready</pre>
+    <script type="module">
+      // The page half of `e2e/gamedata.mjs`: the storage half of persistence, driven
+      // against a REAL origin private file system.
+      //
+      // It cannot be a cargo test. Everything under test here is browser storage - two
+      // OPFS trees and the promise that they do not touch each other - and there is no
+      // OPFS in a native test process. The Rust half (what may be inside a container, and
+      // what a restore does with it) is covered by `cargo test -p vitaslop-runtime`; this
+      // is the half that lives on the other side of the wasm boundary.
+      import * as gamedata from "./gamedata.js";
+      import { importTitle, isImported } from "./opfs.js";
+
+      const ID = "TESTGAME01";
+      const bytes = (n, seed) => Uint8Array.from({ length: n }, (_, i) => (i * 7 + seed) & 0xff);
+
+      window.__gameDataTest = async () => {
+        const out = {};
+
+        // Start from nothing, whatever a previous run left behind.
+        await gamedata.clear(ID);
+        out.emptyBefore = (await gamedata.info(ID)) === null && (await gamedata.read(ID)) === null;
+
+        // A title is imported the way the launcher imports one, so the two trees exist at
+        // the same time and the separation below is a real observation rather than a
+        // statement about an empty directory.
+        await importTitle(ID, [
+          { path: "sce_sys/param.sfo", source: async () => new Blob([bytes(64, 1)]) },
+          { path: "eboot.bin", source: async () => new Blob([bytes(2048, 2)]) },
+        ]);
+        out.titleImported = await isImported(ID, 2);
+
+        // Write, read back, overwrite, read back.
+        const first = bytes(1024, 3);
+        await gamedata.write(ID, first);
+        const readFirst = await gamedata.read(ID);
+        out.roundTrip =
+          readFirst.length === first.length && readFirst.every((b, i) => b === first[i]);
+        const info = await gamedata.info(ID);
+        out.info = { bytes: info && info.bytes, hasModified: !!(info && info.modified) };
+
+        // A SMALLER second container must not leave any of the first one behind - the
+        // failure mode of writing over a file in place rather than replacing it.
+        const second = bytes(64, 9);
+        await gamedata.write(ID, second);
+        const readSecond = await gamedata.read(ID);
+        out.overwrite =
+          readSecond.length === second.length && readSecond.every((b, i) => b === second[i]);
+
+        // >>> THE SEPARATION, WHICH IS THE POINT OF THE WHOLE DESIGN.
+        // Saving game data must not disturb the imported title, and clearing game data
+        // must not remove it either. If these ever come apart, a user clearing a save
+        // silently loses a gigabyte-long import.
+        out.titleSurvivedSave = await isImported(ID, 2);
+        const cleared = await gamedata.clear(ID);
+        out.cleared = cleared && (await gamedata.info(ID)) === null;
+        out.titleSurvivedClear = await isImported(ID, 2);
+
+        // ...and the converse: the game-data tree is not under the title's, so a look at
+        // the OPFS root shows two independent directories.
+        const root = await navigator.storage.getDirectory();
+        const top = [];
+        for await (const [name] of root.entries()) top.push(name);
+        out.topLevel = top.sort();
+
+        document.getElementById("out").textContent = JSON.stringify(out, null, 2);
+        return out;
+      };
+    </script>
+  </body>
+</html>

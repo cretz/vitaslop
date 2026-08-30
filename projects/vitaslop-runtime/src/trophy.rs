@@ -338,6 +338,10 @@ pub struct TrophyStore {
     /// was earned at. The tick is kept because `sceNpTrophyGetTrophyInfo` reports it, and
     /// a title that draws an earned-on date would otherwise get a zero.
     unlocked: std::collections::HashMap<String, std::collections::BTreeMap<u32, u64>>,
+    /// Whether the unlock ledger changed since this was last cleared. A trophy is state
+    /// the guest earned and expects to still hold next time it runs, so it rides in the
+    /// game-data container with the savedata - see [`crate::gamedata`].
+    dirty: bool,
 }
 
 impl TrophyStore {
@@ -390,9 +394,53 @@ impl TrophyStore {
             std::collections::btree_map::Entry::Occupied(_) => false,
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(tick);
+                self.dirty = true;
                 true
             }
         }
+    }
+
+    /// The whole unlock ledger, ordered by communication id so an export is a function of
+    /// the state alone (the ids within a set are already a `BTreeMap`, hence ordered).
+    pub fn all_unlocked(&self) -> Vec<(String, Vec<(u32, u64)>)> {
+        let mut out: Vec<(String, Vec<(u32, u64)>)> = self
+            .unlocked
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(c, ids)| (c.clone(), ids.iter().map(|(i, t)| (*i, *t)).collect()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Restore a ledger read back from a game-data container.
+    ///
+    /// MERGES rather than replaces, and keeps the EARLIER tick on a collision: the tick is
+    /// when the trophy was earned, and a restore is not an earning. Nothing here can lock a
+    /// trophy again - there is no console operation that does, and a container that could
+    /// would be a way to take a user's trophies away.
+    pub fn restore_unlocked(&mut self, ledger: &[(String, Vec<(u32, u64)>)]) -> usize {
+        let mut n = 0;
+        for (comm_id, ids) in ledger {
+            let set = self.unlocked.entry(comm_id.clone()).or_default();
+            for (id, tick) in ids {
+                let slot = set.entry(*id).or_insert(*tick);
+                *slot = (*slot).min(*tick);
+                n += 1;
+            }
+        }
+        // A restore is not a change that needs writing back out - the container it came
+        // from already holds exactly this.
+        n
+    }
+
+    /// Whether the ledger changed since [`clear_dirty`](Self::clear_dirty).
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 
     /// Counts of the unlocked trophies matching `keep`, so unlocked and total counts are

@@ -32,6 +32,18 @@ pub enum Phase {
     DrawIndexScan,
     /// Reading (and, for a multi-stream mesh, interleaving) the vertex bytes.
     DrawVertices,
+    /// The MULTI-STREAM gather alone, nested inside [`Phase::DrawVertices`]: reading every
+    /// bound stream and scattering its rows into one interleaved buffer, then interning the
+    /// result.
+    ///
+    /// Split out because the two halves of `DrawVertices` have opposite shapes and so
+    /// opposite fixes. The single-stream half is a SNAPSHOT - a mesh the guest has not
+    /// written since is not read at all - while this half is documented as taking no such
+    /// shortcut: it gathers from guest memory on every draw, for every stream, however
+    /// static the geometry. A phase that adds the two together cannot say whether the
+    /// remaining cost is reads that are already being skipped or reads that are not, and
+    /// those are different changes. Its `entries` count IS the multi-stream draw count.
+    DrawVertexGather,
     /// Snapshotting and decoding the draw's bound textures.
     DrawTextures,
     /// The FRAGMENT stage's miss path alone: `snapshot_bound_textures` for a binding list
@@ -148,13 +160,14 @@ pub enum Phase {
 }
 
 impl Phase {
-    const COUNT: usize = 30;
+    const COUNT: usize = 31;
 
     pub(crate) fn index(self) -> usize {
         match self {
             Phase::DrawIndices => 0,
             Phase::DrawIndexScan => 1,
             Phase::DrawVertices => 2,
+            Phase::DrawVertexGather => 30,
             Phase::DrawTextures => 3,
             Phase::DrawUniforms => 4,
             Phase::SceneFold => 5,
@@ -195,6 +208,7 @@ impl Phase {
             Phase::DrawIndices,
             Phase::DrawIndexScan,
             Phase::DrawVertices,
+            Phase::DrawVertexGather,
             Phase::DrawTextureBind,
             Phase::DrawTexSetPrev,
             Phase::DrawTexBindDecode,
@@ -228,6 +242,7 @@ impl Phase {
             Phase::DrawIndices => "draw: read indices",
             Phase::DrawIndexScan => "draw: scan/rebase indices",
             Phase::DrawVertices => "draw: read+interleave vertices",
+            Phase::DrawVertexGather => "draw:   ...of which the MULTI-STREAM gather",
             Phase::DrawTextures => "draw: snapshot textures (miss path)",
             Phase::DrawTexFragMiss => "draw:   ...fragment MISS decode",
             Phase::DrawTexRead => "draw:     ...of which get_or_read",

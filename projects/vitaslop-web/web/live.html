@@ -71,6 +71,23 @@
         cursor: pointer;
       }
       button.play:active { transform: translateY(1px); }
+      /* The save-data actions. Deliberately NOT the accent green of PLAY: they are
+         management, not the thing the page is for, and CLEAR is destructive. */
+      button.act {
+        flex: 1;
+        padding: 9px 6px;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--ink);
+        background: #1c1c2a;
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.act:disabled { opacity: 0.4; cursor: default; }
+      button.act.danger { color: #e8a0a8; border-color: #4a2a34; }
+      button.act:active:not(:disabled) { transform: translateY(1px); }
       .note { color: var(--dim); font-size: 11px; margin-top: 10px; }
       .warn { color: #e0c07f; }
       details summary { cursor: pointer; color: var(--dim); font-size: 12px; margin-top: 6px; }
@@ -321,6 +338,7 @@
       import { forwardLocation } from "./location.js";
       import { installPad, installGamepad } from "./pad.js";
       import { importTitle, isImported, storageRoom, requestPersistence } from "./opfs.js";
+      import * as gamedata from "./gamedata.js";
       import { startAudio } from "./audio.js";
 
       const $ = (id) => document.getElementById(id);
@@ -675,6 +693,24 @@ ${window.__fatalWorkerError}` : ``,
               play - the ratios it reports stay valid, the frame times do not.</span>
             </label>
           </div>
+          <!-- >>> THE GUEST'S OWN SAVED STATE. It lives in a DIFFERENT part of this
+               browser's storage from the title (see web/gamedata.js), so clearing it costs
+               nothing but the save, and it can be carried to another browser or another
+               device as an ordinary .zip. -->
+          <details id="gdbox-${t.id}">
+            <summary>saved game data</summary>
+            <p class="note" id="gd-${t.id}">checking...</p>
+            <div class="row">
+              <button class="act" id="gd-dl-${t.id}" type="button">DOWNLOAD</button>
+              <button class="act" id="gd-up-${t.id}" type="button">UPLOAD</button>
+              <button class="act danger" id="gd-rm-${t.id}" type="button">CLEAR</button>
+            </div>
+            <input id="gd-file-${t.id}" type="file" accept=".zip,application/zip" hidden />
+            <p class="note">
+              This is what the GAME saved - its save files and its trophies - and nothing of
+              the game itself. CLEAR deletes only that; the title stays imported.
+            </p>
+          </details>
           <details>
             <summary>knobs</summary>
             <textarea id="k-${t.id}">VITASLOP_FRAME_TOPUP=0
@@ -694,6 +730,7 @@ VITASLOP_LOG=warn</textarea>
         `;
         wrap.appendChild(card);
         applyUrlPreset(t);
+        installGameData(t);
         // A run that cannot possibly work must not be startable. Pressing PLAY into a
         // missing secure context spent a minute of import before failing with a property
         // access on `undefined`, which named nothing.
@@ -718,6 +755,131 @@ VITASLOP_LOG=warn</textarea>
             console.error(e);
             reportFatal("BOOT FAILED\n" + ((e && (e.stack || e.message)) || e));
           });
+        });
+      }
+
+      // ======================= the guest's own saved state =======================
+      //
+      // Three buttons and a line of text, over `web/gamedata.js`. What makes this worth
+      // having on the LAUNCHER rather than buried somewhere: a save that only exists inside
+      // one browser profile is a save the user cannot back up, cannot move to their phone,
+      // and loses to a "clear browsing data" they meant for something else. A download and
+      // an upload turn it into a file they own.
+      //
+      // Nothing here can reach the imported title: `gamedata.js` works under `gamedata/`
+      // and `opfs.js` under `games/`, and the container's own contents are re-checked by
+      // the Rust parser, which refuses any path that is not on the guest's writable mounts.
+
+      /// Human-readable size, because "1219 bytes" and "1.2 MB" answer different questions.
+      const kb = (n) => (n < 1024 ? `${n} bytes` : `${(n / 1024).toFixed(1)} KB`);
+
+      /// Ask the real Rust parser what is in a container, in a worker that is then thrown
+      /// away. See web/gamedata-worker.js for why this is not checked in JS here.
+      const describeContainer = (zip) =>
+        new Promise((resolve, reject) => {
+          const w = new Worker("./gamedata-worker.js", { type: "module" });
+          w.onmessage = (e) => {
+            w.terminate();
+            e.data.ok ? resolve(e.data.summary) : reject(new Error(e.data.error));
+          };
+          w.onerror = (e) => {
+            w.terminate();
+            reject(new Error(e.message || "the game-data worker failed to start"));
+          };
+          w.postMessage({ zip }, [zip]);
+        });
+
+      function installGameData(t) {
+        const box = $(`gd-${t.id}`);
+        const dl = $(`gd-dl-${t.id}`);
+        const up = $(`gd-up-${t.id}`);
+        const rm = $(`gd-rm-${t.id}`);
+        const file = $(`gd-file-${t.id}`);
+
+        // What is stored right now. DOWNLOAD and CLEAR are disabled when there is nothing,
+        // rather than offered and then failing - an empty download is indistinguishable
+        // from a broken one.
+        const refresh = async () => {
+          const info = await gamedata.info(t.id);
+          if (!info) {
+            box.textContent =
+              "nothing saved in this browser yet. It appears here the first time the game saves.";
+            dl.disabled = true;
+            rm.disabled = true;
+            return null;
+          }
+          const when = new Date(info.modified);
+          box.textContent = `${kb(info.bytes)}, last written ${when.toLocaleString()}`;
+          dl.disabled = false;
+          rm.disabled = false;
+          return info;
+        };
+        refresh();
+
+        dl.addEventListener("click", async () => {
+          const bytes = await gamedata.read(t.id);
+          if (!bytes) {
+            box.textContent = "there is nothing saved for this title.";
+            return refresh();
+          }
+          // The bytes handed over are EXACTLY what is stored - the run wrote this file and
+          // this is that file, not something reassembled at download time.
+          const url = URL.createObjectURL(new Blob([bytes], { type: "application/zip" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `vitaslop-${t.id}-gamedata.zip`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        });
+
+        up.addEventListener("click", () => file.click());
+        file.addEventListener("change", async () => {
+          const picked = file.files && file.files[0];
+          file.value = ""; // so picking the same file twice fires again
+          if (!picked) return;
+          box.textContent = `reading ${picked.name}...`;
+          try {
+            const bytes = new Uint8Array(await picked.arrayBuffer());
+            // >>> CHECKED BEFORE IT REPLACES ANYTHING. An upload overwrites a save, so a
+            // file that turns out not to be one must be refused while the old one is still
+            // there - not after.
+            const summary = await describeContainer(bytes.slice().buffer);
+            const existing = await gamedata.info(t.id);
+            const warn = existing
+              ? `\n\nThis REPLACES the ${kb(existing.bytes)} already saved for this title. ` +
+                `Download that first if you want to keep it.`
+              : "";
+            if (!confirm(`Restore this save into ${t.name}?\n\n${summary}${warn}`)) {
+              await refresh();
+              return;
+            }
+            await gamedata.write(t.id, bytes);
+            box.textContent = `restored: ${summary}`;
+            dl.disabled = false;
+            rm.disabled = false;
+          } catch (err) {
+            // Named, and the old save left alone. "That file is not a vitaslop game-data
+            // archive" is actionable; a silent no-op is not.
+            box.textContent = `not restored - ${(err && err.message) || err}`;
+          }
+        });
+
+        rm.addEventListener("click", async () => {
+          const info = await gamedata.info(t.id);
+          if (!info) return refresh();
+          if (
+            !confirm(
+              `Delete the ${kb(info.bytes)} of saved game data for ${t.name}?\n\n` +
+                `This is the game's own save and trophies. It cannot be undone, and it is ` +
+                `not the same as removing the title - ${t.id} stays imported.`
+            )
+          ) {
+            return;
+          }
+          await gamedata.clear(t.id);
+          await refresh();
         });
       }
 
@@ -853,6 +1015,21 @@ VITASLOP_LOG=warn</textarea>
             "WORKER DIED\n" + detail + (e.error && e.error.stack ? "\n" + e.error.stack : "")
           );
         };
+
+        // >>> ASK FOR A SAVE FLUSH WHEN THE PAGE IS BACKGROUNDED.
+        //
+        // The run writes the save on a 3-second floor, so the last few seconds of play are
+        // in the worker and not in storage at any moment. `visibilitychange` to hidden is
+        // the signal that matters on the machine this is for: a phone switching apps fires
+        // it while the page is still ALIVE, so the worker's asynchronous write actually
+        // completes. `pagehide` is wired too and is best-effort by nature - a document
+        // being torn down takes its worker with it, and neither the message nor the write
+        // is guaranteed to land.
+        const flushGameData = () => worker.postMessage({ type: "flush-game-data" });
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "hidden") flushGameData();
+        });
+        window.addEventListener("pagehide", flushGameData);
 
         // Live input: pointer + keyboard from the page, the on-screen pad, and any real
         // gamepad. All three post into the same worker input cell.
