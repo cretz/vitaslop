@@ -1259,7 +1259,16 @@ fn emit_instr(
     // VTST decoder). It reads the same 0-or-1 the bitwise form does, through the same
     // expression; refusing it here would leave those fifteen shaders on the fixed-function
     // fallback, which is what painted this title's whole world flat.
-    let global_ok = matches!(instr.op, Op::Test { alu: TestAlu::BitAnd | TestAlu::IntSub, .. });
+    //
+    // VTSTMSK's unsigned-16-bit form is admitted for the SAME reason and reads the same
+    // register through the same raw-u32 path. It is the mask-writing sibling of the `vtst`
+    // above - `GLOBAL[16]` against an SA register, EQ - and it is the instruction that panicked
+    // a user's run several holes into a round.
+    let global_ok = matches!(
+        instr.op,
+        Op::Test { alu: TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub, .. }
+            | Op::TestMask { alu: TestAlu::IntSub16U, .. }
+    );
     if let Some(g) = instr
         .srcs
         .iter()
@@ -1291,7 +1300,7 @@ fn emit_instr(
     }
     if let Op::TestMask { alu, cmp } = instr.op {
         let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
-        emit_test_mask(s, instr, dest, alu, cmp).ok_or_else(unmapped)?;
+        emit_test_mask(s, instr, dest, alu, cmp, kind).ok_or_else(unmapped)?;
         s.flush();
         return finish_predicated(body, instr, &block(&stmts, staged), index);
     }
@@ -1716,6 +1725,16 @@ fn emit_test(
             bools.push(format!("(({} & {}) {op} 0u)", raw(s1)?, raw(s2)?));
             continue;
         }
+        // SHIFT LEFT, the same raw unsigned 32-bit lane. The decoder has already refused any
+        // amount that is not an inline immediate below 32, so this shift is always in WGSL's
+        // defined range - there is no clamp here because there is nothing to clamp. The
+        // comparison is against `0u` for the same reason the AND above is: the family's
+        // operands are UNSIGNED, so `0x80000000` is a large positive number. Comparing it as
+        // a signed integer instead flips exactly the case the corpus encodes.
+        if matches!(alu, TestAlu::BitShl) {
+            bools.push(format!("(({} << {}) {op} 0u)", raw(s1)?, raw(s2)?));
+            continue;
+        }
         // The INTEGER family reads its operands as the raw 32-bit lane, signed, exactly as the
         // 8-bit family reads its as four unorm bytes - see `TestAlu::IntSub`. Parenthesised for
         // the same precedence reason the bitwise arm is.
@@ -1738,9 +1757,11 @@ fn emit_test(
             TestAlu::Sub | TestAlu::Fx8Sub => format!("({a} - {b})"),
             TestAlu::Mul => format!("({a} * {b})"),
             // Resolved above - the raw-lane paths never reach here.
-            TestAlu::BitAnd | TestAlu::IntSub => {
+            TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub => {
                 unreachable!("raw-lane test resolved before the float path")
             }
+            // VTSTMSK's decoder is the only producer of this family; VTST cannot reach it.
+            TestAlu::IntSub16U => return None,
         };
         bools.push(format!("({value} {op} 0.0)"));
     }
@@ -1767,7 +1788,9 @@ fn emit_test(
                 TestAlu::Mul => format!("({a} * {b})"),
                 // A raw-lane write-back is not modelled in the float store path; the corpus
                 // has no such instruction, so refusing is exact rather than restrictive.
-                TestAlu::BitAnd | TestAlu::IntSub => return None,
+                TestAlu::BitAnd | TestAlu::BitShl | TestAlu::IntSub | TestAlu::IntSub16U => {
+                    return None
+                }
             };
             body.store(dest, c, &value, wp)?;
         }
@@ -1863,15 +1886,23 @@ fn emit_tex_gather(
 /// [`emit_test`], written out as one NUMERIC value per channel instead of reduced to a
 /// predicate bit.
 ///
-/// Only the float ALU families reach here - the decoder blocks the integer and bitwise ones,
-/// which have no corpus instance in this group - so every channel is a float comparison and the
-/// mask value is `1.0` or `0.0` at the instruction's own precision.
+/// Two forms reach here and the decoder refuses every other, because they are the only two
+/// whose written value is agreed by both readings of the mask field (see `decode_grp_test_mask`):
+///
+/// * the FLOAT families with the numeric form - four channels of `1.0` / `0.0`;
+/// * the UNSIGNED 16-BIT integer family with the precision-mask form - ONE channel of
+///   `0xFFFF` / `0x0000`, written as a raw lane.
+///
+/// The integer form goes nowhere near the float channel reader. Its operands are whole raw
+/// lanes, and putting one through a float view would read a small integer as a denormal - the
+/// same near-miss [`TestAlu::Fx8Sub`] and [`TestAlu::IntSub`] exist to avoid.
 fn emit_test_mask(
     body: &mut Dest,
     instr: &Instr,
     dest: &Operand,
     alu: TestAlu,
     cmp: TestCmp,
+    kind: ProgramKind,
 ) -> Option<()> {
     let (s1, s2) = (instr.srcs.first()?, instr.srcs.get(1)?);
     let p = Prec::of(instr);
@@ -1883,6 +1914,33 @@ fn emit_test_mask(
         TestCmp::Gt => ">",
         TestCmp::Ge => ">=",
     };
+    // >>> THE UNSIGNED 16-BIT INTEGER FORM: ONE CHANNEL, A RAW LANE, `0xFFFF` OR `0x0000`.
+    //
+    // The comparison is done on the low 16 bits of each raw lane, which is what makes the
+    // width load-bearing: two lanes differing only above bit 15 are EQUAL to the device and
+    // would not be to a 32-bit compare. The subtract is expressed as the equality it is - the
+    // relation is `== 0` and `a - b == 0` iff `a == b` - so unsigned wraparound cannot enter.
+    if matches!(alu, TestAlu::IntSub16U) {
+        // Only the `== 0` / `!= 0` relations are established for this form: an ordered
+        // relation would additionally need the SIGNEDNESS of the compare pinned, and the one
+        // reading that describes signed integer masks is uncorroborated.
+        let eq = match cmp {
+            TestCmp::Eq => "==",
+            TestCmp::Ne => "!=",
+            _ => return None,
+        };
+        let raw = raw_lane_expr(s1, kind)?;
+        let raw2 = raw_lane_expr(s2, kind)?;
+        // Channel x only - the decoder's write mask says so and the reference derives the
+        // count from the ALU family. `store_raw` because the lane holds an integer bit
+        // pattern: going through the float store would bitcast it and change the bits.
+        body.store_raw(
+            dest,
+            0,
+            &format!("select(0u, 0xffffu, ((({raw}) & 0xffffu) {eq} (({raw2}) & 0xffffu)))"),
+        )?;
+        return Some(());
+    }
     for c in 0..4 {
         let (a, b) = (src_channel(s1, c, p)?, src_channel(s2, c, p)?);
         let value = match alu {
@@ -1891,11 +1949,35 @@ fn emit_test_mask(
             TestAlu::Mul => format!("({a} * {b})"),
             // The decoder does not produce these for this group; refusing keeps the emitter
             // from inventing a raw-lane mask if that ever changes.
-            TestAlu::Fx8Sub | TestAlu::BitAnd | TestAlu::IntSub => return None,
+            TestAlu::Fx8Sub
+            | TestAlu::BitAnd
+            | TestAlu::BitShl
+            | TestAlu::IntSub
+            | TestAlu::IntSub16U => return None,
         };
         body.store(dest, c, &format!("select(0.0, 1.0, ({value} {op} 0.0))"), p)?;
     }
     Some(())
+}
+
+/// One operand read as its RAW 32-bit lane, for the integer/bitwise test families.
+///
+/// Shared by [`emit_test`] and [`emit_test_mask`] so the two cannot drift: the banks that only
+/// ever appear on a raw-lane operand - an assembled inline immediate, a constant-bank entry,
+/// and the hardware GLOBAL registers - each need their own spelling, and a family that read
+/// one of them through the float path would read a small integer as a denormal.
+fn raw_lane_expr(o: &Operand, kind: ProgramKind) -> Option<String> {
+    if matches!(o.bank, Bank::Constant) {
+        let bank = if o.swizzle[0] == 1 { &CNST6_F32_BANK1 } else { &CNST6_F32_BANK0 };
+        return Some(format!("{:#010x}u", bank[(o.index & 0x3f) as usize]));
+    }
+    if matches!(o.bank, Bank::Immediate) {
+        return Some(format!("{}u", o.index as u32));
+    }
+    if matches!(o.bank, Bank::Global) {
+        return global_u32_expr(o, kind);
+    }
+    Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
 }
 
 /// Dot product: a scalar `src1 . src2` over `components` channels, broadcast to every
@@ -2410,6 +2492,88 @@ mod tests {
         // mask lands on i[0..3] rather than on two packed registers.
         assert!(wgsl.contains("i[3] ="), "the fourth channel needs a fourth lane:\n{wgsl}");
     }
+    /// >>> THE WORD THAT PANICKED A USER'S RUN, EMITTED.
+    ///
+    /// `0x7802019271f6a839`: the unsigned 16-bit VTSTMSK. The decoder now translates it (see
+    /// `decode_grp_test_mask`); this pins what comes out, because unblocking the decoder buys
+    /// nothing if the emitter refuses - the pair would hard-fail exactly as before, one layer
+    /// down.
+    ///
+    /// It is a FACING TEST: `GLOBAL[16]` is the back-face register, which this project and the
+    /// vendor's own header independently name, so the shader is asking "is this face front or
+    /// back" and depositing a 16-bit all-ones mask for the answer.
+    /// The OTHER half of the same idiom, and the instruction that panicked the run after the
+    /// VTSTMSK above was unblocked: `0x48090881a00cc79f`, a BITWISE SHIFT-LEFT test.
+    ///
+    /// The program writes a `0x0000FFFF`-or-zero facing mask with the VTSTMSK, then shifts THAT
+    /// register left by 31 and asks whether the result is positive - which keeps bit 0 of the
+    /// mask and nothing else. Two things this pins that a reader could otherwise "simplify"
+    /// away, both of which silently invert the test:
+    ///
+    /// * the comparison is UNSIGNED (`> 0u`). `0xFFFF << 31` is `0x80000000`, which is a large
+    ///   positive number to this family and a NEGATIVE one to a signed compare.
+    /// * there is no clamp on the shift amount, because the decoder refuses any amount that is
+    ///   not an inline immediate below 32.
+    #[test]
+    fn vtst_bitwise_shift_left_tests_bit_zero_of_the_facing_mask() {
+        let pa15 = Operand::plain(Bank::PrimaryAttr, 15, 2);
+        let amount = Operand::plain(Bank::Immediate, 31, 2);
+        let wgsl = emit_fragment(&shader(vec![instr(
+            Op::Test {
+                alu: TestAlu::BitShl,
+                cmp: TestCmp::Gt,
+                reduce: TestReduce::Channel(0),
+                pdst: 0,
+                write_back: false,
+            },
+            None,
+            vec![pa15, amount],
+        )]))
+        .unwrap();
+        assert!(wgsl.contains("p[0] = ((pa[15] << 31u) > 0u);"), "raw unsigned shift test:
+{wgsl}");
+        // Not through the float path: a bitcast here would read 0x0000FFFF as a denormal.
+        assert!(!wgsl.contains("bitcast<f32>(pa[15])"), "no float view:
+{wgsl}");
+        // And it must not have become a signed compare on the way out.
+        assert!(!wgsl.contains("bitcast<i32>"), "unsigned, not signed:
+{wgsl}");
+    }
+
+    #[test]
+    fn vtstmsk_u16_writes_a_raw_sixteen_bit_mask_on_one_channel() {
+        let d = Operand::plain(Bank::PrimaryAttr, 15, 2);
+        let g = Operand::plain(Bank::Global, 16, 1);
+        let sa = Operand::plain(Bank::SecondaryAttr, 57, 3);
+        let wgsl = emit_fragment(&shader(vec![instr(
+            Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq },
+            Some(d),
+            vec![g, sa],
+        )]))
+        .unwrap();
+        // The comparison is on the LOW 16 BITS of each raw lane. Two lanes differing only
+        // above bit 15 are equal to the device, and a 32-bit compare would call them different.
+        assert!(wgsl.contains("& 0xffffu"), "masked to 16 bits:
+{wgsl}");
+        // 0xFFFF for true, 0 for false - the pair both readings of the mask field agree on.
+        assert!(wgsl.contains("select(0u, 0xffffu,"), "an all-ones 16-bit mask:
+{wgsl}");
+        // Written as a RAW lane. Going through the float store would bitcast the pattern and
+        // change the bits a later raw-lane read sees.
+        assert!(wgsl.contains("pa[15] ="), "channel x of pa[15]:
+{wgsl}");
+        assert!(!wgsl.contains("bitcast<u32>(g0)"), "not through the float store path:
+{wgsl}");
+        // ONE channel: the count comes from the ALU family, so pa[16..18] are untouched.
+        for r in ["pa[16]", "pa[17]", "pa[18]"] {
+            assert!(!wgsl.contains(r), "{r} must not be written:
+{wgsl}");
+        }
+        // And it really is the facing register on the other side of the compare.
+        assert!(wgsl.contains("front_facing") || wgsl.contains("FrontFacing"), "reads facing:
+{wgsl}");
+    }
+
     #[test]
     fn emits_scalarised_mul_over_channels() {
         // o[base..] = r[..] * sa[..], full mask -> 4 statements, one per channel.

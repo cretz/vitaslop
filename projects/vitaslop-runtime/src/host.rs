@@ -1307,6 +1307,24 @@ pub const FD_STDERR: i32 = 2;
 /// Without this a title that opens `app0:/settings/foo.ini` or `.../Foo.GXT` would
 /// miss the file stored as `settings/foo.ini` and take its file-missing (often fatal)
 /// path.
+///
+/// # >>> THE SEPARATOR AFTER A MOUNT IS OPTIONAL, AND TREATING IT AS PART OF THE PATH
+/// # LOSES SAVES.
+/// On a Vita the colon IS the separator: `savedata0:foo.bin` and `savedata0:/foo.bin`
+/// name the same file, and a title uses whichever spelling its own string-joining
+/// happens to produce. This split the two apart - the mount was just another path
+/// segment, so `savedata0:` + `foo` and `savedata0:foo` folded to different keys.
+///
+/// The title that found it writes its save through `sceAppUtilSaveDataDataSave`, which
+/// builds `savedata0:/data0_US.bin`, and reads it back with `sceIoOpen`
+/// (`savedata0:data0_US.bin`). The read got ENOENT on the file the same run had just
+/// written, so **every reload started from a fresh profile** however faithfully the
+/// container round-tripped - and it round-tripped perfectly, which is what made this look
+/// like a persistence bug rather than a path one.
+///
+/// The mount is therefore canonicalised, not walked: everything up to the first `:` is
+/// the mount and is re-joined as `mount:/rest`. That also means a `..` cannot climb out
+/// of a mount, which on a real device it cannot either.
 pub fn vfs_key(path: &str) -> String {
     // Normalize like a real Vita FS before matching: collapse repeated separators,
     // drop `.` and empty segments, and resolve `..`. Titles build paths by joining a
@@ -1316,8 +1334,14 @@ pub fn vfs_key(path: &str) -> String {
     // the normalization stays symmetric. Backslashes are folded to `/` for the rare
     // title that uses them. Lowercased last (see the case note above).
     let stripped = strip_app0(path).replace('\\', "/");
+    // Split off the mount, if there is one. A mount name carries no separator, so a `:`
+    // that appears after the first `/` is part of a filename and not a mount at all.
+    let (mount, rest) = match stripped.find(':') {
+        Some(i) if !stripped[..i].contains('/') => (&stripped[..=i], &stripped[i + 1..]),
+        _ => ("", &stripped[..]),
+    };
     let mut segs: Vec<&str> = Vec::new();
-    for seg in stripped.split('/') {
+    for seg in rest.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
@@ -1326,7 +1350,15 @@ pub fn vfs_key(path: &str) -> String {
             s => segs.push(s),
         }
     }
-    segs.join("/").to_ascii_lowercase()
+    let mut key = mount.to_ascii_lowercase();
+    if !segs.is_empty() {
+        if !key.is_empty() {
+            key.push('/');
+        }
+        key.push_str(&segs.join("/"));
+    }
+    key.make_ascii_lowercase();
+    key
 }
 
 /// Strip an `app0:` mount prefix (with or without the separator), case-insensitively:
@@ -15894,6 +15926,36 @@ mod game_data_tests {
         assert_eq!(second.savedata_slot_get("savedata0:", 1), Some(vec![0xAB; 16]));
         assert!(second.trophies.is_unlocked("NPWR00001_00", 7));
         assert_eq!(second.trophies.unlocked_at("NPWR00001_00", 7), Some(0x1234));
+    }
+
+    #[test]
+    fn the_separator_after_a_mount_is_optional() {
+        // >>> THE BUG THIS PINS COST EVERY RELOAD ITS SAVE.
+        // A Vita's colon IS the separator, so `savedata0:x` and `savedata0:/x` are one
+        // file. The title that found it SAVES through `sceAppUtilSaveDataDataSave` (which
+        // builds `savedata0:/data0_US.bin`) and LOADS with `sceIoOpen`
+        // (`savedata0:data0_US.bin`) - two spellings, one file on the device, two keys
+        // here. The read got ENOENT on a file the same run had just written.
+        assert_eq!(vfs_key("savedata0:data0_US.bin"), "savedata0:/data0_us.bin");
+        assert_eq!(vfs_key("savedata0:/data0_US.bin"), "savedata0:/data0_us.bin");
+        assert_eq!(vfs_key("SAVEDATA0:/x"), vfs_key("savedata0:x"));
+        assert_eq!(vfs_key("ux0:data/a//b"), "ux0:/data/a/b");
+        // The mount alone stays the mount, with no separator invented for it - it is the
+        // key `sceIoDopen` on the root of a save uses.
+        assert_eq!(vfs_key("savedata0:"), "savedata0:");
+        assert_eq!(vfs_key("savedata0:/"), "savedata0:");
+        // `..` cannot climb out of a mount, which on a device it cannot either.
+        assert_eq!(vfs_key("savedata0:/../../x"), "savedata0:/x");
+        // A `:` after a separator is a filename, not a mount.
+        assert_eq!(vfs_key("dir/od:d"), "dir/od:d");
+        // And both spellings really do reach the same file through the guest API.
+        let mut st = state();
+        guest_write(&mut st, "savedata0:/DATA.BIN", b"holes in one: 3");
+        assert_eq!(
+            guest_read(&mut st, "savedata0:DATA.BIN").as_deref(),
+            Some(&b"holes in one: 3"[..]),
+            "a save written with the separator must be readable without it"
+        );
     }
 
     #[test]

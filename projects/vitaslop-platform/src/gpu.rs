@@ -3296,6 +3296,27 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// guest's real shaders; a pair that fails to link falls back to the fixed-function
         /// pipelines above. Disabled -> zero cost (the payload is simply ignored).
         gxp: GxpLive,
+        /// >>> THE SIX PER-PASS STAGING ARENAS WERE POOLED ON `self` HERE, AND IT WAS
+        /// REVERTED. Kept as a note because the reasoning that made it look free is the trap.
+        ///
+        /// `encode_pass` opens each pass with six `Vec::new()`, so each grows from zero by
+        /// doubling as several hundred draws append - which a sampler profile charges to the
+        /// ALLOCATOR (7.3% of the busy worker thread, with `push_sa`, `prepare` and
+        /// `encode_pass` named as the `malloc` callers). Holding them on the renderer and
+        /// `clear()`ing instead removes all of that, and it is BIT-IDENTICAL (10 of 10 frames,
+        /// frame-pinned oracle).
+        ///
+        /// **It still made the target device slower, and the user felt it before any instrument
+        /// here saw it** - golf went from holding 30 fps to sitting in the teens. The mechanism
+        /// the "it is obviously free" argument missed: `clear()` keeps CAPACITY, a loading frame
+        /// pushes 16 MB through these, and six arenas pinned at a one-off peak is tens of
+        /// megabytes resident forever in a linear memory a wasm heap can never give back. That
+        /// tightens the heap for EVERYTHING, including the guest - which is why the
+        /// "a render-side change cannot move guest `cpu`" argument was wrong. It reasons about
+        /// call graphs; the allocator is shared.
+        ///
+        /// If this is tried again it needs a bound on retained capacity AND a price taken on
+        /// the device, not on this desktop [[vitaslop-desktop-cannot-price-a-count-win]].
         /// What the last [`GxmRenderer::encode`] spent, phase by phase. See [`EncodePhases`].
         last_phases: EncodePhases,
         /// The same, summed over every pass of the last [`GxmRenderer::encode_chain`] - which
@@ -3322,6 +3343,21 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pub prepare_ms: f64,
         pub upload_ms: f64,
         pub pass_ms: f64,
+        /// `upload` split in two, because the combined number named no fix. A course-load frame
+        /// measured **2,642 ms of `upload` while uploading ZERO textures and ZERO bytes** and
+        /// creating no buffer - so whatever it was, it was not "the arena writes" the doc above
+        /// claims. The two halves have different fixes, so they are timed apart: `arena` is the
+        /// recompiled path's three `write_buffer`s, `ubo_bg` is the per-pipeline uniform bind
+        /// groups. Anything the two do not account for is inside the fixed-function block.
+        pub arena_ms: f64,
+        /// `arena_ms` split again, because its two halves have DIFFERENT fixes and the numbers
+        /// alone cannot tell them apart: on the load frame the slot count and the write count
+        /// are 1:1 (209 passes -> 643 buffers created and 627 `write_buffer` calls), so
+        /// "2.2 ms each" is true of both and names neither. `create` is answered by sharing one
+        /// arena across the frame's passes; `write` is answered by fewer, larger calls.
+        pub arena_create_ms: f64,
+        pub arena_write_ms: f64,
+        pub ubo_bg_ms: f64,
         /// Draws that took the recompiled path, and draws that took the fixed-function
         /// path - the denominator for any per-draw cost.
         pub gxp_draws: usize,
@@ -3339,6 +3375,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.prepare_ms += pass.prepare_ms;
             self.upload_ms += pass.upload_ms;
             self.pass_ms += pass.pass_ms;
+            self.arena_ms += pass.arena_ms;
+            self.arena_create_ms += pass.arena_create_ms;
+            self.arena_write_ms += pass.arena_write_ms;
+            self.ubo_bg_ms += pass.ubo_bg_ms;
             self.gxp_draws += pass.gxp_draws;
             self.fixed_draws += pass.fixed_draws;
         }
@@ -8189,6 +8229,46 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// for a whole session before that happened, which is the argument for a test over a
     /// comment.
     #[cfg(test)]
+    mod fallback_evidence_tests {
+        /// The base64 in a fatal refusal is hand-rolled (this crate has no encoder and one
+        /// dependency for one diagnostic is not a trade worth making), so it is checked against
+        /// the RFC 4648 vectors - including every padding case, which is where a hand-rolled
+        /// encoder goes wrong and where a wrong byte would silently corrupt the one copy of a
+        /// shader nobody can reproduce on demand.
+        #[test]
+        fn the_evidence_base64_round_trips_the_standard_vectors() {
+            let b64 = super::base64;
+            assert_eq!(b64(b""), "");
+            assert_eq!(b64(b"f"), "Zg==");
+            assert_eq!(b64(b"fo"), "Zm8=");
+            assert_eq!(b64(b"foo"), "Zm9v");
+            assert_eq!(b64(b"foob"), "Zm9vYg==");
+            assert_eq!(b64(b"fooba"), "Zm9vYmE=");
+            assert_eq!(b64(b"foobar"), "Zm9vYmFy");
+            // The two characters a 6-bit table gets wrong if the tail is mis-indexed, and the
+            // high bytes a signed shift would mangle.
+            assert_eq!(b64(&[0xff, 0xef, 0xfe]), "/+/+");
+            assert_eq!(b64(&[0x00, 0x00, 0x00]), "AAAA");
+        }
+
+        /// The payload is armed per pair and consumed ONCE: a second refusal must not re-print
+        /// kilobytes, and a refusal for a DIFFERENT pair must not print the armed one's bytes
+        /// under the wrong key - which would send someone to fix the wrong shader.
+        #[test]
+        fn the_evidence_is_keyed_to_its_pair_and_spent_once() {
+            let v: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"vert"[..]);
+            let f: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"frag"[..]);
+            super::arm_fallback_blobs(0xAAAA, v.clone(), f.clone());
+            assert_eq!(super::blob_evidence(0xBBBB), "", "another pair gets nothing");
+            super::arm_fallback_blobs(0xAAAA, v, f);
+            let first = super::blob_evidence(0xAAAA);
+            assert!(first.contains("dmVydA=="), "carries the vertex container: {first}");
+            assert!(first.contains("ZnJhZw=="), "carries the fragment container: {first}");
+            assert_eq!(super::blob_evidence(0xAAAA), "", "spent - a second refusal is quiet");
+        }
+    }
+
+    #[cfg(test)]
     mod wasm_clock_tests {
         /// The only lines allowed to name it: the `Stopwatch` field, its constructor, and prose.
         #[test]
@@ -9678,6 +9758,68 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// >>> A REFUSAL THAT DOES NOT HAND OVER THE EVIDENCE COSTS A PLAY SESSION.
+    ///
+    /// When the recompiler refuses a pair, the ONE thing needed to fix it is that pair's two
+    /// containers - and until this existed the only way to get them was to know in advance to
+    /// set `VITASLOP_DUMP_GXP_BIN` and then reach the same draw again. On a title where the
+    /// refusal is several holes into a round on one course, that is a play session per attempt,
+    /// and the user who first hit `7089f16e34be693f` could not be asked to repeat it on demand.
+    ///
+    /// So the refusal carries the blobs with it, base64 in the panic text, which reaches the
+    /// browser's diagnostics panel - the thing a user can already copy in one tap. Pasting that
+    /// back reconstitutes the exact pair offline, where `tests/corpus.rs` answers in a second
+    /// what a device answers in an evening.
+    ///
+    /// Only on the FATAL path (`allow_fixed_function` off) and only for the first pair, because
+    /// this is kilobytes of text: a warning that fires per draw would bury the panel
+    /// [[vitaslop-a-diagnostic-can-bury-the-findings]].
+    fn base64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for c in bytes.chunks(3) {
+            let (b0, b1, b2) = (c[0] as u32, *c.get(1).unwrap_or(&0) as u32, *c.get(2).unwrap_or(&0) as u32);
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    /// The pair whose containers a fatal refusal should print, set by the recompile path just
+    /// before it may refuse. Cleared after use so only the first refusal carries the payload.
+    fn pending_blobs() -> &'static std::sync::Mutex<Option<(u64, std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>> {
+        static P: std::sync::OnceLock<
+            std::sync::Mutex<Option<(u64, std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>>,
+        > = std::sync::OnceLock::new();
+        P.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    /// Record the containers a subsequent `report_fallback` for `key` should carry.
+    pub(crate) fn arm_fallback_blobs(key: u64, vprog: std::sync::Arc<[u8]>, fprog: std::sync::Arc<[u8]>) {
+        *pending_blobs().lock().unwrap_or_else(|e| e.into_inner()) = Some((key, vprog, fprog));
+    }
+
+    /// The base64 of the armed pair, if it is the one being refused.
+    fn blob_evidence(key: u64) -> String {
+        let armed = pending_blobs().lock().unwrap_or_else(|e| e.into_inner()).take();
+        match armed {
+            Some((k, v, f)) if k == key => format!(
+                "\n\n>>> THE PAIR, so this does not have to be reproduced to be fixed. Base64 of \
+                 the two `SceGxmProgram` containers; decode each to a .gxp and point \
+                 VITASLOP_GXP_CORPUS at the directory.\nVERTEX {} bytes:\n{}\nFRAGMENT {} \
+                 bytes:\n{}\n",
+                v.len(),
+                base64(&v),
+                f.len(),
+                base64(&f),
+            ),
+            _ => String::new(),
+        }
+    }
+
     fn report_fallback(key: u64, reason: &str) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
@@ -9697,7 +9839,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                  run the guest's shader and cannot be told apart from a faithful render by \
                  looking at the frame. Refusing. Set VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1 to \
                  approximate anyway (bring-up only: it is how a title's world silently \
-                 rendered 328 of 388 draws wrong)."
+                 rendered 328 of 388 draws wrong).{}",
+                blob_evidence(key)
             );
         }
     }
@@ -10048,6 +10191,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         modules: &mut HashMap<u64, wgpu::ShaderModule>,
     ) -> Option<GxpPipeline> {
         let debug = std::env::var_os("VITASLOP_GXP_DEBUG").is_some();
+        // Arm the evidence BEFORE anything that can refuse this pair: a refusal that names a
+        // pair nobody can reconstruct costs a play session per attempt. See `blob_evidence`.
+        arm_fallback_blobs(key, gxp.vprog.clone(), gxp.fprog.clone());
         report_branches(key, gxp);
         let linked = match vitaslop_gxp_shader::link_programs(&gxp.vprog, &gxp.fprog) {
             Ok(l) => l,
@@ -11267,6 +11413,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             vdata: &[u8],
             idata: &[u8],
             udata: &[u8],
+            create_ms: &mut f64,
+            write_ms: &mut f64,
         ) {
             // `write_buffer` copies whole 4-byte units, and a packed vertex stream need not
             // land on one. Padding the LENGTH is safe where padding the arena would not be:
@@ -11277,6 +11425,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
             while arenas.len() <= slot {
                 let n = arenas.len();
+                let t_create = Stopwatch::start();
                 let mk = |need: u64, usage: wgpu::BufferUsages, label: &str| {
                     enc(&ENC.buffers_created, 1);
                     device.create_buffer(&wgpu::BufferDescriptor {
@@ -11299,6 +11448,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     ucap: Self::cap_for(u),
                     generation: 0,
                 });
+                *create_ms += t_create.ms();
             }
 
             let a = &mut arenas[slot];
@@ -11323,6 +11473,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 retired.push(std::mem::replace(buf, new));
                 true
             };
+            let t_grow = Stopwatch::start();
             grow(&mut a.vbo, &mut a.vcap, vneed, wgpu::BufferUsages::VERTEX, "gxp-vbo", retired);
             grow(&mut a.ibo, &mut a.icap, ineed, wgpu::BufferUsages::INDEX, "gxp-ibo", retired);
             // Only the UNIFORM arena's identity is baked into a bind group, so only its
@@ -11330,6 +11481,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if grow(&mut a.ubo, &mut a.ucap, uneed, wgpu::BufferUsages::UNIFORM, "gxp-ubo", retired) {
                 a.generation += 1;
             }
+            *create_ms += t_grow.ms();
+            let t_write = Stopwatch::start();
 
             // One `write_buffer` per arena, over the padded length. An empty arena still gets
             // its 4 zero bytes: a pass whose every stage declares no uniforms produces one,
@@ -11347,6 +11500,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             write(&a.vbo, vdata, vneed);
             write(&a.ibo, idata, ineed);
             write(&a.ubo, udata, uneed);
+            *write_ms += t_write.ms();
         }
 
         /// The group-1 bind group for an item (the shared white fallback, or a cached
@@ -11974,7 +12128,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 scene,
                 width,
                 height,
-                1,
+                // The attachment is the target: `ensure_rtt` created it at exactly this size.
+                width,
+                height,
                 Some([0, 0, 0, 0]),
                 1,
                 None,
@@ -12365,14 +12521,23 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         _ => None,
                     };
-                    let (cv, dv) = match (&disp, ss, self.ss_target.as_ref()) {
+                    // >>> THE EXTENT COMES OUT OF THE SAME ARM THAT PICKS THE VIEW.
+                    //
+                    // Every rectangle this pass states in guest pixels is mapped onto this, so
+                    // it has to be what `cv` actually IS, not a second derivation that agrees
+                    // with it today. Deriving an attachment extent in parallel with the
+                    // attachment is precisely the bug this whole change fixes; doing it again
+                    // one level up would leave the same trap for the next arm added here.
+                    let (cv, dv, att_w, att_h) = match (&disp, ss, self.ss_target.as_ref()) {
                         // The depth is the image's OWN, at the image's extent - see
                         // `ensure_display_image`. Nothing samples a display pass's depth (the
                         // report below says so when something tries), so a private one costs
                         // only its bytes and is the only thing a render pass will accept.
-                        (Some((_, v, dv)), _, _) => (v.clone(), dv.clone()),
-                        (None, true, Some(t)) => (t.color_view.clone(), t.depth_view.clone()),
-                        _ => (color_view.clone(), depth_view.clone()),
+                        (Some((_, v, dv)), _, _) => (v.clone(), dv.clone(), fb_w, fb_h),
+                        (None, true, Some(t)) => {
+                            (t.color_view.clone(), t.depth_view.clone(), t.width, t.height)
+                        }
+                        _ => (color_view.clone(), depth_view.clone(), fb_w, fb_h),
                     };
                     if let Some((addr, _, _)) = &disp {
                         display_blit_addr = Some(*addr);
@@ -12388,12 +12553,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // boot, and on every title measured here it is `SCE_GXM_MULTISAMPLE_NONE`
                     // - the console composites the front buffer at one sample. So this pass
                     // has no resolve and does not ask for one.
-                    // The supersampled display pass renders into an attachment `ss_scale`
-                    // times the target size, so every rectangle expressed in TARGET pixels -
-                    // the viewport and the guest's scissor - has to be scaled to reach the
-                    // right texels. It is 1 when supersampling is off, which is the default.
-                    let attach_scale = if ss { self.ss_scale } else { 1 };
-                    self.encode_pass(device, queue, encoder, &cv, &dv, fmt, scene, surf_w, surf_h, attach_scale, first.then_some(clear), 1, None);
+                    self.encode_pass(device, queue, encoder, &cv, &dv, fmt, scene, surf_w, surf_h, att_w, att_h, first.then_some(clear), 1, None);
                     // A display pass keeps no depth copy (its depth attachment belongs to the
                     // caller and is discarded), so if something reads this scene's depth it
                     // will not find it. Say so rather than let the read fall through silently.
@@ -12525,8 +12685,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let clear = first_pass_here.then_some([0, 0, 0, 0]);
                 self.keep_depth = want_depth;
                 self.encode_pass(
-                    device, queue, encoder, &pass_cv, &pass_dv, fmt, scene, t.width, t.height, 1,
-                    clear, pass_samples, resolve.as_ref(),
+                    // Target extent and attachment extent are the same here: an offscreen
+                    // pass rasterises at the size the guest gave its render target.
+                    device, queue, encoder, &pass_cv, &pass_dv, fmt, scene, t.width, t.height,
+                    t.width, t.height, clear, pass_samples, resolve.as_ref(),
                 );
                 self.keep_depth = false;
                 self.rtt_rendered.insert(t.data_addr, cv);
@@ -12727,11 +12889,33 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             scene: &RenderScene,
             surf_w: u32,
             surf_h: u32,
-            // Attachment texels per TARGET pixel. Always 1 except on the supersampled
-            // display pass, whose attachment is `ss_scale` times the target in each axis -
-            // so a rectangle the guest states in target pixels (the viewport, the region
-            // clip) must be multiplied by this to name the right texels.
-            attach_scale: u32,
+            // >>> THE ATTACHMENT'S OWN EXTENT, IN TEXELS. NOT DERIVED FROM `surf_w/surf_h`.
+            //
+            // Every rectangle the guest states - the viewport, the region clip - is in TARGET
+            // pixels, i.e. in `surf_w x surf_h`. The attachment they have to be expressed
+            // against is this, and the two are NOT always the same shape:
+            //
+            //   * an offscreen or depth-only pass renders at the target's own size, so they
+            //     are equal;
+            //   * the SUPERSAMPLED display pass renders `ss_scale` times larger in each axis;
+            //   * the DISPLAY pass renders into the caller's FRAMEBUFFER, which is the panel -
+            //     and a title may declare a display buffer SMALLER than the panel and let the
+            //     display controller stretch it ([[vitaslop-display-buffer-can-be-smaller-than-
+            //     the-panel]]). The golf title's front end declares 640x368 against a 960x544
+            //     canvas.
+            //
+            // This used to be an integer `attach_scale` and the attachment extent was computed
+            // as `surf * attach_scale`, which is true for the first two cases and FALSE for the
+            // third. The cost of that was not subtle and it was not a corner case: on the
+            // browser every UI draw that carries a guest viewport - the whole front end, menus,
+            // HUD, the text marquee - was rasterised into the top-left 640x368 of a 960x544
+            // frame, at two thirds scale, while the 3D scene behind it (which sets no viewport,
+            // and so fell through to wgpu's default of the whole attachment) filled the frame.
+            // The guest's region clip was cornered the same way, which cut UI panels off along
+            // a hard edge two thirds across. It was invisible on every desktop path because
+            // there the attachment IS the target size, so `surf * 1` happened to be right.
+            att_w: u32,
+            att_h: u32,
             clear: Option<[u8; 4]>,
             // Samples per pixel of `color_view`/`depth_view`. A pipeline is bound to its
             // attachments' sample count exactly as it is bound to their format, so this
@@ -12749,6 +12933,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.gxp.decide_scene_negw(scene);
             let t_prepare = Stopwatch::start();
             let stride = self.uniform_stride as usize;
+            // >>> ONE `Vec::new()` PER PASS, AND THAT IS DELIBERATE AGAIN. See
+            // [`GxmRenderer::arenas`] for the pooling attempt that was REVERTED and why.
             let mut vdata: Vec<u8> = Vec::new();
             let mut idata: Vec<u8> = Vec::new();
             let mut udata: Vec<u8> = Vec::new();
@@ -13126,6 +13312,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 prepare_ms: t_prepare.ms(),
                 upload_ms: 0.0,
                 pass_ms: 0.0,
+                arena_ms: 0.0,
+                arena_create_ms: 0.0,
+                arena_write_ms: 0.0,
+                ubo_bg_ms: 0.0,
                 gxp_draws: gxp_prepared.len(),
                 fixed_draws: items.len(),
             };
@@ -13163,6 +13353,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // ORDINAL in the chain and keeps it across frames - see `gxp_arenas` - so the
             // steady state creates no buffer at all, and every buffer named by this frame's
             // commands stays alive through submit because the renderer owns it outright.
+            let t_arena = Stopwatch::start();
+            let (mut arena_create_ms, mut arena_write_ms) = (0.0f64, 0.0f64);
             let gxp_slot = (!gxp_prepared.is_empty()).then(|| {
                 let slot = self.gxp_arena_slot;
                 self.gxp_arena_slot += 1;
@@ -13175,15 +13367,22 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     &gvdata,
                     &gidata,
                     &gudata,
+                    &mut arena_create_ms,
+                    &mut arena_write_ms,
                 );
                 slot
             });
+            self.last_phases.arena_ms = t_arena.ms();
+            self.last_phases.arena_create_ms = arena_create_ms;
+            self.last_phases.arena_write_ms = arena_write_ms;
+            let t_ubo_bg = Stopwatch::start();
             if let Some(slot) = gxp_slot {
                 let generation = self.gxp_arenas[slot].generation;
                 let used: Vec<(u64, wgpu::TextureFormat, u32, u32, u64, u64)> =
                     gxp_prepared.iter().map(|p| (p.key, p.format, p.samples, p.cull, p.layout, p.raster)).collect();
                 self.gxp.ensure_ubo_bgs(device, &self.gxp_arenas[slot].ubo, slot, generation, &used);
             }
+            self.last_phases.ubo_bg_ms = t_ubo_bg.ms();
 
             self.last_phases.upload_ms = t_upload.ms();
 
@@ -13259,7 +13458,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // pass starts at the full rect (wgpu's default), and the tracker below issues
                 // a change only when the requested rect actually differs - which on a title
                 // whose every pass is fullscreen means it never issues one at all.
-                let (att_w, att_h) = (surf_w * attach_scale, surf_h * attach_scale);
+                // ATTACHMENT texels per TARGET pixel, per axis. One on an offscreen pass, the
+                // supersample factor on a supersampled display pass, and the panel-over-buffer
+                // ratio on a display pass whose title declared a buffer smaller than the panel
+                // - which is the case that was being computed wrong. See `att_w`'s doc.
+                let sx = att_w as f32 / surf_w.max(1) as f32;
+                let sy = att_h as f32 / surf_h.max(1) as f32;
                 let full = (0.0f32, 0.0f32, att_w as f32, att_h as f32);
                 let mut cur_vp = full;
                 // The guest's REGION CLIP, tracked exactly as the viewport is and for the
@@ -13301,10 +13505,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let want = match e {
                         Enc::Gxp(idx) => {
                             match gxm_viewport_rect(&gxp_prepared[*idx].viewport, surf_w, surf_h) {
-                                Some(r) => {
-                                    let s = attach_scale as f32;
-                                    (r.0 * s, r.1 * s, r.2 * s, r.3 * s)
-                                }
+                                Some(r) => (r.0 * sx, r.1 * sy, r.2 * sx, r.3 * sy),
                                 None => full,
                             }
                         }
@@ -13323,10 +13524,20 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         last_clip = Some(clips[oi]);
                         super::report_region_clip_applied(clips[oi], surf_w, surf_h);
                     }
+                    // Scaled by the EDGES, not by (origin, extent): scaling a width
+                    // independently of its origin lets rounding move the far edge by a texel,
+                    // which on a clip that is meant to reach the edge of the frame leaves a
+                    // seam. Both edges are clamped to the attachment, because a guest rectangle
+                    // that reaches the target's last pixel must still be inside it after the
+                    // ratio is applied, and wgpu rejects a scissor that leaves the attachment.
                     let want_sc = clips[oi]
                         .rect_in(surf_w, surf_h)
                         .map(|(x, y, w, h)| {
-                            (x * attach_scale, y * attach_scale, w * attach_scale, h * attach_scale)
+                            let x0 = ((x as f32 * sx).floor() as u32).min(att_w);
+                            let y0 = ((y as f32 * sy).floor() as u32).min(att_h);
+                            let x1 = (((x + w) as f32 * sx).ceil() as u32).clamp(x0, att_w);
+                            let y1 = (((y + h) as f32 * sy).ceil() as u32).clamp(y0, att_h);
+                            (x0, y0, x1 - x0, y1 - y0)
                         })
                         .unwrap_or(full_sc);
                     if want_sc != cur_sc {
@@ -13435,9 +13646,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             self.last_phases.pass_ms = t_pass.ms();
             self.chain_phases.add(self.last_phases);
-            // The arenas are NOT retired here any more: this pass's slot keeps them for the
-            // next frame's pass of the same ordinal. Only a slot that had to GROW retires a
-            // buffer, and `ensure_gxp_arena` puts that one in the graveyard itself.
+            // The GPU-side arenas are NOT retired here any more: this pass's slot keeps them
+            // for the next frame's pass of the same ordinal. Only a slot that had to GROW
+            // retires a buffer, and `ensure_gxp_arena` puts that one in the graveyard itself.
         }
 
         /// What the last [`GxmRenderer::encode_chain`] spent, phase by phase, over EVERY pass

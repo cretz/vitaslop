@@ -462,6 +462,35 @@ fn decode_grp_test(word: u64) -> Instr {
         (0, 13) => (TestAlu::Mul, prec == 0, true),
         (0, 14) => (TestAlu::Sub, prec == 0, true),
         (3, 0) => (TestAlu::BitAnd, false, false),
+        // The BITWISE family's SHIFT LEFT. Three routes agree and none of them is a guess:
+        //
+        // * `usse-spec-test-ops.md` gives the family's ordering as 0=AND, 1=OR, 2=XOR, 3=SHL,
+        //   and marks 4..7 INFERRED.
+        // * `usse-spec-test-mask-forms.md` reaches the same table from a different source and
+        //   CORRECTS only 4..7 (ROL=5, a gap at 6, ASR=7). The two disagree about nothing at
+        //   or below 3, so the value in hand does not depend on which of them is right.
+        // * The IDIOM refutes the only competing reading that could be constructed - that the
+        //   TEST group reuses the separate VBW group's `op1` numbering, where 3 is XOR. The
+        //   two corpus instances (`frag_7089f16e34be693f` #31 and #34) are the two SIDES of a
+        //   facing select: a VTSTMSK writes `0x0000FFFF`-or-zero from `GLOBAL[16]` (EQ for one,
+        //   NE for the other), the very next instruction tests THAT register against the inline
+        //   immediate 31, and a `mov IfP(0)` follows. Under XOR both tests are `(mask ^ 31) > 0`
+        //   - unconditionally TRUE for either mask value - so both movs would always fire, the
+        //   second would always win, and the two complementary VTSTMSKs above them would be
+        //   dead code the compiler emitted for nothing. Under SHL each test is `(mask << 31)`,
+        //   which keeps bit 0 of the mask and makes exactly one side fire. That is the same
+        //   two-sided facing select the `(1, 10)` arm below documents for other titles.
+        //
+        // The shift amount is required to be an inline immediate below 32 (checked once the
+        // operands are decoded, further down). WGSL leaves a shift of 32 or more indeterminate
+        // and no source we hold states what the device does there, so that case is REFUSED
+        // rather than masked into something plausible.
+        //
+        // WHAT WOULD REFUTE THIS, named here rather than left for a later reader to notice: an
+        // instance whose src1 is not a value this program's own VTSTMSK just wrote, or whose
+        // shift amount is not 31 - either one puts the op back in a domain where SHL and XOR
+        // give different answers and the idiom no longer decides between them.
+        (3, 3) => (TestAlu::BitShl, false, false),
         // The 8-BIT family (alu_sel 2). Its operands are read as four 8-bit unsigned-
         // normalised channels whatever `prec` says - the precision bit selects between the two
         // FLOAT widths and has no meaning once the family is an integer one. This is the arm
@@ -583,6 +612,18 @@ fn decode_grp_test(word: u64) -> Instr {
         s2.swizzle = [0; 4];
     }
 
+    // A SHIFT's amount has to be known to be in range. WGSL leaves a shift of 32 or more
+    // indeterminate, and what the device does there is not established by either spec source,
+    // so anything but an inline immediate below 32 is refused instead of masked.
+    if matches!(alu, TestAlu::BitShl)
+        && !matches!(s2.bank, Bank::Immediate if (s2.index as u32) < 32)
+    {
+        blocked = blocked.or(Some(
+            "0x48 VTST shift-left whose amount is not an inline immediate below 32 - a shift of \
+             32 or more is indeterminate in WGSL and the device's behaviour is not established",
+        ));
+    }
+
     // The general-register destination is only written when `test_wben` is set; otherwise the
     // dest fields are inert and the instruction is predicate-only.
     let dest = if write_back {
@@ -659,12 +700,10 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     if matches!(pred, Predicate::Raw(_)) {
         blocked = blocked.or(Some("PN (per-instance) predicate depends on repeat state - not modeled"));
     }
-    if bits(word, 37, 36) != 2 {
-        blocked = blocked.or(Some(
-            "0x78 VTSTMSK mask type other than NUMERIC: the bit-pattern mask forms' width rule \
-             is not established",
-        ));
-    }
+    // The mask FORM. Checked against the ALU family below, because what this field selects is
+    // the FORMAT OF THE WRITTEN VALUE and the format's width comes from the family - see the
+    // `mask_type` gate after the ALU table.
+    let mask_type = bits(word, 37, 36);
     if bits(word, 50, 50) != 0 {
         blocked = blocked.or(Some("0x78 VTSTMSK test_flag_2 set - what it feeds is not established"));
     }
@@ -684,11 +723,86 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         (0, 2) => (TestAlu::Add, prec == 0, true),
         (0, 13) => (TestAlu::Mul, prec == 0, true),
         (0, 14) => (TestAlu::Sub, prec == 0, true),
+        // >>> THE 16/32-BIT INTEGER FAMILY'S UNSIGNED 16-BIT SUBTRACT.
+        //
+        // This is the one non-float VTSTMSK that has ever been seen: the word
+        // `0x7802019271f6a839`, which panicked a user's run several holes into a round. Every
+        // part of it is now sourced rather than guessed - see the `mask_type` gate below for
+        // the written value, and note the two things that make it translatable at all:
+        //
+        //   * `float_ty = false`, so the operands are NOT doubled. That was the one open
+        //     contradiction between the two clean-room passes, and the CORPUS settled it: 12
+        //     decisive cases over 4 programs and two unrelated titles where a non-float TEST
+        //     operand stays inside its program's declared register file only if it is not
+        //     doubled, and none the other way (`test_group_operand_numbering_evidence`).
+        //   * The operation only has to be right about ADD vs SUB vs MUL, because the relation
+        //     is `== 0` and `a - b == 0` iff `a == b` at any width and either signedness. Op 10
+        //     being the unsigned 16-bit subtract is corroborated by the vendor's own hardware
+        //     header, which pins indices 14/15 of this family as the 32-bit subtracts and so
+        //     anchors the table numerically.
+        //
+        // `half_precision` is false: this family's operands are raw lanes, not F16 halves, and
+        // the emitter must not put them through a float view [[TestAlu::IntSub16U]].
+        //
+        // >>> THIS IS THE MASK-WRITING SIBLING OF THE VTST `(1, 10)` ARM ABOVE, and the two
+        // should be read together. That arm decodes the SAME operation with the same operand
+        // shape - `GLOBAL[16]` against an SA register, EQ then NE - for a third title's lit
+        // materials, and it reached `float_ty = false` independently, by observing that the
+        // register number only looks like `SA[78]` under a float decode BECAUSE that decode
+        // doubles. The corpus census now says the same thing from a third direction. Three
+        // independent routes to "this family is not double-register" is what makes the operand
+        // numbering settled rather than merely chosen.
+        //
+        // >>> WHAT WOULD REFUTE THIS ARM, named here rather than left for a reader to notice,
+        // exactly as the VTST arm names its own: an instance whose src2 is a value wider than
+        // 16 bits AND not the program's literal zero. The VTST arm rests on src2 being that
+        // zero, where subtract, add and max all test the same predicate; this arm does NOT
+        // need that, because the vendor's own header anchors the family's table numerically
+        // (indices 14/15 are its 32-bit subtracts, added later on the vector core), which makes
+        // index 10 the unsigned 16-bit subtract at table level. But if such an instance ever
+        // appears and renders wrong, the op numbering is where to look first - and note that
+        // the VTST arm models the same op at 32 bits, which is harmless in ITS {0,1}-against-
+        // zero domain and would not be if that domain widened.
+        (1, 10) => (TestAlu::IntSub16U, false, false),
         _ => {
             blocked = blocked.or(Some("0x78 VTSTMSK ALU family/op not modeled"));
             (TestAlu::Sub, prec == 0, true)
         }
     };
+    // >>> WHAT THE MASK FORM WRITES, AND WHY ONLY THESE TWO COMBINATIONS ARE ALLOWED.
+    //
+    // The field is a FORMAT SELECTOR for the written value - a family of "all-ones of some
+    // width" forms plus a numeric one - which is the vendor's own naming and refutes the
+    // earlier reading that it merely chose a channel count. The two available readings agree
+    // on the numbers for some combinations and DIVERGE for others, so only the combinations
+    // where they coincide can be translated; a divergence is a shadow or a facing term that is
+    // silently always-on or always-off.
+    //
+    //   * NUMERIC (2) with a FLOAT family: 1.0 / 0.0. The corpus's three words, and what the
+    //     consumer there requires (the next instruction dots the mask against four bilinear
+    //     coefficients, i.e. averages the comparisons).
+    //   * PRECISION-MASK (1) with the UNSIGNED 16-BIT family: 0xFFFF / 0x0000. "A mask at the
+    //     ALU precision" (vendor naming) and "all-ones at the type width" (the emulator rule)
+    //     are DIFFERENT RULES that land on the SAME PAIR OF NUMBERS here. That is what makes
+    //     this translatable without knowing which rule is the true one - the answer does not
+    //     depend on the choice.
+    //
+    // Still refused, because there the two rules give different numbers: the 8-bit-mask form
+    // (0) with a 16- or 32-bit type (0xFF against 0xFFFF/0xFFFFFFFF), the numeric form (2) with
+    // an INTEGER family (all-ones against 1), and every signed integer type (one reading writes
+    // maximum-positive and nothing corroborates it). Value 3 is named "reserved".
+    let mask_ok = match (mask_type, alu) {
+        (2, TestAlu::Add | TestAlu::Sub | TestAlu::Mul) => true,
+        (1, TestAlu::IntSub16U) => true,
+        _ => false,
+    };
+    if !mask_ok {
+        blocked = blocked.or(Some(
+            "0x78 VTSTMSK: this (mask type, ALU family) pair is one where the two readings of \
+             what a mask writes DISAGREE - only numeric-with-float and precision-with-u16 are \
+             established",
+        ));
+    }
     let cmp = match (bits(word, 43, 42), bits(word, 41, 40), bits(word, 39, 39)) {
         (0, 1, _) => TestCmp::Eq,
         (0, 2, _) => TestCmp::Ne,
@@ -743,9 +857,17 @@ fn decode_grp_test_mask(word: u64) -> Instr {
         op: Op::TestMask { alu, cmp },
         pred,
         dest,
-        // A mask is per-CHANNEL and the group carries no write-mask field, so all four are
-        // written - which is also what makes the four gathered comparisons distinguishable.
-        write_mask: [true; 4],
+        // >>> THE CHANNEL COUNT IS DERIVED FROM THE ALU FAMILY, NOT FROM THE MASK TYPE.
+        //
+        // The group carries no write-mask field, so the count comes from elsewhere, and the
+        // reference is explicit about where: four channels for the FLOAT family (or a dot
+        // product), ONE - channel x only - for every non-float family. That is also the only
+        // reading that makes sense of each: the float form's consumer dots the mask against
+        // four bilinear coefficients and needs four distinguishable comparisons, while the
+        // integer form's operands are whole raw lanes with no per-channel content to compare,
+        // so four channels would be four copies of one answer written over four registers the
+        // instruction was never meant to touch.
+        write_mask: if float_ty { [true; 4] } else { [true, false, false, false] },
         srcs: vec![s1, s2],
         half_precision,
         raw: word,

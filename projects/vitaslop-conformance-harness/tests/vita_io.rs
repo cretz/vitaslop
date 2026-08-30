@@ -1,6 +1,7 @@
 //! End-to-end coverage for the SceIoFilemgr file-IO host module. Drives
 //! sceIoWrite-to-stdout, sceIoOpen/Read/Getstat on a preloaded asset, and
-//! create/write then reopen/lseek/read-back on a guest-produced file, asserting
+//! create/write then reopen/lseek/read-back on a guest-produced file, and the
+//! mount-separator equivalence (`ux0:x` is `ux0:/x`), asserting
 //! the printed transcript plus the bytes the guest actually wrote. Run with:
 //!   cargo test -p vitaslop-conformance-harness --test vita_io
 
@@ -23,6 +24,9 @@ getstat: ret=0 size=10
 open write: ok=1
 seek: pos=4 tail=[slop]
 missing: failed=1
+no separator: ok=1 [vitaslop]
+doubled separator: ok=1
+climb out: ok=1
 ";
 
 #[test]

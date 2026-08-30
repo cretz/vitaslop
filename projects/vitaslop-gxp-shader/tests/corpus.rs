@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use vitaslop_gxp_shader::ir::{Bank, Op, TestAlu, TestCmp};
 use vitaslop_gxp_shader::{link_programs, recompile_fragment, recompile_vertex, Program, ProgramKind};
 
 fn corpus_dir() -> Option<PathBuf> {
@@ -3178,4 +3179,313 @@ fn multi_entry_uniform_buffer_binding_tables() {
     }
     println!("
 {n} blob(s) have more than one +0x78 entry");
+}
+
+/// >>> THE WORD THAT PANICS THE RECOMPILER ON A REAL PHONE, REPRODUCED OFFLINE IN A TEST.
+///
+/// `gxp pair 7089f16e34be693f ... blocked USSE instruction #24 at code byte 0xc0
+/// (raw 0x7802019271f6a839): 0x78 VTSTMSK mask type other than NUMERIC`, hit playing
+/// CHALLENGE on the third course. The pair is in no local corpus and its word appears in no
+/// file of the extracted container (the shaders are packed inside the `.xb` archives).
+///
+/// **It does not need to be.** The refusal is a DECODE refusal - `decode` sets `blocked` and
+/// the emitter hard-fails on it, before any GPU work - so the whole crash reproduces from the
+/// 64 bits, with no game, no device and no capture. That makes the turnaround on this a
+/// second instead of a play session, and it is the reason to reach for the word rather than
+/// the blob whenever the failure is in the decoder.
+///
+/// What the word CANNOT answer, and what a capture is still owed for, is the pair of open
+/// questions below - both of which need the surrounding PROGRAM, not the instruction.
+#[test]
+fn the_word_that_blocks_the_recompiler_decodes_the_way_the_panic_says() {
+    use vitaslop_gxp_shader::usse::decode::decode;
+    const W: u64 = 0x7802019271f6a839;
+    let i = decode(W);
+    assert_eq!(i.group, 0x0f, "group 0x0f is the TEST family (0x78 VTSTMSK)");
+    assert_eq!(i.raw, W);
+
+    // Every field the panic rests on, read back from the word so a decoder change that moves
+    // any of them fails HERE rather than on a phone. Bit positions are the group's documented
+    // layout (see `decode_grp_test_mask`).
+    let b = |hi: u32, lo: u32| ((W >> lo) & ((1u64 << (hi - lo + 1)) - 1)) as u32;
+    assert_eq!(b(37, 36), 1, "tst_mask_type: 1, NOT the NUMERIC 2 - this is what blocks");
+    assert_eq!(b(19, 18), 1, "alu_sel: the INTEGER family, not float");
+    assert_eq!(b(17, 14), 10, "alu_op: the unsigned 16-bit SUBTRACT");
+    assert_eq!((b(43, 42), b(41, 40), b(39, 39)), (0, 1, 1), "sign/zero/crcomb: the relation is == 0");
+    assert_eq!(b(20, 20), 1, "test_wben: the destination IS written");
+    assert_eq!(b(50, 50), 0, "test_flag_2 clear, so that open flag is not in play here");
+    assert_eq!(b(58, 56), 0, "no predicate");
+    // One operand is the special bank at index 16 - GLOBAL[16], which this project and the
+    // vendor's own header independently name the BACK-FACE control register. So whatever the
+    // mask turns out to be, this instruction is a FACING TEST.
+    assert_eq!((b(31, 30), b(49, 49), b(13, 7)), (1, 1, 80), "src1: special bank, 64+16");
+
+    // >>> AND THE TRANSLATION, WHICH IS NO LONGER BLOCKED.
+    //
+    // Both questions that held it are answered, and neither by guessing:
+    //
+    // 1. WHICH REGISTERS IT TOUCHES - settled by the CORPUS, not by either document. The two
+    //    clean-room passes disagreed about operand doubling for the non-float families
+    //    (`SA[57]`/`PA[15]` against `SA[114]`/`PA[30]`).
+    //    `test_group_operand_numbering_evidence` finds 12 cases over 4 programs and two
+    //    unrelated titles where a non-float TEST operand stays inside its program's declared
+    //    register file ONLY if it is not doubled, and none the other way. Not doubled.
+    // 2. WHAT `tst_mask_type = 1` WRITES - the two readings DISAGREE about the mechanism and
+    //    AGREE about this combination's numbers. "A mask at the ALU precision" and "all-ones
+    //    at the type width" both give 0xFFFF/0x0000 for the precision-mask form at an unsigned
+    //    16-bit precision. The translation therefore does not depend on which rule is true,
+    //    which is why it can ship while the mechanism stays open. The combinations where the
+    //    two rules give DIFFERENT numbers are still refused - see `decode_grp_test_mask`.
+    assert!(i.blocked.is_none(), "no longer blocked: {:?}", i.blocked);
+    assert!(
+        matches!(i.op, Op::TestMask { alu: TestAlu::IntSub16U, cmp: TestCmp::Eq }),
+        "an unsigned 16-bit equality test, got {:?}",
+        i.op
+    );
+    // The operands, at the numbering the corpus established.
+    let d = i.dest.as_ref().expect("a mask writes a destination");
+    assert_eq!((d.bank, d.index), (Bank::PrimaryAttr, 15), "PA[15], not PA[30]");
+    assert_eq!((i.srcs[0].bank, i.srcs[0].index), (Bank::Global, 16), "GLOBAL[16], the facing register");
+    assert_eq!((i.srcs[1].bank, i.srcs[1].index), (Bank::SecondaryAttr, 57), "SA[57], not SA[114]");
+    // ONE channel. The count comes from the ALU family, not the mask type: four channels for
+    // the float form (whose consumer dots them against bilinear coefficients), one for this.
+    assert_eq!(i.write_mask, [true, false, false, false], "channel x only");
+}
+
+/// The combinations where the two readings of the mask field give DIFFERENT numbers must stay
+/// refused. This is the half of the fix that is easy to lose: unblocking the established case
+/// is only correct while its neighbours remain blocked, and a later "tidy-up" that widens the
+/// gate would ship a silently wrong shadow or facing term.
+#[test]
+fn the_mask_forms_whose_readings_disagree_are_still_refused() {
+    use vitaslop_gxp_shader::usse::decode::decode;
+    const W: u64 = 0x7802019271f6a839;
+    // Rewrite ONLY `tst_mask_type` (bits 37:36) and check each other value is refused.
+    for mt in [0u64, 2, 3] {
+        let w = (W & !(3 << 36)) | (mt << 36);
+        let i = decode(w);
+        assert!(
+            i.blocked.is_some(),
+            "mask type {mt} with the u16 family must stay blocked - the 8-bit-mask form and              the numeric form are where the vendor naming and the emulator rule diverge"
+        );
+    }
+    // And the established word is still fine, so the loop above is not passing by accident.
+    assert!(decode(W).blocked.is_none());
+}
+
+/// >>> CAN THE CORPUS SETTLE THE TEST-GROUP OPERAND NUMBERING WITHOUT THE CRASHING BLOB?
+///
+/// The two clean-room passes disagree about whether the TEST group's register fields are
+/// DOUBLED for the non-float ALU families: one doubles only for float, the other says the
+/// field counts 32-bit registers with the low bit always zero and doubles unconditionally.
+/// The word that panics is integer, so the two readings name different registers and cannot
+/// be translated between.
+///
+/// This is the cheap oracle to try before capturing anything: a program declares how many
+/// PRIMARY and SECONDARY attribute registers it uses, so a TEST-group instruction naming an
+/// index that only ONE rule keeps inside the declared file refutes the other - no device, no
+/// capture, no gameplay. Census only; it asserts nothing, because what it finds is the input
+/// to a decision rather than the decision.
+#[test]
+#[ignore = "census over a corpus dir; run with VITASLOP_GXP_CORPUS=<dir>"]
+fn test_group_operand_numbering_evidence() {
+    use vitaslop_gxp_shader::usse::decode::decode;
+    let Some(dir) = corpus_dir() else {
+        println!("no VITASLOP_GXP_CORPUS set");
+        return;
+    };
+    // (alu_sel, alu_op) -> how many words, and one example with its context.
+    let mut fams: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let mut masks: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut decisive = 0usize;
+    let mut total = 0usize;
+    let mut progs = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        progs += 1;
+        let (pa, sa) = (p.primary_reg_count as u32, p.secondary_reg_count as u32);
+        for (label, code) in [("primary", p.code.clone()), ("secondary", p.secondary_code.clone())] {
+            for (i, &w) in code.iter().enumerate() {
+                let g = ((w >> 59) & 0x1f) as u8;
+                // 0x09 = VTST (predicate), 0x0f = VTSTMSK (per-channel mask).
+                if g != 0x09 && g != 0x0f {
+                    continue;
+                }
+                total += 1;
+                let b = |hi: u32, lo: u32| ((w >> lo) & ((1u64 << (hi - lo + 1)) - 1)) as u32;
+                let (alu_sel, alu_op) = (b(19, 18), b(17, 14));
+                *fams.entry((alu_sel, alu_op)).or_default() += 1;
+                if g == 0x0f {
+                    *masks.entry(b(37, 36)).or_default() += 1;
+                }
+                // The evidence: a NON-FLOAT test whose doubled index leaves the declared file
+                // while its undoubled one stays inside (or vice versa) decides the rule.
+                if alu_sel == 0 {
+                    continue;
+                }
+                let (s1b, s1n) = (b(31, 30), b(13, 7));
+                let (s2b, s2n) = (b(29, 28), b(6, 0));
+                for (banksel, n) in [(s1b, s1n), (s2b, s2n)] {
+                    // bank 2 = pa (primary attr), 3 = sa (secondary attr) on this selector.
+                    let limit = match banksel {
+                        2 => pa,
+                        3 => sa,
+                        _ => continue,
+                    };
+                    if limit == 0 {
+                        continue;
+                    }
+                    let (single, doubled) = (n < limit, n * 2 < limit);
+                    if single != doubled {
+                        decisive += 1;
+                        println!(
+                            "DECISIVE {name} {label}#{i} w={w:#018x} bank_sel={banksel} n={n} \
+                             limit={limit} -> undoubled {}, doubled {}",
+                            if single { "IN" } else { "OUT" },
+                            if doubled { "IN" } else { "OUT" },
+                        );
+                    }
+                }
+                let _ = decode(w);
+            }
+        }
+    }
+    println!("\n{progs} programs, {total} TEST-group word(s)");
+    println!("ALU (sel, op) populations: {fams:?}");
+    println!("VTSTMSK tst_mask_type populations: {masks:?}");
+    println!("decisive non-float operands found: {decisive}");
+}
+
+/// `0x48090881a00cc79f` - the BITWISE SHIFT-LEFT test that panicked a user's run one fix after
+/// the VTSTMSK above. Decoded from the 64 bits alone: no game, no device, no capture.
+///
+/// Both spec sources give the BITWISE family's `alu_op` 3 as SHIFT LEFT and disagree about
+/// nothing at or below 3, and the idiom refutes the only competing reading (the separate VBW
+/// group's numbering, where 3 is XOR) because XOR makes the test unconditionally true and the
+/// two complementary facing masks above it dead. See the arm in `decode_grp_test`.
+#[test]
+fn the_bitwise_shift_test_decodes_as_a_shift_of_the_facing_mask() {
+    use vitaslop_gxp_shader::ir::{Bank, Op, TestAlu, TestCmp, TestReduce};
+    use vitaslop_gxp_shader::usse::decode::decode;
+    const W: u64 = 0x48090881a00cc79f;
+    let i = decode(W);
+    assert!(i.blocked.is_none(), "must translate: {:?}", i.blocked);
+    assert_eq!(
+        i.op,
+        Op::Test {
+            alu: TestAlu::BitShl,
+            cmp: TestCmp::Gt,
+            reduce: TestReduce::Channel(0),
+            pdst: 0,
+            write_back: false
+        }
+    );
+    // src1 is pa[15] UNDOUBLED - the register the program's own VTSTMSK writes two
+    // instructions earlier. A float decode would double it to pa[30], which this program does
+    // not declare, and the census records that as one of its decisive cases.
+    assert_eq!(i.srcs[0].bank, Bank::PrimaryAttr);
+    assert_eq!(i.srcs[0].index, 15);
+    // src2 is the inline immediate 31: the shift amount, not a register.
+    assert_eq!(i.srcs[1].bank, Bank::Immediate);
+    assert_eq!(i.srcs[1].index, 31);
+    // The sibling word three instructions later is the same test on the complementary mask.
+    let j = decode(0x48090881a00cc31f);
+    assert!(j.blocked.is_none());
+    assert_eq!(j.srcs[0].index, 6, "the NE mask's register");
+}
+
+/// A SHIFT whose amount is not provably in range stays REFUSED. WGSL leaves a shift of 32 or
+/// more indeterminate and neither spec source says what the device does, so masking the amount
+/// into range would be inventing a semantics - the one thing this decoder does not do.
+///
+/// Rewrites only the src2 fields of the real word, so what is being tested is the amount and
+/// nothing else.
+#[test]
+fn a_shift_left_test_with_an_unprovable_amount_is_refused() {
+    use vitaslop_gxp_shader::usse::decode::decode;
+    const W: u64 = 0x48090881a00cc79f;
+    // src2_n (bits 6:0) raised to 32 and to 127: both out of WGSL's defined range.
+    for n in [32u64, 63, 127] {
+        let w = (W & !0x7f) | n;
+        assert!(
+            decode(w).blocked.is_some(),
+            "a shift by {n} must stay blocked - 32 or more is indeterminate"
+        );
+    }
+    // src2_ext (bit 48) cleared makes src2 a REGISTER, whose value cannot be bounded here.
+    assert!(
+        decode(W & !(1 << 48)).blocked.is_some(),
+        "a register shift amount must stay blocked"
+    );
+    // The real word, and every amount below 32, still translate - so the loop above is not
+    // passing because the whole arm is refused.
+    for n in [0u64, 1, 31] {
+        let w = (W & !0x7f) | n;
+        assert!(decode(w).blocked.is_none(), "a shift by {n} is in range");
+    }
+}
+
+/// CENSUS: every TEST-group word in the BITWISE ALU family (`alu_sel` 3), with its operands
+/// and the two words either side of it.
+///
+/// The family's `alu_op` numbering is the open question. `(3, 0)` is modelled as AND; the
+/// corpus also carries `(3, 3)`, and nothing we hold states what 3 is. What decides it is not
+/// a document but the IDIOM: these tests read a value the program itself just produced, so the
+/// neighbours name what src1 holds, and an op that turns that value into a CONSTANT cannot be
+/// the one the compiler emitted. Census only - it asserts nothing.
+#[test]
+#[ignore = "census over a corpus dir; run with VITASLOP_GXP_CORPUS=<dir>"]
+fn bitwise_family_test_words_with_their_context() {
+    use vitaslop_gxp_shader::usse::decode::decode;
+    let Some(dir) = corpus_dir() else {
+        println!("no VITASLOP_GXP_CORPUS set");
+        return;
+    };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for (label, code) in [("primary", p.code.clone()), ("secondary", p.secondary_code.clone())] {
+            for (i, &w) in code.iter().enumerate() {
+                let g = ((w >> 59) & 0x1f) as u8;
+                if g != 0x09 && g != 0x0f {
+                    continue;
+                }
+                let b = |hi: u32, lo: u32| ((w >> lo) & ((1u64 << (hi - lo + 1)) - 1)) as u32;
+                if b(19, 18) != 3 {
+                    continue;
+                }
+                let bank = |s: u32| match s {
+                    0 => "temp",
+                    1 => "out/global",
+                    2 => "pa",
+                    _ => "sa",
+                };
+                println!(
+                    "{name} {label}#{i} w={w:#018x} alu_op={} cmp(sign={},zero={},and={}) \
+                     chan_cc={} pdst={} wben={} prec={}",
+                    b(17, 14),
+                    b(43, 42),
+                    b(41, 40),
+                    b(39, 39),
+                    b(38, 36),
+                    b(35, 34),
+                    b(20, 20),
+                    b(47, 47),
+                );
+                println!(
+                    "    src1 {}[{}] ext={}  src2 {}[{}] ext={} (ext+bank2 = IMMEDIATE {})",
+                    bank(b(31, 30)),
+                    b(13, 7),
+                    b(49, 49),
+                    bank(b(29, 28)),
+                    b(6, 0),
+                    b(48, 48),
+                    b(6, 0),
+                );
+                for j in i.saturating_sub(2)..(i + 3).min(code.len()) {
+                    let mark = if j == i { ">>" } else { "  " };
+                    println!("    {mark} #{j} {:?}", decode(code[j]));
+                }
+            }
+        }
+    }
 }

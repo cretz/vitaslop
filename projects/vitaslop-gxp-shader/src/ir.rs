@@ -159,6 +159,17 @@ pub enum TestAlu {
     Mul,
     /// `src1 & src2` on the raw 32-bit lane (the BITWISE family's AND).
     BitAnd,
+    /// `src1 << src2` on the raw 32-bit lane (the BITWISE family's SHIFT LEFT, `alu_op` 3).
+    ///
+    /// A distinct member rather than a flag on [`Self::BitAnd`] for the reason the whole family
+    /// is split up: the operation decides what the tested value IS. The one idiom that encodes
+    /// it shifts a `0x0000FFFF`-or-zero mask left by 31, which keeps only the mask's bit 0 -
+    /// reading that as an AND would test five bits instead of one.
+    ///
+    /// The family's operands are UNSIGNED 32-bit, so a result of `0x80000000` is a large
+    /// positive number and not a negative one. Both spec sources state that, and it is the
+    /// difference between this test passing and failing.
+    BitShl,
     /// `src1' - src2` in the 8-BIT fixed-point pipeline (the INT8 family's FPSUB8), where a
     /// register holds four 8-bit unsigned-normalised channels rather than one float.
     ///
@@ -176,6 +187,15 @@ pub enum TestAlu {
     /// That happens to survive a `!= 0` test and would not survive a `< 0` one, which is
     /// exactly the kind of near-miss this codebase refuses to leave in.
     IntSub,
+    /// `src1 - src2` as UNSIGNED 16-BIT integers (the 16/32-bit integer family's `alu_op` 10),
+    /// on the raw lane's low half.
+    ///
+    /// Distinct from [`Self::IntSub`], which is the same family's 32-BIT subtract, because the
+    /// WIDTH changes the answer and this codebase does not round that off: the device compares
+    /// only the low 16 bits, so two lanes that differ ONLY above bit 15 are equal to the
+    /// hardware and not equal to a 32-bit compare. That is a silent wrong answer in exactly the
+    /// direction a facing or stencil-style test would take.
+    IntSub16U,
 }
 
 /// One term's coefficient in the 8-bit sum-of-products combiner ([`Op::Sop2`]). The field

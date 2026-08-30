@@ -326,9 +326,36 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 _ => return Err("vtst write-back on a raw-lane family"),
             }
         }
-        // VTSTMSK: the same compare, written out as one NUMERIC value per channel.
+        // VTSTMSK: the same compare, written out as one value per channel - NUMERIC for the
+        // float families, a raw bit-pattern mask for the unsigned 16-bit integer one.
         Op::TestMask { alu, cmp } => {
             use crate::ir::{TestAlu, TestCmp};
+            // >>> THE UNSIGNED 16-BIT FORM WRITES BITS, NOT A NUMBER.
+            //
+            // This register file holds `f32`, and its raw-lane readers already work in the
+            // lane's BITS (`to_bits`), so the mask is stored the same way round: the lane ends
+            // up holding the pattern 0x0000FFFF, which is what a later raw-lane read of it
+            // sees. Writing 65535.0 instead would agree with nothing - not with the device,
+            // not with the emitted WGSL, which uses `store_raw` for exactly this reason.
+            if matches!(alu, TestAlu::IntSub16U) {
+                // Channel x only; the decoder's write mask says so, and any other channel of
+                // this destination is not written by this instruction at all.
+                if c != 0 {
+                    return Err("vtstmsk u16 writes channel x only");
+                }
+                let raw = |i: usize| -> Result<u32, &'static str> {
+                    Ok(s(i, 0)?.to_bits())
+                };
+                let held = (raw(0)? & 0xffff) == (raw(1)? & 0xffff);
+                let held = match cmp {
+                    TestCmp::Eq => held,
+                    TestCmp::Ne => !held,
+                    // An ordered relation would need the compare's signedness pinned, which
+                    // no source establishes - the decoder refuses these before here.
+                    _ => return Err("vtstmsk u16 with an ordered relation"),
+                };
+                return Ok(f32::from_bits(if held { 0xffff } else { 0 }));
+            }
             let (a, b) = (s(0, c)?, s(1, c)?);
             let v = match alu {
                 TestAlu::Add => a + b,
@@ -679,15 +706,26 @@ fn test_channels(
     let mut out = [false; 4];
     for (c, slot) in out.iter_mut().enumerate() {
         *slot = match alu {
-            TestAlu::BitAnd => {
-                let v = raw(s1)? & raw(s2)?;
+            // The BITWISE family, on the raw lane. Its operands are UNSIGNED 32-bit (both spec
+            // sources say so), so the relations are unsigned ones - which is also what the
+            // emitter has always written, comparing against a `0u` literal. Reading them as
+            // signed here would make the oracle disagree with the shader it is checking on
+            // exactly the values that have the top bit set, which is the whole population a
+            // shift-left by 31 produces.
+            TestAlu::BitAnd | TestAlu::BitShl => {
+                let (a, b) = (raw(s1)?, raw(s2)?);
+                let v = match alu {
+                    TestAlu::BitAnd => a & b,
+                    // The decoder refuses any amount that is not an immediate below 32.
+                    _ => a << b,
+                };
                 match cmp {
                     TestCmp::Eq => v == 0,
                     TestCmp::Ne => v != 0,
-                    TestCmp::Lt => (v as i32) < 0,
-                    TestCmp::Le => (v as i32) <= 0,
-                    TestCmp::Gt => (v as i32) > 0,
-                    TestCmp::Ge => (v as i32) >= 0,
+                    TestCmp::Lt => false,
+                    TestCmp::Le => v == 0,
+                    TestCmp::Gt => v > 0,
+                    TestCmp::Ge => true,
                 }
             }
             TestAlu::IntSub => {
@@ -705,6 +743,13 @@ fn test_channels(
                 return Err(InterpError::UnsupportedOp {
                     index,
                     op: "vtst on the 8-bit family (this register file has no byte packing)",
+                })
+            }
+            // Only VTSTMSK's decoder produces this; VTST's own ALU table has no path to it.
+            TestAlu::IntSub16U => {
+                return Err(InterpError::UnsupportedOp {
+                    index,
+                    op: "vtst with the u16 mask family (only VTSTMSK decodes that ALU)",
                 })
             }
             TestAlu::Add | TestAlu::Sub | TestAlu::Mul => {

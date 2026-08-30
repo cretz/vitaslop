@@ -5,7 +5,12 @@ description = "SceIoFilemgr file IO over the host virtual filesystem - RUNNABLE"
 # end to end: sceIoWrite to fd 1 (the newlib-stdout sink), sceIoOpen/Read/Getstat
 # on a preloaded read-only asset (app0:/asset.bin = bytes 1..=10), and
 # create/write then reopen/lseek/read-back on a guest-produced file, plus a
-# missing-file open that fails. Every result is printed through sceClibPrintf, so
+# missing-file open that fails, plus the MOUNT-SEPARATOR
+# equivalence: the colon is the separator, so `ux0:data/x`, `ux0:/data/x` and
+# `ux0://data//x` are one file, and a `..` cannot climb out of a mount. That last
+# group is here because getting it wrong is invisible until a reload - a title that
+# saves through one spelling and loads through the other reads ENOENT on a file it
+# just wrote, and starts from a fresh profile for ever. Every result is printed through sceClibPrintf, so
 # the golden is a deterministic transcript. Executable form: tests/vita_io.rs
 # (the harness preloads the asset before the run). Built -fno-tree-vectorize so
 # the byte-sum loop is not auto-vectorized into (not-yet-lifted) NEON.
@@ -18,4 +23,7 @@ getstat: ret=0 size=10
 open write: ok=1
 seek: pos=4 tail=[slop]
 missing: failed=1
+no separator: ok=1 [vitaslop]
+doubled separator: ok=1
+climb out: ok=1
 """

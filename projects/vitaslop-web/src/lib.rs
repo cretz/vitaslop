@@ -997,6 +997,13 @@ struct RenderSplit {
     /// `encode_ms` broken down by `encode_chain`'s own phases, summed over the frame.
     prepare_ms: f64,
     upload_ms: f64,
+    /// `upload_ms` split into its two halves - see `EncodePhases::arena_ms`. The combined
+    /// number named no fix: a course-load frame read 2,642 ms of "upload" while uploading zero
+    /// textures and zero bytes.
+    arena_ms: f64,
+    arena_create_ms: f64,
+    arena_write_ms: f64,
+    ubo_bg_ms: f64,
     pass_ms: f64,
     gxp_draws: u64,
     fixed_draws: u64,
@@ -1812,6 +1819,10 @@ impl LivePlayback {
         self.split.encode_ms += t2 - t1;
         self.split.prepare_ms += ph.prepare_ms;
         self.split.upload_ms += ph.upload_ms;
+        self.split.arena_ms += ph.arena_ms;
+        self.split.arena_create_ms += ph.arena_create_ms;
+        self.split.arena_write_ms += ph.arena_write_ms;
+        self.split.ubo_bg_ms += ph.ubo_bg_ms;
         self.split.pass_ms += ph.pass_ms;
         self.split.gxp_draws += ph.gxp_draws as u64;
         self.split.fixed_draws += ph.fixed_draws as u64;
@@ -3948,9 +3959,13 @@ async fn live_loop(
                         .to_string()
                 } else {
                     format!(
-                        " (prepare {:.1}, upload {:.1}, pass {:.1})",
+                        " (prepare {:.1}, upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}], pass {:.1})",
                         s.prepare_ms / np,
                         s.upload_ms / np,
+                        s.arena_ms / np,
+                        s.arena_create_ms / np,
+                        s.arena_write_ms / np,
+                        s.ubo_bg_ms / np,
                         s.pass_ms / np
                     )
                 };
@@ -4578,11 +4593,15 @@ async fn live_loop(
                     // counters match the window mean exactly - which is when an outlier is most
                     // puzzling - this is the only line that says which half of encode grew.
                     &format!(
-                        "{:.1} ms over {} draws (prepare {:.1} + upload {:.1} + pass {:.1})",
+                        "{:.1} ms over {} draws (prepare {:.1} + upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}] + pass {:.1})",
                         s.worst_encode_ms,
                         s.worst_encode_draws,
                         s.worst_enc_phases.prepare_ms,
                         s.worst_enc_phases.upload_ms,
+                        s.worst_enc_phases.arena_ms,
+                        s.worst_enc_phases.arena_create_ms,
+                        s.worst_enc_phases.arena_write_ms,
+                        s.worst_enc_phases.ubo_bg_ms,
                         s.worst_enc_phases.pass_ms,
                     ),
                     &s.worst_enc_work.line(1),
