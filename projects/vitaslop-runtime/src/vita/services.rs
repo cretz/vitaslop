@@ -557,6 +557,67 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// int sceRtcGetDayOfWeek(int year, int month, int day)
+///
+/// The weekday of a civil date, 0 = Sunday. Derived from [`days_from_civil`] rather than
+/// from a table, so it agrees with every other date this file produces by construction:
+/// 1970-01-01 was a Thursday, which is the +4 below, and the floored remainder keeps
+/// dates before the Unix epoch (which the RTC's 0001-01-01 range allows) on the same
+/// cycle instead of reflecting them about it.
+#[hostcall]
+pub(super) fn rtc_get_day_of_week(_ctx: &mut GuestCtx, _st: &mut VitaState, year: i32, month: i32, day: i32) -> i32 {
+    // Written as one expression, not a chain of early returns: the `#[hostcall]` body
+    // cannot `return` (the macro appends the return-value write after it).
+    if !(1..=9999).contains(&year) {
+        SCE_RTC_ERROR_INVALID_YEAR
+    } else if !(1..=12).contains(&month) {
+        SCE_RTC_ERROR_INVALID_MONTH
+    } else if !(1..=31).contains(&day) {
+        SCE_RTC_ERROR_INVALID_DAY
+    } else {
+        (days_from_civil(year as i64, month as i64, day as i64) + 4).rem_euclid(7) as i32
+    }
+}
+
+/// int sceRtcFormatRFC3339LocalTime(char *pszDateTime, const SceRtcTick *utc)
+///
+/// Format a tick as an RFC 3339 timestamp in LOCAL time. This engine's local time is UTC
+/// ([`rtc_convert_time_zone`] explains why there is no offset to apply), so the offset
+/// printed is `+00:00` - written out rather than abbreviated to `Z`, because the caller's
+/// buffer is sized for the long form and a title that parses the field back expects the
+/// numeric offset the console emits.
+///
+/// The tick is expanded through the same [`civil_from_days`] path as `sceRtcSetTick`, so
+/// a title that formats a stamp and one that expands it cannot disagree about the date.
+#[hostcall]
+pub(super) fn rtc_format_rfc3339_local_time(ctx: &mut GuestCtx, _st: &mut VitaState, out: Ptr, tick: Ptr) -> i32 {
+    // The validation wants early exits, which a `#[hostcall]` body cannot have.
+    rtc_format_rfc3339_local_time_impl(ctx, out, tick)
+}
+
+fn rtc_format_rfc3339_local_time_impl(ctx: &mut GuestCtx, out: Ptr, tick: Ptr) -> i32 {
+    if out.is_null() || tick.is_null() {
+        return SCE_RTC_ERROR_INVALID_POINTER;
+    }
+    let t = read_tick(ctx, tick.addr());
+    let us = t - RTC_UNIX_EPOCH_TICKS as i64;
+    let secs = us.div_euclid(1_000_000);
+    let micro = us.rem_euclid(1_000_000);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    if !(1..=9999).contains(&y) {
+        return SCE_RTC_ERROR_INVALID_YEAR;
+    }
+    let sod = secs.rem_euclid(86_400);
+    let text = format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{micro:06}+00:00\0",
+        sod / 3600,
+        sod / 60 % 60,
+        sod % 60
+    );
+    ctx.write_bytes(out.addr(), text.as_bytes());
+    0
+}
+
 /// int sceRtcSetTick(SceRtcTime *pTime, const SceRtcTick *pTick)
 /// Expand a 64-bit microsecond tick back into broken-down time - the inverse of
 /// [`rtc_get_tick`]. Titles round-trip through this pair to do date arithmetic (add a day
@@ -838,6 +899,41 @@ pub(super) fn motion_magnetometer_set(ctx: &mut GuestCtx, st: &mut VitaState, on
 #[hostcall]
 pub(super) fn motion_get_magnetometer_state(_ctx: &mut GuestCtx, st: &mut VitaState) -> i32 {
     i32::from(st.motion_magnetometer)
+}
+
+/// int sceMotionSetDeadband(int setValue) / int sceMotionSetTiltCorrection(int setValue)
+///
+/// The two motion tuning bits. Neither changes what [`motion_get_state`] reports - the
+/// modelled device is perfectly still and perfectly level, so there is no jitter to
+/// filter and no tilt to correct - but each is HELD, because each has a getter below.
+/// `tilt` selects which bit.
+pub(super) fn motion_set_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bool) {
+    let on = ctx.arg(0) != 0;
+    if tilt {
+        st.motion_tilt_correction = on;
+    } else {
+        st.motion_deadband = on;
+    }
+    ctx.ret(0);
+}
+
+/// int sceMotionGetDeadband(void) / int sceMotionGetTiltCorrection(void)
+/// 1 if the bit is enabled, 0 if not. Both power up enabled, which is what the device
+/// documents, so a title that only ever reads them sees the device's own defaults.
+pub(super) fn motion_get_tuning(ctx: &mut GuestCtx, st: &mut VitaState, tilt: bool) {
+    let on = if tilt { st.motion_tilt_correction } else { st.motion_deadband };
+    ctx.ret(u32::from(on));
+}
+
+/// int sceMotionRotateYaw(float radians)
+///
+/// Rotates the fused orientation's yaw reference. Ours is the identity at rest and the
+/// device never moves, so the rotated frame is still a constant one - there is nothing
+/// to accumulate into. Accepted (the API returns 0 unconditionally) rather than refused,
+/// for the same reason [`motion_reset`] is.
+#[hostcall]
+pub(super) fn motion_rotate_yaw(_ctx: &mut GuestCtx, _st: &mut VitaState, _radians: f32) -> i32 {
+    0
 }
 
 /// int sceMotionReset(void)

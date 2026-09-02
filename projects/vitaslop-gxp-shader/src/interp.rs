@@ -311,6 +311,16 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         Op::Sop2 { .. } => {
             return Err("sop2.fx8 (this register file is one f32 per lane, not four bytes)")
         }
+        // The NORMALIZED U8 convert refuses for exactly the same reason: one side of it is a
+        // register holding four bytes, and this file has nowhere to put them. Interpreting it
+        // as the identity would make the oracle AGREE with an emitter that had the scaling
+        // wrong, which is the one thing an oracle must not do.
+        Op::PackUnorm8 { .. } => {
+            return Err("pack.unorm8 (this register file is one f32 per lane, not four bytes)")
+        }
+        Op::CopyFx8 => {
+            return Err("mov.fx8 (this register file is one f32 per lane, not four bytes)")
+        }
         // A memory load reads GUEST MEMORY, which this register-file model does not hold; a
         // fabricated value here would defeat the oracle's whole purpose.
         Op::MemLoad { .. } => return Err("ldmem (resolved before the per-channel evaluator)"),

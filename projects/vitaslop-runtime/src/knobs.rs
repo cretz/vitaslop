@@ -356,3 +356,10 @@ mod tests {
         assert!(block.contains("second line"), "the whole block is kept for matching");
     }
 }
+
+/// Device-memory scaling lives in `vitaslop-platform` because BOTH crates' budgets need it and
+/// that is the one they share - this crate depends on it, and it cannot depend back. Re-exported
+/// here so a reader following a budget in this crate finds the explanation without a hop.
+pub use vitaslop_platform::knobs::{
+    device_memory_gb, memory_scale, scale_budget, set_device_memory_gb,
+};

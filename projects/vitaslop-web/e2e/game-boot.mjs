@@ -347,6 +347,58 @@ async function main() {
     });
   });
 
+  // >>> THE EMULATOR'S OWN CONSOLE, WHICH `page.on("console")` DOES NOT CARRY.
+  //
+  // The guest runs in a dedicated Worker, and Playwright's page console event does not
+  // surface a dedicated worker's messages. So a Rust panic in the emulator thread reached
+  // this harness as nothing at all - Chrome's own log showed one line, `Uncaught
+  // RuntimeError: unreachable`, with no message, no location and no panic text. Six minutes
+  // of boot per attempt to learn only that it died.
+  //
+  // CDP carries it. Auto-attach to every worker target, turn on its Runtime domain, and
+  // forward `consoleAPICalled` and `exceptionThrown` into the same log the page writes. The
+  // exception's `description` is where a Rust panic's message and its wasm stack live, and it
+  // is the whole difference between "an allocation failed" and "a decoder refused".
+  const rootCdp = await context.newCDPSession(page).catch(() => null);
+  if (rootCdp) {
+    const wire = async (sessionSend, sessionOn, label) => {
+      sessionOn("Runtime.consoleAPICalled", (e) => {
+        const text = (e.args || []).map((a) => a.value ?? a.description ?? a.type).join(" ");
+        consoleLog.write(`${Date.now()} ${label}:${e.type} ${text}\n`);
+        console.log(`[${label}:${e.type}] ${text}`);
+      });
+      sessionOn("Runtime.exceptionThrown", (e) => {
+        const d = e.exceptionDetails || {};
+        const text = d.exception?.description || d.text || "(no description)";
+        consoleLog.write(`${Date.now()} ${label}:EXCEPTION ${text}\n`);
+        console.log(`[${label}:EXCEPTION] ${text}`);
+      });
+      await sessionSend("Runtime.enable").catch(() => {});
+    };
+    await wire(
+      (m, p) => rootCdp.send(m, p),
+      (ev, fn) => rootCdp.on(ev, fn),
+      "cdp"
+    );
+    rootCdp.on("Target.attachedToTarget", async ({ sessionId, targetInfo }) => {
+      console.log(`[game] cdp attached to ${targetInfo.type}: ${String(targetInfo.url).split("/").pop()}`);
+      const send = (method, params) =>
+        rootCdp.send("Target.sendMessageToTarget", {
+          sessionId,
+          message: JSON.stringify({ id: Date.now() % 1e6, method, params: params || {} }),
+        });
+      // Flat mode delivers the child's events on this same session with a sessionId, so the
+      // handlers wired above already receive them; enabling Runtime on the child is all that
+      // is left. Failures are ignored: a target that vanishes mid-attach is normal.
+      await send("Runtime.enable").catch(() => {});
+    });
+    await rootCdp
+      .send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })
+      .catch(() => {});
+  } else {
+    console.log("[game] NO CDP SESSION - a worker-thread panic will report only `unreachable`");
+  }
+
   // >>> A SLOW DEVICE, ON THIS MACHINE. `CPU_THROTTLE=4` RUNS THE EMULATOR AT A QUARTER SPEED.
   //
   // Every pacing question this project has had for weeks - is the loop keeping up, does the

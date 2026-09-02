@@ -138,6 +138,43 @@ pub(super) fn get_panel_info(ctx: &mut GuestCtx, _st: &mut VitaState, port: u32,
     0
 }
 
+/// `SCE_TOUCH_ERROR_INVALID_ARG`: a port outside the two panels.
+const SCE_TOUCH_ERROR_INVALID_ARG: i32 = 0x8035_0001u32 as i32;
+
+/// int sceTouchSetSamplingState(SceUInt32 port, SceTouchSamplingState state)
+///
+/// STOP(0) / START(1) for one panel. Recorded so [`get_sampling_state`] reads back what
+/// the title set; the panels here always deliver a sample, so this does not gate
+/// `sceTouchRead`/`sceTouchPeek` - see [`crate::host::VitaState::touch_sampling`].
+#[hostcall]
+pub(super) fn set_sampling_state(st: &mut VitaState, port: u32, state: u32) -> i32 {
+    match st.touch_sampling.get_mut(port as usize) {
+        Some(slot) => {
+            *slot = state;
+            0
+        }
+        None => SCE_TOUCH_ERROR_INVALID_ARG,
+    }
+}
+
+/// int sceTouchGetSamplingState(SceUInt32 port, SceTouchSamplingState *pState)
+///
+/// The read-back of [`set_sampling_state`]. A port with no panel behind it is an
+/// argument error rather than a state, which is the answer the caller can act on.
+#[hostcall]
+pub(super) fn get_sampling_state(ctx: &mut GuestCtx, st: &mut VitaState, port: u32, out: Ptr) -> i32 {
+    // One expression, no early return: a `#[hostcall]` body cannot `return`.
+    match st.touch_sampling.get(port as usize) {
+        Some(&state) => {
+            if !out.is_null() {
+                ctx.write_u32(out.addr(), state);
+            }
+            0
+        }
+        None => SCE_TOUCH_ERROR_INVALID_ARG,
+    }
+}
+
 /// int sceTouchRead(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs)
 /// The blocking read; served without parking, like the pad read (the display flip
 /// is the frame-pacing yield).

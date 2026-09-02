@@ -829,6 +829,27 @@ pub struct BindStateLayout {
     /// The bulk copy: `copy_bytes` bytes from the arrays block to `ctx + copy_dst`.
     pub copy_dst: u32,
     pub copy_bytes: u32,
+    /// >>> WHEN NON-ZERO, THE COPY IS PER-SLOT AND SKIPS EMPTY ONES: `copy_bytes` is treated
+    /// >>> as `copy_bytes / copy_slot_stride` slots of this size, and a slot whose FIRST WORD
+    /// >>> is zero is left alone instead of copied.
+    ///
+    /// The fragment stage's copy is the sixteen-unit TEXTURE array, and that array is a block
+    /// this engine allocates and zeroes ([`gxmstate`-side `ensure_state_block`]); the only
+    /// thing that ever fills a slot is a `sceGxmPrecomputedFragmentStateSetTexture`. So a zero
+    /// slot is an UNWRITTEN value, not a guest request to unbind, and copying it over the
+    /// context destroys a binding the guest made through `sceGxmSetFragmentTexture`.
+    ///
+    /// MEASURED on PCSE00120: 19,603 direct binds, **0** textures ever put into a state, ~1,286
+    /// state binds a frame - and its title-screen art did not draw, because the state binds
+    /// erased the sprite texture between the bind and the immediate `sceGxmDraw` that sampled
+    /// it. The handler skips empty slots for that reason and this exists so the emitted form
+    /// does the same: the two must leave byte-identical state, which is the whole contract the
+    /// inline forms rest on.
+    ///
+    /// Zero keeps the plain bulk `memory.copy` - which is what the VERTEX stage wants, because
+    /// its copy is the uniform-buffer TABLE, where a zero entry really does mean "no buffer
+    /// bound" and replacing it is correct.
+    pub copy_slot_stride: u32,
     /// Context slot the program handle is stored to, when `has_prog`.
     pub ctx_prog: u32,
     pub has_prog: bool,
@@ -1500,15 +1521,6 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
 
-    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } =
-        emit::emit_module(
-            &ordered,
-            &func_index,
-            program.base,
-            program.mem_bytes,
-            program.inline_imports,
-            program.import_memory,
-        );
     let funcs = ordered
         .iter()
         .map(|f| FuncExport {
@@ -1516,6 +1528,15 @@ pub fn transpile(program: &Program) -> Result<Artifact, Error> {
             export: abi::func_export(f.addr),
         })
         .collect();
+    let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } =
+        emit::emit_module(
+            ordered,
+            &func_index,
+            program.base,
+            program.mem_bytes,
+            program.inline_imports,
+            program.import_memory,
+        );
     Ok(Artifact { wasm, funcs, mem_pages, arm_word_off, mirror_off, dirty_off, expansion })
 }
 
@@ -1662,24 +1683,25 @@ pub fn transpile_lenient(program: &Program) -> LenientArtifact {
         funcs.insert(addr, ir::Func::new_redirect_thunk(addr, true, target));
     }
 
+    report_lifted_size(&funcs);
     let ordered: Vec<ir::Func> = funcs.into_values().collect();
     let func_index: BTreeMap<u32, u32> = ordered
         .iter()
         .enumerate()
         .map(|(i, f)| (f.addr, emit::IMPORT_FUNCS + i as u32))
         .collect();
+    let funcs = ordered
+        .iter()
+        .map(|f| FuncExport { addr: f.addr, export: abi::func_export(f.addr) })
+        .collect();
     let emit::EmitOutput { wasm, mem_pages, arm_word_off, mirror_off, dirty_off, expansion } = emit::emit_module(
-        &ordered,
+        ordered,
         &func_index,
         program.base,
         program.mem_bytes,
         program.inline_imports,
         program.import_memory,
     );
-    let funcs = ordered
-        .iter()
-        .map(|f| FuncExport { addr: f.addr, export: abi::func_export(f.addr) })
-        .collect();
     stubbed.sort_unstable();
     let stub_wasm_indices = stubbed.iter().map(|a| func_index[a]).collect();
     LenientArtifact {
@@ -2555,4 +2577,34 @@ mod tests {
         let plain_again = build(false);
         assert_eq!(plain, plain_again, "an unpromoted build must be deterministic");
     }
+}
+
+/// Report the size of the lifted program, once, before it is handed to the emitter.
+///
+/// # Why this exists
+/// The transpiler is the allocation peak of the whole system and nothing said how big it was.
+/// MEASURED on one retail title: a **9,975 MB** desktop working-set peak and a ~5,000 MB steady
+/// state, for a 4.9 MB ARM module - and in a browser, where wasm32 caps the address space at
+/// 4 GiB and linear memory never shrinks, the same build died in `lower::discover` with
+/// `std::alloc::rust_oom`. Three other titles peak at 1.4-2.7 GB, so this is a property of the
+/// TITLE's code size, not a constant. A number that decides whether a title can run at all
+/// should not have to be recovered from a stack trace.
+///
+/// Statements are counted, not measured: `Stmt` is an enum whose size the compiler is free to
+/// change, so a byte estimate here would be a number that silently goes stale. The counts are
+/// what scale with the title, and `size_of` is printed beside them so the product is available
+/// without pinning it.
+fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
+    let blocks: usize = funcs.values().map(|f| f.blocks.len()).sum();
+    let stmts: usize = funcs.values().flat_map(|f| &f.blocks).map(|b| b.stmts.len()).sum();
+    let arm: u64 = funcs.values().flat_map(|f| &f.blocks).map(|b| b.arm_count as u64).sum();
+    let stubs = funcs.values().filter(|f| f.stub).count();
+    eprintln!(
+        "transpile: lifted {} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
+         {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone are \
+         about {:.0} MB",
+        funcs.len(),
+        std::mem::size_of::<ir::Stmt>(),
+        (stmts * std::mem::size_of::<ir::Stmt>()) as f64 / 1e6,
+    );
 }

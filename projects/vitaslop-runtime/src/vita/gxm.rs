@@ -666,6 +666,11 @@ fn bind_state_layout(fragment: bool) -> vitaslop_transpiler::BindStateLayout {
             // behind it stay behind, see `gxmstate::VERTEX_BLOCK_BYTES`.
             gxmstate::VERTEX_BLOCK_TEXTURES
         },
+        // The fragment copy is the texture array, and an empty slot there is this engine's own
+        // zero rather than the guest's - see `BindStateLayout::copy_slot_stride` and the
+        // handler's matching loop in `VitaState::bind_precomputed_fragment_state`. The vertex
+        // copy is the uniform-buffer table, where a zero entry IS the guest's "no buffer".
+        copy_slot_stride: if fragment { gxmctx::TEXTURE_STRIDE } else { 0 },
         ctx_prog: gxmctx::off::FRAGMENT_PROGRAM,
         has_prog: fragment,
     }
@@ -1297,6 +1302,62 @@ fn report_blend_info(program_header: u32, blend_info: u32, blend: crate::capture
     );
 }
 
+/// The blend a fragment program performs ITSELF, as a [`crate::capture::BlendState`], for a
+/// program GXM was given no `SceGxmBlendInfo` for.
+///
+/// The GXM enums this builds are the ones the same title passes explicitly for its other
+/// shaders, so the two routes produce the same value for the same equation and everything
+/// downstream - the pipeline cache key included - stays one representation.
+///
+/// It REPORTS, always. A frame whose blending came from the shader bytes rather than from the
+/// API argument must not be indistinguishable from one where the guest asked for it: that is the
+/// difference between reading a blob correctly and having guessed well.
+fn program_rop_blend(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    program_header: u32,
+) -> Option<crate::capture::BlendState> {
+    use vitaslop_gxp_shader::RopDstFactor;
+    let blob = st.program_blob(ctx, program_header);
+    let rop = vitaslop_gxp_shader::rop_blend(&blob)?;
+    // `SceGxmBlendFactor`: 1 = ONE, 4 = SRC_ALPHA, 5 = ONE_MINUS_SRC_ALPHA.
+    // `SceGxmBlendFunc`: 0 = NONE, 1 = ADD.
+    let blend = crate::capture::BlendState {
+        color_mask: 0xf,
+        color_func: 1,
+        alpha_func: 1,
+        color_src: 4,
+        color_dst: match rop.dst {
+            RopDstFactor::One => 1,
+            RopDstFactor::OneMinusSrcAlpha => 5,
+        },
+        alpha_src: 1,
+        alpha_dst: 0,
+    };
+    report_rop_blend(program_header, rop, blend);
+    Some(blend)
+}
+
+/// Report - once per program - that a blend came from the SHADER rather than from GXM.
+fn report_rop_blend(
+    program_header: u32,
+    rop: vitaslop_gxp_shader::RopBlend,
+    blend: crate::capture::BlendState,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(program_header) {
+        return;
+    }
+    eprintln!(
+        "gxm blend: fragment program {program_header:#x} was given a NULL blendInfo but its own \
+         epilogue SOP2 blends ({rop:?}) - using colorSrc={} colorDst={} from the SHADER",
+        blend.color_src, blend.color_dst,
+    );
+}
+
 pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     let program_id = ctx.arg(1);
     let blend_info = ctx.arg(4);
@@ -1307,15 +1368,27 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     let out = ctx.arg(6);
     let program_header = st.shader_program(program_id);
     let handle = st.new_program_handle(ctx, program_header);
-    // The BLEND EQUATION arrives here and nowhere else - GXM has no runtime blend setter, so
-    // a program created with a NULL `blendInfo` never blends and one created with an additive
-    // info always does. Dropping this argument is what forced every renderer downstream to
-    // guess the mode from the geometry, and a guess is wrong for whole classes of draw.
+    // The BLEND EQUATION arrives here - GXM has no runtime blend setter, so a program created
+    // with an additive info always does. Dropping this argument is what forced every renderer
+    // downstream to guess the mode from the geometry, and a guess is wrong for whole classes of
+    // draw.
+    //
+    // >>> A NULL `blendInfo` DOES NOT MEAN "never blends". It means the DRIVER patches nothing
+    // >>> in - and a fragment program whose offline compiler already compiled the blend into its
+    // >>> epilogue needs nothing patched. Such a program ends in a group-0x80 SOP2 whose second
+    // >>> source is the OUTPUT register, which at the end of a fragment program is the
+    // >>> destination colour the ROP feeds back. Reading NULL as REPLACE drew one title's entire
+    // >>> UI - every glyph, every alpha-cut sprite - as opaque rectangles. See
+    // >>> `vitaslop_gxp_shader::rop_blend` for the field evidence and for the frame that pins
+    // >>> the operator. No blob in any corpus here carries both a real `blendInfo` and an
+    // >>> epilogue SOP2, so this is consulted ONLY when GXM supplied nothing and the two can
+    // >>> never compound.
     let blend = match ctx.read_bytes(blend_info, 4) {
         b if blend_info != 0 && b.len() == 4 => {
             crate::capture::BlendState::from_bytes([b[0], b[1], b[2], b[3]])
         }
-        _ => crate::capture::BlendState::default(),
+        _ => program_rop_blend(ctx, st, program_header)
+            .unwrap_or_else(crate::capture::BlendState::default),
     };
     report_blend_info(program_header, blend_info, blend);
     st.set_fragment_program(handle, program_header, blend);
@@ -1885,6 +1958,9 @@ pub(super) fn set_fragment_texture(ctx: &mut GuestCtx, st: &mut VitaState) {
     // be a worse-informed duplicate. It also could not have survived: this handler now runs
     // for a few binds a run, not 1,275 a frame, so the report would have gone quiet and read
     // as "this stopped happening".
+    // The context the GUEST named, recorded before the handler discards it - see
+    // `TextureSlotWrites::last_bind_context` for the divergence this exists to catch.
+    st.note_bind_context(ctx.arg(0));
     st.bind_fragment_texture(ctx, unit, texture);
     ctx.ret(0);
 }
@@ -1984,6 +2060,26 @@ pub(super) fn display_queue_add_entry(ctx: &mut GuestCtx, st: &mut VitaState) {
     if buffer != 0 {
         st.present(buffer);
     }
+    // Diagnostic (`RUST_LOG=vitaslop::display=trace`): WHICH BUFFER REACHES THE PANEL AT
+    // EACH VSYNC is the whole question when a title's picture strobes, and it cannot be
+    // read off the scene list - the renderer presents the last scene's TARGET, which is a
+    // different statement from the guest's own flip. Logged with the clock and the vblank
+    // grid position so a flip can be placed against the vsync it latches at.
+    tracing::trace!(
+        target: "vitaslop::display",
+        thid = st.current_thread(),
+        buffer = format_args!("{buffer:#010x}"),
+        old = format_args!("{:#010x}", ctx.arg(0)),
+        new = format_args!("{:#010x}", ctx.arg(1)),
+        us = st.now_us(),
+        vcount = super::display::vcount(st),
+        // How many entries are waiting for the guest's display-queue callback. GXM runs that
+        // callback once per entry; a depth that GROWS is this engine failing to keep up, and
+        // the ring of callback-data slots is finite, so a growing depth eventually hands the
+        // callback the wrong entry's data.
+        cb_pending = st.display_callback_backlog(),
+        "queue add entry"
+    );
     // Run the registered display callback as guest code (preemptive mode): the
     // game's own buffer bookkeeping lives there, and a double-buffered title
     // spins forever after two frames if it never runs.
@@ -2762,6 +2858,36 @@ pub(super) fn precomputed_draw_set_params(
     0
 }
 
+/// void sceGxmPrecomputedDrawSetParamsInstanced(SceGxmPrecomputedDraw *precomputedDraw,
+///     SceGxmPrimitiveType primType, SceGxmIndexFormat indexType, const void *indexData,
+///     unsigned int indexCount, unsigned int indexWrap)
+///
+/// The instanced form of [`precomputed_draw_set_params`], carrying the same extra
+/// argument `sceGxmDrawInstanced` takes. The bundle stores the base geometry exactly as
+/// the non-instanced call does; the wrap is recorded in the log and not applied, which is
+/// the same coverage [`draw_instanced`] has - the first instance renders, and a title that
+/// instances its scenery says so in the log rather than silently drawing one copy.
+#[hostcall]
+pub(super) fn precomputed_draw_set_params_instanced(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    precomputed: u32,
+    prim_type: u32,
+    index_type: u32,
+    index_data: u32,
+    index_count: u32,
+    index_wrap: u32,
+) -> i32 {
+    tracing::debug!(
+        target: "vitaslop::gxm",
+        index_count, index_wrap,
+        instances = if index_wrap > 0 { index_count / index_wrap } else { 1 },
+        "precomputedDrawSetParamsInstanced"
+    );
+    st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count);
+    0
+}
+
 /// int sceGxmDrawPrecomputed(SceGxmContext *context, const SceGxmPrecomputedDraw
 ///     *precomputedDraw): replay the bundled draw into the current scene.
 pub(super) fn draw_precomputed(ctx: &mut GuestCtx, st: &mut VitaState) {
@@ -3094,6 +3220,17 @@ pub(super) fn color_surface_set_data(ctx: &mut GuestCtx, st: &mut VitaState, sur
 pub(super) fn program_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, program: u32) -> u32 {
     // SCE_GXM_VERTEX_PROGRAM = 0, SCE_GXM_FRAGMENT_PROGRAM = 1.
     (ctx.read_u32(program.wrapping_add(0x14)) & 1) as u32
+}
+
+/// unsigned int sceGxmProgramGetSize(const SceGxmProgram *program)
+///
+/// The container header's own `size` field (+0x08), which is the length in bytes of the
+/// program blob - what a title reads before copying a program it has just been handed.
+/// Not derived from anything we know about the program: the header states it, and a
+/// value computed some other way could disagree with the bytes the guest owns.
+#[hostcall]
+pub(super) fn program_get_size(ctx: &mut GuestCtx, _st: &mut VitaState, program: u32) -> u32 {
+    ctx.read_u32(program.wrapping_add(0x08))
 }
 
 /// const SceGxmProgramParameter *_sceGxmProgramFindParameterBySemantic(
@@ -4198,8 +4335,23 @@ mod precomputed_state_binds {
         r.call(g::PRECOMPUTED_FRAGMENT_STATE_INIT, &[FSTATE, 0x77, 0]);
         r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_DEFAULT_UNIFORM_BUFFER, &[FSTATE, UB]);
         r.call(g::PRECOMPUTED_FRAGMENT_STATE_SET_TEXTURE, &[FSTATE, 2, TEXTURE]);
-        // Bind unit 7 DIRECTLY, then apply the state: the state does not declare unit 7,
-        // so the bind must clear it.
+        // >>> BIND UNIT 7 DIRECTLY, THEN APPLY THE STATE. THE DIRECT BIND MUST SURVIVE, AND
+        // >>> THIS TEST ASSERTED THE OPPOSITE UNTIL A SHIPPING TITLE PROVED IT WRONG.
+        //
+        // The old rule was "the state does not declare unit 7, so the bind must clear it" -
+        // written from the plausible reading that binding a precomputed state REPLACES the
+        // stage's whole texture array. But the array it replaces from is a block THIS ENGINE
+        // allocates and zeroes, and only `PrecomputedFragmentStateSetTexture` ever fills a slot
+        // in it, so an empty slot is an unwritten value rather than an unbind the guest asked
+        // for [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]].
+        //
+        // MEASURED on PCSE00120: 19,603 direct `sceGxmSetFragmentTexture` binds, a texture put
+        // INTO a precomputed state **0 times** (a complete count - that setter is never
+        // inlined), ~1,286 state binds a frame. A store watchpoint on unit 0's slot caught the
+        // sequence: the guest binds its sprite texture, twenty state binds follow, and the
+        // immediate `sceGxmDraw` that samples it reaches the renderer with all sixteen slots
+        // zero. Its title screen could not draw. With empty slots skipped the title runs the
+        // whole recipe with the recompiler STRICT and no fallback at all.
         {
             let mut mem = SliceMemory(&mut r.bytes);
             let mut ctx = crate::host::GuestCtx::new(&mut r.regs, &mut r.vfp, &mut mem, 0);
@@ -4215,8 +4367,12 @@ mod precomputed_state_binds {
         assert_eq!(r.word(slot), TEXTURE, "unit 2: the bound texture's address");
         assert_eq!(r.word(slot + 4), 0x1111_2222, "unit 2: control word 0, copied BY VALUE");
         assert_eq!(r.word(slot + 20), 1, "unit 2: marked from_precomputed");
-        let stale = CTX + gxmctx::off::TEXTURES + 7 * gxmctx::TEXTURE_STRIDE;
-        assert_eq!(r.word(stale), 0, "unit 7: the direct bind must NOT survive");
+        let undeclared = CTX + gxmctx::off::TEXTURES + 7 * gxmctx::TEXTURE_STRIDE;
+        assert_eq!(
+            r.word(undeclared),
+            0x1234,
+            "unit 7: the state carries nothing for this unit, so the DIRECT bind must survive"
+        );
         assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_PROGRAM), 0x77, "the program handle");
         assert_eq!(r.word(CTX + gxmctx::off::FRAGMENT_UNIFORM), UB, "record: buffer");
     }

@@ -80,6 +80,15 @@ pub enum ColorPrecision {
     F32,
     /// Two components per register: `x,y` = the halves of register 0, `z,w` of register 1.
     F16,
+    /// FOUR components in ONE register, each a `byte / 255` unsigned-normalised channel.
+    ///
+    /// This is what a fragment leaves behind when its epilogue is the 8-bit pair
+    /// `pack.unorm8` + `mov.fx8` (see `usse::decode::decode_grp_sop2`): the colour is already
+    /// in the surface's own 8-bit-per-channel form, in one register, not spread over two or
+    /// four. Reading it as [`Self::F16`] would take four bytes for two halves and emit a
+    /// denormal pair - a black frame that reports success, the same failure
+    /// [[vitaslop-f16-colour-output]] records for reading an F16 colour as F32.
+    Fx8,
 }
 
 /// The concrete resources a [`FragmentModule`] expects the renderer to bind. Every count is
@@ -145,8 +154,15 @@ fn bank_read_extent(shader: &Shader, bank: Bank) -> u32 {
                 }
                 let sel = src.swizzle[c];
                 if sel <= 3 {
-                    let step =
-                        if instr.source_half_precision() { (sel >> 1) as u32 } else { sel as u32 };
+                    // A packed-byte source spans ONE register whatever the channel - see
+                    // [`crate::ir::Instr::source_packed_bytes`].
+                    let step = if instr.source_packed_bytes() {
+                        0
+                    } else if instr.source_half_precision() {
+                        (sel >> 1) as u32
+                    } else {
+                        sel as u32
+                    };
                     extent = extent.max(src.index as u32 + step + 1);
                 }
             }
@@ -258,6 +274,14 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
             .is_some_and(|d| d.bank == bank && d.index as u32 == base && i.write_mask.iter().any(|&m| m))
     });
     match last {
+        // An 8-BIT write leaves four bytes in the one register, whatever `half_precision`
+        // says - that flag describes a float view and neither of these ops has one. This has
+        // to be asked FIRST: both carry `half_precision == false`, so the fall-through would
+        // call a packed-byte colour F32 and read four registers, three of which the program
+        // never wrote.
+        Some(i) if matches!(i.op, Op::CopyFx8 | Op::PackUnorm8 { to_unorm8: true, .. } | Op::Sop2 { .. }) => {
+            ColorPrecision::Fx8
+        }
         Some(i) if i.half_precision => ColorPrecision::F16,
         _ => ColorPrecision::F32,
     }
@@ -436,6 +460,9 @@ pub(crate) fn color_return_expr(
             "vec4<f32>(unpack2x16float({bank}[{base}]), unpack2x16float({bank}[{}]))",
             base + 1
         ),
+        // One register, four `byte/255` channels - the inverse of the store `Prec::Fx8` uses,
+        // so a colour that went through the 8-bit epilogue comes back the way it went in.
+        ColorPrecision::Fx8 => format!("unpack4x8unorm({bank}[{base}])"),
     }
 }
 

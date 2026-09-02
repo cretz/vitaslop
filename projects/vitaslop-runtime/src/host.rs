@@ -667,6 +667,11 @@ pub struct MemBlock {
     pub uid: i32,
     pub base: u32,
     pub size: u32,
+    /// The `SceKernelMemBlockType` the guest asked for. Kept because
+    /// `sceKernelGetMemBlockInfoByAddr` reports it back along with the cacheability and
+    /// access rights ENCODED IN IT - deriving those from anything else would let the
+    /// query disagree with the request that created the block.
+    pub ty: u32,
 }
 
 /// A guest thread the program created: its SceUID, entry address (Thumb bit
@@ -944,6 +949,7 @@ pub const SCE_KERNEL_DEFAULT_PRIORITY: i32 = 0x1000_0100;
 /// 0xA0). Absolute user priorities run 0x40 (highest) .. 0xBF (lowest); 0xA0 is the
 /// middle default the initial (main) thread and a defaulted worker resolve to.
 pub const DEFAULT_THREAD_PRIORITY: i32 = 0xA0;
+
 
 /// The SceUID of the initial ("main") thread. It is the one thread with no
 /// [`ThreadRec`]: `create_thread` records what the GUEST creates, and the loader
@@ -2135,6 +2141,40 @@ struct TextureBinding {
     from_precomputed: bool,
 }
 
+/// A tally of the HOST-ROUTED writers of the context block's fragment texture slots, kept for
+/// [`VitaState::report_draw_without_bound_textures`] and printed only by it. See the field's
+/// own doc on `VitaState::texture_writes` for why the counts are host-routed only and which
+/// knob makes them complete.
+#[derive(Default)]
+struct TextureSlotWrites {
+    /// `sceGxmSetFragmentTexture` with a non-null handle.
+    binds: u64,
+    /// ...and with a null one, which UNBINDS the unit.
+    unbinds: u64,
+    /// `sceGxmSetPrecomputedFragmentState`, which replaces the whole 16-unit array.
+    state_binds: u64,
+    /// `sceGxmPrecomputedFragmentStateSetTexture` / `...SetAllTextures` - the calls that put a
+    /// texture INTO a state. Never inlined, so this count is always complete, and it decides
+    /// what a state's empty array MEANS: a title that never makes these calls is not asking for
+    /// sixteen empty units, it is using the state for its uniforms alone.
+    state_texture_sets: u64,
+    /// ...of which this many landed an array whose unit 0 is EMPTY, clearing whatever a direct
+    /// bind had left there. That is the difference between "never bound" and "bound, then
+    /// wiped", and it is invisible in the slots themselves.
+    state_binds_clearing_unit0: u64,
+    /// The last non-null direct bind: `(frame, unit, handle)`.
+    last_bind: Option<(u64, u32, u32)>,
+    /// >>> THE CONTEXT POINTER THE GUEST PASSED on the last direct bind.
+    ///
+    /// The two writers of a texture slot do not agree on where the slot IS. The inlined copy
+    /// form writes through `r0` - the pointer the guest handed the call - while the handler
+    /// ignores `r0` and writes into `VitaState::gxm_context`, the block adopted at
+    /// `sceGxmCreateContext`. Those are the same address for a conforming title and nobody had
+    /// ever checked, so the report prints both: one number decides whether a bind that the host
+    /// counts is landing where the draw reads.
+    last_bind_context: u32,
+}
+
 impl TextureBinding {
     /// Snapshot the 16 control words at `addr` NOW - the moment the guest handed the texture to
     /// GXM. A null handle yields an all-zero binding, which the caller treats as an unbind.
@@ -2261,6 +2301,24 @@ struct TextureSnapshots {
     stamps: FxHashMap<(u32, usize), u8>,
     /// Total bytes held, so the cache cannot grow without bound across a long run.
     bytes: usize,
+    /// >>> FRAMES SINCE THE RUN STARTED, and the recency every eviction here orders by.
+    ///
+    /// Bumped by [`Self::begin_frame`]. An entry stamped with the current value is one THIS
+    /// frame has already used and is never an eviction candidate - see [`lru_victims`].
+    frame_seq: u64,
+    /// The frame each TEXTURE snapshot entry was last used in.
+    used: FxHashMap<(u32, usize), u64>,
+    /// The frame each VERTEX snapshot entry was last used in.
+    vertex_used: FxHashMap<(u32, usize), u64>,
+    /// The frame each INDEX snapshot entry was last used in.
+    index_used: FxHashMap<(u32, usize, usize), u64>,
+    /// The frame each INTERNED vertex buffer was last recognised in, keyed like
+    /// [`Self::vertex_by_content`] itself.
+    vertex_content_used: FxHashMap<(usize, u64), u64>,
+    /// The frame [`Self::evict_textures_to_budget`] last swept the two per-scene memos in. They
+    /// are bounded by ENTRY COUNT and a sweep visits all of them, so it happens once a frame
+    /// rather than once per insert - see there.
+    memo_swept_frame: u64,
     /// Entries already checked this scene, so a texture bound by fifty draws is
     /// compared once, not fifty times. The cache's claim is "these bytes are
     /// unchanged since the last frame", and once per scene is what tests it.
@@ -2409,7 +2467,9 @@ struct TextureSnapshots {
     ///
     /// Cleared when a recorded format changes (see `set_texture_format`), because that is the
     /// one input that is not in the key.
-    templates: FxHashMap<[u32; 4], Option<TextureTemplate>>,
+    /// Each entry carries the SCENE it was last used in, so the cap below sheds the control-word
+    /// sets this title has stopped binding rather than all of them.
+    templates: FxHashMap<[u32; 4], (Option<TextureTemplate>, u64)>,
     /// A whole DRAW's worth of snapshotted textures, by the bindings that produced it - kept
     /// ACROSS scenes and RE-PROVEN on first use in each new scene.
     ///
@@ -2606,15 +2666,17 @@ struct TextureTemplate {
 }
 
 /// Distinct control-word sets the template memo will hold. A title binds a few hundred distinct
-/// textures; this is a bound on a pathological case, not a working limit. Cleared whole when hit,
-/// which costs re-derivation and never correctness - the key IS the input.
+/// textures; this is a bound on a pathological case, not a working limit. Past it the coldest
+/// quarter goes, by the scene each entry was last used in, which costs re-derivation and never
+/// correctness - the key IS the input.
 const TEXTURE_TEMPLATE_CAP: usize = 4096;
 
 /// Distinct vertex streams the content index will hold - see
 /// [`TextureSnapshots::vertex_by_content`]. A frame binds under a thousand; this bounds a title
 /// that streams genuinely new geometry every frame, where the index cannot help and must not be
-/// allowed to grow. Cleared whole when hit: the key is derived from the bytes and every hit is
-/// proven by comparison, so a clear costs a re-read and never correctness.
+/// allowed to grow. Past it the least recently recognised go: the key is derived from the bytes
+/// and every hit is proven by comparison, so shedding one costs a re-read and never
+/// correctness.
 const VERTEX_CONTENT_INDEX_CAP: usize = 8192;
 
 /// A cheap, allocation-free fingerprint of a vertex stream, for [`TextureSnapshots::
@@ -2671,6 +2733,98 @@ fn sampler_narrow_enabled() -> bool {
     *ON.get_or_init(|| crate::knobs::var("VITASLOP_SAMPLER_NARROW").ok().as_deref() != Some("0"))
 }
 
+/// >>> BYTE-SLICE EQUALITY THAT DOES NOT GO THROUGH `memcmp`.
+///
+/// `a == b` on `[u8]` lowers to a `memcmp` LIBCALL, and on `wasm32-unknown-unknown` that is
+/// compiler-builtins' implementation: a byte-at-a-time loop. `-C target-feature=+simd128` does
+/// not change it, because a call into a prebuilt library function is not code LLVM can
+/// vectorise - the flag only helps code it can SEE
+/// [[vitaslop-wasm-simd-must-be-asked-for]].
+///
+/// That matters here because this comparison runs over the whole interleaved vertex buffer of
+/// every multi-stream draw. MEASURED before this existed: the content intern was **2.63 ms of a
+/// 8.20 ms `DRAW TOTAL`** - 32% of all draw work - at an **86.5% HIT RATE**, and a hit is
+/// exactly this comparison. 6.4 MB a frame, one byte per iteration.
+///
+/// Eight bytes at a time instead, with a scalar tail. Identical answer, and the loop is now
+/// something the optimiser can widen further on its own.
+/// # >>> AND IT IS wasm-ONLY, BECAUSE NATIVE `memcmp` IS ALREADY BETTER THAN THIS
+/// On a native target `a == b` calls the platform's `memcmp`, which is hand-written SIMD and
+/// beats an eight-byte Rust loop comfortably. Using this everywhere would have made the desktop
+/// build - the pixel oracle, the headless replay, every test - measurably SLOWER to buy a win
+/// that only exists where the libcall is a byte loop. The `#[cfg]` is the whole point of the
+/// function, not a detail of it.
+#[inline]
+fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        return a == b;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        bytes_eq_wide(a, b)
+    }
+}
+
+/// The eight-at-a-time comparison itself, compiled on every target so the test below actually
+/// exercises it rather than testing `==` against itself on the host.
+#[inline]
+fn bytes_eq_wide(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        // `try_into` on a fixed-size window compiles to a plain unaligned load; the
+        // `unwrap` cannot fire because the slice is exactly 8 long.
+        let x = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+        if x != y {
+            return false;
+        }
+        i += 8;
+    }
+    while i < n {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(test)]
+mod bytes_eq_tests {
+    // The WIDE one by name: `bytes_eq` delegates to `==` off wasm, so testing it on the host
+    // would compare `==` with itself and pass no matter what the eight-byte loop did.
+    use super::bytes_eq_wide as bytes_eq;
+
+    /// The whole point is that it answers exactly what `==` answers, including at every
+    /// boundary of the 8-byte stride and in the scalar tail.
+    #[test]
+    fn it_agrees_with_slice_equality_at_every_length_and_difference() {
+        for len in 0..40usize {
+            let base: Vec<u8> = (0..len).map(|i| (i * 7 + 1) as u8).collect();
+            assert!(bytes_eq(&base, &base.clone()), "len {len}: equal slices");
+            if len > 0 {
+                // At len 0 the "shorter" slice is the same empty slice, so there is nothing to
+                // differ - the case only exists from one byte up.
+                assert!(!bytes_eq(&base, &base[..len - 1]), "len {len}: length differs");
+            }
+            for at in 0..len {
+                let mut other = base.clone();
+                other[at] ^= 0xff;
+                assert!(
+                    !bytes_eq(&base, &other),
+                    "len {len}: a difference at byte {at} was missed - a comparison that reads \
+                     eight bytes at a time must still find a single changed byte anywhere"
+                );
+            }
+        }
+    }
+}
+
 fn vertex_fingerprint(bytes: &[u8]) -> u64 {
     const SAMPLES: usize = 64;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -2716,19 +2870,48 @@ fn tex_memo_per_scene() -> bool {
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_TEX_MEMO_PER_SCENE"))
 }
 
-/// Say - once - that a set-cache hit's stored bindings did not match the probe's, i.e. the
-/// 64-bit fold collided. Treated as a miss, so it costs a rebuild and never an answer; said
-/// aloud because a collision here is rare enough that one occurring is worth a line.
+/// Say that a set-cache hit's stored bindings did not match the probe's. Treated as a miss, so
+/// it costs a rebuild and never an answer.
+///
+/// # >>> THIS IS PROBABLY NOT A HASH COLLISION, AND THE REPORT SAID IT WAS
+/// It fired on a 78-second phone run, which for a genuine 64-bit collision over a few thousand
+/// binding sets is not credible. Look at what the two sides actually use:
+///
+///   * the FOLD (see the `set_key` construction at the probe) mixes the fragment header, and
+///     each binding's `unit` and four control `words`;
+///   * the VERIFY additionally requires `addr` - the guest `SceGxmTexture*` the binding came
+///     from - to match.
+///
+/// So two bindings with identical control words reached through DIFFERENT descriptors fold to
+/// the same key and fail the verify. That is not a collision, it is a key that omits a field its
+/// own equality test depends on, and the cost is a forced rebuild every time a title binds one
+/// texture through two descriptors - which is an ordinary thing for a title to do.
+///
+/// # Why this is a REPORT and not yet a fix
+/// The fix is one line - mix `addr` into the fold, which only ever makes keys MORE distinct and
+/// so can never serve a wrong list. What is not known is whether it is worth it: `addr` may be a
+/// stack descriptor at a fresh address every frame, and then keying on it turns a cheap forced
+/// miss into an entry per frame in `snapshot_sets`. That is a memory question, and the run that
+/// raised this could not answer it because the report FIRED ONCE - "vanishingly rare" and "every
+/// draw of every frame" printed exactly the same line. So it now reports on a DOUBLING cadence:
+/// the last line in a dump carries the order of magnitude, at a cost that stays logarithmic.
+/// [[vitaslop-a-count-needs-its-window]] [[vitaslop-an-address-is-not-an-identity]]
 fn report_set_key_collision() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::warn!(
-            target: "vitaslop::gxm",
-            "texture set-cache key collision: two distinct binding sets folded to one 64-bit \
-             key. Handled exactly (the exact-match check treated it as a miss); noted because \
-             it should be vanishingly rare."
-        );
-    });
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // 1, 2, 4, 8, ... - every line is the last one anybody needs to read.
+    if !n.is_power_of_two() {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        "texture set-cache key collision ({n} so far this run): a set-cache hit's stored \
+         bindings did not match the probe's. Handled exactly (treated as a miss), so the \
+         picture is unaffected and the cost is a rebuild. NOTE a large count here is almost \
+         certainly NOT a 64-bit hash collision: the key fold omits each binding's descriptor \
+         address while the equality test requires it, so one texture bound through two \
+         descriptors lands here every time. See `report_set_key_collision`."
+    );
 }
 
 /// How often, and by what means, a retained texture snapshot is re-validated.
@@ -2800,15 +2983,188 @@ fn report_texture_check_per_frame() {
 /// engine that pays for this runs whatever is defaulted ([[vitaslop-pick-the-default-dont-add-a-knob]]).
 /// If it ever needs changing, the number to change it against is the `draw: read+interleave
 /// vertices` figure in the device panel's bytes line.
-const fn vertex_snapshot_budget() -> usize {
-    64 << 20
+fn vertex_snapshot_budget() -> usize {
+    // Scaled to the DEVICE - see [`crate::knobs::memory_scale`]. A desktop, a headless run and
+    // anything that never reported its memory get exactly this number.
+    crate::knobs::scale_budget(64 << 20)
 }
 
-/// Byte budget for retained texture snapshots. Past it the cache is cleared whole
-/// (and says so): a level's working set is what it holds, and a title that exceeds
-/// this is telling us something worth seeing rather than something to silently trim.
+/// What the snapshot caches are holding and what their budgets have cost, as process-wide
+/// counters so the panel can carry them without threading a borrow of the emulator through the
+/// browser's diagnostics path.
 ///
-/// # What clearing it actually costs, measured
+/// These exist because the question they answer - "is this session slowing down because a cache
+/// keeps being emptied" - previously took four device dumps and a 48,000-frame play session to
+/// ask ONCE, and even then could only be answered by inference. Two atomic stores a frame.
+/// Upper bound on [`TextureSnapshots::snapshot_sets`], in binding sets. At module scope so the
+/// diagnostics can print the cache's occupancy AGAINST it - a live count with no cap beside it
+/// says nothing about whether the bound is being hit.
+const SET_CAP: usize = 16_384;
+
+mod snapcounts {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static EVICT_PASSES: AtomicU64 = AtomicU64::new(0);
+    pub static EVICTED: AtomicU64 = AtomicU64::new(0);
+    pub static FREED: AtomicU64 = AtomicU64::new(0);
+    pub static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static ENTRIES: AtomicU64 = AtomicU64::new(0);
+    pub static VERTEX_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static INDEX_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static VERTEX_EVICTED: AtomicU64 = AtomicU64::new(0);
+    pub static INDEX_EVICTED: AtomicU64 = AtomicU64::new(0);
+    /// >>> LIVE ENTRIES IN THE BINDING-SET CACHE, AND WHAT ITS CAP HAS SHED.
+    ///
+    /// `snapshot_sets` is bounded at `SET_CAP` and nothing reported either number, so the cache
+    /// could sit one entry under its cap - re-deriving a quarter of itself every time it touched
+    /// it - and look exactly like a cache with room to spare. It is also the number that decides
+    /// whether the set KEY may safely be made more specific: adding a field to the fold turns
+    /// forced misses into distinct entries, which is only an improvement while those entries
+    /// fit. See `report_set_key_collision`.
+    pub static SET_LIVE: AtomicU64 = AtomicU64::new(0);
+    pub static SET_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn note_evicted(n: u64, bytes: u64) {
+        if n == 0 {
+            return;
+        }
+        EVICT_PASSES.fetch_add(1, Relaxed);
+        EVICTED.fetch_add(n, Relaxed);
+        FREED.fetch_add(bytes, Relaxed);
+    }
+}
+
+/// One line for the diagnostics panel: what the guest-memory snapshot caches hold, against their
+/// budgets, and what their bounds have actually cost this run.
+///
+/// A budget that never fires and a budget that fires every few seconds look identical in a frame
+/// timing, and they are the difference between a session that holds its frame rate and one that
+/// reaches single digits - see [`lru_victims`].
+pub fn snapshot_cache_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mb = |b: u64| b / (1024 * 1024);
+    format!(
+        "textures {} MB / {} MB budget over {} entries, vertices {} MB, indices {} MB \
+         (budget {} MB each) | EVICTED: {} passes, {} texture entries, {} MB reclaimed, \
+         {} vertex, {} index | binding sets {} live of {} cap ({} shed)",
+        mb(snapcounts::HELD_BYTES.load(Relaxed)),
+        texture_snapshot_budget() / (1024 * 1024),
+        snapcounts::ENTRIES.load(Relaxed),
+        mb(snapcounts::VERTEX_BYTES.load(Relaxed)),
+        mb(snapcounts::INDEX_BYTES.load(Relaxed)),
+        vertex_snapshot_budget() / (1024 * 1024),
+        snapcounts::EVICT_PASSES.load(Relaxed),
+        snapcounts::EVICTED.load(Relaxed),
+        mb(snapcounts::FREED.load(Relaxed)),
+        snapcounts::VERTEX_EVICTED.load(Relaxed),
+        snapcounts::INDEX_EVICTED.load(Relaxed),
+        snapcounts::SET_LIVE.load(Relaxed),
+        SET_CAP,
+        snapcounts::SET_EVICTED.load(Relaxed),
+    )
+}
+
+/// The state the budget is genuinely wrong for: nothing was evictable because every retained
+/// buffer belongs to the frame being built. Reported once - it is a property of the title's
+/// working set, not an event, so repeating it would bury everything else.
+fn report_snapshot_working_set_over_budget(held_mb: usize, entries: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Relaxed) {
+        return;
+    }
+    tracing::warn!(
+        target: "vitaslop::gxm",
+        held_mb,
+        entries,
+        "texture snapshot cache is over budget and NOTHING is evictable - every retained \
+         buffer belongs to the frame being built, so this title's one-frame working set does \
+         not fit VITASLOP_SNAPSHOT_BUDGET_MB. The frame is finished anyway; raise the budget \
+         if this title is the target. Reported once."
+    );
+}
+
+/// >>> WHICH ENTRIES TO SHED TO GET A BYTE-BUDGETED CACHE BACK UNDER ITS BUDGET.
+///
+/// Least recently used first, and NEVER an entry the current frame has already used - that one
+/// is exactly what the rest of the frame is about to ask for again, so evicting it would be the
+/// disease as the cure.
+///
+/// # Why this exists, and why it is worth more than any amount of tuning the budgets
+/// Every cache in this file used to `clear()` at its cap. That is not "a rebuild" once: it is a
+/// rebuild of the whole working set inside the NEXT frame, and it then repeats forever, because
+/// whatever filled the cache the first time fills it again at the same rate. MEASURED across four
+/// device dumps of one title, same code, ordered by how long the session had run: `prepare` 9.4 /
+/// 25.6 / 36.8 / 67.3 us per draw at 30 / 30 / 15 / 8 fps, with every counter the frame prints
+/// flat or FALLING. No hot path moved; what changed was how often these caps were hit. The
+/// snapshot cache's own clear is priced in its comment at 2.1 seconds of `build`, and the
+/// device's slowest-frame list is a cluster of exactly that which gets DENSER with run length.
+/// [[vitaslop-caches-that-clear-whole-are-the-long-run-degradation]]
+///
+/// This is the shape [`RenderSceneBuilder::texture`] already used for the decode cache. It is
+/// lifted here rather than reinvented, because the argument for it is the same one.
+///
+/// # It can return too few, deliberately
+/// If everything in the cache belongs to the current frame there is nothing to shed and the
+/// caller goes over budget for that frame. That is bounded by ONE FRAME's working set rather than
+/// by the run, which is the property that matters, and the caller reports it.
+/// The COUNT-bounded twin of [`lru_victims`], for the memos whose bound is a number of entries
+/// rather than a number of bytes: which keys to shed to get back to `keep`, oldest use first.
+///
+/// `current` is the value a stamp has when the entry is in use RIGHT NOW - the current scene for
+/// the per-scene memos - and those are never candidates, for the reason [`lru_victims`] gives.
+/// If they are all current the caller is handed nothing and stays over its cap for one more
+/// scene, which is bounded by the scene's own working set.
+fn count_victims<K: Copy + Eq + std::hash::Hash, V>(
+    map: &FxHashMap<K, V>,
+    keep: usize,
+    current: u64,
+    stamp: impl Fn(&V) -> u64,
+) -> Vec<K> {
+    if map.len() <= keep {
+        return Vec::new();
+    }
+    let mut old: Vec<(K, u64)> =
+        map.iter().map(|(k, v)| (*k, stamp(v))).filter(|(_, s)| *s != current).collect();
+    old.sort_by_key(|(_, s)| *s);
+    old.truncate(map.len() - keep);
+    old.into_iter().map(|(k, _)| k).collect()
+}
+
+fn lru_victims<K: Copy + Eq + std::hash::Hash, V>(
+    entries: &FxHashMap<K, V>,
+    used: &FxHashMap<K, u64>,
+    held: usize,
+    budget: usize,
+    frame: u64,
+    size: impl Fn(&V) -> usize,
+) -> Vec<K> {
+    // An entry with no stamp at all is older than any stamped one - it has not been used since
+    // whatever dropped its stamp - so it sorts first rather than being excluded.
+    let mut stale: Vec<(K, u64)> = entries
+        .keys()
+        .map(|k| (*k, used.get(k).copied().unwrap_or(0)))
+        .filter(|(_, u)| *u != frame)
+        .collect();
+    stale.sort_by_key(|(_, u)| *u);
+    let mut freed = 0usize;
+    let mut out = Vec::new();
+    for (k, _) in stale {
+        if held.saturating_sub(freed) < budget {
+            break;
+        }
+        freed += entries.get(&k).map_or(0, &size);
+        out.push(k);
+    }
+    out
+}
+
+/// Byte budget for retained texture snapshots, scaled to the device
+/// ([`crate::knobs::memory_scale`]). Past it the LEAST RECENTLY USED entries are shed until it
+/// fits - see [`TextureSnapshots::evict_textures_to_budget`].
+///
+/// # What the wholesale clear this replaced actually cost, measured
+/// It is kept here because it is the argument for the eviction, and because the same reasoning
+/// applies to any future cache added beside this one.
 /// "Cleared whole" is not a local event. Every retained entry is an `Arc` that the
 /// RENDERER's decode cache is keyed on by IDENTITY, so dropping them all means the next
 /// scene re-reads every texture into a fresh buffer, misses the decode cache on all of
@@ -2829,13 +3185,18 @@ const fn vertex_snapshot_budget() -> usize {
 /// `VITASLOP_SNAPSHOT_BUDGET_MB` overrides it - a mobile target will want it smaller.
 fn texture_snapshot_budget() -> usize {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
+    let base = *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_SNAPSHOT_BUDGET_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(192)
             << 20
-    })
+    });
+    // >>> SCALED AT EVERY CALL, NOT AT THE ONCE-LOCK. The knob is parsed once; the DEVICE scale
+    // is applied per call, because the frontend reports the device's memory during startup and a
+    // value folded into the `OnceLock` would be whatever was known the first time a texture was
+    // bound. See [`crate::knobs::memory_scale`] - it is one relaxed load and a multiply.
+    crate::knobs::scale_budget(base)
 }
 
 /// What [`TextureSnapshots::palette_expanded`] may hold, in bytes.
@@ -2936,6 +3297,12 @@ impl TextureSnapshots {
         // One epoch per scene, taken at the scene's first snapshot - see `restamp` for why this
         // is not per texture, and what it cost when it was.
         self.arm_scene_stamp(ctx);
+        // >>> A USE, RECORDED BEFORE ANY OF THE LADDER BELOW. This is what makes eviction
+        // possible at all: without it the only orders available are insertion and hash order,
+        // and neither says which textures the title is still drawing. Every exit from this
+        // function is a use of `(addr, len)` - the shortcut returns as much as the re-read - so
+        // the stamp goes at the top rather than being repeated down each of the six paths.
+        self.used.insert((addr, len), self.frame_seq);
         // The retained buffer, kept past the borrow below so the re-read at the bottom can
         // hand back the SAME `Arc` when the bytes turn out to be identical - see there.
         let mut retained: Option<Arc<[u8]>> = None;
@@ -3095,7 +3462,7 @@ impl TextureSnapshots {
         // byte-identical pixels would re-decode and re-upload an unchanged texture every
         // scene. Same answer, same bytes, one buffer.
         if let Some(p) = retained {
-            if raw[..] == p[..] {
+            if bytes_eq(&raw, &p) {
                 self.restamp(addr, len);
                 return p;
             }
@@ -3320,8 +3687,13 @@ impl TextureSnapshots {
         }
         let fp = vertex_fingerprint(bytes);
         if let Some(p) = self.vertex_by_content.get(&(bytes.len(), fp)) {
-            if bytes == &p[..] {
-                return p.clone();
+            if bytes_eq(bytes, p) {
+                // A HIT pays a comparison; a MISS pays a copy. See `Phase::DrawVertexInternHit`.
+                crate::perf::note_hit(crate::perf::Phase::DrawVertexInternHit);
+                let p = p.clone();
+                // A hit is a use - it is what keeps this entry out of the eviction below.
+                self.vertex_content_used.insert((bytes.len(), fp), self.frame_seq);
+                return p;
             }
         }
         let made: Arc<[u8]> = Arc::from(bytes);
@@ -3330,10 +3702,10 @@ impl TextureSnapshots {
         if self.vertex_content_bytes + made.len() > vertex_snapshot_budget()
             || self.vertex_by_content.len() >= VERTEX_CONTENT_INDEX_CAP
         {
-            self.vertex_by_content.clear();
-            self.vertex_content_bytes = 0;
+            self.evict_interned_vertices(made.len());
         }
         self.vertex_content_bytes += made.len();
+        self.vertex_content_used.insert((made.len(), fp), self.frame_seq);
         self.vertex_by_content.insert((made.len(), fp), made.clone());
         made
     }
@@ -3467,7 +3839,11 @@ impl TextureSnapshots {
             if src.len() < span_len {
                 src.resize(span_len, 0);
             }
-            ctx.read_into(span_start, &mut src[..span_len]);
+            // The merged crossing, charged to the same phase as the per-stream ones so the two
+            // are comparable - see `Phase::DrawVertexGatherRead`.
+            crate::perf::time(crate::perf::Phase::DrawVertexGatherRead, || {
+                ctx.read_into(span_start, &mut src[..span_len])
+            });
         }
         for (si, st) in streams.iter().enumerate() {
             if st.stride == 0 {
@@ -3502,7 +3878,12 @@ impl TextureSnapshots {
                     if src.len() < want {
                         src.resize(want, 0);
                     }
-                    ctx.read_into(addr, &mut src[..want]);
+                    // The CROSSING, timed on its own - see `Phase::DrawVertexGatherRead`. The
+                    // scatter below is a plain memcpy loop inside wasm and is a different cost
+                    // with a different fix.
+                    crate::perf::time(crate::perf::Phase::DrawVertexGatherRead, || {
+                        ctx.read_into(addr, &mut src[..want])
+                    });
                     &src[..want]
                 }
             };
@@ -3536,6 +3917,8 @@ impl TextureSnapshots {
             return Arc::from(&[][..]);
         }
         self.arm_scene_stamp(ctx);
+        // A use - see the same stamp in `get_or_read`.
+        self.vertex_used.insert((addr, len), self.frame_seq);
         // NO once-a-scene shortcut here - see `vertex_entries` for why geometry cannot take one.
         if let Some(p) = self.vertex_entries.get(&(addr, len)) {
             let clean = match self.vertex_stamps.get(&(addr, len)) {
@@ -3555,7 +3938,7 @@ impl TextureSnapshots {
         // is common), and a fresh `Arc` there would miss every downstream cache keyed on
         // identity while being byte-for-byte the thing they already hold.
         if let Some(p) = self.vertex_entries.get(&(addr, len)) {
-            if raw[..] == p[..] {
+            if bytes_eq(&raw, p) {
                 let same = p.clone();
                 self.stamp_vertices(addr, len);
                 return same;
@@ -3574,7 +3957,7 @@ impl TextureSnapshots {
         let fp = vertex_fingerprint(&raw);
         if vertex_intern_enabled() {
         if let Some(p) = self.vertex_by_content.get(&(len, fp)) {
-            if raw[..] == p[..] {
+            if bytes_eq(&raw, p) {
                 let same = p.clone();
                 // NOT also recorded in `vertex_entries`: that map's byte accounting is per
                 // ENTRY, and a rotating arena would file one shared buffer under a new address
@@ -3587,17 +3970,13 @@ impl TextureSnapshots {
         }
         }
         let bytes: Arc<[u8]> = raw;
-        // A budget, cleared whole when exceeded. The keys are (address, length) rather than
-        // content, so a clear costs re-reads and never correctness - and geometry turns over
-        // with the level, so a level change should not leave the previous one's meshes resident.
+        // A budget, and past it the COLDEST meshes are shed rather than all of them. The keys
+        // are (address, length) rather than content, so an eviction costs a re-read and never
+        // correctness - and geometry does turn over with the level, which is exactly what an
+        // eviction by last use sheds and what a wholesale clear could only approximate by
+        // throwing away the current level too. See [`lru_victims`].
         if self.vertex_bytes + bytes.len() > vertex_snapshot_budget() {
-            self.vertex_entries.clear();
-            self.vertex_stamps.clear();
-            // The content index holds `Arc` clones of exactly these buffers, so it is what
-            // would keep them alive past the clear that exists to release them.
-            self.vertex_by_content.clear();
-            self.vertex_content_bytes = 0;
-            self.vertex_bytes = 0;
+            self.evict_vertices_to_budget(bytes.len());
         }
         if let Some(old) = self.vertex_entries.insert((addr, len), bytes.clone()) {
             self.vertex_bytes -= old.len();
@@ -3609,8 +3988,9 @@ impl TextureSnapshots {
         // change what is answered.
         if vertex_intern_enabled() {
             if self.vertex_by_content.len() >= VERTEX_CONTENT_INDEX_CAP {
-                self.vertex_by_content.clear();
+                self.evict_interned_vertices(0);
             }
+            self.vertex_content_used.insert((len, fp), self.frame_seq);
             self.vertex_by_content.insert((len, fp), bytes.clone());
         }
         self.stamp_vertices(addr, len);
@@ -3648,6 +4028,8 @@ impl TextureSnapshots {
         }
         self.arm_scene_stamp(ctx);
         let key = (addr, len, elem);
+        // A use - see the same stamp in `get_or_read`.
+        self.index_used.insert(key, self.frame_seq);
         // NO once-a-scene shortcut, for the reason `vertex_entries` gives: an index buffer is
         // geometry, and write-then-draw inside one scene is how dynamic meshes work.
         if let Some(v) = self.index_entries.get(&key) {
@@ -3691,13 +4073,11 @@ impl TextureSnapshots {
                 (first_vertex, vertex_count)
             });
         let value = (Arc::<[u8]>::from(raw), first_vertex, vertex_count);
-        // The same budget the vertex snapshots use, and cleared the same way: the keys are
-        // (address, length, element size) rather than content, so a clear costs re-reads and can
-        // never cost correctness.
+        // The same budget the vertex snapshots use, and shed the same way - coldest first. The
+        // keys are (address, length, element size) rather than content, so an eviction costs a
+        // re-read and can never cost correctness.
         if self.index_bytes + value.0.len() > vertex_snapshot_budget() {
-            self.index_entries.clear();
-            self.index_stamps.clear();
-            self.index_bytes = 0;
+            self.evict_indices_to_budget(value.0.len());
         }
         if let Some((old, ..)) = self.index_entries.insert(key, value.clone()) {
             self.index_bytes -= old.len();
@@ -3804,42 +4184,193 @@ impl TextureSnapshots {
         crate::perf::note_epoch_rebase();
     }
 
+    /// >>> SHED THE COLDEST SNAPSHOTS UNTIL THE CACHE FITS, INSTEAD OF DROPPING ALL OF THEM.
+    ///
+    /// This replaces a `clear()` whose own comment priced it at **2.1 seconds of `build`**, and
+    /// which the user's device reported doing over and over at `held_mb=191 entries=3264` - hard
+    /// against a 192 MB cap, so it re-fired as fast as the working set could be rebuilt. See
+    /// [`lru_victims`] for the four dumps that show what that costs across a session.
+    ///
+    /// # The two maps that would have made this buy nothing
+    /// `snapshot_sets` and `decoded` hold `Arc` clones of the very buffers `entries` holds, so
+    /// dropping an `entries` key while a memo still names it reclaims NO memory - it only makes
+    /// the byte count lie. Both are re-derivable and both already carry their own recency
+    /// (`valid_scene`), so the entries that are not current are dropped FIRST, before anything is
+    /// weighed: an entry the current scene has not proven is one the next use would re-prove
+    /// anyway, so this costs a re-derivation and never an answer.
+    ///
+    /// `want` is the incoming buffer's size, so the eviction makes room for it rather than
+    /// merely getting back under the line and immediately crossing it again.
+    fn evict_textures_to_budget(&mut self, want: usize) {
+        let budget = texture_snapshot_budget();
+        // >>> THE MEMO SWEEP IS ONCE PER FRAME, NOT ONCE PER INSERT.
+        //
+        // A title sitting hard against its budget - which is exactly what the device reported,
+        // `held_mb=191` of 192 - calls this on EVERY changed texture. Both maps are bounded at
+        // 16,384 entries, so a `retain` over them per insert would be tens of thousands of
+        // visits per frame: a cost that grows with cache size, imposed by the code that exists
+        // to stop costs growing with cache size. Once a frame is enough, because that is the
+        // cadence at which `valid_scene` can have changed for anything.
+        if self.memo_swept_frame != self.frame_seq {
+            self.memo_swept_frame = self.frame_seq;
+            // The memos pin the very buffers `entries` holds, so sweeping them BEFORE weighing
+            // anything is what makes the eviction below reclaim memory rather than accounting.
+            let scene = self.scene_seq;
+            self.snapshot_sets.retain(|_, e| e.valid_scene == scene);
+            self.decoded.retain(|_, e| e.valid_scene == scene);
+        }
+        // >>> EVICTED BELOW THE LINE, NOT TO IT. Freeing exactly enough for the incoming buffer
+        // means the next insert is over budget again, so every insert would pay a sort of the
+        // whole cache. An eighth of the budget of headroom turns that into one eviction pass per
+        // many inserts, which is the same hysteresis the renderer's own caches use.
+        let target = budget.saturating_sub(want + budget / 8);
+        let victims = lru_victims(
+            &self.entries,
+            &self.used,
+            self.bytes,
+            target,
+            self.frame_seq,
+            |b: &Arc<[u8]>| b.len(),
+        );
+        let mut freed = 0usize;
+        for k in &victims {
+            if let Some(old) = self.entries.remove(k) {
+                freed += old.len();
+                self.bytes = self.bytes.saturating_sub(old.len());
+            }
+            // Everything keyed on this entry goes with it. A stamp or a cadence flag left
+            // behind describes a buffer that is no longer here, and `pixel_ids` in particular
+            // is an IDENTITY - a re-read mints a new one, so a stale entry could hand a fresh
+            // buffer its predecessor's id and every cache keyed on that id would hit wrongly.
+            self.pixel_ids.remove(k);
+            self.stamps.remove(k);
+            self.used.remove(k);
+            self.mutable.remove(k);
+            self.checked_this_scene.remove(k);
+            self.checked_this_frame.remove(k);
+            // The expansion of a paletted texture is keyed by the same guest range and is four
+            // times its size; it cannot outlive the indices it was expanded from.
+            if let Some(old) = self.palette_expanded.remove(k) {
+                self.palette_bytes = self.palette_bytes.saturating_sub(old.pixels.len());
+            }
+        }
+        snapcounts::note_evicted(victims.len() as u64, freed as u64);
+        if victims.is_empty() && self.bytes + want > budget {
+            // Nothing was evictable: every retained buffer belongs to the frame being built,
+            // so the working set genuinely does not fit and the frame has to finish anyway.
+            // REPORTED rather than silently done - this is the state the budget is wrong for,
+            // and on a phone it is also how a worker gets killed with no error at all.
+            report_snapshot_working_set_over_budget(self.bytes >> 20, self.entries.len());
+        }
+    }
+
+    /// The vertex twin of [`Self::evict_textures_to_budget`]: shed the coldest meshes until the
+    /// snapshots fit, with room for the incoming one.
+    ///
+    /// The CONTENT index holds `Arc` clones of exactly these buffers, so an eviction that did not
+    /// reach it would drop the accounting and not the memory - it is swept on the same clock,
+    /// just below.
+    fn evict_vertices_to_budget(&mut self, want: usize) {
+        let budget = vertex_snapshot_budget();
+        let victims = lru_victims(
+            &self.vertex_entries,
+            &self.vertex_used,
+            self.vertex_bytes,
+            // Below the line rather than to it, so this is one pass per many inserts - see
+            // `evict_textures_to_budget` for why that matters on a cache under steady pressure.
+            budget.saturating_sub(want + budget / 8),
+            self.frame_seq,
+            |b: &Arc<[u8]>| b.len(),
+        );
+        for k in &victims {
+            if let Some(old) = self.vertex_entries.remove(k) {
+                self.vertex_bytes = self.vertex_bytes.saturating_sub(old.len());
+            }
+            self.vertex_stamps.remove(k);
+            self.vertex_used.remove(k);
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        snapcounts::VERTEX_EVICTED.fetch_add(victims.len() as u64, Relaxed);
+        // The interned copies of what was just dropped are what would keep it alive. Swept to
+        // the same budget rather than cleared, for the same reason everything else here is.
+        self.evict_interned_vertices(want);
+    }
+
+    /// Shed the coldest INTERNED vertex buffers - the content-addressed index that recognises a
+    /// mesh the guest rebuilt at a new address.
+    ///
+    /// Bounded twice, by bytes and by entries, because an entry here is held by this map alone
+    /// and its size is the mesh's. A drop costs one re-intern and can never change an answer:
+    /// every hit is proven by a full comparison, so the index is a pure accelerator.
+    fn evict_interned_vertices(&mut self, want: usize) {
+        let budget = vertex_snapshot_budget();
+        let mut victims = lru_victims(
+            &self.vertex_by_content,
+            &self.vertex_content_used,
+            self.vertex_content_bytes,
+            budget.saturating_sub(want + budget / 8),
+            self.frame_seq,
+            |b: &Arc<[u8]>| b.len(),
+        );
+        // The ENTRY cap is the other half of the bound, and bytes alone will not satisfy it: a
+        // map full of tiny meshes reaches the count long before the budget.
+        if self.vertex_by_content.len() >= VERTEX_CONTENT_INDEX_CAP {
+            let keep = VERTEX_CONTENT_INDEX_CAP - VERTEX_CONTENT_INDEX_CAP / 4;
+            if self.vertex_by_content.len().saturating_sub(victims.len()) > keep {
+                let mut by_age: Vec<((usize, u64), u64)> = self
+                    .vertex_by_content
+                    .keys()
+                    .map(|k| (*k, self.vertex_content_used.get(k).copied().unwrap_or(0)))
+                    .filter(|(_, u)| *u != self.frame_seq)
+                    .collect();
+                by_age.sort_by_key(|(_, u)| *u);
+                let want_n = self.vertex_by_content.len() - keep;
+                victims = by_age.into_iter().take(want_n).map(|(k, _)| k).collect();
+            }
+        }
+        for k in &victims {
+            if let Some(old) = self.vertex_by_content.remove(k) {
+                self.vertex_content_bytes = self.vertex_content_bytes.saturating_sub(old.len());
+            }
+            self.vertex_content_used.remove(k);
+        }
+    }
+
+    /// The index twin of [`Self::evict_vertices_to_budget`].
+    fn evict_indices_to_budget(&mut self, want: usize) {
+        let budget = vertex_snapshot_budget();
+        let victims = lru_victims(
+            &self.index_entries,
+            &self.index_used,
+            self.index_bytes,
+            budget.saturating_sub(want + budget / 8),
+            self.frame_seq,
+            |v: &(Arc<[u8]>, u32, u32)| v.0.len(),
+        );
+        for k in &victims {
+            if let Some((old, ..)) = self.index_entries.remove(k) {
+                self.index_bytes = self.index_bytes.saturating_sub(old.len());
+            }
+            self.index_stamps.remove(k);
+            self.index_used.remove(k);
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        snapcounts::INDEX_EVICTED.fetch_add(victims.len() as u64, Relaxed);
+    }
+
     fn insert(&mut self, addr: u32, len: usize, bytes: Arc<[u8]>) {
         if self.bytes + bytes.len() > texture_snapshot_budget() {
-            // A WARNING, not an info: this drops every buffer the renderer's decode cache
-            // is keyed on, so it costs a full re-decode of the working set inside the next
-            // frame - measured at 2.1 seconds of `build` in the browser. It was `info`,
-            // which the default `warn` filter discards, so the most expensive event in the
-            // frame was also the only one nobody could see. [[vitaslop-fallback-must-report]]
-            tracing::warn!(
-                target: "vitaslop::gxm",
-                held_mb = self.bytes >> 20,
-                entries = self.entries.len(),
-                "texture snapshot cache over budget - CLEARED WHOLE. Every retained buffer \
-                 is dropped, so the next frame re-reads and RE-DECODES the entire working \
-                 set. Raise VITASLOP_SNAPSHOT_BUDGET_MB if this repeats."
-            );
-            self.entries.clear();
-            self.pixel_ids.clear();
-            // The expansions name index buffers that no longer exist here.
-            self.palette_expanded.clear();
-            self.palette_bytes = 0;
-            // The cadence sets and the stamps describe entries that no longer exist.
-            self.mutable.clear();
-            self.checked_this_scene.clear();
-            self.checked_this_frame.clear();
-            self.stamps.clear();
-            // The per-scene decodes hold `Arc`s into the buffers just dropped.
-            self.snapshot_sets.clear();
-            self.decoded.clear();
-            self.bytes = 0;
-            // NOT `scene_stamp`: the epoch describes guest memory, not this cache, and the
-            // scene is still the same one. Clearing it here would take a second epoch value for
-            // one scene, which is exactly the spending this rewrite exists to stop.
+            self.evict_textures_to_budget(bytes.len());
         }
         if let Some(old) = self.entries.insert((addr, len), bytes.clone()) {
             self.bytes -= old.len();
         }
+        // >>> ESTABLISHING AN ENTRY IS USING IT, and stamping here rather than only in
+        // `get_or_read` is what makes that true on every path. `author` - the decoded video
+        // picture, written by the ENGINE rather than read from the guest - reaches this function
+        // without going through the read ladder, so without this line a picture would arrive
+        // unstamped and be the FIRST thing the next eviction chose, every frame.
+        self.used.insert((addr, len), self.frame_seq);
         // A NEW buffer is a new identity, and this is the only place one is established - see
         // `BoundTexture::pixels_id`. `insert` is reached exactly when the bytes were proven to
         // have CHANGED (or were read for the first time); the unchanged paths return the
@@ -3876,20 +4407,32 @@ impl TextureSnapshots {
     /// paletted texture: a re-expansion replaces the entry it supersedes, so this is bounded by
     /// the working set rather than by the run.
     fn remember_palette(&mut self, addr: u32, len: usize, e: PaletteExpansion) {
-        // >>> BOUNDED, AND LOUDLY, because this map PINS buffers nothing else would keep. An
-        // expansion is four times its indices, one entry per paletted texture, and a title that
-        // reaches new paletted art all run would otherwise grow it to the run. Clearing whole is
-        // safe - every entry is re-derivable from guest memory - and costs one re-expansion of
-        // the working set, which is exactly the work this memo exists to avoid, so it says so.
+        // >>> BOUNDED, because this map PINS buffers nothing else would keep. An expansion is
+        // four times its indices, one entry per paletted texture, and a title that reaches new
+        // paletted art all run would otherwise grow it to the run.
+        //
+        // It used to clear WHOLE, and the device reported it doing so at `held_mb=95
+        // entries=169`. Every entry is re-derivable, so that was safe - and it cost a
+        // re-expansion AND a re-upload of every paletted texture in the next frame, which is
+        // precisely the work this memo exists to avoid, repeated as fast as the cap could be
+        // reached. The coldest are shed instead, on the same recency as the snapshots they are
+        // keyed alongside (`used`, stamped by `get_or_read` - a paletted texture's expansion is
+        // used exactly when its indices are).
         if self.palette_bytes + e.pixels.len() > palette_memo_budget() {
-            tracing::warn!(
-                target: "vitaslop::gxm",
-                held_mb = self.palette_bytes >> 20,
-                entries = self.palette_expanded.len(),
-                "paletted-texture expansions over budget - CLEARED WHOLE. Every paletted                  texture in the next frame is expanded and re-uploaded again."
+            let budget = palette_memo_budget();
+            let victims = lru_victims(
+                &self.palette_expanded,
+                &self.used,
+                self.palette_bytes,
+                budget.saturating_sub(e.pixels.len() + budget / 8),
+                self.frame_seq,
+                |x: &PaletteExpansion| x.pixels.len(),
             );
-            self.palette_expanded.clear();
-            self.palette_bytes = 0;
+            for k in &victims {
+                if let Some(old) = self.palette_expanded.remove(k) {
+                    self.palette_bytes = self.palette_bytes.saturating_sub(old.pixels.len());
+                }
+            }
         }
         self.palette_bytes += e.pixels.len();
         if let Some(old) = self.palette_expanded.insert((addr, len), e) {
@@ -3937,6 +4480,20 @@ impl TextureSnapshots {
     /// See [`Self::get_or_read`] for why the two cadences exist.
     fn begin_frame(&mut self) {
         self.checked_this_frame.clear();
+        // The recency clock for every eviction in this struct. It is a FRAME rather than a
+        // scene because a frame is what a working set is a property of: a title's passes bind
+        // different subsets of the same textures, and an entry unused by one scene of a frame
+        // is not therefore cold.
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        // Occupancy, for the panel line - see [`snapshot_cache_report`]. Five relaxed stores a
+        // frame, against a symptom that previously needed a 48,000-frame session to see.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            snapcounts::HELD_BYTES.store(self.bytes as u64, Relaxed);
+            snapcounts::ENTRIES.store(self.entries.len() as u64, Relaxed);
+            snapcounts::VERTEX_BYTES.store(self.vertex_bytes as u64, Relaxed);
+            snapcounts::INDEX_BYTES.store(self.index_bytes as u64, Relaxed);
+        }
     }
 
     /// The memoised decode for `key`, PROVEN current for this scene - or `None` when there is
@@ -3946,9 +4503,9 @@ impl TextureSnapshots {
     /// again this scene and getting the SAME buffer back (`Arc::ptr_eq`) re-establishes every
     /// byte through the same stamps-then-compare ladder a rebuild would use. A changed texture
     /// returns a fresh buffer, the pointers differ, and the entry dies.
-    /// Bound on distinct per-binding decodes held across a long run, now that the map
-    /// survives scenes. Cleared whole when hit - re-derivation, never correctness - like
-    /// [`TEXTURE_TEMPLATE_CAP`] and the set cache's own cap.
+    /// Bound on distinct per-binding decodes held across a long run, now that the map survives
+    /// scenes. Past it the entries proven LONGEST AGO go - re-derivation, never correctness -
+    /// like [`TEXTURE_TEMPLATE_CAP`] and the set cache's own cap.
     const DECODED_CAP: usize = 16_384;
 
     fn decoded_validated(
@@ -4206,11 +4763,17 @@ impl TextureSnapshots {
             }
         }
         // A bound on distinct sets held across a long run, in the spirit of
-        // [`TEXTURE_TEMPLATE_CAP`]: cleared whole when hit, which costs re-derivation and
-        // never correctness - the entries re-prove themselves from live guest state.
-        const SET_CAP: usize = 16_384;
+        // [`TEXTURE_TEMPLATE_CAP`]. Shedding costs re-derivation and never correctness - the
+        // entries re-prove themselves from live guest state - so it sheds the ones proven
+        // LONGEST AGO, which each entry already records, rather than all of them.
         if self.snapshot_sets.len() >= SET_CAP {
-            self.snapshot_sets.clear();
+            let scene = self.scene_seq;
+            for k in count_victims(&self.snapshot_sets, SET_CAP - SET_CAP / 4, scene, |e| {
+                e.valid_scene
+            }) {
+                self.snapshot_sets.remove(&k);
+                snapcounts::SET_EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         self.snapshot_sets.insert(
             key,
@@ -4223,6 +4786,10 @@ impl TextureSnapshots {
                 valid_scene: self.scene_seq,
             },
         );
+        // A GAUGE, not a tally: published here because this is the only place the map grows.
+        // See `snapcounts::SET_LIVE`.
+        snapcounts::SET_LIVE
+            .store(self.snapshot_sets.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The mean colour of `t`'s pixels, computed once per distinct byte buffer.
@@ -5146,8 +5713,13 @@ fn report_default_uniform_container_short(header: u32, container_regs: u32, shor
 enum ClockSource {
     /// A scheduler quantum of guest execution ([`VitaState::charge_cpu_quantum`]).
     Quantum,
-    /// The per-flip top-up ([`VitaState::advance_time_frame`]), off under
-    /// `VITASLOP_FRAME_TOPUP=0`.
+    /// The per-flip top-up ([`VitaState::advance_time_frame`]), which is OPT-IN:
+    /// `VITASLOP_FRAME_TOPUP=1` turns it on and every other value, including absent, leaves it
+    /// OFF. See `frame_topup` - and note the comment on `advance_time_frame` used to say "=0
+    /// switches it off", which reads as though the default were ON. It is not, and that wording
+    /// cost this project a measurement: a run made to test the topup-on arm was the topup-OFF
+    /// arm and produced numbers identical to the run it was meant to be compared against.
+    /// [[vitaslop-knob-is-the-gate-not-the-level]]
     FrameTopup,
     /// The scheduler's idle path jumping to the earliest pending deadline - and the
     /// default, so an advance from an untagged path is attributed rather than lost.
@@ -5347,6 +5919,26 @@ pub struct VitaState {
     gxm_context: u32,
     /// Whether a draw with no context has already been reported, so the report is once.
     reported_no_gxm_context: bool,
+    /// Whether a draw whose fragment program DECLARES samplers but whose binding list came
+    /// out empty has already been reported. See [`Self::report_draw_without_bound_textures`].
+    reported_draw_without_textures: bool,
+    /// >>> WHO HAS WRITTEN THE CONTEXT'S TEXTURE SLOTS, counted for the failure report above.
+    ///
+    /// Only ever PRINTED by [`Self::report_draw_without_bound_textures`], which fires once per
+    /// run on a draw that reaches the renderer with no texture. The counters exist because
+    /// that report can otherwise only say the slots are zero, and "nothing ever bound one" and
+    /// "something bound one and a later bind CLEARED it" are opposite bugs that leave the same
+    /// zeros [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]].
+    ///
+    /// They count the HOST-ROUTED writers only - an inlined `sceGxmSetFragmentTexture` writes
+    /// the slot from emitted code and never reaches this struct
+    /// [[vitaslop-inlined-host-calls-escape-both-watchpoints]] - so read them under
+    /// `VITASLOP_NO_INLINE_TEXTURE=1` (or `VITASLOP_NO_INLINE_IMPORTS=1`), where every bind is
+    /// host-routed and the counts are complete. The report says which.
+    texture_writes: TextureSlotWrites,
+    /// Whether the draw being recorded arrived through `sceGxmDrawPrecomputed`. Set only
+    /// around that call; read only by the empty-bindings report.
+    last_draw_was_precomputed: bool,
     /// Guest address of the fallback SA bank - the uniforms a draw reads when no default
     /// uniform buffer is bound for its stage. Placed once in [`Self::set_alloc_base`],
     /// before any guest code runs, and published to the host-mirror block so an inlined
@@ -5369,8 +5961,6 @@ pub struct VitaState {
     /// Whether "video playback is not implemented" has been reported (once per run).
     /// See `vita::video`.
     pub(crate) reported_no_video: bool,
-    /// Whether the "stream properties are placeholders" line has been said this run.
-    pub(crate) reported_stream_properties: bool,
     /// Whether the "the unit layout is partly inferred" line has been said this run.
     pub(crate) reported_unit_layout: bool,
     /// The movie session `SceMp4` is playing, if any. One at a time: the call surface has
@@ -5412,6 +6002,12 @@ pub struct VitaState {
     /// still held, so it is held here rather than discarded - a title that toggles it
     /// as a progress marker through boot leaves its last marker readable.
     pub(crate) gpo: u32,
+    /// Per-port touch sampling state (`sceTouchSetSamplingState`), front then back.
+    /// Held only so `sceTouchGetSamplingState` reads back what the title set rather
+    /// than a constant: the panels here always deliver a sample, so the value does not
+    /// gate `sceTouchRead`/`Peek`. Starts at START, which is what every title that
+    /// never calls the setter is already getting.
+    pub(crate) touch_sampling: [u32; 2],
     // Preemptive-mode state (unused in the single-thread model). When `preemptive`
     // is set, blocking primitives actually park the calling thread (`current`) and
     // are woken by another thread's signal/unlock/thread-end; the scheduler drains
@@ -5443,6 +6039,15 @@ pub struct VitaState {
     display_cb_next_slot: u32,
     display_cb_queue: std::collections::VecDeque<u32>,
     display_cb_running: Option<i32>,
+    // NGS callback execution (preemptive mode; see [`Self::enqueue_ngs_callback`]):
+    // the same shape as the display queue's - one dedicated guest stack, a ring of
+    // `SceNgsCallbackInfo` slots, entries waiting to run as `(entry, info)`, and the
+    // in-flight callback's thread id. Serial, in the order the events happened.
+    ngs_cb_stack: u32,
+    ngs_cb_slots: u32,
+    ngs_cb_next_slot: u32,
+    ngs_cb_queue: std::collections::VecDeque<(u32, u32)>,
+    ngs_cb_running: Option<i32>,
     // Registered service-state callbacks (preemptive mode). A title registers
     // these at boot and pumps them every frame (`sce*CheckCallback`), waiting for
     // the one-time state notification (offline: signed-out / disconnected) before
@@ -5685,6 +6290,14 @@ pub struct VitaState {
     /// The offline SceNet socket table, its resolver and epoll handles, and the
     /// per-thread errno slots. See `vita::net` for the model.
     net_sockets: Vec<NetSocket>,
+    /// `sceNetAdhocMatchingInit`: the pool the guest handed over, once. `None` until it
+    /// does, which is what makes a later `Create` reportable as NOT_INITIALIZED rather
+    /// than quietly working.
+    adhoc_matching_pool: Option<(u32, u32)>,
+    /// Live `sceNetAdhocMatchingCreate` contexts, as `(id, started)`. Kept so an id the
+    /// guest never got cannot be stopped or deleted, and so the ids are a function of the
+    /// call sequence alone (deterministic across runs).
+    adhoc_matchings: Vec<(i32, bool)>,
     net_resolvers: Vec<(i32, i32)>,
     net_epolls: Vec<(i32, Vec<i32>)>,
     net_errno: Vec<(i32, u32)>,
@@ -5694,6 +6307,13 @@ pub struct VitaState {
     /// Whether `sceMotionMagnetometerOn` has been called and not turned off again. The
     /// guest's own state, read back by `sceMotionGetMagnetometerState`.
     pub motion_magnetometer: bool,
+    /// `sceMotionSetDeadband` / `sceMotionSetTiltCorrection`: the two tuning bits, held
+    /// for the same reason the magnetometer bit is - each has a getter, and a title told
+    /// its setting did not take has been told two different things. Both change nothing
+    /// about what `sceMotionGetState` reports, since the modelled device is at rest.
+    /// The device powers up with both enabled.
+    pub motion_deadband: bool,
+    pub motion_tilt_correction: bool,
     /// The `sce::Xml` DOM: the node arena every parsed document lives in, plus the
     /// interned guest copies of the strings handed back. See `vita::sce_xml`.
     pub xml: crate::vita::sce_xml::XmlState,
@@ -5751,6 +6371,14 @@ pub struct VitaState {
     /// (`on_frame_boundary`). Frame-tags egress-ledger events so a recipe can assert
     /// roughly when a milestone occurred, not only that it did.
     cur_frame: u64,
+    /// Said once when the display-callback backlog reached its data ring's depth - see
+    /// [`VitaState::enqueue_display_callback`].
+    reported_display_cb_overrun: bool,
+    /// The controller samples this run has actually served, per port, newest last.
+    /// See [`crate::vita::ctrl::CtrlHistory`] - a title that acts on a button EDGE reads
+    /// its own past out of this ring, and a ring that repeats the present has no edges in
+    /// it.
+    pub(crate) ctrl_history: crate::vita::ctrl::CtrlHistory,
 }
 
 /// The ceiling on a default uniform buffer, in 4-byte registers. A program header or parameter
@@ -5836,13 +6464,15 @@ impl VitaState {
             scene: None,
             gxm_context: 0,
             reported_no_gxm_context: false,
+            reported_draw_without_textures: false,
+            texture_writes: TextureSlotWrites::default(),
+            last_draw_was_precomputed: false,
             sa_bank: 0,
             bound_binding_scratch: Vec::new(),
             threads: Vec::new(),
             free_stacks: Vec::new(),
             runaway_threads_reported: false,
             reported_no_video: false,
-            reported_stream_properties: false,
             reported_unit_layout: false,
             movie: None,
             avcdec: crate::vita::avcdec::AvcdecState::default(),
@@ -5855,6 +6485,7 @@ impl VitaState {
             fios_overlays: Vec::new(),
             fios_overlay_disabled: std::collections::HashSet::new(),
             gpo: 0,
+            touch_sampling: [1, 1],
             preemptive: false,
             current: 0,
             mutexes: Vec::new(),
@@ -5869,6 +6500,11 @@ impl VitaState {
             display_cb_next_slot: 0,
             display_cb_queue: std::collections::VecDeque::new(),
             display_cb_running: None,
+            ngs_cb_stack: 0,
+            ngs_cb_slots: 0,
+            ngs_cb_next_slot: 0,
+            ngs_cb_queue: std::collections::VecDeque::new(),
+            ngs_cb_running: None,
             np_service_cb: None,
             np_cb_delivered: false,
             net_inet_cb: None,
@@ -5925,9 +6561,13 @@ impl VitaState {
             texture_palettes: std::collections::HashMap::new(),
             photo_exports: 0,
             net_sockets: Vec::new(),
+            adhoc_matching_pool: None,
+            adhoc_matchings: Vec::new(),
             net_resolvers: Vec::new(),
             http_objects: Vec::new(),
             motion_magnetometer: false,
+            motion_deadband: true,
+            motion_tilt_correction: true,
             xml: Default::default(),
             net_epolls: Vec::new(),
             net_errno: Vec::new(),
@@ -5943,6 +6583,8 @@ impl VitaState {
             clock_from_idle_us: 0,
             idle_by_owner: Vec::new(),
             cur_frame: 0,
+            reported_display_cb_overrun: false,
+            ctrl_history: crate::vita::ctrl::CtrlHistory::default(),
         }
     }
 
@@ -7245,6 +7887,11 @@ impl VitaState {
                 self.display_cb_running = None;
                 self.pump_display_callback();
             }
+            // ...and a finished NGS callback starts the next one, in event order.
+            if self.ngs_cb_running == Some(thid) {
+                self.ngs_cb_running = None;
+                self.pump_ngs_callback();
+            }
         }
     }
 
@@ -7929,8 +8576,11 @@ impl VitaState {
     /// [`advance_io_frame`](Self::advance_io_frame) with the game clock's units.
     ///
     /// # The top-up hands out time the guest was never given the CPU to use
-    /// `VITASLOP_FRAME_TOPUP=0` switches it off, and that is not a micro-optimisation -
-    /// it changes what a displayed frame MEANS. With the top-up on, a flip advances the
+    /// >>> IT IS OFF BY DEFAULT AND `VITASLOP_FRAME_TOPUP=1` IS WHAT TURNS IT ON. This is
+    /// stated in that direction deliberately: it used to read "`=0` switches it off", which
+    /// implies a default of ON, and `frame_topup()` tests for `Ok("1")`. Which way round it is
+    /// decides what a displayed frame MEANS, so the sentence has to be unambiguous.
+    /// With the top-up on, a flip advances the
     /// clock a whole frame however little guest code ran, so the render thread's next
     /// vblank wait is already satisfied and it flips again at once. Measured on a
     /// retail title's loading screen: **3120 fps, 8 thread resumes a frame, barely one
@@ -8101,10 +8751,34 @@ impl VitaState {
         // fast as it can draw still latches at 60 Hz and no faster (the 216 fps case).
         let depth = self.display_queue_max_pending.clamp(1, 8) as usize;
         let mut park = 0;
+        // >>> THE SAME DEPTH BOUNDS THE GUEST'S OWN DISPLAY CALLBACK, AND IT WAS NOT BOUNDED
+        // >>> AT ALL.
+        //
+        // GXM runs the display-queue callback once per queued entry, and `AddEntry` blocks
+        // while `displayQueueMaxPendingCount` of them are still outstanding - that is the whole
+        // of the guest's back-pressure on its own display path. This engine ran the callback on
+        // a serial callback thread and never bounded the queue behind it, so a title whose
+        // callback completes less often than it queues runs away.
+        //
+        // MEASURED on PCSE00120's front-end movie (`displayQueueMaxPendingCount = 2`): the
+        // guest queued 60 entries a second and the callback completed 30, and by frame 2700 the
+        // backlog was **1,348 entries deep**. The callback-data ring is
+        // [`Self::DISPLAY_CB_SLOT_COUNT`] slots, so it had wrapped 168 times and EVERY callback
+        // was handed a much newer entry's data - the title's own buffer bookkeeping, fed
+        // garbage, for the whole run.
+        //
+        // So the shortfall is charged back to the thread that queued: parking it for the frames
+        // the callback still owes makes the guest's flip rate the rate its own display path can
+        // retire, exactly as the blocking `AddEntry` does on hardware. In steady state the
+        // backlog is at most `depth` and this adds nothing.
+        let owed = self.display_callback_backlog().saturating_sub(depth);
+        if owed > 0 {
+            park = park.max((owed as u64).saturating_mul(frame_us));
+        }
         if self.display_latches.len() >= depth {
             // Full: wait for the oldest outstanding frame to reach the panel.
             if let Some(oldest) = self.display_latches.pop_front() {
-                park = oldest.saturating_sub(self.virtual_us);
+                park = park.max(oldest.saturating_sub(self.virtual_us));
             }
         }
         // >>> ALWAYS PARK, EVEN FOR ZERO. The scheduler BLOCKS the flipping thread at
@@ -8309,8 +8983,33 @@ impl VitaState {
             let bytes = ctx.read_bytes(callback_data, size as usize);
             ctx.write_bytes(slot, &bytes);
         }
+        // >>> A QUEUE DEEPER THAN THE SLOT RING IS SILENT DATA CORRUPTION.
+        //
+        // The slot the entry just took is reused after `DISPLAY_CB_SLOT_COUNT` more entries,
+        // so a queue that long hands an older, still-pending callback a newer entry's bytes.
+        // `pace_flip` charges the shortfall back to the queueing thread, which keeps the depth
+        // at the guest's own `displayQueueMaxPendingCount`; if it is ever exceeded anyway, the
+        // guest's display bookkeeping is being lied to and only this says so.
+        if self.display_cb_queue.len() >= Self::DISPLAY_CB_SLOT_COUNT as usize
+            && !self.reported_display_cb_overrun
+        {
+            self.reported_display_cb_overrun = true;
+            tracing::warn!(
+                target: "vitaslop::gxm",
+                pending = self.display_cb_queue.len(),
+                slots = Self::DISPLAY_CB_SLOT_COUNT,
+                "the display-queue CALLBACK backlog is as deep as its data ring, so a pending                  callback will be handed a newer entry's callbackData. The guest's own display                  bookkeeping runs on that data. Reported once."
+            );
+        }
         self.display_cb_queue.push_back(slot);
         self.pump_display_callback();
+    }
+
+    /// How many display-queue entries are waiting for their guest callback, including the
+    /// one in flight. See [`Self::enqueue_display_callback`]; GXM runs the callback once per
+    /// entry, so anything but a small constant here is a backlog.
+    pub fn display_callback_backlog(&self) -> usize {
+        self.display_cb_queue.len() + usize::from(self.display_cb_running.is_some())
     }
 
     /// Start the next queued display callback if none is in flight. Chained from
@@ -8329,9 +9028,98 @@ impl VitaState {
             r2: 0,
             stack_top: self.display_cb_stack + Self::DISPLAY_CB_STACK_BYTES,
             thid,
-            priority: DEFAULT_THREAD_PRIORITY - 0x10, // above game threads: presents promptly
+            // Above game threads, so a queued frame is presented promptly.
+            //
+            // >>> RAISING THIS TO `SCE_KERNEL_HIGHEST_PRIORITY_USER` WAS TRIED AND REVERTED.
+            // GXM creates this thread itself and the SDK's samples put it at the top of the
+            // user band, so that looked more faithful - and it MEASURED as no change at all:
+            // PCSE00120's callback rate stayed at one per two vblanks (it is the title's own
+            // TWO `sceDisplayWaitVblankStart` calls that set it, see `pace_flip`), and Ridge
+            // Racer's race was identical either way. What it did do is move the schedule, so
+            // it is not carried on an argument alone.
+            priority: DEFAULT_THREAD_PRIORITY - 0x10,
         });
         self.display_cb_running = Some(thid);
+    }
+
+    /// Guest stack for the NGS callback thread. One callback runs at a time.
+    const NGS_CB_STACK_BYTES: u32 = 0x1_0000;
+    /// `SceNgsCallbackInfo` is seven words: voice, rack, module id, callback data,
+    /// callback data 2, a callback pointer, and the user data.
+    ///
+    /// EVIDENCE for the two fields past the first four, from the callback one title
+    /// registers on its player module: it reads its OWN object out of `info + 0x18` (and
+    /// dereferences it, so that is the user data it registered) and forwards `info + 0x10`
+    /// to its buffer handler beside the constant it uses for "a buffer completed" - the
+    /// second callback datum, the buffer index. A five-word layout with the user data at
+    /// `+0x10` would hand that title a buffer index where it expects its object.
+    const NGS_CB_INFO_BYTES: u32 = 0x1c;
+    /// Info slots in the ring. Callbacks are short and drain serially; the ring only has to
+    /// cover the events one mix can raise before the first callback of the batch runs.
+    const NGS_CB_SLOT_COUNT: u32 = 32;
+
+    /// Queue a guest NGS callback `entry(const SceNgsCallbackInfo *)` with `info` as the
+    /// struct's bytes, to run as guest code on the NGS callback thread (preemptive mode
+    /// only - a run-to-completion host has no thread to run it on).
+    ///
+    /// On the device the synthesizer raises these from `sceNgsSystemUpdate` - a player
+    /// finishing a buffer, a voice finishing its data - and a streaming title does its
+    /// refills IN the callback. So without delivery the stream primes two slots, plays them,
+    /// and ends; with it, the title keeps the ring full. Serial and in order, the way one
+    /// update thread would run them.
+    pub fn enqueue_ngs_callback(&mut self, ctx: &mut GuestCtx, entry: u32, info: &[u8]) {
+        if !self.preemptive || entry == 0 {
+            return;
+        }
+        if self.ngs_cb_slots == 0 {
+            self.ngs_cb_slots = self.galloc(Self::NGS_CB_INFO_BYTES * Self::NGS_CB_SLOT_COUNT, 8);
+            self.ngs_cb_stack = self.galloc(Self::NGS_CB_STACK_BYTES, 16);
+            if self.ngs_cb_slots == 0 || self.ngs_cb_stack == 0 {
+                tracing::warn!(
+                    target: "vitaslop::ngs",
+                    "NGS callback delivery is OFF: the guest heap could not spare a stack and \
+                     an info ring for it, so every module/finished callback from here on is \
+                     dropped and a streaming voice will end after its primed buffers"
+                );
+                self.ngs_cb_slots = u32::MAX;
+                return;
+            }
+        }
+        if self.ngs_cb_slots == u32::MAX {
+            return;
+        }
+        let slot = self.ngs_cb_slots
+            + (self.ngs_cb_next_slot % Self::NGS_CB_SLOT_COUNT) * Self::NGS_CB_INFO_BYTES;
+        self.ngs_cb_next_slot = self.ngs_cb_next_slot.wrapping_add(1);
+        let mut bytes = [0u8; 0x1c];
+        let n = info.len().min(bytes.len());
+        bytes[..n].copy_from_slice(&info[..n]);
+        ctx.write_bytes(slot, &bytes);
+        self.ngs_cb_queue.push_back((entry, slot));
+        self.pump_ngs_callback();
+    }
+
+    /// Start the next queued NGS callback if none is in flight. Chained from
+    /// [`Self::set_thread_exit`] when the in-flight one ends.
+    fn pump_ngs_callback(&mut self) {
+        if self.ngs_cb_running.is_some() {
+            return;
+        }
+        let Some((entry, info)) = self.ngs_cb_queue.pop_front() else { return };
+        let thid = self.new_uid();
+        self.pending_spawns.push(Reentry {
+            entry: entry & !1,
+            arg_len: info, // r0: `const SceNgsCallbackInfo *`
+            arg_ptr: 0,
+            r2: 0,
+            stack_top: self.ngs_cb_stack + Self::NGS_CB_STACK_BYTES,
+            thid,
+            // Above the game's threads, as the synthesizer's own update runs: a refill that
+            // waits behind a frame of game work is a refill that arrives after the ring ran
+            // dry.
+            priority: DEFAULT_THREAD_PRIORITY - 0x10,
+        });
+        self.ngs_cb_running = Some(thid);
     }
 
     /// Guest stack bytes for a one-shot service-state callback delivery.
@@ -8797,6 +9585,50 @@ impl VitaState {
             .map(|b| b.uid)
     }
 
+    // --- SceNetAdhocMatching: the peer table that is always empty --------------
+
+    /// Record the pool `sceNetAdhocMatchingInit` was given. `false` if it was already
+    /// initialised, which the caller turns into ALREADY_INITIALIZED.
+    pub fn adhoc_matching_init(&mut self, pool_ptr: u32, pool_size: u32) -> bool {
+        if self.adhoc_matching_pool.is_some() {
+            return false;
+        }
+        self.adhoc_matching_pool = Some((pool_ptr, pool_size));
+        true
+    }
+
+    /// Whether `sceNetAdhocMatchingInit` has been called.
+    pub fn adhoc_matching_ready(&self) -> bool {
+        self.adhoc_matching_pool.is_some()
+    }
+
+    /// Mint a matching context id. Ids count up from 1 in creation order, so they are a
+    /// function of the guest's own call sequence and identical across runs.
+    pub fn adhoc_matching_create(&mut self) -> i32 {
+        let id = self.adhoc_matchings.len() as i32 + 1;
+        self.adhoc_matchings.push((id, false));
+        id
+    }
+
+    /// Mark a context started/stopped. `None` if `id` names no live context.
+    pub fn adhoc_matching_set_started(&mut self, id: i32, started: bool) -> Option<()> {
+        let slot = self.adhoc_matchings.iter_mut().find(|(i, _)| *i == id)?;
+        slot.1 = started;
+        Some(())
+    }
+
+    /// Whether `id` names a live context.
+    pub fn adhoc_matching_live(&self, id: i32) -> bool {
+        self.adhoc_matchings.iter().any(|(i, _)| *i == id)
+    }
+
+    /// Release a context. `false` if `id` names none.
+    pub fn adhoc_matching_delete(&mut self, id: i32) -> bool {
+        let before = self.adhoc_matchings.len();
+        self.adhoc_matchings.retain(|(i, _)| *i != id);
+        self.adhoc_matchings.len() != before
+    }
+
     // --- SceNet: the offline socket table ------------------------------------
     //
     // Real descriptors and real local state, no host sockets. See `vita::net` for what
@@ -9126,7 +9958,7 @@ impl VitaState {
     /// Returning 0 on exhaustion matters as much as the reuse: the caller turns it into a
     /// real `sceKernelAllocMemBlock` error, where handing back a live SceUID whose base is
     /// 0 is a hollow success the guest cannot detect until it writes through the pointer.
-    pub fn alloc_memblock(&mut self, size: u32, align: u32) -> i32 {
+    pub fn alloc_memblock(&mut self, size: u32, align: u32, ty: u32) -> i32 {
         let want = size.max(4);
         let a = align.max(4);
         let reused = self.freed_memblocks.iter().position(|&(base, sz)| {
@@ -9154,8 +9986,19 @@ impl VitaState {
         }
         let uid = self.next_uid;
         self.next_uid += 1;
-        self.memblocks.push(MemBlock { uid, base, size });
+        self.memblocks.push(MemBlock { uid, base, size, ty });
         uid
+    }
+
+    /// The block containing `addr`, as `(base, size, type)`, for
+    /// `sceKernelGetMemBlockInfoByAddr`. The address may be anywhere inside the block -
+    /// that is the whole point of the query, which a title reaches with a pointer it was
+    /// handed rather than with a base.
+    pub fn memblock_info_at(&self, addr: u32) -> Option<(u32, u32, u32)> {
+        self.memblocks
+            .iter()
+            .find(|b| addr >= b.base && addr < b.base.wrapping_add(b.size))
+            .map(|b| (b.base, b.size, b.ty))
     }
 
     /// The base address of the block with SceUID `uid`, if known.
@@ -9542,6 +10385,7 @@ impl VitaState {
                 ctx.read_u32(texture_addr + 12),
             ]
         };
+        self.note_texture_bind(unit, texture_addr);
         crate::vita::gxmctx::set_texture_binding(
             ctx,
             context,
@@ -9565,6 +10409,130 @@ impl VitaState {
                  nowhere to live and is DROPPED"
             );
         }
+    }
+
+    /// Note the context pointer a host-routed GXM call was handed, for [`TextureSlotWrites`].
+    pub fn note_bind_context(&mut self, context: u32) {
+        self.texture_writes.last_bind_context = context;
+    }
+
+    /// Note a host-routed `sceGxmSetFragmentTexture`, for [`TextureSlotWrites`].
+    fn note_texture_bind(&mut self, unit: u32, handle: u32) {
+        if handle == 0 {
+            self.texture_writes.unbinds += 1;
+        } else {
+            self.texture_writes.binds += 1;
+            self.texture_writes.last_bind = Some((self.cur_frame, unit, handle));
+        }
+    }
+
+    /// Report - ONCE - a draw whose fragment program DECLARES samplers and whose texture
+    /// binding list came out EMPTY.
+    ///
+    /// # Why this exists, and why it dumps the block rather than naming a cause
+    /// Downstream this draw produces `gxp pair ...: sampler unit N wants Two but the bound
+    /// units are []`, and the recompiler then REFUSES it. That message is the renderer's view:
+    /// it says the list is empty and cannot say why. The two candidate causes are opposite
+    /// fixes - the narrowing mask in `record_draw` dropped the unit, or nothing ever wrote the
+    /// context block's slot - and both were guessed at, in that order, before either was
+    /// looked at. `VITASLOP_SAMPLER_NARROW=0` (the mask arm) and `VITASLOP_NO_INLINE_TEXTURE=1`
+    /// (the inline-writer arm) each cleared their own suspect while the draw kept failing, so
+    /// the remaining question is only answerable by the BYTES.
+    ///
+    /// So this prints what the block actually holds at the failing draw: every non-zero slot,
+    /// and the count of zero ones. A block that is entirely zero says no writer ran (or one
+    /// WIPED it - `bind_precomputed_fragment_state` copies a state's array wholesale, and a
+    /// state whose block pointer is null writes zeros over all sixteen units). A block with the
+    /// texture in a DIFFERENT unit than the program declares says the two disagree about
+    /// numbering, which is a different bug with a different fix.
+    ///
+    /// Fires once for the run: the failing pair repeats every frame, and a per-draw line would
+    /// bury the rest of the log [[vitaslop-a-diagnostic-can-bury-the-findings]].
+    fn report_draw_without_bound_textures(&mut self, blk: &crate::vita::gxmctx::Block, fheader: u32, want: u32) {
+        use crate::vita::gxmctx::{self, off, MAX_TEXTURE_UNITS, TEXTURE_STRIDE};
+        if self.reported_draw_without_textures {
+            return;
+        }
+        self.reported_draw_without_textures = true;
+        let mut bound = String::new();
+        let mut zero = 0u32;
+        for unit in 0..MAX_TEXTURE_UNITS {
+            let at = off::TEXTURES + unit as u32 * TEXTURE_STRIDE;
+            let addr = blk.word(at);
+            if addr == 0 {
+                zero += 1;
+                continue;
+            }
+            let pre = blk.word(at + 4 + gxmctx::TEXTURE_CONTROL_WORDS * 4) != 0;
+            bound.push_str(&format!(
+                " [unit {unit}: handle {addr:#x} w0 {:#010x} w2 {:#010x}{}]",
+                blk.word(at + 4),
+                blk.word(at + 12),
+                if pre { " from-precomputed" } else { "" }
+            ));
+        }
+        if bound.is_empty() {
+            bound.push_str(" NONE - all sixteen slots are zero");
+        }
+        // The SLOT ADDRESSES, so the next question is answerable with an existing instrument
+        // rather than another new one: the context block is guest memory, every writer of it
+        // (inlined or host-routed) goes through a guest store, and
+        // `VITASLOP_WATCH_STORE=<addr> VITASLOP_WATCH_STORE_LOG=1` therefore enumerates them
+        // all in one run [[vitaslop-watch-store-log]]. An empty slot cannot be traced without
+        // its address, and the address is only in hand here.
+        let unit0 = self.gxm_context.wrapping_add(off::TEXTURES);
+        eprintln!(
+            "gxm texture: frame {}: this draw came through {}. Fragment program {fheader:#x} DECLARES sampler units \
+             {want:#06x}, but this draw's context block binds:{bound} ({zero} of {} slots \
+             zero). The draw reaches the renderer with no texture, and a recompiled pair that \
+             samples one of those units cannot be built. Narrowing is {}. The context block is \
+             at {:#x} and unit 0's slot at {unit0:#x} - watch that address to enumerate every \
+             writer (VITASLOP_WATCH_STORE={unit0:#x} VITASLOP_WATCH_STORE_LOG=1). Host-routed \
+             writers so far: {} binds, {} unbinds, {} precomputed-state binds of which {} \
+             landed an array with unit 0 EMPTY (so they CLEARED it); last direct bind {}. \
+             This title has put a texture INTO a precomputed state {} times (a count that is \
+             always complete - those setters are never inlined). \
+             {}",
+            self.cur_frame,
+            if self.last_draw_was_precomputed { "sceGxmDrawPrecomputed" } else { "sceGxmDraw" },
+            MAX_TEXTURE_UNITS,
+            if sampler_narrow_enabled() { "ON" } else { "OFF (VITASLOP_SAMPLER_NARROW=0)" },
+            self.gxm_context,
+            self.texture_writes.binds,
+            self.texture_writes.unbinds,
+            self.texture_writes.state_binds,
+            self.texture_writes.state_binds_clearing_unit0,
+            match self.texture_writes.last_bind {
+                Some((f, u, h)) => format!(
+                    "was unit {u} handle {h:#x} at frame {f}, through context {:#x}{}",
+                    self.texture_writes.last_bind_context,
+                    if self.texture_writes.last_bind_context == self.gxm_context {
+                        " (the SAME block this draw reads)"
+                    } else {
+                        " >>> WHICH IS NOT THE BLOCK THIS DRAW READS: the inlined form writes \
+                         through the pointer the guest passes and the handler writes through the \
+                         adopted context, so the two paths are writing DIFFERENT memory"
+                    }
+                ),
+                None => "NEVER HAPPENED".to_string(),
+            },
+            self.texture_writes.state_texture_sets,
+            match crate::vita::texture_slot_writers_are_host_routed() {
+                (true, true) => "Both writers are host-routed in this run, so both counts are \
+                                 COMPLETE.",
+                (true, false) => "The direct-bind count is COMPLETE, but an INLINED \
+                                  sceGxmSetPrecomputedFragmentState replaces all sixteen slots \
+                                  without reaching the host - so a precomputed-state count of 0 \
+                                  here means UNCOUNTED, not none. Re-run with \
+                                  VITASLOP_NO_INLINE_IMPORTS=1 for both.",
+                (false, true) => "The precomputed-state count is COMPLETE; the direct-bind count \
+                                  is a lower bound (the inlined copy form does not reach the \
+                                  host).",
+                (false, false) => "BOTH counts are lower bounds: the inlined copy form and the \
+                                   inlined state bind each write the slots without reaching the \
+                                   host. Re-run with VITASLOP_NO_INLINE_IMPORTS=1.",
+            },
+        );
     }
 
     /// Record the exact `SceGxmTextureFormat` set on a `SceGxmTexture*` (by
@@ -9980,7 +10948,14 @@ impl VitaState {
         for (i, &addr) in d.streams.iter().enumerate() {
             self.set_gxm_state_word(ctx, off::STREAMS + i as u32 * 4, addr);
         }
+        // Which CALL issued the draw, for the empty-bindings report. The two draw entry points
+        // read the same sticky state today, so this changes nothing about the draw - it exists
+        // because "an immediate draw lost its texture" and "a precomputed draw was handed a
+        // state that has none" are different defects with different fixes, and the report
+        // cannot tell them apart from the state alone.
+        self.last_draw_was_precomputed = true;
         self.record_draw(ctx, d.primitive, d.index_format, d.index_addr, d.index_count);
+        self.last_draw_was_precomputed = false;
     }
 
     // --- Precomputed vertex/fragment state ----------------------------------
@@ -10241,6 +11216,7 @@ impl VitaState {
             self.report_precomputed_texture_unit(index, texture);
             return;
         }
+        self.texture_writes.state_texture_sets += 1;
         let b = TextureBinding::read(ctx, index, texture, true);
         let block = self.ensure_state_block(
             ctx,
@@ -10342,9 +11318,15 @@ impl VitaState {
         } else {
             (0, 0, 0, 0)
         };
-        // The whole table, zeros included - the same replace-not-merge the fragment bind's
-        // texture copy performs: a buffer bound by an earlier direct call must not survive
-        // into a state that does not declare it.
+        // The whole table, zeros included: a buffer bound by an earlier direct call must not
+        // survive into a state that does not declare it.
+        //
+        // NOTE this is NOT the rule the fragment bind's TEXTURE copy follows any more, and the
+        // difference is real rather than an oversight. This table is written by the guest's own
+        // `sceGxmPrecomputedVertexStateSetUniformBuffer`, so a zero entry is the guest saying
+        // "no buffer"; the texture array's zeros are this engine's own fill in a block it
+        // allocates. Same-looking zeros, opposite meanings - see
+        // `bind_precomputed_fragment_state`.
         let context = self.gxm_context;
         for i in 0..gxmctx::MAX_UNIFORM_BUFFERS as u32 {
             let addr = if block != 0 { ctx.read_u32(block.wrapping_add(i * 4)) } else { 0 };
@@ -10370,20 +11352,55 @@ impl VitaState {
             self.report_bind_without_context();
             return;
         }
-        // The state's texture array lands over the context's, WHOLESALE - the array is
-        // kept in the context block's own slot layout precisely so this is one copy.
-        // Binding a precomputed state REPLACES the whole array on hardware; the block's
-        // unset slots are zero, which is the context's own unbound encoding, so a unit
-        // bound by an earlier direct call cannot survive into a state that does not
-        // declare it.
+        // The state's texture array lands over the context's SLOT BY SLOT - the array is kept
+        // in the context block's own slot layout, so each unit the state carries is one copy at
+        // the same offset.
+        //
+        // It USED to land wholesale, on the reading that binding a precomputed state replaces
+        // the whole array. That reading is REFUTED - see the loop below for the measurement -
+        // and the difference is only ever visible for a slot the state does not carry.
         //
         // This is the HOST side of `InlineOp::BindPrecomputedState` - the fallback for a
         // pointer or magic the emitted guard declines - and it writes exactly the words
         // the inline form writes.
         let block = ctx.read_u32(state.wrapping_add(gxmstate::off::BLOCK));
-        for w in 0..gxmstate::TEXTURE_ARRAY_BYTES / 4 {
-            let v = if block != 0 { ctx.read_u32(block.wrapping_add(w * 4)) } else { 0 };
-            gxmctx::set(ctx, context, gxmctx::off::TEXTURES + w * 4, v);
+        // Counted before the copy, while the source is still distinguishable from what it is
+        // about to overwrite: an array whose unit 0 is empty CLEARS that unit, and the zeros it
+        // leaves are indistinguishable from a unit nothing ever bound. See `TextureSlotWrites`.
+        self.texture_writes.state_binds += 1;
+        if block == 0 || ctx.read_u32(block) == 0 {
+            self.texture_writes.state_binds_clearing_unit0 += 1;
+        }
+        // >>> ONLY THE UNITS THE STATE ACTUALLY CARRIES. A SLOT OF ZEROS IS OUR OWN DEFAULT,
+        // >>> NOT AN UNBIND THE GUEST ASKED FOR.
+        //
+        // This block is allocated and ZEROED by `ensure_state_block`, and the only thing that
+        // ever writes a slot in it is `precomputed_fragment_state_set_texture`. So a zero slot
+        // means "no setter ever named this unit" - an unwritten value, not guest data
+        // [[vitaslop-poison-separates-a-guest-zero-from-an-unwritten-one]] - and copying it
+        // over the context DESTROYS a binding the guest made directly.
+        //
+        // MEASURED on PCSE00120, which is what found this: the title makes 19,603 direct
+        // `sceGxmSetFragmentTexture` binds, puts a texture into a precomputed state **0 times**
+        // (a complete count - those setters are never inlined), and binds ~1,286 states a
+        // frame. A store watchpoint on unit 0's slot caught the sequence exactly: the guest
+        // binds its sprite texture to unit 0, twenty state binds follow, and the immediate
+        // `sceGxmDraw` after them reaches the renderer with all sixteen slots zero - the pair
+        // then cannot be recompiled ("sampler unit 0 wants Two but the bound units are []").
+        // The title's whole title-screen art hung on this.
+        //
+        // The replace-not-merge rule this had is still right for a unit the state DOES carry:
+        // that slot is guest data and it wins, exactly as before. What changes is only the
+        // meaning of an empty one.
+        for unit in 0..gxmctx::MAX_TEXTURE_UNITS as u32 {
+            let at = unit * gxmctx::TEXTURE_STRIDE;
+            if block == 0 || ctx.read_u32(block.wrapping_add(at)) == 0 {
+                continue;
+            }
+            for w in 0..gxmctx::TEXTURE_STRIDE / 4 {
+                let v = ctx.read_u32(block.wrapping_add(at + w * 4));
+                gxmctx::set(ctx, context, gxmctx::off::TEXTURES + at + w * 4, v);
+            }
         }
         // The non-default uniform-buffer table, replace-not-merge for the same reason the
         // texture array is: a buffer bound by an earlier direct call must not survive into a
@@ -11250,7 +12267,13 @@ impl VitaState {
             crate::perf::note_bytes(crate::perf::Phase::DrawVertices, vertices.len());
             // Only the RESULT's identity is shared with the byte-identical buffer already held,
             // so the caches downstream that key on identity can hit. See `intern_vertices`.
-            let interned = snapshots.intern_vertices(&vertices);
+            //
+            // TIMED SEPARATELY from the gather that produced the bytes: this is a content
+            // fingerprint plus a full comparison, and the gather is guest reads plus a scatter.
+            // See `Phase::DrawVertexGatherRead`.
+            let interned = crate::perf::time(crate::perf::Phase::DrawVertexGatherIntern, || {
+                snapshots.intern_vertices(&vertices)
+            });
             snapshots.interleave_scratch = vertices;
             interned
         });
@@ -11347,6 +12370,15 @@ impl VitaState {
                     mix(fheader as u64);
                     for b in &frag_binds {
                         mix(b.unit as u64);
+                        // >>> THE DESCRIPTOR ADDRESS IS PART OF THE KEY BECAUSE IT IS PART OF
+                        // >>> THE EQUALITY TEST. `set_validated` requires `addr` to match; a
+                        // fold that leaves it out therefore sends every "same words, different
+                        // descriptor" set to the SAME bucket, where the check rejects it as a
+                        // collision and the whole binding list is rebuilt. MEASURED before this
+                        // line existed: **16,384+ such rejections in ~6,000 frames**, about
+                        // three per frame, which no 64-bit hash explains.
+                        // See `report_set_key_collision`.
+                        mix(b.addr as u64);
                         for w in b.words {
                             mix(w as u64);
                         }
@@ -11364,6 +12396,13 @@ impl VitaState {
             }
         };
         drop(bind_phase);
+        // >>> THE FAILURE-ONLY REPORT FOR "the bound units are []". See
+        // `report_draw_without_bound_textures`: the renderer's own message is downstream of
+        // this list and cannot say what the block held, which is the only thing that separates
+        // the two causes.
+        if frag_binds.is_empty() && fref.sampler_units != 0 {
+            self.report_draw_without_bound_textures(&blk, fheader, fref.sampler_units);
+        }
         let texture_phase = crate::perf::scope(crate::perf::Phase::DrawTextures);
         let mut textures = match cached_set {
             Some(_) => Vec::new(),
@@ -11416,6 +12455,9 @@ impl VitaState {
                 mix(VERTEX_STAGE_TAG); // "VERTEX" - the stage tag, mixed first
                 for b in &vert_binds {
                     mix(b.unit as u64);
+                    // The same omission as the fragment fold above, and for the same reason -
+                    // both feed `set_validated`, which compares `addr`.
+                    mix(b.addr as u64);
                     for w in b.words {
                         mix(w as u64);
                     }
@@ -11975,7 +13017,7 @@ impl VitaState {
     /// live program), and the cache is dropped by [`invalidate_program_reflection`] at exactly
     /// the moment a header address can come to mean a different program - the same discipline,
     /// and the same clear, that `program_reflection` already relies on.
-    fn program_blob(&mut self, ctx: &GuestCtx, header: u32) -> std::sync::Arc<[u8]> {
+    pub(crate) fn program_blob(&mut self, ctx: &GuestCtx, header: u32) -> std::sync::Arc<[u8]> {
         if header == 0 {
             return crate::capture::no_program();
         }
@@ -12896,6 +13938,18 @@ impl VitaState {
     pub fn end_scene(&mut self) {
         if let Some(mut scene) = self.scene.take() {
             scene.adopt_viewport_extent();
+            // Diagnostic (`RUST_LOG=vitaslop::display=trace`): which buffer this scene drew
+            // into and how many draws it holds, in submission order, beside the flip trace.
+            // The renderer presents the LAST scene's target; a frame whose flipped buffer is a
+            // different one is showing a different image, and only these two traces together
+            // can say which.
+            tracing::trace!(
+                target: "vitaslop::display",
+                thid = self.current_thread(),
+                target_addr = format_args!("{:#010x}", scene.color.as_ref().map_or(0, |c| c.data_addr)),
+                draws = scene.draws.len(),
+                "end scene"
+            );
             // Hand the renderer whatever the shader patcher has named since the last scene, so
             // it can prepare those pairs before it encodes. Riding the scene keeps this on the
             // path the renderer already consumes - no engine has to learn a new call - and it
@@ -12909,6 +13963,7 @@ impl VitaState {
     }
 
     pub fn present(&mut self, buffer_addr: u32) {
+        report_present_no_scene_rendered(buffer_addr, &self.capture);
         self.capture.presents.push(buffer_addr);
         self.present_since_wait = true;
     }
@@ -13229,6 +14284,101 @@ fn gxp_live_capture() -> bool {
 /// an extension bit, so every format above 0x7f (all of BC/PVRTC, and `U2F10F10F10`) decodes as
 /// a different, smaller format if that bit is not carried. A UI atlas that is really BC3 read as
 /// a 16-bit uncompressed format is not a dropped texture - it renders, subtly wrong.
+/// Say - once per distinct address - that the guest PRESENTED a buffer that no GXM scene in
+/// this capture ever rendered into.
+///
+/// # Why this is worth a line
+/// The renderer takes "the display" to be the LAST scene's colour address
+/// (`gpu.rs`, `let display = last.target.map(...)`) and never consults what the guest actually
+/// handed `sceDisplaySetFrameBuf`. That is right for a title that composites through GXM and
+/// presents what it composited, which is every title measured so far. It is NOT right for a
+/// buffer GXM never wrote - the obvious one being a full-screen MOVIE, whose picture the video
+/// decoder writes straight into guest memory for the display controller to scan out.
+///
+/// When that happens the frame is composed from GXM passes that have nothing in them and the
+/// picture is BLACK, with nothing anywhere saying the guest had a buffer it wanted shown. This
+/// line is that statement. It does not fix it: honouring a presented buffer is a change to how
+/// every frame is composed, and what it needs first is to know which titles do this and with
+/// what.
+fn report_present_no_scene_rendered(buffer_addr: u32, cap: &crate::capture::Capture) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    if buffer_addr == 0 || cap.scenes.is_empty() {
+        return;
+    }
+    // WHICH scene it is, is the question that matters: the renderer takes the display to be the
+    // LAST scene's colour surface, so a present that names an EARLIER one is a frame composed
+    // from the wrong pass - the picture on screen is whatever that last pass drew, and the pass
+    // the guest actually wanted shown is an offscreen target nothing reads.
+    if let Some(i) =
+        cap.scenes.iter().position(|s| s.color.as_ref().is_some_and(|c| c.data_addr == buffer_addr))
+    {
+        if i + 1 != cap.scenes.len() {
+            report_present_is_not_the_last_scene(buffer_addr, i, cap);
+        }
+        return;
+    }
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = g.get_or_insert_with(HashSet::new);
+    // Bounded: a title that presents from a ring of buffers GXM never wrote would otherwise
+    // print one line per buffer forever.
+    if seen.len() >= 8 || !seen.insert(buffer_addr) {
+        return;
+    }
+    let targets: Vec<String> = cap
+        .scenes
+        .iter()
+        .map(|s| match s.color.as_ref() {
+            Some(c) => format!("{:#x}({}x{})", c.data_addr, c.width, c.height),
+            None => "none".to_string(),
+        })
+        .collect();
+    eprintln!(
+        "display: the guest PRESENTED {buffer_addr:#x}, which no GXM scene of this frame \
+         rendered into - the frame's colour surfaces are [{}]. The renderer composes the \
+         picture from the scenes, so whatever is in that buffer (a movie's decoded picture is \
+         the usual one) does not reach the screen.",
+        targets.join(", ")
+    );
+}
+
+/// Say - once per distinct (scene index, scene count) shape - that the guest presented a buffer
+/// that IS one of this frame's colour surfaces but NOT the last one.
+///
+/// `gpu.rs` takes `display` to be the last scene's colour address, which is right for a title
+/// that ends its frame on the pass it wants shown. A title that composites into an offscreen
+/// target and then submits further passes (a UI overlay into a second surface, say) breaks that
+/// assumption, and the symptom is the whole world missing behind a correct HUD - or, when the
+/// later pass is a clear, a flat-coloured screen with every draw of the frame landing somewhere
+/// nothing reads.
+fn report_present_is_not_the_last_scene(
+    buffer_addr: u32,
+    index: usize,
+    cap: &crate::capture::Capture,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(usize, usize)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((index, cap.scenes.len())) {
+        return;
+    }
+    let targets: Vec<String> = cap
+        .scenes
+        .iter()
+        .map(|s| match s.color.as_ref() {
+            Some(c) => format!("{:#x}({}x{}, {} draws)", c.data_addr, c.width, c.height, s.draws.len()),
+            None => format!("none({} draws)", s.draws.len()),
+        })
+        .collect();
+    eprintln!(
+        "display: the guest PRESENTED {buffer_addr:#x}, which is scene {index} of {} - NOT the          last one. The renderer composes the picture from the LAST scene's colour surface, so          what reaches the screen is that pass and not the one the guest asked to show.          Passes: [{}]",
+        cap.scenes.len(),
+        targets.join(", ")
+    );
+}
+
 fn report_texture_resolved_from_control_words(unit: u32, base_format: u32, swizzle: u32) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -13644,8 +14794,16 @@ fn decode_texture(
             let d = entry.res.clone();
             // The count bound, now that the memo outlives scenes. A set whose per-binding
             // entry vanishes here simply fails its next re-proof and rebuilds.
+            //
+            // Shed OLDEST-PROVEN FIRST rather than wholesale: every entry carries the scene it
+            // was last proven in, so "least recently useful" is already recorded here and a
+            // clear threw it away along with the whole working set. See [`count_victims`].
             if cache.decoded.len() >= TextureSnapshots::DECODED_CAP {
-                cache.decoded.clear();
+                let keep = TextureSnapshots::DECODED_CAP - TextureSnapshots::DECODED_CAP / 4;
+                let scene = cache.scene_seq;
+                for k in count_victims(&cache.decoded, keep, scene, |e| e.valid_scene) {
+                    cache.decoded.remove(&k);
+                }
             }
             cache.decoded.insert(key, entry);
             d
@@ -13681,18 +14839,32 @@ fn decode_texture_pixels(
     // See [`TextureSnapshots::templates`]. The PIXELS are deliberately not part of it - they
     // still go through `get_or_read` on every draw, so a texture the guest rewrites is still
     // seen to change. Only the description is remembered.
-    let template = match cache.templates.get(&binding.words) {
-        Some(t) => *t,
+    let scene_now = cache.scene_seq;
+    let template = match cache.templates.get_mut(&binding.words) {
+        Some((t, used)) => {
+            *used = scene_now;
+            *t
+        }
         None => {
             let t = build_texture_template(unit, binding.words, exact_format);
             if cache.templates.len() >= TEXTURE_TEMPLATE_CAP {
-                cache.templates.clear();
-                cache.decoded.clear();
-                // The finished lists were built FROM these templates, and they now outlive
-                // the scene - so they die with them.
-                cache.snapshot_sets.clear();
+                // >>> ONLY THE TEMPLATES, and only the coldest quarter of them.
+                //
+                // This used to clear `decoded` and `snapshot_sets` as well, on the ground that
+                // the finished lists were BUILT from these templates. They were - but a template
+                // is a pure function of the four control words (that is the whole basis of the
+                // memo), so a rebuilt one is bit-identical to the one dropped and nothing
+                // derived from it can be invalidated by dropping it. The clear that IS a
+                // correctness question is the one in `set_texture_format`, where the recorded
+                // format - an input NOT in this key - actually changes; that one still takes all
+                // three. Here it was throwing away the frame's whole texture working set to
+                // bound a map of small `Copy` structs.
+                let keep = TEXTURE_TEMPLATE_CAP - TEXTURE_TEMPLATE_CAP / 4;
+                for k in count_victims(&cache.templates, keep, scene_now, |(_, used)| *used) {
+                    cache.templates.remove(&k);
+                }
             }
-            cache.templates.insert(binding.words, t);
+            cache.templates.insert(binding.words, (t, scene_now));
             t
         }
     };
@@ -13866,7 +15038,7 @@ fn expand_paletted_texture(
     levels: u32,
     src_face_bytes: u32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    use crate::render::{level_layout, texel_element, P4, U8U8U8U8};
+    use crate::render::{level_layout, P4, U8U8U8U8};
     let bits = if t.base_format == P4 { 4u32 } else { 8 };
     let index_mask = if bits == 4 { 0x0fu32 } else { 0xff };
     let entries = crate::render::palette_entries(t.base_format)?;
@@ -14456,6 +15628,21 @@ impl ImportDispatch for VitaEnv {
             .copied()
             .unwrap_or((0, 0));
         self.state.capture.record_call(func_nid, self.state.current);
+        // Diagnostic (`RUST_LOG=vitaslop::display=trace`): EVERY host call the guest's
+        // display-queue callback makes, in order. GXM runs that callback once per queued
+        // entry and the queue is bounded by `displayQueueMaxPendingCount`, so whatever the
+        // callback WAITS on is the ceiling on a title's flip rate - and nothing else in the
+        // engine names those calls.
+        if self.state.display_cb_running == Some(self.state.current) {
+            tracing::trace!(
+                target: "vitaslop::display",
+                thid = self.state.current,
+                nid = format_args!("{func_nid:#010x}"),
+                name = crate::nid::name(func_nid),
+                us = self.state.now_us(),
+                "display callback host call"
+            );
+        }
         let mut ctx = GuestCtx::new(regs, vfp, mem, base);
         vita::dispatch(library_nid, func_nid, &mut ctx, &mut self.state)
     }

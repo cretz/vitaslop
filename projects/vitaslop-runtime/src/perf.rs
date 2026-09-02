@@ -52,6 +52,30 @@ pub enum Phase {
     /// where it always does, and the whole point of it is to remove ~800 boundary crossings a
     /// frame. Its `entries` against `DrawVertexGather`'s is the fraction that merged.
     DrawVertexGatherMerged,
+    /// >>> THE GUEST READS ALONE, inside [`Phase::DrawVertexGather`] - the crossings out of
+    /// wasm and into JS, without the scatter or the intern that follow them.
+    ///
+    /// The parent phase is the largest single item in a gameplay draw (MEASURED: 3.85 ms of a
+    /// 7.55 ms `DRAW TOTAL`, 552 of 553 draws) and it bundles three costs with three different
+    /// fixes: the CROSSINGS (fixed by merging reads - see `gather_span`), the row-by-row
+    /// SCATTER into the packed row (fixed by widening the copy), and the INTERN that content-
+    /// hashes the result (fixed, if at all, by a cheaper identity). A single number over all
+    /// three cannot say which, and picking one without knowing is how this project has twice
+    /// spent a session on the wrong half.
+    DrawVertexGatherRead,
+    /// The intern alone - the content fingerprint and comparison that re-establishes the
+    /// buffer's IDENTITY so downstream caches hit. See `vertex_by_content`.
+    DrawVertexGatherIntern,
+    /// Of those interns, the ones that HIT. Its `entries` count is the hit count; the parent's
+    /// is the total.
+    ///
+    /// The two outcomes cost different things and want opposite fixes, and the timed parent
+    /// cannot tell them apart. A HIT pays a fingerprint plus a full byte comparison of the whole
+    /// interleaved buffer. A MISS pays the fingerprint, a failed comparison, and then
+    /// `Arc::from(bytes)` - a full COPY plus an allocation. So "make the comparison faster" and
+    /// "stop copying" are both plausible from the parent's 2.63 ms/frame and only one of them is
+    /// the work.
+    DrawVertexInternHit,
     /// Snapshotting and decoding the draw's bound textures.
     DrawTextures,
     /// The FRAGMENT stage's miss path alone: `snapshot_bound_textures` for a binding list
@@ -168,7 +192,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    const COUNT: usize = 32;
+    const COUNT: usize = 35;
 
     pub(crate) fn index(self) -> usize {
         match self {
@@ -177,6 +201,9 @@ impl Phase {
             Phase::DrawVertices => 2,
             Phase::DrawVertexGather => 30,
             Phase::DrawVertexGatherMerged => 31,
+            Phase::DrawVertexGatherRead => 32,
+            Phase::DrawVertexGatherIntern => 33,
+            Phase::DrawVertexInternHit => 34,
             Phase::DrawTextures => 3,
             Phase::DrawUniforms => 4,
             Phase::SceneFold => 5,
@@ -219,6 +246,9 @@ impl Phase {
             Phase::DrawVertices,
             Phase::DrawVertexGather,
             Phase::DrawVertexGatherMerged,
+            Phase::DrawVertexGatherRead,
+            Phase::DrawVertexGatherIntern,
+            Phase::DrawVertexInternHit,
             Phase::DrawTextureBind,
             Phase::DrawTexSetPrev,
             Phase::DrawTexBindDecode,
@@ -254,6 +284,9 @@ impl Phase {
             Phase::DrawVertices => "draw: read+interleave vertices",
             Phase::DrawVertexGather => "draw:   ...of which the MULTI-STREAM gather",
             Phase::DrawVertexGatherMerged => "draw:     ...of which read in ONE crossing",
+            Phase::DrawVertexGatherRead => "draw:     ...of which the guest READS",
+            Phase::DrawVertexGatherIntern => "draw:     ...of which the content INTERN",
+            Phase::DrawVertexInternHit => "draw:       ...of which the intern HIT",
             Phase::DrawTextures => "draw: snapshot textures (miss path)",
             Phase::DrawTexFragMiss => "draw:   ...fragment MISS decode",
             Phase::DrawTexRead => "draw:     ...of which get_or_read",

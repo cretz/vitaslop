@@ -48,7 +48,7 @@ use core::fmt::Write as _;
 use crate::container::{
     OutputVarying, ParseError, Program, ProgramKind, VaryingOrder, VaryingUsage,
 };
-use crate::ir::{Bank, Op, Predicate, Shader};
+use crate::ir::{Bank, Instr, Op, Predicate, Shader};
 use crate::module::{plan_bindings, plan_vertex_bindings, BindingPlan, ColorOutput, VertexBindingPlan};
 use crate::wgsl::{emit_body, EmitError, TexBinding, BANK_REGS};
 use crate::{recompile_fragment, recompile_vertex, RecompileError};
@@ -559,7 +559,11 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                 if sel > 3 {
                     continue; // a swizzle constant reads no register
                 }
-                let (reg, halves) = if src_half {
+                let (reg, halves) = if instr.source_packed_bytes() {
+                    // All four channels are bytes of ONE register - see
+                    // [`crate::ir::Instr::source_packed_bytes`].
+                    (src.index as usize, 0..2)
+                } else if src_half {
                     (src.index as usize + (sel >> 1), (sel & 1)..(sel & 1) + 1)
                 } else {
                     (src.index as usize + sel, 0..2)
@@ -816,7 +820,7 @@ fn resolve_ambiguous_order(
     let mut survivors: Vec<Vec<OutputVarying>> = Vec::new();
     for perm in permutations(vout.len()) {
         let candidate = permute_varyings(vout, &perm);
-        if plan_interface_with(vprog, fprog, fshader, &candidate).is_ok() {
+        if plan_interface_with(fprog, fshader, &candidate).is_ok() {
             survivors.push(candidate);
         }
     }
@@ -1248,22 +1252,61 @@ fn hand_typed_layout(vprog: &Program) -> Option<Vec<OutputVarying>> {
 
 fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<Interface, LinkError> {
     if let Some(order) = hand_typed_layout(vprog) {
-        return plan_interface_with(vprog, fprog, fshader, &order);
+        return plan_interface_with(fprog, fshader, &order);
     }
     if std::env::var("VITASLOP_GXP_VARYING_ORDER").as_deref() == Ok("fragment") {
         if let Some(order) = fragment_declared_order(vprog, fprog) {
-            return plan_interface_with(vprog, fprog, fshader, &order);
+            return plan_interface_with(fprog, fshader, &order);
         }
     }
-    // A `Known` order was read off the attributes and is not the convention's to be checked.
-    if vprog.output_order == VaryingOrder::Known {
-        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
-    }
-    // >>> EVERYTHING BELOW IS A LAYOUT THE CONVENTION PLACED, so ask the vertex program's own
-    // forwarding moves whether it is the layout the program was compiled against. See
-    // `forwarding_claims` for why a move can answer that and the varyings block cannot.
+    // >>> ASK THE VERTEX PROGRAM'S OWN FORWARDING MOVES FIRST, WHATEVER PLACED THE REST. See
+    // `forwarding_claims` for why a move can answer the order question and the varyings block
+    // cannot.
+    //
+    // >>> THIS RUNS FOR A `Known` ORDER TOO, and that is a correction. `Known` means
+    // `container::attribute_order` found an attribute carrying each declared varying's semantic
+    // and took the attributes' `resource_index` order as the output order - which is a reading
+    // of a PASSTHROUGH program, whose outputs are its inputs. A program that COMPUTES a varying
+    // it also has an attribute for satisfies that cover without being a passthrough at all, and
+    // then the inference is simply wrong. MEASURED on a retail title's UI pair
+    // (`vert_81a7e8b8` + `frag_81a809b4`): the attributes are `aPosition`@0, `aTexCoord`@4,
+    // `aColor`@8, so `attribute_order` places `TexCoord(0)@4x2 Color0@6x4` - while the code
+    // moves `aColor` straight into lanes 4..8 and writes the texcoord it DIVIDES BY `uTexture`
+    // into lanes 8..10. The fragment's prefetch then sampled the logo texture at the vertex
+    // COLOUR (a constant 1,1), so every sprite came out one flat texel and the title screen
+    // drew solid silhouettes.
+    //
+    // Consulting the moves here cannot disturb a program the attribute reading gets right: a
+    // real passthrough forwards every attribute, so its claims AGREE with that order,
+    // `layout_from_forwarding_claims` walks back onto the same layout and returns `None`. The
+    // resolver is its own gate - it acts only where a claim names a usage the layout does not
+    // put at that lane - which is why the contradiction report below is no longer what admits it.
     let vshader = crate::usse::decode_shader(vprog);
     let claims = forwarding_claims(vprog, &vshader);
+    // Value-sensitive, because a knob used as an A/B ARM has to be: a presence-only reader
+    // turns `=0` into an ON arm and both arms then measure the same build.
+    if std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0") {
+        if let Some(order) = layout_from_forwarding_claims(&vprog.output_varyings, &claims) {
+            let shown: Vec<String> = order
+                .iter()
+                .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
+                .collect();
+            report_forwarding_contradiction(
+                vprog.hash,
+                &forwarding_contradicts(&vprog.output_varyings, &claims).unwrap_or_else(|| {
+                    "a forwarded attribute starts at a lane this layout gives another varying"
+                        .to_string()
+                }),
+                &format!("RESOLVED from the vertex alone -> {}", shown.join(" ")),
+            );
+            return plan_interface_with(fprog, fshader, &order);
+        }
+    }
+    // A `Known` order was read off the attributes and the moves did not refute it.
+    if vprog.output_order == VaryingOrder::Known {
+        return plan_interface_with(fprog, fshader, &vprog.output_varyings);
+    }
+    // >>> EVERYTHING BELOW IS A LAYOUT THE CONVENTION PLACED.
     if let Some(why) = forwarding_contradicts(&vprog.output_varyings, &claims) {
         // >>> IT NOW ACTS, FROM THE VERTEX ALONE - see `layout_from_forwarding_claims`. The
         // history below is why it took three attempts, and every objection in it still stands
@@ -1295,50 +1338,36 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
         // So the witness stays, because what it FINDS is real and is the only statement about
         // lane order that is not itself a convention, and the convention stands until a reading
         // exists that resolves it from the VERTEX alone. Do not reconnect this to the fragment.
-        // Value-sensitive, because a knob used as an A/B ARM has to be: a presence-only reader
-        // turns `=0` into an ON arm and both arms then measure the same build.
-        let resolve = std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0");
-        match layout_from_forwarding_claims(&vprog.output_varyings, &claims).filter(|_| resolve) {
-            Some(order) => {
-                let shown: Vec<String> = order
-                    .iter()
-                    .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
-                    .collect();
-                report_forwarding_contradiction(
-                    vprog.hash,
-                    &why,
-                    &format!("RESOLVED from the vertex alone -> {}", shown.join(" ")),
-                );
-                return plan_interface_with(vprog, fprog, fshader, &order);
-            }
-            None => report_forwarding_contradiction(
-                vprog.hash,
-                &why,
-                "the convention stands - no permutation puts the forwarded attribute's usage at \
-                 the lane it fills, so this pair's varyings may be routed wrongly",
-            ),
-        }
+        //
+        // Reaching HERE means the resolver above already declined: the contradiction is real but
+        // no walk of the declared widths puts the forwarded attribute's usage at the lane it
+        // fills, so there is nothing to act on and the convention stands.
+        report_forwarding_contradiction(
+            vprog.hash,
+            &why,
+            "the convention stands - no permutation puts the forwarded attribute's usage at \
+             the lane it fills, so this pair's varyings may be routed wrongly",
+        );
     }
     // A program whose order the container could read is planned directly against it - this
     // is every program that links today, and its behaviour is untouched.
     if vprog.output_order != VaryingOrder::Ambiguous {
-        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
+        return plan_interface_with(fprog, fshader, &vprog.output_varyings);
     }
     // >>> ASK THE VERTEX PROGRAM'S OWN CODE before refusing. `Ambiguous` means "the
     // convention placed a COLOR1 and no attribute confirms it" - which is a statement about
     // the CONTAINERS, and the containers are not the only witness. If the code's writes
     // agree with the convention's layout, the layout is read rather than assumed.
     if convention_agrees_with_the_code(&vprog.output_varyings, &vshader) {
-        return plan_interface_with(vprog, fprog, fshader, &vprog.output_varyings);
+        return plan_interface_with(fprog, fshader, &vprog.output_varyings);
     }
     let resolved = resolve_ambiguous_order(vprog, fprog, fshader)?;
-    plan_interface_with(vprog, fprog, fshader, &resolved)
+    plan_interface_with(fprog, fshader, &resolved)
 }
 
 /// [`plan_interface`] against an EXPLICIT vertex lane layout, so the permutation search can
 /// try one without mutating the program.
 fn plan_interface_with(
-    vprog: &Program,
     fprog: &Program,
     fshader: &Shader,
     vout: &[OutputVarying],
@@ -1603,26 +1632,13 @@ fn secondary_attr_init(
     // alone refused a program whose whole uniform block is a bound container-0 buffer, with a
     // message naming its "0-register default uniform buffer" - which was true and not the point.
     let uniform_regs = program.sa_carried_extent();
-    // Registers the secondary program computes. These are legitimate sources for the primary
-    // even above the uniform buffer - that is the point of a secondary program - so they must
-    // not be mistaken for reads of the texture-control region.
     let secondary = crate::usse::decode_secondary_shader(program);
-    let mut written = std::collections::BTreeSet::new();
-    for instr in &secondary.instrs {
-        let Some(d) = instr.dest.as_ref() else { continue };
-        if d.bank != Bank::SecondaryAttr {
-            continue;
-        }
-        for c in 0..4u32 {
-            if instr.write_mask[c as usize] {
-                written.insert(d.index as u32 + if instr.half_precision { c >> 1 } else { c });
-            }
-        }
-    }
-    let mut needed = std::collections::BTreeSet::new();
-    for instr in shader.instrs.iter().chain(secondary.instrs.iter()) {
+
+    // The SA registers one instruction READS, addressed exactly as the emitter addresses them.
+    let sa_sources = |instr: &Instr| -> Vec<u32> {
         let half = instr.source_half_precision();
         let read = read_channels(instr);
+        let mut out = Vec::new();
         for (i, src) in instr.srcs.iter().enumerate() {
             if src.bank != Bank::SecondaryAttr {
                 continue;
@@ -1644,9 +1660,63 @@ fn secondary_attr_init(
                 if sel > 3 {
                     continue;
                 }
-                needed.insert(src.index as u32 + if half { (sel >> 1) as u32 } else { sel as u32 });
+                // A packed-byte source is one register for all four channels - see
+                // [`crate::ir::Instr::source_packed_bytes`].
+                let step = if instr.source_packed_bytes() {
+                    0
+                } else if half {
+                    (sel >> 1) as u32
+                } else {
+                    sel as u32
+                };
+                out.push(src.index as u32 + step);
             }
         }
+        out
+    };
+    // The SA registers one instruction WRITES, by the same addressing.
+    let sa_dests = |instr: &Instr| -> Vec<u32> {
+        let mut out = Vec::new();
+        let Some(d) = instr.dest.as_ref() else { return out };
+        if d.bank != Bank::SecondaryAttr {
+            return out;
+        }
+        for c in 0..4u32 {
+            if instr.write_mask[c as usize] {
+                out.push(d.index as u32 + if instr.half_precision { c >> 1 } else { c });
+            }
+        }
+        out
+    };
+
+    // Registers the secondary program computes. For a PRIMARY read these are legitimate sources
+    // even above the uniform buffer - that is the point of a secondary program - so they must
+    // not be mistaken for reads of the texture-control region.
+    //
+    // >>> A SECONDARY read is a different question, and conflating the two blacked out a whole
+    // title's UI. The secondary program is a straight-line prologue, so a register it writes is
+    // only "computed" for a reader that comes AFTER that write; its own earlier reads still see
+    // the container literal. One title's UI vertex program declares `sa[8] = 0.5h`, multiplies
+    // the screen extent by it, and only THEN reuses `sa[8]` as the scratch holding the NDC bias.
+    // Suppressing that literal made the multiply read zero, the reciprocal that follows it
+    // infinite and every clip position NaN - so no UI draw in the title covered a pixel, with
+    // nothing refused and nothing in any log. Walk the stream in order instead.
+    let mut written = std::collections::BTreeSet::new();
+    // Reads that MUST be backed by the uniform buffer or a container literal: a secondary read
+    // that no earlier secondary write has covered.
+    let mut needed_strict = std::collections::BTreeSet::new();
+    for instr in &secondary.instrs {
+        for reg in sa_sources(instr) {
+            if !written.contains(&reg) {
+                needed_strict.insert(reg);
+            }
+        }
+        written.extend(sa_dests(instr));
+    }
+    // Reads the secondary program may satisfy, wherever in it the write happens.
+    let mut needed = std::collections::BTreeSet::new();
+    for instr in &shader.instrs {
+        needed.extend(sa_sources(instr));
     }
     // The mem-window base register is DRIVER data, not texture state: the module initialises
     // it from the bound window's own header (see `MemWindow::base_sa`), so a read of it is fed.
@@ -1656,8 +1726,9 @@ fn secondary_attr_init(
         .map(|w| w.base_sa)
         .collect();
     let mut literals = Vec::new();
-    for reg in needed {
-        if reg < uniform_regs || written.contains(&reg) || mem_base_sa.contains(&reg) {
+    for reg in needed.union(&needed_strict).copied() {
+        let computed = written.contains(&reg) && !needed_strict.contains(&reg);
+        if reg < uniform_regs || computed || mem_base_sa.contains(&reg) {
             continue;
         }
         match program.literals.iter().find(|(r, _)| *r == reg) {
@@ -2669,6 +2740,40 @@ mod tests {
     }
 
     #[test]
+    fn a_forwarding_claim_overrules_a_layout_the_attributes_placed() {
+        // >>> THE ATTRIBUTE ORDER IS A READING OF A PASSTHROUGH PROGRAM, AND THIS PROGRAM IS NOT
+        // >>> ONE. MEASURED on a retail title's UI vertex program (`vert_81a7e8b8`): its
+        // attributes are `aPosition`@0, `aTexCoord`@4, `aColor`@8, so
+        // `container::attribute_order` covers the declared set exactly and reports
+        // `TexCoord(0)@4x2 Color0@6x4` as `VaryingOrder::Known`. The CODE moves `aColor`
+        // straight into lanes 4..8 and writes the texcoord it divides by `uTexture` into 8..10 -
+        // so the cover is satisfied by a program that COMPUTES one of the two varyings, and the
+        // inference is simply wrong.
+        //
+        // It cost the title its art: the paired fragment prefetches its sampler from TEXCOORD 0,
+        // which under that layout is the vertex COLOUR (a constant 1,1), so every sprite sampled
+        // one flat texel. `plan_interface` therefore asks the claims about a `Known` order too,
+        // and this is the shape it has to resolve.
+        let vout = vec![
+            OutputVarying { usage: VaryingUsage::TexCoord(0), base_lane: 4, components: 2 },
+            OutputVarying { usage: VaryingUsage::Color0, base_lane: 6, components: 4 },
+        ];
+        let got = layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])])
+            .expect("the colour attribute fills the lane the layout gives TexCoord(0)");
+        assert_eq!(
+            got,
+            vec![
+                OutputVarying { usage: VaryingUsage::Color0, base_lane: 4, components: 4 },
+                OutputVarying { usage: VaryingUsage::TexCoord(0), base_lane: 8, components: 2 },
+            ]
+        );
+        // The claim spans FOUR lanes and the run at lane 4 is two wide, so `forwarding_contradicts`
+        // - which requires a whole-run match - says nothing about it. That is why the resolver,
+        // not the contradiction report, is what admits a re-layout.
+        assert!(forwarding_contradicts(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])]).is_none());
+    }
+
+    #[test]
     fn pa_reads_are_read_before_write_only() {
         // PA[4] read as a 2D coord (registers 4,5) is a true input. PA[8] is WRITTEN by the
         // first instruction and then sampled - a computed / dependent coordinate, NOT an input.
@@ -2684,6 +2789,24 @@ mod tests {
         let (inputs, _) = pa_read_before_write(&sh);
         let regs: Vec<usize> = (0..BANK_REGS).filter(|&r| inputs[r]).collect();
         assert_eq!(regs, vec![4, 5, 10, 11]);
+    }
+
+    #[test]
+    fn a_packed_byte_read_is_one_register_not_four() {
+        // `CopyFx8 o[0] <- pa[0]` reads FOUR CHANNELS out of ONE register - they are its four
+        // bytes. Reading it at F32 marks `pa[0..4)` as inputs, and a fragment that declares one
+        // primary register is then refused for reading `pa[1]`, which is exactly how a title's
+        // two-instruction passthrough (`Nop`, then this) failed to link.
+        let mut i = instr(
+            Op::CopyFx8,
+            Some(Operand::plain(Bank::Output, 0, 1)),
+            vec![Operand::plain(Bank::PrimaryAttr, 0, 2)],
+            [true; 4],
+        );
+        i.half_precision = false;
+        let (inputs, _) = pa_read_before_write(&shader(ProgramKind::Fragment, vec![i]));
+        let regs: Vec<usize> = (0..BANK_REGS).filter(|&r| inputs[r]).collect();
+        assert_eq!(regs, vec![0], "four bytes of pa[0], not pa[0..4)");
     }
 
     #[test]

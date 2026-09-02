@@ -1035,6 +1035,11 @@ struct RenderSplit {
     arena_create_ms: f64,
     arena_write_ms: f64,
     ubo_bg_ms: f64,
+    /// The parts of `encode_chain` that are not a pass - see `gpu::EncodePhases`. Summed over
+    /// the window like every other phase here.
+    precompile_ms: f64,
+    retire_ms: f64,
+    resident_ms: f64,
     pass_ms: f64,
     gxp_draws: u64,
     fixed_draws: u64,
@@ -1166,6 +1171,32 @@ fn perf_console() -> bool {
 /// This type is how a run says so, and by default how it REFUSES: the house rule is that
 /// a fallback reports itself, and a software rasteriser is the largest fallback in the
 /// system.
+/// >>> WHETHER THE ADAPTER SAYS THIS IS A PHONE, WHICH `navigator.deviceMemory` CANNOT.
+///
+/// `deviceMemory` is capped at 8 by its own specification, so the target phone reports the same
+/// 8 GB a workstation does and every memory budget scales by 1.00 on the one device the scaling
+/// was written for. The GPU vendor is not capped and is not a guess: `img-tec` is PowerVR, and
+/// nothing but a mobile part ships one.
+///
+/// # AND IT IS DELIBERATELY NOT WIRED TO THE BUDGETS. Read this before doing that.
+/// `knobs::scale_budget` only ever makes a budget SMALLER, and the texture budget is what gates
+/// `transcoded_source`'s refusal to re-encode the guest's BC textures to ETC2 - a SECOND lossy
+/// step over the title's own compression. Tightening the budget here would therefore buy memory
+/// by spending picture quality, silently, on the exact device the change was aimed at
+/// [[vitaslop-never-trade-quality]]. And the measurement does not ask for it: the phone dump
+/// that raised this reports a 98 MB texture working set against a 477 MB budget and a 308 MB
+/// wasm heap, with 12.7 ms of SLEEP in every 33.5 ms frame. Nothing there is short of memory.
+///
+/// So this reports, and changes nothing. If a device ever does show real memory pressure, the
+/// budget to move is one that does not gate an encoder.
+static ADAPTER_LOOKS_MOBILE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// GPU vendor strings that only ship in a phone or tablet. Matched against the WebGPU adapter's
+/// own `vendor`/`architecture`, lowercased.
+const MOBILE_ADAPTER_MARKERS: &[&str] =
+    &["img-tec", "imagination", "powervr", "adreno", "qualcomm", "mali", "arm", "apple"];
+
 struct AdapterProbe {
     /// A one-line description for the page and the harness.
     summary: String,
@@ -1383,6 +1414,14 @@ async fn probe_webgpu_adapter() -> Option<AdapterProbe> {
     let haystack = format!("{vendor} {architecture} {device} {description}").to_lowercase();
     let software =
         is_fallback || SOFTWARE_ADAPTER_MARKERS.iter().any(|m| haystack.contains(m));
+    // Matched on the two fields a driver actually fills in, not on `description`, which on some
+    // desktop parts carries a marketing string containing an unrelated vendor name. See
+    // `ADAPTER_LOOKS_MOBILE` - this is READ ONLY BY THE PANEL and moves no budget.
+    let mobile_haystack = format!("{vendor} {architecture}").to_lowercase();
+    ADAPTER_LOOKS_MOBILE.store(
+        !software && MOBILE_ADAPTER_MARKERS.iter().any(|m| mobile_haystack.contains(m)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Some(AdapterProbe {
         summary: format!(
             "vendor={vendor} arch={architecture} device={device} desc={description}{}",
@@ -1788,7 +1827,12 @@ impl LivePlayback {
     /// panel would put the whole picture in the top-left corner. The canvas is a fixed size
     /// and the surface stretches whatever is rendered into it, so passing the declared size
     /// here IS the hardware's upscale.
-    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) -> PresentOutcome {
+    fn present(
+        &mut self,
+        scenes: &[Scene],
+        display: (u32, u32),
+        presents: &[u32],
+    ) -> PresentOutcome {
         let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
         // Asked BEFORE any work: once the device is lost, building scenes and encoding a
         // command buffer is pure cost against a picture that cannot be drawn.
@@ -1887,6 +1931,9 @@ impl LivePlayback {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Which buffers the guest flipped while these scenes were captured - see
+        // `GxmRenderer::set_presented`.
+        self.gxm.set_presented(presents);
         self.gxm.encode_chain(
             &self.device,
             &self.queue,
@@ -1972,6 +2019,9 @@ impl LivePlayback {
         self.split.arena_create_ms += ph.arena_create_ms;
         self.split.arena_write_ms += ph.arena_write_ms;
         self.split.ubo_bg_ms += ph.ubo_bg_ms;
+        self.split.precompile_ms += ph.precompile_ms;
+        self.split.retire_ms += ph.retire_ms;
+        self.split.resident_ms += ph.resident_ms;
         self.split.pass_ms += ph.pass_ms;
         self.split.gxp_draws += ph.gxp_draws as u64;
         self.split.fixed_draws += ph.fixed_draws as u64;
@@ -2044,6 +2094,11 @@ impl LivePlayback {
     }
 
     /// The surface description, for the diagnostics panel.
+    /// How full the renderer's growing caches are - see `GxmRenderer::cache_sizes`.
+    fn cache_sizes(&self) -> String {
+        self.gxm.cache_sizes()
+    }
+
     fn surface_line(&self) -> &str {
         &self.surface_line
     }
@@ -2062,6 +2117,34 @@ impl LivePlayback {
 fn wasm_heap_mb() -> usize {
     // 64 KiB pages, so pages/16 is megabytes.
     core::arch::wasm32::memory_size(0) / 16
+}
+
+/// >>> TELL THE ENGINE HOW MUCH MEMORY THIS DEVICE HAS, from `navigator.deviceMemory`.
+///
+/// Every cache budget in this project was an absolute constant fitted on a desktop, adding up to
+/// close to a gigabyte before the guest's own memory or the wasm heap - and the target device is
+/// a phone whose owner has reported, repeatedly, that a long session makes the WHOLE device
+/// sluggish. Nothing anywhere read a single property of the machine. This is the property the
+/// browser already publishes, and the only one it publishes.
+///
+/// Best-effort by design: `deviceMemory` is absent on Firefox and Safari, and its own
+/// specification caps it at 8, so a machine that does not answer and every desktop that does get
+/// the budgets exactly as they are today. See [`vitaslop_platform::knobs::memory_scale`].
+///
+/// Called once at startup, before the first frame. It is not a knob - the engine that pays for
+/// this runs whatever is defaulted [[vitaslop-pick-the-default-dont-add-a-knob]].
+fn report_device_memory() {
+    let Some(nav) = js_sys::global().dyn_ref::<web_sys::WorkerGlobalScope>().map(|g| g.navigator())
+    else {
+        return;
+    };
+    let Ok(v) = js_sys::Reflect::get(&nav, &JsValue::from_str("deviceMemory")) else {
+        return;
+    };
+    let Some(gb) = v.as_f64() else {
+        return;
+    };
+    vitaslop_platform::knobs::set_device_memory_gb(gb);
 }
 
 /// `performance.now()`, as a plain `fn` the renderer can hold.
@@ -3182,6 +3265,9 @@ pub async fn run_game_worker(
 ) -> Result<String, JsValue> {
     crate::logging::install_panic_hook();
     logging::init();
+    // >>> BEFORE ANYTHING ALLOCATES A CACHE. Every memory budget in the engine is scaled by what
+    // this reports, and a budget read before it lands would be the desktop-sized one.
+    report_device_memory();
     // >>> THE PHASE CLOCK BELONGS TO THIS WORKER, AND IT WAS BEING INSTALLED IN THE WRONG ONE.
     //
     // `transpile_here` also calls this - and `transpile_here` normally runs in a THROWAWAY
@@ -3791,11 +3877,17 @@ async fn live_loop(
                 let scenes = cap.take_frame_scenes();
                 cap.trace.clear();
                 cap.trace_thid.clear();
-                cap.presents.clear();
-                scenes
+                // >>> TAKEN, NOT DISCARDED. These are the buffers the guest FLIPPED while this
+                // frame's scenes were being captured, which is its own statement of what a
+                // display buffer is - the renderer uses it to recognise a frame whose scenes
+                // straddle a flip, where "the display is the last scene's target" drops a whole
+                // pass. See `GxmRenderer::set_presented`.
+                let presents = std::mem::take(&mut cap.presents);
+                (scenes, presents)
             };
+            let (frame_scenes, frame_presents) = frame_scenes;
             if !frame_scenes.is_empty() {
-                latest = Some(frame_scenes);
+                latest = Some((frame_scenes, frame_presents));
             }
 
             let frames = sched.core.frames();
@@ -4041,7 +4133,7 @@ async fn live_loop(
                         // The run is already ending on the line below, so this last frame's
                         // outcome changes nothing - but `present` reports a lost device itself
                         // before returning, so nothing is swallowed by ignoring it here.
-                        let _ = playback.present(scene, display);
+                        let _ = playback.present(&scene.0, display, &scene.1);
                     }
                     break 'run;
                 }
@@ -4125,7 +4217,10 @@ async fn live_loop(
             // that will never change again. The fatal text goes to the copyable box a device
             // report is taken from, because the one thing a black screen cannot do is say why
             // it is black [[vitaslop-fast-fail-no-silent-success]].
-            if let PresentOutcome::Fatal(why) = playback.present(&scene, display) {
+            // NOT `presents` - that name is already a running counter in this scope, and
+            // shadowing it here silently retyped it.
+            let (scene, flips) = scene;
+            if let PresentOutcome::Fatal(why) = playback.present(&scene, display, &flips) {
                 crate::logging::report_fatal(&format!(
                     "RENDERER FAULT at frame {} - the run is over.\n{why}",
                     sched.core.frames()
@@ -4170,15 +4265,32 @@ async fn live_loop(
                     " (no inner split: no wasm clock installed - see gpu::set_wasm_clock)"
                         .to_string()
                 } else {
+                    // >>> AND THE RESIDUAL, WHICH IS THE HALF THE SPLIT WAS HIDING.
+                    //
+                    // `prepare`/`upload`/`pass` are timed inside `encode_pass`; `encode` is the
+                    // whole of `encode_chain`, which also retires buffers, grows or COMPACTS the
+                    // resident geometry heap, precompiles pairs and assembles rendered cube
+                    // maps - none of it timed. A reader naturally sums the three and assumes
+                    // that is encode, and on a long device run it is NOT: measured there,
+                    // `encode 19.3` against `prepare 12.8 + upload 0.8 + pass 1.5`, and on that
+                    // run's worst frame **107.3 ms against 8.8**. Ninety-eight milliseconds with
+                    // no name is worse than no split at all, because the split looks complete.
+                    // This is the same lesson `prepare` already learned
+                    // [[vitaslop-prepare-split-reports-its-own-residual]].
+                    let named = s.prepare_ms + s.upload_ms + s.pass_ms;
                     format!(
-                        " (prepare {:.1}, upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}], pass {:.1})",
+                        " (prepare {:.1}, upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}], pass {:.1}, CHAIN {:.1} [precompile {:.1}, retire {:.1}, resident-heap {:.1}])",
                         s.prepare_ms / np,
                         s.upload_ms / np,
                         s.arena_ms / np,
                         s.arena_create_ms / np,
                         s.arena_write_ms / np,
                         s.ubo_bg_ms / np,
-                        s.pass_ms / np
+                        s.pass_ms / np,
+                        (s.encode_ms - named).max(0.0) / np,
+                        s.precompile_ms / np,
+                        s.retire_ms / np,
+                        s.resident_ms / np,
                     )
                 };
                 // Guest frames per PRESENT, stated rather than left to be inferred.
@@ -4504,13 +4616,20 @@ async fn live_loop(
                         // the one an arbitrary cut would drop, and it cost a run to find that
                         // out. The section is a single panel entry with embedded newlines, so
                         // its length does not eat the page's distinct-line budget.
-                        for (thid, name, state) in blocked.iter().take(48) {
+                        // >>> ONE CONSTANT, USED BY BOTH THE CUT AND THE NOTE ABOUT THE CUT.
+                        // These were 48 and 16, so a run with 17 parked threads printed all
+                        // seventeen and then said "... and 1 more" - a thread that did not
+                        // exist, in the one section a person reads when a title has STOPPED.
+                        // The user reported a stuck game and this line told them the evidence
+                        // was incomplete when it was not.
+                        const SHOWN: usize = 48;
+                        for (thid, name, state) in blocked.iter().take(SHOWN) {
                             s.push_str(&format!("  thid {thid:#x} {name:?}: {state}
 "));
                         }
-                        if blocked.len() > 16 {
+                        if blocked.len() > SHOWN {
                             s.push_str(&format!("  ... and {} more
-", blocked.len() - 16));
+", blocked.len() - SHOWN));
                         }
                         line(&mut diag, "BLOCKED THREADS", &s);
                     }
@@ -4541,9 +4660,15 @@ async fn live_loop(
                         "SLOWEST FRAMES, cumulative for the run",
                         &format!(
                             "{frames_total} guest frames, {presents_total} presented ({:.2} \
-                             frames per present) | worst: {}",
+                             frames per present) | worst: {} | WORST write_buffer OF THE RUN \
+                             {:.1} ms for {:.0} KB",
                             frames_total as f64 / presents_total.max(1) as f64,
                             worst.join(", "),
+                            // >>> ON THIS LINE BECAUSE THIS LINE SURVIVES THE HANG. The windowed
+                            // copy on the ENCODE line has rolled over by the time a frozen page
+                            // can be read - see `gpu::BUFFER_WRITE_WORST_RUN`.
+                            vitaslop_platform::gpu::buffer_write_worst_run_us_kb().0,
+                            vitaslop_platform::gpu::buffer_write_worst_run_us_kb().1,
                         ),
                     );
                 }
@@ -4573,6 +4698,52 @@ async fn live_loop(
                 // volume or per-call boundary overhead, which a millisecond never can.
                 let encode_mean = s.enc_work.line(s.presents.max(1));
                 line(&mut diag, "ENCODE, window mean", &encode_mean);
+                // ...and how full the caches that grow with RUN LENGTH are. Every other line
+                // here describes the frame; this one is the only one that can explain a cost
+                // which appears only after an hour of play. See `GxmRenderer::cache_sizes`.
+                line(&mut diag, "RENDERER CACHES", &playback.cache_sizes());
+                // ...and the GUEST-MEMORY side of the same question. `RENDERER CACHES` covers
+                // what the renderer holds; this covers what the capture holds, which is where
+                // the largest budget in the project lives (192 MB of texture snapshots) and
+                // where the clear-whole that the device kept reporting used to be.
+                line(
+                    &mut diag,
+                    "SNAPSHOT CACHES",
+                    &vitaslop_runtime::host::snapshot_cache_report(),
+                );
+                // >>> AND WHAT IS RESIDENT, WHICH THE PANEL HAS NEVER CARRIED.
+                //
+                // The wasm heap and the texture working set were already computed - for a
+                // CONSOLE line. The diagnostics panel is what a user actually pastes, so the
+                // one symptom nobody could ever act on was "the whole phone feels sluggish":
+                // a report full of milliseconds and not one byte of residency. The wasm heap
+                // is the number that matters most here because it is SHARED with the guest and
+                // can never hand a page back - it only ever goes up, so a run that grows it is
+                // taking memory from the device permanently, and no frame timing shows that.
+                line(
+                    &mut diag,
+                    "MEMORY",
+                    &format!(
+                        "emulator wasm heap {} MB (shared with the guest, never returned to the                          OS - this one only goes UP) | GPU texture working set {} MB of a {} MB                          texture cache budget | device reports {} | cache budgets scaled x{:.2}{}",
+                        wasm_heap_mb(),
+                        vitaslop_platform::gpu::texture_working_set_bytes() / (1024 * 1024),
+                        vitaslop_platform::gpu::tex_cache_budget_now() / (1024 * 1024),
+                        match vitaslop_platform::knobs::device_memory_gb() {
+                            Some(gb) => format!("{gb} GB"),
+                            None => "nothing (no navigator.deviceMemory)".to_string(),
+                        },
+                        vitaslop_platform::knobs::memory_scale(),
+                        // >>> WHAT THE ADAPTER SAYS, BESIDE WHAT `deviceMemory` SAYS, because on
+                        // a phone the two disagree and only one of them is capped. Reported, not
+                        // acted on - see `ADAPTER_LOOKS_MOBILE` for why wiring this to the
+                        // budgets would spend picture quality.
+                        if ADAPTER_LOOKS_MOBILE.load(std::sync::atomic::Ordering::Relaxed) {
+                            " | NOTE the GPU adapter is a MOBILE part, which deviceMemory (capped                          at 8 GB by its own spec) cannot see. Budgets are deliberately NOT                          scaled from this: the texture budget gates the BC->ETC2 re-encode,                          so tightening it here would trade picture quality silently"
+                        } else {
+                            ""
+                        },
+                    ),
+                );
                 // ...and INSIDE `prepare`, when it was asked for. See `WindowSplit::prep`.
                 if !s.prep.is_empty() {
                     line(&mut diag, "PREPARE SPLIT, window mean", &s.prep.line(s.presents.max(1)));
@@ -4806,7 +4977,7 @@ async fn live_loop(
                     // counters match the window mean exactly - which is when an outlier is most
                     // puzzling - this is the only line that says which half of encode grew.
                     &format!(
-                        "{:.1} ms over {} draws (prepare {:.1} + upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}] + pass {:.1})",
+                        "{:.1} ms over {} draws (prepare {:.1} + upload {:.1} [arena {:.1} = create {:.1} + write {:.1}, ubo-bg {:.1}] + pass {:.1} + CHAIN {:.1})",
                         s.worst_encode_ms,
                         s.worst_encode_draws,
                         s.worst_enc_phases.prepare_ms,
@@ -4816,6 +4987,13 @@ async fn live_loop(
                         s.worst_enc_phases.arena_write_ms,
                         s.worst_enc_phases.ubo_bg_ms,
                         s.worst_enc_phases.pass_ms,
+                        // The residual - see the window line for why it is printed. It is the
+                        // whole of this frame on the device run that prompted it.
+                        (s.worst_encode_ms
+                            - (s.worst_enc_phases.prepare_ms
+                                + s.worst_enc_phases.upload_ms
+                                + s.worst_enc_phases.pass_ms))
+                            .max(0.0),
                     ),
                     &s.worst_enc_work.line(1),
                     &encode_mean,

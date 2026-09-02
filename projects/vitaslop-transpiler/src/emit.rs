@@ -28,10 +28,10 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, Encode, ExportKind,
+    BlockType, ConstExpr, DataSection, ElementSection, Elements, Encode, ExportKind,
     ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
     Instruction as W, MemArg, MemorySection, MemoryType, Module, NameMap, NameSection, RefType,
-    TableSection, TableType, TypeSection, ValType,
+    Section, TableSection, TableType, TypeSection, ValType,
 };
 
 use crate::abi;
@@ -1592,7 +1592,14 @@ const L_DIRTY: u32 = 6;
 /// single instruction's lowering, and nothing here should have to reason about which
 /// instruction an inlined import happens to sit next to.
 const L_PARK: u32 = 7;
-const L_I32_COUNT: u32 = 8;
+/// The rebased DESTINATION address of one slot inside a per-slot state copy
+/// ([`crate::BindStateLayout::copy_slot_stride`]), held so the store watchpoint can be tested
+/// against the slot actually being written rather than against the whole array. Its own local
+/// for the same reason [`L_DIRTY`] and [`L_PARK`] are: the `L_T*` scratches are live inside a
+/// single instruction's lowering, and the copy loop's other three are all already spoken for
+/// (context, state struct, arrays block).
+const L_SLOT: u32 = 8;
+const L_I32_COUNT: u32 = 9;
 /// i64 scratch, used to split/merge a double register across its two aliased
 /// single-register halves. Index follows the i32 locals.
 const L_D64: u32 = L_I32_COUNT;
@@ -1774,13 +1781,27 @@ const MIRROR_SLOTS_PER_PAGE: u32 = abi::PAGE_SIZE / 4;
 /// function), which matters because the preemptive scheduler instantiates the module
 /// once per guest thread.
 pub fn emit_module(
-    funcs: &[Func],
+    funcs: Vec<Func>,
     func_index: &BTreeMap<u32, u32>,
     base: u32,
     mem_bytes: u32,
     inline_imports: &[crate::InlineImport],
     import_memory: bool,
 ) -> EmitOutput {
+    // >>> THE FUNCTIONS ARE TAKEN BY VALUE AND DROPPED ONE BY ONE AS THEY ARE EMITTED.
+    //
+    // The lifted IR of one retail title is 7.5 million statements at 80 bytes each - about
+    // 605 MB of statement vectors before the blocks and maps that hold them - and its module
+    // is 369 MB. The old shape held all of the IR for the whole of emission and then held
+    // the module TWICE (the code section's own buffer, then the copy `Module::finish` made
+    // of everything), so the transpile worker of that title peaked at 3,884 MB against
+    // wasm32's 4,096 MB ceiling: 212 MB from failing on a desktop, and the first thing a
+    // phone hits. Emission now frees each function's IR as its body is written, and the
+    // bodies go straight into the final byte vector (see the code section below), so the
+    // peak is the IR alone and the module grows into the room the IR gives back.
+    let addrs: Vec<u32> = funcs.iter().map(|f| f.addr).collect();
+    let guest_instructions: u64 =
+        funcs.iter().flat_map(|f| f.blocks.iter()).map(|b| u64::from(b.arm_count)).sum();
     let mut types = TypeSection::new();
     types.ty().function([ValType::I32], []); // svc / import: (i32) -> ()
     let host_ty = 0;
@@ -1904,7 +1925,7 @@ pub fn emit_module(
     }
 
     let mut function_section = FunctionSection::new();
-    for _ in funcs {
+    for _ in &funcs {
         function_section.function(func_ty);
     }
     // The indirect-call dispatcher: `(target, caller)`. It binary-searches the address
@@ -2019,15 +2040,9 @@ pub fn emit_module(
         elements.active(Some(0), &ConstExpr::i32_const(0), Elements::Functions(Cow::Owned(entries)));
     }
 
-    let mut code = CodeSection::new();
-    let mut expansion = Expansion::default();
-    for (i, func) in funcs.iter().enumerate() {
-        let idx = IMPORT_FUNCS + i as u32;
-        exports.export(&abi::func_export(func.addr), ExportKind::Func, idx);
-        code.function(&emit_func(func, func_index, base, &inline, &mut expansion));
+    for (i, addr) in addrs.iter().enumerate() {
+        exports.export(&abi::func_export(*addr), ExportKind::Func, IMPORT_FUNCS + i as u32);
     }
-    code.function(&emit_dispatch(funcs, addr_table_off));
-    code.function(&emit_reset());
     exports.export(abi::RESET_EXPORT, ExportKind::Func, IMPORT_FUNCS + n + 1);
 
     // The dispatcher's search array: each function's guest address as a little-endian
@@ -2036,13 +2051,14 @@ pub fn emit_module(
     // it initializes at instantiation with no host cooperation.
     let mut data = DataSection::new();
     if n > 0 {
-        let mut bytes = Vec::with_capacity(funcs.len() * 4);
-        for func in funcs {
-            bytes.extend_from_slice(&func.addr.to_le_bytes());
+        let mut bytes = Vec::with_capacity(addrs.len() * 4);
+        for addr in &addrs {
+            bytes.extend_from_slice(&addr.to_le_bytes());
         }
         data.active(0, &ConstExpr::i32_const(addr_table_off as i32), bytes);
     }
 
+    // Every section before the code, through the encoder's own builder...
     let mut module = Module::new();
     module
         .section(&types)
@@ -2052,9 +2068,35 @@ pub fn emit_module(
         .section(&mems)
         .section(&globals)
         .section(&exports)
-        .section(&elements)
-        .section(&code)
-        .section(&data);
+        .section(&elements);
+    // ...and from here on the bytes are written DIRECTLY. `Module::section` copies a
+    // finished section into its buffer, which for a 369 MB code section means holding
+    // the module twice at the moment of the copy. Instead the code section's header is
+    // written with a padded size, each function body is encoded straight into the
+    // module's buffer as its IR is consumed, and the size is patched afterwards. A
+    // non-minimal LEB128 is what the format allows for exactly this purpose.
+    let mut wasm = module.finish();
+    // Sized ONCE, from the guest instruction count, so the buffer never has to double
+    // and copy itself while the IR is still resident. MEASURED: 21.36 wasm operators
+    // per guest instruction and 42.4 bytes of module per guest instruction on the
+    // largest title here; 48 leaves room for a wider title without a second copy.
+    wasm.reserve(usize::try_from(guest_instructions.saturating_mul(48)).unwrap_or(0));
+    wasm.push(CODE_SECTION_ID);
+    let size_at = wasm.len();
+    wasm.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
+    let contents_at = wasm.len();
+    (n + 2).encode(&mut wasm);
+    let mut expansion = Expansion::default();
+    for func in funcs {
+        emit_func(&func, func_index, base, &inline, &mut expansion).encode(&mut wasm);
+        // `func` drops here: its IR is not needed again.
+    }
+    emit_dispatch(n, addr_table_off).encode(&mut wasm);
+    emit_reset().encode(&mut wasm);
+    let contents_len = u32::try_from(wasm.len() - contents_at)
+        .expect("a wasm code section is at most 4 GB");
+    wasm[size_at..size_at + 5].copy_from_slice(&padded_leb128(contents_len));
+    data.append_to(&mut wasm);
 
     // Optional debug `name` section (see `emit_wasm_names`): map each wasm function
     // index to a human-readable name so trap backtraces symbolize directly. Imports
@@ -2066,23 +2108,36 @@ pub fn emit_module(
         names.append(SVC_FUNC, "svc");
         names.append(IMPORT_FUNC, "host_import");
         names.append(DISPATCH_MISS_FUNC, "dispatch_miss");
-        for (i, func) in funcs.iter().enumerate() {
-            names.append(IMPORT_FUNCS + i as u32, &format!("g_{:08x}", func.addr));
+        for (i, addr) in addrs.iter().enumerate() {
+            names.append(IMPORT_FUNCS + i as u32, &format!("g_{addr:08x}"));
         }
         names.append(IMPORT_FUNCS + n, "dispatch");
         names.append(IMPORT_FUNCS + n + 1, "reset");
         let mut name_section = NameSection::new();
         name_section.functions(&names);
-        module.section(&name_section);
+        name_section.append_to(&mut wasm);
     }
     EmitOutput {
-        wasm: module.finish(),
+        wasm,
         mem_pages: total_pages as u32,
         arm_word_off,
         mirror_off,
         dirty_off,
         expansion,
     }
+}
+
+/// The wasm section id of the code section.
+const CODE_SECTION_ID: u8 = 10;
+
+/// `v` as a five-byte unsigned LEB128 - the non-minimal form the format permits, so a
+/// section's size can be written before its contents are and patched afterwards.
+fn padded_leb128(v: u32) -> [u8; 5] {
+    let mut out = [0u8; 5];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = ((v >> (7 * i)) & 0x7f) as u8 | if i < 4 { 0x80 } else { 0 };
+    }
+    out
 }
 
 /// Emit the instance RESET function: `() -> ()`, exported as [`abi::RESET_EXPORT`].
@@ -2109,7 +2164,7 @@ pub fn emit_module(
 fn emit_reset() -> Function {
     let mut f = Function::new([]);
     let mut g = 0u32;
-    let mut zero_i32 = |f: &mut Function, g: &mut u32| {
+    let zero_i32 = |f: &mut Function, g: &mut u32| {
         f.instruction(&W::I32Const(0));
         f.instruction(&W::GlobalSet(*g));
         *g += 1;
@@ -2174,7 +2229,7 @@ fn emit_reset() -> Function {
 /// old O(n) linear address compare. `funcs` must be in ascending-address order (it
 /// is - `emit_module` receives the functions sorted), matching both the address
 /// table and the funcref table.
-fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
+fn emit_dispatch(n: u32, addr_table_off: u64) -> Function {
     // Locals beyond the two params: lo, hi, mid, v (the loaded table entry).
     const P_TARGET: u32 = 0;
     const P_CALLER: u32 = 1;
@@ -2193,7 +2248,7 @@ fn emit_dispatch(funcs: &[Func], addr_table_off: u64) -> Function {
     // lo = 0; hi = n.
     f.instruction(&W::I32Const(0));
     f.instruction(&W::LocalSet(L_LO));
-    f.instruction(&W::I32Const(funcs.len() as i32));
+    f.instruction(&W::I32Const(n as i32));
     f.instruction(&W::LocalSet(L_HI));
 
     // block $done { loop $loop { ... } }  -- breaking to $done means "not found".
@@ -6829,13 +6884,59 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             // No dirty-map stamp on any of these: like every other storing form, they
             // write the guest's context block, which is never a texture's bytes - see
             // `emit_dirty_range` for the rule.
-            emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Const(l.copy_dst as i32));
-            f.instruction(&W::I32Add);
-            f.instruction(&W::LocalGet(L_T2));
-            f.instruction(&W::I32Const(l.copy_bytes as i32));
-            f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            if l.copy_slot_stride == 0 {
+                emit_watch_store_inline(f, base, L_T0, l.copy_dst, l.copy_bytes, index);
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::I32Const(l.copy_dst as i32));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::I32Const(l.copy_bytes as i32));
+                f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            } else {
+                // >>> PER-SLOT, SKIPPING THE EMPTY ONES. The handler
+                // (`bind_precomputed_fragment_state`) walks the same slots with the same test,
+                // because a slot of zeros is this engine's own default and not an unbind the
+                // guest asked for - see `BindStateLayout::copy_slot_stride`.
+                //
+                // A LOOP rather than sixteen unrolled slots: this lowering is emitted at every
+                // call site of the bind, and a title binds states from many of them.
+                let stride = l.copy_slot_stride;
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::LocalSet(L_T3));
+                f.instruction(&W::Loop(BlockType::Empty));
+                // The slot's FIRST WORD decides: it is the texture's guest address, and zero
+                // there is what every reader already treats as "this unit is unbound".
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::LocalGet(L_T3));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::I32Load(mem_arg()));
+                f.instruction(&W::I32Const(0));
+                f.instruction(&W::I32Ne);
+                f.instruction(&W::If(BlockType::Empty));
+                // dst = ctx + copy_dst + i, kept in a local so the watchpoint names THIS slot.
+                f.instruction(&W::LocalGet(L_T0));
+                f.instruction(&W::LocalGet(L_T3));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::I32Const(l.copy_dst as i32));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::LocalSet(L_SLOT));
+                emit_watch_store_inline(f, base, L_SLOT, 0, stride, index);
+                f.instruction(&W::LocalGet(L_SLOT));
+                f.instruction(&W::LocalGet(L_T2));
+                f.instruction(&W::LocalGet(L_T3));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::I32Const(stride as i32));
+                f.instruction(&W::MemoryCopy { src_mem: 0, dst_mem: 0 });
+                f.instruction(&W::End); // the non-empty test
+                f.instruction(&W::LocalGet(L_T3));
+                f.instruction(&W::I32Const(stride as i32));
+                f.instruction(&W::I32Add);
+                f.instruction(&W::LocalTee(L_T3));
+                f.instruction(&W::I32Const(l.copy_bytes as i32));
+                f.instruction(&W::I32LtU);
+                f.instruction(&W::BrIf(0));
+                f.instruction(&W::End); // the loop
+            }
             // The stage's three-word uniform record: buffer, memoised size, program header.
             emit_watch_store_inline(f, base, L_T0, l.ctx_record, 12, index);
             f.instruction(&W::LocalGet(L_T0));

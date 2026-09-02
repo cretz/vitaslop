@@ -193,6 +193,9 @@ pub struct RetailGuest {
     sched: ThreadedScheduler<VitaEnv>,
     /// Every scene of the newest presented frame, in submission order.
     scenes: Vec<Scene>,
+    /// The display buffers the guest FLIPPED while those scenes were captured - see
+    /// [`vitaslop_platform::gpu::gxm::GxmRenderer::set_presented`].
+    presents: Vec<u32>,
     finished: bool,
     err: Option<String>,
     /// The report that ENDED the run, when one did.
@@ -273,7 +276,7 @@ impl RetailGuest {
             .capture
             .set_signature_wanted(vitaslop_runtime::knobs::flag("VITASLOP_SIGNATURE"));
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(RetailGuest { sched, scenes: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms })
+        Ok(RetailGuest { sched, scenes: Vec::new(), presents: Vec::new(), finished: false, err: None, ended_by: None, save: None, build_ms })
     }
 
     /// Keep this title's saved state under `root`, and put back whatever a previous run
@@ -356,6 +359,12 @@ impl RetailGuest {
             // scene this frame, in which case the previous frame's stays on screen.
             if !cap.scenes.is_empty() {
                 self.scenes = std::mem::take(&mut cap.scenes);
+                // Kept with the scenes they belong to, and for the same reason: these are the
+                // buffers the guest FLIPPED while those scenes were captured, which is what
+                // lets the renderer recognise a frame that straddles a flip instead of
+                // classifying half of it as an offscreen pass. See
+                // `GxmRenderer::set_presented`.
+                self.presents = cap.presents.clone();
             }
             cap.scenes.clear();
             cap.trace.clear();
@@ -479,6 +488,10 @@ impl RetailGuest {
     /// has flipped once.
     pub fn current(&self) -> &[Scene] {
         &self.scenes
+    }
+    /// The display buffers the guest flipped while [`Self::current`] was captured.
+    pub fn current_presents(&self) -> &[u32] {
+        &self.presents
     }
     pub fn finished(&self) -> bool {
         self.finished
@@ -717,7 +730,7 @@ impl RetailGfx {
 
     /// `display` is the size the GUEST declared to `sceDisplaySetFrameBuf`, which is what
     /// the frame is projected against. See the `encode_chain` call below.
-    fn present(&mut self, scenes: &[Scene], display: (u32, u32)) {
+    fn present(&mut self, scenes: &[Scene], display: (u32, u32), presents: &[u32]) {
         // Asked BEFORE any work: once the device is lost, building scenes and encoding a
         // command buffer is pure cost against a picture that cannot be drawn.
         if let Some(why) = self.lost.lock().ok().and_then(|s| s.clone()) {
@@ -747,6 +760,7 @@ impl RetailGfx {
         // the hardware's own upscale, for free, on this path.
         let (dw, dh) = display;
         let (fw, fh) = (frame.texture.width(), frame.texture.height());
+        self.gxm.set_presented(presents);
         self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
@@ -1301,12 +1315,22 @@ pub fn headless_check(
             let (clk_q, clk_topup, clk_idle) = guest.clock_sources();
             println!(
                 "shot f{f:06}: guest clock {:.3}s ({:.3}s quanta + {:.3}s topup + {:.3}s idle), \
-                 {scene_count} scenes / {draw_count} draws [{}]",
+                 {scene_count} scenes / {draw_count} draws [{}] flipped=[{}]",
                 guest.clock_us() as f64 / 1e6,
                 clk_q as f64 / 1e6,
                 clk_topup as f64 / 1e6,
                 clk_idle as f64 / 1e6,
                 composition.join(" "),
+                // The buffer(s) the GUEST flipped this frame, beside the scene targets. The
+                // renderer presents the LAST scene's target; a title whose flipped buffer is
+                // not that target is showing a different image from the one this shot holds,
+                // and only this line can say so.
+                guest
+                    .current_presents()
+                    .iter()
+                    .map(|a| format!("{a:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             );
         }
         if use_builtin_taps {
@@ -1727,8 +1751,9 @@ impl RetailApp {
         let display = self.guest.display_size();
         if let Some(gfx) = self.gfx.as_mut() {
             let scenes = self.guest.current();
+            let presents = self.guest.current_presents();
             if !scenes.is_empty() {
-                gfx.present(scenes, display);
+                gfx.present(scenes, display, presents);
             }
         }
         self.update_title(now);

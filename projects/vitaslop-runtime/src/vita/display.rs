@@ -87,7 +87,21 @@ pub(super) fn wait_set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcO
     // already held that queueing thread to the panel's latch rate. Parking here as well
     // charges the title a SECOND display period for one frame - see
     // [`VitaState::take_present_since_wait`] for the 2.99x that measured.
-    if !st.take_present_since_wait() {
+    let latched = st.take_present_since_wait();
+    // Diagnostic (`RUST_LOG=vitaslop::display=trace`): WHO waited and whether the wait cost a
+    // vblank. `present_since_wait` is ONE flag for every thread, so the first waiter after a
+    // present consumes it and the second parks a whole period - and when the second is the
+    // display-queue CALLBACK thread, the callback rate halves and the guest's own display
+    // bookkeeping falls behind the queue.
+    tracing::trace!(
+        target: "vitaslop::display",
+        thid = st.current_thread(),
+        latched,
+        us = st.now_us(),
+        vcount = vcount(st),
+        "wait set frame buf"
+    );
+    if !latched {
         st.vblank_park(1, VBLANK_US);
         return SvcOutcome::Block;
     }
@@ -254,6 +268,18 @@ pub(super) fn set_frame_buf(ctx: &mut GuestCtx, st: &mut VitaState, param: Ptr, 
         report_geometry_once(pitch, fmt, w, h);
         st.set_display_geometry(w, h);
     }
+    // Diagnostic (`RUST_LOG=vitaslop::display=trace`), the partner of the one in
+    // `sceGxmDisplayQueueAddEntry`: this is the call that actually names the scanout
+    // buffer, and its `sync` says whether the change lands at the next vblank or at once.
+    tracing::trace!(
+        target: "vitaslop::display",
+        thid = st.current_thread(),
+        buffer = format_args!("{base:#010x}"),
+        sync,
+        us = st.now_us(),
+        vcount = vcount(st),
+        "set frame buf"
+    );
     if base != 0 {
         st.present(base);
     }

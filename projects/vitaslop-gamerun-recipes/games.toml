@@ -30,3 +30,8 @@ region = "NTSC"
 id = "PCSA00009"
 name = "Hot Shots Golf: World Invitational"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00120"
+name = "Persona 4 Golden"
+region = "NTSC"

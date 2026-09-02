@@ -58,6 +58,14 @@ pub struct AudioState {
     /// `sceNgsVoiceLockParams`. Cached so the per-frame lock/unlock cycle reuses one
     /// buffer instead of leaking a fresh allocation every frame.
     pub(crate) ngs_param_bufs: Vec<((u32, u32, u32), u32)>,
+    /// The guest function a title registered with `sceNgsVoiceSetModuleCallback`, as
+    /// `((voice, module), (entry, userdata))`. Only the player module (0) raises anything
+    /// here - a buffer boundary, see [`super::at9::PlayerEvent`] - but the key carries the
+    /// module so a registration on any other module is recorded rather than misdelivered.
+    pub(crate) ngs_module_cbs: Vec<((u32, u32), (u32, u32))>,
+    /// `sceNgsVoiceSetFinishedCallback` registrations, as `(voice, (entry, userdata))`:
+    /// raised once when a voice's data runs out.
+    pub(crate) ngs_finished_cbs: Vec<(u32, (u32, u32))>,
     /// The voice handle for each `(rack, index)` a title has asked about. A rack is a fixed
     /// array of voices and this is a LOOKUP - see `ngs::rack_get_voice_handle` for what
     /// allocating a fresh handle per query did to the mixer.
@@ -421,6 +429,10 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         st.audio_state.submitted_rate = format.sample_rate;
         st.audio.submit(backend_port, &pcm);
         st.audio_state.scratch_pcm = pcm;
+        // The buffer boundaries the mix just crossed are module callbacks the title is
+        // owed. On the device they fire from the DSP's update; here the update IS the
+        // mix, so they fire from it.
+        super::ngs::deliver_player_events(ctx, st);
     }
     ctx.ret(0);
     // One grain plays for `grain / sample_rate` seconds.

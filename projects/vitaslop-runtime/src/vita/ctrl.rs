@@ -45,19 +45,96 @@ const CTRL_MAX_BUFFERS: u32 = 64;
 /// With one buffer filled, `buf[31]` is whatever was on the stack, so every press was read
 /// and then discarded: the menu consumed a `cross` (9,701 bytes of guest state moved) and
 /// acted on nothing, and a `down` moved not one byte.
-///
-/// The older samples carry the CURRENT buttons rather than a real history: this engine's
-/// world holds one input frame at a time, and inventing a differing past would be
-/// inventing input the recipe never gave. What each sample does carry is its own distinct
-/// timestamp on the sampling grid, because that is the field a title dedupes on.
 fn buffer_count(count: i32) -> u32 {
     (count.max(1) as u32).min(CTRL_MAX_BUFFERS)
 }
 
-/// Fill one `SceCtrlData` at `data` from the current world frame for `port`, then
-/// return the number of buffers reported (always 1 - a single latest sample). When
-/// `negative` is set the button mask is inverted (the `*Negative` family reports a
-/// pressed button as a cleared bit).
+/// >>> A HISTORY THAT REPEATS THE PRESENT HAS NO EDGES IN IT, AND AN EDGE IS WHAT A MENU
+/// >>> CURSOR MOVES ON.
+///
+/// The older samples used to carry the CURRENT buttons, on the reasoning that this engine's
+/// world holds one input frame at a time and inventing a differing past would be inventing
+/// input the recipe never gave. The premise is right and the conclusion was not: the past
+/// this ring should hold is not invented, it is the input the world ALREADY GAVE, one
+/// sample per display frame, and the engine simply was not keeping it.
+///
+/// MEASURED on PCSE00120's difficulty select, which ignored up and down while `cross` worked
+/// at every other screen: a d-pad press moved 9.9 MB of guest heap - the title saw it - and
+/// no cursor index changed. A title tests "held now AND NOT held one sample ago" before it
+/// moves a cursor, precisely so that holding a direction does not scroll a menu at 60 Hz;
+/// with every slot carrying the current buttons that test can never pass, while a press
+/// acted on by LEVEL goes through. That is the shape of the defect exactly: one class of
+/// press works, the other is read and discarded.
+///
+/// So this keeps what the guest was actually served: one sample per display frame, up to
+/// [`CTRL_MAX_BUFFERS`] of them, pushed the first time the pad is read in a frame. Nothing
+/// here is synthesised - a sample enters the ring only when the world produced one - and a
+/// title that reads the pad several times inside a frame is served the same sample each
+/// time, exactly as it is on hardware, where the ring advances only at a vblank.
+#[derive(Default)]
+pub(crate) struct CtrlHistory {
+    /// One ring per port that has ever been read, newest last. A `Vec` rather than a fixed
+    /// array because the port is a guest-supplied word: two ports are the real hardware and
+    /// a title asking for a third must not index out of bounds.
+    ports: Vec<(u32, std::collections::VecDeque<Sample>)>,
+}
+
+/// One controller sample as it was served: the VBLANK it belongs to, the guest timestamp it
+/// carried (the field a title dedupes on), and the pad state itself.
+#[derive(Clone, Copy)]
+struct Sample {
+    vblank: u64,
+    ts: u64,
+    pad: crate::world::CtrlFrame,
+}
+
+impl CtrlHistory {
+    /// Record `pad` as `vblank`'s sample for `port`, unless the newest sample is already this
+    /// vblank's AND says the same thing.
+    ///
+    /// >>> THE STAMP IS THE VBLANK, NOT THE DISPLAY FRAME, and the pad state is part of the
+    /// >>> test. The first version keyed on the display-frame counter, which only the
+    /// preemptive scheduler advances: under the run-to-completion host it never moves, so the
+    /// ring froze on its first (neutral) sample and a title reading more than one buffer never
+    /// saw a button at all. The conformance cube caught it - it pressed START and the guest ran
+    /// on for ever. The vblank counter is a pure function of the clock and advances under every
+    /// host; comparing the pad as well means a change is served the moment the world makes it,
+    /// whatever the clock is doing.
+    fn push(&mut self, port: u32, vblank: u64, ts: u64, pad: crate::world::CtrlFrame) {
+        let ring = match self.ports.iter().position(|(p, _)| *p == port) {
+            Some(k) => &mut self.ports[k].1,
+            None => {
+                let cap = CTRL_MAX_BUFFERS as usize;
+                self.ports.push((port, std::collections::VecDeque::with_capacity(cap)));
+                &mut self.ports.last_mut().expect("just pushed").1
+            }
+        };
+        if ring.back().is_some_and(|s| s.vblank == vblank && s.pad == pad) {
+            return;
+        }
+        if ring.len() == CTRL_MAX_BUFFERS as usize {
+            ring.pop_front();
+        }
+        ring.push_back(Sample { vblank, ts, pad });
+    }
+
+    /// The sample `age` samples back from the newest for `port` (0 = the newest), or `None`
+    /// when the ring does not go back that far.
+    fn sample(&self, port: u32, age: usize) -> Option<Sample> {
+        let (_, ring) = self.ports.iter().find(|(p, _)| *p == port)?;
+        ring.len().checked_sub(1 + age).and_then(|i| ring.get(i)).copied()
+    }
+
+    /// How many samples the ring holds for `port`.
+    fn depth(&self, port: u32) -> usize {
+        self.ports.iter().find(|(p, _)| *p == port).map_or(0, |(_, r)| r.len())
+    }
+}
+
+/// Fill `count` `SceCtrlData` samples at `data` for `port` - the newest of the ring
+/// [`CtrlHistory`] keeps, OLDEST FIRST - and return how many were written. When
+/// `negative` is set each sample's button mask is inverted (the `*Negative` family
+/// reports a pressed button as a cleared bit).
 fn fill_ctrl(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
@@ -68,7 +145,6 @@ fn fill_ctrl(
 ) -> i32 {
     let frame = st.world.poll_ctrl(port);
     let ts = st.guest_mono_us();
-    let buttons = if negative { !frame.buttons } else { frame.buttons };
 
     // Diagnostic (`RUST_LOG=vitaslop::input=trace`): log the pad state the guest
     // reads and its caller, to see whether input reaches the code that should act on
@@ -86,19 +162,42 @@ fn fill_ctrl(
         );
     }
 
+    // The ring advances once per VBLANK - see [`CtrlHistory`], which is the rate the pad is
+    // sampled at. Pushed here rather than on a timer because the world is polled here: asking
+    // it for a sample the guest never requested would put a poll on the record/replay seam
+    // that no title made.
+    st.ctrl_history.push(port, u64::from(super::display::vcount(st)), ts, frame);
+    let depth = st.ctrl_history.depth(port);
+
     let n = buffer_count(count);
     if data != 0 {
+        // The oldest sample the ring holds, for the slots below it: a title asking for more
+        // history than the run has produced gets that sample extended backwards on the vblank
+        // grid, with its own distinct timestamp per slot because that is the field a title
+        // dedupes on. Extending the OLDEST rather than the newest is what keeps the ring
+        // monotone: a run one frame old has one real sample, and the slots below it are the
+        // pad as it was before anything was pressed.
+        let oldest = st.ctrl_history.sample(port, depth.saturating_sub(1));
         for i in 0..n {
-            // Oldest first: sample i is (n - 1 - i) vblanks before now, and the last one
+            // Oldest first: slot i is (n - 1 - i) samples before now, and the last one
             // written is the current sample.
-            let age = u64::from(n - 1 - i) * u64::from(super::display::VBLANK_US);
+            let age = (n - 1 - i) as usize;
+            let (s_ts, pad) = match st.ctrl_history.sample(port, age) {
+                Some(s) => (s.ts, s.pad),
+                None => {
+                    let base = oldest.map_or((ts, crate::world::CtrlFrame::default()), |s| (s.ts, s.pad));
+                    let short = (age + 1 - depth) as u64;
+                    (base.0.saturating_sub(short * u64::from(super::display::VBLANK_US)), base.1)
+                }
+            };
+            let bits = if negative { !pad.buttons } else { pad.buttons };
             let mut buf = [0u8; CTRL_DATA_PREFIX];
-            buf[0..8].copy_from_slice(&ts.saturating_sub(age).to_le_bytes());
-            buf[8..12].copy_from_slice(&buttons.to_le_bytes());
-            buf[12] = frame.lx;
-            buf[13] = frame.ly;
-            buf[14] = frame.rx;
-            buf[15] = frame.ry;
+            buf[0..8].copy_from_slice(&s_ts.to_le_bytes());
+            buf[8..12].copy_from_slice(&bits.to_le_bytes());
+            buf[12] = pad.lx;
+            buf[13] = pad.ly;
+            buf[14] = pad.rx;
+            buf[15] = pad.ry;
             ctx.write_bytes(data + i * CTRL_DATA_SIZE, &buf);
         }
     }

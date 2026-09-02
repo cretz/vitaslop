@@ -214,7 +214,24 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     }
 
     // 3. Assemble the combined image: every segment at its rebased address.
-    let mut image = vec![0u8; image_end.wrapping_sub(IMAGE_BASE) as usize];
+    //
+    // The image is allocated DENSE over the whole rebased span, so a module placed far above
+    // the last one costs its own gap in real bytes. On a wasm32 host that gap comes out of a
+    // 4 GiB address space shared with the transpiler, and linear memory never shrinks - so a
+    // link-time high-water mark is carried for the entire run. Report the number rather than
+    // leaving "the browser ran out of memory" to be attributed from a stack trace: MEASURED,
+    // one retail title reached 3,155 MB before transpiling a single instruction.
+    let image_bytes = image_end.wrapping_sub(IMAGE_BASE) as usize;
+    tracing::warn!(
+        target: "vitaslop::link",
+        "link: image span {:.1} MB over {} modules ({:#x}..{:#x}), {:.1} MB of it in segments",
+        image_bytes as f64 / 1e6,
+        modules.len(),
+        IMAGE_BASE,
+        image_end,
+        modules.iter().flat_map(|m| &m.segments).map(|s| s.data.len()).sum::<usize>() as f64 / 1e6,
+    );
+    let mut image = vec![0u8; image_bytes];
     for m in &modules {
         for s in &m.segments {
             blit(&mut image, IMAGE_BASE, s);

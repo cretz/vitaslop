@@ -122,24 +122,127 @@ const NGS_VOICE_INFO_STATE_OFF: u32 = 0;
 
 /// `SCE_NGS_VOICE_STATE_AVAILABLE`: the voice is idle and holds nothing.
 const NGS_VOICE_STATE_AVAILABLE: u32 = 0;
+/// `SCE_NGS_VOICE_STATE_ACTIVE`: the voice is playing.
+const NGS_VOICE_STATE_ACTIVE: u32 = 1;
 
 /// SceInt32 sceNgsVoiceGetInfo(SceNgsHVoice voice, SceNgsVoiceInfo *info)
 ///
-/// Reports the voice as AVAILABLE, which is the truth for this engine: no synthesis runs,
-/// so no voice is ever active. That is also what unblocks a title waiting for a sound to
-/// finish - the observed caller polls this and treats `state & (ACTIVE | UNLOADING)` as
-/// "still playing", releasing its voice slot only once that clears.
+/// Reports ACTIVE while the voice's source is playing and AVAILABLE otherwise. The
+/// observed callers poll this two ways: one treats `state & (ACTIVE | UNLOADING)` as "still
+/// playing" and releases its voice slot once that clears; another asks it IMMEDIATELY
+/// after `sceNgsVoicePlay` and, seeing AVAILABLE, concludes the play failed and KILLS the
+/// voice. That second caller is a streaming engine, and it was why one title never played
+/// a sound: every stream it started was dead one call later.
+///
+/// >>> THIS USED TO REPORT AVAILABLE UNCONDITIONALLY, ON THE ARGUMENT THAT NO SYNTHESIS
+/// >>> RUNS HERE. Synthesis does run here - the bank decodes and mixes every playing
+/// >>> voice - and a state that contradicts the mixer is what a title acts on.
 ///
 /// Writes ONLY the state word. The rest of `SceNgsVoiceInfo` has no layout in any source
 /// available here, and zeroing a struct whose length is a guess would scribble over
 /// whatever the caller put after it - a stack frame, in the observed call. A field this
 /// function does not know is a field it leaves alone.
 #[hostcall]
-pub(super) fn voice_get_info(ctx: &mut GuestCtx, _st: &mut VitaState, _voice: u32, info: Ptr) -> i32 {
+pub(super) fn voice_get_info(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, info: Ptr) -> i32 {
     if info.addr() != 0 {
-        ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, NGS_VOICE_STATE_AVAILABLE);
+        let state = if st.audio_state.at9.is_playing(voice) {
+            NGS_VOICE_STATE_ACTIVE
+        } else {
+            NGS_VOICE_STATE_AVAILABLE
+        };
+        ctx.write_u32(info.addr() + NGS_VOICE_INFO_STATE_OFF, state);
     }
     0
+}
+
+/// SceInt32 sceNgsVoiceSetModuleCallback(SceNgsHVoice voice, SceUInt32 moduleId,
+///                                       SceNgsModuleCallbackFunc callback, void *userData)
+/// Record the callback; the player module raises it at every buffer boundary - see
+/// [`deliver_player_events`]. A null `callback` clears the registration.
+#[hostcall]
+pub(super) fn voice_set_module_callback(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    module: u32,
+    callback: u32,
+    userdata: u32,
+) -> i32 {
+    let cbs = &mut st.audio_state.ngs_module_cbs;
+    cbs.retain(|(k, _)| *k != (voice, module));
+    if callback != 0 {
+        cbs.push(((voice, module), (callback, userdata)));
+    }
+    0
+}
+
+/// SceInt32 sceNgsVoiceSetFinishedCallback(SceNgsHVoice voice,
+///                                         SceNgsCallbackFunc callback, void *userData)
+/// Record the callback; raised once when the voice's data runs out.
+#[hostcall]
+pub(super) fn voice_set_finished_callback(
+    _ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    voice: u32,
+    callback: u32,
+    userdata: u32,
+) -> i32 {
+    let cbs = &mut st.audio_state.ngs_finished_cbs;
+    cbs.retain(|(v, _)| *v != voice);
+    if callback != 0 {
+        cbs.push((voice, (callback, userdata)));
+    }
+    0
+}
+
+/// The player module's index in every voice definition that has one.
+const NGS_PLAYER_MODULE: u32 = 0;
+
+/// Hand every buffer boundary the mix just crossed to the guest, as the module callback
+/// (and, at the end of a voice's data, the finished callback) the title registered.
+///
+/// The `SceNgsCallbackInfo` handed over is `{ voice, rack, module, reason, buffer index,
+/// callback pointer, user data }` - see `VitaState::NGS_CB_INFO_BYTES` for the evidence
+/// on the last three. The rack is the one the voice was fetched from with
+/// `sceNgsRackGetVoiceHandle`, or 0 for a voice this engine never saw fetched.
+pub(super) fn deliver_player_events(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let events = st.audio_state.at9.take_events();
+    for (voice, event) in events {
+        let rack = st
+            .audio_state
+            .ngs_voice_handles
+            .iter()
+            .find(|(_, v)| *v == voice)
+            .map(|((rack, _), _)| *rack)
+            .unwrap_or(0);
+        let module_cb = st
+            .audio_state
+            .ngs_module_cbs
+            .iter()
+            .find(|(k, _)| *k == (voice, NGS_PLAYER_MODULE))
+            .map(|(_, cb)| *cb);
+        let finished_cb = if matches!(event, super::at9::PlayerEvent::EndOfData { .. }) {
+            st.audio_state.ngs_finished_cbs.iter().find(|(v, _)| *v == voice).map(|(_, cb)| *cb)
+        } else {
+            None
+        };
+        tracing::trace!(
+            target: "vitaslop::ngs",
+            voice = format_args!("{voice:#x}"),
+            ?event,
+            module_cb = module_cb.is_some(),
+            finished_cb = finished_cb.is_some(),
+            "player event"
+        );
+        for (entry, userdata) in module_cb.into_iter().chain(finished_cb) {
+            let mut info = [0u8; 0x1c];
+            let words = [voice, rack, NGS_PLAYER_MODULE, event.reason(), event.buffer(), entry, userdata];
+            for (i, w) in words.iter().enumerate() {
+                info[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            st.enqueue_ngs_callback(ctx, entry, &info);
+        }
+    }
 }
 
 /// Voice key-off / kill / pause - stop producing audio from this voice.
@@ -699,6 +802,92 @@ mod lock_params_tests {
             "after lock -> write -> unlock -> play the voice must be playing; if it is not, \
              the source was rejected and the title will be silent"
         );
+    }
+
+    /// A voice that is playing says so. The streaming engine that reads this right after
+    /// `sceNgsVoicePlay` kills the voice on AVAILABLE, so an unconditional AVAILABLE here
+    /// was a title with no sound at all.
+    #[test]
+    fn a_playing_voice_reports_active() {
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let buf = h.lock(voice);
+        h.write_source(buf, 0x0020_0000, 0x3fc0);
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        let info = 0x3000u32;
+        h.write_u32(info, 0xdead_beef);
+        h.call(voice_get_info, [voice, info, 0, 0]);
+        assert_eq!(h.read_u32(info), 0, "a voice that was never played is AVAILABLE");
+        h.call(voice_play, [voice, 0, 0, 0]);
+        h.call(voice_get_info, [voice, info, 0, 0]);
+        assert_eq!(h.read_u32(info), 1, "a playing voice is ACTIVE");
+        h.call(voice_stop, [voice, 0, 0, 0]);
+        h.call(voice_get_info, [voice, info, 0, 0]);
+        assert_eq!(h.read_u32(info), 0, "a killed voice is AVAILABLE again");
+    }
+
+    /// The PCM player's params descriptor id and the fields a raw-s16 source needs.
+    const PCM_PLAYER_ID: u32 = 0x0101_5ce6;
+
+    /// THE STREAMING CONTRACT. Two 12-byte buffer descriptors chained 0 -> 1 -> end play in
+    /// order, raise a SWAPPED event naming the slot that finished, then END_OF_DATA naming
+    /// the last slot - and a refill written while the voice plays does not restart it.
+    #[test]
+    fn a_buffer_chain_plays_through_and_raises_its_events() {
+        use super::super::at9::PlayerEvent;
+        let mut h = Harness::new();
+        let voice = 0x1234;
+        let info = 0x2000u32;
+        h.call(voice_lock_params, [voice, 0, PCM_PLAYER_ID, info]);
+        let buf = h.read_u32(info);
+        // Two mono s16 slots of 8 frames each, holding 1.. and 101.. so the mix says
+        // which slot it came from.
+        let (a, b) = (0x0020_0000u32, 0x0020_1000u32);
+        for i in 0..8u32 {
+            h.mem[(a + i * 2) as usize..(a + i * 2 + 2) as usize]
+                .copy_from_slice(&(1 + i as i16).to_le_bytes());
+            h.mem[(b + i * 2) as usize..(b + i * 2 + 2) as usize]
+                .copy_from_slice(&(101 + i as i16).to_le_bytes());
+        }
+        h.write_u32(buf + 0x08, a);
+        h.write_u32(buf + 0x0c, 16);
+        h.write_u32(buf + 0x10, 0x0001_0000); // loop 0, next 1
+        h.write_u32(buf + 0x14, b);
+        h.write_u32(buf + 0x18, 16);
+        h.write_u32(buf + 0x1c, 0xffff_0000); // loop 0, next -1
+        h.write_u32(buf + 0x38, 48000.0f32.to_bits());
+        h.write_u32(buf + 0x3c, 1.0f32.to_bits());
+        h.write_u32(buf + 0x4c, 1); // one channel, raw s16
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        h.call(voice_play, [voice, 0, 0, 0]);
+        assert!(h.st.audio_state.at9.is_playing(voice));
+
+        let mut grain = |h: &mut Harness| -> Vec<i32> {
+            let mut mix = vec![0i32; 4];
+            let mut mem = SliceMemory(&mut h.mem);
+            let ctx = GuestCtx::new(&mut h.regs, &mut h.vfp, &mut mem, 0);
+            h.st.audio_state.at9.mix_grain(&ctx, &mut mix, 4, 1, 48000);
+            mix
+        };
+        assert_eq!(grain(&mut h), vec![1, 2, 3, 4]);
+        assert!(h.st.audio_state.at9.take_events().is_empty(), "mid-buffer: no event");
+        assert_eq!(grain(&mut h), vec![5, 6, 7, 8]);
+        // The refill: slot 0 rewritten while slot 1 is about to play. Must not restart.
+        h.write_u32(buf + 0x08, a + 8);
+        h.write_u32(buf + 0x0c, 8);
+        h.call(voice_unlock_params, [voice, 0, 0, 0]);
+        assert_eq!(grain(&mut h), vec![101, 102, 103, 104], "the chain moved to slot 1");
+        assert_eq!(
+            h.st.audio_state.at9.take_events(),
+            vec![(voice, PlayerEvent::Swapped { finished: 0 })]
+        );
+        assert_eq!(grain(&mut h), vec![105, 106, 107, 108]);
+        assert_eq!(grain(&mut h), vec![0, 0, 0, 0], "slot 1 names no successor: silence");
+        assert_eq!(
+            h.st.audio_state.at9.take_events(),
+            vec![(voice, PlayerEvent::EndOfData { last: 1 })]
+        );
+        assert!(!h.st.audio_state.at9.is_playing(voice));
     }
 
     /// The negative control, which is what the engine did before: with the descriptor id

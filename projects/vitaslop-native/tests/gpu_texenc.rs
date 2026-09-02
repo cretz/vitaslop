@@ -959,6 +959,13 @@ fn gpu_raw_expand_matches_the_cpu_decoder() {
                 let Some(got) = enc.expand_rgba8(&device, &queue, &plan, false, Some(first)) else {
                     panic!("{w}x{h} swizzled={swizzled} sel={sel}: the expansion was refused");
                 };
+                // >>> THE BATCH IS WHAT WRITES THE TEXELS. `expand_rgba8` RECORDS its work and
+                // hands the texture back; nothing is on the queue until this. Reading back
+                // without it compares the CPU decoder against an untouched texture, which is
+                // exactly the failure a caller that forgets the flush would ship. Both
+                // expansions above are still pending here, so this also covers two textures
+                // sharing one submit - the case the sub-allocated scratch exists for.
+                enc.flush_raw(&queue);
 
                 // The CPU reference: the same decoder the uploader falls back to, then the same
                 // box filter `build_mip_chain` applies - so this compares the two PATHS, not two
@@ -995,6 +1002,90 @@ fn gpu_raw_expand_matches_the_cpu_decoder() {
                         mine, want,
                         "{w}x{h} swizzled={swizzled} sel={sel} level {level} ({sw}x{sh}): the GPU \
                          un-swizzle and the CPU decoder disagree, and a permutation cannot",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The GPU BC expansion is the CPU BC decoder, byte for byte, over the whole mip chain.
+///
+/// `block_source` exists to take the LARGEST remaining CPU item on the target device off it: a
+/// GPU with no BC support expands every compressed guest texture to RGBA8, and that device's own
+/// report reads one frame's working set of 130 MB with `0x85 BC -> RGBA8 x136 (98.1 MB)` in it,
+/// while its slowest frames are ~600 ms at ordinary host-call counts.
+///
+/// The claim being made is "the same bytes, somewhere else", and that claim is exactly the kind
+/// this project has been wrong about before - a padded Morton grid computed one way here and
+/// another there, a level filtered from the wrong source, a dispatch grid sized in texels where
+/// the shader indexes blocks. So the comparison is EXACT and it covers every level, not just
+/// level 0: `gpu_bc_matches_the_cpu_decoder` already pins the block decoder on its own, and this
+/// pins the PATH that carries it - the plan `block_source` builds, the block-sized dispatch, the
+/// generated chain and the row-aligned copy-out.
+#[test]
+fn gpu_bc_expand_matches_the_cpu_decoder() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter - skipping");
+        return;
+    };
+    let enc = Transcoder::new(&device);
+    // All three BC families (BC1's punch-through mode, BC2's raw nibbles, BC3's alpha ramp),
+    // both addressing modes, and a non-power-of-two shape where the padded block grid and the
+    // real block extent differ.
+    for base_format in [0x85u32, 0x86, 0x87] {
+        for swizzled in [false, true] {
+            for (w, h) in [(32u32, 32u32), (64, 16), (24, 40)] {
+                let tex_type: u32 = if swizzled { 0 } else { 3 };
+                let ll = vitaslop_runtime::render::level_layout(base_format, tex_type, w, h, 0)
+                    .unwrap();
+                let mut seed = 0x0123_4567_89ab_cdefu64;
+                let bytes: Vec<u8> = (0..ll.bytes as usize)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (seed >> 33) as u8
+                    })
+                    .collect();
+                let tex = bc_texture(base_format, tex_type, w, h, &bytes);
+                let label = format!("{base_format:#04x} {w}x{h} swizzled={swizzled}");
+
+                let Some(plan) = vitaslop_runtime::render::block_source(&tex) else {
+                    panic!("{label}: the plan was refused");
+                };
+                // Twice, the second time into the first one's texture: the reuse path is what
+                // the running engine takes on almost every frame, and a fresh-texture-only
+                // test would leave it unexercised.
+                let Some(first) = enc.expand_rgba8(&device, &queue, &plan, false, None) else {
+                    panic!("{label}: the expansion was refused");
+                };
+                let Some(got) = enc.expand_rgba8(&device, &queue, &plan, false, Some(first))
+                else {
+                    panic!("{label}: the expansion was refused");
+                };
+                // The recorded work goes to the queue here - see the same call in
+                // `gpu_raw_expand_matches_the_cpu_decoder` for why a readback without it
+                // compares against an untouched texture.
+                enc.flush_raw(&queue);
+
+                // The CPU reference: the decoder the uploader falls back to, then the same box
+                // filter `build_mip_chain` applies - so this compares the two PATHS.
+                let (_, _, level0) = vitaslop_runtime::render::decode_texture_rgba8(&tex);
+                let mut want = level0;
+                let (mut sw, mut sh) = (w, h);
+                for level in 0..plan.levels {
+                    if level > 0 {
+                        let (nw, nh, next) =
+                            vitaslop_runtime::render::halve_rgba8(sw, sh, &want);
+                        want = next;
+                        sw = nw;
+                        sh = nh;
+                    }
+                    let mine = read_back_rgba8_level(&device, &queue, &got, level, sw, sh);
+                    assert_eq!(
+                        mine, want,
+                        "{label} level {level} ({sw}x{sh}): the GPU block expansion and the CPU                          decoder disagree, and they are supposed to be one function",
                     );
                 }
             }
@@ -1050,4 +1141,91 @@ fn read_back_rgba8_level(
     drop(view);
     buf.unmap();
     out
+}
+
+/// >>> SEVERAL DIFFERENT TEXTURES EXPANDED INTO ONE SUBMIT ALL COME OUT RIGHT.
+///
+/// # What this pins, and why the other two oracles cannot
+/// `gpu_bc_expand_matches_the_cpu_decoder` and its uncompressed twin expand the SAME plan twice
+/// and compare the result, so both of their expansions read the same source bytes. That would
+/// pass just as happily if every texture in a batch read texture zero's bytes - which is the
+/// exact failure mode the batching introduces, because `queue.write_buffer` is not ordered with
+/// the encoder: every write queued before a submit lands before ALL of that submit's commands, so
+/// a scratch buffer shared by two textures would hand the first one the second one's source.
+///
+/// So this expands textures whose contents DIFFER, holds them all in one batch, and checks each
+/// against its own CPU decode. A sub-allocation bug shows up as texture N carrying texture M's
+/// image, which is precisely the kind of defect that reaches a device as "one thing on screen is
+/// wearing another thing's texture" and nothing in a log to say so.
+///
+/// The shapes differ too, so the batch's running offsets are not a multiple of one stride - a
+/// test where every texture is the same size can be passed by an implementation that gets the
+/// alignment wrong.
+#[test]
+fn gpu_expand_batches_several_textures_into_one_submit() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter - skipping");
+        return;
+    };
+    let enc = Transcoder::new(&device);
+    // Distinct shapes AND distinct contents. `seed` is folded into the bytes so no two of these
+    // can be confused for one another, which is the whole point.
+    let shapes: [(u32, u32, u32); 5] =
+        [(0x85, 32, 32), (0x87, 24, 40), (0x85, 64, 16), (0x86, 16, 16), (0x87, 32, 8)];
+    let mut fixtures = Vec::new();
+    for (i, &(base_format, w, h)) in shapes.iter().enumerate() {
+        let tex_type = 3;
+        let ll = vitaslop_runtime::render::level_layout(base_format, tex_type, w, h, 0).unwrap();
+        let mut seed = 0x1000_0000_0000_0001u64.wrapping_mul(i as u64 + 1);
+        let bytes: Vec<u8> = (0..ll.bytes as usize)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        fixtures.push((base_format, w, h, bc_texture(base_format, tex_type, w, h, &bytes)));
+    }
+    // >>> WARM THE SCRATCH FIRST, because a batch cannot span a scratch that has to GROW - the
+    // buffers a pending batch is recorded against cannot be destroyed under it, so `expand_rgba8`
+    // flushes before it re-allocates. The scratch grows to the largest seen in every axis and
+    // then stops, which is why a running title batches: its texture sizes settle within the first
+    // frames of a screen. A test that skipped this would be measuring the first frame after a
+    // resolution change and nothing else.
+    for (_, _, _, tex) in &fixtures {
+        if let Some(plan) = vitaslop_runtime::render::block_source(tex) {
+            let _ = enc.expand_rgba8(&device, &queue, &plan, false, None);
+        }
+    }
+    enc.flush_raw(&queue);
+    // EVERY expansion first, THEN one flush - so all five are in flight together and each one's
+    // source has to have landed in its own range of the shared scratch.
+    let mut got = Vec::new();
+    for (base_format, w, h, tex) in &fixtures {
+        let Some(plan) = vitaslop_runtime::render::block_source(tex) else {
+            panic!("{base_format:#04x} {w}x{h}: the plan was refused");
+        };
+        let Some(t) = enc.expand_rgba8(&device, &queue, &plan, false, None) else {
+            panic!("{base_format:#04x} {w}x{h}: the expansion was refused");
+        };
+        got.push(t);
+    }
+    assert_eq!(
+        enc.raw_batch_pending(),
+        fixtures.len() as u32,
+        "the five expansions did not share a batch, so this test is not testing what it says \
+         it is - it would pass on a per-texture submit"
+    );
+    enc.flush_raw(&queue);
+    for (i, (base_format, w, h, tex)) in fixtures.iter().enumerate() {
+        let (_, _, want) = vitaslop_runtime::render::decode_texture_rgba8(tex);
+        let mine = read_back_rgba8_level(&device, &queue, &got[i], 0, *w, *h);
+        assert_eq!(
+            mine, want,
+            "{base_format:#04x} {w}x{h} (texture {i} of a five-texture batch): the GPU expansion \
+             and the CPU decoder disagree. A batch shares one scratch buffer, so the usual cause \
+             is this texture reading another one's source bytes."
+        );
+    }
 }

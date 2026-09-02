@@ -7,12 +7,13 @@
 //! argument reads and the return write generated. `Ptr` args are guest pointers;
 //! `&mut GuestCtx` is taken only where a handler dereferences one (an out-param).
 
+use crate::host::{GuestCtx, Ptr, VitaState};
 use crate::hostcall;
 
 /// SceUID sceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
 ///                               SceSize size, SceKernelAllocMemBlockOpt *opt)
 #[hostcall]
-pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, _ty: u32, size: u32, _opt: Ptr) -> i32 {
+pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, ty: u32, size: u32, _opt: Ptr) -> i32 {
     // The block's NAME is what the guest calls it, and on the failure path below it is the
     // only thing that says which subsystem asked - worth the read exactly there.
     let named = || {
@@ -24,7 +25,7 @@ pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr,
     };
     // CDRAM aligns to 256 KiB, other blocks to 4 KiB. The guest already rounds
     // size; align the base to match hardware granularity.
-    match st.alloc_memblock(size, 256 * 1024) {
+    match st.alloc_memblock(size, 256 * 1024, ty) {
         0 => {
             // An exhausted arena must be an error the guest can act on. Reporting a live
             // SceUID whose base is 0 is a hollow success: the caller's null check passes,
@@ -99,6 +100,50 @@ pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
     }
 }
 
+/// int sceKernelGetMemBlockInfoByAddr(void *base, SceKernelMemBlockInfo *info)
+///
+/// Describe the block an address falls inside. `SceKernelMemBlockInfo` is
+/// `{ size, mappedBase, mappedSize, memoryType, access, type }`, and its leading `size`
+/// is an IN field: the caller stamps it with the struct version it compiled against
+/// (0x14 before the `type` field existed, 0x18 with it). It is honoured rather than
+/// overwritten with our own idea of the size, so a caller built against the short form
+/// does not get a sixth word written past the end of its struct.
+///
+/// `memoryType` and `access` are DERIVED FROM THE BLOCK'S OWN TYPE WORD, which encodes
+/// both: bits 15..8 are the cacheability (0xD0 normal, 0x80 uncached) and bits 7..4 are
+/// the access rights (R=4, W=2, X=1). Reading them out of the type the guest asked for is
+/// the only construction that cannot contradict the allocation it is describing - e.g.
+/// `..._USER_RW` 0x0C20D060 reports normal/RW, and `..._USER_RW_UNCACHE` 0x0C208060
+/// reports uncached with the same rights.
+#[hostcall]
+pub(super) fn get_mem_block_info_by_addr(ctx: &mut GuestCtx, st: &mut VitaState, base: Ptr, info: Ptr) -> i32 {
+    // Early exits for the two failure cases, which a `#[hostcall]` body cannot have.
+    get_mem_block_info_by_addr_impl(ctx, st, base, info)
+}
+
+fn get_mem_block_info_by_addr_impl(ctx: &mut GuestCtx, st: &mut VitaState, base: Ptr, info: Ptr) -> i32 {
+    let Some((block_base, size, ty)) = st.memblock_info_at(base.addr()) else {
+        return SCE_KERNEL_ERROR_BLOCK_ERROR;
+    };
+    if info.is_null() {
+        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+    }
+    let declared = ctx.read_u32(info.addr());
+    ctx.write_u32(info.addr() + 0x04, block_base);
+    ctx.write_u32(info.addr() + 0x08, size);
+    ctx.write_u32(info.addr() + 0x0c, (ty >> 8) & 0xff);
+    ctx.write_u32(info.addr() + 0x10, (ty >> 4) & 0xf);
+    if declared >= 0x18 {
+        ctx.write_u32(info.addr() + 0x14, ty);
+    }
+    0
+}
+
+/// `SCE_KERNEL_ERROR_BLOCK_ERROR`: the address is in no memory block.
+const SCE_KERNEL_ERROR_BLOCK_ERROR: i32 = 0x8002_D082u32 as i32;
+/// `SCE_KERNEL_ERROR_ILLEGAL_ADDR`: the out-pointer is null.
+const SCE_KERNEL_ERROR_ILLEGAL_ADDR: i32 = 0x8002_0005u32 as i32;
+
 /// SceUID sceKernelFindMemBlockByAddr(const void *addr, SceSize size)
 ///
 /// Resolve an address back to the block it lives in - what a title does when it is
@@ -110,6 +155,6 @@ pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
 pub(super) fn find_mem_block_by_addr(st: &mut VitaState, addr: u32, size: u32) -> i32 {
     match st.memblock_containing(addr, size) {
         Some(uid) => uid,
-        None => 0x8002_D082u32 as i32,
+        None => SCE_KERNEL_ERROR_BLOCK_ERROR,
     }
 }

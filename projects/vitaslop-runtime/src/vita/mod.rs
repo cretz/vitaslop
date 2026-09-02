@@ -128,8 +128,6 @@ fn stub_inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
             | n::SYSTEM_RELEASE
             | n::RACK_RELEASE
             | n::VOICE_RESUME
-            | n::VOICE_SET_FINISHED_CALLBACK
-            | n::VOICE_SET_MODULE_CALLBACK
             | n::VOICE_BYPASS_MODULE
             | n::VOICE_GET_PARAMS_OUT_OF_RANGE
             | n::VOICE_PATCH_SET_VOLUMES_MATRIX
@@ -327,6 +325,23 @@ fn no_inline_lwmutex() -> bool {
 fn no_inline_texture() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_TEXTURE"))
+}
+
+/// Which of the two writers of the context's texture slots reach the host this run, as
+/// `(direct binds, precomputed-state binds)`.
+///
+/// Read by the empty-bindings report, which counts both and must say which half of its own
+/// tally is complete: a report that presents a partial count as a complete one is worse than no
+/// count [[vitaslop-inlined-host-calls-escape-both-watchpoints]].
+///
+/// **The two knobs are NOT interchangeable, and reading them as if they were cost a run.**
+/// `VITASLOP_NO_INLINE_TEXTURE` routes only `sceGxmSetFragmentTexture`; the
+/// `BindPrecomputedState` form stays inlined under it, so a run with that knob set reports
+/// `0 precomputed-state binds` on a title making thousands of them. Only
+/// `VITASLOP_NO_INLINE_IMPORTS` makes both halves complete.
+pub(crate) fn texture_slot_writers_are_host_routed() -> (bool, bool) {
+    let all = no_inline_imports();
+    (all || no_inline_texture(), all)
 }
 
 /// `VITASLOP_NO_INLINE_IMPORTS`: route every host call through the host, even the
@@ -1185,6 +1200,9 @@ pub fn dispatch(
             cont!(gxm::precomputed_draw_set_vertex_stream(ctx, st))
         }
         gxm_nid::PRECOMPUTED_DRAW_SET_PARAMS => cont!(gxm::precomputed_draw_set_params(ctx, st)),
+        gxm_nid::PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED => {
+            cont!(gxm::precomputed_draw_set_params_instanced(ctx, st))
+        }
         gxm_nid::DRAW_PRECOMPUTED => cont!(gxm::draw_precomputed(ctx, st)),
         gxm_nid::GET_PRECOMPUTED_VERTEX_STATE_SIZE => cont!(gxm::get_precomputed_vertex_state_size(ctx, st)),
         gxm_nid::GET_PRECOMPUTED_FRAGMENT_STATE_SIZE => cont!(gxm::get_precomputed_fragment_state_size(ctx, st)),
@@ -1253,6 +1271,7 @@ pub fn dispatch(
         gxm_nid::COLOR_SURFACE_GET_SCALE_MODE => cont!(gxm::color_surface_get_scale_mode(ctx, st)),
         gxm_nid::COLOR_SURFACE_SET_DATA => cont!(gxm::color_surface_set_data(ctx, st)),
         gxm_nid::PROGRAM_GET_TYPE => cont!(gxm::program_get_type(ctx, st)),
+        gxm_nid::PROGRAM_GET_SIZE => cont!(gxm::program_get_size(ctx, st)),
         gxm_nid::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => cont!(gxm::find_parameter_by_semantic(ctx, st)),
         gxm_nid::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => {
             cont!(gxm::render_target_get_driver_mem_block(ctx, st))
@@ -1399,6 +1418,7 @@ pub fn dispatch(
         sm_nid::FREE_MEM_BLOCK => cont!(sysmem::free_mem_block(ctx, st)),
         sm_nid::SET_GPO => cont!(sysmem::set_gpo(ctx, st)),
         sm_nid::FIND_MEM_BLOCK_BY_ADDR => cont!(sysmem::find_mem_block_by_addr(ctx, st)),
+        sm_nid::GET_MEM_BLOCK_INFO_BY_ADDR => cont!(sysmem::get_mem_block_info_by_addr(ctx, st)),
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
@@ -1450,7 +1470,9 @@ pub fn dispatch(
         | ngs_nid::VOICE_DEF_GET_DISTORTION_BUSS
         | ngs_nid::VOICE_DEF_GET_COMPRESSOR_SIDE_CHAIN_BUSS
         | ngs_nid::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE
-        | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE => {
+        | ngs_nid::VOICE_DEF_GET_SCREAM_VOICE
+        | ngs_nid::VOICE_DEF_GET_TEMPLATE1
+        | ngs_nid::VOICE_DEF_GET_ATRAC9_VOICE => {
             // One blob per definition, keyed by the NID this call arrived on - the pointer
             // is the only thing a rack description says about what it is made of.
             let addr = ngs::voice_def_get_for(st, func_nid);
@@ -1465,12 +1487,14 @@ pub fn dispatch(
         ngs_nid::SYSTEM_UPDATE => cont!(ngs::system_update(ctx, st)),
         ngs_nid::VOICE_UNLOCK_PARAMS => cont!(ngs::voice_unlock_params(ctx, st)),
         ngs_nid::VOICE_SET_PARAMS_BLOCK => cont!(ngs::voice_set_params_block(ctx, st)),
+        // The callbacks a streaming title lives by: the player module's buffer-boundary
+        // callback and the voice-finished one. See `ngs::deliver_player_events`.
+        ngs_nid::VOICE_SET_MODULE_CALLBACK => cont!(ngs::voice_set_module_callback(ctx, st)),
+        ngs_nid::VOICE_SET_FINISHED_CALLBACK => cont!(ngs::voice_set_finished_callback(ctx, st)),
         ngs_nid::SYSTEM_SET_FLAGS
         | ngs_nid::SYSTEM_RELEASE
         | ngs_nid::RACK_RELEASE
         | ngs_nid::VOICE_RESUME
-        | ngs_nid::VOICE_SET_FINISHED_CALLBACK
-        | ngs_nid::VOICE_SET_MODULE_CALLBACK
         | ngs_nid::VOICE_BYPASS_MODULE
         | ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE
         | ngs_nid::PATCH_GET_INFO
@@ -1618,7 +1642,16 @@ pub fn dispatch(
         // level, so a deadband and a tilt correction change nothing about what
         // `sceMotionGetState` reports - but they are accepted, because refusing them
         // would fail a title's sensor setup for a setting that cannot matter here.
-        sv_nid::MOTION_SET_DEADBAND | sv_nid::MOTION_SET_TILT_CORRECTION => cont!(gxm::ok(ctx)),
+        // ...and they are HELD, because each has a getter that reads it back.
+        sv_nid::MOTION_SET_DEADBAND => cont!(services::motion_set_tuning(ctx, st, false)),
+        sv_nid::MOTION_SET_TILT_CORRECTION => cont!(services::motion_set_tuning(ctx, st, true)),
+        sv_nid::MOTION_GET_DEADBAND => cont!(services::motion_get_tuning(ctx, st, false)),
+        sv_nid::MOTION_GET_TILT_CORRECTION => cont!(services::motion_get_tuning(ctx, st, true)),
+        sv_nid::MOTION_ROTATE_YAW => cont!(services::motion_rotate_yaw(ctx, st)),
+        sv_nid::RTC_GET_DAY_OF_WEEK => cont!(services::rtc_get_day_of_week(ctx, st)),
+        sv_nid::RTC_FORMAT_RFC3339_LOCAL_TIME => {
+            cont!(services::rtc_format_rfc3339_local_time(ctx, st))
+        }
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
         sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
@@ -1655,6 +1688,12 @@ pub fn dispatch(
             cont!(services::netctl_adhoc_get_peer_list(ctx, st))
         }
         sv_nid::NETCTL_ADHOC_DISCONNECT => cont!(services::netctl_adhoc_disconnect(ctx, st)),
+        sv_nid::ADHOC_MATCHING_INIT => cont!(net::adhoc_matching_init(ctx, st)),
+        sv_nid::ADHOC_MATCHING_CREATE => cont!(net::adhoc_matching_create(ctx, st)),
+        sv_nid::ADHOC_MATCHING_START => cont!(net::adhoc_matching_set_started(ctx, st, true)),
+        sv_nid::ADHOC_MATCHING_STOP => cont!(net::adhoc_matching_set_started(ctx, st, false)),
+        sv_nid::ADHOC_MATCHING_DELETE => cont!(net::adhoc_matching_delete(ctx, st)),
+        sv_nid::ADHOC_MATCHING_SELECT_TARGET => cont!(net::adhoc_matching_select_target(ctx, st)),
         sv_nid::MP4_OPEN_FILE => cont!(video::mp4_open_file(ctx, st)),
         sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
         sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
@@ -1799,6 +1838,8 @@ pub fn dispatch(
         sv_nid::LOCATION_INIT => cont!(location::init(ctx, st)),
         sv_nid::LOCATION_TERM => cont!(location::term(ctx, st)),
         sv_nid::LOCATION_SET_THREAD_PARAMETER => cont!(location::set_thread_parameter(ctx, st)),
+        sv_nid::TOUCH_SET_SAMPLING_STATE => cont!(touch::set_sampling_state(ctx, st)),
+        sv_nid::TOUCH_GET_SAMPLING_STATE => cont!(touch::get_sampling_state(ctx, st)),
         sv_nid::TOUCH_READ => cont!(touch::read(ctx, st)),
         sv_nid::TOUCH_PEEK => cont!(touch::peek(ctx, st)),
         sv_nid::TOUCH_GET_PANEL_INFO => cont!(touch::get_panel_info(ctx, st)),
@@ -1816,7 +1857,36 @@ pub fn dispatch(
         | sv_nid::NP_TUS_CREATE_REQUEST
         | sv_nid::NP_COMMERCE2_START_EMPTY_STORE_CHECK
         | sv_nid::NP_COMMERCE2_CREATE_SESSION_GET_RESULT
-        | sv_nid::NP_SCORE_CREATE_TITLE_CTX => {
+        | sv_nid::NP_SCORE_CREATE_TITLE_CTX
+        // SceNpMatching2, the lobby/room surface, and SceNpScore's request surface. Both
+        // families hang off a context that has to be created against a live service, and
+        // BOTH of those creations already report signed out here - so every call below is
+        // reached either with no context at all or with one the title only thinks it has.
+        // Reporting the same signed-out cause is what tells it which, where a per-call
+        // "bad id" would read as a retryable mistake in its own bookkeeping.
+        //
+        // The teardown calls are NOT in this group: see the success group below for why
+        // destroying something that was never created still succeeds.
+        | sv_nid::NP_MATCHING2_CREATE_CONTEXT
+        | sv_nid::NP_MATCHING2_CONTEXT_START
+        | sv_nid::NP_MATCHING2_REGISTER_CONTEXT_CALLBACK
+        | sv_nid::NP_MATCHING2_REGISTER_ROOM_EVENT_CALLBACK
+        | sv_nid::NP_MATCHING2_REGISTER_ROOM_MESSAGE_CALLBACK
+        | sv_nid::NP_MATCHING2_SET_DEFAULT_REQUEST_OPT_PARAM
+        | sv_nid::NP_MATCHING2_GET_SERVER_LOCAL
+        | sv_nid::NP_MATCHING2_GET_WORLD_INFO_LIST
+        | sv_nid::NP_MATCHING2_SEARCH_ROOM
+        | sv_nid::NP_MATCHING2_CREATE_JOIN_ROOM
+        | sv_nid::NP_MATCHING2_JOIN_ROOM
+        | sv_nid::NP_MATCHING2_SEND_ROOM_MESSAGE
+        | sv_nid::NP_SCORE_CREATE_REQUEST
+        | sv_nid::NP_SCORE_RECORD_SCORE
+        | sv_nid::NP_SCORE_RECORD_SCORE_ASYNC
+        | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE
+        | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC
+        // The async poll: no request was ever accepted, so there is no operation whose
+        // completion this could report.
+        | sv_nid::NP_SCORE_POLL_ASYNC => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
         // Everything else here is an init/register that simply succeeds offline.
@@ -1842,7 +1912,26 @@ pub fn dispatch(
         | sv_nid::NP_SCORE_TERM
         // The requested module is already linked into the image, so a load succeeds.
         | sv_nid::SYSMODULE_LOAD_MODULE
-        | sv_nid::TOUCH_SET_SAMPLING_STATE
+        // SceAppMgr: claim the shared background-music port. On the console this
+        // arbitrates against the system's own music player; nothing else is playing
+        // here, so the claim is granted. `sceAudioOut` opening a BGM-type port is what
+        // actually produces sound (see `vita::audio`), and that is independent of this.
+        | sv_nid::APPMGR_ACQUIRE_BGM_PORT
+        // ScePerf/Razor: a marker packet for the CPU profiler's timeline. No profiler is
+        // attached and there is no capture buffer to append to, so the packet has nowhere
+        // to go - which is exactly the retail case the call is written to survive.
+        | sv_nid::RAZOR_CPU_WRITE_FIBER_ULT_PKT
+        // SceUlobjDbg: the ULT runtime announcing its objects to a debugger, and taking
+        // the announcement back. READ OFF THE TWO CALL SITES, which are the only ones in
+        // any module here: `libult.suprx` calls the first at the end of building its
+        // object array (`f(pool, 1, pool+0x38)`) and the second on teardown, one argument,
+        // an object handle read from `[obj+0x38]`. BOTH DISCARD THE RESULT - the register
+        // site's `r0` is overwritten by the next instruction and so is the unregister's -
+        // so the call cannot be observed to fail, and with no debugger attached there is
+        // no object table to announce into. That makes this a genuine nothing-to-do, not a
+        // skipped step: the same position as the Razor packet above.
+        | sv_nid::ULOBJ_DBG_REGISTER
+        | sv_nid::ULOBJ_DBG_UNREGISTER
         | sv_nid::TOUCH_ENABLE_TOUCH_FORCE
         // SceScreenShot: nothing to capture off-console.
         | sv_nid::SCREENSHOT_DISABLE
@@ -1863,6 +1952,14 @@ pub fn dispatch(
         | sv_nid::NP_MESSAGE_INIT_WITH_PARAM
         | sv_nid::NP_MESSAGE_TERM
         | sv_nid::NP_MATCHING2_INIT
+        // Matching2 / NpScore TEARDOWN, for the same reason the rest of the online stack's
+        // teardown succeeds: nothing was created, so there is nothing that can fail to be
+        // released, and a title unwinding after its offline path found no service must not
+        // be handed an error on the way out.
+        | sv_nid::NP_MATCHING2_DESTROY_CONTEXT
+        | sv_nid::NP_MATCHING2_CONTEXT_STOP
+        | sv_nid::NP_MATCHING2_ABORT_CONTEXT_START
+        | sv_nid::NP_SCORE_DELETE_REQUEST
         // Online-stack TEARDOWN. A title that finds itself offline unwinds the whole
         // stack it brought up; terminating a subsystem with no backing service, and
         // unregistering a callback that never fired, genuinely succeed.
@@ -2090,8 +2187,6 @@ mod frame_boundary_tests {
             ngs_nid::SYSTEM_RELEASE,
             ngs_nid::RACK_RELEASE,
             ngs_nid::VOICE_RESUME,
-            ngs_nid::VOICE_SET_FINISHED_CALLBACK,
-            ngs_nid::VOICE_SET_MODULE_CALLBACK,
             ngs_nid::VOICE_BYPASS_MODULE,
             ngs_nid::VOICE_GET_PARAMS_OUT_OF_RANGE,
             ngs_nid::VOICE_PATCH_SET_VOLUMES_MATRIX,

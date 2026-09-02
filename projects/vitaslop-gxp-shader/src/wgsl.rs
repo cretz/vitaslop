@@ -301,6 +301,12 @@ pub enum Prec {
 impl Prec {
     /// The precision an instruction WRITES its destination at (`half_precision`).
     fn of(instr: &Instr) -> Prec {
+        // The normalized U8 convert writes PACKED BYTES when that is the direction it runs
+        // in - four channels in one register, not one float per lane. `half_precision`
+        // cannot say so: it describes a float destination, and here there is not one.
+        if let Op::PackUnorm8 { to_unorm8: true, .. } | Op::CopyFx8 = instr.op {
+            return Prec::Fx8;
+        }
         Prec::from_half(instr.half_precision)
     }
 
@@ -311,6 +317,10 @@ impl Prec {
     /// value. (A texture sample also carries independent coordinate/result precisions, but it
     /// gets them from its own decoded fields - see [`emit_tex`].)
     fn src_of(instr: &Instr) -> Prec {
+        // ...and it READS packed bytes in the other direction, for the same reason.
+        if let Op::PackUnorm8 { to_unorm8: false, .. } | Op::CopyFx8 = instr.op {
+            return Prec::Fx8;
+        }
         Prec::from_half(instr.source_half_precision())
     }
 
@@ -1344,8 +1354,13 @@ fn emit_instr(
         Op::Rsq => emit_unary(s, instr, dest, mask, &|a| format!("inverseSqrt({a})")).ok_or_else(unmapped),
         Op::Log => emit_unary(s, instr, dest, mask, &|a| format!("log2({a})")).ok_or_else(unmapped),
         Op::Exp => emit_unary(s, instr, dest, mask, &|a| format!("exp2({a})")).ok_or_else(unmapped),
-        // A move and a float<->float pack are both swizzled copies in the f32 register model.
-        Op::Mov | Op::Pack { .. } => {
+        // A move and a float<->float pack are both swizzled copies in the f32 register model,
+        // and so is the NORMALIZED U8 convert: the byte<->float scaling is not written here,
+        // it is what `Prec::Fx8`'s own read and store already do (`unpack4x8unorm` one way,
+        // a rounded `clamp(v,0,1)*255` byte insert the other). `Prec::of`/`src_of` put that
+        // precision on whichever side the conversion runs into, so the copy is the whole
+        // instruction.
+        Op::Mov | Op::Pack { .. } | Op::PackUnorm8 { .. } | Op::CopyFx8 => {
             emit_unary(s, instr, dest, mask, &|a| a.to_string()).ok_or_else(unmapped)
         }
         Op::Cmov { test } => emit_cmov(s, instr, dest, mask, test).ok_or_else(unmapped),

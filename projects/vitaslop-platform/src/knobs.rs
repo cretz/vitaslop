@@ -527,3 +527,76 @@ mod tests {
         set_override("VITASLOP_NOT_ROUTED_ANYWHERE", "1");
     }
 }
+
+/// >>> HOW MUCH MEMORY THE MACHINE THIS IS RUNNING ON ACTUALLY HAS, AND WHAT THE CACHES DO
+/// >>> ABOUT IT.
+///
+/// # The problem this exists for, in the user's own words
+/// "My whole phone feels sluggish", "my phone angry as a whole" - said across three separate
+/// sessions about the target device, a phone, while every cache budget in this project was an
+/// absolute constant fitted on a desktop:
+/// ```text
+///   texture snapshots (guest bytes)   192 MB
+///   decode cache (RGBA8)              256 MB
+///   vertex + index snapshots           64 MB each
+///   GPU texture views                 477 MB   (the CONSOLE's own resident ceiling)
+/// ```
+/// Close to a gigabyte of caching before the guest's own memory, the wasm heap (measured at
+/// 438 MB and never returned to the OS) or the render targets. MEASURED here on a 48,000-frame
+/// session: a browser renderer process at **1.53 GB**. Nothing anywhere read a single property
+/// of the device.
+///
+/// # Why it could not be fixed before, and can be now
+/// Lowering these budgets used to make things WORSE, because every one of these caches dropped
+/// EVERYTHING at its cap: a smaller budget bought more cliffs rather than less memory pressure.
+/// They evict per entry now, oldest-first, so a smaller budget costs proportionally more
+/// re-decode of the COLDEST entries instead of a full rebuild of the working set.
+///
+/// # The scale, and why a desktop cannot move
+/// `navigator.deviceMemory` is capped at 8 by its own specification, so every desktop and most
+/// tablets report exactly 8 and get a scale of 1.0 - the budgets they have today, unchanged, by
+/// construction. A 4 GB phone gets 0.5 and a 2 GB one 0.25, which is the floor: below that the
+/// caches stop being able to hold a frame's working set, and a cache that cannot hold one frame
+/// re-decodes inside the frame, which is the failure the floors on the individual budgets exist
+/// to prevent.
+///
+/// Unknown (nothing called the setter - the desktop and the headless oracle) is 1.0, so those
+/// paths are exactly what they were.
+static DEVICE_MEMORY_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record what the host says this device has, in gigabytes. Called once by the frontend at
+/// startup, BEFORE the first frame - the budgets read the scale on every call rather than
+/// caching it, so a late call is merely late rather than ignored.
+pub fn set_device_memory_gb(gb: f64) {
+    if !(gb > 0.0) {
+        return;
+    }
+    let tenths = (gb * 10.0).round().clamp(1.0, 2550.0) as u32;
+    DEVICE_MEMORY_TENTHS.store(tenths, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What every memory budget in this project is multiplied by. `1.0` when the device is a
+/// desktop, is unknown, or reports the specification's 8 GB cap.
+pub fn memory_scale() -> f64 {
+    let tenths = DEVICE_MEMORY_TENTHS.load(std::sync::atomic::Ordering::Relaxed);
+    if tenths == 0 {
+        return 1.0;
+    }
+    ((tenths as f64 / 10.0) / 8.0).clamp(0.25, 1.0)
+}
+
+/// The device memory that was reported, for the diagnostics panel. `None` when nothing set it.
+pub fn device_memory_gb() -> Option<f64> {
+    let tenths = DEVICE_MEMORY_TENTHS.load(std::sync::atomic::Ordering::Relaxed);
+    (tenths != 0).then(|| tenths as f64 / 10.0)
+}
+
+/// Apply [`memory_scale`] to a byte budget. Kept as one function so every budget scales the same
+/// way and a reader can find them all from here.
+pub fn scale_budget(bytes: usize) -> usize {
+    let scale = memory_scale();
+    if scale >= 1.0 {
+        return bytes;
+    }
+    ((bytes as f64) * scale) as usize
+}

@@ -63,6 +63,14 @@ const MAX_SCRATCH_BYTES: u64 = 96 << 20;
 /// path: the picture is never the variable, the cost is.
 const RAW_SCRATCH_BUDGET: u64 = 24 << 20;
 
+/// How much of [`RAW_SCRATCH_BUDGET`] the source buffer claims so that several expansions can
+/// share one submit - see [`RawBatch`]. Taken out of the same total, never added to it, and
+/// reduced to whatever is actually spare after the two buffers sized by the largest texture.
+///
+/// 8 MiB holds around sixty of a title's block textures at once (a 512x512 BC1 source is 128 KiB),
+/// which turns a load frame's 136 submits into a handful.
+const RAW_BATCH_SRC_WINDOW: u64 = 8 << 20;
+
 /// The compute pipelines, built once per device.
 pub struct Transcoder {
     layout: wgpu::BindGroupLayout,
@@ -75,6 +83,10 @@ pub struct Transcoder {
     yuv_scratch: std::cell::RefCell<Option<YuvScratch>>,
     /// The buffers the RGBA8 expansion reuses across textures - see [`RawScratch`].
     raw_scratch: std::cell::RefCell<Option<RawScratch>>,
+    /// >>> THE EXPANSIONS RECORDED SO FAR THIS FRAME, WAITING FOR ONE `queue.submit`.
+    ///
+    /// See [`RawBatch`] and [`Transcoder::flush_raw`]. `None` means nothing is pending.
+    raw_batch: std::cell::RefCell<Option<RawBatch>>,
     decode_pvrtc: wgpu::ComputePipeline,
     decode_bc: wgpu::ComputePipeline,
     /// The UNCOMPRESSED path: a Morton un-swizzle plus a channel permutation, which is the
@@ -167,10 +179,54 @@ struct RawScratch {
     bind: wgpu::BindGroup,
 }
 
+/// >>> ONE COMMAND BUFFER FOR ALL OF A FRAME'S EXPANSIONS, INSTEAD OF ONE PER TEXTURE.
+///
+/// # The measurement this exists for
+/// `expand_rgba8` used to build its own encoder and `queue.submit` it before returning, so a
+/// load frame with 136 block textures paid 136 command-buffer flushes. MEASURED on this desktop,
+/// three runs of each arm: the frames that path is FOR came out ~12-15% SLOWER with the GPU
+/// expansion than with the CPU decode it replaces, while the CPU decode it removed was real and
+/// large (`texture decode by format` 270.9 -> 175.0 MB). A submit is the one cost in that loop
+/// that scales with the number of textures rather than with their size.
+///
+/// # Why the scratch has to be sub-allocated for this, and only in two of its four buffers
+/// `queue.write_buffer` is not ordered with the encoder: every write queued before a submit
+/// lands before ALL of that submit's commands. So the two buffers the CPU WRITES - the guest's
+/// source bytes and the parameter slots - must occupy disjoint ranges per texture, or the second
+/// texture's bytes would overwrite the first's before the first's dispatch ever ran.
+///
+/// The two the GPU writes - `rgba` and `out` - need no such thing, and that is not luck: commands
+/// within a command buffer execute in order with the implicit barriers WebGPU defines, so
+/// texture A's `copyBufferToTexture` provably reads `out` before texture B's pass writes it.
+/// Giving those a per-texture range as well would have multiplied the scratch by the batch size
+/// for no reason.
+///
+/// # The one rule the caller owes
+/// A batch must be submitted before the frame's own encoder is. The renderer flushes at the end
+/// of `encode_chain`, which is before its caller submits; a leftover batch found at the START of
+/// a frame is therefore a missed flush and is reported as one - it would mean the previous frame
+/// sampled textures nothing had written yet.
+struct RawBatch {
+    enc: wgpu::CommandEncoder,
+    /// Bytes of `scratch.src` already claimed by this batch.
+    src_used: u64,
+    /// Bytes of `scratch.params` already claimed.
+    param_used: u64,
+    /// Textures recorded, for the counter.
+    textures: u32,
+}
+
 impl RawScratch {
-    /// Bytes of parameter slots: two dispatches per level, and a chain is at most 14 levels
-    /// (a 8192-texel side). Fixed rather than grown - it is a few kilobytes.
-    const PARAM_BYTES: u64 = UNIFORM_SLOT * 32;
+    /// Bytes of parameter slots. Two dispatches per level and a chain is at most 14 levels (an
+    /// 8192-texel side), so ONE texture needs at most 28 slots.
+    ///
+    /// Sized for a BATCH of them rather than for one - see [`RawBatch`]: this is the buffer that
+    /// otherwise limits how many expansions can share a submit, and at 256 bytes a slot the
+    /// whole thing is a quarter of a megabyte.
+    const PARAM_BYTES: u64 = UNIFORM_SLOT * 1024;
+    /// The most slots one texture can claim, which is what a batch has to have room for before
+    /// it will accept another.
+    const PARAM_SLOTS_PER_TEXTURE: u64 = 32;
 
     fn new(
         device: &wgpu::Device,
@@ -333,7 +389,245 @@ fn align_up(v: u32, to: u32) -> u32 {
     v.div_ceil(to) * to
 }
 
+/// The same, in the 64-bit offsets a buffer sub-allocation is measured in.
+fn align_up64(v: u64, to: u64) -> u64 {
+    v.div_ceil(to) * to
+}
+
+/// How many textures the RGBA8 expansion has batched into one submit, and how many submits it
+/// has taken - the pair that says whether the batching is working, since neither number means
+/// anything without the other.
+static RAW_BATCH_FLUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RAW_BATCH_TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// >>> THE LARGEST BATCH EVER SUBMITTED, AND THE SUBMITS THAT CARRIED MORE THAN ONE TEXTURE.
+///
+/// # A RATIO OF ~1.0 IS NOT EVIDENCE THAT THE BATCHING IS BROKEN, AND IT WAS READ AS SOME
+/// A device dump read `354 expansions in 331 submits` and was written down as "1.07 textures a
+/// submit, i.e. exactly the per-texture submit `RawBatch` exists to remove". That conclusion
+/// does not follow. This renderer expands about a TENTH of a texture per frame in a steady
+/// window, so almost every frame that expands anything expands exactly one - and one texture
+/// in one submit is not a batching failure, it is a frame with nothing to batch. The two
+/// readings are told apart only by the DISTRIBUTION, never by the mean
+/// [[vitaslop-a-range-is-not-a-distribution]]:
+///
+///   * `most 1` with a load frame in the window -> a batch that never accepted a second
+///     texture, which IS the defect. Look at `RAW_BATCH_WINDOW_ONE` first, then at the flush
+///     sites.
+///   * `most 40, multi 6` -> the batching is doing exactly its job on the load frames it was
+///     written for, and the steady-state ratio near 1.0 is the arithmetic of a title that
+///     expands one texture at a time.
+static RAW_BATCH_MOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RAW_BATCH_MULTI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// >>> TIMES THE BATCH WINDOW WAS SIZED FOR A SINGLE TEXTURE, so no second one could join.
+///
+/// See the `want_src` computation in [`Transcoder::expand_rgba8`]: the source window is
+/// whatever is SPARE under [`RAW_SCRATCH_BUDGET`] once `rgba` and `out` have been sized by the
+/// largest texture of the session. Those two are kept at their high-water mark and never shrink,
+/// so ONE large texture can spend the whole budget and leave the batch window at exactly the
+/// size of the texture in front of it - permanently, for the rest of the run.
+///
+/// On the target phone that is not hypothetical: a 12 MB decoded texture appears in the working
+/// set, and `rgba + out` for one of those is the entire 24 MB. Nothing reported it, because from
+/// the outside a collapsed window looks precisely like a title that expands one texture a frame.
+static RAW_BATCH_WINDOW_ONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// >>> WHY THE LAST `expand_rgba8` DECLINED, so the refusal report can say more than THAT
+    /// >>> it declined.
+    ///
+    /// Eight separate conditions in that function return `None`, and they are not variations on
+    /// one theme: "this texture is bigger than the whole scratch budget" is a device limit worth
+    /// acting on, "a source level runs past the captured bytes" is a short snapshot and correct
+    /// behaviour, and "the chain needs more parameter slots than one texture may claim" is a
+    /// constant in this file that could simply be raised. The report named the guest FORMAT and
+    /// nothing else, so on the target phone `0x0c` - the largest single texture family in the
+    /// run, 15.7 MB in one frame's working set - was known to be taking the CPU decode with no
+    /// way to tell which of the eight sent it there.
+    ///
+    /// A thread local rather than a global: the caller reads it immediately after the `None`
+    /// comes back, on the same thread, so it is exact without a lock.
+    static LAST_RAW_REFUSAL: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("unrecorded") };
+}
+
+/// Why the last RGBA8 expansion on this thread declined. See [`LAST_RAW_REFUSAL`].
+pub fn last_raw_refusal() -> &'static str {
+    LAST_RAW_REFUSAL.with(|c| c.get())
+}
+
+/// >>> HOW BIG THE SHARED SOURCE BUFFER SHOULD BE for a texture needing `need_src` bytes, given
+/// the size it has already grown to (`s0`) and what the RGBA and output buffers will claim.
+///
+/// Three rules, in this order:
+///
+///   1. never smaller than this texture's own source, or the expansion cannot run at all;
+///   2. never smaller than it already is, so a small texture after a large one does not
+///      re-allocate the buffer down and then straight back up;
+///   3. as much of [`RAW_BATCH_SRC_WINDOW`] as is SPARE under [`RAW_SCRATCH_BUDGET`], which is
+///      what lets several expansions share one submit - see [`RawBatch`].
+///
+/// # >>> THERE IS A REAL DEFECT HERE AND THE OBVIOUS FIX MOVES THE PICTURE. DO NOT RE-APPLY IT.
+///
+/// The defect: rules 1 and 2 can between them ask for more than the budget has left, and the
+/// caller's response to a total over budget is to REFUSE the texture to the CPU decode. So a
+/// title that loads a batch of small textures first - growing `s0` to the full 8 MiB window -
+/// can then have a large one declined for room the BATCH WINDOW is holding, while the same
+/// texture arriving first would have been accepted. Which textures take the GPU path therefore
+/// depends on the order a title happens to load its art in.
+///
+/// The obvious fix is one line: the window is only an optimisation, so cut it back to whatever
+/// is spare (down to rule 1's floor) before refusing anything -
+/// `if want + want_rgba + want_out > BUDGET { return need_src.max(room) }`.
+///
+/// **It was written, and the pixel oracle refused it.** Frame-pinned headless replay of the golf
+/// recipe, 4,700 frames, 12 shots:
+///
+/// ```text
+///   with the clamp    vs baseline:  9 identical, 3 DIFFER  (mean abs 0.29-0.75, p99.9 66-111,
+///                                                           0.2-0.55% of pixels off by >32)
+///   without the clamp vs baseline: 12 identical, 0 differ
+///   baseline vs a second baseline run: 12 identical  <- the control, so the machine is not the
+///                                                       explanation [[vitaslop-browser-ab-needs-a-negative-control]]
+/// ```
+///
+/// So the clamp changes what the player sees, and moving MORE textures onto the GPU expansion is
+/// the only thing it does. Two mechanisms fit and this evidence does not separate them:
+///
+///   1. the GPU expansion and the CPU decode do not agree bit-for-bit on some texture, despite
+///      this file's claim that the expansion is a pure permutation and cannot differ; or
+///   2. a SMALLER source window is itself the bug - a texture landing at a wrong offset in a
+///      scratch that now flushes mid-batch - in which case the existing batch is fine and only
+///      the shrunk one is wrong.
+///
+/// A 0.2% pixel population moving a lot, rather than everything moving a little, looks more like
+/// (2) than (1). **The experiment that separates them:** force a tiny `RAW_BATCH_SRC_WINDOW` in
+/// the GPU-vs-CPU test in `vitaslop-native/tests/gpu_texenc.rs` (which already reads back and
+/// compares against the CPU decoder). If the pixels still match, (2) is refuted and the mismatch
+/// is a decoder disagreement worth its own session; if they differ, the bug is the shrink.
+///
+/// Until that is answered this function is the PRE-EXISTING arithmetic exactly, and the tests
+/// below pin the three rules rather than the fix. [[vitaslop-never-trade-quality]]
+fn source_window(need_src: u64, s0: u64, want_rgba: u64, want_out: u64) -> u64 {
+    let room = RAW_SCRATCH_BUDGET.saturating_sub(want_rgba + want_out);
+    need_src.max(s0).max(RAW_BATCH_SRC_WINDOW.min(room))
+}
+
+#[cfg(test)]
+mod source_window_tests {
+    use super::{source_window, RAW_BATCH_SRC_WINDOW, RAW_SCRATCH_BUDGET};
+
+    /// A texture whose own buffers leave plenty spare gets the whole batch window, so several
+    /// expansions share a submit.
+    #[test]
+    fn a_small_texture_gets_the_whole_batch_window() {
+        let (rgba, out) = (2 << 20, 2 << 20);
+        assert_eq!(source_window(256 << 10, 0, rgba, out), RAW_BATCH_SRC_WINDOW);
+    }
+
+    /// The window never shrinks under a title whose texture sizes wobble - rule 2.
+    #[test]
+    fn the_window_does_not_shrink_for_a_smaller_texture() {
+        let (rgba, out) = (1 << 20, 1 << 20);
+        let grown = source_window(4 << 20, RAW_BATCH_SRC_WINDOW, rgba, out);
+        assert_eq!(grown, RAW_BATCH_SRC_WINDOW, "a later small texture pulled the window down");
+    }
+
+    /// >>> THE KNOWN DEFECT, PINNED AS IT CURRENTLY BEHAVES - see `source_window`.
+    ///
+    /// A texture that would fit on its own is still refused to the CPU decode when the batch
+    /// window has already grown, so which path a texture takes depends on LOAD ORDER. This test
+    /// asserts the defect rather than the fix, deliberately: the one-line fix moves three frames
+    /// of the pixel oracle and is not to be re-applied until that is understood.
+    ///
+    /// **If this test starts failing, the fix has been re-applied.** Read `source_window` before
+    /// deciding that is a good thing, and re-run the oracle either way.
+    #[test]
+    fn a_grown_window_still_costs_a_large_texture_its_gpu_path() {
+        // A compressed source: small bytes in, a large RGBA chain out - which is exactly the
+        // family (BC on an adapter with no BC) this path exists for.
+        let need_src = 1 << 20;
+        let want_rgba = 10 << 20;
+        let want_out = 11 << 20;
+        assert!(
+            need_src + want_rgba + want_out <= RAW_SCRATCH_BUDGET,
+            "the fixture itself must fit on its own, or it is describing the wrong refusal"
+        );
+
+        let first = source_window(need_src, 0, want_rgba, want_out);
+        let after = source_window(need_src, RAW_BATCH_SRC_WINDOW, want_rgba, want_out);
+
+        assert!(
+            first + want_rgba + want_out <= RAW_SCRATCH_BUDGET,
+            "arriving first, this texture fits and takes the GPU path"
+        );
+        assert!(
+            after + want_rgba + want_out > RAW_SCRATCH_BUDGET,
+            "arriving after the window grew, the caller refuses it to the CPU - the documented \
+             defect. If this no longer holds, source_window has been changed"
+        );
+    }
+}
+
+/// `(submits, textures)` for the report line.
+pub fn raw_batch_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (RAW_BATCH_FLUSHES.load(Relaxed), RAW_BATCH_TEXTURES.load(Relaxed))
+}
+
+/// `(largest batch, submits carrying more than one, times the window held only one texture)` -
+/// the three numbers that make [`raw_batch_counts`] readable. See [`RAW_BATCH_MOST`].
+pub fn raw_batch_shape() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        RAW_BATCH_MOST.load(Relaxed),
+        RAW_BATCH_MULTI.load(Relaxed),
+        RAW_BATCH_WINDOW_ONE.load(Relaxed),
+    )
+}
+
 impl Transcoder {
+    /// >>> SUBMIT EVERY EXPANSION RECORDED SINCE THE LAST FLUSH.
+    ///
+    /// **The caller owes this before it submits its own frame.** Every texture `expand_rgba8`
+    /// hands back is written by commands sitting in this batch, so a frame that samples one
+    /// without flushing first samples whatever was in that GPU texture before - which for a
+    /// reused texture is the PREVIOUS contents and for a fresh one is undefined. The renderer
+    /// calls it at the end of `encode_chain`, which is before its own caller submits, and
+    /// reports a batch still pending at the START of a frame as the missed flush it would be.
+    ///
+    /// Returns how many textures were in the batch; zero when there was nothing pending, which
+    /// is the common case for a frame that uploaded nothing.
+    pub fn flush_raw(&self, queue: &wgpu::Queue) -> u32 {
+        self.flush_raw_locked(queue)
+    }
+
+    /// The body of [`Self::flush_raw`], named for what it must NOT do: it touches `raw_batch`
+    /// only, never `raw_scratch`, so it is safe to call from inside `expand_rgba8` where the
+    /// scratch is already borrowed.
+    fn flush_raw_locked(&self, queue: &wgpu::Queue) -> u32 {
+        let Some(batch) = self.raw_batch.borrow_mut().take() else {
+            return 0;
+        };
+        let n = batch.textures;
+        queue.submit([batch.enc.finish()]);
+        use std::sync::atomic::Ordering::Relaxed;
+        RAW_BATCH_FLUSHES.fetch_add(1, Relaxed);
+        RAW_BATCH_TEXTURES.fetch_add(n as u64, Relaxed);
+        // The shape, not just the total - see `RAW_BATCH_MOST` for why the mean cannot be read
+        // without these.
+        RAW_BATCH_MOST.fetch_max(n as u64, Relaxed);
+        if n > 1 {
+            RAW_BATCH_MULTI.fetch_add(1, Relaxed);
+        }
+        n
+    }
+
+    /// Whether anything is waiting for a submit - for the renderer's start-of-frame check that
+    /// the previous frame did flush.
+    pub fn raw_batch_pending(&self) -> u32 {
+        self.raw_batch.borrow().as_ref().map_or(0, |b| b.textures)
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("texenc"),
@@ -418,6 +712,7 @@ impl Transcoder {
             yuv_to_texture,
             yuv_scratch: std::cell::RefCell::new(None),
             raw_scratch: std::cell::RefCell::new(None),
+            raw_batch: std::cell::RefCell::new(None),
             decode_pvrtc: make("decode_pvrtc"),
             decode_bc: make("decode_bc"),
             decode_raw: make("decode_raw"),
@@ -844,15 +1139,19 @@ impl Transcoder {
         // megabytes per second, and it ends as a device with nothing left, where even a 48-byte
         // `createBuffer` fails and the worker dies with no frame of its own to blame.
         let mut spare = into;
-        let mut give_up = |spare: Option<wgpu::Texture>| {
+        // >>> EVERY REFUSAL NAMES ITS OWN RULE. See `LAST_RAW_REFUSAL`: eight different
+        // conditions return `None` here and the caller's report could say only THAT one had,
+        // which for the largest texture family on the target device is half an instrument.
+        let mut give_up = |spare: Option<wgpu::Texture>, why: &'static str| {
             if let Some(t) = spare {
                 t.destroy();
             }
+            LAST_RAW_REFUSAL.with(|c| c.set(why));
             None::<wgpu::Texture>
         };
         let (w0, h0) = (plan.width.max(1), plan.height.max(1));
         if plan.src_levels.is_empty() || plan.levels == 0 {
-            return give_up(spare);
+            return give_up(spare, "the plan carried no source levels");
         }
         let mut levels: Vec<RgbaLevel> = Vec::with_capacity(plan.levels as usize);
         let (mut rgba_word, mut out_byte) = (0u32, 0u32);
@@ -863,12 +1162,12 @@ impl Transcoder {
             levels.push(RgbaLevel { width, height, rgba_word, out_byte, out_row_bytes });
             let Some(rw) = rgba_word.checked_add(width.checked_mul(height).unwrap_or(u32::MAX))
             else {
-                return give_up(spare);
+                return give_up(spare, "the RGBA mip chain overflowed 32 bits of texels");
             };
             let Some(ob) =
                 out_byte.checked_add(out_row_bytes.checked_mul(height).unwrap_or(u32::MAX))
             else {
-                return give_up(spare);
+                return give_up(spare, "the aligned output chain overflowed 32 bits of bytes");
             };
             rgba_word = rw;
             out_byte = ob;
@@ -877,22 +1176,37 @@ impl Transcoder {
         // `RAW_SCRATCH_BUDGET`. Checked here so an oversized texture is refused before any
         // buffer is sized for it.
         if (rgba_word as u64) * 4 > RAW_SCRATCH_BUDGET {
-            return give_up(spare);
+            return give_up(spare, "one texture's RGBA chain alone exceeds the scratch budget");
         }
         // Every guest level must be fully inside the bytes we were given, or a dispatch would
         // address past the buffer. A short snapshot is a legitimate outcome (an allocation that
         // ends early), so this refuses rather than reads.
         for (i, sl) in plan.src_levels.iter().enumerate() {
             let Some(l) = levels.get(i) else {
-                return give_up(spare);
+                return give_up(spare, "the guest supplied more source levels than the chain has");
             };
-            let texels = if sl.swizzled {
-                (sl.padded_x as u64) * (sl.padded_y as u64)
-            } else {
-                (sl.blocks_x as u64) * (l.height as u64)
+            // A block source is measured in BLOCKS of `block_bytes`, an uncompressed one in
+            // four-byte texels - so the extent this level may read is not the same arithmetic.
+            let extent = match plan.codec {
+                Some(c) => {
+                    let (bx, by) = if sl.swizzled {
+                        (sl.padded_x as u64, sl.padded_y as u64)
+                    } else {
+                        (sl.blocks_x as u64, sl.blocks_y as u64)
+                    };
+                    bx * by * (c.block_bytes() as u64)
+                }
+                None => {
+                    let texels = if sl.swizzled {
+                        (sl.padded_x as u64) * (sl.padded_y as u64)
+                    } else {
+                        (sl.blocks_x as u64) * (l.height as u64)
+                    };
+                    texels * 4
+                }
             };
-            if sl.byte_offset as u64 + texels * 4 > plan.src.len() as u64 {
-                return give_up(spare);
+            if sl.byte_offset as u64 + extent > plan.src.len() as u64 {
+                return give_up(spare, "a source level runs past the bytes the snapshot captured");
             }
         }
 
@@ -900,21 +1214,48 @@ impl Transcoder {
         let need_src = align_up(plan.src.len() as u32, 4) as u64;
         let (need_rgba, need_out) = ((rgba_word as u64) * 4, out_byte as u64);
         let mut held = self.raw_scratch.borrow_mut();
+        // Grown to the LARGEST seen so far in every axis, so a small texture after a large one
+        // does not re-allocate its way back down and then up again.
+        let (s0, r0, o0) =
+            held.as_ref().map_or((0, 0, 0), |k| (k.src_bytes, k.rgba_bytes, k.out_bytes));
+        let (want_rgba, want_out) = (need_rgba.max(r0), need_out.max(o0));
+        // >>> THE SOURCE BUFFER IS SIZED FOR A BATCH, NOT FOR ONE TEXTURE, and that is the whole
+        // difference between batching and not.
+        //
+        // `src` is one of the two buffers a batch has to SUB-ALLOCATE (see [`RawBatch`]), so a
+        // scratch sized to exactly one texture's source can never hold two - the second
+        // expansion would find no room, flush, and the batch would be one texture long forever.
+        // That is not hypothetical: it is what the first version of this did, and the test that
+        // asserts five expansions share one submit is what caught it.
+        //
+        // Taken out of the SAME total budget rather than added to it: `rgba` and `out` are sized
+        // by the largest single texture and are the expensive pair, so the batch window is
+        // whatever is left under `RAW_SCRATCH_BUDGET` after them, capped. A device with no room
+        // to spare simply batches one texture at a time, which is exactly the behaviour that
+        // shipped before this existed.
+        let want_src = source_window(need_src, s0, want_rgba, want_out);
+        // >>> NOTE WHEN THE WINDOW HAS ROOM FOR THIS TEXTURE AND NOTHING ELSE. A batch that can
+        // never accept a second texture is indistinguishable, in the submit/texture ratio, from
+        // a frame that only ever had one to give - so it is counted here rather than inferred
+        // there. See `RAW_BATCH_WINDOW_ONE`.
+        if want_src < need_src * 2 {
+            RAW_BATCH_WINDOW_ONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let fits = held.as_ref().is_some_and(|k| {
-            k.src_bytes >= need_src && k.rgba_bytes >= need_rgba && k.out_bytes >= need_out
+            k.src_bytes >= want_src && k.rgba_bytes >= want_rgba && k.out_bytes >= want_out
         });
+        // >>> A GROWTH DESTROYS THE BUFFERS A PENDING BATCH IS RECORDED AGAINST, so anything
+        // already recorded has to be submitted first. Destroying a buffer named by unsubmitted
+        // commands is a validation failure, and it would be one that only fires on the frame
+        // where a title first reaches a larger texture.
         if !fits {
-            // Grown to the LARGEST seen so far in every axis, so a small texture after a large
-            // one does not re-allocate its way back down and then up again.
-            let (s0, r0, o0) = held
-                .as_ref()
-                .map_or((0, 0, 0), |k| (k.src_bytes, k.rgba_bytes, k.out_bytes));
-            let (want_src, want_rgba, want_out) =
-                (need_src.max(s0), need_rgba.max(r0), need_out.max(o0));
+            self.flush_raw_locked(queue);
+        }
+        if !fits {
             // The kept scratch is bounded, and the bound is over the SUM - three buffers each
             // individually reasonable still add up to a device.
             if want_src + want_rgba + want_out > RAW_SCRATCH_BUDGET {
-                return give_up(spare);
+                return give_up(spare, "the scratch this texture needs exceeds the whole budget");
             }
             // DESTROYED, not dropped: the scratch being replaced holds four `GPUBuffer`s, and
             // leaving them to the collector leaks the previous size every time this grows.
@@ -925,17 +1266,55 @@ impl Transcoder {
         }
         let scratch = held.as_ref().expect("just set");
 
+        // >>> WHERE THIS TEXTURE'S BYTES GO INSIDE THE SCRATCH - see [`RawBatch`] for why the
+        // two CPU-written buffers are sub-allocated and the two GPU-written ones are not.
+        //
+        // A batch that cannot fit this texture is submitted and started again, which resets both
+        // offsets to zero. The scratch was already proven large enough for ONE texture above, so
+        // after a flush there is always room.
+        let param_need = RawScratch::PARAM_SLOTS_PER_TEXTURE * UNIFORM_SLOT;
+        {
+            let pending = self.raw_batch.borrow();
+            let full = pending.as_ref().is_some_and(|b| {
+                b.src_used + need_src > scratch.src_bytes
+                    || b.param_used + param_need > RawScratch::PARAM_BYTES
+            });
+            drop(pending);
+            if full {
+                self.flush_raw_locked(queue);
+            }
+        }
+        let (src_off, param_off) = {
+            let mut pending = self.raw_batch.borrow_mut();
+            let b = pending.get_or_insert_with(|| RawBatch {
+                enc: device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("texraw-batch"),
+                }),
+                src_used: 0,
+                param_used: 0,
+                textures: 0,
+            });
+            let off = (b.src_used, b.param_used);
+            // Four-byte aligned because the shader addresses the source by WORD, and
+            // `write_buffer` wants the same.
+            b.src_used = align_up64(b.src_used + need_src, 4);
+            b.param_used += param_need;
+            off
+        };
         // >>> WRITTEN, NOT COPIED THEN WRITTEN. `write_buffer` wants a length that is a
         // multiple of four; the last few bytes of an odd-length texture go through a padded
         // tail rather than through a copy of the whole thing - which for this path is
         // megabytes a frame.
         let whole = plan.src.len() & !3;
-        queue.write_buffer(&scratch.src, 0, &plan.src[..whole]);
+        queue.write_buffer(&scratch.src, src_off, &plan.src[..whole]);
         if whole < plan.src.len() {
             let mut tail = [0u8; 4];
             tail[..plan.src.len() - whole].copy_from_slice(&plan.src[whole..]);
-            queue.write_buffer(&scratch.src, whole as u64, &tail);
+            queue.write_buffer(&scratch.src, src_off + whole as u64, &tail);
         }
+        // Every `src_word` below is relative to this texture's own bytes, so the batch's base
+        // is added once, here, rather than being threaded through both `Params` arms.
+        let src_base_word = (src_off / 4) as u32;
 
         let mut slots: Vec<u8> = Vec::new();
         let mut push = |p: Params| {
@@ -954,11 +1333,19 @@ impl Transcoder {
                     blocks_y: sl.blocks_y,
                     padded_x: sl.padded_x,
                     padded_y: sl.padded_y,
-                    src_word: sl.byte_offset / 4,
+                    src_word: src_base_word + sl.byte_offset / 4,
                     rgba_word: l.rgba_word,
                     flags: u32::from(sl.swizzled) * FLAG_SWIZZLED,
-                    // The shader reads the SWIZZLE4 selector here; there is no block format.
-                    src_format: plan.swizzle,
+                    // `src_format` is read by BOTH decoders and means different things to
+                    // them: the SWIZZLE4 selector to `decode_raw`, the guest BASE FORMAT to
+                    // `decode_bc`, which is how it tells BC1 from BC2 from BC3. A block source
+                    // therefore carries no channel swizzle at all, which is why
+                    // `block_source` refuses anything but the identity.
+                    src_format: match plan.codec {
+                        Some(c) => codec_format(c),
+                        None => plan.swizzle,
+                    },
+                    src_block_words: plan.codec.map_or(0, |c| c.block_bytes() / 4),
                     ..Default::default()
                 }),
                 None => {
@@ -988,10 +1375,13 @@ impl Transcoder {
         }
         // A chain deeper than the fixed parameter buffer holds is refused rather than
         // truncated: the CPU decode handles it correctly and only costs more.
-        if slots.len() as u64 > RawScratch::PARAM_BYTES {
-            return give_up(spare);
+        // Against ONE TEXTURE'S share of the parameter buffer, not the whole of it: the rest
+        // belongs to the other expansions in this batch. A chain deeper than this is refused
+        // rather than truncated - the CPU decode handles it correctly and only costs more.
+        if slots.len() as u64 > RawScratch::PARAM_SLOTS_PER_TEXTURE * UNIFORM_SLOT {
+            return give_up(spare, "the mip chain needs more parameter slots than one texture may claim");
         }
-        queue.write_buffer(&scratch.params, 0, &slots);
+        queue.write_buffer(&scratch.params, param_off, &slots);
         let bg = &scratch.bind;
 
         let format = if gamma {
@@ -1036,27 +1426,35 @@ impl Transcoder {
             }
         };
 
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("texraw"),
-        });
+        // >>> RECORDED INTO THE FRAME'S BATCH, NOT SUBMITTED HERE. See [`RawBatch`].
+        let mut pending = self.raw_batch.borrow_mut();
+        let batch = pending.as_mut().expect("reserved above");
+        // Counted HERE and not at the reservation, so a texture the checks above refuse does
+        // not appear in the batch's own count of what it holds.
+        batch.textures += 1;
+        let enc = &mut batch.enc;
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("texraw-pass"),
                 timestamp_writes: None,
             });
             for (i, l) in levels.iter().enumerate() {
-                let off = ((i as u64) * UNIFORM_SLOT) as u32;
-                if plan.src_levels.get(i).is_some() {
-                    pass.set_pipeline(&self.decode_raw);
-                } else {
-                    pass.set_pipeline(&self.halve);
-                }
+                let off = (param_off + (i as u64) * UNIFORM_SLOT) as u32;
+                // The grid is the OUTPUT of the stage, and for a block decoder that is one
+                // invocation per BLOCK, not per texel - dispatching per texel would run it
+                // sixteen times over each block and write the same sixteen texels each time.
+                let (pipe, gx, gy) = match (plan.src_levels.get(i), plan.codec) {
+                    (Some(sl), Some(c)) => (self.decoder(c), sl.blocks_x, sl.blocks_y),
+                    (Some(_), None) => (&self.decode_raw, l.width, l.height),
+                    (None, _) => (&self.halve, l.width, l.height),
+                };
+                pass.set_pipeline(pipe);
                 pass.set_bind_group(0, bg, &[off]);
-                pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
+                pass.dispatch_workgroups(gx.div_ceil(8), gy.div_ceil(8), 1);
             }
             pass.set_pipeline(&self.copy_rows);
             for (i, l) in levels.iter().enumerate() {
-                let off = (((levels.len() + i) as u64) * UNIFORM_SLOT) as u32;
+                let off = (param_off + ((levels.len() + i) as u64) * UNIFORM_SLOT) as u32;
                 pass.set_bind_group(0, bg, &[off]);
                 pass.dispatch_workgroups(l.width.div_ceil(8), l.height.div_ceil(8), 1);
             }
@@ -1080,7 +1478,6 @@ impl Transcoder {
                 wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: 1 },
             );
         }
-        queue.submit([enc.finish()]);
         // Nothing to destroy: the buffers are the scratch and outlive this call. That is the
         // point - `run` has to destroy its own because it sizes them per texture, and doing
         // that here was over a hundred GPU object lifetimes a frame.

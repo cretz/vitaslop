@@ -365,7 +365,13 @@ fn do_start_file_streaming(
     // Whether an audio track can reach this title AT ALL is a separate open question - it has
     // never called `sceAudiodecDecode` on any run - and it is not answered by handing it one
     // it cannot recognise. See `served_cursors`.
-    let streams = served_video_streams(&movie.mp4, &movie.cursors);
+    // >>> THE STREAM COUNT, video AND audio. The title's own debug string for this word is
+    // `" Streams count: %d "`, and it loops over the count calling GetStreamInfo(i) - which
+    // is what `0x8be0e3d3` IS (see `mp4_get_next_unit`). The earlier reading that this had
+    // to be the VIDEO count came from that call answering index 1 with the video description;
+    // with the audio description in its place the title opens an AAC decoder for stream 1,
+    // enables it, and hands its units to `sceAudiodecDecode`.
+    let streams = movie.cursors.len().max(1) as u32;
     if out_word != 0 {
         // EXPERIMENT, and the reasoning is on the record: the guest's wrapper around this
         // call ends `ldr r0,[r4,0x20]; pop {r4,pc}` - it RETURNS this word - so whatever it
@@ -387,14 +393,26 @@ fn do_start_file_streaming(
         for word in 0..16u32 {
             ctx.write_u32(out_struct + word * 4, 0);
         }
-        // The fetch consumer reads the first two words of THIS struct back out of the
-        // session and stamps them onto every unit descriptor (`ldrd r4,r5,[session+0x60]`).
-        // Zeros there are what the guest was faulting on, and the buffer it supplied at
-        // open is the only pair of values in scope that fits base/size.
-        if let Some((buffer, size)) = st.movie.as_ref().and_then(|m| m.unit_buffer) {
-            ctx.write_u32(out_struct, buffer);
-            ctx.write_u32(out_struct + 4, size);
-        }
+        // >>> THE MOVIE'S TIMESCALE AND DURATION, which every stream descriptor inherits.
+        //
+        // The title's GetStreamInfo wrapper copies the first two words of THIS struct into
+        // EVERY stream's descriptor (`ldrd r4,r5,[session+0x60]` -> `strd [desc+0x10]`), the
+        // same descriptor that carries the stream's kind and codec - so they are a per-movie
+        // property shared by the streams, and the timeline's own `mvhd` timescale is the one
+        // such pair a container has. They used to carry the unit buffer's base and size, on
+        // the reasoning that zeros faulted and that pair was in scope: zeros fault because
+        // the word is a DIVISOR. With a 2 GB "timescale" every timestamp divided to zero,
+        // which is invisible while a movie has one stream (nothing to keep in step) and is
+        // a black picture the moment it has two: the player holds each video frame against
+        // an audio clock it can no longer place. The unit timestamps are handed over in this
+        // timescale too - see `do_get_next_unit_info`.
+        let (timescale, duration) = st
+            .movie
+            .as_ref()
+            .map(|m| (m.mp4.timescale, m.mp4.duration))
+            .unwrap_or((0, 0));
+        ctx.write_u32(out_struct, timescale);
+        ctx.write_u32(out_struct + 4, u32::try_from(duration).unwrap_or(u32::MAX));
     }
     // Where the two out-parameters live and WHO asked, because what the second one carries is
     // still open (see the report below) and the only way to settle it is to disassemble the
@@ -407,23 +425,10 @@ fn do_start_file_streaming(
         lr = format_args!("{:#010x}", ctx.regs[14]),
         "sceMp4StartFileStreaming"
     );
-    report_unknown_stream_properties(st);
     0
 }
 
-/// Say, once, that the stream properties handed back are placeholders.
-fn report_unknown_stream_properties(st: &mut crate::host::VitaState) {
-    if st.reported_stream_properties {
-        return;
-    }
-    st.reported_stream_properties = true;
-    tracing::warn!(
-        target: "vitaslop::movie",
-        "SceMp4: sceMp4StartFileStreaming succeeded but what its two out-parameters carry          is not established. Anything the title derives from them (a buffer size, a stream          count, a duration) is therefore an assumption, not a result."
-    );
-}
-
-/// `0x8be0e3d3(handle, arg, out)` - hand back the next decoded picture.
+/// `0x8be0e3d3(handle, stream, out)` - describe one STREAM (see below: not a unit fetch).
 ///
 /// RECOVERED from the one call site (`0x8117d96c`), which memsets a 0x158-byte struct,
 /// passes it as `r2`, and then branches on what came back. The branch structure is what
@@ -444,15 +449,66 @@ fn report_unknown_stream_properties(st: &mut crate::host::VitaState) {
 /// and what the bytes mean, is NOT established by the disassembly** - those fields are
 /// filled on the most probable reading and reported once per run, so a wrong guess reads as
 /// a stated assumption rather than as a silently wrong picture.
+///
+/// >>> IT IS `GetStreamInfo(handle, STREAM INDEX, out)`, NOT A UNIT FETCH. Established from
+/// >>> the title's own debug strings around the call: the caller's loop is bounded by the
+/// >>> word `sceMp4StartFileStreaming` wrote (`" Streams count: %d "`), each iteration calls
+/// >>> this with the index and logs `"GetStreamInfo: Unsupported Codec type "` on a kind it
+/// >>> does not know, and the fields it copies out go on to `sceAudiodecCreateDecoderExternal`
+/// >>> as the AAC channel count and sample rate. The struct's first two words are `{kind,
+/// >>> codec}`: video is `{0, 1}` (AVC) with the size at +0x08/+0x0c; audio is `{1, 2}` (AAC)
+/// >>> with the SAMPLE RATE at +0x38 and the CHANNEL COUNT as a halfword at +0x4c. See
+/// >>> [`stream_info`].
+///
+/// So a movie's sound was silent for a structural reason, not a decoder one: the stream count
+/// only ever named the video streams, and asking about index 1 was answered with the video
+/// description again - which is why the one earlier experiment that reported two streams saw
+/// the title build a second VIDEO decoder and stall.
 #[hostcall]
 pub(super) fn mp4_get_next_unit(
     ctx: &mut crate::host::GuestCtx,
     st: &mut crate::host::VitaState,
     handle: i32,
-    _arg: crate::host::Ptr,
+    stream: u32,
     out: crate::host::Ptr,
 ) -> i32 {
-    do_get_next_unit(ctx, st, handle, out.addr())
+    do_get_next_unit(ctx, st, handle, stream, out.addr())
+}
+
+/// Field offsets of the AUDIO form of the stream-information struct - see
+/// [`mp4_get_next_unit`] for how each was established. The two `unit::` words at +0/+4 are
+/// shared with the video form.
+mod stream_info {
+    /// Kind 1 = an audio stream.
+    pub const KIND_AUDIO: u32 = 1;
+    /// Codec 2 = AAC, the only audio codec the title's player builds a decoder for.
+    pub const CODEC_AAC: u32 = 2;
+    /// Sample rate, read as a word into the player's descriptor and then into
+    /// `SceAudiodecInfoAac.samplingRate`.
+    pub const SAMPLE_RATE: u32 = 0x38;
+    /// Channel count, read as a HALFWORD into `SceAudiodecInfoAac.ch`.
+    pub const CHANNELS: u32 = 0x4c;
+    /// Four bytes the player copies into its descriptor at +0x48..+0x4b. Their roles are
+    /// not established - nothing that consumes them has been found - so they are left zero
+    /// rather than guessed.
+    pub const UNKNOWN_BYTES: u32 = 0x50;
+}
+
+/// The channel count an `AudioSpecificConfig` declares, or `None` when it uses the escape
+/// forms (a program-config element, or an explicit sampling frequency) this does not parse.
+///
+/// The config's head is `audioObjectType:5, samplingFrequencyIndex:4,
+/// channelConfiguration:4` - so with the common object types and an indexed frequency the
+/// channel field sits at bits 3..7 of the second byte.
+fn asc_channels(asc: &[u8]) -> Option<u32> {
+    let (b0, b1) = (*asc.first()?, *asc.get(1)?);
+    let aot = b0 >> 3;
+    let sf_index = ((b0 & 0x7) << 1) | (b1 >> 7);
+    if aot == 31 || sf_index == 15 {
+        return None;
+    }
+    let ch = (b1 >> 3) & 0xf;
+    (ch != 0).then_some(u32::from(ch))
 }
 
 /// Field offsets in the 0x158-byte unit struct, as recovered above.
@@ -490,15 +546,58 @@ fn do_get_next_unit(
     ctx: &mut crate::host::GuestCtx,
     st: &mut crate::host::VitaState,
     handle: i32,
+    stream: u32,
     out: u32,
 ) -> i32 {
     if out == 0 {
         return -1;
     }
-    match st.movie.as_ref() {
-        Some(movie) if movie.handle == handle => {}
-        _ => return -1,
+    // The stream index is an index into the SERVED cursors, in the order the count reported
+    // by `sceMp4StartFileStreaming` enumerates them - and an index past that count is the
+    // error the caller already handles.
+    let Some((track, at)) = st
+        .movie
+        .as_ref()
+        .filter(|m| m.handle == handle)
+        .and_then(|m| m.cursors.get(stream as usize).copied())
+    else {
+        return -1;
+    };
+    let audio = st.movie.as_ref().and_then(|m| m.mp4.tracks.get(track)).and_then(|t| {
+        (t.kind == crate::mp4::TrackKind::Audio).then(|| {
+            (t.timescale, asc_channels(&t.audio_specific_config()))
+        })
+    });
+    if let Some((sample_rate, channels)) = audio {
+        let Some(channels) = channels else {
+            // A config this cannot read the channel count from would hand the title a decoder
+            // it cannot open; better it never learns of the stream than opens it wrong.
+            tracing::warn!(
+                target: "vitaslop::movie",
+                stream,
+                "SceMp4: the audio stream's AudioSpecificConfig does not carry a channel \
+                 configuration this reads, so the stream is reported as unavailable"
+            );
+            return -1;
+        };
+        for word in 0..(0x158 / 4) {
+            ctx.write_u32(out + word * 4, 0);
+        }
+        ctx.write_u32(out + unit::STATUS, stream_info::KIND_AUDIO);
+        ctx.write_u32(out + unit::KIND, stream_info::CODEC_AAC);
+        ctx.write_u32(out + stream_info::SAMPLE_RATE, sample_rate);
+        ctx.write_bytes(out + stream_info::CHANNELS, &(channels as u16).to_le_bytes());
+        ctx.write_u32(out + stream_info::UNKNOWN_BYTES, 0);
+        tracing::debug!(
+            target: "vitaslop::movie",
+            stream, track, sample_rate, channels,
+            "SceMp4: stream info (audio)"
+        );
+        return 0;
     }
+    // Video: the description of the stream's FIRST unit, from the track's own cursor - not
+    // from whichever served stream happens to be earliest, which with an audio track served
+    // can be the audio unit.
 
     // `none` never hands a unit back, which is the arm that separates "the playback path
     // itself faults" from "our inferred fields fault". It used to be read and then
@@ -524,7 +623,7 @@ fn do_get_next_unit(
     // This is the call that decides whether the title commits to a unit at all: it takes the
     // size from here, allocates exactly that, and only then asks for the data. So this is where
     // "not yet" belongs, and the two other placements tried first are both recorded there.
-    let sample = match peek_access_unit(st) {
+    let sample = match access_unit_at(st, track, at) {
         Ok(Some(sample)) => sample,
         Ok(None) => {
             // End of stream: the "nothing right now" outcome the caller takes silently.
@@ -808,19 +907,6 @@ fn served_cursors(mp4: &crate::mp4::Mp4) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// How many of the served cursors are VIDEO tracks.
-///
-/// This is what `sceMp4StartFileStreaming`'s first out-parameter reports - see the call site
-/// for the retail measurement that fixed the reading. Never zero: a caller that reads zero
-/// streams has been told the movie cannot be played at all.
-fn served_video_streams(mp4: &crate::mp4::Mp4, cursors: &[(usize, usize)]) -> u32 {
-    cursors
-        .iter()
-        .filter(|(t, _)| mp4.tracks.get(*t).is_some_and(|t| t.kind == crate::mp4::TrackKind::Video))
-        .count()
-        .max(1) as u32
-}
-
 /// Describe the next access unit WITHOUT consuming it.
 fn peek_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit>, String> {
     let Some((track, at)) = st.movie.as_ref().and_then(next_unit_track) else {
@@ -1037,11 +1123,31 @@ fn do_get_next_unit_info(
         ctx.write_u32(info + unit_info::SIZE, 0);
         return 0;
     }
+    // >>> TIMESTAMPS IN THE MOVIE'S TIMESCALE, not the track's. The title reads the movie
+    // timescale out of `sceMp4StartFileStreaming`'s out-struct (see there) and places every
+    // stream's units on one clock with it, so a video unit stamped in its own 30,060 Hz and
+    // an audio unit stamped in 48,000 Hz would sit on two different clocks. Rescaled here,
+    // at the hand-over; the engine's own cursors keep track units.
+    let (pts, dts) = st
+        .movie
+        .as_ref()
+        .and_then(|m| {
+            let track = m.mp4.tracks.get(unit.stream as usize)?;
+            let scale = |t: u64| {
+                if track.timescale == 0 {
+                    t
+                } else {
+                    (u128::from(t) * u128::from(m.mp4.timescale) / u128::from(track.timescale)) as u64
+                }
+            };
+            Some((scale(unit.pts), scale(unit.dts)))
+        })
+        .unwrap_or((unit.pts, unit.dts));
     ctx.write_u32(info + unit_info::SIZE, unit.bytes.len() as u32);
-    ctx.write_u32(info + unit_info::PTS, unit.pts as u32);
-    ctx.write_u32(info + unit_info::PTS + 4, (unit.pts >> 32) as u32);
-    ctx.write_u32(info + unit_info::DTS, unit.dts as u32);
-    ctx.write_u32(info + unit_info::DTS + 4, (unit.dts >> 32) as u32);
+    ctx.write_u32(info + unit_info::PTS, pts as u32);
+    ctx.write_u32(info + unit_info::PTS + 4, (pts >> 32) as u32);
+    ctx.write_u32(info + unit_info::DTS, dts as u32);
+    ctx.write_u32(info + unit_info::DTS + 4, (dts >> 32) as u32);
     ctx.write_u32(info + unit_info::SYNC, u32::from(unit.sync));
     // >>> THE STREAM THE UNIT BELONGS TO, and this used to be a hard zero.
     //
@@ -1461,13 +1567,15 @@ mod tests {
         assert_eq!(order, vec![1, 2, 1, 2, 1, 2]);
     }
 
-    /// >>> THE STREAM COUNT `sceMp4StartFileStreaming` REPORTS IS THE VIDEO COUNT.
+    /// >>> THE STREAM COUNT `sceMp4StartFileStreaming` REPORTS IS EVERY SERVED STREAM, and
+    /// >>> the per-stream info call tells the two kinds apart.
     ///
-    /// The retail title reads that word and creates one H.264 decoder per count, so a movie
-    /// whose audio track was counted too had its AAC track handed to a video decoder - and its
-    /// player then stalled seven access units into 2,555. See `do_start_file_streaming`.
+    /// The earlier reading (video count only) came from the info call answering the audio
+    /// index with the video description, which made the title build a second H.264 decoder
+    /// and stall. With the audio description in place both are counted - see
+    /// `do_start_file_streaming` and `mp4_get_next_unit`.
     #[test]
-    fn the_reported_stream_count_counts_only_video_tracks() {
+    fn the_reported_stream_count_counts_every_served_track() {
         let mp4 = Mp4 {
             timescale: 1000,
             duration: 0,
@@ -1477,8 +1585,22 @@ mod tests {
             ],
         };
         let cursors = super::served_cursors(&mp4);
-        assert_eq!(cursors.len(), 2, "both tracks are still SERVED - only the count differs");
-        assert_eq!(super::served_video_streams(&mp4, &cursors), 1);
+        assert_eq!(cursors.len(), 2);
+        assert_eq!(cursors[0].0, 0, "stream 0 is the video track");
+        assert_eq!(cursors[1].0, 1, "stream 1 is the audio track");
+    }
+
+    /// The channel count is read out of the `AudioSpecificConfig` head, which is what the
+    /// title's AAC decoder is configured from.
+    #[test]
+    fn audio_specific_config_channel_count() {
+        // AAC-LC (2), 48 kHz (index 3), stereo (2): 00010 0011 0010 000 -> 0x11 0x90.
+        assert_eq!(super::asc_channels(&[0x11, 0x90]), Some(2));
+        // ...and mono: 00010 0011 0001 000 -> 0x11 0x88.
+        assert_eq!(super::asc_channels(&[0x11, 0x88]), Some(1));
+        // An explicit-frequency escape (index 15) is not parsed.
+        assert_eq!(super::asc_channels(&[0x17, 0x80]), None);
+        assert_eq!(super::asc_channels(&[0x11]), None);
     }
 
     /// A track whose codec this engine does not decode is not offered at all: the title's

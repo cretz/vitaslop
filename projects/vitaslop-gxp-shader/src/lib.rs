@@ -281,3 +281,177 @@ pub fn recompile_vertex_module(bytes: &[u8]) -> Result<(RecompiledVertex, Vertex
     let module = module::build_vertex_module(&rc.wgsl_body, &plan);
     Ok((rc, module))
 }
+
+/// The destination coefficient of a fragment program's own ROP blend - see [`rop_blend`].
+/// The SOURCE coefficient is `SRC_ALPHA` in every encoding this corpus establishes and is
+/// refused otherwise, so it is not a field here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopDstFactor {
+    /// `1` - the additive form (`sel2 = ZERO` under the complement).
+    One,
+    /// `1 - src.a` - straight source-over.
+    OneMinusSrcAlpha,
+}
+
+/// A blend equation compiled INTO a fragment program, rather than patched in by GXM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RopBlend {
+    pub dst: RopDstFactor,
+    /// The alpha op field (42:41) differs between titles; `true` is the second observed value.
+    /// Carried so a caller can refuse rather than silently treat the two alike.
+    pub alpha_op_differs: bool,
+}
+
+/// The blend equation a FRAGMENT program performs itself, in its epilogue, or `None`.
+///
+/// # Why this exists
+/// GXM has no runtime blend state and normally bakes the equation into a fragment program from
+/// the `SceGxmBlendInfo*` passed at `sceGxmShaderPatcherCreateFragmentProgram`
+/// ([[vitaslop-blend-is-baked-in]]). A program created with a **NULL** `blendInfo` was therefore
+/// read as "never blends" - and for a program whose epilogue is a plain colour write that is
+/// right. It is NOT right for a program that ends in a group-0x80 SOP2 reading the OUTPUT
+/// register as one of its two sources: the output register at the end of a fragment program is
+/// the DESTINATION colour the ROP feeds back, so such a word IS the blend, compiled in by the
+/// offline shader compiler instead of patched in by the driver.
+///
+/// [`usse::decode`]'s `decode_grp_sop2` reads these words as a COPY of the source term, on the
+/// argument that `o[0]` is "a register the program never writes" and so its coefficient must be
+/// zero. That argument is wrong in exactly this way, and it is why one title's entire UI - every
+/// glyph, every alpha-cut sprite, the box around its logo - drew as an opaque rectangle: the
+/// source term alone is the premultiplied colour with the destination thrown away. The copy is
+/// still what the WGSL emits, because a fragment shader cannot read the framebuffer; what is
+/// recovered here is the PIPELINE state that the second term describes.
+///
+/// # What the corpus establishes
+/// Every group-0x80 word in every captured corpus that writes `o[0]` decodes, through the field
+/// table of its fully-read sibling SOP2M, to one of two equations:
+///
+/// | word | `sel1`/`mod1` | `sel2`/`mod2` | equation |
+/// |---|---|---|---|
+/// | `809080c190000000` | `SRC1_ALPHA` / - | `ZERO` / complement | `a*src + 1*dst` |
+/// | `809080d990000000` | `SRC1_ALPHA` / - | `SRC1_ALPHA` / complement | `a*src + (1-a)*dst` |
+///
+/// Those are the two commonest blend equations there are, and they are the SAME two the same
+/// title passes explicitly as a `SceGxmBlendInfo` for its other shaders (measured:
+/// `colorSrc=4 colorDst=5` and `colorSrc=4 colorDst=1`). A field table that turns unrelated bits
+/// into exactly the pair of equations the title already asks for by another route is not a
+/// coincidence.
+///
+/// **The operator is ADD, and the frame is what says so.** Bits 53:52, which SOP2M spends on its
+/// colour op, are 1 in EVERY observed group-0x80 word - including both equations above and a
+/// second title's - so they cannot be this group's colour op, which would have to differ. Read
+/// as ADD, `809080d990000000` is source-over, and source-over is measurably the right answer:
+/// forcing it made a title's dialogue text, which had been three solid white bars, render as
+/// readable glyphs. Read as SUB nothing composites at all.
+///
+/// # What is refused, and why that matters more than what is accepted
+/// Anything else returns `None` and the caller keeps GXM's own answer. In particular a program
+/// created WITH a `blendInfo` never reaches here, and the corpus says it never needs to: no
+/// fragment blob carries both a real `blendInfo` and an epilogue SOP2. The two are alternatives
+/// - the driver patches the blend in, or the compiler compiled it in - and a program that
+/// somehow had both would be double-blended, so the caller must consult this only when GXM
+/// supplied nothing.
+///
+/// The named risk: if bits 53:52 do encode an operator that is not ADD for some word not in any
+/// corpus here, that word takes this path and blends the wrong way round. It would show as a
+/// surface that is too bright where it should be dark. The guard below pins every field that
+/// this evidence does not read, so such a word returns `None` instead.
+pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
+
+    let program = Program::parse(bytes).ok()?;
+    if program.kind != ProgramKind::Fragment {
+        return None;
+    }
+    let shader = usse::decode_shader(&program);
+    let mut found = None;
+    for instr in &shader.instrs {
+        if instr.group != 0x80 {
+            continue;
+        }
+        let w = instr.raw;
+        let bit = |hi, lo| usse::decode::bits(w, hi, lo);
+        // The destination and the fed-back source must both be the OUTPUT bank: that pairing is
+        // what makes the word a ROP blend rather than an ordinary combine.
+        let dest_is_output = bit(33, 32) == 1 && bit(27, 21) == 0;
+        let src2_is_output = bit(29, 28) == 1 && bit(6, 0) == 0;
+        // >>> THE SWAPPED SHAPE IS A BLEND TOO - `dst + a*src`, THE ADDITIVE FORM.
+        //
+        // `0x8190002160040000` names `o[0]` in SRC1 and `pa[0]` in SRC2 (`decode_grp_sop2`'s
+        // "swapped" form). It was read as a copy on the strength of a sibling pair: one title
+        // registers one flat-colour shader twice, `frag_81a7f590` ending in `809080d990000000`
+        // and `frag_81a7f798` ending in this word, and at the time BOTH were read as copies.
+        // The first is now established above as source-over, so the pair is the same shader
+        // with two BLEND equations - and its fields say which: `sel1 = ZERO` under `mod1`
+        // (complement) is a destination coefficient of 1, exactly as `809080c190000000`'s
+        // complemented ZERO is, with the operands the other way round.
+        //
+        // MEASURED, and it is the whole of one title's Velvet Room: the display pass draws 56
+        // flat-colour quads through `frag_81a7f798` right after the world composite. As a copy
+        // they are opaque black rectangles over the room; the room's own draws replay to
+        // velvet blue in capsules and show on screen the moment those quads are cut out of
+        // the pass (`VITASLOP_DRAW_RANGE=0-1`). Additive black adds nothing, and the magenta
+        // ones are the glow the room is known for.
+        //
+        // Bits 20:14 are 16 in this word and 20 in a lit, fogged world material's epilogue
+        // (`0x8190002160050000`); that material draws opaque scenery whose overlaps do not
+        // brighten, so 20 stays the copy `decode_grp_sop2` emits and only 16 is a blend.
+        // What bit 16 selects is not established - the split is the two observed words.
+        // The source coefficient (`sel2 = 4`, a selector no reference names) is TAKEN as
+        // SRC_ALPHA, the only source coefficient any compiled-in blend here has; if it is ONE,
+        // a translucent additive quad reads a little too bright.
+        let swapped = bit(31, 30) == 1
+            && bit(13, 7) == 0
+            && bit(29, 28) == 2
+            && bit(58, 57) == 0
+            && bit(56, 56) == 1
+            && bit(53, 52) == 1
+            && bit(51, 51) == 0
+            && bit(49, 49) == 0
+            && bit(48, 48) == 0
+            && bit(47, 47) == 0
+            && bit(46, 43) == 0
+            && bit(42, 41) == 0
+            && bit(40, 38) == 0
+            && bit(37, 35) == 4
+            && bit(20, 14) == 16;
+        if dest_is_output && swapped {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(RopBlend { dst: RopDstFactor::One, alpha_op_differs: false });
+            continue;
+        }
+        if !dest_is_output || !src2_is_output {
+            continue;
+        }
+        // Every field this reading does not establish, pinned to its one observed value.
+        let pinned = bit(58, 57) == 0        // unpredicated
+            && bit(56, 56) == 0              // mod1 - the source term is not complemented
+            && bit(53, 52) == 1              // constant across every observed word (see above)
+            && bit(51, 51) == 0              // no destination bank extension
+            && bit(49, 49) == 0              // no src1 bank extension
+            && bit(48, 48) == 0              // no src2 bank extension
+            && bit(47, 47) == 1              // mod2 - the destination term IS complemented
+            && bit(46, 43) == 0              // the bits SOP2M spends on its write mask
+            && bit(40, 38) == 3; // sel1 = SRC1_ALPHA, the source coefficient
+        if !pinned {
+            return None;
+        }
+        let dst = match bit(37, 35) {
+            0 => RopDstFactor::One,
+            3 => RopDstFactor::OneMinusSrcAlpha,
+            _ => return None,
+        };
+        let alpha_op_differs = match bit(42, 41) {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        // Two ROP words in one program is a shape this reading says nothing about.
+        if found.is_some() {
+            return None;
+        }
+        found = Some(RopBlend { dst, alpha_op_differs });
+    }
+    found
+}

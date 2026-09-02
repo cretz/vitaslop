@@ -197,6 +197,11 @@ pub mod gxm {
     pub const COLOR_SURFACE_SET_DATA: u32 = 0x537C_A400;
     // Reflection + render-target/notification.
     pub const PROGRAM_GET_TYPE: u32 = 0x04BB_3C59;
+    /// `sceGxmProgramGetSize`: the byte length the container header declares.
+    pub const PROGRAM_GET_SIZE: u32 = 0xBF5E_2090;
+    /// `sceGxmPrecomputedDrawSetParamsInstanced`: `SetParams` plus an index wrap, the
+    /// same extra argument `sceGxmDrawInstanced` takes.
+    pub const PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED: u32 = 0x3A7B_1633;
     pub const PROGRAM_FIND_PARAMETER_BY_SEMANTIC: u32 = 0x7FFF_DD7A;
     pub const RENDER_TARGET_GET_DRIVER_MEM_BLOCK: u32 = 0x4955_3737;
     pub const NOTIFICATION_WAIT: u32 = 0x9F44_8E79;
@@ -255,6 +260,8 @@ pub mod sysmem {
     pub const SET_GPO: u32 = 0x78E7_02D3;
     /// Resolve an address back to the memory block that contains it.
     pub const FIND_MEM_BLOCK_BY_ADDR: u32 = 0xA33B_99D1;
+    /// ...and describe that block (base, size, cacheability, access, type).
+    pub const GET_MEM_BLOCK_INFO_BY_ADDR: u32 = 0x4010_AD65;
 }
 
 /// SceLibKernel function NIDs: the user-facing clib (string/memory/print) and the
@@ -608,6 +615,21 @@ pub mod services {
     pub const RTC_SET_TIME64_T: u32 = 0xA6C3_6B6A;
     pub const MOTION_SET_DEADBAND: u32 = 0x917E_A390;
     pub const MOTION_SET_TILT_CORRECTION: u32 = 0xAF09_FCDB;
+    pub const MOTION_GET_DEADBAND: u32 = 0x112E_0EAE;
+    pub const MOTION_GET_TILT_CORRECTION: u32 = 0xC165_2201;
+    pub const MOTION_ROTATE_YAW: u32 = 0x20F0_0078;
+    /// `sceRtcGetDayOfWeek` and the RFC 3339 formatter (local time - which is UTC here).
+    pub const RTC_GET_DAY_OF_WEEK: u32 = 0x2F35_31EB;
+    pub const RTC_FORMAT_RFC3339_LOCAL_TIME: u32 = 0x7422_50A9;
+    /// `sceAppMgrAcquireBgmPort`: claim the shared background-music port.
+    pub const APPMGR_ACQUIRE_BGM_PORT: u32 = 0xAFCE_AB96;
+    /// `_sceRazorCpuWriteFiberUltPkt`: a marker packet for the CPU profiler.
+    pub const RAZOR_CPU_WRITE_FIBER_ULT_PKT: u32 = 0x409D_966A;
+    /// SceUlobjDbg, the ULT object debugger. Unnamed on the henkaku wiki's NID list; the
+    /// ROLES are read off the two call sites in `libult.suprx`, which is the only module
+    /// that imports them - see the dispatch group. Registration and its counterpart.
+    pub const ULOBJ_DBG_REGISTER: u32 = 0xD7F0_F610;
+    pub const ULOBJ_DBG_UNREGISTER: u32 = 0xF9C0_F5DA;
     pub const SHUTTER_SOUND_PLAY: u32 = 0x7FFB_6D79;
     pub const PHOTO_EXPORT_FROM_DATA: u32 = 0x7051_2321;
     // SceNp: service state, the friend/presence surface, lookup requests and the
@@ -707,6 +729,7 @@ pub mod services {
     pub const NP_SNS_FACEBOOK_DIALOG_GET_RESULT_LONG_TOKEN: u32 = 0xA868_2304;
     // SceTouch.
     pub const TOUCH_SET_SAMPLING_STATE: u32 = 0x1B9C_5D14;
+    pub const TOUCH_GET_SAMPLING_STATE: u32 = 0x2653_1526;
     pub const TOUCH_READ: u32 = 0x169A_1D58;
     pub const TOUCH_PEEK: u32 = 0xFF08_2DF0;
     pub const TOUCH_GET_PANEL_INFO: u32 = 0x10A2_CA25;
@@ -826,6 +849,32 @@ pub mod services {
     pub const NP_SCORE_DELETE_TITLE_CTX: u32 = 0xF52E_A88A;
     pub const NP_MATCHING2_INIT: u32 = 0xEBB1_FE74;
     pub const NP_MATCHING2_TERM: u32 = 0x0124_641C;
+    // The rest of SceNpMatching2 - the lobby/room surface. Every one of these needs a
+    // matching-server SESSION, which starts at `CreateContext`; see the dispatch group.
+    pub const NP_MATCHING2_CREATE_CONTEXT: u32 = 0xADF5_78E1;
+    pub const NP_MATCHING2_DESTROY_CONTEXT: u32 = 0x368A_A759;
+    pub const NP_MATCHING2_CONTEXT_START: u32 = 0xBB2E_7559;
+    pub const NP_MATCHING2_CONTEXT_STOP: u32 = 0x5064_54DE;
+    pub const NP_MATCHING2_ABORT_CONTEXT_START: u32 = 0xF284_7E3B;
+    pub const NP_MATCHING2_REGISTER_CONTEXT_CALLBACK: u32 = 0xF9E3_5566;
+    pub const NP_MATCHING2_REGISTER_ROOM_EVENT_CALLBACK: u32 = 0xF486_991B;
+    pub const NP_MATCHING2_REGISTER_ROOM_MESSAGE_CALLBACK: u32 = 0xFA51_949B;
+    pub const NP_MATCHING2_SET_DEFAULT_REQUEST_OPT_PARAM: u32 = 0xF3A4_3C50;
+    pub const NP_MATCHING2_GET_SERVER_LOCAL: u32 = 0x65C0_FEED;
+    pub const NP_MATCHING2_GET_WORLD_INFO_LIST: u32 = 0xC086_B560;
+    pub const NP_MATCHING2_SEARCH_ROOM: u32 = 0xD48B_AF13;
+    pub const NP_MATCHING2_CREATE_JOIN_ROOM: u32 = 0x818A_9499;
+    pub const NP_MATCHING2_JOIN_ROOM: u32 = 0x33F7_D5AE;
+    pub const NP_MATCHING2_SEND_ROOM_MESSAGE: u32 = 0x7B90_8D99;
+    // SceNpScore: the leaderboard request surface, on top of the title context that
+    // `NP_SCORE_CREATE_TITLE_CTX` already reports signed out.
+    pub const NP_SCORE_CREATE_REQUEST: u32 = 0xD30D_1993;
+    pub const NP_SCORE_DELETE_REQUEST: u32 = 0xFFF2_4BB1;
+    pub const NP_SCORE_RECORD_SCORE: u32 = 0x320C_0277;
+    pub const NP_SCORE_RECORD_SCORE_ASYNC: u32 = 0x24B0_9634;
+    pub const NP_SCORE_GET_RANKING_BY_RANGE: u32 = 0x427D_3412;
+    pub const NP_SCORE_GET_RANKING_BY_RANGE_ASYNC: u32 = 0xC45E_3FCD;
+    pub const NP_SCORE_POLL_ASYNC: u32 = 0x9F2A_7AC9;
     pub const HTTP_TERM: u32 = 0xC907_6666;
     pub const SSL_TERM: u32 = 0x03CE_6E3A;
     pub const NET_TERM: u32 = 0xEA3C_C286;
@@ -857,6 +906,15 @@ pub mod services {
     pub const MOTION_RESET: u32 = 0x0FD2_CDA2;
     pub const MOTION_STOP_SAMPLING: u32 = 0xAF32_CB1D;
     pub const NETCTL_ADHOC_DISCONNECT: u32 = 0xED43_B79A;
+    // SceNetAdhocMatching: peer discovery over the ad-hoc radio. Modelled as a radio that
+    // is present and finds NOBODY - see `vita::net`, and `NETCTL_ADHOC_GET_PEER_LIST`,
+    // which already reports an empty peer list for the same reason.
+    pub const ADHOC_MATCHING_INIT: u32 = 0x8E0E_0EAE;
+    pub const ADHOC_MATCHING_CREATE: u32 = 0x7BAD_7EA2;
+    pub const ADHOC_MATCHING_START: u32 = 0xF13E_17BE;
+    pub const ADHOC_MATCHING_STOP: u32 = 0x63AB_B632;
+    pub const ADHOC_MATCHING_DELETE: u32 = 0x7BCD_D889;
+    pub const ADHOC_MATCHING_SELECT_TARGET: u32 = 0x9A6B_1D0F;
     pub const POWER_SET_CONFIGURATION_MODE: u32 = 0x3CE1_87B6;
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
     // dialog's result read.
@@ -1133,6 +1191,11 @@ pub mod ngs {
     pub const VOICE_DEF_GET_COMPRESSOR_SIDE_CHAIN_BUSS: u32 = 0x1AF8_3512;
     pub const VOICE_DEF_GET_SCREAM_ATRAC9_VOICE: u32 = 0xCD63_A2BF;
     pub const VOICE_DEF_GET_SCREAM_VOICE: u32 = 0xCE53_BC33;
+    /// The "template 1" voice - the stock player template - and the plain ATRAC9 voice.
+    /// Both are definition getters like the ones above: the pointer is opaque and only
+    /// its identity matters.
+    pub const VOICE_DEF_GET_TEMPLATE1: u32 = 0xE9B5_72B7;
+    pub const VOICE_DEF_GET_ATRAC9_VOICE: u32 = 0x14EF_65A0;
     pub const VOICE_SET_PARAMS_BLOCK: u32 = 0xFB81_74B1;
     pub const VOICE_PATCH_SET_VOLUME: u32 = 0xA3C8_07BC;
     pub const PATCH_REMOVE_ROUTING: u32 = 0xD0C9_AE5A;
@@ -1509,6 +1572,15 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPMGR_RECEIVE_SYSTEM_EVENT => "sceAppMgrReceiveSystemEvent",
         sv::MOTION_SET_DEADBAND => "sceMotionSetDeadband",
         sv::MOTION_SET_TILT_CORRECTION => "sceMotionSetTiltCorrection",
+        sv::MOTION_GET_DEADBAND => "sceMotionGetDeadband",
+        sv::MOTION_GET_TILT_CORRECTION => "sceMotionGetTiltCorrection",
+        sv::MOTION_ROTATE_YAW => "sceMotionRotateYaw",
+        sv::RTC_GET_DAY_OF_WEEK => "sceRtcGetDayOfWeek",
+        sv::RTC_FORMAT_RFC3339_LOCAL_TIME => "sceRtcFormatRFC3339LocalTime",
+        sv::APPMGR_ACQUIRE_BGM_PORT => "sceAppMgrAcquireBgmPort",
+        sv::RAZOR_CPU_WRITE_FIBER_ULT_PKT => "_sceRazorCpuWriteFiberUltPkt",
+        sv::ULOBJ_DBG_REGISTER => "SceUlobjDbg_D7F0F610",
+        sv::ULOBJ_DBG_UNREGISTER => "SceUlobjDbg_F9C0F5DA",
         sv::SHUTTER_SOUND_PLAY => "sceShutterSoundPlay",
         sv::PHOTO_EXPORT_FROM_DATA => "scePhotoExportFromData",
         sv::NP_GET_SERVICE_STATE => "sceNpGetServiceState",
@@ -1528,6 +1600,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_AUTH_GET_ENTITLEMENT_BY_ID => "sceNpAuthGetEntitlementById",
         sv::NP_AUTH_GET_ENTITLEMENT_ID_LIST => "sceNpAuthGetEntitlementIdList",
         s::FIND_MEM_BLOCK_BY_ADDR => "sceKernelFindMemBlockByAddr",
+        s::GET_MEM_BLOCK_INFO_BY_ADDR => "sceKernelGetMemBlockInfoByAddr",
         sv::MOTION_GET_STATE => "sceMotionGetState",
         sv::RTC_GET_CURRENT_CLOCK_LOCAL_TIME => "sceRtcGetCurrentClockLocalTime",
         sv::RTC_GET_TICK => "sceRtcGetTick",
@@ -1582,6 +1655,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPUTIL_SAVEDATA_DATA_SAVE => "sceAppUtilSaveDataDataSave",
         sv::NP_CHECK_CALLBACK => "sceNpCheckCallback",
         sv::TOUCH_SET_SAMPLING_STATE => "sceTouchSetSamplingState",
+        sv::TOUCH_GET_SAMPLING_STATE => "sceTouchGetSamplingState",
         sv::TOUCH_READ => "sceTouchRead",
         sv::TOUCH_PEEK => "sceTouchPeek",
         sv::TOUCH_GET_PANEL_INFO => "sceTouchGetPanelInfo",
@@ -1785,6 +1859,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::COLOR_SURFACE_GET_SCALE_MODE => "sceGxmColorSurfaceGetScaleMode",
         g::COLOR_SURFACE_SET_DATA => "sceGxmColorSurfaceSetData",
         g::PROGRAM_GET_TYPE => "sceGxmProgramGetType",
+        g::PROGRAM_GET_SIZE => "sceGxmProgramGetSize",
+        g::PRECOMPUTED_DRAW_SET_PARAMS_INSTANCED => "sceGxmPrecomputedDrawSetParamsInstanced",
         g::PROGRAM_FIND_PARAMETER_BY_SEMANTIC => "_sceGxmProgramFindParameterBySemantic",
         g::RENDER_TARGET_GET_DRIVER_MEM_BLOCK => "sceGxmRenderTargetGetDriverMemBlock",
         g::NOTIFICATION_WAIT => "sceGxmNotificationWait",
@@ -1805,6 +1881,8 @@ pub fn name(func_nid: u32) -> &'static str {
         ng::VOICE_DEF_GET_COMPRESSOR_SIDE_CHAIN_BUSS => "sceNgsVoiceDefGetCompressorSideChainBuss",
         ng::VOICE_DEF_GET_SCREAM_ATRAC9_VOICE => "sceNgsVoiceDefGetScreamAtrac9Voice",
         ng::VOICE_DEF_GET_SCREAM_VOICE => "sceNgsVoiceDefGetScreamVoice",
+        ng::VOICE_DEF_GET_TEMPLATE1 => "sceNgsVoiceDefGetTemplate1",
+        ng::VOICE_DEF_GET_ATRAC9_VOICE => "sceNgsVoiceDefGetAtrac9Voice",
         ng::VOICE_SET_PARAMS_BLOCK => "sceNgsVoiceSetParamsBlock",
         ng::VOICE_PATCH_SET_VOLUME => "sceNgsVoicePatchSetVolume",
         ng::PATCH_REMOVE_ROUTING => "sceNgsPatchRemoveRouting",
@@ -1874,7 +1952,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::MP4_START_FILE_STREAMING => "sceMp4StartFileStreaming",
         sv::MP4_CLOSE_FILE => "sceMp4CloseFile",
         sv::MP4_RELEASE_BUFFER_7B4832FE => "sceMp4(unnamed 0x7b4832fe, buffer release)",
-        sv::MP4_GET_NEXT_UNIT_8BE0E3D3 => "sceMp4(unnamed 0x8be0e3d3, next unit)",
+        sv::MP4_GET_NEXT_UNIT_8BE0E3D3 => "sceMp4(unnamed 0x8be0e3d3, stream info)",
         sv::MP4_ENABLE_STREAM_609E57AD => "sceMp4(unnamed 0x609e57ad, enable stream)",
         sv::MP4_RESET_40351E1A => "sceMp4(unnamed 0x40351e1a, reset)",
         sv::MP4_GET_NEXT_UNIT => "sceMp4GetNextUnit",
@@ -1897,6 +1975,28 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NP_SCORE_DELETE_TITLE_CTX => "sceNpScoreDeleteTitleCtx",
         sv::NP_MATCHING2_INIT => "sceNpMatching2Init",
         sv::NP_MATCHING2_TERM => "sceNpMatching2Term",
+        sv::NP_MATCHING2_CREATE_CONTEXT => "sceNpMatching2CreateContext",
+        sv::NP_MATCHING2_DESTROY_CONTEXT => "sceNpMatching2DestroyContext",
+        sv::NP_MATCHING2_CONTEXT_START => "sceNpMatching2ContextStart",
+        sv::NP_MATCHING2_CONTEXT_STOP => "sceNpMatching2ContextStop",
+        sv::NP_MATCHING2_ABORT_CONTEXT_START => "sceNpMatching2AbortContextStart",
+        sv::NP_MATCHING2_REGISTER_CONTEXT_CALLBACK => "sceNpMatching2RegisterContextCallback",
+        sv::NP_MATCHING2_REGISTER_ROOM_EVENT_CALLBACK => "sceNpMatching2RegisterRoomEventCallback",
+        sv::NP_MATCHING2_REGISTER_ROOM_MESSAGE_CALLBACK => "sceNpMatching2RegisterRoomMessageCallback",
+        sv::NP_MATCHING2_SET_DEFAULT_REQUEST_OPT_PARAM => "sceNpMatching2SetDefaultRequestOptParam",
+        sv::NP_MATCHING2_GET_SERVER_LOCAL => "sceNpMatching2GetServerLocal",
+        sv::NP_MATCHING2_GET_WORLD_INFO_LIST => "sceNpMatching2GetWorldInfoList",
+        sv::NP_MATCHING2_SEARCH_ROOM => "sceNpMatching2SearchRoom",
+        sv::NP_MATCHING2_CREATE_JOIN_ROOM => "sceNpMatching2CreateJoinRoom",
+        sv::NP_MATCHING2_JOIN_ROOM => "sceNpMatching2JoinRoom",
+        sv::NP_MATCHING2_SEND_ROOM_MESSAGE => "sceNpMatching2SendRoomMessage",
+        sv::NP_SCORE_CREATE_REQUEST => "sceNpScoreCreateRequest",
+        sv::NP_SCORE_DELETE_REQUEST => "sceNpScoreDeleteRequest",
+        sv::NP_SCORE_RECORD_SCORE => "sceNpScoreRecordScore",
+        sv::NP_SCORE_RECORD_SCORE_ASYNC => "sceNpScoreRecordScoreAsync",
+        sv::NP_SCORE_GET_RANKING_BY_RANGE => "sceNpScoreGetRankingByRange",
+        sv::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC => "sceNpScoreGetRankingByRangeAsync",
+        sv::NP_SCORE_POLL_ASYNC => "sceNpScorePollAsync",
         sv::HTTP_TERM => "sceHttpTerm",
         sv::SSL_TERM => "sceSslTerm",
         sv::NET_TERM => "sceNetTerm",
@@ -1920,6 +2020,12 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::NETCTL_ADHOC_GET_STATE => "sceNetCtlAdhocGetState",
         sv::NETCTL_ADHOC_GET_PEER_LIST => "sceNetCtlAdhocGetPeerList",
         sv::NETCTL_ADHOC_DISCONNECT => "sceNetCtlAdhocDisconnect",
+        sv::ADHOC_MATCHING_INIT => "sceNetAdhocMatchingInit",
+        sv::ADHOC_MATCHING_CREATE => "sceNetAdhocMatchingCreate",
+        sv::ADHOC_MATCHING_START => "sceNetAdhocMatchingStart",
+        sv::ADHOC_MATCHING_STOP => "sceNetAdhocMatchingStop",
+        sv::ADHOC_MATCHING_DELETE => "sceNetAdhocMatchingDelete",
+        sv::ADHOC_MATCHING_SELECT_TARGET => "sceNetAdhocMatchingSelectTarget",
         sv::POWER_SET_CONFIGURATION_MODE => "scePowerSetConfigurationMode",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
         // SceCommonDialog lifecycle. These all had dispatch arms already; without a name

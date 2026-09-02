@@ -420,6 +420,21 @@
       /// One line describing what the audio ring actually carried, in seconds rather
       /// than frame counts - "3.2s of gaps" is a thing a person can act on, "153600" is
       /// not. Ratios are against what the device consumed.
+      /// >>> AND THE SAME COUNTERS OVER A RECENT WINDOW, WHICH IS THE ONLY WAY THE NUMBER
+      /// >>> ABOVE CAN BE ACTED ON.
+      ///
+      /// `underrun` is monotonic FOR THE WHOLE RUN, and it sits on a line next to `fps` and
+      /// the backlog, which are a recent window. A run that starves through its boot and its
+      /// first course load - which every run does, because the emulator is far below real time
+      /// while it compiles shaders and decodes a level - carries that forever. MEASURED on the
+      /// user's device: `UNDERRUN 26.36s (34.5%)` on a run whose audio was fine to listen to by
+      /// the time they read it, and whose ring had a healthy 93 ms of backlog right then.
+      ///
+      /// So the cumulative figure answers "has this run ever starved" (almost always yes) and
+      /// cannot answer "is it crackling now". This adds the second question.
+      /// [[vitaslop-a-count-needs-its-window]]
+      const AUDIO_WINDOW_MS = 10000;
+      const audioHist = [];
       const audioLine = () => {
         if (!window.__audioStats) return `audio: no ring on this page - the run is SILENT`;
         const a = window.__audioStats();
@@ -427,12 +442,26 @@
         const s = (n) => (n / rate).toFixed(2);
         const pct = (n) => (a.read ? ((100 * n) / a.read).toFixed(1) : "0.0");
         const ms = (n) => ((1000 * n) / rate).toFixed(0);
+        // The oldest sample still inside the window is the baseline; everything older is
+        // dropped. Deltas of monotonic counters, so this cannot disagree with the totals.
+        const now = performance.now();
+        audioHist.push({ t: now, u: a.underrun, r: a.read });
+        while (audioHist.length > 1 && now - audioHist[0].t > AUDIO_WINDOW_MS) audioHist.shift();
+        const first = audioHist[0];
+        const dRead = a.read - first.r;
+        const dUnder = a.underrun - first.u;
+        const recent =
+          dRead > 0
+            ? `${((100 * dUnder) / dRead).toFixed(1)}% over the last ` +
+              `${((now - first.t) / 1000).toFixed(0)}s`
+            : "no data read yet in the window";
         return (
           `audio: context=${a.state} peak=${(a.peak ?? 0).toFixed(4)}` +
           `${a.peak > 0 ? "" : " (NOTHING was audible at any point)"} | ` +
           `written ${s(a.written)}s, read ${s(a.read)}s | ` +
-          `UNDERRUN ${s(a.underrun)}s (${pct(a.underrun)}% - gaps the device filled with ` +
-          `silence, heard as clicks) | OVERRUN ${s(a.overrun)}s (${pct(a.overrun)}% - ` +
+          `UNDERRUN ${s(a.underrun)}s (${pct(a.underrun)}% of the WHOLE RUN, which includes ` +
+          `the boot and every load - gaps the device filled with silence, heard as clicks; ` +
+          `RECENT ${recent}) | OVERRUN ${s(a.overrun)}s (${pct(a.overrun)}% - ` +
           `samples dropped because the emulator ran ahead) | ` +
           // Latency is what makes a sound arrive after the button that caused it, and it
           // is a different complaint from crackling with a different fix, so it is

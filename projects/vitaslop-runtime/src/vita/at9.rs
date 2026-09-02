@@ -27,6 +27,105 @@ const OFF_LOOP_COUNT: u32 = 0x10;
 const OFF_CHANNELS: u32 = 0x58;
 const OFF_CONFIG: u32 = 0x5c;
 
+/// A player carries FOUR buffer descriptors, not one, and they CHAIN.
+///
+/// Each descriptor is `{ ptr, bytes, i16 loop_count, i16 next_index }`: the buffer plays,
+/// repeats `loop_count` more times (negative = forever), then hands over to buffer
+/// `next_index`, and a negative `next_index` is the end of the data. That is how a title
+/// STREAMS through a player: two or four small slots forming a ring, each refilled from its
+/// module callback as the player leaves it.
+///
+/// EVIDENCE that the descriptors are 16 bytes apart in the AT9 player (12 in the PCM one):
+/// one title's AT9 stream writes `{0x8180c8a0, 0x1c0, loop 0, next 1, 0x0100}` at +0x08 and
+/// `{0x8180d0c0, 0x1c0, loop 0, next 0}` at +0x18 - one 448-byte superframe per slot, slot
+/// 0 pointing at slot 1 and slot 1 back at slot 0. The `0x0100` in the fifth word of slot 0
+/// is 256, which is the ATRAC9 encoder delay in samples: the AT9 descriptor carries two
+/// trailing `i16`s naming samples to DISCARD at the start and end of the buffer. Four
+/// 16-byte descriptors fill +0x08..+0x48, and the playback rate that the 12-byte PCM
+/// layout keeps at +0x38 sits at +0x48 in the AT9 one - which is where this file already
+/// read the AT9 level from (`OFF_CONFIG - 0x10` = +0x4c).
+const PLAYER_BUFFERS: usize = 4;
+const AT9_BUFFER_STRIDE: u32 = 16;
+const PCM_BUFFER_STRIDE: u32 = 12;
+/// Within a descriptor: the two loop/next halves after `{ptr, bytes}`, and (AT9 only) the
+/// discard-start / discard-end sample counts after those.
+const DESC_OFF_LOOP: u32 = 8;
+const DESC_OFF_NEXT: u32 = 10;
+const DESC_OFF_DISCARD_START: u32 = 12;
+const DESC_OFF_DISCARD_END: u32 = 14;
+
+/// One slot of a player's buffer chain - see [`PLAYER_BUFFERS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct BufDesc {
+    ptr: u32,
+    bytes: u32,
+    /// Extra plays of this buffer before moving on; negative = forever.
+    loop_count: i16,
+    /// Buffer to play after this one; negative = the end of the data.
+    next: i16,
+    /// AT9 only: samples to drop at the head of this buffer (the encoder delay).
+    discard_start: i16,
+    /// AT9 only: samples to drop at the tail of this buffer.
+    discard_end: i16,
+}
+
+impl BufDesc {
+    fn read(ctx: &GuestCtx, at: u32, with_discards: bool) -> BufDesc {
+        let loop_next = ctx.read_u32(at + DESC_OFF_LOOP);
+        let discards = if with_discards { ctx.read_u32(at + DESC_OFF_DISCARD_START) } else { 0 };
+        debug_assert_eq!(DESC_OFF_NEXT, DESC_OFF_LOOP + 2);
+        debug_assert_eq!(DESC_OFF_DISCARD_END, DESC_OFF_DISCARD_START + 2);
+        BufDesc {
+            ptr: ctx.read_u32(at),
+            bytes: ctx.read_u32(at + 4),
+            loop_count: loop_next as i16,
+            next: (loop_next >> 16) as i16,
+            discard_start: discards as i16,
+            discard_end: (discards >> 16) as i16,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ptr == 0 || self.bytes == 0
+    }
+}
+
+/// What a player did at a buffer boundary. Each one is a MODULE CALLBACK on the device -
+/// `sceNgsVoiceSetModuleCallback` on the player module - and the callback's
+/// `nCallbackData` is this reason with `nCallbackData2` the index of the buffer it is
+/// about. A streaming title refills the slot it is told about; without the callback it
+/// never refills anything, the chain plays its two primed superframes and the voice ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlayerEvent {
+    /// The buffer finished and the player moved to `next`.
+    Swapped { finished: u32 },
+    /// The buffer finished and the player started it again.
+    Looped { buffer: u32 },
+    /// The buffer finished and there was nothing to move to: the voice has ended.
+    EndOfData { last: u32 },
+}
+
+impl PlayerEvent {
+    /// The player module's callback reasons, as numbered in the published NGS interface:
+    /// end-of-data 0, swapped-buffer 1, looped-buffer 4 (2 and 3 are the header and decode
+    /// errors this engine reports through `refuse` instead).
+    pub(crate) fn reason(self) -> u32 {
+        match self {
+            PlayerEvent::EndOfData { .. } => 0,
+            PlayerEvent::Swapped { .. } => 1,
+            PlayerEvent::Looped { .. } => 4,
+        }
+    }
+
+    pub(crate) fn buffer(self) -> u32 {
+        match self {
+            PlayerEvent::EndOfData { last } => last,
+            PlayerEvent::Swapped { finished } => finished,
+            PlayerEvent::Looped { buffer } => buffer,
+        }
+    }
+}
+
 /// The SECOND source generator: a raw-PCM player, and the one a title's sound effects
 /// and streamed music actually use (one title's front end offers 66 of these against 3
 /// AT9 voices).
@@ -149,11 +248,26 @@ enum SourceKind {
 /// samples.
 pub(crate) struct At9Voice {
     kind: SourceKind,
+    /// The buffer being played NOW: a copy of `bufs[cur]`'s pointer and length, kept as
+    /// plain fields because every decode path reads them per grain.
     data_ptr: u32,
     data_bytes: u32,
     config: [u8; 4],
     channels: u32,
+    /// `bufs[cur].loop_count` - kept beside the pointer for the same reason.
     loop_count: i16,
+    /// The whole buffer chain the title configured - see [`PLAYER_BUFFERS`].
+    bufs: [BufDesc; PLAYER_BUFFERS],
+    /// Index into `bufs` of the buffer being played.
+    cur: usize,
+    /// Extra plays of `bufs[cur]` completed so far, against its `loop_count`.
+    laps: i32,
+    /// AT9 only: decoded samples (interleaved) still to be dropped at the head of the
+    /// current buffer - `discard_start` x channels, counted down as frames decode.
+    discard_pending: usize,
+    /// Buffer boundaries crossed since the bank last drained them - each one is a module
+    /// callback the title is owed. See [`PlayerEvent`].
+    events: Vec<PlayerEvent>,
     playing: bool,
     /// Recreated on play; `None` until first play or if the config is unset.
     decoder: Option<Atrac9Decoder>,
@@ -240,6 +354,11 @@ impl At9Voice {
             config: [0; 4],
             channels: 0,
             loop_count: 0,
+            bufs: [BufDesc::default(); PLAYER_BUFFERS],
+            cur: 0,
+            laps: 0,
+            discard_pending: 0,
+            events: Vec::new(),
             playing: false,
             decoder: None,
             superframe_bytes: 0,
@@ -315,12 +434,94 @@ impl At9Voice {
             return false;
         }
         self.kind = SourceKind::At9;
-        self.data_ptr = data_ptr;
-        self.data_bytes = data_bytes;
         self.config = config;
         self.channels = ctx.read_u32(params_addr + OFF_CHANNELS) & 0xffff;
-        self.loop_count = ctx.read_u32(params_addr + OFF_LOOP_COUNT) as i16;
+        let bufs = std::array::from_fn(|i| {
+            BufDesc::read(ctx, params_addr + OFF_BUFFER_PTR + i as u32 * AT9_BUFFER_STRIDE, true)
+        });
+        self.set_chain(bufs);
+        debug_assert_eq!(self.data_ptr, data_ptr);
+        debug_assert_eq!(self.data_bytes, data_bytes);
+        debug_assert_eq!(self.loop_count, ctx.read_u32(params_addr + OFF_LOOP_COUNT) as i16);
         true
+    }
+
+    /// Take a freshly written buffer chain.
+    ///
+    /// >>> A WRITE WHILE THE VOICE IS PLAYING IS A REFILL, NOT A RESTART. A streaming title
+    /// answers each buffer callback by locking the params, rewriting the slot it was told
+    /// about, and unlocking - with the player two slots further on. Resetting the read
+    /// position on every unlock would restart the sound at every superframe. So the chain
+    /// is replaced but the cursor (`cur`, `consumed`, `laps`) is kept, and only the CURRENT
+    /// slot's copy is refreshed from the new descriptors.
+    fn set_chain(&mut self, bufs: [BufDesc; PLAYER_BUFFERS]) {
+        self.bufs = bufs;
+        if !self.playing {
+            self.cur = 0;
+            self.laps = 0;
+        }
+        self.select(self.cur);
+    }
+
+    /// Make `bufs[index]` the buffer the decode paths read.
+    fn select(&mut self, index: usize) {
+        let b = self.bufs[index.min(PLAYER_BUFFERS - 1)];
+        self.cur = index.min(PLAYER_BUFFERS - 1);
+        self.data_ptr = b.ptr;
+        self.data_bytes = b.bytes;
+        self.loop_count = b.loop_count;
+    }
+
+    /// The source ran out of the current buffer: repeat it, move to the next one, or end.
+    /// Returns whether there is anything left to play. Every outcome is an event the
+    /// title's module callback is owed - see [`PlayerEvent`].
+    fn advance(&mut self) -> bool {
+        let b = self.bufs[self.cur];
+        let index = self.cur as u32;
+        // Carry the fractional part so a looping source does not gain or lose a sample
+        // every lap, which would drift audibly over a long ambience bed.
+        self.resample_pos -= self.resample_pos.floor();
+        self.consumed = 0;
+        if b.loop_count < 0 || self.laps < i32::from(b.loop_count) {
+            self.laps += 1;
+            self.events.push(PlayerEvent::Looped { buffer: index });
+            self.enter_buffer();
+            return true;
+        }
+        let next = b.next;
+        let next_desc = usize::try_from(next).ok().and_then(|n| self.bufs.get(n).copied());
+        match next_desc {
+            Some(nb) if !nb.is_empty() => {
+                self.events.push(PlayerEvent::Swapped { finished: index });
+                self.laps = 0;
+                self.select(next as usize);
+                self.enter_buffer();
+                true
+            }
+            _ => {
+                self.events.push(PlayerEvent::EndOfData { last: index });
+                if self.playing {
+                    note_voice_ended();
+                }
+                self.playing = false;
+                false
+            }
+        }
+    }
+
+    /// Bookkeeping at the head of a buffer: the samples an AT9 descriptor says to drop.
+    fn enter_buffer(&mut self) {
+        let b = self.bufs[self.cur];
+        self.discard_pending = if self.kind == SourceKind::At9 {
+            usize::try_from(b.discard_start).unwrap_or(0) * self.channels.max(1) as usize
+        } else {
+            0
+        };
+    }
+
+    /// The events since the last drain, in order.
+    fn take_events(&mut self) -> Vec<PlayerEvent> {
+        std::mem::take(&mut self.events)
     }
 
     /// Read a raw-PCM player's params - see [`PCM_PARAMS_ID`] for the layout and the
@@ -438,16 +639,24 @@ impl At9Voice {
         );
         self.kind = SourceKind::Pcm;
         self.format = format;
-        self.data_ptr = data_ptr;
-        self.data_bytes = data_bytes;
         self.channels = channels;
         self.rate = rate as u32;
-        self.loop_count = ctx.read_u32(params_addr + OFF_LOOP_COUNT) as i16;
+        let bufs = std::array::from_fn(|i| {
+            BufDesc::read(ctx, params_addr + OFF_BUFFER_PTR + i as u32 * PCM_BUFFER_STRIDE, false)
+        });
+        self.set_chain(bufs);
+        debug_assert_eq!(self.data_ptr, data_ptr);
+        debug_assert_eq!(self.data_bytes, data_bytes);
         true
     }
 
     /// (Re)start playback from the beginning of the current source.
     fn start(&mut self) {
+        // From the head of the chain, whatever slot a previous play ended in.
+        self.laps = 0;
+        self.select(0);
+        self.enter_buffer();
+        self.events.clear();
         if self.kind == SourceKind::Pcm {
             // Nothing to construct: the source is already samples, and playing it is a
             // read cursor over guest memory.
@@ -557,6 +766,8 @@ impl At9Voice {
         // interpolating with a zero fraction returns the sample untouched.
         if self.rate == port_rate {
             while self.pending.len() < needed && self.playing {
+                // Re-read per pass: a wrap can move the cursor to another slot of the chain.
+                let total_frames = (self.data_bytes / frame_bytes) as usize;
                 let start_frame = self.resample_pos as usize;
                 if start_frame >= total_frames {
                     self.wrap_or_stop();
@@ -584,6 +795,7 @@ impl At9Voice {
         }
 
         while self.pending.len() < needed && self.playing {
+            let total_frames = (self.data_bytes / frame_bytes) as usize;
             let want_frames = (needed - self.pending.len()).div_ceil(ch);
             let start_frame = self.resample_pos.floor() as usize;
             if start_frame >= total_frames {
@@ -660,7 +872,7 @@ impl At9Voice {
             let out_frames = (needed - self.pending.len()).div_ceil(ch);
             // Source frames this pass needs, plus one for the interpolation partner.
             let want_src = (self.resample_pos + ratio * out_frames as f64).ceil() as usize + 2;
-            self.decode_adpcm_frames(ctx, want_src * ch, ch, total_blocks, scratch);
+            self.decode_adpcm_frames(ctx, want_src * ch, ch, scratch);
             let have = self.src_pending.len() / ch;
             if have == 0 {
                 return;
@@ -731,19 +943,25 @@ impl At9Voice {
         ctx: &GuestCtx,
         want: usize,
         ch: usize,
-        total_blocks: u32,
         scratch: &mut MixScratch,
     ) {
         while self.src_pending.len() < want && self.playing {
+            // Re-read per pass: `advance` below can move the cursor to a different slot
+            // of the chain, with its own length.
+            let total_blocks = self.data_bytes / ADPCM_BLOCK_BYTES;
             let done = self.consumed / ADPCM_BLOCK_BYTES;
             if done >= total_blocks {
-                if self.loops() {
-                    self.consumed = 0;
-                    self.adpcm_hist = [(0, 0); 2];
-                    continue;
+                let was = self.cur;
+                if !self.advance() {
+                    return;
                 }
-                self.playing = false;
-                return;
+                // A lap of the SAME buffer restarts the predictor, as it always did; a
+                // hand-over to the next slot of a stream carries it, because the slots are
+                // one continuous encoding.
+                if self.cur == was {
+                    self.adpcm_hist = [(0, 0); 2];
+                }
+                continue;
             }
             // A run must cover whole INTERLEAVE GROUPS (one block per channel), or the
             // channel a block belongs to would shift.
@@ -790,16 +1008,7 @@ impl At9Voice {
 
     /// The source ran out: restart it if it loops, otherwise the voice is finished.
     fn wrap_or_stop(&mut self) {
-        if self.loops() {
-            // Carry the fractional part so a looping source does not gain or lose a
-            // sample every lap, which would drift audibly over a long ambience bed.
-            self.resample_pos -= self.resample_pos.floor();
-        } else {
-            if self.playing {
-                note_voice_ended();
-            }
-            self.playing = false;
-        }
+        self.advance();
     }
 
     /// Decode until at least `needed` interleaved samples are pending, or the
@@ -815,12 +1024,13 @@ impl At9Voice {
                 return;
             }
             if self.consumed + self.superframe_bytes > self.data_bytes {
-                if self.loops() {
-                    self.start();
-                    continue;
+                // The decoder is NOT rebuilt at a boundary: a streamed source is one
+                // bitstream cut into slots, and the overlap-add state has to carry across
+                // the cut or every superframe starts with a click.
+                if !self.advance() {
+                    return;
                 }
-                self.playing = false;
-                return;
+                continue;
             }
             // Into the shared buffers rather than into two fresh allocations per superframe.
             scratch.src.resize(self.superframe_bytes as usize, 0);
@@ -833,10 +1043,17 @@ impl At9Voice {
             scratch.pcm.resize(frame_shorts, 0);
             let pcm = &mut scratch.pcm;
             let mut inner = 0usize;
+            let last_superframe = self.consumed + 2 * self.superframe_bytes > self.data_bytes;
+            let before = self.pending.len();
             for _ in 0..frames {
                 match dec.decode_frame(&sf[inner..], pcm) {
                     Ok(used) => {
-                        self.pending.extend(pcm.iter().copied());
+                        // The descriptor's head discard: the encoder delay the title asks
+                        // the player to swallow, so the sound starts where it was encoded
+                        // to start rather than 256 samples of pre-echo late.
+                        let skip = self.discard_pending.min(pcm.len());
+                        self.discard_pending -= skip;
+                        self.pending.extend(pcm[skip..].iter().copied());
                         inner += used;
                     }
                     Err(e) => {
@@ -851,6 +1068,14 @@ impl At9Voice {
                 }
             }
             self.consumed += self.superframe_bytes;
+            // The descriptor's tail discard, once the buffer's last superframe is in.
+            if last_superframe {
+                let drop = usize::try_from(self.bufs[self.cur].discard_end).unwrap_or(0)
+                    * self.channels.max(1) as usize;
+                let added = self.pending.len().saturating_sub(before);
+                let keep = self.pending.len() - drop.min(added);
+                self.pending.truncate(keep);
+            }
         }
     }
 }
@@ -1508,6 +1733,24 @@ impl At9Bank {
     /// Any voice currently producing audio.
     pub(crate) fn any_playing(&self) -> bool {
         self.voices.values().any(|v| v.playing)
+    }
+
+    /// Whether `voice` is producing audio - what `sceNgsVoiceGetInfo` reports as ACTIVE.
+    pub(crate) fn is_playing(&self, voice: u32) -> bool {
+        self.voices.get(&voice).is_some_and(|v| v.playing)
+    }
+
+    /// Every buffer boundary any voice crossed since the last drain, as `(voice, event)`
+    /// in the order they happened. Each is a module callback the title is owed.
+    pub(crate) fn take_events(&mut self) -> Vec<(u32, PlayerEvent)> {
+        let mut out = Vec::new();
+        for (&handle, v) in self.voices.iter_mut() {
+            if v.events.is_empty() {
+                continue;
+            }
+            out.extend(v.take_events().into_iter().map(|e| (handle, e)));
+        }
+        out
     }
 
     /// Mix one grain of every playing voice into `mix` (interleaved, `grain *

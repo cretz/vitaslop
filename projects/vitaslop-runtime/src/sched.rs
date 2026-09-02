@@ -840,6 +840,11 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // Count the frame and advance any frame-keyed input (a scripted TAS
                 // recipe) in lockstep with the render loop.
                 self.frames += 1;
+                // Diagnostic (`RUST_LOG=vitaslop::display=trace`): the frame boundary itself,
+                // so the flip and scene traces either side of it can be attributed to a frame.
+                // Without it those lines are an undivided stream and "which frame flipped what"
+                // - the whole question behind a picture that strobes - cannot be read off them.
+                tracing::trace!(target: "vitaslop::display", frame = self.frames, "frame boundary");
                 {
                     let _f = crate::perf::scope(crate::perf::Phase::FrameBoundary);
                     self.host.lock().unwrap().on_frame_boundary(self.frames);

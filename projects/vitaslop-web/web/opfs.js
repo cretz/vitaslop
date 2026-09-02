@@ -145,13 +145,54 @@ export async function importTitle(id, entries, onProgress = () => {}) {
 /// later - the emulator cannot await inside a guest file read, so every handle it may
 /// need has to be open before the guest starts.
 export async function openTitleSync(id) {
-  const dir = await titleDir(id, { create: false });
-  const handles = {};
-  for await (const [name, h] of dir.entries()) {
-    if (name === MANIFEST || h.kind !== "file") continue;
-    handles[decodeName(name)] = await h.createSyncAccessHandle();
+  // >>> A RELOAD RACES THE PREVIOUS WORKER'S TEARDOWN, AND THAT IS THE NORMAL PATH.
+  //
+  // A sync access handle is EXCLUSIVE per file. The run worker holds one per file for the
+  // whole session, and when the page is reloaded the browser tears that worker down
+  // ASYNCHRONOUSLY - while the new page's transpile worker is already starting. The handles
+  // are still held for a moment, and the open fails with
+  // `NoModificationAllowedError: Access Handles cannot be created if there is another open
+  // Access Handle or Writable stream associated with the same file`.
+  //
+  // Reported by the user on a plain reload of a single tab, with no second tab anywhere:
+  // BOOT FAILED, no adapter, no audio, nothing playable. So this is not a multi-tab edge
+  // case, it is what reloading a running title does.
+  //
+  // >>> AND THE FAILURE USED TO POISON EVERY RETRY. If the throw came part-way through the
+  // loop, the handles already opened were dropped on the floor still OPEN - held by this
+  // worker, for as long as it lives. A second attempt then collided with itself, so the
+  // condition could never clear. Closing the partial set is what makes retrying meaningful.
+  const DELAYS_MS = [0, 100, 200, 400, 800, 1500];
+  let last;
+  for (const wait of DELAYS_MS) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    const dir = await titleDir(id, { create: false });
+    const handles = {};
+    try {
+      for await (const [name, h] of dir.entries()) {
+        if (name === MANIFEST || h.kind !== "file") continue;
+        handles[decodeName(name)] = await h.createSyncAccessHandle();
+      }
+      return handles;
+    } catch (e) {
+      for (const h of Object.values(handles)) {
+        try {
+          h.close();
+        } catch {
+          // Already closed, or the handle died with its file. Nothing to do, and it must not
+          // mask the original failure below.
+        }
+      }
+      last = e;
+      if (e && e.name !== "NoModificationAllowedError") throw e;
+    }
   }
-  return handles;
+  throw new Error(
+    `this title's files are still open in another worker, so they cannot be opened again ` +
+      `(${last}). That is usually the previous run still shutting down - reloading again ` +
+      `after a moment normally clears it. If it does not, close every tab on this address ` +
+      `(the handles are released when the last one goes) and open it again.`,
+  );
 }
 
 /// A reader the wasm side calls: `size(path)` and `read(path, offset, into)`, both

@@ -427,6 +427,124 @@ pub(super) fn epoll_wait(st: &mut VitaState, eid: i32, _events: Ptr, _maxevents:
     }
 }
 
+// --- SceNetAdhocMatching -----------------------------------------------------------
+//
+// Peer discovery over the ad-hoc radio: a title creates a matching context as PARENT or
+// CHILD, starts it, and is called back as consoles appear and offer to join.
+//
+// >>> THE MODEL IS "THE RADIO WORKS AND NOBODY IS THERE", not "the library is broken".
+// That is a real state a console is in constantly - the first player to open a lobby sits
+// in exactly it - and it is the same stance `sceNetCtlAdhocGetPeerList` already takes by
+// reporting an EMPTY list rather than an error. So the lifecycle calls all succeed: a
+// context is created, started, stopped and deleted for real, and the handler callback is
+// simply never invoked, because no peer ever appears to invoke it about. A title that
+// waits for peers waits, which is what it does on hardware in an empty room; a title that
+// was refused at `Create` would instead show an error it need not show.
+//
+// The ids are minted in creation order, so they are a function of the guest's own call
+// sequence and identical across runs (see `VitaState::adhoc_matching_create`).
+
+/// `SceNetAdhocMatchingErrorCode` values this surface reports.
+const SCE_NET_ADHOC_MATCHING_ERROR_INVALID_MODE: i32 = 0x8041_3101u32 as i32;
+const SCE_NET_ADHOC_MATCHING_ERROR_INVALID_MAXNUM: i32 = 0x8041_3103u32 as i32;
+const SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID: i32 = 0x8041_3107u32 as i32;
+const SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET: i32 = 0x8041_310Cu32 as i32;
+const SCE_NET_ADHOC_MATCHING_ERROR_ALREADY_INITIALIZED: i32 = 0x8041_3112u32 as i32;
+const SCE_NET_ADHOC_MATCHING_ERROR_NOT_INITIALIZED: i32 = 0x8041_3113u32 as i32;
+
+/// int sceNetAdhocMatchingInit(unsigned int pool_size, void *pool_ptr)
+///
+/// The library is given a memory pool by the CALLER - so there is nothing to allocate
+/// here, only the fact of initialisation to record, which is what lets a `Create` before
+/// it report NOT_INITIALIZED instead of quietly working.
+#[hostcall]
+pub(super) fn adhoc_matching_init(st: &mut VitaState, pool_size: u32, pool_ptr: u32) -> i32 {
+    if st.adhoc_matching_init(pool_ptr, pool_size) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_ALREADY_INITIALIZED
+    }
+}
+
+/// int sceNetAdhocMatchingCreate(SceNetAdhocMatchingMode mode, int max_members,
+///     SceUShort16 port, int rx_buffer_len, unsigned int hello_interval,
+///     unsigned int keep_alive_interval, int retry_count, unsigned int rexmt_interval,
+///     SceNetAdhocMatchingCallback handler)
+///
+/// Returns the context id, or an error. `mode` is PARENT(1) / CHILD(2) / P2P(3) and
+/// anything else is rejected, as is a non-positive member count: those are the two
+/// validations a caller can trip by itself, and they are worth keeping because they are
+/// the same answer the console gives.
+///
+/// The `handler` is deliberately not stored. Nothing can ever call it - see the note
+/// above - and holding a callback that is never invoked would suggest otherwise.
+#[hostcall]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn adhoc_matching_create(
+    st: &mut VitaState,
+    mode: i32,
+    max_members: i32,
+    _port: u32,
+    _rx_buffer_len: i32,
+    _hello_interval: u32,
+    _keep_alive_interval: u32,
+    _retry_count: i32,
+    _rexmt_interval: u32,
+    _handler: u32,
+) -> i32 {
+    if !st.adhoc_matching_ready() {
+        SCE_NET_ADHOC_MATCHING_ERROR_NOT_INITIALIZED
+    } else if !(1..=3).contains(&mode) {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_MODE
+    } else if max_members <= 0 {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_MAXNUM
+    } else {
+        st.adhoc_matching_create()
+    }
+}
+
+/// int sceNetAdhocMatchingStart(int id, int thread_priority, int thread_stack_size,
+///     int thread_cpu_affinity_mask, int hello_opt_len, void *hello_opt)
+/// int sceNetAdhocMatchingStop(int id)
+///
+/// Start begins advertising and listening. Both really move the context's state, so a
+/// double start or a stop of an id that was never created is reported rather than
+/// accepted. `start` selects which.
+pub(super) fn adhoc_matching_set_started(ctx: &mut GuestCtx, st: &mut VitaState, start: bool) {
+    let id = ctx.arg(0) as i32;
+    let r = match st.adhoc_matching_set_started(id, start) {
+        Some(()) => 0,
+        None => SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID,
+    };
+    ctx.ret(r as u32);
+}
+
+/// int sceNetAdhocMatchingDelete(int id)
+#[hostcall]
+pub(super) fn adhoc_matching_delete(st: &mut VitaState, id: i32) -> i32 {
+    if st.adhoc_matching_delete(id) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingSelectTarget(int id, SceNetInAddr *target, int opt_len,
+///     void *opt)
+///
+/// Offer to pair with a peer the handler reported. No handler has ever fired here, so
+/// whatever address the title passes names a console this context has never heard from -
+/// UNKNOWN_TARGET, which is exactly what the console says about an address that is not in
+/// its member list. Reporting success would promise a pairing that can never complete.
+#[hostcall]
+pub(super) fn adhoc_matching_select_target(st: &mut VitaState, id: i32, _target: Ptr, _opt_len: i32, _opt: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
+        SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
 /// int *sceNetErrnoLoc(void)
 ///
 /// The address of the calling thread's errno. Per THREAD, because two workers failing

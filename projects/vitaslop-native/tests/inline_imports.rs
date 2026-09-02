@@ -634,9 +634,18 @@ fn bind_layout() -> vitaslop_transpiler::BindStateLayout {
         ctx_record: 4,
         copy_dst: 16,
         copy_bytes: 12,
+        // The BULK form. The per-slot form has its own fixture and its own test below - see
+        // `bind_state_skips_a_slot_the_state_does_not_carry`.
+        copy_slot_stride: 0,
         ctx_prog: 28,
         has_prog: true,
     }
+}
+
+/// The same synthetic layout with the copy read as THREE ONE-WORD SLOTS, which is the shape
+/// the fragment texture array uses (sixteen slots of six words).
+fn bind_layout_per_slot() -> vitaslop_transpiler::BindStateLayout {
+    vitaslop_transpiler::BindStateLayout { copy_slot_stride: 4, ..bind_layout() }
 }
 
 /// Where the bind test parks the state struct and its arrays block.
@@ -683,6 +692,42 @@ fn bind_state_copies_the_block_record_and_program() {
     assert_eq!(word(&mut vm, 24), 0x0B10_C003, "copy word 2");
     // The program handle.
     assert_eq!(word(&mut vm, 28), 0xAA55_0001, "the program handle lands at ctx_prog");
+    assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
+}
+
+/// >>> A SLOT THE STATE DOES NOT CARRY MUST SURVIVE THE BIND.
+///
+/// The emitted counterpart of `bind_precomputed_fragment_state`'s per-slot loop. A precomputed
+/// fragment state's texture array is a block this engine allocates and ZEROES, so an empty slot
+/// means "no setter ever named this unit" - and copying that emptiness over the context erases a
+/// texture the guest bound directly. MEASURED on PCSE00120, whose title-screen art did not draw
+/// for exactly this reason: 19,603 direct binds, zero textures ever put into a state, and a
+/// state bind between the bind and the immediate draw that sampled it.
+///
+/// The two writers have to agree, so this pins the emitted form against the same rule: a
+/// non-empty slot is copied, an empty one leaves what was already there.
+#[test]
+fn bind_state_skips_a_slot_the_state_does_not_carry() {
+    let l = bind_layout_per_slot();
+    let mut vm = vm_with(InlineOp::BindPrecomputedState { layout: l });
+    seed_bind(&mut vm, l.ctx_magic, l.st_magic);
+    // The middle slot is EMPTY; the outer two carry values.
+    let blk: [u32; 3] = [0x0B10_C001, 0, 0x0B10_C003];
+    let bytes: Vec<u8> = blk.iter().flat_map(|w| w.to_le_bytes()).collect();
+    vm.write_mem(BLK_PTR, &bytes).expect("arrays block");
+    let crossed = run(&mut vm);
+    assert!(!crossed, "both magics hold - the inline arm must serve this");
+    let word = |vm: &mut Vm, at: u32| {
+        let b = vm.read_mem(OUT_PTR + at, 4).expect("read back");
+        u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"))
+    };
+    assert_eq!(word(&mut vm, 16), 0x0B10_C001, "slot 0 is carried and must be copied");
+    assert_eq!(
+        word(&mut vm, 20),
+        SENTINEL_BASE | 5,
+        "slot 1 is EMPTY in the state, so what was already bound there must SURVIVE"
+    );
+    assert_eq!(word(&mut vm, 24), 0x0B10_C003, "slot 2 is carried and must be copied");
     assert_eq!(vm.get_reg(0), 0, "the call returns the handler's success code");
 }
 

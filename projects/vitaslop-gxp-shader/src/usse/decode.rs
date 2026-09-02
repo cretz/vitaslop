@@ -272,6 +272,7 @@ pub fn decode(word: u64) -> Instr {
         0x09 => decode_grp_test(word),
         0x0f => decode_grp_test_mask(word),
         0x0a | 0x0b | 0x0c | 0x0d => decode_grp_bitwise(word, op1),
+        0x10 => decode_grp_sop2(word),
         0x12 => decode_grp_sop2m(word),
         0x14 => decode_grp_i16mad(word),
         0x15 => decode_grp_imad32(word),
@@ -283,6 +284,177 @@ pub fn decode(word: u64) -> Instr {
     }
 }
 
+
+/// Decode a group-0x80 SOP2 (opcode1 0x10), the write-mask-less sibling of
+/// [`decode_grp_sop2m`] - **as the FRAGMENT-EPILOGUE form only**, which is the one this
+/// corpus establishes and the only one it can.
+///
+/// # What is established, and by what
+/// The OPERAND grammar is SOP2M's, and the def-use chain confirms it rather than assuming it.
+/// Five fragment programs from one title end in the identical two-instruction epilogue:
+///
+/// ```text
+///   pack.unorm8  pa[0] <- pa[0]     (the F16 colour converted to four bytes)
+///   <this>                          (raw 0x809080d990000000, or ...c19... in one program)
+/// ```
+///
+/// Decoded through SOP2M's operand fields this instruction reads `src1 = pa[0]` - exactly the
+/// register the pack before it wrote - and writes `dest = o[0]`, the OUTPUT bank, which is
+/// where a native fragment colour goes. Two independent fields landing on the two registers
+/// the neighbouring instructions name is the same closure that settled SOP2M.
+///
+/// # What is NOT established, and why this still emits something
+/// The COEFFICIENT and colour/alpha-op fields are not. SOP2M spends bits 46:43 on its write
+/// mask and this group does not, so its freed bits carry something unknown and the fields
+/// around them cannot be assumed to sit where SOP2M puts them - `stub_reason` said exactly
+/// this. Read through SOP2M's table these words come out as
+/// `dest = a*src1 - (1-a)*src2`, and **`src2` names `o[0]`, a register not one of the five
+/// programs ever writes**. A compiler does not emit a term over its own uninitialised output
+/// register five times, so whatever the fields mean, the second term's coefficient is zero
+/// here and the instruction is a COPY of the packed colour into the output bank. That is what
+/// is emitted ([`Op::CopyFx8`]).
+///
+/// So the guard below pins every field that is not established and lets the operand fields -
+/// the ones the chain confirms - vary freely. A group-0x80 word that differs anywhere else is
+/// a form this evidence says nothing about and it BLOCKS, naming itself. Emitting a copy for
+/// one of those would be the confident wrong picture this whole family's refusal exists to
+/// avoid.
+///
+/// # A second title carries the same idiom, one bit apart - AND ITS OWN CHAIN NOW SETTLES IT
+/// Another title's single group-0x80 word is `0x809082dd90000000`. Field by field it is the
+/// word above with ONE difference, 42:41 (0 -> 1), the position SOP2M reads as its alpha op;
+/// the operands are identical - `dest = o[0]`, `src1 = pa[0]`, `src2 = o[0]`. Two unrelated
+/// titles emitting one epilogue that differs in one field is what a shared compiler back end
+/// looks like, and this guard names each pinned field separately so exactly one of them can be
+/// widened when the evidence arrives.
+///
+/// It has. That program is TWO instructions - `Nop`, then this - with a PDS-prefetched sample
+/// in `pa[0]` and a `g_TexSampler` on unit 0, so it is the same epilogue with the pack absent
+/// because the prefetch already delivers bytes. **Its `o[0]` is written by nothing at all**,
+/// which is the same closure that settled the first title's word and is stronger here: with
+/// only a `Nop` before it there is no instruction that COULD have written it. So whatever
+/// 42:41 selects, its term stands over an uninitialised output register, and the instruction
+/// is a copy.
+///
+/// What that argument does NOT establish, and it is worth naming because it is where a wrong
+/// picture would come from: if 42:41 turned out to select an alpha op that reads no source at
+/// all (a "write 1.0" would be the obvious one), a copy carries the texel's alpha where the
+/// hardware writes an opaque one. The oracle for that is the title's own frame, where its
+/// alpha-blended sprites either composite or do not.
+///
+/// # A SWAPPED shape, settled by two byte-identical programs
+/// `0x8190002160040000` is the same epilogue with the two source slots the other way round:
+/// `src1` names `o[0]` and `src2` names `pa[0]`, where the words above have it `src1 = pa[0]`,
+/// `src2 = o[0]`. Its `mod1`/`mod2`/`sel1`/`sel2` all differ, so nothing about the coefficient
+/// fields carries over and it is pinned separately.
+///
+/// **What settles it is a PAIR of programs, not a chain.** One title registers this shader
+/// twice: `frag_81a7f590` and `frag_81a7f798`, 216 bytes each, and they differ in exactly two
+/// places - the container's header HASH, and this one instruction word. Same parameter table,
+/// same varyings block, same `Nop`, same `pack.unorm8 pa[0] <- pa[0]`. Both are created with a
+/// **NULL `blendInfo`** (measured: `gxm blend: fragment program 0x81a7f590 ... blends=false`
+/// and the same line for `0x81a7f798`), so the difference is not the ROP's either. Two
+/// encodings of one program, and the first of them is already read as a copy of the packed
+/// colour into the colour register.
+///
+/// So the source is taken from the slot that does NOT name the output bank - which is the same
+/// closure as above, stated over the operand slots instead of over one of them. Every other
+/// field of this shape is pinned to the single observed encoding, `20:14 = 16` included,
+/// because what it selects is not established either.
+///
+/// The risk, named: if the differing coefficient fields make this variant scale or premultiply
+/// what it copies, a copy is wrong by exactly that factor. It would show as the title's 2D UI
+/// being uniformly too bright or too dark against the same shader's other variant, which is on
+/// screen beside it.
+fn decode_grp_sop2(word: u64) -> Instr {
+    let mut blocked: Option<&'static str> = None;
+    // Every field the epilogue evidence does NOT establish, pinned to the value it has in the
+    // two observed encodings. `sel2` (37:35) is the one that differs between them.
+    let established = bits(word, 58, 57) == 0        // no predicate
+        && bits(word, 56, 56) == 0                   // mod1
+        && bits(word, 53, 52) == 1                   // "cop" under SOP2M's reading
+        && bits(word, 51, 51) == 0                   // no destination bank extension
+        && bits(word, 49, 49) == 0                   // no src1 bank extension
+        && bits(word, 48, 48) == 0                   // no src2 bank extension
+        && bits(word, 47, 47) == 1                   // mod2
+        && bits(word, 46, 43) == 0                   // the bits SOP2M spends on its write mask
+        && matches!(bits(word, 42, 41), 0 | 1)       // "aop" - the two observed values
+        && bits(word, 40, 38) == 3                   // "sel1"
+        && matches!(bits(word, 37, 35), 0 | 3); // "sel2" - the two observed values
+    // >>> THE SAME EPILOGUE WITH ITS TWO SOURCE SLOTS THE OTHER WAY ROUND. See the SWAPPED
+    // section of this function's docs: one title carries `frag_81a7f590` and `frag_81a7f798`,
+    // 216 bytes each, byte-identical but for the header hash and THIS WORD - so the two
+    // programs compute the same thing and the first of them is already read as a copy. Every
+    // field of this shape is pinned to the one observed encoding, and the SOURCE is taken from
+    // the other operand slot.
+    let swapped = bits(word, 58, 57) == 0            // no predicate
+        && bits(word, 56, 56) == 1                   // mod1 - set here, clear in the shape above
+        && bits(word, 53, 52) == 1                   // "cop", as above
+        && bits(word, 51, 51) == 0                   // no destination bank extension
+        && bits(word, 49, 49) == 0                   // no src1 bank extension
+        && bits(word, 48, 48) == 0                   // no src2 bank extension
+        && bits(word, 47, 47) == 0                   // mod2 - clear here, set in the shape above
+        && bits(word, 46, 43) == 0                   // the bits SOP2M spends on its write mask
+        && bits(word, 42, 41) == 0                   // "aop"
+        && bits(word, 40, 38) == 0                   // "sel1"
+        && bits(word, 37, 35) == 4                   // "sel2"
+        && bits(word, 29, 28) == 2                   // src2 bank select - the PA bank
+        // The src2 upper field, whatever it selects. 16 is the pair-established encoding;
+        // 20 (bit 16 set as well) is `0x8190002160050000`, the epilogue of one title's lit,
+        // fogged world material (`velvet_fragment_cdb40b4ac29bee79` in its corpus), which
+        // computes its own alpha into `pa[0].w` two instructions earlier and packs the whole
+        // register to unorm8 before this word - so the copy reading is the one that keeps
+        // what the program computed. Which selector bit 16 is has NOT been established: if it
+        // scales or drops the alpha, those materials come out uniformly wrong in alpha, and the
+        // frame it first appears in is the title's first 3D scene. Refusing it stops that
+        // title at its first scene instead.
+        && matches!(bits(word, 20, 14), 16 | 20);
+    if !established && !swapped {
+        blocked = blocked.or(Some(
+            "0x80 SOP2 in a form outside the fragment epilogue this corpus establishes - its \
+             coefficient and op fields are not read, only pinned (see `decode_grp_sop2`)",
+        ));
+    }
+
+    // The operand grammar, which the chain above confirms. The SOURCE is whichever slot does
+    // NOT name the output bank: that is the whole content of the def-use closure this group is
+    // read through, and it is what makes the swapped shape the same instruction rather than a
+    // second reading of it.
+    let (s1_bank, s1_index) = r7_source_bank_index(bits(word, 31, 30) as u8, bits(word, 13, 7));
+    let src1 = if swapped {
+        let sel = bits(word, 29, 28) as u8;
+        let (bank, index) = r7_source_bank_index(sel, bits(word, 6, 0));
+        Operand::plain(bank, index, sel)
+    } else {
+        Operand::plain(s1_bank, s1_index, bits(word, 31, 30) as u8)
+    };
+    let dest_sel = bits(word, 33, 32) as u8;
+    let dest = match r7_dest_bank_index(dest_sel, bits(word, 27, 21)) {
+        Some((b, i)) => Some(Operand::plain(b, i, dest_sel)),
+        None => {
+            blocked = blocked.or(Some("0x80 SOP2 destination in index mode"));
+            None
+        }
+    };
+
+    Instr {
+        op: Op::CopyFx8,
+        // The predicate field is pinned to 0 by the guard above, which is the unpredicated
+        // encoding SOP2M reads the same way.
+        pred: short_predicate(bits(word, 58, 57)),
+        dest,
+        // No write mask field: the instruction writes the whole register, all four bytes.
+        write_mask: [true, true, true, true],
+        srcs: vec![src1],
+        // Neither side is a float view - both are the packed-byte register. `half_precision`
+        // describes a float precision and means nothing here; the emitter reads
+        // `Op::CopyFx8` instead.
+        half_precision: false,
+        raw: word,
+        group: 0x80,
+        blocked,
+    }
+}
 
 /// Decode a group-0x90 SOP2M, the 8-BIT FIXED-POINT SUM-OF-PRODUCTS combiner (opcode1 0x12).
 ///
@@ -2626,11 +2798,20 @@ fn decode_grp_pack(word: u64) -> Instr {
     // an ARRAY INDEX in float and then indexing with it uses.
     let scale = bits(word, 18, 18) != 0;
     let float_to_int = is_float(src_fmt) && int_dest.is_some() && !scale;
-    if !(is_float(src_fmt) && is_float(dest_fmt)) && !float_to_int {
+    // The NORMALIZED U8 conversions, both directions. U8 is format 0, and it is the one
+    // normalized width this model can represent exactly: a register read and written as four
+    // `byte/255` channels is `Prec::Fx8`, which already exists for the SOP2M combiner. So
+    // these are emitted rather than blocked - see `Op::PackUnorm8`. The other normalized
+    // widths (S8/U16/S16) have no such representation and stay blocked below.
+    let unorm8_from_float = scale && is_float(src_fmt) && dest_fmt == 0;
+    let unorm8_to_float = scale && src_fmt == 0 && is_float(dest_fmt);
+    if !(is_float(src_fmt) && is_float(dest_fmt)) && !float_to_int && !unorm8_from_float && !unorm8_to_float {
         blocked = blocked.or(Some("0x40 pack non-float<->float conversion (int-normalize / C10 / O8) not modeled"));
     }
-    if bits(word, 51, 51) != 0 || bits(word, 49, 49) != 0 {
-        blocked = blocked.or(Some("0x40 pack extended-bank operand (immediate/special/indexed) not modeled"));
+    // A DESTINATION in an extended bank stays blocked: the extension row for a destination is
+    // SECATTR/SPECIAL/INDEX/INDEXED2, none of which this group's emit models.
+    if bits(word, 51, 51) != 0 {
+        blocked = blocked.or(Some("0x40 pack extended-bank DESTINATION (secattr/special/indexed) not modeled"));
     }
 
     // Destination: 2-bit bank + R7 number (with reserved top-of-temp internal range).
@@ -2652,7 +2833,30 @@ fn decode_grp_pack(word: u64) -> Instr {
     // (double-register), unlike the R7 destination above. Cross-checked on a real fragment
     // whose F32->F16 fog pack reads field 4 -> register 8, exactly the pa_base the container's
     // Fog interpolant descriptor accumulates to.
-    let (b1, i1) = r6_source_bank_index(src1_sel, bits(word, 13, 8));
+    //
+    // >>> ...UNLESS ITS BANK-EXTENSION BIT IS SET, in which case the row is
+    // INDEXED1/SPECIAL/IMMEDIATE/INDEXED2 and the number is NOT doubled (spec A.3). This used
+    // to block the whole instruction, and what it was blocking is a real and common operand: a
+    // retail title's fragment SECONDARY programs read `SPECIAL` field 15 with bit 0x40 clear,
+    // i.e. FPCONSTANT[15]. Read through the ordinary row that came out as `sa[30]` - a register
+    // three times past the 10 its container declares - and the linker refused the pair for
+    // reading past its uniform buffer. MEASURED: three programs of that title's corpus read
+    // exactly that operand, with uniform buffers of 10, 6 and 10 registers, which is the
+    // signature of a CONSTANT rather than an offset into anything.
+    let src1_ext = bits(word, 49, 49) != 0;
+    let (b1, i1) = if src1_ext {
+        // The extended row's own number, undoubled - `ext_source` splits SPECIAL into
+        // FPCONSTANT/GLOBAL on bit 0x40 exactly as every other group's operands do.
+        match ext_source(src1_sel, bits(word, 13, 8), false) {
+            Ok(o) => (o.bank, o.index),
+            Err(why) => {
+                blocked = blocked.or(Some(why));
+                (Bank::Temp, 0)
+            }
+        }
+    } else {
+        r6_source_bank_index(src1_sel, bits(word, 13, 8))
+    };
     let comp0_hi = if src_fmt == 6 { bits(word, 7, 7) } else { bits(word, 1, 1) };
     let c0 = ((comp0_hi << 1) | bits(word, 0, 0)) as u8;
     let c1 = bits(word, 17, 16) as u8;
@@ -2662,11 +2866,17 @@ fn decode_grp_pack(word: u64) -> Instr {
     s1.swizzle = [c0, c1, c2, c3];
 
     Instr {
-        op: match int_dest {
-            Some((bits_, signed)) if float_to_int => {
-                Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5 }
+        op: if unorm8_from_float {
+            Op::PackUnorm8 { to_unorm8: true, float_half: src_fmt == 5 }
+        } else if unorm8_to_float {
+            Op::PackUnorm8 { to_unorm8: false, float_half: dest_fmt == 5 }
+        } else {
+            match int_dest {
+                Some((bits_, signed)) if float_to_int => {
+                    Op::PackToInt { bits: bits_, signed, src_half: src_fmt == 5 }
+                }
+                _ => Op::Pack { src_half: src_fmt == 5 },
             }
-            _ => Op::Pack { src_half: src_fmt == 5 },
         },
         pred: ext_predicate(predicate_raw),
         dest,
@@ -2988,6 +3198,23 @@ pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
         // would repeat several hundred instructions that demonstrably run once.
         0x03 if bits(word, 53, 53) == 1 => Some(0),
         0x03 => dot_repeat_extra(word),
+        // 0x80 SOP2, in the fragment-epilogue form `decode_grp_sop2` establishes and only
+        // there: that form pins bits 46:43 to zero, and bit 47 is the second complement flag
+        // its sibling 0x90 establishes at the same position. So the four bits where a repeat
+        // count lives elsewhere are `1000` with three of them accounted for as zero and the
+        // fourth as a field the sibling group corroborates - there is no count to read. The
+        // corpus agrees from the other side: this instruction is the LAST one in all five
+        // programs that carry it, and a repeat would step its destination past the colour
+        // register the hardware emits, into registers nothing reads. Any other group-0x80
+        // word is a form this says nothing about, and unknown means blocked.
+        //
+        // The SWAPPED shape reads `00000` here instead, because bit 47 - that same complement
+        // flag - is clear in it. The rest of the argument is unchanged and the corpus makes it
+        // the same way: the one program carrying it ends on this instruction, and it is the
+        // byte-for-byte twin of a program that ends on the `10000` word. Anything outside the
+        // two shapes `decode_grp_sop2` pins still blocks there, so admitting `00000` here does
+        // not admit a word on its own.
+        0x10 if matches!(bits(word, 47, 43), 0b10000 | 0b00000) => Some(0),
         // 0x90 SOP2M: no repeat_count field either, and the field table accounts for every bit
         // - the four bits at 47:44, where every group that HAS a repeat count puts it, are the
         // second complement bit plus the top three bits of the write mask. Both are read by
@@ -4464,26 +4691,91 @@ mod tests {
     }
 
     /// A float->integer VPCK is a TRUNCATING cast when `scale` is clear and a NORMALIZE when it
-    /// is set, and the two differ by a factor of the format's range - so the scaled form stays
-    /// blocked while the plain one converts. The unscaled form is what a shader computing an
-    /// array INDEX in float emits before indexing with it.
+    /// is set, and the two differ by a factor of the format's range - so they decode to
+    /// DIFFERENT operations. The unscaled form is what a shader computing an array INDEX in
+    /// float emits before indexing with it; the scaled U8 form is a fragment epilogue writing
+    /// an 8-bit surface, and it is emittable because `Prec::Fx8` already carries the packed
+    /// representation. The scaled forms of the OTHER widths do not have one and stay blocked.
     #[test]
-    fn pack_float_to_int_converts_unscaled_and_blocks_the_normalized_form() {
+    fn pack_float_to_int_converts_unscaled_and_normalizes_only_into_u8() {
         // VPCK U8<-F32 (src_fmt=6, dest_fmt=0), scale (bit 18) clear: a truncating cast.
         let w = word_bits(&[(0x08, 63, 59), (6, 43, 41), (0, 40, 38)]);
         let ins = decode(w);
         assert_eq!(ins.op, Op::PackToInt { bits: 8, signed: false, src_half: false });
         assert!(ins.blocked.is_none(), "unscaled float->int converts: {:?}", ins.blocked);
-        // The same word with `scale` set is the normalized conversion, which multiplies by the
-        // format's range - a different number, and not modeled.
+        // The same word with `scale` set is the NORMALIZED conversion - a different number by a
+        // factor of 255, and a different operation.
         let scaled = word_bits(&[(0x08, 63, 59), (6, 43, 41), (0, 40, 38), (1, 18, 18)]);
-        assert!(decode(scaled).blocked.is_some(), "the normalized form must stay blocked");
+        let ins = decode(scaled);
+        assert_eq!(ins.op, Op::PackUnorm8 { to_unorm8: true, float_half: false });
+        assert!(ins.blocked.is_none(), "normalized U8 converts: {:?}", ins.blocked);
+        // ...and the other direction, U8 -> float, is the same conversion run backwards.
+        let back = word_bits(&[(0x08, 63, 59), (0, 43, 41), (5, 40, 38), (1, 18, 18)]);
+        assert_eq!(decode(back).op, Op::PackUnorm8 { to_unorm8: false, float_half: true });
+        // A normalized S16 has no packed representation in this register model, so it stays
+        // blocked where the U8 form no longer does.
+        let s16_norm = word_bits(&[(0x08, 63, 59), (6, 43, 41), (4, 40, 38), (1, 18, 18)]);
+        assert!(decode(s16_norm).blocked.is_some(), "normalized S16 must stay blocked");
         // S16<-F32 is the width the one shader that needs this uses, and it is SIGNED.
         let s16 = word_bits(&[(0x08, 63, 59), (6, 43, 41), (4, 40, 38)]);
         assert_eq!(decode(s16).op, Op::PackToInt { bits: 16, signed: true, src_half: false });
         // C10 (7) on the destination is a packed representation this model does not carry.
         let c10 = word_bits(&[(0x08, 63, 59), (6, 43, 41), (7, 40, 38)]);
         assert!(decode(c10).blocked.is_some(), "C10 destination must stay blocked");
+    }
+
+    /// Group 0x80 SOP2 in the fragment-epilogue form, on the two words a title's five
+    /// fragment programs actually carry, and the refusal that keeps every other form out.
+    ///
+    /// The words are captured, not constructed: both end a program whose previous
+    /// instruction is `pack.unorm8 pa[0] <- pa[0]`, and this decode has to name `pa[0]` as the
+    /// source and the OUTPUT bank as the destination for that chain to close. See
+    /// [`decode_grp_sop2`].
+    #[test]
+    fn sop2_decodes_the_fragment_epilogue_and_refuses_every_other_form() {
+        // The third word is a SECOND title's, and it is here because that program's own chain
+        // settles it: two instructions, `Nop` then this, a PDS-prefetched sample in `pa[0]`,
+        // and NOTHING that writes `o[0]` - so the term SOP2M's reading puts over `src2 = o[0]`
+        // stands over a register the program cannot have written. It differs from the first
+        // word at 42:41 alone, which is why that field is the one this decode widened.
+        for word in [0x8090_80d9_9000_0000u64, 0x8090_80c1_9000_0000, 0x8090_82dd_9000_0000] {
+            let ins = decode(word);
+            assert_eq!(ins.op, Op::CopyFx8, "{word:#x}");
+            assert!(ins.blocked.is_none(), "{word:#x}: {:?}", ins.blocked);
+            assert_eq!(ins.write_mask, [true; 4], "no write mask field: all four bytes");
+            let src = ins.srcs.first().expect("one source");
+            assert_eq!((src.bank, src.index), (Bank::PrimaryAttr, 0), "src is what the pack wrote");
+            let dest = ins.dest.as_ref().expect("a destination");
+            assert_eq!((dest.bank, dest.index), (Bank::Output, 0), "dest is the colour register");
+        }
+        // The SWAPPED shape: `src1` names the output register and `src2` the packed colour, so
+        // the source has to come from the other slot. Its twin `frag_81a7f590` carries the word
+        // above, byte-identical program otherwise - see [`decode_grp_sop2`].
+        let swapped = decode(0x8190_0021_6004_0000u64);
+        assert_eq!(swapped.op, Op::CopyFx8);
+        assert!(swapped.blocked.is_none(), "{:?}", swapped.blocked);
+        let src = swapped.srcs.first().expect("one source");
+        assert_eq!(
+            (src.bank, src.index),
+            (Bank::PrimaryAttr, 0),
+            "the source is the slot that is not the output register"
+        );
+        let dest = swapped.dest.as_ref().expect("a destination");
+        assert_eq!((dest.bank, dest.index), (Bank::Output, 0));
+        // ...and the shape is pinned: the same word with `mod2` set is a form nothing
+        // establishes and must block rather than emit a copy.
+        assert!(decode(0x8190_0021_6004_0000u64 | (1 << 47)).blocked.is_some());
+
+        // One bit outside the operand fields - here the "cop" position the epilogue pins to 1
+        // - is a form nothing establishes, and it must refuse rather than emit a copy.
+        let other = 0x8090_80d9_9000_0000u64 & !(1 << 52);
+        assert!(decode(other).blocked.is_some(), "an unestablished 0x80 form must block");
+        // ...and so must one whose repeat-count position is not the pinned `1000`.
+        let repeated = 0x8090_80d9_9000_0000u64 | (1 << 44);
+        assert!(
+            crate::usse::decode::repeat_extra_iterations(repeated).is_none(),
+            "an unpinned repeat field must block rather than assume no repeat"
+        );
     }
 
     #[test]
@@ -4781,6 +5073,36 @@ mod tests {
         );
         assert_eq!(ins.dest.map(|d| (d.bank, d.index)), Some((Bank::PrimaryAttr, 4)));
         assert_eq!(ins.write_mask, [true; 4]);
+    }
+
+    /// The 0x40 PACK group reads its extended source row too, and what it was blocking is the
+    /// operand a retail title's fragment SECONDARY programs are built out of.
+    ///
+    /// `0x40830b5e60014f01` is `pack.f16 sa[0] <- <src1>`, with `src1_sel = 1` and
+    /// `src1_ext` SET, so the row is SPECIAL; the raw field is 15 and its `0x40` bit is clear,
+    /// so the operand is FPCONSTANT[15] - undoubled, because SPECIAL and IMMEDIATE never are.
+    ///
+    /// Read through the ORDINARY row it came out `OUTPUT[15]`, doubled to 30 and then forced to
+    /// SECATTR by the secondary-program remap: `sa[30]`, against a container that declares TEN
+    /// uniform registers. The linker refused the pair for reading past its uniform buffer, and
+    /// the pair is that title's WORLD material. The corpus says the same thing from the other
+    /// side: three of its programs read exactly this operand, with uniform buffers of 10, 6 and
+    /// 10 registers - a fixed register number under three different layouts is a CONSTANT.
+    #[test]
+    fn pack_extended_src1_is_the_hardware_constant_bank_not_a_doubled_register() {
+        const PACK_CONST: u64 = 0x40830b5e60014f01;
+        let ins = decode(PACK_CONST);
+        assert!(ins.blocked.is_none(), "extended-bank src1 must decode: {:?}", ins.blocked);
+        assert_eq!(ins.op, Op::Pack { src_half: true });
+        assert_eq!(
+            (ins.srcs[0].bank, ins.srcs[0].index),
+            (Bank::Constant, 15),
+            "src1_ext + selector 1 + field 15 is FPCONSTANT[15], undoubled"
+        );
+        // The ordinary row is unchanged: clear the extension bit and the same field is the
+        // doubled register the group has always read.
+        let plain = decode(PACK_CONST & !(1 << 49));
+        assert_eq!((plain.srcs[0].bank, plain.srcs[0].index), (Bank::Output, 30));
     }
 
     /// Group 0x50's `src1_ext` bit selects the shared operand decode's EXTENSION row, not a

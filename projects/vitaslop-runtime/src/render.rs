@@ -1255,6 +1255,89 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
         levels: max_mip_levels(w, h),
         swizzle: (t.swizzle >> 12) & 0x7,
         src_levels,
+        codec: None,
+    })
+}
+
+/// The same plan for a texture the guest gave us as BC BLOCKS, so the expansion to RGBA8 runs
+/// on the GPU instead of the CPU. `None` when this texture is not one of them.
+///
+/// # Why this exists beside the transcode, and why it is not the transcode
+/// A GPU with no BC support cannot take the guest's blocks verbatim, and `transcoded_source`
+/// deliberately declines to re-encode a BC texture that already fits the budget: ETC2 is a
+/// second LOSSY step over the guest's own compression and buys only megabytes. So such a
+/// texture fell through to the CPU decode - and on the device that is the largest thing left.
+/// MEASURED there: one frame's texture working set is 130 MB with `0x85 BC -> RGBA8 x136
+/// (98.1 MB)`, and the run's slowest frames are ~600 ms at ORDINARY host-call counts, which
+/// makes them ours rather than the guest's.
+///
+/// This changes where that decode runs, not what it produces. Same RGBA8, same generated mip
+/// chain, same memory - so it trades no image quality, which is the whole reason it can be
+/// unconditional where the ETC2 re-encode cannot be.
+/// [[vitaslop-never-trade-quality]] [[vitaslop-phone-gpu-has-no-bc]]
+pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpand> {
+    use vitaslop_platform::gpu::SourceCodec;
+    if !matches!(t.base_format, 0x85 | 0x86 | 0x87) {
+        return None;
+    }
+    // A cube map's six chains interleave in a way that is not established - the same refusal
+    // the passthrough and the transcode both make.
+    if t.faces != 1 {
+        return None;
+    }
+    // >>> NO CHANNEL SWIZZLE. `decode_bc` spends `src_format` on the BASE FORMAT, so it has
+    // nowhere to carry a SWIZZLE4 selector and does not apply one; the CPU decoder does. A
+    // swizzled texture must therefore keep the CPU path or it renders with its channels in the
+    // wrong order. `gpu_transcode` refuses it for exactly this reason.
+    if (t.swizzle >> 12) & 0x7 != 0 {
+        return None;
+    }
+    let (w, h) = (t.width.max(1), t.height.max(1));
+    let swizzled = swizzled_type(t.tex_type);
+    let mut src_levels = Vec::new();
+    // >>> LEVEL 0 ONLY, AND EVERY LEVEL BELOW IT GENERATED - because that is what the CPU path
+    // >>> this replaces does, and this change is about WHERE the decode runs, nothing else.
+    //
+    // Taking the guest's OWN declared levels here instead would be a quiet change of mip
+    // policy: `decode_texture_rgba8_counted` decodes level 0 and `build_mip_chain` box-filters
+    // the rest, so a texture whose guest chain differs from a generated one would start
+    // sampling differently the moment this path claimed it - visible only as a minified
+    // surface changing, on the device, with nothing to say why. Whether the guest's chain
+    // should be preferred is a real question and it already has a history
+    // (`mips_for_texture`: tried 2026-08-28b and REVERTED); it does not get decided as a side
+    // effect of moving a decode onto the GPU. `raw_source` takes level 0 only for the same
+    // reason.
+    for level in 0..1u32 {
+        let l = level_layout(t.base_format, t.tex_type, w, h, level)?;
+        let off = level_offset(t.base_format, t.tex_type, w, h, level)?;
+        if (off as usize).saturating_add(l.bytes as usize) > t.pixels.len() {
+            break;
+        }
+        src_levels.push(vitaslop_platform::gpu::SrcLevel {
+            byte_offset: off,
+            width: l.width,
+            height: l.height,
+            blocks_x: l.blocks_x,
+            blocks_y: l.blocks_y,
+            // A swizzled block image is Morton-addressed over BLOCKS, so the padding is the
+            // block count rounded up - not the texel count. Same as `gpu_transcode`.
+            padded_x: if swizzled { l.blocks_x.next_power_of_two() } else { l.blocks_x },
+            padded_y: if swizzled { l.blocks_y.next_power_of_two() } else { l.blocks_y },
+            swizzled,
+        });
+    }
+    if src_levels.is_empty() {
+        return None;
+    }
+    Some(vitaslop_platform::gpu::GpuRawExpand {
+        src: t.pixels.clone(),
+        width: w,
+        height: h,
+        levels: max_mip_levels(w, h),
+        // Unused by the block decoder - see the refusal above.
+        swizzle: 0,
+        src_levels,
+        codec: Some(SourceCodec::Bc { base_format: t.base_format }),
     })
 }
 
@@ -6202,14 +6285,18 @@ fn report_depth_range_reader(di: usize, d: &Draw) {
 /// `VITASLOP_DECODE_CACHE_MB` overrides. 256 MB matches the view cache it feeds.
 fn decode_cache_budget_bytes() -> usize {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
+    let base = *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_DECODE_CACHE_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(256)
             * 1024
             * 1024
-    })
+    });
+    // Scaled to the device - see [`crate::knobs::memory_scale`]. The FLOOR at one frame's
+    // working set (`decode_frame_high`, applied by the caller) still holds and is what stops a
+    // scaled-down budget from re-decoding inside a frame.
+    crate::knobs::scale_budget(base)
 }
 
 /// Whether PVRTC decodes a whole face at a time (the default) or one texel at a time.
@@ -6439,6 +6526,9 @@ impl RenderSceneBuilder {
         // What was not knowable was the ORDER - and getting it wrong meant every texture the GPU
         // was about to take as blocks was decoded first and the decode thrown away.
         let compressed = compressed_source(t, None);
+        // Read before `compressed` is moved into the struct below, and read for the reason the
+        // `raw` field explains: it is the test for "nothing else claimed this texture".
+        let has_compressed = compressed.is_some();
         // What this entry will actually HOLD, priced without forcing the decode - see
         // [`resident_texture_bytes`].
         let cost = predicted_texture_bytes(width, height, t.faces.max(1), texel, compressed.as_ref());
@@ -6546,6 +6636,21 @@ impl RenderSceneBuilder {
             mip_filter: t.mip_filter,
             base_format: t.base_format,
             swizzle: t.swizzle,
+            // >>> BOUNDED, AND THE BOUND IS THE POINT. This runs for every texture of every
+            // draw, and an unbounded `all(|b| *b == 0)` is the per-frame byte scan this
+            // renderer spent real effort deleting: the short circuit makes a texture with a
+            // non-zero first byte free, but a large mostly-transparent one is walked to its
+            // end, every draw. MEASURED as a phase shift on a golf title's late frames when it
+            // was unbounded - the arms rendered the same content at different animation phases
+            // [[vitaslop-inline-ab-moves-the-animation-phase]].
+            //
+            // 4 KB is as good a witness as 4 MB for the question actually being asked: a live
+            // render target's guest memory is empty EVERYWHERE, not just past some offset (see
+            // `GxmTexture::guest_bytes_all_zero`). The one case the bound gets wrong is a real
+            // texture whose first 4 KB are zero AND whose address is also held as a render
+            // target AND whose bound extent disagrees with it - and that texture was being
+            // handed the stale target's pixels before any of this existed.
+            guest_bytes_all_zero: t.pixels.iter().take(4096).all(|b| *b == 0),
             filter_linear,
             addr_mode_u: t.u_addr_mode,
             addr_mode_v: t.v_addr_mode,
@@ -6554,7 +6659,13 @@ impl RenderSceneBuilder {
             // The guest's own bytes for a texture whose decode is a permutation, so the
             // uploader can do it on the GPU instead of expanding it here. `rgba` above is still
             // built lazily and is still the fallback.
-            raw: raw_source(t),
+            // >>> ONLY WHEN NOTHING ELSE CLAIMED THE TEXTURE, and the order is load-bearing:
+            // the uploader tries `raw` BEFORE the compressed paths, so offering a block plan
+            // for a texture the passthrough could take verbatim, or the GPU transcoder could
+            // turn into ETC2 under budget pressure, would preempt both with a strictly worse
+            // answer. `compressed` being `None` is exactly the statement "this one is going to
+            // be decoded to RGBA8" - so this decides only WHERE that happens.
+            raw: raw_source(t).or_else(|| if has_compressed { None } else { block_source(t) }),
         };
         // >>> THE PREVIOUS DECODE OF THIS SAME GUEST TEXTURE IS DROPPED HERE, and the choice
         // between dropping it and merely marking it for eviction was MEASURED, both ways, on

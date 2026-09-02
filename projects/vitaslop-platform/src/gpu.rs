@@ -419,14 +419,23 @@ pub(crate) const GAME_RESIDENT_CEILING_MB: usize = 256 + 109 + 112;
 pub(crate) fn tex_cache_budget_bytes() -> usize {
     use std::sync::OnceLock;
     static CELL: OnceLock<usize> = OnceLock::new();
-    *CELL.get_or_init(|| {
+    let base = *CELL.get_or_init(|| {
         crate::knobs::var("VITASLOP_TEX_CACHE_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(GAME_RESIDENT_CEILING_MB)
             * 1024
             * 1024
-    })
+    });
+    // >>> AND SCALED TO THE DEVICE. The default above is the CONSOLE's resident ceiling, which
+    // is the right number for what a title can ask for and says nothing about what the machine
+    // running the emulator has. MEASURED on a 48,000-frame browser session: this cache alone held
+    // **476 MB** against a one-frame working set of 106 MB, inside a renderer process at 1.53 GB.
+    // A desktop reports the specification's 8 GB cap and is unchanged; a 4 GB phone halves it.
+    // See [`crate::knobs::memory_scale`], and note that per-entry eviction (which this cache
+    // already had, and which the rest now have too) is what makes a smaller budget cost
+    // re-decodes of the coldest entries instead of a cliff.
+    crate::knobs::scale_budget(base)
 }
 
 /// `VITASLOP_RTT_BG_CACHE=0` restores the OLD behaviour: a sampler bind group naming a render
@@ -558,6 +567,28 @@ pub fn note_device_error(kind: &str, msg: &str) -> usize {
     newly
 }
 
+/// Say - once per pair - that a prepared GXP draw was encoded with NO geometry.
+///
+/// A draw whose index count or vertex/index slice is empty is submitted and rasterises
+/// nothing, and from the finished frame that is identical to a draw the renderer never
+/// issued, to one the device refused, and to one that shaded transparent. Those are four
+/// different bugs and only this one is silent.
+pub fn report_empty_gxp_geometry(key: u64, index_count: u32, v_len: u64, i_len: u64) {
+    if index_count != 0 && v_len != 0 && i_len != 0 {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert(key) {
+        return;
+    }
+    report_warn!(
+        "gxp pair {key:016x}: encoded with EMPTY geometry - {index_count} indices, {v_len}          vertex bytes, {i_len} index bytes. The draw is submitted and rasterises nothing,          which on screen is indistinguishable from a draw that was never issued."
+    );
+}
+
 /// Whether [`note_device_error`] has seen the device refuse this pair's pipeline.
 ///
 /// The atomic is checked FIRST and is the whole point of it: this runs once per recompiled
@@ -589,6 +620,26 @@ static POISONED_DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// gets slower as it goes needs the CURRENT value on every heartbeat, not the record.
 pub fn texture_working_set_bytes() -> usize {
     LAST_WORKING_SET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The texture-cache budget actually in force, in bytes - what the panel should print beside the
+/// working set.
+///
+/// >>> BECAUSE "scaled x1.00" IS NOT THE SAME STATEMENT AS "THE BUDGET IS 477 MB", AND THE
+/// >>> DIFFERENCE IS THE WHOLE POINT ON A PHONE.
+///
+/// The default is the CONSOLE's resident ceiling (`GAME_RESIDENT_CEILING_MB`), scaled by
+/// `navigator.deviceMemory`. MEASURED on the user's device: it reports **8 GB**, which is the
+/// value the specification caps at, so the scale is 1.00 and the phone is handed a 477 MB
+/// texture budget - the same one a workstation gets. The scaling added for exactly this device
+/// is therefore INERT on it, and the panel said `scaled x1.00` without ever saying what it was
+/// scaling, so the gap was invisible.
+///
+/// Printing the number is not the fix; it is what makes the fix arguable. `deviceMemory` cannot
+/// tell a phone from a desktop, and the ADAPTER can - `vendor=img-tec` is a PowerVR part and
+/// nothing else ships one.
+pub fn tex_cache_budget_now() -> usize {
+    tex_cache_budget_bytes()
 }
 
 pub fn texture_budget_pressure() -> bool {
@@ -746,6 +797,20 @@ pub struct GxmTexture {
     /// decoded the asset through the wrong layout", and those need opposite fixes.
     pub base_format: u32,
     pub swizzle: u32,
+    /// >>> WHETHER THE GUEST'S OWN BYTES AT [`Self::data_addr`] ARE ALL ZERO, as snapshotted at
+    /// >>> bind time.
+    ///
+    /// This is the witness that tells a LIVE render target being sampled from a RECYCLED
+    /// allocation, and it is the only one that does. A target's pixels live on the GPU, so its
+    /// guest memory reads empty [[vitaslop-a-render-target-reads-empty-in-guest-memory]]; a
+    /// texture the guest allocated over a freed target has the guest's real bytes in it. Both
+    /// bind a descriptor whose extent can disagree with the target's, so the extent alone cannot
+    /// separate them - see `encode_chain`'s `rtt_alias_block`.
+    ///
+    /// Computed where the bytes already are (the capture's snapshot) rather than here: the
+    /// renderer holds only [`Self::rgba`], which is produced lazily and on purpose, and forcing
+    /// a decode to answer this would expand every texture the GPU was about to take compressed.
+    pub guest_bytes_all_zero: bool,
     /// True if the guest set this texture's magnification filter to LINEAR
     /// (`SceGxmTextureFilter` == 1); the renderer then bilinear-samples it, matching
     /// the software rasterizer's `sample_texture_bilinear`. False = POINT/nearest.
@@ -1043,6 +1108,23 @@ pub struct GpuRawExpand {
     /// ROW STRIDE IN TEXELS (the guest stride over four) for a linear level, and is unread for
     /// a swizzled one, which addresses through `padded_x`/`padded_y`.
     pub src_levels: Vec<SrcLevel>,
+    /// The BLOCK codec the source levels are in, or `None` for an uncompressed source.
+    ///
+    /// >>> THIS IS WHAT TAKES A PHONE'S BC DECODE OFF ITS CPU, AND IT COSTS NO QUALITY.
+    ///
+    /// A GPU with no BC support has to expand every compressed guest texture to RGBA8, and
+    /// `transcoded_source` deliberately declines to re-encode one that already fits the budget
+    /// - re-encoding to ETC2 is a second LOSSY step and buys only megabytes. So those textures
+    /// took the CPU decode: MEASURED on the user's device, one frame's working set is 130 MB
+    /// with `0x85 BC -> RGBA8 x136 (98.1 MB)` in it, and the run's slowest frames are half a
+    /// second each at ordinary host-call counts.
+    ///
+    /// That reasoning is sound and its premise was incomplete: the alternative is not only the
+    /// lossy re-encode. The `decode_bc` compute pipeline already exists as stage ONE of the
+    /// BC->ETC2 transcode, so the blocks can be expanded to RGBA8 on the GPU and STOPPED there
+    /// - the same bytes the CPU decode produces, at the RGBA8 memory cost the policy already
+    /// accepts. `gpu_bc_expand_matches_the_cpu_decoder` is what says "the same bytes".
+    pub codec: Option<SourceCodec>,
 }
 
 /// One guest mip level inside [`GpuTranscode::src`].
@@ -1276,7 +1358,11 @@ fn report_region_clip_applied(clip: RegionClip, w: u32, h: u32) {
         return;
     }
     let whole = rect[0] == 0 && rect[1] == 0 && rect[2] + 1 >= w && rect[3] + 1 >= h;
-    report!(
+    // At `warn` and deduped on the whole (mode, rect), so a title with a stable scissor pays
+    // one line: an empty or near-empty rectangle is the last per-draw state that can make a
+    // correctly shaded, correctly bound, correctly transformed draw leave no mark, and at
+    // `debug` it was invisible in every documented repro.
+    report_warn!(
         "gxm region clip: mode {mode:#x} over {},{} .. {},{} on a {w}x{h} target - {}",
         rect[0], rect[1], rect[2], rect[3],
         if whole { "the WHOLE target, so no scissor is issued" } else { "SCISSORED" }
@@ -1658,6 +1744,7 @@ pub use render::{CubeRenderer, DEPTH_FORMAT};
 
 #[cfg(feature = "gpu")]
 pub use gxm::{
+    buffer_write_worst_run_us_kb,
     take_encode_work, take_prepare_split, take_sampler_bg_counts, take_sampler_bg_pass,
     take_sampler_bg_prev,
     wasm_clock_installed,
@@ -2384,9 +2471,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         true
     }
 
-    /// Upper bound on the cross-frame texture caches before they are cleared wholesale
-    /// (a re-upload, never incorrectness - the keys are content fingerprints, so a
-    /// re-decoded atlas still hits).
+    /// Upper bound on the cross-frame texture caches. The recompiler's view cache evicts to it
+    /// per entry, oldest-first; the fixed-function one (unused in the shipped GXP-live
+    /// configuration, and reported at 0 MB there) still clears wholesale, which is a re-upload
+    /// and never incorrectness - the keys are content fingerprints, so a re-decoded atlas still
+    /// hits.
     ///
     /// # In BYTES, because a count bounds nothing
     /// This used to be a cap of 512 ENTRIES. An entry is a texture of any size, so 512 of
@@ -2430,6 +2519,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// 1.81 GB, and it was on the ENTRY-count cap with no byte limit at all.
     /// `VITASLOP_TEX_CACHE_MB` overrides.
 
+    // `GAME_RESIDENT_CEILING_MB` reads as UNUSED in a non-test build and is not: the child test
+    // module below reaches it as `super::GAME_RESIDENT_CEILING_MB`, which resolves through this
+    // `use`. Dropping it on the warning's word breaks `cargo test` while `cargo build` stays
+    // green [[lowering-a-warning-is-silencing]] - in reverse.
+    #[allow(unused_imports)]
     use super::{tex_cache_budget_bytes, GAME_RESIDENT_CEILING_MB};
 
     /// Bytes a decoded texture occupies once uploaded, for the cache budget. RGBA8 is what
@@ -2521,7 +2615,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// transition stops costing seconds, and "the transition is still slow" has two completely
     /// different causes - the shaders never ran, or they ran and something else is the weight.
     /// Silence here would leave those indistinguishable.
-    fn report_gpu_transcode_refused(base_format: u32) {
+    ///
+    /// `why` names the rule that declined. It is passed in rather than read here because the two
+    /// callers are DIFFERENT transcoders: only the uncompressed expansion records a reason, and
+    /// reading its thread local after the block path refused would attribute one path's refusal
+    /// to the other - a wrong cause printed with the same confidence as a right one.
+    fn report_gpu_transcode_refused(base_format: u32, why: &str) {
         use std::collections::HashSet;
         use std::sync::Mutex;
         static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
@@ -2532,7 +2631,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         report_warn!(
             "gxm textures: base format {base_format:#04x} asked for a GPU transcode and the \
              transcoder declined it, so it is being decoded and re-encoded on the CPU instead. \
-             The picture is the same; the cost is not.",
+             The picture is the same; the cost is not. The rule that declined it: {why}.",
         );
     }
 
@@ -2610,10 +2709,343 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Upper bound on the repacked-geometry cache, in distinct meshes. A frame here submits a
     /// few hundred; the cap only fires on a title whose geometry genuinely changes every
     /// frame, where the cache would not have helped anyway.
+    ///
+    /// # >>> THAT LAST CLAUSE IS AN ASSUMPTION, AND A DEVICE DUMP PUT IT IN DOUBT
+    /// A 78-second phone run reported `packed geometry (by content) 103x/115758 entries` - the
+    /// cap firing every three quarters of a second and shedding a quarter of the cache each
+    /// time, with the map sitting at 3,077 entries when it was read. Two completely different
+    /// worlds produce that line:
+    ///
+    ///   * the title really does submit fresh geometry every frame, nothing evicted is ever
+    ///     asked for again, and the eviction costs nothing but the walk; or
+    ///   * its working set is simply LARGER than 4,096 meshes, in which case every pass throws
+    ///     away geometry the next second asks for and pays a full repack plus an arena copy
+    ///     plus a `write_buffer` to get it back - the compounding degradation this whole
+    ///     eviction scheme exists to prevent, reintroduced by a cap that is merely too small.
+    ///
+    /// A count of evictions cannot tell those apart, exactly as the texture-view cache's count
+    /// could not until `tex_reuploaded_after_evict` was added. [`PACKED_REPACK_AFTER_EVICT`] is
+    /// that same signal for this cache, and it is the one to read before this number is moved.
     const PACKED_CACHE_CAP: usize = 4096;
+
+    /// >>> REPACKS OF GEOMETRY THIS RUN HAD ALREADY EVICTED - the cache THRASHING.
+    ///
+    /// A miss is not evidence of anything: reaching new geometry is a miss and is unavoidable.
+    /// A miss on a key that was in this cache and got shed is different in kind - it is work
+    /// being done twice because the bound was too tight, and it is the only reading that
+    /// justifies moving [`PACKED_CACHE_CAP`]. Near zero beside a large eviction count means the
+    /// cap is fine and the title's geometry is genuinely fresh.
+    static PACKED_REPACK_AFTER_EVICT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    thread_local! {
+        /// The content keys most recently shed by [`PACKED_CACHE_CAP`], for
+        /// [`PACKED_REPACK_AFTER_EVICT`]. A bounded ring rather than every key ever evicted:
+        /// the question is whether the title comes BACK for what was just thrown away, and
+        /// remembering 115,000 keys to answer it would cost more memory than the cache does.
+        /// One cap's worth of history is a long enough look-back for that.
+        static PACKED_EVICTED: std::cell::RefCell<(HashSet<u64>, std::collections::VecDeque<u64>)> =
+            std::cell::RefCell::new((HashSet::default(), std::collections::VecDeque::new()));
+    }
+
+    /// Remember one shed content key. See [`PACKED_EVICTED`].
+    fn note_packed_evicted(key: u64) {
+        PACKED_EVICTED.with(|c| {
+            let (set, order) = &mut *c.borrow_mut();
+            if set.insert(key) {
+                order.push_back(key);
+                while order.len() > PACKED_CACHE_CAP {
+                    if let Some(old) = order.pop_front() {
+                        set.remove(&old);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Charge a miss whose geometry this cache had shed. Counted ONCE per shed key - the entry
+    /// is back in the cache after this, so a second charge would be counting the same eviction
+    /// twice. See [`PACKED_REPACK_AFTER_EVICT`].
+    fn note_packed_miss(key: u64) {
+        PACKED_EVICTED.with(|c| {
+            let (set, _) = &mut *c.borrow_mut();
+            if set.remove(&key) {
+                PACKED_REPACK_AFTER_EVICT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// What a cache is cut back to when it reaches its cap - three quarters of it, so the cut
+    /// happens once in a while rather than every frame at the boundary.
+    fn evict_target(cap: usize) -> usize {
+        cap - cap / 4
+    }
+
+    /// The repacked-geometry cache, by content: `(the guest stream it was packed from, the
+    /// packed bytes, the frame epoch it was last USED in)`. The stamp is what
+    /// [`evict_oldest`] orders by; see there for why insertion order will not do.
+    type PackedCache = HashMap<(u64, u64), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>, u64)>;
+    /// The same entries reached by allocation rather than by content hash.
+    type PackedAllocCache =
+        HashMap<(u64, usize, usize), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>, u64)>;
+
+    /// The group2 sampler bind groups, by `(pipeline, what the group names)`: `(the group, the
+    /// texture-view keys it names - so a view eviction can invalidate exactly the groups that
+    /// named it - and the frame epoch it was last USED in)`.
+    type SamplerBgCache = HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>, u64)>;
+
+    /// Every cache eviction, by cache, so a run can be asked whether its caps are firing at all
+    /// and at what rate. Default-on: one atomic per eviction PASS, not per entry, and the
+    /// question it answers ("does this session degrade because a cache keeps being emptied")
+    /// took four device dumps and a 48,000-frame session to ask once.
+    static CACHE_EVICTIONS: std::sync::Mutex<Option<Vec<(&'static str, u64, u64)>>> =
+        std::sync::Mutex::new(None);
+
+    fn note_cache_evicted(what: &'static str, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut g = CACHE_EVICTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let v = g.get_or_insert_with(Vec::new);
+        match v.iter_mut().find(|(w, ..)| *w == what) {
+            Some((_, passes, entries)) => {
+                *passes += 1;
+                *entries += n as u64;
+            }
+            None => v.push((what, 1, n as u64)),
+        }
+    }
+
+    /// `"<cache> Nx/M entries"` for every cache that has evicted, for the report line.
+    ///
+    /// The repacked-geometry cache carries one extra number, because its eviction count alone
+    /// is not readable - see [`PACKED_REPACK_AFTER_EVICT`].
+    fn cache_eviction_summary() -> String {
+        let g = CACHE_EVICTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let thrash = PACKED_REPACK_AFTER_EVICT.load(std::sync::atomic::Ordering::Relaxed);
+        match g.as_ref() {
+            None => "none".to_string(),
+            Some(v) => v
+                .iter()
+                .map(|(w, passes, entries)| {
+                    let mut s = format!("{w} {passes}x/{entries} entries");
+                    if *w == "packed geometry (by content)" {
+                        s.push_str(&format!(" [{thrash} REPACKED AFTER EVICTION]"));
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    /// >>> EVICT THE OLDEST QUARTER, NOT EVERYTHING.
+    ///
+    /// The pattern every bounded cache in this file wanted and only the texture-view cache had:
+    /// shed what has gone longest unused, down to `keep`, and leave the working set alone.
+    ///
+    /// # Why a `clear()` at a cap is the long-run degradation itself
+    /// A wholesale clear does not cost "a rebuild" once - it costs a rebuild of the ENTIRE
+    /// working set inside the next frame, and then it repeats, because whatever filled the cache
+    /// the first time fills it again at the same rate. MEASURED on a golf run: four dumps of the
+    /// same title, same code, ordered by session length, read `prepare` 9.4 / 25.6 / 36.8 / 67.3
+    /// us a draw at 30 / 30 / 15 / 8 fps, with every counter the frame prints FLAT or falling.
+    /// Nothing in the frame's work changed; what changed was how often these caps were hit.
+    /// [[vitaslop-caches-that-clear-whole-are-the-long-run-degradation]]
+    ///
+    /// # The bound is honoured "eventually", deliberately
+    /// An entry stamped with the CURRENT epoch is one this frame has already used, so evicting
+    /// it would cost a rebuild inside the very frame that is running - the disease as the cure.
+    /// Those are therefore never evicted, and a frame that alone touches more distinct entries
+    /// than the cap leaves the map above it. That is bounded by one frame's working set rather
+    /// than by the run, which is the property that matters: what these caps exist to stop is
+    /// unbounded growth ACROSS a session, and a frame's own draws are already bounded by the
+    /// title. The caller reports when it happens.
+    ///
+    /// Returns how many entries were shed.
+    fn evict_oldest<K, V>(
+        map: &mut HashMap<K, V>,
+        keep: usize,
+        current: u64,
+        stamp: impl Fn(&V) -> u64,
+    ) -> usize {
+        evict_oldest_noting(map, keep, current, stamp, |_| {})
+    }
+
+    /// [`evict_oldest`], reporting each key it sheds.
+    ///
+    /// Separate so the common caller stays a four-argument call: only the repacked-geometry
+    /// cache needs the keys, and it needs them to answer whether the title comes back for what
+    /// was shed - see [`PACKED_REPACK_AFTER_EVICT`].
+    fn evict_oldest_noting<K, V>(
+        map: &mut HashMap<K, V>,
+        keep: usize,
+        current: u64,
+        stamp: impl Fn(&V) -> u64,
+        mut shed: impl FnMut(&K),
+    ) -> usize {
+        if map.len() <= keep {
+            return 0;
+        }
+        let want = map.len() - keep;
+        // Only entries this frame has NOT touched can go - see above.
+        let mut old: Vec<u64> = map.values().map(&stamp).filter(|s| *s != current).collect();
+        if old.is_empty() {
+            return 0;
+        }
+        // `select_nth_unstable` rather than a sort: the threshold is an order statistic, and
+        // this runs over thousands of entries at the moment a cache is already under pressure.
+        let n = want.min(old.len()) - 1;
+        let cutoff = *old.select_nth_unstable(n).1;
+        let before = map.len();
+        // `<= cutoff` sheds every entry at the threshold rather than an arbitrary subset of
+        // them, so this can shed slightly MORE than `want` when many share an epoch. Shedding
+        // an extra few of the oldest is the harmless direction; picking arbitrarily among
+        // equals is the one that would make two runs differ for no reason.
+        map.retain(|k, v| {
+            let s = stamp(v);
+            let keep = s == current || s > cutoff;
+            if !keep {
+                shed(k);
+            }
+            keep
+        });
+        before - map.len()
+    }
+
+    /// How many frames a render target may go untouched - neither rendered into nor sampled -
+    /// before [`GxmRenderer::reclaim_stale_rtt`] releases it.
+    ///
+    /// 1,800 frames is a full MINUTE at this project's 30 fps target, and the margin is
+    /// deliberate. The one pattern that could be hurt by this is "rendered once, then sampled
+    /// again much later" - a surface baked at load and read on a screen the player reaches
+    /// minutes afterwards. Being SAMPLED stamps a target just as being rendered into does, so
+    /// such a surface survives for as long as anything reads it; the exposure is only the gap
+    /// between the last read and the next. A minute of neither is unambiguous abandonment, and
+    /// combined with [`RTT_KEEP_FREELY`] it means a title that behaves never reaches this code
+    /// at all.
+    const RTT_STALE_FRAMES: u64 = 1800;
+
+    /// How many targets a renderer holds before the reclamation walk runs at all. A title with
+    /// this few is not leaking and should not pay a map walk per frame to prove it.
+    const RTT_KEEP_FREELY: usize = 16;
+
+    /// Targets reclaimed and bytes released, for the residency report.
+    static RTT_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static RTT_RECLAIMED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_rtt_reclaimed(n: u64, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        RTT_RECLAIMED.fetch_add(n, Relaxed);
+        RTT_RECLAIMED_BYTES.fetch_add(bytes, Relaxed);
+    }
+
+    /// `(targets, bytes)` reclaimed this run.
+    fn rtt_reclaimed_counts() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (RTT_RECLAIMED.load(Relaxed), RTT_RECLAIMED_BYTES.load(Relaxed))
+    }
+
+    /// Bound on the group-0/1 uniform bind groups. Generous, because an entry is a small handle
+    /// and a title's legitimate working set of (arena slot, shader pair, format, sample count)
+    /// is in the low thousands - this is a bound on GROWTH ACROSS A RUN, not a working limit.
+    const UBO_BG_CACHE_CAP: usize = 8192;
 
     /// Bound on `resident_i_seen`, which is only a "have I met this address before" set.
     const RESIDENT_SEEN_CAP: usize = 8192;
+
+    /// >>> DROP THE ENTRIES THAT CAN NO LONGER ANSWER, NOT ALL OF THEM.
+    ///
+    /// `resident_*_seen` records "I have met these exact bytes once" as a `Weak`, and at its cap
+    /// it used to `clear()`. That is the most expensive thing this particular map can do. The
+    /// promotion test is "second CONTENT sighting", so dropping a LIVE candidate does not merely
+    /// cost a lookup - it sends geometry that was one sighting away from being RESIDENT back
+    /// through repack + arena copy + `write_buffer`, every frame, until it is sighted twice
+    /// again. MEASURED on a golf run at only 4,400 frames: `resident seen 8037 / 8192`, i.e. the
+    /// cap is reached in minutes and the reset then repeats for the life of the run. That is a
+    /// degradation that COMPOUNDS, and it is the one the long-session reports are about.
+    /// [[vitaslop-caches-that-clear-whole-are-the-long-run-degradation]]
+    ///
+    /// A DEAD entry is free to drop: its `Weak` cannot be upgraded, so it can never match
+    /// anything again and is pure occupancy - the map is keyed on an allocation ADDRESS, and an
+    /// address recycled after the original died fails the upgrade anyway. Pruning those keeps
+    /// every live candidate's promotion progress, which is the entire content of the map.
+    ///
+    /// Wholesale clearing REMAINS, as the last resort for a map whose entries are genuinely all
+    /// live, because the bound is not optional. It reports separately from the prune, so a run
+    /// where the prune is not enough says so instead of looking like a run where it never fired.
+    fn prune_seen<K: Copy + Eq + std::hash::Hash>(
+        map: &mut HashMap<K, (std::sync::Weak<[u8]>, u64)>,
+        now: u64,
+        what: &'static str,
+    ) {
+        let before = map.len();
+        // `strong_count` rather than `upgrade`: this asks whether the buffer is still alive
+        // without briefly resurrecting it, and it is the same answer.
+        map.retain(|_, (w, _)| w.strong_count() > 0);
+        let pruned = before - map.len();
+        note_seen_pruned(pruned as u64);
+        // >>> AND WHEN THE PRUNE FINDS NOTHING, WHICH IS THE MEASURED CASE, EVICT BY AGE.
+        //
+        // The first version of this stopped at the prune and cleared wholesale if the map was
+        // still full. It then reported doing exactly that, on the first headless replay it ran
+        // in: `the vertex promotion map reached its cap with all 8192 entries still LIVE`. The
+        // reason is structural rather than surprising - the `Weak`s point at the PACKED vertex
+        // buffers, which `packed` and `packed_by_alloc` hold strongly at 4,096 entries each, so
+        // the seen map's 8,192 slots fill with entries that are all, correctly, still alive.
+        // A liveness test cannot bound a map whose contents are kept alive by another cache.
+        //
+        // So each entry carries the frame it was filed in, and the oldest quarter goes. An entry
+        // here is short-lived by design - it is consumed on the SECOND sighting of the same
+        // content, which happens within a frame or two if it happens at all - so an entry that
+        // has been waiting for thousands of frames is one whose second sighting never came.
+        // Those are precisely the ones to drop, and dropping them costs nothing at all.
+        if map.len() >= RESIDENT_SEEN_CAP {
+            let n = evict_oldest(map, evict_target(RESIDENT_SEEN_CAP), now, |(_, filed)| *filed);
+            note_cache_evicted(what, n);
+            // Only if even that found nothing - every entry filed in the CURRENT frame, which
+            // would mean one frame alone offered more distinct meshes than the whole cap.
+            if map.len() >= RESIDENT_SEEN_CAP {
+                map.clear();
+                report_seen_cleared(what, before);
+            }
+        }
+    }
+
+    /// How many dead `resident_*_seen` entries the prune above has reclaimed, and how many times
+    /// it ran. Default-on and two atomics, because the question this answers - "is the prune
+    /// enough, or is the map genuinely full of live candidates" - is not answerable from the
+    /// occupancy line alone, and the wholesale clear it replaces was the largest compounding
+    /// cost in a long run.
+    static SEEN_PRUNES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SEEN_PRUNED_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_seen_pruned(n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        SEEN_PRUNES.fetch_add(1, Relaxed);
+        SEEN_PRUNED_ENTRIES.fetch_add(n, Relaxed);
+    }
+
+    /// `(times pruned, dead entries reclaimed)` for the report line.
+    fn seen_prune_counts() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (SEEN_PRUNES.load(Relaxed), SEEN_PRUNED_ENTRIES.load(Relaxed))
+    }
+
+    fn report_seen_cleared(what: &'static str, held: usize) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
+        if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert(what) {
+            return;
+        }
+        report_warn!(
+            "gxm resident: the {what} promotion map reached its cap with all {held} entries \
+             still LIVE, so it was cleared wholesale. Every mesh awaiting its second content \
+             sighting has to be sighted twice again before it can become resident, which costs \
+             a repack, an arena copy and a write_buffer per draw until it is. Reported once."
+        );
+    }
 
     /// Bound on `GxpLive::precompile_seen`, a set of ALLOCATION pairs already considered for
     /// precompilation. Far above any title's program count; clearing costs one re-scan.
@@ -2847,6 +3279,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Make room, at a FRAME BOUNDARY and nowhere else. Returns the buffer being replaced,
         /// for the caller's graveyard - dropping a `wgpu::Buffer` on the web backend only makes
         /// it collectable, and the last frame's commands still name it until its submit retires.
+        /// How many slices the heap is holding - see `GxmRenderer::cache_sizes`. It is pruned
+        /// only by a compaction or a reset, so on a long run it is one of the few numbers here
+        /// that can climb without bound between them.
+        fn slice_count(&self) -> usize {
+            self.slices.len()
+        }
+
         fn grow_or_reset(
             &mut self,
             device: &wgpu::Device,
@@ -2899,7 +3338,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.slices.clear();
                     return None;
                 }
-                enc(&ENC.buffers_created, 1);
+                enc_buffer_created();
                 let new = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
                     size: self.cap,
@@ -2942,7 +3381,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 );
                 return old;
             };
-            enc(&ENC.buffers_created, 1);
+            enc_buffer_created();
             // COPY_SRC so a later compaction (above) can copy the live set out of this buffer.
             let new = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -3112,6 +3551,24 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// pass that fills them writes. Persistent across frames (a title reuses the same
         /// few targets every frame), rebuilt when a target's size changes.
         rtt: HashMap<u32, RttSurface>,
+        /// >>> THE FRAME EACH TARGET WAS LAST TOUCHED IN - see `reclaim_stale_rtt`.
+        ///
+        /// The comment above says "a title reuses the same few targets every frame", and on a
+        /// steady screen it does. Across a SESSION it does not: the key is a guest address, an
+        /// entry is only ever replaced by one at the same address, and nothing was ever removed.
+        /// MEASURED on a 48,000-frame golf run in this repo: **`rtt targets 304`**, holding
+        /// hundreds of megabytes of colour and depth attachments for screens the title left long
+        /// ago, in a renderer process that had reached 1.53 GB. That is unbounded growth in GPU
+        /// memory as a function of RUN LENGTH, which is the shape of every complaint about a
+        /// long session on the target device.
+        rtt_used: HashMap<u32, u64>,
+        /// Addresses this frame binds as a TEXTURE at an extent that disagrees with the render
+        /// target `rtt` still holds there - i.e. addresses the guest has recycled out from under
+        /// a target. `encode_pass` refuses to offer those targets to the sampler, so the draw
+        /// gets the guest's own texture. Rebuilt every frame by `encode_chain`; empty on any
+        /// frame where the two never disagree, which is every frame of a title that does not
+        /// recycle. See `report_rtt_extent_mismatch`.
+        rtt_alias_block: HashSet<u32>,
         /// Bumped whenever a target in `rtt` is CREATED or RE-created - which is the only event
         /// that can invalidate a `wgpu::TextureView` of one.
         ///
@@ -3223,6 +3680,26 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// it can require the same answer twice before reporting. See that function for why
         /// one frame is not enough to ask the question on.
         orphan_candidate: Option<u32>,
+        /// >>> THE GUEST'S OWN DISPLAY BUFFERS FOR THE FRAME BEING ENCODED - every address it
+        /// >>> passed to `sceDisplaySetFrameBuf` while this frame's scenes were captured.
+        ///
+        /// Set by the frontend before [`Self::encode_chain`] (see `set_presented`), and EMPTY
+        /// on a frontend that does not supply it, which is exactly the behaviour that shipped
+        /// before this existed.
+        ///
+        /// # What it is for
+        /// The display buffer is otherwise taken to be "whatever the LAST scene draws to". That
+        /// is right for a frame whose scenes all belong to one image and wrong for one that
+        /// STRADDLES A FLIP: a title rotating three display buffers (0x88b00300 / 0x88d00400 /
+        /// 0x88f00500 on the one measured) can draw its world into buffer A, flip, and draw its
+        /// HUD into buffer B - and then A is classified as an offscreen pass, rendered into a
+        /// target nothing reads, and DROPPED. The picture that produces is a HUD over black,
+        /// which is the "black course" symptom exactly.
+        ///
+        /// A flip address is the guest's own statement that a buffer is a display buffer, so
+        /// this is evidence rather than a heuristic about extents. It is used ONLY to rescue
+        /// the straddling case - see `encode_chain`.
+        presented: Vec<u32>,
         /// Addresses whose entry in `rtt_rendered` is currently the snapshot rather than
         /// the live target (the pass being encoded draws into that address).
         rtt_reads_snapshot: HashSet<u32>,
@@ -3370,6 +3847,21 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pub arena_create_ms: f64,
         pub arena_write_ms: f64,
         pub ubo_bg_ms: f64,
+        /// >>> THE PARTS OF `encode_chain` THAT ARE NOT A PASS, which used to be nothing but a
+        /// >>> gap between `encode` and the three phases above.
+        ///
+        /// MEASURED on a long device run: `encode 19.3` against `prepare 12.8 + upload 0.8 +
+        /// pass 1.5`, and on that run's WORST frame **107.3 ms against 8.8**. A split that
+        /// leaves ninety-eight milliseconds unnamed is worse than none, because it reads as
+        /// complete. These three are what runs there, per FRAME rather than per draw, so the
+        /// clock reads cost nothing.
+        ///
+        /// `resident_ms` is the one to watch on a long run: it covers `grow_or_reset`, which
+        /// COMPACTS the resident geometry heap by allocating a whole new buffer and copying
+        /// every live slice into it.
+        pub precompile_ms: f64,
+        pub retire_ms: f64,
+        pub resident_ms: f64,
         /// Draws that took the recompiled path, and draws that took the fixed-function
         /// path - the denominator for any per-draw cost.
         pub gxp_draws: usize,
@@ -3391,6 +3883,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.arena_create_ms += pass.arena_create_ms;
             self.arena_write_ms += pass.arena_write_ms;
             self.ubo_bg_ms += pass.ubo_bg_ms;
+            self.precompile_ms += pass.precompile_ms;
+            self.retire_ms += pass.retire_ms;
+            self.resident_ms += pass.resident_ms;
             self.gxp_draws += pass.gxp_draws;
             self.fixed_draws += pass.fixed_draws;
         }
@@ -3482,21 +3977,39 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// instrument costs nothing next to what it measures. It is NOT behind a knob, for the usual
     /// reason: a diagnostic you have to switch on is one nobody has on when the surprising frame
     /// is already in front of them.
+    ///
+    /// # A MAXIMUM IS NOT A SUM, AND THIS MACRO USED TO ADD ONE
+    /// Every field here is folded across the window by [`EncodeWork::add`], and `add` did
+    /// `+=` to all of them. That is right for a count and WRONG for a maximum: a per-frame
+    /// worst call summed over a window is a number with no meaning, and it read as one that
+    /// had - a device dump reported `1.44 MB written in 15.2 write_buffer CALLS, WORST SINGLE
+    /// CALL 1.0 ms for 14080 KB`, i.e. a single call carrying ten times the bytes of the whole
+    /// frame it happened in. The `@max` section below is folded with `max` instead. Put a
+    /// counter there if it is a high-water mark and in the list above if it is a tally; there
+    /// is no third kind.
     macro_rules! encode_work {
-        ($($(#[$m:meta])* $name:ident),+ $(,)?) => {
+        ($($(#[$m:meta])* $name:ident),+ $(,)? ; @max $($(#[$mm:meta])* $mname:ident),+ $(,)?) => {
             #[derive(Default, Clone, Copy, Debug)]
-            pub struct EncodeWork { $($(#[$m])* pub $name: u64,)+ }
+            pub struct EncodeWork {
+                $($(#[$m])* pub $name: u64,)+
+                $($(#[$mm])* pub $mname: u64,)+
+            }
 
-            struct EncodeCounters { $($name: std::sync::atomic::AtomicU64,)+ }
+            struct EncodeCounters {
+                $($name: std::sync::atomic::AtomicU64,)+
+                $($mname: std::sync::atomic::AtomicU64,)+
+            }
 
             static ENC: EncodeCounters = EncodeCounters {
                 $($name: std::sync::atomic::AtomicU64::new(0),)+
+                $($mname: std::sync::atomic::AtomicU64::new(0),)+
             };
 
             /// Take and RESET every encode counter. The caller owns the window it divides by.
             pub fn take_encode_work() -> EncodeWork {
                 EncodeWork {
                     $($name: ENC.$name.swap(0, std::sync::atomic::Ordering::Relaxed),)+
+                    $($mname: ENC.$mname.swap(0, std::sync::atomic::Ordering::Relaxed),)+
                 }
             }
 
@@ -3504,6 +4017,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 /// Fold another tally in, so a caller can accumulate per PRESENT.
                 pub fn add(&mut self, o: &EncodeWork) {
                     $(self.$name += o.$name;)+
+                    // >>> MAXIMA, NOT TOTALS. See the macro's own doc comment.
+                    $(self.$mname = self.$mname.max(o.$mname);)+
                 }
             }
         };
@@ -3633,6 +4148,216 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Uploads that asked for a GPU transcode and were declined by it, falling back to the
         /// CPU decode. Never a wrong picture - only a slower one.
         tex_gpu_encode_refused,
+        ;
+        @max
+        /// >>> THE WORST SINGLE `queue.write_buffer` OF THE WINDOW, IN MICROSECONDS, AND THE
+        /// >>> BYTES THAT SAME CALL CARRIED.
+        ///
+        /// The pair that says WHAT this call is waiting on, which neither a total nor a call
+        /// count can. MEASURED on the user's phone, one gameplay window: `arena 81.1 = write
+        /// 81.1` over `2.88 MB in 11.9 calls` - 6.8 ms a call for 242 KB, and a worst frame of
+        /// 2,427 ms for 3.36 MB in 12. No copy of 242 KB costs 6.8 ms and no crossing into the
+        /// browser costs it either, so the call is BLOCKING; these two say whether it is one
+        /// call blocking (a wait for something specific - the previous submit, a staging ring
+        /// that has to be recycled) or all of them equally (a per-call cost that is simply
+        /// enormous). Those have opposite fixes, and the notes have been carrying the question
+        /// unanswered because nothing timed the calls individually.
+        ///
+        /// # THE TWO HALVES HAVE TO COME FROM THE SAME CALL, so they are ONE counter
+        /// This was a pair of independent `fetch_max`es, which is not a pair at all: the
+        /// microseconds came from the slowest call and the bytes from the FATTEST, and nothing
+        /// said they were the same one. That is the exact question this counter exists to
+        /// answer - a slow call carrying few bytes is a BLOCK, a slow call carrying many is a
+        /// COPY - so an unpaired reading cannot answer it even when both numbers are correct.
+        /// They are packed into one `u64` as `us << 32 | bytes` and maximised TOGETHER, so the
+        /// winner is the slowest call and the bytes are the ones IT carried.
+        ///
+        /// It lives in the `@max` section because [`EncodeWork::add`] folds a window with `+=`
+        /// otherwise, and a summed maximum is what produced `WORST SINGLE CALL 1.0 ms for
+        /// 14080 KB` on a frame that wrote 1.44 MB in total.
+        ///
+        /// Read it with [`EncodeWork::buffer_write_worst_us_kb`].
+        buffer_write_worst,
+    }
+
+    #[cfg(test)]
+    mod encode_work_tests {
+        use super::EncodeWork;
+
+        /// A window is folded with [`EncodeWork::add`], and a MAXIMUM folded with `+=` is not a
+        /// maximum. This is the test the shipped instrument did not have: it reported `WORST
+        /// SINGLE CALL 1.0 ms for 14080 KB` on a frame whose every write together came to
+        /// 1.44 MB, and nothing failed.
+        #[test]
+        fn a_window_maxes_the_worst_write_and_sums_the_rest() {
+            let frame = |us: u64, bytes: u64, writes: u64| EncodeWork {
+                buffer_writes: writes,
+                buffer_write_worst: (us << 32) | bytes,
+                ..EncodeWork::default()
+            };
+            let mut w = EncodeWork::default();
+            w.add(&frame(1_000, 200 * 1024, 5));
+            w.add(&frame(6_800, 242 * 1024, 7));
+            w.add(&frame(300, 900 * 1024, 3));
+
+            assert_eq!(w.buffer_writes, 15, "a tally is still summed across the window");
+            let (ms, kb) = w.buffer_write_worst_us_kb();
+            assert!((ms - 6.8).abs() < 1e-9, "the window's worst call is 6.8 ms, got {ms}");
+            // >>> AND THE BYTES ARE THAT CALL'S. The 900 KB frame is the FATTEST write of the
+            // window and must not appear here: a slow call carrying little is a BLOCK and a slow
+            // call carrying a lot is a COPY, and pairing the two maxima independently reports
+            // the second when the truth is the first.
+            assert!((kb - 242.0).abs() < 1e-9, "expected the slow call's own 242 KB, got {kb}");
+        }
+    }
+
+    /// >>> THE WORST `queue.write_buffer` OF THE WHOLE RUN, packed as `us << 32 | bytes`.
+    ///
+    /// # A WINDOWED MAXIMUM CANNOT BE READ WHEN THE BAD FRAME HANGS THE BROWSER
+    /// `EncodeWork::buffer_write_worst` is a maximum over the REPORTING WINDOW, which is the
+    /// right thing for "what is this frame doing now" and the wrong thing for the case that
+    /// actually matters here. The user's report: *"often hangs/hiccups actually hang the browser
+    /// so you can't copy at that time"*. So the sequence is - the stall happens, the page is
+    /// unresponsive, it recovers, and only THEN can a dump be taken - by which point the window
+    /// holding the stall's worst call has rolled over and the number is gone. Asking for a dump
+    /// "at the moment it hitches" is asking for something the platform does not allow.
+    ///
+    /// This one never resets, so a dump taken after recovery still carries the worst single
+    /// write the run ever made. It sits beside the `SLOWEST FRAMES, cumulative for the run`
+    /// list, which survives for exactly the same reason and is exactly the pairing that makes a
+    /// post-hoc dump worth taking. [[vitaslop-a-count-needs-its-window]]
+    static BUFFER_WRITE_WORST_RUN: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// >>> WHICH WRITE OF THE FRAME THIS IS - the number that separates the two live stories.
+    ///
+    /// If `write_buffer` is blocking because it needs a staging chunk that only completion of
+    /// the PREVIOUS SUBMIT can free, the stalls land on the FIRST write of a frame and the rest
+    /// run at microseconds. If instead the queue is simply saturated, they land anywhere. Those
+    /// have different fixes - rotating the arenas over more buffers versus reducing GPU work -
+    /// and no total, no maximum and no byte count can tell them apart. Reset per frame at the
+    /// top of `encode_chain`.
+    static BUFFER_WRITES_THIS_FRAME: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// >>> TEXTURE UPLOADED IN *THIS FRAME*, for the stall report.
+    ///
+    /// The user's observation, which is worth more than my theory was: the stall happens on a
+    /// NEW thing - a new course, a new menu - which is precisely when a frame first meets
+    /// textures it has never uploaded. That covers EVERY texture path, not just the BC
+    /// expansion I tested and wrongly generalised from: `0x00`/`0x13`/`0x0c` are uncompressed
+    /// SWIZZLED formats that are un-swizzled and uploaded whether or not the adapter has BC, and
+    /// a device dump has 36.9 MB of exactly those. Switching off `NO_BC` never touched them, so
+    /// "expansion is refuted" was a statement about one path reported as if it were all of them.
+    ///
+    /// Per FRAME rather than cumulative, because the question is what THIS frame put in the
+    /// queue in front of the write that stalled.
+    static TEX_UPLOADS_THIS_FRAME: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static TEX_UPLOAD_BYTES_THIS_FRAME: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// >>> ARENA BUFFERS CREATED IN *THIS FRAME* - the untested candidate.
+    ///
+    /// Two mechanisms are already refuted by measurement: the stalls are not the first write of
+    /// a frame (so not simply waiting on the previous submit), and the frame that uploaded 79
+    /// textures / 5.7 MB stalled for LESS time than two frames that uploaded 2 textures /
+    /// 601 KB (so not upload volume).
+    ///
+    /// What both of those miss is that a NEW course or menu brings bigger geometry, which makes
+    /// a pass arena GROW: a fresh `create_buffer`, the old one destroyed, in the middle of a
+    /// frame. That matches the user's report of where the stall happens far better than
+    /// anything about steady-state volume, and nothing counts it.
+    static BUFFERS_MADE_THIS_FRAME: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Charge a texture upload to both the window tally and the current FRAME.
+    ///
+    /// One function rather than two calls at six sites: the per-frame pair existing but being
+    /// updated at five of the six upload paths would be a counter that reads low for reasons
+    /// nobody could see, which is the failure this file keeps finding in its own instruments.
+    /// Charge one GPU buffer creation to the window tally and to the current FRAME.
+    ///
+    /// Written AFTER the call sites were renamed, deliberately: doing it the other way round is
+    /// what turned `enc_tex_upload` into a call to itself a few minutes ago.
+    fn enc_buffer_created() {
+        enc(&ENC.buffers_created, 1);
+        BUFFERS_MADE_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn enc_tex_upload(bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // NOT `enc_tex_upload` - a bulk rename rewrote this line into a call to its own
+        // function, and the worker died with `Maximum call stack size exceeded` naming nothing
+        // useful. A rename that matches the body of the thing being renamed is how that happens.
+        enc(&ENC.tex_upload_bytes, bytes);
+        TEX_UPLOADS_THIS_FRAME.fetch_add(1, Relaxed);
+        TEX_UPLOAD_BYTES_THIS_FRAME.fetch_add(bytes, Relaxed);
+    }
+
+    /// `(milliseconds, KB)` of the worst single `queue.write_buffer` of the run - the pair that
+    /// survives a hang. See [`BUFFER_WRITE_WORST_RUN`].
+    pub fn buffer_write_worst_run_us_kb() -> (f64, f64) {
+        let v = BUFFER_WRITE_WORST_RUN.load(std::sync::atomic::Ordering::Relaxed);
+        ((v >> 32) as f64 / 1000.0, (v & 0xffff_ffff) as f64 / 1024.0)
+    }
+
+    /// >>> A SINGLE `queue.write_buffer` THAT BLOCKED FOR A LONG TIME, SAID OUT LOUD.
+    ///
+    /// MEASURED on the user's phone: **5,240 ms for 55 KB**, and on this workstation 890-1,550 ms
+    /// for 0.5-3.6 MB. Fifty-five kilobytes is not a bandwidth figure and no call costs seconds,
+    /// so this is the CPU stopped dead waiting on the GPU queue.
+    ///
+    /// # Why a report and not just the maxima
+    /// The panel's `WORST write_buffer OF THE RUN` says it happened; it cannot say WHEN or what
+    /// else was in flight, and the device dump that carried it also showed a WORST FRAME of
+    /// 1,085 ms - a 5.2-second write cannot fit inside a 1.1-second frame, so it did not happen
+    /// inside a counted frame at all. That contradiction is the whole lead
+    /// [[vitaslop-contradiction-means-look-between]], and it needs a line at the moment it
+    /// happens, next to whatever else the log is saying, rather than a number read minutes later.
+    ///
+    /// Every stall over the threshold is reported, on a doubling cadence so a pathological run
+    /// cannot bury the rest of the log.
+    fn report_write_buffer_stall(us: u64, bytes: u64, nth_this_frame: u64) {
+        /// A write is microseconds when it is healthy. 100 ms is far outside anything a copy
+        /// explains, and low enough to catch the ones that are not yet seconds.
+        const STALL_US: u64 = 100_000;
+        if us < STALL_US {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if !n.is_power_of_two() {
+            return;
+        }
+        // >>> THE CONTEXT TRAVELS WITH THE REPORT. The first stall this caught happened to sit
+        // one line below a `texture working set is 145 MB (new high)`, which reads like a cause;
+        // the second sat among ordinary draw warnings and had no such neighbour. Log ADJACENCY
+        // is not attribution - it is whatever else happened to be logging. These counters are
+        // cumulative, so the DIFFERENCE between two consecutive stall lines is how much
+        // expansion work went into the queue between them.
+        let (submits, textures) = crate::texenc::raw_batch_counts();
+        // >>> WHAT *THIS FRAME* PUT IN THE QUEUE AHEAD OF THE STALLED WRITE. The user's report is
+        // that the stall happens on a NEW course/menu, i.e. exactly when a frame first uploads
+        // textures it has never seen - see `TEX_UPLOADS_THIS_FRAME`.
+        let frame_texn = TEX_UPLOADS_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        let frame_texkb =
+            TEX_UPLOAD_BYTES_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed) / 1024;
+        let frame_bufs = BUFFERS_MADE_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        report_warn!(
+            "gxm: a single queue.write_buffer BLOCKED for {:.0} ms writing {} KB ({n} such \
+             stalls so far this run). That is not a copy - no call costs milliseconds per \
+             kilobyte - it is this thread waiting on the GPU queue to drain. THIS WAS WRITE \
+             #{nth_this_frame} OF THE FRAME (0 = the first, i.e. the one right after the \
+             previous frame's submit), and THIS FRAME had already uploaded {frame_texn} \
+             textures / {frame_texkb} KB ahead of it and CREATED {frame_bufs} GPU buffers. \
+             AT THIS MOMENT, cumulative for the run: {textures} GPU \
+             texture expansions in {submits} submits. Compare with the previous stall line - \
+             the DELTA is what went into the queue between them, and log order is not evidence. \
+             See `report_write_buffer_stall`.",
+            us as f64 / 1000.0,
+            bytes / 1024,
+        );
     }
 
     /// Bump one encode counter. Relaxed: these are a diagnostic, and no reader depends on
@@ -3793,6 +4518,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     impl EncodeWork {
+        /// Unpack [`EncodeWork::buffer_write_worst`] into `(milliseconds, KB)` - the slowest
+        /// single `queue.write_buffer` of the window and the bytes THAT call carried.
+        ///
+        /// Packed rather than stored as a pair so the two cannot drift onto different calls;
+        /// see the field's own comment for what that cost.
+        pub fn buffer_write_worst_us_kb(&self) -> (f64, f64) {
+            let us = self.buffer_write_worst >> 32;
+            let bytes = self.buffer_write_worst & 0xffff_ffff;
+            (us as f64 / 1000.0, bytes as f64 / 1024.0)
+        }
+
         /// One line, per FRAME (the caller divides), naming every unit above.
         pub fn line(&self, frames: u64) -> String {
             let n = frames.max(1) as f64;
@@ -3805,7 +4541,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                  encodes refused, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
                  passes dropping {:.1} entries, {:.1} superseded in place, {:.2} WHOLESALE clears, {:.1} DESTROYED), bind groups {:.1} built \
                  / {:.1} reused, {:.2} pipelines built, buffers {:.1} created / {:.1} destroyed ({:.2} MB \
-                 written in {:.1} write_buffer CALLS), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
+                 written in {:.1} write_buffer CALLS, WORST SINGLE CALL {:.1} ms for {:.0} KB), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
                  conversions, {:.2} depth-bind-cache clears",
                 per(self.passes),
                 per(self.draw_calls),
@@ -3833,6 +4569,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 per(self.buffers_destroyed),
                 mb(self.buffer_bytes),
                 per(self.buffer_writes),
+                // NOT divided by the window: this is a MAX over it, and dividing a maximum by
+                // the number of frames produces a number that is nothing at all. It is also
+                // FOLDED with `max` rather than `+=` - see the `@max` section of the macro.
+                self.buffer_write_worst_us_kb().0,
+                self.buffer_write_worst_us_kb().1,
                 per(self.rtt_created),
                 per(self.rtt_destroyed),
                 per(self.rtt_snapshots),
@@ -3874,10 +4615,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         depth_addr: u32,
         depth_is_sampled: bool,
         had_extent: bool,
+        pairs: &str,
     ) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        if !REPORTED.swap(true, Ordering::Relaxed) {
+        // >>> DEDUPED ON THE PAIR SET, NOT ONCE FOR THE WHOLE RUN. A once-only report fires on
+        // the FIRST such scene, which on a title that boots through a loading screen is not the
+        // one anybody is asking about - it named the boot screen's two pairs and stayed silent
+        // for every frame after, including the frames whose picture was missing.
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        static REPORTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+        let mut g = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = g.get_or_insert_with(HashSet::new);
+        if seen.len() < 16 && seen.insert(pairs.to_string()) {
             if depth_is_sampled {
                 // Reaching here now means the depth-only path could not be taken, and there is
                 // exactly one reason left: no extent. A `SceGxmDepthStencilSurface` carries
@@ -3896,10 +4645,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 );
                 return;
             }
-            report!(
-                "gxm: a scene with {draws} draws has no resolvable colour surface - it renders \
-                 nowhere. Nothing in this frame samples its depth ({depth_addr:#x}), so as far \
-                 as this frame is concerned nothing is missing"
+            report_warn!(
+                "gxm: a scene with {draws} draws has no resolvable colour surface - IT RENDERS NOWHERE. Nothing in this frame samples its depth ({depth_addr:#x}), so nothing needs its DEPTH - but its colour draws are LOST. Pairs: [{pairs}]"
             );
         }
     }
@@ -4151,6 +4898,29 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 m.color.destroy();
                 m.depth.destroy();
             }
+        }
+
+        /// Roughly what this target costs in GPU memory, for the residency report and for the
+        /// reclamation that reads it.
+        ///
+        /// Approximate on purpose: it counts four bytes a texel for each attachment it owns,
+        /// which is exact for the formats actually in use here and never off by more than the
+        /// depth format's own width. What it is FOR is a number that tracks run length - a
+        /// hundred stale targets read as hundreds of megabytes either way, and that is the
+        /// distinction nothing in this renderer could make before.
+        fn bytes(&self) -> u64 {
+            let one = (self.width as u64) * (self.height as u64) * 4;
+            let mut n = one * 2; // colour + depth
+            if self.shadow.is_some() {
+                n += one;
+            }
+            if self.gxm_depth.is_some() {
+                n += one;
+            }
+            if let Some(m) = &self.msaa {
+                n += one * 2 * (m.samples.max(1) as u64);
+            }
+            n
         }
     }
 
@@ -4629,7 +5399,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// target format, group) rather than one per draw - the draw supplies only a dynamic
         /// offset. Cleared wholesale when the arena buffer is re-created, because a bind group
         /// names a specific buffer; `ubo_bgs_gen` is that buffer's generation.
-        ubo_bgs: HashMap<(usize, u64, wgpu::TextureFormat, u32, u8), wgpu::BindGroup>,
+        /// Each entry carries the frame epoch it was last USED in, so the cap below sheds the
+        /// pairs a title has stopped drawing rather than the ones it is drawing now.
+        ubo_bgs: HashMap<(usize, u64, wgpu::TextureFormat, u32, u8), (wgpu::BindGroup, u64)>,
         /// Per arena SLOT, the generation of the uniform buffer its cached entries name.
         ubo_bgs_gen: HashMap<usize, u64>,
         /// Repacked vertex streams, keyed by `(pipeline key, content hash of the guest
@@ -4643,7 +5415,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// source is not there for lifetime reasons - it is the hit's PROOF. See the lookup in
         /// `prepare`: a content-hash cache over geometry that trusts its hash fails by silently
         /// drawing another draw's mesh, and this one did.
-        packed: HashMap<(u64, u64), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>,
+        packed: PackedCache,
         /// The same entries, reached WITHOUT hashing: `(pipeline key, allocation address,
         /// length)` of the guest stream.
         ///
@@ -4667,7 +5439,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         ///
         /// A miss here falls through to the content hash, so nothing that used to hit stops
         /// hitting. It is a fast path, not a replacement.
-        packed_by_alloc: HashMap<(u64, usize, usize), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>,
+        packed_by_alloc: PackedAllocCache,
         /// Repacked vertices and expanded indices that have not changed since the renderer first
         /// saw them, resident on the GPU instead of copied into a pass arena every frame. See
         /// [`ResidentHeap`] for the measurement this is aimed at and for why an address is a
@@ -4692,12 +5464,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// upgraded, and an address recycled after the original died fails the upgrade, which is
         /// the honest answer) and owns nothing.
         ///
-        /// Cleared wholesale at its cap, which delays a promotion and nothing else.
-        resident_i_seen: HashMap<(u64, usize, usize), std::sync::Weak<[u8]>>,
+        /// At its cap the DEAD entries go first, then the oldest-filed - see `prune_seen`, and
+        /// note that a liveness prune alone cannot bound this map, because the packed-vertex
+        /// caches hold strong references to the very buffers it points at.
+        /// Each entry carries the FRAME it was filed in, so the cap can shed the candidates
+        /// whose second sighting never came - see `prune_seen` for why liveness alone cannot
+        /// bound this map.
+        resident_i_seen: HashMap<(u64, usize, usize), (std::sync::Weak<[u8]>, u64)>,
         /// The vertex twin of [`Self::resident_i_seen`], keyed on the PACKED content `Arc`
         /// (plus the pipeline, whose repack plan shaped those bytes). Same `Weak` argument,
         /// same cap, same clearing.
-        resident_v_seen: HashMap<(u64, usize, usize), std::sync::Weak<[u8]>>,
+        resident_v_seen: HashMap<(u64, usize, usize), (std::sync::Weak<[u8]>, u64)>,
         /// Shader pairs `precompile_pairs` has already considered, by the ALLOCATION of the two
         /// program blobs. The pending list is re-offered every frame and `module_key` hashes
         /// both blobs, so without this the preparation costs a few hundred kilobytes of hashing
@@ -4769,7 +5546,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Each entry carries the view-cache keys it NAMES, so an eviction can drop exactly the
         /// groups that just went stale. See the eviction site for why a generation counter was
         /// the wrong instrument here.
-        sampler_bgs: HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>)>,
+        sampler_bgs: SamplerBgCache,
         /// The group the PREVIOUS draw of this pass got, against a fingerprint of what decided
         /// it - see `make_sampler_bg`. Reset at every pass boundary, because the maps a unit
         /// resolves through (this frame's rendered targets) change there and nowhere else.
@@ -4994,8 +5771,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 fit_by_addr: HashMap::default(),
                 ubo_bgs: HashMap::default(),
                 ubo_bgs_gen: HashMap::default(),
-                packed: HashMap::default(),
-                packed_by_alloc: HashMap::default(),
+                packed: PackedCache::default(),
+                packed_by_alloc: PackedAllocCache::default(),
                 resident_v: ResidentHeap::new(),
                 resident_i: ResidentHeap::new(),
                 resident_i_seen: HashMap::default(),
@@ -5013,7 +5790,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     * 1024,
                 depth_bgs: HashMap::default(),
                 depth_retired: Vec::new(),
-                sampler_bgs: HashMap::default(),
+                sampler_bgs: SamplerBgCache::default(),
                 last_sampler_bg: None,
                 sampler_pre: HashMap::default(),
             }
@@ -5039,10 +5816,31 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 self.ubo_bgs.retain(|k, _| k.0 != slot);
                 self.ubo_bgs_gen.insert(slot, generation);
             }
+            // >>> AND A COUNT BOUND, BECAUSE THE GENERATION BOUND IS NOT ONE.
+            //
+            // An entry dies only when its SLOT's uniform buffer is re-created, and the arena
+            // pool exists precisely so that stops happening - so in a steady run nothing here
+            // is ever dropped, and the map grows with every distinct (slot, pair, format,
+            // samples, group) the title ever draws. MEASURED on the user's device across one
+            // long session: **3,182 -> 15,254 entries**, each one a live `GPUBindGroup` in the
+            // browser. That is the same growth-with-run-length shape as every other cache this
+            // session bounded; it was missed because "bounded by generation" reads like a
+            // bound. [[vitaslop-caches-that-clear-whole-are-the-long-run-degradation]]
+            if self.ubo_bgs.len() >= UBO_BG_CACHE_CAP {
+                let n = evict_oldest(
+                    &mut self.ubo_bgs,
+                    evict_target(UBO_BG_CACHE_CAP),
+                    self.views_epoch,
+                    |(_, used)| *used,
+                );
+                note_cache_evicted("ubo bind groups", n);
+            }
             for &(key, format, samples, cull, layout, raster) in used {
                 let Some(Some(pipe)) = self.pipelines.get(&(key, format, samples, cull, layout, raster)) else { continue };
                 for (group, lanes) in [(0u8, pipe.vsa_lanes), (1u8, pipe.fsa_lanes)] {
-                    if self.ubo_bgs.contains_key(&(slot, key, format, samples, group)) {
+                    if let Some((_, last)) = self.ubo_bgs.get_mut(&(slot, key, format, samples, group)) {
+                        // A hit is a use - it is what keeps this entry out of the eviction.
+                        *last = self.views_epoch;
                         enc(&ENC.bind_groups_reused, 1);
                         continue;
                     }
@@ -5076,7 +5874,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         layout,
                         entries: &entries,
                     });
-                    self.ubo_bgs.insert((slot, key, format, samples, group), bg);
+                    self.ubo_bgs.insert((slot, key, format, samples, group), (bg, self.views_epoch));
                 }
             }
         }
@@ -5376,21 +6174,29 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// for is a stream RE-SNAPSHOTTED into a new allocation with the same contents - the
         /// same-allocation hit is served by the caller without reaching here at all.
         fn pack_vertices(
-            packed: &mut HashMap<(u64, u64), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>,
-            packed_by_alloc: &mut HashMap<(u64, usize, usize), (std::sync::Arc<[u8]>, std::sync::Arc<[u8]>)>,
+            packed: &mut PackedCache,
+            packed_by_alloc: &mut PackedAllocCache,
             akey: (u64, usize, usize),
             gxp: &GxpRecompile,
             repack: &[RepackAttr],
             packed_stride: u32,
+            epoch: u64,
         ) -> std::sync::Arc<[u8]> {
             let t_hash = split_start();
             let pkey = (akey.0, fnv64(0xcbf2_9ce4_8422_2325, &gxp.vertices));
             split_end(t_hash, &PREP.hash_ns);
             split_add(&PREP.hash_bytes, gxp.vertices.len() as u64);
+            // `get_mut`, because a HIT is a USE and this cache is now evicted by last use. The
+            // stamp is what makes "oldest" mean anything: without it the only orders available
+            // are insertion order and hash order, and neither says which meshes this title is
+            // still drawing.
             let hit = packed
-                .get(&pkey)
-                .filter(|(src, _)| src[..] == gxp.vertices[..])
-                .map(|(_, bytes)| bytes.clone());
+                .get_mut(&pkey)
+                .filter(|(src, ..)| src[..] == gxp.vertices[..])
+                .map(|(_, bytes, used)| {
+                    *used = epoch;
+                    bytes.clone()
+                });
             let bytes = match hit {
                 Some(bytes) => {
                     split_add(&PREP.packed_hits, 1);
@@ -5398,27 +6204,45 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 None => {
                     split_add(&PREP.packed_misses, 1);
+                    // Was this a miss on geometry the cap itself threw away? Charged BEFORE the
+                    // eviction below, so a key shed by this very pass cannot be counted as a
+                    // thrash it caused. See `PACKED_REPACK_AFTER_EVICT`.
+                    note_packed_miss(pkey.1);
                     let t_repack = split_start();
-                    // Bound the cache the way the texture caches are bounded: the key is a
-                    // content hash, so clearing wholesale costs a repack and never correctness.
+                    // Bound the cache - but by shedding the meshes this title has stopped
+                    // drawing, not by dropping the ones it is drawing right now. See
+                    // `evict_oldest` for what the wholesale clear this replaces actually cost.
                     if packed.len() >= PACKED_CACHE_CAP {
-                        packed.clear();
+                        let n = evict_oldest_noting(
+                            packed,
+                            evict_target(PACKED_CACHE_CAP),
+                            epoch,
+                            |(_, _, used)| *used,
+                            |k: &(u64, u64)| note_packed_evicted(k.1),
+                        );
+                        note_cache_evicted("packed geometry (by content)", n);
                     }
                     let mut out = Vec::new();
                     repack_vertices_into(&gxp.vertices, gxp.vertex_stride, repack, packed_stride, &mut out);
                     split_end(t_repack, &PREP.repack_ns);
                     split_add(&PREP.repack_bytes, gxp.vertices.len() as u64);
                     let out: std::sync::Arc<[u8]> = out.into();
-                    packed.insert(pkey, (gxp.vertices.clone(), out.clone()));
+                    packed.insert(pkey, (gxp.vertices.clone(), out.clone(), epoch));
                     out
                 }
             };
             // Both maps hold the source `Arc`, which is what keeps the allocation alive and so
             // keeps its ADDRESS from being handed to a later stream. Bounded the same way.
             if packed_by_alloc.len() >= PACKED_CACHE_CAP {
-                packed_by_alloc.clear();
+                let n = evict_oldest(
+                    packed_by_alloc,
+                    evict_target(PACKED_CACHE_CAP),
+                    epoch,
+                    |(_, _, used)| *used,
+                );
+                note_cache_evicted("packed geometry (by allocation)", n);
             }
-            packed_by_alloc.insert(akey, (gxp.vertices.clone(), bytes.clone()));
+            packed_by_alloc.insert(akey, (gxp.vertices.clone(), bytes.clone(), epoch));
             bytes
         }
 
@@ -5663,6 +6487,30 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if self.texenc.is_none() {
                 self.texenc = Some(crate::texenc::Transcoder::new(device));
             }
+            // >>> THE FRAME'S TEXTURE EXPANSIONS GO TO THE QUEUE AT EVERY PASS BOUNDARY, AND
+            // >>> THAT IS A DEVICE MEASUREMENT, NOT A TIDINESS CHOICE.
+            //
+            // Batching them across the WHOLE frame submits fewer command buffers, and a desktop
+            // says that is better. The user's phone said otherwise the first time it ran: play
+            // "hiccups a tad more". The mechanism fits a tile-based GPU exactly - held to the
+            // end of `encode_chain`, every expansion's COMPUTE lands in one submit immediately
+            // before the render pass that samples those textures, so the render cannot start
+            // until the compute drains. Flushed per pass, that work is already in flight while
+            // the CPU builds the rest of the frame.
+            //
+            // So this is a count win that a desktop cannot price
+            // [[vitaslop-desktop-cannot-price-a-count-win]], and the count is not the thing that
+            // matters. Batching still happens - within a pass, which is where consecutive
+            // uploads actually occur - and a load frame still submits far fewer times than the
+            // one-per-texture this replaced. Widening it back to the frame needs a DEVICE
+            // measurement that says so.
+            //
+            // No report here: a batch pending at a PASS boundary is the batching working. The
+            // watchdog for a genuinely missed flush is at the top of `encode_chain`, where a
+            // pending batch means a whole frame went by without one.
+            if let Some(t) = self.texenc.as_ref() {
+                t.flush_raw(queue);
+            }
             let GxpLive {
                 pipelines,
                 texenc,
@@ -5757,17 +6605,31 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // `packed_by_alloc`. Both halves of the fat pointer, so a shorter stream that
             // happens to start at the same address is a different key rather than a truncation.
             let akey = (key, std::sync::Arc::as_ptr(&gxp.vertices) as *const u8 as usize, gxp.vertices.len());
+            // `get_mut`, so a hit STAMPS the entry: this is the fast path, so it is also where
+            // most of a frame's uses are, and an entry the fast path serves every frame must not
+            // look untouched to the eviction below.
             let alloc_hit = packed_by_alloc
-                .get(&akey)
-                .filter(|(src, _)| std::sync::Arc::ptr_eq(src, &gxp.vertices))
-                .map(|(_, bytes)| bytes.clone());
+                .get_mut(&akey)
+                .filter(|(src, ..)| std::sync::Arc::ptr_eq(src, &gxp.vertices))
+                .map(|(_, bytes, used)| {
+                    *used = *views_epoch;
+                    bytes.clone()
+                });
             // The packed bytes for this draw, however they were reached.
             let packed_bytes: std::sync::Arc<[u8]> = match alloc_hit {
                 Some(bytes) => {
                     split_add(&PREP.packed_hits, 1);
                     bytes
                 }
-                None => Self::pack_vertices(packed, packed_by_alloc, akey, gxp, &pipe.repack, pipe.packed_stride),
+                None => Self::pack_vertices(
+                    packed,
+                    packed_by_alloc,
+                    akey,
+                    gxp,
+                    &pipe.repack,
+                    pipe.packed_stride,
+                    *views_epoch,
+                ),
             };
             // >>> THE RESIDENCY KEY IS THE PACKED CONTENT `Arc`, AND THE HISTORY HERE HAS TWO
             // >>> TURNS - read both before changing it again.
@@ -5819,15 +6681,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     if resident {
                         let v_seen = resident_v_seen
                             .get(&rkey)
-                            .and_then(|prev| prev.upgrade())
+                            .and_then(|(prev, _)| prev.upgrade())
                             .is_some_and(|prev| std::sync::Arc::ptr_eq(&prev, &packed_bytes));
                         if v_seen {
                             resident_v.place(queue, rkey, &packed_bytes, &packed_bytes);
                         } else {
                             if resident_v_seen.len() >= RESIDENT_SEEN_CAP {
-                                resident_v_seen.clear();
+                                prune_seen(resident_v_seen, *views_epoch, "vertex promotion map");
                             }
-                            resident_v_seen.insert(rkey, std::sync::Arc::downgrade(&packed_bytes));
+                            resident_v_seen.insert(
+                                rkey,
+                                (std::sync::Arc::downgrade(&packed_bytes), *views_epoch),
+                            );
                         }
                     }
                     (off, len, false)
@@ -5843,7 +6708,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let ikey = (0u64, std::sync::Arc::as_ptr(&gxp.indices) as *const u8 as usize, gxp.indices.len());
             let i_seen = resident_i_seen
                 .get(&ikey)
-                .and_then(|prev| prev.upgrade())
+                .and_then(|(prev, _)| prev.upgrade())
                 .is_some_and(|prev| std::sync::Arc::ptr_eq(&prev, &gxp.indices));
             let (i_off, i_len, i_resident) = match resident
                 .then(|| resident_i.get(&ikey, &gxp.indices))
@@ -5868,9 +6733,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             resident_i.place(queue, ikey, &gxp.indices, &gxp.indices);
                         } else {
                             if resident_i_seen.len() >= RESIDENT_SEEN_CAP {
-                                resident_i_seen.clear();
+                                prune_seen(resident_i_seen, *views_epoch, "index promotion map");
                             }
-                            resident_i_seen.insert(ikey, std::sync::Arc::downgrade(&gxp.indices));
+                            resident_i_seen.insert(
+                                ikey,
+                                (std::sync::Arc::downgrade(&gxp.indices), *views_epoch),
+                            );
                         }
                     }
                     (off, len, false)
@@ -5987,7 +6855,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             let (bg3, _) = depth_bgs.entry((key, depth_key, corrected)).or_insert_with(|| {
                 enc(&ENC.bind_groups_built, 1);
-                enc(&ENC.buffers_created, 1);
+                enc_buffer_created();
                 enc(&ENC.buffer_bytes, 48);
                 // >>> NOT `create_buffer_init`, AND THAT IS THE WHOLE POINT.
                 //
@@ -6074,7 +6942,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// The cached group0/group1 bind group for a prepared draw's shader pair (only called
         /// after `ensure_ubo_bgs` has run for this pass).
         fn ubo_bg(&self, slot: usize, key: u64, format: wgpu::TextureFormat, samples: u32, group: u8) -> &wgpu::BindGroup {
-            &self.ubo_bgs[&(slot, key, format, samples, group)]
+            &self.ubo_bgs[&(slot, key, format, samples, group)].0
         }
 
         /// The cached pipeline for a prepared draw (only called after `prepare` succeeded).
@@ -6162,7 +7030,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // be in its key. See `GxmRenderer::rtt_epoch`.
             rtt_epoch: u64,
             reads_snapshot: &HashSet<u32>,
-            sampler_bgs: &mut HashMap<(u64, u64), (wgpu::BindGroup, Vec<(u64, SamplerDim)>)>,
+            sampler_bgs: &mut SamplerBgCache,
             // The previous draw's answer - see `GxpLive::last_sampler_bg`.
             last_sampler_bg: &mut Option<(u64, wgpu::BindGroup)>,
             // Every answer this PASS has produced, by the same fingerprint - see
@@ -6191,7 +7059,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // An EMPTY group is still a GPU object, and building one per draw is the
                 // same waste as building a full one per draw. It names nothing, so one per
                 // pipeline is all there can ever be.
-                let (bg, _) = sampler_bgs.entry((key, sel)).or_insert_with(|| {
+                let (bg, _, used) = sampler_bgs.entry((key, sel)).or_insert_with(|| {
                     note_sampler_bg(false);
                     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("gxp-samplers-empty"),
@@ -6199,8 +7067,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         entries: &[],
                     });
                     // Names nothing, so no eviction can ever invalidate it.
-                    (bg, Vec::new())
+                    (bg, Vec::new(), *views_epoch)
                 });
+                // A hit here is a use, like every other probe of this cache.
+                *used = *views_epoch;
                 return Some(bg.clone());
             }
             // >>> WHAT EACH UNIT WILL BIND, NOT THE VIEW ITSELF - and that is a measurement,
@@ -6275,7 +7145,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // and a key that has been invalidated since simply misses. See
             // `GxpLive::sampler_pre`.
             if let Some(&known) = sampler_pre.get(&pre) {
-                if let Some((bg, _)) = sampler_bgs.get(&(key, known)) {
+                if let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, known)) {
+                    *used = *views_epoch;
+                    let bg = &*bg;
                     note_sampler_bg_pass();
                     *last_sampler_bg = Some((pre, bg.clone()));
                     return Some(bg.clone());
@@ -6503,7 +7375,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     // 792.6 reused - one cold entry a frame was throwing away a
                                     // third of the cache that exists to stop per-draw GPU object
                                     // creation ([[vitaslop-per-pass-render-arenas]]).
-                                    sampler_bgs.retain(|_, (_, named)| {
+                                    sampler_bgs.retain(|_, (_, named, _)| {
                                         !named.iter().any(|k| just_evicted.contains(k))
                                     });
                                 } else {
@@ -6570,7 +7442,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                         views_used.remove(&k).map_or(0, |(_, b, ..)| b);
                                     *view_cache_bytes = view_cache_bytes.saturating_sub(bytes);
                                     view_dead.remove(&k);
-                                    sampler_bgs.retain(|_, (_, named)| !named.contains(&k));
+                                    sampler_bgs.retain(|_, (_, named, _)| !named.contains(&k));
                                     enc(&ENC.tex_view_superseded, 1);
                                     // The slot now names the CURRENT contents, so the
                                     // bookkeeping below finds nothing to supersede. Without
@@ -6685,7 +7557,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // The finished group is a pure function of what it names, so ask for it before
             // building it. Only when nothing in it belongs to THIS frame's render targets.
             if !per_frame {
-                if let Some((bg, _)) = sampler_bgs.get(&(key, sel)) {
+                if let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, sel)) {
+                    *used = *views_epoch;
+                    let bg = &*bg;
                     note_sampler_bg(true);
                     *last_sampler_bg = Some((pre, bg.clone()));
                     remember_sampler_pre(sampler_pre, pre, sel);
@@ -6735,9 +7609,15 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // fingerprint of what the group names, so dropping it costs a rebuild and
                 // never correctness.
                 if sampler_bgs.len() >= SAMPLER_BG_CACHE_CAP {
-                    sampler_bgs.clear();
+                    let n = evict_oldest(
+                        sampler_bgs,
+                        evict_target(SAMPLER_BG_CACHE_CAP),
+                        *views_epoch,
+                        |(_, _, used)| *used,
+                    );
+                    note_cache_evicted("sampler bind groups", n);
                 }
-                sampler_bgs.insert((key, sel), (bg.clone(), named_views));
+                sampler_bgs.insert((key, sel), (bg.clone(), named_views, *views_epoch));
                 *last_sampler_bg = Some((pre, bg.clone()));
                 remember_sampler_pre(sampler_pre, pre, sel);
             }
@@ -6980,7 +7860,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             };
             if let Some(tex) = texenc.convert_yuv420p2(device, queue, &source) {
                 enc(&ENC.tex_uploaded, 1);
-                enc(&ENC.tex_upload_bytes, planes.data.len() as u64);
+                enc_tex_upload(planes.data.len() as u64);
                 return tex;
             }
             report_yuv_gpu_refused();
@@ -7002,12 +7882,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if let Some(raw) = t.raw.as_ref() {
             if let Some(tex) = texenc.expand_rgba8(device, queue, raw, t.gamma, reuse.take()) {
                 enc(&ENC.tex_uploaded, 1);
-                enc(&ENC.tex_upload_bytes, raw.src.len() as u64);
+                enc_tex_upload(raw.src.len() as u64);
                 enc(&ENC.tex_encoded_on_gpu, 1);
                 return tex;
             }
             enc(&ENC.tex_gpu_encode_refused, 1);
-            report_gpu_transcode_refused(t.base_format);
+            // Read on the same thread, immediately after the refusal that set it - see
+            // `texenc::LAST_RAW_REFUSAL`.
+            report_gpu_transcode_refused(t.base_format, crate::texenc::last_raw_refusal());
         }
         // Not consumed by the expansion - a refusal above, or a format that never offered it.
         if let Some(t) = reuse {
@@ -7033,16 +7915,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let CompressedData::Gpu(plan) = &c.data {
                 if let Some(tex) = texenc.run(device, queue, c, plan, t.gamma) {
                     enc(&ENC.tex_uploaded, 1);
-                    enc(&ENC.tex_upload_bytes, c.byte_len() as u64);
+                    enc_tex_upload(c.byte_len() as u64);
                     enc(&ENC.tex_uploaded_compressed, 1);
                     enc(&ENC.tex_encoded_on_gpu, 1);
                     return tex;
                 }
                 enc(&ENC.tex_gpu_encode_refused, 1);
-                report_gpu_transcode_refused(t.base_format);
+                // The BLOCK transcoder, which records no reason of its own yet. Said so rather
+                // than borrowing the uncompressed path's - see `report_gpu_transcode_refused`.
+                report_gpu_transcode_refused(t.base_format, "not recorded (the block transcoder)");
             } else {
             enc(&ENC.tex_uploaded, 1);
-            enc(&ENC.tex_upload_bytes, c.byte_len() as u64);
+            enc_tex_upload(c.byte_len() as u64);
             enc(&ENC.tex_uploaded_compressed, 1);
             // The compressed data's OWN dimensions - see `CompressedUpload::width`. They equal
             // the guest's today; using `w`/`h` here anyway would let anything that ever changed
@@ -7097,7 +7981,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // output is the level-0 size; the mip chain adds a third more, and a tally taken from
         // the decoder would under-report the upload by exactly that much.
         enc(&ENC.tex_uploaded, 1);
-        enc(&ENC.tex_upload_bytes, data.len() as u64);
+        enc_tex_upload(data.len() as u64);
         note_texture_created();
         device.create_texture_with_data(
             queue,
@@ -8454,6 +9338,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 raw: None,
                 key: 0,
                 data_addr: 0,
+                // Irrelevant to a MIP-accounting fixture: the flag only decides whether a
+                // render target keeps its alias - see `GxmTexture::guest_bytes_all_zero`.
+                guest_bytes_all_zero: false,
                 width,
                 height,
                 faces,
@@ -9573,6 +10460,120 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// after a change the pass encoded through one view while every sampler decoded through
     /// the other, and on a feedback path the mismatch compounded to white or to black. It is
     /// handled now, and this says when a title exercises it - a fact no other line carries.
+    /// Why a render target was (re)created, deduped by ADDRESS AND REASON so a target that is
+    /// rebuilt every frame says so once rather than three thousand times.
+    ///
+    /// See `ensure_rtt` for what a recreation costs: it bumps `rtt_epoch`, which invalidates
+    /// every cached sampler bind group naming ANY target, and it discards the target's own
+    /// contents. `rtt_created` alone cannot name the cause because the reasons have nothing in
+    /// common - a SIZE change is the guest resizing, a DEPTH companion is a legitimate one-off,
+    /// and a SAMPLE-COUNT change is this renderer's own per-frame `sample_depth` answer
+    /// flipping.
+    fn report_rtt_recreated(addr: u32, why: &'static str) {
+        if why == "first sighting" {
+            return;
+        }
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u32, &'static str)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((addr, why)) {
+            return;
+        }
+        report_warn!(
+            "gxm rtt: render target {addr:#010x} was RE-CREATED because its {why} changed.              Every recreation bumps `rtt_epoch`, which invalidates every cached sampler bind              group naming any target - so a target that does this every frame makes every one              of those groups a first sighting, every frame. It also DISCARDS the target's              contents. Reported once per target per reason."
+        );
+    }
+
+    /// A frame whose scenes straddle a display FLIP, and which passes were rescued by it.
+    ///
+    /// Reported once. It is a property of how a title's scene list lines up with its flips
+    /// rather than an event, so repeating it would bury everything else in the log - and the
+    /// interesting question is whether it happens at all, which one line answers.
+    fn report_frame_straddles_a_flip(extra: &HashSet<u32>, presents: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if SAID.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let list: Vec<String> = extra.iter().map(|a| format!("{a:#010x}")).collect();
+        report_warn!(
+            "gxm: this frame's scenes STRADDLE A DISPLAY FLIP - the guest presented {presents}              different buffers while it was being captured, and {} of its passes draw into one              that is not the last scene's target ([{}]). Those passes used to be classified as              OFFSCREEN and dropped, which shows as a HUD over a black world; they are now              composited into the same display image, in scene order. Reported once.",
+            extra.len(),
+            list.join(", ")
+        );
+    }
+
+    /// A texture-expansion batch that survived to the next frame - see `texenc::RawBatch`.
+    /// Reported once: it is a defect in this file's own flush discipline, not a title's doing.
+    fn report_raw_batch_not_flushed(pending: u32) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if SAID.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        report_warn!(
+            "gxm: {pending} texture expansions were still UNSUBMITTED at the start of a frame,              so the frame before this one drew with textures nothing had written yet. They are              submitted now, but the flush belongs at the end of `encode_chain` and something              returned from it without reaching that line. Reported once."
+        );
+    }
+
+    /// Render targets released as abandoned - see [`GxmRenderer::reclaim_stale_rtt`].
+    ///
+    /// Reported the FIRST time only. That it happens at all is the finding (a title whose target
+    /// count grows with run length), and after that the standing count is in the caches line,
+    /// where it can be read against the occupancy rather than scrolled through.
+    fn report_rtt_reclaimed(n: usize, bytes: u64, left: usize) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if SAID.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        report_warn!(
+            "gxm: released {n} render targets ({} MB) that had gone a full minute without being              rendered into or sampled, leaving {left}. This map is keyed by guest address and              had no removal path at all, so a title that moves between screens accumulated their              colour and depth attachments for the whole run - MEASURED at 304 targets on a              48,000-frame session. Reported once; the running total is in the caches line.",
+            bytes / (1024 * 1024)
+        );
+    }
+
+    /// >>> A DRAW BOUND A TEXTURE AT AN ADDRESS THIS RENDERER STILL HOLDS A RENDER TARGET FOR,
+    /// >>> AND THE TWO ARE NOT THE SAME SIZE.
+    ///
+    /// The guest reuses memory. A render target it has finished with can be freed and an
+    /// ordinary texture allocated over it, and `rtt` - keyed by that address, and offered to the
+    /// sampler path through `sample_views` - will then hand the draw the OLD TARGET's pixels
+    /// instead of the texture the guest actually put there. The picture that produces is a
+    /// surface wearing something else's image, which is what "a garbage texture inside the
+    /// banner" looks like from the outside.
+    ///
+    /// A disagreeing EXTENT is the cheap evidence for it: a pass sampling a real target binds it
+    /// at the size it was rendered. **This changes NOTHING yet** - not what is bound, and not
+    /// whether the address counts as a use. It exists to find out whether the case occurs at all,
+    /// because both repairs it would justify (refusing the alias, or letting the target be
+    /// reclaimed) risk taking a target away from a title that is legitimately sampling it through
+    /// a descriptor of another size.
+    ///
+    /// Deduped per address per shape pair: a title that does this does it every frame.
+    fn report_rtt_extent_mismatch(addr: u32, target: (u32, u32), bound: (u32, u32), guest_empty: bool) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<(u32, u32, u32)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::default()));
+        if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((addr, bound.0, bound.1)) {
+            return;
+        }
+        report_warn!(
+            "gxm rtt: {addr:#010x} is held as a {}x{} RENDER TARGET, but a draw binds a texture              of {}x{} at that address, and the guest's own bytes there are {}. {} Reported once              per address per bound shape.",
+            target.0,
+            target.1,
+            bound.0,
+            bound.1,
+            if guest_empty { "ALL ZERO" } else { "NOT all zero" },
+            if guest_empty {
+                "That is the signature of a LIVE target sampled through a differently-sized                  descriptor (its pixels are on the GPU, so guest memory reads empty), so the                  alias STANDS and the target counts as used."
+            } else {
+                "So the guest has really allocated something over the freed target: the alias                  is REFUSED - this draw samples the guest's own texture - and the stale target                  stops counting as used, so it is reclaimed within its TTL."
+            }
+        );
+    }
+
     fn report_gamma_mode_changed(addr: u32, gamma: bool) {
         use std::sync::{Mutex, OnceLock};
         static SEEN: OnceLock<Mutex<HashSet<(u32, bool)>>> = OnceLock::new();
@@ -11250,6 +12251,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 rtt_binds: HashMap::default(),
                 rtt_cubes: HashMap::default(),
                 orphan_candidate: None,
+                presented: Vec::new(),
+                rtt_used: HashMap::default(),
+                rtt_alias_block: HashSet::default(),
                 cubes_done: HashSet::default(),
                 rtt_reads_snapshot: HashSet::default(),
                 rtt_depth_rendered: HashMap::default(),
@@ -11397,7 +12401,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             if !self.views.contains_key(&t.key) {
                 enc(&ENC.tex_uploaded, 1);
-                enc(&ENC.tex_upload_bytes, t.rgba.len() as u64);
+                enc_tex_upload(t.rgba.len() as u64);
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("gxm-tex"),
                     size: wgpu::Extent3d {
@@ -11478,7 +12482,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 return false;
             }
             let new_cap = Self::cap_for(need);
-            enc(&ENC.buffers_created, 1);
+            enc_buffer_created();
             *buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: new_cap,
@@ -11523,7 +12527,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let n = arenas.len();
                 let t_create = Stopwatch::start();
                 let mk = |need: u64, usage: wgpu::BufferUsages, label: &str| {
-                    enc(&ENC.buffers_created, 1);
+                    enc_buffer_created();
                     device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some(label),
                         size: Self::cap_for(need),
@@ -11548,7 +12552,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
 
             let a = &mut arenas[slot];
-            let mut grow = |buf: &mut wgpu::Buffer,
+            let grow = |buf: &mut wgpu::Buffer,
                             cap: &mut u64,
                             need: u64,
                             usage: wgpu::BufferUsages,
@@ -11558,7 +12562,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if *cap >= need {
                     return false;
                 }
-                enc(&ENC.buffers_created, 1);
+                enc_buffer_created();
                 let new = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
                     size: Self::cap_for(need),
@@ -11598,6 +12602,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 enc(&ENC.buffer_bytes, need);
                 enc(&ENC.buffer_writes, 1);
+                // >>> TIMED PER CALL, because the total cannot say what this is waiting on.
+                // See `buffer_write_max_us`. A `Stopwatch` here is two clock reads on a path
+                // that runs about a dozen times a frame.
+                let t_one = Stopwatch::start();
                 if data.len() as u64 == need {
                     queue.write_buffer(buf, 0, data);
                 } else {
@@ -11605,6 +12613,28 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     padded[..data.len()].copy_from_slice(data);
                     queue.write_buffer(buf, 0, &padded);
                 }
+                let us = (t_one.ms() * 1000.0) as u64;
+                // A MAX, so it is published with a compare-and-set rather than an add - the
+                // frame's worst call is the one being looked for, not their sum.
+                //
+                // >>> ONE PACKED WORD, so the time and the bytes are THE SAME CALL. Maximising
+                // two words independently pairs the slowest call's milliseconds with the
+                // fattest call's bytes, and the whole question here is whether the slow call
+                // was carrying anything. `us` in the high half orders the comparison; the
+                // clamps keep a pathological frame from carrying into the other field.
+                let packed = (us.min(u32::MAX as u64) << 32) | need.min(u32::MAX as u64);
+                ENC.buffer_write_worst.fetch_max(packed, std::sync::atomic::Ordering::Relaxed);
+                // >>> AND SAY SO, THE MOMENT IT HAPPENS. A single write blocking for SECONDS is
+                // not a slow copy, and the panel's maxima can only report it after the fact.
+                // See `report_write_buffer_stall`.
+                report_write_buffer_stall(
+                    us,
+                    need,
+                    BUFFER_WRITES_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
+                // >>> AND THE SAME THING FOR THE WHOLE RUN, which is the only one a person can
+                // actually read. See `BUFFER_WRITE_WORST_RUN`.
+                BUFFER_WRITE_WORST_RUN.fetch_max(packed, std::sync::atomic::Ordering::Relaxed);
             };
             write(&a.vbo, vdata, vneed);
             write(&a.ibo, idata, ineed);
@@ -12459,21 +13489,33 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // Prepare whatever the guest's shader patcher named since the last frame, BEFORE any
             // encoding. On the frame after a loading screen this is a burst; in a gameplay frame
             // it is empty, which is the point.
+            // The three chain-level phases - see `EncodePhases::precompile_ms`. Once per FRAME,
+            // so the clock reads are free where a per-draw one would not be.
+            let t_precompile = Stopwatch::start();
             for s in scenes {
                 if !s.precompile.is_empty() {
                     let pairs = s.precompile.clone();
                     self.precompile_pairs(device, &pairs);
                 }
             }
+            let t_retire = Stopwatch::start();
+            let precompile_ms = t_precompile.ms();
             let evicted = std::mem::take(&mut self.gxp.depth_retired);
             self.retired_buffers.extend(evicted);
             enc(&ENC.buffers_destroyed, self.retired_buffers.len() as u64);
             for b in self.retired_buffers.drain(..) {
                 b.destroy();
             }
+            let retire_ms = t_retire.ms();
             // A new frame starts at pass ordinal 0, so pass N of this frame reuses the arenas
             // pass N of the last frame used. See `gxp_arenas`.
             self.gxp_arena_slot = 0;
+            // ...and so does the frame's write ordinal, which is what says whether a stalled
+            // write was the FIRST one after the previous submit. See `BUFFER_WRITES_THIS_FRAME`.
+            BUFFER_WRITES_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
+            TEX_UPLOADS_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
+            TEX_UPLOAD_BYTES_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
+            BUFFERS_MADE_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
             // >>> THE ONLY PLACE THE RESIDENT HEAPS MAY CHANGE IDENTITY.
             //
             // A prepared draw carries an OFFSET; the buffer it addresses is read at encode time.
@@ -12481,6 +13523,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // already prepared, so `place` only ever declines and the grow it asks for lands
             // here, between frames, with the old buffer going to the graveyard above rather than
             // being dropped - the last frame's commands still name it until its submit retires.
+            let t_resident = Stopwatch::start();
             if self.gxp.resident {
                 let budget = self.gxp.resident_budget;
                 if let Some(old) = self.gxp.resident_v.grow_or_reset(
@@ -12502,11 +13545,37 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.retired_buffers.push(old);
                 }
             }
+            let resident_ms = t_resident.ms();
+            // >>> A BATCH STILL PENDING HERE IS A MISSED FLUSH FROM THE PREVIOUS FRAME, and it
+            // means that frame drew with textures nothing had written yet. The flush at the
+            // BOTTOM of this function is the one that must happen; this says so if it did not.
+            //
+            // >>> IT LIVES HERE, ONCE PER FRAME, AND IT USED TO LIVE IN `prepare`, WHICH IS ONCE
+            // >>> PER PASS. That was wrong twice over and a device dump caught both: pass 2 of a
+            // frame legitimately sees pass 1's batch still pending - that IS the batching - so it
+            // reported a defect that had not happened; and because it also flushed, every pass
+            // boundary submitted. MEASURED on the device before this fix: `GPU texture expansions
+            // 360 in 332 submits`, i.e. the per-texture submit this batching exists to remove,
+            // reintroduced by its own watchdog. A frame there is 6.6 passes.
+            if let Some(t) = self.gxp.texenc.as_ref() {
+                let pending = t.raw_batch_pending();
+                if pending > 0 {
+                    t.flush_raw(queue);
+                    report_raw_batch_not_flushed(pending);
+                }
+            }
             self.rtt_rendered.clear();
             self.rtt_depth_rendered.clear();
             self.cubes_done.clear();
             self.rtt_hits = 0;
             self.chain_phases = EncodePhases::default();
+            // >>> ASSIGNED AFTER THE RESET ABOVE, not before it. These three run BEFORE
+            // `chain_phases` is cleared, so recording them into it directly would have
+            // been wiped on the same line and the residual would have stayed unnamed -
+            // which is the failure this split exists to remove.
+            self.chain_phases.precompile_ms = precompile_ms;
+            self.chain_phases.retire_ms = retire_ms;
+            self.chain_phases.resident_ms = resident_ms;
             // A new frame: everything the texture cache holds is now a candidate for eviction
             // again. Bumped HERE and nowhere else, because "used by the frame being encoded"
             // is the one property that makes an entry un-evictable, and a frame is exactly
@@ -12542,6 +13611,51 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     )
                 })
                 .collect();
+            // The EXTENT each draw binds a RENDER TARGET's address at - see the stamping below
+            // for why an address alone cannot say whether a target is still what lives there.
+            //
+            // >>> DERIVED FROM THE SET ABOVE, NOT FROM A SECOND WALK OF THE FRAME.
+            //
+            // This is a DIAGNOSTIC, and it went through two worse versions before this one: a
+            // `HashMap` insert for every bound texture in the frame (several hundred a frame,
+            // on a phone, to answer a question about the handful in `rtt`), then the same walk
+            // with a filter. Both re-traversed every draw's every sampler for a report that
+            // changes nothing. A diagnostic that scales with the frame's working set is exactly
+            // the cost this renderer keeps finding in the code it replaces
+            // [[vitaslop-a-diagnostic-can-bury-the-findings]].
+            //
+            // `sampled` has already visited them all, and `rtt` is small, so the whole thing is
+            // one pass over the DISTINCT addresses - a few hundred at most - and it stops at
+            // the first hit for each. The extent has to come from a draw, so it is looked up
+            // only for the addresses that survive the `rtt` test, which is a handful.
+            // The bound extent AND whether the guest's own bytes at that address are all zero.
+            // The second is what separates the two things an extent mismatch can mean - see
+            // `report_rtt_extent_mismatch`. `all(|b| *b == 0)` short-circuits on the first
+            // non-zero byte, so the ordinary case (a real texture, non-zero almost immediately)
+            // costs a handful of bytes; only a genuinely empty buffer is scanned through, and
+            // this whole loop runs for the handful of sampled addresses that are in `rtt`.
+            let mut sampled_extents: HashMap<u32, (u32, u32, bool)> = HashMap::default();
+            for addr in sampled.iter().filter(|a| self.rtt.contains_key(a)) {
+                if let Some(e) = scenes.iter().flat_map(|s| s.draws.iter()).find_map(|d| {
+                    d.texture
+                        .iter()
+                        .find(|t| t.data_addr == *addr)
+                        .map(|t| (t.width, t.height, t.guest_bytes_all_zero))
+                        .or_else(|| {
+                            d.gxp.iter().find_map(|g| {
+                                g.textures
+                                    .iter()
+                                    .chain(g.vertex_textures.iter())
+                                    .find(|t| t.tex.data_addr == *addr)
+                                    .map(|t| {
+                                        (t.tex.width, t.tex.height, t.tex.guest_bytes_all_zero)
+                                    })
+                            })
+                        })
+                }) {
+                    sampled_extents.insert(*addr, e);
+                }
+            }
             let depth_sampled: HashSet<u32> = scenes
                 .iter()
                 .map(|s| s.depth_addr)
@@ -12589,6 +13703,149 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 .flat_map(|(base, c)| (0..CUBE_FACES).map(move |k| base.wrapping_add(c.stride * k)))
                 .collect();
             report_world_not_on_display(scenes, display, &sampled, &cube_faces, &mut self.orphan_candidate);
+            // >>> ...AND SO IS ANY SCENE DRAWING INTO A BUFFER THE GUEST FLIPPED THIS FRAME.
+            //
+            // See `GxpLive`'s `presented` field for the defect this closes. The rule above is
+            // right for a frame that belongs to one image and drops a whole pass on one that
+            // STRADDLES A FLIP, which a title rotating three display buffers produces whenever
+            // its scene list crosses the boundary: the world goes into buffer A, the HUD into
+            // buffer B, and A is classified as an offscreen target nothing reads. That is a HUD
+            // over black.
+            //
+            // Deliberately NARROW. It fires only for a target the GUEST ITSELF presented (its
+            // own statement that the buffer is a display buffer - not a guess from the extent),
+            // that nothing in this frame samples, and that is not a cube face. A frame with one
+            // display buffer - which is every ordinary frame - produces an empty set here and is
+            // encoded exactly as it was before this existed.
+            let extra_display: HashSet<u32> = match display {
+                Some(d) if self.presented.len() > 1 => scenes
+                    .iter()
+                    .filter_map(|s| s.target.map(|t| t.data_addr))
+                    .filter(|a| {
+                        *a != d
+                            && self.presented.contains(a)
+                            && !sampled.contains(a)
+                            && !cube_faces.contains(a)
+                    })
+                    .collect(),
+                _ => HashSet::default(),
+            };
+            if !extra_display.is_empty() {
+                report_frame_straddles_a_flip(&extra_display, self.presented.len());
+            }
+            // >>> EVERY RENDER TARGET THIS FRAME TOUCHES, STAMPED, AND THE STALE ONES
+            // >>> RECLAIMED. See `rtt_used` for the 304-target measurement this is for.
+            //
+            // "Touched" is deliberately both halves: a target this frame RENDERS into (a scene
+            // target, or the depth address of one) and a target this frame SAMPLES (`sampled`
+            // is every texture address any draw binds, and it is already computed above for the
+            // depth question). A static shadow map rendered once at load and sampled every frame
+            // after is touched by the second half alone, and stamping only renders would throw
+            // it away and rebuild it - which is worse than the leak.
+            {
+                let now = self.gxp.views_epoch;
+                // >>> ONLY ADDRESSES THAT ARE ACTUALLY TARGETS. `sampled` is every texture
+                // address any draw binds - hundreds a frame, nearly all of them ordinary guest
+                // textures - so stamping all of them would give this map an entry per distinct
+                // address the title ever binds, i.e. exactly the unbounded growth with run
+                // length that the map exists to fix. A target created THIS frame is not in
+                // `rtt` yet; `reclaim_stale_rtt` stamps anything it finds unstamped rather than
+                // treating it as stale, which is what gives a new target its full TTL.
+                let mut stamp = |m: &mut HashMap<u32, u64>, rtt: &HashMap<u32, RttSurface>, a: u32| {
+                    if rtt.contains_key(&a) {
+                        m.insert(a, now);
+                    }
+                };
+                for s in scenes {
+                    if let Some(t) = s.target {
+                        stamp(&mut self.rtt_used, &self.rtt, t.data_addr);
+                    }
+                    if s.depth_addr != 0 {
+                        stamp(&mut self.rtt_used, &self.rtt, s.depth_addr);
+                    }
+                }
+                // >>> A SAMPLE ONLY COUNTS AS A USE IF THE EXTENTS AGREE, and that test is
+                // >>> doing more work than keeping a map tidy.
+                //
+                // `rtt` is keyed by the guest address of a colour surface, and the guest reuses
+                // memory: a target it has finished with can be freed and an ordinary TEXTURE
+                // allocated at the same address. When that happens the address is in `rtt` AND
+                // bound as a texture, so stamping on the address alone marks a dead target live
+                // for ever - MEASURED on the device: `rtt targets 357 holding 276 MB (0
+                // reclaimed as stale)` in a 78-second window, with nothing aging out at all.
+                //
+                // The extent is the cheapest thing that tells the two apart: a pass sampling a
+                // real render target binds it at the size it was rendered, while a fresh texture
+                // that merely inherited the address is whatever size the guest made it. So an
+                // address whose bound extent DISAGREES with the target's is not a use of that
+                // target, it goes unstamped, and the reclamation takes it within the TTL.
+                //
+                // That matters beyond memory: `sample_views` offers every `rtt` entry to the
+                // sampler path, so while such a target lives, a draw binding that address is
+                // handed the OLD TARGET's pixels instead of the guest's texture. Reclaiming it
+                // is what stops that. See `report_rtt_extent_mismatch` - the report fires first
+                // and names it, because this is a suspicion the device has to confirm.
+                self.rtt_alias_block.clear();
+                for (a, (w, h, guest_empty)) in sampled_extents.iter() {
+                    let Some((tw, th)) = self.rtt.get(a).map(|t| (t.width, t.height)) else {
+                        continue;
+                    };
+                    if tw != *w || th != *h {
+                        report_rtt_extent_mismatch(*a, (tw, th), (*w, *h), *guest_empty);
+                        // >>> AN EXTENT MISMATCH ALONE DOES NOT DECIDE THIS, AND TREATING IT AS
+                        // >>> IF IT DID COST A TITLE ITS ARTWORK.
+                        //
+                        // Two different things produce a mismatch, and the repair for one is the
+                        // bug for the other:
+                        //   * the guest FREED the target and allocated an ordinary texture over
+                        //     it - then its bytes are in guest memory and the draw must sample
+                        //     those, which is what blocking the alias achieves;
+                        //   * the guest is sampling a LIVE target through a descriptor of
+                        //     another size - a 1024x1024 declaration over an 840x476 target is
+                        //     a title rendering into part of a power-of-two texture, and there
+                        //     is nothing wrong with it.
+                        //
+                        // Guest memory tells them apart, and it is the one witness that does: a
+                        // render target's pixels live on the GPU and read as ZEROS in guest
+                        // memory [[vitaslop-a-render-target-reads-empty-in-guest-memory]],
+                        // whereas a recycled allocation has the guest's real bytes in it. So an
+                        // all-zero buffer is not evidence of a dead target - it is evidence of a
+                        // LIVE one, and blocking it hands the draw an empty texture.
+                        //
+                        // MEASURED on PCSE00120, which is what found this: its title-screen logo
+                        // is rendered into an 840x476 target and sampled through a 1024x1024
+                        // descriptor, and blocking the alias drew the logo as an untextured
+                        // gradient band. The 192x192-against-1024x1024 cases the block was built
+                        // for are unaffected - those buffers have guest bytes.
+                        if !*guest_empty {
+                            // >>> A RECYCLED ALLOCATION IS NOT A USE OF THIS TARGET, so it goes
+                            // unstamped and the reclamation takes it within the TTL - which is
+                            // what ends the aliasing. The device dump justifies this: the report
+                            // ran unconditionally for a session first, precisely so the decision
+                            // would rest on evidence, and it fired for ~20 addresses.
+                            self.rtt_alias_block.insert(*a);
+                            continue;
+                        }
+                    }
+                    // >>> SAMPLING A LIVE TARGET IS A USE, AND IT WAS NOT BEING COUNTED AS ONE.
+                    //
+                    // The note above this block says "touched" is deliberately both halves -
+                    // rendered into OR sampled - and names the static shadow map, rendered once
+                    // at load and sampled every frame after, as the case the second half is for.
+                    // The loop then `continue`d past the stamp for EVERY sampled address, so
+                    // that half never happened: such a target aged out after its TTL and was
+                    // rebuilt, which the note itself calls worse than the leak.
+                    //
+                    // It matters more now that an empty-guest mismatch aliases: a logo rendered
+                    // once and sampled thereafter would otherwise vanish a minute into a run,
+                    // which no short replay would ever show.
+                    stamp(&mut self.rtt_used, &self.rtt, *a);
+                }
+                for a in cube_faces.iter() {
+                    stamp(&mut self.rtt_used, &self.rtt, *a);
+                }
+                self.reclaim_stale_rtt(now);
+            }
             let ss = self.ss_scale > 1;
             if ss {
                 self.ensure_ss_target(device, queue, surf_w, surf_h);
@@ -12607,7 +13864,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if !cube_bases.is_empty() {
                     self.assemble_rendered_cubes(device, encoder, &cube_bases);
                 }
-                let to_display = i + 1 == n || (scene.target.map(|t| t.data_addr) == display && display.is_some());
+                let to_display = i + 1 == n
+                    || (scene.target.map(|t| t.data_addr) == display && display.is_some())
+                    // The straddled case - see `extra_display`. The pass is composited into the
+                    // SAME kept image as the rest of the frame, in scene order, so the world
+                    // clears it and the HUD lands on top, which is the picture the console shows
+                    // across the two flips.
+                    || scene.target.is_some_and(|t| extra_display.contains(&t.data_addr));
                 if to_display {
                     // >>> THE FINISHED DISPLAY IMAGE IS KEPT, because a title may SAMPLE IT ON
                     // >>> A LATER FRAME - see `display_images` for the defect and for why this
@@ -12686,11 +13949,19 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             continue;
                         }
                     }
+                    let mut keys: Vec<String> = scene
+                        .draws
+                        .iter()
+                        .filter_map(|d| d.gxp.as_ref())
+                        .map(|g| format!("{:016x}", GxpLive::key(g)))
+                        .collect();
+                    keys.dedup();
                     report_unplaced_scene(
                         scene.draws.len(),
                         scene.depth_addr,
                         depth_sampled.contains(&scene.depth_addr),
                         scene.depth_extent.is_some(),
+                        &keys.join(" "),
                     );
                     continue;
                 };
@@ -12824,11 +14095,27 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // the composite never reads the world, which looks exactly like the passes not
             // being drawn at all but is a different bug.
             if scenes.len() > 1 || self.rtt_hits > 0 {
+                // >>> WITH EACH SCENE'S PAIR KEYS. Which PASS a draw is in is the fact this
+                // line exists to carry, and without the keys it cannot be checked against
+                // anything: "the composite reads the world" and "the composite is in the pass
+                // that reaches the screen" are different claims, and a frame that is a flat
+                // colour is consistent with either failing. Deduped on the whole shape with the
+                // rest of the line, so a stable frame structure still costs one line.
                 let shape = scenes
                     .iter()
-                    .map(|s| match s.target {
-                        Some(t) => format!("{:#x}:{}x{}/{}", t.data_addr, t.width, t.height, s.draws.len()),
-                        None => format!("?/{}", s.draws.len()),
+                    .map(|s| {
+                        let mut keys: Vec<String> = s
+                            .draws
+                            .iter()
+                            .filter_map(|d| d.gxp.as_ref())
+                            .map(|g| format!("{:016x}", GxpLive::key(g)))
+                            .collect();
+                        keys.dedup();
+                        let where_ = match s.target {
+                            Some(t) => format!("{:#x}:{}x{}/{}", t.data_addr, t.width, t.height, s.draws.len()),
+                            None => format!("?/{}", s.draws.len()),
+                        };
+                        format!("{where_}{{{}}}", keys.join(","))
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -12842,7 +14129,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     sampled.join(" ")
                 );
                 if self.last_chain_shape.as_deref() != Some(line.as_str()) {
-                    report!("{line}");
+                    // >>> AT `warn`. This is the line that says whether the composite READ the
+                    // world, and its own comment above calls that "a different bug" from the
+                    // passes not being drawn - the exact distinction a black frame cannot make.
+                    // It is deduped on the whole shape, so a title whose frame structure is
+                    // stable pays one line for a run; at `debug` it was invisible in every
+                    // documented repro, all of which say `VITASLOP_LOG=warn`.
+                    report_warn!("{line}");
                     self.last_chain_shape = Some(line);
                 }
             }
@@ -12935,6 +14228,16 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     ENC.textures_destroyed.load(Ordering::Relaxed),
                     self.gxp.views.len(),
                 );
+            }
+            // >>> AND SUBMIT THE FRAME'S TEXTURE EXPANSIONS, BEFORE THE CALLER SUBMITS ITS OWN.
+            //
+            // Every texture `expand_rgba8` handed back this frame is written by commands sitting
+            // in a batch of its own; this is where they go to the queue. It has to be HERE and
+            // not in the caller: the draws that sample those textures are in the caller's
+            // encoder, which is submitted the moment this returns, and a queue submit made after
+            // that one would write the texels a frame late. See `texenc::RawBatch`.
+            if let Some(t) = self.gxp.texenc.as_ref() {
+                t.flush_raw(queue);
             }
         }
 
@@ -13103,6 +14406,26 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 self.rtt_cubes.iter().map(|(a, c)| (*a, c.view.clone())).collect();
             let mut sample_views = rendered.clone();
             for (addr, t) in self.rtt.iter() {
+                // >>> AN ADDRESS THE GUEST HAS REUSED IS NOT THIS TARGET ANY MORE.
+                //
+                // `rtt` is keyed by a guest ADDRESS, and the guest frees a render target and
+                // allocates an ordinary texture over it. While the entry lives, offering it here
+                // hands that draw the OLD TARGET's pixels instead of the texture the guest put
+                // there - a surface wearing something else's image.
+                //
+                // CONFIRMED on the device, not inferred: the report below fired for about twenty
+                // distinct addresses in one session, and the disagreements are not subtle -
+                // `192x192 target` against a `1024x1024` bound texture, `64x64` against
+                // `192x192`. A title sampling its own target through an odd descriptor does not
+                // look like that; a recycled allocation does.
+                //
+                // So the extent decides. On a mismatch the entry is not offered, the draw falls
+                // through to the ordinary path and decodes the guest's texture, and the target
+                // goes unstamped so the reclamation takes it within its TTL.
+                // [[vitaslop-an-address-is-not-an-identity]]
+                if self.rtt_alias_block.contains(addr) {
+                    continue;
+                }
                 // NEVER the attachment this pass is writing: binding it as a sampler at the
                 // same time is a use-after-alias the driver rejects. Within-frame feedback is
                 // what `rtt_reads_snapshot` is for, and it only applies once a pass has
@@ -13238,7 +14561,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         })
                         .collect();
                     if !hits.is_empty() || trace_all {
-                        report!(
+                        report_knob!(
                             // "carries a payload" is NOT "is recompiled" - a payload that
                             // fails to link falls back, and labelling that `recompiled=true`
                             // is how a composite draw got read as working when it was not.
@@ -13248,14 +14571,35 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             // use), and printing that made every draw of a recompiled pass
                             // read as empty geometry - a diagnostic saying exactly the wrong
                             // thing about the question it exists to answer.
-                            "chain draw #{di}: samples {:?} key={:?} has_payload={} blend={:?} opaque={} space={:?} idx={}",
+                            // >>> THE DEPTH STATE IS ON THIS LINE BECAUSE A DRAW THAT SHOULD
+                            // >>> NOT BE ON SCREEN IS AS OFTEN DEPTH-REJECTED AS BLENDED AWAY.
+                            //
+                            // "which draw put this on screen" and "which draw should have been
+                            // thrown away" are the same question, and a frame in which one
+                            // opaque quad covers everything cannot distinguish a wrong blend
+                            // from a depth test the guest expected to fail. The guest's own
+                            // func/write and the VIEWPORT's depth map (zScale/zOffset - what
+                            // turns a guest z of 65535 into a clip-space one) are what decide
+                            // it, and neither appears anywhere else a knob can reach.
+                            "chain draw #{di}: samples {:?} key={:?} has_payload={} blend={:?} opaque={} space={:?} idx={} depth=(func {:#x}, write {}, zScale {:?}, zOffset {:?}, bias {:?}) blend_state={:?}",
                             hits,
                             d.gxp.as_ref().map(|g| format!("{:x}", GxpLive::key(g))),
                             d.gxp.is_some(),
                             d.gxp.as_ref().map(|g| g.blend),
                             d.opaque,
                             d.space,
-                            d.gxp.as_ref().map(|g| g.index_count).unwrap_or(d.index_count)
+                            d.gxp.as_ref().map(|g| g.index_count).unwrap_or(d.index_count),
+                            d.gxp.as_ref().map(|g| g.depth_func).unwrap_or(0),
+                            d.gxp.as_ref().map(|g| g.depth_write).unwrap_or(false),
+                            d.gxp.as_ref().map(|g| g.viewport[5]),
+                            d.gxp.as_ref().map(|g| g.viewport[4]),
+                            d.gxp.as_ref().map(|g| g.depth_bias),
+                            // The GUEST'S OWN blend equation, raw (`[mask, colour func, alpha
+                            // func, colour src, colour dst, alpha src, alpha dst]`). `blend`
+                            // above is the fixed-function heuristic and says nothing about it;
+                            // a full-screen quad that should contribute nothing and a
+                            // full-screen quad that paints white differ only here.
+                            d.gxp.as_ref().map(|g| g.blend_state),
                         );
                     }
                 }
@@ -13404,7 +14748,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
                 if self.last_gxp_summary != Some(summary) {
                     self.last_gxp_summary = Some(summary);
-                    report!(
+                    // At `warn`, and deduped on the whole tuple, so a stable pass costs one
+                    // line: "carries a payload" and "was prepared" are different numbers, and
+                    // the gap between them is a draw that vanished with no fallback recorded -
+                    // which is precisely the shape that hid a composite for a whole session.
+                    report_warn!(
                         "gxp: scene has {} draws, {} carry a shader payload, {} recompiled+prepared, {} fixed-function items",
                         summary.0, summary.1, summary.2, summary.3,
                     );
@@ -13426,6 +14774,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 arena_create_ms: 0.0,
                 arena_write_ms: 0.0,
                 ubo_bg_ms: 0.0,
+                // A PASS has no chain-level work by definition - these belong to the frame and
+                // are set on `chain_phases` directly, so folding a pass must not touch them.
+                precompile_ms: 0.0,
+                retire_ms: 0.0,
+                resident_ms: 0.0,
                 gxp_draws: gxp_prepared.len(),
                 fixed_draws: items.len(),
             };
@@ -13685,6 +15038,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         Enc::Gxp(idx) => {
                             let p = &gxp_prepared[*idx];
+                            // >>> A DRAW WITH NO GEOMETRY IS THE ONE FAILURE THIS PATH CANNOT
+                            // >>> SHOW. Everything else about a prepared draw is visible from
+                            // outside - its pipeline, its bindings, its pass - and a draw whose
+                            // index count or vertex slice came out EMPTY is encoded, submitted,
+                            // and rasterises nothing, which is indistinguishable on screen from
+                            // a draw that was never issued. Fires once per pair, only on the
+                            // failure, so it costs nothing on a working title.
+                            super::report_empty_gxp_geometry(p.key, p.index_count, p.v_len, p.i_len);
                             // >>> A PIPELINE THE DEVICE REFUSED IS NOT BOUND, because binding it
                             // would invalidate the pass, the command buffer and therefore every
                             // OTHER draw in the frame. See `note_device_error`, which is what
@@ -13763,6 +15124,176 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
         /// What the last [`GxmRenderer::encode_chain`] spent, phase by phase, over EVERY pass
         /// of the frame. Reporting one pass instead described the composite and hid the world.
+        /// How full every cache in the renderer that can GROW WITH RUN LENGTH is, as one line.
+        ///
+        /// >>> A COST THAT SCALES WITH HOW LONG YOU HAVE PLAYED IS INVISIBLE TO EVERY OTHER
+        /// >>> COUNTER HERE, because they all describe the FRAME.
+        ///
+        /// MEASURED on a device run of 48,703 frames: `prepare` had gone from 3.2 ms over 341
+        /// draws to 12.8 ms over 406 - **9.4 us a draw to 31.5 us, three and a half times** -
+        /// while every counter that frame prints stayed flat or fell: `0.0` textures uploaded,
+        /// `0.0` expanded, `0.1` sampler bind groups built, `0.0` view evictions. Nothing the
+        /// report carried could name it, because the thing that changed was not the frame's
+        /// work, it was the SIZE of the structures that work walks.
+        ///
+        /// Every map here is probed per draw or per bound unit, so any one of them growing into
+        /// the tens of thousands is a per-draw cache miss that no per-frame count can show. This
+        /// line is what turns "it degrades as you play" into a name.
+        /// >>> WHICH BUFFERS THE GUEST FLIPPED WHILE THIS FRAME WAS CAPTURED.
+        ///
+        /// Called by the frontend before [`Self::encode_chain`], from the same drain that takes
+        /// the frame's scenes, so the two describe the same window. A frontend that has nothing
+        /// to say here simply does not call it and the renderer behaves exactly as it did before
+        /// this existed - see the `presented` field for what it rescues and how narrowly.
+        /// >>> RELEASE RENDER TARGETS THE TITLE HAS FINISHED WITH.
+        ///
+        /// # What this is fixing
+        /// `rtt` is keyed by the guest address of a colour surface and had no removal path at
+        /// all: an entry was replaced only when the SAME address was created again. A title that
+        /// moves through screens - menus, a course, a results banner - allocates its targets
+        /// wherever its allocator happens to put them, so the map grows for the life of the run.
+        /// MEASURED here on a 48,000-frame session: **304 targets**, in a renderer process at
+        /// 1.53 GB. Every one of them owns a colour texture, a depth texture, and possibly a
+        /// snapshot copy, a guest-depth companion and a pair of multisampled attachments.
+        ///
+        /// # Why a long TTL and not a budget
+        /// Re-creating a target is not merely a re-allocation: it bumps `rtt_epoch`, which is
+        /// folded into the key of EVERY cached sampler bind group naming any target, so all of
+        /// them become first sightings. A budget that squeezed the live working set would pay
+        /// that every frame - the disease as the cure, and this renderer has already measured
+        /// what per-frame target churn costs (`rtt 3.10 created` a frame against `23.5` sampler
+        /// bind groups built). So this reclaims only what is unambiguously ABANDONED: untouched,
+        /// as a render destination or as a sampled texture, for [`RTT_STALE_FRAMES`]. A steady
+        /// screen never reaches it and the whole function is a walk of a map with a handful of
+        /// entries in it.
+        fn reclaim_stale_rtt(&mut self, now: u64) {
+            // A cheap gate: the walk is O(targets) and a title with a handful of them should not
+            // pay even that every frame.
+            if self.rtt.len() <= RTT_KEEP_FREELY {
+                return;
+            }
+            // >>> AN UNSTAMPED TARGET IS STAMPED, NOT RECLAIMED. A target created this frame is
+            // not yet in `rtt` when the stamping above runs, so its first appearance here has no
+            // stamp - and reading that as "stale" would destroy it one frame after it was built.
+            // On a title that uses such a target every hundred frames that is a create/destroy
+            // cycle forever, each one bumping `rtt_epoch` and invalidating every sampler bind
+            // group naming any target. Far worse than the leak. Give it the clock instead.
+            let unstamped: Vec<u32> =
+                self.rtt.keys().filter(|a| !self.rtt_used.contains_key(*a)).copied().collect();
+            for a in unstamped {
+                self.rtt_used.insert(a, now);
+            }
+            let stale: Vec<u32> = self
+                .rtt
+                .keys()
+                .filter(|a| {
+                    self.rtt_used
+                        .get(*a)
+                        .is_some_and(|used| now.saturating_sub(*used) > RTT_STALE_FRAMES)
+                })
+                .copied()
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            let mut freed = 0u64;
+            for a in &stale {
+                if let Some(t) = self.rtt.remove(a) {
+                    freed += t.bytes();
+                    // DESTROYED, not dropped: in the browser these are `GPUTexture`s and a drop
+                    // only makes them collectable - which is the whole reason this reclamation
+                    // is worth doing. See `RttSurface::destroy`.
+                    t.destroy();
+                    enc(&ENC.rtt_destroyed, 1);
+                }
+                self.rtt_used.remove(a);
+                self.rtt_binds.retain(|&(k, _, _), _| k != *a);
+                // BY VALUE, not by key: this map is `depth address -> colour address`, so the
+                // target being released is on the RIGHT of it. Removing `a` as a key would
+                // almost never match and would leave a depth address resolving to a target that
+                // no longer exists.
+                self.rtt_depth_addrs.retain(|_, colour| *colour != *a);
+            }
+            // >>> AND EVERY CACHED VIEW OF ONE IS NOW DANGLING. `rtt_epoch` is folded into the
+            // key of every sampler bind group that names a target, so bumping it is what stops
+            // a cached group handing a destroyed texture to a draw. This is the expensive half
+            // of the reclamation and the reason the TTL is long: it costs a rebuild of those
+            // groups, once, per reclamation pass.
+            self.rtt_epoch = self.rtt_epoch.wrapping_add(1);
+            note_rtt_reclaimed(stale.len() as u64, freed);
+            report_rtt_reclaimed(stale.len(), freed, self.rtt.len());
+        }
+
+        pub fn set_presented(&mut self, addrs: &[u32]) {
+            self.presented.clear();
+            self.presented.extend_from_slice(addrs);
+        }
+
+        pub fn cache_sizes(&self) -> String {
+            // The promotion maps' PRUNE, beside their occupancy: an occupancy alone cannot tell
+            // a map that has never reached its cap from one that reaches it every few minutes
+            // and reclaims its way back down, and those two are the difference between a run
+            // that degrades and one that does not. See `prune_seen`.
+            let (prunes, pruned) = seen_prune_counts();
+            // What each cap has actually COST this run. A cap that never fires and a cap that
+            // fires every few seconds look identical in an occupancy line, and they are the
+            // difference between a session that holds 30 fps and one that reaches single
+            // digits - see `evict_oldest`.
+            let evictions = cache_eviction_summary();
+            // >>> WHAT THE RENDER TARGETS THEMSELVES COST, which no line here has ever carried.
+            // A count of 304 says nothing until it is priced; these are colour and depth
+            // ATTACHMENTS, so a hundred stale ones is hundreds of megabytes of GPU memory held
+            // for screens the title has left. See `reclaim_stale_rtt`.
+            let rtt_mb: u64 = self.rtt.values().map(|t| t.bytes()).sum::<u64>() / (1024 * 1024);
+            let (rtt_gone, rtt_gone_bytes) = rtt_reclaimed_counts();
+            // How well the texture-expansion batching is doing: textures per submit. Neither
+            // number means anything without the other - see `texenc::RawBatch`.
+            //
+            // >>> AND THE RATIO ALONE STILL CANNOT SAY. A steady window expands about a tenth
+            // of a texture per frame, so ~1.0 per submit is what a healthy batcher reports when
+            // there is never a second texture in the same frame. `largest` and `window-limited`
+            // are the two that separate that from a batch being destroyed - see
+            // `texenc::RAW_BATCH_MOST`.
+            let (batch_submits, batch_textures) = crate::texenc::raw_batch_counts();
+            let (batch_most, batch_multi, batch_window_one) = crate::texenc::raw_batch_shape();
+            format!(
+                "renderer caches: pipelines {}, sampler bind groups {}, texture views {}                  ({} stamped, {} dead, {} slots), packed geometry {} by content / {} by                  allocation, resident slices {} vertex / {} index, resident seen {} / {}                  ({} prunes, {} dead entries reclaimed), ubo bind groups {}, samplers {},                  rtt targets {} holding {} MB ({} reclaimed as stale, {} MB released)                  ({} colour binds, {} depth addrs, {} cubes), fixed-function views {} / binds {}                  | RETAINED BYTES: recompiler views {} MB, fixed-function views {} MB                  | EVICTIONS: {} | GPU texture expansions {} in {} submits (largest batch {}, {} submits carried more than one, {} expansions had room for no second texture)",
+                self.gxp.pipelines.len(),
+                self.gxp.sampler_bgs.len(),
+                self.gxp.views.len(),
+                self.gxp.views_used.len(),
+                self.gxp.view_dead.len(),
+                self.gxp.view_slots.len(),
+                self.gxp.packed.len(),
+                self.gxp.packed_by_alloc.len(),
+                self.gxp.resident_v.slice_count(),
+                self.gxp.resident_i.slice_count(),
+                self.gxp.resident_v_seen.len(),
+                self.gxp.resident_i_seen.len(),
+                prunes,
+                pruned,
+                self.gxp.ubo_bgs.len(),
+                self.gxp.samplers_by_mode.len(),
+                self.rtt.len(),
+                rtt_mb,
+                rtt_gone,
+                rtt_gone_bytes / (1024 * 1024),
+                self.rtt_binds.len(),
+                self.rtt_depth_addrs.len(),
+                self.rtt_cubes.len(),
+                self.views.len(),
+                self.tex_binds.len(),
+                self.gxp.views_bytes / (1024 * 1024),
+                self.views_bytes / (1024 * 1024),
+                evictions,
+                batch_textures,
+                batch_submits,
+                batch_most,
+                batch_multi,
+                batch_window_one,
+            )
+        }
+
         pub fn last_phases(&self) -> EncodePhases {
             self.chain_phases
         }

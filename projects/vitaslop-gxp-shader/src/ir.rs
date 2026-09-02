@@ -349,6 +349,27 @@ pub enum Op {
     /// (VBW, the integer MADs) read and write. The normalized (`scale` set) and C10/O8 forms
     /// stay blocked - they change the value by a factor this does not model.
     PackToInt { bits: u8, signed: bool, src_half: bool },
+    /// VPCK converting between a FLOAT and a U8 with `scale` SET - the NORMALIZED
+    /// conversion, where the byte range 0..255 maps onto 0.0..1.0. This is how a fragment
+    /// program that computes in F16 writes an 8-bit-per-channel surface, and how it reads
+    /// one back.
+    ///
+    /// It is emittable, where the other normalized widths are not, because the packed U8
+    /// representation is one this model ALREADY carries: [`crate::wgsl::Prec::Fx8`] reads a
+    /// register as four `byte/255` channels for the SOP2M combiner, and its store is the
+    /// same rounded `clamp(v,0,1)*255` this conversion performs. So there is nothing to
+    /// invent - the two directions are that precision on one side and the float precision
+    /// on the other. `to_unorm8` says which way; `float_half` is the FLOAT side's
+    /// precision, whichever side that is.
+    ///
+    /// S8/U16/S16 normalized stay blocked: no packed representation for them exists here,
+    /// and inventing one would put a wrong value in a register that reads back plausibly.
+    PackUnorm8 { to_unorm8: bool, float_half: bool },
+    /// A whole-register copy in the FOUR-BYTE view: `dest = src1`, all four unorm8 channels.
+    /// This is the group-0x80 SOP2 form a fragment epilogue ends with - see
+    /// `decode_grp_sop2`, which explains what the corpus establishes about it and what it
+    /// pins rather than reads.
+    CopyFx8,
     /// Integer multiply-add (group 0x15, IMAD32): `dest = src0 * src1 + src2`, scalar, on the
     /// 32-bit lane read as an integer of the given signedness. `bits` is the operand width;
     /// only 32 is decoded, because the narrower selector values are encoded but not
@@ -485,7 +506,8 @@ impl Op {
                 | Op::Dot { .. }
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. } | Op::TexGather { .. }
-                | Op::Pack { .. } | Op::PackToInt { .. } | Op::Bitwise { .. }
+                | Op::Pack { .. } | Op::PackToInt { .. } | Op::PackUnorm8 { .. } | Op::CopyFx8
+                | Op::Bitwise { .. }
                 | Op::Sop2 { .. }
                 | Op::IntMad { .. }
                 | Op::IntMadStep { .. }
@@ -528,6 +550,14 @@ impl Op {
             Op::TexGather { .. } => "tex.gather4",
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
+            Op::PackUnorm8 { to_unorm8, .. } => {
+                if to_unorm8 {
+                    "pack.unorm8"
+                } else {
+                    "unpack.unorm8"
+                }
+            }
+            Op::CopyFx8 => "mov.fx8",
             Op::IntMad { .. } => "imad",
             Op::IntMadStep { high_half, .. } => {
                 if high_half {
@@ -598,8 +628,33 @@ impl Instr {
             // exactly like the float->float form - the instruction's own `half_precision`
             // describes the destination, which here is not a float at all.
             Op::PackToInt { src_half, .. } => src_half,
+            // The normalized U8 convert reads its source at the FLOAT precision only when the
+            // float is the source; in the other direction the source is the packed byte
+            // register, whose four channels live in one word and are read through
+            // `Prec::Fx8`, so this flag does not describe it at all. Reporting the float
+            // precision there would make the read maps size a varying or uniform as if it
+            // held halves.
+            Op::PackUnorm8 { to_unorm8, float_half } => to_unorm8 && float_half,
             _ => self.half_precision,
         }
+    }
+
+    /// True when this instruction reads its source as PACKED BYTES - four channels in ONE
+    /// register, not one register per channel and not a half pair.
+    ///
+    /// [`Self::source_half_precision`] answers a two-way question (F32 or F16) and there is a
+    /// third width. The emitter has always known it - `wgsl::Prec::src_of` returns `Prec::Fx8`
+    /// for exactly these ops - but every place that computes which REGISTERS an operand spans
+    /// asked only the two-way question, and so read a four-channel `fx8` operand at `pa[0]` as
+    /// spanning `pa[0..4)`.
+    ///
+    /// That is four times too wide, and it is not cosmetic: the linker refuses a fragment that
+    /// reads past its declared PA allocation, and a title's two-instruction passthrough
+    /// (`Nop`, then `CopyFx8 o[0] <- pa[0]`) declares ONE primary register. It was refused for
+    /// reading `pa[1]`, a register nothing in it names. Another title's version of the same
+    /// shader survived only because it happened to allocate four.
+    pub fn source_packed_bytes(&self) -> bool {
+        matches!(self.op, Op::CopyFx8 | Op::PackUnorm8 { to_unorm8: false, .. })
     }
 
     /// True when the instruction's operation is known from the ISA (may not be emittable
