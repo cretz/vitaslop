@@ -443,8 +443,10 @@ fn do_avcdec_create_decoder(
                 ctx.read_u32(query.addr() + query::VERTICAL),
             )
         };
-        tracing::warn!(
-            target: "vitaslop::movie",
+        // A milestone, not a warning: it says which decoder a movie got, which the panel's
+        // STATUS section is for. A backend that cannot decode reports itself further down.
+        tracing::info!(
+            target: "vitaslop::status",
             width, height, backend = %host.describe(),
             "sceAvcdecCreateDecoder: decoding the movie on the host's own H.264 decoder"
         );
@@ -483,6 +485,23 @@ fn do_avcdec_delete_decoder(ctx: &mut GuestCtx, st: &mut VitaState, decoder: Ptr
     let session = st.avcdec.sessions.remove(index);
     // Whatever this decoder still owed goes with it - see `pictures_owed`.
     PICTURES_OWED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // >>> THE ERROR IS DECIDED HERE, AT THE END, WHERE IT CAN BE TRUE.
+    //
+    // It used to fire the moment 120 access units had produced nothing - and on a loaded
+    // machine the host decoder then produced every picture of the movie, so a clean run
+    // carried an ERROR saying "the movie will not appear" above a movie that appeared.
+    // A decoder that was handed real work and delivered NOTHING by the time the title
+    // closed it is the genuine failure, and it is only knowable now.
+    if session.delivered == 0 && session.submitted >= PICTURES_OWED_BEFORE_REPORTING {
+        tracing::error!(
+            target: "vitaslop::movie",
+            handle,
+            access_units = session.submitted,
+            backend = %session.decoder.describe(),
+            "sceAvcdecDeleteDecoder: the host decoder was given every access unit of this \
+             movie and produced NO pictures - the movie never appeared"
+        );
+    }
     tracing::info!(
         target: "vitaslop::movie",
         handle,
@@ -688,10 +707,12 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
     // "still starting up" has stopped being a plausible reading.
     if session.delivered == 0 && session.submitted == PICTURES_OWED_BEFORE_REPORTING {
         let backend = session.decoder.describe();
-        tracing::error!(
+        // A WARNING, worded as what is known: the decoder is late, and whether it ever
+        // answers is decided at `sceAvcdecDeleteDecoder`, which is where the ERROR lives.
+        tracing::warn!(
             target: "vitaslop::movie",
             submitted = PICTURES_OWED_BEFORE_REPORTING, %backend,
-            "the host decoder has been given {PICTURES_OWED_BEFORE_REPORTING} access units              and has produced NO pictures. Every call succeeded and reported zero outputs,              which is what a decoder answers while it fills its pipeline - but not this              many times. The movie will not appear, and a title that waits for a picture              before asking for more will stop here."
+            "the host decoder has been given {PICTURES_OWED_BEFORE_REPORTING} access units              and has produced NO pictures yet. Every call succeeded and reported zero outputs,              which is what a decoder answers while it fills its pipeline - but not usually              this many times. If the movie never appears, this is why; if it appears late,              the host decoder was slow to start."
         );
     }
     0
@@ -978,8 +999,9 @@ fn write_picture(
             .session_mut(handle)
             .map(|s| s.decoder.describe())
             .unwrap_or_default();
-        tracing::warn!(
-            target: "vitaslop::movie",
+        // A milestone for the panel's STATUS section, not a console warning.
+        tracing::info!(
+            target: "vitaslop::status",
             pixel_type = format_args!("{pixel_type:#x}"),
             pitch, height,
             visible = format_args!("{}x{}", pic.width, pic.height),

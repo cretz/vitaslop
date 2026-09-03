@@ -709,11 +709,16 @@ fn report_unfilled_varying_registers(usage: VaryingUsage, vertex_components: u32
     if !g.get_or_insert_with(HashSet::new).insert((usage, vertex_components, declared)) {
         return;
     }
-    eprintln!(
-        "gxp link: {usage:?} is allocated {declared} fragment registers but the vertex program \
-         fills only {vertex_components} components - the surplus is fed the iterator's default \
-         (0, 0, 0, 1), the same fill a vertex attribute's missing components get"
-    );
+    // Only when a log filter was NAMED: this crate has no tracing, and a run nobody
+    // configured prints nothing. The fill is the measured hardware value, so this is a
+    // note, not a warning.
+    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
+        eprintln!(
+            "gxp link: {usage:?} is allocated {declared} fragment registers but the vertex program \
+             fills only {vertex_components} components - the surplus is fed the iterator's default \
+             (0, 0, 0, 1), the same fill a vertex attribute's missing components get"
+        );
+    }
 }
 
 /// Report, once per distinct shape, that a fragment consumes only a PREFIX of what the vertex
@@ -1190,7 +1195,11 @@ fn report_forwarding_contradiction(hash: u64, why: &str, resolution: &str) {
     if !g.get_or_insert_with(HashSet::new).insert(hash) {
         return;
     }
-    eprintln!("gxp link: vertex {hash:016x}: {why} - {resolution}");
+    // Only when a log filter was NAMED (this crate has no tracing): it is a resolved layout
+    // note, and a run nobody configured prints nothing.
+    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
+        eprintln!("gxp link: vertex {hash:016x}: {why} - {resolution}");
+    }
 }
 
 /// Diagnostic (`VITASLOP_GXP_VARYING_LAYOUT=<vhash>:<usage>@<lane>x<comps>,...`): plan ONE

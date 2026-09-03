@@ -807,8 +807,11 @@ fn mspace_alloc(st: &mut VitaState, msp: Ptr, size: u32, align: u32, what: &str)
             let (used, capacity) = (space.used_bytes(), space.capacity());
             let first = st.mspace_exhausted.insert(msp.addr());
             if first {
-                tracing::warn!(
-                    target: "vitaslop::err",
+                // STATUS, not a warning: the text below says it - this is the guest's own
+                // pool and a NULL is an outcome it handles. A title that fills a pool is
+                // running as designed, and the panel is where the count is read.
+                tracing::info!(
+                    target: "vitaslop::status",
                     msp = format_args!("{:#x}", msp.addr()),
                     size,
                     align,

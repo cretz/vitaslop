@@ -90,7 +90,8 @@ pub(super) fn create_render_target(ctx: &mut GuestCtx, st: &mut VitaState) {
     // that decodes 1x1 while every draw in it sets a 960x544 viewport, and a 1x1 target with a
     // 1x1 valid region would clip that pass away entirely on hardware.
     {
-        eprintln!(
+        tracing::debug!(
+            target: "vitaslop::gxm",
             "gxm render target {handle:#x} extent {width}x{height}{} - raw \
              SceGxmRenderTargetParams at {params:#x}: {:#010x} {:#010x} {:#010x} {:#010x} \
              {:#010x} (flags, width|height<<16, scenesPerFrame|multisample<<16, \
@@ -114,7 +115,11 @@ pub(super) fn create_render_target(ctx: &mut GuestCtx, st: &mut VitaState) {
             .filter(|v| (0x8100_0000..0x8200_0000).contains(v))
             .map(|v| format!("{v:#010x}"))
             .collect();
-        eprintln!("gxm render target {handle:#x}: caller candidates [{}]", chain.join(" "));
+        tracing::debug!(
+            target: "vitaslop::gxm",
+            "gxm render target {handle:#x}: caller candidates [{}]",
+            chain.join(" ")
+        );
     }
     ctx.write_u32(out, handle);
     ctx.ret(0);
@@ -161,7 +166,8 @@ fn report_multisample_mode(handle: u32, width: u32, height: u32, mode: u32) {
             2 => ("4X", width * 2, height * 2),
             _ => ("an unrecognised mode", width, height),
         };
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm render target {handle:#x} ({width}x{height}) was created MULTISAMPLED ({name}), \
              so on hardware its depth surface is {dw}x{dh} samples. This is the REQUEST; whether \
              a pass through this target got it is the renderer's own MULTISAMPLE granted/REFUSED \
@@ -1181,7 +1187,9 @@ fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
               resolves into it)",
         _ => "an unrecognised scale mode",
     };
-    eprintln!(
+    // A WARNING: the mode is ignored, which is an approximation the picture cannot show.
+    tracing::warn!(
+        target: "vitaslop::gxm",
         "gxm surface: colour surface at {data_addr:#x} was created with {name} - we rasterise it \
          at the stored resolution and IGNORE the mode, so anything the guest derives from the \
          two resolutions is computed for a buffer twice the size of the one we produce"
@@ -1287,7 +1295,11 @@ fn report_blend_info(program_header: u32, blend_info: u32, blend: crate::capture
     if !g.get_or_insert_with(HashSet::new).insert((program_header, blend)) {
         return;
     }
-    eprintln!(
+    // DEBUG: one line per (program, blend state) is ~170 lines on one title's boot, which is
+    // a per-program detail rather than run status. `VITASLOP_LOG=vitaslop::gxm=debug` lists
+    // them; the NULL-blendInfo-but-blends case below stays a warning in its own right.
+    tracing::debug!(
+        target: "vitaslop::gxm",
         "gxm blend: fragment program {program_header:#x} created with {} - mask={:#x} colorFunc={} alphaFunc={} \
          colorSrc={} colorDst={} alphaSrc={} alphaDst={} (blends={})",
         if blend_info == 0 { "a NULL blendInfo" } else { "a blendInfo" },
@@ -1519,7 +1531,8 @@ fn report_scene_target(
     if !g.get_or_insert_with(HashSet::new).insert((color_addr, render_target, w, h)) {
         return;
     }
-    eprintln!(
+    tracing::info!(
+        target: "vitaslop::status",
         "gxm scene target: colour {color_addr:#x} rasterises through render target \
          {render_target:#x} ({w}x{h}, multisample {}) with colour scale mode {scale_mode}{}",
         multisample_mode_of(render_target),
@@ -1577,7 +1590,8 @@ fn report_scene_extent_sources(
         Some((w, h)) => format!("{w}x{h}"),
         None => "(none)".to_string(),
     };
-    eprintln!(
+    tracing::info!(
+        target: "vitaslop::status",
         "gxm scene extent: colour {color_addr:#x} surface={} target={} validRegion={} -> \
          RASTERISED AT {}",
         fmt(surface),
@@ -1612,7 +1626,8 @@ fn report_scene_depth(
         // struct addresses let a `VITASLOP_PEEK` answer it. (A well-formed pass in the same
         // frame puts its depth just PAST its colour buffer, which is what the anomaly is
         // measured against.)
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm scene depth: colour {color_addr:#x} (surface struct {color_surface:#x}) renders \
              depth into {:#x} (stencil {:#x}, zlsControl {:#010x}, background {}, depthStencil \
              struct {depth_stencil:#x})",
@@ -2731,7 +2746,8 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
         // most common reading of this diagnostic (`mode 0x0` beside the word GAMMA-CORRECT)
         // asserted the opposite of what had happened, on the exact question - does this
         // surface hold encoded bytes - that decides how everything sampling it must decode.
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
             if gamma != 0 { "GAMMA-CORRECT writes ENABLED" } else { "gamma-correct writes DISABLED (linear)" },
             s.data_addr,

@@ -211,3 +211,153 @@ export function syncReader(handles) {
     },
   };
 }
+
+// >>> THE RUN'S READER: A PAGE RING FILLED BY A SEPARATE STORAGE WORKER.
+//
+// `syncReader` above makes every read a synchronous trip through the browser's storage
+// stack on the emulator's own thread - about a millisecond per 64 KB where it was measured,
+// several times a frame while a title streams. `openTitleCached` moves the handles to
+// `storage-worker.js`, which serves 64 KB pages into this ring and reads AHEAD along the
+// file between requests, so a sequential stream is answered out of shared memory and the
+// emulator waits only on a genuine miss. See the header of storage-worker.js.
+//
+// Layout of the `SharedArrayBuffer`, as `Int32Array` indices: a small header, one tag per
+// slot, then - at `DATA_OFF` bytes - `SLOTS` pages of `PAGE` bytes.
+export const PAGE = 64 * 1024;
+export const SLOTS = 128;
+export const H = {
+  REQ: 0, // 1 while a request is posted
+  ACK: 1, // count of requests completed
+  CLOSE: 2, // 1 asks the worker to close its handles and exit
+  ERR: 3, // nonzero once the worker has failed a read; the reader then reports rather than waits
+  REQ_PATH: 4,
+  REQ_PAGE: 5,
+  REQ_COUNT: 6,
+  TAGS: 8,
+};
+export const TAG = { PATH: 0, PAGE: 1, STATE: 2, LEN: 3, STRIDE: 4 };
+export const STATE = { READY: 0, FILLING: 1, PINNED: 2 };
+export const DATA_OFF = PAGE; // the header and tags fit in the first page with room to spare
+/// Pages one request may ask for. A larger read loops; the ring must hold a request plus
+/// the worker's read-ahead without lapping itself.
+const MAX_REQ = 32;
+
+/// Open `id`'s files on a storage worker and return a reader with the SAME interface as
+/// `syncReader` - `paths()`, `size(path)`, `read(path, offset, into)`, `close()` - whose
+/// reads come out of the shared page ring. Worker-only, like `syncReader`.
+export async function openTitleCached(id) {
+  const sab = new SharedArrayBuffer(DATA_OFF + SLOTS * PAGE);
+  const h = new Int32Array(sab);
+  const data = new Uint8Array(sab, DATA_OFF, SLOTS * PAGE);
+  const worker = new Worker("./storage-worker.js", { type: "module" });
+  const ready = await new Promise((resolve, reject) => {
+    worker.onmessage = (e) => {
+      if (e.data.type === "ready") resolve(e.data);
+      else if (e.data.type === "error") reject(new Error(e.data.message));
+    };
+    worker.onerror = (e) => reject(new Error(`storage worker failed: ${e.message || e}`));
+    worker.postMessage({ id, sab });
+  });
+  // From here the worker reports only failures; a read error is also flagged in `H.ERR`,
+  // which is what the synchronous reader can see.
+  let workerError = null;
+  worker.onmessage = (e) => {
+    if (e.data.type === "error") {
+      workerError = e.data.message;
+      console.error(`[storage] ${e.data.message}`);
+    }
+  };
+  const { paths, sizes } = ready;
+  const ids = new Map(paths.map((p, i) => [p, i]));
+
+  const tag = (slot, f) => h[H.TAGS + slot * TAG.STRIDE + f];
+  /// Pin the slot holding (pid, page): READY -> PINNED, then re-check the tag, since the
+  /// worker may have refilled the slot between the scan and the exchange.
+  const pin = (pid, page) => {
+    for (let s = 0; s < SLOTS; s++) {
+      if (tag(s, TAG.PATH) !== pid + 1 || tag(s, TAG.PAGE) !== page) continue;
+      const st = H.TAGS + s * TAG.STRIDE + TAG.STATE;
+      if (Atomics.compareExchange(h, st, STATE.READY, STATE.PINNED) !== STATE.READY) continue;
+      if (tag(s, TAG.PATH) === pid + 1 && tag(s, TAG.PAGE) === page) return s;
+      Atomics.store(h, st, STATE.READY);
+    }
+    return -1;
+  };
+  const unpin = (s) => Atomics.store(h, H.TAGS + s * TAG.STRIDE + TAG.STATE, STATE.READY);
+  // >>> WHETHER THE READ-AHEAD IS ACTUALLY SERVING ANYTHING.
+  //
+  // The panel's STORAGE line counts the emulator's read CALLS, and once those calls come out
+  // of this ring the count says nothing about what they cost: a hit is a memcpy out of shared
+  // memory, a miss is a round trip to another thread with an `Atomics.wait` in the middle, and
+  // the line shows the same number either way. A device dump was read with the storage worker
+  // live and could not say whether the 16-page read-ahead was working at all, which is the
+  // whole claim the worker exists to make. A miss already pays for a thread hop, so timing
+  // only the misses adds nothing measurable to the hit path.
+  let ringHits = 0;
+  let ringMisses = 0;
+  let ringWaitMs = 0;
+  const request = (pid, page, count) => {
+    const t0 = performance.now();
+    Atomics.store(h, H.REQ_PATH, pid);
+    Atomics.store(h, H.REQ_PAGE, page);
+    Atomics.store(h, H.REQ_COUNT, count);
+    const seq = Atomics.load(h, H.ACK);
+    Atomics.store(h, H.REQ, 1);
+    Atomics.notify(h, H.REQ);
+    // Bounded waits, so a worker that has died leaves an error rather than a hang.
+    let waited = 0;
+    while (Atomics.load(h, H.ACK) === seq) {
+      if (Atomics.load(h, H.ERR) !== 0 || workerError !== null) {
+        throw new Error(`storage worker failed: ${workerError || "read error"}`);
+      }
+      if (Atomics.wait(h, H.ACK, seq, 1000) === "timed-out" && ++waited >= 30) {
+        throw new Error(`storage worker did not answer a read of ${paths[pid]} page ${page} in 30 s`);
+      }
+    }
+    ringWaitMs += performance.now() - t0;
+  };
+
+  return {
+    paths: () => paths.slice(),
+    size: (path) => (ids.has(path) ? sizes[ids.get(path)] : -1),
+    read: (path, offset, into) => {
+      const pid = ids.get(path);
+      if (pid === undefined) return 0;
+      const size = sizes[pid];
+      let done = 0;
+      while (done < into.length) {
+        const at = offset + done;
+        if (at >= size) break;
+        const page = Math.floor(at / PAGE);
+        let s = pin(pid, page);
+        if (s >= 0) {
+          ringHits += 1;
+        } else {
+          ringMisses += 1;
+          const count = Math.min(MAX_REQ, Math.ceil((into.length - done + (at % PAGE)) / PAGE));
+          request(pid, page, count);
+          s = pin(pid, page);
+          if (s < 0) throw new Error(`storage ring did not hold ${path} page ${page} after a request`);
+        }
+        const from = at - page * PAGE;
+        const n = Math.min(into.length - done, tag(s, TAG.LEN) - from);
+        if (n <= 0) {
+          unpin(s);
+          break;
+        }
+        into.set(data.subarray(s * PAGE + from, s * PAGE + from + n), done);
+        unpin(s);
+        done += n;
+      }
+      return done;
+    },
+    // Read once per panel window, never per read - see ringHits above.
+    stats: () => ({ hits: ringHits, misses: ringMisses, waitMs: ringWaitMs }),
+    close: () => {
+      Atomics.store(h, H.CLOSE, 1);
+      Atomics.store(h, H.REQ, 1);
+      Atomics.notify(h, H.REQ);
+      setTimeout(() => worker.terminate(), 2000);
+    },
+  };
+}

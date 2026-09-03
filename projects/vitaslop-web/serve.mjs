@@ -372,7 +372,16 @@ const handler = async (req, res) => {
     }
 
     const file = join(webDir, path === "/" ? "/live.html" : path);
-    const body = await readFile(file);
+    let body = await readFile(file);
+    // >>> THE DIAG SINK ANNOUNCES ITSELF IN THE PAGE, so the page never has to ASK.
+    //
+    // The page used to probe `GET /diag-sink` at load; on the product (static hosting) that
+    // probe is a 404, and a 404 is a red line in an otherwise EMPTY console on every load.
+    // A dev server is the only thing that has the sink, so it is the only thing that can
+    // say so - one global stamped into the served HTML, read by the page instead of fetched.
+    if (extname(file) === ".html") {
+      body = body.toString("utf8").replace("<head>", "<head><script>window.__vitaslopDiagSink = true;</script>");
+    }
     res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
     res.end(body);
   } catch {

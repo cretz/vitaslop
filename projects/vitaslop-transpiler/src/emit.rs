@@ -290,6 +290,68 @@ struct Body {
     /// The register file held in wasm LOCALS, when this build promotes it. `None` is the
     /// build that keeps every register on its global - see [`crate::promote`].
     cache: Option<crate::promote::Cache>,
+    /// The low-bank NEON cache: what each of Q0..Q7's `L_NQ0 + k` locals holds right now.
+    /// See [`NqState`].
+    nq: [NqState; NQ_COUNT as usize],
+    /// Whether the statement being emitted may use that cache. [`emit_block`] turns it on
+    /// for the statement kinds that reach low-bank state only through the cache-aware
+    /// accessors, and off (after a write-back) for everything else.
+    nq_enabled: bool,
+    /// Whether this build uses the cache at all ([`neon_cache`]), read once per body.
+    nq_allowed: bool,
+    /// The current run's plan ([`plan_neon_run`]): which quads the cache may take.
+    nq_allow: [bool; NQ_COUNT as usize],
+    /// Which HALVES of each held quad are behind their globals: bit 0 the low double
+    /// (lanes 0-1), bit 1 the high (lanes 2-3). A double write dirties one half, a quad
+    /// write both, and the write-back sends only the dirty halves - six operators for a
+    /// lone double instead of twelve for the quad.
+    nq_dirty: [u8; NQ_COUNT as usize],
+    /// The cache's own tally, for the expansion report: quads gathered from their globals,
+    /// quads written back, and operand accesses served from a local.
+    nq_gathers: u64,
+    nq_writebacks: u64,
+    nq_hits: u64,
+}
+
+/// What a low-bank NEON cache local ([`L_NQ0`]) holds.
+///
+/// # Why a cache, and why it is scoped the way it is
+/// The low VFP/NEON bank (S0..S31 = D0..D15 = Q0..Q7) is thirty-two scalar `i32` globals,
+/// because the host marshals VFP arguments through them and the JS API cannot read a
+/// `v128` global (see the model in `abi`). Every NEON operand on that bank was therefore
+/// assembled from four `global.get`s and every result scattered back through four
+/// `global.set`s - about 8 operators in and 9 out, against ONE for an upper-bank quad.
+///
+/// MEASURED (V8 worker profile, a retail racer's race, 33,115 samples): the largest guest
+/// function of the whole thread, 4.1% of it SELF, was a 135-instruction straight-line NEON
+/// kernel (a hull/ray test) working almost entirely in Q0..Q3 and D0..D7; the next NEON
+/// function down had the same shape. That is hand-written NEON, and hand-written NEON uses
+/// the argument and callee-saved quads - the "rare in auto-vectorized output" the model was
+/// written against does not describe a physics engine.
+///
+/// So within a block, across a run of statements that touch low-bank state only through
+/// the cache-aware accessors ([`neon_get`], [`neon_set`], [`get_d_bits`], [`set_d_bits`]),
+/// each quad is gathered ONCE into its local on first use and written back ONCE at the
+/// end of the run - or never, if the run only read it. The run ends at any statement that
+/// can reach the `s` globals another way (a scalar VFP op, a single-register load/store),
+/// at anything that can leave the function or reach the host (a call, an import, a
+/// terminator), and at a predicated guard (whose two arms would otherwise disagree about
+/// what is cached). Core-register statements do not touch VFP state at all, so a run
+/// survives them.
+///
+/// What this does NOT change: the globals are the architectural state at every point a
+/// host, a scheduler or another guest function can observe it - the write-back happens
+/// before any of those. A trap INSIDE a run (an out-of-range vector load) prints a
+/// register dump from globals that may be behind by that run's writes; the run is not
+/// resumed after a trap, so nothing computes on the stale values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NqState {
+    /// The local holds nothing; the globals are current.
+    Absent,
+    /// The local holds the quad and matches the globals.
+    Clean,
+    /// The local holds the quad and the globals are BEHIND it - a write-back is owed.
+    Dirty,
 }
 
 impl Body {
@@ -326,6 +388,14 @@ impl Body {
             dispatch_reentries: 0,
             promotion: crate::promote::RunTracker::default(),
             cache,
+            nq: [NqState::Absent; NQ_COUNT as usize],
+            nq_enabled: false,
+            nq_allowed: neon_cache(),
+            nq_allow: [false; NQ_COUNT as usize],
+            nq_dirty: [0; NQ_COUNT as usize],
+            nq_gathers: 0,
+            nq_writebacks: 0,
+            nq_hits: 0,
         }
     }
 
@@ -1065,6 +1135,9 @@ const BULK_WATCH_TAG: u32 = 0xB01C_0000;
 /// when a runtime function-pointer matches no translated function, so an unmapped
 /// target becomes a reported, debuggable trap instead of an opaque `unreachable`.
 const DISPATCH_MISS_FUNC: u32 = 2;
+/// The non-suspending NID trap - see [`abi::IMPORT_FAST_NAME`]. Declared LAST so the three
+/// imports above keep the indices every backtrace mapping was written against.
+const IMPORT_FAST_FUNC: u32 = 3;
 /// Number of imported functions before the guest functions. Re-exported through
 /// [`abi::IMPORT_FUNC_COUNT`] so hosts mapping a trap backtrace stay in lockstep.
 pub(crate) const IMPORT_FUNCS: u32 = abi::IMPORT_FUNC_COUNT;
@@ -1529,8 +1602,8 @@ fn trap_halt() -> bool {
 
 /// Scratch local holding the pre-call snapshot of the guarded register (see
 /// [`guard_reg`]). Only declared when the guard is enabled, so an unguarded build is
-/// byte-identical; it follows the v128 scratch locals.
-const L_GUARD: u32 = L_V128C + 1;
+/// byte-identical; it follows the v128 scratch locals and the low-bank NEON cache.
+const L_GUARD: u32 = L_NQ0 + NQ_COUNT;
 
 /// Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`):
 /// `any` traps on any store to the address, `nz` only on a non-zero store, `arm`
@@ -1613,6 +1686,17 @@ const L_V128B: u32 = L_D64 + 2;
 /// first result register while the second is computed and written (a plain low-bank `neon_set`
 /// itself reuses `L_V128A`, so the staged result must live elsewhere).
 const L_V128C: u32 = L_D64 + 3;
+/// >>> THE LOW NEON BANK, HELD IN `v128` LOCALS ACROSS A RUN OF VECTOR STATEMENTS.
+///
+/// Eight `v128` locals, one per low-bank quad Q0..Q7, following the scratch locals. See
+/// [`NqState`] and [`nq_load`] for the cache they back: the low bank is stored as 32 scalar
+/// `s` globals (the host has to marshal them, and JS cannot touch a `v128` global), so a
+/// vector operand there cost a GATHER of four globals and a result a SCATTER of four - and
+/// the hottest guest function in a retail racer's race is a straight-line NEON kernel that
+/// lives almost entirely in Q0..Q7.
+const L_NQ0: u32 = L_V128C + 1;
+/// How many low-bank quads there are (Q0..Q7), and therefore how many cache locals.
+const NQ_COUNT: u32 = crate::abi::VFP_Q_HI_FIRST as u32;
 
 /// The exported linear-memory layout, returned by [`emit_module`] so the host can
 /// provision a shared memory that exactly matches what the module declares.
@@ -1724,6 +1808,14 @@ pub struct Expansion {
     pub blocks: u64,
     pub fallthrough_blocks: u64,
     pub dispatch_reentries: u64,
+    /// The low-bank NEON cache's static tally (see [`NqState`]): quads gathered from their
+    /// globals, quads written back, and operand accesses served from a local without
+    /// either. `hits` against `gathers + writebacks` is the ratio that says whether the
+    /// runs are long enough to pay - one gather and one write-back replace a gather per
+    /// read and a scatter per write.
+    pub neon_cache_gathers: u64,
+    pub neon_cache_writebacks: u64,
+    pub neon_cache_hits: u64,
     /// What that change would actually be worth, modelled over this same operator stream
     /// under the policy it would have to use. `core_state_ops` is a CEILING and a
     /// misleading one - most of those accesses sit in runs too short to pay a promotion
@@ -1908,6 +2000,9 @@ pub fn emit_module(
         abi::DISPATCH_MISS_NAME,
         wasm_encoder::EntityType::Function(dispatch_ty),
     );
+    // `env.import_fast(selector)`: the same trap as `env.import` for a NID the host has
+    // named as never suspending - see `InlineOp::Fast`. Function index `IMPORT_FAST_FUNC`.
+    imports.import(abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME, wasm_encoder::EntityType::Function(host_ty));
     if import_memory {
         // A shared memory must declare a maximum; the guest never grows memory, so
         // pin max == min at the provisioned size (guest region + dispatch table).
@@ -2108,6 +2203,7 @@ pub fn emit_module(
         names.append(SVC_FUNC, "svc");
         names.append(IMPORT_FUNC, "host_import");
         names.append(DISPATCH_MISS_FUNC, "dispatch_miss");
+        names.append(IMPORT_FAST_FUNC, "host_import_fast");
         for (i, addr) in addrs.iter().enumerate() {
             names.append(IMPORT_FUNCS + i as u32, &format!("g_{addr:08x}"));
         }
@@ -2378,6 +2474,9 @@ fn emit_func(
     expansion.blocks += f.blocks;
     expansion.fallthrough_blocks += f.fallthrough_blocks;
     expansion.dispatch_reentries += f.dispatch_reentries;
+    expansion.neon_cache_gathers += f.nq_gathers;
+    expansion.neon_cache_writebacks += f.nq_writebacks;
+    expansion.neon_cache_hits += f.nq_hits;
     f.into_function(func_locals(promoted_locals))
 }
 
@@ -2389,7 +2488,9 @@ fn emit_func(
 /// The promoted group goes LAST so every existing local index is unchanged, which is what
 /// lets an unpromoted build stay byte-identical.
 fn func_locals(promoted: u32) -> Vec<(u32, ValType)> {
-    let mut locals = vec![(L_I32_COUNT, ValType::I32), (1, ValType::I64), (3, ValType::V128)];
+    // Three v128 scratches, then the eight low-bank NEON cache quads (`L_NQ0`..).
+    let mut locals =
+        vec![(L_I32_COUNT, ValType::I32), (1, ValType::I64), (3 + NQ_COUNT, ValType::V128)];
     if guard_reg().is_some() {
         locals.push((1, ValType::I32)); // L_GUARD: pre-call snapshot for the CSR guard
     }
@@ -2404,7 +2505,7 @@ fn promotion_local_base() -> u32 {
     if guard_reg().is_some() {
         L_GUARD + 1
     } else {
-        L_V128C + 1
+        L_NQ0 + NQ_COUNT
     }
 }
 
@@ -2420,6 +2521,28 @@ thread_local! {
     static DISPATCH_ALL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of the guest-address name section - see [`set_wasm_names`].
     static WASM_NAMES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of the low-bank NEON cache - see [`set_neon_cache`].
+    static NEON_CACHE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether emitted modules hold the low NEON bank in locals across a run of vector
+/// statements (see [`NqState`]). ON by default; `VITASLOP_NEON_CACHE=0` is the A/B arm
+/// that restores the per-operand gather and scatter, and the arm the execution test
+/// compares against.
+pub fn neon_cache() -> bool {
+    use std::sync::OnceLock;
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    NEON_CACHE.with(|c| c.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| {
+            std::env::var("VITASLOP_NEON_CACHE").map(|v| v.trim() != "0").unwrap_or(true)
+        })
+    })
+}
+
+/// Choose whether emitted modules use the low-bank NEON cache, overriding the knob above
+/// for this thread - the only way a test can build both arms in one process.
+pub fn set_neon_cache(on: bool) {
+    NEON_CACHE.with(|c| c.set(Some(on)));
 }
 
 /// `VITASLOP_PROMOTE_REGS=1` - hold the ARM register file in wasm LOCALS along each
@@ -2589,9 +2712,28 @@ fn emit_block(
     // Nothing here charges the software fuel counter: `Body` does it, per operator, as
     // the block below is emitted (see [`emit_fuel_check`]). The CHECK is what is placed
     // by hand, and only on back edges.
-    for stmt in &block.stmts {
+    for (i, stmt) in block.stmts.iter().enumerate() {
+        // The low-bank NEON cache (see `NqState`) lives across a run of statements that
+        // reach low-bank state only through the cache-aware accessors: the vector ops, a
+        // double-register load/store, and the core-register statements (which touch no
+        // VFP state at all). Anything else - a scalar VFP op or single-register memory op
+        // (both address the `s` globals directly), a call, an import, a system call, a
+        // predicated guard - first gets the globals made current and runs uncached.
+        let cacheable = neon_run_member(stmt);
+        if !cacheable {
+            nq_flush(f);
+            f.nq_enabled = false;
+        } else if f.nq_allowed && !f.nq_enabled {
+            // A run begins here: decide which quads it is worth holding.
+            f.nq_allow = plan_neon_run(&block.stmts[i..]);
+            f.nq_enabled = true;
+        }
         emit_stmt(f, stmt, func_index, base, inline, func.addr);
     }
+    // The terminator can leave the block, the function or the thread: the globals are the
+    // state it hands on.
+    nq_flush(f);
+    f.nq_enabled = false;
     emit_term(f, &block.term, func, base, loop_depth, block.addr);
 }
 
@@ -3412,10 +3554,226 @@ fn set_s_f32(f: &mut Body, n: u8) {
     f.instruction(&W::GlobalSet(abi::vfp_s_global(n)));
 }
 
+// --- The low-bank NEON cache (see `NqState`) --------------------------------
+
+/// The cache local holding low-bank quad `k` (0..8).
+fn nq_local(k: u8) -> u32 {
+    L_NQ0 + u32::from(k)
+}
+
+/// Whether the cache may TAKE low-bank quad `k` for the statement being emitted: the
+/// statement is in a cached run and the run's plan says the quad pays.
+fn nq_on(f: &Body, k: u8) -> bool {
+    f.nq_enabled && (k as usize) < abi::VFP_Q_HI_FIRST && f.nq_allow[k as usize]
+}
+
+/// Whether low-bank quad `k` is HELD right now - the only condition under which a
+/// double-register access goes through the local. See [`plan_neon_run`] for why a
+/// double access never populates the cache on its own.
+fn nq_held(f: &Body, k: u8) -> bool {
+    f.nq_enabled && (k as usize) < abi::VFP_Q_HI_FIRST && f.nq[k as usize] != NqState::Absent
+}
+
+/// Every low-bank quad a statement touches, as `(quad-level accesses, double-level
+/// accesses)` per quad, added into `q` and `d`. A `Q(k)` operand is a quad access; a
+/// `D(n)` operand (`n < 16`) is a double access to quad `n / 2`. Raw `u8` double fields
+/// (a scalar's source, a lane move's register, a table, an element transfer) count as
+/// doubles too. Approximate by design - it steers a policy, not a result.
+fn count_neon_regs(s: &crate::ir::NeonStmt, q: &mut [u32; 8], d: &mut [u32; 8]) {
+    use crate::ir::NeonReg;
+    use crate::ir::NeonStmt::*;
+    let mut reg = |r: &NeonReg| match *r {
+        NeonReg::Q(k) if (k as usize) < abi::VFP_Q_HI_FIRST => q[k as usize] += 1,
+        NeonReg::D(n) if (n as usize) < abi::VFP_D_HI_FIRST => d[(n / 2) as usize] += 1,
+        _ => {}
+    };
+    let dn = |n: u8, d: &mut [u32; 8]| {
+        if (n as usize) < abi::VFP_D_HI_FIRST {
+            d[(n / 2) as usize] += 1;
+        }
+    };
+    match s {
+        Bin { dst, a, b, .. }
+        | RecipStep { dst, a, b, .. }
+        | PairAdd { dst, a, b, .. }
+        | WideAddSub { dst, a, b, .. }
+        | WideAbd { dst, a, b, .. }
+        | Ext { dst, a, b, .. }
+        | Cmp { dst, a, b, .. }
+        | CmpAbs { dst, a, b, .. }
+        | PairMinMax { dst, a, b, .. }
+        | Test { dst, a, b, .. }
+        | Bitwise { dst, a, b, .. } => {
+            reg(dst);
+            reg(a);
+            reg(b);
+        }
+        MulAcc { dst, a, b, .. } | WideMul { dst, a, b, .. } => {
+            reg(dst);
+            reg(dst);
+            reg(a);
+            reg(b);
+        }
+        MulScalar { dst, a, src, .. } => {
+            reg(dst);
+            reg(a);
+            dn(*src, d);
+        }
+        RecipEstimate { dst, src, .. }
+        | Widen { dst, a: src, .. }
+        | PairLong { dst, a: src, .. }
+        | Unary { dst, a: src, .. }
+        | ShiftImm { dst, src, .. }
+        | CvtFloatInt { dst, src, .. }
+        | CmpZero { dst, src, .. }
+        | Rev { dst, src, .. }
+        | Not { dst, src }
+        | SatAbsNeg { dst, src, .. }
+        | NarrowShift { dst, src, .. }
+        | WidenShift { dst, src, .. }
+        | Narrow { dst, src, .. }
+        | NarrowSat { dst, src, .. } => {
+            reg(dst);
+            reg(src);
+        }
+        ShiftReg { dst, src, amt, .. } => {
+            reg(dst);
+            reg(src);
+            reg(amt);
+        }
+        Permute { a, b, .. } => {
+            reg(a);
+            reg(a);
+            reg(b);
+            reg(b);
+        }
+        MovImm { dst, .. } | DupCore { dst, .. } | MovImm64 { dst, .. } => reg(dst),
+        DupLane { dst, src, .. } => {
+            reg(dst);
+            dn(*src, d);
+        }
+        MovLane { dreg, .. } => dn(*dreg, d),
+        TableLookup { dst, table, len, index, .. } => {
+            dn(*dst, d);
+            dn(*index, d);
+            for i in 0..*len {
+                dn(table.wrapping_add(i), d);
+            }
+        }
+        ElemMem { d: n, .. } => dn(*n, d),
+    }
+}
+
+/// Decide, for the cacheable run beginning at `stmts[0]`, which low-bank quads the cache
+/// should hold.
+///
+/// # The cost model this encodes
+/// Uncached, a quad read is 8 operators and a quad write 9; a double read is 7 and a
+/// double write 7. Cached, the first quad read gathers (9), every later access is 1,
+/// a quad write is 1, a double read of a held quad is 3, a double write 5, and each
+/// dirty quad pays a 12-operator write-back once at the end of the run. So the cache
+/// PAYS when a quad is touched at quad level and touched again, and LOSES on a quad
+/// touched once - most of all on a lone double write, where gathering the whole quad
+/// to replace one half and writing all four lanes back would cost four times the
+/// scatter it replaces. MEASURED before this rule existed: the whole title's expansion
+/// fell 2.5% but the second-hottest NEON function, which is loops of short blocks over
+/// doubles, did not get cheaper.
+///
+/// Hence: a quad is held only if the run has at least one QUAD-level access to it and
+/// at least two accesses in all; and a double access never populates the cache by
+/// itself ([`nq_held`]) - it rides a quad that quad-level code already brought in.
+fn plan_neon_run(stmts: &[Stmt]) -> [bool; NQ_COUNT as usize] {
+    let mut q = [0u32; 8];
+    let mut d = [0u32; 8];
+    for s in stmts {
+        match s {
+            Stmt::Neon(op) => count_neon_regs(op, &mut q, &mut d),
+            Stmt::VfpMem { reg: crate::ir::VfpReg::D(n), .. } => {
+                if (*n as usize) < abi::VFP_D_HI_FIRST {
+                    d[(n / 2) as usize] += 1;
+                }
+            }
+            s if neon_run_member(s) => {}
+            _ => break,
+        }
+    }
+    std::array::from_fn(|k| q[k] >= 1 && q[k] + d[k] >= 2)
+}
+
+/// Whether a statement may sit inside a cached run - it reaches low-bank state only
+/// through the cache-aware accessors, or not at all. See [`NqState`].
+fn neon_run_member(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Neon(..)
+            | Stmt::VfpMem { reg: crate::ir::VfpReg::D(_), .. }
+            | Stmt::SetReg(..)
+            | Stmt::Store { .. }
+            | Stmt::FlagsAdd { .. }
+            | Stmt::FlagsLogic { .. }
+            | Stmt::Rbit { .. }
+            | Stmt::MulLong { .. }
+            | Stmt::Uadd8 { .. }
+            | Stmt::Sel { .. }
+            | Stmt::ShiftRegFlags { .. }
+    )
+}
+
+/// Make sure low-bank quad `k` is in its local: gather it from its four `s` globals if the
+/// local holds nothing. Leaves the operand stack as it found it.
+fn nq_load(f: &mut Body, k: u8) {
+    if f.nq[k as usize] != NqState::Absent {
+        f.nq_hits += 1;
+        return;
+    }
+    let s = 4 * k;
+    f.instruction(&W::GlobalGet(abi::vfp_s_global(s)));
+    f.instruction(&W::I32x4Splat);
+    f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 1)));
+    f.instruction(&W::I32x4ReplaceLane(1));
+    f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 2)));
+    f.instruction(&W::I32x4ReplaceLane(2));
+    f.instruction(&W::GlobalGet(abi::vfp_s_global(s + 3)));
+    f.instruction(&W::I32x4ReplaceLane(3));
+    f.instruction(&W::LocalSet(nq_local(k)));
+    f.nq[k as usize] = NqState::Clean;
+    f.nq_dirty[k as usize] = 0;
+    f.nq_gathers += 1;
+}
+
+/// Write every dirty quad back to its globals and empty the cache. The point at which the
+/// globals become the architectural state again - emitted before anything that could read
+/// them another way (see [`NqState`]). A no-op when nothing is cached, which is every
+/// block that has no low-bank NEON in it.
+fn nq_flush(f: &mut Body) {
+    for k in 0..NQ_COUNT as u8 {
+        if f.nq[k as usize] == NqState::Dirty {
+            let s = 4 * k;
+            for lane in 0..4u8 {
+                if f.nq_dirty[k as usize] & (1 << (lane / 2)) == 0 {
+                    continue;
+                }
+                f.instruction(&W::LocalGet(nq_local(k)));
+                f.instruction(&W::I32x4ExtractLane(lane));
+                f.instruction(&W::GlobalSet(abi::vfp_s_global(s + lane)));
+            }
+            f.nq_writebacks += 1;
+        }
+        f.nq[k as usize] = NqState::Absent;
+        f.nq_dirty[k as usize] = 0;
+    }
+}
+
 /// Push the raw 64 bits of D`n` as an i64. Low bank (n < 16): merge the two S
-/// halves. Upper bank (n >= 16): extract `i64x2` lane `n & 1` of the quad `q(n/2)`.
+/// halves - or, inside a cached run, extract the `i64x2` lane of the cached quad.
+/// Upper bank (n >= 16): extract `i64x2` lane `n & 1` of the quad `q(n/2)`.
 fn get_d_bits(f: &mut Body, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
+        if nq_held(f, n / 2) {
+            f.instruction(&W::LocalGet(nq_local(n / 2)));
+            f.instruction(&W::I64x2ExtractLane(n & 1));
+            return;
+        }
         let lo = 2 * n;
         let hi = 2 * n + 1;
         f.instruction(&W::GlobalGet(abi::vfp_s_global(hi)));
@@ -3436,6 +3794,21 @@ fn get_d_bits(f: &mut Body, n: u8) {
 /// leaving the sibling D untouched. Uses the i64 scratch local.
 fn set_d_bits(f: &mut Body, n: u8) {
     if (n as usize) < abi::VFP_D_HI_FIRST {
+        if nq_held(f, n / 2) {
+            // The quad is held, so the lane goes into the local (the sibling lane is
+            // already there) and the write-back is owed. Same read-modify-write shape as
+            // the upper bank, against a local. A quad that is NOT held takes the scatter
+            // below and leaves the cache alone - see `plan_neon_run`.
+            let q = n / 2;
+            f.instruction(&W::LocalSet(L_D64));
+            f.instruction(&W::LocalGet(nq_local(q)));
+            f.instruction(&W::LocalGet(L_D64));
+            f.instruction(&W::I64x2ReplaceLane(n & 1));
+            f.instruction(&W::LocalSet(nq_local(q)));
+            f.nq[q as usize] = NqState::Dirty;
+            f.nq_dirty[q as usize] |= 1 << (n & 1);
+            return;
+        }
         let lo = 2 * n;
         let hi = 2 * n + 1;
         f.instruction(&W::LocalSet(L_D64));
@@ -3879,6 +4252,10 @@ fn neon_get(f: &mut Body, reg: crate::ir::NeonReg) {
         Q(k) => {
             if (k as usize) >= abi::VFP_Q_HI_FIRST {
                 f.instruction(&W::GlobalGet(abi::vfp_qhi_global(k)));
+            } else if nq_on(f, k) {
+                // Low bank inside a cached run: the quad is in (or goes into) its local.
+                nq_load(f, k);
+                f.instruction(&W::LocalGet(nq_local(k)));
             } else {
                 // Low bank: assemble the quad from its four aliased S registers.
                 let s = 4 * k;
@@ -3932,6 +4309,13 @@ fn neon_set(f: &mut Body, reg: crate::ir::NeonReg) {
         Q(k) => {
             if (k as usize) >= abi::VFP_Q_HI_FIRST {
                 f.instruction(&W::GlobalSet(abi::vfp_qhi_global(k)));
+            } else if nq_on(f, k) {
+                // Low bank inside a cached run: the whole quad is replaced, so nothing
+                // needs gathering first - the local simply takes the value and owes a
+                // write-back.
+                f.instruction(&W::LocalSet(nq_local(k)));
+                f.nq[k as usize] = NqState::Dirty;
+                f.nq_dirty[k as usize] = 0b11;
             } else {
                 let s = 4 * k;
                 f.instruction(&W::LocalSet(L_V128A));
@@ -5902,6 +6286,8 @@ enum InlineLowering {
     RetConst { value: u32 },
     /// Emit nothing at all, r0 included - see [`crate::InlineOp::Nop`].
     Nop,
+    /// The real call, through the non-suspending trap - see [`crate::InlineOp::Fast`].
+    Fast,
     /// Read the host-mirror word at `off` into r0, decrement the countdown word at
     /// `budget_off`, and park the thread when it reaches zero - see
     /// [`crate::InlineOp::LoadMirrorParking`].
@@ -6021,6 +6407,7 @@ impl InlineImports {
             }
             crate::InlineOp::RetConst { value } => Some(InlineLowering::RetConst { value }),
             crate::InlineOp::Nop => Some(InlineLowering::Nop),
+            crate::InlineOp::Fast => Some(InlineLowering::Fast),
             crate::InlineOp::LoadMirror { slot } => {
                 // The block is reserved by the same layout pass that fills `mirror_off`
                 // from these very ops, so a mirror op without a block is a bug here, not
@@ -6289,6 +6676,12 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             // A void handler that observably does nothing: the call becomes no code at all,
             // and r0 keeps the argument it was passed - which is exactly what the dispatcher
             // left there.
+            return;
+        }
+        Some(InlineLowering::Fast) => {
+            // The same call, through the trap the host binds WITHOUT suspension support.
+            f.instruction(&W::I32Const(index as i32));
+            f.instruction(&W::Call(IMPORT_FAST_FUNC));
             return;
         }
         Some(InlineLowering::MirrorParking { off, budget_off }) => {

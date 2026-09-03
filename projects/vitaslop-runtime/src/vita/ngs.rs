@@ -341,10 +341,40 @@ pub(super) fn rack_init(ctx: &mut GuestCtx, st: &mut VitaState, _system: u32, ra
             // somewhere we do not model. Say the address rather than a name we do not have.
             None => format!("an unrecognised definition at {defn:#010x}"),
         };
-        tracing::warn!(
-            target: "vitaslop::at9",
+        // TWO DIFFERENT THINGS WERE ON ONE LINE, and it printed once per RACK - nine
+        // near-identical paragraphs on one title, differing only in a count and an address.
+        //
+        //  * WHAT IS OWED A FIX, and so stays a warning: this engine runs NO buss processing.
+        //    The mix is a sum of source voices scaled by their routing volumes, so whatever a
+        //    definition implies - compression, EQ, delay - is silently absent from the sound.
+        //    That is one defect per DEFINITION, not one per rack, so it is deduped on the name
+        //    and a title with four buss kinds reports four, each naming a distinct missing DSP.
+        //  * THE RACK'S GEOMETRY, which is not a defect at all - it describes what the title
+        //    asked for and reads identically on a healthy run. That is STATUS.
+        //
+        // [[vitaslop-a-warning-means-we-owe-a-fix]]
+        {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            static DEFS_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+            let first = DEFS_WARNED
+                .lock()
+                .map(|mut g| g.get_or_insert_with(HashSet::new).insert(name.clone()))
+                .unwrap_or(false);
+            if first {
+                tracing::warn!(
+                    target: "vitaslop::at9",
+                    "NGS buss processing is NOT RUN for {name}: the mix is a sum of source \
+                     voices scaled by their routing volumes, so any compression, EQ or delay \
+                     this definition implies is missing from the sound."
+                );
+            }
+        }
+        tracing::info!(
+            target: "vitaslop::status",
             rack = format_args!("{rack:#x}"),
-            "sceNgsRackInit: a rack of {voices} voice(s) x {channels} channel(s) of {name}              (max {per_in} patches per input, {per_out} per output). The MIX this engine              performs is a sum of source voices scaled by their routing volumes; any              processing a buss definition implies - compression, EQ, delay - is NOT run."
+            "sceNgsRackInit: {voices} voice(s) x {channels} channel(s) of {name} \
+             (max {per_in} patches per input, {per_out} per output)."
         );
     }
     0

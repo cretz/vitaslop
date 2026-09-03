@@ -222,15 +222,44 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
     // leaving "the browser ran out of memory" to be attributed from a stack trace: MEASURED,
     // one retail title reached 3,155 MB before transpiling a single instruction.
     let image_bytes = image_end.wrapping_sub(IMAGE_BASE) as usize;
-    tracing::warn!(
-        target: "vitaslop::link",
-        "link: image span {:.1} MB over {} modules ({:#x}..{:#x}), {:.1} MB of it in segments",
-        image_bytes as f64 / 1e6,
-        modules.len(),
-        IMAGE_BASE,
-        image_end,
-        modules.iter().flat_map(|m| &m.segments).map(|s| s.data.len()).sum::<usize>() as f64 / 1e6,
-    );
+    // WARN ONLY WHEN THERE IS SOMETHING TO FIX. The number above is a footprint, and a title
+    // whose modules pack tightly has a healthy one - 10.9 MB over 4 modules with 5.9 MB of it in
+    // segments is not a defect, and reporting it at `warn` claimed it was
+    // [[vitaslop-a-warning-means-we-owe-a-fix]]. What IS a defect is the GAP: the image is dense
+    // over the whole rebased span, so a module placed far above the last one costs its gap in
+    // real bytes that linear memory never gives back. That is the shape that reached 3,155 MB
+    // before a single instruction was transpiled, and it is worth shouting about.
+    const GAP_WARN_BYTES: usize = 64 * 1024 * 1024;
+    let segment_bytes: usize = modules.iter().flat_map(|m| &m.segments).map(|s| s.data.len()).sum();
+    let gap = image_bytes.saturating_sub(segment_bytes);
+    if gap >= GAP_WARN_BYTES {
+        tracing::warn!(
+            target: "vitaslop::link",
+            "link: image span {:.1} MB over {} modules ({:#x}..{:#x}) holds only {:.1} MB of \
+             segments, so {:.1} MB is GAP between rebased modules - allocated dense, and on a \
+             wasm32 host it comes out of the address space the transpiler shares and is never \
+             returned",
+            image_bytes as f64 / 1e6,
+            modules.len(),
+            IMAGE_BASE,
+            image_end,
+            segment_bytes as f64 / 1e6,
+            gap as f64 / 1e6,
+        );
+    } else {
+        tracing::info!(
+            target: "vitaslop::status",
+            "link: image span {:.1} MB over {} modules ({:#x}..{:#x}), {:.1} MB of it in \
+             segments ({:.1} MB gap, under the {} MB that would be a problem)",
+            image_bytes as f64 / 1e6,
+            modules.len(),
+            IMAGE_BASE,
+            image_end,
+            segment_bytes as f64 / 1e6,
+            gap as f64 / 1e6,
+            GAP_WARN_BYTES / (1024 * 1024),
+        );
+    }
     let mut image = vec![0u8; image_bytes];
     for m in &modules {
         for s in &m.segments {
@@ -364,13 +393,17 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         v
     };
     if !unnamed.is_empty() {
-        eprintln!(
+        tracing::warn!(
+            target: "vitaslop::link",
             "link: {} imported function NID(s) have no handler - the title will hard-fail if it \
              CALLS one. Look each up in the vitasdk NID db (db/360/*.yml) and implement it:",
             unnamed.len()
         );
         for (lib, func) in &unnamed {
-            eprintln!("  unhandled import: library_nid={lib:#010x} func_nid={func:#010x}");
+            tracing::warn!(
+                target: "vitaslop::link",
+                "  unhandled import: library_nid={lib:#010x} func_nid={func:#010x}"
+            );
         }
     }
 
@@ -496,6 +529,9 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         .enumerate()
         .filter_map(|(i, &(_, func_nid))| {
             crate::vita::inline_op(func_nid)
+                // No inline form, but a handler that can only continue: the real call, through
+                // the non-suspending trap. See `vita::fast_nid`.
+                .or_else(|| crate::vita::fast_nid(func_nid).then_some(vitaslop_transpiler::InlineOp::Fast))
                 .map(|op| vitaslop_transpiler::InlineImport { import: i as u32, op })
         })
         .collect();

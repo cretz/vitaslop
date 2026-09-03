@@ -604,6 +604,17 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 x.core_state_share(),
                 x.core_state_ops,
             );
+            // The low-bank NEON cache, statically: how often a vector operand on Q0..Q7
+            // came out of a local instead of a four-global gather or scatter.
+            tracing::info!(
+                target: "vitaslop::perf",
+                "neon low-bank cache: {} operand accesses served from a local against {} \
+                 quad gathers and {} write-backs (the uncached code did one gather per read \
+                 and one scatter per write)",
+                x.neon_cache_hits,
+                x.neon_cache_gathers,
+                x.neon_cache_writebacks,
+            );
             // >>> AND THE SPLIT OF THAT BOOKKEEPING, because the total names no fix. Three
             // unrelated mechanisms share it: the work counter (commits + fuel checks), the
             // guest-store dirty map, and the promotion cache. The commits-per-guest-
@@ -874,8 +885,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                 other = rest,
                 "decode gaps INSIDE lifted functions. Each one TRAPS if its path runs, so a                  gap here is a hole in ISA coverage, not a crash waiting to happen. The                  SIMD/VFP-space ones are listed below and are the ones worth implementing;                  the rest are overwhelmingly tentative discovery walking into data. Confirm                  each against the decoder at its real alignment before implementing it -                  several will already decode."
             );
+            // The headline above carries the COUNT at warn; the per-gap list is sixty lines on
+            // one title's default run and is a detail for whoever implements them:
+            // `VITASLOP_LOG=vitaslop::perf=debug`.
             for (addr, hw1, hw2) in likely {
-                tracing::warn!(
+                tracing::debug!(
                     target: "vitaslop::perf",
                     "  decode gap @ {addr:#010x}: hw1={hw1:#06x} hw2={hw2:#06x}"
                 );
@@ -1891,6 +1905,10 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                 })
             },
         )
+        .map_err(|e| RunError::Wasm(e.to_string()))?;
+    // The non-suspending trap is the same call here - see `abi::IMPORT_FAST_NAME`.
+    linker
+        .alias(abi::IMPORT_MODULE, abi::IMPORT_NAME, abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME)
         .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
 }

@@ -1,222 +1,235 @@
-@title  PCSE00120 - New Game: title screen, difficulty, opening movie, the Velvet Room, name entry
+@title  PCSE00120 - New Game: title screen, difficulty, both movies, the Velvet Room, name entry, the tarot reading, the intro cutscene
 @game   PCSE00120
 @shot-every 1000
 
 # WHAT THIS RECIPE PROVES
 # ----------------------
 # The title boots, reaches its title screen, starts a NEW GAME at NORMAL difficulty, plays
-# its two front-end movies, reaches the Velvet Room (Igor's dialogue), enters a name, and
-# goes on into the opening cutscene movie. Every screen along the way renders through the
-# recompiler (no fixed-function fallback), the title music and confirm sounds play, and the
-# movies decode.
+# its two front-end movies, reaches the Velvet Room, ENTERS A NAME, sits through Igor's
+# tarot reading and goes on into the opening cutscene movie. Every screen along the way
+# renders through the recompiler (no fixed-function fallback), the title music and confirm
+# sounds play, and both movies decode with their sound.
 #
 # THE ONE THING THAT COSTS A SESSION IF IT IS NOT WRITTEN DOWN: this title sits on a BLACK
-# screen forever with no input, looking perfectly healthy while it does. Every press below
-# is held 8 frames; the guest samples the pad once a display frame.
+# screen forever with no input, looking perfectly healthy while it does.
 #
-# WHERE THE SCREENS ARE (measured, shot every 200-400 frames):
-#   f2000  the boot notices (Vox Populi / PSN prompt) - a cross dismisses each
-#   f2400  the P4G logo splash, then the CRIWARE splash
-#   f3200  the yellow title screen; f3400 "PRESS ANY BUTTON"
-#   f3790  the main menu: NEW GAME / CONFIG / LOAD GAME / TV LISTINGS, NEW GAME selected
-#   f4400  the pre-game notices again, then the difficulty select (NORMAL preselected)
-#   f5900  "Start at NORMAL difficulty? Yes/No" - cross takes Yes
-#   f6500  "We hope you have fun with the game" text box, then the disclaimer
-#   f6900  the first movie (the truck in the fog), ~1,500 frames
-#   f8700  the opening anime movie (Margaret, Igor) - plays to the Velvet Room
-#   f14000 the Velvet Room: Igor's "guest with an intriguing destiny" dialogue
-#   f15700 name entry: the last name is filled with the preselected letter, START ends it
-#   f17900 the first name, START ends it, cross confirms "Proceed? Yes"
-#   f18100 Igor's tarot reading, then the scene fades to the intro cutscene movie
-#   f24000 the intro cutscene (the beach, the news desk, the train)
+# THIS FILE IS ON THE PACED TIMELINE. The display queue is bounded now, so the title runs at
+# its OWN 30 flips a second (its display callback waits TWO vblanks) instead of the 60 an
+# unbounded queue let it reach. Every frame number below belongs to that rate; a recipe
+# authored against the old one plays its inputs at roughly twice the speed the screens
+# arrive. The lead-in through the notices was re-timed through game time (a clock-mapping
+# script over the old recipe); everything from the name entry on was authored
+# by driving a resident `session` and MEASURING where each screen lands, because a clock
+# mapping cannot know that the movies now play at their true rate and so take longer.
 #
-# WHAT IS NOT RIGHT YET, and where the evidence is (working-area/agent-notes.md):
-#   - the Velvet Room's 3D backdrop composites BLACK behind the portraits; its draws replay
-#     to the right velvet blue in a capsule, so the loss is in a later draw of the frame.
-#   - the movies' sound depends on the stream-info fix of 2026-09-01c.
+# WHERE THE SCREENS ARE (measured, GPU shots from the session that authored the tail):
+#   f0995  the boot notices (Vox Populi / PSN prompt) - a cross dismisses each
+#   f1197  the P4G logo splash, then the CRIWARE splash
+#   f1703  the yellow title screen
+#   f1900  the main menu: NEW GAME / CONFIG / LOAD GAME / TV LISTINGS, NEW GAME selected
+#   f2815  the difficulty select (NORMAL preselected); a cross takes it, then Yes
+#   f3776  the first movie (the truck in the fog)
+#   f5040  the opening anime movie - plays into the Velvet Room
+#   f7063  the Velvet Room: Igor's "guest with an intriguing destiny" dialogue
+#   f7900  name entry, LAST name, with one letter already typed
+#   f8194  name entry, FIRST name
+#   f8262  "> Proceed?", then Yes
+#   f8458  back in the Velvet Room; the tarot reading starts
+#   f10234 the reading ("The Moon, in the upright position")
+#   f12604 the intro cutscene movie (the beach), f13000 the news desk, f13504 the train,
+#          f15904 the missing-persons broadcast
 #
-# THE PRESSES ARE A MASH THROUGH THE NOTICES, NOT A MINIMAL SEQUENCE. Which single press
-# first leaves each notice has not been bisected; `explore` over 300..900 is how.
+# HOW THE NAME ENTRY WORKS, because two probes read it as broken and it is not:
+#   - a DIRECTION press held 4 frames moves the keyboard cursor ONE cell. Held 8 it moves
+#     TWO: the title's input manager computes its own edges and auto-repeats at 7 frames
+#     delay / 3 frames interval, faithfully.
+#   - on the LAST-name screen `START End` is GREYED OUT. The field is left by FILLING its
+#     eight characters (or with R); the screen then advances to the first name on its own.
+#     `< L` and `R >` move the caret within the field, they do not switch fields.
+#   - on the FIRST-name screen START is lit and ENDS the name: it raises `> Proceed?`, a
+#     cross opens Yes/No, and a second cross takes Yes.
+#   A phone report of "the START button is greyed out" is the last-name screen, working.
+#
+# There is deliberately NO `@sig` and no `@assert`. No live-state address is known for this
+# title, and this run decodes two movies through the HOST's video and AAC decoders, so its
+# frames are not a cross-machine invariant. [[vitaslop-a-recipe-through-a-movie-is-not-a-render-oracle]]
 
-300: @section wake
-300: cross
-308:
-360: start
-368:
-420: circle
-428:
-480: cross
-488:
-540: start
-548:
+147: cross
+147: @section wake
+151: 
+176: start
+180: 
+206: circle
+210: 
+235: cross
+239: 
+264: start
+268: 
+441: cross
+441: @section settle
+445: 
+470: start
+474: 
+742: cross
+746: 
+772: start
+776: 
+944: @section title-screen
+995: @shot notices
+1197: cross
+1197: @shot logo
+1201: 
+1277: cross
+1281: 
+1433: cross
+1437: 
+1588: cross
+1592: 
+1703: @shot title-screen
+1744: cross
+1748: 
+1900: cross
+1900: @shot main-menu
+1904: 
+2056: cross
+2057: @section new-game
+2060: 
+2211: cross
+2215: 
+2367: cross
+2371: 
+2523: cross
+2527: 
+2679: cross
+2683: 
+2815: @shot difficulty
+2834: cross
+2838: 
+2990: cross
+2994: 
+3146: cross
+3150: 
+3302: cross
+3306: 
+3457: cross
+3461: 
+3523: @section movies
+3776: @shot movie-1
+4068: cross
+4072: 
+4376: cross
+4380: 
+5040: @shot movie-2
+7012: @section velvet-room
+7063: @shot velvet-room
+7110: cross
+7114: 
+7215: cross
+7219: 
+7320: cross
+7324: 
+7426: cross
+7430: 
+7531: cross
+7535: 
+7636: cross
+7640: 
+7741: cross
+7745: 
+7846: cross
+7850: 
+7900: right
 
-900: @section settle
-900: cross
-908:
-960: start
-968:
-1500: cross
-1508:
-1560: start
-1568:
+7900: @section name-entry
+7900: @shot name-entry
+7904: 
+7924: cross
+7928: 
+7948: right
+7952: 
+7964: cross
+7968: 
+7988: rtrigger
+7992: 
+8032: rtrigger
+8044: 
+8104: cross
+8108: 
+8118: cross
+8122: 
+8132: cross
+8136: 
+8146: cross
+8150: 
+8160: cross
+8164: 
+8194: start
+8194: @shot first-name
+8202: 
+8262: cross
+8262: @shot proceed
+8270: 
+8330: cross
+8338: 
+8458: cross
+8458: @shot name-confirmed
+8466: 
 
-1900: @section title-screen
-2000: @shot notices
-2400: cross
-2400: @shot logo
-2408:
-2558: cross
-2566:
-2866: cross
-2874:
-3174: cross
-3182:
-3400: @shot title-screen
-3482: cross
-3490:
-3790: @shot main-menu
-3790: cross
-3798:
-
-4100: @section new-game
-4098: cross
-4106:
-4406: cross
-4414:
-4714: cross
-4722:
-5022: cross
-5030:
-5330: cross
-5338:
-5600: @shot difficulty
-5638: cross
-5646:
-5946: cross
-5954:
-6254: cross
-6262:
-6562: cross
-6570:
-6870: cross
-6878:
-
-7000: @section movies
-7500: @shot movie-1
-8078: cross
-8086:
-8686: cross
-8694:
-10000: @shot movie-2
-
-13900: @section velvet-room
-14000: @shot velvet-room
-14094: cross
-14102:
-14302: cross
-14310:
-14510: cross
-14518:
-14718: cross
-14726:
-14926: cross
-14934:
-15134: cross
-15142:
-15342: cross
-15350:
-15550: cross
-15558:
-
-15700: @section name-entry
-15700: @shot name-entry
-15758: start
-15766:
-15966: cross
-15974:
-16074: start
-16082:
-16282: cross
-16290:
-16490: cross
-16498:
-16698: cross
-16706:
-17006: cross
-17014:
-17314: cross
-17322:
-17622: cross
-17630:
-17930: start
-17938:
-18138: cross
-18146:
-18300: @shot name-confirmed
-
-18346: @section tarot
-18346: cross
-18354:
-18654: cross
-18662:
-18962: cross
-18970:
-19270: cross
-19278:
-19578: cross
-19586:
-19886: cross
-19894:
-20194: cross
-20202:
-20442: cross
-20450:
-20690: cross
-20698:
-20938: cross
-20946:
-21186: cross
-21194:
-21434: cross
-21442:
-21682: cross
-21690:
-21930: cross
-21938:
-22178: cross
-22186:
-22426: cross
-22434:
-22674: cross
-22682:
-22922: cross
-22930:
-23170: cross
-23178:
-23418: cross
-23426:
-23666: cross
-23674:
-23914: cross
-23922:
-
-24000: @section intro-movie
-24500: @shot intro-movie
-24762: cross
-24770:
-25170: cross
-25178:
-25578: cross
-25586:
-25986: cross
-25994:
-26394: cross
-26402:
-26802: cross
-26810:
-27210: cross
-27218:
-28000: @shot after-intro
-
-# @todo A live-state address (the difficulty index, or the name buffer) and a real `@assert`.
-# @todo Walk past the intro cutscene into the first playable scene.
+8556: @section tarot
+8556: cross
+8564: 
+8654: cross
+8662: 
+8752: cross
+8760: 
+8850: cross
+8858: 
+8948: cross
+8956: 
+9046: cross
+9054: 
+9144: cross
+9152: 
+9242: cross
+9250: 
+9340: cross
+9348: 
+9438: cross
+9446: 
+9536: cross
+9544: 
+10234: @shot tarot
+10834: cross
+10842: 
+10952: cross
+10960: 
+11070: cross
+11078: 
+11188: cross
+11196: 
+11306: cross
+11314: 
+11424: cross
+11432: 
+11542: cross
+11550: 
+11660: cross
+11668: 
+11778: cross
+11786: 
+11896: cross
+11904: 
+12014: cross
+12022: 
+12132: cross
+12140: 
+12250: cross
+12258: 
+12368: cross
+12376: 
+12486: cross
+12494: 
+12604: @section intro-movie
+12604: @shot intro-movie
+13504: @shot intro-movie-train
+15904: @shot after-intro

@@ -1160,6 +1160,13 @@ pub struct FileTable {
     /// file.
     backed: std::collections::HashMap<String, usize>,
     backing: Option<Box<dyn FileBacking>>,
+    /// Read-only PSARC archives found among the title's own files, mounted so that a
+    /// path INSIDE one resolves as an ordinary file. See [`crate::psarc`] for why a
+    /// system module's open needs this when the title's own asset loading does not.
+    archives: Vec<crate::psarc::Psarc>,
+    /// Normalised key -> (archive, entry). Consulted only after `files` and `backed`
+    /// have missed, so an archive can never shadow a real file.
+    archived: std::collections::HashMap<String, (usize, usize)>,
     /// Original (as-added) spelling per lowercased key, so a directory listing can
     /// return real mixed-case names for a title's own glob matching. Lookup stays
     /// case-insensitive through the lowercased `files` key.
@@ -1444,6 +1451,8 @@ impl FileTable {
             self.backed.insert(key, n);
         }
         self.backing = Some(backing);
+        let keys: Vec<String> = self.backed.keys().cloned().collect();
+        self.mount_archives(&keys);
     }
 
     /// Mark the persisted set as changed, if `key` is part of it.
@@ -1466,14 +1475,84 @@ impl FileTable {
         self.dirty = false;
     }
 
-    /// Whether `key` exists at all - resident or served by the backing.
+    /// Whether `key` exists at all - resident, served by the backing, or inside a
+    /// mounted archive.
     fn has(&self, key: &str) -> bool {
-        self.files.contains_key(key) || self.backed.contains_key(key)
+        self.files.contains_key(key)
+            || self.backed.contains_key(key)
+            || self.archived.contains_key(key)
     }
 
     /// Length of `key`, wherever it lives.
     fn byte_len(&self, key: &str) -> Option<usize> {
-        self.files.get(key).map(|d| d.len()).or_else(|| self.backed.get(key).copied())
+        self.files
+            .get(key)
+            .map(|d| d.len())
+            .or_else(|| self.backed.get(key).copied())
+            .or_else(|| self.archived_entry(key).map(|(_, e)| e.size as usize))
+    }
+
+    /// The archive and entry serving `key`, if one does.
+    fn archived_entry(&self, key: &str) -> Option<(&crate::psarc::Psarc, &crate::psarc::Entry)> {
+        let &(a, e) = self.archived.get(key)?;
+        let archive = self.archives.get(a)?;
+        Some((archive, archive.entries.get(e)?))
+    }
+
+    /// Mount every `.psarc` among the keys just installed.
+    ///
+    /// Called from the two places a title's files arrive - [`FileTable::set_backing`] for a
+    /// lazily-served container and `add_file` for a resident one - so both front ends get
+    /// this without either having to ask for it, and both get it BEFORE the guest runs.
+    ///
+    /// A refusal is reported and otherwise ignored: the archive stays what it already was,
+    /// an opaque file the title reads for itself.
+    fn mount_archives(&mut self, keys: &[String]) {
+        for key in keys {
+            if !key.ends_with(".psarc") || self.archives.iter().any(|a| a.key == *key) {
+                continue;
+            }
+            // The archive's own bytes are read back through this table, which is what lets
+            // the browser serve a 1.6 GB container out of OPFS without ever holding it.
+            let read = |off: usize, len: usize| self.read_range(key, off, len);
+            let parsed = match crate::psarc::Psarc::parse(key, &read) {
+                Ok(p) => p,
+                Err(reason) => {
+                    tracing::warn!(
+                        target: "vitaslop::io",
+                        %reason,
+                        "a .psarc file could not be mounted, so any path INSIDE it stays \
+                         invisible to a system module that opens by path (the title's own \
+                         asset loading is unaffected - it reads the archive itself)"
+                    );
+                    continue;
+                }
+            };
+            let idx = self.archives.len();
+            let mut mounted = 0usize;
+            let mut shadowed = 0usize;
+            for (i, entry) in parsed.entries.iter().enumerate() {
+                let ekey = vfs_key(&entry.name);
+                // Resident and backed files win: an archive is the LAST place a path
+                // resolves, so mounting one can never change what an existing path means.
+                if self.files.contains_key(&ekey) || self.backed.contains_key(&ekey) {
+                    shadowed += 1;
+                    continue;
+                }
+                self.originals.entry(ekey.clone()).or_insert_with(|| entry.name.clone());
+                self.archived.insert(ekey, (idx, i));
+                mounted += 1;
+            }
+            tracing::info!(
+                target: "vitaslop::status",
+                archive = %key,
+                files = mounted,
+                shadowed,
+                "psarc mounted: its files now resolve by path, so a system module that opens \
+                 one on the title's behalf (sceMp4OpenFile) reads the same bytes the device does"
+            );
+            self.archives.push(parsed);
+        }
     }
 
     /// Read `[start, start+len)` of `key`, clamped to its end. Serves a resident file
@@ -1485,12 +1564,27 @@ impl FileTable {
             let end = (start + len).min(data.len());
             return Some(data[start..end].to_vec());
         }
-        let size = *self.backed.get(key)?;
-        let backing = self.backing.as_ref()?;
+        if let Some(&size) = self.backed.get(key) {
+            let backing = self.backing.as_ref()?;
+            let start = start.min(size);
+            let end = (start + len).min(size);
+            let mut out = vec![0u8; end - start];
+            let got = backing.read_at(key, start, &mut out);
+            out.truncate(got);
+            return Some(out);
+        }
+        // Last: a file that only exists inside a mounted archive. The archive's own bytes
+        // come back through this same function - one level down, never two, because an
+        // archive inside an archive is not mounted (its key is not among the ones
+        // `mount_archives` was handed).
+        let (archive, entry) = self.archived_entry(key)?;
+        let size = entry.size as usize;
         let start = start.min(size);
         let end = (start + len).min(size);
         let mut out = vec![0u8; end - start];
-        let got = backing.read_at(key, start, &mut out);
+        let idx = self.archived.get(key)?.1;
+        let inner = |off: usize, n: usize| self.read_range(&archive.key, off, n);
+        let got = archive.read_entry(idx, start, &mut out, &inner);
         out.truncate(got);
         Some(out)
     }
@@ -1511,13 +1605,16 @@ impl FileTable {
     /// savedata, which they create, not the assets they shipped).
     fn make_resident(&mut self, key: &str) -> &mut Vec<u8> {
         if !self.files.contains_key(key) {
-            let bytes = if self.backed.contains_key(key) {
-                let n = self.backed[key];
-                self.read_range(key, 0, n).unwrap_or_default()
-            } else {
-                Vec::new()
+            // A backed file and an archived one both fault in whole; only a key that
+            // exists nowhere starts empty.
+            let bytes = match self.byte_len(key) {
+                Some(n) if self.backed.contains_key(key) || self.archived.contains_key(key) => {
+                    self.read_range(key, 0, n).unwrap_or_default()
+                }
+                _ => Vec::new(),
             };
             self.backed.remove(key);
+            self.archived.remove(key);
             self.files.insert(key.to_string(), bytes);
         }
         self.files.get_mut(key).expect("just inserted")
@@ -1686,6 +1783,13 @@ impl FileTable {
             .chain(
                 self.backed.iter().filter(|(k, _)| !self.files.contains_key(*k)).map(|(k, n)| (k, *n)),
             )
+            // A file inside a mounted archive lists like any other: a title that
+            // enumerates a directory to find its assets must see the same names the
+            // device's own archive layer would hand it. See [`crate::psarc`].
+            .chain(self.archived.iter().filter_map(|(k, &(a, e))| {
+                let size = self.archives.get(a)?.entries.get(e)?.size as usize;
+                Some((k, size))
+            }))
             .collect();
         for (k, len) in entries {
             let Some(rest) = k.strip_prefix(&prefix) else { continue };
@@ -6841,6 +6945,12 @@ impl VitaState {
         self.fs.originals.insert(key.clone(), strip_app0(path).trim_start_matches('/').to_string());
         self.fs.files.insert(key.clone(), bytes);
         self.fs.touch(&key);
+        // An archive arrives as an ordinary file, so this is where a resident one is
+        // mounted. `mount_archives` ignores a key it has already seen, so re-adding a file
+        // does not re-parse it. See [`crate::psarc`].
+        if key.ends_with(".psarc") {
+            self.fs.mount_archives(&[key]);
+        }
     }
 
     /// Serve the guest's read-only files from `backing` instead of loading them.
@@ -7027,6 +7137,22 @@ impl VitaState {
     pub fn fios_overlay_add(&mut self, mut overlay: FiosOverlay) -> i32 {
         let id = FIOS_OVERLAY_ID_BASE + self.fios_overlays.len() as i32;
         overlay.id = id;
+        // SAY THAT A PATH REMAP EXISTS. Overlays are consulted ONLY by the FIOS2 resolve NIDs;
+        // a raw `sceIoOpen` does not apply them. So a title that registers one and then opens a
+        // remapped path through some OTHER system module gets a miss here that hardware would
+        // resolve - and the miss is silent everywhere except in whatever that module reports.
+        // One title's intro movie opens `data/Videos/intro.mp4` through SceMp4 and fails
+        // (`0x80010002`) while all of its other assets load, which is exactly that shape.
+        // Listing the overlays makes it checkable instead of theoretical.
+        tracing::info!(
+            target: "vitaslop::status",
+            id,
+            order = overlay.order,
+            kind = overlay.kind,
+            dst = %overlay.dst,
+            src = %overlay.src,
+            "fios overlay registered (a path REMAP; raw sceIoOpen does NOT apply these)"
+        );
         let at = self
             .fios_overlays
             .iter()
@@ -10123,7 +10249,8 @@ impl VitaState {
             }
             let key = (old.data_addr.min(new.data_addr), old.data_addr.max(new.data_addr));
             if self.reported_surface_overlaps.insert(key) {
-                eprintln!(
+                tracing::warn!(
+                    target: "vitaslop::gxm",
                     "gxm surface: colour surfaces {:#x} ({}x{} stride {}, >= {} bytes) and {:#x} \
                      ({}x{} stride {}, >= {} bytes) OVERLAP in guest memory even at ONE byte per \
                      pixel - they cannot both hold their pixels, so either the guest aliases them \
@@ -10609,7 +10736,8 @@ impl VitaState {
         if gamma != 0 {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
+                tracing::info!(
+                    target: "vitaslop::status",
                     "gxm texture: sceGxmTextureSetGammaMode({texture_addr:#x}, {gamma:#x}) - \
                      this texture is sampled through an sRGB format, so its texels are decoded \
                      on fetch as the hardware does"
@@ -10660,7 +10788,8 @@ impl VitaState {
     pub fn set_color_surface_gamma(&mut self, surface_addr: u32, gamma: u32) {
         if gamma != 0 && self.color_surface_gamma.iter().all(|(a, _)| *a != surface_addr) {
             {
-                eprintln!(
+                tracing::info!(
+                    target: "vitaslop::status",
                     "gxm surface: sceGxmColorSurfaceSetGammaMode({surface_addr:#x}, {gamma:#x}) - \
                      writes to this surface are sRGB-encoded after blending, as the hardware \
                      does; the renderer reports which view it actually rendered through."
@@ -11117,7 +11246,8 @@ impl VitaState {
         if n > 4 && !n.is_power_of_two() && n % 50 != 0 {
             return;
         }
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm precompile: precomputed states name {} distinct vertex + {} distinct fragment \
              programs ({} states) by frame {}",
             self.precomputed_state_vertex_headers.len(),
@@ -13049,7 +13179,8 @@ impl VitaState {
         if vertex_header != 0 || fragment_header == 0 || SEEN.swap(true, Ordering::Relaxed) {
             return;
         }
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm precompile: this title creates fragment programs with a NULL vertexProgram (first \
              at frag {fragment_header:#x}), so sceGxmShaderPatcherCreateFragmentProgram names no \
              shader PAIR and none can be compiled ahead of the draw that binds it. The WGSL \
@@ -13152,7 +13283,10 @@ impl VitaState {
         if n > 4 && !n.is_power_of_two() && n % 10 != 0 {
             return;
         }
-        eprintln!(
+        // Status, not stderr: this is the count that answered the cross-product question,
+        // and it belongs in the panel's STATUS section, not on a clean run's console.
+        tracing::info!(
+            target: "vitaslop::status",
             "gxm precompile: {v} vertex + {f} NULL-paired fragment programs created by frame {}",
             self.cur_frame
         );
@@ -14334,7 +14468,8 @@ fn report_present_no_scene_rendered(buffer_addr: u32, cap: &crate::capture::Capt
             None => "none".to_string(),
         })
         .collect();
-    eprintln!(
+    tracing::warn!(
+        target: "vitaslop::display",
         "display: the guest PRESENTED {buffer_addr:#x}, which no GXM scene of this frame \
          rendered into - the frame's colour surfaces are [{}]. The renderer composes the \
          picture from the scenes, so whatever is in that buffer (a movie's decoded picture is \
@@ -14387,7 +14522,8 @@ fn report_texture_resolved_from_control_words(unit: u32, base_format: u32, swizz
     if !g.get_or_insert_with(HashSet::new).insert((base_format, swizzle)) {
         return;
     }
-    eprintln!(
+    tracing::info!(
+        target: "vitaslop::status",
         "gxm texture: unit {unit} bound a texture with NO recorded format - resolving it from \
          its control words alone as base format {base_format:#04x}, swizzle {swizzle}. This is a \
          copy of a texture initialised elsewhere."

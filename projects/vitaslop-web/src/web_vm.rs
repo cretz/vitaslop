@@ -207,6 +207,14 @@ impl WebVm {
         let env_obj = Object::new();
         Reflect::set(&env_obj, &JsValue::from_str(abi::SVC_NAME), svc_closure.as_ref())?;
         Reflect::set(&env_obj, &JsValue::from_str(abi::IMPORT_NAME), import_closure.as_ref())?;
+        // >>> THE NON-SUSPENDING TRAP IS AN IMPORT EVERY EMITTED MODULE DECLARES.
+        //
+        // `env.import_fast` (the game path's plain-function trap for host calls that never
+        // block) was added to the emitted module and the game engine, and not here - so every
+        // browser conformance case failed at `WebAssembly.Instance` with "Import #3
+        // import_fast: function import requires a callable", and nothing ran that suite until
+        // CI did. This VM has no fast/slow distinction: both names take the one handler.
+        Reflect::set(&env_obj, &JsValue::from_str(abi::IMPORT_FAST_NAME), import_closure.as_ref())?;
         Reflect::set(&env_obj, &JsValue::from_str(abi::DISPATCH_MISS_NAME), dispatch_miss_closure.as_ref())?;
         let imports = Object::new();
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env_obj)?;

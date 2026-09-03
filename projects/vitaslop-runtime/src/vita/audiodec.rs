@@ -116,7 +116,12 @@ pub struct AudiodecState {
     /// One-shot reports.
     reported_open: bool,
     reported_starved: bool,
-    reported_out_of_order: bool,
+    reported_resync: bool,
+    /// Decoded audio frames discarded to keep the queue in step with the title's own access
+    /// unit. Counted for the whole run even though the report fires once - a single resync
+    /// behind a slow decoder start and a run that resyncs constantly are different faults.
+    /// The panel reads the same figure from `video::audio_counters`.
+    pub resynced_frames: u64,
 }
 
 /// One decoder the title created.
@@ -244,11 +249,11 @@ pub(crate) fn do_create_decoder_external(
     ctx.write_u32(ctrl_addr + ctrl::WORD_LENGTH, 16);
     if !st.audiodec.reported_open {
         st.audiodec.reported_open = true;
-        // WARN and unconditional, like the video path's first-picture line: it is the one
-        // line that says a movie's SOUND was set up at all, and a device's default log
-        // level is `warn`.
-        tracing::warn!(
-            target: "vitaslop::movie",
+        // STATUS, like the video path's first-picture line: it is the one line that says a
+        // movie's SOUND was set up at all, and the panel's STATUS section carries it on every
+        // engine. It is not a warning, so it is not on a clean run's console.
+        tracing::info!(
+            target: "vitaslop::status",
             channels, sample_rate, is_adts, is_sbr,
             "sceAudiodecCreateDecoderExternal: the title opened an AAC decoder for a movie"
         );
@@ -612,31 +617,47 @@ pub(crate) fn do_decode(ctx: &mut GuestCtx, st: &mut VitaState, p_ctrl: Ptr) -> 
     let pcm_dest = ctx.read_u32(ctrl_addr + ctrl::P_PCM);
     let max_pcm = ctx.read_u32(ctrl_addr + ctrl::MAX_PCM_SIZE);
 
-    // The frame the demuxer decoded ahead, and the access unit it came from.
-    let Some(frame) = crate::vita::video::take_decoded_audio(st) else {
-        // Nothing decoded ahead. On a host with no decoder that is every frame, and on a
-        // browser it can be the first frame or two of a movie while the decoder fills.
-        // Reported once, and answered with a frame of silence rather than with a failure:
-        // the title stops playing the movie's sound entirely on a negative result.
+    // >>> THE FRAME FOR THE UNIT THE TITLE IS DECODING - not merely the oldest one queued.
+    // The queue identifies every frame by a hash of the access unit it was cut from, and the
+    // same hash over the elementary stream the title passed names the frame it wants. Frames
+    // older than that one are units the title has moved past (a starved call serves silence
+    // without popping, and the title consumes the unit regardless) and are discarded; a unit
+    // that is not queued yet is answered with silence and NOTHING is discarded. See
+    // `take_decoded_audio` for why both halves matter.
+    let es_offered = ctx.read_u32(ctrl_addr + ctrl::INPUT_ES_SIZE);
+    // Whatever the decoder answered since the last handover is collected first: on a browser
+    // it answers on a task, and the task ran between then and now.
+    crate::vita::video::collect_decoded_audio(st);
+    let taken = if es != 0 {
+        crate::vita::video::take_decoded_audio(st, |len| {
+            let bytes = ctx.read_bytes(es, len as usize);
+            crate::vita::video::unit_id(&bytes)
+        })
+    } else {
+        None
+    };
+    let Some((frame, resynced)) = taken else {
+        // Nothing decoded for this unit. On a host with no decoder that is every frame, and
+        // on a browser it can be the first frame or two of a movie while the decoder fills.
+        // Reported once and counted always, and answered with a frame of silence rather than
+        // with a failure: the title stops playing the movie's sound entirely on a negative
+        // result.
         report_starved(st);
         let bytes = max_pcm.min(1024 * 2 * channels.max(1)) as usize;
         if pcm_dest != 0 && bytes > 0 {
             ctx.write_bytes(pcm_dest, &vec![0u8; bytes]);
         }
         ctx.write_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE, bytes as u32);
-        ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, ctx.read_u32(ctrl_addr + ctrl::MAX_ES_SIZE));
+        // Consumed: what the title offered. A raw AAC unit is one frame, so the title
+        // offers exactly the unit and that is what a decoder that decoded it would report.
+        // The buffer's capacity (`maxEsSize`) is the fallback for a title that offers
+        // nothing, and would over-advance a title that keeps several units in one buffer.
+        let consumed = if es_offered != 0 { es_offered } else { ctx.read_u32(ctrl_addr + ctrl::MAX_ES_SIZE) };
+        ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, consumed);
         return 0;
     };
-
-    // >>> THE ONE CHECK THAT KEEPS THE QUEUE HONEST. The frames are served in the order the
-    // units were handed over, which is only right if the title consumes them in that order
-    // too. It does - a demux thread feeding a decode thread - and if it ever does not, this
-    // says so instead of playing the wrong audio silently.
-    if es != 0 && frame.es_head != 0 {
-        let head = ctx.read_u32(es);
-        if head != frame.es_head {
-            report_out_of_order(st, head, frame.es_head);
-        }
+    if resynced > 0 {
+        report_resynced(st, resynced);
     }
 
     let mut bytes: Vec<u8> = Vec::with_capacity(frame.samples.len() * 2);
@@ -654,8 +675,8 @@ pub(crate) fn do_decode(ctx: &mut GuestCtx, st: &mut VitaState, p_ctrl: Ptr) -> 
     if let Some(session) = st.audiodec.session(handle) {
         session.delivered += 1;
         if session.delivered == 1 {
-            tracing::warn!(
-                target: "vitaslop::movie",
+            tracing::info!(
+                target: "vitaslop::status",
                 channels, sample_rate,
                 samples = frame.samples.len(),
                 "the movie's FIRST AUDIO FRAME reached guest memory"
@@ -721,30 +742,49 @@ fn report_unsupported_codec(st: &mut VitaState, codec_type: u32) {
 
 /// Say, once, that the guest asked for a frame the decoder had not produced.
 fn report_starved(st: &mut VitaState) {
+    crate::vita::video::audio_counters::STARVED_CALLS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if st.audiodec.reported_starved {
+        return;
+    }
+    // >>> A STARVE BEFORE THE FIRST FRAME IS THE PIPELINE FILLING, NOT A DEFECT.
+    //
+    // Every movie's first call or two arrives before the host decoder has answered, and
+    // reporting that made a clean run carry a warning about silence it played over
+    // correctly. A starve AFTER sound has been delivered is the real gap - the ring ran
+    // dry mid-movie - and that is the one worth a line. A host with no decoder at all
+    // never delivers, and is reported where the decoder is opened, not here.
+    if !st.audiodec.sessions.iter().any(|s| s.delivered > 0) {
         return;
     }
     st.audiodec.reported_starved = true;
     tracing::warn!(
         target: "vitaslop::movie",
-        "sceAudiodecDecode: no decoded frame was ready, so this one is SILENCE. On a host \
-         with no AAC decoder that is every frame of the movie; otherwise it is the decoder \
-         filling, and it should not repeat once playback has settled."
+        "sceAudiodecDecode: no decoded frame was ready, so this one is SILENCE - a gap in \
+         the movie's sound after it had started. The decoder fell behind the title's \
+         calls; see the movie audio line in the panel for how often."
     );
 }
 
-/// Say, once, that the title consumed audio units in a different order than they were
-/// handed over - which would make the queue serve the wrong frame.
-fn report_out_of_order(st: &mut VitaState, guest_head: u32, ours: u32) {
-    if st.audiodec.reported_out_of_order {
+/// Say, once, how much decoded sound was discarded to put the queue back in step with the
+/// access unit the title is actually decoding.
+///
+/// This is a REPAIR, not a defect, but it is sound the movie does not have any more, so it
+/// says so: a run that resyncs once has lost a frame or two behind a slow decoder start, and
+/// a run that reports a large figure is starving repeatedly and the decoder is the problem.
+fn report_resynced(st: &mut VitaState, dropped: u64) {
+    st.audiodec.resynced_frames += dropped;
+    if st.audiodec.reported_resync {
         return;
     }
-    st.audiodec.reported_out_of_order = true;
-    tracing::error!(
+    st.audiodec.reported_resync = true;
+    tracing::warn!(
         target: "vitaslop::movie",
-        guest = format_args!("{guest_head:#010x}"), ours = format_args!("{ours:#010x}"),
-        "sceAudiodecDecode: the elementary stream the title passed is not the access unit \
-         the queued frame was decoded from. The audio served from here is out of step with \
-         the picture."
+        dropped,
+        "sceAudiodecDecode: the decoded-audio queue had fallen behind the access unit the \
+         title is decoding (a starved call serves silence without popping, and the title \
+         moves on regardless). The stale frames were discarded so the sound tracks the \
+         picture again - that much of the movie's sound is missing. See take_decoded_audio."
     );
 }
+

@@ -1136,6 +1136,40 @@ fn parse_fragment_interpolants(bytes: &[u8]) -> Result<Vec<Interpolant>, &'stati
                 }
                 None
             }
+            // A PREFETCH-ONLY descriptor that states NO WIDTH says it once, in `attribute_info`.
+            //
+            // `component_info` describes the ITERATED components - their precision, their count,
+            // and its redundant copy of the prefetch bit. A descriptor whose semantic nibble is
+            // 0xF iterates nothing and, when `size` carries no width bits either, the whole word
+            // is zero: there is no component for it to describe. Reading that structural zero as
+            // a CONTRADICTION threw away the program's entire interpolant list (the parse is
+            // all-or-nothing), and the recompiler then refused every draw of the pair.
+            //
+            // MEASURED across 331 captured blobs from five titles: this shape is 3 descriptors,
+            // all `size=0x00, component_info=0x00`, and EVERY descriptor that sets
+            // `COMPONENT_INFO_PREFETCH` also sets `SIZE_PREFETCH`. So the cross-check is intact
+            // for every shape the corpus contains; this is the one it never contained.
+            //
+            // CLOSURE settles the reading, as it did for bit 7 above. The program this was found
+            // on declares `primary_reg_count = 1`, its one descriptor iterates nothing
+            // (`register_count = 0`), and its only instruction is a four-component `CopyFx8` of
+            // `PrimaryAttr[0]` - four 8-bit channels packed in ONE register. A single-register
+            // prefetch at `pa_base + 0` closes the count exactly AND covers the register the
+            // program reads; at two registers it would overrun, which closure refuses.
+            //
+            // The guard is deliberately narrow: prefetch-only, no width bits, and a wholly zero
+            // `component_info`. Any other disagreement still refuses, because binding a wrong PA
+            // map paints a silently wrong picture.
+            [true, false] if prefetch_only && size == 0 && component_info == 0 => {
+                if source > MAX_TEXCOORD as u32 || resource_index > u8::MAX as u32 {
+                    return Err("a prefetch descriptor names an out-of-range texcoord or unit");
+                }
+                Some(SamplePrefetch {
+                    unit: resource_index as u8,
+                    source_texcoord: source as u8,
+                    last: attribute_info & INFO_PREFETCH_LAST != 0,
+                })
+            }
             [true, true] => {
                 if source > MAX_TEXCOORD as u32 || resource_index > u8::MAX as u32 {
                     return Err("a prefetch descriptor names an out-of-range texcoord or unit");

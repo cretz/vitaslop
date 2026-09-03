@@ -14,13 +14,14 @@ import init, {
   worker_input_key,
   worker_input_pointer,
   worker_input_stick,
+  worker_set_paused,
   worker_location_fix,
   worker_location_error,
   worker_location_unavailable,
   worker_location_note,
   flush_game_data,
 } from "./pkg/vitaslop_web.js";
-import { openTitleSync, syncReader } from "./opfs.js";
+import { openTitleCached } from "./opfs.js";
 import * as gamedata from "./gamedata.js";
 
 // >>> THE SYSTEM FONT, IF THE DEPLOYMENT SUPPLIES ONE.
@@ -36,18 +37,27 @@ import * as gamedata from "./gamedata.js";
 // from the page: drop any TTF/OTF at `web/system-font.ttf` and it is used. A 404 is a NORMAL
 // outcome, not an error - the run then reports the refusal and shows no dynamic text, exactly
 // as a device with no font installed would.
+// >>> A RUN NOTE: onto the page's diagnostics panel always, onto the console only under
+// `VITASLOP_CONSOLE=1`. The product page's console is EMPTY on a clean run; every line a
+// normal run used to log is a status note and lives in the panel instead.
+let consoleOn = false;
+const note = (text) => {
+  if (consoleOn) console.log(text);
+  self.postMessage({ type: "note", text });
+};
+
 async function loadSystemFont() {
   try {
     const res = await fetch("./system-font.ttf", { cache: "force-cache" });
     if (!res.ok) {
-      console.log("[font] no web/system-font.ttf - the title's dynamic text will be BLANK");
+      note("[font] no web/system-font.ttf - the title's dynamic text will be BLANK");
       return;
     }
     const bytes = new Uint8Array(await res.arrayBuffer());
     set_system_font(bytes);
-    console.log(`[font] system-font substitute loaded, ${bytes.length} bytes`);
+    note(`[font] system-font substitute loaded, ${bytes.length} bytes`);
   } catch (err) {
-    console.log(`[font] system-font substitute not loaded (${err}); dynamic text will be BLANK`);
+    note(`[font] system-font substitute not loaded (${err}); dynamic text will be BLANK`);
   }
 }
 
@@ -90,7 +100,8 @@ if (typeof navigator !== "undefined" && navigator.gpu && !navigator.gpu.__vitasl
       // and every view, bind group and render pass built on it cascades into nothing - which
       // arrives on screen as BLACK, with the cause 4,000 validation errors upstream.
       globalThis.__vitaslopWebgpuCompat = true;
-      console.log(
+      // A warning, not a note: this is a degraded mode a person should know they are in.
+      console.warn(
         "[gpu] no ordinary WebGPU adapter (this driver is likely blocklisted); " +
           "running on a COMPATIBILITY-MODE adapter instead"
       );
@@ -163,6 +174,12 @@ self.onmessage = async (e) => {
     worker_input_stick(d.stick, d.x, d.y, d.active);
     return;
   }
+  // The page's hard pause (tab hidden / window blurred) - see live.html. The live loop
+  // reads it at the top of every tick and runs no guest frame while it is set.
+  if (d.type === "pause") {
+    worker_set_paused(!!d.paused);
+    return;
+  }
 
   // Position from the page's watchPosition (see web/location.js). `navigator.geolocation`
   // is Window-only, so the page owns the API and this worker only receives its answers.
@@ -230,16 +247,19 @@ self.onmessage = async (e) => {
     await ready;
     // A worker is its own wasm instance, so it needs the knobs set here, not on the page.
     for (const [k, v] of Object.entries(knobs || {})) set_knob(k, String(v));
+    consoleOn = String((knobs || {}).VITASLOP_CONSOLE ?? "") === "1";
     await loadSystemFont();
     // Forward each (id, text) metric the run publishes to the page.
     const report = (id, text) => self.postMessage({ type: "report", id, text });
-    // Sync access handles can only be opened here (Workers only) and only
-    // asynchronously - which is precisely why it happens now, before any guest code
-    // runs. Once open, every read the emulator makes is a plain synchronous call, which
-    // is what a guest file read inside a host call requires.
+    // The title's files are opened on a STORAGE WORKER (see storage-worker.js), which
+    // serves them into a shared page ring and reads ahead between requests. That open is
+    // asynchronous, which is why it happens now, before any guest code runs. Once it is
+    // up, every read the emulator makes is a plain synchronous call - out of shared memory
+    // on a hit, one `Atomics.wait` on a miss - which is what a guest file read inside a
+    // host call requires.
     let source;
     if (titleId) {
-      source = { kind: "opfs", payload: syncReader(await openTitleSync(titleId)) };
+      source = { kind: "opfs", payload: await openTitleCached(titleId) };
     } else if (files) {
       source = { kind: "memory", payload: files };
     } else {
@@ -257,7 +277,7 @@ self.onmessage = async (e) => {
     let persist;
     if (titleId) {
       const stored = await gamedata.read(titleId);
-      if (stored) console.log(`[gamedata] restoring ${stored.length} bytes for ${titleId}`);
+      if (stored) note(`[gamedata] restoring ${stored.length} bytes for ${titleId}`);
       saveSink = gamedata.sink(titleId, (err) => {
         // The emulator reports the failure on the diagnostics panel; this reaches the page's
         // status line as well, because losing progress is not a console-only event.

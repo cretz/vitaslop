@@ -50,7 +50,10 @@
 /// ascending-address order. A wasmtime backtrace's "wasm function N" is a module
 /// index that counts these imports, so mapping it back to a guest function is
 /// `funcs[N - IMPORT_FUNC_COUNT]`.
-pub const IMPORT_FUNC_COUNT: u32 = 3;
+///
+/// Four since the NON-SUSPENDING host trap [`IMPORT_FAST_NAME`] was added (it is the
+/// last import, so the three before it keep their indices).
+pub const IMPORT_FUNC_COUNT: u32 = 4;
 
 /// Number of general-purpose ARM registers (r0..r15).
 pub const REG_COUNT: usize = 16;
@@ -104,7 +107,12 @@ pub const fn flag_global(f: Flag) -> u32 {
 //   `q(n/2)`. Storing the upper bank as `v128` lets NEON data-processing (which
 //   gcc's auto-vectorizer parks in Q8..Q15) map straight onto wasm 128-bit SIMD
 //   with no per-op gather/scatter; NEON on the low bank assembles a `v128` from the
-//   `s` globals instead (correct, and rare in auto-vectorized output).
+//   `s` globals instead. That is NOT rare: hand-written NEON works in the argument and
+//   callee-saved quads Q0..Q7, and a retail racer's hottest guest function is a
+//   straight-line kernel there. The emitter therefore holds low-bank quads in `v128`
+//   LOCALS across a run of vector statements and writes them back once (see
+//   `emit::NqState`); the globals stay the architectural state wherever a host, the
+//   scheduler or another guest function can see it.
 //
 // Floating-point compare results (FPSCR N,Z,C,V) live in four more i32 globals;
 // `vmrs APSR_nzcv, fpscr` copies them into the integer condition flags.
@@ -350,6 +358,20 @@ pub const SVC_NAME: &str = "svc";
 pub const SVC_MODULE: &str = IMPORT_MODULE;
 /// Import name of the Vita NID host trap: `(i32 index) -> ()`.
 pub const IMPORT_NAME: &str = "import";
+/// Import name of the NON-SUSPENDING Vita NID host trap, same signature as [`IMPORT_NAME`].
+///
+/// # Why a second trap
+/// In the browser `env.import` is a JSPI `Suspending` import: every call through it pays
+/// the stack switch and the promise plumbing that let a BLOCKING call park its thread. A
+/// draw does not block - nor does a scene boundary, an allocator call, a mixer update or a
+/// signal - and those are the overwhelming majority of a race frame's ~700 host calls. The
+/// host names the NIDs whose handler can only ever CONTINUE ([`InlineOp::Fast`]); the
+/// transpiler routes them here, and the browser binds this to a plain function. A native
+/// engine binds it as an alias of `env.import`, since a fiber host call costs nothing more
+/// for a call that does not suspend.
+///
+/// [`InlineOp::Fast`]: crate::InlineOp::Fast
+pub const IMPORT_FAST_NAME: &str = "import_fast";
 /// Import name of the indirect-dispatch miss reporter: `(i32 target, i32 caller) ->
 /// ()`. The dispatcher calls it when a runtime function-pointer resolves to no
 /// translated function; the host records the addresses and traps, turning an

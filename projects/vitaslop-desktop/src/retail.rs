@@ -442,11 +442,53 @@ impl RetailGuest {
     /// `VitaState::idle_attribution` for why a total is not enough.
     pub fn idle_attribution(&mut self) -> String {
         let v = self.sched.host().state.idle_attribution();
+        Self::format_idle_attribution("headless: the idle clock", &v)
+    }
+
+    /// The idle attribution as data, for a WINDOW: a caller snapshots it at one frame and
+    /// hands the snapshot to [`Self::idle_attribution_since`] at another.
+    pub fn idle_attribution_raw(&mut self) -> Vec<(vitaslop_runtime::host::IdleOwner, u64, u64)> {
+        self.sched.host().state.idle_attribution()
+    }
+
+    /// Where the idle clock went SINCE `before` - the windowed reading.
+    ///
+    /// # Why the cumulative one is not enough
+    /// The end-of-run figure counts from boot, and a title's boot and front end are a
+    /// different program from its gameplay: MEASURED on a retail racer, one thread's
+    /// 1.95 million 28-us sleeps read as "the race parks ~200 times a frame" for a
+    /// session, and the windowed figure is what says whether any of them are in the
+    /// race at all. Same reason `VITASLOP_CALLSITES_WINDOW` exists for the call tally.
+    pub fn idle_attribution_since(
+        &mut self,
+        before: &[(vitaslop_runtime::host::IdleOwner, u64, u64)],
+    ) -> String {
+        let now = self.idle_attribution_raw();
+        let mut delta: Vec<(vitaslop_runtime::host::IdleOwner, u64, u64)> = now
+            .into_iter()
+            .map(|(owner, us, jumps)| {
+                let (us0, j0) = before
+                    .iter()
+                    .find(|(o, _, _)| *o == owner)
+                    .map(|&(_, u, j)| (u, j))
+                    .unwrap_or((0, 0));
+                (owner, us.saturating_sub(us0), jumps.saturating_sub(j0))
+            })
+            .filter(|(_, _, jumps)| *jumps > 0)
+            .collect();
+        delta.sort_by(|a, b| b.1.cmp(&a.1));
+        Self::format_idle_attribution("callsites: the window's idle clock", &delta)
+    }
+
+    fn format_idle_attribution(
+        head: &str,
+        v: &[(vitaslop_runtime::host::IdleOwner, u64, u64)],
+    ) -> String {
         if v.is_empty() {
             return String::new();
         }
         let total: u64 = v.iter().map(|(_, us, _)| us).sum();
-        let mut s = format!("headless: the idle clock ({:.1}s) was bought by:\n", total as f64 / 1e6);
+        let mut s = format!("{head} ({:.1}s) was bought by:\n", total as f64 / 1e6);
         for (owner, us, jumps) in v.iter().take(8) {
             s.push_str(&format!(
                 "  {:>8.3}s over {jumps:>8} jump(s), mean {:>7.1}us - {} on thread {:#x}\n",
@@ -914,15 +956,17 @@ fn report_hiccups(rows: &[Hiccup]) {
     );
     // ...and what those pipeline builds actually SPENT, split into the two halves that have
     // different fixes. A 2.5-second first frame is not actionable until it says which half.
-    let (module_ms, create_ms) = vitaslop_platform::gpu::take_pipeline_build_split();
+    let (link_ms, module_ms, create_ms) = vitaslop_platform::gpu::take_pipeline_build_split();
     let pre_ms = vitaslop_platform::gpu::take_precompile_ms();
     println!(
-        "hiccups: the pipeline builds of the WHOLE RUN cost {module_ms:.0} ms compiling WGSL + \
-         {create_ms:.0} ms creating pipelines, IN the frame that drew them, plus {pre_ms:.0} ms \
-         compiling WGSL AHEAD of any draw (when the guest's shader patcher named the pair, which \
-         is where the device does its shader work). The in-frame WGSL figure is what the \
-         preparation failed to catch; the pipeline half also needs that draw's blend, depth, \
-         cull, format and sample count, and cannot be moved without them."
+        "hiccups: the pipeline builds of the WHOLE RUN cost {link_ms:.0} ms in OUR translation \
+         (USSE -> IR -> WGSL text) + {module_ms:.0} ms compiling that WGSL + {create_ms:.0} ms \
+         creating pipelines, IN the frame that drew them, plus {pre_ms:.0} ms compiling WGSL \
+         AHEAD of any draw (when the guest's shader patcher named the pair, which is where the \
+         device does its shader work). The three have unrelated fixes: the first is our Rust, \
+         the second is the driver's front end (and falls with the OPERATIONS a module performs, \
+         not with its source bytes), the third also needs that draw's blend, depth, cull, format \
+         and sample count and cannot be moved without them."
     );
 }
 
@@ -1188,6 +1232,9 @@ pub fn headless_check(
             Some((from, to))
         }
     };
+    // The idle attribution at the call-site window's open, so its close can print the
+    // window's own figure - see `idle_attribution_since`.
+    let mut idle_at_window_open: Vec<(vitaslop_runtime::host::IdleOwner, u64, u64)> = Vec::new();
     let mut periodic: Option<vitaslop_native::GeneralRenderer> = None;
     if shot_every > 0 {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -1225,13 +1272,19 @@ pub fn headless_check(
         if let Some((from, to)) = callsite_window {
             if f == from {
                 vitaslop_runtime::vita::reset_call_sites();
+                idle_at_window_open = guest.idle_attribution_raw();
                 println!("callsites: window {from}..{to} OPEN (counts before this are discarded)");
             }
             if f == to {
+                // The idle clock's owners over the SAME window, beside the calls: a park
+                // reached without a host call (an inlined wait, a display flip) is invisible
+                // to the call tally and visible here, and a cumulative figure cannot say
+                // whether the parking happens in these frames at all.
                 println!(
-                    "callsites: window {from}..{to} = {} display frames\n{}",
+                    "callsites: window {from}..{to} = {} display frames\n{}{}",
                     to - from,
-                    vitaslop_runtime::vita::call_sites_report(30)
+                    vitaslop_runtime::vita::call_sites_report(30),
+                    guest.idle_attribution_since(&idle_at_window_open)
                 );
             }
         }
@@ -1559,6 +1612,7 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
         window: None,
         gfx: None,
         paused: false,
+        paused_by_blur: false,
         cursor: (0.0, 0.0),
         mouse_down: false,
         acc: Duration::ZERO,
@@ -1588,6 +1642,12 @@ struct RetailApp {
     window: Option<Arc<Window>>,
     gfx: Option<RetailGfx>,
     paused: bool,
+    /// >>> THE HARD PAUSE: the window lost focus and `VITASLOP_PAUSE_ON_BLUR` (default on)
+    /// says that pauses the emulator. Kept apart from `paused` (the Space toggle) so a run
+    /// the user paused by hand stays paused when the window comes back, and one paused only
+    /// by the blur resumes. Distinct from a title's own pause menu: the guest sees a wall
+    /// clock that did not advance.
+    paused_by_blur: bool,
     /// Last cursor position in physical window pixels, and whether the left button is
     /// held - together the mouse-as-touch source.
     cursor: (f64, f64),
@@ -1656,6 +1716,16 @@ impl ApplicationHandler for RetailApp {
                     self.input.set_key(code, pressed);
                 }
             }
+            // Losing the window's focus hard-pauses the emulator, by default - see
+            // `paused_by_blur`. `VITASLOP_PAUSE_ON_BLUR=0` keeps it running in the background.
+            WindowEvent::Focused(focused) => {
+                let wanted = vitaslop_runtime::knobs::var("VITASLOP_PAUSE_ON_BLUR")
+                    .map(|v| v.trim() != "0")
+                    .unwrap_or(true);
+                if wanted {
+                    self.paused_by_blur = !focused;
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
             }
@@ -1707,7 +1777,7 @@ impl RetailApp {
         self.acc += now.duration_since(self.last_tick);
         self.last_tick = now;
 
-        if self.paused {
+        if self.paused || self.paused_by_blur {
             self.acc = Duration::ZERO;
         } else {
             if self.guest.current().is_empty() {
@@ -1783,6 +1853,8 @@ impl RetailApp {
         let Some(w) = self.window.as_ref() else { return };
         let state = if self.guest.finished() {
             " [exited]"
+        } else if self.paused_by_blur {
+            " [paused - window not focused]"
         } else if self.paused {
             " [paused]"
         } else {
@@ -1790,7 +1862,7 @@ impl RetailApp {
         };
         // The step pace is the reference for "full speed": one FRAME_DT per emulated flip.
         let target = 1.0 / FRAME_DT.as_secs_f64();
-        let speed = if self.paused || self.guest.finished() {
+        let speed = if self.paused || self.paused_by_blur || self.guest.finished() {
             String::new()
         } else {
             format!("  |  speed {:.0}%", self.guest_fps / target * 100.0)

@@ -285,6 +285,26 @@ pub fn set_worker_input(state: SharedInput) {
     WORKER_INPUT.with(|c| *c.borrow_mut() = Some(state));
 }
 
+thread_local! {
+    /// >>> THE HARD PAUSE. Set by the page when the tab is hidden or the window loses focus
+    /// (and the setting says so), cleared when it comes back. Read once per tick by the
+    /// live loop, which then runs no guest frame, presents nothing and charges no game
+    /// time - the title sees a wall clock that simply did not advance, which is what a
+    /// device in a pocket sees. Distinct from a title's own pause menu.
+    static PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Worker entry point: the page's hard-pause state changed.
+#[wasm_bindgen]
+pub fn worker_set_paused(paused: bool) {
+    PAUSED.with(|p| p.set(paused));
+}
+
+/// Whether the page has hard-paused this run.
+pub fn hard_paused() -> bool {
+    PAUSED.with(|p| p.get())
+}
+
 /// Apply `f` to the registered worker input state, if any.
 fn with_worker_input(f: impl FnOnce(&mut InputState)) {
     WORKER_INPUT.with(|c| {

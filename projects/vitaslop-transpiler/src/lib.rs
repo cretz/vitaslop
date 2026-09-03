@@ -20,6 +20,7 @@ pub use emit::set_fuel_interval;
 /// straight-line run (`VITASLOP_PROMOTE_REGS`), and the per-thread override a test uses
 /// to emit both arms in one process. See [`promote`].
 pub use emit::{promote_registers, set_promote_registers};
+pub use emit::{neon_cache, set_neon_cache};
 /// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
 /// has no environment, so it selects the arm through the setter.
 pub use emit::{flags_wide_c, set_flags_wide_c};
@@ -277,6 +278,12 @@ pub enum InlineOp {
     /// exactly the same reason `RetConst` is, and under the same rule - the handler must do
     /// nothing that anything observes - with the extra requirement that it return void.
     Nop,
+    /// The real host call, through the NON-SUSPENDING trap ([`abi::IMPORT_FAST_NAME`]).
+    /// Admissible only for a NID whose handler can never block, reschedule, flip or exit -
+    /// the host's dispatch wraps such handlers in an unconditional `Continue`, and it is
+    /// the host that names them. A fast call that returns anything else is a loud error
+    /// in the browser, never a silently unparked thread.
+    Fast,
     /// `r0 = u32_at(r0 + offset) << shl`, but ONLY when the loaded word is `<= max`;
     /// otherwise the real host call runs.
     ///
@@ -992,6 +999,8 @@ impl InlineOp {
             InlineOp::LoadScaled { shl, .. } => word << shl,
             // The pair forms deliver the mirror words untouched, wherever they land.
             InlineOp::StoreMirrorPair { .. } | InlineOp::LoadMirrorPair { .. } => word,
+            // Not an inline form at all: the handler runs and r0 is whatever it wrote.
+            InlineOp::Fast => word,
             // A void setter: the guest gets the success code and nothing else.
             InlineOp::StoreArg { .. }
             | InlineOp::StoreArgIndexed { .. }
@@ -1088,7 +1097,7 @@ impl InlineOp {
             | InlineOp::LoadMirrorParking { .. }
             | InlineOp::LoadMirrorPair { .. } => None,
             // Take no pointer and read nothing.
-            InlineOp::RetConst { .. } | InlineOp::Nop => None,
+            InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
             // Reads four words and writes two, so no single offset describes it.
             InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => None,
             // Reaches from the pointer itself for a length the guest supplies; there is no
@@ -1149,7 +1158,7 @@ impl InlineOp {
             | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
             // Read nothing at all, mirror included.
-            InlineOp::RetConst { .. } | InlineOp::Nop => None,
+            InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
             // Everything it reads is in the two guest structures it is handed.
             InlineOp::ReserveUniformBuffer { .. } => None,
             // Reads the SA bank's ADDRESS out of the block - the one slot that is not a
@@ -2599,6 +2608,9 @@ fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
     let stmts: usize = funcs.values().flat_map(|f| &f.blocks).map(|b| b.stmts.len()).sum();
     let arm: u64 = funcs.values().flat_map(|f| &f.blocks).map(|b| b.arm_count as u64).sum();
     let stubs = funcs.values().filter(|f| f.stub).count();
+    // Only when a log filter was NAMED: this crate has no tracing, and a run nobody
+    // configured prints nothing. (`VITASLOP_LOG=warn` is a debugging session.)
+    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
     eprintln!(
         "transpile: lifted {} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
          {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone are \
@@ -2607,4 +2619,5 @@ fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
         std::mem::size_of::<ir::Stmt>(),
         (stmts * std::mem::size_of::<ir::Stmt>()) as f64 / 1e6,
     );
+    }
 }

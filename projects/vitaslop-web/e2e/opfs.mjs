@@ -53,6 +53,18 @@ try {
     result.reused === true,
     result.reused === true ? "" : "importTitle re-wrote an already-complete title"
   );
+  // The reader a RUN uses: the storage worker's page ring (see web/storage-worker.js).
+  const c = result.cached;
+  check("ring reader: storage worker opened every file", c.opened === result.written, `${c.opened} files`);
+  check("ring reader: whole and chunked reads agree", c.verify.ok === true, c.verify.detail);
+  check(
+    "ring reader: a read past end of file is SHORT, not padded",
+    c.shortRead.got === c.shortRead.expected,
+    `got ${c.shortRead.got}, expected ${c.shortRead.expected}`
+  );
+  check("ring reader: a read straddling pages into a short last page", c.straddle.ok === true, `got ${c.straddle.got} of 40`);
+  check("ring reader: a read starting past the end returns 0", c.pastEnd === 0, `got ${c.pastEnd}`);
+  check("ring reader: an offset read returns the bytes at that offset", c.offsetRead === true);
 } catch (e) {
   check("opfs test ran", false, e.message);
 } finally {

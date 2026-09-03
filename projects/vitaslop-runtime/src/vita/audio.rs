@@ -93,10 +93,17 @@ pub struct AudioState {
     scratch_mix: Vec<i32>,
     scratch_bytes: Vec<u8>,
     scratch_pcm: Vec<i16>,
-    /// Output frames the guest has submitted through `sceAudioOutOutput`, and the port rate
-    /// they were submitted at. See [`AudioState::produced_seconds`].
-    submitted_frames: u64,
-    submitted_rate: u32,
+    /// Output frames the guest has submitted through `sceAudioOutOutput`, PER PORT, with the
+    /// rate each was submitted at: `(port, frames, rate)`.
+    ///
+    /// >>> PER PORT, BECAUSE PORTS PLAY AT THE SAME TIME AND A SUM COUNTS WALL TIME TWICE.
+    /// This was one running total, and a title playing a movie holds a second output port
+    /// open beside its game audio - both submitting a grain per period, both heard together.
+    /// The sum then says the guest produced two seconds of sound per second of clock, which
+    /// reads exactly like the audio path running at double rate. MEASURED 2026-09-02 on one
+    /// title's intro movie: `1.98x over this window`, entirely from the second port.
+    /// [[vitaslop-audio-ports-are-mixed-not-appended]]
+    submitted: Vec<(i32, u64, u32)>,
 }
 
 impl AudioState {
@@ -120,11 +127,16 @@ impl AudioState {
     ///
     /// So a device capture showing `UNDERRUN 24.7%` beside `OVERRUN 49.5%` is a RATE problem,
     /// not a buffer one, and the period count is where to look for it.
+    /// >>> AND IT IS THE BUSIEST PORT, NOT THE SUM OF THEM. Concurrent ports are MIXED into
+    /// one output, so a second of movie sound played over a second of game sound is one
+    /// second of sound. The port that has submitted the most is the one whose length this
+    /// measures; a port that opens late and plays briefly cannot inflate the figure.
     pub fn produced_seconds(&self) -> f64 {
-        if self.submitted_rate == 0 {
-            return 0.0;
-        }
-        self.submitted_frames as f64 / f64::from(self.submitted_rate)
+        self.submitted
+            .iter()
+            .filter(|(_, _, rate)| *rate != 0)
+            .map(|(_, frames, rate)| *frames as f64 / f64::from(*rate))
+            .fold(0.0, f64::max)
     }
 }
 
@@ -425,8 +437,13 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         st.audio_state.capture_pcm(&pcm);
         // Counted where the grain is SUBMITTED, so it measures what the guest actually
         // handed the device rather than what it mixed - see `produced_seconds`.
-        st.audio_state.submitted_frames += grain as u64;
-        st.audio_state.submitted_rate = format.sample_rate;
+        match st.audio_state.submitted.iter_mut().find(|(p, ..)| *p == port) {
+            Some((_, frames, rate)) => {
+                *frames += grain as u64;
+                *rate = format.sample_rate;
+            }
+            None => st.audio_state.submitted.push((port, grain as u64, format.sample_rate)),
+        }
         st.audio.submit(backend_port, &pcm);
         st.audio_state.scratch_pcm = pcm;
         // The buffer boundaries the mix just crossed are module callbacks the title is

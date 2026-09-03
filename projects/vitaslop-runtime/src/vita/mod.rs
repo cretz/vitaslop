@@ -96,6 +96,64 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
         .or_else(|| (!no_inline_stubs()).then(|| stub_inline_op(func_nid)).flatten())
 }
 
+/// Whether `func_nid`'s handler can only ever CONTINUE, so the transpiler may route the
+/// call through the non-suspending trap ([`vitaslop_transpiler::abi::IMPORT_FAST_NAME`]).
+///
+/// # Why this list is written out rather than derived
+/// The admissibility test is the SHAPE of the dispatch arm: every NID here is dispatched
+/// as `cont!(handler(..))` in [`dispatch`], an unconditional `Continue` around a handler
+/// that returns nothing - so it cannot block, reschedule, flip or exit whatever the guest
+/// passes it. (`sceKernelTryLockLwMutex` is the one arm here that returns an outcome, and
+/// both of its paths are `Continue`: a contended try-lock fails rather than parks.) A
+/// handler that later grows a parking path must leave this list in the same edit; the
+/// browser turns a fast call that suspends into a loud run-ending error, never a thread
+/// left unparked.
+///
+/// The list is the race's own host-call profile: draws and scene boundaries are ~90% of a
+/// retail race frame's calls, and the rest of it is the allocator, the mixer, the
+/// lightweight signal/unlock side of the title's thread handoffs, and input polling.
+/// `VITASLOP_NO_FAST_IMPORT=1` routes every call through the suspending trap again (the
+/// A/B arm).
+pub fn fast_nid(func_nid: u32) -> bool {
+    if no_fast_import() {
+        return false;
+    }
+    matches!(
+        func_nid,
+        gxm_nid::DRAW
+            | gxm_nid::DRAW_PRECOMPUTED
+            | gxm_nid::BEGIN_SCENE
+            | gxm_nid::END_SCENE
+            | gxm_nid::SET_VISIBILITY_BUFFER
+            | gxm_nid::COLOR_SURFACE_GET_DATA
+            | gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS
+            | gxm_nid::PAD_HEARTBEAT
+            | lw_nid::SIGNAL_LW_COND
+            // (the lightweight-mutex lock/unlock pair is INLINED - `lwsync::inline_op` - so
+            // it never reaches a trap and is not named here)
+            | lw_nid::TRY_LOCK_LW_MUTEX
+            | sync_nid::UNLOCK_MUTEX
+            | sync_nid::SIGNAL_COND
+            | lk_nid::CLIB_MSPACE_MALLOC
+            | lk_nid::CLIB_MSPACE_MEMALIGN
+            | lk_nid::CLIB_MSPACE_FREE
+            | lk_nid::GET_TLS_ADDR
+            | ngs_nid::VOICE_GET_STATE_DATA
+            | ngs_nid::SYSTEM_UPDATE
+            | ngs_nid::VOICE_SET_PARAMS_BLOCK
+            | pm_nid::POWER_TICK
+            | sv_nid::APP_MGR_GET_APP_STATE
+            | sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER
+            | sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT
+            | sv_nid::TOUCH_READ
+    )
+}
+
+fn no_fast_import() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_FAST_IMPORT"))
+}
+
 /// The calls whose handler is EXACTLY `ctx.ret(0)` - a constant return and nothing else -
 /// so the transpiler can emit the constant and never cross the boundary
 /// ([`vitaslop_transpiler::InlineOp::RetConst`]).
@@ -2169,6 +2227,64 @@ mod frame_boundary_tests {
             SvcOutcome::Halt => "Halt",
             SvcOutcome::ThreadExit => "ThreadExit",
             SvcOutcome::Fatal(m) => panic!("dispatch refused the call: {m}"),
+        }
+    }
+
+    /// >>> EVERY NID [`fast_nid`] ROUTES THROUGH THE NON-SUSPENDING TRAP REALLY CANNOT SUSPEND.
+    ///
+    /// The browser binds that trap to a plain function: a handler that returned anything but
+    /// `Continue` there would end the run. So every name on the list is dispatched here with
+    /// zeroed registers and required to CONTINUE - the arm shape (`cont!`) is what admits it,
+    /// and this is that shape asserted at the one place a grown parking path would show.
+    /// The list is also required to be DISJOINT from the inline forms: a NID with an inline
+    /// lowering never reaches either trap, so naming it fast would be a lie the link step
+    /// silently drops.
+    ///
+    /// The blocking primitives the race also makes - a cond wait, a plain lock - are held to
+    /// the opposite: not fast, so a copy-paste that widened the list would fail here.
+    #[test]
+    fn the_fast_nids_only_continue() {
+        let fast = [
+            gxm_nid::DRAW,
+            gxm_nid::DRAW_PRECOMPUTED,
+            gxm_nid::BEGIN_SCENE,
+            gxm_nid::END_SCENE,
+            gxm_nid::SET_VISIBILITY_BUFFER,
+            gxm_nid::COLOR_SURFACE_GET_DATA,
+            gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
+            gxm_nid::PAD_HEARTBEAT,
+            lw_nid::SIGNAL_LW_COND,
+            lw_nid::TRY_LOCK_LW_MUTEX,
+            sync_nid::UNLOCK_MUTEX,
+            sync_nid::SIGNAL_COND,
+            lk_nid::CLIB_MSPACE_MALLOC,
+            lk_nid::CLIB_MSPACE_MEMALIGN,
+            lk_nid::CLIB_MSPACE_FREE,
+            lk_nid::GET_TLS_ADDR,
+            ngs_nid::VOICE_GET_STATE_DATA,
+            ngs_nid::SYSTEM_UPDATE,
+            ngs_nid::VOICE_SET_PARAMS_BLOCK,
+            pm_nid::POWER_TICK,
+            sv_nid::APP_MGR_GET_APP_STATE,
+            sv_nid::SYSTEM_GESTURE_UPDATE_TOUCH_RECOGNIZER,
+            sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENTS_COUNT,
+            sv_nid::TOUCH_READ,
+        ];
+        for nid_fn in fast {
+            let name = nid::name(nid_fn);
+            assert!(fast_nid(nid_fn), "{name} is on the fast list but fast_nid() refuses it");
+            assert!(
+                inline_op(nid_fn).is_none(),
+                "{name} has an inline form, so routing it through a trap is unreachable"
+            );
+            assert_eq!(
+                outcome_of(0, nid_fn, [0, 0, 0, 0]),
+                "Continue",
+                "{name} is routed through the non-suspending trap but did not CONTINUE"
+            );
+        }
+        for nid_fn in [lw_nid::WAIT_LW_COND, lw_nid::LOCK_LW_MUTEX, tm_nid::DELAY_THREAD] {
+            assert!(!fast_nid(nid_fn), "{} can park and must not be fast", nid::name(nid_fn));
         }
     }
 

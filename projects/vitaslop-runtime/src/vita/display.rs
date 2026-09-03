@@ -222,7 +222,8 @@ fn report_geometry_once(pitch: u32, fmt: u32, w: u32, h: u32) {
     } else {
         "NOT THE PANEL - the display controller stretches this onto 960x544, so the frame is          rendered at this size and scaled up to present. Everything in it, text included,          carries only this much detail"
     };
-    eprintln!(
+    tracing::info!(
+        target: "vitaslop::status",
         "display: sceDisplaySetFrameBuf declares a {w}x{h} buffer (pitch {pitch}, format          {fmt:#x}) - {note}."
     );
 }

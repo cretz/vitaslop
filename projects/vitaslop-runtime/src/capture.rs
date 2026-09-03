@@ -648,7 +648,8 @@ fn report_adopted_viewport_extent(data_addr: u32, from: (u32, u32), to: (u32, u3
     if !g.get_or_insert_with(HashSet::new).insert((data_addr, from.0, from.1, to.0, to.1)) {
         return;
     }
-    eprintln!(
+    tracing::warn!(
+        target: "vitaslop::gxm",
         "gxm scene extent: colour {data_addr:#x} was described as {}x{} by EVERY guest struct \
          (colour surface and render target), so its extent is being taken from its draws' \
          VIEWPORT instead: {}x{}. That is a guess, and everything derived from this pass's \

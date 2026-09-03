@@ -561,6 +561,13 @@ struct LivePlayback {
     targets: Option<TargetProbe>,
     /// The most recent probe description, waiting for the next diagnostics window.
     last_probe: Option<String>,
+    /// Milliseconds from a `queue.submit` to the GPU reporting that everything submitted is
+    /// DONE - the one number that says whether a `write_buffer` stall is the GPU being
+    /// saturated or the staging path being ours to fix. See the `on_submitted_work_done` call
+    /// in `present`. Written by a callback, read by the next diagnostics window.
+    gpu_done_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether a work-done promise is already outstanding, so presents do not stack them.
+    gpu_done_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Presents since the run started. NOT `split.presents`, which `take_split` resets every
     /// diagnostics window - a probe cadence driven off that one restarts at zero each window,
     /// so it fires on the same relative frame forever and every report is labelled "frame 0".
@@ -1284,10 +1291,10 @@ async fn webgpu_preflight() -> Result<(), String> {
             if !(got.is_null() || got.is_undefined()) {
                 set_preferred_power(pref);
                 if name != "high-performance" {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                    logging::note(&format!(
                         "adapter: `high-performance` was refused; this device answered to \
                          powerPreference `{name}`, which is what the renderer will use"
-                    )));
+                    ));
                 }
                 return Ok(());
             }
@@ -1480,7 +1487,7 @@ impl LivePlayback {
             "wgpu name unavailable",
             if software { " | SOFTWARE RASTERISER" } else { " | GPU" },
         );
-        web_sys::console::log_1(&JsValue::from_str(&summary));
+        logging::note(&summary);
         report.emit("adapter", &summary);
         // >>> WHICH COMPRESSED TEXTURE FAMILIES THIS ADAPTER OFFERS, because it decides the
         // single biggest memory question this renderer has and cannot be guessed from here.
@@ -1514,7 +1521,7 @@ impl LivePlayback {
                 compressed.join(", ")
             }
         );
-        web_sys::console::log_1(&JsValue::from_str(&compressed));
+        logging::note(&compressed);
         // >>> ITS OWN ID. `Report::emit` RATE-LIMITS BY ID (100 ms), and this fires immediately
         // after the `adapter` summary above - so publishing it under the same name meant it was
         // DROPPED on every run this line has ever existed for. The one fact that decides whether
@@ -1729,7 +1736,7 @@ impl LivePlayback {
              present Fifo | offered formats {:?}, alpha modes {:?}",
             caps.formats, caps.alpha_modes,
         );
-        web_sys::console::log_1(&JsValue::from_str(&surface_line));
+        logging::note(&surface_line);
         report.emit("surface", &surface_line);
 
         // Give the renderer a clock BEFORE it draws anything. See `perf_now`: without this the
@@ -1786,6 +1793,8 @@ impl LivePlayback {
             targets: probe.is_some().then(TargetProbe::new),
             probe,
             last_probe: None,
+            gpu_done_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            gpu_done_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             presents_total: 0,
             lost,
             surface_config,
@@ -1933,6 +1942,8 @@ impl LivePlayback {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // Which buffers the guest flipped while these scenes were captured - see
         // `GxmRenderer::set_presented`.
+        // Collect the GPU timestamps of whichever earlier frame's readback has completed.
+        self.gxm.ts_poll();
         self.gxm.set_presented(presents);
         self.gxm.encode_chain(
             &self.device,
@@ -1964,7 +1975,51 @@ impl LivePlayback {
                 tp.capture(&self.device, &mut encoder, &list, n);
             }
         }
+        // This frame's GPU timestamps ride the same submit; the map is asked for after it.
+        // See `GpuTimestamps` - the GPU TIME panel line is the number the latency below
+        // cannot give.
+        self.gxm.ts_finish_chain(&mut encoder);
         self.queue.submit([encoder.finish()]);
+        self.gxm.ts_map_after_submit();
+        // >>> HOW FAR BEHIND THE GPU IS, WHICH NOTHING ELSE IN THIS PANEL CAN SAY.
+        //
+        // MEASURED on the target device, one title's race: `arena write` was 10.8 ms of a
+        // 20.4 ms render, with a SINGLE 204 KB `queue.write_buffer` blocking 277 ms and an 8 KB
+        // one blocking 667 ms over the run. No byte count explains that - the thread is waiting
+        // on the queue to drain. But WHY it is draining slowly has two answers that need
+        // OPPOSITE fixes, and the renderer's own counters cannot tell them apart:
+        //
+        //  * THE GPU IS SATURATED. Then the writes are merely where the wait surfaces, and the
+        //    fix is less GPU work (multisampling, target sizes, draw count). Restructuring the
+        //    writes would move the stall, not remove it.
+        //  * THE GPU IS KEEPING UP and the block is the staging path - a write aimed at a
+        //    buffer the GPU still has in flight, or an exhausted staging ring
+        //    [[vitaslop-mapped-at-creation-exhausts-a-staging-arena]]. Then N-buffering the
+        //    per-pass arenas fixes it and touching GPU work would be wasted.
+        //
+        // This times SUBMIT -> "the GPU finished everything submitted". It is one promise per
+        // present, resolved off the critical path: the value it stores is read by the NEXT
+        // panel, so nothing here waits on it. A figure near the frame budget means saturated;
+        // a small one means the GPU is idle and the stall is ours.
+        {
+            let pending = self.gpu_done_pending.clone();
+            // Do not stack promises: if the previous one has not resolved, this frame is
+            // already inside the window it is measuring and a second would only race it.
+            // No clock, no measurement - and NOT an early return: this sits in the middle of
+            // `present`, which owes its caller a `PresentOutcome`.
+            // ATOMICS, not `Rc<Cell<_>>`: the callback must be `Send`.
+            use std::sync::atomic::Ordering;
+            if let (false, Some(started)) = (pending.load(Ordering::Relaxed), now_ms()) {
+                pending.store(true, Ordering::Relaxed);
+                let slot = self.gpu_done_us.clone();
+                self.queue.on_submitted_work_done(move || {
+                    if let Some(t) = now_ms() {
+                        slot.store(((t - started) * 1000.0).max(0.0) as u64, Ordering::Relaxed);
+                    }
+                    pending.store(false, Ordering::Relaxed);
+                });
+            }
+        }
         // The map is requested only now: before the submit it would resolve against an
         // unwritten buffer and describe zeros. See `PresentProbe::begin_map`.
         if let Some(probe) = self.probe.as_mut() {
@@ -2415,6 +2470,15 @@ thread_local! {
     /// `(actual - requested)` over the sleeps [`next_tick_in`] has taken. Subtracted from the
     /// next request so the wake-up lands on the frame boundary instead of past it.
     static TIMER_OVERSHOOT_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+
+    /// `(our translation, module compile, pipeline create, compiled ahead of any draw)` in
+    /// milliseconds, accumulated over the whole run for the `SHADER BUILDS` diagnostic.
+    ///
+    /// Kept here rather than read straight from the platform counters because those counters
+    /// RESET when taken: the panel is rendered per window, and a window that built no shader
+    /// would otherwise report zero and erase a burst that a earlier window paid.
+    static SHADER_BUILD_MS: RefCell<(f64, f64, f64, f64)> =
+        const { RefCell::new((0.0, 0.0, 0.0, 0.0)) };
 }
 
 /// The learned timer error, never negative: a host whose timer returns EARLY is already handled
@@ -2719,7 +2783,7 @@ fn transpile_here(
     // the calibration moves with it - a faithfulness change with nothing to notice it by.
     // Printing it is what turns that into something a capture can be read against.
     let x = built.artifact.expansion;
-    web_sys::console::log_1(&JsValue::from_str(&format!(
+    logging::note(&format!(
         "[setup] transpiled wasm {} MB, {} functions (the per-instance funcref table), \
          guest memory {} MB, emulator heap {} MB | code expansion {:.2} wasm operators \
          per guest instruction ({} instructions -> {} operators)",
@@ -2730,12 +2794,12 @@ fn transpile_here(
         x.per_instruction(),
         x.arm_instructions,
         x.emitted_ops,
-    )));
+    ));
     // >>> AND WHICH BUILD THIS IS, so an A/B can never again be a build measured against
     // itself. The register file is either on its globals or in locals, and the two are
     // indistinguishable from every other counter a run reports - the expansion factor
     // moves (9.87 -> 10.33 on one title) but nothing SAYS which arm produced it.
-    web_sys::console::log_1(&JsValue::from_str(&format!(
+    logging::note(&format!(
         "[setup] register promotion {} | {} accesses would become LOCAL ({:.1}% of all \
          operators), {} left on their globals, {} operators of overhead",
         if vitaslop_transpiler::promote_registers() { "ON" } else { "OFF" },
@@ -2743,7 +2807,7 @@ fn transpile_here(
         x.promotion.converted_share(x.emitted_ops),
         x.promotion.left,
         x.promotion.overhead,
-    )));
+    ));
     let func_addrs: Vec<u32> = built.artifact.funcs.iter().map(|f| f.addr).collect();
     // Record it for THIS worker too: the main-thread path transpiles in place and runs the
     // guest itself, so it needs the table without any handoff.
@@ -2898,10 +2962,10 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
     // so whatever setup peaks at is carried for the whole run. Sampling either side of
     // each stage is the only way to attribute it - a single number at the end cannot say
     // whether it is the emulator's steady state or a transient the run is still paying for.
-    web_sys::console::log_1(&JsValue::from_str(&format!(
+    logging::note(&format!(
         "[setup] heap after decrypt+link: {} MB",
         wasm_heap_mb()
-    )));
+    ));
     Ok(Mounted { linked, backing, resident, nfiles, decrypt_ms })
 }
 
@@ -2961,11 +3025,11 @@ async fn setup_game(
     match audio::WebAudioSink::new(audio_ring) {
         Some(sink) => {
             env.state.audio = Box::new(sink);
-            web_sys::console::log_1(&JsValue::from_str("[audio] shared ring attached"));
+            logging::note("[audio] shared ring attached");
         }
-        None => web_sys::console::log_1(&JsValue::from_str(
+        None => logging::note(
             "[audio] no ring supplied - this run is SILENT (the NullSink discards every grain)",
-        )),
+        ),
     }
     // Give the guest its files. From OPFS that is a backing - nothing is read until the
     // guest asks - and from memory it is a MOVE of the decrypted assets (for a large 3D
@@ -2993,11 +3057,11 @@ async fn setup_game(
     // compiled `WebAssembly.Module` crosses over (it is structured-cloneable).
     let (module, mem_pages, mirror_off, dirty_off, transpile_ms) = match prebuilt {
         Some(p) => {
-            web_sys::console::log_1(&JsValue::from_str(&format!(
+            logging::note(&format!(
                 "[setup] using a PREBUILT module (transpiled in a throwaway worker); \
                  emulator heap {} MB",
                 wasm_heap_mb()
-            )));
+            ));
             browser_sched::record_function_addresses(p.func_addrs);
             (p.module, p.mem_pages, p.mirror_off, p.dirty_off, 0.0)
         }
@@ -3227,7 +3291,7 @@ pub async fn run_game(
         LivePlayback::new(wgpu::SurfaceTarget::Canvas(canvas), report.clone()).await?;
 
     let status = setup.status("main thread");
-    web_sys::console::log_1(&JsValue::from_str(&status));
+    logging::note(&status);
     // NO PERSISTENCE ON THIS PATH, deliberately. This is the harness page (`game.html`),
     // which is handed a file map rather than a stored title and so has no title id to key
     // a save by - and a scripted boot that silently wrote a save would make the NEXT run of
@@ -3299,7 +3363,7 @@ pub async fn run_game_worker(
         match vitaslop_runtime::gamedata::GameData::from_zip(bytes) {
             Ok((data, refused)) => {
                 let report = setup.sched.host.lock().unwrap().state.restore_game_data(&data);
-                web_sys::console::log_1(&JsValue::from_str(&format!("[gamedata] {report}")));
+                logging::note(&format!("[gamedata] {report}"));
                 if !refused.is_empty() {
                     // Loud, not swallowed: an entry outside the guest's own saved state is
                     // either a corrupted container or one that was built to reach the
@@ -3339,7 +3403,7 @@ pub async fn run_game_worker(
         LivePlayback::new(wgpu::SurfaceTarget::OffscreenCanvas(offscreen), report.clone()).await?;
 
     let status = setup.status("web worker");
-    web_sys::console::log_1(&JsValue::from_str(&status));
+    logging::note(&status);
     wasm_bindgen_futures::spawn_local(live_loop(
         setup.sched,
         playback,
@@ -3372,6 +3436,15 @@ impl vitaslop_runtime::recipe_eval::GuestRead for CoreRead<'_> {
 /// `recipe`, when given, is EVALUATED as well as replayed: its `@watch`/`@assert`/`@sig`
 /// go through the same `vitaslop-runtime` evaluator the native runner uses, so a browser
 /// run of a recipe reaches the same verdict instead of merely pressing the same buttons.
+/// The `(sound seconds, clock seconds)` the last diagnostics panel read, so the next one
+/// can report the RATE between them rather than only the run's cumulative total. See the
+/// `CLOCK vs PICTURE vs SOUND` line for why the cumulative figure cannot answer "is the
+/// audio path keeping up". A worker is single-threaded, so a thread-local Cell is the whole
+/// mechanism.
+thread_local! {
+    static SOUND_CLOCK_WINDOW: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
 async fn live_loop(
     mut sched: browser_sched::BrowserSched,
     mut playback: LivePlayback,
@@ -3434,6 +3507,20 @@ async fn live_loop(
     let mut cpu_frames = 0u32;
     let mut render_ms = 0.0f64;
     let mut presents = 0u32;
+    // >>> THE HOST-CALL SHARE OVER THE SAME WINDOW AS `cpu_ms`, BECAUSE THAT IS THE
+    // >>> COMPARISON THE WHOLE FORK TURNS ON.
+    //
+    // The per-frame status line already carries this frame's host-call estimate, and that is
+    // the wrong number to read against `cpu`: `cpu` is a THIRTY-FRAME MEAN and the estimate
+    // beside it was ONE frame's, sampled - the noisiest quantity on the line against the
+    // steadiest. Read that way, the frame after a fast-forward said 3.6 of 10 ms, which
+    // describes that frame and nothing else. These accumulate over exactly the frames
+    // `cpu_ms` does (warmup excluded, reset with it), so the panel can state the split as a
+    // share instead of leaving it to be eyeballed across two windows.
+    let mut hc_win_ms = 0.0f64;
+    let mut hc_win_est_ms = 0.0f64;
+    let mut hc_win_calls = 0u64;
+    let mut hc_win_samples = 0u64;
     // >>> THE LAST PUBLISHED RENDER SPLIT, SO THE HEARTBEAT CARRIES IT TOO.
     //
     // The split is recomputed every `PERF_WINDOW` presents and written to the PAGE, where it
@@ -3523,6 +3610,8 @@ async fn live_loop(
     let mut was_fast = false;
     // Host-call totals at the end of the previous frame, so each frame can report its own.
     let (mut last_hc_calls, mut last_hc_ms) = browser_sched::host_call_totals();
+    let (mut last_est_ms, mut last_est_n) = browser_sched::host_call_estimate();
+    let mut last_fast_calls = browser_sched::fast_call_total();
 
     // How often the live loop repeats its status on the console. Slow by default, because
     // this is a progress heartbeat for a watcher, not a metric.
@@ -3573,6 +3662,19 @@ async fn live_loop(
     }
 
     'run: loop {
+        // >>> THE HARD PAUSE, checked before anything is charged.
+        //
+        // While the page has paused the run (tab hidden, window blurred - see live.html and
+        // `input::worker_set_paused`) no guest frame runs, nothing is presented and no game
+        // time accrues: the accumulator is reset so the resume does not catch up the whole
+        // absence in a burst. The loop still turns the event loop, which is what lets the
+        // resume message arrive. Not during a fast-forward, which presents nothing anyway.
+        if input::hard_paused() && sched.core.frames() >= ff_to {
+            next_tick_in(50.0).await;
+            last = now();
+            acc = 0.0;
+            continue 'run;
+        }
         // How long until a frame is actually DUE: the accumulator carries what has already
         // accrued, so the wait is the rest of one frame's budget. Fast-forward asks for zero -
         // it is deliberately unpaced - and so does a machine that is behind, whose `acc` is
@@ -3608,6 +3710,10 @@ async fn live_loop(
         } else if was_fast {
             cpu_ms = 0.0;
             cpu_frames = 0;
+            hc_win_ms = 0.0;
+            hc_win_est_ms = 0.0;
+            hc_win_calls = 0;
+            hc_win_samples = 0;
             render_ms = 0.0;
             presents = 0;
             acc = 0.0;
@@ -3722,9 +3828,41 @@ async fn live_loop(
             let report_progress = {
                 let report = report.clone();
                 let perf = perf.clone();
+                // >>> THROTTLED, AND THAT IS A MEASURED FIX, NOT TIDYING.
+                //
+                // `run_frames` calls this MANY TIMES INSIDE ONE FRAME, and it used to format a
+                // string and emit it on every call. MEASURED with a V8 profile of the worker on
+                // one title's live race: `alloc::fmt::format::format_inner` was 549 ms of a
+                // 20.5 s sample - 4.3% of the busy worker - and 545 ms of that arrived through
+                // THIS closure. Nothing else in the engine formatted measurably.
+                //
+                // The line exists to say what a LONG frame is doing while it does it, so that a
+                // healthy grind and a hang do not print the same text for minutes. A healthy
+                // 16 ms frame has nothing to say and should cost nothing to say it: the first
+                // report is due only once a frame has already run past `PROGRESS_AFTER_MS`, and
+                // then at most every `PROGRESS_EVERY_MS`. A frame that never completes still
+                // reports, which is the whole point; a frame that completes normally is silent.
+                //
+                // The last-FINISHED-frame status line is emitted elsewhere and is untouched, so
+                // the panel does not go stale during normal play.
+                const PROGRESS_AFTER_MS: f64 = 50.0;
+                const PROGRESS_EVERY_MS: f64 = 50.0;
+                // Without `performance.now()` there is no clock to throttle on, so fall back to
+                // the round count - never to "emit every call", which is the defect above.
+                const PROGRESS_EVERY_ROUNDS: u64 = 200_000;
+                let mut next_due_ms = c0 + PROGRESS_AFTER_MS;
                 move |rounds: u64| {
-                    let elapsed =
-                        perf.as_ref().map(|p| p.now()).unwrap_or(0.0) - c0;
+                    let now_ms = perf.as_ref().map(|p| p.now()).unwrap_or(0.0);
+                    let have_clock = now_ms > 0.0;
+                    if have_clock {
+                        if now_ms < next_due_ms {
+                            return;
+                        }
+                        next_due_ms = now_ms + PROGRESS_EVERY_MS;
+                    } else if rounds % PROGRESS_EVERY_ROUNDS != 0 {
+                        return;
+                    }
+                    let elapsed = now_ms - c0;
                     let rate = if elapsed > 0.0 { rounds as f64 * 1000.0 / elapsed } else { 0.0 };
                     let line = format!(
                         "frame {target} in progress: {rounds} scheduler rounds in \
@@ -3737,7 +3875,7 @@ async fn live_loop(
                     // thing a watcher sees is the previous frame finishing - and a frame
                     // that dies half way through looks identical to one that never started.
                     if console_status_ms == 0.0 && rounds % 200_000 == 0 {
-                        web_sys::console::log_1(&JsValue::from_str(&format!("[live] {line}")));
+                        logging::note(&format!("[live] {line}"));
                     }
                 }
             };
@@ -3945,6 +4083,32 @@ async fn live_loop(
             let frame_hc_ms = hc_ms - last_hc_ms;
             last_hc_calls = hc_calls;
             last_hc_ms = hc_ms;
+            let fast_calls = browser_sched::fast_call_total();
+            let frame_fast = fast_calls - last_fast_calls;
+            last_fast_calls = fast_calls;
+            // >>> AND WHAT THE CALLS COST, WHICH THE COUNT CANNOT SAY.
+            //
+            // With full timing off - which is every run nobody is deliberately profiling -
+            // `frame_hc_ms` is 0, and this line then reports a count with no price beside it.
+            // That empty slot is the split of `cpu` into the guest's own translated code and
+            // OUR host calls, which is the fork every performance decision here turns on; taken
+            // from a DESKTOP profile and extrapolated instead, it has now failed to predict a
+            // device result twice. `host_call_estimate` fills it for about 24 clock reads a
+            // frame. Marked `~` because it is a sample, carrying the sample count so a thin
+            // window is visibly thin, and stood down entirely when the real figure is measured.
+            let (est_ms, est_n) = browser_sched::host_call_estimate();
+            let frame_est_ms = est_ms - last_est_ms;
+            let est_samples = est_n - last_est_n;
+            last_est_ms = est_ms;
+            last_est_n = est_n;
+            // Into the window `cpu_ms` is measured over - the same frames, so the share the
+            // panel prints is one window's split and not two windows compared.
+            if frames > WARMUP_FRAMES {
+                hc_win_ms += frame_hc_ms;
+                hc_win_est_ms += frame_est_ms;
+                hc_win_calls += frame_calls;
+                hc_win_samples += est_samples;
+            }
             // The run's slowest frames, kept as they happen - see `slowest`. Counted from the
             // FIRST frame, warmup included: the boot frame is the whole point of the list, and
             // it is the one every other counter on this page deliberately excludes.
@@ -3964,9 +4128,17 @@ async fn live_loop(
             }
             let status = format!(
                 "frame {frames}{} (live via WebGPU) | {:.0} ms, {frame_calls} host calls \
-                 ({frame_hc_ms:.0} ms) | {report_step:?}",
+                 ({frame_fast} through the non-suspending trap, {}) | \
+                 {report_step:?}",
                 if fast { format!(" fast-forwarding to {ff_to}") } else { String::new() },
                 c1 - c0,
+                if frame_hc_ms > 0.0 {
+                    format!("{frame_hc_ms:.1} ms, every call timed")
+                } else if est_samples > 0 {
+                    format!("~{frame_est_ms:.1} ms, estimated from {est_samples} timed of them")
+                } else {
+                    "no timing this frame".to_string()
+                },
             );
             report.emit("status", &status);
             // Also say it on the CONSOLE, slowly.
@@ -4018,6 +4190,7 @@ async fn live_loop(
                     (q, f, host.state.now_us(), from_q, from_idle)
                 };
                 let (preempts, on_fuel) = browser_sched::preemption_stats();
+                let (stop_q, stop_b, stop_f) = browser_sched::stop_split();
                 // Instances INSTANTIATED against instances reused from the pool. A title
                 // that creates a guest thread per frame instantiates the whole transpiled
                 // module per frame without the pool, and each instance is a funcref table
@@ -4041,13 +4214,14 @@ async fn live_loop(
                 let (fuel_total, fuel_samples, fuel_max) = sched.core.fuel_report();
                 let (raw_last, raw_min) = browser_sched::raw_fuel_stats();
                 let (unbilled_none, unbilled_idle) = sched.core.unbilled_report();
-                web_sys::console::log_1(&JsValue::from_str(&format!(
+                logging::note(&format!(
                     "[live] {status} | clock {:.2}s over {flips} flips ({quanta} quanta, \
                      {:.1} us/frame; {:.2}s quanta + {:.2}s idle) \
                      | preempt {preempts} ({on_fuel} on fuel, {vparks} vblank spins PARKED) \
                      | fuel {fuel_total} over {fuel_samples} (max {fuel_max}, \
                      raw {raw_last}/min {raw_min}, unbilled {unbilled_none}+{unbilled_idle})                      | wasm heap {} MB \
-                     | jspi {susp} susp, {starts} stacks, {abandoned} abandoned, \
+                     | jspi {susp} susp ({stop_q} quantum / {stop_b} blocked / {stop_f} flip), \
+                     {starts} stacks, {abandoned} abandoned, \
                      {released} released | instances {inst_new} new, {inst_reused} reused \
                      | threads {live_threads} live, {finished_threads} finished \
                      | texture working set {} MB | {last_perf}",
@@ -4057,7 +4231,7 @@ async fn live_loop(
                     clk_idle as f64 / 1e6,
                     wasm_heap_mb(),
                     vitaslop_platform::gpu::texture_working_set_bytes() / (1024 * 1024)
-                )));
+                ));
             }
             // Keep spending this tick's budget while the fast-forward target is still
             // ahead; otherwise fall out and let the wall clock pace the next frame.
@@ -4090,9 +4264,9 @@ async fn live_loop(
                             browser_sched::name_guest_frames(why)
                         ));
                     }
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                    logging::note(&format!(
                         "live run ended at frame {frames}: {report_step:?}"
-                    )));
+                    ));
                     // The recipe's VERDICT, on the console, at the end of the run.
                     //
                     // Without it a browser run that replayed a recipe reported only where
@@ -4302,9 +4476,58 @@ async fn live_loop(
                 // unaccounted, when really the loop ran four guest frames and presented once.
                 // This ratio is the whole explanation and it costs one number.
                 let per_present = cpu_frames as f64 / np;
+                // >>> AND HOW MUCH OF `cpu` IS OURS RATHER THAN THE GUEST'S.
+                //
+                // `cpu` is the emulator thread's whole frame: the guest's translated code plus
+                // every host call it made. WHICH HALF IT IS decides where any work goes, and
+                // until this line existed that answer came from a desktop profile extrapolated
+                // to the device - which has failed to predict a device result twice. The
+                // estimate is sampled (about one call in 33, ~24 clock reads a frame, measured
+                // +2.5% against full timing over a race), so it is marked `~` and carries its
+                // sample count: a thin window has to be visibly thin. A run that IS paying for
+                // full timing prints the measured figure instead and drops the tilde.
+                let nf = cpu_frames.max(1) as f64;
+                let hc_measured = hc_win_ms > 0.0;
+                let hc_ms_avg = if hc_measured { hc_win_ms / nf } else { hc_win_est_ms / nf };
+                let hc_share = if cpu_avg > 0.0 { 100.0 * hc_ms_avg / cpu_avg } else { 0.0 };
+                let hc_calls_avg = hc_win_calls as f64 / nf;
+                // >>> AND THE ONE WAY A SAMPLED ESTIMATE CAN LIE LOUDLY.
+                //
+                // One call in ~33 is timed and scaled by 33, so a SINGLE long call - a blocking
+                // read, a collection, a compile - arrives on the panel multiplied by 33. Once in
+                // thirty race windows that produced `15.5 ms (156% of cpu)`, which is not a
+                // measurement of anything: host calls cannot cost more than the frame that
+                // contains them. Reported rather than clamped, with the longest single sample of
+                // the window beside it, because the reader who sees a 156% share and no
+                // explanation has to work out the sampler's arithmetic to dismiss it - and the
+                // reader who sees it CLAMPED to 100% cannot dismiss it at all.
+                let hc_worst_ms = browser_sched::take_host_call_sample_max();
+                let hc_impossible = hc_ms_avg > cpu_avg && cpu_avg > 0.0;
+                let hc_note = if hc_impossible {
+                    format!(
+                        " >>> IMPOSSIBLE, so read it as ONE SCALED OUTLIER, not a share: the \
+                         longest single timed call this window was {hc_worst_ms:.1} ms \
+                         and the sampler multiplies one call by ~33"
+                    )
+                } else {
+                    String::new()
+                };
+                let hc_line = if hc_measured {
+                    format!(
+                        " | host calls {hc_calls_avg:.0}/frame costing {hc_ms_avg:.1} ms \
+                         ({hc_share:.0}% of cpu, every call timed)"
+                    )
+                } else if hc_win_samples > 0 {
+                    format!(
+                        " | host calls {hc_calls_avg:.0}/frame costing ~{hc_ms_avg:.1} ms \
+                         ({hc_share:.0}% of cpu, estimated from {hc_win_samples} timed){hc_note}"
+                    )
+                } else {
+                    format!(" | host calls {hc_calls_avg:.0}/frame, untimed")
+                };
                 let perf_line = format!(
                     "cpu {cpu_avg:.1} ms/frame ({cpu_fps:.0} fps uncapped, {per_present:.1} \
-                     guest frames per present) | render \
+                     guest frames per present){hc_line} | render \
                      {render_avg:.1} ms = build {:.1} + encode {:.1}{inner} + submit {:.1} \
                      over {:.0} scenes / {:.0} draws ({:.0} gxp, {:.0} fixed)",
                     s.build_ms / np,
@@ -4384,22 +4607,62 @@ async fn live_loop(
                             line(diag, tag, &format!("{prefix} | {payload}"));
                         }
                     };
-                // FIRST, and only when there is one: anything the run reported at WARN or ERROR.
-                // A `WebGPU uncaptured error`, a dropped draw or a renderer fallback each turn a
-                // silent wrong picture into a named one, and on a phone the console they were
-                // written to does not exist. Nothing is printed when the run is clean, so a
-                // healthy panel is not made longer by the instrument.
-                if let Some(log) = crate::logging::page_log_report() {
-                    line(&mut diag, "WARNINGS AND ERRORS", &log);
-                }
-                // WHAT WE PRESENTED, when the probe is on. Directly under the warnings because
-                // it answers the question a silent panel raises: a healthy set of counters over
-                // a blank screen is either a blank picture or a picture nobody showed, and
-                // nothing else in this panel can tell those apart.
+                // >>> THE WARNINGS USED TO BE FIRST. THEY ARE NOW LAST, AND THAT IS DELIBERATE.
+                //
+                // This panel is read by being COPIED OUT OF A PHONE BROWSER BY HAND, and that
+                // copy has a length limit neither this code nor the user controls. Putting the
+                // warn block first meant a truncated paste kept 96 lines of prose and lost every
+                // measurement below it - RENDER SPLIT, PREPARE SPLIT, SHADER BUILDS, the whole
+                // reason the panel exists. Measurements first, then the warnings, so what
+                // survives a clipboard is what ranks the next piece of work.
+                //
+                // The warnings are still at the same level and still say the same things; only
+                // their POSITION changed. See the end of this function for the emission.
+                //
+                // WHAT WE PRESENTED, when the probe is on. FIRST in the panel now, because it
+                // answers the question a silent panel raises: a healthy set of counters over a
+                // blank screen is either a blank picture or a picture nobody showed, and nothing
+                // else in this panel can tell those apart.
                 if let Some(probe) = playback.take_probe_report() {
                     line(&mut diag, "PRESENTED SURFACE", &probe);
                 }
                 line(&mut diag, "RENDER SPLIT", &perf_line);
+                // >>> AND WHETHER THE GPU IS THE ONE HOLDING THINGS UP. See the
+                // `on_submitted_work_done` call in `present` for why this exists: `arena write`
+                // reached 10.8 ms of a 20.4 ms render on the device, with single writes blocking
+                // for hundreds of milliseconds, and a blocked write cannot say whether the GPU
+                // is saturated or the staging path is at fault. Those need opposite fixes.
+                {
+                    let raw = playback.gpu_done_us.load(std::sync::atomic::Ordering::Relaxed);
+                    let done = raw as f64 / 1000.0;
+                    if raw != u64::MAX {
+                        line(
+                            &mut diag,
+                            "GPU WORK-DONE LATENCY",
+                            &format!(
+                                "{done:.1} ms from a submit to the GPU reporting everything \
+                                 submitted is finished. >>> COMPARE IT WITH `period` IN PACING, \
+                                 NOT WITH 16.7: the surface presents FIFO, so this covers GPU \
+                                 execution PLUS the event-loop dispatch of the callback PLUS any \
+                                 wait behind the present, and a vsync-paced run is EXPECTED to \
+                                 read about one period. Well ABOVE the period, beside a large \
+                                 `arena write`, is the GPU genuinely behind - then the write \
+                                 stall is only where that surfaces and the fix is less GPU work \
+                                 (multisampling, target sizes, draws). At or BELOW the period, \
+                                 beside a large `arena write`, the GPU is keeping up and the \
+                                 block is OURS (a write aimed at a buffer still in flight, or an \
+                                 exhausted staging ring) - there N-buffering the per-pass arenas \
+                                 is the fix, with a capacity bound. It CANNOT separate GPU time \
+                                 from callback latency; for that a timestamp query is needed. \
+                                 One promise per present, off the critical path; this is the \
+                                 PREVIOUS window's value.",
+                            ),
+                        );
+                    }
+                }
+                // >>> THE GPU'S OWN CLOCK, which the latency above cannot separate from the
+                // event loop. See `GpuTimestamps`.
+                line(&mut diag, "GPU TIME", &playback.gxm.take_gpu_time_report());
                 // >>> AND THE PACING, WHICH IS WHAT DECIDES HOW MANY OF THOSE FRAMES ANYONE SEES.
                 //
                 // `frames/tick` above 1.0 is the loop computing pictures and discarding them:
@@ -4419,7 +4682,11 @@ async fn live_loop(
                          {:.2} presents/tick | charged {:.1} ms of game time per frame | \
                          acc {:.1} ms at tick \
                          ({saturated_ticks} saturated at {MAX_CATCHUP_MS:.0} ms) | \
-                         unaccounted {:.1} ms/tick | host timer runs {:.1} ms late (learned)",
+                         unaccounted {:.1} ms/tick | host timer runs {:.1} ms late (learned) \
+                         | THIS WINDOW: {:.1} presented/s, {:.0}% speed (game time charged \
+                         over wall time) - the `fps:` headline is a separate half-second \
+                         meter published through the page, so if it disagrees with this line \
+                         it is describing a different moment, not a different machine",
                         tick_span_ms / nt,
                         sleep_ms / nt,
                         sleep_asked_ms / nt,
@@ -4429,6 +4696,8 @@ async fn live_loop(
                         acc_at_tick_ms / nt,
                         (tick_span_ms - sleep_ms - cpu_ms - render_ms) / nt,
                         timer_overshoot_ms(),
+                        if tick_span_ms > 0.0 { presents as f64 * 1000.0 / tick_span_ms } else { 0.0 },
+                        if tick_span_ms > 0.0 { charged_ms * 100.0 / tick_span_ms } else { 0.0 },
                     );
                     line(&mut diag, "PACING", &pacing);
                 }
@@ -4472,12 +4741,42 @@ async fn live_loop(
                         )
                     };
                     let clock_s = clock_us as f64 / 1.0e6;
+                    // >>> AND THE SAME RATIO OVER THIS WINDOW, BECAUSE THE CUMULATIVE ONE
+                    // >>> CANNOT ANSWER THE QUESTION IT IS ASKED.
+                    //
+                    // `produced / clock_s` counts from the start of the RUN, boot included.
+                    // A title that spends nine seconds loading with the clock running and
+                    // nothing playing reads 0.90x for the rest of the run no matter how
+                    // perfectly the audio path then behaves, and the gap never closes
+                    // because it is behind, not falling behind. That reading was carried as
+                    // "the audio defect" for a session and it establishes nothing.
+                    //
+                    // The window figure is the derivative: sound produced since the last
+                    // panel over clock advanced since the last panel. THAT one is 1.00 on a
+                    // healthy path, drops below it while the guest is loading and silent,
+                    // and a run of windows under 1.00 during PLAY is the actual defect.
+                    // Both are printed because they answer different questions and the
+                    // cumulative one is the only one that can say how much sound a whole run
+                    // owes.
+                    let (dp, dc) = SOUND_CLOCK_WINDOW.with(|w| {
+                        let (lp, lc) = w.get();
+                        w.set((produced, clock_s));
+                        (produced - lp, clock_s - lc)
+                    });
                     if flips > 0 && clock_s > 0.0 {
+                        let window = if dc > 0.05 {
+                            format!("{:.2}x over this window ({dp:.1}s of sound against {dc:.1}s of clock)", dp / dc)
+                        } else {
+                            // Under a twentieth of a second of clock there is no ratio to
+                            // report, only rounding - say so rather than print a number
+                            // built out of two nearly equal figures.
+                            "no window figure yet (too little clock advanced since the last panel)".to_string()
+                        };
                         line(
                             &mut diag,
                             "CLOCK vs PICTURE vs SOUND",
                             &format!(
-                                "the clock advanced {:.2} display periods per displayed frame - the title's own vblank divisor, so a WHOLE number (1 = 60 fps, 2 = 30); a fraction, or one period more than its limiter waits for, is game time no frame accounted for and is what fills the audio ring. Sound {produced:.1}s against {clock_s:.1}s of clock ({:.2}x) - audio is billed in clock time, so THAT one is 1.00 at any frame rate and does not move when the clock is wrong.",
+                                "the clock advanced {:.2} display periods per displayed frame - the title's own vblank divisor, so a WHOLE number (1 = 60 fps, 2 = 30); a fraction, or one period more than its limiter waits for, is game time no frame accounted for and is what fills the audio ring. Sound: {window}. Cumulative {produced:.1}s against {clock_s:.1}s of clock ({:.2}x) - THE CUMULATIVE ONE INCLUDES BOOT AND EVERY LOAD, so it is a debt, not a rate; read the WINDOW figure to judge the audio path. Audio is billed in clock time, so a healthy window is 1.00 at any frame rate and does not move when the clock is wrong.",
                                 clock_s * 60.0 / flips as f64,
                                 if clock_s > 0.0 { produced / clock_s } else { 0.0 },
                             ),
@@ -4519,6 +4818,15 @@ async fn live_loop(
                             calls - last_movie.2,
                         ));
                         last_movie = (sub, del, calls, empty);
+                        // The movie's SOUND, on the same terms: cumulative counters, because
+                        // the one-shot warnings cannot say whether a starve or a resync fired
+                        // once or on every call, and that is the whole question when the
+                        // sound repeats. Near the top of the panel on purpose - a phone's
+                        // clipboard truncates the paste and the warnings at the bottom are
+                        // what it loses.
+                        if let Some(line) = vitaslop_runtime::vita::video::movie_audio_report() {
+                            movie.push(line);
+                        }
                         let turns = browser_sched::event_loop_turns();
                         let per_frame =
                             if paced_frames > 0 { turns as f64 / paced_frames as f64 } else { 0.0 };
@@ -4569,6 +4877,65 @@ async fn live_loop(
                         ),
                     };
                     line(&mut diag, "GAME DATA (the guest's own save)", &text);
+                }
+                // >>> HOW OFTEN THE TITLE'S FILES ARE ACTUALLY READ OUT OF STORAGE.
+                //
+                // A V8 profile put the sync OPFS `read` at 2-3% of the worker during a race
+                // (the title streams its own video and music through its own file layer),
+                // and a share cannot say whether that is many small reads - a call-count
+                // problem the read-ahead window answers - or a few large ones, which is the
+                // storage's own speed. The counts can, and they survive a busy machine.
+                {
+                    static LAST: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
+                    let now = opfs::opfs_read_counts();
+                    let mut last = LAST.lock().unwrap();
+                    let (reads, bytes, hits) = (now.0 - last.0, now.1 - last.1, now.2 - last.2);
+                    *last = now;
+                    line(
+                        &mut diag,
+                        "STORAGE (this window)",
+                        &format!(
+                            "{reads} OPFS reads moving {:.2} MB ({:.1} KB each), {hits} more calls                              served from the 64 KB read-ahead window | cumulative {} reads, {:.1} MB,                              {} window hits",
+                            bytes as f64 / (1024.0 * 1024.0),
+                            if reads > 0 { bytes as f64 / reads as f64 / 1024.0 } else { 0.0 },
+                            now.0,
+                            now.1 as f64 / (1024.0 * 1024.0),
+                            now.2,
+                        ),
+                    );
+                    // >>> AND WHAT THOSE READS COST, WHICH THE COUNT ABOVE CANNOT SAY.
+                    //
+                    // Once the reads come out of the storage worker's page ring, a hit is a
+                    // copy out of shared memory and a miss is a thread hop with an
+                    // `Atomics.wait` in it - and the count is the same number either way. The
+                    // ring was shipped to take the synchronous OPFS stall off this thread, a
+                    // device dump was taken with it live, and the dump could not say whether
+                    // the read-ahead served a single call. This is that answer: a high miss
+                    // share means the 16-page read-ahead is not reaching what the title asks
+                    // for next, and the waited milliseconds are what the emulator thread
+                    // actually lost to storage.
+                    static LASTR: std::sync::Mutex<(u64, u64, f64)> =
+                        std::sync::Mutex::new((0, 0, 0.0));
+                    if let Some(now) = opfs::ring_read_counts() {
+                        let mut last = LASTR.lock().unwrap();
+                        let (h, m, w) = (now.0 - last.0, now.1 - last.1, now.2 - last.2);
+                        *last = now;
+                        line(
+                            &mut diag,
+                            "STORAGE RING (this window)",
+                            &format!(
+                                "{h} page hits + {m} misses ({:.0}% missed), {w:.1} ms waited \
+                                 on the storage worker | cumulative {} hits, {} misses, \
+                                 {:.0} ms waited. A miss is a thread hop; a hit is a memcpy. \
+                                 If the miss share is high the read-ahead is not reaching what \
+                                 the title asks for next.",
+                                if h + m > 0 { m as f64 * 100.0 / (h + m) as f64 } else { 0.0 },
+                                now.0,
+                                now.1,
+                                now.2,
+                            ),
+                        );
+                    }
                 }
                 // >>> WHERE THE IDLE CLOCK WENT, BY (wait kind, thread) - the instrument
                 // that names a PARKED thread. It found the display-wait double-charge on
@@ -4748,6 +5115,46 @@ async fn live_loop(
                 if !s.prep.is_empty() {
                     line(&mut diag, "PREPARE SPLIT, window mean", &s.prep.line(s.presents.max(1)));
                 }
+                // >>> WHERE A SHADER BUILD'S TIME WENT, ON THE ENGINE THAT SHIPS.
+                //
+                // The desktop prints this split and the desktop is the WRONG MACHINE to read it
+                // on: there `create_shader_module` is naga, a Rust WGSL front end, while here it
+                // is the BROWSER's own compiler (Tint under Dawn), a different implementation
+                // that is known to defer work to pipeline creation. A desktop reading of "66%
+                // of the shader cost is the module compile" therefore says nothing about what a
+                // phone pays, and this project has already ranked browser work off desktop
+                // numbers once [[vitaslop-desktop-cannot-price-a-count-win]].
+                //
+                // Three numbers because they have three unrelated fixes: OUR translation is our
+                // Rust, the module compile falls with the OPERATIONS a module performs (not its
+                // source bytes - [[vitaslop-shader-compile-cost-is-the-backend-not-the-parse]]),
+                // and pipeline creation additionally needs the draw's blend, depth, cull, format
+                // and sample count and so cannot be moved off the frame at all.
+                //
+                // CUMULATIVE, not per window: these are once-per-pair costs that land in
+                // whichever frame first draws the pair, so a window mean would divide a burst by
+                // frames that did no shader work and report a number no frame ever paid.
+                let (link_ms, module_ms, create_ms) =
+                    vitaslop_platform::gpu::take_pipeline_build_split();
+                let pre_ms = vitaslop_platform::gpu::take_precompile_ms();
+                SHADER_BUILD_MS.with(|c| {
+                    let mut c = c.borrow_mut();
+                    c.0 += link_ms;
+                    c.1 += module_ms;
+                    c.2 += create_ms;
+                    c.3 += pre_ms;
+                    line(
+                        &mut diag,
+                        "SHADER BUILDS, cumulative",
+                        &format!(
+                            "{:.0} ms OUR translation (USSE -> IR -> WGSL text) + {:.0} ms the \
+                             browser compiling that WGSL + {:.0} ms creating pipelines, all IN \
+                             the frame that first drew the pair; plus {:.0} ms compiled AHEAD of \
+                             any draw",
+                            c.0, c.1, c.2, c.3
+                        ),
+                    );
+                });
                 // >>> WHAT THE GUEST-CPU HALF MOVED, IN BYTES. The only phase instrument this
                 // engine can have.
                 //
@@ -5022,8 +5429,81 @@ async fn live_loop(
                 // running in a production run by default, deciding for the user that a permanent
                 // eighth of their frame budget belongs to diagnostics. It does not. Debug capture
                 // is asked for, or it does not happen.
+                // >>> WHICH HOST CALLS THE ESTIMATE IS MADE OF, ON ANY RUN.
+                //
+                // The perf line says host calls are 35-40% of the emulator thread's frame. That
+                // number decides WHERE the work goes and cannot say WHICH calls, and the per-NID
+                // ranking that could was filled only under debug capture - a run with a cable,
+                // on a machine that is not the target. The sampler already times one call in
+                // ~33, so charging each sample to its own selector prices the boundary on the
+                // phone's own untimed run for nothing extra.
+                //
+                // ESTIMATED, and it says so on every row: a row is one selector's samples
+                // scaled by that selector's own sampling rate, so a rare NID stands on very few
+                // samples and the count is printed to make that visible. Ranked by estimated
+                // ms, with us/call beside it, because a NID crossed often and cheaply and a NID
+                // crossed rarely and expensively need opposite fixes.
+                {
+                    let rows: Vec<String> = {
+                        let host = sched.host.lock().unwrap();
+                        browser_sched::take_host_calls_by_sampled_ms_window(12)
+                            .into_iter()
+                            .map(|(sel, calls, ms, samples)| {
+                                let name = match host.import_at(sel) {
+                                    Some((_, func_nid)) => {
+                                        let n = vitaslop_runtime::nid::name(func_nid);
+                                        if n.is_empty() || n == "?" {
+                                            format!("{func_nid:#010x}")
+                                        } else {
+                                            n.to_string()
+                                        }
+                                    }
+                                    None => format!("selector {sel}"),
+                                };
+                                format!(
+                                    "~{ms:>8.0} ms {:>7.2} us/call x{calls:<9} ({samples} sampled) {name}",
+                                    if calls > 0 { ms * 1000.0 / calls as f64 } else { 0.0 }
+                                )
+                            })
+                            .collect()
+                    };
+                    if !rows.is_empty() {
+                        line(
+                            &mut diag,
+                            "HOST CALLS by ESTIMATED TIME, THIS WINDOW (sampled ~1 call in 33 \
+                             and scaled per selector - a row with few samples is a weak \
+                             row; a cumulative ranking on this title would be a ranking \
+                             of its boot)",
+                            &rows.join("\n"),
+                        );
+                    }
+                }
                 if debug_capture {
                     let (calls, total, handler, marshal) = browser_sched::host_call_split();
+                    // >>> THE ESTIMATOR, PRICED AGAINST THE THING IT ESTIMATES.
+                    //
+                    // The running line's `~N ms` is a 1-in-32 sample, and on an untimed run
+                    // there is nothing to check it against - which is exactly the run it is for.
+                    // A timed run has the true total, so it prints the error here and the claim
+                    // stops being an assumption. Host calls differ by more than an order of
+                    // magnitude in cost, so this is the number that says whether sampling them
+                    // uniformly is sound; a large error here means the running line's estimate
+                    // must not be read as a measurement.
+                    let (est, est_n) = browser_sched::host_call_estimate();
+                    if total > 0.0 && est_n > 0 {
+                        line(
+                            &mut diag,
+                            "HOST-CALL ESTIMATOR, checked against the timed total",
+                            &format!(
+                                "the 1-in-32 sample estimates {est:.0} ms from {est_n} timed \
+                                 calls against {total:.0} ms actually measured over {calls} - \
+                                 an error of {:+.1}%. This is the accuracy of the `~N ms` on \
+                                 the running line of an UNTIMED run, which is the only place \
+                                 the host-call share of a device frame comes from.",
+                                (est - total) * 100.0 / total,
+                            ),
+                        );
+                    }
                     line(
                         &mut diag,
                         "HOST CALLS, handler vs marshalling, cumulative",
@@ -5076,9 +5556,31 @@ async fn live_loop(
                     }
                     line(&mut diag, "HOST CALLS by NID, cumulative", &vitaslop_runtime::vita::call_sites_report(20));
                 }
+                // LAST, and only when there is one: anything the run reported at WARN or ERROR.
+                // A `WebGPU uncaptured error`, a dropped draw or a renderer fallback each turn a
+                // silent wrong picture into a named one, and on a phone the console they were
+                // written to does not exist. Nothing is printed when the run is clean, so a
+                // healthy panel is not made longer by the instrument.
+                //
+                // It sits at the BOTTOM so that a hand-copied panel truncated by a clipboard
+                // limit loses warnings rather than measurements - see the note where the other
+                // sections begin.
+                // STATUS: what the run DID, as opposed to what went wrong with it. Its own
+                // section because a warning is a claim that something is broken and owed a fix,
+                // and mixing a frame-shape trace in with that made both unreadable.
+                if let Some(status) = crate::logging::page_status_report() {
+                    line(&mut diag, "STATUS (not defects)", &status);
+                }
+                if let Some(log) = crate::logging::page_log_report() {
+                    line(&mut diag, "WARNINGS AND ERRORS (each one is a fix we owe)", &log);
+                }
                 report.emit("diag", &diag);
                 cpu_ms = 0.0;
                 cpu_frames = 0;
+                hc_win_ms = 0.0;
+                hc_win_est_ms = 0.0;
+                hc_win_calls = 0;
+                hc_win_samples = 0;
                 render_ms = 0.0;
                 presents = 0;
             }
@@ -5104,7 +5606,7 @@ pub async fn run(canvas: JsValue) -> Result<String, JsValue> {
         cpu.run_ms,
         cpu.run_ms * 1000.0 / FRAMES as f64,
     );
-    web_sys::console::log_1(&JsValue::from_str(&status));
+    logging::note(&status);
 
     let playback = Playback::new(canvas, cpu.scenes).await?;
     start_raf_loop(playback);

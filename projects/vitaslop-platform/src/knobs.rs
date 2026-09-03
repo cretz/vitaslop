@@ -45,6 +45,13 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_BROWSER_INSTANCE_POOL",
     "VITASLOP_BROWSER_QUANTUM_CALLS",
     "VITASLOP_BROWSER_SUPERSAMPLE",
+    // Mirror the run's status notes and heartbeat to the browser console. Off by default:
+    // a clean run's console shows warnings and nothing else; the panel carries the rest.
+    "VITASLOP_CONSOLE",
+    // Hard-pause the emulator when the window loses focus or the tab is hidden. ON by
+    // default; `0` keeps the guest running unfocused. Read on both engines: the desktop's
+    // window event and the browser page's visibility/blur handlers.
+    "VITASLOP_PAUSE_ON_BLUR",
     // The per-NID / per-call-site host-call histogram. Reachable from the browser because that
     // is where the host-call boundary costs the most: a phone spends roughly 16 ms of a 56 ms
     // guest frame on ~4,950 calls, and the only way to spend less is to make fewer of them -
@@ -216,6 +223,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // family worth ~1,000 calls cannot be priced against that baseline. This one changes
     // nothing else. Read at LINK time; set it before the run, not during it.
     "VITASLOP_NO_INLINE_LWMUTEX",
+    // Routes every host call back through the SUSPENDING trap (`env.import`) instead of
+    // sending the never-blocking NIDs through `env.import_fast`. Reachable from the browser
+    // because the browser is the only engine where the two traps differ: the JSPI stack
+    // switch per call is what the fast trap removes, and only a phone can price it. Read
+    // at LINK time; set it before the run, not during it.
+    "VITASLOP_NO_FAST_IMPORT",
     // The SCOPED switch for the two default-uniform RESERVES, which are the largest single
     // family of host calls a gameplay frame still made before they were inlined (1,189 a
     // frame on one title, 53% of everything it calls). Reachable from the browser for both
@@ -405,18 +418,50 @@ pub fn var_os(name: &str) -> Option<String> {
 /// is written against it, so a desktop binary answering only to `RUST_LOG` turns a documented
 /// invocation into silence - which is indistinguishable from a diagnostic that never fires,
 /// and that is exactly how it was found. `RUST_LOG` still works, for the ordinary Rust habit.
+/// The target `report_status!` emits on. Forced ON below whenever a filter was NAMED.
+///
+/// Status rides at `info` so it never claims to be a warning, but a channel the DEFAULT filter
+/// switches off is a channel that does not exist - and that is precisely the trade that put this
+/// material at `warn` in the first place. The web logger forces the same directive; this is the
+/// native half, and without it every `VITASLOP_LOG=warn` desktop run (which is all of them,
+/// including every headless oracle) silently loses the frame-shape trace, the precompile counts
+/// and the pair-hash lines.
+pub const STATUS_TARGET_DIRECTIVE: &str = "vitaslop::status=info";
+
 pub fn log_filter() -> String {
+    // >>> A RUN NOBODY CONFIGURED PRINTS NOTHING UNLESS SOMETHING IS WRONG.
+    //
+    // The status channel used to be appended to EVERY filter, the default included, so a
+    // clean run of a working title wrote a dozen `INFO vitaslop::status` lines (the image
+    // span, the mounted archive, the adapter's texture families, every NGS rack) before its
+    // first frame. Those answer questions a developer asks; the product's answer to "how is
+    // it going" is silence. So with no filter NAMED the directive is `warn` alone, and
+    // status is forced on only when one was - `VITASLOP_LOG=warn` is a debugging session,
+    // and every recorded repro command keeps exactly the output it had.
+    //
+    // Appended LAST so it wins: a user narrowing `VITASLOP_LOG` must not lose the status
+    // channel by accident, and a user who deliberately names `vitaslop::status` still can
+    // (their directive is more specific than the level default they are overriding).
+    match log_filter_base() {
+        Some(base) if base.contains("vitaslop::status") => base,
+        Some(base) => format!("{base},{STATUS_TARGET_DIRECTIVE}"),
+        None => "warn".to_string(),
+    }
+}
+
+/// The filter the user NAMED, or `None` when neither knob is set.
+fn log_filter_base() -> Option<String> {
     match var("VITASLOP_LOG") {
-        Ok(v) if !v.is_empty() => v,
+        Ok(v) if !v.is_empty() => Some(v),
         _ => match std::env::var("RUST_LOG") {
-            Ok(v) if !v.is_empty() => v,
+            Ok(v) if !v.is_empty() => Some(v),
             // WARN by default, not silence. Everything this engine approximates is required
             // to report itself - a shader pair that falls back to fixed-function, a dropped
             // draw, an unplaced scene - and those reports are `warn`. With an empty filter
             // they were all discarded, so the DEFAULT invocation was the one that could not
             // see them: a run that quietly drew a whole title through the fallback looked
             // exactly like a run that recompiled it. A knob nobody sets is not a report.
-            _ => "warn".to_string(),
+            _ => None,
         },
     }
 }

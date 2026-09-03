@@ -249,8 +249,9 @@ fn open_movie(
     let handle = 0x4d50_0001u32 as i32;
     // WARN so a device's default log level carries it - see the note on the first-picture
     // report in `vita::avcdec` for why the movie path says its landmarks out loud.
-    tracing::warn!(
-        target: "vitaslop::movie",
+    // A milestone for the panel's STATUS section: which movie, at what size, with what sound.
+    tracing::info!(
+        target: "vitaslop::status",
         %path, width, height, samples, ?audio,
         buffer = format_args!("{buffer:#010x}"), buffer_size,
         "SceMp4: demuxing a movie"
@@ -673,14 +674,52 @@ fn do_get_next_unit(
 /// is served synchronously. See [`crate::vita::audiodec`].
 pub struct MovieAudio {
     decoder: Box<dyn vitaslop_platform::audio_dec::AudioDecode>,
+    /// Decoded PCM the decoder has handed back and no frame has been cut from yet,
+    /// interleaved, oldest first. See [`Self::cut_frames`] for why the decoder's outputs are
+    /// pooled here rather than taken as frames.
+    pcm: std::collections::VecDeque<i16>,
     /// Decoded frames, oldest first, each with the access unit it came from.
     ready: std::collections::VecDeque<DecodedFrame>,
-    /// Access units submitted and not yet answered, oldest first: `(byte length, first
-    /// word)`. The first word is what `sceAudiodecDecode` checks the guest's elementary
-    /// stream against, which is how a queue that went out of step says so.
-    pending: std::collections::VecDeque<(u32, u32)>,
+    /// Access units submitted and not yet cut into a frame, oldest first.
+    pending: std::collections::VecDeque<PendingUnit>,
     /// Frames dropped because nothing collected them - a title that stopped decoding.
     dropped: u64,
+    /// The sample rate the container declares for the track. The decoder's own output rate
+    /// is compared against it to size a frame - see [`Self::cut_frames`].
+    track_rate: u32,
+    /// Channels in a decoded frame, from the decoder's first output (the stream's own
+    /// declaration until then).
+    channels: u32,
+    /// PCM frames (samples per channel) one access unit decodes to. Fixed once the first
+    /// output has said what the decoder produces.
+    unit_frames: Option<u32>,
+    /// Index of the next sample of the audio track to hand the decoder. Runs AHEAD of the
+    /// title's own cursor by [`AUDIO_LOOKAHEAD`] units - see [`pump_movie_audio`].
+    submitted_to: usize,
+}
+
+/// How many access units the decoder is kept fed AHEAD of the one the title has just been
+/// handed.
+///
+/// # Why the decoder is fed ahead at all
+/// The first version submitted a unit at the moment it was handed to the title and nothing
+/// earlier. A host decoder holds a frame of latency - the desktop's answers unit `n` when it
+/// is given `n+1`, and a browser's answers on a later task - so whether the title's decode
+/// call found its frame depended on how far its demux thread happened to be running ahead of
+/// its decode thread. MEASURED on one title's intro, desktop: **955 of 3440 decode calls
+/// starved** (28%), each one 21 ms of silence with that unit's sound then discarded as
+/// stale - which is a stutter, and it is what the user heard on the device. The container is
+/// whole and indexed, so nothing stops the engine reading the next few audio samples early;
+/// six units is ~130 ms of sound in flight, a few kilobytes, and more than any decoder's
+/// latency.
+const AUDIO_LOOKAHEAD: usize = 6;
+
+/// One access unit handed to the decoder and not yet answered.
+struct PendingUnit {
+    /// Bytes of elementary stream, which is what `SceAudiodecCtrl::inputEsSize` is owed.
+    es_size: u32,
+    /// [`unit_id`] of the unit's bytes.
+    id: u64,
 }
 
 /// One decoded audio frame, waiting for the guest to ask for it.
@@ -689,8 +728,120 @@ pub struct DecodedFrame {
     /// Bytes of elementary stream this frame was decoded from, which is what
     /// `SceAudiodecCtrl::inputEsSize` is owed.
     pub es_size: u32,
-    /// The first word of that access unit, for the ordering check.
-    pub es_head: u32,
+    /// [`unit_id`] of the access unit this frame was decoded from. `sceAudiodecDecode`
+    /// computes the same over the elementary stream the guest passes, which is how the queue
+    /// knows WHICH unit the title is decoding rather than merely whether it is the next one.
+    pub id: u64,
+}
+
+/// The identity of one access unit: FNV-1a over its bytes, folded with its length.
+///
+/// # Why a hash of the whole unit and not its first word
+/// The first version keyed frames on the unit's first 32 bits. AAC frames of similar content
+/// START ALIKE - the element id and the ICS info come first, and a stretch of near-silence
+/// repeats them frame after frame - so a queue one unit behind the title could match on the
+/// wrong frame and serve it as the right one, and the ordering check could never say so.
+/// Hashing the whole unit makes a false match as unlikely as a 64-bit collision, and the
+/// cost is one pass over ~700 bytes per decode call, which is nothing against the decode.
+pub(crate) fn unit_id(es: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in es {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ ((es.len() as u64) << 48)
+}
+
+/// Cumulative counters for the movie's audio path, for the diagnostics panel. Reset when a
+/// movie's decoder is opened, so a run's second movie does not inherit the first's totals.
+///
+/// These are the numbers the one-shot warnings cannot carry: a resync that fired once and one
+/// that fires on every call print the same warning, and which of the two a run is having IS
+/// the question when the sound is wrong [[vitaslop-a-once-only-report-can-fire-in-its-own-warmup]].
+pub mod audio_counters {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    /// Access units handed to the decoder.
+    pub static UNITS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+    /// Outputs the decoder handed back, and the smallest and largest of them in PCM frames -
+    /// a decoder that answers in anything but whole access units is what these show.
+    pub static OUTPUTS: AtomicU64 = AtomicU64::new(0);
+    pub static OUTPUT_FRAMES_MIN: AtomicU32 = AtomicU32::new(u32::MAX);
+    pub static OUTPUT_FRAMES_MAX: AtomicU32 = AtomicU32::new(0);
+    /// PCM frames decoded in total, against `UNITS_SUBMITTED * unit_frames`.
+    pub static FRAMES_DECODED: AtomicU64 = AtomicU64::new(0);
+    /// Frames cut and queued for the title.
+    pub static FRAMES_CUT: AtomicU64 = AtomicU64::new(0);
+    /// Frames the title collected through `sceAudiodecDecode`.
+    pub static FRAMES_DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// `sceAudiodecDecode` calls answered with silence because the unit asked for was not
+    /// decoded yet.
+    pub static STARVED_CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Frames discarded because the title had moved past their unit.
+    pub static RESYNC_DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// Times a decode call found its unit somewhere OTHER than the head of the queue.
+    pub static RESYNCS: AtomicU64 = AtomicU64::new(0);
+    /// Frames shed because the title stopped collecting them.
+    pub static BACKLOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// PCM frames per access unit, once known.
+    pub static UNIT_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+    pub fn reset() {
+        UNITS_SUBMITTED.store(0, Relaxed);
+        OUTPUTS.store(0, Relaxed);
+        OUTPUT_FRAMES_MIN.store(u32::MAX, Relaxed);
+        OUTPUT_FRAMES_MAX.store(0, Relaxed);
+        FRAMES_DECODED.store(0, Relaxed);
+        FRAMES_CUT.store(0, Relaxed);
+        FRAMES_DELIVERED.store(0, Relaxed);
+        STARVED_CALLS.store(0, Relaxed);
+        RESYNC_DROPPED.store(0, Relaxed);
+        RESYNCS.store(0, Relaxed);
+        BACKLOG_DROPPED.store(0, Relaxed);
+        UNIT_FRAMES.store(0, Relaxed);
+    }
+}
+
+/// The movie audio path's own line for the diagnostics panel, or `None` if no movie audio
+/// decoder was ever opened this run.
+pub fn movie_audio_report() -> Option<String> {
+    use audio_counters::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    let submitted = UNITS_SUBMITTED.load(Relaxed);
+    if submitted == 0 {
+        return None;
+    }
+    let unit_frames = UNIT_FRAMES.load(Relaxed) as u64;
+    let decoded = FRAMES_DECODED.load(Relaxed);
+    let expected = submitted * unit_frames;
+    let (lo, hi) = (OUTPUT_FRAMES_MIN.load(Relaxed), OUTPUT_FRAMES_MAX.load(Relaxed));
+    let outputs = OUTPUTS.load(Relaxed);
+    let shape = if outputs == 0 {
+        "no output yet".to_string()
+    } else if lo == hi {
+        format!("{outputs} outputs of {lo} frames each")
+    } else {
+        format!("{outputs} outputs of {lo}..{hi} frames - NOT one per unit, which is why frames are cut by sample count")
+    };
+    Some(format!(
+        "movie audio: {submitted} units submitted -> {shape} -> {decoded} PCM frames decoded \
+         ({} against the {expected} the units add up to at {unit_frames}/unit) -> {} frames cut, \
+         {} delivered to the title | {} calls STARVED (served silence, nothing decoded yet for \
+         that unit) | {} resyncs dropping {} stale frames (the title had moved past them) | \
+         {} frames shed to the backlog cap. Sound that repeats or echoes is here: a starved \
+         call is a gap, a resync is lost sound, and a decoded total short of the expected one \
+         is a decoder that trims - all three leave the TOTAL looking right.",
+        match decoded.cmp(&expected) {
+            std::cmp::Ordering::Less => format!("{} SHORT", expected - decoded),
+            std::cmp::Ordering::Equal => "exact".to_string(),
+            std::cmp::Ordering::Greater => format!("{} OVER", decoded - expected),
+        },
+        FRAMES_CUT.load(Relaxed),
+        FRAMES_DELIVERED.load(Relaxed),
+        STARVED_CALLS.load(Relaxed),
+        RESYNCS.load(Relaxed),
+        RESYNC_DROPPED.load(Relaxed),
+        BACKLOG_DROPPED.load(Relaxed),
+    ))
 }
 
 /// How many decoded frames to hold for a title that is not collecting them. One AAC frame
@@ -727,17 +878,25 @@ fn open_movie_audio(
     };
     match st.audio_dec.open_aac(&stream) {
         Ok(decoder) => {
-            tracing::warn!(
-                target: "vitaslop::movie",
+            tracing::info!(
+                target: "vitaslop::status",
                 backend = %decoder.describe(),
                 samples = track.samples.len(),
                 "SceMp4: decoding the movie's sound on the host's own AAC decoder"
             );
+            audio_counters::reset();
             Some(MovieAudio {
                 decoder,
+                pcm: std::collections::VecDeque::new(),
                 ready: std::collections::VecDeque::new(),
                 pending: std::collections::VecDeque::new(),
                 dropped: 0,
+                track_rate: track.timescale,
+                // A placeholder until the first output says what the decoder produces;
+                // nothing is cut before then.
+                channels: 2,
+                unit_frames: None,
+                submitted_to: 0,
             })
         }
         Err(e) => {
@@ -755,32 +914,71 @@ fn open_movie_audio(
 /// Submit one delivered audio access unit to the movie's decoder and collect whatever has
 /// come back. Called where the unit is handed to the title, which is what makes the decode
 /// run AHEAD of the title's own decode call.
-fn pump_movie_audio(movie: &mut MovieSession, es: &[u8], pts: i64) {
-    let Some(audio) = movie.audio.as_mut() else { return };
-    let head = u32::from_le_bytes([
-        es.first().copied().unwrap_or(0),
-        es.get(1).copied().unwrap_or(0),
-        es.get(2).copied().unwrap_or(0),
-        es.get(3).copied().unwrap_or(0),
-    ]);
-    if let Err(e) = audio.decoder.submit(es, pts) {
-        report_audio_decode_failed(&e.to_string());
-        return;
+fn pump_movie_audio(
+    st: &mut crate::host::VitaState,
+    track: usize,
+    at: usize,
+    unit: &AccessUnit,
+) {
+    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+    // The title's cursor moved somewhere this queue did not follow - a seek, or a reset that
+    // did not come through `sceMp4Reset`. Everything decoded is for the wrong units, so it
+    // starts again from here rather than serving them.
+    if audio.submitted_to > at + AUDIO_LOOKAHEAD + 1 {
+        audio.ready.clear();
+        audio.pending.clear();
+        audio.pcm.clear();
+        let _ = audio.decoder.reset();
+        audio.submitted_to = at;
     }
-    audio.pending.push_back((es.len() as u32, head));
+    if audio.submitted_to <= at {
+        audio.submitted_to = at;
+    }
+    let target = at + 1 + AUDIO_LOOKAHEAD;
     loop {
-        match audio.decoder.poll() {
-            Ok(Some(pcm)) => {
-                let (es_size, es_head) = audio.pending.pop_front().unwrap_or((0, 0));
-                audio.ready.push_back(DecodedFrame { samples: pcm.samples, es_size, es_head });
-                while audio.ready.len() > AUDIO_BACKLOG {
-                    audio.ready.pop_front();
-                    audio.dropped += 1;
-                    // A movie quietly missing half a second of sound is exactly the kind of
-                    // thing that gets noticed as "the audio is a bit odd" a week later.
-                    report_audio_backlog_dropped(audio.dropped);
+        let Some(next) = st
+            .movie
+            .as_ref()
+            .and_then(|m| m.audio.as_ref())
+            .map(|a| a.submitted_to)
+            .filter(|&n| n < target)
+        else {
+            break;
+        };
+        // The unit just handed over is in hand; only the lookahead is read again.
+        let (bytes, pts): (std::borrow::Cow<[u8]>, i64) = if next == at {
+            (std::borrow::Cow::Borrowed(&unit.bytes[..]), unit.pts as i64)
+        } else {
+            match access_unit_at(st, track, next) {
+                Ok(Some(u)) => (std::borrow::Cow::Owned(u.bytes), u.pts as i64),
+                // End of the track: nothing more to feed.
+                Ok(None) => break,
+                Err(e) => {
+                    report_audio_decode_failed(&e);
+                    break;
                 }
             }
+        };
+        let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+        if let Err(e) = audio.decoder.submit(&bytes, pts) {
+            report_audio_decode_failed(&e.to_string());
+            return;
+        }
+        audio_counters::UNITS_SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        audio.pending.push_back(PendingUnit { es_size: bytes.len() as u32, id: unit_id(&bytes) });
+        audio.submitted_to = next + 1;
+    }
+    collect_decoded_audio(st);
+}
+
+/// Collect whatever the decoder has answered since the last look, and cut it into frames.
+/// Called at every handover and at every decode call: on a browser the decoder answers on a
+/// task, so what arrived between the two is only visible by asking.
+pub(crate) fn collect_decoded_audio(st: &mut crate::host::VitaState) {
+    let Some(audio) = st.movie.as_mut().and_then(|m| m.audio.as_mut()) else { return };
+    loop {
+        match audio.decoder.poll() {
+            Ok(Some(pcm)) => audio.take_output(pcm),
             Ok(None) => break,
             Err(e) => {
                 report_audio_decode_failed(&e.to_string());
@@ -788,11 +986,137 @@ fn pump_movie_audio(movie: &mut MovieSession, es: &[u8], pts: i64) {
             }
         }
     }
+    audio.cut_frames();
 }
 
-/// Take the oldest decoded audio frame, for `sceAudiodecDecode`.
-pub(crate) fn take_decoded_audio(st: &mut crate::host::VitaState) -> Option<DecodedFrame> {
-    st.movie.as_mut()?.audio.as_mut()?.ready.pop_front()
+impl MovieAudio {
+    /// Pool one decoder output. See [`Self::cut_frames`] for why it is not a frame yet.
+    fn take_output(&mut self, pcm: vitaslop_platform::audio_dec::DecodedAudio) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let channels = pcm.channels.max(1);
+        let frames = (pcm.samples.len() / channels as usize) as u32;
+        audio_counters::OUTPUTS.fetch_add(1, Relaxed);
+        audio_counters::FRAMES_DECODED.fetch_add(frames as u64, Relaxed);
+        audio_counters::OUTPUT_FRAMES_MIN.fetch_min(frames, Relaxed);
+        audio_counters::OUTPUT_FRAMES_MAX.fetch_max(frames, Relaxed);
+        if self.unit_frames.is_none() {
+            // AAC-LC decodes 1024 PCM frames per access unit. A decoder that applies the
+            // stream's SBR extension answers at TWICE the container's declared rate, and then
+            // one unit is 2048 frames of that. Decided from what the decoder actually
+            // produced rather than from the stream's declaration, because it is the
+            // decoder's output that has to be cut, and whether it applied SBR is its call.
+            let unit = if self.track_rate > 0 && pcm.sample_rate >= self.track_rate * 2 {
+                2048
+            } else {
+                1024
+            };
+            self.unit_frames = Some(unit);
+            self.channels = channels;
+            audio_counters::UNIT_FRAMES.store(unit, Relaxed);
+        }
+        self.pcm.extend(pcm.samples);
+    }
+
+    /// Cut every whole access unit's worth of PCM off the pool into a frame for the title.
+    ///
+    /// # Why the decoder's outputs are not the frames
+    /// The first version took each decoder output as one frame and paired it with the oldest
+    /// unanswered unit. That is right only for a decoder that answers one output per input,
+    /// which WebCodecs does not promise and a phone's does not do: `AudioData` describes what
+    /// the platform decoder produced, and a hardware AAC path is entitled to answer two units
+    /// in one buffer or one unit in two ([[vitaslop-webcodecs-frame-layout-varies-by-device]]
+    /// is the same fact for the video path). Under that pairing a half-unit output is served
+    /// as a whole frame - the guest's buffer keeps the previous call's second half, which is
+    /// a REPEAT of the last 10 ms in every frame - and a double-unit output is served as one
+    /// frame and truncated, which drops every other 21 ms. Both keep the total right.
+    ///
+    /// So the outputs are pooled as PCM and frames are cut by SAMPLE COUNT: unit `n` gets the
+    /// `n`th 1024 frames the decoder produced, whatever shape it produced them in. That is
+    /// exact for any decoder whose output totals its input, which is what an AAC decoder
+    /// without an edit list does; a decoder that trims is visible as a shortfall in the panel
+    /// line and would need its priming accounted for here.
+    fn cut_frames(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(unit_frames) = self.unit_frames else { return };
+        let per_frame = unit_frames as usize * self.channels.max(1) as usize;
+        while self.pcm.len() >= per_frame {
+            let Some(unit) = self.pending.pop_front() else {
+                // More PCM than units: a decoder that answered with more than it was given.
+                // There is no unit to charge it to, so it is not a frame; it is dropped and
+                // the panel's decoded-against-expected figure reads OVER.
+                self.pcm.drain(..per_frame);
+                continue;
+            };
+            let samples: Vec<i16> = self.pcm.drain(..per_frame).collect();
+            self.ready.push_back(DecodedFrame { samples, es_size: unit.es_size, id: unit.id });
+            audio_counters::FRAMES_CUT.fetch_add(1, Relaxed);
+            while self.ready.len() > AUDIO_BACKLOG {
+                self.ready.pop_front();
+                self.dropped += 1;
+                audio_counters::BACKLOG_DROPPED.fetch_add(1, Relaxed);
+                // A movie quietly missing half a second of sound is exactly the kind of
+                // thing that gets noticed as "the audio is a bit odd" a week later.
+                report_audio_backlog_dropped(self.dropped);
+            }
+        }
+    }
+}
+
+/// The frame decoded from the access unit whose bytes `matches` recognises, if it is queued:
+/// discards every older frame in front of it (the title has moved past those units) and
+/// pops it. `None` leaves the queue untouched - the unit asked for is not decoded yet, or
+/// was never queued - and the caller serves silence for this call.
+///
+/// `matches` is given each candidate's elementary-stream length and returns the identity of
+/// that many bytes of the guest's stream, so the caller hashes the guest's bytes once per
+/// DISTINCT length in the queue rather than once per frame; in step, that is once.
+///
+/// # Why the queue can fall behind the title in the first place
+/// When the decoder has nothing ready, `sceAudiodecDecode` serves a frame of SILENCE and does
+/// not pop anything - it cannot, there is nothing there. The title, meanwhile, has consumed
+/// that access unit and moves to the next one. From then on the queue is one unit behind the
+/// title FOR EVER, and every frame it serves is the sound of the previous unit: measured on
+/// one title's intro movie, the very next call after the single starve reported the mismatch,
+/// and the offset never closed. The old code reported that once and kept serving the stale
+/// frames, which is the "sound is out of step with the picture" defect itself.
+///
+/// Dropping the older frames is the right direction and not a guess: a frame the title never
+/// asked for is stale by construction, and serving it late would put the audio permanently
+/// behind the picture and one unit further behind after every subsequent starve. Dropping
+/// on a MISS is not: the first version emptied the whole queue when nothing matched, and
+/// with a decoder that answers late that is the title's next frames thrown away just before
+/// they are wanted.
+pub(crate) fn take_decoded_audio(
+    st: &mut crate::host::VitaState,
+    mut matches: impl FnMut(u32) -> u64,
+) -> Option<(DecodedFrame, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let audio = st.movie.as_mut()?.audio.as_mut()?;
+    let mut ids: Vec<(u32, u64)> = Vec::new();
+    let mut found = None;
+    for (i, frame) in audio.ready.iter().enumerate() {
+        let id = match ids.iter().find(|(len, _)| *len == frame.es_size) {
+            Some((_, id)) => *id,
+            None => {
+                let id = matches(frame.es_size);
+                ids.push((frame.es_size, id));
+                id
+            }
+        };
+        if id == frame.id {
+            found = Some(i);
+            break;
+        }
+    }
+    let at = found?;
+    let dropped = audio.ready.drain(..at).count() as u64;
+    if dropped > 0 {
+        audio_counters::RESYNCS.fetch_add(1, Relaxed);
+        audio_counters::RESYNC_DROPPED.fetch_add(dropped, Relaxed);
+    }
+    let frame = audio.ready.pop_front()?;
+    audio_counters::FRAMES_DELIVERED.fetch_add(1, Relaxed);
+    Some((frame, dropped))
 }
 
 /// Say, once, that decoded audio was thrown away because the title stopped collecting it.
@@ -1319,6 +1643,9 @@ fn do_get_next_unit_data(
         Some(movie) if movie.handle == handle => {}
         _ => return SCE_ERROR_ERRNO_ENOENT,
     }
+    // Which sample this call is about to take, for the audio pump below: the cursor has
+    // moved on by the time the unit is in hand.
+    let taking = st.movie.as_ref().and_then(next_unit_track);
     let unit = match next_access_unit(st) {
         Ok(Some(unit)) => unit,
         Ok(None) => return 0,
@@ -1329,12 +1656,11 @@ fn do_get_next_unit_data(
         }
     };
     ctx.write_bytes(dest, &unit.bytes);
-    // An AUDIO unit is decoded the moment it is handed over, so its PCM is waiting when the
-    // title's own decode call comes - see [`MovieAudio`].
+    // An AUDIO unit is decoded AHEAD of being handed over, so its PCM is waiting when the
+    // title's own decode call comes - see [`MovieAudio`] and [`AUDIO_LOOKAHEAD`].
     if !unit.video {
-        let pts = unit.pts as i64;
-        if let Some(movie) = st.movie.as_mut() {
-            pump_movie_audio(movie, &unit.bytes, pts);
+        if let Some((track, at)) = taking {
+            pump_movie_audio(st, track, at, &unit);
         }
     }
     if let Some(movie) = st.movie.as_mut() {
@@ -1384,6 +1710,8 @@ fn do_reset(st: &mut crate::host::VitaState, handle: i32) -> i32 {
     if let Some(audio) = movie.audio.as_mut() {
         audio.ready.clear();
         audio.pending.clear();
+        audio.pcm.clear();
+        audio.submitted_to = 0;
         let _ = audio.decoder.reset();
     }
     tracing::debug!(target: "vitaslop::movie", "sceMp4Reset: back to the first unit");
@@ -1477,6 +1805,12 @@ fn do_close_file(st: &mut crate::host::VitaState, handle: i32) -> i32 {
              and how this title's player is meant to reach a movie's sound is not established - \
              it has never called sceAudiodecDecode on any run."
         );
+    }
+    // The sound path's totals, at the one moment they are complete. Status, not a defect:
+    // the defects it can show (starves, resyncs, a decoder that trims) are each named in the
+    // line, and the browser panel prints the same line live under MOVIE.
+    if let Some(line) = movie_audio_report() {
+        tracing::info!(target: "vitaslop::status", %path, "sceMp4CloseFile: {line}");
     }
     st.movie = None;
     st.io_close(fd);

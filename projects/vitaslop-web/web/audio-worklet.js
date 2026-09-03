@@ -136,12 +136,25 @@ class VitaslopAudio extends AudioWorkletProcessor {
     this.stopped = false;
     this.port.onmessage = (e) => {
       if (e.data === "stop") this.stopped = true;
+      // A HARD PAUSE (the page lost focus or was hidden): the emulator stops producing, and
+      // this side stops consuming - silence out, the ring left exactly as it is, and NO
+      // underrun counted, because nothing ran dry. Without this the pause reads on the
+      // panel as seconds of underrun that the audio path never caused.
+      if (e.data === "pause") this.paused = true;
+      if (e.data === "resume") this.paused = false;
     };
   }
 
   process(_inputs, outputs) {
     const out = outputs[0];
     const frames = out[0].length;
+    if (this.paused) {
+      for (let c = 0; c < out.length; c++) out[c].fill(0);
+      // The envelope restarts from silence on resume, so the first block ramps in rather
+      // than stepping - the same click the underrun edge is ramped for.
+      this.env = 0;
+      return !this.stopped;
+    }
     const write = Atomics.load(this.ctl, CTL_WRITE);
     let read = Atomics.load(this.ctl, CTL_READ);
 

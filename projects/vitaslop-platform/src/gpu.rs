@@ -35,6 +35,25 @@ macro_rules! report_warn {
     ($($arg:tt)*) => { tracing::warn!(target: "vitaslop::gxm", $($arg)*) };
 }
 
+/// A STATUS line: something the panel should carry, that is NOT a defect.
+///
+/// # The rule this exists to enforce
+/// A WARNING IS A CLAIM THAT SOMETHING IS BROKEN AND OWED A FIX. Before writing
+/// `report_warn!`, ask what you would FIX on reading the line; if there is no answer, it is
+/// status and belongs here. The frame's pass structure, a precompile count, a texture working
+/// set, "the state is live", "the tallies are clean" - none of those are defects, and filing
+/// them at `warn` made the one channel a phone has unreadable: the genuine findings sat
+/// between twenty copies of a trace, and a user could not tell a defect from a heartbeat.
+///
+/// This is NOT a way to quieten an inconvenient warning. Lowering a real warning is silencing
+/// it. Status rides at `info` on its own target, which the web logging layer forces ON
+/// regardless of `VITASLOP_LOG` and renders in the panel's own STATUS section - so nothing
+/// that used to be visible stops being visible. It is sorted, not hidden.
+#[allow(unused_macros)]
+macro_rules! report_status {
+    ($($arg:tt)*) => { tracing::info!(target: "vitaslop::status", $($arg)*) };
+}
+
 /// A diagnostic with ONE shape and MANY subjects: the first subject in full, the rest folded
 /// into a single line that only advances a count.
 ///
@@ -76,11 +95,26 @@ impl Census {
     /// subject - a census of the same rectangle seen a thousand times counts occurrences, not
     /// subjects, and the two answer different questions.
     pub(crate) fn note(&self, headline: &str, subject: &str) {
+        self.note_at(true, headline, subject);
+    }
+
+    /// The same census on the STATUS channel: for a shape that is expected and measured
+    /// rather than owed a fix, so it reaches the panel's STATUS section and never the
+    /// console of a clean run.
+    pub(crate) fn note_status(&self, headline: &str, subject: &str) {
+        self.note_at(false, headline, subject);
+    }
+
+    fn note_at(&self, warn: bool, headline: &str, subject: &str) {
         use std::sync::atomic::Ordering;
         let n = self.n.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 {
             let _ = self.first.set(subject.to_string());
-            report_warn!("{headline} {subject}");
+            if warn {
+                report_warn!("{headline} {subject}");
+            } else {
+                report_status!("{headline} {subject}");
+            }
             return;
         }
         // The full text still exists, one level down, for anyone chasing a specific subject.
@@ -89,11 +123,18 @@ impl Census {
         // what lets the panel fold these into one line and show the LATEST count. Nothing
         // that varies with `n` may appear before the suffix, or the fold stops working and
         // this becomes the flood it replaced.
-        report_warn!(
-            "{headline} [more than one subject - this line carries the running total; the \
-             first was: {}] count={n}",
-            self.first.get().map_or("?", String::as_str),
-        );
+        let first = self.first.get().map_or("?", String::as_str);
+        if warn {
+            report_warn!(
+                "{headline} [more than one subject - this line carries the running total; the \
+                 first was: {first}] count={n}"
+            );
+        } else {
+            report_status!(
+                "{headline} [more than one subject - this line carries the running total; the \
+                 first was: {first}] count={n}"
+            );
+        }
     }
 }
 
@@ -266,8 +307,21 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
              compressed texture takes the TRANSCODE path exactly as the target device does"
         );
     }
-    let want =
+    let mut want =
         have & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_COMPRESSION_ETC2);
+    // >>> GPU TIMESTAMPS, WHERE THE ADAPTER OFFERS THEM. The work-done latency the browser
+    // measures cannot separate GPU execution from the event loop's dispatch of its callback
+    // ([`GpuTimestamps`] is the instrument that can), and a device that reads 44 ms of
+    // latency against a 27 ms period has no other way to say whether its GPU is the bottleneck.
+    // A pair of timestamps per render pass costs the GPU nothing it can measure.
+    if have.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        want |= wgpu::Features::TIMESTAMP_QUERY;
+    } else {
+        report_status!(
+            "gxm: this adapter offers no `timestamp-query`, so the GPU TIME line cannot be \
+             measured on this run - only the work-done latency, which includes the event loop."
+        );
+    }
     set_block_family(if want.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
         BlockFamily::Bc
     } else if want.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
@@ -293,7 +347,7 @@ pub fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     .filter(|(bit, _)| f.contains(*bit))
     .map(|(_, name)| *name)
     .collect();
-    report_warn!(
+    report_status!(
         "gxm textures: adapter compressed-texture support: {}. This build implements `bc` \
          (passthrough of the guest's own blocks, plus transcode) and `etc2` (transcode only, \
          4 bpp opaque / 8 bpp with alpha); taking {} for this run. A format in neither family is \
@@ -484,6 +538,12 @@ pub(crate) fn gxp_precompile() -> bool {
 /// pairs, and how many pipelines that was. See the timing site in `build_gxp_pipeline`.
 static PIPE_MODULE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PIPE_CREATE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Microseconds spent in OUR OWN translation before the driver sees anything: `link_programs`
+/// (decoding both USSE programs, building the IR, emitting the WGSL) plus the clip fixup. It is
+/// separate from [`PIPE_MODULE_US`] because "the shader build is slow" has two halves with
+/// unrelated fixes - our Rust, and the driver's compiler - and one number cannot say which.
+/// Counted for a REFUSED link too: a pair that fails to link still paid for the attempt.
+static PIPE_LINK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Microseconds spent compiling WGSL AHEAD of any draw, when the guest's shader patcher named
 /// the pair - see `GxmRenderer::precompile_pairs`. Reported separately from `PIPE_MODULE_US`
 /// because the whole point is that this time is NOT in a gameplay frame: adding the two together
@@ -505,9 +565,10 @@ fn add_build_ms(slot: &std::sync::atomic::AtomicU64, ms: f64) {
 /// `(shader-module ms, pipeline-create ms)` since the last call, and reset. The split that says
 /// whether building pipelines AHEAD of the draw that needs them is worth doing, and which half
 /// of it could be moved.
-pub fn take_pipeline_build_split() -> (f64, f64) {
+pub fn take_pipeline_build_split() -> (f64, f64, f64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
+        PIPE_LINK_US.swap(0, Relaxed) as f64 / 1000.0,
         PIPE_MODULE_US.swap(0, Relaxed) as f64 / 1000.0,
         PIPE_CREATE_US.swap(0, Relaxed) as f64 / 1000.0,
     )
@@ -1358,15 +1419,29 @@ fn report_region_clip_applied(clip: RegionClip, w: u32, h: u32) {
         return;
     }
     let whole = rect[0] == 0 && rect[1] == 0 && rect[2] + 1 >= w && rect[3] + 1 >= h;
-    // At `warn` and deduped on the whole (mode, rect), so a title with a stable scissor pays
-    // one line: an empty or near-empty rectangle is the last per-draw state that can make a
-    // correctly shaded, correctly bound, correctly transformed draw leave no mark, and at
-    // `debug` it was invisible in every documented repro.
-    report_warn!(
-        "gxm region clip: mode {mode:#x} over {},{} .. {},{} on a {w}x{h} target - {}",
-        rect[0], rect[1], rect[2], rect[3],
-        if whole { "the WHOLE target, so no scissor is issued" } else { "SCISSORED" }
-    );
+    // ONE line for the whole run, not one per rectangle. The stated purpose is to prove the
+    // capture is carrying scissor state at all - `scissor_sets` reads zero both for a title
+    // that only ever sets a whole-target default and for a scissor that never reached the
+    // renderer, and one line tells those apart. That purpose is served by the FIRST rectangle;
+    // the rest are normal operation. Deduping per (mode, rect) instead was written expecting
+    // "a title with a stable scissor pays one line", which a real title refutes: one paginates
+    // a 128x128 atlas through eight distinct rectangles and paid eight.
+    //
+    // The two rectangles that are NOT merely informational still report every time they are
+    // seen, below - narrowing this line does not narrow those.
+    static ANNOUNCED: Mutex<bool> = Mutex::new(false);
+    let mut announced = ANNOUNCED.lock().unwrap_or_else(|e| e.into_inner());
+    if !*announced {
+        *announced = true;
+        report_status!(
+            "gxm region clip: state is LIVE - first rectangle mode {mode:#x} over {},{} .. {},{} \
+             on a {w}x{h} target - {}. Further rectangles are normal operation and are not \
+             printed; an ALL or a non-tile-aligned OUTSIDE still reports.",
+            rect[0], rect[1], rect[2], rect[3],
+            if whole { "the WHOLE target, so no scissor is issued" } else { "SCISSORED" }
+        );
+    }
+    drop(announced);
     // The two cases that are not merely informational, checked here rather than in
     // `RegionClip::rect_in` so that the pure geometry stays pure and neither check costs a
     // lock on the per-draw path.
@@ -3049,6 +3124,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Bound on `GxpLive::precompile_seen`, a set of ALLOCATION pairs already considered for
     /// precompilation. Far above any title's program count; clearing costs one re-scan.
+    /// Distinct frame SHAPES and scene TALLIES that will be reported before the two
+    /// diagnostics go quiet. Each is a finding; a title producing more than this many distinct
+    /// ones is not being diagnosed by them, it is being buried by them - and the volume is
+    /// itself measurable in the frame (see `GxmRenderer::chain_shapes_seen`).
+    const CHAIN_SHAPE_CAP: usize = 6;
+    const GXP_SUMMARY_CAP: usize = 64;
     const PRECOMPILE_SEEN_CAP: usize = 16384;
 
     /// How long one frame may spend preparing shader pairs AHEAD of any draw. A budget in
@@ -3448,6 +3529,235 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         stride: u32,
     }
 
+    /// Timestamps at both ends of every render pass of a frame, so a run can say how long the
+    /// GPU itself took - the one figure the work-done latency cannot give.
+    ///
+    /// # Why this exists
+    /// The browser's `GPU WORK-DONE LATENCY` times a submit to the moment the event loop
+    /// dispatches the queue's completion callback. On a worker that yields the loop about
+    /// twice a frame, that figure carries up to a whole tick of dispatch delay on top of the
+    /// GPU's own time, and cannot say which of the two it is looking at. A device reading 44 ms
+    /// of latency against a 27 ms period could be a GPU taking 17 ms and a callback landing
+    /// late, or a GPU taking 40 ms - and those need opposite fixes. `timestamp-query` writes
+    /// the GPU's own clock at the start and end of each pass.
+    ///
+    /// # Shape
+    /// One query pair per pass, up to [`Self::PAIRS`] a frame. After the chain is encoded the
+    /// pairs are resolved into a buffer, copied to a mappable one on the same submit, and the
+    /// map is requested after the submit; the values are read on a LATER present, whenever the
+    /// map has completed, so nothing here waits on the GPU. One readback is in flight at a
+    /// time: while it is, the frame's passes take no pairs, which is why the report says how
+    /// many frames it measured.
+    ///
+    /// The report is the per-pass execution time SUMMED (what the GPU spent on this frame) and
+    /// the SPAN from the first pass's start to the last pass's end (what the frame occupied,
+    /// including any gaps the GPU idled through). Sum near the frame budget is a GPU that
+    /// cannot make the rate whatever the CPU does; a span well above the sum is a GPU waiting
+    /// on something between passes.
+    pub struct GpuTimestamps {
+        set: std::sync::Arc<wgpu::QuerySet>,
+        resolve: wgpu::Buffer,
+        read: wgpu::Buffer,
+        /// Nanoseconds per timestamp tick, from the queue.
+        period_ns: f32,
+        /// Pairs taken by the chain being encoded, and what each pass was.
+        next: u32,
+        labels: Vec<String>,
+        /// Whether the chain being encoded may take pairs: set when no readback is in flight.
+        armed: bool,
+        /// The readback in flight: how many pairs, their labels, and where the map is.
+        in_flight: Option<(u32, Vec<String>)>,
+        /// 0 nothing to map, 1 copy encoded and awaiting the submit, 2 map requested,
+        /// 3 mapped, 4 map failed.
+        state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        /// The window's statistics: measured frames, summed pass time, its max, summed span.
+        win_frames: u32,
+        win_sum_ms: f64,
+        win_max_ms: f64,
+        win_span_ms: f64,
+        /// The most recently measured frame's passes, `(label, ms)`, for the report.
+        last_passes: Vec<(String, f64)>,
+    }
+
+    impl GpuTimestamps {
+        /// Query pairs a frame may take. A retail frame is 11-14 passes; the rest is headroom
+        /// for a title that draws more scenes, and anything past it is simply unmeasured.
+        const PAIRS: u32 = 32;
+
+        fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+            if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                return None;
+            }
+            let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("gxm-frame-timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: Self::PAIRS * 2,
+            });
+            let bytes = (Self::PAIRS * 2 * 8) as u64;
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-frame-timestamps-resolve"),
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-frame-timestamps-read"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Some(GpuTimestamps {
+                set: std::sync::Arc::new(set),
+                resolve,
+                read,
+                period_ns: queue.get_timestamp_period(),
+                next: 0,
+                labels: Vec::new(),
+                armed: false,
+                in_flight: None,
+                state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                win_frames: 0,
+                win_sum_ms: 0.0,
+                win_max_ms: 0.0,
+                win_span_ms: 0.0,
+                last_passes: Vec::new(),
+            })
+        }
+
+        /// Take the next pair for a pass, or `None` when the frame is not being measured.
+        /// The label is built only when a pair is taken.
+        fn take(&mut self, label: impl FnOnce() -> String) -> Option<(std::sync::Arc<wgpu::QuerySet>, u32)> {
+            if !self.armed || self.next >= Self::PAIRS {
+                return None;
+            }
+            let i = self.next;
+            self.next += 1;
+            self.labels.push(label());
+            Some((self.set.clone(), i))
+        }
+
+        /// A new chain: it may take pairs only if the previous readback has been collected.
+        fn begin_chain(&mut self) {
+            self.next = 0;
+            self.labels.clear();
+            self.armed = self.in_flight.is_none();
+        }
+
+        /// Encode the resolve and the copy to the mappable buffer, after the chain's passes.
+        fn finish_chain(&mut self, encoder: &mut wgpu::CommandEncoder) {
+            if !self.armed || self.next == 0 {
+                return;
+            }
+            let n = self.next;
+            encoder.resolve_query_set(&self.set, 0..n * 2, &self.resolve, 0);
+            encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.read, 0, (n * 2 * 8) as u64);
+            self.in_flight = Some((n, std::mem::take(&mut self.labels)));
+            self.state.store(1, std::sync::atomic::Ordering::Relaxed);
+            self.armed = false;
+        }
+
+        /// Request the map, once the submit carrying the copy has been made.
+        fn map_after_submit(&mut self) {
+            use std::sync::atomic::Ordering;
+            let Some((n, _)) = self.in_flight.as_ref() else { return };
+            if self.state.load(Ordering::Relaxed) != 1 {
+                return;
+            }
+            self.state.store(2, Ordering::Relaxed);
+            let state = self.state.clone();
+            let bytes = (*n * 2 * 8) as u64;
+            self.read.slice(0..bytes).map_async(wgpu::MapMode::Read, move |r| {
+                state.store(if r.is_ok() { 3 } else { 4 }, Ordering::Relaxed);
+            });
+        }
+
+        /// Collect a completed readback into the window's statistics.
+        fn poll(&mut self) {
+            use std::sync::atomic::Ordering;
+            match self.state.load(Ordering::Relaxed) {
+                3 => {}
+                4 => {
+                    // A failed map is dropped and the next frame measures again; the failure is
+                    // not silent because the frame count in the report stays low.
+                    self.state.store(0, Ordering::Relaxed);
+                    self.in_flight = None;
+                    return;
+                }
+                _ => return,
+            }
+            let Some((n, labels)) = self.in_flight.take() else { return };
+            let bytes = (n * 2 * 8) as u64;
+            let words: Vec<u64> = match self.read.slice(0..bytes).get_mapped_range() {
+                Ok(view) => view
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            self.read.unmap();
+            self.state.store(0, Ordering::Relaxed);
+            if words.len() < (n * 2) as usize {
+                return;
+            }
+            let ns = self.period_ns as f64;
+            let mut sum = 0.0f64;
+            let mut first = u64::MAX;
+            let mut last = 0u64;
+            self.last_passes.clear();
+            for (i, label) in labels.into_iter().enumerate() {
+                let (b, e) = (words[i * 2], words[i * 2 + 1]);
+                // A driver may hand back a zero for a query it could not time; leave such a
+                // pass out of the sum rather than credit it with the whole epoch.
+                if b == 0 || e == 0 || e < b {
+                    continue;
+                }
+                let ms = (e - b) as f64 * ns / 1.0e6;
+                sum += ms;
+                first = first.min(b);
+                last = last.max(e);
+                self.last_passes.push((label, ms));
+            }
+            if self.last_passes.is_empty() {
+                return;
+            }
+            let span = (last - first) as f64 * ns / 1.0e6;
+            self.win_frames += 1;
+            self.win_sum_ms += sum;
+            self.win_max_ms = self.win_max_ms.max(sum);
+            self.win_span_ms += span;
+        }
+
+        /// The window's report, resetting it. `None` until a frame has been measured.
+        fn take_report(&mut self) -> Option<String> {
+            if self.win_frames == 0 {
+                return None;
+            }
+            let n = self.win_frames as f64;
+            let mut passes = self.last_passes.clone();
+            passes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top: Vec<String> = passes.iter().take(5).map(|(l, ms)| format!("{l} {ms:.2} ms")).collect();
+            let out = format!(
+                "GPU execution {:.1} ms per frame (max {:.1}) summed over its passes, spanning \
+                 {:.1} ms from the first pass's start to the last pass's end, over {} measured \
+                 frame(s) this window; the last measured frame's costliest passes: {}. This is \
+                 the GPU's OWN clock from a timestamp query, so unlike the work-done latency it \
+                 carries no event-loop delay. A sum near the display period is a GPU that \
+                 cannot make the rate whatever the CPU does; a span well above the sum is a GPU \
+                 idling between passes, i.e. waiting on this thread.",
+                self.win_sum_ms / n,
+                self.win_max_ms,
+                self.win_span_ms / n,
+                self.win_frames,
+                top.join(", "),
+            );
+            self.win_frames = 0;
+            self.win_sum_ms = 0.0;
+            self.win_max_ms = 0.0;
+            self.win_span_ms = 0.0;
+            Some(out)
+        }
+    }
+
     pub struct GxmRenderer {
         opaque: wgpu::RenderPipeline,
         blend: wgpu::RenderPipeline,
@@ -3509,6 +3819,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// Reported so a run says whether the preparation actually happened; a count of zero with
         /// pipelines still building mid-race means the patcher signal never arrived.
         gxp_precompiled: u32,
+        /// GPU timestamps at both ends of every pass, where the adapter offers them - see
+        /// [`GpuTimestamps`]. `None` on an adapter without `timestamp-query`.
+        ts: Option<GpuTimestamps>,
         /// Per-draw uniform spacing: `UNIFORM_BYTES` rounded up to the device's
         /// `min_uniform_buffer_offset_alignment` (256 by default).
         uniform_stride: u64,
@@ -3527,12 +3840,22 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// dimensions into an offscreen buffer and box-downsamples it into the caller's view).
         /// See [`GxmRenderer::set_supersample`] and the `resolve_*` fields below.
         ss_scale: u32,
-        /// Last reported `(draws, with_payload, prepared, fixed)` recompiler summary. The
-        /// summary is per-RENDER, so printing it unconditionally writes a line every frame -
-        /// 60 a second in a live window. Reporting only when the tuple CHANGES keeps the whole
-        /// signal (the first frame, and any draw moving between the recompiled and
-        /// fixed-function paths) without the spam.
-        last_gxp_summary: Option<(usize, usize, usize, usize)>,
+        /// Every `(draws, with_payload, prepared, fixed)` recompiler summary already reported.
+        ///
+        /// Was a single `Option`, on the reasoning that reporting "only when the tuple CHANGES"
+        /// removes the spam. It does not: this fires per SCENE, a race frame has eleven of them
+        /// with different draw counts, so the tuple changes on nearly every scene and the memo
+        /// never matches. MEASURED: 41,775 of these lines in one browser race run - see
+        /// [`GxmRenderer::chain_shapes_seen`] for what the pair of them cost the frame.
+        gxp_summaries_seen: HashSet<(usize, usize, usize, usize)>,
+        /// Whether the summary cap has been announced - see `chain_shapes_capped`.
+        gxp_summaries_capped: bool,
+        /// Whether the one-off "tallies are live and clean" line has been printed.
+        ///
+        /// The tally is FAILURE-ONLY (see its emission site), and a report that says nothing
+        /// when all is well cannot be told apart from one that never ran
+        /// [[report-that-only-fires-on-failure]]. This makes it say so exactly once.
+        gxp_summary_all_clear: bool,
         /// The box-downsample resolve pipeline + its bind-group layout and scale uniform,
         /// used only when `ss_scale > 1`. Built once in [`GxmRenderer::new`].
         resolve_pipeline: wgpu::RenderPipeline,
@@ -3772,9 +4095,25 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// different problem from the passes not being drawn - and the two look identical
         /// on screen.
         rtt_hits: usize,
-        /// Last reported chain shape, so the report prints on a change rather than every
-        /// frame. See the `gxm chain:` line.
-        last_chain_shape: Option<String>,
+        /// Every chain SHAPE already reported, as a 64-bit fold. See the `gxm chain:` line.
+        ///
+        /// >>> A SINGLE-SLOT MEMO WAS A PER-FRAME DIAGNOSTIC IN DISGUISE, AND IT WAS MEASURED.
+        ///
+        /// This was `Option<String>`, holding the last line, on the reasoning that "a title
+        /// whose frame structure is stable pays one line for a run". A race's structure is not
+        /// stable - it CYCLES, and a one-slot memo turns a cycle of N shapes into N reports per
+        /// cycle, for ever. MEASURED in the browser on PCSA00015's race: 16,218 of these lines
+        /// in one run, and with the `gxp: scene has` tally beside it **58,418 warn lines**, worth
+        /// **1.9 ms of a 5.0 ms render** - 38% of the browser's whole renderer
+        /// ([[vitaslop-a-diagnostic-can-bury-the-findings]] is the same lesson from the other
+        /// end: there the volume hid the findings, here it costs the frame).
+        ///
+        /// A SET reports each distinct shape once, which is what the single slot was trying to
+        /// say. Bounded, and it says so when the bound is reached rather than going quiet.
+        chain_shapes_seen: HashSet<u64>,
+        /// Whether the chain-shape cap has been announced, so a run that reaches it says so
+        /// exactly once instead of silently dropping every later shape.
+        chain_shapes_capped: bool,
         /// Guest addresses of every texture the pass being encoded sampled. Reported for
         /// the frame's LAST pass: a composite that shows none of the world is either not
         /// sampling the world target or sampling an address nothing rendered, and those
@@ -4084,6 +4423,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bind_groups_built,
         bind_groups_reused,
         pipelines_built,
+        /// Of the pipelines built, those for a PAIR that already had a pipeline under another
+        /// baked state (cull, samples, format, layout, raster). The module is shared, so on a
+        /// native driver these are cheap; a browser's GPU process may still compile the
+        /// backend shader per pipeline. A race that keeps building these mid-lap is the case
+        /// for creating the common variants ahead of the draw.
+        pipelines_built_variant,
         /// Buffers created, and bytes written into a buffer (`write_buffer` plus the
         /// create-with-contents arenas). Vertex/index/uniform volume, separable from texture
         /// volume because the two have completely different fixes.
@@ -4344,16 +4689,20 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let frame_texkb =
             TEX_UPLOAD_BYTES_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed) / 1024;
         let frame_bufs = BUFFERS_MADE_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        // HOW TO READ THIS LINE, kept here rather than re-transmitted on every stall:
+        //
+        //  * It is NOT a copy. No call costs milliseconds per kilobyte; the time is this thread
+        //    waiting on the GPU queue to DRAIN, so the bytes in the line are not the cause.
+        //  * `write #N of the frame` counts from 0 = the first write after the previous frame's
+        //    submit. A large N with little uploaded ahead of it means this frame is draining a
+        //    backlog left by EARLIER frames, not paying for its own work.
+        //  * Compare consecutive stall lines: the DELTA between their cumulative counts is what
+        //    actually entered the queue in between. Log ORDER is not evidence.
         report_warn!(
-            "gxm: a single queue.write_buffer BLOCKED for {:.0} ms writing {} KB ({n} such \
-             stalls so far this run). That is not a copy - no call costs milliseconds per \
-             kilobyte - it is this thread waiting on the GPU queue to drain. THIS WAS WRITE \
-             #{nth_this_frame} OF THE FRAME (0 = the first, i.e. the one right after the \
-             previous frame's submit), and THIS FRAME had already uploaded {frame_texn} \
-             textures / {frame_texkb} KB ahead of it and CREATED {frame_bufs} GPU buffers. \
-             AT THIS MOMENT, cumulative for the run: {textures} GPU \
-             texture expansions in {submits} submits. Compare with the previous stall line - \
-             the DELTA is what went into the queue between them, and log order is not evidence. \
+            "gxm: queue.write_buffer BLOCKED {:.0} ms writing {} KB (stall {n} this run) - \
+             waiting on the queue to drain, not copying. Write #{nth_this_frame} of the frame, \
+             behind {frame_texn} textures / {frame_texkb} KB and {frame_bufs} new buffers; run \
+             total {textures} texture expansions in {submits} submits. \
              See `report_write_buffer_stall`.",
             us as f64 / 1000.0,
             bytes / 1024,
@@ -4410,8 +4759,32 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     prepare_split! {
+        /// >>> THE WHOLE OF `prepare`, SO THE SPLIT CAN BE HELD TO ACCOUNT.
+        ///
+        /// A phase table is only an argument if it accounts for the thing it divides. Without
+        /// this the seven named phases below summed to ~0.7 ms a frame while the browser's own
+        /// `RENDER SPLIT` put `prepare` at 2.5 - so 72% of the function had no instrument on it
+        /// and nothing in the report could say so. Adding an eighth named phase on a hunch, with
+        /// a residual that large, is guessing.
+        ///
+        /// Charged by a `Drop` guard rather than an explicit end call: `prepare` leaves through
+        /// half a dozen `?` and `return None` paths (link refused, key filtered, no vertices,
+        /// pipeline poisoned), and timing only the path that reaches the bottom under-reports
+        /// exactly the CHEAP draws while the residual silently absorbs the difference.
+        total_ns,
+        /// Calls to `prepare`, so the total can be read per DRAW. A per-frame millisecond figure
+        /// hides that a frame's draw count moves with what is on screen.
+        draws,
         /// Nanoseconds in the cache-key and pipeline-lookup preamble.
         key_ns,
+        /// Nanoseconds in the whole GEOMETRY path - the packed-vertex cache probe, the resident
+        /// heap lookup, the promotion bookkeeping and the index side of the same - with
+        /// `hash`/`repack`/`arena` nested INSIDE it as sub-phases.
+        ///
+        /// Split out because those three are the work the caches exist to AVOID: when they are
+        /// small and this is not, the cost is the bookkeeping itself (several map probes per
+        /// draw over ~490 draws), which is a different fix from making a copy faster.
+        vpath_ns,
         /// Nanoseconds hashing the guest vertex stream to key the packed-vertex cache, and the
         /// bytes that hash read. This is pure cache overhead: it is paid on a HIT as well as a
         /// miss, and it scales with the frame's whole vertex volume rather than with its misses.
@@ -4428,6 +4801,23 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         arena_bytes,
         /// Nanoseconds pushing the two SA blocks into the pass's uniform arena.
         uni_ns,
+        /// The `uni_ns` phase SUB-SPLIT, because "uniforms is the biggest phase" does not name a
+        /// fix. MEASURED on one title's race: `uniforms 0.95 ms` was 37% of a 2.56 ms `prepare`,
+        /// and the two halves want OPPOSITE fixes - arena growth is a pooling question (already
+        /// tried and reverted once for pinning a loading-frame peak in a wasm heap that never
+        /// shrinks), while the guest-memory windows are a per-draw copy question. Arithmetic put
+        /// the append at ~0.2 ms and could not account for the rest, so it is measured.
+        ///
+        /// `uni_sa_ns` is the two [`push_sa`] calls; `uni_mem_ns` is [`push_mem_windows`];
+        /// `uni_sa_bytes` is what the SA pushes actually wrote, INCLUDING the alignment padding
+        /// each one zero-fills - a draw needing 16 bytes still consumes a 256-byte slot, and
+        /// whether that padding is the cost is the whole question.
+        uni_sa_ns,
+        uni_mem_ns,
+        uni_sa_bytes,
+        /// `push_sa` calls that wrote nothing because the stage declares no SA lanes. A pair
+        /// with none still pays the call and the alignment probe.
+        uni_sa_empty,
         /// Nanoseconds in `make_sampler_bg` - group2, the one that is a GPU object per draw when
         /// its cache misses.
         sampler_ns,
@@ -4459,14 +4849,27 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// One line, per FRAME (the caller divides), naming every sub-phase above.
         pub fn line(&self, frames: u64) -> String {
             let n = frames.max(1) as f64;
+            // The top-level phases only. `hash`/`repack`/`arena` are nested inside `vpath` and
+            // adding them here would double-count them into a negative residual.
+            let residual = self
+                .total_ns
+                .saturating_sub(self.key_ns)
+                .saturating_sub(self.vpath_ns)
+                .saturating_sub(self.uni_ns)
+                .saturating_sub(self.sampler_ns)
+                .saturating_sub(self.depth_ns);
             let ms = |v: u64| v as f64 / n / 1.0e6;
             let mb = |v: u64| v as f64 / n / (1024.0 * 1024.0);
             let per = |v: u64| v as f64 / n;
             format!(
                 "prepare split/frame: key {:.2} ms, vertex-hash {:.2} ms ({:.2} MB hashed), \
                  repack {:.2} ms ({:.2} MB read, {:.0} misses vs {:.0} hits), arena copy {:.2} ms \
-                 ({:.2} MB), uniforms {:.2} ms, samplers {:.2} ms, depth {:.2} ms; RESIDENT \
-                 {:.0} vertex + {:.0} index draws bound in place, {:.2} MB newly placed",
+                 ({:.2} MB), uniforms {:.2} ms [SA {:.2} ms writing {:.2} MB over {:.0} pushes, \
+                 {:.0} of them empty; mem-windows {:.2} ms], samplers {:.2} ms, depth {:.2} ms; RESIDENT \
+                 {:.0} vertex + {:.0} index draws bound in place, {:.2} MB newly placed. \
+                 TOTAL {:.2} ms over {:.0} draws ({:.1} us/draw), of which geom path {:.2} ms \
+                 (its own lookup+bookkeeping {:.2} ms, i.e. what is left after hash/repack/arena) \
+                 and {:.2} ms UNATTRIBUTED ({:.0}%)",
                 ms(self.key_ns),
                 ms(self.hash_ns),
                 mb(self.hash_bytes),
@@ -4477,11 +4880,34 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 ms(self.arena_ns),
                 mb(self.arena_bytes),
                 ms(self.uni_ns),
+                ms(self.uni_sa_ns),
+                mb(self.uni_sa_bytes),
+                // Two pushes per draw, so this is the call count, not the draw count.
+                per(self.draws * 2),
+                per(self.uni_sa_empty),
+                ms(self.uni_mem_ns),
                 ms(self.sampler_ns),
                 ms(self.depth_ns),
                 per(self.resident_v_hits),
                 per(self.resident_i_hits),
                 mb(self.resident_placed_bytes),
+                ms(self.total_ns),
+                per(self.draws),
+                if self.draws == 0 { 0.0 } else { self.total_ns as f64 / self.draws as f64 / 1000.0 },
+                ms(self.vpath_ns),
+                // What the geometry path costs BEYOND the three phases nested in it: the map
+                // probes, the residency test and the promotion bookkeeping.
+                ms(self
+                    .vpath_ns
+                    .saturating_sub(self.hash_ns)
+                    .saturating_sub(self.repack_ns)
+                    .saturating_sub(self.arena_ns)),
+                // >>> `saturating_sub`, because the parts and the total are separate relaxed
+                // counters: a window taken between two writes could otherwise go negative and
+                // print as an enormous number, and an instrument that reads as a finding is the
+                // one failure mode it must not have.
+                ms(residual),
+                if self.total_ns == 0 { 0.0 } else { 100.0 * residual as f64 / self.total_ns as f64 },
             )
         }
     }
@@ -4517,6 +4943,31 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// Charges the WHOLE of `prepare` to [`PrepareSplit::total_ns`] however the function leaves.
+    ///
+    /// A guard rather than a call at the bottom, because `prepare` returns early on half a dozen
+    /// paths and every one of them is a draw that happened. Timing only the complete path
+    /// under-reports the cheap draws and inflates the unattributed remainder by exactly the
+    /// amount that would have explained it.
+    struct SplitTotal(Option<Stopwatch>);
+
+    impl SplitTotal {
+        #[inline]
+        fn start() -> Self {
+            let t = split_start();
+            if t.is_some() {
+                enc(&PREP.draws, 1);
+            }
+            SplitTotal(t)
+        }
+    }
+
+    impl Drop for SplitTotal {
+        fn drop(&mut self) {
+            split_end(self.0.take(), &PREP.total_ns);
+        }
+    }
+
     impl EncodeWork {
         /// Unpack [`EncodeWork::buffer_write_worst`] into `(milliseconds, KB)` - the slowest
         /// single `queue.write_buffer` of the window and the bytes THAT call carried.
@@ -4540,7 +4991,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                  ({:.2} MB, {:.1} COMPRESSED passthrough, {:.1} ENCODED ON THE GPU, {:.1} GPU \
                  encodes refused, {:.1} RE-uploaded after eviction) / {:.1} cached ({:.2} view evict \
                  passes dropping {:.1} entries, {:.1} superseded in place, {:.2} WHOLESALE clears, {:.1} DESTROYED), bind groups {:.1} built \
-                 / {:.1} reused, {:.2} pipelines built, buffers {:.1} created / {:.1} destroyed ({:.2} MB \
+                 / {:.1} reused, {:.2} pipelines built ({:.2} of them state variants of a pair \
+                 already built), buffers {:.1} created / {:.1} destroyed ({:.2} MB \
                  written in {:.1} write_buffer CALLS, WORST SINGLE CALL {:.1} ms for {:.0} KB), rtt {:.2} created / {:.2} destroyed / {:.2} snapshots ({:.2} MB) / {:.2} depth \
                  conversions, {:.2} depth-bind-cache clears",
                 per(self.passes),
@@ -4565,6 +5017,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 per(self.bind_groups_built),
                 per(self.bind_groups_reused),
                 per(self.pipelines_built),
+                per(self.pipelines_built_variant),
                 per(self.buffers_created),
                 per(self.buffers_destroyed),
                 mb(self.buffer_bytes),
@@ -5004,7 +5457,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // documented job of the warn-level macro, and a refusal that only shows up at
         // `vitaslop::gxm=debug` is a refusal nobody reads. The grant above stays at debug -
         // it says the renderer did what it was told, which is not news.
-        report_warn!("gxm rtt {addr:#x} ({w}x{h}): MULTISAMPLE REFUSED - {why}. This pass stays more aliased than the title asked.");
+        // STATUS, not a warning: both refusals are this renderer's own standing decisions
+        // (a sampled depth attachment, a gamma-correct resolve), taken on every run of a title
+        // that has those passes. A warning is a fix owed; this is a documented trade, and it
+        // still lands in the panel's STATUS section where a capture reads it.
+        report_status!("gxm rtt {addr:#x} ({w}x{h}): MULTISAMPLE REFUSED - {why}. This pass stays more aliased than the title asked.");
     }
 
     /// Say - once per target - that the guest created a render target MULTISAMPLED but did NOT
@@ -6363,6 +6820,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if gxp.index_count == 0 || gxp.vertices.is_empty() {
                 return None;
             }
+            // Everything below is charged to `total_ns` however this function leaves - see
+            // `SplitTotal`. Placed after the empty-geometry guard, which is not a draw.
+            let _total = SplitTotal::start();
             // The preamble: the pair key, the pipeline-cache lookup and, on a miss, the pipeline
             // BUILD. The build is separately counted (`pipelines_built`), so a frame that reads
             // high here with a zero build count is paying the lookups, not the compiler.
@@ -6409,7 +6869,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let ph = |b: &[u8]| {
                         vitaslop_gxp_shader::Program::parse(b).map(|p| p.hash).unwrap_or(0)
                     };
-                    report_warn!(
+                    report_status!(
                         "gxp pair {key:x}: vprog hash {:016x}, fprog hash {:016x}",
                         ph(&gxp.vprog),
                         ph(&gxp.fprog)
@@ -6420,6 +6880,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 report_unfed_uniforms(key, "vertex", &gxp.vprog);
                 report_unfed_uniforms(key, "fragment", &gxp.fprog);
                 enc(&ENC.pipelines_built, 1);
+                // A variant of a pair already built under another baked state: cheap to
+                // count here (builds are rare), and the number that says whether creating
+                // the common variants ahead of the draw would remove a mid-lap build.
+                if self.pipelines.keys().any(|k| k.0 == key) {
+                    enc(&ENC.pipelines_built_variant, 1);
+                }
                 let built = build_gxp_pipeline(device, color_format, samples, gxp.cull_mode, gxp, key, self.zfix, self.yflip, self.solid, self.nodepth, self.noblend, &mut self.modules);
                 self.pipelines.insert(cache_key, built);
             }
@@ -6482,8 +6948,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     BlockFamily::None
                 }
             });
-            // Built here rather than lazily at the upload site, because that site holds `self`
-            // destructured and cannot reach back for a `&mut`. Three compute shaders, once.
+            // >>> THE TRANSCODER IS BUILT AT RENDERER CONSTRUCTION - see `GxpLive::texenc`.
+            //
+            // It used to be built HERE, on the first recompiled draw of the run, which put a
+            // generic engine shader's compile inside a gameplay frame. A fallback build is kept
+            // for a `GxpLive` that reached a draw without one (a renderer constructed with the
+            // recompiler off and enabled later), because a missing transcoder is a dropped
+            // texture, not a slow one.
             if self.texenc.is_none() {
                 self.texenc = Some(crate::texenc::Transcoder::new(device));
             }
@@ -6604,6 +7075,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // The allocation this stream lives in, which is the fast key - see
             // `packed_by_alloc`. Both halves of the fat pointer, so a shorter stream that
             // happens to start at the same address is a different key rather than a truncation.
+            // The whole geometry path, with hash/repack/arena nested inside it - see `vpath_ns`.
+            let t_vpath = split_start();
             let akey = (key, std::sync::Arc::as_ptr(&gxp.vertices) as *const u8 as usize, gxp.vertices.len());
             // `get_mut`, so a hit STAMPS the entry: this is the fast path, so it is also where
             // most of a frame's uses are, and an entry the fast path serves every frame must not
@@ -6706,10 +7179,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // The key has no pipeline in it: an expanded index list is a function of the guest
             // buffer alone, so two pairs drawing the same mesh share one resident copy.
             let ikey = (0u64, std::sync::Arc::as_ptr(&gxp.indices) as *const u8 as usize, gxp.indices.len());
-            let i_seen = resident_i_seen
-                .get(&ikey)
-                .and_then(|(prev, _)| prev.upgrade())
-                .is_some_and(|prev| std::sync::Arc::ptr_eq(&prev, &gxp.indices));
             let (i_off, i_len, i_resident) = match resident
                 .then(|| resident_i.get(&ikey, &gxp.indices))
                 .flatten()
@@ -6729,6 +7198,17 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     split_end(t, &PREP.arena_ns);
                     split_add(&PREP.arena_bytes, len);
                     if resident {
+                        // >>> ASKED HERE, NOT ABOVE, BECAUSE ONLY THIS BRANCH READS IT.
+                        // The promotion test is a map probe plus a `Weak` upgrade and it was
+                        // computed for EVERY draw while only the resident MISS path uses it -
+                        // and a miss is the rare case: a race on the device binds 859 of its
+                        // 952 index draws in place, so nine draws in ten paid for an answer
+                        // that was discarded. The vertex half above already asks inside its
+                        // own miss branch; this makes the two match.
+                        let i_seen = resident_i_seen
+                            .get(&ikey)
+                            .and_then(|(prev, _)| prev.upgrade())
+                            .is_some_and(|prev| std::sync::Arc::ptr_eq(&prev, &gxp.indices));
                         if i_seen {
                             resident_i.place(queue, ikey, &gxp.indices, &gxp.indices);
                         } else {
@@ -6744,6 +7224,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     (off, len, false)
                 }
             };
+
+            split_end(t_vpath, &PREP.vpath_ns);
 
             // The two SA blocks go into the pass's uniform ARENA at dynamic-offset alignment;
             // the bind groups over that arena belong to the shader pair and are built once,
@@ -6772,6 +7254,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     return None;
                 }
+                let t_mem = split_start();
                 let off = push_mem_windows(
                     udata,
                     pipe.mem_bind_bytes,
@@ -6779,16 +7262,28 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     &gxp.mem_windows,
                     ubo_align,
                 );
+                split_end(t_mem, &PREP.uni_mem_ns);
                 split_add(&PREP.arena_bytes, pipe.mem_bind_bytes as u64);
                 off
             } else {
                 0
             };
+            // The SA half, timed apart from the memory-window half above - see `uni_sa_ns`.
+            let t_sa = split_start();
+            let sa_before = udata.len() as u64;
             let u_off = [
                 push_sa(udata, pipe.vsa_lanes, &vert_sa, ubo_align),
                 push_sa(udata, pipe.fsa_lanes, &frag_sa, ubo_align),
                 mem_off,
             ];
+            split_end(t_sa, &PREP.uni_sa_ns);
+            split_add(&PREP.uni_sa_bytes, udata.len() as u64 - sa_before);
+            if pipe.vsa_lanes == 0 {
+                split_add(&PREP.uni_sa_empty, 1);
+            }
+            if pipe.fsa_lanes == 0 {
+                split_add(&PREP.uni_sa_empty, 1);
+            }
             split_end(t_uni, &PREP.uni_ns);
             let t_samp = split_start();
             let bg2 = Self::make_sampler_bg(
@@ -10282,7 +10777,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
               to RGBA8 and no passthrough or transcode is possible here - the fix for this device \
               is an ETC2/ASTC encoder, not a refusal to chase."
         };
-        report_warn!(
+        report_status!(
             "gxm textures: one frame's texture working set is {mb} MB (new high). \
              Composition: {}.{why}",
             texture_composition(views_used, epoch).join(", ")
@@ -10559,7 +11054,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if !seen.lock().unwrap_or_else(|e| e.into_inner()).insert((addr, bound.0, bound.1)) {
             return;
         }
-        report_warn!(
+        let text = format!(
             "gxm rtt: {addr:#010x} is held as a {}x{} RENDER TARGET, but a draw binds a texture              of {}x{} at that address, and the guest's own bytes there are {}. {} Reported once              per address per bound shape.",
             target.0,
             target.1,
@@ -10572,6 +11067,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 "So the guest has really allocated something over the freed target: the alias                  is REFUSED - this draw samples the guest's own texture - and the stale target                  stops counting as used, so it is reclaimed within its TTL."
             }
         );
+        // A standing alias is the RESOLVED case - the evidence said live target, the target
+        // was bound - so it is status. A refused one changes what the draw samples and stays
+        // a warning.
+        if guest_empty {
+            report_status!("{text}");
+        } else {
+            report_warn!("{text}");
+        }
     }
 
     fn report_gamma_mode_changed(addr: u32, gamma: bool) {
@@ -10845,7 +11348,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // title reaches 177 of these, which is more than the page's whole panel. See
             // [`Census`] for the capture that measured it.
             static CENSUS: crate::gpu::Census = crate::gpu::Census::new();
-            CENSUS.note(
+            // STATUS, not a warning: the 1.0 fill is the MEASURED value of the lanes the
+            // device leaves unbound, so a wider declaration is the expected shape of this
+            // title's shaders, not a fault owed a fix. It still reaches the panel.
+            CENSUS.note_status(
                 "gxp attribute fill: a linked attribute is declared WIDER than the guest \
                  binds, so its surplus lane(s) read this renderer's fill of 1.0 rather than \
                  guest data - a shader reading one of those lanes reads a constant where the \
@@ -11292,9 +11798,19 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // pair nobody can reconstruct costs a play session per attempt. See `blob_evidence`.
         arm_fallback_blobs(key, gxp.vprog.clone(), gxp.fprog.clone());
         report_branches(key, gxp);
+        // >>> OUR OWN HALF OF THE TRANSLATION, TIMED SEPARATELY FROM THE DRIVER'S.
+        //
+        // `create_shader_module` and `create_render_pipeline` are timed below, and between them
+        // they are the whole in-frame shader cost a run reports - which invites reading that
+        // total as "the driver is slow" when a third of the work in this function is OURS:
+        // decoding both USSE programs, building the IR and emitting ~27 KB of WGSL text. Those
+        // have completely different fixes (a Rust profile against emitting fewer operations),
+        // so a number that adds them together names neither.
+        let t_link = Stopwatch::start();
         let linked = match vitaslop_gxp_shader::link_programs(&gxp.vprog, &gxp.fprog) {
             Ok(l) => l,
             Err(e) => {
+                super::add_build_ms(&super::PIPE_LINK_US, t_link.ms());
                 report_fallback(key, &format!("link failed: {e}"));
                 return None;
             }
@@ -11457,6 +11973,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let wgsl = match inject_clip_fixup(&linked.wgsl, zfix, yflip, solid, keycolor) {
             Some(w) => w,
             None => {
+                super::add_build_ms(&super::PIPE_LINK_US, t_link.ms());
                 report_fallback(
                     key,
                     "no `out.position` assignment to wrap with the clip fixup - refusing to \
@@ -11486,6 +12003,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // `GxmRenderer::precompile_pairs`), while the pipeline also needs the draw's blend,
         // depth, cull, format and sample count and cannot be. This lookup is what a precompiled
         // pair HITS; a miss compiles here exactly as it always did.
+        // Everything above this line is ours; everything below is the driver's.
+        super::add_build_ms(&super::PIPE_LINK_US, t_link.ms());
         let t_module = Stopwatch::start();
         let mkey = match keycolor {
             Some(_) => key,
@@ -11813,6 +12332,61 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     impl GxmRenderer {
+        /// The next timestamp pair for a pass being begun, if this frame is measured.
+        fn ts_pair(
+            &mut self,
+            label: impl FnOnce() -> String,
+        ) -> Option<(std::sync::Arc<wgpu::QuerySet>, u32)> {
+            self.ts.as_mut().and_then(|t| t.take(label))
+        }
+
+        /// A pass descriptor's `timestamp_writes` for a pair from [`Self::ts_pair`].
+        fn ts_writes(
+            pair: &Option<(std::sync::Arc<wgpu::QuerySet>, u32)>,
+        ) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+            pair.as_ref().map(|(set, i)| wgpu::RenderPassTimestampWrites {
+                query_set: set,
+                beginning_of_pass_write_index: Some(i * 2),
+                end_of_pass_write_index: Some(i * 2 + 1),
+            })
+        }
+
+        /// After [`Self::encode_chain`] and before the encoder is finished: resolve this
+        /// frame's timestamps onto the same submit. See [`GpuTimestamps`].
+        pub fn ts_finish_chain(&mut self, encoder: &mut wgpu::CommandEncoder) {
+            if let Some(ts) = self.ts.as_mut() {
+                ts.finish_chain(encoder);
+            }
+        }
+
+        /// After the submit that carried [`Self::ts_finish_chain`]'s copy: ask for the map.
+        pub fn ts_map_after_submit(&mut self) {
+            if let Some(ts) = self.ts.as_mut() {
+                ts.map_after_submit();
+            }
+        }
+
+        /// Before a chain: collect a readback that has completed since the last present.
+        pub fn ts_poll(&mut self) {
+            if let Some(ts) = self.ts.as_mut() {
+                ts.poll();
+            }
+        }
+
+        /// The window's GPU-time report, or why there is none. See [`GpuTimestamps`].
+        pub fn take_gpu_time_report(&mut self) -> String {
+            match self.ts.as_mut() {
+                None => "not measurable: this adapter offers no `timestamp-query`, so only the \
+                         work-done latency above is available, and that includes the event loop"
+                    .to_string(),
+                Some(ts) => ts.take_report().unwrap_or_else(|| {
+                    "no frame was measured this window (a readback is collected on a later \
+                     present; a window with no presents measures nothing)"
+                        .to_string()
+                }),
+            }
+        }
+
         /// Build both pipelines for a `color_format` render target. `queue` is used
         /// once here to upload the 1x1 white fallback texel.
         pub fn new(
@@ -12233,11 +12807,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 gxp_arenas: Vec::new(),
                 gxp_arena_slot: 0,
                 gxp_precompiled: 0,
+                ts: GpuTimestamps::new(device, queue),
                 uniform_stride,
                 uniform_align,
                 color_format,
                 ss_scale: 1,
-                last_gxp_summary: None,
+                gxp_summaries_seen: HashSet::default(),
+                gxp_summaries_capped: false,
+                gxp_summary_all_clear: false,
                 last_phases: EncodePhases::default(),
                 chain_phases: EncodePhases::default(),
                 resolve_pipeline,
@@ -12261,9 +12838,37 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 retired_buffers: Vec::new(),
                 keep_depth: false,
                 rtt_hits: 0,
-                last_chain_shape: None,
+                chain_shapes_seen: HashSet::default(),
+                chain_shapes_capped: false,
                 sampled_addrs: HashSet::default(),
-                gxp: GxpLive::from_env(),
+                gxp: {
+                    // >>> THE GPU TRANSCODER IS COMPILED HERE, WITH EVERY OTHER ENGINE SHADER.
+                    //
+                    // It is generic WGSL - it has no dependence on the title - and it used to be
+                    // built on the first recompiled DRAW instead, which put its compile inside a
+                    // gameplay frame. MEASURED on this desktop: 9.4-10.9 ms, and a desktop that
+                    // takes the guest's blocks verbatim is the floor, not the case that matters:
+                    // the device with no BC is the one that transcodes
+                    // [[vitaslop-phone-gpu-has-no-bc]].
+                    //
+                    // Only when the recompiler is ON, which is what the field's doc always
+                    // intended and what the draw-site build did not deliver: that site ran for
+                    // every run that drew a recompiled pair, so "a run that never transcodes
+                    // should not pay for it" was never true. A run with the recompiler off
+                    // reaches no `GxpLive::prepare` at all and now genuinely pays nothing.
+                    let mut gxp = GxpLive::from_env();
+                    if gxp.enabled {
+                        let t = Stopwatch::start();
+                        gxp.texenc = Some(crate::texenc::Transcoder::new(device));
+                        report_status!(
+                            "gxp texenc: compiled the GPU transcoder's compute pipelines in \
+                             {:.1} ms, at renderer construction - generic engine WGSL, kept out \
+                             of the frame that first needs it",
+                            t.ms()
+                        );
+                    }
+                    gxp
+                },
             }
         }
 
@@ -12939,6 +13544,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             });
             let view = gd.view.clone();
             {
+                let ts = self.ts_pair(|| "depth-convert".to_string());
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("gxm-depth-convert"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -12951,7 +13557,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: Self::ts_writes(&ts),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -13442,15 +14048,23 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // way. An instrument whose steady state is indistinguishable from its own
                     // failure is the defect this project keeps finding
                     // [[vitaslop-instrument-failure-imitating-its-subject]].
-                    report_warn!(
-                        "gxp precompile: {} shader modules compiled AHEAD of any draw, out of {} \
-                         candidate pairs offered ({built} new in this pass) - WGSL compile time \
-                         that will not land in a gameplay frame. NOTE this warms the shader \
-                         MODULE, not the render PIPELINE: a pipeline bakes the blend program and \
-                         the attachment formats too, so a pair whose module is warm still pays \
-                         `create_render_pipeline` at the draw. The candidates are the pairs the \
-                         shader patcher NAMED unless VITASLOP_GXP_PRECOMPILE_CROSS is set, in \
-                         which case they are a cross product and most of this is speculative",
+                    // WHAT THIS LINE MEANS, kept here rather than re-transmitted on every pass:
+                    //
+                    //  * It warms the shader MODULE, not the render PIPELINE. A pipeline bakes
+                    //    the blend program and the attachment formats too, so a pair whose module
+                    //    is warm still pays `create_render_pipeline` at the draw.
+                    //  * The candidates are the pairs the shader patcher NAMED, unless
+                    //    VITASLOP_GXP_PRECOMPILE_CROSS is set - then they are a cross product and
+                    //    most of the count is speculative
+                    //    [[vitaslop-precompile-cross-product-refuted]].
+                    //
+                    // The line itself carries only the numbers. Three near-identical copies of
+                    // the paragraph above, differing in two counts, was several KB of a panel a
+                    // user has to copy by hand, and it crowded out the measurements.
+                    report_status!(
+                        "gxp precompile: {} modules warmed ahead of any draw / {} candidate pairs \
+                         ({built} new this pass). Module only - the pipeline is still built at \
+                         the draw. See `precompile_pairs`.",
                         self.gxp_precompiled,
                         pairs.len(),
                     );
@@ -13510,6 +14124,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // A new frame starts at pass ordinal 0, so pass N of this frame reuses the arenas
             // pass N of the last frame used. See `gxp_arenas`.
             self.gxp_arena_slot = 0;
+            if let Some(ts) = self.ts.as_mut() {
+                ts.begin_chain();
+            }
             // ...and so does the frame's write ordinal, which is what says whether a stalled
             // write was the FIRST one after the previous submit. See `BUFFER_WRITES_THIS_FRAME`.
             BUFFER_WRITES_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -14095,12 +14712,80 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // the composite never reads the world, which looks exactly like the passes not
             // being drawn at all but is a different bug.
             if scenes.len() > 1 || self.rtt_hits > 0 {
+                // >>> THE SHAPE IS FOLDED TO 64 BITS BEFORE ANYTHING IS FORMATTED, AND THAT IS
+                // >>> THE WHOLE COST OF THIS DIAGNOSTIC, NOT A TIDINESS CHOICE.
+                //
+                // The line used to be BUILT and then compared against the last one - so a frame
+                // that printed nothing still paid for the string. Building it calls the pair
+                // KEY for every draw of every scene, and `GxpLive::key` is an FNV over BOTH
+                // program blobs (kilobytes each) - about 490 draws a frame on this title's race,
+                // several megabytes of hashing per frame, thrown away. `pair_key` is the
+                // memoised form the renderer already uses on the draw path (a pointer-keyed
+                // lookup), and it is what this now folds.
+                //
+                // Order-independent for the sampled addresses (a `HashSet`, whose iteration
+                // order is not stable) and order-DEPENDENT for the scene list, which is the
+                // frame's structure and is exactly what a change should report.
+                let mut fold: u64 = 0xcbf2_9ce4_8422_2325;
+                let mut mix = |v: u64| {
+                    fold ^= v;
+                    fold = fold.wrapping_mul(0x0000_0100_0000_01b3);
+                };
+                // >>> THE KEY IS THE SHAPE, NOT THE VOLUME. Everything that DRIFTS is printed
+                // in the line but kept OUT of the fold, or the memo never converges and the
+                // report becomes per-frame - the same defect that made this line 38% of the
+                // browser renderer, arriving from a different direction.
+                //
+                // MEASURED on one title's race: with the draw counts, the rtt-sample count and
+                // the sampled-address set in the key, a SIX-scene frame minted about twenty
+                // distinct "shapes" that described the same six passes. Draw counts drift with
+                // what is on screen (1 -> 3 -> 4 in a single pass), `rtt_hits` drifts with them,
+                // and the sampled set follows.
+                //
+                // The DISPLAY buffer rotates too: a triple-buffered title cycles its final
+                // target between three addresses by design, so keying on the last scene's
+                // address multiplies every real shape by three. Its SIZE still counts - a
+                // display pass that changed resolution IS a new shape - but its address does
+                // not. Interior targets keep their addresses: which pass a draw lands in is
+                // exactly what this line exists to carry.
+                let last = scenes.len().saturating_sub(1);
+                for (i, s) in scenes.iter().enumerate() {
+                    match s.target {
+                        Some(t) => {
+                            if i != last {
+                                mix(t.data_addr as u64);
+                            }
+                            mix(((t.width as u64) << 32) | t.height as u64);
+                        }
+                        None => mix(u64::MAX),
+                    }
+                }
+                for s in scenes.iter() {
+                    for d in s.draws.iter() {
+                        if let Some(g) = d.gxp.as_ref() {
+                            let k = self.gxp.pair_key(g);
+                            fold ^= k;
+                            fold = fold.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    }
+                }
+                let fresh = !self.chain_shapes_seen.contains(&fold);
+                if fresh && self.chain_shapes_seen.len() >= CHAIN_SHAPE_CAP {
+                    if !self.chain_shapes_capped {
+                        self.chain_shapes_capped = true;
+                        report_status!(
+                            "gxm chain: {CHAIN_SHAPE_CAP} distinct frame shapes reported; further \
+                             NEW shapes will not be printed. A title reaching this is changing \
+                             its pass structure constantly, which is itself the finding."
+                        );
+                    }
+                } else if fresh {
+                self.chain_shapes_seen.insert(fold);
                 // >>> WITH EACH SCENE'S PAIR KEYS. Which PASS a draw is in is the fact this
                 // line exists to carry, and without the keys it cannot be checked against
                 // anything: "the composite reads the world" and "the composite is in the pass
                 // that reaches the screen" are different claims, and a frame that is a flat
-                // colour is consistent with either failing. Deduped on the whole shape with the
-                // rest of the line, so a stable frame structure still costs one line.
+                // colour is consistent with either failing.
                 let shape = scenes
                     .iter()
                     .map(|s| {
@@ -14108,7 +14793,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             .draws
                             .iter()
                             .filter_map(|d| d.gxp.as_ref())
-                            .map(|g| format!("{:016x}", GxpLive::key(g)))
+                            // The MEMOISED key, for the reason the fold above uses it.
+                            .map(|g| format!("{:016x}", self.gxp.pair_key(g)))
                             .collect();
                         keys.dedup();
                         let where_ = match s.target {
@@ -14128,15 +14814,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.rtt_hits,
                     sampled.join(" ")
                 );
-                if self.last_chain_shape.as_deref() != Some(line.as_str()) {
-                    // >>> AT `warn`. This is the line that says whether the composite READ the
-                    // world, and its own comment above calls that "a different bug" from the
-                    // passes not being drawn - the exact distinction a black frame cannot make.
-                    // It is deduped on the whole shape, so a title whose frame structure is
-                    // stable pays one line for a run; at `debug` it was invisible in every
-                    // documented repro, all of which say `VITASLOP_LOG=warn`.
-                    report_warn!("{line}");
-                    self.last_chain_shape = Some(line);
+                // >>> STATUS, NOT A WARNING - and still ALWAYS SHOWN.
+                //
+                // This is the line that says whether the composite READ the world, which is a
+                // different bug from the passes not being drawn, and a black frame cannot make
+                // that distinction. So it has to remain visible on a phone, and `debug` would
+                // delete it. But it describes a HEALTHY frame just as readily as a broken one:
+                // there is nothing to FIX on reading it, so it is not a warning
+                // [[vitaslop-a-warning-means-we-owe-a-fix]]. It goes to the panel's STATUS
+                // section, which is forced on regardless of `VITASLOP_LOG`.
+                //
+                // One line per distinct SHAPE, decided above.
+                report_status!("{line}");
                 }
             }
             // Put the kept display image on the caller's framebuffer. The same fullscreen
@@ -14160,6 +14849,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     enc(&ENC.bind_group_sets, 1);
                     enc(&ENC.draw_calls, 1);
                     enc(&ENC.bind_groups_built, 1);
+                    let ts = self.ts_pair(|| "display-blit".to_string());
                     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("gxm-display-blit"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -14169,7 +14859,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                         })],
                         depth_stencil_attachment: None,
-                        timestamp_writes: None,
+                        timestamp_writes: Self::ts_writes(&ts),
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
@@ -14179,6 +14869,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
             // Resolve the supersampled display buffer once, after the last pass into it.
+            // The pair is taken before the target is borrowed, since taking one is a mutable use.
+            let ts_resolve =
+                if ss && self.ss_target.is_some() { self.ts_pair(|| "ss-resolve".to_string()) } else { None };
             if let (true, Some(t)) = (ss, self.ss_target.as_ref()) {
                 enc(&ENC.passes, 1);
                 enc(&ENC.pipeline_sets, 1);
@@ -14193,7 +14886,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: Self::ts_writes(&ts_resolve),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -14746,8 +15439,37 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if gxp_enabled {
                 let with_payload = scene.draws.iter().filter(|d| d.gxp.is_some()).count();
                 let summary = (scene.draws.len(), with_payload, gxp_prepared.len(), items.len());
-                if self.last_gxp_summary != Some(summary) {
-                    self.last_gxp_summary = Some(summary);
+                // FAILURE-ONLY. Every number agreeing with no fixed-function item is the HEALTHY
+                // case, and printing it buried the disagreements this line exists to catch under
+                // 64 copies of the all-clear: a race's draw count drifts frame to frame, so each
+                // frame minted a fresh tuple and the dedup never converged. What is diagnostic is
+                // the GAP - a draw that carried a payload but was not prepared vanished with no
+                // fallback recorded, the shape that hid a composite for a whole session - and any
+                // fixed-function item at all, which recompile-or-fail should have refused.
+                //
+                // `draws != with_payload` is deliberately NOT a trigger: a scene legitimately
+                // holds draws that carry no shader payload, and those are already counted by
+                // `items`. Triggering on it would reopen the same flood from the other side.
+                let interesting = gxp_prepared.len() != with_payload || !items.is_empty();
+                // Said ONCE, so "no tally lines" is distinguishable from "the tally never ran".
+                if !interesting && !self.gxp_summary_all_clear {
+                    self.gxp_summary_all_clear = true;
+                    report_status!(
+                        "gxp: scene tallies are live and CLEAN ({} draws, every payload prepared, \
+                         no fixed-function items). Only DISAGREEMENTS are printed from here.",
+                        summary.0,
+                    );
+                }
+                let fresh = interesting && !self.gxp_summaries_seen.contains(&summary);
+                if fresh && self.gxp_summaries_seen.len() >= GXP_SUMMARY_CAP {
+                    if !self.gxp_summaries_capped {
+                        self.gxp_summaries_capped = true;
+                        report_warn!(
+                            "gxp: {GXP_SUMMARY_CAP} distinct scene tallies reported; further NEW                              ones will not be printed."
+                        );
+                    }
+                } else if fresh {
+                    self.gxp_summaries_seen.insert(summary);
                     // At `warn`, and deduped on the whole tuple, so a stable pass costs one
                     // line: "carries a payload" and "was prepared" are different numbers, and
                     // the gap between them is a draw that vanished with no fallback recorded -
@@ -14855,6 +15577,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let t_pass = Stopwatch::start();
             enc(&ENC.passes, 1);
             {
+                let ts = self.ts_pair(|| match scene.target.as_ref() {
+                    Some(t) => format!("{}x{} {} draws", t.width, t.height, order.len()),
+                    None => format!("depth-only {} draws", order.len()),
+                });
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("gxm-scene"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -14895,7 +15621,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }),
                         stencil_ops: None,
                     }),
-                    timestamp_writes: None,
+                    timestamp_writes: Self::ts_writes(&ts),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -15076,22 +15802,43 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             // group0/group1 belong to the PAIR and take this draw's byte offset
                             // into the pass's uniform arena; a stage with no uniforms has an
                             // empty bind group, which takes no dynamic offsets at all.
-                            let dyn_off = |lanes: u32, off: u32| if lanes == 0 { Vec::new() } else { vec![off] };
+                            //
+                            // >>> ON THE STACK, BECAUSE THIS RAN ONCE PER DRAW AND ALLOCATED.
+                            //
+                            // The offsets used to be built as `Vec`s (`vec![off]`, plus a
+                            // `push` for the memory window), which is two heap allocations and
+                            // two frees for every recompiled draw - ~1,150 a frame on a title
+                            // that submits ~580. There are at most two offsets in either group,
+                            // both `u32`, so a fixed array and a slice of its filled prefix says
+                            // exactly the same thing to wgpu with no allocator in the loop. The
+                            // browser is where that matters: the allocator is a measured 7.3% of
+                            // the busy worker on this title's race
+                            // [[vitaslop-wipeout-race-guest-half-is-closed]], and a wasm malloc
+                            // is dearer than a native one. The bytes handed to `set_bind_group`
+                            // are unchanged, so the frame is bit-identical.
+                            //
                             // group 0's dynamic offsets in BINDING order: the SA block, then
                             // the guest-memory window when this pipeline declares one.
-                            let mut g0_offs = dyn_off(pipe.vsa_lanes, p.u_off[0]);
+                            let mut g0_offs = [0u32; 2];
+                            let mut g0_n = 0usize;
+                            if pipe.vsa_lanes != 0 {
+                                g0_offs[g0_n] = p.u_off[0];
+                                g0_n += 1;
+                            }
                             if pipe.mem_bind_bytes > 0 {
-                                g0_offs.push(p.u_off[2]);
+                                g0_offs[g0_n] = p.u_off[2];
+                                g0_n += 1;
                             }
                             pass.set_bind_group(
                                 0,
                                 self.gxp.ubo_bg(slot, p.key, p.format, p.samples, 0),
-                                &g0_offs,
+                                &g0_offs[..g0_n],
                             );
+                            let g1_offs = [p.u_off[1]];
                             pass.set_bind_group(
                                 1,
                                 self.gxp.ubo_bg(slot, p.key, p.format, p.samples, 1),
-                                &dyn_off(pipe.fsa_lanes, p.u_off[1]),
+                                &g1_offs[..usize::from(pipe.fsa_lanes != 0)],
                             );
                             pass.set_bind_group(2, &p.bg2, &[]);
                             pass.set_bind_group(3, &p.bg3, &[]);

@@ -302,8 +302,15 @@
            `#fatal`), which is the one time it must not be behind a click. -->
       <details id="diagbox">
         <summary>diagnostics <button id="copydiag" type="button">copy</button></summary>
+        <!-- The hard pause: leaving the tab or losing the window's focus stops the emulator
+             (not the title's own pause menu) and the game clock with it. On by default, as a
+             device in a pocket would be; remembered per browser. -->
+        <label class="inline"><input type="checkbox" id="pauseblur" checked /> pause the emulator when this tab is hidden or the window loses focus</label>
         <pre id="fatal"></pre>
         <pre id="diag">waiting for the first perf window (30 presents)...</pre>
+        <!-- Run notes: everything a normal run used to say on the console (setup, adapter,
+             audio, storage, font). The console stays empty unless VITASLOP_CONSOLE=1. -->
+        <pre id="notes"></pre>
       </details>
       <div id="pad">
         <div class="stack">
@@ -481,6 +488,10 @@
             ? `WARNING: this tab was backgrounded ${hiddenSince}x during the run - a hidden tab is ` +
               `throttled, so any window spanning that measures the throttle, not the emulator`
             : `tab stayed in the foreground for the whole run`,
+          (window.__hardPauses || 0) > 0
+            ? `hard-paused ${window.__hardPauses}x for ${((window.__hardPausedMs || 0) / 1000).toFixed(1)}s ` +
+              `in total (tab hidden or window unfocused) - a perf window spanning a pause measures the pause`
+            : `never hard-paused`,
           `knobs: ${JSON.stringify(window.__runKnobs || {})}`,
           `user agent: ${navigator.userAgent}`,
           `${$("adapter").textContent}`,
@@ -542,11 +553,11 @@ ${window.__fatalWorkerError}` : ``,
       // capture, which made the SECOND capture - the one that turns an observation into an A/B -
       // something nobody wanted to take.
       (async () => {
-        try {
-          if (!(await fetch("/diag-sink")).ok) return;
-        } catch {
-          return;
-        }
+        // The dev server stamps this global into the HTML it serves (see serve.mjs). A page
+        // served from anywhere else has no sink and no probe to make - a fetch here was a
+        // 404 in the product's console on every load, which is the one thing an empty
+        // console must not have.
+        if (!window.__vitaslopDiagSink) return;
         const run = `${(window.__runTitle || "run").replace(/[^A-Za-z0-9_-]/g, "")}-${Date.now()}`;
         let seq = 0;
         // >>> AND THE PICTURE, NOT JUST THE NUMBERS.
@@ -925,6 +936,17 @@ VITASLOP_LOG=warn</textarea>
         window.__runRecipe = recipeName;
         window.__runKnobs = knobs;
         window.__runDebug = !!knobs.VITASLOP_DEBUG_CAPTURE;
+        // >>> RUN NOTES GO TO THE PANEL, AND TO THE CONSOLE ONLY WHEN ASKED.
+        // A clean run's console is EMPTY: warnings and errors only. Everything the page and
+        // the worker used to `console.log` (storage, audio, font, pad, setup) lands in the
+        // panel's notes instead; `VITASLOP_CONSOLE=1` mirrors it, which the harness sets.
+        window.__vitaslopConsole = String(knobs.VITASLOP_CONSOLE ?? "") === "1";
+        const note = (text, fromWorker = false) => {
+          // The worker already mirrored its own notes when the knob is on.
+          if (window.__vitaslopConsole && !fromWorker) console.log(text);
+          const el = $("notes");
+          if (el) el.textContent += text + "\n";
+        };
         status.textContent = "reading the recipe...";
 
         let recipe = "";
@@ -942,7 +964,7 @@ VITASLOP_LOG=warn</textarea>
         // against a 4 GB ceiling when it was copied in).
         if (await isImported(t.id, manifest.length)) {
           status.textContent = `already stored (${manifest.length} files); starting...`;
-          console.log(`[opfs] REUSED an existing import of ${t.id}`);
+          note(`[opfs] REUSED an existing import of ${t.id}`);
         } else {
           // Does it FIT, before a byte moves. A quota refusal hundreds of megabytes into a
           // download over wifi is the same failure discovered the expensive way.
@@ -957,7 +979,7 @@ VITASLOP_LOG=warn</textarea>
             );
           }
           const persisted = await requestPersistence();
-          console.log(`[opfs] persistent storage ${persisted ? "GRANTED" : "refused - an import may be evicted"}`);
+          note(`[opfs] persistent storage ${persisted ? "GRANTED" : "refused - an import may be evicted"}`);
           const t0 = performance.now();
           const entries = manifest.map((p) => ({
             path: p,
@@ -975,7 +997,7 @@ VITASLOP_LOG=warn</textarea>
               `copying into this browser: ${mb | 0} / ${t.mb} MB${rate}${left} ` +
               `(file ${done}/${total}) - one time only`;
           });
-          console.log(`[opfs] IMPORTED ${manifest.length} files for ${t.id}`);
+          note(`[opfs] IMPORTED ${manifest.length} files for ${t.id}`);
         }
 
         // Transpile in a THROWAWAY worker: it costs ~460 MB of heap a wasm memory can never
@@ -1011,6 +1033,8 @@ VITASLOP_LOG=warn</textarea>
           if (d.type === "report") {
             const el = $(d.id);
             if (el) el.textContent = d.text;
+          } else if (d.type === "note") {
+            note(d.text, true);
           } else if (d.type === "error") {
             status.textContent = "error: " + d.message;
             console.error("[worker]", d.message);
@@ -1064,7 +1088,7 @@ VITASLOP_LOG=warn</textarea>
         // gamepad. All three post into the same worker input cell.
         forwardInput(worker, canvas);
         installPad(worker, $("pad"));
-        installGamepad(worker, (msg) => console.log("[pad] " + msg));
+        installGamepad(worker, (msg) => note("[pad] " + msg));
 
         // SceLibLocation: the page owns navigator.geolocation (Window-only) and the
         // worker owns the guest. Nothing is requested until the guest asks - the browser
@@ -1079,14 +1103,60 @@ VITASLOP_LOG=warn</textarea>
         // run down - a silent emulator beats no emulator - but it must SAY so rather than
         // look like silence the guest produced.
         let audioRing;
+        let audioPause = () => {};
         try {
-          const audio = await startAudio();
+          const audio = await startAudio(note);
           audioRing = audio.ring;
+          audioPause = audio.pause;
           window.__audioStats = audio.stats;
           window.__audioSamples = audio.samples;
         } catch (err) {
           console.warn("[audio] could not start; this run will be SILENT:", err);
         }
+
+        // >>> THE HARD PAUSE: leaving the tab or losing the window's focus stops the emulator.
+        //
+        // Not the title's pause menu - the guest simply sees a wall clock that did not
+        // advance, as a device in a pocket does. On by default; the checkbox in the
+        // diagnostics box (remembered per browser) and `VITASLOP_PAUSE_ON_BLUR=0` turn it
+        // off. Both `visibilitychange` (tab switch, minimise, phone app switch) and window
+        // `blur`/`focus` (alt-tab with the tab still visible) drive it; the audio worklet is
+        // told too, so the pause is silence and not an underrun. The panel's copy reports how
+        // often and for how long, because a perf window spanning a pause measures the pause.
+        const pauseBox = $("pauseblur");
+        const PAUSE_KEY = "vitaslop.pauseOnBlur";
+        try {
+          const stored = localStorage.getItem(PAUSE_KEY);
+          if (stored !== null) pauseBox.checked = stored === "1";
+        } catch {}
+        if (String(knobs.VITASLOP_PAUSE_ON_BLUR ?? "") === "0") pauseBox.checked = false;
+        pauseBox.addEventListener("change", () => {
+          try {
+            localStorage.setItem(PAUSE_KEY, pauseBox.checked ? "1" : "0");
+          } catch {}
+          if (!pauseBox.checked) setPaused(false);
+        });
+        window.__hardPauses = 0;
+        window.__hardPausedMs = 0;
+        let pausedAt = 0;
+        let hardPaused = false;
+        const setPaused = (paused) => {
+          if (paused && !pauseBox.checked) return;
+          if (paused === hardPaused) return;
+          hardPaused = paused;
+          worker.postMessage({ type: "pause", paused });
+          audioPause(paused);
+          if (paused) {
+            pausedAt = performance.now();
+            window.__hardPauses += 1;
+          } else {
+            window.__hardPausedMs += performance.now() - pausedAt;
+          }
+        };
+        const wantPause = () => document.visibilityState === "hidden" || !document.hasFocus();
+        document.addEventListener("visibilitychange", () => setPaused(wantPause()));
+        window.addEventListener("blur", () => setPaused(wantPause()));
+        window.addEventListener("focus", () => setPaused(wantPause()));
 
         // Hand the canvas's render control to the worker. The title is NOT transferred - it is
         // in storage and the worker opens its own handles to it.

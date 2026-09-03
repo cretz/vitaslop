@@ -31,6 +31,8 @@ pub struct OpfsReader {
     paths: Function,
     size: Function,
     read: Function,
+    /// `stats()` if the reader has a ring behind it - see [`OpfsReader::ring_stats`].
+    stats: Option<Function>,
     this: Object,
 }
 
@@ -64,8 +66,41 @@ impl OpfsReader {
             paths: get("paths")?,
             size: get("size")?,
             read: get("read")?,
+            // OPTIONAL, unlike the three above: the in-memory fixture reader has no ring
+            // behind it and nothing to report, and an absent counter is a reader without a
+            // ring rather than a failure. The three that ARE required stay required - a
+            // missing `read` is a title that silently reads zeros.
+            stats: {
+                let f = Reflect::get(&this, &JsValue::from_str("stats"))
+                    .ok()
+                    .and_then(|f| f.dyn_into::<Function>().ok());
+                // Also parked where the PANEL can reach it. Everything else on this line is
+                // counted into a global atomic by `read_at`; the ring's own counters live in
+                // JS and cost a call to fetch, so the panel holds the handle and asks once a
+                // window instead of the read path asking every time.
+                if let Some(f) = f.clone() {
+                    RING.with(|r| *r.borrow_mut() = Some((f, this.clone())));
+                }
+                f
+            },
             this,
         })
+    }
+
+    /// `(ring hits, misses, ms waited on a miss)` from the storage worker's page ring, or
+    /// `None` from a reader that has no ring.
+    ///
+    /// # Why the read COUNT could not answer this
+    /// Once the emulator's reads come out of the ring, the panel's read count says nothing
+    /// about what they cost: a hit is a `copy_from_slice` out of shared memory, a miss is a
+    /// round trip to another thread with an `Atomics.wait` in the middle, and the count is the
+    /// same number either way. A device dump was read with the storage worker live and could
+    /// not say whether its 16-page read-ahead was serving anything at all - which is the entire
+    /// claim the worker exists to make. Called once per panel window, never per read.
+    pub fn ring_stats(&self) -> Option<(u64, u64, f64)> {
+        let v = self.stats.as_ref()?.call0(&self.this).ok()?;
+        let num = |k: &str| Reflect::get(&v, &JsValue::from_str(k)).ok()?.as_f64();
+        Some((num("hits")? as u64, num("misses")? as u64, num("waitMs")?))
     }
 
     /// Every stored path.
@@ -100,11 +135,15 @@ impl OpfsReader {
         // A view over this call's slice, handed to JS to fill in place - no intermediate
         // JS array, no copy. From here to the call there is no allocation at all.
         let view = unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) };
-        self.read
+        let n = self
+            .read
             .call3(&self.this, &path, &off_js, &view)
             .ok()
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as usize
+            .unwrap_or(0.0) as usize;
+        OPFS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OPFS_READ_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        n
     }
 }
 
@@ -123,7 +162,55 @@ pub struct OpfsBacking {
     /// for any path with a capital letter in it, and fails as a guest trap far away rather
     /// than as a missing file.
     by_key: std::collections::HashMap<String, String>,
+    /// The most recent read-ahead window: the stored path it belongs to, the file offset
+    /// it starts at, and its bytes (short only at end of file). See [`Self::read_at`].
+    window: std::cell::RefCell<ReadWindow>,
 }
+
+/// One read-ahead window over one stored file - see [`OpfsBacking::read_at`].
+#[derive(Default)]
+struct ReadWindow {
+    path: String,
+    off: usize,
+    data: Vec<u8>,
+}
+
+/// OPFS reads made and bytes moved, cumulatively, and how many `read_at` calls the window
+/// answered without one. The panel differences two snapshots. See [`opfs_read_counts`].
+thread_local! {
+    /// The live reader's `stats()` and its receiver, for [`ring_read_counts`]. A
+    /// thread_local because this target has exactly one thread - see the `unsafe impl Send`
+    /// on `OpfsReader` and the reasoning above it.
+    static RING: std::cell::RefCell<Option<(Function, Object)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `(ring hits, misses, ms waited on a miss)` for the panel, or `None` before a title with a
+/// storage ring is open. See [`OpfsReader::ring_stats`] for why the read count cannot say this.
+pub fn ring_read_counts() -> Option<(u64, u64, f64)> {
+    RING.with(|r| {
+        let borrowed = r.borrow();
+        let (f, this) = borrowed.as_ref()?;
+        let v = f.call0(this).ok()?;
+        let num = |k: &str| Reflect::get(&v, &JsValue::from_str(k)).ok()?.as_f64();
+        Some((num("hits")? as u64, num("misses")? as u64, num("waitMs")?))
+    })
+}
+
+static OPFS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPFS_READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OPFS_WINDOW_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(OPFS reads, bytes read, calls served from the window)` since the page loaded.
+pub fn opfs_read_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (OPFS_READS.load(Relaxed), OPFS_READ_BYTES.load(Relaxed), OPFS_WINDOW_HITS.load(Relaxed))
+}
+
+/// Size of the read-ahead window. A title's own archive layer reads 64 KB blocks, and a
+/// streamed video's access units are tens of KB, so one window serves a run of the
+/// small sequential reads either produces.
+const READ_WINDOW: usize = 64 * 1024;
 
 impl OpfsBacking {
     pub fn new(reader: OpfsReader, prefix: impl Into<String>) -> Self {
@@ -135,7 +222,7 @@ impl OpfsBacking {
             by_key.insert(vfs_key(rel), stored.clone());
             keys.push(rel.to_string());
         }
-        OpfsBacking { reader, keys, by_key }
+        OpfsBacking { reader, keys, by_key, window: std::cell::RefCell::new(ReadWindow::default()) }
     }
 
     /// The stored path a normalised guest key maps back to.
@@ -218,11 +305,65 @@ impl FileBacking for OpfsBacking {
         self.reader.size(self.stored(key)?)
     }
 
+    /// Serve a read out of the read-ahead window when it can, and refill the window from
+    /// OPFS when it cannot.
+    ///
+    /// # Why a window
+    /// Every OPFS read is a boundary crossing - a JS string for the path, a typed-array
+    /// view, the call, the sync handle's own read - and the engine is billed in crossings,
+    /// not bytes. MEASURED in a V8 worker profile of a retail race: the sync `read` alone
+    /// was 2.7% of the whole thread while the title streamed its own video through its own
+    /// file layer, which reads a stream in small consecutive pieces. One 64 KB window turns
+    /// a run of those into one crossing and a `copy_from_slice` each.
+    ///
+    /// A read at least a window long goes straight through: buffering it would copy the
+    /// bytes twice for nothing. The backing serves the title's read-only files (a save
+    /// lives in the resident table and the game-data tree, never here), so a window can
+    /// never go stale.
     fn read_at(&self, key: &str, off: usize, buf: &mut [u8]) -> usize {
-        match self.stored(key) {
-            Some(path) => self.reader.read_at(path, off, buf),
-            None => 0,
+        let Some(path) = self.stored(key) else { return 0 };
+        if buf.len() >= READ_WINDOW {
+            return self.reader.read_at(path, off, buf);
         }
+        let mut w = self.window.borrow_mut();
+        let mut done = 0usize;
+        let mut refilled = false;
+        // A request can straddle two windows: serve what the current one holds, then
+        // refill at the next boundary and carry on, so a mid-file read is never short.
+        while done < buf.len() {
+            let at = off + done;
+            let in_window = w.path == path && at >= w.off && at < w.off + w.data.len();
+            if !in_window {
+                // Outside the window - or inside its span but past its bytes, which is
+                // the end of the file only when the window was already short.
+                let short_eof = w.path == path
+                    && at >= w.off
+                    && at >= w.off + w.data.len()
+                    && w.data.len() < READ_WINDOW;
+                if short_eof {
+                    break;
+                }
+                let start = at - (at % READ_WINDOW);
+                w.data.resize(READ_WINDOW, 0);
+                let got = self.reader.read_at(path, start, &mut w.data);
+                refilled = true;
+                w.data.truncate(got);
+                w.off = start;
+                w.path.clear();
+                w.path.push_str(path);
+                if at >= start + got {
+                    break;
+                }
+            }
+            let from = at - w.off;
+            let n = (buf.len() - done).min(w.data.len() - from);
+            buf[done..done + n].copy_from_slice(&w.data[from..from + n]);
+            done += n;
+        }
+        if !refilled {
+            OPFS_WINDOW_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        done
     }
 
     fn keys(&self) -> Vec<String> {

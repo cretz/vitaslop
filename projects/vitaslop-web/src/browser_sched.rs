@@ -74,6 +74,22 @@ mod hostcalls {
         /// the reader and the setter below - two `thread_local!` blocks declaring the same name
         /// would be two different cells, and the setter would write one nothing reads.
         static TIMING_SAMPLED: Cell<bool> = const { Cell::new(false) };
+        /// The cheap always-on estimate: see `start_sample`. Milliseconds measured over
+        /// `SAMPLE_N` calls, which is a known fraction of `CALLS`.
+        static SAMPLE_MS: Cell<f64> = const { Cell::new(0.0) };
+        static SAMPLE_N: Cell<u64> = const { Cell::new(0) };
+        /// The longest SINGLE timed call since the last take - see [`take_sample_max`].
+        ///
+        /// A sampled estimate scales one call in ~33 up by that factor, so one unusually long
+        /// call lands on the panel multiplied by 33. Over a race window that read 156% of `cpu`
+        /// once in thirty windows: an impossible share, and the only thing that can produce it.
+        /// The panel says so when it happens rather than smoothing it, and this is the number
+        /// that names the cause.
+        static SAMPLE_MAX: Cell<f64> = const { Cell::new(0.0) };
+        /// The call number the next sample is due at, and the 0/1/2 stride skew that keeps
+        /// the sampled positions walking. See `start_sample`.
+        static SAMPLE_NEXT: Cell<u64> = const { Cell::new(0) };
+        static SAMPLE_PHASE: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Whether to time each host call right now.
@@ -160,6 +176,34 @@ mod hostcalls {
         /// of magnitude in what they do. This is the browser's own per-NID cost.
         static PER_SELECTOR_MS: std::cell::RefCell<Vec<f64>> =
             std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
+        /// The SAMPLED milliseconds and sample count per import selector.
+        ///
+        /// `PER_SELECTOR_MS` above is filled only while full timing is on, which is a run
+        /// somebody is deliberately profiling on a machine with a cable. On every other run -
+        /// including every run on the device this is all for - the per-NID answer was a COUNT
+        /// with no cost beside it, and two NIDs called equally often differ by an order of
+        /// magnitude in what they do. The sampler already times one call in ~33; charging that
+        /// sample to its OWN selector costs one array write and turns "35-40% of the frame is
+        /// host calls" into "and it is these ones", which is the question a count cannot
+        /// answer. Scaled per selector by its own sampled share, not the global one.
+        static SAMPLED_SELECTOR_MS: std::cell::RefCell<Vec<f64>> =
+            std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
+        static SAMPLED_SELECTOR_N: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        /// The previous panel window's readings, so the ranking can be a WINDOW rather than a
+        /// run total.
+        ///
+        /// A cumulative ranking on this title is a ranking of its BOOT: a race run reaches the
+        /// grid at frame 9,600 and races for 1,700, so nine tenths of every cumulative row is
+        /// the loader, the menus and the attract movie - which is how `sceAvcdecDecode` at 589
+        /// us/call comes third in a table meant to describe a race. Every other figure on the
+        /// panel is windowed for exactly this reason.
+        static PREV_SAMPLED_MS: std::cell::RefCell<Vec<f64>> =
+            std::cell::RefCell::new(vec![0.0; MAX_SELECTOR]);
+        static PREV_SAMPLED_N: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
+        static PREV_SELECTOR_CALLS: std::cell::RefCell<Vec<u64>> =
+            std::cell::RefCell::new(vec![0; MAX_SELECTOR]);
     }
 
     /// Highest selector tracked per-NID; a real title imports a few hundred. Calls above
@@ -180,6 +224,46 @@ mod hostcalls {
     }
 
     /// Count one fuel preemption.
+    thread_local! {
+        /// Every suspension the scheduler loop saw, by what the thread stopped for:
+        /// `[quantum, blocked, flip]`. The `susp` total on the running line could not say
+        /// whether a race's ~300 suspensions a frame were guest threads genuinely handing
+        /// off (blocked) or preemption; those need different fixes, and a phone dump is the
+        /// only place the question can be asked.
+        static STOPS: Cell<[u64; 3]> = const { Cell::new([0; 3]) };
+    }
+
+    /// Count one suspension of the given kind - see [`STOPS`].
+    pub fn note_stop(kind: usize) {
+        STOPS.with(|c| {
+            let mut v = c.get();
+            v[kind.min(2)] += 1;
+            c.set(v);
+        });
+    }
+
+    /// `(quantum, blocked, flip)` suspensions so far.
+    pub fn stops() -> (u64, u64, u64) {
+        let v = STOPS.with(|c| c.get());
+        (v[0], v[1], v[2])
+    }
+
+    thread_local! {
+        /// Host calls that went through the NON-SUSPENDING trap (`env.import_fast`). On the
+        /// running line beside the total, so a dump says how many of a frame's calls paid
+        /// the JSPI switch - and a zero here on a title that draws is the transpiler not
+        /// routing them, which nothing else would show.
+        static FAST_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn note_fast_call() {
+        FAST_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn fast_calls() -> u64 {
+        FAST_CALLS.with(|c| c.get())
+    }
+
     pub fn note_fuel_yield() {
         FUEL_YIELDS.with(|c| c.set(c.get() + 1));
     }
@@ -254,6 +338,74 @@ mod hostcalls {
             all.truncate(n);
             all
         })
+    }
+
+    /// The `n` costliest selectors BY THE SAMPLED ESTIMATE, as
+    /// `(selector, calls, estimated ms, samples)`, descending by estimated ms.
+    ///
+    /// Each selector's sampled milliseconds are scaled by ITS OWN sampled share - calls
+    /// divided by samples - not by the global one. A NID called 200,000 times and a NID called
+    /// twice are not sampled at the same rate, and scaling both by the run's average rate puts
+    /// the rare one wherever chance placed its single sample. The sample count rides along for
+    /// the same reason it does on the panel line: a row standing on three samples has to be
+    /// visibly standing on three samples.
+    pub fn sampled_selectors_by_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
+        let calls = PER_SELECTOR.with(|v| v.borrow().clone());
+        let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
+        SAMPLED_SELECTOR_MS.with(|v| {
+            let ms = v.borrow();
+            let mut all: Vec<(u32, u64, f64, u64)> = ms
+                .iter()
+                .enumerate()
+                .filter(|&(i, &m)| m > 0.0 && samples[i] > 0)
+                .map(|(i, &m)| {
+                    (i as u32, calls[i], m * calls[i] as f64 / samples[i] as f64, samples[i])
+                })
+                .collect();
+            all.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+            all.truncate(n);
+            all
+        })
+    }
+
+    /// The costliest selectors SINCE THIS WAS LAST CALLED, as
+    /// `(selector, calls, estimated ms, samples)`, descending by estimated ms.
+    ///
+    /// The same scaling as [`sampled_selectors_by_ms`], over one panel window's deltas. Taken
+    /// rather than read, because a window is defined by the previous take.
+    pub fn take_sampled_selector_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+        let calls = PER_SELECTOR.with(|v| v.borrow().clone());
+        let ms = SAMPLED_SELECTOR_MS.with(|v| v.borrow().clone());
+        let samples = SAMPLED_SELECTOR_N.with(|v| v.borrow().clone());
+        let mut out: Vec<(u32, u64, f64, u64)> = Vec::new();
+        PREV_SAMPLED_MS.with(|pm| {
+            PREV_SAMPLED_N.with(|pn| {
+                PREV_SELECTOR_CALLS.with(|pc| {
+                    let mut pm = pm.borrow_mut();
+                    let mut pn = pn.borrow_mut();
+                    let mut pc = pc.borrow_mut();
+                    for i in 0..ms.len() {
+                        let d_ms = ms[i] - pm[i];
+                        let d_n = samples[i] - pn[i];
+                        let d_calls = calls[i] - pc[i];
+                        pm[i] = ms[i];
+                        pn[i] = samples[i];
+                        pc[i] = calls[i];
+                        if d_n > 0 && d_ms > 0.0 {
+                            out.push((
+                                i as u32,
+                                d_calls,
+                                d_ms * d_calls as f64 / d_n as f64,
+                                d_n,
+                            ));
+                        }
+                    }
+                })
+            })
+        });
+        out.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+        out.truncate(n);
+        out
     }
 
     /// Calls per guest thread, descending.
@@ -367,6 +519,99 @@ mod hostcalls {
              {} preemptions ({} on fuel)", quanta(), fuel_yields()
         );
         true
+    }
+
+    /// >>> THE CHEAP ESTIMATE, FOR THE RUN NOBODY IS PROFILING.
+    ///
+    /// Full per-call timing costs four `performance.now()` crossings a call and roughly doubles
+    /// a phone's frame, so it is opt-in and a normal device run reports `0 ms` of host-call
+    /// time - which is exactly the number that decides where the remaining frame lives. A
+    /// device dump was read three sessions running with that slot empty, and the split of `cpu`
+    /// into the guest's own code and OUR host calls was taken from a DESKTOP profile and
+    /// extrapolated. Two nights of changes priced that way moved the phone by nothing.
+    ///
+    /// So: time ONE call in [`SAMPLE_EVERY`] - two clock reads, no per-selector map, no
+    /// handler/marshalling split - and scale by the call count. At ~760 calls a frame that is
+    /// ~24 clock pairs a frame against ~3,000 for the full instrument, which is small enough to
+    /// leave on for everyone and still answer the question. It is an ESTIMATE and the panel
+    /// says so, with the sample count beside it so a thin window is visibly thin.
+    ///
+    /// # Why the phase rotates
+    /// A guest frame issues its calls in nearly the same order every frame, so a FIXED stride
+    /// would sample the same positions in that sequence for ever - and host calls differ by
+    /// more than an order of magnitude in cost, so locking onto the draw calls (or onto the
+    /// mutex unlocks) would give a stable, confident and wrong answer. Advancing the phase by
+    /// one on every sample walks all `SAMPLE_EVERY` residues, so every position is reached.
+    const SAMPLE_EVERY: u64 = 32;
+
+    /// Should this call be timed for the estimate? Sets the next due call when it says yes.
+    ///
+    /// >>> THE FIRST VERSION SAMPLED EVERY CALL AND REPORTED 0.0% ERROR.
+    /// It took a call when `CALLS % 32` equalled a phase that then advanced by one - but
+    /// `CALLS` also advances by one per call, so the phase tracked it exactly and the test was
+    /// true every time. The estimator agreed with the timed total perfectly because it WAS the
+    /// timed total. Only the sample COUNT gave it away, which is why the check prints it.
+    ///
+    /// A due-call countdown cannot drift into the counter that way. The stride cycles 32/33/34
+    /// rather than sitting on 32: a guest frame issues its calls in nearly the same order every
+    /// frame, so a fixed stride would sample the same POSITIONS in that sequence for ever, and
+    /// host calls differ by more than an order of magnitude in cost. Three strides summing to
+    /// 99, and `gcd(99 mod 32, 32) = gcd(3, 32) = 1`, so the sampled positions walk every
+    /// residue instead of locking onto the draws or onto the mutex unlocks.
+    pub fn start_sample() -> bool {
+        let calls = CALLS.with(|c| c.get());
+        if calls < SAMPLE_NEXT.with(|n| n.get()) {
+            return false;
+        }
+        let skew = SAMPLE_PHASE.with(|p| {
+            let s = p.get();
+            p.set((s + 1) % 3);
+            s
+        });
+        SAMPLE_NEXT.with(|n| n.set(calls + SAMPLE_EVERY + skew));
+        true
+    }
+
+    pub fn note_sample(ms: f64, selector: u32) {
+        SAMPLE_MS.with(|m| m.set(m.get() + ms));
+        SAMPLE_N.with(|n| n.set(n.get() + 1));
+        SAMPLED_SELECTOR_MS.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += ms;
+            }
+        });
+        SAMPLED_SELECTOR_N.with(|v| {
+            if let Some(slot) = v.borrow_mut().get_mut(selector as usize) {
+                *slot += 1;
+            }
+        });
+        SAMPLE_MAX.with(|m| {
+            if ms > m.get() {
+                m.set(ms);
+            }
+        });
+    }
+
+    /// The longest single timed call since this was last called, and reset.
+    ///
+    /// Taken rather than read so the figure describes ONE panel window: a running maximum
+    /// would keep reporting a spike from minutes ago as though it had just happened.
+    pub fn take_sample_max() -> f64 {
+        SAMPLE_MAX.with(|m| m.replace(0.0))
+    }
+
+    /// `(estimated total ms in host calls, samples taken)` since the run started.
+    ///
+    /// Scaled by the SAMPLED calls' share of all calls rather than by `SAMPLE_EVERY`, so a run
+    /// that spent part of its life with full timing on - where nothing is sampled - does not
+    /// report an estimate short by exactly that stretch.
+    pub fn sampled_estimate() -> (f64, u64) {
+        let n = SAMPLE_N.with(|c| c.get());
+        if n == 0 {
+            return (0.0, 0);
+        }
+        let ms = SAMPLE_MS.with(|m| m.get());
+        (ms * CALLS.with(|c| c.get()) as f64 / n as f64, n)
     }
 
     /// Total host calls made and milliseconds spent in them since the run started.
@@ -516,6 +761,35 @@ pub fn host_call_totals() -> (u64, f64) {
     hostcalls::totals()
 }
 
+/// `(estimated ms spent in host calls, samples taken)` - the cheap always-on estimate that
+/// fills the panel's host-call time when full timing is off. See [`hostcalls::start_sample`].
+pub fn host_call_estimate() -> (f64, u64) {
+    hostcalls::sampled_estimate()
+}
+
+/// The longest single timed host call since the last call to this - see
+/// [`hostcalls::take_sample_max`].
+pub fn take_host_call_sample_max() -> f64 {
+    hostcalls::take_sample_max()
+}
+
+/// The costliest host calls BY THE SAMPLED ESTIMATE - see
+/// [`hostcalls::sampled_selectors_by_ms`]. Available on any run, timed or not.
+pub fn host_calls_by_sampled_ms(n: usize) -> Vec<(u32, u64, f64, u64)> {
+    hostcalls::sampled_selectors_by_ms(n)
+}
+
+/// The costliest host calls of the last panel window, by the sampled estimate - see
+/// [`hostcalls::take_sampled_selector_window`].
+pub fn take_host_calls_by_sampled_ms_window(n: usize) -> Vec<(u32, u64, f64, u64)> {
+    hostcalls::take_sampled_selector_window(n)
+}
+
+/// Host calls made through the non-suspending trap so far - see [`hostcalls::note_fast_call`].
+pub fn fast_call_total() -> u64 {
+    hostcalls::fast_calls()
+}
+
 /// `(calls, total ms, handler ms, marshalling ms)` since the run started. See
 /// [`hostcalls::split`] - the split is only meaningful over calls that were actually timed.
 /// The `n` costliest host calls as `(selector, calls, ms)`, descending by total time.
@@ -561,6 +835,11 @@ pub fn instance_stats() -> (u64, u64, u64) {
 /// screen the calibration was taken on and wrong everywhere else.
 pub fn preemption_stats() -> (u64, u64) {
     (hostcalls::quanta(), hostcalls::fuel_yields())
+}
+
+/// `(quantum, blocked, flip)` suspensions so far - see [`hostcalls::note_stop`].
+pub fn stop_split() -> (u64, u64, u64) {
+    hostcalls::stops()
 }
 
 /// `(the last raw software-fuel reading, the smallest one seen)` - see
@@ -1076,10 +1355,23 @@ fn transpiler_dirty_map_off() -> u64 {
 export function save_some(globals, idxs, out) {
   for (let k = 0; k < idxs.length; k++) { const i = idxs[k]; out[i] = globals[i].value; }
 }
+export function set_one(g, v) { g.value = v; }
 ")]
 extern "C" {
     /// Copy just the globals named by `idxs` into `out`, at their own indices.
     fn save_some(globals: &Array, idxs: &js_sys::Uint32Array, out: &js_sys::Uint32Array);
+    /// `g.value = v`, with `v` crossing as a plain number.
+    ///
+    /// >>> ONE CROSSING, NOT TWO, AND NO BOXED NUMBER. `Global::set_value(&JsValue)` first
+    /// turns the `u32` into a `JsValue` - a `F64 -> Externref` cast intrinsic, which is its
+    /// own import call and, for a value outside the small-integer range, a heap-allocated
+    /// number on the JS side - and then calls the setter. MEASURED in a V8 worker profile
+    /// of a retail race: that cast intrinsic alone was **4.8% of the whole thread**, the
+    /// largest single entry, called once per host call for the return register's
+    /// write-back. Passing the value as a number argument lets the shim hand it over as a
+    /// plain `f64` and the setter's `ToInt32` do the rest, which is the same bit-exact
+    /// round trip the read side already relies on.
+    fn set_one(g: &WebAssembly::Global, v: u32);
 }
 
 /// >>> THE REGISTERS A HOST CALL CAN ACTUALLY REACH.
@@ -1228,7 +1520,7 @@ impl ThreadRt {
 
 
     fn set_reg(&self, i: usize, v: u32) {
-        self.regs[i].set_value(&JsValue::from_f64(v as f64));
+        set_one(&self.regs[i], v);
     }
     fn read_reg(&self, i: usize) -> u32 {
         self.regs[i].value().as_f64().unwrap_or(0.0) as i64 as u32
@@ -1319,6 +1611,9 @@ struct ThreadEngine {
     cont: Rc<RefCell<Option<Function>>>,
     /// The import closure must outlive every call the instance can make into it.
     _import: Closure<dyn FnMut(i32) -> JsValue>,
+    /// The non-suspending trap's closure - see `abi::IMPORT_FAST_NAME`. Kept for the same
+    /// reason as `_import`: the instance calls it for as long as it lives.
+    _import_fast: Closure<dyn FnMut(i32)>,
     /// This instance's SOFTWARE FUEL counter (`abi::FUEL_EXPORT`), or `None` in a build
     /// with fuel switched off. Read to price this thread's guest work - see
     /// [`BrowserThread::fuel_used`].
@@ -1735,6 +2030,9 @@ impl BrowserEngine {
         // Cells rather than captured values because the instance outlives the thread.
         let thid_cell = Rc::new(Cell::new(0i32));
         let abandoned = Rc::new(Cell::new(false));
+        // Raised by the NON-SUSPENDING trap when the host-call quantum expires on one of its
+        // calls - it cannot suspend, so the next call through the suspending trap does.
+        let pending_preempt = Rc::new(Cell::new(false));
 
         let import_closure = {
             let host = self.host.clone();
@@ -1743,6 +2041,7 @@ impl BrowserEngine {
             let cont = cont.clone();
             let thid_cell = thid_cell.clone();
             let abandoned = abandoned.clone();
+            let pending_preempt = pending_preempt.clone();
             Closure::wrap(Box::new(move |selector: i32| -> JsValue {
                 let thid = thid_cell.get();
                 // A software fuel point (see `vitaslop_transpiler::emit::set_fuel_interval`)
@@ -1763,7 +2062,12 @@ impl BrowserEngine {
                     return suspend(&signal, &cont, Stop::Quantum);
                 }
                 let timed = hostcalls::timing_enabled();
+                // The cheap estimate runs BESIDE full timing rather than instead of it, so a
+                // timed run prices its own estimator: the panel prints both and their error.
+                // An estimator nothing ever checks is a number with no claim attached.
+                let sampling = hostcalls::start_sample();
                 let clock = || if timed { hostcalls::now() } else { 0.0 };
+                let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
                 let t0 = clock();
                 let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
                 let (mut regs, mut vfp) = rt.read_file();
@@ -1783,6 +2087,10 @@ impl BrowserEngine {
                 // everything around it. The difference is register MARSHALLING - work the
                 // guest never asked for - and the two need completely different fixes.
                 let total_ms = clock() - t0;
+                if sampling {
+                    let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
+                    hostcalls::note_sample(sample_ms, selector as u32);
+                }
                 hostcalls::note_selector(selector as u32, thid, total_ms);
                 if hostcalls::record(total_ms, d1 - d0) {
                     // Name the NIDs the guest is spending its calls on. This is the
@@ -1829,7 +2137,11 @@ impl BrowserEngine {
                     // thread has used its quantum, in which case preempt it here. This is
                     // the browser's stand-in for native's fuel interrupt; see
                     // [`preempt_note`] for why the run cannot work without one.
-                    SvcOutcome::Continue if hostcalls::quantum_expired() => {
+                    // ...or the quantum expired on a call through the NON-suspending trap,
+                    // which could only raise the flag and leave the switch to this one.
+                    SvcOutcome::Continue
+                        if hostcalls::quantum_expired() || pending_preempt.replace(false) =>
+                    {
                         suspend(&signal, &cont, Stop::Quantum)
                     }
                     SvcOutcome::Continue => JsValue::UNDEFINED,
@@ -1863,8 +2175,87 @@ impl BrowserEngine {
             }) as Box<dyn FnMut(i32) -> JsValue>)
         };
 
-        // env.import wrapped as Suspending; env.memory the shared memory; env.svc /
-        // env.dispatch_miss the shared non-suspending stubs.
+        // >>> THE NON-SUSPENDING TRAP: `env.import_fast`, a plain function.
+        //
+        // The same marshalling and the same dispatch as `env.import`, minus everything a
+        // suspension needs - no `Suspending` wrapper (so no JSPI stack switch per call), no
+        // promise, no `JsValue` return. The transpiler routes only the NIDs the host named
+        // as never suspending here (`vita::fast_nid`); a race frame's draws and scene
+        // boundaries are ~90% of its host calls and all of them qualify.
+        //
+        // What a fast call may NOT do is change the schedule: it cannot park, so when its
+        // outcome is anything but `Continue` the run ends loudly - a handler whose arm was
+        // misnamed as fast is a bug to fix at the list, never a thread quietly left running
+        // - and when the host-call quantum expires on it, it raises `pending_preempt` for
+        // the suspending trap to act on at the thread's next blocking-capable call.
+        let fast_closure = {
+            let host = self.host.clone();
+            let rt_cell = rt_cell.clone();
+            let thid_cell = thid_cell.clone();
+            let abandoned = abandoned.clone();
+            let pending_preempt = pending_preempt.clone();
+            Closure::wrap(Box::new(move |selector: i32| {
+                let thid = thid_cell.get();
+                let timed = hostcalls::timing_enabled();
+                // The cheap estimate runs BESIDE full timing rather than instead of it, so a
+                // timed run prices its own estimator: the panel prints both and their error.
+                // An estimator nothing ever checks is a number with no claim attached.
+                let sampling = hostcalls::start_sample();
+                let clock = || if timed { hostcalls::now() } else { 0.0 };
+                let t_sample = if sampling && !timed { hostcalls::now() } else { 0.0 };
+                let t0 = clock();
+                let rt = rt_cell.borrow().as_ref().expect("rt set before first call").clone();
+                let (mut regs, mut vfp) = rt.read_file();
+                let before = (regs, vfp);
+                let d0 = clock();
+                let outcome = {
+                    let mut mem: &SharedView = &rt.view;
+                    let mut host = host.lock().unwrap();
+                    host.set_current_thread(thid);
+                    host.dispatch(selector as u32, &mut regs, &mut vfp, &mut mem, rt.base)
+                };
+                let d1 = clock();
+                rt.write_file_changed(&before, &regs, &vfp);
+                let total_ms = clock() - t0;
+                if sampling {
+                    let sample_ms = if timed { total_ms } else { hostcalls::now() - t_sample };
+                    hostcalls::note_sample(sample_ms, selector as u32);
+                }
+                hostcalls::note_selector(selector as u32, thid, total_ms);
+                hostcalls::note_fast_call();
+                // The periodic per-NID dump rides the suspending trap's calls; this only
+                // keeps the totals honest.
+                let _ = hostcalls::record(total_ms, d1 - d0);
+                if hostcalls::quantum_expired() {
+                    pending_preempt.set(true);
+                }
+                let (fatal, refused) = match outcome {
+                    SvcOutcome::Continue => return,
+                    SvcOutcome::Fatal(msg) => (true, msg),
+                    SvcOutcome::Reschedule => (false, "Reschedule".to_string()),
+                    SvcOutcome::Block => (false, "Block".to_string()),
+                    SvcOutcome::Flip => (false, "Flip".to_string()),
+                    SvcOutcome::ThreadExit => (false, "ThreadExit".to_string()),
+                    SvcOutcome::Halt => (false, "Halt".to_string()),
+                };
+                let msg = if fatal {
+                    refused
+                } else {
+                    format!(
+                        "host call selector {selector} on thread {thid:#x} was routed through the \
+                         NON-SUSPENDING trap but its handler returned {refused} - a NID in \
+                         `vita::fast_nid` has grown a suspending path; remove it from that list"
+                    )
+                };
+                // The stack is unwound by the throw and never resumed, which is what
+                // `abandoned` means; the entry's rejection handler reports the message.
+                abandoned.set(true);
+                wasm_bindgen::throw_str(&msg);
+            }) as Box<dyn FnMut(i32)>)
+        };
+
+        // env.import wrapped as Suspending; env.import_fast plain; env.memory the shared
+        // memory; env.svc / env.dispatch_miss the shared non-suspending stubs.
         let suspending_import = Reflect::construct(
             &self.suspending,
             &Array::of1(import_closure.as_ref().unchecked_ref()),
@@ -1872,6 +2263,11 @@ impl BrowserEngine {
         let env = Object::new();
         Reflect::set(&env, &JsValue::from_str(abi::MEMORY_EXPORT), &self.shared_mem)?;
         Reflect::set(&env, &JsValue::from_str(abi::IMPORT_NAME), &suspending_import)?;
+        Reflect::set(
+            &env,
+            &JsValue::from_str(abi::IMPORT_FAST_NAME),
+            fast_closure.as_ref().unchecked_ref(),
+        )?;
         Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?;
         Reflect::set(&env, &JsValue::from_str(abi::DISPATCH_MISS_NAME), &self.dispatch_miss_fn)?;
         let imports = Object::new();
@@ -1920,6 +2316,7 @@ impl BrowserEngine {
             signal,
             cont,
             _import: import_closure,
+            _import_fast: fast_closure,
             // Absent in a build with `VITASLOP_BROWSER_FUEL=0`, which is exactly the
             // build that has no fuel to report; the clock then falls back to advancing
             // on flips and idles alone, as it did before fuel existed.
@@ -2059,6 +2456,27 @@ pub fn event_loop_turns() -> u64 {
 /// an outstanding host reply is the thing it is waiting for, and the counter resets the
 /// moment any thread becomes runnable - so a busy frame never reaches it at all.
 const IDLE_ROUNDS_PER_EVENT_LOOP_TURN: u64 = 64;
+
+/// The wall-clock floor between two idle-path turns taken BECAUSE a decoder owes pictures.
+///
+/// # Why the owed cadence needs a floor at all
+/// The power-of-two cadence below fires on the FIRST idle round of every idle run, and a
+/// title with many live threads has many idle runs a frame: a racer's audio, demux and
+/// decode threads each park for a few microseconds of guest time and are runnable again on
+/// the next round, so "consecutive idle" restarts a hundred times a frame. MEASURED on a
+/// phone, mid-race, with the intro movie's decoder still holding its 20-picture pipeline:
+/// `event loop: 136.76 extra turns per displayed frame`, against 0.0-6.6 in every other
+/// capture from the same device - and a `MessageChannel` turn on that device is a real
+/// task dispatch, with the input port, the audio ring and the compositor all queued behind
+/// it. `pictures_owed` is not a transient there: a hardware H.264 decoder ALWAYS holds a
+/// pipeline of frames in flight, so "owed > 0" is the steady state for as long as any movie
+/// is decoding, and the immediate-turn rule became "a task per idle run, every frame".
+///
+/// What a decoder needs is not a turn per idle run but a turn SOON: its output callback is
+/// a task, and one task per couple of milliseconds of wall time serves a 30 fps movie many
+/// times over. Two milliseconds bounds the turns to a few hundred a second, whatever the
+/// title's thread count does.
+const OWED_TURN_MIN_MS: f64 = 2.0;
 
 /// A Promise that never resolves - a finished thread's stack parks here forever (it is
 /// never resumed), the browser analog of a fiber that has returned.
@@ -2346,7 +2764,11 @@ pub async fn run_frames(
                     // "a task per idle round costs more than running" objection from applying.
                     let owed = vitaslop_runtime::vita::avcdec::pictures_owed() > 0;
                     let turn = if owed {
+                        // The cadence picks the CANDIDATE rounds; the wall clock decides.
+                        // The clock is read only on a candidate round, which is a handful
+                        // per idle run rather than one per round. See `OWED_TURN_MIN_MS`.
                         consecutive_idle.is_power_of_two()
+                            && perf_clock() - slice_start >= OWED_TURN_MIN_MS
                     } else {
                         consecutive_idle % IDLE_ROUNDS_PER_EVENT_LOOP_TURN == 0
                     };
@@ -2379,6 +2801,11 @@ pub async fn run_frames(
                 Stop::Blocked => n_blocked += 1,
                 Stop::Flip => n_flip += 1,
             }
+            hostcalls::note_stop(match stop {
+                Stop::Quantum => 0,
+                Stop::Blocked => 1,
+                Stop::Flip => 2,
+            });
         }
         // The post-resume bookkeeping is scheduler work too, and it is where the guest
         // clock is charged and the wake queue is applied.

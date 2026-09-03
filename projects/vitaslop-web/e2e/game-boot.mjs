@@ -436,6 +436,14 @@ async function main() {
     // KNOBS='{"VITASLOP_FRAME_TOPUP":"0"}' - the browser has no environment, so a knob a
     // title needs has to be handed to the page explicitly.
     const knobs = JSON.parse(process.env.KNOBS || "{}");
+    // The product page's console is silent on a clean run: setup notes, the adapter and
+    // surface lines, the status channel and the `[live]` heartbeat all go to the panel
+    // only. This harness READS the heartbeat (liveness, progress, the frames.csv join), so
+    // it asks for the console mirror unless the caller decided otherwise.
+    if (!("VITASLOP_CONSOLE" in knobs)) knobs.VITASLOP_CONSOLE = "1";
+    // A harness page is never "focused" the way a person's is, and a hard pause on a blur
+    // it cannot see would stall every run silently. Off unless the caller is testing it.
+    if (!("VITASLOP_PAUSE_ON_BLUR" in knobs)) knobs.VITASLOP_PAUSE_ON_BLUR = "0";
     if (Object.keys(knobs).length) console.log("[game] knobs:", knobs);
     // The OPFS key for this title. Derived from the game directory so two different
     // titles never share stored files, and stable across runs so the second run of the

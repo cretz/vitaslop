@@ -413,6 +413,10 @@ fn bind_import(linker: &mut Linker<SchedState>) -> Result<(), RunError> {
             },
         )
         .map_err(|e| RunError::Wasm(e.to_string()))?;
+    // The non-suspending trap is the same call here - see `abi::IMPORT_FAST_NAME`.
+    linker
+        .alias(abi::IMPORT_MODULE, abi::IMPORT_NAME, abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME)
+        .map_err(|e| RunError::Wasm(e.to_string()))?;
     Ok(())
 }
 

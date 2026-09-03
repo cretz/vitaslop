@@ -50,7 +50,7 @@ const VITA_SAMPLE_RATE = 48000;
  * Returns `{ ring, context, node, stats() }`. Post `ring` to the emulator worker; it is
  * a SharedArrayBuffer, so it is shared, not copied, and needs no transfer list.
  */
-export async function startAudio() {
+export async function startAudio(note = () => {}) {
   const channels = 2;
   const context = new AudioContext({ sampleRate: VITA_SAMPLE_RATE, latencyHint: "playback" });
   await context.audioWorklet.addModule("./audio-worklet.js");
@@ -72,7 +72,7 @@ export async function startAudio() {
   // Autoplay policy: without a user gesture the context stays "suspended" and plays
   // nothing. Say which happened - see the note at the top.
   await context.resume().catch(() => {});
-  console.log(
+  note(
     `[audio] context ${context.state} at ${context.sampleRate} Hz, ` +
       `ring ${capacity} frames (${RING_SECONDS}s)` +
       (context.state === "suspended"
@@ -84,7 +84,7 @@ export async function startAudio() {
   // rather than leaving the page silently mute until someone thinks to click.
   if (context.state !== "running") {
     const wake = () => {
-      context.resume().then(() => console.log(`[audio] context ${context.state} after a gesture`));
+      context.resume().then(() => note(`[audio] context ${context.state} after a gesture`));
       window.removeEventListener("pointerdown", wake);
       window.removeEventListener("keydown", wake);
     };
@@ -137,5 +137,9 @@ export async function startAudio() {
     return out;
   };
 
-  return { ring, context, node, stats, samples };
+  // A hard pause (see live.html): the worklet plays silence and leaves the ring alone, so
+  // the pause is neither heard as a stale burst on resume nor counted as an underrun.
+  const pause = (paused) => node.port.postMessage(paused ? "pause" : "resume");
+
+  return { ring, context, node, stats, samples, pause };
 }

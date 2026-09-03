@@ -3345,6 +3345,21 @@ fn positions_are_ndc(d: &Draw, layout: &Layout) -> bool {
 }
 
 fn interpret_draw(d: &Draw) -> DrawInterp {
+    interpret_draw_for(d, false)
+}
+
+/// [`interpret_draw`], with the per-vertex classification SKIPPED when the draw will be
+/// rendered by the guest's own recompiled shaders.
+///
+/// Two of this function's outputs are decided by walking every vertex of the draw: whether a
+/// 2D draw is in pixel or NDC space (`positions_are_ndc`) and the texcoord divisor (the
+/// max-UV scan). Both feed the FIXED-FUNCTION packing and nothing else - the recompiled path
+/// takes the guest's own vertex stream and shaders and never reads them. MEASURED in the
+/// browser, one title's race, V8 worker profile: `decode_vertex` under `interpret_draw` under
+/// `RenderSceneBuilder::build` was **4.1% of the whole thread** - the largest single engine
+/// function - on draws whose fixed-function form was then discarded. The walk `build` itself
+/// does was already gated on the same test; this gates the classifier's.
+fn interpret_draw_for(d: &Draw, recompiled: bool) -> DrawInterp {
     let layout = layout_of(d);
     // Recover the draw's coordinate space (see `Space`). A 4x4 MVP uniform is the 3D
     // cube path (depth-tested, opaque). Otherwise a 2D draw: a texcoord marks a
@@ -3353,6 +3368,9 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
         let mut m = [0f32; 16];
         m.copy_from_slice(&d.uniforms[..16]);
         Space::Mvp(m)
+    } else if recompiled {
+        // Either 2D space is a dead answer here; NDC is the one that costs no walk.
+        Space::Ndc
     } else if layout.uv_off.is_some() && !positions_are_ndc(d, &layout) {
         Space::Pixel
     } else {
@@ -3370,7 +3388,7 @@ fn interpret_draw(d: &Draw) -> DrawInterp {
     // apply the texel-unit normalization to non-MVP (2D) draws; 3D UVs pass through and the
     // sampler's REPEAT wrap handles the tiling.
     let uv_div = match (textured, d.albedo()) {
-        (true, Some(tex)) if !matches!(space, Space::Mvp(_)) => {
+        (true, Some(tex)) if !recompiled && !matches!(space, Space::Mvp(_)) => {
             let stride = d.vertex_stride.max(1) as usize;
             let nverts = d.vertices.len() / stride;
             let mut max_uv = 0f32;
@@ -6801,7 +6819,11 @@ impl RenderSceneBuilder {
                 }
                 continue;
             }
-            let interp = interpret_draw(d);
+            // Whether this draw's FIXED-FUNCTION representation will be used at all - see
+            // `gxp_only`, and the note further down. Decided here because the classifier
+            // walks every vertex for it, and that walk is dead when it will not.
+            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
+            let interp = interpret_draw_for(d, !fixed_function);
             // A position-only draw whose colour lives in the guest's shader is NOT dropped
             // when the recompiler can have it: the fixed-function packing has no colour
             // source, but the recompiled pair does. It is carried through marked
@@ -6854,10 +6876,7 @@ impl RenderSceneBuilder {
             // winding is submission-defined, so it is never culled (matches `render_scene`).
             let cull_mode = if mvp.is_some() { d.render_state.cull_mode } else { SCE_GXM_CULL_NONE };
 
-            // Whether this draw's FIXED-FUNCTION representation will be used at all - see
-            // `gxp_only`, and the note further down.
-            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
-            // ...and if it will not, the ONLY thing the per-vertex walk still produces is
+            // ...and if the fixed-function form will not be used, the ONLY thing the per-vertex walk still produces is
             // the opaque depth RANGE, which the recompiled path maps its clip depth
             // through. When that is not wanted either, the whole walk - and the index scan
             // that sizes it - is dead. MEASURED in the browser, where this shows up as

@@ -486,7 +486,8 @@ impl Drop for ThreadedDecode {
 fn report_pictures_dropped(dropped: u64) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "vitaslop video: {dropped} decoded picture(s) were dropped because the title \
              stopped collecting them and the decoder's backlog was full. The decode is \
              correct and the movie is short by that many frames."

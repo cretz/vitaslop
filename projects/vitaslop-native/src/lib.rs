@@ -658,6 +658,9 @@ fn bind_import(linker: &mut Linker<Host>) -> Result<(), RunError> {
             Ok(())
         },
     )?;
+    // The non-suspending trap is the same call here: a native host call costs nothing more
+    // for a NID that does not suspend. See `abi::IMPORT_FAST_NAME`.
+    linker.alias(abi::IMPORT_MODULE, abi::IMPORT_NAME, abi::IMPORT_MODULE, abi::IMPORT_FAST_NAME)?;
     Ok(())
 }
 

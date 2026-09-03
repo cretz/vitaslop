@@ -36,7 +36,9 @@ fn report_once(key: &'static str, msg: &str) {
     static SEEN: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
     if seen.lock().unwrap().insert(key) {
-        eprintln!("{msg}");
+        // A warning, on the tracing channel like every other approximation report: it
+        // reaches the browser panel and the desktop's stderr, and it is a fix owed.
+        tracing::warn!(target: "vitaslop::input", "{msg}");
     }
 }
 
@@ -206,7 +208,8 @@ pub(super) fn create_touch_recognizer(
         // recognizer only reports a touch inside its rectangle and on its own panel, so
         // this set is the map of where the title is listening - the first thing worth
         // knowing when a scripted tap "has an effect but does not do anything".
-        eprintln!(
+        tracing::info!(
+            target: "vitaslop::status",
             "sceSystemGesture: recognizer #{} type={kind} port={port} rect=({x},{y} {w}x{h}) \
              from rect_ptr={:#010x} at {:#010x}",
             RECOGNIZER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

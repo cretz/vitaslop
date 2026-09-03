@@ -98,3 +98,93 @@ jobs:
         run: |
           cargo run --locked -p vitaslop-conformance-suite-arm --bin regen
           git diff --exit-code
+
+  # The browser is the product, and the native job above never executes a byte of it: the
+  # wasm build, the wasm-bindgen glue, the JSPI scheduler, OPFS storage, WebCodecs and the
+  # WebGPU render all exist only in a browser. This job builds the bundle and runs the
+  # browser suites that need no private fixture:
+  #
+  #   conformance.mjs      the ARM corpus on Chrome's WebAssembly engine, against the same
+  #                        goldens the native job proves - identical behaviour on both engines
+  #   opfs.mjs             guest file reads at offsets out of OPFS, on a synthetic fixture
+  #   gamedata.mjs         the guest's saved state: a second OPFS tree, replace-not-append
+  #   h264-conformance.mjs the H.264 crate's suite against WebCodecs (Chrome, not Chromium:
+  #                        the codec is the proprietary one)
+  #   run.mjs              the clean-room cube through WebGPU, on SwiftShader - a runner has
+  #                        no GPU, and the harness refuses a software rasteriser unless told
+  #
+  # Chrome via Playwright's `chrome` channel, because that is the browser the page ships to
+  # and the one with the codecs. The game-boot runs (a real title, a recipe) are NOT here:
+  # they need a game dump, which cannot live in a public runner.
+  web:
+    name: web (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+
+      # The CLI must match the pinned `wasm-bindgen` crate version exactly (see
+      # vitaslop-web/Cargo.toml) or the generated glue refuses the wasm. Cached by version so
+      # the install is paid once per bump, not per run.
+      - name: Cache wasm-bindgen-cli
+        id: wbg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-0.2.126-${{ runner.os }}
+      - name: Install wasm-bindgen-cli
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: projects/vitaslop-web/e2e/package-lock.json
+
+      - name: Build the wasm bundle
+        working-directory: projects/vitaslop-web
+        run: node build.mjs
+
+      - name: Install the browser test dependencies
+        working-directory: projects/vitaslop-web/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chrome
+
+      - name: ARM conformance corpus on Chrome's wasm engine
+        working-directory: projects/vitaslop-web/e2e
+        run: node conformance.mjs
+
+      - name: OPFS storage read path
+        working-directory: projects/vitaslop-web/e2e
+        run: node opfs.mjs
+
+      - name: Game data persistence
+        working-directory: projects/vitaslop-web/e2e
+        run: node gamedata.mjs
+
+      - name: H.264 conformance on WebCodecs
+        working-directory: projects/vitaslop-web/e2e
+        run: node h264-conformance.mjs
+
+      - name: Cube through WebGPU (software rasteriser)
+        working-directory: projects/vitaslop-web/e2e
+        env:
+          ALLOW_SOFTWARE: "1"
+        run: node run.mjs
+
+      - name: Keep the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-screenshots
+          path: projects/vitaslop-web/e2e/screenshots
+          if-no-files-found: ignore

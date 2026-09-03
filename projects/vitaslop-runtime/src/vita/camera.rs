@@ -39,7 +39,8 @@ fn note_no_camera() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        tracing::warn!(
+            target: "vitaslop::camera",
             "sceCamera: this title opened a camera and there is none - reporting \
              SCE_CAMERA_ERROR_NOT_MOUNTED. Any camera-driven feature (an AR or photo \
              mode) will be unavailable, which is a real console state, not a stub."

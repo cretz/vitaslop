@@ -44,6 +44,28 @@ const PAGE_LOG_CAP: usize = 96;
 /// through to the console, so `VITASLOP_LOG` still says what is emitted.
 static PAGE_LOG: Mutex<Option<PageLog>> = Mutex::new(None);
 
+/// The STATUS lines this run has emitted, kept apart from the warnings above.
+///
+/// # Why this exists, and it is the whole point of the split
+/// A WARNING IS A CLAIM THAT SOMETHING IS BROKEN AND OWED A FIX. A great deal of what this
+/// engine reports is not that: the frame's pass structure, a precompile count, a texture
+/// working set, "the region-clip state is live", "the scene tallies are clean". Those are
+/// STATUS, and filing them at `warn` made the panel unreadable - a user looking at a phone
+/// could not tell a defect from a heartbeat, and the genuine findings sat between twenty
+/// copies of a frame-shape trace.
+///
+/// The wrong cure is `debug`: a report nobody sees does not exist, and this project has met
+/// that failure repeatedly. So status keeps a channel of its own that is ALWAYS on and
+/// ALWAYS shown - `init` forces `vitaslop::status=info` on top of whatever `VITASLOP_LOG`
+/// says - and the panel renders it in its own section. Nothing is silenced; it is sorted.
+static PAGE_STATUS: Mutex<Option<PageLog>> = Mutex::new(None);
+
+/// The target that routes an event to [`PAGE_STATUS`] instead of [`PAGE_LOG`].
+///
+/// Emitted through `vitaslop_platform::report_status!`, which is the only thing that should
+/// ever name this string.
+pub(crate) const STATUS_TARGET: &str = "vitaslop::status";
+
 #[derive(Default)]
 struct PageLog {
     /// Each distinct line, with how many times it has been emitted.
@@ -61,7 +83,17 @@ use vitaslop_platform::diag::dedupe_key;
 /// Non-draining on purpose: the panel is rebuilt from scratch each perf window, and a warning
 /// that fired once must not vanish from it one window later.
 pub fn page_log_report() -> Option<String> {
-    let guard = PAGE_LOG.lock().ok()?;
+    render_page_log(&PAGE_LOG)
+}
+
+/// The STATUS lines so far, for the panel's own section. Same contract as
+/// [`page_log_report`]: non-draining, oldest first, `None` when there are none.
+pub fn page_status_report() -> Option<String> {
+    render_page_log(&PAGE_STATUS)
+}
+
+fn render_page_log(which: &Mutex<Option<PageLog>>) -> Option<String> {
+    let guard = which.lock().ok()?;
     let log = guard.as_ref()?;
     if log.lines.is_empty() {
         return None;
@@ -84,7 +116,15 @@ pub fn page_log_report() -> Option<String> {
 }
 
 fn push_page_log(text: &str) {
-    let Ok(mut guard) = PAGE_LOG.lock() else { return };
+    push_into(&PAGE_LOG, text);
+}
+
+fn push_page_status(text: &str) {
+    push_into(&PAGE_STATUS, text);
+}
+
+fn push_into(which: &Mutex<Option<PageLog>>, text: &str) {
+    let Ok(mut guard) = which.lock() else { return };
     let log = guard.get_or_insert_with(PageLog::default);
     let key = dedupe_key(text);
     // A repeat updates the line already held - keeping the LATEST text, so a diagnostic that
@@ -266,6 +306,29 @@ pub fn report_fatal(text: &str) {
 /// hard failure or a `warn`, not an `info`, so no filter can hide it.
 const DEFAULT_FILTER: &str = "warn";
 
+/// `VITASLOP_CONSOLE=1`: mirror the run's status notes - the setup summary, the adapter and
+/// surface lines, the live heartbeat and the tracing status channel - to the browser console.
+///
+/// Off by default, because the product page's console must be EMPTY on a clean run: every
+/// one of those lines is an answer to a developer's question, and they all reach the
+/// diagnostics panel regardless. The e2e harness turns it on (it reads the heartbeat for
+/// liveness), and so does anyone watching a headless run.
+pub fn console_notes_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| vitaslop_runtime::knobs::flag("VITASLOP_CONSOLE"))
+}
+
+/// A run-lifecycle note: onto the panel's STATUS section always, onto the console only
+/// under [`console_notes_on`]. Every `console.log` a normal run used to make goes through
+/// here, so the console's default content is exactly the warnings.
+pub fn note(text: &str) {
+    if console_notes_on() {
+        web_sys::console::log_1(&JsValue::from_str(text));
+    }
+    push_page_status(text);
+}
+
 /// A line-buffered writer that emits each completed line to the browser console.
 ///
 /// `console.log` is per-message, not a stream, so the formatter's several small writes
@@ -273,8 +336,10 @@ const DEFAULT_FILTER: &str = "warn";
 /// becomes half a dozen console entries broken mid-word.
 struct ConsoleWriter {
     buf: Vec<u8>,
-    /// Also mirror this event to the page panel (WARN and ERROR only).
+    /// Also mirror this event to the page panel's WARNINGS section (WARN and ERROR only).
     to_page: bool,
+    /// Mirror this event to the panel's STATUS section instead - see [`PAGE_STATUS`].
+    to_status: bool,
 }
 
 impl std::io::Write for ConsoleWriter {
@@ -289,8 +354,21 @@ impl std::io::Write for ConsoleWriter {
         }
         let text = String::from_utf8_lossy(&self.buf);
         let text = text.trim_end();
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(text));
-        if self.to_page {
+        // >>> STATUS GOES TO THE PANEL, AND TO THE CONSOLE ONLY WHEN ASKED.
+        //
+        // The status channel is forced on for the panel's own STATUS section, and it used to
+        // reach the console with it - so a clean run of a working title logged every NGS
+        // rack, the mounted archive, the adapter's texture families and every new frame
+        // shape. A well-running emulator says nothing on the console; the panel (and the
+        // diag snapshot) is where those answers live. `VITASLOP_CONSOLE=1` mirrors them,
+        // which is what a headless run reads. Warnings and errors are unchanged: they are
+        // reports of something wrong, and the console is the right place for them.
+        if !self.to_status || console_notes_on() {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(text));
+        }
+        if self.to_status {
+            push_page_status(text);
+        } else if self.to_page {
             push_page_log(text);
         }
         self.buf.clear();
@@ -312,7 +390,7 @@ struct MakeConsoleWriter;
 impl<'a> MakeWriter<'a> for MakeConsoleWriter {
     type Writer = ConsoleWriter;
     fn make_writer(&'a self) -> ConsoleWriter {
-        ConsoleWriter { buf: Vec::new(), to_page: false }
+        ConsoleWriter { buf: Vec::new(), to_page: false, to_status: false }
     }
 
     /// The per-event writer, which is where the LEVEL is knowable. `make_writer` above has no
@@ -322,6 +400,7 @@ impl<'a> MakeWriter<'a> for MakeConsoleWriter {
         ConsoleWriter {
             buf: Vec::new(),
             to_page: *meta.level() <= tracing::Level::WARN,
+            to_status: meta.target() == STATUS_TARGET,
         }
     }
 }
@@ -333,6 +412,12 @@ impl<'a> MakeWriter<'a> for MakeConsoleWriter {
 pub fn init() {
     let filter = vitaslop_runtime::knobs::var("VITASLOP_LOG")
         .unwrap_or_else(|_| DEFAULT_FILTER.to_string());
+    // STATUS IS FORCED ON, whatever `VITASLOP_LOG` says. It rides at `info` so it never
+    // pretends to be a warning, but a status channel the default filter switches off is a
+    // channel that does not exist - which is exactly the trade that put this material at
+    // `warn` in the first place. A directive appended last wins in `EnvFilter`, so a user
+    // cannot accidentally lose the panel's status section by narrowing the knob.
+    let filter = format!("{filter},{STATUS_TARGET}=info");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
         .with_writer(MakeConsoleWriter)
