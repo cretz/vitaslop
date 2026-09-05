@@ -1,0 +1,17 @@
+[package]
+name = "vitaslop-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The logic both front ends share: the settings schema and its defaults, the
+# per-title override merge, the button names and default input maps, and the
+# title-metadata record the library shows. Pure data, no platform - the browser
+# reaches it through wasm-bindgen exports in vitaslop-web, the desktop directly.
+# Two UIs, one definition of what a setting IS.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,95 @@
+# Publish the web build to GitHub Pages.
+#
+# Triggered by a release tag (`v*`), so the site and the desktop binaries of the same
+# release come from the same commit and a bug report can name one version. `main` is a
+# working branch: it does not deploy on its own. `workflow_dispatch` publishes whatever
+# ref you run it from, for a site fix that should not wait for a tag.
+#
+# What is published is `projects/vitaslop-web/web/` verbatim, with the wasm bundle built
+# into `web/pkg/`. The page is plain ES modules over a static host: no bundler, no server.
+# GitHub Pages cannot send COOP/COEP, so `coi.js` (a service worker registered by the
+# page) supplies cross-origin isolation; the CSP is a `<meta>` policy in `index.html`.
+#
+# One-time repository setup: Settings -> Pages -> Source: "GitHub Actions".
+
+name: Pages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer run supersedes an older one still in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the web bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: projects
+
+      # The CLI must match the pinned `wasm-bindgen` crate version exactly (see
+      # vitaslop-web/Cargo.toml) or the generated glue refuses the wasm. Same cache key as
+      # ci.yml so the two workflows share one install.
+      - name: Cache wasm-bindgen-cli
+        id: wbg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-0.2.126-${{ runner.os }}
+      - name: Install wasm-bindgen-cli
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the wasm bundle (wasm-release profile)
+        working-directory: projects/vitaslop-web
+        run: node build.mjs
+
+      # The debug pages are rigs, not the product; they stay out of the published site.
+      - name: Stage the site
+        run: |
+          rm -rf site
+          cp -r projects/vitaslop-web/web site
+          rm -rf site/debug
+          test -f site/pkg/vitaslop_web_bg.wasm
+          du -sh site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

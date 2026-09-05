@@ -26,9 +26,9 @@
          also a diagnostic and the panel does not belong on top of the frame. -->
     <pre id="diag" style="position:absolute;left:-9999px;top:0;white-space:pre-wrap"></pre>
     <script type="module">
-      import { forwardInput } from "./worker-input.js";
-      import { importTitle, isImported } from "./opfs.js";
-      import { startAudio } from "./audio.js";
+      import { forwardInput } from "../worker-input.js";
+      import { importTitle, isImported } from "../opfs.js";
+      import { startAudio } from "../audio.js";
       const canvas = document.getElementById("screen");
       const status = document.getElementById("status");
 
@@ -86,7 +86,7 @@
         // a sync access handle is an exclusive lock.
         status.textContent = "transpiling (throwaway worker)...";
         const prebuilt = await new Promise((resolve, reject) => {
-          const tw = new Worker("./transpile-worker.js", { type: "module" });
+          const tw = new Worker("../transpile-worker.js", { type: "module" });
           tw.onmessage = (e) => {
             tw.terminate();
             e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
@@ -99,7 +99,7 @@
         });
         status.textContent = "transpiled; starting run worker...";
 
-        const worker = new Worker("./worker.js", { type: "module" });
+        const worker = new Worker("../worker.js", { type: "module" });
         worker.onmessage = (e) => {
           const d = e.data;
           if (d.type === "report") {

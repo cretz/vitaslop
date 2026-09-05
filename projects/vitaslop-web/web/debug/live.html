@@ -341,12 +341,12 @@
     </div>
 
     <script type="module">
-      import { forwardInput } from "./worker-input.js";
-      import { forwardLocation } from "./location.js";
-      import { installPad, installGamepad } from "./pad.js";
-      import { importTitle, isImported, storageRoom, requestPersistence } from "./opfs.js";
-      import * as gamedata from "./gamedata.js";
-      import { startAudio } from "./audio.js";
+      import { forwardInput } from "../worker-input.js";
+      import { forwardLocation } from "../location.js";
+      import { installPad, installGamepad } from "../pad.js";
+      import { importTitle, isImported, storageRoom, requestPersistence } from "../opfs.js";
+      import * as gamedata from "../gamedata.js";
+      import { startAudio } from "../audio.js";
 
       const $ = (id) => document.getElementById(id);
       const menu = $("menu");
@@ -817,7 +817,7 @@ VITASLOP_LOG=warn</textarea>
       /// away. See web/gamedata-worker.js for why this is not checked in JS here.
       const describeContainer = (zip) =>
         new Promise((resolve, reject) => {
-          const w = new Worker("./gamedata-worker.js", { type: "module" });
+          const w = new Worker("../gamedata-worker.js", { type: "module" });
           w.onmessage = (e) => {
             w.terminate();
             e.data.ok ? resolve(e.data.summary) : reject(new Error(e.data.error));
@@ -1006,7 +1006,7 @@ VITASLOP_LOG=warn</textarea>
         // opens its own - a sync access handle is an exclusive lock.
         status.textContent = "transpiling the title (a few seconds, one time per load)...";
         const prebuilt = await new Promise((resolve, reject) => {
-          const tw = new Worker("./transpile-worker.js", { type: "module" });
+          const tw = new Worker("../transpile-worker.js", { type: "module" });
           tw.onmessage = (e) => {
             // A panic report is NOT the end of this worker's message stream - the abort trap
             // follows it - so it must not terminate the worker or settle the promise. It is
@@ -1027,7 +1027,7 @@ VITASLOP_LOG=warn</textarea>
         });
 
         status.textContent = "starting the run...";
-        const worker = new Worker("./worker.js", { type: "module" });
+        const worker = new Worker("../worker.js", { type: "module" });
         worker.onmessage = (e) => {
           const d = e.data;
           if (d.type === "report") {

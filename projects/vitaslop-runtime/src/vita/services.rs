@@ -893,6 +893,136 @@ pub(super) fn motion_magnetometer_set(ctx: &mut GuestCtx, st: &mut VitaState, on
     ctx.ret(0);
 }
 
+/// int scePowerSet{Arm,Bus,Gpu,GpuXbar}ClockFrequency(int mhz)
+/// Held in `power_clocks[which]` so the matching getter reads it back. Nothing here
+/// runs faster or slower for it: this engine's clock is the emulated device's, and the
+/// guest's request is recorded, not obeyed.
+pub(super) fn power_set_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    st.power_clocks[which] = ctx.arg(0);
+    ctx.ret(0);
+}
+
+/// int scePowerGet{Arm,Bus,Gpu,GpuXbar}ClockFrequency(void)
+pub(super) fn power_get_clock(ctx: &mut GuestCtx, st: &mut VitaState, which: usize) {
+    ctx.ret(st.power_clocks[which]);
+}
+
+/// int sceMotionSetAngleThreshold(float angle) / float sceMotionGetAngleThreshold(void)
+/// Held as bits; the modelled device never moves, so the threshold changes nothing
+/// it reports, but the getter answers with what was set.
+pub(super) fn motion_set_angle_threshold(ctx: &mut GuestCtx, st: &mut VitaState) {
+    st.motion_angle_threshold = ctx.arg(0);
+    ctx.ret(0);
+}
+pub(super) fn motion_get_angle_threshold(ctx: &mut GuestCtx, st: &mut VitaState) {
+    // A float return travels in r0 on this ABI (softfp), which `ret` writes.
+    ctx.ret(st.motion_angle_threshold);
+}
+
+/// int sceAppMgrGetBudgetInfo(SceAppMgrBudgetInfo *info)
+/// The memory budget of the running application. The figures are the device's for a
+/// game: 256 MB of USER_RW with most of it free, no extra memory, 32 MB of physically
+/// contiguous memory and 112 MB of CDRAM. A homebrew uses them to size its heaps.
+#[hostcall]
+pub(super) fn app_mgr_get_budget_info(ctx: &mut GuestCtx, st: &mut VitaState, info: Ptr) -> i32 {
+    let _ = st;
+    let a = info.addr();
+    if a == 0 {
+        -1
+    } else {
+        let mut w = [0u32; 0x88 / 4];
+        w[0] = 0x88; // size
+        w[1] = 1; // app_mode: a game
+        w[3] = 0x1000_0000; // total_user_rw_mem
+        w[4] = 0x0C00_0000; // free_user_rw
+        w[11] = 0x0200_0000; // total_phycont_mem
+        w[12] = 0x0200_0000; // free_phycont_mem
+        w[23] = 0x0700_0000; // total_cdram_mem
+        w[24] = 0x0700_0000; // free_cdram_mem
+        for (i, v) in w.iter().enumerate() {
+            ctx.write_u32(a + 4 * i as u32, *v);
+        }
+        0
+    }
+}
+
+/// SceSharedFb: a system-mode homebrew draws straight into the shell's framebuffer
+/// instead of owning display buffers. Here that framebuffer is two 960x544 RGBA8
+/// buffers this engine allocates on first open; `sceSharedFbEnd` presents the first,
+/// exactly as `sceDisplaySetFrameBuf` would.
+const SHARED_FB_BYTES: u32 = 960 * 544 * 4;
+
+pub(super) fn shared_fb_open(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = match st.shared_fb {
+        Some((uid, _, _)) => uid,
+        None => {
+            let base = st.galloc(SHARED_FB_BYTES * 2, 0x1000);
+            let uid = st.new_uid();
+            st.shared_fb = Some((uid, base, 0));
+            st.set_display_geometry(960, 544);
+            uid
+        }
+    };
+    ctx.ret(uid as u32);
+}
+
+/// `cur` is the buffer the display is SHOWING (`curbuf`, +0x34); the guest draws the
+/// other one, and `sceSharedFbEnd` presents that one and swaps `cur`.
+fn shared_fb_write_info(ctx: &mut GuestCtx, base: u32, cur: u8, info: u32) {
+    let w = |ctx: &mut GuestCtx, off: u32, v: u32| ctx.write_u32(info + off, v);
+    for off in (0..0x58).step_by(4) {
+        w(ctx, off, 0);
+    }
+    w(ctx, 0x00, base); // fb_base
+    w(ctx, 0x04, SHARED_FB_BYTES); // fb_size
+    w(ctx, 0x08, base + SHARED_FB_BYTES); // fb_base2
+    w(ctx, 0x24, 960); // stride
+    w(ctx, 0x28, 960); // width
+    w(ctx, 0x2c, 544); // height
+    w(ctx, 0x34, cur as u32); // curbuf: the buffer on screen; draw the other
+    w(ctx, 0x48, 1); // vsync
+}
+
+/// int sceSharedFbBegin(SceUID fb, SceSharedFbInfo *info) / sceSharedFbGetInfo
+pub(super) fn shared_fb_info(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let info = ctx.arg(1);
+    match st.shared_fb {
+        Some((u, base, cur)) if u == uid && info != 0 => {
+            shared_fb_write_info(ctx, base, cur, info);
+            ctx.ret(0);
+        }
+        _ => ctx.ret(0x8002_0005), // SCE_KERNEL_ERROR_INVALID_UID
+    }
+}
+
+/// int sceSharedFbEnd(SceUID fb): the frame is finished; show it.
+pub(super) fn shared_fb_end(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    match st.shared_fb {
+        Some((u, base, cur)) if u == uid => {
+            // The guest drew the buffer that was NOT on screen; show it and swap.
+            let drawn = if cur == 0 { base + SHARED_FB_BYTES } else { base };
+            st.shared_fb = Some((u, base, cur ^ 1));
+            st.present(drawn);
+            // The shared framebuffer's End is the title's flip: pace it to the scanout
+            // exactly as `sceGxmDisplayQueueAddEntry` does (see `pace_flip`), which is
+            // also what arranges the wake the scheduler's frame boundary expects.
+            if st.is_preemptive() {
+                st.pace_flip(1_000_000 / 60);
+            }
+            ctx.ret(0);
+        }
+        _ => ctx.ret(0x8002_0005),
+    }
+}
+
+/// int sceSharedFbClose(SceUID fb)
+pub(super) fn shared_fb_close(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    ctx.ret(if matches!(st.shared_fb, Some((u, _, _)) if u == uid) { 0 } else { 0x8002_0005 });
+}
+
 /// int sceMotionGetMagnetometerState(void)
 /// 1 if magnetometer sampling is enabled, 0 if not - read off the bit the two calls above
 /// set. This is the guest's own state, so it is exact.

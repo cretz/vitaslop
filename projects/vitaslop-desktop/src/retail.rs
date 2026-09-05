@@ -24,26 +24,27 @@ use vitaslop_loader as loader;
 use pollster::block_on;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::input::Input;
+use crate::session::Session;
 
 /// The Vita display resolution the guest draws in (pixel-space 2D coords are in this
 /// space); the window opens here and the general renderer projects against it. The
 /// front touch panel is twice this in each axis.
-const GAME_W: u32 = 960;
-const GAME_H: u32 = 544;
-const PANEL_SCALE: f32 = 2.0;
+pub(crate) const GAME_W: u32 = 960;
+pub(crate) const GAME_H: u32 = 544;
+pub(crate) const PANEL_SCALE: f32 = 2.0;
 
 /// Background clear color, matching the software oracle and the browser.
 const CLEAR: [u8; 4] = [16, 16, 24, 255];
 
 /// Step one guest frame per 1/60 s of wall time (60 Hz), regardless of the monitor's
 /// refresh, so the game runs at its intended speed.
-const FRAME_DT: Duration = Duration::from_micros(16_666);
+pub(crate) const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 /// Scheduler quantum + per-frame round cap. The quantum matches the retail boot probe
 /// (a fuel slice large enough that most between-host-call work finishes in one slice);
@@ -636,7 +637,7 @@ fn peek_regions(guest: &RetailGuest) {
 /// frame through the same `GxmRenderer` the browser canvas uses (so pixels match). The
 /// guest draws in 960x544 game space; the renderer projects against that and fills the
 /// (possibly larger) window, stretching to fit.
-struct RetailGfx {
+pub(crate) struct RetailGfx {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -655,7 +656,7 @@ struct RetailGfx {
 }
 
 impl RetailGfx {
-    fn new(window: Arc<Window>) -> Result<RetailGfx, String> {
+    pub(crate) fn new(window: Arc<Window>) -> Result<RetailGfx, String> {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
@@ -760,7 +761,7 @@ impl RetailGfx {
         })
     }
 
-    fn resize(&mut self, w: u32, h: u32) {
+    pub(crate) fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
         }
@@ -772,15 +773,38 @@ impl RetailGfx {
 
     /// `display` is the size the GUEST declared to `sceDisplaySetFrameBuf`, which is what
     /// the frame is projected against. See the `encode_chain` call below.
-    fn present(&mut self, scenes: &[Scene], display: (u32, u32), presents: &[u32]) {
-        // Asked BEFORE any work: once the device is lost, building scenes and encoding a
-        // command buffer is pure cost against a picture that cannot be drawn.
+    pub(crate) fn present(&mut self, scenes: &[Scene], display: (u32, u32), presents: &[u32]) -> Result<(), String> {
+        self.frame(Some((scenes, display, presents)), |_, _, _, _, _| {})
+    }
+
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+    pub(crate) fn render_format(&self) -> wgpu::TextureFormat {
+        self.render_format
+    }
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+    pub(crate) fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// One surface frame: the guest's scenes (or a clear, when there are none), then
+    /// `overlay` on top in the same encoder - the shell draws its UI there. A LOST
+    /// device is an `Err`, not a panic: every GPU object built from it is invalid and
+    /// nothing this run draws can reach the screen, but the caller decides what to do.
+    pub(crate) fn frame(
+        &mut self,
+        scenes: Option<(&[Scene], (u32, u32), &[u32])>,
+        overlay: impl FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView, (u32, u32)),
+    ) -> Result<(), String> {
         if let Some(why) = self.lost.lock().ok().and_then(|s| s.clone()) {
-            panic!(
-                "the WebGPU device was LOST and every GPU object built from it is invalid, so                  nothing this run draws from here can reach the screen ({why})"
-            );
+            return Err(format!("the GPU device was lost ({why})"));
         }
-        let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
         let Some(frame) = acquire(
             &self.surface,
             &self.device,
@@ -788,24 +812,41 @@ impl RetailGfx {
             &mut self.acquire_failures,
             ACQUIRE_FAILURE_LIMIT,
         ) else {
-            return;
+            return Ok(());
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.render_format),
             ..Default::default()
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        // Project against the resolution the GUEST declared (not the window size), so
-        // pixel-space 2D coords map correctly; the window-sized framebuffer stretches the
-        // resolution-independent clip output to fill the window. That stretch is also what
-        // makes a title presenting a buffer SMALLER than the panel come out full-screen -
-        // the hardware's own upscale, for free, on this path.
-        let (dw, dh) = display;
         let (fw, fh) = (frame.texture.width(), frame.texture.height());
-        self.gxm.set_presented(presents);
-        self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
+        match scenes {
+            Some((scenes, (dw, dh), presents)) => {
+                let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+                self.gxm.set_presented(presents);
+                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
+            }
+            None => {
+                let c = wgpu::Color { r: 11.0 / 255.0, g: 11.0 / 255.0, b: 18.0 / 255.0, a: 1.0 };
+                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shell clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(c), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+        }
+        overlay(&self.device, &self.queue, &mut encoder, &view, (fw, fh));
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        Ok(())
     }
 }
 
@@ -1597,77 +1638,29 @@ pub fn run(dir: PathBuf, recipe: Option<String>, save_dir: Option<PathBuf>) -> R
     if recipe.is_some() {
         println!("replaying scripted recipe (keyboard/mouse still nudge live)");
     }
-    println!("controls:");
-    println!("  menus  : click the window (the front-end is touch driven)");
-    println!("  d-pad  : arrow keys        faces: Z cross / X circle / A square / S triangle");
-    println!("  L / R  : Q / E             Start: Enter   Select: Shift");
-    println!("  a gamepad also works; Space pauses, Esc quits");
+    println!("controls: the default keyboard map (see the shell's settings); a gamepad also works; Space pauses, Esc quits");
 
+    let pause_on_blur = vitaslop_runtime::knobs::var("VITASLOP_PAUSE_ON_BLUR").map(|v| v.trim() != "0").unwrap_or(true);
+    let settings = vitaslop_frontend::settings::Settings::default();
     let event_loop = EventLoop::new().map_err(|e| format!("create event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = RetailApp {
-        guest,
-        input_shared: input,
-        input: Input::new(),
+        session: Session::new(guest, input, Input::new(&settings), pause_on_blur),
         window: None,
         gfx: None,
-        paused: false,
-        paused_by_blur: false,
-        cursor: (0.0, 0.0),
-        mouse_down: false,
-        acc: Duration::ZERO,
-        last_tick: Instant::now(),
-        fps_since: Instant::now(),
-        fps_frames: 0,
-        guest_frames_since: 0,
-        fps: 0.0,
-        guest_fps: 0.0,
-        reported_exit: false,
     };
     let ended = event_loop.run_app(&mut app);
-    // The window closing is the OTHER way a session ends, and `advance` never sees it -
-    // the guest is still running, so nothing forced a write. Without this, quitting a
-    // session throws away everything saved since the last three-second flush.
-    app.guest.flush_save(true);
+    app.session.guest.flush_save(true);
     ended.map_err(|e| format!("run event loop: {e}"))?;
     Ok(())
 }
 
-/// The retail window app: the live guest, the merged input, mouse-as-touch state, the
-/// window + its general-renderer surface, and 60 Hz pacing + FPS bookkeeping.
+/// The `--game` window: a session, presented straight to the surface, with the
+/// statistics in the title bar.
 struct RetailApp {
-    guest: RetailGuest,
-    input_shared: SharedInput,
-    input: Input,
+    session: Session,
     window: Option<Arc<Window>>,
     gfx: Option<RetailGfx>,
-    paused: bool,
-    /// >>> THE HARD PAUSE: the window lost focus and `VITASLOP_PAUSE_ON_BLUR` (default on)
-    /// says that pauses the emulator. Kept apart from `paused` (the Space toggle) so a run
-    /// the user paused by hand stays paused when the window comes back, and one paused only
-    /// by the blur resumes. Distinct from a title's own pause menu: the guest sees a wall
-    /// clock that did not advance.
-    paused_by_blur: bool,
-    /// Last cursor position in physical window pixels, and whether the left button is
-    /// held - together the mouse-as-touch source.
-    cursor: (f64, f64),
-    mouse_down: bool,
-    acc: Duration,
-    last_tick: Instant,
-    fps_since: Instant,
-    /// Frames PRESENTED since the meter window opened (redraws), and the guest display
-    /// flips retired in the same window. These are different numbers and the difference is
-    /// the point: the guest is stepped against real time with a catch-up budget, so when
-    /// emulation cannot keep up the window keeps presenting at the display rate while the
-    /// guest falls behind. Reporting only the present rate would show a steady 60 while the
-    /// title ran in slow motion.
-    fps_frames: u32,
-    guest_frames_since: u64,
-    fps: f64,
-    /// Emulated display flips per second, and that as a fraction of the pace the guest is
-    /// being stepped at (`FRAME_DT`) - i.e. how close to real-time speed it is running.
-    guest_fps: f64,
-    reported_exit: bool,
 }
 
 impl ApplicationHandler for RetailApp {
@@ -1690,189 +1683,61 @@ impl ApplicationHandler for RetailApp {
                 return;
             }
         }
-        self.last_tick = Instant::now();
+        self.session.last_tick = Instant::now();
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
+        let size = self.window.as_ref().map(|w| {
+            let s = w.inner_size();
+            (s.width.max(1) as f64, s.height.max(1) as f64)
+        });
+        match &event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.resize(size.width, size.height);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let pressed = event.state == ElementState::Pressed;
-                if let PhysicalKey::Code(code) = event.physical_key {
+            WindowEvent::KeyboardInput { event: k, .. } => {
+                let pressed = k.state == ElementState::Pressed;
+                if let PhysicalKey::Code(code) = k.physical_key {
                     match code {
                         KeyCode::Escape if pressed => {
                             event_loop.exit();
                             return;
                         }
-                        KeyCode::Space if pressed && !event.repeat => self.paused = !self.paused,
+                        KeyCode::Space if pressed && !k.repeat => self.session.paused = !self.session.paused,
                         _ => {}
                     }
-                    self.input.set_key(code, pressed);
                 }
             }
-            // Losing the window's focus hard-pauses the emulator, by default - see
-            // `paused_by_blur`. `VITASLOP_PAUSE_ON_BLUR=0` keeps it running in the background.
-            WindowEvent::Focused(focused) => {
-                let wanted = vitaslop_runtime::knobs::var("VITASLOP_PAUSE_ON_BLUR")
-                    .map(|v| v.trim() != "0")
-                    .unwrap_or(true);
-                if wanted {
-                    self.paused_by_blur = !focused;
+            WindowEvent::RedrawRequested => {
+                self.session.tick(size);
+                if let Some(gfx) = self.gfx.as_mut() {
+                    let (scenes, display, presents) = self.session.scenes();
+                    if !scenes.is_empty() {
+                        if let Err(e) = gfx.present(scenes, display, presents) {
+                            eprintln!("error: {e}");
+                            event_loop.exit();
+                            return;
+                        }
+                    }
                 }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x, position.y);
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    self.mouse_down = state == ElementState::Pressed;
+                if let (Some(stats), Some(w)) = (self.session.stats(Instant::now()), self.window.as_ref()) {
+                    w.set_title(&format!("vitaslop  |  {}", stats.title_line()));
                 }
+                return;
             }
-            WindowEvent::RedrawRequested => self.render(),
             _ => {}
         }
+        self.session.event(&event, size);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
-    }
-}
-
-impl RetailApp {
-    /// The mouse-as-touch frame this instant: a front-panel finger at the cursor when
-    /// the left button is held, else no touch. Cursor physical pixels map through the
-    /// window size to 960x544 game space, then double to panel coords.
-    fn mouse_touch(&self) -> Option<TouchFrame> {
-        if !self.mouse_down {
-            return None;
-        }
-        let (ww, wh) = self
-            .window
-            .as_ref()
-            .map(|w| {
-                let s = w.inner_size();
-                (s.width.max(1) as f64, s.height.max(1) as f64)
-            })
-            .unwrap_or((GAME_W as f64, GAME_H as f64));
-        let sx = (self.cursor.0 / ww * GAME_W as f64).clamp(0.0, GAME_W as f64);
-        let sy = (self.cursor.1 / wh * GAME_H as f64).clamp(0.0, GAME_H as f64);
-        Some(TouchFrame::single((sx as f32 * PANEL_SCALE) as u16, (sy as f32 * PANEL_SCALE) as u16))
-    }
-
-    fn render(&mut self) {
-        self.input.pump_gamepad();
-        let ctrl = self.input.ctrl_frame();
-        let touch = self.mouse_touch();
-        *self.input_shared.lock().unwrap() = DesktopInput { ctrl, touch };
-
-        let now = Instant::now();
-        self.acc += now.duration_since(self.last_tick);
-        self.last_tick = now;
-
-        if self.paused || self.paused_by_blur {
-            self.acc = Duration::ZERO;
-        } else {
-            if self.guest.current().is_empty() {
-                self.guest.advance(); // bootstrap the first frame (runs the whole boot)
-            }
-            // >>> ONE GUEST FRAME PER REDRAW, SO EVERY FRAME COMPUTED IS A FRAME SHOWN.
-            //
-            // This used to allow four, and present once - so three of the four were computed
-            // and discarded. The budget looks like a safety cap and behaves like a frame-rate
-            // halver, because the loop has a stable fixed point at EVERY count: at two frames
-            // per redraw the redraw takes twice as long, so `acc` arrives at twice the size,
-            // so it runs two again. Nothing pushes it back down, and one hitch is enough to
-            // settle it there for the rest of the run.
-            //
-            // MEASURED in the browser, whose loop had the identical shape (see `live_loop` in
-            // vitaslop-web): a race at 100% emulated speed was showing 31 of the 60 frames a
-            // second it computed, on a machine with headroom. One frame per tick showed 60.
-            //
-            // Catch-up is not lost, it is recognised as unavailable: sprinting through extra
-            // frames is only possible for a machine with spare time, and a machine with spare
-            // time is already keeping up. `acc` still carries the deficit, and the clamp below
-            // still drops it when a boot frame makes it absurd.
-            if self.acc >= FRAME_DT {
-                self.acc -= FRAME_DT;
-                self.guest.advance();
-            }
-            if self.acc > FRAME_DT * 4 {
-                self.acc = Duration::ZERO;
-            }
-        }
-
-        if self.guest.finished() && !self.reported_exit {
-            self.reported_exit = true;
-            match self.guest.error() {
-                Some(e) => eprintln!("guest exited with error: {e}"),
-                None => println!("guest exited after {} frames", self.guest.frames()),
-            }
-        }
-
-        // Read before the renderer is borrowed: both live on `self`.
-        let display = self.guest.display_size();
-        if let Some(gfx) = self.gfx.as_mut() {
-            let scenes = self.guest.current();
-            let presents = self.guest.current_presents();
-            if !scenes.is_empty() {
-                gfx.present(scenes, display, presents);
-            }
-        }
-        self.update_title(now);
-    }
-
-    /// Publish both rates to the window title, four times a second.
-    ///
-    /// Two numbers, deliberately: `fps` is what the window PRESENTED, `guest` is how many
-    /// emulated display flips actually retired, and `speed` is that against the pace the
-    /// guest is stepped at. On a machine with headroom they agree and speed sits at 100%;
-    /// when emulation cannot keep up, present stays pinned to the display rate and only the
-    /// guest number drops - which is the number a user actually wants when asking "is this
-    /// running full speed?".
-    fn update_title(&mut self, now: Instant) {
-        self.fps_frames += 1;
-        let since = now.duration_since(self.fps_since);
-        if since < Duration::from_millis(250) {
-            return;
-        }
-        let secs = since.as_secs_f64();
-        let guest_now = self.guest.frames();
-        self.fps = self.fps_frames as f64 / secs;
-        self.guest_fps = guest_now.saturating_sub(self.guest_frames_since) as f64 / secs;
-        self.fps_frames = 0;
-        self.guest_frames_since = guest_now;
-        self.fps_since = now;
-        let Some(w) = self.window.as_ref() else { return };
-        let state = if self.guest.finished() {
-            " [exited]"
-        } else if self.paused_by_blur {
-            " [paused - window not focused]"
-        } else if self.paused {
-            " [paused]"
-        } else {
-            ""
-        };
-        // The step pace is the reference for "full speed": one FRAME_DT per emulated flip.
-        let target = 1.0 / FRAME_DT.as_secs_f64();
-        let speed = if self.paused || self.paused_by_blur || self.guest.finished() {
-            String::new()
-        } else {
-            format!("  |  speed {:.0}%", self.guest_fps / target * 100.0)
-        };
-        w.set_title(&format!(
-            "vitaslop  |  {:.0} fps present  |  {:.0} fps guest{speed}{state}  |  frame {}",
-            self.fps,
-            self.guest_fps,
-            guest_now
-        ));
     }
 }
 

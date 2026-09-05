@@ -2,77 +2,106 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" href="data:," />
-    <title>vitaslop - cube in the browser</title>
-    <style>
-      body {
-        margin: 0;
-        background: #101018;
-        color: #d8d8e0;
-        font: 14px/1.5 system-ui, sans-serif;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 12px;
-        padding: 24px;
-      }
-      canvas {
-        width: 960px;
-        max-width: 100%;
-        aspect-ratio: 960 / 544;
-        border: 1px solid #2a2a3a;
-        image-rendering: pixelated;
-      }
-      #status {
-        font-family: ui-monospace, monospace;
-        text-align: center;
-        min-height: 2.5em;
-      }
-      #fps {
-        font-family: ui-monospace, monospace;
-        font-weight: 600;
-        color: #8fe0a0;
-      }
-      a {
-        color: #7fb0ff;
-      }
-    </style>
+    <!-- Content-Security-Policy, at the minimum the page needs, all of it same-origin:
+         scripts, workers and the audio worklet are our own files; 'wasm-unsafe-eval' is
+         WebAssembly.compile (the engine module and every title's transpiled module);
+         connect-src is the wasm and font fetches; img-src blob: is a title's icon read out
+         of OPFS. Nothing inline, nothing from another origin, no frames, no forms. A meta
+         policy governs this document; workers take theirs from their own response
+         headers, which a static host does not send. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' blob:; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#0b0b12" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+    <link rel="stylesheet" href="./app.css" />
+    <title>vitaslop</title>
   </head>
   <body>
-    <h1>vitaslop</h1>
-    <p>
-      A clean-room Vita GXM cube: loaded, transpiled from ARM/Thumb/VFP to wasm,
-      run on the browser's own WebAssembly engine, its GXM stream captured and
-      drawn with WebGPU. No emulated GPU shader blob, no server.
-    </p>
-    <canvas id="screen" width="960" height="544"></canvas>
-    <div id="fps" aria-live="off">fps: --</div>
-    <div id="status">Loading...</div>
-    <script type="module">
-      import init, { run } from "./pkg/vitaslop_web.js";
+    <header id="top">
+      <a class="brand" href="#/">vitaslop</a>
+      <nav>
+        <a href="#/">Library</a>
+        <a href="#/import">Add games</a>
+        <a href="#/settings">Settings</a>
+        <a href="#/about">About</a>
+      </nav>
+    </header>
 
-      const status = document.getElementById("status");
-      const canvas = document.getElementById("screen");
+    <main id="view"></main>
 
-      async function main() {
-        if (!("gpu" in navigator)) {
-          status.textContent =
-            "This browser has no WebGPU (navigator.gpu). Try a recent Chrome/Edge, or Safari/Firefox with WebGPU enabled.";
-          return;
-        }
-        try {
-          status.textContent = "Initializing wasm...";
-          await init();
-          status.textContent = "Running the cube on browser wasm...";
-          const msg = await run(canvas);
-          status.textContent = msg;
-        } catch (e) {
-          status.textContent = "Error: " + (e && e.message ? e.message : e);
-          throw e;
-        }
-      }
-      main();
-    </script>
+    <!-- The play screen lives outside #view: its canvas is handed to the emulator worker
+         once per page and must not be re-created by a render. -->
+    <section id="player" hidden>
+      <div id="stage">
+        <canvas id="screen" width="960" height="544"></canvas>
+        <div id="fpsbadge" hidden>--</div>
+        <button id="mutebtn" type="button" aria-label="Mute" title="Mute">&#128266;</button>
+        <button id="menubtn" type="button" aria-label="Menu">&#9776;</button>
+      </div>
+      <div id="pad"></div>
+
+      <div id="loading">
+        <div class="loading-in">
+          <h2 id="loading-title"></h2>
+          <p id="loading-status">starting...</p>
+          <div class="spinner"></div>
+        </div>
+      </div>
+
+      <div id="menu" hidden>
+        <div class="menu-in">
+          <h2 id="m-title" class="menu-title"></h2>
+          <div class="menu-row">
+            <button id="m-resume" class="btn primary" type="button">Resume</button>
+            <button id="m-fullscreen" class="btn" type="button">Fullscreen</button>
+            <button id="m-quit" class="btn danger" type="button">Quit to library</button>
+          </div>
+          <label class="row"><input id="m-mute" type="checkbox" /><span>Mute</span></label>
+          <label class="row"><input id="m-fps" type="checkbox" /><span>Show frame rate</span></label>
+          <label class="row"><input id="m-pause-blur" type="checkbox" /><span>Pause when hidden or unfocused</span></label>
+          <label class="row"><span>On-screen controls</span>
+            <select id="m-pad-mode">
+              <option value="auto">Automatic (touch screens only)</option>
+              <option value="overlay">Over the game</option>
+              <option value="beside">Beside the game</option>
+              <option value="hidden">Hidden</option>
+            </select></label>
+          <label class="row"><span>Opacity</span><input id="m-pad-opacity" type="range" min="0.1" max="1" step="0.05" /></label>
+          <details open>
+            <summary>Controls</summary>
+            <div id="m-vita"></div>
+            <p class="dim">To change them: <a id="m-settings" href="#/settings">this title's settings</a> (leaves the game).</p>
+          </details>
+          <details>
+            <summary>Diagnostics</summary>
+            <div class="menu-row">
+              <button id="m-copy" class="btn small" type="button">Copy</button>
+              <button id="m-download" class="btn small" type="button">Download</button>
+              <button id="m-shot" class="btn small" type="button">Screenshot</button>
+            </div>
+            <pre id="m-diag"></pre>
+          </details>
+          <p class="dim">Esc or the menu button opens and closes this. The game is paused while it is open.</p>
+        </div>
+      </div>
+
+      <div id="fatal" hidden>
+        <div class="fatal-in">
+          <h2>The emulator stopped</h2>
+          <pre id="fatal-text"></pre>
+          <div class="menu-row">
+            <button id="fatal-copy" class="btn primary" type="button">Copy diagnostics</button>
+            <button id="fatal-quit" class="btn" type="button">Back to library</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

@@ -26,7 +26,7 @@ const check = (name, ok, detail = "") => {
 };
 
 try {
-  await page.goto(url + "gamedata-test.html", { waitUntil: "load", timeout: 30000 });
+  await page.goto(url + "debug/gamedata-test.html", { waitUntil: "load", timeout: 30000 });
   const r = await page.evaluate(() => window.__gameDataTest());
 
   check("a title with no save reports nothing stored", r.emptyBefore === true);

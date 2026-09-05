@@ -1,4 +1,4 @@
-// Validate the USER-FACING browser play path end to end: load play.html (which auto-
+// Validate the USER-FACING browser play path end to end: load debug/play.html (which auto-
 // boots the emulator in a Web Worker with NO Chrome flags and live input), then drive
 // it to the Tutorial level with REAL POINTER TAPS (not the scripted Rust recipe) - the
 // exact thing a human does. Proves the whole chain: worker run + OffscreenCanvas render
@@ -55,7 +55,7 @@ async function main() {
         res.writeHead(200, { "content-type": "application/json", ...coi });
         return res.end(JSON.stringify(manifest));
       }
-      const file = url.startsWith("/game/") ? join(gameDir, url.slice("/game/".length)) : join(webDir, url === "/" ? "/play.html" : url);
+      const file = url.startsWith("/game/") ? join(gameDir, url.slice("/game/".length)) : join(webDir, url === "/" ? "/debug/play.html" : url);
       const body = await readFile(file);
       res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
       res.end(body);

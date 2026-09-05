@@ -45,7 +45,7 @@ async function main() {
 
   let ok = false;
   try {
-    await page.goto(url, { waitUntil: "load", timeout: 30000 });
+    await page.goto(url + "debug/index.html", { waitUntil: "load", timeout: 30000 });
     await page.waitForFunction(
       () => /cube ran|Error|no WebGPU/i.test(document.getElementById("status")?.textContent || ""),
       { timeout: 120000 }

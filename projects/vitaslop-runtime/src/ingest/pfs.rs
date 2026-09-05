@@ -97,7 +97,15 @@ impl PfsImage {
     /// returned context borrows this image and `klicensee`.
     pub fn file_ctx<'a>(&'a self, path: &str, klicensee: &'a [u8; 16]) -> Option<FileCtx<'a>> {
         let file = self.files().into_iter().find(|f| f.path == path)?;
-        Some(FileCtx {
+        Some(self.ctx_of(&file, klicensee))
+    }
+
+    /// The decryption context of one file already found by [`PfsImage::files`]. The
+    /// streaming ingest walks the file list ONCE and builds each context from it here;
+    /// `file_ctx` rebuilds the whole list per call, which is quadratic over a title
+    /// with thousands of files.
+    pub fn ctx_of<'a>(&'a self, file: &PfsFile<'_>, klicensee: &'a [u8; 16]) -> FileCtx<'a> {
+        FileCtx {
             klicensee,
             files_salt: self.files_db.header.seed,
             key_id: self.files_db.header.key_id,
@@ -109,7 +117,7 @@ impl PfsImage {
             signatures: file_table_signatures(self, file.table_index),
             plaintext_size: file.node.size as usize,
             encrypted: file.node.is_encrypted(),
-        })
+        }
     }
 
     /// Decrypt one file's on-disk ciphertext to plaintext, via `crypto`. `path`

@@ -53,7 +53,7 @@ pub struct PkgItem {
 /// Whether an item-table entry is a directory (no file data) rather than a file,
 /// per the low byte of its `flags`. A pkg records directories as their own
 /// entries; types 4 and 18 are the directory codes, everything else is a file.
-fn is_directory(flags: u32) -> bool {
+pub(crate) fn is_directory(flags: u32) -> bool {
     matches!(flags & 0xff, 4 | 18)
 }
 
@@ -93,7 +93,7 @@ impl PkgHeader {
     }
 
     /// The per-package AES-128-CTR session key: `AES-128-ECB-encrypt(pkg_key, riv)`.
-    fn session_key(&self) -> Result<[u8; 16], Error> {
+    pub(crate) fn session_key(&self) -> Result<[u8; 16], Error> {
         let pkg_key = match self.key_type {
             2 => keys::PKG_TYPE2,
             _ => return Err(Error::MissingKey("pkg key type")),

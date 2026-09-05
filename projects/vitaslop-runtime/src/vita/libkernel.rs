@@ -541,6 +541,82 @@ pub(super) fn get_tls_addr(st: &mut VitaState, key: u32) -> u32 {
     st.tls_addr(key)
 }
 
+/// void *sceKernelGetThreadTLSAddr(SceUID thid, int key)
+#[hostcall]
+pub(super) fn get_thread_tls_addr(st: &mut VitaState, thid: i32, key: u32) -> u32 {
+    st.tls_addr_of(thid, key)
+}
+
+/// int sceKernelGetRandomNumber(void *buf, SceSize size)
+/// Fills `buf` from the world's random source - the same one every other random
+/// read goes through, so a recorded run replays the same bytes.
+#[hostcall]
+pub(super) fn get_random_number(ctx: &mut GuestCtx, st: &mut VitaState, buf: Ptr, size: u32) -> i32 {
+    if buf.addr() == 0 && size > 0 {
+        -1
+    } else {
+        let mut bytes = vec![0u8; size.min(64 * 1024) as usize];
+        st.world.fill_random(&mut bytes);
+        ctx.write_bytes(buf.addr(), &bytes);
+        0
+    }
+}
+
+/// SceUID sceKernelCreateMsgPipe(const char *name, int type, int attr, unsigned int bufSize, void *opt)
+/// A byte FIFO between threads. Sends and receives here are the non-blocking
+/// semantics: a receive on an empty pipe reports a timeout rather than parking the
+/// thread. A guest that needs the blocking form will show up as a spin here, and that
+/// is the moment to wire it into the scheduler.
+pub(super) fn msg_pipe_create(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = st.new_uid();
+    st.msg_pipes.insert(uid, std::collections::VecDeque::new());
+    ctx.ret(uid as u32);
+}
+
+/// int sceKernelDeleteMsgPipe(SceUID uid)
+pub(super) fn msg_pipe_delete(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    ctx.ret(if st.msg_pipes.remove(&uid).is_some() { 0 } else { 0x8002_0005 });
+}
+
+/// int sceKernelSendMsgPipe(SceUID uid, const void *buf, unsigned int size, int mode, unsigned int *result, unsigned int *timeout)
+pub(super) fn msg_pipe_send(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let (buf, size, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(4));
+    let Some(pipe) = st.msg_pipes.get_mut(&uid) else {
+        ctx.ret(0x8002_0005);
+        return;
+    };
+    let bytes = ctx.read_bytes(buf, size as usize);
+    pipe.extend(bytes);
+    if result != 0 {
+        ctx.write_u32(result, size);
+    }
+    ctx.ret(0);
+}
+
+/// int sceKernelReceiveMsgPipe(SceUID uid, void *buf, unsigned int size, int mode, unsigned int *result, unsigned int *timeout)
+pub(super) fn msg_pipe_receive(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let uid = ctx.arg(0) as i32;
+    let (buf, size, result) = (ctx.arg(1), ctx.arg(2), ctx.arg(4));
+    let Some(pipe) = st.msg_pipes.get_mut(&uid) else {
+        ctx.ret(0x8002_0005);
+        return;
+    };
+    if pipe.is_empty() {
+        tracing::warn!(target: "vitaslop::kernel", uid, "sceKernelReceiveMsgPipe on an EMPTY pipe: reported as a timeout (the blocking form is not modelled)");
+        ctx.ret(0x8002_8005); // SCE_KERNEL_ERROR_WAIT_TIMEOUT
+        return;
+    }
+    let n = (size as usize).min(pipe.len());
+    let bytes: Vec<u8> = pipe.drain(..n).collect();
+    ctx.write_bytes(buf, &bytes);
+    if result != 0 {
+        ctx.write_u32(result, n as u32);
+    }
+    ctx.ret(0);
+}
+
 /// int sceClibPrintf(const char *fmt, ...)
 /// Formats to the debug console. Returns the number of bytes produced.
 pub(super) fn clib_printf(ctx: &mut GuestCtx, st: &mut VitaState) {

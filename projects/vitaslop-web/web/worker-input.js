@@ -8,10 +8,24 @@ export function forwardInput(worker, canvas) {
   const SCREEN_W = 960;
   const SCREEN_H = 544;
 
+  // The picture is fitted inside the element (`object-fit: contain`), so the element's
+  // box can be wider or taller than the drawn 960x544: the letterbox has to be taken
+  // off before scaling, or every touch lands short of where the finger is.
   const toScreen = (e) => {
     const r = canvas.getBoundingClientRect();
-    const x = ((e.clientX - r.left) / Math.max(1, r.width)) * SCREEN_W;
-    const y = ((e.clientY - r.top) / Math.max(1, r.height)) * SCREEN_H;
+    const fit = getComputedStyle(canvas).objectFit;
+    let { left, top, width, height } = r;
+    if (fit !== "fill" && width > 0 && height > 0) {
+      const k = Math.min(width / SCREEN_W, height / SCREEN_H);
+      const dw = SCREEN_W * k;
+      const dh = SCREEN_H * k;
+      left += (width - dw) / 2;
+      top += (height - dh) / 2;
+      width = dw;
+      height = dh;
+    }
+    const x = Math.min(SCREEN_W, Math.max(0, ((e.clientX - left) / Math.max(1, width)) * SCREEN_W));
+    const y = Math.min(SCREEN_H, Math.max(0, ((e.clientY - top) / Math.max(1, height)) * SCREEN_H));
     return { x, y };
   };
 

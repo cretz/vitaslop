@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The macOS app bundle's manifest. release.yml copies it into
+     vitaslop-desktop.app/Contents/ and replaces VERSION with the release tag. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>vitaslop</string>
+  <key>CFBundleDisplayName</key>
+  <string>vitaslop</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.vitaslop.desktop</string>
+  <key>CFBundleVersion</key>
+  <string>VERSION</string>
+  <key>CFBundleShortVersionString</key>
+  <string>VERSION</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleExecutable</key>
+  <string>vitaslop</string>
+  <key>CFBundleIconFile</key>
+  <string>icon</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+</dict>
+</plist>

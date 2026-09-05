@@ -51,7 +51,6 @@ pub const OVERRIDABLE: &[&str] = &[
     // Hard-pause the emulator when the window loses focus or the tab is hidden. ON by
     // default; `0` keeps the guest running unfocused. Read on both engines: the desktop's
     // window event and the browser page's visibility/blur handlers.
-    "VITASLOP_PAUSE_ON_BLUR",
     // The per-NID / per-call-site host-call histogram. Reachable from the browser because that
     // is where the host-call boundary costs the most: a phone spends roughly 16 ms of a 56 ms
     // guest frame on ~4,950 calls, and the only way to spend less is to make fewer of them -
@@ -210,6 +209,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // 318 of them playing every grain. It is here so a device can price the difference.
     "VITASLOP_NGS_VOICE_HANDLE_MEMO",
     "VITASLOP_NO_BC",
+    "VITASLOP_NO_FAST_IMPORT",
     "VITASLOP_NO_INLINE_CLIB",
     // The A/B switch for the whole inline-import mechanism. Reachable from the browser for the
     // same reason `VITASLOP_DBG_CALLSITES` is, and more sharply: inlining exists to stop paying
@@ -228,7 +228,6 @@ pub const OVERRIDABLE: &[&str] = &[
     // because the browser is the only engine where the two traps differ: the JSPI stack
     // switch per call is what the fast trap removes, and only a phone can price it. Read
     // at LINK time; set it before the run, not during it.
-    "VITASLOP_NO_FAST_IMPORT",
     // The SCOPED switch for the two default-uniform RESERVES, which are the largest single
     // family of host calls a gameplay frame still made before they were inlined (1,189 a
     // frame on one title, 53% of everything it calls). Reachable from the browser for both
@@ -260,6 +259,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // where the audio path had to be priced - it decodes and mixes up to ~100 voices a grain,
     // which is guest-CPU work on the machine that has the least of it.
     "VITASLOP_NO_NGS_MIX",
+    "VITASLOP_PAUSE_ON_BLUR",
     "VITASLOP_PERF",
     // Whether the per-window performance report is ALSO written to the browser console. The
     // panel and the sink always get it; this is the console copy, off by default because the

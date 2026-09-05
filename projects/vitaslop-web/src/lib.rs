@@ -22,6 +22,7 @@
 mod audio;
 mod browser_sched;
 mod conformance;
+mod frontend;
 mod input;
 mod location;
 mod logging;

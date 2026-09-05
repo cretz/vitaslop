@@ -21,6 +21,22 @@ is where it is either true or not.
 - Implements the platform seam for the browser: OPFS-backed storage, and
   pointer/keyboard events on the canvas mapped to the touch panel and SceCtrl.
 
+## The front end
+
+- `web/index.html` + `app.js` is the product: a hash-routed library (`#/`), title page
+  (`#/title/<id>`), settings (`#/settings[/<id>]`), import (`#/import`) and the player.
+  Plain ES modules and CSS, no framework, no bundler; GitHub Pages is the target and
+  `coi.js` (a service worker) supplies the cross-origin-isolation headers a static host
+  cannot.
+- Settings are one record (`vitaslop-frontend`); the global one is stored whole, a
+  title stores only its patch. `store.js` keeps both in localStorage and the library
+  records (`library/<id>/meta.json` + images) in OPFS beside the titles (`games/<id>/`).
+- Importing streams: the page hands the picked `File`s to `import-worker.js`, which
+  reads ranges with `FileReaderSync` and writes OPFS sync handles while the Rust
+  streaming ingest peels zip/pkg/PFS/SELF. Nothing is ever resident.
+- The old debug pages (`live.html`, the cube, conformance) live under `web/debug/`
+  and the e2e rigs drive them there.
+
 ## The guest engine
 
 - The guest's transpiled wasm runs on the *browser's* engine, not on an

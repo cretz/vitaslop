@@ -491,7 +491,8 @@ pub enum Stmt {
     /// (ARM `umull`/`smull`). The two 32-bit operands are extended to 64 bits
     /// (per `signed`), multiplied, and the product's low/high halves written to
     /// `rdlo`/`rdhi`.
-    MulLong { rdlo: u8, rdhi: u8, rn: Value, rm: Value, signed: bool },
+    /// `accumulate` adds the 64-bit `rdhi:rdlo` already in the registers (`smlal`/`umlal`).
+    MulLong { rdlo: u8, rdhi: u8, rn: Value, rm: Value, signed: bool, accumulate: bool },
     /// A direct guest call (`bl`/`blx` to translated code): call the callee's
     /// wasm function, which returns here. `lr` is set by a preceding `SetReg`.
     Call { target: u32 },
@@ -577,6 +578,10 @@ pub enum Term {
     BranchZero { reg: u8, nonzero: bool, taken: u32 },
     /// Return to the caller (`bx lr`, `pop {..,pc}`, ...).
     Return,
+    /// A conditional return (`bxeq lr`, `popne {pc}`, an `it`-guarded `bx lr`): return
+    /// when `cond` holds, else fall through to the next block by index, exactly as
+    /// [`Term::Fallthrough`] does.
+    ReturnIf { cond: ConditionCode },
     /// A computed jump through a dense index (ARM `tbb`/`tbh` switch dispatch):
     /// branch to `targets[index]`. The jump table was read statically at discovery
     /// time, so `targets` are resolved block addresses and the runtime only needs
@@ -612,7 +617,9 @@ pub struct Block {
 }
 
 /// A discovered guest function: one wasm function. Blocks are sorted ascending by
-/// address; `blocks[0]` is the entry block.
+/// address (fall-through is by index); the entry block is the one at `addr`, which is
+/// NOT always `blocks[0]` - a hand-written routine can keep a shared tail below its
+/// entry (newlib's strcmp), reached by a backward branch.
 pub struct Func {
     pub addr: u32,
     /// Decode mode this function was discovered in. Carried for the future
@@ -686,7 +693,11 @@ impl Func {
             Term::Switch { targets, default, .. } => {
                 targets.iter().all(|&t| is_block(t)) && default.map_or(true, is_block)
             }
-            Term::Fallthrough | Term::Return | Term::Halt | Term::Unreachable => true,
+            Term::Fallthrough
+            | Term::Return
+            | Term::ReturnIf { .. }
+            | Term::Halt
+            | Term::Unreachable => true,
         })
     }
 }

@@ -15,6 +15,7 @@ import init, {
   worker_input_pointer,
   worker_input_stick,
   worker_set_paused,
+  worker_set_keymap,
   worker_location_fix,
   worker_location_error,
   worker_location_unavailable,
@@ -180,6 +181,17 @@ self.onmessage = async (e) => {
     worker_set_paused(!!d.paused);
     return;
   }
+  // The person's keyboard map (see vitaslop-frontend); the on-screen pad and a gamepad
+  // post keyboard codes too, so this one table serves all three.
+  if (d.type === "keymap") {
+    try {
+      await ready;
+      worker_set_keymap(String(d.json));
+    } catch (err) {
+      self.postMessage({ type: "error", message: `keymap rejected: ${err}` });
+    }
+    return;
+  }
 
   // Position from the page's watchPosition (see web/location.js). `navigator.geolocation`
   // is Window-only, so the page owns the API and this worker only receives its answers.
@@ -242,7 +254,9 @@ self.onmessage = async (e) => {
   // `audioRing` is the SharedArrayBuffer the page's AudioWorklet drains (see
   // web/audio.js). It is shared, not transferred, so it needs no transfer list - and a
   // start message without one simply runs silent, which the setup says on the console.
-  const { offscreen, titleId, files, recipe, maxFrames, knobs, prebuilt, audioRing } = d;
+  const { offscreen, titleId, files, recipe, maxFrames, knobs, prebuilt, audioRing, profile } = d;
+  // Which game-data profile this run saves into; the page picked it from the settings.
+  gamedata.setProfile(profile || "default");
   try {
     await ready;
     // A worker is its own wasm instance, so it needs the knobs set here, not on the page.

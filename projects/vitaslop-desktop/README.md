@@ -32,3 +32,16 @@ in a window instead of a canvas.
   from a different pass than the game shows is worse than no screenshot.
 - Runtime `tracing` diagnostics surface through `RUST_LOG` (e.g.
   `vitaslop::io=trace`); see `KNOBS.md` for the env knobs.
+
+## The shell
+
+- `vitaslop` (the binary this crate builds) with no arguments opens the native shell (egui over the same wgpu
+  surface the game presents to): library, title page, settings, import, an Esc menu in
+  game, F11 fullscreen.
+- `import <pkg|zip|folder>`, `list`, and `serve [--port N]` (hosts the embedded web
+  bundle with the isolation headers) are the command-line faces of the same library.
+- Data lives under `VITASLOP_HOME` or the per-user data directory: `library/<id>/` (the
+  decrypted dump tree plus `meta.json`, `icon0.png`, `pic0.png`), `saves/<profile>/`,
+  `settings.json`, `titles/<id>.json` (per-title patches).
+- `--game <dir>` is unchanged and is what the measurement rigs drive; `session.rs` is
+  the loop both it and the shell share.

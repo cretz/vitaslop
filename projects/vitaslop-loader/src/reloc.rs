@@ -30,6 +30,7 @@ pub mod code {
     pub const THM_CALL: u8 = 10;
     pub const CALL: u8 = 28;
     pub const JUMP24: u8 = 29;
+    pub const THM_JUMP24: u8 = 30;
     pub const TARGET1: u8 = 38;
     pub const V4BX: u8 = 40;
     pub const TARGET2: u8 = 41;
@@ -38,6 +39,8 @@ pub mod code {
     pub const MOVT_ABS: u8 = 44;
     pub const THM_MOVW_ABS_NC: u8 = 47;
     pub const THM_MOVT_ABS: u8 = 48;
+    pub const THM_JUMP11: u8 = 102;
+    pub const THM_JUMP8: u8 = 103;
 }
 
 /// One decoded relocation fixup: write, at `sym_seg`-plus-`code`-computed value,

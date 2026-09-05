@@ -12,7 +12,7 @@ async function main() {
 
   const server = await startServer(webDir);
   const { port } = server.address();
-  const url = `http://127.0.0.1:${port}/conformance.html`;
+  const url = `http://127.0.0.1:${port}/debug/conformance.html`;
   console.log(`[conformance] ${url}`);
 
   const browser = await launchChrome();

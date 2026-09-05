@@ -509,6 +509,18 @@ pub(super) fn io_chstat(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr, stat:
     }
 }
 
+/// int sceIoChstatByFd(SceUID fd, const SceIoStat *stat, unsigned int bits)
+/// `sceIoChstat` addressed by an open descriptor.
+#[hostcall]
+pub(super) fn io_chstat_by_fd(ctx: &mut GuestCtx, st: &mut VitaState, fd: i32, stat: Ptr, bits: i32) -> i32 {
+    if stat.addr() == 0 {
+        EBADF
+    } else {
+        let over = read_stat_override(ctx, stat.addr(), bits);
+        st.io_chstat_fd(fd, over)
+    }
+}
+
 /// int sceIoDevctl(const char *devname, int cmd, void *arg, SceSize arglen,
 ///                 void *bufp, SceSize buflen)
 ///

@@ -276,6 +276,16 @@ fn flow(
             None => Flow::Halt,
         },
         Opcode::BX => match inst.operands[0] {
+            // `bx pc`: the interworking veneer (`bx pc; nop; <ARM code>`) that a
+            // homebrew toolchain emits to enter ARM from Thumb. The target is the pc
+            // VALUE - Align(addr+4, 4) in Thumb, addr+8 in ARM - and it is ARM code
+            // (a pc value has bit 0 clear). Decoding on into the `nop` and the ARM
+            // words as Thumb would make plausible garbage, so this is a tail call to
+            // a separate function in ARM mode, not a fall-through.
+            Operand::Reg(r) if r.number() == 15 => {
+                let pc = if thumb { addr.wrapping_add(4) & !3 } else { addr.wrapping_add(8) };
+                Flow::TailCall(pc, false)
+            }
             // `bx lr` returns; `bx rN` is an indirect tail call (dispatch to the
             // target, then return). Either way there is no in-function successor.
             Operand::Reg(_) => Flow::Return,
@@ -292,9 +302,12 @@ fn flow(
                 Flow::Seq
             }
         }
+        // `ldr pc, [...]` / `mov pc, rN`: a return (`ldr pc, [sp], #4` is how gcc pops a
+        // lone lr; `mov pc, lr` is the ARMv4 return) or an indirect jump through
+        // memory (a thunk, a pc-relative jump table). Either way there is no
+        // in-function successor; the lowering picks return vs dispatch.
+        Opcode::LDR | Opcode::MOV if regnum(&inst.operands[0]) == Some(15) => Flow::Return,
         _ => {
-            // A write to pc via mov/ldr etc. would be an indirect jump; not yet
-            // handled. Everything else falls through.
             let _ = len;
             Flow::Seq
         }
@@ -459,6 +472,150 @@ struct SwitchInfo {
     index: u8,
     targets: Vec<u32>,
     default: Option<u32>,
+    /// `targets[(reg + bias) >> shift]`; `(0, 0)` for a `tbb`/`tbh`, whose register IS the
+    /// index. An ARM `add pc, pc, rN` (see [`arm_add_pc_switch`]) indexes by a byte
+    /// offset over a window, so it needs both.
+    bias: i32,
+    shift: u32,
+}
+
+/// The window an ARM `add pc, pc, rN` may land in: `pc + 8 + rN` for `rN` in
+/// `[-ADD_PC_BACK, ADD_PC_FWD)`. Every word in ARM code is an instruction boundary,
+/// so each is a valid case body; the ones the register never names are simply
+/// never taken. newlib's memcpy (every vitasdk homebrew) enters its unrolled copy
+/// loop this way: `rsb r3, r3, #0x34 ; add pc, pc, r3`.
+const ADD_PC_BACK: u32 = 64;
+const ADD_PC_FWD: u32 = 192;
+
+/// `add pc, pc, rN` in ARM mode, unconditional: the switch over its window.
+fn arm_add_pc_switch(inst: &Instruction, addr: u32, thumb: bool, code_len: u32, base: u32) -> Option<SwitchInfo> {
+    if thumb || inst.opcode != Opcode::ADD || inst.condition != ConditionCode::AL {
+        return None;
+    }
+    let (Some(Operand::Reg(rd)), Some(Operand::Reg(rn)), Some(Operand::Reg(rm))) =
+        (inst.operands.first(), inst.operands.get(1), inst.operands.get(2))
+    else {
+        return None;
+    };
+    if rd.number() != 15 || rn.number() != 15 || rm.number() == 15 {
+        return None;
+    }
+    let pc = addr.wrapping_add(8);
+    // The window is clamped to the code image on both sides: below `base` there is
+    // no instruction to name (a function at the very start of an image), and past
+    // its end there is none either.
+    let start = pc.wrapping_sub(ADD_PC_BACK).max(base);
+    let mut targets = Vec::new();
+    let mut t = start;
+    while t < pc.wrapping_add(ADD_PC_FWD) && t.wrapping_sub(base) < code_len {
+        targets.push(t);
+        t = t.wrapping_add(4);
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some(SwitchInfo { index: rm.number(), targets, default: None, bias: pc.wrapping_sub(start) as i32, shift: 2 })
+}
+
+/// libgcc's integer-division ladder (`__aeabi_uidiv`/`__aeabi_idiv`, `lib1funcs.S`
+/// `ARM_DIV_BODY` on a core without hardware divide - every vitasdk homebrew) enters
+/// its unrolled shift-subtract steps with a computed jump:
+///
+/// ```text
+///   adr  r2, 1f                ; the first 16-byte step
+///   add  r3, r2, r3, lsl #4    ; step index (0..31) scaled by the step size
+///   mov  r2, #0                ; (unrelated instructions may sit in between)
+///   mov  pc, r3
+/// ```
+///
+/// Recognised at the `mov pc` from the decoded stream: walk back to the writer of the
+/// jump register (an `add rd, rn, rm, lsl #s`), then to the writer of its base (`adr`
+/// or `add rn, pc, #imm`), skipping instructions that write neither. The switch keys
+/// on the JUMP REGISTER's final value - `targets[(rd - ladder) >> s]` - because the
+/// index register is usually `rd` itself and is gone by the jump. Targets are the
+/// ladder's entries for the 32 steps a 32-bit divide can need, clamped to the image.
+/// Without this the jump has no static target and the divide misses in the dispatcher
+/// (before the `mov pc` lowering existed it fell through, and `n / es` came back
+/// undivided - newlib's qsort then recursed over garbage).
+fn mov_pc_ladder_switch(
+    inst: &Instruction,
+    addr: u32,
+    decoded: &BTreeMap<u32, (Instruction, u32, ConditionCode, bool)>,
+    code_len: u32,
+    base: u32,
+) -> Option<SwitchInfo> {
+    if inst.opcode != Opcode::MOV || inst.condition != ConditionCode::AL {
+        return None;
+    }
+    let (Operand::Reg(pc), Operand::Reg(rd)) = (&inst.operands[0], &inst.operands[1]) else {
+        return None;
+    };
+    if pc.number() != 15 || rd.number() == 15 {
+        return None;
+    }
+    let rd = rd.number();
+    // The unconditional instruction ending exactly at `at`.
+    let ending_at = |at: u32| {
+        decoded
+            .range(..at)
+            .next_back()
+            .filter(|(a, (_, len, cond, in_it))| {
+                a.wrapping_add(*len) == at && !*in_it && *cond == ConditionCode::AL
+            })
+            .map(|(a, (i, _, _, _))| (*a, i))
+    };
+    let writes = |i: &Instruction, r: u8| regnum(&i.operands[0]) == Some(r);
+    // The most recent writer of `r`, walking back at most `max` instructions.
+    let writer_of = |from: u32, r: u8, max: usize| -> Option<(u32, &Instruction)> {
+        let mut cur = from;
+        for _ in 0..max {
+            let (a, i) = ending_at(cur)?;
+            if writes(i, r) {
+                return Some((a, i));
+            }
+            cur = a;
+        }
+        None
+    };
+    let (add_addr, add) = writer_of(addr, rd, 4)?;
+    if add.opcode != Opcode::ADD {
+        return None;
+    }
+    let (Operand::Reg(arn), Operand::RegShift(rs)) = (&add.operands[1], &add.operands[2]) else {
+        return None;
+    };
+    let RegShiftStyle::RegImm(sh) = rs.into_shift() else { return None };
+    if sh.stype() != ShiftStyle::LSL {
+        return None;
+    }
+    let shift = sh.imm() as u32;
+    let (adr_addr, adr) = writer_of(add_addr, arn.number(), 4)?;
+    let pc_of = |a: u32| if adr.thumb { a.wrapping_add(4) & !3 } else { a.wrapping_add(8) };
+    let ladder = match (adr.opcode, &adr.operands[1], &adr.operands[2]) {
+        (Opcode::ADR, op, _) => pc_of(adr_addr).wrapping_add(imm(op)?),
+        (Opcode::ADD, Operand::Reg(p), op) if p.number() == 15 => {
+            pc_of(adr_addr).wrapping_add(imm(op)?)
+        }
+        _ => return None,
+    };
+    let mut targets = Vec::new();
+    for k in 0..32u32 {
+        let t = ladder.wrapping_add(k << shift);
+        if t.wrapping_sub(base) >= code_len {
+            break;
+        }
+        targets.push(t);
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some(SwitchInfo {
+        index: rd,
+        targets,
+        default: None,
+        bias: 0u32.wrapping_sub(ladder) as i32,
+        shift,
+    })
 }
 
 /// The index register of a pc-relative `tbb`/`tbh`. Returns `None` (leaving the
@@ -909,7 +1066,7 @@ fn resolve_switch(
     if why {
         eprintln!("switch @{tb_addr:#x}: RESOLVED {count} targets, default={default:?}");
     }
-    Some(SwitchInfo { index, targets, default })
+    Some(SwitchInfo { index, targets, default, bias: 0, shift: 0 })
 }
 
 /// Whether the table-branch diagnostic is on for this address
@@ -988,6 +1145,13 @@ pub fn discover(
     // multiple predecessors).
     let init: RegConsts = [None; 16];
     let mut work: Vec<(u32, u8, RegConsts)> = vec![(entry, 0, init)];
+    // The low halves of CONDITIONAL `movw`s, by register: (condition, value). An
+    // `itete` block interleaves two movw/movt pairs into one register
+    // (`movweq r2, #lo1 ; movwne r2, #lo2 ; movteq r2, #hi ; movtne r2, #hi` - FreeType
+    // picking a rasteriser callback), and the linear tracker only ever completes the
+    // second pair. Pairing each `movt` with the `movw` of ITS condition seeds both.
+    // Reset at every leader: an IT block never spans one.
+    let mut cond_lo: Vec<(u8, ConditionCode, u32)> = Vec::new();
     leaders.insert(entry);
     // Table branches whose extent could not be bounded on first sight; retried after the
     // walk settles, when `leaders` is complete (see the retry loop below).
@@ -1064,6 +1228,27 @@ pub fn discover(
         let next_regs =
             track_regs(&inst, addr, regs, &in_bounds, discover_pointers, &mut code_pointers);
         let next = addr.wrapping_add(len);
+        if leaders.contains(&addr) {
+            cond_lo.clear();
+        }
+        if applied != ConditionCode::AL {
+            if let (Some(rd), Some(v)) = (regnum(&inst.operands[0]), inst.operands.get(1).and_then(imm)) {
+                match inst.opcode {
+                    Opcode::MOV => cond_lo.push((rd, applied, v)),
+                    Opcode::MOVT => {
+                        if let Some(&(_, _, lo)) =
+                            cond_lo.iter().rev().find(|(r, c, _)| *r == rd && *c == applied)
+                        {
+                            let full = (lo & 0xFFFF) | (v << 16);
+                            if discover_pointers && full & 1 == 1 && in_bounds(full & !1) {
+                                code_pointers.insert(full & !1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // A register-indirect `blx`/`bx` whose target register holds a tracked
         // `movw`/`movt` constant is a definite code pointer: its low bit selects
@@ -1110,6 +1295,16 @@ pub fn discover(
         // instruction are the table itself, never code, so this path never falls
         // through - resolved or not. An unresolved table is reported per-function in
         // pass 2 rather than marching the decoder into table data.
+        if let Some(info) = arm_add_pc_switch(&inst, addr, thumb, code.len() as u32, base)
+            .or_else(|| mov_pc_ladder_switch(&inst, addr, &decoded, code.len() as u32, base))
+        {
+            for &t in &info.targets {
+                leaders.insert(t);
+                work.push((t, 0, init));
+            }
+            switches.insert(addr, info);
+            continue;
+        }
         if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
             match resolve_switch(code, base, addr, &inst, &decoded, &leaders) {
                 Some(info) => {
@@ -1134,7 +1329,21 @@ pub fn discover(
             continue;
         }
 
-        match flow(&inst, addr, len, thumb, entry, imports, regs[7], noreturn_svc) {
+        // A terminator under a condition (`bxeq lr`, an `it`-guarded `bx lr`/`pop {pc}`,
+        // `beq` inside an IT block) has a fall-through successor as well: the
+        // instruction after it is a leader, entered when the condition fails.
+        let mut fl = flow(&inst, addr, len, thumb, entry, imports, regs[7], noreturn_svc);
+        if applied != ConditionCode::AL {
+            match fl {
+                Flow::Return | Flow::Halt | Flow::TailCall(..) => {
+                    leaders.insert(next);
+                    work.push((next, next_it, next_regs));
+                }
+                Flow::Jump(t) => fl = Flow::Fork(t),
+                _ => {}
+            }
+        }
+        match fl {
             Flow::Seq => work.push((next, next_it, next_regs)),
             Flow::Call { guest } => {
                 if let Some((t, t_thumb)) = guest {
@@ -1370,12 +1579,21 @@ pub fn discover(
             };
             // A table branch ends the block with a computed jump built from the table
             // recovered in pass 1. An unresolved one is a clean per-function failure.
-            if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) {
+            if matches!(inst.opcode, Opcode::TBB | Opcode::TBH) || arm_add_pc_switch(inst, cursor, thumb, 0, 0).is_some() || switches.contains_key(&cursor) {
                 match switches.get(&cursor) {
                     Some(info) => {
                         arm_count += 1;
+                        let index = if info.bias == 0 && info.shift == 0 {
+                            Value::Reg(info.index)
+                        } else {
+                            bin(
+                                BinOp::Lsr,
+                                bin(BinOp::Add, Value::Reg(info.index), Value::Imm(info.bias as u32)),
+                                Value::Imm(info.shift),
+                            )
+                        };
                         break Term::Switch {
-                            index: Value::Reg(info.index),
+                            index,
                             targets: info.targets.clone(),
                             default: info.default,
                         };
@@ -1396,6 +1614,23 @@ pub fn discover(
                     Err(_) if isolate => break Term::Unreachable,
                     Err(e) => return Err(e),
                 };
+            // The conditional form of a terminator: its effects run under the
+            // condition and the transfer itself becomes the conditional one.
+            let term = match term {
+                Some(t) if *applied != ConditionCode::AL => {
+                    if !effects.is_empty() {
+                        effects = vec![Stmt::Guard(*applied, std::mem::take(&mut effects))];
+                    }
+                    Some(match t {
+                        Term::Return => Term::ReturnIf { cond: *applied },
+                        Term::Jump(t) => Term::Branch { cond: *applied, taken: t },
+                        // A conditional halt: the (guarded) effect is what halts.
+                        Term::Halt => Term::Fallthrough,
+                        other => other,
+                    })
+                }
+                t => t,
+            };
             stmts.append(&mut effects);
             arm_count += 1;
             cursor = cursor.wrapping_add(*len);
@@ -1444,7 +1679,11 @@ pub fn discover(
                         }
                     }
                 }
-                Term::Fallthrough | Term::Return | Term::Halt | Term::Unreachable => {}
+                Term::Fallthrough
+                | Term::Return
+                | Term::ReturnIf { .. }
+                | Term::Halt
+                | Term::Unreachable => {}
             }
         }
         if !missing.is_empty() {
@@ -1813,9 +2052,50 @@ fn lower_insn(
                 }),
             ));
         }
+        // `ldr pc, [sp], #4`: the return of a function that pushed only lr - the
+        // address loaded IS our caller, so it is a plain return (the load itself is
+        // skipped, as `pop {pc}` skips it). Any other `ldr pc, [...]` is an indirect
+        // jump through memory: dispatch to the loaded target, then return to our
+        // caller, exactly like `bx rN`.
+        LDR if regnum(&ops[0]) == Some(15) => {
+            let a = lower_addr(&ops[1], addr, thumb).ok_or_else(err)?;
+            let pops_sp = matches!(
+                &ops[1],
+                Operand::RegDerefPostindexOffset(b, _, _, _) if b.number() == 13
+            );
+            let mut stmts = a.pre;
+            if pops_sp {
+                stmts.extend(a.post);
+                return Ok((stmts, Some(Term::Return)));
+            }
+            stmts.push(Stmt::SetReg(
+                15,
+                Value::Load { addr: Box::new(a.addr), size: MemSize::Word, signed: false },
+            ));
+            stmts.extend(a.post);
+            stmts.push(Stmt::CallIndirect { addr: Value::Reg(15), set_lr: None });
+            return Ok((stmts, Some(Term::Return)));
+        }
+        // `mov pc, lr` returns; `mov pc, rN` is an indirect tail call.
+        MOV if regnum(&ops[0]) == Some(15) => {
+            return match ops[1] {
+                Operand::Reg(r) if r.number() == 14 => Ok((vec![], Some(Term::Return))),
+                Operand::Reg(r) => Ok((
+                    vec![Stmt::CallIndirect { addr: Value::Reg(r.number()), set_lr: None }],
+                    Some(Term::Return),
+                )),
+                _ => Err(err()),
+            };
+        }
         BX => {
             return match ops[0] {
                 Operand::Reg(r) if r.number() == 14 => Ok((vec![], Some(Term::Return))),
+                // `bx pc`: a direct tail call to the ARM code at the pc value (see
+                // `flow`); the callee returns to OUR caller, so call then return.
+                Operand::Reg(r) if r.number() == 15 => {
+                    let pc = if thumb { addr.wrapping_add(4) & !3 } else { addr.wrapping_add(8) };
+                    Ok((vec![Stmt::Call { target: pc }], Some(Term::Return)))
+                }
                 // `bx rN` tail-calls through a function pointer: dispatch to the
                 // runtime target, then return to our caller (lr is unchanged, so
                 // the callee's own return unwinds past us correctly). If the target
@@ -1952,8 +2232,12 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             // Flags before the write: the value expression reads original regs.
             if sets_flags {
-                let carry = match src {
-                    Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+                let carry = match (&src, &ops[1]) {
+                    (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
+                    // ARM `movs rd, rm, <shift> #n` (the A32 spelling of `lsls`/`lsrs`/
+                    // `asrs`/`rors`): C is the shifter carry-out. newlib's memcpy tail
+                    // reads it (`lsls r2, r2, #31 ; ldrhhs ...`).
+                    (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
                     _ => None,
                 };
                 out.push(Stmt::FlagsLogic { value: src.clone(), carry, live: ALL_FLAGS });
@@ -1974,9 +2258,11 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         MVN => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let src = operand_value(&ops[1], pc_const).ok_or_else(err)?;
-            // MVN's carry-out comes from the raw immediate expansion, not the ~value.
-            let carry = match src {
-                Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+            // MVN's carry-out comes from the raw immediate expansion, not the ~value;
+            // a shifted register contributes its shifter carry-out.
+            let carry = match (&src, &ops[1]) {
+                (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
+                (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
                 _ => None,
             };
             let value = Value::Not(Box::new(src));
@@ -2098,13 +2384,19 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.push(Stmt::FlagsAdd { a, b, cin: Value::Imm(0), live: ALL_FLAGS });
         }
 
-        AND | BIC | ORR | ORN | EOR | TST => {
+        AND | BIC | ORR | ORN | EOR | TST | TEQ => {
             let (rd, rn, op2) = dataproc(inst, pc_const).ok_or_else(err)?;
             // A flag-setting logical op with a rotate-form immediate updates C from the
             // immediate expansion (ThumbExpandImm_C). Read it from the *raw* immediate,
             // before BIC/ORN complement the operand below.
-            let imm_carry = match op2 {
-                Value::Imm(v) => modified_imm_carry(v, inst.thumb),
+            // A shifted-register second operand (`ands r6, r3, r0, asr #32` - newlib's
+            // qsort selects its pivot on the C this leaves) carries the shifter's
+            // carry-out instead.
+            let op2_operand =
+                if matches!(ops[2], Operand::Nothing) { &ops[1] } else { &ops[2] };
+            let imm_carry = match (&op2, op2_operand) {
+                (Value::Imm(v), _) => modified_imm_carry(*v, inst.thumb),
+                (_, Operand::RegShift(rs)) => reg_shift_carry(rs),
                 _ => None,
             };
             // BIC/ORN take the bitwise complement of the second operand.
@@ -2115,11 +2407,13 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             };
             let binop = match inst.opcode {
                 ORR | ORN => BinOp::Or,
-                EOR => BinOp::Xor,
+                EOR | TEQ => BinOp::Xor,
                 _ => BinOp::And, // AND, BIC, TST
             };
             let result = bin(binop, rn, op2);
-            if inst.opcode == TST {
+            // `tst`/`teq` set flags only (libgcc's signed divide fixes its result's
+            // sign with `teq ip, r0 ; rsbmi r0, r0, #0`).
+            if matches!(inst.opcode, TST | TEQ) {
                 out.push(Stmt::FlagsLogic { value: result, carry: imm_carry, live: ALL_FLAGS });
             } else {
                 if sets_flags {
@@ -2227,12 +2521,19 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
         // umull/smull rdlo, rdhi, rn, rm: {rdhi:rdlo} = rn * rm (64-bit). The S
         // form (flag-setting) is not emitted by the compilers we target; ignore
         // flags here (the widening product's N/Z would need the 64-bit value).
-        UMULL | SMULL => {
+        UMULL | SMULL | UMLAL | SMLAL => {
             let rdlo = regnum(&ops[0]).ok_or_else(err)?;
             let rdhi = regnum(&ops[1]).ok_or_else(err)?;
             let rn = operand_value(&ops[2], pc_const).ok_or_else(err)?;
             let rm = operand_value(&ops[3], pc_const).ok_or_else(err)?;
-            out.push(Stmt::MulLong { rdlo, rdhi, rn, rm, signed: inst.opcode == SMULL });
+            out.push(Stmt::MulLong {
+                rdlo,
+                rdhi,
+                rn,
+                rm,
+                signed: matches!(inst.opcode, SMULL | SMLAL),
+                accumulate: matches!(inst.opcode, UMLAL | SMLAL),
+            });
         }
         // clz rd, rm.
         CLZ => {
@@ -2245,6 +2546,56 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
             out.push(Stmt::Rbit { rd, rm });
+        }
+        // Signed halfword multiplies (DSP): rd = sext16(rn.half) * sext16(rm.half),
+        // plus ra for the accumulating form. The Q flag these can set is not modelled
+        // (nothing here reads it). smulw/smlaw: rd = (rn * sext16(rm.half)) >> 16.
+        SMUL(n_top, m_top) | SMLA(n_top, m_top) => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let half = |v: Value, top: bool| {
+                if top {
+                    bin(BinOp::Asr, v, Value::Imm(16))
+                } else {
+                    bin(BinOp::Asr, bin(BinOp::Shl, v, Value::Imm(16)), Value::Imm(16))
+                }
+            };
+            let prod = bin(BinOp::Mul, half(rn, n_top), half(rm, m_top));
+            let result = if matches!(inst.opcode, SMLA(..)) {
+                let ra = operand_value(&ops[3], pc_const).ok_or_else(err)?;
+                bin(BinOp::Add, prod, ra)
+            } else {
+                prod
+            };
+            out.push(Stmt::SetReg(rd, result));
+        }
+        SMULW(m_top) | SMLAW(m_top) => {
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rn = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let rm = operand_value(&ops[2], pc_const).ok_or_else(err)?;
+            let half = if m_top {
+                bin(BinOp::Asr, rm, Value::Imm(16))
+            } else {
+                bin(BinOp::Asr, bin(BinOp::Shl, rm, Value::Imm(16)), Value::Imm(16))
+            };
+            // Bits 47:16 of the 48-bit product, in 32-bit arithmetic: with rn split
+            // as hi*2^16 + lo (hi signed, lo unsigned 16-bit), (rn*h) >> 16 is
+            // hi*h + ((lo*h) >> 16), and lo*h fits an i32 (|h| < 2^15, lo < 2^16).
+            let hi = bin(BinOp::Asr, rn.clone(), Value::Imm(16));
+            let lo = bin(BinOp::And, rn, Value::Imm(0xFFFF));
+            let word = bin(
+                BinOp::Add,
+                bin(BinOp::Mul, hi, half.clone()),
+                bin(BinOp::Asr, bin(BinOp::Mul, lo, half), Value::Imm(16)),
+            );
+            let result = if matches!(inst.opcode, SMLAW(..)) {
+                let ra = operand_value(&ops[3], pc_const).ok_or_else(err)?;
+                bin(BinOp::Add, word, ra)
+            } else {
+                word
+            };
+            out.push(Stmt::SetReg(rd, result));
         }
         // mla rd, rn, rm, ra => rd = rn*rm + ra; mls => rd = ra - rn*rm.
         MLA | MLS => {
@@ -2274,6 +2625,17 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             let hi = bin(BinOp::And, bin(BinOp::Lsr, rm.clone(), Value::Imm(8)), Value::Imm(0x00FF_00FF));
             let lo = bin(BinOp::And, bin(BinOp::Shl, rm, Value::Imm(8)), Value::Imm(0xFF00_FF00));
             out.push(Stmt::SetReg(rd, bin(BinOp::Or, hi, lo)));
+        }
+        REVSH => {
+            // Byte-swap the low halfword, then sign-extend it (a big-endian int16 read:
+            // FreeType's TrueType table parsers).
+            let rd = regnum(&ops[0]).ok_or_else(err)?;
+            let rm = operand_value(&ops[1], pc_const).ok_or_else(err)?;
+            let hi = bin(BinOp::And, bin(BinOp::Lsr, rm.clone(), Value::Imm(8)), Value::Imm(0xFF));
+            let lo = bin(BinOp::And, bin(BinOp::Shl, rm, Value::Imm(8)), Value::Imm(0xFF00));
+            let swapped = bin(BinOp::Or, hi, lo);
+            let sext = bin(BinOp::Asr, bin(BinOp::Shl, swapped, Value::Imm(16)), Value::Imm(16));
+            out.push(Stmt::SetReg(rd, sext));
         }
         // Sign/zero extend a byte or halfword. An optional `ROR #rot` (rot in
         // {8,16,24}, carried by yaxpeax as a trailing Imm32 operand) rotates the
@@ -2890,6 +3252,26 @@ fn modified_imm_carry(value: u32, thumb: bool) -> Option<Value> {
     Some(Value::Imm(value >> 31))
 }
 
+/// The shifter carry-out of a shifted-register operand with an immediate amount
+/// (`rm, lsl #n` and friends); `None` when the amount is a register or the shift
+/// leaves C unchanged (`lsl #0`).
+fn reg_shift_carry(rs: &RegShift) -> Option<Value> {
+    let RegShiftStyle::RegImm(s) = rs.into_shift() else { return None };
+    let base = Value::Reg(s.shiftee().number());
+    let n = s.imm() as u32;
+    match s.stype() {
+        ShiftStyle::LSL => shift_carry(Opcode::LSL, &base, &Value::Imm(n)),
+        ShiftStyle::LSR => shift_carry(Opcode::LSR, &base, &Value::Imm(n)),
+        ShiftStyle::ASR => shift_carry(Opcode::ASR, &base, &Value::Imm(n)),
+        // `ror #0` is `rrx`: C takes the bit shifted out, bit 0. `ror #n` carries the
+        // result's top bit, which is bit `n-1` of the source.
+        ShiftStyle::ROR => {
+            let k = if n == 0 { 0 } else { n - 1 };
+            Some(bin(BinOp::And, bin(BinOp::Lsr, base, Value::Imm(k)), Value::Imm(1)))
+        }
+    }
+}
+
 /// The shifter carry-out for a flag-setting immediate shift.
 fn shift_carry(op: Opcode, rn: &Value, sh: &Value) -> Option<Value> {
     // Only the immediate-shift form has a statically simple carry; register
@@ -3225,8 +3607,84 @@ fn neon_structure_mem(
     addr: u32,
 ) -> Result<Vec<Stmt>, Error> {
     let unsupported = || Error::Unsupported { addr, opcode: Opcode::VLDN(n, SIMDDataType::Any(esize)) };
-    if n != 1 || stride != 1 {
-        // vld2/vld3/vld4 (and any strided list) need deinterleaving - deferred.
+    let eb = (esize / 8) as u32;
+    let at = |off: u32| {
+        if off == 0 { Value::Reg(base) } else { bin(BinOp::Add, Value::Reg(base), Value::Imm(off)) }
+    };
+    if n >= 2 {
+        // vld2/vld3/vld4 and vst2/vst3/vst4: `n` interleaved structures. Every form
+        // is a fixed set of single-element transfers at known offsets, so it lowers
+        // to `ElemMem` lane moves - exact, if not fast (these run in image decoders
+        // and format converters, not per draw).
+        let mut out = Vec::new();
+        match element {
+            SIMDElement::Whole => {
+                // Multiple structures: `count` registers, in `passes` groups of `n`.
+                // Register `k` of structure element `e` in pass `r` is
+                // `first + k*inc + r` (ARM ARM VLDn multiple: inc is 2 for the
+                // four-register vld2 and the `{d0,d2,...}` lists, else 1); lane `e`
+                // of it comes from memory element `(r*lanes + e)*n + k`.
+                if count % n != 0 || esize == 0 || 64 % esize as u32 != 0 {
+                    return Err(unsupported());
+                }
+                let passes = count / n;
+                let inc = if passes > 1 { passes } else { stride };
+                let lanes = 64 / esize;
+                for r in 0..passes {
+                    for e in 0..lanes {
+                        for k in 0..n {
+                            let d = first + k * inc + r;
+                            let off = ((r as u32 * lanes as u32 + e as u32) * n as u32 + k as u32) * eb;
+                            out.push(Stmt::Neon(NeonStmt::ElemMem {
+                                d,
+                                esize,
+                                lane: ElemLane::One(e),
+                                addr: at(off),
+                                load,
+                            }));
+                        }
+                    }
+                }
+                if let Some(rm) = post {
+                    out.push(Stmt::SetReg(base, bin(BinOp::Add, Value::Reg(base), Value::Reg(rm))));
+                } else if wback {
+                    out.push(Stmt::SetReg(
+                        base,
+                        bin(BinOp::Add, Value::Reg(base), Value::Imm(count as u32 * 8)),
+                    ));
+                }
+            }
+            SIMDElement::Lane(idx) => {
+                for k in 0..n {
+                    out.push(Stmt::Neon(NeonStmt::ElemMem {
+                        d: first + k * stride,
+                        esize,
+                        lane: ElemLane::One(idx),
+                        addr: at(k as u32 * eb),
+                        load,
+                    }));
+                }
+                out.extend(elem_writeback(base, (n as u32 * eb) as u8, wback, post));
+            }
+            SIMDElement::AllLanes => {
+                if !load {
+                    return Err(unsupported());
+                }
+                for k in 0..n {
+                    out.push(Stmt::Neon(NeonStmt::ElemMem {
+                        d: first + k * stride,
+                        esize,
+                        lane: ElemLane::All,
+                        addr: at(k as u32 * eb),
+                        load: true,
+                    }));
+                }
+                out.extend(elem_writeback(base, (n as u32 * eb) as u8, wback, post));
+            }
+        }
+        return Ok(out);
+    }
+    if stride != 1 {
         return Err(unsupported());
     }
     match element {
@@ -3853,3 +4311,4 @@ mod pc_source_operand_tests {
         assert_ne!(got, Some(77), "an unfolded pc read gives the immediate alone");
     }
 }
+

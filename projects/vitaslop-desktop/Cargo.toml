@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The shipped binary is `vitaslop`; the crate keeps its directory name.
+[[bin]]
+name = "vitaslop"
+path = "src/main.rs"
+
 [dependencies]
 # The native wasmtime-backed engine (Vm) plus the loader and the engine-agnostic
 # runtime (host calls, capture, World seam). Same stack the headless render tests
@@ -13,6 +18,8 @@ publish.workspace = true
 vitaslop-native = { path = "../vitaslop-native" }
 vitaslop-loader = { path = "../vitaslop-loader" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }
+# The settings schema, input maps and title record shared with the browser front end.
+vitaslop-frontend = { path = "../vitaslop-frontend" }
 # The shared cube pipeline (WGSL + per-draw encoding). The `gpu` feature pulls the
 # wgpu-backed CubeRenderer this window presents through, the same one the browser
 # canvas and the native headless oracle use.
@@ -26,5 +33,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # gamepads. wgpu/pollster are workspace deps shared with the native renderer.
 winit = "0.30"
 gilrs = "0.11"
+# The native shell: library, settings and the in-game menu, drawn with egui onto the
+# same wgpu surface the game presents to. Versions track wgpu 30 / winit 0.30.
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false }
+egui-winit = { version = "0.36", default-features = false }
+# Native file/folder pickers for the import.
+rfd = "0.15"
+# Decoding a title's icon0.png for the library grid.
+png = "0.17"
+serde_json = "1"
 wgpu.workspace = true
 pollster.workspace = true
+
+# Windows only: stamps `assets/icon.ico` into the executable as its icon (Explorer, the
+# taskbar, the title bar). Needs the SDK's rc.exe, which the msvc toolchain brings.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[build-dependencies]
+# build.rs embeds the built web bundle so `vitaslop-desktop serve` can host it.

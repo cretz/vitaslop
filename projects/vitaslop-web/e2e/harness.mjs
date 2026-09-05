@@ -19,6 +19,9 @@ const MIME = {
   ".wasm": "application/wasm",
   ".json": "application/json",
   ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".webmanifest": "application/manifest+json",
+  ".png": "image/png",
 };
 
 /// Fail early with a clear message if the wasm bundle has not been built.
@@ -30,7 +33,7 @@ export function requireBundle() {
 }
 
 /// Serve `root` on an ephemeral localhost port. Returns the http.Server.
-export function startServer(root) {
+export function startServer(root, port = 0) {
   const server = createServer(async (req, res) => {
     try {
       const urlPath = decodeURIComponent(req.url.split("?")[0]);
@@ -54,7 +57,7 @@ export function startServer(root) {
       res.writeHead(404).end("not found");
     }
   });
-  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+  return new Promise((resolve) => server.listen(port, "127.0.0.1", () => resolve(server)));
 }
 
 /// Launch Chrome with WebGPU enabled. Uses the installed Chrome channel by default -

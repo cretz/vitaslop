@@ -2633,6 +2633,18 @@ fn emit_func_body(
         return f;
     }
 
+    // Blocks are sorted by address and the dispatch index local starts at 0, so the
+    // body would begin at the LOWEST block. A compiler places a function's entry
+    // first, but newlib's hand-written routines (strcmp, memcpy) put a shared tail
+    // BEFORE the entry - a backward branch makes it a block of this function - and
+    // entering there returns garbage from a body that never ran. Start at the entry.
+    if let Some(idx) = func.blocks.iter().position(|b| b.addr == func.addr) {
+        if idx != 0 {
+            f.instruction(&W::I32Const(idx as i32));
+            f.instruction(&W::LocalSet(L_BB));
+        }
+    }
+
     // block $exit ; loop $loop ; block $B{n-1} ... block $B0 ; br_table ...
     f.instruction(&W::Block(BlockType::Empty)); // $exit
     f.instruction(&W::Loop(BlockType::Empty)); // $loop
@@ -2796,6 +2808,22 @@ fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32,
         }
         Term::Return => {
             f.instruction(&W::Return);
+        }
+        // Return when the condition holds; otherwise this is a fall-through (see above).
+        Term::ReturnIf { cond } => {
+            emit_cond(f, *cond);
+            f.instruction(&W::If(BlockType::Empty));
+            f.instruction(&W::Return);
+            f.instruction(&W::End);
+            if dispatch_all() {
+                if let Some(next) = func
+                    .block_index(from)
+                    .and_then(|i| func.blocks.get(i + 1))
+                    .map(|b| b.addr)
+                {
+                    goto(f, func, next, loop_depth, 0, from);
+                }
+            }
         }
         // A `Halt` is a block that ran off the end of decoded code - almost always the
         // boundary just before an instruction the decoder could not lift. Normally it
@@ -3192,7 +3220,7 @@ fn emit_stmt_inner(
             f.instruction(&W::I32Rotr);
             f.instruction(&W::GlobalSet(abi::reg_global(*rd as usize)));
         }
-        Stmt::MulLong { rdlo, rdhi, rn, rm, signed } => {
+        Stmt::MulLong { rdlo, rdhi, rn, rm, signed, accumulate } => {
             // Extend both operands to i64 (sign- or zero-extend), multiply, and
             // split the 64-bit product into its low and high 32-bit halves. The
             // full product is computed before either register is written, so an
@@ -3209,6 +3237,18 @@ fn emit_stmt_inner(
             emit_value(f, rm, base);
             extend(f);
             f.instruction(&W::I64Mul);
+            if *accumulate {
+                // + the 64-bit value already in rdhi:rdlo (`smlal`/`umlal`), read before
+                // either half is written.
+                f.instruction(&W::GlobalGet(abi::reg_global(*rdhi as usize)));
+                f.instruction(&W::I64ExtendI32U);
+                f.instruction(&W::I64Const(32));
+                f.instruction(&W::I64Shl);
+                f.instruction(&W::GlobalGet(abi::reg_global(*rdlo as usize)));
+                f.instruction(&W::I64ExtendI32U);
+                f.instruction(&W::I64Or);
+                f.instruction(&W::I64Add);
+            }
             f.instruction(&W::LocalTee(L_D64)); // full product, kept for the high half
             f.instruction(&W::I32WrapI64); // low 32 bits
             f.instruction(&W::GlobalSet(abi::reg_global(*rdlo as usize)));

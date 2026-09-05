@@ -108,7 +108,7 @@ async function main() {
       }
       const file = url.startsWith("/game/")
         ? join(gameDir, url.slice("/game/".length))
-        : join(webDir, url === "/" ? "/game.html" : url);
+        : join(webDir, url === "/" ? "/debug/game.html" : url);
       const body = await readFile(file);
       res.writeHead(200, { "content-type": MIME[extname(file)] || "application/octet-stream", ...coi });
       res.end(body);
@@ -428,7 +428,7 @@ async function main() {
 
   let ok = false;
   try {
-    await page.goto(url + (useWorker ? "game-worker.html" : ""), { waitUntil: "load", timeout: 30000 });
+    await page.goto(url + (useWorker ? "debug/game-worker.html" : ""), { waitUntil: "load", timeout: 30000 });
     console.log(`[game] mode: ${useWorker ? "web worker (no sync-compile flag)" : "main thread"}`);
     console.log(`[game] recipe: ${recipe ? `${recipe.split("\n").length} lines` : "(none - live input)"}`);
     // __boot resolves after the one-time decrypt/link/transpile + WebGPU setup, then

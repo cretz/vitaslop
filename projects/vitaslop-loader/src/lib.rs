@@ -265,6 +265,44 @@ impl Module {
                         arm_code_pointers.push(target);
                     }
                 }
+                // PC-relative words. Homebrew toolchains emit these (a retail title never
+                // did); `P` is the site's own post-shift address.
+                reloc::code::REL32 | reloc::code::TARGET2 => {
+                    let site = seg_base
+                        .get(r.data_seg as usize)
+                        .ok_or(Error::OutOfBounds("reloc data_seg"))?
+                        .wrapping_add(r.offset);
+                    let slot = data
+                        .data
+                        .get_mut(off..off + 4)
+                        .ok_or(Error::OutOfBounds("reloc rel32 site"))?;
+                    slot.copy_from_slice(&target.wrapping_sub(site).to_le_bytes());
+                }
+                reloc::code::PREL31 => {
+                    let site = seg_base
+                        .get(r.data_seg as usize)
+                        .ok_or(Error::OutOfBounds("reloc data_seg"))?
+                        .wrapping_add(r.offset);
+                    let slot = data
+                        .data
+                        .get_mut(off..off + 4)
+                        .ok_or(Error::OutOfBounds("reloc prel31 site"))?;
+                    let old = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+                    let v = (target.wrapping_sub(site) & 0x7FFF_FFFF) | (old & 0x8000_0000);
+                    slot.copy_from_slice(&v.to_le_bytes());
+                }
+                // PC-relative branches. Every segment moves by the same `delta`, so a
+                // branch from one place in the module to another keeps its encoded
+                // distance: nothing to patch. Homebrew toolchains emit these; a retail
+                // title never did.
+                reloc::code::THM_CALL
+                | reloc::code::CALL
+                | reloc::code::JUMP24
+                | reloc::code::THM_JUMP24
+                | reloc::code::THM_JUMP11
+                | reloc::code::THM_JUMP8 => {}
+                // `BX Rm` on a v4 target: nothing to patch on ARMv7.
+                reloc::code::V4BX => {}
                 reloc::code::THM_MOVW_ABS_NC => {
                     patch_thumb_mov(&mut data.data, off, (target & 0xFFFF) as u16)?;
                 }

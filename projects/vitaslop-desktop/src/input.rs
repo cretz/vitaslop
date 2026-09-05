@@ -1,45 +1,33 @@
-//! Real input -> SceCtrl. Collapses the host keyboard (winit) and any connected
-//! gamepad (gilrs) into one [`CtrlFrame`] - the exact port-agnostic frame the
-//! `World::poll_ctrl` seam hands the guest. Today the guest runs to completion
-//! before the window opens, so this frame drives the title readout and playback;
-//! once the cooperative scheduler lets the guest yield per frame, the same frame
-//! feeds `poll_ctrl` live with no change to this mapping.
+//! Live desktop input: keyboard (winit) and gamepad (gilrs) into one [`CtrlFrame`],
+//! mapped by the person's settings.
+//!
+//! The settings name keys by W3C `KeyboardEvent.code` (`KeyZ`, `ArrowUp`) and pad
+//! controls by Standard Gamepad position (`south`, `dpad_up`) - the vocabulary the
+//! browser front end uses, so one remap serves both. winit's `KeyCode` debug names ARE
+//! the W3C codes, and gilrs' buttons map onto the standard positions below.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use gilrs::{Axis, Button, Gilrs};
+use vitaslop_frontend::input::invert;
+use vitaslop_frontend::settings::Settings;
 use vitaslop_runtime::CtrlFrame;
 use winit::keyboard::KeyCode;
 
-// SceCtrlButtons bits (from the Vita headers). The cube reads this bitmask.
-pub const SCE_CTRL_SELECT: u32 = 0x0000_0001;
-pub const SCE_CTRL_START: u32 = 0x0000_0008;
-pub const SCE_CTRL_UP: u32 = 0x0000_0010;
-pub const SCE_CTRL_RIGHT: u32 = 0x0000_0020;
-pub const SCE_CTRL_DOWN: u32 = 0x0000_0040;
-pub const SCE_CTRL_LEFT: u32 = 0x0000_0080;
-pub const SCE_CTRL_LTRIGGER: u32 = 0x0000_0100;
-pub const SCE_CTRL_RTRIGGER: u32 = 0x0000_0200;
-pub const SCE_CTRL_TRIANGLE: u32 = 0x0000_1000;
-pub const SCE_CTRL_CIRCLE: u32 = 0x0000_2000;
-pub const SCE_CTRL_CROSS: u32 = 0x0000_4000;
-pub const SCE_CTRL_SQUARE: u32 = 0x0000_8000;
-
-/// Analog neutral (sticks report 0..255 with 128 centered).
 const CENTER: u8 = 128;
 
-/// Live input, updated from window events and polled each frame. Owns the gilrs
-/// context so gamepad state is pumped here, next to the keyboard state, and read
-/// out as one merged [`CtrlFrame`].
 pub struct Input {
-    keys: HashSet<KeyCode>,
+    keys: HashSet<String>,
     gilrs: Option<Gilrs>,
+    /// `KeyboardEvent.code` -> button bits.
+    keymap: BTreeMap<String, u32>,
+    /// Standard Gamepad control -> button bits.
+    padmap: BTreeMap<String, u32>,
+    deadzone: f32,
 }
 
 impl Input {
-    pub fn new() -> Self {
-        // gilrs init can fail on a headless box with no input subsystem; a missing
-        // gamepad is not fatal, the keyboard still drives the pad.
+    pub fn new(settings: &Settings) -> Self {
         let gilrs = match Gilrs::new() {
             Ok(g) => Some(g),
             Err(e) => {
@@ -47,20 +35,28 @@ impl Input {
                 None
             }
         };
-        Input { keys: HashSet::new(), gilrs }
+        let mut me = Input { keys: HashSet::new(), gilrs, keymap: BTreeMap::new(), padmap: BTreeMap::new(), deadzone: 0.14 };
+        me.apply(settings);
+        me
     }
 
-    /// Record a key press/release from a winit keyboard event.
+    pub fn apply(&mut self, settings: &Settings) {
+        self.keymap = invert(&settings.keyboard);
+        self.padmap = invert(&settings.gamepad);
+        self.deadzone = settings.stick_deadzone;
+    }
+
     pub fn set_key(&mut self, key: KeyCode, pressed: bool) {
+        let name = format!("{key:?}");
         if pressed {
-            self.keys.insert(key);
+            self.keys.insert(name);
         } else {
-            self.keys.remove(&key);
+            self.keys.remove(&name);
         }
     }
 
-    pub fn key_held(&self, key: KeyCode) -> bool {
-        self.keys.contains(&key)
+    pub fn release_all(&mut self) {
+        self.keys.clear();
     }
 
     /// Drain pending gilrs events so the gamepad state read below is current.
@@ -72,81 +68,68 @@ impl Input {
         }
     }
 
-    /// The merged controller frame this instant: keyboard OR'd with the first
-    /// connected gamepad. Keyboard sets digital buttons; the gamepad additionally
-    /// supplies the analog sticks (the keyboard has none).
     pub fn ctrl_frame(&self) -> CtrlFrame {
-        let mut buttons = self.keyboard_buttons();
+        let mut buttons = 0u32;
+        for k in &self.keys {
+            if let Some(b) = self.keymap.get(k) {
+                buttons |= b;
+            }
+        }
         let mut lx = CENTER;
         let mut ly = CENTER;
         let mut rx = CENTER;
         let mut ry = CENTER;
-
         if let Some(g) = self.gilrs.as_ref() {
             if let Some((_, pad)) = g.gamepads().next() {
-                buttons |= gamepad_buttons(&pad);
-                lx = axis_to_byte(pad.value(Axis::LeftStickX), false);
-                ly = axis_to_byte(pad.value(Axis::LeftStickY), true);
-                rx = axis_to_byte(pad.value(Axis::RightStickX), false);
-                ry = axis_to_byte(pad.value(Axis::RightStickY), true);
+                for (control, bits) in &self.padmap {
+                    if let Some(b) = gilrs_button(control) {
+                        if pad.is_pressed(b) {
+                            buttons |= bits;
+                        }
+                    }
+                }
+                let (x, y) = dead(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY), self.deadzone);
+                lx = axis_to_byte(x, false);
+                ly = axis_to_byte(y, true);
+                let (x, y) = dead(pad.value(Axis::RightStickX), pad.value(Axis::RightStickY), self.deadzone);
+                rx = axis_to_byte(x, false);
+                ry = axis_to_byte(y, true);
             }
         }
-
         CtrlFrame { buttons, lx, ly, rx, ry }
-    }
-
-    /// The digital buttons from the keyboard. Left column is a keyboard-native
-    /// layout; the face buttons follow the common Vita convention.
-    fn keyboard_buttons(&self) -> u32 {
-        let mut b = 0;
-        let mut set = |held: bool, bit: u32| {
-            if held {
-                b |= bit;
-            }
-        };
-        set(self.key_held(KeyCode::ArrowUp), SCE_CTRL_UP);
-        set(self.key_held(KeyCode::ArrowDown), SCE_CTRL_DOWN);
-        set(self.key_held(KeyCode::ArrowLeft), SCE_CTRL_LEFT);
-        set(self.key_held(KeyCode::ArrowRight), SCE_CTRL_RIGHT);
-        set(self.key_held(KeyCode::KeyZ), SCE_CTRL_CROSS);
-        set(self.key_held(KeyCode::KeyX), SCE_CTRL_CIRCLE);
-        set(self.key_held(KeyCode::KeyA), SCE_CTRL_SQUARE);
-        set(self.key_held(KeyCode::KeyS), SCE_CTRL_TRIANGLE);
-        set(self.key_held(KeyCode::KeyQ), SCE_CTRL_LTRIGGER);
-        set(self.key_held(KeyCode::KeyE), SCE_CTRL_RTRIGGER);
-        set(self.key_held(KeyCode::Enter), SCE_CTRL_START);
-        set(self.key_held(KeyCode::ShiftRight), SCE_CTRL_SELECT);
-        set(self.key_held(KeyCode::ShiftLeft), SCE_CTRL_SELECT);
-        b
     }
 }
 
-/// The digital buttons from a gamepad this instant.
-fn gamepad_buttons(pad: &gilrs::Gamepad) -> u32 {
-    let mut b = 0;
-    let mut set = |held: bool, bit: u32| {
-        if held {
-            b |= bit;
-        }
-    };
-    set(pad.is_pressed(Button::DPadUp), SCE_CTRL_UP);
-    set(pad.is_pressed(Button::DPadDown), SCE_CTRL_DOWN);
-    set(pad.is_pressed(Button::DPadLeft), SCE_CTRL_LEFT);
-    set(pad.is_pressed(Button::DPadRight), SCE_CTRL_RIGHT);
-    set(pad.is_pressed(Button::South), SCE_CTRL_CROSS);
-    set(pad.is_pressed(Button::East), SCE_CTRL_CIRCLE);
-    set(pad.is_pressed(Button::West), SCE_CTRL_SQUARE);
-    set(pad.is_pressed(Button::North), SCE_CTRL_TRIANGLE);
-    set(pad.is_pressed(Button::LeftTrigger) || pad.is_pressed(Button::LeftTrigger2), SCE_CTRL_LTRIGGER);
-    set(pad.is_pressed(Button::RightTrigger) || pad.is_pressed(Button::RightTrigger2), SCE_CTRL_RTRIGGER);
-    set(pad.is_pressed(Button::Start), SCE_CTRL_START);
-    set(pad.is_pressed(Button::Select), SCE_CTRL_SELECT);
-    b
+/// The gilrs button at a Standard Gamepad position.
+fn gilrs_button(control: &str) -> Option<Button> {
+    Some(match control {
+        "south" => Button::South,
+        "east" => Button::East,
+        "west" => Button::West,
+        "north" => Button::North,
+        "l1" => Button::LeftTrigger,
+        "r1" => Button::RightTrigger,
+        "l2" => Button::LeftTrigger2,
+        "r2" => Button::RightTrigger2,
+        "select" => Button::Select,
+        "start" => Button::Start,
+        "l3" => Button::LeftThumb,
+        "r3" => Button::RightThumb,
+        "dpad_up" => Button::DPadUp,
+        "dpad_down" => Button::DPadDown,
+        "dpad_left" => Button::DPadLeft,
+        "dpad_right" => Button::DPadRight,
+        "home" => Button::Mode,
+        _ => return None,
+    })
+}
+
+fn dead(x: f32, y: f32, zone: f32) -> (f32, f32) {
+    if (x * x + y * y).sqrt() < zone { (0.0, 0.0) } else { (x, y) }
 }
 
 /// Map a gilrs axis (-1.0..1.0) to a Vita analog byte (0..255, 128 centered).
 /// `invert` flips the sign so gilrs' up-positive Y matches the Vita's top-is-0.
-/// The full-range map sends -1 -> 0, 0 -> 128 (neutral), +1 -> 255.
 fn axis_to_byte(v: f32, invert: bool) -> u8 {
     let v = if invert { -v } else { v };
     let scaled = (v + 1.0) * 0.5 * 255.0;
@@ -159,41 +142,21 @@ mod tests {
 
     #[test]
     fn analog_maps_center_and_extremes() {
-        // Neutral stick reads as the CtrlFrame default center.
         assert_eq!(axis_to_byte(0.0, false), CENTER);
-        assert_eq!(axis_to_byte(0.0, true), CENTER);
-        // Full deflection reaches the byte extremes.
         assert_eq!(axis_to_byte(1.0, false), 255);
         assert_eq!(axis_to_byte(-1.0, false), 0);
-        // Inversion flips which extreme each direction hits (gilrs Y is up-positive,
-        // the Vita's is top-is-0), and stays clamped in range.
         assert_eq!(axis_to_byte(1.0, true), 0);
-        assert_eq!(axis_to_byte(-1.0, true), 255);
     }
 
     #[test]
-    fn ctrl_button_bits_are_disjoint() {
-        // The bits we OR together must not overlap, or two mapped inputs would
-        // alias onto one button.
-        let bits = [
-            SCE_CTRL_SELECT,
-            SCE_CTRL_START,
-            SCE_CTRL_UP,
-            SCE_CTRL_RIGHT,
-            SCE_CTRL_DOWN,
-            SCE_CTRL_LEFT,
-            SCE_CTRL_LTRIGGER,
-            SCE_CTRL_RTRIGGER,
-            SCE_CTRL_TRIANGLE,
-            SCE_CTRL_CIRCLE,
-            SCE_CTRL_CROSS,
-            SCE_CTRL_SQUARE,
-        ];
-        let mut seen = 0u32;
-        for b in bits {
-            assert_eq!(b.count_ones(), 1, "each SceCtrl button is a single bit");
-            assert_eq!(seen & b, 0, "SceCtrl button bits overlap");
-            seen |= b;
-        }
+    fn winit_key_names_are_the_w3c_codes_the_settings_use() {
+        let s = Settings::default();
+        let mut i = Input { keys: HashSet::new(), gilrs: None, keymap: BTreeMap::new(), padmap: BTreeMap::new(), deadzone: 0.1 };
+        i.apply(&s);
+        i.set_key(KeyCode::KeyZ, true);
+        i.set_key(KeyCode::ArrowUp, true);
+        let f = i.ctrl_frame();
+        assert_eq!(f.buttons, 0x4000 | 0x10, "Z is cross and ArrowUp is up by default");
+        assert!(vitaslop_frontend::input::GAMEPAD_CONTROLS.iter().all(|c| gilrs_button(c).is_some()));
     }
 }

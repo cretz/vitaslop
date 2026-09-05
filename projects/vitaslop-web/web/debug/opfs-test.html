@@ -13,7 +13,7 @@
       // in one. Driving it from the page would test a different API than the product uses.
       window.__opfsTest = () =>
         new Promise((resolve, reject) => {
-          const w = new Worker("./opfs-test-worker.js", { type: "module" });
+          const w = new Worker("../opfs-test-worker.js", { type: "module" });
           w.onmessage = (e) => {
             document.getElementById("out").textContent = JSON.stringify(e.data, null, 2);
             w.terminate();

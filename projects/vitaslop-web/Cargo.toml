@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # `cargo build --target wasm32-unknown-unknown -p vitaslop-web` pulls the stack.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 vitaslop-runtime = { path = "../vitaslop-runtime" }
+vitaslop-frontend = { path = "../vitaslop-frontend" }
 vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video", "aac"] }
 # Direct, for `run_h264_conformance` only: the decoder crate's own suite has to run in a
 # BROWSER, which is the one place `cargo test` cannot reach and the one place its WebCodecs

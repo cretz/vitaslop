@@ -190,39 +190,63 @@ impl GameData {
     }
 }
 
-impl PfsCrypto for GameData {
-    fn decrypt_file(&self, ctx: &FileCtx, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+/// The two per-file secrets a page decrypt needs, derived once per file rather than
+/// once per page.
+pub struct PageKeys {
+    secret: [u8; 20],
+    tweak: [u8; 16],
+}
+
+impl GameData {
+    /// Derive the per-file integrity secret and IV tweak for `ctx`.
+    pub fn page_keys(&self, ctx: &FileCtx) -> PageKeys {
         let secret = integrity_secret(&self.drv_key, ctx.files_salt, ctx.icv_salt);
-        // The sector-IV tweak mask is HMAC-keyed on the per-file dbseed in the
-        // newer read-only format (unicv icv_version > 1); the older v1 format
-        // (launch-window titles) has no dbseed and keys it on the salt(s) instead.
         let tweak = if ctx.has_dbseed {
             tweak_key(ctx.iv_seed)
         } else {
             tweak_mask(&secret_salt(ctx.files_salt, ctx.icv_salt))
         };
-        let page_size = ctx.page_size.max(1) as usize;
-        let mut out = Vec::with_capacity(ciphertext.len());
+        PageKeys { secret, tweak }
+    }
 
-        for (idx, chunk) in ciphertext.chunks(page_size).enumerate() {
-            if self.verify {
-                if let Some(expect) = ctx.signatures.get(idx) {
-                    let subkey = hmac_sha1(&secret, &(idx as u32).to_le_bytes());
-                    let got = hmac_sha1(&subkey, chunk);
-                    if &got != expect {
-                        return Err(Error::IntegrityCheck("pfs sector hmac mismatch"));
-                    }
+    /// Verify and decrypt ONE page (`idx` counted from the file's start; `chunk` is that
+    /// page's ciphertext, short only for the last page). The streaming ingest calls this
+    /// per page so a gigabyte file never has to be resident.
+    pub fn decrypt_page(
+        &self,
+        ctx: &FileCtx,
+        keys: &PageKeys,
+        idx: usize,
+        chunk: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.verify {
+            if let Some(expect) = ctx.signatures.get(idx) {
+                let subkey = hmac_sha1(&keys.secret, &(idx as u32).to_le_bytes());
+                let got = hmac_sha1(&subkey, chunk);
+                if &got != expect {
+                    return Err(Error::IntegrityCheck("pfs sector hmac mismatch"));
                 }
             }
-            let offset = (page_size as u64).wrapping_mul(idx as u64);
-            let mut iv = [0u8; 16];
-            iv[..8].copy_from_slice(&offset.to_le_bytes());
-            for j in 0..16 {
-                iv[j] ^= tweak[j];
-            }
-            out.extend_from_slice(&cbc_cts_decrypt(&self.drv_key, &iv, chunk));
         }
+        let page_size = ctx.page_size.max(1) as usize;
+        let offset = (page_size as u64).wrapping_mul(idx as u64);
+        let mut iv = [0u8; 16];
+        iv[..8].copy_from_slice(&offset.to_le_bytes());
+        for j in 0..16 {
+            iv[j] ^= keys.tweak[j];
+        }
+        Ok(cbc_cts_decrypt(&self.drv_key, &iv, chunk))
+    }
+}
 
+impl PfsCrypto for GameData {
+    fn decrypt_file(&self, ctx: &FileCtx, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+        let keys = self.page_keys(ctx);
+        let page_size = ctx.page_size.max(1) as usize;
+        let mut out = Vec::with_capacity(ciphertext.len());
+        for (idx, chunk) in ciphertext.chunks(page_size).enumerate() {
+            out.extend_from_slice(&self.decrypt_page(ctx, &keys, idx, chunk)?);
+        }
         out.truncate(ctx.plaintext_size);
         Ok(out)
     }

@@ -29,7 +29,7 @@ use super::vfs::{MemVfs, Vfs};
 use super::{detect, Container, Error};
 
 /// Where a NoNpDrm license (the fake RIF) lives, relative to the app root.
-const WORK_BIN_PATH: &str = "sce_sys/package/work.bin";
+pub(crate) const WORK_BIN_PATH: &str = "sce_sys/package/work.bin";
 
 /// The SCE container magic (`"SCE\0"`) that marks a SELF executable, as the first
 /// four bytes. Used to tell an executable module apart from a plain asset.
@@ -120,7 +120,7 @@ pub fn decrypt_container(vfs: &mut dyn Vfs) -> Result<Game, Error> {
 /// The manifest filename marking a decrypted-dump tree.
 pub const DUMP_MANIFEST: &str = "vitaslop-dump.txt";
 /// First line of the manifest; bumps if the layout ever changes.
-const DUMP_MAGIC: &str = "vitaslop-decrypted-dump v1";
+pub const DUMP_MAGIC: &str = "vitaslop-decrypted-dump v1";
 
 /// Serialize `game` as the relative `(path, bytes)` entries of a decrypted-dump
 /// tree: the manifest (content id + module load order), every plaintext file under

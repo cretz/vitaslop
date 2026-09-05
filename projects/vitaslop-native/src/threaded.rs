@@ -1602,6 +1602,8 @@ fn qdiff_log_regtrace<H: ImportDispatch + Send + 'static>(
     }
     use std::io::Write;
     if let Some(w) = guard.as_mut() {
+        // Unbuffered on purpose: the lines that matter are the last ones before a
+        // trap, and a trap does not run destructors.
         let _ = w.write_all(line.as_bytes());
     }
 }

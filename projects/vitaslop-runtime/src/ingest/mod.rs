@@ -33,6 +33,7 @@ pub mod pkg;
 pub mod rif;
 pub mod self2elf;
 pub mod sfo;
+pub mod stream;
 pub mod unicv;
 pub mod vfs;
 pub mod zip;
@@ -172,6 +173,9 @@ pub enum Error {
     /// A key the derivation needs is not available (see the module docs on the
     /// clean-room key-derivation seam).
     MissingKey(&'static str),
+    /// The source could not be read or the sink could not be written (streaming
+    /// ingest); carries the platform's own message.
+    Io(String),
 }
 
 impl core::fmt::Display for Error {
@@ -183,6 +187,7 @@ impl core::fmt::Display for Error {
             Error::MissingFile(p) => write!(f, "file not in container: {p}"),
             Error::IntegrityCheck(w) => write!(f, "integrity check failed: {w}"),
             Error::MissingKey(w) => write!(f, "missing key: {w}"),
+            Error::Io(w) => write!(f, "i/o: {w}"),
         }
     }
 }

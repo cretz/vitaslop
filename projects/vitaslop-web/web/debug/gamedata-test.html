@@ -15,8 +15,8 @@
       // OPFS in a native test process. The Rust half (what may be inside a container, and
       // what a restore does with it) is covered by `cargo test -p vitaslop-runtime`; this
       // is the half that lives on the other side of the wasm boundary.
-      import * as gamedata from "./gamedata.js";
-      import { importTitle, isImported } from "./opfs.js";
+      import * as gamedata from "../gamedata.js";
+      import { importTitle, isImported } from "../opfs.js";
 
       const ID = "TESTGAME01";
       const bytes = (n, seed) => Uint8Array.from({ length: n }, (_, i) => (i * 7 + seed) & 0xff);

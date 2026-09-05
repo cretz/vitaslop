@@ -19,11 +19,57 @@
 // byte-for-byte the file the run wrote, rather than something reassembled at download time
 // which could differ from what is actually stored.
 
+/// Which profile this module reads and writes. "default" is the unnamed one and keeps
+/// the original `gamedata/<id>` path, so a save made before profiles existed is still
+/// found; any other name lives under `gamedata-profiles/<name>/<id>`. The page sets it
+/// from the settings, and the run worker sets it from its start message - the two
+/// sides must agree, and this is the one place the path is spelled.
+let profile = "default";
+export function setProfile(name) {
+  profile = name && name !== "default" ? name : "default";
+}
+export const currentProfile = () => profile;
+
 /// The directory holding one title's saved state. Deliberately NOT under `games/`.
 export async function gameDataDir(id, { create = true } = {}) {
   const root = await navigator.storage.getDirectory();
-  const all = await root.getDirectoryHandle("gamedata", { create });
-  return all.getDirectoryHandle(id, { create });
+  if (profile === "default") {
+    const all = await root.getDirectoryHandle("gamedata", { create });
+    return all.getDirectoryHandle(id, { create });
+  }
+  const all = await root.getDirectoryHandle("gamedata-profiles", { create });
+  const p = await all.getDirectoryHandle(profile, { create });
+  return p.getDirectoryHandle(id, { create });
+}
+
+/// Every profile that has a directory, plus "default".
+export async function listProfiles() {
+  const out = ["default"];
+  try {
+    const root = await navigator.storage.getDirectory();
+    const all = await root.getDirectoryHandle("gamedata-profiles", { create: false });
+    for await (const [name, h] of all.entries()) if (h.kind === "directory") out.push(name);
+  } catch {}
+  return out;
+}
+
+/// Every title id with a save in the CURRENT profile.
+export async function listSaved() {
+  const out = [];
+  try {
+    const root = await navigator.storage.getDirectory();
+    let all;
+    if (profile === "default") all = await root.getDirectoryHandle("gamedata", { create: false });
+    else all = await (await root.getDirectoryHandle("gamedata-profiles", { create: false })).getDirectoryHandle(profile, { create: false });
+    for await (const [name, h] of all.entries()) {
+      if (h.kind !== "directory") continue;
+      try {
+        await h.getFileHandle(BLOB);
+        out.push(name);
+      } catch {}
+    }
+  } catch {}
+  return out;
 }
 
 const BLOB = "gamedata.zip";

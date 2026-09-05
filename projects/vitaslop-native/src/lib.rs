@@ -452,9 +452,11 @@ impl Vm {
                 } else if e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
                     CallOutcome::OutOfFuel
                 } else {
+                    // `{:#}` prints the whole cause chain: a dispatcher miss's
+                    // `(target, caller)` lives below the backtrace, not in the top line.
                     let detail = match e.downcast_ref::<wasmtime::Trap>() {
-                        Some(t) => format!("{t:?}: {e}"),
-                        None => e.to_string(),
+                        Some(t) => format!("{t:?}: {e:#}"),
+                        None => format!("{e:#}"),
                     };
                     CallOutcome::Trap(detail)
                 }
@@ -546,9 +548,11 @@ impl Vm {
                 if self.store.data().halted {
                     Ok(())
                 } else {
+                    // `{:#}` prints the whole cause chain: a dispatcher miss's
+                    // `(target, caller)` lives below the backtrace, not in the top line.
                     let detail = match e.downcast_ref::<wasmtime::Trap>() {
-                        Some(t) => format!("{t:?}: {e}"),
-                        None => e.to_string(),
+                        Some(t) => format!("{t:?}: {e:#}"),
+                        None => format!("{e:#}"),
                     };
                     Err(RunError::Wasm(detail))
                 }

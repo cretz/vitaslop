@@ -17,7 +17,7 @@ async function main() {
 
   const server = await startServer(webDir);
   const { port } = server.address();
-  const url = `http://127.0.0.1:${port}/h264-conformance.html`;
+  const url = `http://127.0.0.1:${port}/debug/h264-conformance.html`;
   console.log(`[h264] ${url}`);
 
   const browser = await launchChrome();

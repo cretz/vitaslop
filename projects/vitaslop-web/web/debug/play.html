@@ -28,7 +28,7 @@
       <kbd>Q</kbd>/<kbd>E</kbd> L/R, <kbd>Enter</kbd> start.
     </div>
     <script type="module">
-      import { forwardInput } from "./worker-input.js";
+      import { forwardInput } from "../worker-input.js";
       const canvas = document.getElementById("screen");
       const status = document.getElementById("status");
 
@@ -61,7 +61,7 @@
           }
           status.textContent = `loaded ${manifest.length} files (${(bytes/1e6)|0} MB); starting (one-time decrypt + transpile takes a few seconds)...`;
 
-          const worker = new Worker("./worker.js", { type: "module" });
+          const worker = new Worker("../worker.js", { type: "module" });
           worker.onmessage = (e) => {
             const d = e.data;
             if (d.type === "report") {

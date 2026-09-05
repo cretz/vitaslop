@@ -14009,6 +14009,16 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 else {
                     continue;
                 };
+                // `VITASLOP_GXP_WGSL_DIR`: the same dump the miss path writes, because a pair
+                // named at `sceGxmShaderPatcherCreateFragmentProgram` never reaches that path.
+                if let Ok(dir) = std::env::var("VITASLOP_GXP_WGSL_DIR") {
+                    let dir = std::path::Path::new(&dir);
+                    if let Err(e) = std::fs::create_dir_all(dir)
+                        .and_then(|()| std::fs::write(dir.join(format!("{mkey:016x}.wgsl")), &wgsl))
+                    {
+                        report_warn!("gxp: cannot write WGSL for pair {mkey:016x}: {e}");
+                    }
+                }
                 self.gxp.modules.insert(
                     mkey,
                     device.create_shader_module(wgpu::ShaderModuleDescriptor {

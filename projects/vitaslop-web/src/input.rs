@@ -51,25 +51,32 @@ pub struct InputState {
 /// A shared, thread-safe handle to the live input state.
 pub type SharedInput = Arc<Mutex<InputState>>;
 
-/// The `SceCtrlButtons` bit for a `KeyboardEvent.code`, or `None` if unmapped. A
-/// small, ergonomic default map: arrows/WASD for the dpad, J/K/L/I (and Z/X) for the
-/// face buttons, Q/E for the shoulder buttons, Enter for start, Right-Shift for select.
+/// The live keyboard map: `KeyboardEvent.code` -> `SceCtrlButtons` bits. Starts as the
+/// shared default (`vitaslop_frontend::input::default_keyboard`) and is replaced by
+/// [`worker_set_keymap`] with the person's own map from their settings - the page is
+/// the source, this is only the lookup.
+static KEYMAP: Mutex<Option<std::collections::BTreeMap<String, u32>>> = Mutex::new(None);
+
+/// The `SceCtrlButtons` bit for a `KeyboardEvent.code`, or `None` if unmapped.
 pub fn key_button(code: &str) -> Option<u32> {
-    Some(match code {
-        "ArrowUp" | "KeyW" => 0x0000_0010,    // up
-        "ArrowRight" | "KeyD" => 0x0000_0020, // right
-        "ArrowDown" | "KeyS" => 0x0000_0040,  // down
-        "ArrowLeft" | "KeyA" => 0x0000_0080,  // left
-        "KeyQ" => 0x0000_0100,                // L
-        "KeyE" => 0x0000_0200,                // R
-        "Enter" => 0x0000_0008,               // start
-        "ShiftRight" => 0x0000_0001,          // select
-        "KeyI" => 0x0000_8000,                // square
-        "KeyL" => 0x0000_1000,                // triangle
-        "KeyK" | "KeyX" => 0x0000_2000,       // circle
-        "KeyJ" | "KeyZ" => 0x0000_4000,       // cross
-        _ => return None,
-    })
+    let mut g = KEYMAP.lock().unwrap();
+    let map = g.get_or_insert_with(|| {
+        vitaslop_frontend::input::invert(&vitaslop_frontend::input::default_keyboard())
+    });
+    match map.get(code) {
+        Some(&bits) if bits != 0 => Some(bits),
+        _ => None,
+    }
+}
+
+/// Install the person's keyboard map (`{"cross": "KeyZ", ...}` as JSON) for every
+/// later key event. An unparsable map keeps the previous one and reports it.
+#[wasm_bindgen]
+pub fn worker_set_keymap(json: &str) -> Result<(), JsValue> {
+    let map: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(json).map_err(|e| JsValue::from_str(&format!("keymap: {e}")))?;
+    *KEYMAP.lock().unwrap() = Some(vitaslop_frontend::input::invert(&map));
+    Ok(())
 }
 
 /// Microseconds per virtual 60Hz frame (matches the runtime's `RecipeWorld`), so a

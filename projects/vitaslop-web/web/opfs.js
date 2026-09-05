@@ -42,6 +42,27 @@ export function decodeName(name) {
 /// count too means a partial directory that somehow kept its marker is still caught.
 const MANIFEST = "vitaslop-opfs-manifest.json";
 
+/// Whether `id` has a complete import, whatever its size. The marker is written last.
+export async function isComplete(id) {
+  try {
+    const dir = await titleDir(id, { create: false });
+    const fh = await dir.getFileHandle(MANIFEST);
+    const m = JSON.parse(await (await fh.getFile()).text());
+    return m.complete === true;
+  } catch {
+    return false;
+  }
+}
+
+/// Remove every stored byte of `id`. The saves are elsewhere and untouched.
+export async function removeTitle(id) {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const games = await root.getDirectoryHandle("games", { create: false });
+    await games.removeEntry(id, { recursive: true });
+  } catch {}
+}
+
 /// Whether `id` is already imported and complete. Cheap: one read of the marker.
 export async function isImported(id, expectedCount) {
   try {

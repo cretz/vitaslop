@@ -87,7 +87,7 @@ fn read_local_entry(
 }
 
 /// Scan backward from EOF for the EOCD signature.
-fn find_eocd(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn find_eocd(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < EOCD_MIN {
         return None;
     }

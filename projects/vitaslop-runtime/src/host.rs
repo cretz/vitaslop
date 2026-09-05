@@ -2074,6 +2074,13 @@ impl FileTable {
         self.byte_len(&of.path).map(|n| n as u64)
     }
 
+    /// `chstat` on an open descriptor: the same change, addressed by fd.
+    fn chstat_fd(&mut self, fd: i32, over: FileStatOverride) -> i32 {
+        let Some(of) = self.open.get(&fd) else { return SCE_ERROR_ERRNO_EBADF };
+        let path = of.path.clone();
+        self.chstat(&path, over)
+    }
+
     /// Everything on a persisted mount, for [`crate::gamedata`].
     ///
     /// RESIDENT files only, and that is the whole point rather than a shortcut: a backed
@@ -6411,12 +6418,23 @@ pub struct VitaState {
     /// Whether `sceMotionMagnetometerOn` has been called and not turned off again. The
     /// guest's own state, read back by `sceMotionGetMagnetometerState`.
     pub motion_magnetometer: bool,
+    /// ScePower's four clocks in MHz (ARM, bus, GPU, GPU crossbar), as the guest last
+    /// set them; the device's defaults until it does. Held so a getter answers with
+    /// what the setter was given.
+    pub power_clocks: [u32; 4],
     /// `sceMotionSetDeadband` / `sceMotionSetTiltCorrection`: the two tuning bits, held
     /// for the same reason the magnetometer bit is - each has a getter, and a title told
     /// its setting did not take has been told two different things. Both change nothing
     /// about what `sceMotionGetState` reports, since the modelled device is at rest.
     /// The device powers up with both enabled.
     pub motion_deadband: bool,
+    /// `sceMotionSetAngleThreshold`'s float, as bits; held for its getter.
+    pub motion_angle_threshold: u32,
+    /// Message pipes by uid: a byte FIFO each.
+    pub msg_pipes: std::collections::BTreeMap<i32, std::collections::VecDeque<u8>>,
+    /// The shell's shared framebuffer, once a system-mode homebrew opens it:
+    /// `(uid, base of two 960x544 RGBA8 buffers)`.
+    pub shared_fb: Option<(i32, u32, u8)>,
     pub motion_tilt_correction: bool,
     /// The `sce::Xml` DOM: the node arena every parsed document lives in, plus the
     /// interned guest copies of the strings handed back. See `vita::sce_xml`.
@@ -6670,7 +6688,11 @@ impl VitaState {
             net_resolvers: Vec::new(),
             http_objects: Vec::new(),
             motion_magnetometer: false,
+            power_clocks: [333, 166, 111, 166],
             motion_deadband: true,
+            motion_angle_threshold: 0,
+            msg_pipes: std::collections::BTreeMap::new(),
+            shared_fb: None,
             motion_tilt_correction: true,
             xml: Default::default(),
             net_epolls: Vec::new(),
@@ -6796,9 +6818,18 @@ impl VitaState {
     /// allocating a fresh zero-initialized 4-byte pointer slot on first use. Guest
     /// memory starts zeroed, so a never-written slot reads back as NULL.
     pub fn tls_addr(&mut self, key: u32) -> u32 {
+        let current = self.current;
+        self.tls_addr_of(current, key)
+    }
+
+    /// The TLS slot of ANOTHER thread (`sceKernelGetThreadTLSAddr`); `thid` 0 is the
+    /// caller. Same table as [`tls_addr`](Self::tls_addr), so a slot a thread reads
+    /// through either call is the one slot.
+    pub fn tls_addr_of(&mut self, thid: i32, key: u32) -> u32 {
+        let thid = if thid == 0 { self.current } else { thid };
         // A fiber shares its runner's thread-local storage: on hardware it runs ON that
         // thread, so a slot it reads must be the same slot the runner writes.
-        let thread = self.logical_thread(self.current);
+        let thread = self.logical_thread(thid);
         if let Some(&(_, addr)) = self.tls_slots.iter().find(|&&(k, _)| k == (thread, key)) {
             return addr;
         }
@@ -7299,6 +7330,10 @@ impl VitaState {
     /// int sceIoChstat: apply the selected status fields to a path.
     pub fn io_chstat(&mut self, path: &str, over: FileStatOverride) -> i32 {
         self.fs.chstat(path, over)
+    }
+
+    pub fn io_chstat_fd(&mut self, fd: i32, over: FileStatOverride) -> i32 {
+        self.fs.chstat_fd(fd, over)
     }
 
     /// The chstat overrides recorded for a path, if any.

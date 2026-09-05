@@ -311,9 +311,24 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     //
     // The precision comes from the interpolant that lands there: a HALF descriptor packs four
     // components into two registers, which is the shape `ColorPrecision::F16` unpacks.
+    //
+    // When that interpolant carries NO data of its own (`register_count == 0`) and a sample prefetch
+    // lands at register 0, the colour IS the prefetched texel - vita2d's plain texture
+    // program, every sprite of every homebrew: a body of one PHAS word and nothing else.
+    // Its precision is the prefetch's: two registers hold four packed F16 channels, four
+    // hold F32 (`Interpolant::prefetch_regs`). The descriptor's `half` flag describes the
+    // (empty) data part and says F32 here, which read the packed halves as raw floats and
+    // painted every sprite black.
     if is_passthrough(&frc.shader, &pa_read_before_write(&frc.shader).0) {
         fplan.color = ColorOutput::NonNativePa(0);
         fplan.color_precision = match fprog.interpolants.iter().find(|it| it.pa_base == 0) {
+            Some(it) if it.register_count == 0 && it.prefetch.is_some() && it.prefetch_base() == Some(0) => {
+                if it.prefetch_regs >= 4 {
+                    crate::module::ColorPrecision::F32
+                } else {
+                    crate::module::ColorPrecision::F16
+                }
+            }
             Some(it) if it.half => crate::module::ColorPrecision::F16,
             _ => crate::module::ColorPrecision::F32,
         };

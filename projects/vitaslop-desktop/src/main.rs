@@ -11,8 +11,12 @@
 
 mod gfx;
 mod input;
+mod library;
 mod live;
 mod retail;
+mod serve;
+mod session;
+mod shell;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,9 +55,60 @@ fn main() {
     // -> preemptive scheduler -> general GXM renderer) in a live window. With no
     // argument, run the built-in clean-room cube demo below.
     let args: Vec<String> = std::env::args().collect();
+    // Subcommands. With no arguments the native shell opens (library, settings, play);
+    // `--game <dir>` is the direct window the rigs drive; `--cube` the built-in demo.
+    match args.get(1).map(String::as_str) {
+        None => {
+            if let Err(e) = shell::run() {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("serve") => {
+            let port = args.iter().position(|a| a == "--port").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()).unwrap_or(8080u16);
+            let host = args.iter().position(|a| a == "--host").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "0.0.0.0".into());
+            if let Err(e) = serve::run(&host, port) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("import") => {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: vitaslop import <pkg|zip|folder>");
+                std::process::exit(2);
+            };
+            let progress = std::sync::Arc::new(std::sync::Mutex::new(library::ImportProgress::default()));
+            match library::import(std::path::Path::new(path), &progress) {
+                Ok(m) => println!("imported {} ({}) into {}", m.title, m.title_id, library::title_dir(&m.title_id).display()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("list") => {
+            for t in library::list_titles() {
+                println!("{}  {}  v{}  {} MB", t.title_id, t.title, t.app_version, t.bytes / 1_000_000);
+            }
+            return;
+        }
+        Some("--help") | Some("-h") => {
+            println!("vitaslop                         open the shell (library, settings, play)");
+            println!("vitaslop import <pkg|zip|folder> add a title to the library ({})", library::library_dir().display());
+            println!("vitaslop list                    list the library");
+            println!("vitaslop serve [--port N]        host the web front end from this binary");
+            println!("vitaslop --game <dir> [--recipe <file>] [--headless <shot-dir>] [--save-dir <dir>]");
+            println!("vitaslop --cube                  the built-in demo");
+            return;
+        }
+        _ => {}
+    }
     if let Some(i) = args.iter().position(|a| a == "--game" || a == "-g") {
         let Some(dir) = args.get(i + 1).cloned() else {
-            eprintln!("usage: vitaslop-desktop --game <extracted-app-dir> [--headless <shot-dir>] [--save-dir <dir>]");
+            eprintln!("usage: vitaslop --game <extracted-app-dir> [--headless <shot-dir>] [--save-dir <dir>]");
             std::process::exit(2);
         };
         // `--recipe <file>` replays a scripted TAS recipe. In the live window it drives input
@@ -107,6 +162,10 @@ fn main() {
         return;
     }
 
+    if args.get(1).map(String::as_str) != Some("--cube") {
+        eprintln!("unknown arguments; try --help");
+        std::process::exit(2);
+    }
     // Load, transpile, and instantiate the cube for cooperative execution.
     let guest = match LiveGuest::new() {
         Ok(g) => g,
@@ -124,7 +183,7 @@ fn main() {
 
     let mut app = App {
         guest,
-        input: Input::new(),
+        input: Input::new(&vitaslop_frontend::settings::Settings::default()),
         window: None,
         gfx: None,
         paused: false,
@@ -304,31 +363,17 @@ impl App {
 /// A short human label for the buttons and sticks held this frame, so input is
 /// visibly reaching the SceCtrl mapping that the guest reads.
 fn describe_ctrl(f: CtrlFrame) -> String {
-    use input::*;
     let mut parts = Vec::new();
-    for (bit, name) in [
-        (SCE_CTRL_UP, "Up"),
-        (SCE_CTRL_DOWN, "Down"),
-        (SCE_CTRL_LEFT, "Left"),
-        (SCE_CTRL_RIGHT, "Right"),
-        (SCE_CTRL_TRIANGLE, "Triangle"),
-        (SCE_CTRL_CIRCLE, "Circle"),
-        (SCE_CTRL_CROSS, "Cross"),
-        (SCE_CTRL_SQUARE, "Square"),
-        (SCE_CTRL_LTRIGGER, "L"),
-        (SCE_CTRL_RTRIGGER, "R"),
-        (SCE_CTRL_START, "Start"),
-        (SCE_CTRL_SELECT, "Select"),
-    ] {
-        if f.buttons & bit != 0 {
-            parts.push(name);
+    for b in vitaslop_frontend::input::Button::ALL {
+        if f.buttons & b.bit() != 0 {
+            parts.push(b.label().to_string());
         }
     }
-    let buttons = if parts.is_empty() { "none".to_string() } else { parts.join("+") };
-    // Only mention sticks when off center, so the readout stays quiet at rest.
-    if f.lx != 128 || f.ly != 128 || f.rx != 128 || f.ry != 128 {
-        format!("{buttons}  L({},{}) R({},{})", f.lx, f.ly, f.rx, f.ry)
-    } else {
-        buttons
+    if f.lx != 128 || f.ly != 128 {
+        parts.push(format!("L({},{})", f.lx, f.ly));
     }
+    if f.rx != 128 || f.ry != 128 {
+        parts.push(format!("R({},{})", f.rx, f.ry));
+    }
+    if parts.is_empty() { "-".to_string() } else { parts.join(" ") }
 }

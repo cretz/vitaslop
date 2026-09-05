@@ -29,6 +29,8 @@ pub mod lib {
 /// SceGxm function NIDs.
 pub mod gxm {
     pub const INITIALIZE: u32 = 0xB0F1_E4EC;
+    /// The "vsh" entry a system-mode homebrew uses: the same initialisation.
+    pub const VSH_INITIALIZE: u32 = 0xA04F_5FAC;
     pub const TERMINATE: u32 = 0xB627_DE66;
     pub const MAP_MEMORY: u32 = 0xC61E_34FC;
     pub const MAP_VERTEX_USSE_MEMORY: u32 = 0xFA43_7510;
@@ -291,6 +293,14 @@ pub mod libkernel {
     pub const CLIB_MSPACE_MEMALIGN: u32 = 0x3C84_7D57;
     // Thread-local storage: a per-thread pointer slot indexed by key.
     pub const GET_TLS_ADDR: u32 = 0xB295_EB61;
+    // Message pipes: a byte FIFO between threads.
+    pub const CREATE_MSG_PIPE: u32 = 0x0A10_C1C8;
+    pub const SEND_MSG_PIPE: u32 = 0x0CA7_1EA2;
+    pub const RECEIVE_MSG_PIPE: u32 = 0x4E81_DD5C;
+    pub const TRY_SEND_MSG_PIPE: u32 = 0xDFC6_70E0;
+    pub const TRY_RECEIVE_MSG_PIPE: u32 = 0x5615_B006;
+    pub const GET_THREAD_TLS_ADDR: u32 = 0xBACA_6891;
+    pub const GET_RANDOM_NUMBER: u32 = 0xB270_0165;
     // Process/thread timing and status.
     pub const GET_PROCESS_TIME: u32 = 0x4C46_72BF;
     pub const GET_PROCESS_TIME_WIDE: u32 = 0xB110_C123;
@@ -614,6 +624,17 @@ pub mod services {
     pub const APPMGR_RECEIVE_SYSTEM_EVENT: u32 = 0x10B5_765F;
     pub const RTC_SET_TIME64_T: u32 = 0xA6C3_6B6A;
     pub const MOTION_SET_DEADBAND: u32 = 0x917E_A390;
+    pub const MOTION_SET_ANGLE_THRESHOLD: u32 = 0xDACB_2A41;
+    pub const MOTION_GET_ANGLE_THRESHOLD: u32 = 0x499B_6C87;
+    /// SceAppMgr's memory budget report.
+    pub const APP_MGR_GET_BUDGET_INFO: u32 = 0x5F00_F261;
+    /// SceSharedFb: the shell's framebuffer, which a system-mode homebrew draws into
+    /// directly instead of owning display buffers of its own.
+    pub const SHARED_FB_OPEN: u32 = 0xB358_E1B6;
+    pub const SHARED_FB_CLOSE: u32 = 0x33DA_3428;
+    pub const SHARED_FB_BEGIN: u32 = 0x7206_7C6B;
+    pub const SHARED_FB_END: u32 = 0xFC5A_62B6;
+    pub const SHARED_FB_GET_INFO: u32 = 0x8199_54FB;
     pub const MOTION_SET_TILT_CORRECTION: u32 = 0xAF09_FCDB;
     pub const MOTION_GET_DEADBAND: u32 = 0x112E_0EAE;
     pub const MOTION_GET_TILT_CORRECTION: u32 = 0xC165_2201;
@@ -916,6 +937,16 @@ pub mod services {
     pub const ADHOC_MATCHING_DELETE: u32 = 0x7BCD_D889;
     pub const ADHOC_MATCHING_SELECT_TARGET: u32 = 0x9A6B_1D0F;
     pub const POWER_SET_CONFIGURATION_MODE: u32 = 0x3CE1_87B6;
+    // ScePower clock control: homebrew sets the four clocks at start and may read
+    // them back, so each setter is HELD and each getter reads the held value.
+    pub const POWER_SET_ARM_CLOCK: u32 = 0x74DB_5AE5;
+    pub const POWER_SET_BUS_CLOCK: u32 = 0xB8D7_B3FB;
+    pub const POWER_SET_GPU_CLOCK: u32 = 0x717D_B06C;
+    pub const POWER_SET_GPU_XBAR_CLOCK: u32 = 0xA773_9DBE;
+    pub const POWER_GET_ARM_CLOCK: u32 = 0xABC6_F88F;
+    pub const POWER_GET_BUS_CLOCK: u32 = 0x478F_E6F5;
+    pub const POWER_GET_GPU_CLOCK: u32 = 0x1B04_A1D6;
+    pub const POWER_GET_GPU_XBAR_CLOCK: u32 = 0x0A75_0DEE;
     // SceCommonDialog: shared config for the dialog families, plus the trophy-setup
     // dialog's result read.
     pub const COMMON_DIALOG_SET_CONFIG_PARAM: u32 = 0xBECD_35C8;
@@ -989,6 +1020,7 @@ pub mod lwsync {
 /// SceLibKernel.
 pub mod threadmgr {
     pub const DELAY_THREAD: u32 = 0x4B67_5D05;
+    pub const DELETE_MSG_PIPE: u32 = 0xE78B_CCF7;
     pub const EXIT_DELETE_THREAD: u32 = 0x1D17_DECF;
     pub const DELETE_THREAD: u32 = 0x1BBD_E3D9;
     pub const EXIT_THREAD: u32 = 0x0C8A_38E1;
@@ -1053,6 +1085,7 @@ pub mod iofilemgr {
     pub const IO_PWRITE: u32 = 0x8FFF_F5A8;
     pub const IO_GETSTAT: u32 = 0xBCA5_B623;
     pub const IO_GETSTAT_BY_FD: u32 = 0x57F8_CD25;
+    pub const IO_CHSTAT_BY_FD: u32 = 0x6E90_3AB2;
     pub const IO_MKDIR: u32 = 0x9670_D39F;
     pub const IO_REMOVE: u32 = 0xE20E_D0F3;
     pub const IO_DOPEN: u32 = 0xA928_3DD0;
@@ -1375,6 +1408,7 @@ pub fn name(func_nid: u32) -> &'static str {
         au::OUT_RELEASE_PORT => "sceAudioOutReleasePort",
         au::OUT_GET_ADOPT => "sceAudioOutGetAdopt",
         g::INITIALIZE => "sceGxmInitialize",
+        g::VSH_INITIALIZE => "sceGxmVshInitialize",
         g::TERMINATE => "sceGxmTerminate",
         g::MAP_MEMORY => "sceGxmMapMemory",
         g::MAP_VERTEX_USSE_MEMORY => "sceGxmMapVertexUsseMemory",
@@ -1469,6 +1503,13 @@ pub fn name(func_nid: u32) -> &'static str {
         lk::CLIB_MSPACE_FREE => "sceClibMspaceFree",
         lk::CLIB_MSPACE_MEMALIGN => "sceClibMspaceMemalign",
         lk::GET_TLS_ADDR => "sceKernelGetTLSAddr",
+        lk::CREATE_MSG_PIPE => "sceKernelCreateMsgPipe",
+        lk::SEND_MSG_PIPE => "sceKernelSendMsgPipe",
+        lk::RECEIVE_MSG_PIPE => "sceKernelReceiveMsgPipe",
+        lk::TRY_SEND_MSG_PIPE => "sceKernelTrySendMsgPipe",
+        lk::TRY_RECEIVE_MSG_PIPE => "sceKernelTryReceiveMsgPipe",
+        lk::GET_THREAD_TLS_ADDR => "sceKernelGetThreadTLSAddr",
+        lk::GET_RANDOM_NUMBER => "sceKernelGetRandomNumber",
         lk::GET_PROCESS_TIME => "sceKernelGetProcessTime",
         lk::GET_PROCESS_TIME_WIDE => "sceKernelGetProcessTimeWide",
         lk::GET_THREAD_EXIT_STATUS => "sceKernelGetThreadExitStatus",
@@ -1571,6 +1612,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::APPMGR_LOAD_EXEC => "sceAppMgrLoadExec",
         sv::APPMGR_RECEIVE_SYSTEM_EVENT => "sceAppMgrReceiveSystemEvent",
         sv::MOTION_SET_DEADBAND => "sceMotionSetDeadband",
+        sv::MOTION_SET_ANGLE_THRESHOLD => "sceMotionSetAngleThreshold",
+        sv::MOTION_GET_ANGLE_THRESHOLD => "sceMotionGetAngleThreshold",
+        sv::APP_MGR_GET_BUDGET_INFO => "sceAppMgrGetBudgetInfo",
+        sv::SHARED_FB_OPEN => "_sceSharedFbOpen",
+        sv::SHARED_FB_CLOSE => "sceSharedFbClose",
+        sv::SHARED_FB_BEGIN => "sceSharedFbBegin",
+        sv::SHARED_FB_END => "sceSharedFbEnd",
+        sv::SHARED_FB_GET_INFO => "sceSharedFbGetInfo",
         sv::MOTION_SET_TILT_CORRECTION => "sceMotionSetTiltCorrection",
         sv::MOTION_GET_DEADBAND => "sceMotionGetDeadband",
         sv::MOTION_GET_TILT_CORRECTION => "sceMotionGetTiltCorrection",
@@ -1740,12 +1789,15 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_PWRITE => "sceIoPwrite",
         io::IO_GETSTAT => "sceIoGetstat",
         io::IO_GETSTAT_BY_FD => "sceIoGetstatByFd",
+        io::IO_CHSTAT_BY_FD => "sceIoChstatByFd",
         io::IO_MKDIR => "sceIoMkdir",
         io::IO_REMOVE => "sceIoRemove",
         io::IO_DOPEN => "sceIoDopen",
         io::IO_DREAD => "sceIoDread",
         io::IO_DCLOSE => "sceIoDclose",
         tm::DELAY_THREAD => "sceKernelDelayThread",
+        tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
+        tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
         tm::EXIT_DELETE_THREAD => "sceKernelExitDeleteThread",
         tm::DELETE_THREAD => "sceKernelDeleteThread",
         tm::EXIT_THREAD => "sceKernelExitThread",
@@ -2027,6 +2079,14 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::ADHOC_MATCHING_DELETE => "sceNetAdhocMatchingDelete",
         sv::ADHOC_MATCHING_SELECT_TARGET => "sceNetAdhocMatchingSelectTarget",
         sv::POWER_SET_CONFIGURATION_MODE => "scePowerSetConfigurationMode",
+        sv::POWER_SET_ARM_CLOCK => "scePowerSetArmClockFrequency",
+        sv::POWER_SET_BUS_CLOCK => "scePowerSetBusClockFrequency",
+        sv::POWER_SET_GPU_CLOCK => "scePowerSetGpuClockFrequency",
+        sv::POWER_SET_GPU_XBAR_CLOCK => "scePowerSetGpuXbarClockFrequency",
+        sv::POWER_GET_ARM_CLOCK => "scePowerGetArmClockFrequency",
+        sv::POWER_GET_BUS_CLOCK => "scePowerGetBusClockFrequency",
+        sv::POWER_GET_GPU_CLOCK => "scePowerGetGpuClockFrequency",
+        sv::POWER_GET_GPU_XBAR_CLOCK => "scePowerGetGpuXbarClockFrequency",
         sv::COMMON_DIALOG_SET_CONFIG_PARAM => "sceCommonDialogSetConfigParam",
         // SceCommonDialog lifecycle. These all had dispatch arms already; without a name
         // each the link-time coverage report counted them as MISSING, which is how a

@@ -148,7 +148,13 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
         Stmt::Store { addr, data, .. } => {
             (value_reads(addr).union(value_reads(data)), FlagMask::NONE)
         }
-        Stmt::MulLong { rn, rm, .. } => (value_reads(rn).union(value_reads(rm)), FlagMask::NONE),
+        Stmt::MulLong { rdlo, rdhi, rn, rm, accumulate, .. } => {
+            let mut r = value_reads(rn).union(value_reads(rm));
+            if *accumulate {
+                r = r.union(value_reads(&Value::Reg(*rdlo))).union(value_reads(&Value::Reg(*rdhi)));
+            }
+            (r, FlagMask::NONE)
+        }
         // Writes all four. Its own operands may read C (the carry-in of `adc`/`sbc`), and
         // that read happens BEFORE the write - the walk below applies them in that order.
         Stmt::FlagsAdd { a, b, cin, .. } => (
@@ -415,6 +421,8 @@ fn term_effect(func: &Func, b: usize, term: &Term) -> (FlagMask, Vec<usize>, boo
             }
             (value_reads(index), succ, leaves)
         }
+        // A conditional return reads its condition; the false arm is a fall-through.
+        Term::ReturnIf { cond } => (cond_reads(*cond), next, true),
         Term::Return | Term::Halt | Term::Unreachable => (FlagMask::NONE, Vec::new(), true),
     }
 }

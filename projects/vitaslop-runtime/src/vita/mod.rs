@@ -959,6 +959,12 @@ pub fn dispatch(
         lk_nid::GET_THREAD_ID => cont!(libkernel::get_thread_id(ctx, st)),
         lk_nid::GET_THREAD_EXIT_STATUS => cont!(libkernel::get_thread_exit_status(ctx, st)),
         lk_nid::GET_TLS_ADDR => cont!(libkernel::get_tls_addr(ctx, st)),
+        lk_nid::CREATE_MSG_PIPE => cont!(libkernel::msg_pipe_create(ctx, st)),
+        tm_nid::DELETE_MSG_PIPE => cont!(libkernel::msg_pipe_delete(ctx, st)),
+        lk_nid::SEND_MSG_PIPE | lk_nid::TRY_SEND_MSG_PIPE => cont!(libkernel::msg_pipe_send(ctx, st)),
+        lk_nid::RECEIVE_MSG_PIPE | lk_nid::TRY_RECEIVE_MSG_PIPE => cont!(libkernel::msg_pipe_receive(ctx, st)),
+        lk_nid::GET_THREAD_TLS_ADDR => cont!(libkernel::get_thread_tls_addr(ctx, st)),
+        lk_nid::GET_RANDOM_NUMBER => cont!(libkernel::get_random_number(ctx, st)),
         lk_nid::GET_PROCESS_TIME => libkernel::get_process_time(ctx, st),
         lk_nid::GET_PROCESS_TIME_WIDE => libkernel::get_process_time_wide(ctx, st),
         lk_nid::EXIT_PROCESS => {
@@ -1006,6 +1012,29 @@ pub fn dispatch(
         sv_nid::MOTION_MAGNETOMETER_ON => cont!(services::motion_magnetometer_set(ctx, st, true)),
         sv_nid::MOTION_MAGNETOMETER_OFF => cont!(services::motion_magnetometer_set(ctx, st, false)),
         sv_nid::MOTION_RESET => cont!(services::motion_reset(ctx, st)),
+        sv_nid::MOTION_SET_ANGLE_THRESHOLD => cont!(services::motion_set_angle_threshold(ctx, st)),
+        sv_nid::MOTION_GET_ANGLE_THRESHOLD => cont!(services::motion_get_angle_threshold(ctx, st)),
+        sv_nid::APP_MGR_GET_BUDGET_INFO => cont!(services::app_mgr_get_budget_info(ctx, st)),
+        sv_nid::SHARED_FB_OPEN => cont!(services::shared_fb_open(ctx, st)),
+        sv_nid::SHARED_FB_BEGIN | sv_nid::SHARED_FB_GET_INFO => cont!(services::shared_fb_info(ctx, st)),
+        // The shared framebuffer's End IS the title's present: it is what
+        // `sceGxmDisplayQueueAddEntry` is to a title that owns its buffers, so it
+        // closes the frame the same way (the scheduler's frame boundary, the clock's
+        // per-frame top-up, the recipe's frame count). Without it a SceSharedFb title
+        // never flips: it runs unpaced, and a frame-bounded run never ends.
+        sv_nid::SHARED_FB_END => {
+            services::shared_fb_end(ctx, st);
+            SvcOutcome::Flip
+        }
+        sv_nid::SHARED_FB_CLOSE => cont!(services::shared_fb_close(ctx, st)),
+        sv_nid::POWER_SET_ARM_CLOCK => cont!(services::power_set_clock(ctx, st, 0)),
+        sv_nid::POWER_SET_BUS_CLOCK => cont!(services::power_set_clock(ctx, st, 1)),
+        sv_nid::POWER_SET_GPU_CLOCK => cont!(services::power_set_clock(ctx, st, 2)),
+        sv_nid::POWER_SET_GPU_XBAR_CLOCK => cont!(services::power_set_clock(ctx, st, 3)),
+        sv_nid::POWER_GET_ARM_CLOCK => cont!(services::power_get_clock(ctx, st, 0)),
+        sv_nid::POWER_GET_BUS_CLOCK => cont!(services::power_get_clock(ctx, st, 1)),
+        sv_nid::POWER_GET_GPU_CLOCK => cont!(services::power_get_clock(ctx, st, 2)),
+        sv_nid::POWER_GET_GPU_XBAR_CLOCK => cont!(services::power_get_clock(ctx, st, 3)),
 
         // --- SceLibXml (DOM): a real parser over a host-side node arena. See
         // `sce_xml` for how the C++ object layouts were established and why the
@@ -1133,7 +1162,7 @@ pub fn dispatch(
         fiber_nid::GET_INFO => cont!(fiber::get_info(ctx, st)),
 
         // --- gxm: graphics ------------------------------------------------------
-        gxm_nid::INITIALIZE => cont!(gxm::initialize(ctx, st)),
+        gxm_nid::INITIALIZE | gxm_nid::VSH_INITIALIZE => cont!(gxm::initialize(ctx, st)),
         gxm_nid::FINISH
         | gxm_nid::PAD_HEARTBEAT
         | gxm_nid::DISPLAY_QUEUE_FINISH
@@ -1404,6 +1433,7 @@ pub fn dispatch(
         io_nid::IO_PWRITE => cont!(iofilemgr::io_pwrite(ctx, st)),
         io_nid::IO_GETSTAT => cont!(iofilemgr::io_getstat(ctx, st)),
         io_nid::IO_GETSTAT_BY_FD => cont!(iofilemgr::io_getstat_by_fd(ctx, st)),
+        io_nid::IO_CHSTAT_BY_FD => cont!(iofilemgr::io_chstat_by_fd(ctx, st)),
         io_nid::IO_MKDIR => cont!(iofilemgr::io_mkdir(ctx, st)),
         io_nid::IO_REMOVE => cont!(iofilemgr::io_remove(ctx, st)),
         io_nid::IO_DOPEN => cont!(iofilemgr::io_dopen(ctx, st)),

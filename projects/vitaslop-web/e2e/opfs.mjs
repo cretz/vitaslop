@@ -31,7 +31,7 @@ const check = (name, ok, detail = "") => {
 };
 
 try {
-  await page.goto(url + "opfs-test.html", { waitUntil: "load", timeout: 30000 });
+  await page.goto(url + "debug/opfs-test.html", { waitUntil: "load", timeout: 30000 });
   const result = await page.evaluate(() => window.__opfsTest());
 
   // Sizes with awkward remainders against the 997-byte verify chunk, so an off-by-one in

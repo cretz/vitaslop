@@ -79,6 +79,9 @@ const MIME = {
   ".json": "application/json",
   ".css": "text/css",
   ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webmanifest": "application/manifest+json",
+  ".ttf": "font/ttf",
 };
 
 /// Recursively list files under `root`, returning forward-slash relative paths.
@@ -326,7 +329,7 @@ const handler = async (req, res) => {
       return res.end(JSON.stringify(listing));
     }
     // The file list for one title. `?title=` names it; with a single title served the
-    // parameter is optional, which is what keeps the older pages (play.html, game.html and
+    // parameter is optional, which is what keeps the older pages (debug/play.html, debug/game.html and
     // the e2e harness's own copies) working unchanged.
     if (path === "/game-manifest.json") {
       const t = byId.get(url.searchParams.get("title")) || (titles.length === 1 ? titles[0] : null);
@@ -371,7 +374,7 @@ const handler = async (req, res) => {
       return res.end(body);
     }
 
-    const file = join(webDir, path === "/" ? "/live.html" : path);
+    const file = join(webDir, path === "/" ? "/index.html" : path);
     let body = await readFile(file);
     // >>> THE DIAG SINK ANNOUNCES ITSELF IN THE PAGE, so the page never has to ASK.
     //
