@@ -185,7 +185,7 @@ fn chain_centre(gpu: &mut GeneralRenderer, gamma: u32, feedback: usize) -> [u8; 
     // seed that silently fails makes every later reading meaningless.
     let mut seed = texture_naming_target();
     seed.data_addr = SEED_ADDR;
-    seed.pixels = std::iter::repeat([MID, MID, MID, 255]).take(16).flatten().collect::<Vec<u8>>().into();
+    seed.pixels = std::iter::repeat_n([MID, MID, MID, 255], 16).flatten().collect::<Vec<u8>>().into();
     let mut scenes = vec![Scene {
         precompile: Default::default(),
         color: Some(surface(gamma)),

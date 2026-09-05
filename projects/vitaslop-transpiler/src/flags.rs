@@ -355,11 +355,10 @@ fn sum_is_read_after(stmts: &[Stmt], i: usize) -> bool {
         // A guard body could hold the reader, and `for_each_value` walks into it - but a
         // guard could equally hold a `FlagsAdd` that redefines the local, and then a later
         // read is not ours. Treating that as a read is the conservative direction.
-        if let Stmt::Guard(_, inner) = s {
-            if inner.iter().any(|s| matches!(s, Stmt::FlagsAdd { .. })) {
+        if let Stmt::Guard(_, inner) = s
+            && inner.iter().any(|s| matches!(s, Stmt::FlagsAdd { .. })) {
                 return true;
             }
-        }
     }
     false
 }

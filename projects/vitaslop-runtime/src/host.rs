@@ -164,8 +164,8 @@ pub trait GuestMemory {
     }
 
     /// >>> WHICH PARTS of `[off, off + len)` the guest may have stored into since `stamp`,
-    /// as byte ranges RELATIVE TO `off`, appended to `out`. `None` from a backing that
-    /// tracks no stores - which is not "clean" and not "all dirty", it is no answer.
+    /// > > > as byte ranges RELATIVE TO `off`, appended to `out`. `None` from a backing that
+    /// > > > tracks no stores - which is not "clean" and not "all dirty", it is no answer.
     ///
     /// [`dirty_since`](Self::dirty_since) answers one bit for a whole range, so a texture is
     /// re-read in full whenever any page of it was written. CENSUSED on a browser run of one
@@ -219,7 +219,7 @@ pub trait GuestMemory {
     }
 
     /// >>> RENUMBER THE EPOCH INSTEAD OF SPENDING IT, so a wrap does not throw the whole
-    /// texture working set away.
+    /// > > > texture working set away.
     ///
     /// The epoch is ONE BYTE and advances once per SCENE. A race frame is eleven scenes and
     /// the browser runs more than one guest frame per present, so the 253 usable values are
@@ -379,11 +379,10 @@ impl<'a> GuestCtx<'a> {
     /// Write a little-endian u32 at guest address `addr` (ignored if out of range).
     pub fn write_u32(&mut self, addr: u32, v: u32) {
         report_host_write(self, addr, 4, &v.to_le_bytes());
-        if let Some(o) = self.offset(addr) {
-            if o + 4 <= self.mem.len() {
+        if let Some(o) = self.offset(addr)
+            && o + 4 <= self.mem.len() {
                 self.mem.write_u32(o, v);
             }
-        }
     }
 
     /// Read `len` bytes at guest address `addr` (short read clamped to range).
@@ -428,12 +427,12 @@ impl<'a> GuestCtx<'a> {
         }
         // Zeroed rather than uninit so `assume_init` below is unconditionally sound for
         // `u8`; the memset is a fraction of the boundary copy it precedes.
-        let arc = Arc::<[u8]>::from(unsafe {
+        let arc = unsafe {
             // SAFETY: a zeroed byte is an initialised byte.
             std::sync::Arc::<[std::mem::MaybeUninit<u8>]>::assume_init(
                 std::sync::Arc::new_zeroed_slice(n),
             )
-        });
+        };
         let mut arc = arc;
         let buf = Arc::get_mut(&mut arc).expect("freshly created, uniquely owned");
         self.mem.read(o, buf);
@@ -469,14 +468,13 @@ impl<'a> GuestCtx<'a> {
         // Borrow and convert straight into the result: no staging buffer, and the
         // result is written once. A default uniform buffer is hundreds of floats and
         // is read on every draw.
-        if let Some(o) = self.offset(addr) {
-            if let Some(s) = self.mem.borrow(o, count * 4) {
+        if let Some(o) = self.offset(addr)
+            && let Some(s) = self.mem.borrow(o, count * 4) {
                 return s
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
             }
-        }
         let mut raw = vec![0u8; count * 4];
         self.read_into(addr, &mut raw);
         raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
@@ -2155,6 +2153,9 @@ impl FileTable {
 /// Per-draw vertex program layout captured at create time, keyed by the vertex
 /// program handle so a later Draw knows how to snapshot the vertex buffer.
 struct VertexProgramInfo {
+    // Captured at create time and kept beside the streams it belongs with, though the snapshot
+    // path reads the streams only.
+    #[allow(dead_code)]
     attributes: Vec<crate::capture::VertexAttribute>,
     /// >>> THE INTERLEAVED LAYOUT A DRAW ACTUALLY CAPTURES INTO, BUILT ONCE HERE.
     ///
@@ -2195,6 +2196,9 @@ impl VertexProgramInfo {
     /// Stream `i`'s layout, or a zero-stride per-vertex stream if the program declared
     /// fewer streams than an attribute references (which a well-formed program cannot do,
     /// and which then contributes no bytes rather than reading somewhere arbitrary).
+    // Kept: the doc states what a program that under-declares its streams does, which is a
+    // property of the format rather than of this caller.
+    #[allow(dead_code)]
     fn stream(&self, i: usize) -> VertexStreamInfo {
         self.streams.get(i).copied().unwrap_or_default()
     }
@@ -2506,10 +2510,10 @@ struct TextureSnapshots {
     /// A high-water buffer read into with [`GuestCtx::read_into`] pays neither.
     ///
     /// >>> AND IT IS BOUNDED, which is not optional here. A pooled buffer that only ever grows
-    /// is how the last render-side arena change went wrong: the wasm heap is SHARED with the
-    /// guest and can never give a page back, so one loading frame's peak stays resident
-    /// forever and tightens allocation for everything, guest included - a cost no allocator
-    /// profile and no pixel oracle can see. See [`GATHER_SCRATCH_CAP`].
+    /// > > > is how the last render-side arena change went wrong: the wasm heap is SHARED with the
+    /// > > > guest and can never give a page back, so one loading frame's peak stays resident
+    /// > > > forever and tightens allocation for everything, guest included - a cost no allocator
+    /// > > > profile and no pixel oracle can see. See [`GATHER_SCRATCH_CAP`].
     gather_src: Vec<u8>,
     /// Bytes held by `vertex_entries`, against [`vertex_snapshot_budget`].
     vertex_bytes: usize,
@@ -2869,7 +2873,7 @@ fn sampler_narrow_enabled() -> bool {
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        return a == b;
+        a == b
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -2880,6 +2884,7 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
 /// The eight-at-a-time comparison itself, compiled on every target so the test below actually
 /// exercises it rather than testing `==` against itself on the host.
 #[inline]
+#[allow(dead_code)]
 fn bytes_eq_wide(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -3321,7 +3326,7 @@ fn palette_memo_budget() -> usize {
 }
 
 /// >>> HOW MUCH OF A TEXTURE THE GUEST ACTUALLY TOUCHED, when the dirty map says it touched
-/// SOMETHING (`VITASLOP_TEX_DIRTY_CENSUS=1`).
+/// > > > SOMETHING (`VITASLOP_TEX_DIRTY_CENSUS=1`).
 ///
 /// The map answers one bit for a whole range, so a texture is re-read in full whenever any
 /// page of it was written - and in a browser that read is a copy of the whole texture across
@@ -3369,7 +3374,7 @@ fn dirty_page_census(
     let n = RANGES.fetch_add(1, Relaxed) + 1;
     let total = PAGES.fetch_add(pages as u64, Relaxed) + pages as u64;
     let hot = DIRTY.fetch_add(dirty as u64, Relaxed) + dirty as u64;
-    if n % 200 == 0 {
+    if n.is_multiple_of(200) {
         tracing::warn!(
             target: "vitaslop::gxm",
             ranges = n,
@@ -3572,12 +3577,11 @@ impl TextureSnapshots {
         // upload caches on this buffer's IDENTITY, so handing back a fresh `Arc` holding
         // byte-identical pixels would re-decode and re-upload an unchanged texture every
         // scene. Same answer, same bytes, one buffer.
-        if let Some(p) = retained {
-            if bytes_eq(&raw, &p) {
+        if let Some(p) = retained
+            && bytes_eq(&raw, &p) {
                 self.restamp(addr, len);
                 return p;
             }
-        }
         let bytes: Arc<[u8]> = raw;
         crate::perf::note_bytes(crate::perf::Phase::DrawTextures, bytes.len());
         self.insert(addr, len, bytes.clone());
@@ -3737,19 +3741,16 @@ impl TextureSnapshots {
         // The set and per-binding memos hold the PREVIOUS picture and are re-proven by
         // pointer identity against `entries`, so they reject themselves on their next use.
         // Nothing to clear here.
-        match ctx.bump_dirty_epoch() {
-            Some((stamp, wrapped)) => {
-                if wrapped {
-                    crate::perf::note_epoch_wrap();
-                    self.stamps.clear();
-                    self.vertex_stamps.clear();
-                    self.index_stamps.clear();
-                }
-                self.stamps.insert((addr, len), stamp);
+        // `None` is an engine that tracks no stores: it has no fast path to arm, the entry is
+        // still the right bytes, and the ordinary compare will confirm it and cost one pass.
+        if let Some((stamp, wrapped)) = ctx.bump_dirty_epoch() {
+            if wrapped {
+                crate::perf::note_epoch_wrap();
+                self.stamps.clear();
+                self.vertex_stamps.clear();
+                self.index_stamps.clear();
             }
-            // An engine that tracks no stores has no fast path to arm; the entry is still
-            // the right bytes, and the ordinary compare will confirm it and cost one pass.
-            None => {}
+            self.stamps.insert((addr, len), stamp);
         }
     }
 
@@ -3797,8 +3798,8 @@ impl TextureSnapshots {
             return Arc::from(bytes);
         }
         let fp = vertex_fingerprint(bytes);
-        if let Some(p) = self.vertex_by_content.get(&(bytes.len(), fp)) {
-            if bytes_eq(bytes, p) {
+        if let Some(p) = self.vertex_by_content.get(&(bytes.len(), fp))
+            && bytes_eq(bytes, p) {
                 // A HIT pays a comparison; a MISS pays a copy. See `Phase::DrawVertexInternHit`.
                 crate::perf::note_hit(crate::perf::Phase::DrawVertexInternHit);
                 let p = p.clone();
@@ -3806,7 +3807,6 @@ impl TextureSnapshots {
                 self.vertex_content_used.insert((bytes.len(), fp), self.frame_seq);
                 return p;
             }
-        }
         let made: Arc<[u8]> = Arc::from(bytes);
         // Bounded by BYTES as well as entries: an interned buffer is held by this map alone,
         // where an entry that is also in `vertex_entries` is covered by that map's budget.
@@ -4048,13 +4048,12 @@ impl TextureSnapshots {
         // page with identical contents (a rebuilt-every-frame buffer whose contents are static
         // is common), and a fresh `Arc` there would miss every downstream cache keyed on
         // identity while being byte-for-byte the thing they already hold.
-        if let Some(p) = self.vertex_entries.get(&(addr, len)) {
-            if bytes_eq(&raw, p) {
+        if let Some(p) = self.vertex_entries.get(&(addr, len))
+            && bytes_eq(&raw, p) {
                 let same = p.clone();
                 self.stamp_vertices(addr, len);
                 return same;
             }
-        }
         // ...and the same bytes held under a DIFFERENT address, which is what a title that
         // rebuilds its geometry into a rotating arena produces every frame. See
         // `vertex_by_content`. Proven by comparison, never by the fingerprint.
@@ -4066,9 +4065,9 @@ impl TextureSnapshots {
         // geometry's downstream cache entries. The content index is sound about CONTENT and
         // says nothing about that, so it is off with the rest of the feature.
         let fp = vertex_fingerprint(&raw);
-        if vertex_intern_enabled() {
-        if let Some(p) = self.vertex_by_content.get(&(len, fp)) {
-            if bytes_eq(&raw, p) {
+        if vertex_intern_enabled()
+        && let Some(p) = self.vertex_by_content.get(&(len, fp))
+            && bytes_eq(&raw, p) {
                 let same = p.clone();
                 // NOT also recorded in `vertex_entries`: that map's byte accounting is per
                 // ENTRY, and a rotating arena would file one shared buffer under a new address
@@ -4078,8 +4077,6 @@ impl TextureSnapshots {
                 self.stamp_vertices(addr, len);
                 return same;
             }
-        }
-        }
         let bytes: Arc<[u8]> = raw;
         // A budget, and past it the COLDEST meshes are shed rather than all of them. The keys
         // are (address, length) rather than content, so an eviction costs a re-read and never
@@ -4701,10 +4698,8 @@ impl TextureSnapshots {
             self.snapshot_sets.remove(&key);
             return None;
         };
-        let (list, null_drops) = match self.snapshot_sets.get(&key) {
-            Some(e) => (e.list.clone(), e.null_drops),
-            None => return None,
-        };
+        let e = self.snapshot_sets.get(&key)?;
+        let (list, null_drops) = (e.list.clone(), e.null_drops);
         let mut proven = true;
         for (dep_key, held) in deps.iter() {
             // The pointer compare against the SET's own buffer is what makes this exact
@@ -4744,11 +4739,10 @@ impl TextureSnapshots {
     /// not need [`Self::decoded_validated`]'s full [`crate::capture::BoundTexture`] clone -
     /// which copies a dozen fields and a second `Arc` per dependency, ~1,150 times a frame.
     fn decoded_pixels_validated(&mut self, ctx: &GuestCtx, key: (u32, [u32; 4])) -> Option<Arc<[u8]>> {
-        if let Some(e) = self.decoded.get(&key) {
-            if e.valid_scene == self.scene_seq {
+        if let Some(e) = self.decoded.get(&key)
+            && e.valid_scene == self.scene_seq {
                 return e.res.as_ref().ok().map(|t| t.pixels.clone());
             }
-        }
         match self.decoded_validated(ctx, key) {
             Some(Ok(t)) => Some(t.pixels),
             _ => None,
@@ -5535,7 +5529,7 @@ mod texture_snapshot_stamp_tests {
         let binding = TextureBinding { unit: 0, addr: 0x1000, words, from_precomputed: false };
         let fmt = Some(crate::render::P8 << 24);
 
-        let mut decode = |snaps: &mut TextureSnapshots,
+        let decode = |snaps: &mut TextureSnapshots,
                           mem: &mut StampedMemory,
                           regs: &mut [u32; REG_COUNT],
                           vfp: &mut [u32; VFP_ARG_COUNT]| {
@@ -5942,11 +5936,11 @@ pub struct VitaState {
     /// The `(width, height)` of the buffer the guest last handed `sceDisplaySetFrameBuf`.
     ///
     /// >>> A TITLE MAY PRESENT A BUFFER SMALLER THAN THE PANEL AND LET THE HARDWARE SCALE IT.
-    /// The display controller stretches whatever this struct describes onto the 960x544 panel,
-    /// so a front end that wants the frame rate more than the pixels renders 640x368 and
-    /// declares it. Composing that pass at the size it rasterised and stopping there puts the
-    /// whole screen in the top-left corner with black around it - MEASURED on one title's
-    /// menus. Every frontend that presents has to ask for this and scale.
+    /// > > > The display controller stretches whatever this struct describes onto the 960x544 panel,
+    /// > > > so a front end that wants the frame rate more than the pixels renders 640x368 and
+    /// > > > declares it. Composing that pass at the size it rasterised and stopping there puts the
+    /// > > > whole screen in the top-left corner with black around it - MEASURED on one title's
+    /// > > > menus. Every frontend that presents has to ask for this and scale.
     ///
     /// Starts at the panel size, which is what every title that renders today declares, so a
     /// run that never calls the setter behaves as it always did.
@@ -5964,9 +5958,9 @@ pub struct VitaState {
     /// resolves the bound handle several times, and a title registers hundreds of
     /// programs, so a linear scan here was per-draw cost that grew with the level.
     /// >>> AND AN INTEGER HASHER, LIKE EVERY OTHER PER-DRAW MAP HERE. The key is a guest
-    /// address; SipHash on it is tens of nanoseconds per probe, and a draw probes this and the
-    /// two below several times each - about 4,000 probes a presented frame. See
-    /// [`crate::fasthash`], which the texture maps have used since the same measurement.
+    /// > > > address; SipHash on it is tens of nanoseconds per probe, and a draw probes this and the
+    /// > > > two below several times each - about 4,000 probes a presented frame. See
+    /// > > > [`crate::fasthash`], which the texture maps have used since the same measurement.
     vertex_programs: FxHashMap<u32, VertexProgramInfo>,
     /// Reflected constants of each `SceGxmProgram`, keyed by its header address. See
     /// [`ProgramReflection`]; cleared whenever a program is registered or unregistered,
@@ -7061,8 +7055,8 @@ impl VitaState {
     /// human-readable "the game persisted state" signal a conformance recipe asserts
     /// on. Close is the natural commit point (the whole file is present by then).
     pub fn io_close(&mut self, fd: i32) -> i32 {
-        if let Some(of) = self.fs.open.get(&fd) {
-            if of.writable && is_persisted_mount(&of.path) {
+        if let Some(of) = self.fs.open.get(&fd)
+            && of.writable && is_persisted_mount(&of.path) {
                 let path = of.path.clone();
                 if let Some(data) = self.fs.files.get(&path) {
                     let ev = crate::capture::EgressEvent {
@@ -7076,7 +7070,6 @@ impl VitaState {
                     self.capture.egress.push(ev);
                 }
             }
-        }
         self.fs.close(fd)
     }
 
@@ -7160,7 +7153,6 @@ impl VitaState {
         )
     }
 
-    /// sceIoDopen: open a directory listing; a new fd or a negative errno.
     // --- FIOS2 path overlays -------------------------------------------------
 
     /// Register an overlay, returning its id. Insertion keeps the list sorted by
@@ -7768,11 +7760,10 @@ impl VitaState {
         }
         self.fibers[i].runner = 0;
         self.fibers[i].resume_out = arg_on_run_out;
-        if let Some(&out) = self.fiber_run_out.get(&runner) {
-            if out != 0 {
+        if let Some(&out) = self.fiber_run_out.get(&runner)
+            && out != 0 {
                 self.pending_stat_writes.push((out, arg_on_return));
             }
-        }
         self.fiber_run_out.remove(&runner);
         self.pending_wakes.push(runner);
         Ok(())
@@ -8131,12 +8122,11 @@ impl VitaState {
     /// Try to take `need` from semaphore `uid` without blocking. Returns true if
     /// the count was available (and consumed), false otherwise.
     pub fn sema_try_acquire(&mut self, uid: i32, need: i32) -> bool {
-        if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid) {
-            if s.count >= need {
+        if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid)
+            && s.count >= need {
                 s.count -= need;
                 return true;
             }
-        }
         false
     }
 
@@ -8738,16 +8728,16 @@ impl VitaState {
     ///
     /// # The top-up hands out time the guest was never given the CPU to use
     /// >>> IT IS OFF BY DEFAULT AND `VITASLOP_FRAME_TOPUP=1` IS WHAT TURNS IT ON. This is
-    /// stated in that direction deliberately: it used to read "`=0` switches it off", which
-    /// implies a default of ON, and `frame_topup()` tests for `Ok("1")`. Which way round it is
-    /// decides what a displayed frame MEANS, so the sentence has to be unambiguous.
-    /// With the top-up on, a flip advances the
-    /// clock a whole frame however little guest code ran, so the render thread's next
-    /// vblank wait is already satisfied and it flips again at once. Measured on a
-    /// retail title's loading screen: **3120 fps, 8 thread resumes a frame, barely one
-    /// whole scheduler quantum per frame** - the guest gets about a TENTH of the CPU a
-    /// console frame carries, so a load that costs hardware 3,000 frames costs us
-    /// 30,000+, and the wall time goes on per-frame overhead instead of on the loader.
+    /// > > > stated in that direction deliberately: it used to read "`=0` switches it off", which
+    /// > > > implies a default of ON, and `frame_topup()` tests for `Ok("1")`. Which way round it is
+    /// > > > decides what a displayed frame MEANS, so the sentence has to be unambiguous.
+    /// > > > With the top-up on, a flip advances the
+    /// > > > clock a whole frame however little guest code ran, so the render thread's next
+    /// > > > vblank wait is already satisfied and it flips again at once. Measured on a
+    /// > > > retail title's loading screen: **3120 fps, 8 thread resumes a frame, barely one
+    /// > > > whole scheduler quantum per frame** - the guest gets about a TENTH of the CPU a
+    /// > > > console frame carries, so a load that costs hardware 3,000 frames costs us
+    /// > > > 30,000+, and the wall time goes on per-frame overhead instead of on the loader.
     ///
     /// With it off, a flip advances the clock by nothing it did not earn. The render
     /// thread's vblank wait is then a real wait: its spin burns quanta, every other
@@ -9355,11 +9345,10 @@ impl VitaState {
         if self.net_cb_delivered {
             return;
         }
-        if let Some((entry, userdata)) = self.net_inet_cb {
-            if self.spawn_oneshot_callback(entry, event, userdata, 0) {
+        if let Some((entry, userdata)) = self.net_inet_cb
+            && self.spawn_oneshot_callback(entry, event, userdata, 0) {
                 self.net_cb_delivered = true;
             }
-        }
     }
 
     /// The earliest pending timed-wake deadline across every timed blocking wait -
@@ -9417,7 +9406,7 @@ impl VitaState {
     /// the waiting thread and the wait FAMILY turns that from an inference into a lookup.
     pub fn idle_attribution(&self) -> Vec<(IdleOwner, u64, u64)> {
         let mut v = self.idle_by_owner.clone();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
 
@@ -10418,7 +10407,7 @@ impl VitaState {
     /// ordinary case (`InlineOp::CopyArgIndexed`), so what reaches here is a null texture, an
     /// out-of-range unit, or a pointer outside guest memory - the cases the inline form hands
     /// back precisely because this side defines them.
-
+    ///
     /// Decode a list of texture bindings into snapshotted [`crate::capture::BoundTexture`]s.
     ///
     /// Shared by the fragment and vertex stages so the two can never decode a texture
@@ -11061,7 +11050,7 @@ impl VitaState {
     /// Read back a precomputed draw from its guest block, or `None` when the block does
     /// not carry the initialised tag.
     /// >>> ONE BULK READ, NOT TEN WORD READS, and the block is the most-read structure in a
-    /// race frame.
+    /// > > > race frame.
     ///
     /// A `dyn GuestMemory` word read is a bounds check plus a virtual call, and in the browser
     /// it crosses into a `SharedArrayBuffer` view; the bytes are never the cost, the CALLS are
@@ -11278,7 +11267,7 @@ impl VitaState {
         // The distinct-header lists ARE the two counts: `cross_precomputed_state_programs`
         // pushes each non-zero header once.
         let n = self.precomputed_state_count;
-        if n > 4 && !n.is_power_of_two() && n % 50 != 0 {
+        if n > 4 && !n.is_power_of_two() && !n.is_multiple_of(50) {
             return;
         }
         tracing::info!(
@@ -11786,6 +11775,9 @@ impl VitaState {
     }
 
     /// The fragment stage's.
+    // Kept beside `vertex_uniform`: a pair where only one is currently read is a pair a
+    // reader should still see whole.
+    #[allow(dead_code)]
     fn fragment_uniform(&self, ctx: &GuestCtx) -> crate::vita::gxmctx::UniformBinding {
         self.uniform_binding(ctx, crate::vita::gxmctx::off::FRAGMENT_UNIFORM)
     }
@@ -11893,7 +11885,7 @@ impl VitaState {
             let h = u32::from(crate::render::f32_to_half(*v));
             ctx.write_u32(
                 addr,
-                if component % 2 == 0 {
+                if component.is_multiple_of(2) {
                     (word & 0xffff_0000) | h
                 } else {
                     (word & 0x0000_ffff) | (h << 16)
@@ -12116,6 +12108,7 @@ impl VitaState {
     }
 
     /// The bound vertex program's layout, if recorded.
+    #[allow(dead_code)]
     fn bound_layout(&self, ctx: &GuestCtx) -> Option<&VertexProgramInfo> {
         self.vertex_programs.get(&self.bound_vertex_program(ctx))
     }
@@ -12126,7 +12119,7 @@ impl VitaState {
         if n == 0 {
             return false;
         }
-        while n % 10 == 0 {
+        while n.is_multiple_of(10) {
             n /= 10;
         }
         n == 1
@@ -12667,11 +12660,10 @@ impl VitaState {
                 {
                     textures[..=pos].rotate_right(1);
                 }
-                if let Some(unit) = Self::fragment_albedo_unit(&fref) {
-                    if let Some(pos) = textures.iter().position(|t| t.unit == unit) {
+                if let Some(unit) = Self::fragment_albedo_unit(&fref)
+                    && let Some(pos) = textures.iter().position(|t| t.unit == unit) {
                         textures[..=pos].rotate_right(1);
                     }
-                }
                 let set: Arc<[crate::capture::BoundTexture]> = textures.into();
                 // Taken and put back: `set_insert` needs the bindings that produced the
                 // list, and they were returned to `self.bound_textures` above.
@@ -12806,11 +12798,10 @@ impl VitaState {
         } else {
             uniforms[..bank_lanes.min(16)].to_vec()
         };
-        if let Some(mvp) = composed {
-            if draw_uniforms.len() >= 16 {
+        if let Some(mvp) = composed
+            && draw_uniforms.len() >= 16 {
                 draw_uniforms[..16].copy_from_slice(&mvp);
             }
-        }
         // >>> READ AFTER THE STAMP, WHICH IS WHERE IT ALWAYS WAS.
         //
         // A shader whose reflected exposure lane sits inside 0..16 reads the composed MVP
@@ -12927,7 +12918,7 @@ impl VitaState {
             vertex_stride: stride,
             attributes,
             vertex_textures,
-            indices: indices.into(),
+            indices,
             uniforms: draw_uniforms,
             textures,
             render_state,
@@ -13315,7 +13306,7 @@ impl VitaState {
         let v = self.created_vertex_headers.len();
         let f = self.null_fragment_headers.len();
         let n = v + f;
-        if n > 4 && !n.is_power_of_two() && n % 10 != 0 {
+        if n > 4 && !n.is_power_of_two() && !n.is_multiple_of(10) {
             return;
         }
         // Status, not stderr: this is the count that answered the cross-product question,
@@ -13474,10 +13465,18 @@ impl VitaState {
     /// The model-to-world matrix reflected from the vertex program's `vsModelToWorldMatrix`
     /// (column-major 4x4), or identity if the shader declares no world matrix. Used to bring
     /// the object-space vertex normal into world space for lighting.
+    // Reflection accessors kept as a complete set: the `_by` variants are the ones the
+    // draw path calls, and these read the same field through the plain uniform slice, which is
+    // what a reader checking one against the other needs.
+    #[allow(dead_code)]
     fn reflected_world_matrix(&self, r: &ProgramReflection, uniforms: &[f32]) -> [f32; 16] {
         Self::reflected_world_matrix_by(r, |i| uniforms.get(i).copied())
     }
 
+    // Reflection accessors kept as a complete set: the `_by` variants are the ones the
+    // draw path calls, and these read the same field through the plain uniform slice, which is
+    // what a reader checking one against the other needs.
+    #[allow(dead_code)]
     fn reflected_world_matrix_by(
         r: &ProgramReflection,
         lane: impl Fn(usize) -> Option<f32>,
@@ -13492,6 +13491,10 @@ impl VitaState {
     /// this draw's `uniforms`, at the offsets [`ProgramReflection`] located by name.
     /// Returns `(world, proj)` or `None` when the shader has no separate projection
     /// matrix (a single-transform 2D/UI shader) or the buffer is short of either.
+    // Reflection accessors kept as a complete set: the `_by` variants are the ones the
+    // draw path calls, and these read the same field through the plain uniform slice, which is
+    // what a reader checking one against the other needs.
+    #[allow(dead_code)]
     fn reflected_world_proj(
         r: &ProgramReflection,
         uniforms: &[f32],
@@ -13521,6 +13524,10 @@ impl VitaState {
     /// exposure scale the shaders multiply lit albedo by before tone-mapping). Returns
     /// `1.0` when the shader declares no exposure uniform (2D/UI shaders), or when the
     /// value is not a sane positive number, so it is a safe no-op there.
+    // Reflection accessors kept as a complete set: the `_by` variants are the ones the
+    // draw path calls, and these read the same field through the plain uniform slice, which is
+    // what a reader checking one against the other needs.
+    #[allow(dead_code)]
     fn reflected_exposure(r: &ProgramReflection, uniforms: &[f32]) -> f32 {
         Self::reflected_exposure_by(r, |i| uniforms.get(i).copied())
     }
@@ -13718,11 +13725,10 @@ impl VitaState {
         // one is bound. It is a coarse (16x16 / 128x128) light probe, so its mean is a good
         // flat ambient for a renderer that does not sample it per-normal. Leaves the default
         // grey ambient when no such map is present.
-        if let Some(amb) = textures.iter().find(|t| t.unit == 15) {
-            if let Some(mean) = self.texture_snapshots.mean_rgb(amb) {
+        if let Some(amb) = textures.iter().find(|t| t.unit == 15)
+            && let Some(mean) = self.texture_snapshots.mean_rgb(amb) {
                 m.ambient = mean;
             }
-        }
         m
     }
 
@@ -14425,7 +14431,7 @@ fn fixed_function_wanted() -> bool {
     use std::sync::OnceLock;
     static WANTED: OnceLock<bool> = OnceLock::new();
     *WANTED.get_or_init(|| {
-        !(gxp_live_capture() && !crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION"))
+        !gxp_live_capture() || crate::knobs::flag("VITASLOP_GXP_ALLOW_FIXED_FUNCTION")
     })
 }
 
@@ -14715,7 +14721,7 @@ pub fn report_texture_drops() {
         return;
     }
     let mut ranked: Vec<_> = DROP_CAUSES.iter().zip(counts).filter(|(_, c)| *c > 0).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1));
     eprintln!("gxm texture: sampler-unit bindings DROPPED over this run, by cause:");
     for (cause, n) in ranked {
         eprintln!("gxm texture:   {n} - {cause}");
@@ -14724,8 +14730,8 @@ pub fn report_texture_drops() {
         "gxm texture:   {} texture format(s) were recorded through the init API over the run",
         TEXTURE_INITS.load(std::sync::atomic::Ordering::Relaxed)
     );
-    if let Ok(g) = ZERO_TEXTURE_ADDRS.lock() {
-        if let Some(addrs) = g.as_ref().filter(|a| !a.is_empty()) {
+    if let Ok(g) = ZERO_TEXTURE_ADDRS.lock()
+        && let Some(addrs) = g.as_ref().filter(|a| !a.is_empty()) {
             let mut list: Vec<u32> = addrs.iter().copied().collect();
             list.sort_unstable();
             let shown: Vec<String> = list.iter().take(12).map(|a| format!("{a:#x}")).collect();
@@ -14736,7 +14742,6 @@ pub fn report_texture_drops() {
                 if list.len() > shown.len() { " ..." } else { "" }
             );
         }
-    }
 }
 
 /// Report - once per unit - that a bound `SceGxmTexture` handle reads as all zeros at draw
@@ -14980,7 +14985,7 @@ fn decode_texture(
             d
         }
     };
-    return match cached {
+    match cached {
         Ok(mut t) => {
             t.unit = unit;
             Some(t)
@@ -14991,7 +14996,7 @@ fn decode_texture(
             note_texture_drop(code as usize);
             None
         }
-    };
+    }
 }
 
 /// The decode itself - everything [`decode_texture`] memoises, returned with the facts the
@@ -15166,7 +15171,7 @@ fn decode_texture_pixels(
                 }
             }
         };
-    return entry(Ok(crate::capture::BoundTexture {
+    entry(Ok(crate::capture::BoundTexture {
         unit,
         base_format,
         swizzle: t.swizzle,
@@ -15187,7 +15192,7 @@ fn decode_texture_pixels(
         mag_filter: t.mag_filter,
         gamma: t.gamma,
         mip_filter: t.mip_filter,
-    }), snap, degraded);
+    }), snap, degraded)
 }
 
 /// Turn a paletted texture's INDICES into the colours its table names, level by level and face
@@ -16545,10 +16550,10 @@ mod register_window_tests {
                     if let Some(end) = rest.strip_prefix(&digits).and_then(|r| r.strip_prefix(".."))
                     {
                         let e: String = end.chars().take_while(|c| c.is_ascii_digit()).collect();
-                        if let Ok(e) = e.parse::<usize>() {
-                            if (n..e).any(|k| !WINDOW.contains(&k)) {
-                                bad.push(format!("{rel}:{} reads r{n}..r{e}", i + 1));
-                            }
+                        if let Ok(e) = e.parse::<usize>()
+                            && (n..e).any(|k| !WINDOW.contains(&k))
+                        {
+                            bad.push(format!("{rel}:{} reads r{n}..r{e}", i + 1));
                         }
                     }
                 }

@@ -130,9 +130,7 @@ pub(super) fn overlay_add_for_process(
     overlay: Ptr,
     out_id: Ptr,
 ) -> i32 {
-    if !is_own_process(target) {
-        EINVAL
-    } else if overlay.is_null() {
+    if !is_own_process(target) || overlay.is_null() {
         EINVAL
     } else {
         let rec = read_overlay(ctx, overlay.addr());

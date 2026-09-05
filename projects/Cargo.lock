@@ -3945,7 +3945,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vitaslop-aac"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -3954,11 +3954,11 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-atrac9"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "vitaslop-conformance-harness"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vitaslop-conformance-suite-arm",
  "vitaslop-loader",
@@ -3969,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-conformance-suite-arm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "include_dir",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-desktop"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "egui",
  "egui-wgpu",
@@ -3989,6 +3989,7 @@ dependencies = [
  "pollster 1.0.1",
  "rfd",
  "serde_json",
+ "tracing",
  "tracing-subscriber",
  "vitaslop-frontend",
  "vitaslop-loader",
@@ -4002,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4010,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-gamerun-recipes"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tracing-subscriber",
  "vitaslop-native",
@@ -4019,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-gxp-shader"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "naga",
  "pollster 1.0.1",
@@ -4028,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-h264"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "js-sys",
  "libc",
@@ -4039,7 +4040,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-hostcall"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4048,14 +4049,14 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-loader"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vitaslop-transpiler",
 ]
 
 [[package]]
 name = "vitaslop-native"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pollster 1.0.1",
  "tracing",
@@ -4071,7 +4072,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-platform"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tracing",
  "vitaslop-aac",
@@ -4082,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "cbc",
@@ -4108,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-transpiler"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "wasm-encoder 0.253.0",
  "wasmparser 0.253.0",
@@ -4118,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "vitaslop-web"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "js-sys",
  "serde",
@@ -5284,6 +5285,7 @@ dependencies = [
 [[package]]
 name = "yaxpeax-arm"
 version = "0.4.0"
+source = "git+https://github.com/cretz/yaxpeax-arm?rev=e8fd10345a4dc9ba91efe2479d2db022e4607b9e#e8fd10345a4dc9ba91efe2479d2db022e4607b9e"
 dependencies = [
  "bitvec",
  "yaxpeax-arch",

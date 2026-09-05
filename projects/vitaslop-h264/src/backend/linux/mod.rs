@@ -810,6 +810,10 @@ mod tests {
         // The NAL slice offsets recorded by the splitter must point at the NAL header byte.
         let data = [0u8, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
         assert_eq!(&data[4..], &[0x65, 0x88, 0x84, 0x00]);
+        // Fully qualified: `use super::*` brings in this backend's items, and the NAL parser
+        // is not one of them. Only a Linux runner compiles this test, so a bare `nal::` built
+        // nowhere a developer would notice.
+        use crate::bitstream::nal;
         assert_eq!(nal::Nal::parse(&data[4..]).unwrap().kind, nal::kind::IDR);
     }
 }

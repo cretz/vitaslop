@@ -38,6 +38,10 @@ enum Screen {
     Title(String),
     Settings(Option<String>),
     Import,
+    /// What this run reported. The warnings are captured whether or not anyone is watching
+    /// stderr (see `crate::log`), so this screen is the only place a person who launched the
+    /// app by double-clicking it can read them.
+    Diagnostics,
 }
 
 /// A settings form being edited: the record plus the text of the knobs box.
@@ -80,6 +84,8 @@ struct Shell {
     confirm_remove: Option<String>,
     error: Option<String>,
     last_key: Option<String>,
+    /// The outcome of the last diagnostics save, shown in the in-game menu.
+    diag_saved: Option<String>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -106,6 +112,7 @@ pub fn run() -> Result<(), String> {
         confirm_remove: None,
         error: None,
         last_key: None,
+        diag_saved: None,
     };
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = Color32::from_rgb(0x0b, 0x0b, 0x12);
@@ -158,11 +165,10 @@ impl ApplicationHandler for Shell {
         // sees them only when the menu is open, so the game gets the keys.
         let ui_wants = self.session.is_none() || self.menu_open;
         let mut consumed = false;
-        if ui_wants {
-            if let Some(st) = self.egui_state.as_mut() {
+        if ui_wants
+            && let Some(st) = self.egui_state.as_mut() {
                 consumed = st.on_window_event(&window, &event).consumed;
             }
-        }
         match &event {
             WindowEvent::CloseRequested => {
                 if let Some(s) = self.session.as_mut() {
@@ -314,6 +320,7 @@ impl Shell {
             confirm_remove: None,
             error: None,
             last_key: None,
+            diag_saved: None,
         }
     }
 
@@ -465,6 +472,15 @@ impl Shell {
                 if ui.button("Settings").clicked() {
                     self.open_draft(None);
                 }
+                let (held, _, dropped) = vitaslop_platform::diag::counts(vitaslop_platform::diag::Channel::Warning);
+                let label = if held + dropped == 0 {
+                    "Diagnostics".to_string()
+                } else {
+                    format!("Diagnostics ({})", held + dropped)
+                };
+                if ui.button(RichText::new(label).color(if held + dropped == 0 { DIM } else { DANGER })).clicked() {
+                    self.screen = Screen::Diagnostics;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(library::home().display().to_string()).color(DIM).small());
                 });
@@ -506,6 +522,10 @@ impl Shell {
                 Screen::Import => {
                     self.screen = Screen::Import;
                     self.ui_import(ui);
+                }
+                Screen::Diagnostics => {
+                    self.screen = Screen::Diagnostics;
+                    self.ui_diagnostics(ui);
                 }
             }
         });
@@ -732,11 +752,10 @@ impl Shell {
                     d.s = Settings::default();
                     d.knobs_text.clear();
                 }
-                if let Some(t) = d.saved_at {
-                    if t.elapsed().as_secs_f32() < 2.0 {
+                if let Some(t) = d.saved_at
+                    && t.elapsed().as_secs_f32() < 2.0 {
                         ui.label(RichText::new("saved").color(ACCENT));
                     }
-                }
             });
         });
         let id = d.title_id.clone();
@@ -744,30 +763,29 @@ impl Shell {
         if save {
             self.save_draft();
         }
-        if use_global {
-            if let Some(id) = id {
+        if use_global
+            && let Some(id) = id {
                 let _ = library::save_title_patch(&id, None);
                 self.open_draft(Some(id));
             }
-        }
     }
 
     fn ui_import(&mut self, ui: &mut egui::Ui) {
         ui.heading("Add games");
+        ui.label("vitaslop only works with games you own, from your own console. It provides no games and downloads nothing.");
+        ui.add_space(4.0);
         ui.label(RichText::new("A .pkg with its work.bin beside it, a folder dumped from a console (with sce_pfs and sce_sys inside), a zip of either, or a homebrew .vpk.").color(DIM));
         ui.add_space(8.0);
         let busy = self.import.as_ref().map(|p| !p.lock().unwrap().finished).unwrap_or(false);
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("Pick a folder")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+            if ui.add_enabled(!busy, egui::Button::new("Pick a folder")).clicked()
+                && let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.start_import(p);
                 }
-            }
-            if ui.add_enabled(!busy, egui::Button::new("Pick a .pkg, .zip or .vpk")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("Vita package, zip or homebrew vpk", &["pkg", "zip", "vpk", "PKG", "ZIP", "VPK"]).pick_file() {
+            if ui.add_enabled(!busy, egui::Button::new("Pick a .pkg, .zip or .vpk")).clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("Vita package, zip or homebrew vpk", &["pkg", "zip", "vpk", "PKG", "ZIP", "VPK"]).pick_file() {
                     self.start_import(p);
                 }
-            }
         });
         if let Some(p) = self.import.clone() {
             let g = p.lock().unwrap().clone();
@@ -787,21 +805,81 @@ impl Shell {
         }
     }
 
+    /// Everything this run reported, in the two channels it reported them on.
+    ///
+    /// # Why a warning being HERE is not a warning being hidden
+    /// A run that approximates something is required to say so, and it still does - every one
+    /// of these lines was emitted exactly as before. What changed is that a player is not
+    /// shouted at in a terminal they did not open. The count sits in the top bar on every
+    /// screen, so a run with findings never looks like a run without them, and `Save report`
+    /// writes the whole thing out for a bug report.
+    fn ui_diagnostics(&mut self, ui: &mut egui::Ui) {
+        use vitaslop_platform::diag::{Channel, counts, report};
+        let (held, total, dropped) = counts(Channel::Warning);
+        ui.horizontal(|ui| {
+            ui.heading("Diagnostics");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Save report").clicked() {
+                    let name = format!("vitaslop-diagnostics-{}.txt", std::process::id());
+                    if let Some(p) = rfd::FileDialog::new().set_file_name(&name).save_file() {
+                        match std::fs::write(&p, crate::log::snapshot()) {
+                            Ok(()) => self.import_msg = Some(Ok(format!("saved {}", p.display()))),
+                            Err(e) => self.error = Some(format!("could not save the report: {e}")),
+                        }
+                    }
+                }
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(crate::log::snapshot());
+                }
+            });
+        });
+        ui.label(
+            RichText::new(
+                "Warnings are the emulator saying it did something the console would not have                  done. A title can look and play perfectly with warnings here.",
+            )
+            .color(DIM)
+            .small(),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(RichText::new(format!(
+                "{held} distinct warning(s), {total} in total{}",
+                if dropped > 0 { format!(", {dropped} older one(s) dropped") } else { String::new() }
+            )).strong());
+            match report(Channel::Warning) {
+                Some(text) => ui.label(RichText::new(text).monospace().small()),
+                None => ui.label(RichText::new("Nothing was reported.").color(DIM)),
+            };
+            ui.add_space(12.0);
+            ui.label(RichText::new("Status").strong());
+            ui.label(
+                RichText::new("What the run did rather than what went wrong: the adapter, the                                archive, the shapes it saw.")
+                    .color(DIM)
+                    .small(),
+            );
+            match report(Channel::Status) {
+                Some(text) => ui.label(RichText::new(text).monospace().small()),
+                None => ui.label(RichText::new("Nothing yet.").color(DIM)),
+            };
+        });
+    }
+
     fn ui_playing(&mut self, ctx: &egui::Context) {
-        if self.session_settings.show_fps {
-            if let Some(st) = self.stats.as_ref() {
+        if self.session_settings.show_fps
+            && let Some(st) = self.stats.as_ref() {
                 egui::Area::new(egui::Id::new("fps")).fixed_pos([8.0, 8.0]).show(ctx, |ui| {
                     egui::Frame::new().fill(Color32::from_black_alpha(140)).inner_margin(4.0).show(ui, |ui| {
                         ui.label(RichText::new(format!("{:.0} fps  {:.0}%", st.fps, st.speed_pct)).monospace().color(ACCENT));
                     });
                 });
             }
-        }
         if !self.menu_open {
             return;
         }
         let mut close = false;
         let mut quit = false;
+        // Held across the window closure so the outcome can be shown in the same menu.
+        let mut diag_saved = self.diag_saved.clone();
         egui::Window::new("vitaslop").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             if let Some(st) = self.stats.as_ref() {
                 ui.label(RichText::new(st.title_line()).color(DIM).small());
@@ -829,14 +907,28 @@ impl Shell {
                 g.fps_in_title = self.session_settings.fps_in_title;
                 g.pause_on_blur = self.session_settings.pause_on_blur;
                 let _ = library::save_global_settings(&g);
-                if !self.session_settings.fps_in_title {
-                    if let Some(w) = self.window.as_ref() {
+                if !self.session_settings.fps_in_title
+                    && let Some(w) = self.window.as_ref() {
                         w.set_title("vitaslop");
+                    }
+            }
+            ui.separator();
+            let (held, _, dropped) = vitaslop_platform::diag::counts(vitaslop_platform::diag::Channel::Warning);
+            if ui.button(format!("Save a diagnostics report ({} warning(s))", held + dropped)).clicked() {
+                let name = format!("vitaslop-diagnostics-{}.txt", std::process::id());
+                if let Some(p) = rfd::FileDialog::new().set_file_name(&name).save_file() {
+                    match std::fs::write(&p, crate::log::snapshot()) {
+                        Ok(()) => diag_saved = Some(format!("saved {}", p.display())),
+                        Err(e) => diag_saved = Some(format!("could not save the report: {e}")),
                     }
                 }
             }
+            if let Some(m) = diag_saved.as_ref() {
+                ui.label(RichText::new(m).color(DIM).small());
+            }
             ui.label(RichText::new("Esc closes this menu. F11 toggles fullscreen.").color(DIM).small());
         });
+        self.diag_saved = diag_saved;
         if close {
             self.toggle_menu();
         }

@@ -407,12 +407,11 @@ impl Body {
     /// reads the whole register file across it. A model (or a policy) that watched only
     /// the billed path would have missed it.
     fn note_promotion(&mut self, i: &W) {
-        if let W::GlobalGet(g) | W::GlobalSet(g) = i {
-            if crate::promote::is_core(*g) {
+        if let W::GlobalGet(g) | W::GlobalSet(g) = i
+            && crate::promote::is_core(*g) {
                 self.promotion.access(*g, matches!(i, W::GlobalSet(_)));
                 return;
             }
-        }
         if let Some(by) = crate::promote::ends_run(i) {
             self.promotion.sync(by);
         }
@@ -467,11 +466,10 @@ impl Body {
             self.billed += u64::from(cost);
             // The 16 registers and the 4 flags occupy the first globals, in that order
             // (see `abi`), so one range test identifies a core-state move.
-            if let W::GlobalGet(g) | W::GlobalSet(g) = i {
-                if crate::promote::is_core(*g) {
+            if let W::GlobalGet(g) | W::GlobalSet(g) = i
+                && crate::promote::is_core(*g) {
                     self.core_state += 1;
                 }
-            }
             if self.fuelled {
                 self.pending += cost;
                 if operator_flushes(i) {
@@ -1089,10 +1087,10 @@ fn watch_read_nonzero() -> bool {
 /// module is byte-identical to a normal build when unset.
 ///
 /// >>> BROWSER-REACHABLE, because a V8 CPU PROFILE is the honest instrument for the inside
-/// of a frame and it reports a nameless guest function as `wasm-function[8719]`. With the
-/// section on, the same sample reads `g_812e9ac0` and the hot guest function can be
-/// disassembled. Without it the profiler can say a single guest function is 30% of all guest
-/// CPU and not say WHICH.
+/// > > > of a frame and it reports a nameless guest function as `wasm-function[8719]`. With the
+/// > > > section on, the same sample reads `g_812e9ac0` and the hot guest function can be
+/// > > > disassembled. Without it the profiler can say a single guest function is 30% of all guest
+/// > > > CPU and not say WHICH.
 pub fn emit_wasm_names() -> bool {
     use std::sync::OnceLock;
     static FROM_ENV: OnceLock<bool> = OnceLock::new();
@@ -1303,13 +1301,13 @@ pub fn set_flags_wide_c(on: bool) {
 /// VALUE-sensitive, like every other arm here.
 ///
 /// >>> IT IS BROWSER-REACHABLE, AND THAT IS THE WHOLE POINT OF IT.
-/// What this arm prices - an indirect branch through a `br_table` - is the one cost no
-/// operator count and no fuel figure can see, and the DESKTOP has already been shown unable
-/// to answer questions of that shape: an 8.7% cut in executed operators moved wasmtime's
-/// wall clock by nothing and the browser by 4.5% ([[vitaslop-operator-count-is-not-browser-time]]).
-/// V8 is the engine whose branch predictor is being asked about, so the arm has to be
-/// selectable where the transpile actually happens - in the browser's throwaway worker,
-/// which has no environment to read.
+/// > > > What this arm prices - an indirect branch through a `br_table` - is the one cost no
+/// > > > operator count and no fuel figure can see, and the DESKTOP has already been shown unable
+/// > > > to answer questions of that shape: an 8.7% cut in executed operators moved wasmtime's
+/// > > > wall clock by nothing and the browser by 4.5% ([[vitaslop-operator-count-is-not-browser-time]]).
+/// > > > V8 is the engine whose branch predictor is being asked about, so the arm has to be
+/// > > > selectable where the transpile actually happens - in the browser's throwaway worker,
+/// > > > which has no environment to read.
 pub fn dispatch_all() -> bool {
     use std::sync::OnceLock;
     static FROM_ENV: OnceLock<bool> = OnceLock::new();
@@ -2638,12 +2636,11 @@ fn emit_func_body(
     // first, but newlib's hand-written routines (strcmp, memcpy) put a shared tail
     // BEFORE the entry - a backward branch makes it a block of this function - and
     // entering there returns garbage from a body that never ran. Start at the entry.
-    if let Some(idx) = func.blocks.iter().position(|b| b.addr == func.addr) {
-        if idx != 0 {
+    if let Some(idx) = func.blocks.iter().position(|b| b.addr == func.addr)
+        && idx != 0 {
             f.instruction(&W::I32Const(idx as i32));
             f.instruction(&W::LocalSet(L_BB));
         }
-    }
 
     // block $exit ; loop $loop ; block $B{n-1} ... block $B0 ; br_table ...
     f.instruction(&W::Block(BlockType::Empty)); // $exit
@@ -2796,15 +2793,14 @@ fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32,
         // would be the way to go the other way. Read the result per GUEST INSTRUCTION: the
         // arm shifts preemption, so the two arms do not sit at the same point in a race.
         Term::Fallthrough => {
-            if dispatch_all() {
-                if let Some(next) = func
+            if dispatch_all()
+                && let Some(next) = func
                     .block_index(from)
                     .and_then(|i| func.blocks.get(i + 1))
                     .map(|b| b.addr)
                 {
                     goto(f, func, next, loop_depth, 0, from);
                 }
-            }
         }
         Term::Return => {
             f.instruction(&W::Return);
@@ -2815,15 +2811,14 @@ fn emit_term(f: &mut Body, term: &Term, func: &Func, base: u32, loop_depth: u32,
             f.instruction(&W::If(BlockType::Empty));
             f.instruction(&W::Return);
             f.instruction(&W::End);
-            if dispatch_all() {
-                if let Some(next) = func
+            if dispatch_all()
+                && let Some(next) = func
                     .block_index(from)
                     .and_then(|i| func.blocks.get(i + 1))
                     .map(|b| b.addr)
                 {
                     goto(f, func, next, loop_depth, 0, from);
                 }
-            }
         }
         // A `Halt` is a block that ran off the end of decoded code - almost always the
         // boundary just before an instruction the decoder could not lift. Normally it
@@ -5359,7 +5354,7 @@ fn emit_neon(f: &mut Body, op: &crate::ir::NeonStmt, base: u32, func_addr: u32) 
             // `ShiftImm` node because that node would have to write a real NEON register
             // to hand the value on, and there is no scratch NEON register to spend.
             let wide = *esize * 2;
-            let src_signed = sat.map_or(true, |(s, _)| s);
+            let src_signed = sat.is_none_or(|(s, _)| s);
             // The rounding identity, as in `emit_shift_imm`: `(x >> n) + bit(n-1 of x)`.
             neon_get(f, *src);
             f.instruction(&W::I32Const(*shift as i32));
@@ -5662,7 +5657,7 @@ fn permute_masks(op: crate::ir::PermuteOp, esize: u8, q: bool) -> ([u8; 16], [u8
         }
         Zip => {
             // Interleave into [a0,b0,a1,b1,...]; low n -> a_new, high n -> b_new.
-            let comb = |i: usize| if i % 2 == 0 { (false, i / 2) } else { (true, i / 2) };
+            let comb = |i: usize| if i.is_multiple_of(2) { (false, i / 2) } else { (true, i / 2) };
             for j in 0..n {
                 a_el.push(comb(j));
             }

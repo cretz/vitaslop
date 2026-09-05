@@ -1,0 +1,56 @@
+name: Bug report
+description: Something does not work the way it looks like it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a side project with no maintenance commitment. Issues are read. There is no
+        promise that any of them get fixed, and reports about one specific game are the least
+        likely to, because most of them need that game to investigate.
+
+        Do not attach game files, licence files, or keys. Issues containing them are deleted.
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before filing
+      options:
+        - label: I read the FAQ.
+          required: true
+        - label: This issue contains no game files, licence files, or keys.
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, and what you saw instead of what you expected.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - Browser (the hosted page)
+        - Browser (built from source)
+        - Desktop app
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Browser and operating system
+      placeholder: Chrome 141 on Windows 11, Firefox 145 on Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: >
+        Both front ends can produce one. In the browser, open the menu while playing and choose
+        the diagnostics option. On the desktop, use the Diagnostics screen or the in-game menu.
+        Paste it here.
+      render: text
+    validations:
+      required: true

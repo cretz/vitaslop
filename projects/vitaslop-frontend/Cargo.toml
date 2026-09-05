@@ -12,6 +12,9 @@ publish.workspace = true
 # reaches it through wasm-bindgen exports in vitaslop-web, the desktop directly.
 # Two UIs, one definition of what a setting IS.
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

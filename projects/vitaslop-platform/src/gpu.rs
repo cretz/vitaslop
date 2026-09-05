@@ -58,8 +58,9 @@ macro_rules! report_status {
 /// into a single line that only advances a count.
 ///
 /// # Why this exists, and it is not a style point
-/// The page's diagnostics panel - the only channel a phone has - keeps DISTINCT WARN lines
-/// (`vitaslop_web::logging::PAGE_LOG_CAP`, 96 of them) and folds two lines that differ only in
+/// The diagnostics panel each front end shows - the only channel a phone has, and the only
+/// one a shipped desktop build has - keeps DISTINCT WARN lines (`diag::RING_CAP`, 96 of them)
+/// and folds two lines that differ only in
 /// a trailing `count=<n>` (`vitaslop_platform::diag::dedupe_key`). A report that NAMES its
 /// subject is distinct per subject, so a shape with hundreds of subjects fills the panel by
 /// itself and evicts every other finding.
@@ -461,8 +462,8 @@ static LAST_WORKING_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 ///
 /// >>> AT FILE SCOPE ON PURPOSE. It used to live inside `mod gxm`, which is `#[cfg(feature =
 /// "gpu")]`, so `texture_budget_pressure` - which is not - could not reach it and carried its own
-/// `unwrap_or(256)` instead. That is how the two disagreed by 221 MiB while a comment said they
-/// could not.
+/// > > > `unwrap_or(256)` instead. That is how the two disagreed by 221 MiB while a comment said they
+/// > > > could not.
 pub(crate) const GAME_RESIDENT_CEILING_MB: usize = 256 + 109 + 112;
 
 /// The texture-cache budget in bytes: [`GAME_RESIDENT_CEILING_MB`] unless
@@ -553,11 +554,11 @@ static PIPE_PRECOMPILE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Takes MILLISECONDS from `gxm::Stopwatch`, never a `std::time::Instant`.
 ///
 /// >>> `std::time::Instant::now()` PANICS ON wasm32-unknown-unknown - "time not implemented on
-/// this platform" - and it panics inside `GxpLive::prepare`, i.e. on the first frame the browser
-/// renders anything. It shipped that way for one build and killed the run worker outright.
-/// `Stopwatch` exists a few hundred lines above precisely for this and is the only clock this
-/// module may use. [[vitaslop-count-bytes-when-there-is-no-clock]] is the same lesson from the
-/// other direction: the browser has no phase timer, so reach for a COUNT before a clock.
+/// > > > this platform" - and it panics inside `GxpLive::prepare`, i.e. on the first frame the browser
+/// > > > renders anything. It shipped that way for one build and killed the run worker outright.
+/// > > > `Stopwatch` exists a few hundred lines above precisely for this and is the only clock this
+/// > > > module may use. [[vitaslop-count-bytes-when-there-is-no-clock]] is the same lesson from the
+/// > > > other direction: the browser has no phase timer, so reach for a COUNT before a clock.
 fn add_build_ms(slot: &std::sync::atomic::AtomicU64, ms: f64) {
     slot.fetch_add((ms * 1000.0).max(0.0) as u64, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1835,7 +1836,7 @@ pub use gxm::set_wasm_clock;
 #[cfg(feature = "gpu")]
 mod render {
     use super::{DrawBatch, CUBE_SHADER};
-    use wgpu::util::DeviceExt;
+    
 
     /// The depth format the cube pipeline renders with. A host that supplies its
     /// own depth attachment must use this format.
@@ -1857,6 +1858,28 @@ mod render {
         bind_group: wgpu::BindGroup,
         index_count: u32,
         index_u32: bool,
+    }
+
+    /// A buffer holding `contents`, filled through the QUEUE's pooled staging rather than a
+    /// `mappedAtCreation` region of its own. `write_buffer` wants a size that is a multiple of
+    /// `COPY_BUFFER_ALIGNMENT`, so the allocation is rounded up and the tail left as zeros.
+    fn write_buffer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &str,
+        contents: &[u8],
+        usage: wgpu::BufferUsages,
+    ) -> wgpu::Buffer {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let size = ((contents.len() as u64).max(align)).div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, contents);
+        buffer
     }
 
     impl CubeRenderer {
@@ -1949,7 +1972,23 @@ mod render {
 
         /// Upload GPU buffers for each batch. Kept separate from encoding so the
         /// resources outlive the render pass that references them.
-        fn prepare(&self, device: &wgpu::Device, batches: &[DrawBatch]) -> Vec<Prepared> {
+        ///
+        /// # Why this goes through the QUEUE and not `create_buffer_init`
+        /// `create_buffer_init` is `mappedAtCreation` on the web backend, so every call takes
+        /// a renderer-side shared-memory STAGING region as well as a GPU buffer. This runs
+        /// three times per batch per FRAME, and when that arena is exhausted Chrome refuses
+        /// whichever allocation comes next: CI failed with `createBuffer failed, size (64) is
+        /// too large for the implementation when mappedAtCreation == true`, naming the 64-byte
+        /// mvp uniform, which is the victim rather than the cause. A desktop adapter's arena is
+        /// large enough to hide this indefinitely; SwiftShader's is not, which is why the
+        /// software runner is the machine that finds it.
+        /// [[vitaslop-mapped-at-creation-exhausts-a-staging-arena]]
+        fn prepare(
+            &self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            batches: &[DrawBatch],
+        ) -> Vec<Prepared> {
             batches
                 .iter()
                 .map(|b| {
@@ -1957,12 +1996,13 @@ mod render {
                     for v in &b.mvp {
                         mvp.extend_from_slice(&v.to_le_bytes());
                     }
-                    let uniform =
-                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("mvp"),
-                            contents: &mvp,
-                            usage: wgpu::BufferUsages::UNIFORM,
-                        });
+                    let uniform = write_buffer(
+                        device,
+                        queue,
+                        "mvp",
+                        &mvp,
+                        wgpu::BufferUsages::UNIFORM,
+                    );
                     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &self.bind_layout,
@@ -1971,16 +2011,10 @@ mod render {
                             resource: uniform.as_entire_binding(),
                         }],
                     });
-                    let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("vbo"),
-                        contents: &b.vertices,
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("ibo"),
-                        contents: &b.indices,
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
+                    let vertices =
+                        write_buffer(device, queue, "vbo", &b.vertices, wgpu::BufferUsages::VERTEX);
+                    let indices =
+                        write_buffer(device, queue, "ibo", &b.indices, wgpu::BufferUsages::INDEX);
                     Prepared {
                         vertices,
                         indices,
@@ -1999,13 +2033,14 @@ mod render {
         pub fn encode(
             &self,
             device: &wgpu::Device,
+            queue: &wgpu::Queue,
             encoder: &mut wgpu::CommandEncoder,
             color_view: &wgpu::TextureView,
             depth_view: &wgpu::TextureView,
             batches: &[DrawBatch],
             clear: [u8; 4],
         ) {
-            let prepared = self.prepare(device, batches);
+            let prepared = self.prepare(device, queue, batches);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2593,7 +2628,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// Still far below what a browser worker can survive: the run that was killed climbed to
     /// 1.81 GB, and it was on the ENTRY-count cap with no byte limit at all.
     /// `VITASLOP_TEX_CACHE_MB` overrides.
-
+    //
     // `GAME_RESIDENT_CEILING_MB` reads as UNUSED in a non-test build and is not: the child test
     // module below reaches it as `super::GAME_RESIDENT_CEILING_MB`, which resolves through this
     // `use`. Dropping it on the warning's word breaks `cargo test` while `cargo build` stays
@@ -2641,11 +2676,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // no estimate needed, and no 4/3 either, because the chain is already counted. A
         // GPU-built chain is priced from its geometry, which is the same number the CPU one
         // reports for the same shape; see `CompressedUpload::byte_len`.
-        if passthrough {
-            if let Some(c) = t.compressed.as_ref() {
+        if passthrough
+            && let Some(c) = t.compressed.as_ref() {
                 return c.byte_len();
             }
-        }
         let (w, h) = (t.width.max(1) as usize, t.height.max(1) as usize);
         let layers = t.faces.max(1) as usize;
         let level0 = w * h * layers * t.texel.bytes_per_texel();
@@ -3828,10 +3862,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// That alignment itself, kept so `prepare` does not have to ask the device again.
         ///
         /// >>> `Device::limits()` IS A BOUNDARY CROSSING IN THE BROWSER. wgpu's WebGPU backend
-        /// answers it by reading the live `GPUSupportedLimits` object and building a whole
-        /// `wgt::Limits` from it - `map_wgt_limits` shows up by name in a V8 worker profile of
-        /// a race. It was being asked once per PASS, sixteen times a frame, for a constant the
-        /// device fixed when it was created.
+        /// > > > answers it by reading the live `GPUSupportedLimits` object and building a whole
+        /// > > > `wgt::Limits` from it - `map_wgt_limits` shows up by name in a V8 worker profile of
+        /// > > > a race. It was being asked once per PASS, sixteen times a frame, for a constant the
+        /// > > > device fixed when it was created.
         uniform_align: u64,
         /// The caller's target colour format, needed to size the supersampled offscreen
         /// colour target (its format must match the scene pipelines' target).
@@ -4079,13 +4113,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// in flight as completing that work before releasing the memory.
         ///
         /// >>> THE INVARIANT THIS RELIES ON, stated because it is now load-bearing rather than
-        /// merely true: **each caller creates one encoder, calls `encode_chain` ONCE on it, and
-        /// submits before calling again.** All of them do - `vitaslop-desktop/retail.rs`,
-        /// `vitaslop-native/wgpu_render.rs`, `vitaslop-web/lib.rs`, and the `encode` wrapper,
-        /// which forwards a single scene. A caller that encoded two chains into one
-        /// un-submitted encoder would have the second frame's start destroy the first frame's
-        /// arenas out from under recorded commands, so if that ever becomes a shape this
-        /// renderer supports, the graveyard has to be keyed to the SUBMISSION, not to the call.
+        /// > > > merely true: **each caller creates one encoder, calls `encode_chain` ONCE on it, and
+        /// > > > submits before calling again.** All of them do - `vitaslop-desktop/retail.rs`,
+        /// > > > `vitaslop-native/wgpu_render.rs`, `vitaslop-web/lib.rs`, and the `encode` wrapper,
+        /// > > > which forwards a single scene. A caller that encoded two chains into one
+        /// > > > un-submitted encoder would have the second frame's start destroy the first frame's
+        /// > > > arenas out from under recorded commands, so if that ever becomes a shape this
+        /// > > > renderer supports, the graveyard has to be keyed to the SUBMISSION, not to the call.
         retired_buffers: Vec<wgpu::Buffer>,
         /// The pass currently being encoded writes into a target whose depth is sampled later,
         /// so its depth attachment must be STORED rather than discarded.
@@ -4125,7 +4159,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// pipelines above. Disabled -> zero cost (the payload is simply ignored).
         gxp: GxpLive,
         /// >>> THE SIX PER-PASS STAGING ARENAS WERE POOLED ON `self` HERE, AND IT WAS
-        /// REVERTED. Kept as a note because the reasoning that made it look free is the trap.
+        /// > > > REVERTED. Kept as a note because the reasoning that made it look free is the trap.
         ///
         /// `encode_pass` opens each pass with six `Vec::new()`, so each grows from zero by
         /// doubling as several hundred draws append - which a sampler profile charges to the
@@ -4235,12 +4269,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// A count, not a time: the browser has no `Instant` inside `encode`, and "how many GPU
     /// objects did this frame create" is the question either way. See `GxpLive::sampler_bgs`.
     /// >>> TWO ATOMICS, NOT A MUTEX. This is on the per-DRAW path - every draw of every
-    /// frame passes through `note_sampler_bg`, several hundred a frame - and a `Mutex` there
-    /// is a lock/unlock pair per draw to move a counter that is only ever added to. The two
-    /// halves are read together by `take_sampler_bg_counts`, which is a report boundary and
-    /// does not need them to be one atomic transaction: a count that lands in the next window
-    /// instead of this one is a rounding error in a diagnostic, where the lock was real work
-    /// on the hottest path in the renderer.
+    /// > > > frame passes through `note_sampler_bg`, several hundred a frame - and a `Mutex` there
+    /// > > > is a lock/unlock pair per draw to move a counter that is only ever added to. The two
+    /// > > > halves are read together by `take_sampler_bg_counts`, which is a report boundary and
+    /// > > > does not need them to be one atomic transaction: a count that lands in the next window
+    /// > > > instead of this one is a rounding error in a diagnostic, where the lock was real work
+    /// > > > on the hottest path in the renderer.
     static SAMPLER_BG_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static SAMPLER_BG_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -5689,7 +5723,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// surfaces builds exactly as many pipelines as before.
         ///
         /// >>> AND THE GUEST'S VERTEX LAYOUT IS IN THE KEY, because a pipeline OWNS a repack
-        /// plan and that plan is built from the layout of whichever draw happened to be first.
+        /// > > > plan and that plan is built from the layout of whichever draw happened to be first.
         ///
         /// `build_gxp_pipeline` turns each linked attribute into a `RepackAttr` carrying the
         /// GUEST byte offset, format and component count it reads from - per DRAW state, not a
@@ -5743,12 +5777,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// multi-megabyte shadow map thousands of times a frame and exhausts GPU memory.
         ///
         /// >>> THE TEXTURE IS HELD BESIDE THE VIEW SO AN EVICTION CAN `destroy()` IT. Keeping
-        /// only the view works - the view holds the texture alive - but it leaves nothing to
-        /// call `destroy()` ON, and in the browser dropping a view merely makes the texture
-        /// collectable ([[vitaslop-browser-gpu-needs-destroy]]). This cache evicts hardly at all
-        /// on the desktop and CONSTANTLY on the user's device, where 83% of decodes were
-        /// measured to be re-decodes of something just evicted - so this is the one leak the
-        /// desktop is structurally unable to observe, on the engine that can least afford it.
+        /// > > > only the view works - the view holds the texture alive - but it leaves nothing to
+        /// > > > call `destroy()` ON, and in the browser dropping a view merely makes the texture
+        /// > > > collectable ([[vitaslop-browser-gpu-needs-destroy]]). This cache evicts hardly at all
+        /// > > > on the desktop and CONSTANTLY on the user's device, where 83% of decodes were
+        /// > > > measured to be re-decodes of something just evicted - so this is the one leak the
+        /// > > > desktop is structurally unable to observe, on the engine that can least afford it.
         views: HashMap<(u64, SamplerDim), (wgpu::Texture, wgpu::TextureView)>,
         /// Bytes currently held by `views`, against [`tex_cache_budget_bytes`]. Tracked
         /// rather than derived because a `TextureView` cannot be asked its size.
@@ -5777,8 +5811,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// evicting one entry has to subtract exactly what that entry added.
         views_used: HashMap<(u64, SamplerDim), (u64, usize, u32, Residency)>,
         /// >>> WHICH UPLOAD IS THE CURRENT ONE FOR A GIVEN GUEST TEXTURE: a SLOT (the guest
-        /// address, format, shape and sampler state - see [`view_slot_key`]) to the cache key
-        /// holding its latest contents.
+        /// > > > address, format, shape and sampler state - see [`view_slot_key`]) to the cache key
+        /// > > > holding its latest contents.
         ///
         /// The cache key folds the source bytes, which is what makes it exact and what makes a
         /// texture the guest REWRITES arrive as a brand new entry every time. A movie is one
@@ -5908,18 +5942,18 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// `packed_by_alloc`.
         ///
         /// >>> IT IDENTIFIES THE ALLOCATION, NOT THE ADDRESS. A set of bare addresses says
-        /// "seen before" for an address a FREED list used to occupy, so a title whose index
-        /// buffers churn promotes a fresh allocation every frame and fills the heap with
-        /// geometry no draw will ever ask for again. MEASURED on one of them's on-track
-        /// run before this distinction existed: **9,580 index meshes placed in 328 frames,
-        /// filling the 48 MB heap and resetting it** - about 29 dead promotions a frame.
+        /// > > > "seen before" for an address a FREED list used to occupy, so a title whose index
+        /// > > > buffers churn promotes a fresh allocation every frame and fills the heap with
+        /// > > > geometry no draw will ever ask for again. MEASURED on one of them's on-track
+        /// > > > run before this distinction existed: **9,580 index meshes placed in 328 frames,
+        /// > > > filling the 48 MB heap and resetting it** - about 29 dead promotions a frame.
         ///
         /// >>> AND IT IS A `Weak`, BECAUSE A STRONG ONE WOULD BE A LEAK. Holding the `Arc` makes
-        /// the test exact and ALSO keeps every index list this map has ever seen alive - up to
-        /// the cap, which on the title above is thousands of expanded index buffers the title
-        /// itself has finished with. A `Weak` is exactly as good a test (a dead one cannot be
-        /// upgraded, and an address recycled after the original died fails the upgrade, which is
-        /// the honest answer) and owns nothing.
+        /// > > > the test exact and ALSO keeps every index list this map has ever seen alive - up to
+        /// > > > the cap, which on the title above is thousands of expanded index buffers the title
+        /// > > > itself has finished with. A `Weak` is exactly as good a test (a dead one cannot be
+        /// > > > upgraded, and an address recycled after the original died fails the upgrade, which is
+        /// > > > the honest answer) and owns nothing.
         ///
         /// At its cap the DEAD entries go first, then the oldest-filed - see `prune_seen`, and
         /// note that a liveness prune alone cannot bound this map, because the packed-vertex
@@ -5956,15 +5990,15 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// would collapse this to one entry, and is the right follow-up.
         ///
         /// >>> THIS CACHE IS BOUNDED, AND IT WAS NOT. The key holds the depth range's RAW
-        /// BITS, and a depth range is a continuous quantity: on a menu it is constant and this
-        /// cache holds a handful of entries, but in a RACE the near/far pair moves every frame,
-        /// so every frame mints entries that will never be asked for again. Each one retains a
-        /// GPU buffer AND a bind group for the rest of the run. Measured on the committed race
-        /// recipe in desktop Chrome: **30-33 buffers created EVERY FRAME, sustained**, in a
-        /// renderer whose steady state should create none - and the GPU process climbed from a
-        /// flat 0.20 GB through the menus to 5.8 GB (13.4 GB private) by frame 9000. The two
-        /// sibling caches on either side of this one are both bounded (`ubo_bgs` by generation,
-        /// `sampler_bgs` by [`SAMPLER_BG_CACHE_CAP`]); this one was simply missed.
+        /// > > > BITS, and a depth range is a continuous quantity: on a menu it is constant and this
+        /// > > > cache holds a handful of entries, but in a RACE the near/far pair moves every frame,
+        /// > > > so every frame mints entries that will never be asked for again. Each one retains a
+        /// > > > GPU buffer AND a bind group for the rest of the run. Measured on the committed race
+        /// > > > recipe in desktop Chrome: **30-33 buffers created EVERY FRAME, sustained**, in a
+        /// > > > renderer whose steady state should create none - and the GPU process climbed from a
+        /// > > > flat 0.20 GB through the menus to 5.8 GB (13.4 GB private) by frame 9000. The two
+        /// > > > sibling caches on either side of this one are both bounded (`ubo_bgs` by generation,
+        /// > > > `sampler_bgs` by [`SAMPLER_BG_CACHE_CAP`]); this one was simply missed.
         ///
         /// Bounded the same way `sampler_bgs` is, and for the same reason that makes a wholesale
         /// clear safe here: the key IS the value, so a cleared entry is rebuilt to something
@@ -6016,13 +6050,13 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// repeats within a pass.
         ///
         /// >>> IT IS A SMALL WIN AND THE MEASUREMENT SAYS SO. On a retail sports title's
-        /// gameplay frame (browser, real GPU, 672 draws) it answers **32 draws a frame** on top
-        /// of the previous-draw slot's 190, and a CDP profile of the worker could not tell the
-        /// two builds apart. What it also established is worth more than the win: the pass
-        /// carries about **310 DISTINCT sampler fingerprints**, so the resolution loop is not
-        /// where `make_sampler_bg` spends its 10% of the thread - the ~2 TEXTURE UPLOADS a
-        /// frame it performs inside that loop are. Do not re-open the loop on the strength of
-        /// the function's total; look at the upload.
+        /// > > > gameplay frame (browser, real GPU, 672 draws) it answers **32 draws a frame** on top
+        /// > > > of the previous-draw slot's 190, and a CDP profile of the worker could not tell the
+        /// > > > two builds apart. What it also established is worth more than the win: the pass
+        /// > > > carries about **310 DISTINCT sampler fingerprints**, so the resolution loop is not
+        /// > > > where `make_sampler_bg` spends its 10% of the thread - the ~2 TEXTURE UPLOADS a
+        /// > > > frame it performs inside that loop are. Do not re-open the loop on the strength of
+        /// > > > the function's total; look at the upload.
         ///
         /// It is sound on exactly the argument the one-slot cache is sound on, and no more:
         /// everything the resolution consults besides the fingerprint is CONSTANT WITHIN A
@@ -6098,14 +6132,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// zOffset = 0` hard-coded - reads it wrong wherever the guest asked for anything else.
         ///
         /// >>> AND A TITLE DOES. MEASURED on one title's title screen: that pass reports
-        /// `zOffset=0.5 zScale=0.5`, i.e. clip z in [-w, w], and its whole lattice sits at clip
-        /// `z ~ -0.98`. Under `Clamp` every vertex of it lands at window depth EXACTLY 0, so a
-        /// `LESS_EQUAL` depth test can reject nothing and the mesh's own hidden faces paint over
-        /// the faces in front of them - which is what the over-embossed lattice was. Under the
-        /// guest's own mapping the same geometry spans 0.0098..0.0107, the prism tops sit in
-        /// front of their skirts by 0.0009, and the test does what the hardware does.
-        /// `VITASLOP_GXP_NODEPTH=1` being BIT-IDENTICAL to the normal render was the fingerprint:
-        /// a depth test that rejects nothing is not a working depth test.
+        /// > > > `zOffset=0.5 zScale=0.5`, i.e. clip z in [-w, w], and its whole lattice sits at clip
+        /// > > > `z ~ -0.98`. Under `Clamp` every vertex of it lands at window depth EXACTLY 0, so a
+        /// > > > `LESS_EQUAL` depth test can reject nothing and the mesh's own hidden faces paint over
+        /// > > > the faces in front of them - which is what the over-embossed lattice was. Under the
+        /// > > > guest's own mapping the same geometry spans 0.0098..0.0107, the prism tops sit in
+        /// > > > front of their skirts by 0.0009, and the test does what the hardware does.
+        /// > > > `VITASLOP_GXP_NODEPTH=1` being BIT-IDENTICAL to the normal render was the fingerprint:
+        /// > > > a depth test that rejects nothing is not a working depth test.
         ///
         /// The PowerVR clamp of [`Clamp`](Self::Clamp) is kept - it is a separate fact about the
         /// hardware and it is still true - so this differs from it only by asking the guest.
@@ -6456,7 +6490,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // projection) a single full-screen quad silently decides the whole pass.
             //
             // MEASURED before it was acted on, over every title that renders: across
-            // MotorStorm, OlliOlli, WipEout and Ridge Racer the two verdicts agree on EVERY
+            // PCSA00027, PCSE00341, PCSA00015 and PCSE00001 the two verdicts agree on EVERY
             // pass, and they disagree on exactly ONE pass anywhere - a golf title's 960x544
             // world, where 241 perspective draws put 2,058 sampled vertices behind the eye and
             // two screen-space quads put 4 in front. Those four vertices were the whole reason
@@ -6478,7 +6512,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // SETTLE on the first frame that produced any evidence at all - the original
             // rule, and it is the right one now that the KEY distinguishes the passes that
             // share a buffer. Waiting for a PERSPECTIVE draw instead was tried and MEASURED
-            // wrong: a WipEout pass whose fit comes from a draw with no vertex inside the
+            // wrong: a PCSA00015 pass whose fit comes from a draw with no vertex inside the
             // frustum then never settles at all, so it re-decides every frame - which
             // re-interprets every pair of the pass per frame (the cost this cache exists to
             // avoid) and lets its stored depth fit drift with the camera. It moved three of
@@ -7145,7 +7179,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let off = vdata.len() as u64;
                     vdata.extend_from_slice(&packed_bytes);
                     let len = vdata.len() as u64 - off;
-                    while vdata.len() % 4 != 0 {
+                    while !vdata.len().is_multiple_of(4) {
                         vdata.push(0);
                     }
                     split_end(t, &PREP.arena_ns);
@@ -7192,7 +7226,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let off = idata.len() as u64;
                     idata.extend_from_slice(&gxp.indices);
                     let len = idata.len() as u64 - off;
-                    while idata.len() % 4 != 0 {
+                    while !idata.len().is_multiple_of(4) {
                         idata.push(0);
                     }
                     split_end(t, &PREP.arena_ns);
@@ -7629,25 +7663,23 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 h
             };
-            if let Some((last, bg)) = last_sampler_bg.as_ref() {
-                if *last == pre {
+            if let Some((last, bg)) = last_sampler_bg.as_ref()
+                && *last == pre {
                     note_sampler_bg_prev();
                     return Some(bg.clone());
                 }
-            }
             // ...and, failing that, ANY draw of this pass that decided the same thing. The
             // stored value is the CONTENT key, so the group still comes out of `sampler_bgs`
             // and a key that has been invalidated since simply misses. See
             // `GxpLive::sampler_pre`.
-            if let Some(&known) = sampler_pre.get(&pre) {
-                if let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, known)) {
+            if let Some(&known) = sampler_pre.get(&pre)
+                && let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, known)) {
                     *used = *views_epoch;
                     let bg = &*bg;
                     note_sampler_bg_pass();
                     *last_sampler_bg = Some((pre, bg.clone()));
                     return Some(bg.clone());
                 }
-            }
             let mut plan: Vec<(Bind, (bool, u32, u32))> = Vec::with_capacity(total);
             for &(samplers, textures) in stages {
             for &(unit, want) in samplers {
@@ -7979,14 +8011,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             // marked entries before anything else, so a picture that never
                             // returns is shed under pressure while an image that cycles is
                             // still there when it comes round.
-                            if let Some(slot) = view_slot_key(&gt.tex, want) {
-                                if let Some(stale) = view_slots.insert(slot, gt.tex.key) {
-                                    if stale != gt.tex.key {
+                            if let Some(slot) = view_slot_key(&gt.tex, want)
+                                && let Some(stale) = view_slots.insert(slot, gt.tex.key)
+                                    && stale != gt.tex.key {
                                         view_dead.insert((stale, want));
                                         enc(&ENC.tex_view_superseded, 1);
                                     }
-                                }
-                            }
                             // It is current again, whatever it was before.
                             view_dead.remove(&cache_key);
                             view_cache.insert(cache_key, (tex, view));
@@ -8051,8 +8081,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             // The finished group is a pure function of what it names, so ask for it before
             // building it. Only when nothing in it belongs to THIS frame's render targets.
-            if !per_frame {
-                if let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, sel)) {
+            if !per_frame
+                && let Some((bg, _, used)) = sampler_bgs.get_mut(&(key, sel)) {
                     *used = *views_epoch;
                     let bg = &*bg;
                     note_sampler_bg(true);
@@ -8060,7 +8090,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     remember_sampler_pre(sampler_pre, pre, sel);
                     return Some(bg.clone());
                 }
-            }
             // Create every sampler this bind group needs FIRST, so the map is not borrowed
             // mutably while the entries hold shared references into it.
             for &(_, st) in &plan {
@@ -8593,7 +8622,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         if pad != 0 {
             udata.resize(udata.len() + (align - pad) as usize, 0);
         }
-        let off = udata.len() as usize;
+        let off = udata.len();
         let need = bind_bytes as usize;
         udata.resize(off + need, 0);
         for (i, (base, _)) in windows.iter().enumerate() {
@@ -8610,25 +8639,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         off as u32
     }
 
-    fn make_uniform_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, lanes: u32, guest: &[u8]) -> wgpu::BindGroup {
-        if lanes == 0 {
-            return device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gxp-ubo-empty"), layout, entries: &[] });
-        }
-        let need = (lanes.div_ceil(4) as usize) * 16;
-        let mut data = vec![0u8; need];
-        let n = guest.len().min(need);
-        data[..n].copy_from_slice(&guest[..n]);
-        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gxp-ubo"),
-            contents: &data,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gxp-ubo-bind"),
-            layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
-        })
-    }
 
     /// Convert an IEEE-754 half (binary16) to f32.
     fn half_to_f32(h: u16) -> f32 {
@@ -9405,14 +9415,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// registers and an F32 float4 needs four.
     ///
     /// >>> THE OFFSET IS RELATIVE TO THE PARAMETER'S OWN CONTAINER, NOT TO THE IMAGE. `bytes`
-    /// is what `VitaState::sa_uniform_image` lays out: the default buffer at container 14's
-    /// stored `base_sa` and every SA-resident buffer at its own. A program whose default
-    /// container sits at `sa[88]` with an 80-register buffer underneath it therefore has TWO
-    /// parameters at `resource_index = 0`, in different address spaces, and reading both from
-    /// offset 0 prints one of them over the other. This diagnostic exists to say what a draw
-    /// was FED, so a value it prints from the wrong block is worse than no line at all - it
-    /// reads as a measurement. A parameter naming a container this program does not declare
-    /// gets `None` and is reported that way rather than guessed at zero.
+    /// > > > is what `VitaState::sa_uniform_image` lays out: the default buffer at container 14's
+    /// > > > stored `base_sa` and every SA-resident buffer at its own. A program whose default
+    /// > > > container sits at `sa[88]` with an 80-register buffer underneath it therefore has TWO
+    /// > > > parameters at `resource_index = 0`, in different address spaces, and reading both from
+    /// > > > offset 0 prints one of them over the other. This diagnostic exists to say what a draw
+    /// > > > was FED, so a value it prints from the wrong block is worse than no line at all - it
+    /// > > > reads as a measurement. A parameter naming a container this program does not declare
+    /// > > > gets `None` and is reported that way rather than guessed at zero.
     fn decode_uniform(
         bytes: &[u8],
         p: &vitaslop_gxp_shader::container::Parameter,
@@ -10040,7 +10050,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// would let a truncated stream collide with its own prefix.
         #[test]
         fn length_reaches_the_whole_hash() {
-            let v = vec![0u8; 64];
+            let v = [0u8; 64];
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for n in 0..=64 {
                 assert!(seen.insert(super::fnv64(0, &v[..n])), "zero-fill of length {n} collided");
@@ -10710,7 +10720,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         epoch: u64,
     ) -> Vec<String> {
         let mut by_format: HashMap<(u32, Residency), (usize, usize)> = HashMap::default();
-        for (_, (used, b, fmt, resident)) in views_used.iter() {
+        for (used, b, fmt, resident) in views_used.values() {
             if *used == epoch {
                 let e = by_format.entry((*fmt, *resident)).or_insert((0, 0));
                 e.0 += *b;
@@ -10964,6 +10974,9 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     /// common - a SIZE change is the guest resizing, a DEPTH companion is a legitimate one-off,
     /// and a SAMPLE-COUNT change is this renderer's own per-frame `sample_depth` answer
     /// flipping.
+    // Kept: the doc above is the list of reasons a recreate is LEGITIMATE, which is what
+    // stops the next person treating one as a defect.
+    #[allow(dead_code)]
     fn report_rtt_recreated(addr: u32, why: &'static str) {
         if why == "first sighting" {
             return;
@@ -11873,8 +11886,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // CPU interpreter with the real captured SA + the first vertex's attributes, and print
         // the clip output o[0..3]. If the recompiler math + uniforms are right, this is a
         // sensible clip position; if it is off-screen/NaN, the problem is upstream of the GPU.
-        if std::env::var_os("VITASLOP_GXP_INTERP").is_some() {
-            if let Ok(vrc) = vitaslop_gxp_shader::recompile_vertex(&gxp.vprog) {
+        if std::env::var_os("VITASLOP_GXP_INTERP").is_some()
+            && let Ok(vrc) = vitaslop_gxp_shader::recompile_vertex(&gxp.vprog) {
                 let mut regs = vitaslop_gxp_shader::interp::RegFile::with_lanes(512);
                 for (k, c) in gxp.vert_sa.chunks_exact(4).enumerate() {
                     if k < regs.sa.len() {
@@ -11961,7 +11974,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     Err(e) => report!("gxp interp: run failed: {e}"),
                 }
             }
-        }
 
         // Through `KeySpec` so the knob takes `all` / a key list / `!<key list>`. The exclusion
         // form is the one that matters here: see `KeySpec::resolve`.
@@ -12898,11 +12910,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         /// readable.
         fn ensure_display_image(&mut self, device: &wgpu::Device, addr: u32, w: u32, h: u32) {
             let (w, h) = (w.max(1), h.max(1));
-            if let Some(d) = self.display_images.get(&addr) {
-                if d.tex.width() == w && d.tex.height() == h {
+            if let Some(d) = self.display_images.get(&addr)
+                && d.tex.width() == w && d.tex.height() == h {
                     return;
                 }
-            }
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gxm-display-image"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -13004,7 +13015,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.views_bytes = texture_bytes(t.width, t.height);
                 }
             }
-            if !self.views.contains_key(&t.key) {
+            self.views.entry(t.key).or_insert_with(|| {
                 enc(&ENC.tex_uploaded, 1);
                 enc_tex_upload(t.rgba.len() as u64);
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -13036,8 +13047,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     },
                     wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 },
                 );
-                self.views.insert(t.key, tex.create_view(&Default::default()));
-            }
+                tex.create_view(&Default::default())
+            });
             let bind_key = (t.key, t.filter_linear);
             if self.tex_binds.contains_key(&bind_key) {
                 enc(&ENC.bind_groups_reused, 1);
@@ -13201,7 +13212,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // three calls for each of them regardless. Nothing can read what is not written:
             // a draw addresses an arena only through an offset the same pass produced, so an
             // empty arena has no reader, and a newly created WebGPU buffer is already zeroed.
-            let mut write = |buf: &wgpu::Buffer, data: &[u8], need: u64| {
+            let write = |buf: &wgpu::Buffer, data: &[u8], need: u64| {
                 if data.is_empty() {
                     return;
                 }
@@ -13314,15 +13325,14 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // compounds every iteration, running the image to white or to black depending on
             // which way round the two ended up. Measured on a 3-pass feedback chain with a
             // stale-true flag over a linear target: 128 -> 55 -> 10 -> 1 -> 0.
-            if let Some(t) = self.rtt.get_mut(&addr) {
-                if t.gamma != gamma {
+            if let Some(t) = self.rtt.get_mut(&addr)
+                && t.gamma != gamma {
                     t.gamma = gamma;
                     report_gamma_mode_changed(addr, gamma);
                     // The cached fixed-function bind groups name a view chosen under the old
                     // answer, so they are stale in exactly the same way.
                     self.rtt_binds.retain(|&(a, _, _), _| a != addr);
                 }
-            }
             if !stale {
                 return;
             }
@@ -13897,7 +13907,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         None => viewports.push((v, 1)),
                     }
                 }
-                viewports.sort_by(|a, b| b.1.cmp(&a.1));
+                viewports.sort_by_key(|v| std::cmp::Reverse(v.1));
             }
             report_depth_only_pass(
                 addr,
@@ -14378,7 +14388,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // length that the map exists to fix. A target created THIS frame is not in
                 // `rtt` yet; `reclaim_stale_rtt` stamps anything it finds unstamped rather than
                 // treating it as stale, which is what gives a new target its full TTL.
-                let mut stamp = |m: &mut HashMap<u32, u64>, rtt: &HashMap<u32, RttSurface>, a: u32| {
+                let stamp = |m: &mut HashMap<u32, u64>, rtt: &HashMap<u32, RttSurface>, a: u32| {
                     if rtt.contains_key(&a) {
                         m.insert(a, now);
                     }
@@ -14570,12 +14580,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // one unchanged. Building a second, colour-less pipeline variant for each
                     // pair would be the only alternative, and it would double the pipeline
                     // cache to serve the passes that need it least.
-                    if depth_sampled.contains(&scene.depth_addr) {
-                        if let Some((w, h)) = scene.depth_extent {
+                    if depth_sampled.contains(&scene.depth_addr)
+                        && let Some((w, h)) = scene.depth_extent {
                             self.encode_depth_only_pass(device, queue, encoder, scene, w, h);
                             continue;
                         }
-                    }
                     let mut keys: Vec<String> = scene
                         .draws
                         .iter()
@@ -14639,12 +14648,11 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             }))
                             .any(|a| a == t.data_addr)
                     });
-                if samples_own_target {
-                    if let Some(before) = self.snapshot_rtt(device, encoder, t.data_addr) {
+                if samples_own_target
+                    && let Some(before) = self.snapshot_rtt(device, encoder, t.data_addr) {
                         self.rtt_rendered.insert(t.data_addr, before);
                         self.rtt_reads_snapshot.insert(t.data_addr);
                     }
-                }
                 // A GAMMA-CORRECT surface is rendered through the sRGB view of the same
                 // texture, so the ROP encodes each store after blending exactly as the
                 // hardware does. The same view goes into `rtt_rendered` below, so a later pass
@@ -14843,8 +14851,8 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // `fres` an exact 1:1 `textureLoad` copy - the image and the caller's target are
             // the same size by construction (`ensure_display_image` takes the FRAMEBUFFER
             // extent, `fb_w/fb_h`, not the guest surface's).
-            if let Some(addr) = display_blit_addr {
-                if let Some(view) = self.display_images.get(&addr).map(|d| &d.view) {
+            if let Some(addr) = display_blit_addr
+                && let Some(view) = self.display_images.get(&addr).map(|d| &d.view) {
                     queue.write_buffer(&self.resolve_scale_buf, 0, &1u32.to_le_bytes());
                     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("gxm-display-blit-bind"),
@@ -14877,7 +14885,6 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     rpass.set_bind_group(0, &bind, &[]);
                     rpass.draw(0..3, 0..1);
                 }
-            }
             // Resolve the supersampled display buffer once, after the last pass into it.
             // The pair is taken before the target is borrowed, since taking one is a mutable use.
             let ts_resolve =
@@ -15317,11 +15324,10 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // run with the movie switched off entirely.
                 //
                 // A diagnostic, never a mode: it renders a frame the guest never asked for.
-                if let Some((lo, hi)) = crate::gpu::draw_range() {
-                    if di < lo || di > hi {
+                if let Some((lo, hi)) = crate::gpu::draw_range()
+                    && (di < lo || di > hi) {
                         continue;
                     }
-                }
                 if let Some(t) = &d.texture {
                     self.sampled_addrs.insert(t.data_addr);
                 }
@@ -15823,7 +15829,7 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             // exactly the same thing to wgpu with no allocator in the loop. The
                             // browser is where that matters: the allocator is a measured 7.3% of
                             // the busy worker on this title's race
-                            // [[vitaslop-wipeout-race-guest-half-is-closed]], and a wasm malloc
+                            // (PCSA00015, the race), and a wasm malloc
                             // is dearer than a native one. The bytes handed to `set_bind_group`
                             // are unchanged, so the frame is bit-identical.
                             //
@@ -16051,7 +16057,12 @@ fn fdep(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             )
         }
 
-        pub fn last_phases(&self) -> EncodePhases {
+        /// Where the last `encode_chain` went, SUMMED over its passes - the frame total, and
+        /// the only figure a caller's own `encode` total can be compared with.
+        ///
+        /// (Named `last_phases` until clippy pointed out that a getter of that name beside a
+        /// field of that name reads as returning the last PASS. It never did.)
+        pub fn chain_phases(&self) -> EncodePhases {
             self.chain_phases
         }
 

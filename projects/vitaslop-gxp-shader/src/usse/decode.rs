@@ -271,7 +271,7 @@ pub fn decode(word: u64) -> Instr {
         0x08 => decode_grp_pack(word),
         0x09 => decode_grp_test(word),
         0x0f => decode_grp_test_mask(word),
-        0x0a | 0x0b | 0x0c | 0x0d => decode_grp_bitwise(word, op1),
+        0x0a..=0x0d => decode_grp_bitwise(word, op1),
         0x10 => decode_grp_sop2(word),
         0x12 => decode_grp_sop2m(word),
         0x14 => decode_grp_i16mad(word),
@@ -963,11 +963,10 @@ fn decode_grp_test_mask(word: u64) -> Instr {
     // (0) with a 16- or 32-bit type (0xFF against 0xFFFF/0xFFFFFFFF), the numeric form (2) with
     // an INTEGER family (all-ones against 1), and every signed integer type (one reading writes
     // maximum-positive and nothing corroborates it). Value 3 is named "reserved".
-    let mask_ok = match (mask_type, alu) {
-        (2, TestAlu::Add | TestAlu::Sub | TestAlu::Mul) => true,
-        (1, TestAlu::IntSub16U) => true,
-        _ => false,
-    };
+    let mask_ok = matches!(
+        (mask_type, alu),
+        (2, TestAlu::Add | TestAlu::Sub | TestAlu::Mul) | (1, TestAlu::IntSub16U)
+    );
     if !mask_ok {
         blocked = blocked.or(Some(
             "0x78 VTSTMSK: this (mask type, ALU family) pair is one where the two readings of \
@@ -2805,7 +2804,7 @@ fn decode_grp_pack(word: u64) -> Instr {
     // widths (S8/U16/S16) have no such representation and stay blocked below.
     let unorm8_from_float = scale && is_float(src_fmt) && dest_fmt == 0;
     let unorm8_to_float = scale && src_fmt == 0 && is_float(dest_fmt);
-    if !(is_float(src_fmt) && is_float(dest_fmt)) && !float_to_int && !unorm8_from_float && !unorm8_to_float {
+    if (!is_float(src_fmt) || !is_float(dest_fmt)) && !float_to_int && !unorm8_from_float && !unorm8_to_float {
         blocked = blocked.or(Some("0x40 pack non-float<->float conversion (int-normalize / C10 / O8) not modeled"));
     }
     // A DESTINATION in an extended bank stays blocked: the extension row for a destination is
@@ -3168,7 +3167,7 @@ fn decode_grp_tex(word: u64) -> Instr {
 fn dot_repeat_extra(word: u64) -> Option<u32> {
     match bits(word, 47, 44) {
         0x8 => Some(0),
-        n @ 1..=3 => Some(n as u32),
+        n @ 1..=3 => Some(n),
         _ => None,
     }
 }
@@ -3176,8 +3175,8 @@ fn dot_repeat_extra(word: u64) -> Option<u32> {
 pub fn repeat_extra_iterations(word: u64) -> Option<u32> {
     match opcode1(word) {
         // Established repeat_count fields.
-        0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44) as u32), // 0x30, 0x40, 0x50 family
-        0x07 | 0x09 | 0x0f => Some(bits(word, 45, 44) as u32),        // 0x38 VMOV, 0x48 VTST
+        0x06 | 0x08 | 0x0a..=0x0d => Some(bits(word, 47, 44)), // 0x30, 0x40, 0x50 family
+        0x07 | 0x09 | 0x0f => Some(bits(word, 45, 44)),        // 0x38 VMOV, 0x48 VTST
         // No repeat_count field exists in these layouts.
         0x01 | 0x02 => Some(0), // 0x08/0x10 V32NMAD/V16NMAD - 47:44 is src2_swiz
         0x1c => Some(0),        // 0xE0 SMP
@@ -3446,10 +3445,12 @@ fn decode_grp_flow(word: u64) -> Instr {
 
     // Identify the member (order matches the ISA reference: specific members before the
     // broad catch-all). Returns the classified op and, for a no-op member, `None` blocked.
-    let (op, blocked): (Op, Option<&'static str>) = if op2 == 0b010 && bits(word, 54, 52) == 0b100 {
-        (Op::Nop, None) // PHAS - phase declaration header, no data effect
-    } else if opcat_extra == 0 && opcat == 0 && bits(word, 42, 40) == 0b101 {
-        (Op::Nop, None) // NOP
+    let (op, blocked): (Op, Option<&'static str>) = if (op2 == 0b010 && bits(word, 54, 52) == 0b100)
+        || (opcat_extra == 0 && opcat == 0 && bits(word, 42, 40) == 0b101)
+    {
+        // PHAS (a phase declaration header) and NOP. Different instructions, same absence of a
+        // data effect, so they classify identically.
+        (Op::Nop, None)
     } else if op2 == 0b010 && opcat == 0b01 {
         (Op::Todo("flow smlsi (repeat-state) not modeled"), Some("0xF8 SMLSI repeat/swizzle state not modeled - would mis-address later instructions"))
     } else if op2 == 0b011 && opcat == 0b01 {
@@ -3544,7 +3545,7 @@ fn decode_grp_flow(word: u64) -> Instr {
         // and unlike an ALU op it cannot be treated as unpredicated: the predicate IS the
         // control flow, so an unresolved encoding (PN) must reach the emitter as `Raw` and
         // block there rather than silently becoming "always taken".
-        ext_predicate(op2 as u32)
+        ext_predicate(op2)
     } else {
         Predicate::Always
     };

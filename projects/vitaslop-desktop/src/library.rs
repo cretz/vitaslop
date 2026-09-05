@@ -100,7 +100,7 @@ pub fn list_titles() -> Vec<TitleMeta> {
             }
         }
     }
-    out.sort_by(|a, b| b.imported_at.cmp(&a.imported_at));
+    out.sort_by_key(|t| std::cmp::Reverse(t.imported_at));
     out
 }
 

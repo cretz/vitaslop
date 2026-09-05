@@ -21,6 +21,11 @@ impl Error {
         matches!(self, Error::NoDecoder(_))
     }
 
+    // Constructed only by the backends that HAVE a platform error to report - Media Foundation
+    // on Windows and WebCodecs in the browser. A host whose backend reports none (Linux, where
+    // there is no native AAC backend at all) compiles neither, so this is genuinely dead there
+    // and only there. Deleting it would delete the Windows and web error path with it.
+    #[allow(dead_code)]
     pub(crate) fn platform(what: &'static str, code: i32, detail: impl Into<String>) -> Error {
         Error::Platform { what, code, detail: detail.into() }
     }

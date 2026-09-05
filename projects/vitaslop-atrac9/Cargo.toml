@@ -12,4 +12,7 @@ publish = false
 # dependencies, no_std-friendly compute so it builds identically for native and
 # wasm.
 
+[lints]
+workspace = true
+
 [dependencies]

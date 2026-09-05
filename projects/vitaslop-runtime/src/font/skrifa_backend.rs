@@ -121,9 +121,9 @@ impl FontBackend for SkrifaBackend {
 
         // One hinter per (face, size); reused across glyphs.
         let key = (face, (size.v.to_bits(), size.h.to_bits()));
-        if !self.hinters.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.hinters.entry(key) {
             let hinter = HintingInstance::new(&outlines, px, LocationRef::default(), HintingOptions::default()).ok()?;
-            self.hinters.insert(key, hinter);
+            e.insert(hinter);
         }
         let hinter = self.hinters.get(&key)?;
 

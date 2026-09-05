@@ -2,8 +2,8 @@
 //! reductions into NEON data-processing (vmovl / vaddw / vadd.i / vpadd / vabdl /
 //! vabal / vpadal), which the transpiler lifts to wasm 128-bit SIMD. Each array is
 //! >= 16 elements so the vector body actually runs; the printed sums prove the
-//! lift is numerically correct. Run with:
-//!   cargo test -p vitaslop-conformance-harness --test vita_neon
+//! > lift is numerically correct. Run with:
+//! > cargo test -p vitaslop-conformance-harness --test vita_neon
 
 use std::cell::RefCell;
 use std::rc::Rc;

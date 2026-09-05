@@ -21,6 +21,9 @@ video = ["dep:vitaslop-h264"]
 # decoder the crate behind it reports one is missing and the caller carries on silently.
 aac = ["dep:vitaslop-aac"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Platform-native H.264, for the `video` seam. Knows nothing about the Vita; it reaches
 # Media Foundation / Video Toolbox / VA-API / WebCodecs behind one API.

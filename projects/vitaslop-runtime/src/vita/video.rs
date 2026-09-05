@@ -147,7 +147,7 @@ fn do_open_file(
 }
 
 /// >>> OPEN A DIFFERENT MOVIE THAN THE TITLE ASKED FOR
-/// (`VITASLOP_MOVIE_SUBSTITUTE=app0:Data/Movie/SOMETHING.mp4`).
+/// > > > (`VITASLOP_MOVIE_SUBSTITUTE=app0:Data/Movie/SOMETHING.mp4`).
 ///
 /// A diagnostic, and it exists for one specific reason: the movie a title opens on its front
 /// screen may have no AUDIO TRACK, while the ones that do are behind thousands of frames of
@@ -935,16 +935,13 @@ fn pump_movie_audio(
         audio.submitted_to = at;
     }
     let target = at + 1 + AUDIO_LOOKAHEAD;
-    loop {
-        let Some(next) = st
-            .movie
-            .as_ref()
-            .and_then(|m| m.audio.as_ref())
-            .map(|a| a.submitted_to)
-            .filter(|&n| n < target)
-        else {
-            break;
-        };
+    while let Some(next) = st
+        .movie
+        .as_ref()
+        .and_then(|m| m.audio.as_ref())
+        .map(|a| a.submitted_to)
+        .filter(|&n| n < target)
+    {
         // The unit just handed over is in hand; only the lookahead is read again.
         let (bytes, pts): (std::borrow::Cow<[u8]>, i64) = if next == at {
             (std::borrow::Cow::Borrowed(&unit.bytes[..]), unit.pts as i64)
@@ -1158,7 +1155,7 @@ struct AccessUnit {
     dts: u64,
     sync: bool,
     /// >>> THE STREAM THE UNIT BELONGS TO, AS THE TITLE NUMBERS STREAMS: the 0-BASED INDEX
-    /// of the track in the container, NOT its `track_ID`.
+    /// > > > of the track in the container, NOT its `track_ID`.
     ///
     /// This is what the title routes on - its demux thread looks the id up in its own table
     /// and queues the record on that stream's decoder - so the numbering has to be the one
@@ -1171,7 +1168,7 @@ struct AccessUnit {
 }
 
 /// >>> WHICH TRACK OWES THE NEXT UNIT: the one whose next sample has the earliest
-/// DECODE time, across every track this engine can serve.
+/// > > > DECODE time, across every track this engine can serve.
 ///
 /// A movie file is one interleaved stream and its consumer is one demux thread pulling
 /// units in decode order; splitting that into "the video track" was fine while nothing else
@@ -1249,8 +1246,8 @@ fn next_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit
         return Ok(None);
     };
     let unit = access_unit_at(st, track, at)?;
-    if unit.is_some() {
-        if let Some(movie) = st.movie.as_mut() {
+    if unit.is_some()
+        && let Some(movie) = st.movie.as_mut() {
             // The gate opened, so the refusal run ends here - see `movie_unit_wait_us`.
             movie.gate_refusals = 0;
             if let Some(c) = movie.cursors.iter_mut().find(|(t, _)| *t == track) {
@@ -1262,7 +1259,6 @@ fn next_access_unit(st: &mut crate::host::VitaState) -> Result<Option<AccessUnit
                 movie.next_sample = at + 1;
             }
         }
-    }
     Ok(unit)
 }
 
@@ -1658,11 +1654,10 @@ fn do_get_next_unit_data(
     ctx.write_bytes(dest, &unit.bytes);
     // An AUDIO unit is decoded AHEAD of being handed over, so its PCM is waiting when the
     // title's own decode call comes - see [`MovieAudio`] and [`AUDIO_LOOKAHEAD`].
-    if !unit.video {
-        if let Some((track, at)) = taking {
+    if !unit.video
+        && let Some((track, at)) = taking {
             pump_movie_audio(st, track, at, &unit);
         }
-    }
     if let Some(movie) = st.movie.as_mut() {
         movie.delivered += 1;
         if movie.delivered <= 4 || movie.delivered % 200 == 0 {
@@ -1840,7 +1835,6 @@ pub(super) fn mp4_release_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::mp4::{Mp4, Sample, Track, TrackKind};
 
     fn track(id: u32, kind: TrackKind, codec: &[u8; 4], timescale: u32, dts: &[u64]) -> Track {

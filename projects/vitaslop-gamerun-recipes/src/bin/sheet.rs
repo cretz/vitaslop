@@ -172,7 +172,7 @@ fn shrink(w: u32, h: u32, rgba: &[u8], div: u32) -> (u32, u32, Vec<u8>) {
     }
     let (ow, oh) = ((w / div).max(1), (h / div).max(1));
     let mut out = Vec::with_capacity((ow * oh * 4) as usize);
-    let inv = (div * div) as u32;
+    let inv = div * div;
     for oy in 0..oh {
         for ox in 0..ow {
             let mut acc = [0u32; 4];

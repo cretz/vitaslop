@@ -53,7 +53,7 @@ pub enum Phase {
     /// frame. Its `entries` against `DrawVertexGather`'s is the fraction that merged.
     DrawVertexGatherMerged,
     /// >>> THE GUEST READS ALONE, inside [`Phase::DrawVertexGather`] - the crossings out of
-    /// wasm and into JS, without the scatter or the intern that follow them.
+    /// > > > wasm and into JS, without the scatter or the intern that follow them.
     ///
     /// The parent phase is the largest single item in a gameplay draw (MEASURED: 3.85 ms of a
     /// 7.55 ms `DRAW TOTAL`, 552 of 553 draws) and it bundles three costs with three different
@@ -322,7 +322,7 @@ static HITS: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::CO
 static BYTES: [AtomicU64; Phase::COUNT] = [const { AtomicU64::new(0) }; Phase::COUNT];
 
 /// >>> HOW MANY TIMES THE HOST REACHED INTO GUEST MEMORY, split by whether it took one
-/// word or a block.
+/// > > > word or a block.
 ///
 /// A `dyn GuestMemory` access is a bounds check and a VIRTUAL CALL, and in the browser it
 /// crosses into a `SharedArrayBuffer` view. The bytes are never the cost; the CALLS are.
@@ -396,7 +396,7 @@ pub fn guest_accesses() -> (u64, u64) {
 }
 
 /// >>> WHICH PHASE THE WORD READS HAPPENED IN, because the total names the DEFECT CLASS and
-/// not the line to fix.
+/// > > > not the line to fix.
 ///
 /// The totals above said a a retail race frame took **27,107 single-word reads
 /// over 560 draws**
@@ -455,7 +455,7 @@ pub fn note_bytes(phase: Phase, n: usize) {
 /// Taken rather than read so a caller can report PER FRAME without keeping its own baseline -
 /// a running total looks like a per-frame figure that keeps growing, which reads as a leak.
 /// >>> PAIRED WITH ITS PHASE, BECAUSE AN ARRAY INDEXED ONE WAY AND READ THE OTHER MISLABELS
-/// EVERY ROW.
+/// > > > EVERY ROW.
 ///
 /// The counters are indexed by [`Phase::index`], which is the order variants were ADDED;
 /// [`Phase::all`] returns them in REPORT order, which is the order they read well in. The one

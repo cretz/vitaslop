@@ -22,7 +22,7 @@
 //! freshly installed title on a real console, and it is what `GetFrameUserData`
 //! reports - it does NOT write a zero-filled buffer and call it a stored blob.
 
-use crate::host::{GuestCtx, Ptr, VitaState};
+use crate::host::VitaState;
 use crate::hostcall;
 
 /// The title's own gate declaration, inside its package.

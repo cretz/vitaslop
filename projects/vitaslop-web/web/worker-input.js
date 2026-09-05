@@ -29,21 +29,35 @@ export function forwardInput(worker, canvas) {
     return { x, y };
   };
 
+  // Every listener is remembered so the caller can take them off again. The KEY ones are on
+  // `document`, which outlives any one run: without this, quitting a game and starting
+  // another left the first run's handlers installed, so each key posted to a worker that had
+  // already been terminated, once more for every game played this session.
+  const off = [];
+  const on = (target, type, fn, opts) => {
+    target.addEventListener(type, fn, opts);
+    off.push(() => target.removeEventListener(type, fn, opts));
+  };
+
   const pointer = (down, requireButton) => (e) => {
     if (requireButton && (e.buttons & 1) === 0) return; // only track drags while pressed
     const { x, y } = toScreen(e);
     worker.postMessage({ type: "pointer", x, y, down });
   };
-  canvas.addEventListener("pointerdown", pointer(true, false));
-  canvas.addEventListener("pointermove", pointer(true, true));
-  canvas.addEventListener("pointerup", pointer(false, false));
-  canvas.addEventListener("pointerleave", pointer(false, false));
+  on(canvas, "pointerdown", pointer(true, false));
+  on(canvas, "pointermove", pointer(true, true));
+  on(canvas, "pointerup", pointer(false, false));
+  on(canvas, "pointerleave", pointer(false, false));
 
   const scrollers = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Enter"]);
   const key = (pressed) => (e) => {
     worker.postMessage({ type: "key", code: e.code, pressed });
     if (scrollers.has(e.code)) e.preventDefault(); // don't scroll the page while playing
   };
-  document.addEventListener("keydown", key(true));
-  document.addEventListener("keyup", key(false));
+  on(document, "keydown", key(true));
+  on(document, "keyup", key(false));
+
+  return () => {
+    for (const undo of off.splice(0)) undo();
+  };
 }

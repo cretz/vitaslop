@@ -267,18 +267,17 @@ impl<'a> RecipeEval<'a> {
         for a in self.recipe.asserts.iter().filter(|a| a.frame == frame) {
             let mut outcome = eval_assert(cap, frame, &a.kind, &self.watch_vals);
             // Say when the answer came from an earlier frame's sample - see `watch_vals`.
-            if let AssertKind::Mem(m) = &a.kind {
-                if self.watch_vals.contains_key(&m.watch) && !self.fresh.contains(&m.watch) {
+            if let AssertKind::Mem(m) = &a.kind
+                && self.watch_vals.contains_key(&m.watch) && !self.fresh.contains(&m.watch) {
                     outcome.detail.push_str(" (STALE - the watch read out of bounds this frame)");
                 }
-            }
             self.asserts.push(outcome);
         }
 
         let mut shots: Vec<String> =
             self.recipe.shots.iter().filter(|s| s.frame == frame).map(|s| s.name.clone()).collect();
-        if let Some(n) = self.shot_every {
-            if n > 0 && frame % n == 0 {
+        if let Some(n) = self.shot_every
+            && n > 0 && frame.is_multiple_of(n) {
                 let section =
                     self.recipe.sections.iter().rev().find(|s| s.frame <= frame).map(|s| &s.name);
                 shots.push(match section {
@@ -286,7 +285,6 @@ impl<'a> RecipeEval<'a> {
                     None => format!("f{frame:05}"),
                 });
             }
-        }
         shots
     }
 

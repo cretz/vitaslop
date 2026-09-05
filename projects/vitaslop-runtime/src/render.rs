@@ -45,7 +45,7 @@ impl Framebuffer {
         let ow = self.width / factor;
         let oh = self.height / factor;
         let mut rgba = Vec::with_capacity((ow * oh * 4) as usize);
-        let inv = (factor * factor) as u32;
+        let inv = factor * factor;
         for oy in 0..oh {
             for ox in 0..ow {
                 let mut acc = [0u32; 4];
@@ -1120,7 +1120,7 @@ fn passthrough_source(t: &BoundTexture) -> Option<CompressedUpload> {
     if t.faces != 1 {
         return why("it is a cube map, whose six mip chains' interleaving is not established");
     }
-    if t.width % 4 != 0 || t.height % 4 != 0 {
+    if !t.width.is_multiple_of(4) || !t.height.is_multiple_of(4) {
         return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
     }
     // >>> "NO CHAIN" AND "NO MIP FILTER" ARE DIFFERENT FACTS, AND ONLY ONE OF THEM BLOCKS THIS.
@@ -1223,7 +1223,9 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
     // picture - probably a more faithful one, since the hardware samples exactly those - but
     // this change is a cost change and has to be bit-identical to be judged as one. The guest's
     // own mips are a separate question with its own evidence to gather.
-    for level in 0..1u32.min(t.levels.max(1)) {
+    // (Written as `0..1u32.min(t.levels.max(1))`, which is a constant `0..1` however many
+    // levels the guest has - the clamp never chose anything. Said plainly instead.)
+    for level in 0..1u32 {
         let l = level_layout(t.base_format, t.tex_type, w, h, level)?;
         let off = level_offset(t.base_format, t.tex_type, w, h, level)?;
         // A level the guest's allocation does not actually reach is not a level - the CPU path
@@ -1277,7 +1279,7 @@ pub fn raw_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpa
 /// [[vitaslop-never-trade-quality]] [[vitaslop-phone-gpu-has-no-bc]]
 pub fn block_source(t: &BoundTexture) -> Option<vitaslop_platform::gpu::GpuRawExpand> {
     use vitaslop_platform::gpu::SourceCodec;
-    if !matches!(t.base_format, 0x85 | 0x86 | 0x87) {
+    if !matches!(t.base_format, 0x85..=0x87) {
         return None;
     }
     // A cube map's six chains interleave in a way that is not established - the same refusal
@@ -1399,7 +1401,7 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     if t.faces != 1 {
         return why("it is a cube map, whose six mip chains' interleaving is not established");
     }
-    if t.width % 4 != 0 || t.height % 4 != 0 {
+    if !t.width.is_multiple_of(4) || !t.height.is_multiple_of(4) {
         return why("its size is not a multiple of the 4x4 block, which WebGPU requires");
     }
     // >>> THE GPU BUILDS THE BLOCKS WHEN IT CAN, AND THEN NOTHING BELOW THIS RUNS.
@@ -1496,8 +1498,8 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
     let want = max_mip_levels(t.width, t.height);
     let mut levels: Vec<(u32, u32, Vec<u8>)> = Vec::new();
     for level in 0..want {
-        if level < t.levels {
-            if let Some(view) = level_view(t, 0, level) {
+        if level < t.levels
+            && let Some(view) = level_view(t, 0, level) {
                 let (w, h, rgba, seam) = decode_texture_seam(&view);
                 if seam != TexelSeam::Rgba8 {
                     return why("it decodes onto the half seam, which is DATA and not colour");
@@ -1505,7 +1507,6 @@ fn transcoded_source(t: &BoundTexture, force_format: Option<BlockFormat>) -> Opt
                 levels.push((w, h, rgba));
                 continue;
             }
-        }
         let Some((pw, ph, prev)) = levels.last() else {
             return why("its level 0 could not be decoded");
         };
@@ -1612,7 +1613,7 @@ fn gpu_transcode(t: &BoundTexture, force_format: Option<BlockFormat>) -> Option<
             crate::pvrtc::face_is_opaque(face, v),
         ),
         None => match t.base_format {
-            0x85 | 0x86 | 0x87 => {
+            0x85..=0x87 => {
                 // >>> A BC SOURCE IS RE-ENCODED ONLY WHILE THE BUDGET IS TIGHT, exactly as the
                 // CPU path decides it - and for a reason the CPU path's own cost argument
                 // happens to share but does not state: **decoding BC to RGBA8 is EXACT**. Those
@@ -1736,17 +1737,34 @@ fn report_transcoded(base_format: u32, to: BlockFormat) {
     // and pass through untouched on any desktop - they reach this path only because THIS adapter
     // has no BC. The old wording told a reader that a BC texture was unrepresentable in WebGPU,
     // which sends the next investigation looking for a missing format rather than at the adapter.
-    let why = if crate::pvrtc::Variant::from_base_format(base_format).is_some() {
-        "no WebGPU adapter has a PVRTC format at all"
+    // >>> THE TWO BRANCHES ARE NOT THE SAME KIND OF FACT, and only one is owed a fix.
+    //
+    // PVRTC: no WebGPU adapter has the format, on any platform, and none is going to. There is
+    // no version of this engine that stops transcoding a PVRTC texture, so reporting it as a
+    // warning is telling a player, every run, what the emulator IS. That is STATUS - still
+    // recorded, still in every diagnostics report, still the answer to "why did the texture
+    // working set grow 8x" - but not a claim that something is broken.
+    //
+    // The other branch IS a warning: a UBC texture is BC and passes through untouched on any
+    // desktop adapter. Reaching here means THIS adapter refused a family it could have taken,
+    // which is a property of the machine and can change - and the picture pays for it.
+    if crate::pvrtc::Variant::from_base_format(base_format).is_some() {
+        tracing::info!(
+            target: "vitaslop::status",
+            "gxm textures: base format {base_format:#04x} is RE-ENCODED to {to:?} because no \
+             WebGPU adapter has a PVRTC format at all. The blocks the GPU gets are ours, not \
+             the guest's - a second lossy step, roughly 8x the GPU memory, and the only way to \
+             show a PVRTC asset through this API"
+        );
     } else {
-        "this adapter does not accept the block family it is already in"
-    };
-    tracing::warn!(
-        target: "vitaslop::gxm",
-        "gxm textures: base format {base_format:#04x} is being RE-ENCODED to {to:?} because \
-         {why}. This is a second lossy step on top of the guest's own compression - it buys \
-         roughly 8x the GPU memory and costs image quality"
-    );
+        tracing::warn!(
+            target: "vitaslop::gxm",
+            "gxm textures: base format {base_format:#04x} is being RE-ENCODED to {to:?} because \
+             this adapter does not accept the block family it is already in. This is a second \
+             lossy step on top of the guest's own compression - it buys roughly 8x the GPU \
+             memory and costs image quality"
+        );
+    }
 }
 
 /// Report - once per (format, reason) - that a texture WebGPU has a block format for was
@@ -1928,7 +1946,7 @@ pub(crate) fn decode_bc_texel(block: &[u8], base_format: u32, px: u32, py: u32) 
         // BC2: 4-bit alpha per texel, two texels per byte, low nibble first.
         0x86 => {
             let byte = g(t / 2);
-            let a4 = if t % 2 == 0 { byte & 0xf } else { byte >> 4 };
+            let a4 = if t.is_multiple_of(2) { byte & 0xf } else { byte >> 4 };
             (a4 as u32 * 255 / 15) as u8
         }
         // BC3: two 8-bit endpoints + 3-bit interpolation indices.
@@ -2236,11 +2254,10 @@ fn predicted_texture_bytes(
     texel: TexelSeam,
     compressed: Option<&CompressedUpload>,
 ) -> usize {
-    if let Some(c) = compressed {
-        if c.format.family() == vitaslop_platform::gpu::block_family() {
+    if let Some(c) = compressed
+        && c.format.family() == vitaslop_platform::gpu::block_family() {
             return c.byte_len();
         }
-    }
     let level0 =
         (width.max(1) as usize) * (height.max(1) as usize) * (faces.max(1) as usize) * texel.bytes_per_texel();
     // The same 4/3 the uploader's own budget uses for a chain it builds, and the same reason:
@@ -2426,6 +2443,8 @@ fn clamp8(v: i32) -> u8 {
 ///
 /// The bulk path uses [`BT601_TABLES`]; this is the same arithmetic written out, and the
 /// test below holds the two together.
+// Kept: the written-out arithmetic the table path is checked against.
+#[allow(dead_code)]
 fn bt601_studio_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     let y = (y as i32 - 16) * 76309;
     let u = cb as i32 - 128;
@@ -2854,7 +2873,7 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         // inside the byte-wise 8888 range below but are NOT four 8-bit lanes: decoding them
         // as bytes splits each 16-bit value in half and produces noise, so they are pulled
         // out ahead of it. SWIZZLE2, low lane first.
-        0x0f | 0x10 | 0x11 => {
+        0x0f..=0x11 => {
             let lane = |i: usize| -> u8 {
                 let raw = u16::from_le_bytes([byte(i * 2), byte(i * 2 + 1)]);
                 let v = match t.base_format {
@@ -3007,7 +3026,7 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         }
         // Single-channel 16-bit (U16 / S16 / F16), reduced to 8 bits for the shared RGBA8
         // seam and routed by SWIZZLE1 exactly as the 8-bit single-channel case below.
-        0x09 | 0x0a | 0x0b => {
+        0x09..=0x0b => {
             let raw = u16::from_le_bytes([byte(0), byte(1)]);
             let lane = match t.base_format {
                 0x09 => unorm16_to_u8(raw),
@@ -3066,7 +3085,7 @@ fn decode_uncompressed_at(t: &BoundTexture, off: usize) -> [u8; 4] {
         // 8 bits for the shared RGBA8 texture seam: F16 saturates to [0,1] (these are HDR
         // lookup tables - a value above 1.0 clamps, which the seam cannot represent), while
         // U16/S16 are normalized ranges that map exactly.
-        0x1b | 0x1c | 0x1d => {
+        0x1b..=0x1d => {
             let lane = |i: usize| -> u8 {
                 let raw = u16::from_le_bytes([byte(i * 2), byte(i * 2 + 1)]);
                 match t.base_format {
@@ -4033,7 +4052,7 @@ impl WorldMap {
             *hist.entry((h / bucket).floor() as i64).or_insert(0) += 1;
         }
         let mut v: Vec<(f32, u32)> = hist.into_iter().map(|(k, n)| (k as f32 * bucket, n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
         v
     }
 
@@ -5332,11 +5351,10 @@ fn raster_triangle(
             // BC1 albedo (its alpha is always 255, so nothing is discarded).
             const ALPHA_TEST: u8 = 128;
             if depth_test {
-                if let Some(t) = texel {
-                    if t[3] < ALPHA_TEST {
+                if let Some(t) = texel
+                    && t[3] < ALPHA_TEST {
                         continue;
                     }
-                }
                 depth[idx] = z;
             }
 
@@ -5377,8 +5395,8 @@ fn raster_triangle(
                 }
             }
 
-            if let Some((tx, ty)) = trace {
-                if x == tx && y == ty {
+            if let Some((tx, ty)) = trace
+                && x == tx && y == ty {
                     let (tu, tv, texel) = match texture {
                         Some(tex) => {
                             let u = interp(verts[0].uv[0], verts[1].uv[0], verts[2].uv[0]) / uv_div[0];
@@ -5393,7 +5411,6 @@ fn raster_triangle(
                         verts[0].color, texel
                     );
                 }
-            }
             let dst = idx * 4;
             if depth_test {
                 // Opaque 3D replace (z-buffer already updated): run the reflected forward-lit
@@ -5471,8 +5488,9 @@ fn depth_passes(z: f32, stored: f32, func: u32) -> bool {
         NOT_EQUAL => z != stored,
         GREATER_EQUAL => z >= stored,
         ALWAYS => true,
-        // LESS_EQUAL is the GXM default; treat any unrecognized encoding as it.
-        LESS_EQUAL | _ => z <= stored,
+        LESS_EQUAL => z <= stored,
+        // Anything unrecognised is treated as LESS_EQUAL, which is the GXM default.
+        _ => z <= stored,
     }
 }
 
@@ -5700,7 +5718,7 @@ pub struct RenderSceneBuilder {
     /// [`RenderSceneBuilder::decode_frame_high`].
     decode_used: crate::fasthash::FxHashMap<u64, (u64, usize)>,
     /// >>> WHICH DECODE IS THE CURRENT ONE FOR A GIVEN GUEST TEXTURE: [`tex_slot_key`] ->
-    /// [`tex_key`].
+    /// > > > [`tex_key`].
     ///
     /// The decode key folds the SOURCE BUFFER's address, because that is what makes it exact
     /// ("are these the same decoded bytes"). The consequence is that a texture the guest -
@@ -6471,11 +6489,10 @@ impl RenderSceneBuilder {
             return Arc::from(&[][..]);
         }
         let key = (Arc::as_ptr(src) as *const crate::capture::VertexAttribute as usize, src.len());
-        if let Some(e) = self.gxp_attr_sets.get(&key) {
-            if Arc::ptr_eq(&e.src, src) {
+        if let Some(e) = self.gxp_attr_sets.get(&key)
+            && Arc::ptr_eq(&e.src, src) {
                 return e.out.clone();
             }
-        }
         let out: Arc<[vitaslop_platform::gpu::GxpAttr]> = src
             .iter()
             .map(|a| vitaslop_platform::gpu::GxpAttr {
@@ -6702,13 +6719,12 @@ impl RenderSceneBuilder {
         // all. The re-decode column is what says the "content comes back" worry does not
         // happen HERE, on the CPU side; the same experiment on the GPU-side view cache says
         // the opposite, and that cache marks instead (see `GxpLive::view_dead`).
-        if let Some(stale) = self.decode_slots.insert(tex_slot_key(t), key) {
-            if stale != key && self.decode_cache.remove(&stale).is_some() {
+        if let Some(stale) = self.decode_slots.insert(tex_slot_key(t), key)
+            && stale != key && self.decode_cache.remove(&stale).is_some() {
                 let bytes = self.decode_used.remove(&stale).map_or(0, |(_, b)| b);
                 self.decode_cache_bytes = self.decode_cache_bytes.saturating_sub(bytes);
                 work.tex_superseded += 1;
             }
-        }
         self.decode_cache.insert(key, (g.clone(), t.pixels.clone()));
         self.touch_decode(key, cost);
         g
@@ -6822,7 +6838,7 @@ impl RenderSceneBuilder {
             // Whether this draw's FIXED-FUNCTION representation will be used at all - see
             // `gxp_only`, and the note further down. Decided here because the classifier
             // walks every vertex for it, and that walk is dead when it will not.
-            let fixed_function = !(self.gxp_only && !d.vprog.is_empty());
+            let fixed_function = !self.gxp_only || d.vprog.is_empty();
             let interp = interpret_draw_for(d, !fixed_function);
             // A position-only draw whose colour lives in the guest's shader is NOT dropped
             // when the recompiler can have it: the fixed-function packing has no colour
@@ -6898,8 +6914,8 @@ impl RenderSceneBuilder {
                         report_depth_range_reader(di, d);
                     }
                     range_has_reader = true;
-                } else if !need_depth_range {
-                    deferred.push((di, *layout, mvp.expect("checked just above")));
+                } else if !need_depth_range && let Some(mvp) = mvp {
+                    deferred.push((di, *layout, mvp));
                 }
             }
 
@@ -6979,8 +6995,8 @@ impl RenderSceneBuilder {
                 // Accumulate the visible opaque depth range (post-divide c.z/c.w over
                 // on-screen vertices) so the GPU can linearly normalize depth into [0,1]
                 // at full precision - see `RenderScene::depth_min`/`depth_scale`.
-                if opaque {
-                    if let Some(m) = mvp {
+                if opaque
+                    && let Some(m) = mvp {
                         let c = transform(&m, v.pos[0], v.pos[1], v.pos[2]);
                         if c[3] > 1e-4 {
                             let (nx, ny, depth) = (c[0] / c[3], c[1] / c[3], -1.0 / c[3]);
@@ -6992,7 +7008,6 @@ impl RenderSceneBuilder {
                             }
                         }
                     }
-                }
             }
 
             // Expand the topology into a flat triangle-LIST index buffer with winding
@@ -8321,7 +8336,7 @@ mod supersample_tests {
         let mut verts = Vec::new();
         for (x, y, u, v) in [(0.0, 0.0, 0.0, 0.0), (w as f32, 0.0, 1.0, 0.0), (w as f32, h as f32, 1.0, 1.0), (0.0, h as f32, 0.0, 1.0)] {
             for f in [x, y, u, v] {
-                verts.extend_from_slice(&(f as f32).to_le_bytes());
+                verts.extend_from_slice(&f.to_le_bytes());
             }
         }
         let tex = BoundTexture {

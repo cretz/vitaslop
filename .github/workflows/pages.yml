@@ -1,9 +1,9 @@
 # Publish the web build to GitHub Pages.
 #
-# Triggered by a release tag (`v*`), so the site and the desktop binaries of the same
-# release come from the same commit and a bug report can name one version. `main` is a
-# working branch: it does not deploy on its own. `workflow_dispatch` publishes whatever
-# ref you run it from, for a site fix that should not wait for a tag.
+# Triggered by a merge to `main`, so the hosted page is whatever main says it is and a
+# site fix does not wait for a release. `workflow_dispatch` publishes whatever ref you
+# run it from. Note the consequence: the site can be AHEAD of the newest tagged release,
+# so the desktop binaries and the page are not always the same commit.
 #
 # What is published is `projects/vitaslop-web/web/` verbatim, with the wasm bundle built
 # into `web/pkg/`. The page is plain ES modules over a static host: no bundler, no server.
@@ -16,7 +16,7 @@ name: Pages
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -39,7 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Same pin as ci.yml and `projects/rust-toolchain.toml`: a released artifact and the
+      # build that tested it must come from one compiler.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
 

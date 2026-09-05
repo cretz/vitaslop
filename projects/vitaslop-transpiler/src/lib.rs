@@ -1339,15 +1339,14 @@ fn scan_materialized_code_pointers(code: &[u8], base: u32) -> Vec<u32> {
         if let Some((rd, lo)) = parts(o, false) {
             let mut p = o + 4;
             while p + 4 <= code.len() && p < o + 4 + PAIR_WINDOW * 2 {
-                if let Some((rd2, hi)) = parts(p, true) {
-                    if rd2 == rd {
+                if let Some((rd2, hi)) = parts(p, true)
+                    && rd2 == rd {
                         let value = (hi << 16) | lo;
                         if value & 1 == 1 && looks_like_thumb_entry(code, base, value & !1) {
                             out.push(value & !1);
                         }
                         break;
                     }
-                }
                 p += 2;
             }
         }
@@ -1853,6 +1852,40 @@ pub fn transpile_report(program: &Program) -> Report {
     Report { ok, failures }
 }
 
+/// Report the size of the lifted program, once, before it is handed to the emitter.
+///
+/// # Why this exists
+/// The transpiler is the allocation peak of the whole system and nothing said how big it was.
+/// MEASURED on one retail title: a **9,975 MB** desktop working-set peak and a ~5,000 MB steady
+/// state, for a 4.9 MB ARM module - and in a browser, where wasm32 caps the address space at
+/// 4 GiB and linear memory never shrinks, the same build died in `lower::discover` with
+/// `std::alloc::rust_oom`. Three other titles peak at 1.4-2.7 GB, so this is a property of the
+/// TITLE's code size, not a constant. A number that decides whether a title can run at all
+/// should not have to be recovered from a stack trace.
+///
+/// Statements are counted, not measured: `Stmt` is an enum whose size the compiler is free to
+/// change, so a byte estimate here would be a number that silently goes stale. The counts are
+/// what scale with the title, and `size_of` is printed beside them so the product is available
+/// without pinning it.
+fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
+    let blocks: usize = funcs.values().map(|f| f.blocks.len()).sum();
+    let stmts: usize = funcs.values().flat_map(|f| &f.blocks).map(|b| b.stmts.len()).sum();
+    let arm: u64 = funcs.values().flat_map(|f| &f.blocks).map(|b| b.arm_count as u64).sum();
+    let stubs = funcs.values().filter(|f| f.stub).count();
+    // Only when a log filter was NAMED: this crate has no tracing, and a run nobody
+    // configured prints nothing. (`VITASLOP_LOG=warn` is a debugging session.)
+    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
+    eprintln!(
+        "transpile: lifted {} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
+         {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone are \
+         about {:.0} MB",
+        funcs.len(),
+        std::mem::size_of::<ir::Stmt>(),
+        (stmts * std::mem::size_of::<ir::Stmt>()) as f64 / 1e6,
+    );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2040,8 +2073,7 @@ mod tests {
                         Operator::I64Add,
                         Operator::GlobalSet { global_index: h },
                     ] = ops[i..(i + 4).min(ops.len())]
-                    {
-                        if g == abi::WORK_GLOBAL && h == abi::WORK_GLOBAL {
+                        && g == abi::WORK_GLOBAL && h == abi::WORK_GLOBAL {
                             let ops_half = value & abi::WORK_OPS_MASK;
                             let instr_half = value >> abi::WORK_INSTR_SHIFT;
                             assert!(
@@ -2057,7 +2089,6 @@ mod tests {
                             i += 4;
                             continue;
                         }
-                    }
                     // A back-edge test:
                     //   global.get $work ; i64.const MASK ; i64.and ; i64.const INTERVAL ;
                     //   i64.ge_u ; if ; i32.const -1 ; call $host ;
@@ -2068,8 +2099,7 @@ mod tests {
                         Operator::I64And,
                         Operator::I64Const { value: interval },
                     ] = ops[i..(i + 4).min(ops.len())]
-                    {
-                        if g == abi::WORK_GLOBAL && mask == abi::WORK_OPS_MASK {
+                        && g == abi::WORK_GLOBAL && mask == abi::WORK_OPS_MASK {
                             assert_eq!(
                                 interval, INTERVAL as i64,
                                 "{what}: a back-edge test must compare the whole interval"
@@ -2087,7 +2117,6 @@ mod tests {
                             i += 12;
                             continue;
                         }
-                    }
                     owed += wasmtime_cost(&ops[i]);
                     i += 1;
                 }
@@ -2561,11 +2590,9 @@ mod tests {
                     while let Ok(op) = reader.read() {
                         if let Operator::GlobalGet { global_index } | Operator::GlobalSet
                         { global_index } = op
-                        {
-                            if promote::is_core(global_index) {
+                            && promote::is_core(global_index) {
                                 n += 1;
                             }
-                        }
                     }
                 }
             }
@@ -2585,39 +2612,5 @@ mod tests {
         set_promote_registers(false);
         let plain_again = build(false);
         assert_eq!(plain, plain_again, "an unpromoted build must be deterministic");
-    }
-}
-
-/// Report the size of the lifted program, once, before it is handed to the emitter.
-///
-/// # Why this exists
-/// The transpiler is the allocation peak of the whole system and nothing said how big it was.
-/// MEASURED on one retail title: a **9,975 MB** desktop working-set peak and a ~5,000 MB steady
-/// state, for a 4.9 MB ARM module - and in a browser, where wasm32 caps the address space at
-/// 4 GiB and linear memory never shrinks, the same build died in `lower::discover` with
-/// `std::alloc::rust_oom`. Three other titles peak at 1.4-2.7 GB, so this is a property of the
-/// TITLE's code size, not a constant. A number that decides whether a title can run at all
-/// should not have to be recovered from a stack trace.
-///
-/// Statements are counted, not measured: `Stmt` is an enum whose size the compiler is free to
-/// change, so a byte estimate here would be a number that silently goes stale. The counts are
-/// what scale with the title, and `size_of` is printed beside them so the product is available
-/// without pinning it.
-fn report_lifted_size(funcs: &std::collections::BTreeMap<u32, ir::Func>) {
-    let blocks: usize = funcs.values().map(|f| f.blocks.len()).sum();
-    let stmts: usize = funcs.values().flat_map(|f| &f.blocks).map(|b| b.stmts.len()).sum();
-    let arm: u64 = funcs.values().flat_map(|f| &f.blocks).map(|b| b.arm_count as u64).sum();
-    let stubs = funcs.values().filter(|f| f.stub).count();
-    // Only when a log filter was NAMED: this crate has no tracing, and a run nobody
-    // configured prints nothing. (`VITASLOP_LOG=warn` is a debugging session.)
-    if std::env::var_os("VITASLOP_LOG").is_some() || std::env::var_os("RUST_LOG").is_some() {
-    eprintln!(
-        "transpile: lifted {} functions ({stubs} stubs), {blocks} blocks, {stmts} statements, \
-         {arm} guest instructions; size_of::<Stmt>()={} B, so the statement vectors alone are \
-         about {:.0} MB",
-        funcs.len(),
-        std::mem::size_of::<ir::Stmt>(),
-        (stmts * std::mem::size_of::<ir::Stmt>()) as f64 / 1e6,
-    );
     }
 }

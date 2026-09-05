@@ -117,7 +117,7 @@ impl Gfx {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.cube
-            .encode(&self.device, &mut encoder, &view, &self.depth, &batches, CLEAR);
+            .encode(&self.device, &self.queue, &mut encoder, &view, &self.depth, &batches, CLEAR);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
     }

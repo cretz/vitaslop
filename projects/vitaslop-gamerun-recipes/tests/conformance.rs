@@ -39,11 +39,10 @@ fn recipes_pass_their_assertions() {
         let recipe = Recipe::parse(&text).expect("parse recipe");
         // Skip recipes for a different title than the one dumped.
         let recipe_game = recipe.meta.game.clone().unwrap_or_else(|| title_id.clone());
-        if let Some(want) = &want_id {
-            if &recipe_game != want {
+        if let Some(want) = &want_id
+            && &recipe_game != want {
                 continue;
             }
-        }
         ran += 1;
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         eprintln!("\n=== running {name} (title {recipe_game}) ===");

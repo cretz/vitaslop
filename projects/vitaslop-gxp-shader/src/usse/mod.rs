@@ -295,14 +295,15 @@ fn validate_imad_step_pairs(instrs: &mut [crate::ir::Instr]) {
     }
 }
 
-/// Decode a parsed program's USSE code stream into the shader IR.
-///
-/// A `SMP` instruction addresses its sampler by a REGISTER field, not by texture unit: the
-/// texture's control words live at SA register `2 * field`, and only the container's
-/// texture-control table says which GXM unit those words describe. That resolution happens here,
-/// so `Op::Tex::unit` is a real texture unit everywhere downstream - the same namespace a
-/// PDS-prefetched sample names directly, and the one the renderer binds by. A field the table
-/// does not describe blocks the instruction rather than naming an arbitrary unit.
+// How the decode above resolves a sampler, kept as a plain comment because the item it used to
+// document is gone and a `///` block with nothing under it attaches itself to whatever follows.
+//
+// A `SMP` instruction addresses its sampler by a REGISTER field, not by texture unit: the
+// texture's control words live at SA register `2 * field`, and only the container's
+// texture-control table says which GXM unit those words describe. That resolution happens in
+// the decode above, so `Op::Tex::unit` is a real texture unit everywhere downstream - the same
+// namespace a PDS-prefetched sample names directly, and the one the renderer binds by. A field
+// the table does not describe blocks the instruction rather than naming an arbitrary unit.
 
 /// Which OUTPUT-bank lanes a decoded program writes, as a bitmap indexed by lane.
 ///

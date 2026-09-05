@@ -19,8 +19,50 @@ members = [
     "vitaslop-web",
 ]
 
+# ---------------------------------------------------------------------------------------
+# Lint policy. CI runs `cargo clippy --workspace --all-targets -- -D warnings`, so every
+# lint left on is a build failure. These are the families turned OFF, each for a stated
+# reason rather than because they were noisy:
+#
+#   doc_lazy_continuation / doc_overindented_list_items - this codebase's doc comments are
+#     long prose that explains why a thing is the way it is. Reflowing hundreds of them to
+#     satisfy a markdown-continuation rule edits the explanations, which is the one part
+#     of this repo worth protecting from a mechanical pass.
+#   needless_range_loop - the guest-memory, texture and block loops index several parallel
+#     arrays from one counter, where an iterator rewrite is longer and easier to get wrong.
+#   type_complexity - the seam types (capture callbacks, per-draw closures) are complex
+#     because the domain is; naming each one moves the complexity rather than removing it.
+#   too_many_arguments - the render and encode entry points take what a draw call needs.
+#   identity_op - bitfield packers write `v << 0` for the first field so every field in the
+#     block reads the same way. Collapsing just that one is what makes such code drift.
+#   unusual_byte_groupings - hardware constants are grouped the way the reference manual
+#     prints them, not in even pairs.
+[workspace.lints.clippy]
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"
+identity_op = "allow"
+unusual_byte_groupings = "allow"
+#   field_reassign_with_default - the capsule/capture parsers and the render-state fixtures
+#     build a wide struct field by field, in the order the format defines them. A 30-field
+#     literal would read worse and would hide which fields a case actually sets.
+#   items_after_test_module - purely about file order, and moving code to satisfy it churns
+#     diffs without changing what anything does.
+#   assertions_on_constants - the layout guards (`BYTES <= WORK_SIZE`) assert a constant on
+#     purpose: the constant is what is under test, and a build where it stops holding is
+#     exactly what the assert exists to catch.
+field_reassign_with_default = "allow"
+items_after_test_module = "allow"
+assertions_on_constants = "allow"
+#   chunks_exact_to_as_chunks - 49 call sites, and `chunks_exact(4)` says what it does at the
+#     point of use. `as_chunks::<4>().0.iter()` is three calls to say the same thing, and the
+#     lint is new in 1.98 rather than a rule this code was written against.
+chunks_exact_to_as_chunks = "allow"
+
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/cretz/vitaslop"

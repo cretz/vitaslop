@@ -244,6 +244,9 @@ impl core::fmt::Display for LinkError {
 /// components as packed F16 halves. The per-descriptor width is
 /// [`crate::container::Interpolant::prefetch_regs`], which is 1, 2 or 4 - this is only the
 /// common case the test helpers build. See [`crate::container::SamplePrefetch`].
+// Kept for the record: it names the COMMON prefetch width, which is the thing a reader
+// needs when `Interpolant::prefetch_regs` returns 1 or 4 instead.
+#[allow(dead_code)]
 const PREFETCH_REGS: u32 = 2;
 
 impl std::error::Error for LinkError {}
@@ -594,8 +597,8 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                 }
             }
         }
-        if let Some(d) = instr.dest.as_ref() {
-            if d.bank == Bank::PrimaryAttr {
+        if let Some(d) = instr.dest.as_ref()
+            && d.bank == Bank::PrimaryAttr {
                 for c in 0..4 {
                     if !instr.write_mask[c] {
                         continue;
@@ -613,7 +616,6 @@ fn pa_read_before_write(shader: &Shader) -> (Vec<bool>, Vec<bool>) {
                     }
                 }
             }
-        }
     }
     (inputs, untouched)
 }
@@ -1278,11 +1280,10 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     if let Some(order) = hand_typed_layout(vprog) {
         return plan_interface_with(fprog, fshader, &order);
     }
-    if std::env::var("VITASLOP_GXP_VARYING_ORDER").as_deref() == Ok("fragment") {
-        if let Some(order) = fragment_declared_order(vprog, fprog) {
+    if std::env::var("VITASLOP_GXP_VARYING_ORDER").as_deref() == Ok("fragment")
+        && let Some(order) = fragment_declared_order(vprog, fprog) {
             return plan_interface_with(fprog, fshader, &order);
         }
-    }
     // >>> ASK THE VERTEX PROGRAM'S OWN FORWARDING MOVES FIRST, WHATEVER PLACED THE REST. See
     // `forwarding_claims` for why a move can answer the order question and the varyings block
     // cannot.
@@ -1309,8 +1310,8 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     let claims = forwarding_claims(vprog, &vshader);
     // Value-sensitive, because a knob used as an A/B ARM has to be: a presence-only reader
     // turns `=0` into an ON arm and both arms then measure the same build.
-    if std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0") {
-        if let Some(order) = layout_from_forwarding_claims(&vprog.output_varyings, &claims) {
+    if std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0")
+        && let Some(order) = layout_from_forwarding_claims(&vprog.output_varyings, &claims) {
             let shown: Vec<String> = order
                 .iter()
                 .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
@@ -1325,7 +1326,6 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             );
             return plan_interface_with(fprog, fshader, &order);
         }
-    }
     // A `Known` order was read off the attributes and the moves did not refute it.
     if vprog.output_order == VaryingOrder::Known {
         return plan_interface_with(fprog, fshader, &vprog.output_varyings);
@@ -1612,11 +1612,10 @@ fn plan_interface_with(
     // A passthrough program's colour IS its primary-attribute allocation, so a register in that
     // allocation that no interpolant feeds is a colour channel we would emit as zero. Fail
     // instead: for these programs the routing is the whole translation.
-    if passthrough {
-        if let Some(reg) = (0..primary_regs).find(|&r| !fed.get(r as usize).copied().unwrap_or(false)) {
+    if passthrough
+        && let Some(reg) = (0..primary_regs).find(|&r| !fed.get(r as usize).copied().unwrap_or(false)) {
             return Err(LinkError::PaReadUnfed { register: reg, varyings_error: fprog.varyings_error });
         }
-    }
     Ok(iface)
 }
 
@@ -2415,7 +2414,7 @@ fn arm(name: &str) -> Option<&'static str> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let v = std::env::var(name).ok()?;
-        return Some(Box::leak(v.trim().to_string().into_boxed_str()));
+        Some(Box::leak(v.trim().to_string().into_boxed_str()))
     }
     #[cfg(target_arch = "wasm32")]
     None

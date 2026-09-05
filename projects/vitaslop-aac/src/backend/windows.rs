@@ -17,7 +17,6 @@
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Media::MediaFoundation::*;
-use windows::core::Interface;
 
 use super::Backend;
 use crate::error::{Error, Result};

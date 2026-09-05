@@ -12,6 +12,9 @@ publish.workspace = true
 # `run_all`), used by BOTH the native (wasmtime) test here and the browser
 # (WebAssembly) runner in vitaslop-web. The lib deps are therefore wasm-safe (no
 # wasmtime); the native engine used by the tests is a dev-dependency only.
+[lints]
+workspace = true
+
 [dependencies]
 vitaslop-transpiler = { path = "../vitaslop-transpiler" }
 vitaslop-runtime = { path = "../vitaslop-runtime" }

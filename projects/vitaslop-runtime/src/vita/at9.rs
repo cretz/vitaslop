@@ -159,8 +159,8 @@ const OFF_PCM_RATE: u32 = 0x38;
 /// The per-voice LEVEL, immediately after the playback rate.
 ///
 /// >>> WITHOUT IT THE MIX SUMS EVERY VOICE AT UNITY AND CLIPS. One title's front end
-/// clamped 14.7% of its nonzero samples - gross distortion that reads as a broken
-/// decoder.
+/// > > > clamped 14.7% of its nonzero samples - gross distortion that reads as a broken
+/// > > > decoder.
 ///
 /// EVIDENCE that it is a level and not the `fPlaybackScalar` that would sit in the same
 /// place, from 2,569 voices in one run: the value is NEVER 1.0. It is 0.500, 0.610,
@@ -193,8 +193,8 @@ const OFF_PCM_FORMAT: u32 = 0x4f;
 /// first float is the master level.
 ///
 /// >>> THIS IS THE STAGE THAT KEEPS THE MIX OFF THE CLAMP. Sources sum to as much as
-/// **2.733x full scale** in one measured front end, so without it 4.1% of nonzero
-/// samples clamp and the mix distorts.
+/// > > > **2.733x full scale** in one measured front end, so without it 4.1% of nonzero
+/// > > > samples clamp and the mix distorts.
 ///
 /// EVIDENCE, four independent strands rather than a guess - the last guess in this file
 /// decoded to noise:
@@ -290,13 +290,13 @@ pub(crate) struct At9Voice {
     /// being the 1.0 this struct starts at.
     ///
     /// >>> A DEFAULT AND A MEASUREMENT LOOK IDENTICAL ONCE THEY ARE BOTH `1.0`, and that
-    /// distinction is the open question about this mixer. The race sums to ~4.9x full scale
-    /// and clips half its grains; the output port is not the cause (its mean over the grains
-    /// is 0.995) and no voice is unrouted (0.0 a grain), so the attenuation that is missing
-    /// is a LEVEL somewhere in the graph. A buss voice whose params arrived through a module
-    /// this engine does not parse keeps `level = 1.0` and contributes a silent no-op to
-    /// `buss_gain` - indistinguishable, in the mix, from a buss the title really did leave at
-    /// unity. This flag is what tells those two apart.
+    /// > > > distinction is the open question about this mixer. The race sums to ~4.9x full scale
+    /// > > > and clips half its grains; the output port is not the cause (its mean over the grains
+    /// > > > is 0.995) and no voice is unrouted (0.0 a grain), so the attenuation that is missing
+    /// > > > is a LEVEL somewhere in the graph. A buss voice whose params arrived through a module
+    /// > > > this engine does not parse keeps `level = 1.0` and contributes a silent no-op to
+    /// > > > `buss_gain` - indistinguishable, in the mix, from a buss the title really did leave at
+    /// > > > unity. This flag is what tells those two apart.
     level_set: bool,
     /// PS-ADPCM only: the two-sample predictor history PER CHANNEL, carried across
     /// blocks (and therefore across grains - resetting it per grain would put a
@@ -328,7 +328,7 @@ impl At9Voice {
     /// an ungated log line would be its own performance defect.
     fn refuse(&mut self, reason: std::fmt::Arguments<'_>) {
         let text = reason.to_string();
-        if self.reported.iter().any(|r| *r == text) {
+        if self.reported.contains(&text) {
             return;
         }
         tracing::warn!(target: "vitaslop::at9", "NGS voice not audible: {text}");
@@ -339,7 +339,7 @@ impl At9Voice {
     /// rather than a defect, which would be noise at WARN on every run.
     fn refuse_quiet(&mut self, reason: std::fmt::Arguments<'_>) {
         let text = reason.to_string();
-        if self.reported.iter().any(|r| *r == text) {
+        if self.reported.contains(&text) {
             return;
         }
         tracing::debug!(target: "vitaslop::at9", "NGS voice not audible: {text}");
@@ -380,10 +380,10 @@ impl At9Voice {
     /// false if the buffer is not a recognizable AT9 player params block.
     ///
     /// >>> EVERY REFUSAL HERE IS A VOICE THAT WILL NEVER BE AUDIBLE, so each one names
-    /// itself through [`refuse`] rather than returning a bare `false`. A silently
-    /// rejected source is indistinguishable from a title that chose not to play a
-    /// sound, and that is exactly how a whole stack - decoder, mixer, ring, worklet -
-    /// sat correct and untested behind a stream of digital silence.
+    /// > > > itself through [`refuse`] rather than returning a bare `false`. A silently
+    /// > > > rejected source is indistinguishable from a title that chose not to play a
+    /// > > > sound, and that is exactly how a whole stack - decoder, mixer, ring, worklet -
+    /// > > > sat correct and untested behind a stream of digital silence.
     fn load_params(&mut self, ctx: &GuestCtx, params_addr: u32) -> bool {
         let id = ctx.read_u32(params_addr);
         if id == PCM_PARAMS_ID {
@@ -449,11 +449,11 @@ impl At9Voice {
     /// Take a freshly written buffer chain.
     ///
     /// >>> A WRITE WHILE THE VOICE IS PLAYING IS A REFILL, NOT A RESTART. A streaming title
-    /// answers each buffer callback by locking the params, rewriting the slot it was told
-    /// about, and unlocking - with the player two slots further on. Resetting the read
-    /// position on every unlock would restart the sound at every superframe. So the chain
-    /// is replaced but the cursor (`cur`, `consumed`, `laps`) is kept, and only the CURRENT
-    /// slot's copy is refreshed from the new descriptors.
+    /// > > > answers each buffer callback by locking the params, rewriting the slot it was told
+    /// > > > about, and unlocking - with the player two slots further on. Resetting the read
+    /// > > > position on every unlock would restart the sound at every superframe. So the chain
+    /// > > > is replaced but the cursor (`cur`, `consumed`, `laps`) is kept, and only the CURRENT
+    /// > > > slot's copy is refreshed from the new descriptors.
     fn set_chain(&mut self, bufs: [BufDesc; PLAYER_BUFFERS]) {
         self.bufs = bufs;
         if !self.playing {
@@ -600,7 +600,7 @@ impl At9Voice {
             PcmFormat::S16 => channels * 2,
             PcmFormat::Adpcm => ADPCM_BLOCK_BYTES,
         };
-        if data_bytes % unit != 0 {
+        if !data_bytes.is_multiple_of(unit) {
             self.refuse(format_args!(
                 "{format:?} source of {data_bytes} bytes is not a whole number of {unit}-byte \
                  units - the sample format is misread, so the source is refused"
@@ -609,7 +609,7 @@ impl At9Voice {
         }
         // Stereo PS-ADPCM interleaves whole blocks, so the buffer must divide into whole
         // interleave GROUPS - a remainder means the interleave is not what this reads.
-        if format == PcmFormat::Adpcm && data_bytes % (ADPCM_BLOCK_BYTES * channels) != 0 {
+        if format == PcmFormat::Adpcm && !data_bytes.is_multiple_of(ADPCM_BLOCK_BYTES * channels) {
             self.refuse(format_args!(
                 "PS-ADPCM source of {data_bytes} bytes is not a whole number of {channels}-channel \
                  16-byte block groups - the interleave is misread, so the source is refused"
@@ -1239,13 +1239,13 @@ static MIX_BUSS_PATCH_PERMILLE: std::sync::atomic::AtomicU64 =
 /// `(params id, module index, the voice is a buss)` and carrying `(writes, first bytes seen)`.
 ///
 /// >>> A LIST OF UNKNOWN MODULE IDS IS NOT ENOUGH TO CHASE ONE.
-/// The missing attenuation in this mixer is a buss LEVEL - the counters say every source
-/// voice has its own level set and every routing between busses is at unity, so what is left
-/// is the levels of the busses themselves, which arrive on a module nothing here reads. Which
-/// module that is cannot be answered by the id alone: the same id turns up on source voices
-/// too, where it is a synthesiser stage and no concern of the mix. Splitting the census on
-/// "does anything route INTO this voice" is what separates the two, and the byte sample makes
-/// the candidate readable without a second run.
+/// > > > The missing attenuation in this mixer is a buss LEVEL - the counters say every source
+/// > > > voice has its own level set and every routing between busses is at unity, so what is left
+/// > > > is the levels of the busses themselves, which arrive on a module nothing here reads. Which
+/// > > > module that is cannot be answered by the id alone: the same id turns up on source voices
+/// > > > too, where it is a synthesiser stage and no concern of the mix. Splitting the census on
+/// > > > "does anything route INTO this voice" is what separates the two, and the byte sample makes
+/// > > > the candidate readable without a second run.
 static UNKNOWN_MODULES: std::sync::Mutex<
     std::collections::BTreeMap<(u32, u32, bool), UnknownModule>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -1374,11 +1374,11 @@ pub fn report_mix() {
 /// The same counters as TEXT, one string per line, empty when nothing ever mixed.
 ///
 /// >>> THE BROWSER IS THE HOST THAT NEEDS THESE AND IT COULD NOT PRINT THEM.
-/// `report_mix` writes to `tracing`, and it was called from exactly one place: the desktop
-/// binary's shutdown. So the audio counters existed for the host where audio already works
-/// and were unreachable on the one where a user reports crackling - a phone, which has no
-/// console, and whose only report is the on-screen diagnostics panel. Returning the lines
-/// lets that panel carry them alongside the render split.
+/// > > > `report_mix` writes to `tracing`, and it was called from exactly one place: the desktop
+/// > > > binary's shutdown. So the audio counters existed for the host where audio already works
+/// > > > and were unreachable on the one where a user reports crackling - a phone, which has no
+/// > > > console, and whose only report is the on-screen diagnostics panel. Returning the lines
+/// > > > lets that panel carry them alongside the render split.
 pub fn mix_report() -> Vec<String> {
     use std::sync::atomic::Ordering::Relaxed;
     let grains = MIX_GRAINS.load(Relaxed);

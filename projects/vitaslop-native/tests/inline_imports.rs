@@ -1186,7 +1186,7 @@ fn store_arg_field_clears_before_it_writes() {
     assert!(!run(&mut vm));
     let got = vm.read_mem(OUT_PTR, 4).expect("read back");
     let got = u32::from_le_bytes(got[0..4].try_into().expect("4 bytes"));
-    assert_eq!(got, 0xFFFF_FFFF & !(0x7 << 6), "writing zero must CLEAR the field");
+    assert_eq!(got, !(0x7 << 6), "writing zero must CLEAR the field");
 }
 
 /// A field store READS the word before writing it, so an out-of-range pointer would load

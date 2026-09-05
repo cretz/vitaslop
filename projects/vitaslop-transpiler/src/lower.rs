@@ -384,11 +384,10 @@ fn track_regs(
                     }
                     _ => None,
                 };
-                if let Some(v) = v {
-                    if discover_pointers && v & 1 == 1 && in_code(v & !1) {
+                if let Some(v) = v
+                    && discover_pointers && v & 1 == 1 && in_code(v & !1) {
                         code_pointers.insert(v & !1);
                     }
-                }
                 regs[rd as usize] = v;
             }
         }
@@ -814,13 +813,10 @@ fn recover_switch_bound(
         let mut reg = index_reg;
         let mut k: u32 = 0;
         let mut from = snaps.len();
-        loop {
-            let Some(i) = snaps[..from]
-                .iter()
-                .rposition(|(_, ins, _, _)| ins.operands.first().and_then(regnum) == Some(reg))
-            else {
-                break;
-            };
+        while let Some(i) = snaps[..from]
+            .iter()
+            .rposition(|(_, ins, _, _)| ins.operands.first().and_then(regnum) == Some(reg))
+        {
             let (_, ins, _, before) = &snaps[i];
             let (next_reg, step) = adjustment_step(ins, reg, before);
             k = k.wrapping_add(step);
@@ -1215,7 +1211,7 @@ pub fn discover(
             ConditionCode::AL
         };
         let in_it = itstate != 0 && inst.opcode != Opcode::IT;
-        decoded.insert(addr, (inst.clone(), len, applied, in_it));
+        decoded.insert(addr, (inst, len, applied, in_it));
 
         // Next IT state for the fall-through successor.
         let next_it = if inst.opcode == Opcode::IT {
@@ -1231,8 +1227,8 @@ pub fn discover(
         if leaders.contains(&addr) {
             cond_lo.clear();
         }
-        if applied != ConditionCode::AL {
-            if let (Some(rd), Some(v)) = (regnum(&inst.operands[0]), inst.operands.get(1).and_then(imm)) {
+        if applied != ConditionCode::AL
+            && let (Some(rd), Some(v)) = (regnum(&inst.operands[0]), inst.operands.get(1).and_then(imm)) {
                 match inst.opcode {
                     Opcode::MOV => cond_lo.push((rd, applied, v)),
                     Opcode::MOVT => {
@@ -1248,7 +1244,6 @@ pub fn discover(
                     _ => {}
                 }
             }
-        }
 
         // A register-indirect `blx`/`bx` whose target register holds a tracked
         // `movw`/`movt` constant is a definite code pointer: its low bit selects
@@ -1256,8 +1251,8 @@ pub fn discover(
         // an ARM-mode helper (which the odd-only `movw`/`movt` scan would miss).
         // Seeds discovery so the runtime dispatcher can resolve the target instead
         // of trapping on it. `bx lr`/returns carry no tracked constant, so skip.
-        if discover_pointers && matches!(inst.opcode, Opcode::BLX | Opcode::BX) {
-            if let Some(v) = inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize]) {
+        if discover_pointers && matches!(inst.opcode, Opcode::BLX | Opcode::BX)
+            && let Some(v) = inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize]) {
                 // A register-indirect call whose tracked target is a host-import
                 // stub is a host-import call reached through a function pointer
                 // (a compiler routing e.g. `memset` through one thunk). Record the
@@ -1287,7 +1282,6 @@ pub fn discover(
                     }
                 }
             }
-        }
 
         // Table-branch (`tbb`/`tbh`) switch dispatch: resolve the inline jump table
         // now, while the whole decoded stream (the range check that bounds it) is in
@@ -1385,7 +1379,7 @@ pub fn discover(
         let mut progressed = false;
         for addr in core::mem::take(&mut pending_switches) {
             let Some((inst, _, _, _)) = decoded.get(&addr) else { continue };
-            let inst = inst.clone();
+            let inst = *inst;
             match resolve_switch(code, base, addr, &inst, &decoded, &leaders) {
                 Some(info) => {
                     for &t in &info.targets {
@@ -1472,8 +1466,8 @@ pub fn discover(
                 }
             }
             let (inst, len) = match decoded.get(&addr) {
-                Some((i, l, _, _)) => (i.clone(), *l),
-                None => extra[&addr].clone(),
+                Some((i, l, _, _)) => (*i, *l),
+                None => extra[&addr],
             };
             let (inst, len) = (&inst, &len);
             let regs = at[&addr];
@@ -1482,8 +1476,8 @@ pub fn discover(
             // A register-indirect call/branch through a tracked constant is an entry,
             // exactly as in pass 1 - but here the constant may have come from across a
             // branch.
-            if matches!(inst.opcode, Opcode::BLX | Opcode::BX) {
-                if let Some(v) =
+            if matches!(inst.opcode, Opcode::BLX | Opcode::BX)
+                && let Some(v) =
                     inst.operands.first().and_then(regnum).and_then(|rn| regs[rn as usize])
                 {
                     let s = v & !1;
@@ -1495,9 +1489,8 @@ pub fn discover(
                         }
                     }
                 }
-            }
             let mut go = |t: u32, r: RegConsts, work: &mut Vec<u32>| {
-                if !decoded.contains_key(&t) && !(in_bounds(t) && near(t)) {
+                if !decoded.contains_key(&t) && (!in_bounds(t) || !near(t)) {
                     return;
                 }
                 let merged = match at.get(&t) {
@@ -1709,11 +1702,10 @@ pub fn discover(
     // emitting - and running - the garbage. Keyed on span, not block count, so a
     // legitimately large but contiguous function is unaffected.
     const MAX_FUNC_SPAN: u32 = 0x1_0000; // 64 KiB - larger than any real function
-    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
-        if last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
+    if let (Some(first), Some(last)) = (blocks.first(), blocks.last())
+        && last.addr.wrapping_sub(first.addr) > MAX_FUNC_SPAN {
             return Err(Error::Decode { addr: last.addr });
         }
-    }
 
     // The function is complete, so its flag liveness is knowable. Annotating HERE rather
     // than at each of the three `discover` call sites is what makes it unmissable: a
@@ -3392,7 +3384,7 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
     // address the remaining words off that garbage (underflowing linear memory ->
     // MemoryOutOfBounds). Defer the base's own load to last so every other element's
     // address still sees the original base.
-    let base_in_list = regs.iter().any(|&r| r == base);
+    let base_in_list = regs.contains(&base);
     let mut out = Vec::new();
     let load_at = |i: usize, r: u8| {
         Stmt::SetReg(
@@ -3624,7 +3616,7 @@ fn neon_structure_mem(
                 // `first + k*inc + r` (ARM ARM VLDn multiple: inc is 2 for the
                 // four-register vld2 and the `{d0,d2,...}` lists, else 1); lane `e`
                 // of it comes from memory element `(r*lanes + e)*n + k`.
-                if count % n != 0 || esize == 0 || 64 % esize as u32 != 0 {
+                if !count.is_multiple_of(n) || esize == 0 || 64 % esize as u32 != 0 {
                     return Err(unsupported());
                 }
                 let passes = count / n;
@@ -4011,11 +4003,10 @@ fn scalar_lane(op: &Operand) -> Option<(u8, u8)> {
 fn neon_emittable(s: &NeonStmt) -> bool {
     // wasm SIMD has lanewise float arithmetic only for f32x4 and f64x2; NEON's F16
     // vector float has no wasm primitive. Integer widths are checked per op below.
-    if let NeonStmt::Bin { ty, .. } | NeonStmt::MulAcc { ty, .. } | NeonStmt::Unary { ty, .. } = s {
-        if ty.float && ty.bits != 32 && ty.bits != 64 {
+    if let NeonStmt::Bin { ty, .. } | NeonStmt::MulAcc { ty, .. } | NeonStmt::Unary { ty, .. } = s
+        && ty.float && ty.bits != 32 && ty.bits != 64 {
             return false;
         }
-    }
     match s {
         NeonStmt::Bin { op, ty, .. } => match op {
             // wasm has no `i8x16.mul` (but f32x4.mul is fine).

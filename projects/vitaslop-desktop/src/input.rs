@@ -79,14 +79,13 @@ impl Input {
         let mut ly = CENTER;
         let mut rx = CENTER;
         let mut ry = CENTER;
-        if let Some(g) = self.gilrs.as_ref() {
-            if let Some((_, pad)) = g.gamepads().next() {
+        if let Some(g) = self.gilrs.as_ref()
+            && let Some((_, pad)) = g.gamepads().next() {
                 for (control, bits) in &self.padmap {
-                    if let Some(b) = gilrs_button(control) {
-                        if pad.is_pressed(b) {
+                    if let Some(b) = gilrs_button(control)
+                        && pad.is_pressed(b) {
                             buttons |= bits;
                         }
-                    }
                 }
                 let (x, y) = dead(pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY), self.deadzone);
                 lx = axis_to_byte(x, false);
@@ -95,7 +94,6 @@ impl Input {
                 rx = axis_to_byte(x, false);
                 ry = axis_to_byte(y, true);
             }
-        }
         CtrlFrame { buttons, lx, ly, rx, ry }
     }
 }

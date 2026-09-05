@@ -263,7 +263,7 @@ impl RetailGuest {
             env.state.add_file(&path, bytes);
         }
 
-        let (mut sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
+        let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
             .map_err(|e| format!("scheduler: {e:?}"))?;
         // >>> NO DETERMINISM SIGNATURE unless something will read it. The fold hashes every
         // retired scene's vertices, indices and uniforms - 3.5 MB a frame on a race, MEASURED
@@ -284,10 +284,10 @@ impl RetailGuest {
     /// left there.
     ///
     /// >>> CALL BEFORE THE FIRST [`advance`](RetailGuest::advance), and nothing here can
-    /// check that you did. Restoring replaces files the title may already hold open
-    /// descriptors on, so doing it mid-run corrupts exactly the state it is trying to keep.
-    /// Construction has just returned and the guest has not been stepped, which is why this
-    /// is a separate call taken immediately rather than a fourth argument to `new`.
+    /// > > > check that you did. Restoring replaces files the title may already hold open
+    /// > > > descriptors on, so doing it mid-run corrupts exactly the state it is trying to keep.
+    /// > > > Construction has just returned and the guest has not been stepped, which is why this
+    /// > > > is a separate call taken immediately rather than a fourth argument to `new`.
     pub fn persist_to(&mut self, root: &Path, game_dir: &Path) -> Result<(), String> {
         // Asked of the container, not of the path - see `SaveStore::title_for`.
         let sfo = self.sched.host().state.read_file("app0:/sce_sys/param.sfo");
@@ -300,8 +300,16 @@ impl RetailGuest {
         }
         let mut store = vitaslop_native::SaveStore::new(root, &title);
         match store.restore(&mut self.sched.host().state) {
-            Ok(Some(report)) => println!("[gamedata] restored from {}: {report}", store.path().display()),
-            Ok(None) => println!("[gamedata] no saved state at {} yet", store.path().display()),
+            // Status, not stdout: this is the run describing itself, and the shell shows it
+            // in its diagnostics view rather than at whoever is playing.
+            Ok(Some(report)) => tracing::info!(
+                target: "vitaslop::status",
+                "[gamedata] restored from {}: {report}", store.path().display()
+            ),
+            Ok(None) => tracing::info!(
+                target: "vitaslop::status",
+                "[gamedata] no saved state at {} yet", store.path().display()
+            ),
             // A container that exists and does not parse fails the run. Starting fresh over
             // the top of it is how a save gets silently played past and then overwritten.
             Err(e) => return Err(format!("game data: {e}")),
@@ -477,7 +485,7 @@ impl RetailGuest {
             })
             .filter(|(_, _, jumps)| *jumps > 0)
             .collect();
-        delta.sort_by(|a, b| b.1.cmp(&a.1));
+        delta.sort_by_key(|d| std::cmp::Reverse(d.1));
         Self::format_idle_attribution("callsites: the window's idle clock", &delta)
     }
 
@@ -695,11 +703,10 @@ impl RetailGfx {
         {
             let sink = lost.clone();
             device.set_device_lost_callback(move |reason, message| {
-                if let Ok(mut slot) = sink.lock() {
-                    if slot.is_none() {
+                if let Ok(mut slot) = sink.lock()
+                    && slot.is_none() {
                         *slot = Some(format!("{reason:?}: {message}"));
                     }
-                }
             });
         }
 
@@ -788,9 +795,6 @@ impl RetailGfx {
     }
     pub(crate) fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
-    }
-    pub(crate) fn adapter_name(&self) -> &str {
-        &self.adapter_name
     }
 
     /// One surface frame: the guest's scenes (or a clear, when there are none), then
@@ -1145,12 +1149,11 @@ pub fn headless_check(
         .transpose()?;
     // Both spellings exist and the notes use both. If they are BOTH given they must agree,
     // because silently preferring one is how a run ends up replaying a recipe nobody named.
-    if let (Some(a), Some(b)) = (&flag_recipe, &env_recipe) {
-        if a != b {
+    if let (Some(a), Some(b)) = (&flag_recipe, &env_recipe)
+        && a != b {
             return Err("both --recipe and VITASLOP_HEADLESS_RECIPE are set and they are \
                         different recipes - pass one, not two".into());
         }
-    }
     let recipe = flag_recipe.or(env_recipe);
     // Say which way input is being driven, unconditionally. "Did the recipe apply" was
     // previously answerable only by recognising the final screenshot.
@@ -1601,7 +1604,7 @@ pub fn headless_check(
     if samples > 0 {
         println!(
             "headless: fuel {fuel} over {samples} suspends (mean {}, max {max}, interval {})",
-            fuel / samples,
+            fuel.checked_div(samples).unwrap_or(0),
             vitaslop_runtime::host::QUANTUM_FUEL,
         );
     }
@@ -1716,13 +1719,12 @@ impl ApplicationHandler for RetailApp {
                 self.session.tick(size);
                 if let Some(gfx) = self.gfx.as_mut() {
                     let (scenes, display, presents) = self.session.scenes();
-                    if !scenes.is_empty() {
-                        if let Err(e) = gfx.present(scenes, display, presents) {
+                    if !scenes.is_empty()
+                        && let Err(e) = gfx.present(scenes, display, presents) {
                             eprintln!("error: {e}");
                             event_loop.exit();
                             return;
                         }
-                    }
                 }
                 if let (Some(stats), Some(w)) = (self.session.stats(Instant::now()), self.window.as_ref()) {
                     w.set_title(&format!("vitaslop  |  {}", stats.title_line()));

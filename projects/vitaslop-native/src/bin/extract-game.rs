@@ -61,11 +61,10 @@ fn main() -> ExitCode {
     let (mut n, mut bytes) = (0usize, 0u64);
     for (rel, data) in &entries {
         let path = out.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 return fail(&format!("mkdir {}: {e}", parent.display()));
             }
-        }
         if let Err(e) = std::fs::write(&path, data) {
             return fail(&format!("write {}: {e}", path.display()));
         }

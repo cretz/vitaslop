@@ -378,7 +378,7 @@ mod tests {
     fn reads_every_file_at_every_offset() {
         // 64 bytes a block, so the long file spans several and the reader's block
         // arithmetic is exercised rather than trivially satisfied.
-        let compressible: Vec<u8> = std::iter::repeat(b'a').take(300).collect();
+        let compressible: Vec<u8> = std::iter::repeat_n(b'a', 300).collect();
         let mut incompressible: Vec<u8> = Vec::new();
         let mut x = 0x1234_5678u32;
         for _ in 0..200 {

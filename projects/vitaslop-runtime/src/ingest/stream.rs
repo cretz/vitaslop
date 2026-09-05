@@ -397,11 +397,10 @@ impl ByteSource for PkgSource {
         if let Some(i) = self.items.get(path) {
             return Some(i.data_size);
         }
-        if path == WORK_BIN_PATH {
-            if let Some(p) = &self.work_bin {
+        if path == WORK_BIN_PATH
+            && let Some(p) = &self.work_bin {
                 return self.inner.size(p);
             }
-        }
         None
     }
     fn read_at(&self, path: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
@@ -412,11 +411,10 @@ impl ByteSource for PkgSource {
             let want = buf.len().min((i.data_size - off) as usize);
             return self.decrypt_into(i.data_offset + off, &mut buf[..want]);
         }
-        if path == WORK_BIN_PATH {
-            if let Some(p) = &self.work_bin {
+        if path == WORK_BIN_PATH
+            && let Some(p) = &self.work_bin {
                 return self.inner.read_at(p, off, buf);
             }
-        }
         Err(Error::MissingFile(path.to_string()))
     }
 }
@@ -853,11 +851,10 @@ fn import_pfs(
         )?;
         sink.finish()?;
         done = before + consumed;
-        if let Some(bytes) = keep {
-            if bytes.len() >= 4 && &bytes[..4] == b"SCE\0" {
+        if let Some(bytes) = keep
+            && bytes.len() >= 4 && &bytes[..4] == b"SCE\0" {
                 modules.push((f.path.clone(), bytes));
             }
-        }
     }
     modules.sort_by(|a, b| a.0.cmp(&b.0));
     modules.sort_by_key(|(p, _)| p == "eboot.bin");

@@ -761,11 +761,10 @@ pub fn encode_etc2_rgb8_block(block: &Block) -> [u8; 8] {
     let mut reachable_flip = [false; 2];
     for flip in [false, true] {
         reachable_flip[usize::from(flip)] = differential_can_reach(block, flip);
-        if let Some(c) = best_for(block, flip, true) {
-            if best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
+        if let Some(c) = best_for(block, flip, true)
+            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
                 best = Some(c);
             }
-        }
     }
     // Exact already: nothing can improve on it, and both remaining modes would be searched to
     // arrive at the same block.
@@ -776,11 +775,10 @@ pub fn encode_etc2_rgb8_block(block: &Block) -> [u8; 8] {
         if reachable_flip[usize::from(flip)] {
             continue;
         }
-        if let Some(c) = best_for(block, flip, false) {
-            if best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
+        if let Some(c) = best_for(block, flip, false)
+            && best.as_ref().map(|b| c.err < b.err).unwrap_or(true) {
                 best = Some(c);
             }
-        }
     }
     // Individual mode with both bases equal is always expressible, so a candidate always exists;
     // the `expect` is a statement of that, not a hope.
@@ -1285,7 +1283,7 @@ mod tests {
         assert_eq!(encode_etc2_rgb8(w, h, &rgba).len(), (3 * 2 * 8) as usize, "4 bpp");
         assert_eq!(encode_etc2_rgba8(w, h, &rgba).len(), (3 * 2 * 16) as usize, "8 bpp");
         // A non-multiple-of-4 image still produces whole blocks.
-        assert_eq!(encode_etc2_rgb8(5, 5, &vec![0u8; 100]).len(), 2 * 2 * 8);
+        assert_eq!(encode_etc2_rgb8(5, 5, &[0u8; 100]).len(), 2 * 2 * 8);
     }
 
     #[test]
@@ -1655,7 +1653,20 @@ mod conformance {
             (w * h) as f64 / (ms / 1000.0) / 1e6
         );
         assert_eq!(out.len(), (blocks * 16.0) as usize);
-        assert!(ms < 400.0, "encoding 256x256 RGBA took {ms} ms, which scales to an unusable atlas");
+        // >>> THE BUDGET IS ONLY MEANINGFUL ON AN OPTIMISED BUILD.
+        //
+        // Unoptimised, this measures rustc's debug output rather than the search, and it fails
+        // for anyone running a plain `cargo test` - it did exactly that on a loaded machine at
+        // 472 ms. The figure is still PRINTED in both builds, because the number is the point
+        // of the test and a silent budget is one nobody reads.
+        if cfg!(debug_assertions) {
+            eprintln!("etc2 RGBA encode: unoptimised build, so the budget is not asserted");
+        } else {
+            assert!(
+                ms < 400.0,
+                "encoding 256x256 RGBA took {ms} ms, which scales to an unusable atlas"
+            );
+        }
     }
 
     /// A CORPUS error figure, so a change to the search shape shows its quality cost next to the
@@ -1981,7 +1992,7 @@ mod conformance {
                         }
                     }
                 }
-                if flip == false || err_of(&block, &candidate) < err_of(&block, &flat_dec) {
+                if !flip || err_of(&block, &candidate) < err_of(&block, &flat_dec) {
                     flat_dec = candidate;
                 }
             }

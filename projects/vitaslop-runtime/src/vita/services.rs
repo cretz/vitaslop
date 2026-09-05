@@ -516,10 +516,10 @@ fn rtc_decode_broken_down(ctx: &mut GuestCtx, time: Ptr) -> Result<(i64, i64), i
     let (year, month, day) = (u16_at(0), u16_at(2), u16_at(4));
     let (hour, minute, second) = (u16_at(6), u16_at(8), u16_at(10));
     let micro = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as i64;
-    if year < 1 || year > 9999 {
+    if !(1..=9999).contains(&year) {
         return Err(SCE_RTC_ERROR_INVALID_YEAR);
     }
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(SCE_RTC_ERROR_INVALID_MONTH);
     }
     if day < 1 || day > days_in_month(year, month) {
@@ -644,7 +644,7 @@ fn rtc_set_tick_impl(ctx: &mut GuestCtx, time: Ptr, tick: Ptr) -> i32 {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
-    if y < 1 || y > 9999 {
+    if !(1..=9999).contains(&y) {
         return SCE_RTC_ERROR_INVALID_YEAR;
     }
     let fields: [u16; 6] =
@@ -722,7 +722,7 @@ pub(super) fn rtc_tick_add_calendar(ctx: &mut GuestCtx, months_per_unit: i64) {
     // Months as an absolute count so a negative delta borrows across the year boundary.
     let total = (y * 12 + (m - 1)) + n * months_per_unit;
     let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
-    if ny < 1 || ny > 9999 {
+    if !(1..=9999).contains(&ny) {
         ctx.ret(SCE_RTC_ERROR_INVALID_YEAR as u32);
         return;
     }

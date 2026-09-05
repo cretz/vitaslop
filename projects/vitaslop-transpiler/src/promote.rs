@@ -357,8 +357,8 @@ impl Cache {
     /// `billed` is carried through to whatever the cache emits, so a replacement costs
     /// the emulator exactly what the operator it replaced would have.
     pub fn offer<S: Sink>(&mut self, out: &mut S, i: &Instruction, billed: bool) -> bool {
-        match i {
-            &Instruction::GlobalGet(g) if is_core(g) => {
+        match *i {
+            Instruction::GlobalGet(g) if is_core(g) => {
                 self.touched = true;
                 if !self.promoted(g) {
                     return false;
@@ -382,7 +382,7 @@ impl Cache {
                 }
                 true
             }
-            &Instruction::GlobalSet(g) if is_core(g) => {
+            Instruction::GlobalSet(g) if is_core(g) => {
                 self.touched = true;
                 if !self.promoted(g) {
                     return false;

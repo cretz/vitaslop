@@ -1797,7 +1797,6 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_DCLOSE => "sceIoDclose",
         tm::DELAY_THREAD => "sceKernelDelayThread",
         tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
-        tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
         tm::EXIT_DELETE_THREAD => "sceKernelExitDeleteThread",
         tm::DELETE_THREAD => "sceKernelDeleteThread",
         tm::EXIT_THREAD => "sceKernelExitThread",

@@ -392,6 +392,8 @@ struct Playback {
     scenes: Vec<Scene>,
     frame: usize,
     fps: FpsMeter,
+    /// The adapter and surface this run actually got, for the status line.
+    describe: String,
 }
 
 impl Playback {
@@ -431,6 +433,28 @@ impl Playback {
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
+        // >>> ASK FOR OPAQUE, DO NOT TAKE WHATEVER THE ADAPTER LISTS FIRST.
+        //
+        // `alpha_modes[0]` is the adapter's preference, and adapters disagree: this machine's
+        // GPU lists an opaque mode first and the canvas composites as drawn, while a CI runner
+        // painted a canvas that came back FULLY TRANSPARENT - 88% of it never written, no cube
+        // pixels at all - with the loop presenting at 60 fps the whole time. A premultiplied
+        // surface whose contents are treated as already-multiplied is exactly what that looks
+        // like. This page draws an opaque picture and there is nothing behind it, so the mode
+        // is a fact about the content rather than a preference to inherit.
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+        // What the surface actually settled on, returned to the caller so a headless run says
+        // it out loud. A run that renders nothing and a run that renders correctly are
+        // indistinguishable from a frame COUNT, and the frame count was 60 fps in both.
+        let describe = format!(
+            "{:?} {:?}, surface {format:?} {alpha_mode:?}",
+            adapter.get_info().backend,
+            adapter.get_info().device_type,
+        );
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -440,7 +464,7 @@ impl Playback {
                 width: WIDTH,
                 height: HEIGHT,
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: caps.alpha_modes[0],
+                alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
@@ -452,7 +476,7 @@ impl Playback {
             .and_then(|w| w.performance())
             .ok_or_else(|| JsValue::from_str("no performance clock"))?;
         let fps = FpsMeter::new(perf, Report::dom());
-        Ok(Playback { surface, device, queue, cube, depth, scenes, frame: 0, fps })
+        Ok(Playback { surface, device, queue, cube, depth, scenes, frame: 0, fps, describe })
     }
 
     /// Render the next captured scene to the canvas.
@@ -475,7 +499,7 @@ impl Playback {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.cube
-            .encode(&self.device, &mut encoder, &view, &self.depth, &batches, CLEAR);
+            .encode(&self.device, &self.queue, &mut encoder, &view, &self.depth, &batches, CLEAR);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
         self.fps.tick();
@@ -2045,7 +2069,7 @@ impl LivePlayback {
         // arena writes) and pass (command encoding). Take that rather than reporting one
         // opaque encode number: the three have different fixes and only `pass` scales with
         // the wasm/JS boundary crossings per draw.
-        let ph = self.gxm.last_phases();
+        let ph = self.gxm.chain_phases();
         // Per PRESENT, not per window: the worst frame is the one that needs explaining, and
         // the counters that explain it have to come from that same frame.
         let work = vitaslop_runtime::render::take_build_work();
@@ -4971,7 +4995,7 @@ async fn live_loop(
                 // for every LIVE thread, is it parked, and on which object.
                 //
                 // Per THREAD rather than per object, and parked threads only: the page keeps a
-                // bounded number of DISTINCT lines (`logging::PAGE_LOG_CAP`) and the
+                // bounded number of DISTINCT lines (`vitaslop_platform::diag::RING_CAP`) and the
                 // whole-machine sync dump the desktop watchdog prints
                 // (`VitaState::debug_sync_dump`) would fill it by itself.
                 {
@@ -5610,6 +5634,10 @@ pub async fn run(canvas: JsValue) -> Result<String, JsValue> {
     logging::note(&status);
 
     let playback = Playback::new(canvas, cpu.scenes).await?;
+    // The surface description joins the status, which is the line a headless harness reads and
+    // prints. Without it a run that presents 60 transparent frames a second reports exactly
+    // what a correct run reports.
+    let status = format!("{status}; rendering on {}", playback.describe);
     start_raf_loop(playback);
     Ok(status)
 }

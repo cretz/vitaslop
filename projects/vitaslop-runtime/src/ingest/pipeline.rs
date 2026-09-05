@@ -378,15 +378,12 @@ pub trait Cache {
 /// before any bulk decryption, so a cache hit never touches the ciphertext.
 pub fn ingest_cached(vfs: &mut dyn Vfs, cache: &dyn Cache) -> Result<Game, Error> {
     // Peek the content id from the RIF without decrypting anything.
-    if let Ok(Container::Pfs { root }) = detect(&*vfs) {
-        if let Ok(work) = vfs.read(&under(&root, "sce_sys/package/work.bin")) {
-            if let Ok(rif) = Rif::parse(&work) {
-                if let Some(game) = cache.load(&rif.content_id) {
+    if let Ok(Container::Pfs { root }) = detect(&*vfs)
+        && let Ok(work) = vfs.read(&under(&root, "sce_sys/package/work.bin"))
+            && let Ok(rif) = Rif::parse(&work)
+                && let Some(game) = cache.load(&rif.content_id) {
                     return Ok(game);
                 }
-            }
-        }
-    }
     let game = decrypt_container(vfs)?;
     cache.store(&game)?;
     Ok(game)
@@ -600,7 +597,7 @@ mod tests {
         let mut hdr = fdb_bytes[..0x160].to_vec();
         for b in &mut hdr[0x4c..0x160] { *b = 0; }
         let got = crate::ingest::pfscrypt::hmac_sha1(&secret, &hdr);
-        eprintln!("header ICV match={} (got {:02x?} vs {:02x?})", &got[..] == &fdb_bytes[0x4c..0x60], &got[..8], &fdb_bytes[0x4c..0x4c+8]);
+        eprintln!("header ICV match={} (got {:02x?} vs {:02x?})", got[..] == fdb_bytes[0x4c..0x60], &got[..8], &fdb_bytes[0x4c..0x4c+8]);
 
         let eboot_file = files.iter().find(|f| f.path == "eboot.bin").expect("eboot node");
         let etbl = &img.unicv.tables[eboot_file.table_index];
@@ -624,7 +621,7 @@ mod tests {
         };
         let pt_drv = recover(&drv);
         eprintln!("CBC-chain pt[16..32] with K=drv_key: {:02x?}", pt_drv);
-        eprintln!("  expected pt[16..24] = [00,10,00,00,00,00,00,00] -> match={}", &pt_drv[..8] == [0,0x10,0,0,0,0,0,0]);
+        eprintln!("  expected pt[16..24] = [00,10,00,00,00,00,00,00] -> match={}", pt_drv[..8] == [0,0x10,0,0,0,0,0,0]);
 
         // Recover sector-0 IV. AES_dec(drv,ct[0..16]) XOR IV = pt[0..16]. Known pt:
         // 53 43 45 00 03 00 00 00 [kr kr] 01 00 00 06 00 00 (kr = key_revision).

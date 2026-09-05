@@ -90,23 +90,19 @@ pub fn detect(vfs: &dyn Vfs) -> Result<Container, Error> {
     }
     // PKG: a `.pkg` file whose bytes carry the pkg magic.
     for p in vfs.list() {
-        if p.ends_with(".pkg") {
-            if let Ok(head) = vfs.read(&p) {
-                if head.len() >= 4 && &head[0..4] == b"\x7fPKG" {
+        if p.ends_with(".pkg")
+            && let Ok(head) = vfs.read(&p)
+                && head.len() >= 4 && &head[0..4] == b"\x7fPKG" {
                     return Ok(Container::Pkg { path: p });
                 }
-            }
-        }
     }
     // Bare velf/SELF.
     for p in vfs.list() {
-        if p == "eboot.bin" || p.ends_with("/eboot.bin") {
-            if let Ok(head) = vfs.read(&p) {
-                if head.len() >= 4 && (&head[0..4] == b"SCE\0" || &head[0..4] == b"\x7fELF") {
+        if (p == "eboot.bin" || p.ends_with("/eboot.bin"))
+            && let Ok(head) = vfs.read(&p)
+                && head.len() >= 4 && (&head[0..4] == b"SCE\0" || &head[0..4] == b"\x7fELF") {
                     return Ok(Container::Velf { path: p });
                 }
-            }
-        }
     }
     Err(Error::UnknownContainer)
 }

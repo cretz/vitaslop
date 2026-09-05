@@ -48,7 +48,7 @@
 use vitaslop_loader as loader;
 use vitaslop_native::{render, CtrlFrame, RunReport, ThreadedScheduler, VitaEnv, World};
 use vitaslop_runtime::ingest::pipeline::decrypt_container;
-use vitaslop_runtime::ingest::vfs::{DirVfs, Vfs};
+use vitaslop_runtime::ingest::vfs::DirVfs;
 use vitaslop_runtime::link::link;
 
 const WIDTH: u32 = 960;
@@ -102,7 +102,7 @@ impl World for BootWorld {
             .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
         if let Some(buttons) = hold {
             let from = std::env::var("VITASLOP_HOLD_FROM").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            if self.polls >= from && (self.polls / 30) % 2 == 0 {
+            if self.polls >= from && (self.polls / 30).is_multiple_of(2) {
                 let mut f = CtrlFrame::default();
                 f.buttons = buttons;
                 return f;
@@ -113,16 +113,14 @@ impl World for BootWorld {
     fn poll_touch(&mut self, _port: u32) -> vitaslop_native::TouchFrame {
         // Diagnostic: VITASLOP_HOLD_TOUCH=x,y pulses a front-panel finger at (x,y) ~30
         // polls on / 30 off after VITASLOP_HOLD_FROM. Tests a touch-driven attract screen.
-        if let Ok(spec) = std::env::var("VITASLOP_HOLD_TOUCH") {
-            if let Some((xs, ys)) = spec.split_once(',') {
-                if let (Ok(x), Ok(y)) = (xs.trim().parse::<u16>(), ys.trim().parse::<u16>()) {
+        if let Ok(spec) = std::env::var("VITASLOP_HOLD_TOUCH")
+            && let Some((xs, ys)) = spec.split_once(',')
+                && let (Ok(x), Ok(y)) = (xs.trim().parse::<u16>(), ys.trim().parse::<u16>()) {
                     let from = std::env::var("VITASLOP_HOLD_FROM").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    if self.polls >= from && (self.polls / 30) % 2 == 0 {
+                    if self.polls >= from && (self.polls / 30).is_multiple_of(2) {
                         return vitaslop_native::TouchFrame::single(x, y);
                     }
                 }
-            }
-        }
         vitaslop_native::TouchFrame::default()
     }
     fn fill_random(&mut self, buf: &mut [u8]) {
@@ -562,7 +560,7 @@ fn retail_boot_probe() {
             let max_waves: u32 = std::env::var("VITASLOP_STALL_WAVES").ok()
                 .and_then(|s| s.parse().ok()).unwrap_or(40);
             eprintln!("STALL_WAKE: semas={sema_ids:?} conds={cond_works:?} chunk={chunk} waves<={max_waves}");
-            let mut done;
+            let done;
             let mut waves = 0u32;
             loop {
                 let rep = sched.run_frames(max_frames, chunk);
@@ -600,7 +598,7 @@ fn retail_boot_probe() {
                 if b.len() < 4 { return 0; }
                 u32::from_le_bytes([b[0], b[1], b[2], b[3]])
             };
-            let rdkey = |node: u32| -> String {
+            let _rdkey = |node: u32| -> String {
                 let sz = (rdu(node + 0x20) as usize).min(256);
                 let dptr = if sz <= 15 { node + 0x10 } else { rdu(node + 0x10) };
                 if dptr < 0x8000_0000 { return String::new(); }
@@ -676,12 +674,11 @@ fn retail_boot_probe() {
         // ~stepping-every-frame to just the window that matters - the difference between
         // a ~90s and a ~30s iteration when the prefix is a long menu+lesson navigation.
         let mut last = RunReport::FramesReached(0);
-        if let Some(from) = std::env::var("VITASLOP_WATCH_FROM").ok().and_then(|s| s.parse::<u64>().ok()) {
-            if from > 0 && from < max_frames {
+        if let Some(from) = std::env::var("VITASLOP_WATCH_FROM").ok().and_then(|s| s.parse::<u64>().ok())
+            && from > 0 && from < max_frames {
                 last = sched.run_frames(from, max_rounds);
                 eprintln!("batched prefix to frame {} ({last:?})", sched.frames());
             }
-        }
         // Diagnostic steering: VITASLOP_POKE=addr:frame:value (hex addr, decimal frame,
         // decimal u32 value) writes `value` to guest `addr` once, at the start of the
         // given frame. Lets a probe force a stuck state variable to test causality.
@@ -819,12 +816,11 @@ fn retail_boot_probe() {
                     eprintln!("FORCE_READY_V2 frame {}: set +84 on {hits} loaded item(s) (vtable2 {vt:#x})", sched.frames());
                 }
             }
-            if let Some((addr, frame, value)) = poke {
-                if sched.frames() == frame {
+            if let Some((addr, frame, value)) = poke
+                && sched.frames() == frame {
                     sched.write_guest(addr, &value.to_le_bytes());
                     eprintln!("POKE {addr:#x} = {value} at frame {frame}");
                 }
-            }
             for &(addr, value, from) in &hold_mems {
                 if sched.frames() >= from {
                     sched.write_guest(addr, &value.to_le_bytes());
@@ -890,8 +886,8 @@ fn retail_boot_probe() {
         while let Some(p) = rest.find("wasm function ") {
             rest = &rest[p + "wasm function ".len()..];
             let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(widx) = n.parse::<usize>() {
-                if seen.insert(widx) {
+            if let Ok(widx) = n.parse::<usize>()
+                && seen.insert(widx) {
                     let addr = widx
                         .checked_sub(import_funcs)
                         .and_then(|i| built.artifact.funcs.get(i))
@@ -901,7 +897,6 @@ fn retail_boot_probe() {
                         None => eprintln!("  backtrace wasm[{widx}] = <dispatcher or out of range>"),
                     }
                 }
-            }
         }
     }
 
@@ -1116,7 +1111,7 @@ fn retail_boot_probe() {
                 // Decode the first few vertices as f32 lanes so the actual position
                 // coordinate space (NDC vs pixels vs clip) and UV range are visible.
                 let stride = d.vertex_stride.max(1) as usize;
-                let nverts = if stride > 0 { d.vertices.len() / stride } else { 0 };
+                let nverts = d.vertices.len().checked_div(stride).unwrap_or(0);
                 for vi in 0..nverts.min(4) {
                     let base = vi * stride;
                     let lanes: Vec<f32> = (0..stride / 4)
@@ -1152,7 +1147,7 @@ fn retail_boot_probe() {
         *hist.entry(vitaslop_runtime::nid::name(nid)).or_default() += 1;
     }
     let mut hist: Vec<_> = hist.into_iter().collect();
-    hist.sort_by(|a, b| b.1.cmp(&a.1));
+    hist.sort_by_key(|h| std::cmp::Reverse(h.1));
     eprintln!("--- serviced-call histogram ---");
     for (name, n) in &hist {
         eprintln!("  {n:>5}  {name}");
@@ -1252,15 +1247,14 @@ fn retail_boot_probe() {
                     }
                     // VITASLOP_DUMP_TEX: write each bound texture's decoded RGBA8 + raw
                     // bytes to the shot dir, so the atlas can be inspected directly.
-                    if std::env::var("VITASLOP_DUMP_TEX").is_ok() {
-                        if let Ok(dir) = std::env::var("VITASLOP_SHOT_DIR") {
+                    if std::env::var("VITASLOP_DUMP_TEX").is_ok()
+                        && let Ok(dir) = std::env::var("VITASLOP_SHOT_DIR") {
                             let (tw, th, rgba) = render::decode_texture_rgba8(t);
                             let raw = format!("{dir}/tex_s{i}_d{j}_{tw}x{th}.rgba");
                             let _ = std::fs::write(&raw, &rgba);
                             let g = format!("{dir}/tex_s{i}_d{j}_{}x{}.gray", t.width, t.height);
                             let _ = std::fs::write(&g, &t.pixels);
                         }
-                    }
                 }
             }
         }
@@ -1293,8 +1287,8 @@ fn retail_boot_probe() {
             // (attributes, stride, primitive) and the first few vertices as f32 + f16 + u8
             // lanes - to diagnose a mesh that decodes to scatter (wrong position attr,
             // multi-stream, or a half-float layout the decoder mis-reads).
-            if let Ok(list) = std::env::var("VITASLOP_DUMP_DRAW") {
-                if let Some(scene) = st.capture.scenes.last() {
+            if let Ok(list) = std::env::var("VITASLOP_DUMP_DRAW")
+                && let Some(scene) = st.capture.scenes.last() {
                     let h2f = |h: u16| -> f32 {
                         let s = (h >> 15) & 1;
                         let e = ((h >> 10) & 0x1f) as i32;
@@ -1330,14 +1324,13 @@ fn retail_boot_probe() {
                         }
                     }
                 }
-            }
             // VITASLOP_DUMP_RENDERSCENE prints, for the last captured scene, how the GPU
             // builder classifies each draw (space / opaque / exposure / textured) plus, for
             // MVP draws, the transformed NDC-z range and on-screen vertex count - the data
             // that tells us why an opaque 3D draw might render on the software oracle but
             // vanish on the GPU (wrong pipeline, off-screen, or out-of-range depth).
-            if std::env::var("VITASLOP_DUMP_RENDERSCENE").is_ok() {
-                if let Some(scene) = st.capture.scenes.last() {
+            if std::env::var("VITASLOP_DUMP_RENDERSCENE").is_ok()
+                && let Some(scene) = st.capture.scenes.last() {
                     let rs = vitaslop_runtime::render::RenderSceneBuilder::new().build(scene);
                     eprintln!("RENDERSCENE last scene: {} draws", rs.draws.len());
                     let lanef = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -1394,7 +1387,6 @@ fn retail_boot_probe() {
                         );
                     }
                 }
-            }
             // VITASLOP_GPU also renders each scene through the general GXM->WebGPU
             // renderer (the browser's real path) to frame_gpu_XXXX.png, so the GPU
             // output can be compared to the software oracle on the real title's frames.

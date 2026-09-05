@@ -708,7 +708,12 @@ mod tests {
             reference_pic_flag: true,
             ..PicFields::default()
         };
-        assert_eq!(pic.pack(), 1 | (2 << 2) | (1 << 12));
+        // entropy at bit 0, weighted_pred at 1, weighted_bipred_idc at 2..4, transform_8x8 at
+        // 4, field_pic at 5, constrained_intra at 6, pic_order_present at 7, deblocking at 8,
+        // redundant at 9, reference_pic_flag at 10. The expectation used to say bit 12, which
+        // is not where `pack` puts it and not where the C header does either - the packing was
+        // right and only this line was wrong, and only a Linux runner ever ran it.
+        assert_eq!(pic.pack(), 1 | (2 << 2) | (1 << 10));
     }
 
     #[test]

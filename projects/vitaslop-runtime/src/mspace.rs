@@ -176,20 +176,18 @@ impl Mspace {
         let mut start = ptr;
         let mut len = len;
         // Coalesce with the run ending here.
-        if let Some((&prev_start, &prev_len)) = self.free_by_addr.range(..start).next_back() {
-            if prev_start + prev_len == start {
+        if let Some((&prev_start, &prev_len)) = self.free_by_addr.range(..start).next_back()
+            && prev_start + prev_len == start {
                 self.remove_free(prev_start, prev_len);
                 start = prev_start;
                 len += prev_len;
             }
-        }
         // Coalesce with the run starting at our end.
-        if let Some((&next_start, &next_len)) = self.free_by_addr.range(start + len..).next() {
-            if next_start == start + len {
+        if let Some((&next_start, &next_len)) = self.free_by_addr.range(start + len..).next()
+            && next_start == start + len {
                 self.remove_free(next_start, next_len);
                 len += next_len;
             }
-        }
         self.insert_free(start, len);
         true
     }

@@ -103,13 +103,15 @@ fn pollster_lite<F: std::future::Future>(mut future: F) -> F::Output {
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `future` is owned here and never moved again.
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
-    loop {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => panic!(
-                "the shared conformance suite parked on a native backend, where every                  await is supposed to be ready already"
-            ),
-        }
+    // ONE poll, not a loop: a native backend's awaits are all ready already, so a `Pending`
+    // here is the bug being reported rather than a reason to poll again. (It was written as a
+    // `loop` whose arms both diverge, which clippy denies by default and which read as if
+    // parking were survivable.)
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "the shared conformance suite parked on a native backend, where every                  await is supposed to be ready already"
+        ),
     }
 }
 
@@ -310,20 +312,58 @@ fn an_oversized_picture_is_refused_rather_than_half_decoded() {
         Err(e) if e.is_missing_decoder() => return,
         Err(e) => panic!("decoder creation failed: {e}"),
     };
-    let result = decoder.send(Packet::new(&stream.annex_b)).and_then(|()| decoder.finish());
+    let mut frames = Vec::new();
+    let result = decoder
+        .send(Packet::new(&stream.annex_b))
+        .and_then(|()| {
+            while let Some(frame) = decoder.receive()? {
+                frames.push(frame);
+            }
+            decoder.finish()
+        })
+        .and_then(|()| {
+            while let Some(frame) = decoder.receive()? {
+                frames.push(frame);
+            }
+            Ok(())
+        });
 
     match decoder.acceleration() {
         // Only the hardware path has this limit, and only it must refuse.
         Acceleration::Software(_) => {}
-        _ => {
-            let error = result.expect_err("an oversized picture must not decode silently");
-            assert!(
-                matches!(error, Error::Unsupported(_)),
-                "expected an Unsupported error, got {error}"
-            );
-            let text = error.to_string();
-            assert!(text.contains("hardware: Some(false)"), "the error must say what to do: {text}");
-        }
+        // >>> THE INVARIANT IS "NEVER A HALF-DECODED PICTURE", NOT "ALWAYS AN ERROR".
+        //
+        // The buffer limit above was measured on ONE hardware decoder. Asserting the refusal
+        // everywhere made this a test of that decoder rather than of the crate: Video Toolbox
+        // on an arm64 macOS runner takes the whole 1.35 MB picture and the assertion failed on
+        // a backend doing nothing wrong. So both outcomes are allowed, and each is held to
+        // what makes it correct - a refusal must say what to do instead, and an acceptance
+        // must produce the RIGHT picture, which is what rules out the silent partial decode.
+        _ => match result {
+            Err(error) => {
+                assert!(
+                    matches!(error, Error::Unsupported(_)),
+                    "expected an Unsupported error, got {error}"
+                );
+                let text = error.to_string();
+                assert!(
+                    text.contains("hardware: Some(false)"),
+                    "the error must say what to do: {text}"
+                );
+            }
+            Ok(()) => {
+                assert_eq!(frames.len(), 1, "one coded picture in, one frame out");
+                let mut actual = Vec::new();
+                frames[0].copy_to_i420(&mut actual);
+                assert_same(
+                    &actual,
+                    &stream.frames[0],
+                    stream.width,
+                    stream.height,
+                    "an accepted oversized picture",
+                );
+            }
+        },
     }
 }
 

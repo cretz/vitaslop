@@ -318,7 +318,7 @@ pub fn zlib_inflate(input: &[u8], expected_len: usize) -> Result<Vec<u8>, Inflat
     if cmf & 0x0f != 8 {
         return Err(InflateError::BadZlibHeader);
     }
-    if ((cmf as u16) << 8 | flg as u16) % 31 != 0 {
+    if !((cmf as u16) << 8 | flg as u16).is_multiple_of(31) {
         return Err(InflateError::BadZlibHeader);
     }
     // FDICT (preset dictionary) is not used by vita-make-fself; reject it.

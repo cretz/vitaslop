@@ -882,7 +882,7 @@ mod tests {
     fn a_single_texel_image_is_one_block_of_that_texel() {
         let rgba = vec![130u8, 66, 200, 255];
         let got = roundtrip(1, 1, &rgba, false);
-        assert_eq!(max_rgb_err(&rgba, &got) <= 8, true, "1x1 came back {got:?}");
+        assert!(max_rgb_err(&rgba, &got) <= 8, "1x1 came back {got:?}");
     }
 }
 

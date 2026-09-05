@@ -1,10 +1,21 @@
 name: CI
 
+# Every branch push USED to run this, and `pull_request` ran it again, so a branch with an
+# open PR built everything twice. Push is now `main` only: branch work is covered by the PR
+# event, and a branch with no PR open is not waiting on anything.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# One run per branch. A push while a run is in flight supersedes it rather than leaving two
+# alive: overlapping runs race for the same rust-cache key, and the loser reports "Unable to
+# reserve cache ... another job may be creating this cache" and discards everything it just
+# compiled. Cancelling also stops paying a Windows runner for a commit nobody will merge.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +40,9 @@ jobs:
   ci:
     name: ci (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A job that is genuinely stuck should say so rather than hold a runner to the
+    # six-hour default.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -36,11 +50,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # `projects/rust-toolchain.toml` pins the version; this installs exactly that one, so
+      # the lint set CI denies is the lint set a developer sees. `@stable` here would install
+      # a second toolchain and rustup would switch off it anyway.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
 
+      # >>> SAVE THE CACHE EVEN WHEN THE JOB FAILS.
+      #
+      # Off by default, and the default is wrong for this repo: a red run still compiled the
+      # whole dependency graph, and on the Windows runner that is ~14 minutes. Throwing it
+      # away means the next attempt at the same fix pays it again, which is most of what a
+      # failing streak costs. A partial target dir is not a hazard - cargo re-checks every
+      # fingerprint and rebuilds whatever does not match.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects
+          cache-on-failure: true
 
       # The desktop frontend links a window/input stack. These are its Linux build
       # dependencies only - the crate is cross-platform and macOS/Windows ship the
@@ -55,13 +82,45 @@ jobs:
       # `--locked` throughout: CI must build the dependency set the committed lockfile
       # pins, which is the set a shipped artifact is built from. Letting cargo re-resolve
       # would test something nobody runs, and lockfile drift would never surface.
+      # >>> RELEASE, and it is not a preference. This suite TRANSPILES whole ARM programs
+      # >>> and runs texture encoders; unoptimised, that is tens of times slower, and the
+      # >>> Windows runner sat in `Test` for over half an hour looking hung when it was
+      # >>> simply working. It also makes the throughput assertions meaningful: a debug
+      # >>> build measures the compiler's output, not this code's speed.
+      # >>> ON ALL THREE HOSTS, not just the cheapest one. Half of this workspace is behind
+      # >>> `#[cfg(windows)]` / `#[cfg(target_os = "linux")]` / Video Toolbox, and a lint pass
+      # >>> that only ever sees one host cannot see that code at all - which is exactly how a
+      # >>> Linux-only test referencing an unresolved module survived in the tree.
+      #
+      # `-D warnings` promotes every lint to an error, rustc's included. A gate that only
+      # half-applies is one people learn to scroll past.
+      # Linting the 50 integration-test targets means compiling them all again, and on the
+      # Windows runner that is the single most expensive thing in the job. The TESTS are
+      # linted once, on the cheapest host; every host still lints its own `#[cfg]`-gated
+      # SOURCE, which is where the platform-specific code lives and where a lint pass on one
+      # OS is blind.
+      # >>> FIRST, BEFORE THE BUILD. Clippy stops after analysis and never links, so it is
+      # >>> the cheapest step that can fail. Run after the build and a lint error costs a
+      # >>> full release codegen of the workspace before it is reported; run after the
+      # >>> tests and it costs that plus linking 50 integration-test binaries, which on the
+      # >>> Windows runner is most of the job.
+      - name: Clippy (all targets)
+        if: runner.os == 'Linux'
+        working-directory: projects
+        run: cargo clippy --workspace --all-targets --locked --release -- -D warnings
+
+      - name: Clippy
+        if: runner.os != 'Linux'
+        working-directory: projects
+        run: cargo clippy --workspace --locked --release -- -D warnings
+
       - name: Build
         working-directory: projects
-        run: cargo build --workspace --locked
+        run: cargo build --workspace --locked --release
 
       - name: Test
         working-directory: projects
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --release
 
       # --- generated artifacts must be identical after regeneration --------------------
       # A stale golden is worse than no golden: it keeps passing while describing code
@@ -122,13 +181,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
 
+      # >>> SAVE THE CACHE EVEN WHEN THE JOB FAILS.
+      #
+      # Off by default, and the default is wrong for this repo: a red run still compiled the
+      # whole dependency graph, and on the Windows runner that is ~14 minutes. Throwing it
+      # away means the next attempt at the same fix pays it again, which is most of what a
+      # failing streak costs. A partial target dir is not a hazard - cargo re-checks every
+      # fingerprint and rebuilds whatever does not match.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: projects
+          cache-on-failure: true
 
       # The CLI must match the pinned `wasm-bindgen` crate version exactly (see
       # vitaslop-web/Cargo.toml) or the generated glue refuses the wasm. Cached by version so

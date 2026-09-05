@@ -215,7 +215,7 @@ mod tests {
         // The table names must decrypt to sane paths.
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert!(
-            names.iter().any(|n| *n == "eboot.bin"),
+            names.contains(&"eboot.bin"),
             "eboot.bin not among {} decrypted names (first few: {:?})",
             names.len(),
             &names[..names.len().min(6)]

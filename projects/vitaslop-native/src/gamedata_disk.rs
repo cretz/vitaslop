@@ -72,10 +72,10 @@ impl SaveStore {
     /// The name this title's saves are kept under, asked of the TITLE and not of the path.
     ///
     /// >>> THE DIRECTORY NAME IS NOT AN IDENTITY, and the common layout makes that acute:
-    /// every title extracted as `<name>/extracted/` has the same last component, so keying
-    /// on the path would file every game's save in one directory called `extracted` and let
-    /// each overwrite the last. The container carries its own title id; that is the answer,
-    /// and it is the same one the browser's launcher keys its OPFS tree on.
+    /// > > > every title extracted as `<name>/extracted/` has the same last component, so keying
+    /// > > > on the path would file every game's save in one directory called `extracted` and let
+    /// > > > each overwrite the last. The container carries its own title id; that is the answer,
+    /// > > > and it is the same one the browser's launcher keys its OPFS tree on.
     ///
     /// `sfo` is the bytes of the title's `sce_sys/param.sfo`, read out of the guest
     /// filesystem after boot. Falling back to the path when it is missing or unreadable is
@@ -155,13 +155,11 @@ impl SaveStore {
         if !st.game_data_dirty() {
             return Ok(None);
         }
-        if !force {
-            if let Some(t) = self.last_write {
-                if t.elapsed() < FLOOR {
+        if !force
+            && let Some(t) = self.last_write
+                && t.elapsed() < FLOOR {
                     return Ok(None);
                 }
-            }
-        }
         // NOT gated on `is_empty`. A guest that deleted its only save collects to nothing,
         // and skipping that would make the one change that matters the one never written -
         // the old container would stay on disk and the deletion would come back undone.
@@ -248,8 +246,8 @@ mod tests {
     #[test]
     fn the_container_names_the_title_and_the_path_is_only_a_fallback() {
         // The layout that makes this necessary: two different titles, one directory name.
-        assert_eq!(SaveStore::title_from_game_dir("C:/games/hotshots/extracted"), "extracted");
-        assert_eq!(SaveStore::title_from_game_dir("C:/games/ridgeracer/extracted"), "extracted");
+        assert_eq!(SaveStore::title_from_game_dir("C:/games/titleone/extracted"), "extracted");
+        assert_eq!(SaveStore::title_from_game_dir("C:/games/titletwo/extracted"), "extracted");
 
         // A one-entry `param.sfo`, built here rather than exported from the parser's own
         // tests: a builder nothing ships has no business being public API.
@@ -268,17 +266,17 @@ mod tests {
         sfo.extend_from_slice(key);
         sfo.extend_from_slice(val);
         assert_eq!(
-            SaveStore::title_for("C:/games/hotshots/extracted", Some(&sfo)),
+            SaveStore::title_for("C:/games/titleone/extracted", Some(&sfo)),
             ("PCSA00009".to_string(), true),
         );
         // No container, or one that carries no usable id: the path, and the caller is told.
         assert_eq!(
-            SaveStore::title_for("C:/games/hotshots/extracted", None),
+            SaveStore::title_for("C:/games/titleone/extracted", None),
             ("extracted".to_string(), false),
         );
         assert_eq!(
-            SaveStore::title_for("/games/hotshots/", Some(b"not a container")),
-            ("hotshots".to_string(), false),
+            SaveStore::title_for("/games/titleone/", Some(b"not a container")),
+            ("titleone".to_string(), false),
         );
     }
 }

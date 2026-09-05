@@ -270,26 +270,6 @@ pub const fn split_work(bits: u64) -> (u32, u32) {
     ((bits & WORK_OPS_MASK as u64) as u32, (bits >> WORK_INSTR_SHIFT) as u32)
 }
 
-#[cfg(test)]
-mod work_tests {
-    use super::*;
-
-    #[test]
-    fn the_work_counter_survives_its_instruction_half_setting_the_sign_bit() {
-        // 2^31 retired instructions: the packed i64 is NEGATIVE from here on.
-        let packed = pack_work(1 << 31, 1234);
-        assert!(packed < 0, "the premise: {packed}");
-        assert_eq!(split_work(packed as u64), (1234, 1 << 31));
-
-        // And at the very top of both fields, where a magnitude reading is furthest off.
-        let packed = pack_work(u32::MAX, u32::MAX);
-        assert_eq!(split_work(packed as u64), (u32::MAX, u32::MAX));
-
-        // The ordinary case still round-trips, so the fix is not a special case.
-        assert_eq!(split_work(pack_work(7, 5_000_000) as u64), (5_000_000, 7));
-    }
-}
-
 /// Exported name of the software work counter (see [`WORK_GLOBAL`]). Exported so a host
 /// can read both halves at a switch point; nothing needs to WRITE it - the emitted code
 /// clears the operator half itself after each yield.
@@ -384,4 +364,24 @@ pub const PAGE_SIZE: u32 = 65536;
 /// Exported name of the wasm function for the guest function at `addr`.
 pub fn func_export(addr: u32) -> String {
     format!("f_{addr:x}")
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+
+    #[test]
+    fn the_work_counter_survives_its_instruction_half_setting_the_sign_bit() {
+        // 2^31 retired instructions: the packed i64 is NEGATIVE from here on.
+        let packed = pack_work(1 << 31, 1234);
+        assert!(packed < 0, "the premise: {packed}");
+        assert_eq!(split_work(packed as u64), (1234, 1 << 31));
+
+        // And at the very top of both fields, where a magnitude reading is furthest off.
+        let packed = pack_work(u32::MAX, u32::MAX);
+        assert_eq!(split_work(packed as u64), (u32::MAX, u32::MAX));
+
+        // The ordinary case still round-trips, so the fix is not a special case.
+        assert_eq!(split_work(pack_work(7, 5_000_000) as u64), (5_000_000, 7));
+    }
 }

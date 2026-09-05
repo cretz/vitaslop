@@ -47,7 +47,7 @@
 //! allocated once and handed back for every query that yields it, so a title walking a
 //! document in a loop does not leak a copy per node.
 
-use crate::host::{GuestCtx, Ptr, VitaState};
+use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
 
 /// Magic stamped into each object we hand back, so a pointer that never came from the

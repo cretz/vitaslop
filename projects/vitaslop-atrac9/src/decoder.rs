@@ -110,11 +110,11 @@ pub(crate) struct Block {
     /// The gradient curve, one entry per quantisation unit.
     ///
     /// >>> 48, NOT 31, AND THE DIFFERENCE CRASHED THE EMULATOR. `create_gradient`
-    /// writes `gradient[i]` for `i` up to `gradient_end_unit`, and the unpack validation
-    /// deliberately admits `gradient_end_unit` anywhere in `0..48` - the same 48 the
-    /// gradient CURVES are sized to. At 31 a perfectly legal stream indexed one past the
-    /// end and panicked, which in the browser takes the whole run worker with it.
-    /// Measured on a retail title the moment its AT9 voices first decoded for real.
+    /// > > > writes `gradient[i]` for `i` up to `gradient_end_unit`, and the unpack validation
+    /// > > > deliberately admits `gradient_end_unit` anywhere in `0..48` - the same 48 the
+    /// > > > gradient CURVES are sized to. At 31 a perfectly legal stream indexed one past the
+    /// > > > end and panicked, which in the browser takes the whole run worker with it.
+    /// > > > Measured on a retail title the moment its AT9 voices first decoded for real.
     pub gradient: [i32; 48],
     pub gradient_mode: i32,
     pub gradient_start_unit: i32,
@@ -896,7 +896,7 @@ fn calculate_mask(quantization_unit_count: i32, channel: &mut Channel) {
         if delta > 1 {
             channel.precision_mask[i] += (delta - 1).min(5);
         } else if delta < -1 {
-            channel.precision_mask[i - 1] += (delta * -1 - 1).min(5);
+            channel.precision_mask[i - 1] += (-delta - 1).min(5);
         }
     }
 }

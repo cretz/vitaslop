@@ -113,8 +113,18 @@ impl Default for Settings {
 
 /// The knobs every run starts from. These were the launcher's per-title defaults
 /// for every run it ever made, so they are the product's defaults.
+///
+/// # `VITASLOP_LOG=warn` used to be here, and it made every product run a debugging session
+/// `warn` is already the default level on both front ends, so the knob looked like a
+/// harmless restatement of it. It is not: `knobs::log_filter` treats the knob being SET as
+/// the signal that a human is investigating this run, and several diagnostics are gated on
+/// exactly that - the status channel is forced onto the output, and the transpiler's own
+/// size report prints. So the shell shipped with a terminal full of link inventories and
+/// lifted-statement counts, which is what a rig wants to see and the opposite of what a
+/// player should be shown. A product run names no filter; a person debugging one names it
+/// themselves.
 pub fn base_knobs() -> BTreeMap<String, String> {
-    [("VITASLOP_FRAME_TOPUP", "0"), ("VITASLOP_GXP_LIVE", "1"), ("VITASLOP_LOG", "warn")]
+    [("VITASLOP_FRAME_TOPUP", "0"), ("VITASLOP_GXP_LIVE", "1")]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()

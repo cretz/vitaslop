@@ -1175,11 +1175,25 @@ fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
     if scale_mode == 0 {
         return;
     }
-    use std::collections::HashSet;
+    // >>> ONE FINDING PER MODE, NOT ONE PER SURFACE. Keyed on the address, a title that
+    // >>> allocates a surface per frame-in-flight reported the identical approximation five
+    // >>> times over. The number of surfaces is not what a reader needs: the fix is the same
+    // >>> one piece of work whether it affects one surface or fifty. The first address is
+    // >>> named so the finding still points somewhere concrete, and the running count says
+    // >>> whether the shape is an exception or the norm.
+    use std::collections::HashMap;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashMap<u32, (u32, u64)>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.get_or_insert_with(HashSet::new).insert((data_addr, scale_mode)) {
+    let map = g.get_or_insert_with(HashMap::new);
+    let entry = map.entry(scale_mode).or_insert((data_addr, 0));
+    entry.1 += 1;
+    let (first, count) = *entry;
+    // After the first, the line is re-emitted only on a power of ten - and a `count=` suffix
+    // is exactly what the panel folds onto the finding it already holds
+    // (`vitaslop_platform::diag::dedupe_key`), so those repeats update one line rather than
+    // filling the ring.
+    if count > 1 && !matches!(count, 10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000) {
         return;
     }
     let name = match scale_mode {
@@ -1187,12 +1201,14 @@ fn report_color_surface_scale_mode(data_addr: u32, scale_mode: u32) {
               resolves into it)",
         _ => "an unrecognised scale mode",
     };
-    // A WARNING: the mode is ignored, which is an approximation the picture cannot show.
+    // A WARNING: the mode is ignored, which is an approximation the picture cannot show, and
+    // honouring it (rasterise at 2x, resolve) is a real piece of work that is owed.
     tracing::warn!(
         target: "vitaslop::gxm",
-        "gxm surface: colour surface at {data_addr:#x} was created with {name} - we rasterise it \
-         at the stored resolution and IGNORE the mode, so anything the guest derives from the \
-         two resolutions is computed for a buffer twice the size of the one we produce"
+        "gxm surface: colour surface(s) created with {name} - we rasterise at the stored \
+         resolution and IGNORE the mode, so anything the guest derives from the two resolutions \
+         is computed for a buffer twice the size of the one we produce. first={first:#x} \
+         count={count}"
     );
 }
 
@@ -1400,7 +1416,7 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
             crate::capture::BlendState::from_bytes([b[0], b[1], b[2], b[3]])
         }
         _ => program_rop_blend(ctx, st, program_header)
-            .unwrap_or_else(crate::capture::BlendState::default),
+            .unwrap_or_default(),
     };
     report_blend_info(program_header, blend_info, blend);
     st.set_fragment_program(handle, program_header, blend);
@@ -1438,8 +1454,8 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
     // struct from a template: this one begins a 20,160-triangle pass on a 1024x1024
     // target through a colour surface initialised 1x1, and reading the surface made
     // that whole pass a single pixel. Where both are known the render target wins.
-    if let (Some(c), Some((w, h))) = (color.as_mut(), st.render_target_extent(render_target)) {
-        if w != 0 && h != 0 && (c.width, c.height) != (w, h) {
+    if let (Some(c), Some((w, h))) = (color.as_mut(), st.render_target_extent(render_target))
+        && w != 0 && h != 0 && (c.width, c.height) != (w, h) {
             tracing::debug!(
                 target: "vitaslop::gxm",
                 surface = format_args!("{color_surface:#x}"),
@@ -1451,7 +1467,6 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
             c.width = w;
             c.height = h;
         }
-    }
     if color.is_none() {
         tracing::debug!(
             target: "vitaslop::gxm",
@@ -1791,7 +1806,7 @@ pub(super) fn set_uniform_data_f(ctx: &mut GuestCtx, st: &mut VitaState) {
             let addr = uniform_buffer + (component / 2) * 4;
             let word = ctx.read_u32(addr);
             let h = u32::from(f32_to_half(*v));
-            let merged = if component % 2 == 0 { (word & 0xffff_0000) | h } else { (word & 0x0000_ffff) | (h << 16) };
+            let merged = if component.is_multiple_of(2) { (word & 0xffff_0000) | h } else { (word & 0x0000_ffff) | (h << 16) };
             ctx.write_u32(addr, merged);
         } else {
             ctx.write_u32(uniform_buffer + component * 4, v.to_bits());
@@ -1942,7 +1957,7 @@ pub(super) fn draw_instanced(ctx: &mut GuestCtx, st: &mut VitaState) {
     tracing::debug!(
         target: "vitaslop::gxm",
         index_count, index_wrap,
-        instances = if index_wrap > 0 { index_count / index_wrap } else { 1 },
+        instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "drawInstanced"
     );
     st.record_draw(ctx, primitive, index_format, index_data, index_count);
@@ -2897,7 +2912,7 @@ pub(super) fn precomputed_draw_set_params_instanced(
     tracing::debug!(
         target: "vitaslop::gxm",
         index_count, index_wrap,
-        instances = if index_wrap > 0 { index_count / index_wrap } else { 1 },
+        instances = index_count.checked_div(index_wrap).unwrap_or(1),
         "precomputedDrawSetParamsInstanced"
     );
     st.precomputed_draw_set_params(ctx, precomputed, prim_type, index_type, index_data, index_count);
@@ -3235,7 +3250,7 @@ pub(super) fn color_surface_set_data(ctx: &mut GuestCtx, st: &mut VitaState, sur
 #[hostcall]
 pub(super) fn program_get_type(ctx: &mut GuestCtx, _st: &mut VitaState, program: u32) -> u32 {
     // SCE_GXM_VERTEX_PROGRAM = 0, SCE_GXM_FRAGMENT_PROGRAM = 1.
-    (ctx.read_u32(program.wrapping_add(0x14)) & 1) as u32
+    ctx.read_u32(program.wrapping_add(0x14)) & 1
 }
 
 /// unsigned int sceGxmProgramGetSize(const SceGxmProgram *program)
@@ -3369,7 +3384,7 @@ pub(super) fn texture_get_palette(ctx: &mut GuestCtx, st: &mut VitaState, textur
 /// its low bits silently dropped, which is worth a line rather than a wrong table.
 fn report_unaligned_palette(texture: u32, palette: u32) {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if palette % 64 == 0 || REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if palette.is_multiple_of(64) || REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     tracing::warn!(

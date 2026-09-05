@@ -115,7 +115,7 @@ fn recompile_every_blob_and_rank_the_failures() {
     }
     println!("corpus: {} blobs, {ok} recompile on their own, {failed} do not", all.len());
     let mut ranked: Vec<_> = by_reason.iter().collect();
-    ranked.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1.len()));
     for (reason, names) in ranked {
         println!("  {} blobs - {reason}", names.len());
         for n in names.iter().take(4) {
@@ -303,7 +303,7 @@ fn tabulate_fragment_varying_declaration_order() {
 #[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
 fn assumed_varying_orders_the_vertex_code_contradicts() {
     use vitaslop_gxp_shader::container::VaryingOrder;
-    use vitaslop_gxp_shader::ir::Bank;
+    
 
     let Some(dir) = corpus_dir() else {
         eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
@@ -1295,8 +1295,8 @@ fn repeating_operands_must_stay_inside_the_register_file() {
                     let SmlsiSlot::Increment(n) = state[slot] else { continue };
                     // Both candidate slots govern the same six-bit (stride 2) source field.
                     let end = base.get(1).map(|b| *b as i64 + i64::from(n) * 2 * i64::from(extra));
-                    if let Some(end) = end {
-                        if !(0..=255).contains(&end) {
+                    if let Some(end) = end
+                        && !(0..=255).contains(&end) {
                             *escapes
                                 .entry(format!(
                                     "group {group:#04x} source read as {tag}: steps to {end}"
@@ -1309,7 +1309,6 @@ fn repeating_operands_must_stay_inside_the_register_file() {
                                 base.get(1).copied().unwrap_or(0)
                             );
                         }
-                    }
                 }
             }
         }
@@ -1406,7 +1405,7 @@ fn rank_link_failures_over_all_pairings() {
     }
     println!("{linked} of {} pairings link", verts.len() * frags.len());
     let mut ranked: Vec<_> = by_reason.into_iter().collect();
-    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.1 .0));
     for (reason, (n, vn, fname)) in ranked.iter().take(20) {
         println!("  {n} pairings - {reason}
       e.g. {vn} + {fname}");
@@ -1646,7 +1645,7 @@ fn tabulate_vertex_output_sensitivity_to_attributes() {
     const LANES: usize = 512;
     /// How far to move an attribute lane. Large and irrational-ish so a perturbation cannot
     /// coincidentally land back on the baseline through a wrap, a saturate or a fract.
-    const KICK: f32 = 0.6180339887;
+    const KICK: f32 = 0.618_034;
 
     let mut interpretable = 0usize;
     let mut refused: BTreeMap<String, usize> = BTreeMap::new();
@@ -1827,7 +1826,7 @@ fn tabulate_fragment_varyings_used_as_texture_coordinates() {
     };
 
     const LANES: usize = 512;
-    const KICK: f32 = 0.6180339887;
+    const KICK: f32 = 0.618_034;
 
     let mut interpretable = 0usize;
     let mut fragment_programs = 0usize;
@@ -1928,7 +1927,7 @@ fn tabulate_fragment_varyings_used_as_texture_coordinates() {
             let (a_bank, b_bank) =
                 if native { (&base.o, &f2.o) } else { (&base.pa, &f2.pa) };
             let out_moved = (0..4usize)
-                .filter(|&i| !(!native && (lo..hi).contains(&i)))
+                .filter(|&i| native || !(lo..hi).contains(&i))
                 .filter(|&i| (a_bank[i] - b_bank[i]).abs() > 1e-6)
                 .collect::<Vec<_>>();
             rows.push(format!(
@@ -1977,7 +1976,7 @@ fn attribute_sensitivity_agrees_with_the_container_on_known_programs() {
     };
 
     const LANES: usize = 512;
-    const KICK: f32 = 0.6180339887;
+    const KICK: f32 = 0.618_034;
     /// `Parameter::semantic` for TEXCOORD - see `container::SEMANTIC_*`.
     const SEMANTIC_TEXCOORD: u8 = 14;
 
@@ -2232,7 +2231,7 @@ fn tally_pair_link_outcomes() {
         verts.len() * frags.len()
     );
     let mut rows: Vec<_> = by_reason.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (why, n) in rows.iter().take(12) {
         println!("  {n:>6}  {why}");
     }
@@ -2510,7 +2509,7 @@ fn dot_repeat_field_census() {
     }
     println!("0x18 DOT bits 47:44 histogram:");
     for (v, n) in &hist {
-        println!("  {v:#03x} (unk7={} abs_op2={} strange1={} strange0={}): {n}", v >> 3, (v >> 2) & 1, (v >> 1) & 1, v & 1);
+        println!("  {v:#04x} (unk7={} abs_op2={} strange1={} strange0={}): {n}", v >> 3, (v >> 2) & 1, (v >> 1) & 1, v & 1);
     }
     println!("blobs with a non-zero field: {}", blobs_with.len());
     for (name, ws) in blobs_with.iter().take(20) {
@@ -2852,7 +2851,7 @@ fn data_container_sa_reads_census() {
 #[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
 fn ambiguous_order_convention_gate_census() {
     use vitaslop_gxp_shader::container::VaryingOrder;
-    use vitaslop_gxp_shader::ir::Bank;
+    
     const POSITION_LANES: usize = 4;
     let Some(dir) = corpus_dir() else { return };
     let (mut n, mut both, mut relaxed_only, mut neither) = (0usize, 0usize, 0usize, 0usize);
@@ -3084,7 +3083,7 @@ fn the_default_uniform_container_ends_on_a_parameter_boundary() {
                 // components reported two of this corpus's fragment programs as straddling a cut
                 // that in fact falls exactly at the end of their only parameter.
                 // [[vitaslop-uniform-extent-is-registers-not-components]]
-                let width = u32::from(q.ptype.component_bytes().unwrap_or(4));
+                let width = q.ptype.component_bytes().unwrap_or(4);
                 let regs = (u32::from(q.component_count.max(1)) * q.array_size.max(1) * width)
                     .div_ceil(4);
                 (start < carried && start + regs > carried)

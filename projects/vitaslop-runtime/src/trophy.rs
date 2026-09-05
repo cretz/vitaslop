@@ -538,11 +538,10 @@ impl Conf {
                     }
                     if self_closing {
                         pending_text = None;
-                        if name == "group" {
-                            if let Some(g) = open_group.take() {
+                        if name == "group"
+                            && let Some(g) = open_group.take() {
                                 conf.groups.push(g);
                             }
-                        }
                     }
                 }
                 XmlEvent::Text(text) => {

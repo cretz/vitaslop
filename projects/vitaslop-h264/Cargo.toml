@@ -28,6 +28,9 @@ mp4 = []
 # hundred lines of pure code and a caller who never calls it pays nothing.
 synth = []
 
+[lints]
+workspace = true
+
 [dependencies]
 
 # --- Windows: Media Foundation -----------------------------------------------

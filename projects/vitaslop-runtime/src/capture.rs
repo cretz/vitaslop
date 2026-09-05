@@ -502,13 +502,13 @@ pub struct Draw {
     /// above (which the fixed-function path needs but the real shader recomputes itself).
 ///
 /// >>> SHARED (`Arc<[u8]>`), NOT OWNED: THIS BANK WAS COPIED TWICE PER DRAW.
-/// It is read out of guest memory in `record_draw` and CLONED again when
-/// `RenderSceneBuilder::build` turns the captured draw into a render draw, so a 525-draw
-/// race frame at 60 fps made ~126,000 heap allocations a second for byte ranges nobody
-/// mutates - a V8 worker profile put 1.0% of the whole thread in `malloc` under
-/// `record_draw` alone. Every reader wants `&[u8]` (hash it, walk it in `chunks_exact(4)`,
-/// ask its length), so sharing costs them nothing and the clone becomes a refcount bump.
-/// The program blobs beside it are already carried this way.
+/// > > > It is read out of guest memory in `record_draw` and CLONED again when
+/// > > > `RenderSceneBuilder::build` turns the captured draw into a render draw, so a 525-draw
+/// > > > race frame at 60 fps made ~126,000 heap allocations a second for byte ranges nobody
+/// > > > mutates - a V8 worker profile put 1.0% of the whole thread in `malloc` under
+/// > > > `record_draw` alone. Every reader wants `&[u8]` (hash it, walk it in `chunks_exact(4)`,
+/// > > > ask its length), so sharing costs them nothing and the clone becomes a refcount bump.
+/// > > > The program blobs beside it are already carried this way.
     pub vert_sa: std::sync::Arc<[u8]>,
     /// Raw fragment default-uniform-buffer (SA bank) bytes exactly as the guest wrote them,
     /// consumed by the recompiled fragment shader's `@group(1)` uniform. Empty off-path.
@@ -1051,7 +1051,7 @@ impl Capture {
     pub fn draw_lane_hashes(&self, scene_ix: usize, draw_ix: usize) -> Option<(usize, Vec<u64>)> {
         let d = self.scenes.get(scene_ix)?.draws.get(draw_ix)?;
         let stride = d.vertex_stride as usize;
-        if stride == 0 || stride % 4 != 0 {
+        if stride == 0 || !stride.is_multiple_of(4) {
             return None;
         }
         let lanes = stride / 4;

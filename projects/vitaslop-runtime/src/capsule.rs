@@ -620,7 +620,7 @@ mod tests {
     /// A capsule from a different format version must be refused, not misread.
     #[test]
     fn a_capsule_with_the_wrong_magic_is_refused() {
-        let mut bytes = vec![0u8; 64];
+        let mut bytes = [0u8; 64];
         bytes[..8].copy_from_slice(b"VSCAPS\x00\x00");
         let e = Capsule::read(&mut &bytes[..]).expect_err("must refuse");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);

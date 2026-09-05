@@ -445,8 +445,8 @@ impl Session {
             if self.finished() {
                 break;
             }
-            if let Some(v) = sample_watch(&self.sched, &decl) {
-                if op.eval(v, want, tol) {
+            if let Some(v) = sample_watch(&self.sched, &decl)
+                && op.eval(v, want, tol) {
                     return Ok(format!(
                         "HIT  f{} after {} frames: {name}={}",
                         self.frame(),
@@ -454,7 +454,6 @@ impl Session {
                         format_f64(v)
                     ));
                 }
-            }
         }
         let now = sample_watch(&self.sched, &decl).map(format_f64).unwrap_or("oob".into());
         Ok(format!(
@@ -522,7 +521,7 @@ impl Session {
         }
         if let Some(n) = self.shot_every {
             let f = self.frame();
-            if n > 0 && f % n == 0 {
+            if n > 0 && f.is_multiple_of(n) {
                 let section = self
                     .recipe
                     .sections
@@ -1210,7 +1209,7 @@ impl Session {
             let scene = host.state.capture.world_scene().ok_or("no scene captured yet")?;
             render::locate_scene(scene, observe::WIDTH, observe::HEIGHT)
         };
-        let previous = std::mem::replace(&mut self.last_locate, Some(objects.clone()));
+        let previous = self.last_locate.replace(objects.clone());
         let drift = previous
             .as_deref()
             .and_then(|p| render::origin_drift(p, &objects, 0.05))
@@ -1675,7 +1674,7 @@ impl Session {
             };
             render::locate_sprites(scene, observe::WIDTH, observe::HEIGHT)
         };
-        let previous = std::mem::replace(&mut self.last_sprites, Some(sprites.clone()));
+        let previous = self.last_sprites.replace(sprites.clone());
         let drift = previous
             .as_deref()
             .and_then(|p| render::scroll_drift(p, &sprites, 0.75))
@@ -2411,14 +2410,13 @@ impl Session {
             const MIN_SPEED: f32 = 0.15;
             let moving = fix.speed > MIN_SPEED;
             let vel_bearing = bearing(fix.motion[0], fix.motion[2]);
-            if moving {
-                if let (None, Some(h)) = (fwd_axis, fix.heading) {
+            if moving
+                && let (None, Some(h)) = (fwd_axis, fix.heading) {
                     // Whichever mesh axis agrees with the direction of travel is forward.
                     let d0 = wrap(h[0] - vel_bearing).abs();
                     let d1 = wrap(h[1] - vel_bearing).abs();
                     fwd_axis = Some(if d0 <= d1 { 0 } else { 1 });
                 }
-            }
             let heading = match (moving, fwd_axis, fix.heading) {
                 (true, _, _) => Some(vel_bearing),
                 (false, Some(a), Some(h)) => Some(h[a]),
@@ -2775,9 +2773,9 @@ impl ControlDir {
                 body.clear();
                 continue;
             }
-            if ok.is_some() {
+            if let Some(status) = ok {
                 if line == close {
-                    return Ok(Some((ok.unwrap(), body)));
+                    return Ok(Some((status, body)));
                 }
                 body.push_str(line);
                 body.push('\n');
@@ -2939,7 +2937,7 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].seq, 2);
         c.reply(seq2, false, "no shot written").unwrap();
-        assert_eq!(c.read_reply(seq2).unwrap().unwrap().0, false);
+        assert!(!c.read_reply(seq2).unwrap().unwrap().0);
         assert!(c.read_reply(seq).unwrap().unwrap().0, "the first reply is still intact");
         let _ = std::fs::remove_dir_all(&dir);
     }

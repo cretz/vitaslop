@@ -655,7 +655,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                         .map(|(i, k)| (k.label(), x.by_stmt[i].0, x.by_stmt[i].1))
                         .filter(|r| r.2 != 0)
                         .collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.1));
                 let total: u64 = rows.iter().map(|r| r.1).sum();
                 let line: Vec<String> = rows
                     .iter()
@@ -689,7 +689,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                         (if name.is_empty() { "-".into() } else { name }, x.flags_add_live[m])
                     })
                     .collect();
-                rows.sort_by(|a, b| b.1.cmp(&a.1));
+                rows.sort_by_key(|r| std::cmp::Reverse(r.1));
                 let line: Vec<String> = rows
                     .iter()
                     .map(|(n, c)| format!("{n} {c} ({:.1}%)", 100.0 * *c as f64 / total.max(1) as f64))
@@ -879,8 +879,12 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
                     rest += 1;
                 }
             }
-            tracing::warn!(
-                target: "vitaslop::perf",
+            // STATUS: a gap is a hole in ISA COVERAGE, not a defect in this run - the line
+            // says so itself. Each one TRAPS if its path is ever executed, and that trap is
+            // the warning, naming the address that actually mattered. The census is for
+            // whoever is implementing the decoder.
+            tracing::info!(
+                target: "vitaslop::status",
                 simd_space = likely.len(),
                 other = rest,
                 "decode gaps INSIDE lifted functions. Each one TRAPS if its path runs, so a                  gap here is a hole in ISA coverage, not a crash waiting to happen. The                  SIMD/VFP-space ones are listed below and are the ones worth implementing;                  the rest are overwhelmingly tentative discovery walking into data. Confirm                  each against the decoder at its real alignment before implementing it -                  several will already decode."
@@ -1276,15 +1280,14 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                         // qemu-diff capture (opt-in; see the qdiff_* helpers below). The
                         // snapshot fires on the (skip+1)-th entry to its block, so a specific
                         // invocation of a repeatedly-called function can be targeted.
-                        if let Some((snap_pc, path)) = qdiff_snapshot().as_ref().filter(|_| diag_armed()) {
-                            if *snap_pc == sel && !QDIFF_SNAP_FIRED.load(Relaxed) {
+                        if let Some((snap_pc, path)) = qdiff_snapshot().as_ref().filter(|_| diag_armed())
+                            && *snap_pc == sel && !QDIFF_SNAP_FIRED.load(Relaxed) {
                                 let seen = QDIFF_SNAP_SEEN.fetch_add(1, Relaxed);
                                 if seen >= qdiff_snapshot_skip() {
                                     QDIFF_SNAP_FIRED.store(true, Relaxed);
                                     qdiff_dump_snapshot(&mut caller, sel, path);
                                 }
                             }
-                        }
                         if let Some((lo, hi, path)) = qdiff_regtrace() {
                             let armed = diag_armed()
                                 && (qdiff_snapshot().is_none() || QDIFF_SNAP_FIRED.load(Relaxed));
@@ -1515,13 +1518,12 @@ fn qdiff_dump_snapshot<H: ImportDispatch + Send + 'static>(
     while i < bytes.len() {
         let end = (i + PAGE).min(bytes.len());
         if bytes[i..end].iter().any(|&b| b != 0) || page_dense(base + i as u32) {
-            if let Some(last) = regions.last_mut() {
-                if last.1 + last.2 == i {
+            if let Some(last) = regions.last_mut()
+                && last.1 + last.2 == i {
                     last.2 += end - i;
                     i = end;
                     continue;
                 }
-            }
             regions.push((base + i as u32, i, end - i));
         }
         i = end;
@@ -1817,7 +1819,7 @@ fn bind_import<H: ImportDispatch + Send + 'static>(
                     // counter is a relaxed add.
                     {
                         let n = STALL_DUMP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n % STALL_DUMP_EVERY == 0 && tracing::enabled!(target: "vitaslop::sched", tracing::Level::DEBUG) {
+                        if n.is_multiple_of(STALL_DUMP_EVERY) && tracing::enabled!(target: "vitaslop::sched", tracing::Level::DEBUG) {
                             let host = caller.data().host.lock().unwrap();
                             tracing::debug!(
                                 target: "vitaslop::sched",
@@ -1955,7 +1957,7 @@ fn sample_arm_instructions<H: ImportDispatch + Send + 'static>(
     if caller.data().fuel_interval == 0 {
         return None;
     }
-    let g = caller.data().sw_fuel.clone()?;
+    let g = caller.data().sw_fuel?;
     let packed = g.get(&mut *caller).i64()? as u64;
     Some(packed >> abi::WORK_INSTR_SHIFT)
 }
@@ -2060,7 +2062,7 @@ fn sample_software_fuel<H: ImportDispatch + Send + 'static>(
     if interval == 0 {
         return;
     }
-    let Some(g) = caller.data().sw_fuel.clone() else { return };
+    let Some(g) = caller.data().sw_fuel else { return };
     // The counter is the PACKED i64 work global: operators in the low half, guest
     // instructions in the high half (see `abi::WORK_GLOBAL`). Only the operator half is
     // wasmtime's unit, so only that half is comparable with wasmtime's own reading.
@@ -2134,11 +2136,16 @@ impl SharedView {
     /// SAFETY of the caller's use: the block lies above the guest region inside the
     /// same linear memory, and scheduling is cooperative, so no fiber runs while a host
     /// call holds this.
-    unsafe fn dirty_block(&self) -> Option<&mut [u8]> {
+    // The `&self -> &mut [u8]` shape is what clippy denies, and it is deliberate here: the
+    // view owns a raw pointer into the guest's linear memory, and the SAFETY paragraph above
+    // is the argument for why handing out one mutable slice is sound. Taking `&mut self`
+    // instead would move the aliasing question rather than answer it.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn dirty_block(&self) -> Option<&mut [u8]> { unsafe {
         let off = self.dirty_off? as usize;
         let end = self.len.min(off + vitaslop_transpiler::DIRTY_MAP_OFF as usize + self.pages() + 1);
         Some(std::slice::from_raw_parts_mut(self.ptr.add(off), end - off))
-    }
+    }}
 
     fn pages(&self) -> usize {
         self.len >> vitaslop_transpiler::DIRTY_SHIFT
@@ -2314,13 +2321,13 @@ fn write_shared(mem: &SharedMemory, off: usize, bytes: &[u8]) {
 /// dereferenced (and `this` in r0..r3 for a C++ vtable dispatch). Diagnostic only.
 ///
 /// >>> THAT "no caching in wasm locals" IS A REAL PRECONDITION, AND ONE BUILD BREAKS IT.
-/// `VITASLOP_PROMOTE_REGS` holds the register file in wasm LOCALS along each straight-line
-/// run and writes back only at calls, branches and returns (see `transpiler::promote`). A
-/// trap in the middle of such a run therefore leaves the globals holding the values from
-/// the last write-back, not the faulting instruction - so this dump goes STALE rather than
-/// wrong-looking, which is the worse failure for a diagnostic. The knob is off by default;
-/// if it is ever made the default, this dump has to spill the promoted locals first or say
-/// that it cannot.
+/// > > > `VITASLOP_PROMOTE_REGS` holds the register file in wasm LOCALS along each straight-line
+/// > > > run and writes back only at calls, branches and returns (see `transpiler::promote`). A
+/// > > > trap in the middle of such a run therefore leaves the globals holding the values from
+/// > > > the last write-back, not the faulting instruction - so this dump goes STALE rather than
+/// > > > wrong-looking, which is the worse failure for a diagnostic. The knob is off by default;
+/// > > > if it is ever made the default, this dump has to spill the promoted locals first or say
+/// > > > that it cannot.
 fn reg_dump<T>(store: &mut Store<T>, instance: &Instance) -> String {
     let mut s = String::from("regs at trap:");
     for i in 0..abi::REG_COUNT {

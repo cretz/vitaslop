@@ -432,8 +432,8 @@ pub(crate) fn color_return_expr(
     // question with no instrument at all, which is how a composite's UV offset stayed a matter
     // of argument for a whole session. `<n>.xy` shows as red/green, so an on-screen ramp from
     // black to yellow is UV 0..1 and anything flat is a coordinate that does not vary.
-    if let Ok(n) = std::env::var("VITASLOP_GXP_VPROBE").map(|s| s.trim().to_string()) {
-        if let Ok(i) = n.parse::<u32>() {
+    if let Ok(n) = std::env::var("VITASLOP_GXP_VPROBE").map(|s| s.trim().to_string())
+        && let Ok(i) = n.parse::<u32>() {
             if i < varyings {
                 return format!("vec4<f32>(in.v{i}.x, in.v{i}.y, in.v{i}.z, 1.0)");
             }
@@ -442,7 +442,6 @@ pub(crate) fn color_return_expr(
             // cannot answer, and "not applicable" has to be visibly different from "zero".
             return "vec4<f32>(1.0, 0.0, 1.0, 1.0)".to_string();
         }
-    }
     if let Some(spec) = probe_spec() {
         // An `@<instr>` probe reads the SNAPSHOT locals the emitter wrote at that instruction,
         // not the register's end value - see [`ProbeSpec`] for why those differ.
@@ -772,7 +771,7 @@ pub fn mem_window_helper(windows: &[MemWindow]) -> String {
 /// corpus closure over five reads in two programs (see [`MemWindow::base_offset`]), which is
 /// strong but is not a specification, and a title whose driver turns out to place the base
 /// after all should cost one run to find out rather than a rebuild. It is also what PROVED
-/// this change inert for the other titles - Ridge Racer's first 1,600 frames are bit-identical
+/// this change inert for the other titles - PCSE00001's first 1,600 frames are bit-identical
 /// under both arms while the golf title's menu differs on 98.6% of its pixels, which is the
 /// negative control an A/B needs - and a no-regression claim that needs a rebuild to check is
 /// one nobody checks.

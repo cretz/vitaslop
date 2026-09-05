@@ -11,6 +11,9 @@ publish.workspace = true
 name = "vitaslop"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # The native wasmtime-backed engine (Vm) plus the loader and the engine-agnostic
 # runtime (host calls, capture, World seam). Same stack the headless render tests
@@ -27,6 +30,9 @@ vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video",
 # Installs the fmt/EnvFilter subscriber so the runtime's `tracing` diagnostics
 # surface via RUST_LOG (e.g. vitaslop::io=trace).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The shell emits on the status channel too (game data restored, and anything else that
+# describes the run rather than faulting), and reads event metadata in its capture writer.
+tracing = { workspace = true }
 
 # Window + input + GPU. winit 0.30 (latest stable; the 0.31 line is a pre-release
 # beta) integrates with wgpu 30 through raw-window-handle 0.6. gilrs reads real

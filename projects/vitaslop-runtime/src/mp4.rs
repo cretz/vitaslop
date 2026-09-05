@@ -118,7 +118,7 @@ pub struct Track {
 
 impl Track {
     /// >>> THE `AudioSpecificConfig` INSIDE AN `esds`, which is what a decoder is
-    /// configured from and is NOT the box's own bytes.
+    /// > > > configured from and is NOT the box's own bytes.
     ///
     /// [`Track::codec_config`] holds the whole `esds` payload for an audio track, and that
     /// is a nest of MPEG-4 descriptors: an `ES_Descriptor` (tag 3) holding a
@@ -637,7 +637,11 @@ fn parse_ctts(d: &[u8]) -> Result<Vec<i32>, Mp4Error> {
         let at = 8 + 8 * i;
         let n = be_u32(d, at)?;
         let raw = be_u32(d, at + 4)?;
-        let offset = if signed { raw as i32 } else { raw as i32 };
+        // Version 1's offsets are SIGNED and version 0's are UNSIGNED. `raw as i32` is the
+        // right reinterpretation for version 1; for version 0 it would turn a value above
+        // i32::MAX into a negative offset, so that case saturates instead. (Both arms used to
+        // read `raw as i32`, which is what made `signed` a flag nothing acted on.)
+        let offset = if signed { raw as i32 } else { raw.min(i32::MAX as u32) as i32 };
         if out.len().saturating_add(n as usize) > 16_000_000 {
             return Err(Mp4Error::InconsistentTables("ctts run count is implausible"));
         }

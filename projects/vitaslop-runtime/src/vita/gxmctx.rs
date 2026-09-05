@@ -641,6 +641,11 @@ pub fn load(ctx: &GuestCtx, context: u32) -> crate::capture::RenderState {
 ///
 /// A snapshot is only valid for the host call that took it, which is the only scope it is
 /// ever used in - it is a local, never a field.
+// `Copied` is 652 bytes against `Lent`'s 16, and that is the whole design: the copy exists so
+// a backing that cannot lend (the browser's SharedArrayBuffer) still gets ONE crossing instead
+// of a dozen. Boxing it to even the variants out would put that copy on the heap per host call,
+// which is the cost this type was written to avoid. It is always a local, never a field.
+#[allow(clippy::large_enum_variant)]
 pub enum Block<'a> {
     /// Lent in place by a backing that can hand out a slice - every in-process host. No copy
     /// at all, which is what the readers used to do one span at a time.

@@ -90,7 +90,7 @@ impl WgpuRenderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.cube
-            .encode(&self.device, &mut encoder, &color_view, &depth_view, &batches, clear);
+            .encode(&self.device, &self.queue, &mut encoder, &color_view, &depth_view, &batches, clear);
 
         // Copy the color texture into a readback buffer. width*4 is 256-aligned
         // for 960 (3840 = 15*256), so no per-row padding is needed here.
@@ -412,7 +412,7 @@ impl GeneralRenderer {
             encode_ms,
             // Submit-and-wait: the only part of this that contains GPU execution.
             submit_ms: t_submit.elapsed().as_secs_f64() * 1000.0,
-            phases: self.gxm.last_phases(),
+            phases: self.gxm.chain_phases(),
         };
         if let Some(dir) = std::env::var_os("VITASLOP_GPU_CHAIN_DIR") {
             self.dump_chain_targets(std::path::Path::new(&dir));

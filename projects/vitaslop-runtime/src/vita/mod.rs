@@ -774,8 +774,8 @@ pub fn dispatch(
     // The chain is a stack SCAN (every word in the code range, innermost first), not a
     // frame-pointer walk - ARM leaf frames often keep no frame pointer at all - so it
     // may contain stale slots; it is a set of candidates ordered by depth, not proof.
-    if let Some((want_nid, lo_f, hi_f)) = *BACKTRACE_AT {
-        if func_nid == want_nid && (lo_f..=hi_f).contains(&st.cur_frame()) {
+    if let Some((want_nid, lo_f, hi_f)) = *BACKTRACE_AT
+        && func_nid == want_nid && (lo_f..=hi_f).contains(&st.cur_frame()) {
             let key = (want_nid, st.current_thread());
             if BACKTRACE_DONE.lock().unwrap().insert(key) {
                 let (lo, hi) = *CALLSITE_CODE_RANGE;
@@ -796,7 +796,6 @@ pub fn dispatch(
                 );
             }
         }
-    }
 
     // Diagnostic (env `VITASLOP_HOSTCALL_WATCH`): every host call that names a watched guest
     // ADDRESS in any of its first four arguments, with the call, its arguments and the site.
@@ -808,8 +807,8 @@ pub fn dispatch(
     // exactly the interesting case for a struct that is all zeros. Watching the ARGUMENT catches
     // the call either way, including the one that was never made looking absent from a complete
     // list of the ones that were.
-    if let Some(watch) = HOSTCALL_WATCH.as_ref() {
-        if let Some(hit) = (0..4).map(|i| ctx.arg(i)).find(|a| watch.contains(a)) {
+    if let Some(watch) = HOSTCALL_WATCH.as_ref()
+        && let Some(hit) = (0..4).map(|i| ctx.arg(i)).find(|a| watch.contains(a)) {
             eprintln!(
                 "hostcall watch {hit:#x}: f{} t{} {}({:#x}, {:#x}, {:#x}, {:#x}) lr={:#010x}",
                 st.cur_frame(),
@@ -822,7 +821,6 @@ pub fn dispatch(
                 ctx.regs[14],
             );
         }
-    }
 
     // Diagnostic (env `VITASLOP_TRACE_ORDER`): live, globally-ordered timeline of
     // meaningful calls. Filters the lock/unlock and shader-reflection storm so the

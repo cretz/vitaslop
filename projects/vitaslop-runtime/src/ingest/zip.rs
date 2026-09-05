@@ -94,12 +94,7 @@ pub(crate) fn find_eocd(bytes: &[u8]) -> Option<usize> {
     // The comment is at most 0xFFFF bytes, so bound the scan.
     let max_back = (bytes.len()).min(EOCD_MIN + 0xFFFF);
     let start = bytes.len() - max_back;
-    for i in (start..=bytes.len() - EOCD_MIN).rev() {
-        if u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) == EOCD_SIG {
-            return Some(i);
-        }
-    }
-    None
+    (start..=bytes.len() - EOCD_MIN).rev().find(|&i| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) == EOCD_SIG)
 }
 
 

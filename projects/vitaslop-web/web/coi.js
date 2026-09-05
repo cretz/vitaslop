@@ -29,6 +29,20 @@ self.addEventListener("fetch", (e) => {
         headers.set("Cross-Origin-Resource-Policy", "same-origin");
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
       })
-      .catch((err) => new Response(String(err), { status: 502 }))
+      // The error path carries the SAME headers. Without them a failed navigation would
+      // load a document with no cross-origin isolation, which is the one thing this worker
+      // exists to guarantee - and the page would then fail on SharedArrayBuffer instead of
+      // on the network error that actually happened.
+      .catch(
+        (err) =>
+          new Response(String(err), {
+            status: 502,
+            headers: {
+              "Cross-Origin-Embedder-Policy": "require-corp",
+              "Cross-Origin-Opener-Policy": "same-origin",
+              "Cross-Origin-Resource-Policy": "same-origin",
+            },
+          })
+      )
   );
 });

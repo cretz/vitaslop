@@ -261,8 +261,14 @@ pub fn run_recipe(game_dir: &str, recipe: &Recipe, opts: RunOpts) -> Result<Reci
     });
     if let Some(store) = save.as_mut() {
         match store.restore(&mut sched.host().state) {
-            Ok(Some(report)) => println!("[gamedata] restored from {}: {report}", store.path().display()),
-            Ok(None) => println!("[gamedata] no saved state at {} yet", store.path().display()),
+            Ok(Some(report)) => tracing::info!(
+                target: "vitaslop::status",
+                "[gamedata] restored from {}: {report}", store.path().display()
+            ),
+            Ok(None) => tracing::info!(
+                target: "vitaslop::status",
+                "[gamedata] no saved state at {} yet", store.path().display()
+            ),
             Err(e) => return Err(format!("game data: {e}")),
         }
     }

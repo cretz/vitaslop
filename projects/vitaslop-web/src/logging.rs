@@ -11,134 +11,43 @@
 //! The filter comes from the `VITASLOP_LOG` knob rather than `RUST_LOG`, because
 //! `wasm32-unknown-unknown` has no environment (see [`vitaslop_platform::knobs`]).
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::fmt::MakeWriter;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
-/// How many DISTINCT WARN/ERROR lines the page mirror holds.
-///
-/// Distinct, not total: repeats are counted against the line already held (see
-/// [`push_page_log`]), so this bounds the panel by how many different things went wrong
-/// rather than by how often. The race screen produced 70+ occurrences of one warning shape
-/// across dozens of program pairs and evicted six DIFFERENT warnings to fit them - including
-/// the three that named real render defects. A ring that drops a unique warning to keep the
-/// hundredth copy of another has its priority exactly backwards.
-const PAGE_LOG_CAP: usize = 96;
+use vitaslop_platform::diag::{self, Channel};
 
-/// The WARN/ERROR lines this run has emitted, for the page's diagnostics panel.
-///
-/// # Why the console is not where these can live
-/// The console is unreachable on a phone without a cable and remote debugging, and the phone
-/// is the only machine whose numbers are not a proxy. That argument is already written out at
-/// the `diag` emit in `lib.rs` - and it was made for the COUNTERS while every warning and
-/// error kept going to the console alone. So the one line that settles "did this draw fail, or
-/// did the guest never submit it" - `WebGPU uncaptured error: ...`, a dropped draw, a renderer
-/// falling back - was reachable only from a desktop. A session's notes recorded it as already
-/// being in the page's diagnostics box; it was not, and a device capture taken on that belief
-/// would have read a SILENT panel as "no error occurred".
-///
-/// This is a mirror, not a second sink: a line reaches it only if the filter already let it
-/// through to the console, so `VITASLOP_LOG` still says what is emitted.
-static PAGE_LOG: Mutex<Option<PageLog>> = Mutex::new(None);
-
-/// The STATUS lines this run has emitted, kept apart from the warnings above.
-///
-/// # Why this exists, and it is the whole point of the split
-/// A WARNING IS A CLAIM THAT SOMETHING IS BROKEN AND OWED A FIX. A great deal of what this
-/// engine reports is not that: the frame's pass structure, a precompile count, a texture
-/// working set, "the region-clip state is live", "the scene tallies are clean". Those are
-/// STATUS, and filing them at `warn` made the panel unreadable - a user looking at a phone
-/// could not tell a defect from a heartbeat, and the genuine findings sat between twenty
-/// copies of a frame-shape trace.
-///
-/// The wrong cure is `debug`: a report nobody sees does not exist, and this project has met
-/// that failure repeatedly. So status keeps a channel of its own that is ALWAYS on and
-/// ALWAYS shown - `init` forces `vitaslop::status=info` on top of whatever `VITASLOP_LOG`
-/// says - and the panel renders it in its own section. Nothing is silenced; it is sorted.
-static PAGE_STATUS: Mutex<Option<PageLog>> = Mutex::new(None);
-
-/// The target that routes an event to [`PAGE_STATUS`] instead of [`PAGE_LOG`].
+/// The target that files an event as STATUS rather than as a warning.
 ///
 /// Emitted through `vitaslop_platform::report_status!`, which is the only thing that should
 /// ever name this string.
-pub(crate) const STATUS_TARGET: &str = "vitaslop::status";
-
-#[derive(Default)]
-struct PageLog {
-    /// Each distinct line, with how many times it has been emitted.
-    lines: VecDeque<(String, u64)>,
-    /// Distinct lines pushed out of the ring. Reported rather than dropped silently - a panel
-    /// showing the LAST N warnings while implying it shows all of them is the failure this
-    /// project keeps meeting under other names.
-    dropped: usize,
-}
-
-use vitaslop_platform::diag::dedupe_key;
+pub(crate) const STATUS_TARGET: &str = diag::STATUS_TARGET;
 
 /// The WARN/ERROR lines so far, oldest first, or `None` if there were none.
 ///
 /// Non-draining on purpose: the panel is rebuilt from scratch each perf window, and a warning
 /// that fired once must not vanish from it one window later.
+///
+/// The ring itself is `vitaslop_platform::diag` - the desktop shell shows the same lines in
+/// its own diagnostics view, and one ring is what keeps the two front ends honest about what
+/// a run reported.
 pub fn page_log_report() -> Option<String> {
-    render_page_log(&PAGE_LOG)
+    diag::report(Channel::Warning)
 }
 
 /// The STATUS lines so far, for the panel's own section. Same contract as
 /// [`page_log_report`]: non-draining, oldest first, `None` when there are none.
 pub fn page_status_report() -> Option<String> {
-    render_page_log(&PAGE_STATUS)
-}
-
-fn render_page_log(which: &Mutex<Option<PageLog>>) -> Option<String> {
-    let guard = which.lock().ok()?;
-    let log = guard.as_ref()?;
-    if log.lines.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    if log.dropped > 0 {
-        out.push_str(&format!(
-            "({} earlier DISTINCT line(s) dropped - this panel keeps {PAGE_LOG_CAP} of them)\n",
-            log.dropped
-        ));
-    }
-    for (l, n) in &log.lines {
-        out.push_str(l);
-        if *n > 1 {
-            out.push_str(&format!("  [x{n}]"));
-        }
-        out.push('\n');
-    }
-    Some(out)
+    diag::report(Channel::Status)
 }
 
 fn push_page_log(text: &str) {
-    push_into(&PAGE_LOG, text);
+    diag::push(Channel::Warning, text);
 }
 
 fn push_page_status(text: &str) {
-    push_into(&PAGE_STATUS, text);
-}
-
-fn push_into(which: &Mutex<Option<PageLog>>, text: &str) {
-    let Ok(mut guard) = which.lock() else { return };
-    let log = guard.get_or_insert_with(PageLog::default);
-    let key = dedupe_key(text);
-    // A repeat updates the line already held - keeping the LATEST text, so a diagnostic that
-    // reports its own running count shows the newest one rather than the first.
-    if let Some(slot) = log.lines.iter_mut().find(|(l, _)| dedupe_key(l) == key) {
-        slot.0 = text.to_string();
-        slot.1 += 1;
-        return;
-    }
-    if log.lines.len() == PAGE_LOG_CAP {
-        log.lines.pop_front();
-        log.dropped += 1;
-    }
-    log.lines.push_back((text.to_string(), 1));
+    diag::push(Channel::Status, text);
 }
 
 /// Set once, so a second entry point calling this is a no-op.

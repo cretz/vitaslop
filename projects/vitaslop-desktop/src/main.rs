@@ -13,6 +13,7 @@ mod gfx;
 mod input;
 mod library;
 mod live;
+mod log;
 mod retail;
 mod serve;
 mod session;
@@ -41,24 +42,23 @@ const HEIGHT: u32 = 544;
 const FRAME_DT: Duration = Duration::from_micros(16_666);
 
 fn main() {
-    // Surface the runtime's `tracing` diagnostics (`vitaslop::io=trace`, `vitaslop::gxm=debug`,
-    // ...).
-    //
-    // `VITASLOP_LOG` first, `RUST_LOG` as the fallback - see `knobs::log_filter`.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            vitaslop_platform::knobs::log_filter(),
-        ))
-        .with_writer(std::io::stderr)
-        .try_init();
     // `--game <dir>` plays a real extracted retail title (decrypt -> link -> transpile
     // -> preemptive scheduler -> general GXM renderer) in a live window. With no
-    // argument, run the built-in clean-room cube demo below.
+    // argument, the shell opens.
     let args: Vec<String> = std::env::args().collect();
     // Subcommands. With no arguments the native shell opens (library, settings, play);
     // `--game <dir>` is the direct window the rigs drive; `--cube` the built-in demo.
+    //
+    // >>> THE SUBSCRIBER IS CHOSEN BY THE ENTRY POINT, and that is the whole quiet-shell
+    // >>> change: a rig invocation keeps stderr exactly as it was, and the shell captures
+    // >>> the same events into the diagnostics rings instead of printing them at a player.
+    // >>> See `log` for why this is an audience decision and not a level one.
+    if args.len() > 1 {
+        log::init_verbose();
+    }
     match args.get(1).map(String::as_str) {
         None => {
+            log::init_quiet();
             if let Err(e) = shell::run() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -321,11 +321,10 @@ impl App {
             }
         }
 
-        if let Some(gfx) = self.gfx.as_mut() {
-            if let Some(scene) = self.guest.current() {
+        if let Some(gfx) = self.gfx.as_mut()
+            && let Some(scene) = self.guest.current() {
                 gfx.present(scene);
             }
-        }
 
         self.update_title(ctrl, now);
     }

@@ -97,12 +97,12 @@ pub struct AudioState {
     /// rate each was submitted at: `(port, frames, rate)`.
     ///
     /// >>> PER PORT, BECAUSE PORTS PLAY AT THE SAME TIME AND A SUM COUNTS WALL TIME TWICE.
-    /// This was one running total, and a title playing a movie holds a second output port
-    /// open beside its game audio - both submitting a grain per period, both heard together.
-    /// The sum then says the guest produced two seconds of sound per second of clock, which
-    /// reads exactly like the audio path running at double rate. MEASURED 2026-09-02 on one
-    /// title's intro movie: `1.98x over this window`, entirely from the second port.
-    /// [[vitaslop-audio-ports-are-mixed-not-appended]]
+    /// > > > This was one running total, and a title playing a movie holds a second output port
+    /// > > > open beside its game audio - both submitting a grain per period, both heard together.
+    /// > > > The sum then says the guest produced two seconds of sound per second of clock, which
+    /// > > > reads exactly like the audio path running at double rate. MEASURED 2026-09-02 on one
+    /// > > > title's intro movie: `1.98x over this window`, entirely from the second port.
+    /// > > > [[vitaslop-audio-ports-are-mixed-not-appended]]
     submitted: Vec<(i32, u64, u32)>,
 }
 
@@ -128,9 +128,9 @@ impl AudioState {
     /// So a device capture showing `UNDERRUN 24.7%` beside `OVERRUN 49.5%` is a RATE problem,
     /// not a buffer one, and the period count is where to look for it.
     /// >>> AND IT IS THE BUSIEST PORT, NOT THE SUM OF THEM. Concurrent ports are MIXED into
-    /// one output, so a second of movie sound played over a second of game sound is one
-    /// second of sound. The port that has submitted the most is the one whose length this
-    /// measures; a port that opens late and plays briefly cannot inflate the figure.
+    /// > > > one output, so a second of movie sound played over a second of game sound is one
+    /// > > > second of sound. The port that has submitted the most is the one whose length this
+    /// > > > measures; a port that opens late and plays briefly cannot inflate the figure.
     pub fn produced_seconds(&self) -> f64 {
         self.submitted
             .iter()

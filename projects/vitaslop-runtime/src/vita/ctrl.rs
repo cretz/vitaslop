@@ -94,12 +94,12 @@ impl CtrlHistory {
     ///
     /// >>> THE STAMP IS THE VBLANK, NOT THE DISPLAY FRAME, and the pad state is part of the
     /// >>> test. The first version keyed on the display-frame counter, which only the
-    /// preemptive scheduler advances: under the run-to-completion host it never moves, so the
-    /// ring froze on its first (neutral) sample and a title reading more than one buffer never
-    /// saw a button at all. The conformance cube caught it - it pressed START and the guest ran
-    /// on for ever. The vblank counter is a pure function of the clock and advances under every
-    /// host; comparing the pad as well means a change is served the moment the world makes it,
-    /// whatever the clock is doing.
+    /// > > > preemptive scheduler advances: under the run-to-completion host it never moves, so the
+    /// > > > ring froze on its first (neutral) sample and a title reading more than one buffer never
+    /// > > > saw a button at all. The conformance cube caught it - it pressed START and the guest ran
+    /// > > > on for ever. The vblank counter is a pure function of the clock and advances under every
+    /// > > > host; comparing the pad as well means a change is served the moment the world makes it,
+    /// > > > whatever the clock is doing.
     fn push(&mut self, port: u32, vblank: u64, ts: u64, pad: crate::world::CtrlFrame) {
         let ring = match self.ports.iter().position(|(p, _)| *p == port) {
             Some(k) => &mut self.ports[k].1,
@@ -187,7 +187,7 @@ fn fill_ctrl(
                 None => {
                     let base = oldest.map_or((ts, crate::world::CtrlFrame::default()), |s| (s.ts, s.pad));
                     let short = (age + 1 - depth) as u64;
-                    (base.0.saturating_sub(short * u64::from(super::display::VBLANK_US)), base.1)
+                    (base.0.saturating_sub(short * super::display::VBLANK_US), base.1)
                 }
             };
             let bits = if negative { !pad.buttons } else { pad.buttons };

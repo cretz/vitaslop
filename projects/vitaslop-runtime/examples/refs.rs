@@ -65,14 +65,13 @@ fn main() {
                 let imm16 = ((w >> 4) & 0xf000) | (w & 0xfff);
                 if op == 0x30 {
                     pending[rd] = Some((pc, imm16));
-                } else if op == 0x34 {
-                    if let Some((lo_pc, lo)) = pending[rd] {
+                } else if op == 0x34
+                    && let Some((lo_pc, lo)) = pending[rd] {
                         let addr = (imm16 << 16) | lo;
                         if hit(addr) {
                             println!("{pc:#010x}  movt r{rd} (movw at {lo_pc:#010x})  -> {addr:#010x}");
                         }
                     }
-                }
                 at += 4;
                 continue;
             }

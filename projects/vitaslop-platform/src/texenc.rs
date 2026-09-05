@@ -97,6 +97,9 @@ pub struct Transcoder {
     copy_rows: wgpu::ComputePipeline,
     halve: wgpu::ComputePipeline,
     encode_etc2: wgpu::ComputePipeline,
+    // BUILT BUT NEVER DISPATCHED - the YUV conversion runs on the CPU today. Kept so the
+    // pipeline that exists is visible rather than silently absent.
+    #[allow(dead_code)]
     convert_yuv: wgpu::ComputePipeline,
 }
 
@@ -456,7 +459,7 @@ pub fn last_raw_refusal() -> &'static str {
 }
 
 /// >>> HOW BIG THE SHARED SOURCE BUFFER SHOULD BE for a texture needing `need_src` bytes, given
-/// the size it has already grown to (`s0`) and what the RGBA and output buffers will claim.
+/// > > > the size it has already grown to (`s0`) and what the RGBA and output buffers will claim.
 ///
 /// Three rules, in this order:
 ///
@@ -912,7 +915,7 @@ impl Transcoder {
         // as `array<u32>`. The pad is zeros, and the shader never addresses past a block it was
         // told exists.
         let mut src_bytes = plan.src.to_vec();
-        while src_bytes.len() % 4 != 0 {
+        while !src_bytes.len().is_multiple_of(4) {
             src_bytes.push(0);
         }
         // `create_buffer_init` is `mappedAtCreation` on the web backend and every call takes a
@@ -1142,7 +1145,7 @@ impl Transcoder {
         // >>> EVERY REFUSAL NAMES ITS OWN RULE. See `LAST_RAW_REFUSAL`: eight different
         // conditions return `None` here and the caller's report could say only THAT one had,
         // which for the largest texture family on the target device is half an instrument.
-        let mut give_up = |spare: Option<wgpu::Texture>, why: &'static str| {
+        let give_up = |spare: Option<wgpu::Texture>, why: &'static str| {
             if let Some(t) = spare {
                 t.destroy();
             }
@@ -1160,12 +1163,12 @@ impl Transcoder {
             let height = (h0 >> i).max(1);
             let out_row_bytes = align_up(width * 4, COPY_ROW_ALIGN);
             levels.push(RgbaLevel { width, height, rgba_word, out_byte, out_row_bytes });
-            let Some(rw) = rgba_word.checked_add(width.checked_mul(height).unwrap_or(u32::MAX))
+            let Some(rw) = rgba_word.checked_add(width.saturating_mul(height))
             else {
                 return give_up(spare, "the RGBA mip chain overflowed 32 bits of texels");
             };
             let Some(ob) =
-                out_byte.checked_add(out_row_bytes.checked_mul(height).unwrap_or(u32::MAX))
+                out_byte.checked_add(out_row_bytes.saturating_mul(height))
             else {
                 return give_up(spare, "the aligned output chain overflowed 32 bits of bytes");
             };
@@ -1621,7 +1624,7 @@ impl Transcoder {
         let size = rgba_words * 4;
 
         let mut src_bytes = plan.src.to_vec();
-        while src_bytes.len() % 4 != 0 {
+        while !src_bytes.len().is_multiple_of(4) {
             src_bytes.push(0);
         }
         let src_buf = wgpu::util::DeviceExt::create_buffer_init(

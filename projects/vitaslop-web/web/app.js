@@ -494,6 +494,7 @@ function featureList() {
 async function renderImport() {
   view.innerHTML = `
     <h1>Add games</h1>
+    <p class="own">vitaslop only works with games you own, from your own console. It provides no games and downloads nothing.</p>
     <div class="tabs" id="tabs">
       <button class="tab on" data-mode="pkg">Package (.pkg + work.bin)</button>
       <button class="tab" data-mode="folder">Dumped folder</button>

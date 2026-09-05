@@ -219,15 +219,14 @@ impl GameData {
         idx: usize,
         chunk: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        if self.verify {
-            if let Some(expect) = ctx.signatures.get(idx) {
+        if self.verify
+            && let Some(expect) = ctx.signatures.get(idx) {
                 let subkey = hmac_sha1(&keys.secret, &(idx as u32).to_le_bytes());
                 let got = hmac_sha1(&subkey, chunk);
                 if &got != expect {
                     return Err(Error::IntegrityCheck("pfs sector hmac mismatch"));
                 }
             }
-        }
         let page_size = ctx.page_size.max(1) as usize;
         let offset = (page_size as u64).wrapping_mul(idx as u64);
         let mut iv = [0u8; 16];

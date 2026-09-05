@@ -13,6 +13,9 @@ publish = false
 # SGX543 instruction-set encoding and vitasdk/psdevwiki definitions - permissive,
 # fact-only sources; no copyleft or proprietary code is read, linked, or derived from.
 
+[lints]
+workspace = true
+
 [dependencies]
 
 [dev-dependencies]

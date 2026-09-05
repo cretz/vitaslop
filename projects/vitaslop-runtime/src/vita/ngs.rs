@@ -892,7 +892,7 @@ mod lock_params_tests {
         h.call(voice_play, [voice, 0, 0, 0]);
         assert!(h.st.audio_state.at9.is_playing(voice));
 
-        let mut grain = |h: &mut Harness| -> Vec<i32> {
+        let grain = |h: &mut Harness| -> Vec<i32> {
             let mut mix = vec![0i32; 4];
             let mut mem = SliceMemory(&mut h.mem);
             let ctx = GuestCtx::new(&mut h.regs, &mut h.vfp, &mut mem, 0);

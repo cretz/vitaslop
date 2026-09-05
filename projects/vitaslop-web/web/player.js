@@ -29,6 +29,8 @@ export function createPlayer({ onExit }) {
   let worker = null;
   let touch = null;
   let pads = null;
+  // Undo functions for listeners installed per run on targets that outlive it.
+  const unlisten = [];
   let audioPause = () => {};
   let audio = null;
   let muted = false;
@@ -350,11 +352,16 @@ export function createPlayer({ onExit }) {
         fatal("WORKER DIED\n" + (e.message || "died") + site + (e.error && e.error.stack ? "\n" + e.error.stack : ""));
       };
       const flush = () => worker && worker.postMessage({ type: "flush-game-data" });
-      document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && flush());
+      const onHide = () => document.visibilityState === "hidden" && flush();
+      document.addEventListener("visibilitychange", onHide);
       window.addEventListener("pagehide", flush);
+      unlisten.push(() => {
+        document.removeEventListener("visibilitychange", onHide);
+        window.removeEventListener("pagehide", flush);
+      });
 
       worker.postMessage({ type: "keymap", json: JSON.stringify(settings.keyboard) });
-      forwardInput(worker, canvas);
+      unlisten.push(forwardInput(worker, canvas));
       vocab = await vocabulary();
       touch = mountTouchPad($("pad"), worker, settings.keyboard, { vibrate: settings.pad.vibrate });
       touch.setOpacity(settings.pad.opacity);
@@ -410,6 +417,9 @@ export function createPlayer({ onExit }) {
       // Give the flush a moment to land before the worker is torn down.
       setTimeout(() => w.terminate(), 500);
     }
+    // Page-level listeners installed for this run come off with it. `document` and `window`
+    // outlive a run, so anything left here is still live for the next game.
+    for (const undo of unlisten.splice(0)) undo();
     if (touch) touch.destroy();
     if (pads) pads.stop();
     audio = null;

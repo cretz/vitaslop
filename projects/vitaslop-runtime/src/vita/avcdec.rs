@@ -687,7 +687,7 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
         EMPTY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
-    if session.delivered <= 4 || session.submitted % 200 == 0 {
+    if session.delivered <= 4 || session.submitted.is_multiple_of(200) {
         tracing::debug!(
             target: "vitaslop::movie",
             written, capacity, queued = session.ready.len(),
@@ -897,8 +897,8 @@ fn picture_frame_timing(st: &VitaState) -> Option<(u32, u32)> {
     let movie = st.movie.as_ref()?;
     let track = movie.mp4.tracks.iter().find(|t| t.kind == crate::mp4::TrackKind::Video)?;
     let units = track.samples.iter().map(|s| s.duration).find(|&d| d != 0)?;
-    let scale = u32::try_from(track.timescale.checked_mul(2)?).ok()?;
-    Some((u32::try_from(units).ok()?, scale))
+    let scale = track.timescale.checked_mul(2)?;
+    Some((units, scale))
 }
 
 /// Fill one `SceAvcdecPicture` from a decoded frame, writing the pixels into the buffer
@@ -1061,7 +1061,7 @@ fn report_picture_hash(st: &mut VitaState, bytes: &[u8], pitch: u32, height: u32
 }
 
 /// >>> AND WHAT THE PICTURE ACTUALLY LOOKS LIKE, because "a picture arrived" and "the movie
-/// is playing" are different claims and only one of them a hash can make.
+/// > > > is playing" are different claims and only one of them a hash can make.
 ///
 /// `VITASLOP_MOVIE_DUMP_DIR=<dir>` writes every `VITASLOP_MOVIE_DUMP_EVERY`th picture (default
 /// 30) as `movie-<n>.png`, converted out of the surface the guest was just given - so it is
@@ -1075,7 +1075,7 @@ fn dump_picture(n: u64, bytes: &[u8], pitch: u32, height: u32) {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(30);
-    if every == 0 || n % every != 0 {
+    if every == 0 || !n.is_multiple_of(every) {
         return;
     }
     let (w, h) = (pitch as usize, height as usize);
@@ -1160,6 +1160,8 @@ fn report_unsupported_pixel_format(st: &mut VitaState, pixel_type: u32) {
 /// Still an ASSUMPTION, and a different one: both titles also ask for `CSC1` while this engine
 /// converts every 4:2:0 texture with the BT.601 studio-swing profile. That is reported once per
 /// swizzle by `report_yuv_profile_assumed` and is a separate question from the byte order.
+// Kept: a place to hang the assumption above, which is still an assumption.
+#[allow(dead_code)]
 const PACKED_RASTER_IS_VU: () = ();
 
 fn write_nv12(

@@ -945,12 +945,14 @@ impl Program {
             return Err(ParseError::OffsetOutOfRange("asm"));
         }
         let code_bytes = &bytes[asm_abs..end];
-        if code_bytes.len() % 8 != 0 {
+        if !code_bytes.len().is_multiple_of(8) {
             return Err(ParseError::CodeMisaligned);
         }
         let code = code_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
 
         let secondary_code = parse_secondary_code(bytes)?;
@@ -1652,8 +1654,10 @@ fn parse_secondary_code(bytes: &[u8]) -> Result<Vec<u64>, ParseError> {
         return Err(ParseError::SecondaryCodeInconsistent);
     }
     Ok(bytes[start..end]
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 

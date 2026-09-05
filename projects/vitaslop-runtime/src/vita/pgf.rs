@@ -16,7 +16,7 @@
 //! other zero is the kind of half-filled struct that produces text laid out at zero
 //! width with no error anywhere, so both are written from the same values.
 
-use crate::host::{GuestCtx, Ptr, VitaState};
+use crate::host::{GuestCtx, VitaState};
 use crate::hostcall;
 
 /// `SceFontErrorCode`, from `psp2/pgf.h`. The facility is shared with ScePvf, so the

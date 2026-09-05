@@ -268,7 +268,10 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
     let out = match exp {
         // Zero / subnormal: scale the fraction by 2^-24 in f32 terms.
         0 if frac == 0 => sign,
-        0 => return f32::from_bits(sign | 0x3380_0000).mul_add(frac as f32, 0.0) * if sign != 0 { 1.0 } else { 1.0 },
+        // `sign` is already in the bit pattern handed to `from_bits`, so the value carries it.
+        // (There was a trailing `* if sign != 0 { 1.0 } else { 1.0 }` here, which multiplied by
+        // one whichever way it went.)
+        0 => return f32::from_bits(sign | 0x3380_0000).mul_add(frac as f32, 0.0),
         // Inf / NaN keep their payload in the top fraction bits.
         0x1f => sign | 0x7f80_0000 | (frac << 13),
         _ => sign | ((exp + 112) << 23) | (frac << 13),
@@ -3088,7 +3091,7 @@ mod tests {
             mov(4),
         ]))
         .unwrap();
-        let (before, inside) = wgsl.split_once("loop {").expect(&format!("got:\n{wgsl}"));
+        let (before, inside) = wgsl.split_once("loop {").unwrap_or_else(|| panic!("got:\n{wgsl}"));
         assert!(!before.contains("r[0] ="), "the body belongs to the loop:\n{wgsl}");
         assert!(inside.contains("if (p[0]) { break; }"), "got:\n{wgsl}");
         assert!(inside.contains("r[0] ="), "got:\n{wgsl}");

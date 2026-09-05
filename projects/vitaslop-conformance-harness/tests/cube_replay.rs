@@ -32,7 +32,7 @@ impl World for Script {
         let mut f = CtrlFrame::default();
         // Wiggle the stick and hold a face button on some frames.
         f.lx = (128 + self.polls) as u8;
-        if self.polls % 2 == 0 {
+        if self.polls.is_multiple_of(2) {
             f.buttons = 0x0000_4000; // SCE_CTRL_CROSS
         }
         if self.polls > 6 {

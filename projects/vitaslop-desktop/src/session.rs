@@ -107,11 +107,10 @@ impl Session {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
-            WindowEvent::MouseInput { state, button, .. } => {
-                if *button == MouseButton::Left {
+            WindowEvent::MouseInput { state, button, .. }
+                if *button == MouseButton::Left => {
                     self.mouse_down = *state == ElementState::Pressed;
                 }
-            }
             _ => {}
         }
     }

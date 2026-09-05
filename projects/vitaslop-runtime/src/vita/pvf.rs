@@ -397,7 +397,7 @@ fn glyph_image_impl(ctx: &mut GuestCtx, st: &mut VitaState, font: u32, ch: u32, 
     let rect_word = ctx.read_u32(image_buffer + 12);
     let rect_w = (rect_word & 0xFFFF) as i32;
     let rect_h = (rect_word >> 16) as i32;
-    let bytes_per_line = (ctx.read_u32(image_buffer + 16) & 0xFFFF) as u32;
+    let bytes_per_line = ctx.read_u32(image_buffer + 16) & 0xFFFF;
     let buffer = ctx.read_u32(image_buffer + 20);
 
     if pixel_format != SCE_PVF_USERIMAGE_DIRECT8 && pixel_format != SCE_PVF_USERIMAGE_DIRECT4_L {

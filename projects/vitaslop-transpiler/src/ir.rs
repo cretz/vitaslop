@@ -691,7 +691,7 @@ impl Func {
                 is_block(*t)
             }
             Term::Switch { targets, default, .. } => {
-                targets.iter().all(|&t| is_block(t)) && default.map_or(true, is_block)
+                targets.iter().all(|&t| is_block(t)) && default.is_none_or(is_block)
             }
             Term::Fallthrough
             | Term::Return

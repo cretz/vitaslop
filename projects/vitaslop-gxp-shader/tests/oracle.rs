@@ -356,13 +356,11 @@ fn oracle_parse_decode_all_blobs() {
         let mut smp_fields: Vec<u8> = Vec::new();
         for &w in &program.code {
             let ins = decode(w);
-            if matches!(ins.op, vitaslop_gxp_shader::Op::Tex { .. }) {
-                if let Some(c) = ins.srcs.first() {
-                    if c.bank == Bank::PrimaryAttr {
+            if matches!(ins.op, vitaslop_gxp_shader::Op::Tex { .. })
+                && let Some(c) = ins.srcs.first()
+                    && c.bank == Bank::PrimaryAttr {
                         smp_fields.push(c.index / 2); // undo field*2 double-register scaling
                     }
-                }
-            }
         }
         let mut miss_list = Vec::new();
         for &f in &smp_fields {
@@ -502,15 +500,14 @@ fn vertex_output_layout_analysis() {
         let mut pa_lanes: Vec<u16> = Vec::new();
         for &w in &program.code {
             let ins = decode(w);
-            if let Some(d) = &ins.dest {
-                if d.bank == Bank::Output {
+            if let Some(d) = &ins.dest
+                && d.bank == Bank::Output {
                     for c in 0..4 {
                         if ins.write_mask[c] {
                             o_lanes.push(d.index as u16 + c as u16);
                         }
                     }
                 }
-            }
             for s in &ins.srcs {
                 if s.bank == Bank::PrimaryAttr {
                     pa_lanes.push(s.index as u16);
@@ -598,11 +595,10 @@ fn vertex_output_lane_provenance() {
                     return format!("{}[{}]", p.name, index as i64 - base);
                 }
             }
-            if bank == Bank::SecondaryAttr {
-                if let Some(&(_, w)) = program.literals.iter().find(|&&(sa, _)| sa == index as u32) {
+            if bank == Bank::SecondaryAttr
+                && let Some(&(_, w)) = program.literals.iter().find(|&&(sa, _)| sa == index as u32) {
                     return format!("literal({})", f32::from_bits(w));
                 }
-            }
             String::new()
         };
         let shader = vitaslop_gxp_shader::usse::decode_shader(&program);
@@ -694,15 +690,14 @@ fn link_pair_correlation() {
         let mut ofields: Vec<u16> = Vec::new();
         for &w in &vp.code {
             let ins = decode(w);
-            if let Some(d) = &ins.dest {
-                if d.bank == Bank::Output {
+            if let Some(d) = &ins.dest
+                && d.bank == Bank::Output {
                     for c in 0..4u16 {
                         if ins.write_mask[c as usize] {
                             ofields.push((d.index as u16 + c) / 2);
                         }
                     }
                 }
-            }
         }
         ofields.sort_unstable();
         ofields.dedup();
@@ -839,7 +834,7 @@ fn group_microscope() {
     }
     let varying = ones & zeros;
     println!("  constant-1 bits: {:#018x}", ones & !varying);
-    println!("  constant-0 bits: {:#018x}", !ones & !zeros & u64::MAX);
+    println!("  constant-0 bits: {:#018x}", (!ones & !zeros));
     println!("  VARYING bits:    {:#018x}", varying);
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut bit = 0;
@@ -1140,18 +1135,17 @@ fn varying_interface_evidence() {
         let fsh = vitaslop_gxp_shader::usse::decode_shader(&fp);
 
         // Vertex: OUTPUT lanes written (one interpolated scalar per lane).
-        let mut owritten = vec![false; 64];
+        let mut owritten = [false; 64];
         for ins in &vsh.instrs {
             let Some(d) = ins.dest.as_ref() else { continue };
             if d.bank != Bank::Output {
                 continue;
             }
             for c in 0..4 {
-                if ins.write_mask[c] {
-                    if let Some(s) = owritten.get_mut(d.index as usize + c) {
+                if ins.write_mask[c]
+                    && let Some(s) = owritten.get_mut(d.index as usize + c) {
                         *s = true;
                     }
-                }
             }
         }
         let olanes: Vec<usize> =
@@ -1163,7 +1157,7 @@ fn varying_interface_evidence() {
         // register file is untyped, so the reading instruction's precision is the only
         // in-code statement of a varying's width).
         let mut code_half: Vec<Option<bool>> = vec![None; 64];
-        let mut pwritten = vec![false; 64];
+        let mut pwritten = [false; 64];
         for ins in &fsh.instrs {
             let half = ins.half_precision;
             let read = match ins.op {
@@ -1187,8 +1181,8 @@ fn varying_interface_evidence() {
                     }
                 }
             }
-            if let Some(d) = ins.dest.as_ref() {
-                if d.bank == Bank::PrimaryAttr {
+            if let Some(d) = ins.dest.as_ref()
+                && d.bank == Bank::PrimaryAttr {
                     for c in 0..4 {
                         if ins.write_mask[c] {
                             let reg = d.index as usize + if half { c >> 1 } else { c };
@@ -1198,7 +1192,6 @@ fn varying_interface_evidence() {
                         }
                     }
                 }
-            }
         }
 
         // Vertex varyings block: vo1 (usage presence bits) + vo2 (ten 3-bit texcoord widths).
@@ -1857,15 +1850,14 @@ fn full_precision_sample_destination_closure() {
             if matches!(ins.op, vitaslop_gxp_shader::ir::Op::Tex { .. }) {
                 continue;
             }
-            if let Some(d) = ins.dest.as_ref() {
-                if d.bank == Bank::Temp {
+            if let Some(d) = ins.dest.as_ref()
+                && d.bank == Bank::Temp {
                     for c in 0..4 {
                         if ins.write_mask[c] {
                             written.push(d.index as u32 + if ins.half_precision { (c as u32) >> 1 } else { c as u32 });
                         }
                     }
                 }
-            }
         }
         // Every TEMP register the program reads, at the reader's own precision and through its
         // own SWIZZLE. The swizzle is not a detail here: a source written `Temp[7].[1,1,1,1]`

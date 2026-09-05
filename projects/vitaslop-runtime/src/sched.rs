@@ -191,6 +191,7 @@ pub trait GuestEngine {
     /// thid, priority), ready to resume from its entry. `Err` if the entry was not
     /// translated (the caller records the thread as immediately finished so a join
     /// does not hang).
+    #[allow(clippy::result_unit_err)] // the failure has no detail worth carrying: it either spawned or it did not
     fn spawn(&mut self, reentry: &Reentry) -> Result<Self::Thread, ()>;
     /// Write `bytes` into shared guest memory at guest address `addr`. Out-of-range
     /// writes are dropped. Used to deliver exit codes owed to a woken joiner's `stat`
@@ -324,7 +325,7 @@ pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     /// variable's wakeup token has, and for the same reason.
     wake_tokens: std::collections::HashSet<i32>,
     /// >>> THE SLOTS THAT ARE NOT FINISHED, ASCENDING. Every scheduler pass iterates THIS,
-    /// never `threads`.
+    /// > > > never `threads`.
     ///
     /// A finished thread keeps its slot for the whole run - the index is stable and the exit
     /// code outlives the thread ([[vitaslop-finished-threads-must-be-released]]) - so the
@@ -498,7 +499,7 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
             .iter()
             .map(|t| (t.thread.thid(), t.thread.priority(), t.picks, t.quanta, t.state))
             .collect();
-        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
         let mut s = format!("--- scheduler CPU share: {total} resumes over {} threads ---\n", rows.len());
         for (thid, prio, picks, quanta, state) in rows {
             let pct = if total == 0 { 0.0 } else { picks as f64 * 100.0 / total as f64 };

@@ -1,0 +1,14 @@
+# ONE toolchain for everyone, and it is not "stable".
+#
+# CI denies every lint (`clippy -- -D warnings`), and `stable` is a moving target: a Rust
+# release adds lints, and the build then fails on a machine nobody can reproduce. That
+# happened here - a developer on 1.96 had a clean clippy run while CI on 1.98 failed on
+# `chunks_exact_to_as_chunks`, a lint the older toolchain does not know exists and cannot
+# even be named in the lint policy without erroring there.
+#
+# So the version is pinned and CI installs exactly this. Bumping it is a deliberate change
+# with its own run, which is the only way a lint gate stays honest.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

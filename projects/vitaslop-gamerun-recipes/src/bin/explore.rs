@@ -313,7 +313,7 @@ fn main() -> ExitCode {
     for o in &broken {
         println!("FAIL {:<16} {}", o.label, o.error.as_deref().unwrap_or("no signature reported"));
     }
-    if let Some(_) = &dump {
+    if dump.is_some() {
         let base_dump = dump_root.join("baseline.bin");
         let variants: Vec<PathBuf> = outcomes
             .iter()
@@ -500,5 +500,5 @@ fn session_binary() -> Option<PathBuf> {
 /// large speedup over serial and leaves the machine usable; raise it with
 /// `--workers` when you know the RAM is there.
 fn default_workers() -> usize {
-    std::thread::available_parallelism().map(|n| n.get().min(4).max(1)).unwrap_or(2)
+    std::thread::available_parallelism().map(|n| n.get().clamp(1, 4)).unwrap_or(2)
 }

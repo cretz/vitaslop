@@ -20,6 +20,9 @@ description = "Platform-native AAC audio decoding for Windows, macOS, Linux and 
 # in a browser the answer arrives on a callback, and no synchronous API can be honest
 # about that.
 
+[lints]
+workspace = true
+
 [dependencies]
 
 # --- Windows: Media Foundation -----------------------------------------------

@@ -280,7 +280,7 @@ fn report(
         win.clock_us as f64 / n / (1_000_000.0 / 60.0),
         win.fuel as f64 / 1e6 / n,
         win.suspends,
-        if win.suspends == 0 { 0 } else { win.fuel / win.suspends },
+        win.fuel.checked_div(win.suspends).unwrap_or(0),
         win.fuel_max,
         vitaslop_runtime::host::QUANTUM_FUEL,
     );

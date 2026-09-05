@@ -25,6 +25,22 @@ use vitaslop_platform::texenc::Transcoder;
 /// A device with nothing special asked for. The encoder is plain compute over storage buffers,
 /// so it needs no texture-compression feature at all - which is what lets this run on a desktop
 /// whose adapter has no ETC2 support and would refuse the finished texture.
+/// Whether this adapter is a SOFTWARE rasteriser, in which case these tests do not run.
+///
+/// # Why a software adapter is a skip and not a slower pass
+/// These tests compare a GPU compute encoder against the CPU one over a corpus of images. On a
+/// real adapter the whole file takes ~16 s. On a runner with no GPU there is still an adapter -
+/// Windows offers WARP, Linux offers llvmpipe - so nothing "skips when no adapter is present",
+/// and every one of these tests instead runs the same compute work on the CPU through a driver,
+/// where CI reported each of them "running for over 60 seconds".
+///
+/// What it would prove there is also not what it looks like: a software adapter is not the
+/// hardware whose agreement with the CPU encoder is in question, so a pass on WARP is not
+/// evidence about a GPU and a failure would be evidence about WARP. It says so and skips.
+fn is_software(adapter: &wgpu::Adapter) -> bool {
+    matches!(adapter.get_info().device_type, wgpu::DeviceType::Cpu)
+}
+
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -34,6 +50,10 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         apply_limit_buckets: false,
     }))
     .ok()?;
+    if is_software(&adapter) {
+        eprintln!("adapter is a software rasteriser ({}) - skipping", adapter.get_info().name);
+        return None;
+    }
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("texenc-test"),
         required_features: wgpu::Features::empty(),
@@ -565,7 +585,7 @@ fn round_trip_one(
     };
 
     let texture = enc
-        .run(&device, &queue, &upload, &plan, false)
+        .run(device, queue, &upload, &plan, false)
         .expect("this adapter has ETC2, so the transcode must not decline");
 
     // The CPU pipeline over the same bytes: decode every guest level, then encode each. Each of
@@ -702,6 +722,14 @@ fn device_with_block_compression() -> Option<(wgpu::Device, wgpu::Queue)> {
         apply_limit_buckets: false,
     }))
     .ok()?;
+    if is_software(&adapter) {
+        eprintln!("adapter is a software rasteriser ({}) - skipping", adapter.get_info().name);
+        return None;
+    }
+    if is_software(&adapter) {
+        eprintln!("adapter is a software rasteriser ({}) - skipping", adapter.get_info().name);
+        return None;
+    }
     let want = adapter.features()
         & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_COMPRESSION_ETC2);
     if want.is_empty() {

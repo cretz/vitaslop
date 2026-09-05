@@ -393,15 +393,25 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
         v
     };
     if !unnamed.is_empty() {
-        tracing::warn!(
-            target: "vitaslop::link",
-            "link: {} imported function NID(s) have no handler - the title will hard-fail if it \
-             CALLS one. Look each up in the vitasdk NID db (db/360/*.yml) and implement it:",
+        // >>> STATUS, NOT A WARNING, AND THE DISTINCTION IS WHETHER ANYTHING IS OWED.
+        //
+        // A title IMPORTS far more than it calls. This list is an inventory taken at link
+        // time: nothing has gone wrong, and on a title that plays perfectly every entry here
+        // is a function it never reaches. What IS owed a fix is an unhandled NID that is
+        // actually CALLED - and that is a hard failure with a report of its own naming the one
+        // NID that stopped the run, which no reader can miss. Filing the inventory at `warn`
+        // put twenty lines in front of a player to describe a risk that had not occurred, and
+        // buried the report that would matter if it did.
+        tracing::info!(
+            target: "vitaslop::status",
+            "link: {} imported function NID(s) have no handler. A call to one is a hard failure \
+             that names it; an import that is never called costs nothing. To implement them, \
+             look each up in the vitasdk NID db (db/360/*.yml):",
             unnamed.len()
         );
         for (lib, func) in &unnamed {
-            tracing::warn!(
-                target: "vitaslop::link",
+            tracing::info!(
+                target: "vitaslop::status",
                 "  unhandled import: library_nid={lib:#010x} func_nid={func:#010x}"
             );
         }

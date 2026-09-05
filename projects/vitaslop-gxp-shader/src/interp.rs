@@ -188,7 +188,9 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         Op::Rsq => 1.0 / s(0, c)?.sqrt(),
         Op::Log => s(0, c)?.log2(),
         Op::Exp => s(0, c)?.exp2(),
-        // Move and float<->float pack are swizzled copies.
+        // Move and float<->float pack are swizzled copies. A format convert between float
+        // widths is value-preserving, and this register file holds one f32 per lane and
+        // carries no packing, so `Pack` is the identity here.
         Op::Mov | Op::Pack { .. } => s(0, c)?,
         // Conditional move (VMOVC): test src0 (srcs[2]) against zero, pick src1 (srcs[0]) when
         // it holds else src2 (srcs[1]) - the same select the emitter produces.
@@ -301,9 +303,6 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
             };
             f32::from_bits(raw & lane_mask)
         }
-        // A format convert between float widths is value-preserving; this register file holds
-        // one f32 per lane and carries no packing, so it is the identity here.
-        Op::Pack { .. } => s(0, c)?,
         // The 8-bit combiner is EMITTABLE but not interpretable here, and that is a property
         // of this register file rather than of the instruction: it holds one f32 per lane,
         // where the 8-bit pipeline holds four unsigned-normalised BYTES in one register. There
@@ -646,8 +645,8 @@ pub fn run_watching_for_nan_with_env(
         }
         // Read the sources BEFORE the write, so the report shows what went in - an in-place op
         // would otherwise print its own result back as its input.
-        if site.is_none() {
-            if let Some(c) = (0..4).find(|&c| instr.write_mask[c] && !out[c].is_finite()) {
+        if site.is_none()
+            && let Some(c) = (0..4).find(|&c| instr.write_mask[c] && !out[c].is_finite()) {
                 let sources = instr
                     .srcs
                     .iter()
@@ -670,7 +669,6 @@ pub fn run_watching_for_nan_with_env(
                     sources,
                 });
             }
-        }
         let base = dest.index as usize;
         let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
         for c in 0..4 {
