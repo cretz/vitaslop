@@ -52,13 +52,17 @@ function spawn() {
   return new Worker("./import-worker.js", { type: "module" });
 }
 
-/// What these files are. Resolves to the worker's probe object.
-export function probe(entries) {
+/// What these files are, without importing them. Resolves to the worker's probe
+/// object; `onProgress({ stage, file, done, total })` reports the bytes it reads on
+/// the way, which on a phone is the difference between a slow read and a hang.
+export function probe(entries, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     const w = spawn();
     w.onmessage = (e) => {
       const d = e.data;
       if (d.type === "panic") return reject(new Error("import panicked: " + d.message));
+      // The identify job reports its reads. Anything but a report ends the job.
+      if (d.type === "progress") return onProgress(d);
       w.terminate();
       d.type === "probe" ? resolve(d.probe) : reject(new Error(d.message || "probe failed"));
     };

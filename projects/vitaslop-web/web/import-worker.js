@@ -66,11 +66,14 @@ function fileSource(files, onRead = () => {}) {
 }
 
 /// Throttled progress out. `postMessage` is cheap but the page has to render each one.
+/// The FIRST report always goes out: it is the one that says the job is alive, and a
+/// short job (identifying a small source on a fast machine) would otherwise finish
+/// inside the first window having reported nothing at all.
 function throttle(ms) {
   let last = 0;
   return (force, make) => {
     const now = performance.now();
-    if (!force && now - last < ms) return;
+    if (!force && last && now - last < ms) return;
     last = now;
     self.postMessage(make());
   };

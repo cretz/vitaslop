@@ -614,14 +614,18 @@ async function startImport(entries) {
   const fill = $("bar-fill");
   const text = $("prog-text");
   let probe = null;
-  let existing = null;
+  // The library record of the title being replaced, as a PROMISE: `onProbe` is called
+  // from a message handler that nobody awaits, so the value it resolves to has to be
+  // waited for where it is used (`lastPlayedAt`), not assumed to have arrived.
+  let existingP = null;
   let iconUrl = null;
   try {
     const done = await imp.run(
       entries,
       async (p) => {
         probe = p;
-        existing = p.titleId ? await store.readTitle(p.titleId) : null;
+        existingP = p.titleId ? store.readTitle(p.titleId) : null;
+        const existing = existingP ? await existingP : null;
         if (p.icon0) {
           iconUrl = URL.createObjectURL(new Blob([p.icon0], { type: "image/png" }));
           const icon = $("imp-icon");
@@ -657,6 +661,7 @@ async function startImport(entries) {
       }
     );
     const id = done.titleId;
+    const existing = existingP ? await existingP : null;
     const meta = {
       titleId: id,
       title: (probe && probe.title) || id,
