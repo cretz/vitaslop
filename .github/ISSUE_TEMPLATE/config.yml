@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the FAQ first
+    url: https://github.com/cretz/vitaslop#faq
+    about: How this project is maintained, what it will and will not do, and why there is no compatibility list.
+  - name: Pull requests are not accepted
+    url: https://github.com/cretz/vitaslop#will-you-accept-a-pull-request
+    about: An agent writes all of the code here. Issues are welcome. Code contributions are not.

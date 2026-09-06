@@ -1,0 +1,19 @@
+category = "vita"
+description = "SceLibKernel clib memory/string calls on real guest memory - RUNNABLE"
+
+# Source: ../clib-src/clib.c (clean-room, -nostdlib). Drives each pure clib host
+# call (sceClibMemcpy/Memset/Memcmp/Strnlen/Strncpy/Strcmp/Strncmp/Snprintf) on
+# real guest memory and prints the observable result through sceClibPrintf, so the
+# golden is a deterministic transcript. Executable form: tests/vita_clib.rs.
+[out]
+output = """
+memset: AAAAAAAA
+memcpy: copied text
+memcmp: neg=-1 eq=0
+strnlen: 5 3
+strncpy: [hi] pad=0
+strcmp: 0 -1
+strncmp: -1
+snprintf: [n=7 s=ok] ret=8
+snprintf trunc: [123] ret=4
+"""

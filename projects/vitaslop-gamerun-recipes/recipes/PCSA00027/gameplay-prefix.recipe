@@ -1,0 +1,51 @@
+@title Boot to live gameplay, no driving input
+@game  PCSA00027
+
+# ============================================================================
+# WHAT THIS IS: the shortest input timeline that leaves the title sitting in
+# LIVE GAMEPLAY with nothing held. It exists to be a PREFIX, not a playthrough:
+#
+#   session --game <app> --dir <sess> --recipe .../gameplay-prefix.recipe --to 1800
+#   explore --game <app> --recipe .../gameplay-prefix.recipe --at 1800 ...
+#
+# Both of those apply their own input from the frame they stop at, so the prefix
+# must not still be holding anything (or scheduling a press later on) when they
+# take over - a segment further down the timeline would silently override the
+# experiment's input the moment the run passed its frame. That is why the drive
+# inputs live in tutorial-drive.recipe and NOT here: this file ends at f1562.
+#
+# THE FRAME NUMBERS ARE ON THE CORRECTED CLOCK (a frame is a display-queue flip
+# and nothing else). Anything recorded before 2026-07-25 counted voluntary
+# yields too and ran about 80x fast, so old landmark frames do not apply.
+#
+# EVERY PRESS IS HELD 12 FRAMES ON PURPOSE. The guest samples the pad exactly
+# once per display frame, so a 1-2 frame press can fall between two samples and
+# is then never observed at all - which looks exactly like a title that ignores
+# input. If a press here ever stops working, check whether the guest polled
+# (RUST_LOG=vitaslop::input=trace) before retiming it.
+# ============================================================================
+
+0: @section boot
+# Legal splash to ~f450, then a "Communicating with server" spinner to ~f600.
+# No input is accepted or needed through either.
+
+800: @section accept-terms
+# The ONLINE TERMS dialog is live and scrolling by f800; Cross accepts it.
+820: cross
+832:
+
+1250: @section dialogs
+# Three dialogs walk the tutorial intro. The exact frames are not critical (each
+# dialog waits indefinitely), but they must be far enough apart that the next
+# dialog has appeared before the next press lands.
+1250: cross          # "Welcome to the ... tutorial"
+1262:
+1400: cross          # "There are 2 control schemes available..."
+1412:
+1550: cross
+1562:
+
+# By f1800 the tutorial shows its driving instruction with the REGULAR CONTROLS
+# legend up (left stick = rotate in direction, L = accelerate, R = brake), and
+# the car is under player control. Nothing is held from here on.
+1800: @note live gameplay reached with a neutral pad - drive from here

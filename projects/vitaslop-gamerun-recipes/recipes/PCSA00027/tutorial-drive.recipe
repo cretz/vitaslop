@@ -1,0 +1,93 @@
+@title Tutorial - drive the car
+@game  PCSA00027
+@shot-every 60
+
+# ============================================================================
+# THE CONTROL SCHEME. Read this before touching the inputs - it has been got
+# wrong twice, in both directions.
+#
+#   RIGHT stick UP    (ry=0)   accelerate
+#   RIGHT stick DOWN  (ry=255) brake / reverse
+#   LEFT  stick L/R   (lx=)    steer - a TURN RATE, and `ly` is NOT read
+#
+# `lx=128` drives straight, `lx>128` turns one way and `lx<128` the other, and
+# the rate grows with deflection. Measured over 90 frames at full throttle:
+# lx=218 turned about -90 degrees, lx=255 about -254, lx=38 about +80, lx=1
+# about +267.
+#
+# For a while this file claimed the left stick was an ABSOLUTE camera-relative
+# heading needing lx and ly set together, because the legend says "ROTATE IN
+# DIRECTION". That is REFUTED, by an 8-bearing `explore` sweep from one
+# identical state at f1810 with every variant reporting `locate --id <car>`:
+# lang=0 (lx=128 ly=1) and lang=180 (lx=128 ly=255) produced BIT-IDENTICAL
+# determinism signatures. If the stick were a heading those would be the two
+# most different outcomes possible. Every variant grouped strictly by `lx`.
+#
+# The wrong answer came from holding single inputs and watching by eye. The park
+# is small and the car crosses it in about two seconds at full throttle, so a
+# long hold always ends against a wall and every reading is contaminated by the
+# collision. Settle control questions with a parallel sweep reporting a MEASURED
+# quantity, not by driving a session and looking at it.
+#
+# The in-game legend renders these as three round glyphs labelled L, R, R. They
+# are the two STICKS, not the shoulder triggers: `l` and `r` were tested at
+# length and do nothing on this screen.
+#
+# FRAME NUMBERS ARE ON THE CORRECTED CLOCK (a frame is a display-queue flip and
+# nothing else). Anything recorded before 2026-07-25 counted voluntary yields
+# too and ran ~80x fast, so older landmark frames do not apply.
+# ============================================================================
+
+# --- the prefix: identical to gameplay-prefix.recipe -------------------------
+# Kept inline rather than included (the format has no include) so this file
+# replays standalone. If the boot timings change, change both.
+0: @section boot
+
+800: @section accept-terms
+820: cross              # ONLINE TERMS dialog is live and scrolling by f800
+832:
+
+1250: @section dialogs
+1250: cross             # "Welcome to the ... tutorial"
+1262:
+1400: cross             # "There are 2 control schemes available..."
+1412:
+1550: cross
+1562:
+# By f1800 the tutorial shows "Follow the trail to try out the new handling"
+# with the REGULAR CONTROLS legend up, and the car is under player control.
+
+# --- drive -------------------------------------------------------------------
+# Every press is held for many frames on purpose: the guest samples the pad once
+# per DISPLAY FRAME, so a short press can fall between two samples and is then
+# never observed at all.
+1810: @section drive
+1810: ry=0              # accelerate away from the start pad
+1930: @shot drive-accelerated
+
+1930: ry=0 lx=70        # accelerate + steer left
+1990: ry=0              # straighten up
+2110: @shot drive-crossed-ground
+
+# The car will eventually meet a wall - the park is enclosed. Reverse out with
+# the right stick DOWN, steer while reversing, then drive off in the new
+# direction. This is the manoeuvre the rest of the tutorial needs.
+2110: @section recover
+2110: ry=255            # reverse
+2200: ry=255 lx=40      # reverse while turning
+2260:                   # settle, so the reverse does not carry into the launch
+2280: ry=0 lx=40        # drive away on the new heading
+2370: ry=0
+2460: @shot drive-recovered
+
+2460: @todo Follow the actual tutorial trail. This recipe just drives around: it
+2460: @todo proves control works, not that the tutorial objective completes.
+2460: @todo TWO things are missing, and neither is the control scheme any more.
+2460: @todo (1) the trail in WORLD coordinates - it is ground texture, not a set
+2460: @todo of marker objects, and a hand-guessed waypoint ring keeps catching on
+2460: @todo internal railings and benches. (2) a machine-readable progress value
+2460: @todo (explore --dump + memdiff across a driving vs parked pair, NOT a
+2460: @todo single-run scan - see the crate README) to @assert on.
+2460: @todo Drive with `locate` for feedback: it reports the car's world position
+2460: @todo and heading, and a wedged car reads moved=0 so a loop can reverse.
+2460: @todo The arena is roughly x -107..104, z 24..110.

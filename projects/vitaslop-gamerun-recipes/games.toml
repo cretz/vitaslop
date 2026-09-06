@@ -1,0 +1,37 @@
+# Registry of titles that have game-run recipes. Maps a title id (the name of the
+# subdir under recipes/) to a friendly name. The engine never reads this file - it is
+# provenance for humans and a listing for tooling (the `play` binary, a future recipe
+# picker in the front-ends).
+#
+# A title id here plus a recipe under recipes/<id>/ are the ONLY places a specific
+# game is named in this project. The engine crates stay game-agnostic.
+
+[[game]]
+id = "PCSE00341"
+name = "OlliOlli"
+region = "PAL"
+
+[[game]]
+id = "PCSA00027"
+name = "MotorStorm RC"
+region = "NTSC"
+
+[[game]]
+id = "PCSE00001"
+name = "Ridge Racer"
+region = "NTSC"
+
+[[game]]
+id = "PCSA00015"
+name = "WipEout 2048"
+region = "NTSC"
+
+[[game]]
+id = "PCSA00009"
+name = "Hot Shots Golf: World Invitational"
+region = "NTSC"
+
+[[game]]
+id = "PCSE00120"
+name = "Persona 4 Golden"
+region = "NTSC"

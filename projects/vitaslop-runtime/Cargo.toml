@@ -1,0 +1,76 @@
+[package]
+name = "vitaslop-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
+vitaslop-loader = { path = "../vitaslop-loader" }
+vitaslop-atrac9 = { path = "../vitaslop-atrac9" }
+vitaslop-platform = { path = "../vitaslop-platform" }
+# Clean-room GXP (SceGxmProgram) -> WGSL shader recompiler. Engaged only in the
+# explicit VITASLOP_GXP_RECOMPILE grind mode; hard-fails naming the unimplemented
+# opcode (never a silent fixed-function fallback). wasm-safe, ships no game data.
+vitaslop-gxp-shader = { path = "../vitaslop-gxp-shader" }
+# The #[hostcall] attribute macro that generates AAPCS-VFP arg marshalling for the
+# Vita host handlers in vita/. A proc-macro crate, so it is host-side only and
+# adds nothing to the guest wasm.
+vitaslop-hostcall = { path = "../vitaslop-hostcall" }
+
+# Structured, env-filterable diagnostics (`RUST_LOG=vitaslop::io=trace`, etc.).
+# Zero cost when no subscriber is installed, so the hot NID-dispatch paths can
+# carry trace points without a release-run penalty (wasm32-safe: events are
+# simply dropped in the browser unless a subscriber is set up there).
+tracing = { workspace = true }
+
+# ROM ingestion (the `ingest` module): decrypting a retail app container down to
+# the plaintext velf the loader parses. Pure-Rust RustCrypto primitives, all
+# wasm-safe so the browser decrypts in OPFS exactly as native does on disk.
+# AES-128 (ECB/CBC/CTR) block cipher; the mode wrappers; AES-CMAC and HMAC for
+# key derivation and page verification; SHA-1/SHA-256 for the digest steps.
+aes = "0.8"
+cbc = "0.1"
+ctr = "0.9"
+cmac = "0.7"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+# Raw DEFLATE for the SELF segment decompression and the container zip. Permissive
+# (MIT/Apache), pure Rust, wasm-clean - unlike a zlib-crate C dependency.
+miniz_oxide = "0.8"
+skrifa = "0.45.0"
+zeno = "0.3.3"
+
+[features]
+# >>> A DIAGNOSTIC BUILD, NOT A SHIPPING ONE. Marks a handful of audio-path functions
+# `inline(never)` so a SAMPLING PROFILER can attribute them separately.
+#
+# `out_output` reads as 3.65% of a browser worker's whole thread, and everything the audio
+# path does is inlined into it - the mix, the per-voice fill, the resampler - so the profile
+# says "audio is expensive" and cannot say which half. Turning off inlining for those five
+# functions costs a little speed and buys the attribution; the phase timers cannot substitute,
+# because they cost a sixth of the frame at this call rate.
+#
+# Off by default: an inlining barrier left in a shipping build is a permanent tax paid for a
+# question that was answered once.
+profile-symbols = []
+
+[dev-dependencies]
+# The AAC seam, for the movie-audio test only: it drives the guest's own SceMp4 and
+# SceAudiodec calls end to end, and without a real decoder behind them the test would
+# assert on silence. Features unify per build, so this does not put a decoder in the
+# engine's own dependency graph.
+vitaslop-platform = { path = "../vitaslop-platform", features = ["aac"] }
+
+# Dev-only: the `disasm` example prints guest instructions when recovering an
+# undocumented library from its call sites. The transpiler already decodes with this.
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "e8fd10345a4dc9ba91efe2479d2db022e4607b9e", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arch = { version = "0.3.1", default-features = false }
+# Validates the whole-program wasm the linker+transpiler emit, in the fixture tests.
+wasmparser = "0.253"

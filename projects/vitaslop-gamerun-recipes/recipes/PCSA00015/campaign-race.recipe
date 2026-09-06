@@ -1,0 +1,142 @@
+@title PCSA00015 campaign race - boot to a LIVE RACE on the campaign's first event
+@game  PCSA00015
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+#   boot -> attract demo -> PRESS ANY BUTTON -> GAME MODE
+#        -> SINGLE PLAYER CAMPAIGN -> campaign intro -> the campaign MAP
+#        -> the event EMPIRE CLIMB -> briefing -> START -> the load
+#        -> the pre-race RACE card -> the race is LIVE at f9600.
+#
+# At the end of this recipe the title is racing: LAP 1/3, POS 8/8, the ship on
+# the start line at Empire Climb, the world pass carrying several hundred draws.
+# ZERO shader fallbacks over the whole run.
+#
+# >>> IT NEEDS `VITASLOP_FRAME_TOPUP=0`, AND THAT IS NOT OPTIONAL.
+# With the default per-flip clock top-up a displayed frame carries about a
+# TENTH of the guest work a console frame carries, and this title never
+# finishes loading at all. See `VitaState::advance_time_frame`.
+#
+#   VITASLOP_GXP_LIVE=1 VITASLOP_HEADLESS_FRAMES=10000 \
+#   VITASLOP_HEADLESS_SHOT_EVERY=200 VITASLOP_HEADLESS_SHOT_FROM=9400 \
+#   vitaslop-desktop --game <wipeout>/extracted --recipe <this> --headless <dir>
+#
+# >>> RETIMED 2026-08-19b, EVERY FRAME MEASURED ON THE CURRENT CLOCK.
+# The committed version reached the title screen at f1300; the derived guest
+# clock has moved since and it now arrives at ~f5200. Do not scale these by
+# hand if the clock moves again - re-measure with `VITASLOP_HEADLESS_SHOT_EVERY`
+# and look at the shots.
+#   f5100  the attract demo (loading reaches 99% about f5035)
+#   f5200  title, PRESS ANY BUTTON TO START
+#   f5750  GAME MODE, four tiles
+#   f6000  campaign intro ("It's the year 2048...")
+#   f6700  the campaign MAP, A.G.R.C 2048, first node captioned TOUCH TO START
+#   f8000  EMPIRE CLIMB briefing (PASS: FINISH THE EVENT, NO WEAPONS)
+#   f8800  the CONTROLS/RACER legend with LOADING 38%
+#   f9200  the pre-race RACE card over a flyby of the circuit
+#   f9600  THE RACE IS LIVE
+# Judge a live race by the HUD (LAP/POS/TOTAL), never by a world scene: the
+# flyby that plays over the load is a world scene and reads exactly like one.
+#
+# >>> THE TITLE SCREEN WANTS A BUTTON, NOT A TOUCH. The old recipe sent one
+# cross and then a touch, which worked when boot went straight to the title
+# screen; the attract demo now sits in between, so the first cross dismisses
+# that and the title screen needs its own.
+#
+# >>> THE MAP NEEDS ONE AIMED TAP NOW, NOT TWO BLIND ONES. The old header said
+# the map "renders as a white hex lattice, and that is a KNOWN DEFECT" so its
+# node could not be aimed at. That defect is FIXED (it was our depth map, not
+# the map shader - see `vitaslop-viewport-carries-the-depth-map`), the map draws
+# its nodes, and the tap below is read off the shot.
+#
+# >>> THE GESTURE TYPE MASK MATTERS AND THE DEFAULT IS NOW RIGHT
+# SceSystemGesture recognizers come in types 1/2/4/8 and their meanings are not
+# published. Reporting a touch to ALL of them tells the title a tap and a drag
+# and a pinch happened at once, and the map then only ever PANS - no tap
+# selects anything. Type 1 alone selects. `vita::gesture::type_mask` now
+# defaults to 1 for that reason; `VITASLOP_GESTURE_TYPE_MASK=15` reproduces the
+# old behaviour and this recipe then reaches the map and stops there.
+#
+# TOUCH COORDINATES are in PANEL coordinates, which are screen*2.
+# ============================================================================
+
+0: @section boot
+# No input while it loads - this is boot.recipe's ladder, unchanged.
+
+5150: cross
+5170:
+# Dismisses the attract demo. The title screen is up from about f5200.
+
+5450: cross
+5450: @shot title-screen
+5470:
+# "PRESS ANY BUTTON TO START" -> GAME MODE, up by about f5750.
+
+5800: touch=472,524
+5800: @shot game-mode
+5840:
+# The SINGLE PLAYER CAMPAIGN tile (screen 236,262). ONLINE CAMPAIGN and
+# CROSS-PLAY are correctly greyed out (signed out); ADHOC needs a second unit.
+
+6300: touch=1764,960
+6300: @shot campaign-intro
+6340:
+# The intro text ("Touch the nodes to play events") and its confirm checkmark,
+# bottom right (screen 882,480).
+
+6800: @section campaign-map
+6800: @shot campaign-map
+
+7000: touch=1016,570
+7040:
+# The first event node (screen 508,285), the only unlocked one. The title
+# spawns its LoadingScreenThread a few frames later
+# (`VITASLOP_LOG=vitaslop::thread=debug`), which is the machine-readable signal.
+
+8000: @shot event-briefing
+# EMPIRE CLIMB / NO WEAPONS, with the track photo, a ship button, a cancel X
+# and a START triangle along the bottom (screen 622/752/883, 480).
+
+8400: touch=1766,960
+8440:
+# START.
+
+8800: @section event-loading
+8800: @shot event-loading
+# The CONTROLS/RACER legend with a LOADING percentage. That legend is where the
+# race controls below come from: STEER/PITCH = LEFT STICK, R = THRUST,
+# X = FIRE/USE PICKUP, plus airbrake and absorb.
+
+9200: @shot pre-race
+# The RACE card over a flyby of the circuit, with a confirm checkmark.
+
+9400: touch=1762,960
+9440:
+
+9600: @section race
+9600: @shot race-start
+# From here the title is in the event: the HUD reads LAP 1/3 POS 8/8, `start`
+# opens the in-race GAME PAUSED menu, and the frame is a race frame - a
+# 1024x1024 shadow pass, reflection and post targets, and a world pass of
+# several hundred draws into an offscreen target that the composite samples.
+#
+# @note The composite CANNOT be reproduced by the software renderer: its
+# fullscreen blit carries no texcoord attribute (the shader derives the UV), so
+# `play`'s `@shot` here is the HUD over black - which is exactly what makes it
+# the right oracle for LAP/POS/TOTAL. For the world, render through
+# `vitaslop-desktop --headless` with VITASLOP_GXP_LIVE=1.
+#
+# @todo Drive it, and drive it WELL. `working-area/drive_ai.py` now gets the ship
+# @todo round the WHOLE circuit with zero wedges - (296,1215) -> (1224,1108) ->
+# @todo (165,643) -> (-414,493) -> (-1291,999) - where every earlier controller
+# @todo died against the wall at (1115,1788) inside forty ticks. Three things did
+# @todo that, all measured: a speed TARGET instead of a brake on/off switch
+# @todo (there are three pedal positions, and it was using two); REFUSING to steer
+# @todo at a breadcrumb line shorter than 8 points, because the pack leaves view
+# @todo in five ticks and a three-point stub aims sideways into the wall; and
+# @todo CARRYING a course, because a heading-holding controller cannot tell a wall
+# @todo bounce from a corner and the HUD read WRONG WAY! at 2.50.18.
+# @todo STILL NOT COUNTED A LAP. Judge it by the HUD - `ctl shot` renders
+# @todo HUD-over-black by design and LAP / POS / TOTAL / shield are all legible -
+# @todo never by distance travelled. There is no @assert here until a lap counts.
+14000: @section end

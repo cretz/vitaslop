@@ -1,0 +1,76 @@
+@title  PCSE00120 - boot to the title screen
+@game   PCSE00120
+@shot-every 400
+
+# WHAT THIS RECIPE PROVES
+# ----------------------
+# The title boots, links, loads its boot data out of its CPK, brings up its audio graph, and
+# reaches the "PRESS ANY BUTTON" title screen. It is the first recipe for this title and it is
+# deliberately a BOOT recipe, not a playthrough: nothing past the title screen has been walked.
+#
+# THE THING THAT COSTS A SESSION IF IT IS NOT WRITTEN DOWN: with NO INPUT AT ALL this title
+# sits on a black screen FOREVER, and it looks perfectly healthy while it does - the clock runs
+# at 1.00 display periods a frame, audio is produced at 1.00x the clock, its own worker threads
+# (model, collision, dungeon) are parked on their condition variables the way an idle frame
+# parks them, and the frame issues THREE EMPTY SCENES. A 9,000-frame run of that produces
+# fourteen bit-identical black shots. It is waiting for the pad and nothing says so.
+#
+# HOW TO REPLAY IT, and the knob that is not optional:
+#
+#   VITASLOP_GXP_LIVE=1 VITASLOP_HEADLESS_RECIPE=<this file> \
+#   VITASLOP_HEADLESS_FRAMES=2100 VITASLOP_HEADLESS_SHOT_EVERY=50 \
+#   VITASLOP_HEADLESS_SHOT_FROM=1900 vitaslop-desktop --game <app> --headless <dir>
+#
+# WITHOUT `VITASLOP_GXP_LIVE=1` THE FRAME IS BLACK whatever the title is doing: a draw then
+# carries no shader blobs, and this title's whole UI is position-only draws whose colour lives
+# in the shader, so every one of them is DROPPED for having no colour source. The drop report
+# says so on every frame and it still reads as "the guest drew nothing".
+#
+# WHAT IS NOT ASSERTED, AND WHY
+# There is no `@assert` and no `@sig`. No live-state address is known for this title yet, and a
+# signature has not been checked for stability across two replays - pinning one that has not
+# been measured twice is how a recipe starts failing on a clean tree.
+#
+# WHAT THE SHOTS ACTUALLY SHOW (re-measured 2026-09-01c, every 200 frames): the boot
+# notices (Vox Populi, PSN) up to f2000, the P4G logo splash at f2400, and the yellow title
+# screen from about f3200 with "PRESS ANY BUTTON" by f3400. An earlier version of this
+# comment said the title screen did not reproduce; it does, and the recipe that goes on
+# from it is `new-game.recipe`.
+#
+# THE PRESSES ARE A MASH, NOT A MINIMAL SEQUENCE. They were found by asking whether the title
+# responds to the pad at all, and it does. Which single press first leaves the black screen has
+# not been bisected - `explore` over the 300..900 window is the way to narrow it, and doing that
+# is what turns this into a tight recipe.
+#
+# Every press is held 8 frames. The guest samples the pad once per display frame, so a press
+# that spans no sample is never observed at all.
+
+300: @section wake
+300: cross
+308:
+360: start
+368:
+420: circle
+428:
+480: cross
+488:
+540: start
+548:
+
+900: @section settle
+900: cross
+908:
+960: start
+968:
+
+1500: cross
+1508:
+1560: start
+1568:
+
+1900: @section title-screen
+2000: @shot title-screen
+
+# @todo Find a live-state address (a menu cursor index is the usual first one) and turn the
+# @todo shot judgement above into a real `@assert`.
+# @todo Walk past this screen - new game / continue - and extend this into a playable recipe.

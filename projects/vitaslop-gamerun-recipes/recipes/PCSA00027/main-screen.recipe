@@ -1,0 +1,44 @@
+@title MotorStorm RC - reach the main-screen sandbox
+@game  PCSA00027
+@shot-every 60   # in-game shots through the boot so a human can judge render quality
+
+# ============================================================================
+# GOAL
+# Reach the MAIN SCREEN: a top-down RC car sandbox in a skatepark, which is a
+# live 3D scene and therefore the render-quality proving ground.
+#
+# THE ONE GATE BEFORE THE MAIN SCREEN
+# A save-less first boot lands on an ONLINE TERMS (EULA) accept/decline screen
+# and waits there forever with no input. Cross = ACCEPT. On real hardware you
+# accept once and it is saved, so later boots skip straight to the sandbox; we
+# have no saved acceptance, so this recipe scripts the accept every run.
+#
+# FRAME NUMBERS ARE POST-2026-07-27. Two clock corrections have moved them:
+#  - 2026-07-25: a plain cooperative yield (sceKernelDelayThread(0),
+#    sceDisplayWaitVblankStartMulti(0)) used to count as a display frame, so this
+#    title's frame clock ran roughly 80x fast while a worker spun.
+#  - 2026-07-27: file reads take modelled STORAGE TIME instead of completing
+#    instantly, so a load now occupies the frames it would occupy on hardware.
+#    That moved this title's whole boot later by ~500 frames - the terms panel
+#    was live at ~f800 and is live at ~f1300.
+# Old recipes' frame numbers are meaningless; do not port them.
+# ============================================================================
+
+0: @section boot
+# (no input) - studio logos to ~f1050, then the ONLINE TERMS panel fades in and is
+# live and scrolling by f1300.
+
+# --- accept the terms with a single brief Cross press ---
+1350: @section accept-terms
+1350: cross          # ACCEPT. Held 12 frames: the guest samples the pad once per
+1362:                 # display frame, so a press must span several frames to be seen.
+
+# --- the sandbox loads in behind a tutorial dialog ---
+1380: @section post-accept
+1500: @shot post-accept-1500
+1700: @shot post-accept-1700
+1900: @shot post-accept-1900
+2100: @shot main-screen-2100   # sandbox fully up: skatepark, both RC cars, the
+                               # "Welcome to the MotorStorm RC tutorial" dialog.
+2100: @note This recipe stops at the main screen on purpose - it is the render target.
+2100: @note To play the tutorial, use tutorial-drive.recipe, which continues from here.

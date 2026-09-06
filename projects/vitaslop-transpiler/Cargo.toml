@@ -1,0 +1,26 @@
+[package]
+name = "vitaslop-transpiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# ARMv7/Thumb2 decode front-end, from our consolidation fork, pinned to an exact
+# pushed rev so the workspace builds anywhere. It was a PATH dep on a sibling
+# checkout during co-development of the decoder and the transpiler, which meant
+# only this machine could build the repo - CI failed on every runner at once.
+# To co-develop again, point it back at `path = "../../../yaxpeax-arm"` locally,
+# then push the fork and re-pin here before merging.
+yaxpeax-arm = { git = "https://github.com/cretz/yaxpeax-arm", rev = "e8fd10345a4dc9ba91efe2479d2db022e4607b9e", default-features = false, features = ["non-exhaustive-enums"] }
+yaxpeax-arch = { version = "0.3.1", default-features = false }
+# WASM backend.
+wasm-encoder = "0.253"
+
+[dev-dependencies]
+# Validate emitted modules in unit tests.
+wasmparser = "0.253"

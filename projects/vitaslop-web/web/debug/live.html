@@ -1,0 +1,1171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#0b0b12" />
+    <link rel="icon" href="data:," />
+    <title>vitaslop</title>
+    <style>
+      :root {
+        --bg: #0b0b12;
+        --panel: #14141f;
+        --edge: #2a2a3a;
+        --ink: #d8d8e0;
+        --dim: #8a8a9a;
+        --accent: #8fe0a0;
+        --pad: #1c1c2a;
+        --pad-lit: #3a5a44;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        overscroll-behavior: none;
+      }
+      body { display: flex; flex-direction: column; }
+
+      /* ---- the launcher ---- */
+      #menu { padding: 16px; max-width: 720px; margin: 0 auto; width: 100%; overflow-y: auto; }
+      h1 { font-size: 17px; margin: 0 0 2px; color: var(--accent); letter-spacing: 0.5px; }
+      .sub { color: var(--dim); margin: 0 0 18px; font-size: 12px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--edge);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+      }
+      .card h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+      .card .meta { color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+      label { display: block; margin: 10px 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.6px; }
+      select, input, textarea {
+        width: 100%;
+        background: #0f0f18;
+        color: var(--ink);
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        padding: 9px 10px;
+        font: inherit;
+        font-size: 13px;
+      }
+      textarea { min-height: 60px; resize: vertical; }
+      .row { display: flex; gap: 10px; }
+      .row > * { flex: 1; min-width: 0; }
+      button.play {
+        width: 100%;
+        margin-top: 14px;
+        padding: 13px;
+        font: inherit;
+        font-weight: 700;
+        font-size: 15px;
+        letter-spacing: 0.5px;
+        color: #08120c;
+        background: var(--accent);
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      button.play:active { transform: translateY(1px); }
+      /* The save-data actions. Deliberately NOT the accent green of PLAY: they are
+         management, not the thing the page is for, and CLEAR is destructive. */
+      button.act {
+        flex: 1;
+        padding: 9px 6px;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--ink);
+        background: #1c1c2a;
+        border: 1px solid var(--edge);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.act:disabled { opacity: 0.4; cursor: default; }
+      button.act.danger { color: #e8a0a8; border-color: #4a2a34; }
+      button.act:active:not(:disabled) { transform: translateY(1px); }
+      .note { color: var(--dim); font-size: 11px; margin-top: 10px; }
+      .warn { color: #e0c07f; }
+      details summary { cursor: pointer; color: var(--dim); font-size: 12px; margin-top: 6px; }
+      .check label.inline {
+        display: block;
+        margin: 0;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 13px;
+        color: var(--ink);
+      }
+      .check input { width: auto; margin-right: 8px; transform: scale(1.3); vertical-align: middle; }
+      .check .hint { display: block; color: var(--dim); font-size: 11px; margin: 2px 0 0 30px; }
+      .check label.inline + label.inline { margin-top: 10px; }
+
+      /* ---- the player ---- */
+      #player { display: none; flex: 1; min-height: 0; flex-direction: column; }
+      #player.on { display: flex; }
+      #screenwrap {
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        aspect-ratio: 960 / 544;
+        max-height: 56vh;
+        object-fit: contain;
+        /* NO `image-rendering: pixelated` here, and that is deliberate.
+           The backing store is the panel's own 960x544. A phone lays the canvas out at
+           `width: 100%` of a ~390-430px viewport and then multiplies by a devicePixelRatio
+           of about 2.6-3.5, so the presented size is a NON-INTEGER multiple of 960 - and
+           `pixelated` resolves that by dropping and duplicating whole pixel columns
+           unevenly, which turns a 1px letter stem into 1px here and 2px there. That is the
+           "text edges are not crisp" the desktop never shows, because a desktop window
+           happens to land near 1:1. Nearest-neighbour is only correct at an INTEGER ratio,
+           and nothing here guarantees one, so take the browser's smooth resample.
+           MEASURED, on the front end: this is not the supersample factor. A 2x supersampled
+           GAME MODE differs from a 1x one by 3.31% of pixels and a mean of 0.20/255, and
+           its text is very slightly SOFTER (mean |dx| 1.807 against 1.900), not sharper -
+           supersampling cannot be the fix for a sharpness complaint on this content. */
+        /* The canvas IS the Vita's front touch panel, so it must never pan or zoom the page. */
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #hud {
+        display: flex;
+        gap: 12px;
+        align-items: baseline;
+        padding: 4px 10px;
+        font-size: 11px;
+        color: var(--dim);
+        border-bottom: 1px solid var(--edge);
+        flex-wrap: wrap;
+      }
+      #fps { color: var(--accent); font-weight: 700; }
+      #status, #perf, #adapter { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+      #status { flex: 1 1 100%; color: var(--dim); }
+
+      /* ---- diagnostics ---- */
+      #diagbox {
+        border-bottom: 1px solid var(--edge);
+        background: #0d0d16;
+        flex: 0 0 auto;
+      }
+      #diagbox summary { margin: 0; padding: 6px 10px; font-size: 11px; }
+      #copydiag {
+        float: right;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        color: #08120c;
+        background: var(--accent);
+        border: 0;
+        border-radius: 5px;
+        padding: 3px 12px;
+        margin: -2px 0 0;
+      }
+      #diagbox[open] { max-height: 40vh; overflow: auto; }
+      /* A fatal error is not a counter and must not scroll away inside the panel with them:
+         it opens the box itself, sits above everything, and is never overwritten by a later
+         report. Hidden entirely until there is one. */
+      #fatal {
+        display: none;
+        margin: 0 0 6px;
+        padding: 6px 10px;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #ffd9d9;
+        background: #3a0d12;
+        border-left: 3px solid #ff5566;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      #diag {
+        margin: 0;
+        padding: 0 10px 10px;
+        font-size: 10px;
+        line-height: 1.35;
+        color: #a8b8c8;
+        /* Wrap rather than scroll sideways: a phone cannot pan a 400-character line, and
+           these lines are long by design (a whole counter set each). */
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      /* ---- the on-screen pad ---- */
+      #pad {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+      .btn {
+        background: var(--pad);
+        border: 1px solid var(--edge);
+        color: var(--ink);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 15px;
+        font-weight: 700;
+        width: 100%;
+        aspect-ratio: 1;
+        touch-action: none;
+      }
+      .btn.held { background: var(--pad-lit); border-color: var(--accent); }
+      .dpad, .faces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; width: min(42vw, 168px); }
+      .dpad .sp, .faces .sp { visibility: hidden; }
+      .mid { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+      .mid .small {
+        border-radius: 8px;
+        aspect-ratio: auto;
+        padding: 8px 12px;
+        font-size: 11px;
+        letter-spacing: 0.5px;
+        width: auto;
+      }
+      .shoulders { display: flex; gap: 8px; }
+      .stickpad {
+        position: relative;
+        width: min(34vw, 130px);
+        aspect-ratio: 1;
+        border-radius: 50%;
+        background: radial-gradient(circle, #1a1a28 60%, #12121c 100%);
+        border: 1px solid var(--edge);
+        touch-action: none;
+        margin-top: 8px;
+      }
+      .stickpad .knob {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 40%;
+        height: 40%;
+        margin: -20% 0 0 -20%;
+        border-radius: 50%;
+        background: #3a3a52;
+        border: 1px solid #4a4a68;
+        pointer-events: none;
+      }
+      .stickpad .lbl {
+        position: absolute;
+        bottom: -14px;
+        width: 100%;
+        text-align: center;
+        font-size: 9px;
+        color: var(--dim);
+        letter-spacing: 1px;
+      }
+      .stack { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    </style>
+  </head>
+  <body>
+    <!-- ============================ launcher ============================ -->
+    <div id="menu">
+      <h1>vitaslop</h1>
+      <p class="sub">
+        A clean-room Vita emulator running entirely in this browser - the guest's ARM code
+        transpiled to wasm, its GXM stream drawn with WebGPU. Pick a title and a recipe.
+      </p>
+      <div id="titles"><div class="card">looking for titles...</div></div>
+      <p class="note" id="caps"></p>
+    </div>
+
+    <!-- ============================= player ============================= -->
+    <div id="player">
+      <div id="hud">
+        <span id="fps">fps: --</span>
+        <span id="perf">perf: --</span>
+        <span id="adapter">adapter: --</span>
+        <span id="status">starting...</span>
+      </div>
+      <div id="screenwrap"><canvas id="screen" width="960" height="544"></canvas></div>
+      <!-- Every counter the run publishes, on the PAGE. The console is unreachable on a phone,
+           which is the device whose numbers are the ones that matter.
+           CLOSED by default: this page is the PRODUCT, and on a phone an open counter panel takes
+           40vh of the screen the game is meant to be on. It opens itself on a fatal error (see
+           `#fatal`), which is the one time it must not be behind a click. -->
+      <details id="diagbox">
+        <summary>diagnostics <button id="copydiag" type="button">copy</button></summary>
+        <!-- The hard pause: leaving the tab or losing the window's focus stops the emulator
+             (not the title's own pause menu) and the game clock with it. On by default, as a
+             device in a pocket would be; remembered per browser. -->
+        <label class="inline"><input type="checkbox" id="pauseblur" checked /> pause the emulator when this tab is hidden or the window loses focus</label>
+        <pre id="fatal"></pre>
+        <pre id="diag">waiting for the first perf window (30 presents)...</pre>
+        <!-- Run notes: everything a normal run used to say on the console (setup, adapter,
+             audio, storage, font). The console stays empty unless VITASLOP_CONSOLE=1. -->
+        <pre id="notes"></pre>
+      </details>
+      <div id="pad">
+        <div class="stack">
+          <div class="dpad">
+            <div class="sp"></div><div class="btn" data-btn="up">&#9650;</div><div class="sp"></div>
+            <div class="btn" data-btn="left">&#9664;</div><div class="sp"></div><div class="btn" data-btn="right">&#9654;</div>
+            <div class="sp"></div><div class="btn" data-btn="down">&#9660;</div><div class="sp"></div>
+          </div>
+          <div class="stickpad" data-stick="0"><div class="knob"></div><div class="lbl">LEFT STICK</div></div>
+        </div>
+        <div class="mid">
+          <div class="shoulders">
+            <div class="btn small" data-btn="l">L</div>
+            <div class="btn small" data-btn="r">R</div>
+          </div>
+          <div class="btn small" data-btn="start">START</div>
+          <div class="btn small" data-btn="select">SELECT</div>
+        </div>
+        <div class="stack">
+          <div class="faces">
+            <div class="sp"></div><div class="btn" data-btn="triangle">&#9651;</div><div class="sp"></div>
+            <div class="btn" data-btn="square">&#9633;</div><div class="sp"></div><div class="btn" data-btn="circle">&#9711;</div>
+            <div class="sp"></div><div class="btn" data-btn="cross">&#10005;</div><div class="sp"></div>
+          </div>
+          <div class="stickpad" data-stick="1"><div class="knob"></div><div class="lbl">RIGHT STICK</div></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import { forwardInput } from "../worker-input.js";
+      import { forwardLocation } from "../location.js";
+      import { installPad, installGamepad } from "../pad.js";
+      import { importTitle, isImported, storageRoom, requestPersistence } from "../opfs.js";
+      import * as gamedata from "../gamedata.js";
+      import { startAudio } from "../audio.js";
+
+      const $ = (id) => document.getElementById(id);
+      const menu = $("menu");
+      const player = $("player");
+      const status = $("status");
+      const canvas = $("screen");
+
+      // The run is effectively unbounded - it plays until the tab closes. A recipe that runs
+      // out simply stops driving, and live input keeps working, which is what makes "watch it
+      // reach the race, then take over" one session rather than two.
+      const MAX_FRAMES = 0xffffffff;
+
+      /// What this browser can and cannot do HERE, stated up front rather than discovered as a
+      /// mysterious failure part-way through a gigabyte import.
+      ///
+      /// # Why this list is not decoration
+      /// Three of these are properties of the ORIGIN, not of the browser, and every one of them
+      /// is invisible when you develop against localhost - which is itself a secure context.
+      /// The first phone to open `http://<lan-ip>:8080` failed with
+      /// `Cannot read properties of undefined (reading 'getDirectory')`, because
+      /// `navigator.storage` is exposed only in a SECURE context and the title is streamed into
+      /// the storage it hands out. That is a one-line diagnosis and it was reported as a
+      /// stack-shaped mystery. `fatal` entries block PLAY and say what to do instead.
+      function capabilities() {
+        const out = [];
+        if (!("WebAssembly" in self)) out.push({ fatal: true, text: "no WebAssembly in this browser" });
+        if (!("gpu" in navigator)) {
+          out.push({
+            fatal: true,
+            text: "no WebGPU (navigator.gpu) - the renderer cannot start. Try a recent Chrome; on iOS, Safari 18.2+.",
+          });
+        }
+        if (!self.isSecureContext) {
+          out.push({
+            fatal: true,
+            text:
+              "this page is not a SECURE CONTEXT, so the browser hides the storage the title " +
+              "has to be copied into (navigator.storage). Serve with --https and accept the " +
+              "certificate once. http://localhost works too, but a LAN address does not.",
+          });
+        } else if (!navigator.storage || !navigator.storage.getDirectory) {
+          out.push({
+            fatal: true,
+            text: "this browser has no origin-private file system (navigator.storage.getDirectory).",
+          });
+        }
+        if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
+          out.push({
+            fatal: false,
+            text:
+              "no SharedArrayBuffer here, so this run will be SILENT. Video, input and the perf " +
+              "numbers are unaffected.",
+          });
+        }
+        return out;
+      }
+
+      // Was this tab ever in the background? A hidden tab has its timers and animation frames
+      // throttled hard, so a perf window that spans a backgrounded moment measures the throttle,
+      // not the emulator - and it looks exactly like a slow machine. The copy dump has to say so,
+      // because nothing else about the numbers reveals it.
+      let hiddenSince = document.visibilityState === "hidden" ? 1 : 0;
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") hiddenSince++;
+      });
+
+      // "copy" on the diagnostics panel: put everything worth reporting on the clipboard in one
+      // tap, so a phone can hand over a full picture without a cable, a console or retyping.
+      //
+      // It copies the CONTEXT as well as the counters - the adapter, the frame rate, the last
+      // status line and whether debug capture was on - because every one of those changes how the
+      // numbers should be read, and a paste without them invites exactly the misreadings this
+      // session already produced twice (a present rate read as a guest rate, an instrumented
+      // frame time read as a real one).
+      // The dump itself, built ONCE for both readers: the copy button below and the dev-server
+      // sink. Two builders would drift, and the one that drifted would be the one nobody was
+      // looking at when it mattered.
+      /// One line describing what the audio ring actually carried, in seconds rather
+      /// than frame counts - "3.2s of gaps" is a thing a person can act on, "153600" is
+      /// not. Ratios are against what the device consumed.
+      /// >>> AND THE SAME COUNTERS OVER A RECENT WINDOW, WHICH IS THE ONLY WAY THE NUMBER
+      /// >>> ABOVE CAN BE ACTED ON.
+      ///
+      /// `underrun` is monotonic FOR THE WHOLE RUN, and it sits on a line next to `fps` and
+      /// the backlog, which are a recent window. A run that starves through its boot and its
+      /// first course load - which every run does, because the emulator is far below real time
+      /// while it compiles shaders and decodes a level - carries that forever. MEASURED on the
+      /// user's device: `UNDERRUN 26.36s (34.5%)` on a run whose audio was fine to listen to by
+      /// the time they read it, and whose ring had a healthy 93 ms of backlog right then.
+      ///
+      /// So the cumulative figure answers "has this run ever starved" (almost always yes) and
+      /// cannot answer "is it crackling now". This adds the second question.
+      /// [[vitaslop-a-count-needs-its-window]]
+      const AUDIO_WINDOW_MS = 10000;
+      const audioHist = [];
+      const audioLine = () => {
+        if (!window.__audioStats) return `audio: no ring on this page - the run is SILENT`;
+        const a = window.__audioStats();
+        const rate = a.sampleRate || 48000;
+        const s = (n) => (n / rate).toFixed(2);
+        const pct = (n) => (a.read ? ((100 * n) / a.read).toFixed(1) : "0.0");
+        const ms = (n) => ((1000 * n) / rate).toFixed(0);
+        // The oldest sample still inside the window is the baseline; everything older is
+        // dropped. Deltas of monotonic counters, so this cannot disagree with the totals.
+        const now = performance.now();
+        audioHist.push({ t: now, u: a.underrun, r: a.read });
+        while (audioHist.length > 1 && now - audioHist[0].t > AUDIO_WINDOW_MS) audioHist.shift();
+        const first = audioHist[0];
+        const dRead = a.read - first.r;
+        const dUnder = a.underrun - first.u;
+        const recent =
+          dRead > 0
+            ? `${((100 * dUnder) / dRead).toFixed(1)}% over the last ` +
+              `${((now - first.t) / 1000).toFixed(0)}s`
+            : "no data read yet in the window";
+        return (
+          `audio: context=${a.state} peak=${(a.peak ?? 0).toFixed(4)}` +
+          `${a.peak > 0 ? "" : " (NOTHING was audible at any point)"} | ` +
+          `written ${s(a.written)}s, read ${s(a.read)}s | ` +
+          `UNDERRUN ${s(a.underrun)}s (${pct(a.underrun)}% of the WHOLE RUN, which includes ` +
+          `the boot and every load - gaps the device filled with silence, heard as clicks; ` +
+          `RECENT ${recent}) | OVERRUN ${s(a.overrun)}s (${pct(a.overrun)}% - ` +
+          `samples dropped because the emulator ran ahead) | ` +
+          // Latency is what makes a sound arrive after the button that caused it, and it
+          // is a different complaint from crackling with a different fix, so it is
+          // reported separately rather than inferred from the counters above.
+          `LATENCY ${ms(a.fill ?? 0)}ms of backlog now, ${s(a.latencySkip ?? 0)}s skipped ` +
+          `to keep it bounded`
+        );
+      };
+
+
+      const diagText = () =>
+        [
+          `vitaslop diagnostics`,
+          `title: ${window.__runTitle || "?"}  recipe: ${window.__runRecipe || "(none)"}`,
+          `debug capture: ${window.__runDebug ? "ON (frame times inflated)" : "off"}`,
+          hiddenSince > 0
+            ? `WARNING: this tab was backgrounded ${hiddenSince}x during the run - a hidden tab is ` +
+              `throttled, so any window spanning that measures the throttle, not the emulator`
+            : `tab stayed in the foreground for the whole run`,
+          (window.__hardPauses || 0) > 0
+            ? `hard-paused ${window.__hardPauses}x for ${((window.__hardPausedMs || 0) / 1000).toFixed(1)}s ` +
+              `in total (tab hidden or window unfocused) - a perf window spanning a pause measures the pause`
+            : `never hard-paused`,
+          `knobs: ${JSON.stringify(window.__runKnobs || {})}`,
+          `user agent: ${navigator.userAgent}`,
+          `${$("adapter").textContent}`,
+          `${$("fps").textContent}`,
+          `${$("status").textContent}`,
+          // >>> AUDIO, AND IT IS THE LINE THAT DIAGNOSES CRACKLING.
+          //
+          // `peak` says whether anything was ever audible at all - the ring holds half a
+          // second, so its contents at any one moment prove nothing about a title that
+          // is mostly quiet. `underrun` and `overrun` say what kind of broken: underrun
+          // is the device's audio thread arriving to find nothing written and emitting
+          // silence, overrun is the emulator running AHEAD and having samples dropped.
+          // Both sound identical through a speaker - a discontinuity, i.e. a click - and
+          // they have opposite causes, so a report that merged them would be useless.
+          // Both being large at once means the producer is BURSTY rather than simply
+          // slow, which is a different fix again.
+          audioLine(),
+          // A worker that died takes its console with it. Carrying the fatal error in every
+          // later dump is what makes it reach disk at all: the sink's own POST races the
+          // worker's death, and the tick that follows does not.
+          window.__fatalWorkerError ? `
+FATAL WORKER ERROR
+${window.__fatalWorkerError}` : ``,
+          ``,
+          $("diag").textContent,
+        ].join("\n");
+
+      // >>> ONE PLACE A FATAL ERROR LANDS, AND IT IS ON THE SCREEN.
+      //
+      // Everything that kills the run - a worker `onerror`, a reported error, and above all a
+      // Rust PANIC forwarded by `globalThis.__vitaslopPanic` in the worker - comes here. The
+      // status line cannot serve: it is one ellipsised row, it is overwritten by the next
+      // report, and a panic message is multi-line with a stack under it.
+      //
+      // This is the whole point of the change: on a phone there is no console, so a crash used
+      // to be reportable only as "it stopped". Now the text is on the page, in the copy dump,
+      // and in the `/diag` sink, and the panel OPENS itself so it cannot be missed while
+      // collapsed.
+      //
+      // Appends rather than replaces - a panic often follows a first error that explains it,
+      // and keeping only the last one throws away the cause to keep the symptom.
+      const reportFatal = (text) => {
+        const box = $("fatal");
+        box.textContent = box.textContent ? box.textContent + "\n\n" + text : text;
+        box.style.display = "block";
+        $("diagbox").open = true;
+        window.__fatalWorkerError = box.textContent;
+        if (typeof window.__diagSend === "function") window.__diagSend("fatal");
+      };
+
+      // >>> STREAM THE DUMP TO THE DEV SERVER, IF THERE IS ONE.
+      //
+      // Capability discovery, not a flag: the page asks once whether `/diag-sink` exists, and
+      // only a dev server answers. Served from anywhere else this is one 404 at startup and
+      // then silence for ever - so the page that ships never phones anywhere and needs no knob
+      // to be told not to ([[vitaslop-web-is-the-product-not-the-tool]]).
+      //
+      // It exists because the alternative was a person on a phone hand-copying a 4 KB panel per
+      // capture, which made the SECOND capture - the one that turns an observation into an A/B -
+      // something nobody wanted to take.
+      (async () => {
+        // The dev server stamps this global into the HTML it serves (see serve.mjs). A page
+        // served from anywhere else has no sink and no probe to make - a fetch here was a
+        // 404 in the product's console on every load, which is the one thing an empty
+        // console must not have.
+        if (!window.__vitaslopDiagSink) return;
+        const run = `${(window.__runTitle || "run").replace(/[^A-Za-z0-9_-]/g, "")}-${Date.now()}`;
+        let seq = 0;
+        // >>> AND THE PICTURE, NOT JUST THE NUMBERS.
+        //
+        // Half of every report about this emulator is "what does it look like", and the counters
+        // cannot answer it: a frame that is white and a frame that is correct produce the same
+        // draw counts (MEASURED - 1534 draws white against 1136 correct, so the numbers moved
+        // the wrong way). Pairing each dump with the frame it describes is what makes a capture
+        // self-contained.
+        //
+        // `toBlob` on a WebGPU canvas reads the CURRENT contents, so this is taken on an
+        // animation frame - after the present, before the next one clears it.
+        const screen = $("screen");
+        const shot = (n, tag) =>
+          new Promise((done) => {
+            requestAnimationFrame(() => {
+              try {
+                screen.toBlob((b) => {
+                  if (b) {
+                    fetch(`/diag-shot?run=${run}&seq=${n}&tag=${tag}`, { method: "POST", body: b })
+                      .catch(() => {});
+                  }
+                  done();
+                }, "image/png");
+              } catch {
+                done();
+              }
+            });
+          });
+        const send = (tag = "tick") => {
+          seq += 1;
+          // The sequence is captured HERE, not read inside `shot` - two sends close together
+          // otherwise share one number and the second shot overwrites the first, which is what
+          // happened to every `hidden`/`shown` pair on the first run.
+          const n = String(seq).padStart(4, "0");
+          fetch(`/diag?run=${run}&seq=${n}&tag=${tag}`, { method: "POST", body: diagText() }).catch(
+            () => {}
+          );
+          shot(n, tag);
+        };
+        // >>> A BURST ON RESTORE, because the event lasts about a SECOND and a 4 s tick cannot
+        // see it. The interesting window is entirely inside the first couple of seconds after
+        // the tab comes back: it renders correctly and is then consumed. Sampling that at 4 s
+        // catches the end state and nothing of the transition.
+        const burst = (tag) => {
+          for (const ms of [0, 150, 300, 500, 750, 1000, 1400, 1800, 2400, 3000]) {
+            setTimeout(() => send(tag), ms);
+          }
+        };
+        // Exposed so a fatal error can push a dump at once rather than waiting up to 4 s for a
+        // tick that a dead worker may never reach.
+        window.__diagSend = send;
+        setInterval(() => send("tick"), 4000);
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "visible") burst("shown");
+          else send("hidden");
+        });
+        window.addEventListener("pagehide", () => send("pagehide"));
+        send("start");
+      })();
+
+      $("copydiag").addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation(); // do not toggle the <details> it lives in
+        const btn = $("copydiag");
+        const text = diagText();
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = "copied";
+        } catch {
+          // The async clipboard needs a secure context and a user gesture; we have both, but a
+          // refusal must still leave the text reachable rather than silently doing nothing.
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand && document.execCommand("copy");
+          ta.remove();
+          btn.textContent = ok ? "copied" : "copy failed - select the text below";
+        }
+        setTimeout(() => (btn.textContent = "copy"), 2000);
+      });
+
+      const caps = capabilities();
+      const fatal = caps.some((c) => c.fatal);
+      $("caps").innerHTML = caps.length
+        ? '<span class="warn">' + caps.map((c) => (c.fatal ? "STOP: " : "note: ") + c.text).join("<br><br>") + "</span>"
+        : "WebGPU present, secure and cross-origin isolated - video and audio both available.";
+
+      /// Prefill one title's card from the URL, so a run can be SET UP somewhere else and
+      /// opened as a link.
+      ///
+      /// # Why this exists
+      /// Every knob here has to be typed into a textarea, and the machine that decides which
+      /// knobs a measurement needs is not the phone holding it. An A/B is two runs differing
+      /// in ONE line, and a line retyped on a touch keyboard between them is exactly the
+      /// variable nobody wants in the experiment. A link carries the whole arm.
+      ///
+      /// `?recipe=<name>&ff=<frame>&debug=1&knobs=A=1,B=2` (knobs are comma- or
+      /// newline-separated). Knobs MERGE over the box's defaults rather than replacing them,
+      /// because some of those defaults are load-bearing per recipe (`VITASLOP_FRAME_TOPUP=0`)
+      /// and a link that silently dropped one would fail as a title that never finishes
+      /// loading. The box is opened whenever a preset applies, so what the link set is
+      /// visible and editable before PLAY rather than hidden behind a summary.
+      function applyUrlPreset(t) {
+        const q = new URLSearchParams(location.search);
+        const only = q.get("title");
+        if (only && only !== t.id) return;
+        if (!q.has("recipe") && !q.has("ff") && !q.has("debug") && !q.has("knobs")) return;
+
+        const recipe = q.get("recipe");
+        if (recipe !== null) {
+          const sel = $(`r-${t.id}`);
+          // A recipe this title does not have must SAY so - a silent fall back to
+          // "interactive, no recipe" looks like a recipe that ran and did nothing.
+          if ([...sel.options].some((o) => o.value === recipe)) sel.value = recipe;
+          else status.textContent = `link names recipe "${recipe}", which ${t.id} does not have`;
+        }
+        if (q.has("ff")) $(`ff-${t.id}`).value = String(Number(q.get("ff")) || 0);
+        if (q.has("debug")) $(`dbg-${t.id}`).checked = q.get("debug") !== "0";
+
+        const box = $(`k-${t.id}`);
+        const lines = new Map();
+        for (const line of box.value.split(/\r?\n/)) {
+          const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+          if (m) lines.set(m[1], m[2]);
+        }
+        for (const one of (q.get("knobs") || "").split(/[,\r\n]/)) {
+          const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(one);
+          if (m) lines.set(m[1], m[2]);
+        }
+        box.value = [...lines].map(([k, v]) => `${k}=${v}`).join("\n");
+        box.parentElement.open = true;
+      }
+
+      // ---- the title list ----
+      const titles = await (await fetch("/titles.json")).json();
+      const wrap = $("titles");
+      wrap.innerHTML = "";
+      if (titles.length === 0) wrap.innerHTML = '<div class="card">no titles served</div>';
+
+      for (const t of titles) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const recipeOptions = [
+          '<option value="">interactive - no recipe (you drive from the first frame)</option>',
+          ...t.recipes.map(
+            (r) => `<option value="${r.name}">${r.name}${r.description ? " - " + r.description : ""}</option>`
+          ),
+        ].join("");
+        card.innerHTML = `
+          <h2>${t.name}</h2>
+          <div class="meta">${t.id} &middot; ${t.files} files &middot; ${t.mb} MB &middot; ${t.recipes.length} recipes</div>
+          <label for="r-${t.id}">Recipe</label>
+          <select id="r-${t.id}">${recipeOptions}</select>
+          <!-- NO supersample control. It was a per-platform picture setting whose default
+               here ("1x - recommended on a phone") silently overrode the engine's own
+               default on EVERY live run, so the phone and the desktop review shots were
+               never rendering the same way and no run ever used the documented default.
+               How finely a pass is rasterised is the guest's call, not the page's: the
+               title states it per render target with SceGxmMultisampleMode and the renderer
+               honours it. Anything still worth A/B-ing goes in the knobs box below. -->
+          <div class="row">
+            <div>
+              <label for="ff-${t.id}">Fast-forward to frame</label>
+              <input id="ff-${t.id}" type="number" min="0" step="100" value="0" />
+            </div>
+          </div>
+          <div class="check">
+            <label class="inline"><input type="checkbox" id="dbg-${t.id}" /> capture debug
+              <span class="hint">times every host call and counts them by NID, so the diagnostics panel
+              can say where the guest CPU goes. Roughly DOUBLES the frame cost, so leave it off to
+              play - the ratios it reports stay valid, the frame times do not.</span>
+            </label>
+          </div>
+          <!-- >>> THE GUEST'S OWN SAVED STATE. It lives in a DIFFERENT part of this
+               browser's storage from the title (see web/gamedata.js), so clearing it costs
+               nothing but the save, and it can be carried to another browser or another
+               device as an ordinary .zip. -->
+          <details id="gdbox-${t.id}">
+            <summary>saved game data</summary>
+            <p class="note" id="gd-${t.id}">checking...</p>
+            <div class="row">
+              <button class="act" id="gd-dl-${t.id}" type="button">DOWNLOAD</button>
+              <button class="act" id="gd-up-${t.id}" type="button">UPLOAD</button>
+              <button class="act danger" id="gd-rm-${t.id}" type="button">CLEAR</button>
+            </div>
+            <input id="gd-file-${t.id}" type="file" accept=".zip,application/zip" hidden />
+            <p class="note">
+              This is what the GAME saved - its save files and its trophies - and nothing of
+              the game itself. CLEAR deletes only that; the title stays imported.
+            </p>
+          </details>
+          <details>
+            <summary>knobs</summary>
+            <textarea id="k-${t.id}">VITASLOP_FRAME_TOPUP=0
+VITASLOP_GXP_LIVE=1
+VITASLOP_LOG=warn</textarea>
+            <p class="note">
+              One NAME=VALUE per line. The browser has no environment, so this is the only way
+              to reach a VITASLOP_* knob here.
+            </p>
+          </details>
+          <button class="play" id="p-${t.id}">PLAY</button>
+          <p class="note">
+            First play of a title copies it into this browser's storage (${t.mb} MB, once);
+            later plays start straight away. Fast-forward presents NOTHING while it runs, on
+            purpose - leave it at 0 to watch from the first frame.
+          </p>
+        `;
+        wrap.appendChild(card);
+        applyUrlPreset(t);
+        installGameData(t);
+        // A run that cannot possibly work must not be startable. Pressing PLAY into a
+        // missing secure context spent a minute of import before failing with a property
+        // access on `undefined`, which named nothing.
+        if (fatal) {
+          const b = $(`p-${t.id}`);
+          b.disabled = true;
+          b.style.opacity = "0.45";
+          b.textContent = "CANNOT RUN HERE - SEE ABOVE";
+          continue;
+        }
+        $(`p-${t.id}`).addEventListener("click", () => {
+          const knobs = {};
+          for (const line of $(`k-${t.id}`).value.split(/\r?\n/)) {
+            const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+            if (m) knobs[m[1]] = m[2];
+          }
+          if ($(`dbg-${t.id}`).checked) knobs.VITASLOP_DEBUG_CAPTURE = "1";
+          const ff = Number($(`ff-${t.id}`).value || 0);
+          if (ff > 0) knobs.VITASLOP_BROWSER_FASTFORWARD = String(ff);
+          boot(t, $(`r-${t.id}`).value, knobs).catch((e) => {
+            status.textContent = "failed to start: " + (e && e.message ? e.message : e);
+            console.error(e);
+            reportFatal("BOOT FAILED\n" + ((e && (e.stack || e.message)) || e));
+          });
+        });
+      }
+
+      // ======================= the guest's own saved state =======================
+      //
+      // Three buttons and a line of text, over `web/gamedata.js`. What makes this worth
+      // having on the LAUNCHER rather than buried somewhere: a save that only exists inside
+      // one browser profile is a save the user cannot back up, cannot move to their phone,
+      // and loses to a "clear browsing data" they meant for something else. A download and
+      // an upload turn it into a file they own.
+      //
+      // Nothing here can reach the imported title: `gamedata.js` works under `gamedata/`
+      // and `opfs.js` under `games/`, and the container's own contents are re-checked by
+      // the Rust parser, which refuses any path that is not on the guest's writable mounts.
+
+      /// Human-readable size, because "1219 bytes" and "1.2 MB" answer different questions.
+      const kb = (n) => (n < 1024 ? `${n} bytes` : `${(n / 1024).toFixed(1)} KB`);
+
+      /// Ask the real Rust parser what is in a container, in a worker that is then thrown
+      /// away. See web/gamedata-worker.js for why this is not checked in JS here.
+      const describeContainer = (zip) =>
+        new Promise((resolve, reject) => {
+          const w = new Worker("../gamedata-worker.js", { type: "module" });
+          w.onmessage = (e) => {
+            w.terminate();
+            e.data.ok ? resolve(e.data.summary) : reject(new Error(e.data.error));
+          };
+          w.onerror = (e) => {
+            w.terminate();
+            reject(new Error(e.message || "the game-data worker failed to start"));
+          };
+          w.postMessage({ zip }, [zip]);
+        });
+
+      function installGameData(t) {
+        const box = $(`gd-${t.id}`);
+        const dl = $(`gd-dl-${t.id}`);
+        const up = $(`gd-up-${t.id}`);
+        const rm = $(`gd-rm-${t.id}`);
+        const file = $(`gd-file-${t.id}`);
+
+        // What is stored right now. DOWNLOAD and CLEAR are disabled when there is nothing,
+        // rather than offered and then failing - an empty download is indistinguishable
+        // from a broken one.
+        const refresh = async () => {
+          const info = await gamedata.info(t.id);
+          if (!info) {
+            box.textContent =
+              "nothing saved in this browser yet. It appears here the first time the game saves.";
+            dl.disabled = true;
+            rm.disabled = true;
+            return null;
+          }
+          const when = new Date(info.modified);
+          box.textContent = `${kb(info.bytes)}, last written ${when.toLocaleString()}`;
+          dl.disabled = false;
+          rm.disabled = false;
+          return info;
+        };
+        refresh();
+
+        dl.addEventListener("click", async () => {
+          const bytes = await gamedata.read(t.id);
+          if (!bytes) {
+            box.textContent = "there is nothing saved for this title.";
+            return refresh();
+          }
+          // The bytes handed over are EXACTLY what is stored - the run wrote this file and
+          // this is that file, not something reassembled at download time.
+          const url = URL.createObjectURL(new Blob([bytes], { type: "application/zip" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `vitaslop-${t.id}-gamedata.zip`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        });
+
+        up.addEventListener("click", () => file.click());
+        file.addEventListener("change", async () => {
+          const picked = file.files && file.files[0];
+          file.value = ""; // so picking the same file twice fires again
+          if (!picked) return;
+          box.textContent = `reading ${picked.name}...`;
+          try {
+            const bytes = new Uint8Array(await picked.arrayBuffer());
+            // >>> CHECKED BEFORE IT REPLACES ANYTHING. An upload overwrites a save, so a
+            // file that turns out not to be one must be refused while the old one is still
+            // there - not after.
+            const summary = await describeContainer(bytes.slice().buffer);
+            const existing = await gamedata.info(t.id);
+            const warn = existing
+              ? `\n\nThis REPLACES the ${kb(existing.bytes)} already saved for this title. ` +
+                `Download that first if you want to keep it.`
+              : "";
+            if (!confirm(`Restore this save into ${t.name}?\n\n${summary}${warn}`)) {
+              await refresh();
+              return;
+            }
+            await gamedata.write(t.id, bytes);
+            box.textContent = `restored: ${summary}`;
+            dl.disabled = false;
+            rm.disabled = false;
+          } catch (err) {
+            // Named, and the old save left alone. "That file is not a vitaslop game-data
+            // archive" is actionable; a silent no-op is not.
+            box.textContent = `not restored - ${(err && err.message) || err}`;
+          }
+        });
+
+        rm.addEventListener("click", async () => {
+          const info = await gamedata.info(t.id);
+          if (!info) return refresh();
+          if (
+            !confirm(
+              `Delete the ${kb(info.bytes)} of saved game data for ${t.name}?\n\n` +
+                `This is the game's own save and trophies. It cannot be undone, and it is ` +
+                `not the same as removing the title - ${t.id} stays imported.`
+            )
+          ) {
+            return;
+          }
+          await gamedata.clear(t.id);
+          await refresh();
+        });
+      }
+
+      /// Import (once) and run one title. The whole emulator lives in a Web Worker; this page
+      /// owns the storage import, the audio context (there is no AudioContext in a worker) and
+      /// the input, and forwards each to the worker. Structurally the same boot as
+      /// game-worker.html, which the e2e harness drives - kept in step with it deliberately,
+      /// so a change here is exercised there.
+      async function boot(t, recipeName, knobs) {
+        menu.style.display = "none";
+        player.classList.add("on");
+        // What this run IS, for the copy button to report alongside the numbers.
+        window.__runTitle = `${t.name} (${t.id})`;
+        window.__runRecipe = recipeName;
+        window.__runKnobs = knobs;
+        window.__runDebug = !!knobs.VITASLOP_DEBUG_CAPTURE;
+        // >>> RUN NOTES GO TO THE PANEL, AND TO THE CONSOLE ONLY WHEN ASKED.
+        // A clean run's console is EMPTY: warnings and errors only. Everything the page and
+        // the worker used to `console.log` (storage, audio, font, pad, setup) lands in the
+        // panel's notes instead; `VITASLOP_CONSOLE=1` mirrors it, which the harness sets.
+        window.__vitaslopConsole = String(knobs.VITASLOP_CONSOLE ?? "") === "1";
+        const note = (text, fromWorker = false) => {
+          // The worker already mirrored its own notes when the knob is on.
+          if (window.__vitaslopConsole && !fromWorker) console.log(text);
+          const el = $("notes");
+          if (el) el.textContent += text + "\n";
+        };
+        status.textContent = "reading the recipe...";
+
+        let recipe = "";
+        if (recipeName) {
+          recipe = await (
+            await fetch(`/recipe?title=${encodeURIComponent(t.id)}&name=${encodeURIComponent(recipeName)}`)
+          ).text();
+        }
+
+        status.textContent = "fetching the file list...";
+        const manifest = await (await fetch(`/game-manifest.json?title=${encodeURIComponent(t.id)}`)).json();
+
+        // The title goes into OPFS once and is read lazily from there. It cannot be held in
+        // memory: a retail container does not fit a wasm32 heap (measured at 8.01 GB peak
+        // against a 4 GB ceiling when it was copied in).
+        if (await isImported(t.id, manifest.length)) {
+          status.textContent = `already stored (${manifest.length} files); starting...`;
+          note(`[opfs] REUSED an existing import of ${t.id}`);
+        } else {
+          // Does it FIT, before a byte moves. A quota refusal hundreds of megabytes into a
+          // download over wifi is the same failure discovered the expensive way.
+          const room = await storageRoom();
+          const need = t.mb * 1e6;
+          if (room && room.free < need * 1.05) {
+            throw new Error(
+              `this title needs ${t.mb} MB but this browser will only give this site ` +
+                `${(room.free / 1e6) | 0} MB more (quota ${(room.quota / 1e6) | 0} MB, ` +
+                `${(room.usage / 1e6) | 0} MB already used). Free up space on the device, or ` +
+                `pick a smaller title.`
+            );
+          }
+          const persisted = await requestPersistence();
+          note(`[opfs] persistent storage ${persisted ? "GRANTED" : "refused - an import may be evicted"}`);
+          const t0 = performance.now();
+          const entries = manifest.map((p) => ({
+            path: p,
+            source: async () => (await fetch(`/game/${encodeURIComponent(t.id)}/${p}`)).body,
+          }));
+          await importTitle(t.id, entries, (done, total, bytes) => {
+            // MEGABYTES first, and a rate. The file count is the misleading half: this title's
+            // bytes are not spread evenly over its files, so `220/248` sat still for minutes
+            // while a single large file downloaded.
+            const mb = bytes / 1e6;
+            const secs = (performance.now() - t0) / 1000;
+            const rate = secs > 1 ? ` at ${(mb / secs).toFixed(1)} MB/s` : "";
+            const left = mb > 1 && secs > 2 ? `, ~${Math.max(0, Math.round((t.mb - mb) / (mb / secs)))}s left` : "";
+            status.textContent =
+              `copying into this browser: ${mb | 0} / ${t.mb} MB${rate}${left} ` +
+              `(file ${done}/${total}) - one time only`;
+          });
+          note(`[opfs] IMPORTED ${manifest.length} files for ${t.id}`);
+        }
+
+        // Transpile in a THROWAWAY worker: it costs ~460 MB of heap a wasm memory can never
+        // give back, so the peak has to die with the worker that paid it. Only the compiled
+        // module crosses over. It must also close its storage handles before the run worker
+        // opens its own - a sync access handle is an exclusive lock.
+        status.textContent = "transpiling the title (a few seconds, one time per load)...";
+        const prebuilt = await new Promise((resolve, reject) => {
+          const tw = new Worker("../transpile-worker.js", { type: "module" });
+          tw.onmessage = (e) => {
+            // A panic report is NOT the end of this worker's message stream - the abort trap
+            // follows it - so it must not terminate the worker or settle the promise. It is
+            // recorded, and the `error`/`onerror` that arrives next settles it.
+            if (e.data.type === "panic") {
+              console.error("[transpile] panic:", e.data.message);
+              reportFatal("RUST PANIC IN THE TRANSPILE WORKER\n" + e.data.message);
+              return;
+            }
+            tw.terminate();
+            e.data.type === "built" ? resolve(e.data.built) : reject(new Error(e.data.message));
+          };
+          tw.onerror = (e) => {
+            tw.terminate();
+            reject(new Error(e.message || "transpile worker failed to start"));
+          };
+          tw.postMessage({ titleId: t.id, knobs });
+        });
+
+        status.textContent = "starting the run...";
+        const worker = new Worker("../worker.js", { type: "module" });
+        worker.onmessage = (e) => {
+          const d = e.data;
+          if (d.type === "report") {
+            const el = $(d.id);
+            if (el) el.textContent = d.text;
+          } else if (d.type === "note") {
+            note(d.text, true);
+          } else if (d.type === "error") {
+            status.textContent = "error: " + d.message;
+            console.error("[worker]", d.message);
+            reportFatal("WORKER ERROR\n" + d.message);
+          } else if (d.type === "panic") {
+            // A Rust panic. This arrives BEFORE the `unreachable` trap that the worker's
+            // `onerror` will report a moment later, so the two lines appear in causal order:
+            // the panic that names the file, the line and the reason, then the trap that is
+            // only a wasm offset. Reading them the other way round is what made the last
+            // device crash report unactionable.
+            status.textContent = "PANIC (see diagnostics)";
+            console.error("[worker] panic:", d.message);
+            reportFatal("RUST PANIC IN THE RUN WORKER\n" + d.message);
+          }
+        };
+        // A worker that dies without reporting would otherwise leave a stale status line.
+        //
+        // >>> SAY WHERE IT DIED, NOT ONLY WHAT IT SAID.
+        // `e.message` alone gives a line like "Uncaught TypeError: Cannot read properties of
+        // null (reading 'info')" and nothing else - no file, no line, no stack. That is a
+        // message you can only act on if you can reproduce it, and a defect reported from a
+        // device is by definition one that did not reproduce here. The file and position come
+        // free on an ErrorEvent, and pushing them into the diagnostics sink puts them on disk
+        // beside the panel dump instead of only in a console nobody is holding.
+        worker.onerror = (e) => {
+          const site = e.filename ? ` at ${e.filename}:${e.lineno || "?"}:${e.colno || "?"}` : "";
+          const detail = (e.message || "died") + site;
+          status.textContent = "worker error: " + detail;
+          console.error("[worker] onerror:", detail, e.error && e.error.stack ? "\n" + e.error.stack : "");
+          reportFatal(
+            "WORKER DIED\n" + detail + (e.error && e.error.stack ? "\n" + e.error.stack : "")
+          );
+        };
+
+        // >>> ASK FOR A SAVE FLUSH WHEN THE PAGE IS BACKGROUNDED.
+        //
+        // The run writes the save on a 3-second floor, so the last few seconds of play are
+        // in the worker and not in storage at any moment. `visibilitychange` to hidden is
+        // the signal that matters on the machine this is for: a phone switching apps fires
+        // it while the page is still ALIVE, so the worker's asynchronous write actually
+        // completes. `pagehide` is wired too and is best-effort by nature - a document
+        // being torn down takes its worker with it, and neither the message nor the write
+        // is guaranteed to land.
+        const flushGameData = () => worker.postMessage({ type: "flush-game-data" });
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "hidden") flushGameData();
+        });
+        window.addEventListener("pagehide", flushGameData);
+
+        // Live input: pointer + keyboard from the page, the on-screen pad, and any real
+        // gamepad. All three post into the same worker input cell.
+        forwardInput(worker, canvas);
+        installPad(worker, $("pad"));
+        installGamepad(worker, (msg) => note("[pad] " + msg));
+
+        // SceLibLocation: the page owns navigator.geolocation (Window-only) and the
+        // worker owns the guest. Nothing is requested until the guest asks - the browser
+        // permission prompt appears when the title calls sceLocationConfirm, which is
+        // exactly when its own permission dialog would appear on a console. Its notes go
+        // into the diagnostics mirror so a device run says why location did or did not
+        // work, rather than the title sitting on "acquiring" with nothing logged.
+        forwardLocation(worker);
+
+        // Audio is a MAIN-THREAD API and the emulator is in a worker, so the page owns the
+        // context and the worker only fills a shared ring. A failure here must not take the
+        // run down - a silent emulator beats no emulator - but it must SAY so rather than
+        // look like silence the guest produced.
+        let audioRing;
+        let audioPause = () => {};
+        try {
+          const audio = await startAudio(note);
+          audioRing = audio.ring;
+          audioPause = audio.pause;
+          window.__audioStats = audio.stats;
+          window.__audioSamples = audio.samples;
+        } catch (err) {
+          console.warn("[audio] could not start; this run will be SILENT:", err);
+        }
+
+        // >>> THE HARD PAUSE: leaving the tab or losing the window's focus stops the emulator.
+        //
+        // Not the title's pause menu - the guest simply sees a wall clock that did not
+        // advance, as a device in a pocket does. On by default; the checkbox in the
+        // diagnostics box (remembered per browser) and `VITASLOP_PAUSE_ON_BLUR=0` turn it
+        // off. Both `visibilitychange` (tab switch, minimise, phone app switch) and window
+        // `blur`/`focus` (alt-tab with the tab still visible) drive it; the audio worklet is
+        // told too, so the pause is silence and not an underrun. The panel's copy reports how
+        // often and for how long, because a perf window spanning a pause measures the pause.
+        const pauseBox = $("pauseblur");
+        const PAUSE_KEY = "vitaslop.pauseOnBlur";
+        try {
+          const stored = localStorage.getItem(PAUSE_KEY);
+          if (stored !== null) pauseBox.checked = stored === "1";
+        } catch {}
+        if (String(knobs.VITASLOP_PAUSE_ON_BLUR ?? "") === "0") pauseBox.checked = false;
+        pauseBox.addEventListener("change", () => {
+          try {
+            localStorage.setItem(PAUSE_KEY, pauseBox.checked ? "1" : "0");
+          } catch {}
+          if (!pauseBox.checked) setPaused(false);
+        });
+        window.__hardPauses = 0;
+        window.__hardPausedMs = 0;
+        let pausedAt = 0;
+        let hardPaused = false;
+        const setPaused = (paused) => {
+          if (paused && !pauseBox.checked) return;
+          if (paused === hardPaused) return;
+          hardPaused = paused;
+          worker.postMessage({ type: "pause", paused });
+          audioPause(paused);
+          if (paused) {
+            pausedAt = performance.now();
+            window.__hardPauses += 1;
+          } else {
+            window.__hardPausedMs += performance.now() - pausedAt;
+          }
+        };
+        const wantPause = () => document.visibilityState === "hidden" || !document.hasFocus();
+        document.addEventListener("visibilitychange", () => setPaused(wantPause()));
+        window.addEventListener("blur", () => setPaused(wantPause()));
+        window.addEventListener("focus", () => setPaused(wantPause()));
+
+        // Hand the canvas's render control to the worker. The title is NOT transferred - it is
+        // in storage and the worker opens its own handles to it.
+        const offscreen = canvas.transferControlToOffscreen();
+        worker.postMessage(
+          { offscreen, titleId: t.id, recipe, maxFrames: MAX_FRAMES, knobs, prebuilt, audioRing },
+          [offscreen]
+        );
+      }
+    </script>
+  </body>
+</html>

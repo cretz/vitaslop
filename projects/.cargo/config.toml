@@ -1,0 +1,17 @@
+# Browser build flags.
+#
+# >>> WASM SIMD IS OFF BY DEFAULT AND EVERY BROWSER THAT CAN RUN THIS HAS IT.
+#
+# `wasm32-unknown-unknown` does not enable `simd128` unless it is asked for, so every block
+# encoder, every texture decode and every mip box-filter in this project was compiling to scalar
+# wasm on the one engine whose CPU cost actually matters. The same code on the desktop is
+# auto-vectorised by LLVM through SSE, which is why a throughput measured natively flatters the
+# browser by a wide margin and why an optimisation can measure as nothing here and as a lot there.
+#
+# The floor this project already requires is far above the floor SIMD needs: the scheduler needs
+# JSPI (Chrome 137), the renderer needs WebGPU, and audio needs SharedArrayBuffer over a
+# cross-origin-isolated origin. wasm SIMD shipped in Chrome 91 and Firefox 89, years before any of
+# those, so there is no device that can run this page and cannot take these instructions - it is
+# not a compatibility trade, it was simply never switched on.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

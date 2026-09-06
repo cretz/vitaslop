@@ -1,0 +1,281 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vitaslop - what a host call costs</title>
+<!--
+  WHAT THIS PAGE IS FOR, and why it is not part of the engine.
+
+  The plan to make host calls cheaper rests on one unmeasured claim: that wrapping an
+  import in `WebAssembly.Suspending` costs real time on every call, including the large
+  majority that never suspend. Every host call this engine makes is wrapped that way
+  today, so if the claim is true it is a tax on ~5,000 calls a frame, and if it is false
+  the whole "two imports, one plain and one suspending" plan buys nothing.
+
+  Rebuilding the host-call path to find out is a day's work across the transpiler, both
+  engines and the ABI. This page answers it in a few seconds instead, on the machine whose
+  answer counts - a PHONE - because a desktop crossing is cheap enough to mis-rank
+  anything (see `vitaslop-rank-host-calls-by-phone-count`).
+
+  It is deliberately standalone: no bundle, no wasm build, no game. It assembles its own
+  tiny wasm modules so the arms differ in exactly one thing each.
+
+  THE ARMS, and the question each one answers:
+    plain-bare     a plain import, plain export. The floor: what a crossing costs with no
+                   suspension machinery at all.
+    jspi-bare      the same module, import wrapped in `Suspending`, export in `promising`,
+                   and the handler returns a VALUE rather than a Promise - so it does not
+                   actually suspend. This is what ~99% of real host calls do.
+                   >>> (jspi-bare - plain-bare) IS THE TAX. It is the whole question.
+    jspi-suspend   the handler returns an already-resolved Promise, so every call really
+                   suspends and resumes. What a call that BLOCKS costs, for scale.
+    plain-marshal  plain import, and the handler moves a 32-slot register file out of the
+                   instance's wasm globals and back, exactly the way `save_globals` /
+                   `load_globals` do it in `browser_sched.rs`. Prices the marshalling.
+    jspi-marshal   both together: THE SHAPE THE ENGINE ACTUALLY RUNS TODAY.
+
+  Reading it: the arms are ns per call. `plain-marshal - plain-bare` is what moving the
+  register file into shared linear memory could remove; `jspi-bare - plain-bare` is what
+  a non-suspending import for non-blocking NIDs could remove. Whichever is larger is the
+  one to build first, and until this page has been run on a phone neither is known.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 0; padding: 16px; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  p.note { opacity: 0.75; margin: 4px 0 16px; max-width: 62em; }
+  button { font: inherit; padding: 8px 16px; margin-right: 8px; }
+  table { border-collapse: collapse; margin-top: 14px; width: 100%; max-width: 62em; }
+  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid rgba(128,128,128,0.35); }
+  th:first-child, td:first-child { text-align: left; }
+  td.n { font-variant-numeric: tabular-nums; }
+  pre { white-space: pre-wrap; word-break: break-all; opacity: 0.85; margin-top: 14px; }
+  .bad { color: #c0392b; font-weight: bold; }
+</style>
+
+<h1>what a host call costs</h1>
+<p class="note">
+  Five arms over the same hand-assembled wasm module, differing in one thing each. The
+  number that decides the next piece of work is <b>jspi-bare minus plain-bare</b>: the
+  price of wrapping an import for suspension on a call that never suspends. Run it on the
+  phone - a desktop crossing is too cheap to rank anything.
+</p>
+<button id="go">RUN</button>
+<button id="copy">copy results</button>
+<div id="out"></div>
+<pre id="env"></pre>
+
+<script type="module">
+  // ---------------------------------------------------------------- wasm builder
+  // Little-endian LEB128, unsigned. Only used on section sizes and small indices.
+  const uleb = (n) => {
+    const out = [];
+    do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n);
+    return out;
+  };
+  const vec = (items) => [...uleb(items.length), ...items.flat()];
+  const section = (id, body) => [id, ...uleb(body.length), ...body];
+  const str = (s) => [...uleb(s.length), ...[...s].map((c) => c.charCodeAt(0))];
+
+  // (module
+  //   (import "env" "f" (func $f (param i32)))
+  //   (global $g0..$gN-1 (mut i32) i32.const 0)   ;; all exported
+  //   (func (export "run") (param $n i32)
+  //     (block (loop
+  //       local.get $n  i32.eqz  br_if 1
+  //       local.get $n  call $f
+  //       local.get $n  i32.const 1  i32.sub  local.set $n
+  //       br 0)))
+  //
+  // The loop passes the counter as the call argument so the engine cannot hoist the
+  // call out or turn the body into a constant.
+  function buildModule(nGlobals, withMemory) {
+    const TYPE = section(1, vec([[0x60, ...vec([[0x7f]]), ...vec([])]]));
+    const IMPORT = section(2, vec([[...str("env"), ...str("f"), 0x00, 0x00]]));
+    const FUNC = section(3, vec([[0x00]]));
+    const MEMORY = withMemory ? section(5, vec([[0x00, 0x01]])) : [];
+    const globals = [];
+    for (let i = 0; i < nGlobals; i++) globals.push([0x7f, 0x01, 0x41, 0x00, 0x0b]);
+    const GLOBAL = nGlobals ? section(6, vec(globals)) : [];
+    const exports = [[...str("run"), 0x00, 0x01]];
+    if (withMemory) exports.push([...str("mem"), 0x02, 0x00]);
+    for (let i = 0; i < nGlobals; i++) exports.push([...str("g" + i), 0x03, ...uleb(i)]);
+    const EXPORT = section(7, vec(exports));
+    const body = [
+      0x00,                               // no locals
+      0x02, 0x40,                         // block
+      0x03, 0x40,                         //   loop
+      0x20, 0x00, 0x45, 0x0d, 0x01,       //     local.get 0; i32.eqz; br_if 1
+      0x20, 0x00, 0x10, 0x00,             //     local.get 0; call $f
+      0x20, 0x00, 0x41, 0x01, 0x6b, 0x21, 0x00, // local.get 0; i32.const 1; i32.sub; local.set 0
+      0x0c, 0x00,                         //     br 0
+      0x0b, 0x0b, 0x0b,                   //   end; end; end
+    ];
+    const CODE = section(10, vec([[...uleb(body.length), ...body]]));
+    return new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+      ...TYPE, ...IMPORT, ...FUNC, ...MEMORY, ...GLOBAL, ...EXPORT, ...CODE,
+    ]);
+  }
+
+  // ---------------------------------------------------------------- the arms
+  // The register file the engine really marshals: 16 ARM registers plus 16 VFP argument
+  // registers (`browser_sched.rs`: FILE_LEN = REG_COUNT + VFP_ARG_COUNT).
+  const FILE_LEN = 32;
+
+  // Byte-for-byte what `save_globals` / `load_globals` do today.
+  const save = (globals, out) => { for (let i = 0; i < globals.length; i++) out[i] = globals[i].value; };
+  const load = (globals, values) => { for (let i = 0; i < globals.length; i++) globals[i].value = values[i]; };
+
+  // A sink the optimiser cannot prove dead, so an empty handler is not deleted outright.
+  let sink = 0;
+
+  const ARMS = [
+    {
+      name: "plain-bare",
+      what: "plain import, no marshalling - the floor",
+      globals: 0, jspi: false, n: 2_000_000,
+      handler: () => (v) => { sink += v; },
+    },
+    {
+      name: "jspi-bare",
+      what: "Suspending import, handler returns a VALUE (never suspends)",
+      globals: 0, jspi: true, n: 2_000_000,
+      handler: () => (v) => { sink += v; },
+    },
+    {
+      name: "jspi-suspend",
+      what: "Suspending import, handler returns a Promise (suspends every call)",
+      globals: 0, jspi: true, n: 500_000,
+      handler: () => async (v) => { sink += v; },
+    },
+    {
+      name: "plain-marshal",
+      what: "plain import + the 32-slot register file out of globals and back",
+      globals: FILE_LEN, jspi: false, n: 500_000,
+      handler: (s) => (v) => { save(s.globals, s.buf); sink += v; load(s.globals, s.buf); },
+    },
+    {
+      name: "jspi-marshal",
+      what: "both - WHAT THE ENGINE RUNS TODAY",
+      globals: FILE_LEN, jspi: true, n: 500_000,
+      handler: (s) => (v) => { save(s.globals, s.buf); sink += v; load(s.globals, s.buf); },
+    },
+    {
+      // THE PROPOSED FIX, priced directly rather than assumed: the same 32 slots, but
+      // living in the instance's LINEAR MEMORY instead of its wasm globals, so the
+      // handler reads and writes them through a typed-array view and nothing crosses
+      // the JS/wasm boundary per slot. Compare against `plain-marshal`, not against
+      // `plain-bare` - the difference between those two is what the move would buy.
+      name: "plain-linmem",
+      what: "plain import + the same 32 slots through a linear-memory view",
+      globals: 0, memory: true, jspi: false, n: 500_000,
+      handler: (s) => (v) => {
+        const w = s.view;
+        for (let i = 0; i < FILE_LEN; i++) sink += w[i];
+        sink += v;
+        for (let i = 0; i < FILE_LEN; i++) w[i] = i;
+      },
+    },
+  ];
+
+  async function runArm(arm) {
+    const mod = await WebAssembly.compile(buildModule(arm.globals, !!arm.memory));
+    // The handler needs the instance's own globals and memory, and the instance needs the
+    // handler - so the handler closes over a state object that is filled in immediately
+    // after instantiation, rather than over a first throwaway instance. Every arm that
+    // touches state pays the same one property load for it, so the differences hold.
+    const state = { globals: [], buf: new Float64Array(FILE_LEN), view: null };
+    const fn = arm.handler(state);
+    const imported = arm.jspi ? new WebAssembly.Suspending(fn) : fn;
+    const inst = await WebAssembly.instantiate(mod, { env: { f: imported } });
+    for (let i = 0; i < arm.globals; i++) state.globals.push(inst.exports["g" + i]);
+    if (arm.memory) state.view = new Int32Array(inst.exports.mem.buffer, 0, FILE_LEN);
+    const run = arm.jspi ? WebAssembly.promising(inst.exports.run) : inst.exports.run;
+
+    // Warm up (tier up the wasm and the handler), then take the BEST of five reps: the
+    // minimum is the reading least contaminated by GC and by whatever else the phone is
+    // doing, and this is a floor measurement, not an average-case one.
+    await run(Math.min(arm.n, 20_000));
+    let best = Infinity;
+    for (let rep = 0; rep < 5; rep++) {
+      const t0 = performance.now();
+      await run(arm.n);
+      const ms = performance.now() - t0;
+      if (ms < best) best = ms;
+    }
+    return { name: arm.name, what: arm.what, calls: arm.n, ms: best, ns: (best * 1e6) / arm.n };
+  }
+
+  // ---------------------------------------------------------------- ui
+  const $ = (id) => document.getElementById(id);
+  let lastText = "";
+
+  $("env").textContent =
+    `ua: ${navigator.userAgent}\n` +
+    `dpr: ${window.devicePixelRatio}  cores: ${navigator.hardwareConcurrency}  ` +
+    `jspi: promising=${typeof WebAssembly.promising} suspending=${typeof WebAssembly.Suspending}`;
+
+  $("go").addEventListener("click", async () => {
+    $("go").disabled = true;
+    $("out").textContent = "running...";
+    if (typeof WebAssembly.promising !== "function" || typeof WebAssembly.Suspending !== "function") {
+      $("out").innerHTML =
+        `<p class="bad">This browser has no JSPI, so the arms that matter cannot run here.
+         That is the same requirement the engine itself has.</p>`;
+      $("go").disabled = false;
+      return;
+    }
+    const results = [];
+    for (const arm of ARMS) {
+      try {
+        results.push(await runArm(arm));
+      } catch (e) {
+        results.push({ name: arm.name, what: arm.what, error: String(e) });
+      }
+      // Yield to the event loop so the page can repaint between arms - on a phone the
+      // whole set is several seconds and a frozen page reads as a hang.
+      $("out").textContent = `running... (${results.length}/${ARMS.length})`;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    const by = Object.fromEntries(results.map((r) => [r.name, r]));
+    const delta = (a, b) =>
+      by[a] && by[b] && by[a].ns != null && by[b].ns != null
+        ? (by[a].ns - by[b].ns).toFixed(1) + " ns"
+        : "-";
+
+    let html = "<table><tr><th>arm</th><th>ns/call</th><th>calls</th><th>ms</th><th>what</th></tr>";
+    for (const r of results) {
+      html += `<tr><td>${r.name}</td><td class="n">${r.error ? "-" : r.ns.toFixed(1)}</td>` +
+        `<td class="n">${r.calls ? r.calls.toLocaleString() : "-"}</td>` +
+        `<td class="n">${r.error ? "-" : r.ms.toFixed(1)}</td>` +
+        `<td>${r.error ? '<span class="bad">' + r.error + "</span>" : r.what}</td></tr>`;
+    }
+    html += "</table>";
+    html +=
+      `<p class="note">Against <b>jspi-marshal</b>, which is what the engine runs today:` +
+      ` dropping the <b>Suspending wrap</b> alone is worth <b>${delta("jspi-marshal", "plain-marshal")}</b>/call,` +
+      ` dropping the <b>globals marshalling</b> alone is worth <b>${delta("jspi-marshal", "jspi-bare")}</b>/call,` +
+      ` and doing both leaves <b>${delta("jspi-marshal", "plain-bare")}</b>/call on the table.` +
+      ` A real suspend costs ${delta("jspi-suspend", "jspi-bare")} more than a Suspending call that does not suspend.` +
+      `<br /><b>plain-linmem is an UPPER BOUND on the marshalling fix, not the fix</b>: it still copies the 32 slots` +
+      ` in JS. In the real design the register file lives in memory the emulator already maps, so the handler` +
+      ` copies nothing and the endpoint is plain-bare.</p>`;
+    $("out").innerHTML = html;
+
+    lastText =
+      $("env").textContent + "\n" +
+      results.map((r) => (r.error ? `${r.name}: ERROR ${r.error}` : `${r.name}: ${r.ns.toFixed(1)} ns/call (${r.calls} calls, ${r.ms.toFixed(1)} ms)`)).join("\n") +
+      `\nsuspension tax = ${delta("jspi-bare", "plain-bare")}/call, marshalling = ${delta("plain-marshal", "plain-bare")}/call` +
+      `\nsink=${sink}`;
+    $("go").disabled = false;
+    window.__jspiCost = { results, text: lastText };
+  });
+
+  $("copy").addEventListener("click", async () => {
+    if (!lastText) return;
+    try { await navigator.clipboard.writeText(lastText); $("copy").textContent = "copied"; }
+    catch { $("copy").textContent = "copy failed - select the text"; }
+    setTimeout(() => ($("copy").textContent = "copy results"), 1500);
+  });
+</script>

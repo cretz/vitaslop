@@ -1,0 +1,339 @@
+//! The browser's `tracing` seam: the runtime's diagnostics, on the console.
+//!
+//! # Why the browser was silent
+//! Every crate below this one reports through `tracing` (`vitaslop::io`, `vitaslop::sema`,
+//! `vitaslop::thread`, ...), and the desktop binary installs a `tracing_subscriber::fmt`
+//! over stderr filtered by `RUST_LOG`. The browser installed nothing, so `tracing` dropped
+//! every event - the emulator ran completely mute in the one place a debugger, a stderr
+//! pipe and a profiler are all hardest to reach. This module is the browser half of that
+//! seam: same events, same filter syntax, written to `console.log`.
+//!
+//! The filter comes from the `VITASLOP_LOG` knob rather than `RUST_LOG`, because
+//! `wasm32-unknown-unknown` has no environment (see [`vitaslop_platform::knobs`]).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing_subscriber::fmt::MakeWriter;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+
+use vitaslop_platform::diag::{self, Channel};
+
+/// The target that files an event as STATUS rather than as a warning.
+///
+/// Emitted through `vitaslop_platform::report_status!`, which is the only thing that should
+/// ever name this string.
+pub(crate) const STATUS_TARGET: &str = diag::STATUS_TARGET;
+
+/// The WARN/ERROR lines so far, oldest first, or `None` if there were none.
+///
+/// Non-draining on purpose: the panel is rebuilt from scratch each perf window, and a warning
+/// that fired once must not vanish from it one window later.
+///
+/// The ring itself is `vitaslop_platform::diag` - the desktop shell shows the same lines in
+/// its own diagnostics view, and one ring is what keeps the two front ends honest about what
+/// a run reported.
+pub fn page_log_report() -> Option<String> {
+    diag::report(Channel::Warning)
+}
+
+/// The STATUS lines so far, for the panel's own section. Same contract as
+/// [`page_log_report`]: non-draining, oldest first, `None` when there are none.
+pub fn page_status_report() -> Option<String> {
+    diag::report(Channel::Status)
+}
+
+fn push_page_log(text: &str) {
+    diag::push(Channel::Warning, text);
+}
+
+fn push_page_status(text: &str) {
+    diag::push(Channel::Status, text);
+}
+
+/// Set once, so a second entry point calling this is a no-op.
+static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// The global function a host page/worker may expose to receive a panic report.
+///
+/// A string, not a channel: the panic hook runs on the edge of an abort and must not depend on
+/// anything it might have poisoned.
+const PANIC_SINK: &str = "__vitaslopPanic";
+
+/// Frame-name fragments that belong to the PANIC MACHINERY rather than to the code that
+/// panicked. Every one of these sits between the hook and the real fault, in a fixed order.
+///
+/// They are dropped from the FRONT of the stack only, so a legitimate later frame that happens
+/// to contain one of these strings is kept.
+const PANIC_MACHINERY: &[&str] = &[
+    "js_sys::Error::new",
+    "__wbg_new",
+    "logging::install_panic_hook",
+    "panicking::",
+    "rust_begin_unwind",
+    "panic_fmt",
+    "__rust_end_short_backtrace",
+];
+
+/// The JS stack at the panic, with the hook's own frames removed.
+///
+/// # Why the trim is not cosmetic
+/// The JS stack is what names the FRAMES; the Rust location names only the line that gave up.
+/// A panic inside shared code (a slice index, an `unwrap` on a `None` a caller produced) is
+/// attributed only by the frames above it.
+///
+/// V8 caps a stack at TEN frames by default, and getting here costs six of them - the hook, the
+/// `Error` it constructs, and the four `std` panicking frames. MEASURED before this trim: the
+/// captured stack ended one frame into real code. So the cap is raised and the machinery is
+/// dropped, which turns ten frames of overhead-plus-nothing into thirty frames of caller.
+///
+/// `stack` and `stackTraceLimit` are both V8/SpiderMonkey extensions rather than standard, so
+/// both are reached reflectively and an engine without them yields no stack rather than an error.
+fn panic_stack() -> String {
+    let error_ctor = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Error")).ok();
+    if let Some(ctor) = &error_ctor {
+        let _ = js_sys::Reflect::set(
+            ctor,
+            &JsValue::from_str("stackTraceLimit"),
+            &JsValue::from_f64(30.0),
+        );
+    }
+    let raw = js_sys::Reflect::get(
+        js_sys::Error::new("panic").as_ref(),
+        &JsValue::from_str("stack"),
+    )
+    .ok()
+    .and_then(|v| v.as_string())
+    .unwrap_or_default();
+
+    // The first line is the Error's own message ("Error: panic"), which is this hook talking to
+    // itself; the frames follow. Drop that, then drop leading machinery frames.
+    let mut lines = raw.lines();
+    if raw.starts_with("Error") {
+        lines.next();
+    }
+    let kept: Vec<&str> = lines
+        .skip_while(|l| PANIC_MACHINERY.iter().any(|m| l.contains(m)))
+        .collect();
+    kept.join("\n")
+}
+
+/// Install the panic hook that puts the panic MESSAGE where a phone can read it.
+///
+/// # Why `console_error_panic_hook` is not enough
+/// A Rust panic under `panic = "abort"` reaches the browser as
+/// `Uncaught RuntimeError: unreachable at ...vitaslop_web_bg.wasm:1:3542933`, and that offset is
+/// worthless: the wasm ships `lto = "fat"` with `codegen-units = 1`, so there is no symbol to
+/// resolve it against. The only useful text - `panicked at src/....rs:NNN: <message>` - is
+/// printed by the panic hook, and `console_error_panic_hook` prints it to the CONSOLE and
+/// nowhere else.
+///
+/// **On a phone there is no console.** The device is the only machine whose numbers are not a
+/// proxy, and it is the machine where the one line that names the fault was unreachable. A
+/// device report therefore arrived as "it crashed, here is a wasm offset", which is a defect
+/// that cannot be worked on. That is the same argument the counters and the WARN/ERROR mirror
+/// above were already moved on; the panic - the single most valuable line the emulator can ever
+/// emit - was the one thing left behind.
+///
+/// So the hook writes the panic THREE ways, and each covers a case the others do not:
+/// 1. `console.error`, for a desktop run with devtools open (what we had).
+/// 2. [`push_page_log`], so it appears in the on-page diagnostics panel and in every later
+///    `/diag` dump - which is what reaches disk on the dev server.
+/// 3. A call to `globalThis.__vitaslopPanic`, if the host defined one. The run worker wires that
+///    to `postMessage`, so the page can show the text AT ONCE rather than waiting for a perf
+///    window that a dead worker will never publish. The panel is rebuilt from reports, and after
+///    a panic there are no more reports - so (2) alone would show the panic only if something
+///    else happened to be still running.
+///
+/// The hook is deliberately total: no `unwrap`, no allocation it cannot afford to lose, and a
+/// missing sink is silence rather than a second panic inside the panic hook.
+pub fn install_panic_hook() {
+    if PANIC_HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        // `payload_as_str` covers the two payload shapes a `panic!` can produce (`&str` and
+        // `String`); anything else is a payload nobody in this workspace creates.
+        let message = info.payload_as_str().unwrap_or("<non-string panic payload>");
+        let stack = panic_stack();
+        let text = if stack.is_empty() {
+            format!("PANIC at {location}: {message}")
+        } else {
+            format!("PANIC at {location}: {message}\n{stack}")
+        };
+
+        web_sys::console::error_1(&JsValue::from_str(&text));
+        push_page_log(&text);
+
+        let global = js_sys::global();
+        if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
+            if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+                let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&text));
+            }
+        }
+    }));
+}
+
+/// Report a FATAL run outcome that is not a Rust panic, through the same three channels
+/// [`install_panic_hook`] uses.
+///
+/// # Why this exists
+/// The panic hook covers a panic and nothing else, and the failure that actually reaches a
+/// player is not a panic: a guest trap surfaces as a `RunReport::Error(..)` on the run's
+/// ordinary status line, which the page shows for a moment and the diagnostics panel then
+/// rebuilds away. MEASURED on the user's device: a guest fault ("memory access
+/// out of bounds", with a full wasm backtrace) reached the status line and **never appeared
+/// in the fatal box at all** - the whole crash report had to be copied out of the status
+/// text by hand.
+///
+/// A panic and a guest trap are the same thing to a person holding the phone: the run is
+/// over and they need to know why. So they go to the same place.
+pub fn report_fatal(text: &str) {
+    web_sys::console::error_1(&JsValue::from_str(text));
+    push_page_log(text);
+    let global = js_sys::global();
+    if let Ok(sink) = js_sys::Reflect::get(&global, &JsValue::from_str(PANIC_SINK)) {
+        if let Some(f) = sink.dyn_ref::<js_sys::Function>() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+}
+
+/// The default filter when `VITASLOP_LOG` is unset: warnings and errors only.
+///
+/// A player's browser should be quiet. Everything below `warn` here is diagnostic - the
+/// per-frame timing split, the host-call rate, the I/O and semaphore traces - and it is
+/// for a run someone is investigating, not for a run someone is playing. The test
+/// harness asks for it by name (`VITASLOP_LOG=warn,vitaslop::perf=info`), which is also
+/// how a user can turn it on when reporting a problem.
+///
+/// Note this only silences OUTPUT. Anything that indicates the emulator is not being
+/// faithful - an unimplemented NID, a renderer falling back, a software adapter - is a
+/// hard failure or a `warn`, not an `info`, so no filter can hide it.
+const DEFAULT_FILTER: &str = "warn";
+
+/// `VITASLOP_CONSOLE=1`: mirror the run's status notes - the setup summary, the adapter and
+/// surface lines, the live heartbeat and the tracing status channel - to the browser console.
+///
+/// Off by default, because the product page's console must be EMPTY on a clean run: every
+/// one of those lines is an answer to a developer's question, and they all reach the
+/// diagnostics panel regardless. The e2e harness turns it on (it reads the heartbeat for
+/// liveness), and so does anyone watching a headless run.
+pub fn console_notes_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| vitaslop_runtime::knobs::flag("VITASLOP_CONSOLE"))
+}
+
+/// A run-lifecycle note: onto the panel's STATUS section always, onto the console only
+/// under [`console_notes_on`]. Every `console.log` a normal run used to make goes through
+/// here, so the console's default content is exactly the warnings.
+pub fn note(text: &str) {
+    if console_notes_on() {
+        web_sys::console::log_1(&JsValue::from_str(text));
+    }
+    push_page_status(text);
+}
+
+/// A line-buffered writer that emits each completed line to the browser console.
+///
+/// `console.log` is per-message, not a stream, so the formatter's several small writes
+/// per event have to be joined before they are worth emitting - otherwise one event
+/// becomes half a dozen console entries broken mid-word.
+struct ConsoleWriter {
+    buf: Vec<u8>,
+    /// Also mirror this event to the page panel's WARNINGS section (WARN and ERROR only).
+    to_page: bool,
+    /// Mirror this event to the panel's STATUS section instead - see [`PAGE_STATUS`].
+    to_status: bool,
+}
+
+impl std::io::Write for ConsoleWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&self.buf);
+        let text = text.trim_end();
+        // >>> STATUS GOES TO THE PANEL, AND TO THE CONSOLE ONLY WHEN ASKED.
+        //
+        // The status channel is forced on for the panel's own STATUS section, and it used to
+        // reach the console with it - so a clean run of a working title logged every NGS
+        // rack, the mounted archive, the adapter's texture families and every new frame
+        // shape. A well-running emulator says nothing on the console; the panel (and the
+        // diag snapshot) is where those answers live. `VITASLOP_CONSOLE=1` mirrors them,
+        // which is what a headless run reads. Warnings and errors are unchanged: they are
+        // reports of something wrong, and the console is the right place for them.
+        if !self.to_status || console_notes_on() {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(text));
+        }
+        if self.to_status {
+            push_page_status(text);
+        } else if self.to_page {
+            push_page_log(text);
+        }
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl Drop for ConsoleWriter {
+    /// The fmt layer drops the writer at the end of each event rather than flushing it,
+    /// so this is where a line actually reaches the console.
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = self.flush();
+    }
+}
+
+struct MakeConsoleWriter;
+
+impl<'a> MakeWriter<'a> for MakeConsoleWriter {
+    type Writer = ConsoleWriter;
+    fn make_writer(&'a self) -> ConsoleWriter {
+        ConsoleWriter { buf: Vec::new(), to_page: false, to_status: false }
+    }
+
+    /// The per-event writer, which is where the LEVEL is knowable. `make_writer` above has no
+    /// metadata, so a mirror decided there would either copy every line to the page (the perf
+    /// windows are hundreds of lines a run) or none.
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> ConsoleWriter {
+        ConsoleWriter {
+            buf: Vec::new(),
+            to_page: *meta.level() <= tracing::Level::WARN,
+            to_status: meta.target() == STATUS_TARGET,
+        }
+    }
+}
+
+/// Install the console subscriber. Idempotent - a second call is a no-op, so the
+/// main-thread and worker entries can both call it without ordering rules.
+///
+/// Call AFTER the page's knobs are applied, so `VITASLOP_LOG` is visible.
+pub fn init() {
+    let filter = vitaslop_runtime::knobs::var("VITASLOP_LOG")
+        .unwrap_or_else(|_| DEFAULT_FILTER.to_string());
+    // STATUS IS FORCED ON, whatever `VITASLOP_LOG` says. It rides at `info` so it never
+    // pretends to be a warning, but a status channel the default filter switches off is a
+    // channel that does not exist - which is exactly the trade that put this material at
+    // `warn` in the first place. A directive appended last wins in `EnvFilter`, so a user
+    // cannot accidentally lose the panel's status section by narrowing the knob.
+    let filter = format!("{filter},{STATUS_TARGET}=info");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+        .with_writer(MakeConsoleWriter)
+        // No ANSI (the console shows the escapes literally) and no timestamp
+        // (`SystemTime` is not available on `wasm32-unknown-unknown`; the console
+        // stamps every line itself anyway).
+        .with_ansi(false)
+        .without_time()
+        .try_init();
+}

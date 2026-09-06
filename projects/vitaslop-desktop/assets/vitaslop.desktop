@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=vitaslop
+Comment=A clean-room PlayStation Vita emulator
+Exec=vitaslop
+Icon=vitaslop
+Terminal=false
+Categories=Game;Emulator;

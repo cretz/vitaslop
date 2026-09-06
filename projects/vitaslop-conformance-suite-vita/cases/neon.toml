@@ -1,0 +1,20 @@
+category = "vita"
+description = "NEON auto-vectorization: widen/wide-add/pairwise/abs-diff reductions - RUNNABLE"
+
+# Source: ../neon-src/neon.c (clean-room, -nostdlib). Built WITH the tree
+# vectorizer (unlike the other probes, which pin -fno-tree-vectorize to stay off
+# the NEON path) - hitting NEON data-processing is the whole point. gcc -O2
+# auto-vectorizes the array reductions into vmovl / vaddw / vadd.i / vpadd / vabdl
+# / vabal / vpadal, which the transpiler lifts to wasm 128-bit SIMD (the upper VFP
+# bank Q8..Q15 is stored as v128 globals so these map with no gather/scatter). Each
+# array is >= 16 elements so the vector body actually runs; the printed sums prove
+# the lift is numerically correct. The decode side is certified against capstone
+# over the whole A32/Thumb NEON data-processing space. Executable form:
+# tests/vita_neon.rs.
+[out]
+output = """
+bsum=528
+ssum=-16
+isum=272
+sad=850
+"""

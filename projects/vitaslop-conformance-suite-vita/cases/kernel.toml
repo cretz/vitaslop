@@ -1,0 +1,21 @@
+category = "vita"
+description = "SceLibKernel/SceThreadmgr sync + timing primitives - RUNNABLE"
+
+# Source: ../kernel-src/kernel.c (clean-room, -nostdlib). Rounds out the kernel-
+# basics NID surface after print/mem/thread: mutex (create/lock/unlock/delete),
+# semaphore (create/wait/signal/delete), event flag (create/set/wait/read/clear/
+# delete), and the wide system clock. Each result is printed and checked.
+#
+# Bring-up model: one thread of control, so lock/wait never block (always succeed)
+# - correct for single-thread use; the event-flag set-then-read path is fully
+# observable. Executable form: tests/vita_kernel.rs.
+#
+# En route this case forced the transpiler to lift adc/sbc (the compiler's 64-bit
+# `t2 >= t1` compare), now certified against qemu (arm suite thumb_adc/thumb_sbc).
+[out]
+output = """
+mutex: id_ok=1 lock=0 unlock=0
+sema: id_ok=1 wait=0 signal=0
+eventflag: id_ok=1 pattern=0x5
+time: monotonic=1
+"""

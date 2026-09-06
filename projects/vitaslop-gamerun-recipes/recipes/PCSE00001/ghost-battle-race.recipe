@@ -1,0 +1,263 @@
+@title Ghost Battle - reach a live race on Highland Cliffs and drive it
+@game  PCSE00001
+@shot-every 200
+
+# ============================================================================
+# WHY THIS PATH AND NOT TIME ATTACK
+# `time-attack-lap.recipe` cannot reach its race on the current engine: selecting
+# LAP TIME ATTACK faults at frame 9459 in the resource-group collector (the group
+# is loaded and swept in the same frame). WORLD RACE -> GHOST BATTLE loads its
+# course through the same streaming path and does NOT fault, so this is the
+# route to a live race today.
+#
+# It is also a better race to have: GHOST BATTLE runs POSITION 2/2 against the
+# built-in Default Ghost, so the HUD carries a real opponent and a lap timer.
+# Nothing here needs a network - the Default Ghost ships with the title.
+#
+# EVERY COORDINATE BELOW WAS TAKEN FROM A SCREENSHOT OF THE SCREEN IT ACTS ON,
+# in a resident session, not guessed. Panel coordinates are screen*2.
+# ============================================================================
+
+0: @section boot
+
+# --- the mandatory first-run wizard, identical to play.recipe ---------------
+# PLAY on the title screen (screen 480,420 -> panel 960,840)
+1500: touch=960,840
+1520:
+1560: touch=960,840
+1580:
+
+# PLANETARY LEAGUE -> SIGN ON. Despite the name this is NOT a PSN sign-in.
+1700: touch=960,874
+1720:
+1780: touch=960,874
+1800:
+
+# TEAMS: "Touch the ticket to sign the contract" - ticket centre screen (200,270).
+2000: touch=400,540
+2020:
+2100: touch=400,540
+2120:
+
+# TEAM CONFIRMATION: "touch and HOLD the team icon". A tap does nothing.
+2400: touch=960,556
+2600:
+
+# The ID card advances on the RIGHT-EDGE ARROW, not on the cyan OK box.
+2700: touch=1870,516
+2740:
+2820: touch=1870,516
+2860:
+
+# SIGNING COMPLETE -> NEXT.
+3200: touch=960,874
+3240:
+
+# LOCATION INFO and the rest of the setup walk on the right-edge arrow.
+3500: touch=1870,540
+3540:
+3700: touch=1870,540
+3740:
+# "Now creating your ID Card..." needs a CHOICE: take FIND LOCATION ON MAP,
+# which is the offline path (the tracker wants a real position fix).
+3900: touch=960,878
+3940:
+4000: touch=960,878
+4040:
+
+# Place the marker on the world map and confirm with the right-edge arrow.
+4200: touch=960,540
+4240:
+4400: touch=1870,540
+4440:
+4600: touch=1870,540
+4640:
+4800: touch=960,874
+4840:
+5000: touch=960,874
+5040:
+
+# COUNTRY/REGION list, "Other" -> the single entry "RID / Ridge State".
+5200: touch=960,314
+5240:
+5350: touch=960,314
+5390:
+
+# Confirm out of the region list and on through whatever the wizard has left.
+5550: touch=1870,540
+5590:
+5750: touch=960,874
+5790:
+5950: touch=1870,540
+5990:
+6150: touch=960,874
+6190:
+
+# SETTINGS COMPLETE - READY is the big arrow panel at screen (826,276).
+6400: touch=1652,552
+6440:
+6600: touch=1652,552
+6640:
+
+# Team trophy + RCTV ticker; the right-edge arrow dismisses it to the MAIN MENU.
+7000: touch=1870,540
+7040:
+7300: touch=1870,540
+7340:
+
+# --- from the main menu to a live race --------------------------------------
+7500: @section world-race
+
+# MAIN MENU: GARAGE | WORLD RACE | SPOT | TIME. Take WORLD RACE, the card
+# centred at screen (727,270).
+7500: touch=1454,540
+7520:
+
+# RACE SELECTION: Ghost Battle | Online Battle | Face-to-Face Battle. Only
+# GHOST BATTLE (screen 240,270) is offline.
+7640: touch=480,540
+7660:
+
+# GHOST: one entry, "Default Ghost" (screen 572,272). It ships with the title,
+# so the list is never empty and needs no download.
+7780: touch=1144,544
+7800:
+
+# MACHINE: BISARGENTO is the only car owned at LV1. The right-edge arrow
+# confirms it.
+7920: touch=1870,540
+7940:
+
+# CONFIRM: Highland Cliffs / BISARGENTO / Default Ghost, and READY at screen
+# (838,275). This is the touch that streams the course in.
+8060: touch=1676,550
+8080:
+
+# LOADING runs to about f8600; the race is live and accepting input by f8800.
+8800: @section race
+
+# ============================================================================
+# THE DRIVING LINE BELOW IS RECORDED, NOT AUTHORED.
+# It is the response of a closed-loop controller (`drive_ghost.py`) that read the
+# car's position and facing from `camera` every four frames and aimed at the far
+# end of the ROAD MATERIAL ahead, reported by `surface --tex 0x8c62b500`. Every
+# lx value here is an input the car actually received at that frame.
+#
+# THREE THINGS THAT COST A RUN EACH, ALL MEASURED, ALL WORTH KNOWING BEFORE
+# TOUCHING THIS:
+#  1. lx ABOVE 128 steers towards +X, which DECREASES the bearing that `camera`
+#     and `surface` report (both are math angles in the x/-z plane). Getting the
+#     sign backwards drives off the outside of the first corner in nine ticks.
+#  2. THE STICK IS DEADZONED AND THE DEADZONE IS MOST OF THE RANGE. Degrees of
+#     yaw per 10 frames against deflection from neutral, measured on the start
+#     straight: 12 -> 0.0, 27 -> 0.75, 42 -> 10.6, 75 -> ~28. A "gentle
+#     correction" of 12 units is not gentle, it is nothing, and a car steered
+#     with it holds a dead-straight line into the scenery. That is why almost
+#     every value below is either 128 or past 160 / under 90.
+#  3. A CARRIED LAP DIRECTION IS NOT OPTIONAL. Road reaches BOTH ways from the
+#     car, so a fan aimed at a car that has spun finds the road it came in on and
+#     drives a confident lap the WRONG WAY. The controller aims its fan along a
+#     course that may only turn 20 degrees per tick, so no single reading can
+#     reverse it.
+#
+# WHERE THIS LINE ENDS, AND WHY. The car drives the start straight, the first
+# right-hander and the long sweep out to x~685 - about 420 frames of real racing
+# with the ghost's HUD live - and then wedges against the barrier on the tight
+# left at (685,-228). `square` is NOT a reverse gear (40 frames of it moved a
+# pinned car 0.0 units), so the controller cannot back out of that one, and the
+# input is released rather than left thrashing. Completing the lap needs a
+# recorded racing line for this circuit, which is the next piece of work.
+# ============================================================================
+
+8800: @section drive
+8800: cross lx=177
+8804: cross lx=176
+8808: cross lx=128
+8812: cross lx=85
+8816: lx=128
+8820: cross lx=128
+8828: cross lx=164
+8832: cross lx=128
+8836: lx=128
+8840: cross lx=128
+8852: lx=128
+8856: cross lx=128
+8868: cross lx=166
+8872: lx=128
+8876: cross lx=128
+8884: cross lx=164
+8888: lx=128
+8892: cross lx=128
+8900: cross lx=169
+8904: lx=165
+8908: lx=128
+8912: cross lx=128
+8924: cross lx=171
+8928: cross lx=169
+8932: square lx=167
+8936: lx=128
+8940: cross lx=128
+8948: cross lx=165
+8952: square lx=165
+8956: square lx=85
+8960: cross lx=76
+8964: cross lx=79
+8968: cross lx=128
+8972: lx=175
+8976: lx=128
+8980: cross lx=87
+8984: cross lx=128
+8988: cross lx=164
+8992: lx=128
+8996: lx=87
+9000: cross lx=128
+9004: cross lx=165
+9008: cross lx=91
+9012: cross lx=87
+9016: lx=128
+9020: lx=169
+9024: cross lx=128
+9028: cross lx=90
+9032: cross lx=128
+9036: square lx=195
+9040: cross lx=79
+9044: cross lx=68
+9048: cross lx=128
+9052: lx=170
+9056: lx=92
+9060: cross lx=83
+9064: cross lx=128
+9068: cross lx=172
+9072: lx=128
+9076: cross lx=87
+9080: cross lx=128
+9088: lx=128
+9096: cross lx=128
+9108: cross lx=90
+9112: lx=128
+9116: square lx=201
+9120: square lx=69
+9124: cross lx=53
+9128: cross lx=87
+9132: square lx=203
+9136: cross lx=203
+9144: square lx=75
+9148: cross lx=72
+9152: cross lx=128
+9156: cross lx=187
+9160: square lx=87
+9164: lx=165
+9168: cross lx=179
+9172: cross lx=81
+9176: cross lx=128
+9180: square lx=203
+9188: cross lx=79
+9192: cross lx=75
+9196: cross lx=128
+9200: cross lx=203
+9212: cross lx=53
+9224: cross lx=203
+9236: cross lx=53
+
+# Wedged on the barrier at the tight left. Let go rather than grind against it.
+9244:

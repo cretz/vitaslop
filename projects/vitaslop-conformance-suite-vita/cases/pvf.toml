@@ -1,0 +1,27 @@
+category = "vita"
+description = "ScePvf vector-font engine over a real font file - RUNNABLE"
+
+# Source: ../pvf-src/pvf.c (clean-room, -nostdlib). Drives the ScePvf host module
+# end to end: scePvfNewLib/SetResolution/SetEM, scePvfOpenUserFile on a preloaded
+# font (app0:/ahem.ttf - the first case to read a real data file the way a title
+# does), SetCharSize, IsElement, GetCharInfo/GetFontInfo (metrics), and
+# GetCharGlyphImage (rasterize a glyph into a caller buffer), then DoneLib.
+#
+# Font: Ahem (public domain / CC0), chosen for predictable geometry - every glyph
+# advances exactly 1 em and 'X' is a solid box. At a 16 px em that fixes the
+# principled values exactly: horizontalAdvance64 = 16*64 = 1024, 'X' present and a
+# C0 control (BEL) absent, and the glyph is a solid 16x16 coverage block (filled =
+# 256, center = 255). Bitmap dims and counts are the pure-Rust (skrifa + zeno)
+# backend's output, pinned as a regression guard. Executable form:
+# tests/vita_pvf.rs (the harness preloads the font before the run).
+[out]
+output = """
+lib_ok=1 err=0
+font_ok=1 err=0
+setsize_ret=0
+isX=1 isBEL=0
+charinfo ret=0 w=16 h=16 adv64=1024 left=0 top=13
+fontinfo ret=0 numchars=278 maxadv64=1024
+glyph ret=0 filled=256 near=256 center=255
+donelib=0
+"""

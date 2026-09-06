@@ -1,0 +1,76 @@
+[package]
+name = "vitaslop-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Browser-only crate: everything is gated to wasm32 (see the crate-level cfg in
+# lib.rs), so the deps live under the wasm32 target. A native `cargo build
+# --workspace` then sees an empty crate with no deps to build, while
+# `cargo build --target wasm32-unknown-unknown -p vitaslop-web` pulls the stack.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vitaslop-runtime = { path = "../vitaslop-runtime" }
+vitaslop-frontend = { path = "../vitaslop-frontend" }
+vitaslop-platform = { path = "../vitaslop-platform", features = ["gpu", "video", "aac"] }
+# Direct, for `run_h264_conformance` only: the decoder crate's own suite has to run in a
+# BROWSER, which is the one place `cargo test` cannot reach and the one place its WebCodecs
+# backend exists. `synth` is what makes that suite assetless.
+vitaslop-h264 = { path = "../vitaslop-h264", default-features = false, features = ["synth"] }
+vitaslop-loader = { path = "../vitaslop-loader" }
+vitaslop-transpiler = { path = "../vitaslop-transpiler" }
+# The engine-agnostic conformance runner + the embedded ARM corpus, so the browser
+# runs the exact same suite as the native test through WebVm (proves engine parity).
+vitaslop-conformance-harness = { path = "../vitaslop-conformance-harness" }
+vitaslop-conformance-suite-arm = { path = "../vitaslop-conformance-suite-arm" }
+# Pinned to match the installed `wasm-bindgen` CLI: the CLI and crate must be the
+# exact same version (the CLI reads a schema the macro embeds). Bump both together
+# (cargo install -f wasm-bindgen-cli, then set this to its --version).
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# No `console_error_panic_hook`: it prints the panic to the console and nowhere else, and the
+# machine whose panics matter (the phone) has no console. `logging::install_panic_hook` does the
+# same job and additionally puts the text in the on-page diagnostics panel and through the
+# worker's `__vitaslopPanic` sink to the page.
+# The runtime emits its diagnostics as `tracing` events. On native a subscriber turns
+# them into stderr lines under RUST_LOG; without one here the browser DROPS every one of
+# them, so the same emulator is silent in the one place it is hardest to observe. These
+# two give the browser the same seam, writing to the console and filtered by
+# VITASLOP_LOG (the browser has no environment, so RUST_LOG cannot be the source).
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# Serialize the conformance summary the browser returns to the page/Playwright.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same wgpu as native, WebGPU backend on the canvas. The shared cube pipeline in
+# vitaslop-platform is fed the surface's format.
+wgpu = { workspace = true, features = ["webgpu"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window", "Performance", "HtmlCanvasElement", "console",
+    "CanvasRenderingContext2d", "ImageData", "Document", "Element",
+    # Live input: pointer/keyboard events on the canvas + document, mapped to the
+    # touch panel and SceCtrl through the browser World.
+    "EventTarget", "PointerEvent", "KeyboardEvent", "DomRect",
+    # The worker production path presents to a transferred OffscreenCanvas.
+    "OffscreenCanvas",
+    # SceLibLocation: the browser's own positioning provider. `Geolocation` is a
+    # Window-only API, so the worker engine relays through the page - which is what
+    # `DedicatedWorkerGlobalScope` is for here (detecting which side we are on, and
+    # posting the request across). See `src/location.rs`.
+    "Navigator", "Geolocation", "Position", "Coordinates", "PositionError",
+    "DedicatedWorkerGlobalScope",
+    # The live loop's per-tick yield in a WORKER. `setTimeout(0)` is clamped to 4 ms once
+    # nested, and this loop is an unbroken chain of nested timeouts - see `next_tick`.
+    "MessageChannel", "MessagePort",
+]
+
+[lints]
+workspace = true

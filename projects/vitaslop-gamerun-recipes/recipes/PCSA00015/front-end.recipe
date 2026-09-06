@@ -1,0 +1,70 @@
+@title PCSA00015 front end - title screen and GAME MODE
+@game  PCSA00015
+# (no cadence shots - judge this title through `vitaslop-desktop --headless`)
+
+# ============================================================================
+# WHAT THIS RECIPE DOES
+# Boots the title and drives its TOUCH front end:
+#
+#   loading -> attract demo -> PRESS ANY BUTTON TO START -> GAME MODE (4 tiles)
+#
+# >>> RETIMED 2026-08-17d. THE OLD FRAME NUMBERS WERE FIVE TIMES TOO LATE.
+# The committed version pressed its first button at f28000, which was right when
+# it was authored and is not right now: on the derived guest clock the loading
+# screen finishes about f5040 and the attract demo is running by f5100, so every
+# cue fired long after the screen it was aimed at and the run never left the
+# attract loop. Do not scale these numbers by hand if the clock moves again -
+# re-measure with `VITASLOP_HEADLESS_SHOT_EVERY` and look at the shots.
+#
+# HOW THESE FRAMES WERE MEASURED (repeat this, do not guess):
+#   VITASLOP_GXP_LIVE=1 VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1 \
+#   VITASLOP_HEADLESS_FRAMES=9200 VITASLOP_HEADLESS_SHOT_EVERY=200 \
+#   VITASLOP_HEADLESS_SHOT_FROM=5200 VITASLOP_LOG=error \
+#   vitaslop-desktop --game <wipeout>/extracted --recipe <this> --headless <dir>
+# `VITASLOP_GXP_ALLOW_FIXED_FUNCTION=1` is for FINDING FRAMES ONLY - one draw on
+# the loading path still blocks on USSE group 0x1d, and without it a periodic
+# shot that lands on that frame kills the run. Take the judged shot WITHOUT it.
+#
+# >>> THE SCREEN THIS RECIPE EXISTS FOR IS THE TITLE SCREEN AT ~f5600.
+# White frame, the hex lattice, the logo, PRESS ANY BUTTON TO START and the
+# copyright line. That lattice is the over-embossed one the user has reported:
+# see `working-area/agent-notes.md` for what is measured about it.
+#
+# TOUCH COORDINATES are in PANEL coordinates, which are screen*2.
+# ============================================================================
+
+0: @section boot
+# No input while it loads. Loading reaches 99% by about f5035 and the attract
+# demo takes over immediately after.
+
+5150: cross
+5170:
+# Any button during the attract demo brings up the title screen: WIPEOUT 2048
+# over the hex lattice, PRESS ANY BUTTON TO START. It is up from about f5200.
+
+5450: cross
+5470:
+# >>> THE TITLE SCREEN WANTS A BUTTON, NOT A TOUCH, AND THAT IS WHAT THE OLD
+# RECIPE GOT WRONG. It had `touch=472,524` here - the SINGLE PLAYER CAMPAIGN
+# tile's coordinates, aimed at a GAME MODE screen that was not up yet - so the
+# tap fell on PRESS ANY BUTTON TO START, which ignores it, and the run sat on
+# the title screen for the rest of its length. The screen is measurably still
+# there at f6400 under the old cue and gone by f5700 under this one.
+# GAME MODE (four tiles) is up by about f5750.
+
+5750: touch=472,524
+5790:
+# The SINGLE PLAYER CAMPAIGN tile (screen 236,262). The two greyed tiles are
+# ONLINE CAMPAIGN and CROSS-PLAY - this build is signed out, so they are
+# correctly unavailable. The campaign INTRO ("It's the year 2048...") is up by
+# about f6000 and waits on its confirm button.
+
+6200: touch=1764,960
+6240:
+# The confirm tick, bottom right (screen 882,480). Past it is the CAMPAIGN MAP:
+# the A.G.R.C 2048 hex chain, with the first event node captioned TOUCH TO START
+# and every later node still locked. It is up by about f6700.
+
+7000: touch=1016,570
+7040:
+# That first node (screen 508,285).

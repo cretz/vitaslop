@@ -1,0 +1,703 @@
+//! The transpiler's intermediate representation: a per-function control-flow
+//! graph of basic blocks, each a list of side-effect statements over a small
+//! value-expression tree. Decode/lowering ([`crate::lower`]) produces it; wasm
+//! emission ([`crate::emit`]) consumes it. Keeping a real IR here (rather than a
+//! 1:1 decode-to-wasm emitter) is what lets optimizations - const folding, lazy
+//! flags, better register allocation, a relooper - grow later without touching
+//! the front or back end.
+
+pub use crate::flags::FlagMask;
+pub use yaxpeax_arm::armv7::ConditionCode;
+
+/// Width of a memory access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemSize {
+    Byte,
+    Half,
+    Word,
+}
+
+/// A pure, side-effect-free value expression. Emitted post-order onto the wasm
+/// stack. Loads are here (not statements) because ARM addressing folds a load
+/// into an operand; stores, which have an effect, are statements.
+#[derive(Clone, Debug)]
+pub enum Value {
+    /// A 32-bit constant.
+    Imm(u32),
+    /// The current value of guest register `r` (r0..r15).
+    Reg(u8),
+    /// A memory load of `size` at `addr`, zero- or sign-extended to 32 bits.
+    Load {
+        addr: Box<Value>,
+        size: MemSize,
+        signed: bool,
+    },
+    /// Bitwise NOT.
+    Not(Box<Value>),
+    /// A binary operation.
+    Bin(BinOp, Box<Value>, Box<Value>),
+    /// The current value (0 or 1) of a condition flag. Used as the runtime
+    /// carry-in of `adc`/`sbc` (and their flag computation).
+    Flag(crate::abi::Flag),
+    /// The `a + b + carry_in` sum the immediately preceding [`Stmt::FlagsAdd`] just
+    /// computed (held in a scratch local). `adc`/`sbc` that set flags use this for
+    /// their result register instead of recomputing `... + Flag(C)`, because
+    /// `FlagsAdd` has already overwritten the C flag with the carry-*out* - reading
+    /// `Flag(C)` again would fold in the wrong carry. Valid only right after a
+    /// `FlagsAdd`.
+    CarryAddResult,
+    /// Count leading zeros of the inner value (ARM `clz`, wasm `i32.clz`).
+    Clz(Box<Value>),
+    /// The per-thread pointer (ARM `TPIDRURO`, read by `MRC p15,0,Rt,c13,c0,3`): the
+    /// base of this thread's thread-local-storage block. Reads the per-instance `tp`
+    /// global (see [`crate::abi::TP_GLOBAL`]).
+    ThreadPtr,
+}
+
+/// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
+/// forms; ARM shift-amount masking is applied during lowering when needed.
+#[derive(Debug, Clone, Copy)]
+pub enum BinOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Lsr,
+    Asr,
+    /// Rotate right (ARM `ror`): the amount is taken modulo 32, matching both
+    /// wasm `i32.rotr` and ARM's register-rotate masking.
+    Ror,
+    Mul,
+}
+
+/// A VFP register reference: single-precision `S` (32-bit) or double `D` (64-bit).
+/// `Q`/lane forms are not modeled yet (the cube uses only S arithmetic and whole-D
+/// memory moves).
+#[derive(Debug, Clone, Copy)]
+pub enum VfpReg {
+    S(u8),
+    D(u8),
+}
+
+/// A NEON vector register operand: a 128-bit quad `Q` (0..15) or a 64-bit double
+/// `D` (0..31). NEON data-processing operates on these; [`crate::emit`] maps each
+/// onto a wasm `v128` (a `D` uses the low 64 bits, high 64 discarded on store).
+#[derive(Debug, Clone, Copy)]
+pub enum NeonReg {
+    Q(u8),
+    D(u8),
+}
+
+/// Element data type for a NEON operation: element size in bits (8/16/32/64) plus
+/// how to interpret it. `signed` matters for the widening / min-max / abs-diff /
+/// pairwise-long ops; `float` selects the f32 element (only `vabs`/`vneg`).
+#[derive(Debug, Clone, Copy)]
+pub struct NeonType {
+    pub bits: u8,
+    pub signed: bool,
+    pub float: bool,
+}
+
+/// The same-length elementwise NEON binary operations ([`NeonStmt::Bin`]).
+#[derive(Debug, Clone, Copy)]
+pub enum NeonBin {
+    Add,
+    Sub,
+    /// `vqadd`/`vqsub`: add/subtract with SATURATION into the element's range instead of
+    /// wrapping. A mixer that wraps turns its loudest peak into a sample of the opposite
+    /// sign, which is a click, so these are never folded into `Add`/`Sub`.
+    QAdd,
+    QSub,
+    /// `vhadd`/`vhsub`: `(a +- b) >> 1`, and `vrhadd`: `(a + b + 1) >> 1`. The halving
+    /// happens in a WIDER intermediate, so the sum cannot overflow the element - which is
+    /// exactly why a title averages this way instead of adding and shifting itself.
+    HAdd,
+    HSub,
+    RHAdd,
+    Mul,
+    Max,
+    Min,
+    /// Absolute difference `|a - b|` (unsigned magnitude), `vabd`.
+    Abd,
+}
+
+/// A NEON data-processing operation lowered to the IR. Every operand is a vector
+/// register (except the `vmov` immediate). [`crate::emit::emit_neon`] turns each
+/// into wasm 128-bit SIMD - see there for the exact instruction sequences and why
+/// each maps cleanly (extend/extmul/extadd-pairwise cover the widening family).
+#[derive(Debug)]
+pub enum NeonStmt {
+    /// Same-length elementwise: `dst = a <op> b`.
+    Bin { op: NeonBin, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Same-length multiply-accumulate: `dst = dst -/+ (a * b)` (`vmls`/`vmla`).
+    MulAcc { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg, sub: bool },
+    /// Multiply[-accumulate] by a broadcast scalar lane: `dst = [dst -/+] a * broadcast(D[src].lane)`
+    /// (`vmul`/`vmla`/`vmls` by scalar). `acc` enables the accumulate; `sub` picks its sign. `ty`
+    /// gives the element size (16 or 32) and float-ness, which also drives how the lane is extracted.
+    MulScalar { ty: NeonType, dst: NeonReg, a: NeonReg, src: u8, lane: u8, acc: bool, sub: bool },
+    /// Reciprocal (`sqrt = false`) or reciprocal-square-root (`sqrt = true`) of each f32 lane
+    /// (`vrecpe`/`vrsqrte`). Computed to full f32 precision (`1/x` / `1/sqrt(x)`) rather than
+    /// NEON's ~8-bit table seed: the Newton-Raphson steps that accompany it converge to this same
+    /// value, and code consuming the estimate directly only gains accuracy. Deterministic across
+    /// our backends (the conformance requirement); not bit-identical to Cortex-A9 hardware.
+    RecipEstimate { sqrt: bool, dst: NeonReg, src: NeonReg },
+    /// Newton-Raphson refinement step, f32 (`vrecps`/`vrsqrts`): `2 - a*b` (`sqrt = false`) or
+    /// `(3 - a*b) / 2` (`sqrt = true`). Non-fused, matching the two-rounding NEON definition.
+    RecipStep { sqrt: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Two-register permute (`vtrn`/`vzip`/`vuzp`): rearranges the `esize`-bit elements between the
+    /// two registers, writing BOTH. The register form (`D` vs `Q`) comes from `a`/`b`. See emit for
+    /// the shuffle masks.
+    Permute { op: PermuteOp, esize: u8, a: NeonReg, b: NeonReg },
+    /// Pairwise add of adjacent elements of `a` then `b` into `dst` (`vpadd`).
+    PairAdd { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Widening move: `dst(Q) = widen(a(D))` (`vmovl`). `ty` is the source element.
+    Widen { ty: NeonType, dst: NeonReg, a: NeonReg },
+    /// Widening add/sub: `dst(Q) = a -/+ widen(b(D))`. `wide` picks the wide form
+    /// (`a` is a `Q` of already-wide elements, `vaddw`/`vsubw`) over the long form
+    /// (`a` is a `D`, widened too, `vaddl`/`vsubl`). `ty` is the narrow element.
+    WideAddSub { sub: bool, wide: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Widening multiply[-accumulate]: `dst(Q) = [dst -/+] widen(a(D)) * widen(b(D))`
+    /// (`vmull`/`vmlal`/`vmlsl`). `acc` enables the accumulate, `sub` its sign.
+    WideMul { acc: bool, sub: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Widening absolute difference[-accumulate]: `dst(Q) = [dst +] |widen(a) - widen(b)|`
+    /// (`vabdl`/`vabal`). `acc` enables the accumulate. `ty` is the narrow element.
+    WideAbd { acc: bool, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Pairwise-add-long[-accumulate]: `dst = [dst +] pairwise_widen_add(a)`
+    /// (`vpaddl`/`vpadal`). `acc` enables the accumulate. `ty` is the narrow element.
+    PairLong { acc: bool, ty: NeonType, dst: NeonReg, a: NeonReg },
+    /// Elementwise unary: `dst = |a|` or `dst = -a` (`vabs`/`vneg`), integer or f32.
+    Unary { neg: bool, ty: NeonType, dst: NeonReg, a: NeonReg },
+    /// Immediate broadcast: set every `ty.bits`-bit element of `dst` to `imm`
+    /// (`vmov.iN`). `imm` is the per-element value.
+    MovImm { ty: NeonType, dst: NeonReg, imm: u32 },
+    /// Duplicate the low `ty.bits` bits of core register `rt` into every element
+    /// of `dst` (`vdup.N Qd/Dd, Rt`).
+    DupCore { ty: NeonType, dst: NeonReg, rt: u8 },
+    /// Broadcast one `esize`-bit lane of source D register `src` (element `lane`)
+    /// into every element of `dst` (`vdup.<size> Qd/Dd, Dm[lane]`, the scalar form).
+    DupLane { esize: u8, dst: NeonReg, src: u8, lane: u8 },
+    /// Move one `bits`-wide lane (`bits` = 8/16/32) between D register `dreg`
+    /// (element `lane`) and core register `rt` (`vmov Rt, Dn[x]` / `vmov Dn[x], Rt`).
+    /// `to_core` picks the direction: lane->core reads the lane and, for the 8/16-bit
+    /// forms, sign-extends it to 32 bits when `signed` (else zero-extends; 32-bit
+    /// lanes ignore `signed`); core->lane writes the low `bits` bits of `rt` into the
+    /// lane, leaving the rest of `dreg` intact.
+    MovLane { to_core: bool, bits: u8, signed: bool, dreg: u8, lane: u8, rt: u8 },
+    /// 64-bit-per-lane immediate broadcast: every D lane of `dst` receives `val`
+    /// (`vmov.i64`, whose per-byte 0x00/0xff pattern no narrower broadcast matches).
+    MovImm64 { dst: NeonReg, val: u64 },
+    /// Immediate shift-by-N (`vshr`/`vsra`/`vshl`/`vsli`/`vsri`). Every `ty.bits`-bit
+    /// lane of `src` is shifted by `amount`; `op` picks the direction, whether the
+    /// result accumulates into or inserts through `dst`, and (via `ty.signed`) an
+    /// arithmetic vs logical right shift.
+    ShiftImm { op: NeonShift, ty: NeonType, dst: NeonReg, src: NeonReg, amount: u8 },
+    /// Vector extract (`vext`): `dst` is the `byte_off`-byte window into the byte
+    /// concatenation `a : b` (a's bytes low), taking the destination's byte width.
+    Ext { dst: NeonReg, a: NeonReg, b: NeonReg, byte_off: u8 },
+    /// Vector convert between f32 and 32-bit integer lanes (`vcvt`). `to_int` picks
+    /// the direction (f32->int when true, int->f32 when false); `signed` picks the
+    /// integer signedness. Float->int rounds toward zero (saturating).
+    CvtFloatInt { to_int: bool, signed: bool, dst: NeonReg, src: NeonReg },
+    /// Vector compare (`vceq`/`vcgt`/`vcge`): each `dst` lane is all-ones when the
+    /// relation holds and zero otherwise, matching wasm SIMD compare semantics.
+    /// `ty.float`/`ty.signed`/`ty.bits` select the lane type.
+    Cmp { op: NeonCmp, ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Vector compare against zero (`vceq`/`vcgt`/`vcge`/`vcle`/`vclt` with a `#0`
+    /// operand): each `dst` lane is all-ones when `src <rel> 0` and zero otherwise.
+    CmpZero { op: NeonCmp, ty: NeonType, dst: NeonReg, src: NeonReg },
+    /// Absolute-value f32 compare (`vacge`/`vacgt`): `dst` lane is all-ones when
+    /// `|a| >= |b|` (`ge = true`) or `|a| > |b|` (`ge = false`), zero otherwise.
+    CmpAbs { ge: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Pairwise max/min (`vpmax`/`vpmin`): adjacent element pairs within the
+    /// concatenation `a : b` are reduced (`min` picks min over max). Doubleword only.
+    /// `ty` carries the element size and whether it is the f32 or the integer form -
+    /// the integer forms also carry the signedness that decides the comparison.
+    PairMinMax { ty: NeonType, min: bool, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Reverse the order of the `esize`-bit elements within each `container`-bit group
+    /// (`vrev16`/`vrev32`/`vrev64`). `container` is 16/32/64 and is a multiple of `esize`.
+    Rev { esize: u8, container: u8, dst: NeonReg, src: NeonReg },
+    /// Shift-left by a signed per-lane amount, register form (`vshl`/`vqshl`): each
+    /// `ty.bits`-bit lane of `src` is shifted by the signed low byte of the matching
+    /// lane of `amt` (negative shifts right; `vshl` truncates, `vqshl` saturates).
+    ShiftReg { sat: bool, ty: NeonType, dst: NeonReg, src: NeonReg, amt: NeonReg },
+    /// Bitwise test (`vtst`): each `ty.bits`-bit lane of `dst` is all-ones when
+    /// `a AND b` is nonzero in that lane, and zero otherwise.
+    Test { ty: NeonType, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// Bitwise NOT (`vmvn`) - element-size agnostic, so no type rides with it.
+    Not { dst: NeonReg, src: NeonReg },
+    /// Saturating absolute value (`vqabs`) or negate (`vqneg`). They differ from the plain
+    /// forms at exactly ONE input - the element's minimum, whose true magnitude is one past
+    /// the maximum - and that input is the one a signal at full scale produces.
+    SatAbsNeg { ty: NeonType, neg: bool, dst: NeonReg, src: NeonReg },
+    /// Narrowing right shift (`vshrn`/`vrshrn`/`vqshrn`/`vqrshrn`/`vqshrun`/`vqrshrun`):
+    /// shift each `2*esize`-bit element of the `Qm` source right by `shift`, then write
+    /// `esize` bits of each to the `Dd` result.
+    ///
+    /// The six forms differ in two independent bits, which is why they are one node:
+    /// `round` adds the half-ulp before the shift discards it, and `sat` - when present -
+    /// clamps on the way down instead of truncating, carrying `(source signed, result
+    /// signed)` because `vqshrun` narrows a SIGNED source into an UNSIGNED result.
+    NarrowShift {
+        esize: u8,
+        dst: NeonReg,
+        src: NeonReg,
+        shift: u8,
+        round: bool,
+        sat: Option<(bool, bool)>,
+    },
+    /// Widening left shift (`vshll`): widen each `esize`-bit element of the `Dm` source
+    /// to `2*esize` bits (sign- or zero-extending per `signed`) and shift it left by
+    /// `shift`. `vmovl` is the `shift == 0` case and has its own node.
+    WidenShift { esize: u8, dst: NeonReg, src: NeonReg, shift: u8, signed: bool },
+    /// Narrowing move (`vmovn`): truncate each `2*esize`-bit element of the `Qm`
+    /// source `src` to its low `esize` bits and write the `Dd` result `dst`.
+    Narrow { esize: u8, dst: NeonReg, src: NeonReg },
+    /// Saturating narrowing move (`vqmovn`/`vqmovun`): CLAMP each `2*esize`-bit element
+    /// of the `Qm` source `src` into `esize` bits and write the `Dd` result `dst`.
+    ///
+    /// The three encodings differ only in which range each end is clamped to, which is
+    /// exactly what the two signedness flags carry: `vqmovn.sNN` is signed -> signed,
+    /// `vqmovn.uNN` unsigned -> unsigned, and `vqmovun.sNN` signed -> unsigned. Clamping
+    /// is the whole point of the instruction - a title uses it where truncation would
+    /// wrap a loud sample into a quiet one of the opposite sign - so this is deliberately
+    /// NOT folded into [`NeonStmt::Narrow`].
+    NarrowSat { esize: u8, dst: NeonReg, src: NeonReg, src_signed: bool, dst_signed: bool },
+    /// Byte table lookup (`vtbl`/`vtbx`): each byte of the D register `index` selects a
+    /// byte from the table of `len` consecutive D registers starting at `table`, and the
+    /// result goes to the D register `dst`. An index at or past the table's `8 * len`
+    /// bytes writes zero (`vtbl`) or leaves that destination byte alone (`vtbx`, which is
+    /// what `extend` selects).
+    TableLookup { dst: u8, table: u8, len: u8, index: u8, extend: bool },
+    /// Whole-register bitwise logical op (the 3-same logical family): `vand`,
+    /// `vorr`, `veor`, `vbic`, `vorn`, and the insert/select forms `vbsl`/`vbit`/
+    /// `vbif` (which also read `dst`). Element-size agnostic.
+    Bitwise { op: NeonBitwise, dst: NeonReg, a: NeonReg, b: NeonReg },
+    /// NEON single-element load/store to/from one lane of a D register, or a
+    /// broadcast load to all its lanes (`vld1`/`vst1` single-element forms). `esize`
+    /// is the element size in bits (8/16/32). This is the element-wise, deinterleave-
+    /// free 1-structure case: a lane load reads `esize` bits and inserts them into
+    /// lane `lane`, leaving the rest of `d` intact; a broadcast load replicates the
+    /// read element across every lane; a lane store writes one lane's bits out.
+    ElemMem { d: u8, esize: u8, lane: ElemLane, addr: Value, load: bool },
+}
+
+/// Which lane(s) a [`NeonStmt::ElemMem`] transfer touches.
+#[derive(Debug, Clone, Copy)]
+pub enum ElemLane {
+    /// A single lane, by index (`{dN[i]}`).
+    One(u8),
+    /// Every lane (a broadcast load, `{dN[]}`); store is not a valid form.
+    All,
+}
+
+/// The NEON bitwise logical operations ([`NeonStmt::Bitwise`]).
+#[derive(Debug, Clone, Copy)]
+pub enum NeonBitwise {
+    And,
+    Or,
+    Xor,
+    /// `vbic`: `a AND NOT b`.
+    Bic,
+    /// `vorn`: `a OR NOT b`.
+    Orn,
+    /// `vbsl`: bitwise select with `dst` as the mask.
+    Bsl,
+    /// `vbit`: insert `a` where `b` is set.
+    Bit,
+    /// `vbif`: insert `a` where `b` is clear.
+    Bif,
+}
+
+/// The NEON two-register permutes ([`NeonStmt::Permute`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermuteOp {
+    /// `vtrn`: transpose adjacent element pairs across the two registers.
+    Trn,
+    /// `vzip`: interleave the two registers.
+    Zip,
+    /// `vuzp`: de-interleave (the inverse of `vzip`).
+    Uzp,
+}
+
+/// The NEON vector-compare relations ([`NeonStmt::Cmp`] and [`NeonStmt::CmpZero`]).
+/// `Le`/`Lt` occur only against `#0` (the register `a <= b`/`a < b` forms are assembled as
+/// `Ge`/`Gt` with the operands swapped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeonCmp {
+    /// `vceq`: equal.
+    Eq,
+    /// `vcgt`: greater-than.
+    Gt,
+    /// `vcge`: greater-than-or-equal.
+    Ge,
+    /// `vcle`: less-than-or-equal (against `#0` only).
+    Le,
+    /// `vclt`: less-than (against `#0` only).
+    Lt,
+}
+
+/// The NEON immediate-shift operations ([`NeonStmt::ShiftImm`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeonShift {
+    /// `vshr`: right shift (arithmetic if the element type is signed, else logical).
+    Shr,
+    /// `vsra`: right shift, accumulated into `dst` (`dst += src >> n`).
+    Sra,
+    /// `vshl`: left shift by an immediate.
+    Shl,
+    /// `vsli`: shift left and insert - the low `n` bits of `dst` are preserved.
+    Sli,
+    /// `vsri`: shift right and insert - the high `n` bits of `dst` are preserved.
+    Sri,
+    /// `vrshr`: right shift with ROUNDING - half an ulp is added before the discarded
+    /// bits go. Not a cosmetic difference from [`Shr`](Self::Shr): truncation biases
+    /// every sample toward zero, which over a signal is a DC offset, and that is exactly
+    /// why a codec reaches for this form.
+    Rshr,
+    /// `vrsra`: the rounding right shift, accumulated into `dst`.
+    Rsra,
+}
+
+/// Floating-point binary operators (single precision).
+#[derive(Debug, Clone, Copy)]
+pub enum FBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// A VFP data-processing / move / compare / convert operation. All single
+/// precision (f32); operands name S-register numbers unless noted. Kept separate
+/// from the integer [`Value`] tree because these produce/consume f32 on the wasm
+/// stack rather than i32.
+#[derive(Debug)]
+pub enum VfpOp {
+    /// `rd = rn <op> rm` (vadd/vsub/vmul/vdiv, f32).
+    Bin32 { op: FBinOp, rd: u8, rn: u8, rm: u8 },
+    /// Multiply-accumulate: `rd = (-rd if neg else rd) +/- (rn * rm)`, non-fused
+    /// (two roundings), f32. Covers vmla (`neg=false,sub=false`), vmls
+    /// (`neg=false,sub=true`), vnmls (`neg=true,sub=false`), vnmla
+    /// (`neg=true,sub=true`).
+    MulAcc32 { rd: u8, rn: u8, rm: u8, sub: bool, neg: bool },
+    /// `rd = -(rn * rm)` (vnmul, f32).
+    NegMul32 { rd: u8, rn: u8, rm: u8 },
+    /// `rd = -rm` (vneg, f32).
+    Neg32 { rd: u8, rm: u8 },
+    /// `rd = |rm|` (vabs, f32).
+    Abs32 { rd: u8, rm: u8 },
+    /// `rd = sqrt(rm)` (vsqrt, f32).
+    Sqrt32 { rd: u8, rm: u8 },
+    /// `rd = rm` raw bit copy (vmov S,S).
+    Mov32 { rd: u8, rm: u8 },
+    /// Copy the raw 32 bits of single-precision register S`s` into core register
+    /// `rt` (`vmov Rt, Sn`).
+    ScalarToCore { rt: u8, s: u8 },
+    /// Copy the 32 bits of core register `rt` into single-precision register S`s`
+    /// (`vmov Sn, Rt`).
+    CoreToScalar { s: u8, rt: u8 },
+    /// Set single register `s` to a 32-bit immediate bit pattern (the VFP
+    /// `vmov.f32 sd, #imm`).
+    SetImmS { s: u8, bits: u32 },
+    /// Set double register `d` to a 64-bit immediate (`lo` low word, `hi` high
+    /// word) - the NEON `vmov.iN` modified-immediate (per constituent D register)
+    /// and the VFP `vmov.f64 dd, #imm`.
+    SetImmD { d: u8, lo: u32, hi: u32 },
+    /// Compare `rn` against `rm` (or `+0.0` when `rm` is `None`), setting the FP
+    /// condition flags (vcmp/vcmpe).
+    Cmp32 { rn: u8, rm: Option<u8> },
+    /// Copy FP condition flags into the integer NZCV flags (`vmrs APSR_nzcv`).
+    MrsNzcv,
+    /// Read the FPSCR into core register `rt` (`vmrs Rt, fpscr`): reconstruct the
+    /// NZCV bits [31:28] from the FP flags; all other bits read as zero.
+    MrsFpscr { rt: u8 },
+    /// Convert f32 in `rm` to a 32-bit integer in `rd` (round toward zero,
+    /// saturating), signed or unsigned (vcvt.s32/u32.f32).
+    CvtToInt { rd: u8, rm: u8, signed: bool },
+    /// Convert a 32-bit integer in `rm` to f32 in `rd` (vcvt.f32.s32/u32).
+    CvtFromInt { rd: u8, rm: u8, signed: bool },
+
+    // --- Double precision (f64). Operands name D-register numbers. ---
+    /// `rd = rn <op> rm` (vadd/vsub/vmul/vdiv, f64).
+    Bin64 { op: FBinOp, rd: u8, rn: u8, rm: u8 },
+    /// `rd = (-rd if neg else rd) +/- (rn * rm)`, f64 (vmla/vmls/vnmls/vnmla).
+    MulAcc64 { rd: u8, rn: u8, rm: u8, sub: bool, neg: bool },
+    /// `rd = -(rn * rm)` (vnmul, f64).
+    NegMul64 { rd: u8, rn: u8, rm: u8 },
+    /// `rd = -rm` (vneg, f64).
+    Neg64 { rd: u8, rm: u8 },
+    /// `rd = |rm|` (vabs, f64).
+    Abs64 { rd: u8, rm: u8 },
+    /// `rd = sqrt(rm)` (vsqrt, f64).
+    Sqrt64 { rd: u8, rm: u8 },
+    /// `rd = rm` raw 64-bit copy (vmov D,D).
+    Mov64 { rd: u8, rm: u8 },
+    /// Compare `rn` against `rm` (or `+0.0` when `None`), setting the FP flags
+    /// (vcmp/vcmpe, f64).
+    Cmp64 { rn: u8, rm: Option<u8> },
+    /// Convert a 32-bit integer in S`s` to f64 in D`d` (vcvt.f64.s32/u32).
+    CvtF64FromInt { d: u8, s: u8, signed: bool },
+    /// Convert f64 in D`d` to a 32-bit integer in S`s`, round toward zero,
+    /// saturating (vcvt.s32/u32.f64).
+    CvtIntFromF64 { s: u8, d: u8, signed: bool },
+    /// Widen f32 in S`s` to f64 in D`d` (vcvt.f64.f32).
+    CvtF64FromF32 { d: u8, s: u8 },
+    /// Narrow f64 in D`d` to f32 in S`s` (vcvt.f32.f64).
+    CvtF32FromF64 { s: u8, d: u8 },
+    /// Widen the IEEE half-precision (f16) value in a 16-bit half of S`sm` to f32 in
+    /// S`sd` (`vcvtb`/`vcvtt.f32.f16`). `top` selects the top half (`vcvtt`) over the
+    /// bottom (`vcvtb`). Emitted as the branchless bit/float conversion.
+    CvtF32FromHalf { sd: u8, sm: u8, top: bool },
+    /// `vmov Rt, Rt2, Dm`: copy D`d`'s low 32 bits to `rt`, high 32 to `rt2`.
+    DoubleToCore { rt: u8, rt2: u8, d: u8 },
+    /// `vmov Dm, Rt, Rt2`: assemble D`d` from `rt` (low) and `rt2` (high).
+    CoreToDouble { d: u8, rt: u8, rt2: u8 },
+}
+
+/// One side-effecting statement within a basic block.
+#[derive(Debug)]
+pub enum Stmt {
+    /// `r[reg] = value`.
+    SetReg(u8, Value),
+    /// Store the low `size` bytes of `data` to `addr`.
+    Store {
+        addr: Value,
+        data: Value,
+        size: MemSize,
+    },
+    /// Set N,Z,C,V for the result of `a + b + cin`. Subtraction and compare pass
+    /// `b` already bit-inverted with `cin = 1` (ARM computes `a - b` as
+    /// `a + ~b + 1`), so this one primitive covers adds/subs/cmp/cmn/adc/sbc.
+    ///
+    /// `live` is which of those four a later read can actually observe - see
+    /// [`crate::flags`]. Lowering cannot know (the consumer may be blocks away), so it
+    /// writes [`FlagMask::ALL`] and the liveness pass narrows it before emission. An
+    /// un-narrowed statement therefore emits exactly what it always did.
+    FlagsAdd { a: Value, b: Value, cin: Value, live: FlagMask },
+    /// Set N,Z from `value` (logical result); set C to bit 0 of `carry` if
+    /// present (the shifter carry-out); leave V unchanged. `live` as for
+    /// [`Stmt::FlagsAdd`].
+    FlagsLogic { value: Value, carry: Option<Value>, live: FlagMask },
+    /// Service an ARM `svc #imm` through the host `svc` import.
+    Svc(u32),
+    /// Service a Vita NID call through the host `import` import, by dense index.
+    Import(u32),
+    /// Reverse the bit order of `rm` into `rd` (ARM `rbit`). No single wasm
+    /// primitive; emitted as the 5-step swap network over a scratch local.
+    Rbit { rd: u8, rm: Value },
+    /// A 64-bit widening multiply: `{rdhi:rdlo} = rn * rm`, unsigned or signed
+    /// (ARM `umull`/`smull`). The two 32-bit operands are extended to 64 bits
+    /// (per `signed`), multiplied, and the product's low/high halves written to
+    /// `rdlo`/`rdhi`.
+    /// `accumulate` adds the 64-bit `rdhi:rdlo` already in the registers (`smlal`/`umlal`).
+    MulLong { rdlo: u8, rdhi: u8, rn: Value, rm: Value, signed: bool, accumulate: bool },
+    /// A direct guest call (`bl`/`blx` to translated code): call the callee's
+    /// wasm function, which returns here. `lr` is set by a preceding `SetReg`.
+    Call { target: u32 },
+    /// An indirect guest call (`blx rN` through a function pointer - init_array
+    /// constructors, qsort comparators, C++ vtables): `addr` is the runtime target
+    /// (Thumb bit set). Emission routes it through the module's dispatcher, which
+    /// maps the address to the matching translated function. `set_lr` is the return
+    /// address to load into `lr` for a call (`blx rN`), or `None` for a tail call
+    /// through a register (`bx rN`) that leaves `lr` untouched. Emission snapshots
+    /// `addr` *before* writing `lr`, so `blx lr` (a compiler using `lr` as the
+    /// call-target scratch) dispatches to the real target, not the clobbered return.
+    CallIndirect { addr: Value, set_lr: Option<u32> },
+    /// Execute the inner statements only if `cond` holds (ARM predication / an
+    /// `IT` block body).
+    Guard(ConditionCode, Vec<Stmt>),
+    /// A VFP data-processing / move / compare / convert op.
+    Vfp(VfpOp),
+    /// One VFP register <-> memory transfer (a single lane of vldr/vstr/vldm/
+    /// vstm/vpush/vpop/vld1/vst1). `load` picks direction; `reg`'s width picks the
+    /// access size (S = 4 bytes, D = 8 bytes).
+    VfpMem { reg: VfpReg, addr: Value, load: bool },
+    /// A NEON (Advanced SIMD) data-processing operation.
+    Neon(NeonStmt),
+    /// Set the per-thread pointer (ARM `MCR p15,0,Rt,c13,c0,{2,3}` write of
+    /// `TPIDRURW`/`TPIDRURO`): write the per-instance `tp` global (see
+    /// [`crate::abi::TP_GLOBAL`]). The kernel normally owns this register, but a
+    /// module that manages its own thread pointer may write it.
+    SetThreadPtr(Value),
+    /// Byte-wise unsigned parallel add (`uadd8`): for each of the four bytes,
+    /// `rd.byte[i] = (rn.byte[i] + rm.byte[i]) mod 256`, and set APSR `GE[i]` to
+    /// the unsigned carry-out (1 iff the byte sum is >= 256). The GE bits are held
+    /// in a scratch local for a later [`Sel`] to consume. This pair is the core of
+    /// the word-at-a-time zero-byte search in optimized `strlen`/`memchr`.
+    Uadd8 { rd: u8, rn: u8, rm: u8 },
+    /// Byte-wise select by the GE flags (`sel`): for each byte, `rd.byte[i] =
+    /// GE[i] ? rn.byte[i] : rm.byte[i]`, reading the GE bits a preceding parallel
+    /// add/sub (e.g. [`Uadd8`]) deposited.
+    Sel { rd: u8, rn: u8, rm: u8 },
+    /// A register-controlled shift (`lsl/lsr/asr Rd, Rn, Rm`) where the amount is a
+    /// runtime value (ARM uses `Rm[7:0]`, range 0..255). Both the result and the
+    /// shifter carry-out depend on the amount in a way wasm's mod-32-masked shifts
+    /// cannot express (e.g. `lsl` by >=32 yields 0, not `Rn << (amt & 31)`; the
+    /// carry-out for `amt==0` is the OLD carry, unchanged), so this is emitted as a
+    /// dedicated exact model rather than a `Bin` shift plus `FlagsLogic`. When
+    /// `set_flags`, sets N,Z from the result and C to the exact shifter carry-out
+    /// (V unchanged); otherwise only writes `rd`. Immediate-amount shifts keep the
+    /// simpler `Bin`+`FlagsLogic` path (their amount is known at lowering). `live` as
+    /// for [`Stmt::FlagsAdd`], and ignored when `set_flags` is false.
+    ShiftRegFlags {
+        kind: ShiftKind,
+        rd: u8,
+        rn: Value,
+        amount: Value,
+        set_flags: bool,
+        live: FlagMask,
+    },
+}
+
+/// Which register-controlled shift [`Stmt::ShiftRegFlags`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    Lsl,
+    Lsr,
+    Asr,
+}
+
+/// How a basic block hands control to the next. The not-taken side of a branch
+/// and an explicit fall-through both continue into the textually-next block
+/// (blocks are emitted in ascending address order, so that successor is
+/// adjacent and needs no wasm branch).
+#[derive(Debug)]
+pub enum Term {
+    /// Continue into the next block (this block ended only because its successor
+    /// is a branch target).
+    Fallthrough,
+    /// Unconditional direct branch to another block in this function.
+    Jump(u32),
+    /// Conditional branch: if `cond`, go to `taken`; else fall through.
+    Branch { cond: ConditionCode, taken: u32 },
+    /// `cbz`/`cbnz`: branch to `taken` if register `reg` is zero (`nonzero`
+    /// false) or non-zero (`nonzero` true); else fall through. These test a
+    /// register directly, not the condition flags.
+    BranchZero { reg: u8, nonzero: bool, taken: u32 },
+    /// Return to the caller (`bx lr`, `pop {..,pc}`, ...).
+    Return,
+    /// A conditional return (`bxeq lr`, `popne {pc}`, an `it`-guarded `bx lr`): return
+    /// when `cond` holds, else fall through to the next block by index, exactly as
+    /// [`Term::Fallthrough`] does.
+    ReturnIf { cond: ConditionCode },
+    /// A computed jump through a dense index (ARM `tbb`/`tbh` switch dispatch):
+    /// branch to `targets[index]`. The jump table was read statically at discovery
+    /// time, so `targets` are resolved block addresses and the runtime only needs
+    /// the index register - no guest-memory table read. `index` is guaranteed in
+    /// `0..targets.len()` by a preceding range-check branch (the compiler's
+    /// `cmp; bhi default`), so `default` (the out-of-range block) is normally
+    /// unreachable from here; it is recorded for faithfulness when known.
+    Switch { index: Value, targets: Vec<u32>, default: Option<u32> },
+    /// Stop running this function without returning: an infinite self-loop
+    /// (`b .`), a statically-known noreturn `svc`, or undecodable tail.
+    Halt,
+    /// A block reached only speculatively - a heuristically-recovered branch/switch
+    /// target that turned out to be undecodable (e.g. a mis-recovered jump-table
+    /// entry pointing into data). Emitted as a `wasm` trap: the rest of the function
+    /// lifts normally, and if this block is ever actually executed it faults loudly
+    /// (the same posture as a whole-function stub), rather than silently corrupting.
+    Unreachable,
+}
+
+/// A basic block: its start address, its statements, and how it terminates.
+#[derive(Debug)]
+pub struct Block {
+    pub addr: u32,
+    pub stmts: Vec<Stmt>,
+    pub term: Term,
+    /// How many GUEST instructions were lifted into this block.
+    ///
+    /// This is the emulator's unit of guest work - see [`crate::emit::emit_work_charge`].
+    /// It is a property of the ARM code, so it does not move when the wasm this lowers to
+    /// gets better, which is the whole reason the clock and the scheduler are billed in it
+    /// rather than in emitted operators.
+    pub arm_count: u32,
+}
+
+/// A discovered guest function: one wasm function. Blocks are sorted ascending by
+/// address (fall-through is by index); the entry block is the one at `addr`, which is
+/// NOT always `blocks[0]` - a hand-written routine can keep a shared tail below its
+/// entry (newlib's strcmp), reached by a backward branch.
+pub struct Func {
+    pub addr: u32,
+    /// Decode mode this function was discovered in. Carried for the future
+    /// per-function `blx` mode switch; the emitter is mode-agnostic today.
+    #[allow(dead_code)]
+    pub thumb: bool,
+    pub blocks: Vec<Block>,
+    /// A placeholder for a function that could not be lowered (an unlifted
+    /// instruction). Its body is a single `unreachable` trap, so the module still
+    /// builds and runs; reaching this function at runtime faults loudly, revealing
+    /// that the un-transpiled code is actually on the executed path. Used only by
+    /// the lenient whole-program build ([`crate::transpile_lenient`]).
+    pub stub: bool,
+}
+
+impl Func {
+    /// Index of the block starting at `addr`, if any (for branch lowering).
+    pub fn block_index(&self, addr: u32) -> Option<usize> {
+        self.blocks.iter().position(|b| b.addr == addr)
+    }
+
+    /// A trapping placeholder function at `addr` (see [`Func::stub`]).
+    pub fn new_stub(addr: u32) -> Self {
+        Func { addr, thumb: true, blocks: Vec::new(), stub: true }
+    }
+
+    /// A one-statement function that performs host import `idx` and returns.
+    ///
+    /// This is what an import STUB's address is lowered to when the guest reaches it
+    /// through a function POINTER. A direct call to a stub is resolved to the import at
+    /// lift time and never lands here; a dynamic one (a vtable slot or a registered
+    /// callback holding an imported function) has only the address, and the stub's own
+    /// bytes are the loader's unresolved placeholder (`mvn r0,#0; bx lr`) - lifting those
+    /// would make the call a silent no-op returning -1. The thunk performs the real host
+    /// call instead, without lifting the placeholder.
+    pub fn new_import_thunk(addr: u32, thumb: bool, idx: u32) -> Self {
+        Func::new_thunk(addr, thumb, Stmt::Import(idx))
+    }
+
+    /// The inter-module counterpart of [`Self::new_import_thunk`]: a one-statement
+    /// function that calls the guest function a REDIRECT stub resolves to and returns.
+    /// `lr` is untouched, so the callee's own return unwinds through here to the
+    /// original caller.
+    pub fn new_redirect_thunk(addr: u32, thumb: bool, target: u32) -> Self {
+        Func::new_thunk(addr, thumb, Stmt::Call { target })
+    }
+
+    fn new_thunk(addr: u32, thumb: bool, stmt: Stmt) -> Self {
+        Func {
+            addr,
+            thumb,
+            // One instruction's worth of work: a thunk stands in for the single guest
+            // operation (an import call, a redirect) the stub would have performed.
+            blocks: vec![Block { addr, stmts: vec![stmt], term: Term::Return, arm_count: 1 }],
+            stub: false,
+        }
+    }
+
+    /// True if every intra-function branch target resolves to a block in this
+    /// function. A tentatively-discovered function (a guessed code pointer) can
+    /// decode into nonsense whose terminator branches to an address that is not a
+    /// block - emitting it would panic in `goto`. Such a function was never real
+    /// and must be dropped. Hard (call-graph-reachable) functions are always
+    /// well-formed by construction; this guards the tentative path.
+    pub fn well_formed(&self) -> bool {
+        let is_block = |a: u32| self.blocks.iter().any(|b| b.addr == a);
+        self.blocks.iter().all(|b| match &b.term {
+            Term::Jump(t) | Term::Branch { taken: t, .. } | Term::BranchZero { taken: t, .. } => {
+                is_block(*t)
+            }
+            Term::Switch { targets, default, .. } => {
+                targets.iter().all(|&t| is_block(t)) && default.is_none_or(is_block)
+            }
+            Term::Fallthrough
+            | Term::Return
+            | Term::ReturnIf { .. }
+            | Term::Halt
+            | Term::Unreachable => true,
+        })
+    }
+}
