@@ -52,6 +52,8 @@ game to investigate.
 
 There is no compatibility list and there will not be one. Keeping it accurate is
 more work than the project itself, and it turns into a promise.
+[Games tried](#games-tried) is the handful the agent has played: playable, still
+buggy, a record of what was done rather than a claim about what works.
 
 #### Why is it slow on my phone?
 
@@ -105,6 +107,18 @@ than expected.
 - **A pixel oracle.** Headless runs render deterministic frames that tests compare
   bit for bit, so a rendering change either matches the previous build exactly or
   says which draw moved.
+
+## Games tried
+
+Not a compatibility list. Owned games the agent has played, all US releases, all
+playable and all still buggy. Anything not listed was never tried.
+
+- Hot Shots Golf: World Invitational
+- MotorStorm RC
+- OlliOlli
+- Persona 4 Golden
+- Ridge Racer
+- WipEout 2048
 
 ## Build
 

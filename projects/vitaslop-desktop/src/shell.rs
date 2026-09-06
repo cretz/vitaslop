@@ -793,7 +793,9 @@ impl Shell {
             if !g.finished {
                 let frac = if g.total > 0 { g.done as f32 / g.total as f32 } else { 0.0 };
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
-                ui.label(RichText::new(format!("{} {} / {} - {}", g.stage, fmt_bytes(g.done), fmt_bytes(g.total), g.file)).color(DIM).small());
+                // The ingest's stage names (copy, decrypt, unwrap) are for whoever reads
+                // the code; what a person watching an import needs is that it is working.
+                ui.label(RichText::new(format!("loading {} / {} - {}", fmt_bytes(g.done), fmt_bytes(g.total), g.file)).color(DIM).small());
             } else if let Some(e) = g.error {
                 ui.label(RichText::new(format!("Import failed: {e}")).color(DANGER));
             } else if let Some(id) = g.title_id {

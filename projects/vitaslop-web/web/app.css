@@ -179,6 +179,9 @@ details.card[open] > summary::before { content: "\25BE"; }
 
 /* ---------- import ---------- */
 .tabs { display: flex; gap: 6px; margin: 12px 0 0; }
+/* A class that sets display beats the UA [hidden] rule, and every screen here hides
+   things with el.hidden. */
+[hidden] { display: none !important; }
 .tab { padding: 8px 14px; font: inherit; font-size: 14px; font-weight: 600; color: var(--dim); background: transparent; border: 1px solid var(--edge); border-bottom: 0; border-radius: 8px 8px 0 0; cursor: pointer; }
 .tab.on { color: var(--accent-ink); background: var(--accent); border-color: transparent; }
 .card.mode { margin-top: 0; border-top-left-radius: 0; }
@@ -345,7 +348,6 @@ details.card[open] > summary::before { content: "\25BE"; }
 #player.overlay .tp-mid { left: 50%; transform: translateX(-50%); bottom: max(10px, env(safe-area-inset-bottom)); flex-direction: row; }
 /* beside: the stage shrinks and the controls take the rest */
 #player.beside #stage { flex: 0 0 auto; height: 56vh; }
-#player.beside.landscape #stage { height: auto; flex: 1; }
 #player.beside #pad {
   flex: 1;
   min-height: 0;
@@ -361,8 +363,26 @@ details.card[open] > summary::before { content: "\25BE"; }
 #player.beside .tp-mid { grid-column: 2; grid-row: 1 / span 2; }
 #player.beside .tp-left { grid-column: 1; grid-row: 2; }
 #player.beside .tp-right { grid-column: 3; grid-row: 2; }
-#player.beside.landscape { flex-direction: row; }
-#player.beside.landscape #pad { grid-template-columns: auto; grid-template-rows: auto auto auto auto; }
+/* Beside, in LANDSCAPE, is a handheld: the left-hand controls to the left of the
+   game and the right-hand ones to the right, not both stacked in one column beside
+   it. #pad stops generating a box (its opacity and scale custom properties still
+   inherit through it) so its groups can be placed around the stage. */
+#player.beside.landscape {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-items: center;
+  justify-items: center;
+  padding: max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+  gap: 8px;
+}
+#player.beside.landscape #pad { display: contents; }
+#player.beside.landscape #stage { grid-column: 2; grid-row: 1 / 3; width: 100%; height: 100%; }
+#player.beside.landscape .tp-l { grid-column: 1; grid-row: 1; justify-self: start; }
+#player.beside.landscape .tp-left { grid-column: 1; grid-row: 2; }
+#player.beside.landscape .tp-r { grid-column: 3; grid-row: 1; justify-self: end; }
+#player.beside.landscape .tp-right { grid-column: 3; grid-row: 2; }
+#player.beside.landscape .tp-mid { grid-column: 2; grid-row: 3; flex-direction: row; }
 
 /* loading, menu, fatal */
 #loading, #menu, #fatal {

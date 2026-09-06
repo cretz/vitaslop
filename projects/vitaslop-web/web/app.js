@@ -187,7 +187,7 @@ async function renderTitle(id) {
       </div>
       <p class="dim">What the game saved - its save files and trophies - and nothing of the game itself. A download is a file you own; upload it on another device to continue there.</p>
     </div>`;
-  $("play").addEventListener("click", () => play(id, matchMedia("(pointer: coarse)").matches));
+  $("play").addEventListener("click", () => play(id, wantsFullscreen(eff)));
   // The backdrop goes on through the element's style property: a `style="..."` attribute
   // in the markup is an inline style the page's Content-Security-Policy refuses.
   if (pic) view.querySelector(".hero").style.backgroundImage = `url('${pic}')`;
@@ -259,6 +259,12 @@ function downloadBytes(name, bytes, type = "application/zip") {
 
 // ------------------------------- play -------------------------------
 
+/// Whether pressing Play should take over the screen. `auto` is the shipped answer -
+/// a touch screen has no room to spare and a desktop browser has other tabs - and the
+/// setting exists because that is a preference, not a fact about the device.
+const wantsFullscreen = (eff) =>
+  eff.fullscreenOnStart === "always" || (eff.fullscreenOnStart !== "never" && matchMedia("(pointer: coarse)").matches);
+
 async function play(id, fullscreen) {
   const meta = await store.readTitle(id);
   if (!meta || !playable) return;
@@ -316,6 +322,8 @@ async function renderSettings(id) {
         <label class="row"><input type="checkbox" name="pauseOnBlur" ${eff.pauseOnBlur ? "checked" : ""} /><span>Pause when this page is hidden or loses focus<small>Not the game's pause menu: the emulator stops, as a console in a pocket would.</small></span></label>
         <label class="row"><input type="checkbox" name="showFps" ${eff.showFps ? "checked" : ""} /><span>Show the frame rate over the game</span></label>
         <label class="row"><span>Scaling</span><select name="scaling">${opt("fit", eff.scaling, "Fit (smooth)")}${opt("integer", eff.scaling, "Integer (crisp)")}${opt("stretch", eff.scaling, "Stretch")}</select></label>
+        <label class="row"><span>Start in fullscreen<small>Automatic takes over the screen on a touch device and plays in the page on a desktop. The in-game menu toggles it either way.</small></span><select name="fullscreenOnStart">${opt("auto", eff.fullscreenOnStart, "Automatic (touch screens)")}${opt("always", eff.fullscreenOnStart, "Always")}${opt("never", eff.fullscreenOnStart, "Never")}</select></label>
+        <label class="row"><input type="checkbox" name="lockLandscape" ${eff.lockLandscape ? "checked" : ""} /><span>Hold the screen in landscape<small>Touch devices, in fullscreen. Off, the game turns with the device and the controls move below it in portrait.</small></span></label>
         <label class="row"><span>Save profile<small>Each profile keeps its own saved data for every game.</small></span>
           <span class="inline"><select name="profile">${profiles.map((p) => opt(p, eff.profile)).join("")}</select><button type="button" id="new-profile" class="btn small">New</button></span></label>
       </section>
@@ -363,6 +371,8 @@ async function renderSettings(id) {
       showFps: form.showFps.checked,
       fpsInTitle: eff.fpsInTitle,
       scaling: fd.get("scaling"),
+      fullscreenOnStart: fd.get("fullscreenOnStart"),
+      lockLandscape: form.lockLandscape.checked,
       pad: { mode: fd.get("pad.mode"), opacity: Number(fd.get("pad.opacity")), scale: Number(fd.get("pad.scale")), vibrate: form["pad.vibrate"].checked },
       keyboard: { ...kb },
       gamepad: { ...gp },
@@ -507,7 +517,7 @@ async function renderImport() {
       <label class="pick"><span>2. Its licence</span><span class="inline"><button id="pick-work" class="btn">Choose work.bin</button><span id="work-name" class="dim">none chosen</span></span></label>
       <input id="f-pkg" type="file" accept=".pkg,application/octet-stream" hidden />
       <input id="f-work" type="file" accept=".bin,application/octet-stream" hidden />
-      <div class="actions"><button id="go-pkg" class="btn primary" disabled>Continue</button></div>
+      <div class="actions"><button id="go-pkg" class="btn primary" disabled>Import</button></div>
     </div>
     <div class="card mode" id="mode-folder" hidden>
       <p class="dim">A folder dumped from a console (with <code>sce_pfs</code> and <code>sce_sys</code> inside, and the <code>work.bin</code> under <code>sce_sys/package</code>).</p>
@@ -568,69 +578,120 @@ async function renderImport() {
   });
 }
 
+// The ingest's own stage names (copy, decrypt, unwrap) describe the step to whoever is
+// reading the code. What a person watching an import needs to know is that it is
+// working, so all of them read as one word here.
+const stageWord = (s) => (s === "preparing" ? "preparing storage" : "loading");
+
+/// A remaining time a person can read at a glance, and one that does not twitch: at
+/// this range a second of precision is noise, so it is coarse on purpose.
+function fmtLeft(secs) {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 55) return `${Math.max(5, Math.round(s / 5) * 5)}s`;
+  const m = Math.round(s / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// ONE STEP: picking the files IS the import. There is no "we read it, now confirm"
+// screen - identifying a package means reading it, which on a phone takes long enough
+// to look like a hang, and the confirmation bought a second read of the same bytes.
+// The card starts as a progress bar and fills in the title, icon and size as the
+// worker reports them, part way through the import it is already running.
 async function startImport(entries) {
   const result = $("result");
-  const total = entries.reduce((a, e) => a + e.file.size, 0);
-  result.innerHTML = `<div class="card"><p>Reading ${entries.length} file${entries.length === 1 ? "" : "s"} (${store.fmtBytes(total)})...</p></div>`;
-  let probe;
-  try {
-    probe = await imp.probe(entries);
-  } catch (err) {
-    result.innerHTML = `<div class="card error"><h2>Not a title this emulator recognises</h2><p>${esc(err.message || err)}</p>
-      <p class="dim">It looks for a .pkg (with work.bin beside it), a folder with sce_pfs/files.db, or a homebrew .vpk. ${entries.length === 1 && /\.pkg$/i.test(entries[0].path) ? "Only the .pkg was given - it needs its work.bin too." : ""}</p></div>`;
-    return;
-  }
-  const id = probe.titleId;
-  const existing = id ? await store.readTitle(id) : null;
-  let iconUrl = null;
-  if (probe.icon0) iconUrl = URL.createObjectURL(new Blob([probe.icon0], { type: "image/png" }));
+  // The pickers go away while this runs: a second pick would start a second import
+  // into the same directory.
+  const hidden = [...view.querySelectorAll("#tabs, .mode, #drop")].filter((el) => !el.hidden);
+  for (const el of hidden) el.hidden = true;
+  const picked = entries.reduce((a, e) => a + e.file.size, 0);
   result.innerHTML = `<div class="card confirm">
-    <span class="icon big ${iconUrl ? "" : "noicon"}">${iconUrl ? `<img src="${iconUrl}" alt="" />` : ""}</span>
+    <span class="icon big noicon" id="imp-icon"></span>
     <div>
-      <h2>${esc(probe.title || id || "Unknown title")}</h2>
-      <p class="meta">${esc(id || "no title id")}${probe.appVersion ? " &middot; v" + esc(probe.appVersion) : ""} &middot; ${probe.kind === "vpk" ? "homebrew" : esc(probe.kind) + (probe.zipped ? " in a zip" : "")} &middot; ${probe.files} files &middot; ${store.fmtBytes(probe.bytes)}</p>
-      ${probe.missingWorkBin ? `<p class="warn">This pkg has no work.bin and none was picked with it. It cannot be decrypted without one - pick both files together.</p>` : ""}
-      ${!id ? `<p class="warn">No param.sfo was found, so this cannot be named or stored.</p>` : ""}
-      ${existing ? `<p class="warn">${esc(existing.title)} is already in the library; importing again replaces its files (saved data is kept).</p>` : ""}
-      <div class="actions"><button id="do-import" class="btn primary" ${probe.missingWorkBin || !id ? "disabled" : ""}>${existing ? "Replace" : "Import"}</button><a class="btn" href="#/">Cancel</a></div>
-      <div id="progress" hidden><div class="bar"><div id="bar-fill"></div></div><p id="prog-text" class="dim"></p></div>
+      <h2 id="imp-title">Reading ${entries.length} file${entries.length === 1 ? "" : "s"}...</h2>
+      <p class="meta" id="imp-meta">${store.fmtBytes(picked)} picked. Keep this tab open; a large title takes a few minutes.</p>
+      <div id="progress"><div class="bar"><div id="bar-fill"></div></div><p id="prog-text" class="dim">starting</p></div>
     </div></div>`;
-  $("do-import").addEventListener("click", async () => {
-    $("do-import").disabled = true;
-    $("progress").hidden = false;
-    const fill = $("bar-fill");
-    const text = $("prog-text");
-    try {
-      const done = await imp.run(entries, id, probe.bytes, (p) => {
-        const pct = p.total ? Math.min(100, (100 * p.done) / p.total) : 0;
+  const fill = $("bar-fill");
+  const text = $("prog-text");
+  let probe = null;
+  // The library record of the title being replaced, as a PROMISE: `onProbe` is called
+  // from a message handler that nobody awaits, so the value it resolves to has to be
+  // waited for where it is used (`lastPlayedAt`), not assumed to have arrived.
+  let existingP = null;
+  let iconUrl = null;
+  try {
+    const done = await imp.run(
+      entries,
+      async (p) => {
+        probe = p;
+        existingP = p.titleId ? store.readTitle(p.titleId) : null;
+        const existing = existingP ? await existingP : null;
+        if (p.icon0) {
+          iconUrl = URL.createObjectURL(new Blob([p.icon0], { type: "image/png" }));
+          const icon = $("imp-icon");
+          if (icon) {
+            icon.classList.remove("noicon");
+            icon.innerHTML = `<img src="${iconUrl}" alt="" />`;
+          }
+        }
+        const title = $("imp-title");
+        const meta = $("imp-meta");
+        if (title) title.textContent = p.title || p.titleId || "Unknown title";
+        if (meta) {
+          meta.textContent =
+            `${p.titleId || "no title id"}${p.appVersion ? " - v" + p.appVersion : ""} - ` +
+            `${p.kind === "vpk" ? "homebrew" : p.kind + (p.zipped ? " in a zip" : "")} - ${p.files} files - ${store.fmtBytes(p.bytes)}` +
+            (existing ? ` - replacing what is in the library (saved data is kept)` : "");
+        }
+      },
+      (p) => {
+        if (p.stage === "reading") {
+          fill.style.width = "0%";
+          text.textContent = `identifying, read ${store.fmtBytes(p.done)}${p.file ? ` - ${p.file}` : ""}`;
+          return;
+        }
+        if (!p.total) {
+          text.textContent = p.stage === "preparing" ? "preparing storage" : stageWord(p.stage);
+          return;
+        }
+        const pct = Math.min(100, (100 * p.done) / p.total);
         fill.style.width = `${pct}%`;
-        const left = p.rate > 0 ? `, about ${Math.max(0, Math.round((p.total - p.done) / p.rate))}s left` : "";
-        text.textContent = `${p.stage} ${store.fmtBytes(p.done)} / ${store.fmtBytes(p.total)}${p.rate ? ` at ${(p.rate / 1e6).toFixed(0)} MB/s` : ""}${left} - ${p.file}`;
-      });
-      const meta = {
-        titleId: id,
-        title: probe.title || id,
-        contentId: done.contentId || probe.contentId || "",
-        appVersion: probe.appVersion || "",
-        sourceKind: probe.kind,
-        bytes: probe.bytes,
-        files: done.count,
-        hasIcon: !!probe.icon0,
-        hasPic: !!probe.pic0,
-        importedAt: Date.now(),
-        lastPlayedAt: existing ? existing.lastPlayedAt || 0 : 0,
-      };
-      await store.removeTitleRecord(id);
-      await store.writeTitle(meta, { "icon0.png": probe.icon0, "pic0.png": probe.pic0 });
-      fill.style.width = "100%";
-      text.textContent = "done";
-      go(`#/title/${id}`);
-    } catch (err) {
-      text.textContent = "";
-      result.insertAdjacentHTML("beforeend", `<div class="card error"><h2>Import failed</h2><pre>${esc(err.message || err)}</pre></div>`);
-      $("do-import").disabled = false;
-    }
-  });
+        const left = p.rate > 0 ? `, about ${fmtLeft((p.total - p.done) / p.rate)} left` : "";
+        text.textContent = `${stageWord(p.stage)} ${store.fmtBytes(p.done)} / ${store.fmtBytes(p.total)}${p.rate ? ` at ${(p.rate / 1e6).toFixed(0)} MB/s` : ""}${left} - ${p.file}`;
+      }
+    );
+    const id = done.titleId;
+    const existing = existingP ? await existingP : null;
+    const meta = {
+      titleId: id,
+      title: (probe && probe.title) || id,
+      contentId: done.contentId || (probe && probe.contentId) || "",
+      appVersion: (probe && probe.appVersion) || "",
+      sourceKind: probe ? probe.kind : "",
+      bytes: probe ? probe.bytes : picked,
+      files: done.count,
+      hasIcon: !!(probe && probe.icon0),
+      hasPic: !!(probe && probe.pic0),
+      importedAt: Date.now(),
+      lastPlayedAt: existing ? existing.lastPlayedAt || 0 : 0,
+    };
+    await store.removeTitleRecord(id);
+    await store.writeTitle(meta, { "icon0.png": probe && probe.icon0, "pic0.png": probe && probe.pic0 });
+    fill.style.width = "100%";
+    text.textContent = "done";
+    go(`#/title/${id}`);
+  } catch (err) {
+    text.textContent = "";
+    for (const el of hidden) el.hidden = false;
+    const unknown = /unknown container|not a|no param\.sfo|work\.bin/i.test(String(err.message || err));
+    result.innerHTML = "";
+    result.insertAdjacentHTML(
+      "beforeend",
+      `<div class="card error"><h2>${unknown ? "Not a title this emulator recognises" : "Import failed"}</h2><pre>${esc(err.message || err)}</pre>
+       ${unknown ? `<p class="dim">It looks for a .pkg (with its work.bin picked alongside), a folder with sce_pfs/files.db, or a homebrew .vpk.</p>` : ""}
+       <p class="dim">Pick again above to retry.</p></div>`
+    );
+  }
 }
 
 // ------------------------------- about -------------------------------

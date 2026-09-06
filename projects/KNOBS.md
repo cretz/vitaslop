@@ -14,18 +14,18 @@ until a chosen display frame with `VITASLOP_ARM_AT_FRAME`, which is what
 makes a first-hit watchpoint usable deep inside a game instead of firing
 during boot.
 
-287 knobs.
+288 knobs.
 
 | knob | read in | what it does |
 |---|---|---|
-| `VITASLOP_A` | vitaslop-frontend/src/settings.rs:244 | - |
+| `VITASLOP_A` | vitaslop-frontend/src/settings.rs:263 | - |
 | `VITASLOP_AAC_DIR` | vitaslop-aac/tests/oracle.rs:69 | The `AudioSpecificConfig` an ADTS header describes: 5 bits of object type, 4 of |
 | `VITASLOP_ALLOW_SOFTWARE_GPU` | vitaslop-web/src/lib.rs:1172 | Whether a run may proceed on a software rasteriser (`VITASLOP_ALLOW_SOFTWARE_GPU`). |
 | `VITASLOP_ARM_AT_FRAME` | vitaslop-native/src/threaded.rs:323 | Linear-memory offset of the "diagnostics armed" word, when this build was |
 | `VITASLOP_ARM_FUNC` | vitaslop-native/tests/homebrew_memcpy.rs:21 | Scratch window well past the code: `[SRC, SRC+WIN)` and `[DST, DST+WIN)`. |
 | `VITASLOP_AT9_DIR` | vitaslop-atrac9/tests/oracle.rs:66 | Decode a whole AT9 payload the way a superframe consumer does: for each |
 | `VITASLOP_AUDIO_RAW` | vitaslop-runtime/src/vita/audio.rs:80 | Optional raw-s16le capture of the mixed output stream (env |
-| `VITASLOP_B` | vitaslop-frontend/src/settings.rs:244 | - |
+| `VITASLOP_B` | vitaslop-frontend/src/settings.rs:263 | - |
 | `VITASLOP_BACKTRACE` | vitaslop-runtime/src/vita/mod.rs:491 | Print the guest call chain the first time a chosen NID is called from each thread |
 | `VITASLOP_BLOCK_HIST` | vitaslop-native/src/recipe_runner.rs:167 | Dump the per-PC block-entry histogram gathered under `VITASLOP_BLOCK_HIST`, for |
 | `VITASLOP_BLOCK_HIST_SEQ` | vitaslop-native/src/threaded.rs:1665 | Print the block-visit histogram gathered under `VITASLOP_BLOCK_HIST`: the `top` |
@@ -46,7 +46,7 @@ during boot.
 | `VITASLOP_CONSOLE` | vitaslop-web/src/logging.rs:218 | `VITASLOP_CONSOLE=1`: mirror the run's status notes - the setup summary, the adapter and |
 | `VITASLOP_CPU_SHARE` | vitaslop-native/src/recipe_runner.rs:111 | Who actually got the CPU over the run, when `VITASLOP_CPU_SHARE` is set - see |
 | `VITASLOP_DBG_CALLSITES` | vitaslop-runtime/src/vita/mod.rs:432 | Diagnostic call-site profiler (`VITASLOP_DBG_CALLSITES`): counts host calls |
-| `VITASLOP_DEBUG_CAPTURE` | vitaslop-frontend/src/settings.rs:148 | The `VITASLOP_*` map a run of these settings is configured with: the base set, |
+| `VITASLOP_DEBUG_CAPTURE` | vitaslop-frontend/src/settings.rs:167 | The `VITASLOP_*` map a run of these settings is configured with: the base set, |
 | `VITASLOP_DECODE_CACHE_MB` | vitaslop-runtime/src/render.rs:6321 | Budget for the decode cache, in BYTES of decoded RGBA8, before it is cleared wholesale. |
 | `VITASLOP_DIRTY_PAGES` | vitaslop-native/src/threaded.rs:128 | Linear-memory offset of the guest-store dirty block, when this build was |
 | `VITASLOP_DISPATCH_ALL` | vitaslop-transpiler/src/emit.rs:1298 | The ablation arm that prices a dispatch re-entry: `VITASLOP_DISPATCH_ALL=1` sends even a |
@@ -216,6 +216,7 @@ during boot.
 | `VITASLOP_PERF` | vitaslop-native/src/perf.rs:43 | Is perf accounting on (`VITASLOP_PERF` set)? Read once and cached. |
 | `VITASLOP_PERF_CONSOLE` | vitaslop-web/src/lib.rs:1185 | Whether the per-window performance report is also written to the browser CONSOLE |
 | `VITASLOP_PIXEL_TRACE` | vitaslop-runtime/src/render.rs:5080 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
+| `VITASLOP_PKG` | vitaslop-runtime/src/ingest/stream.rs:1003 | A pkg's item table, read over a source that only ever hands out RANGES |
 | `VITASLOP_POISON_UNRESOLVED_VARS` | vitaslop-runtime/src/link.rs:318 | - |
 | `VITASLOP_POKE` | vitaslop-native/tests/retail_boot_probe.rs:682 | - |
 | `VITASLOP_POLL_ADDR` | vitaslop-native/src/threaded.rs:1756 | Guest address to sample after each host call, from `VITASLOP_POLL_ADDR` (hex). |
@@ -285,7 +286,7 @@ during boot.
 | `VITASLOP_UV_DEBUG` | vitaslop-runtime/src/render.rs:5094 | Draw one scene onto an EXISTING framebuffer and depth buffer, composing with whatever |
 | `VITASLOP_VBLANK_PARK` | vitaslop-runtime/src/vita/display.rs:201 | Whether an inlined `sceDisplayGetVcount` carries the spin guard (`VITASLOP_VBLANK_PARK`, |
 | `VITASLOP_VERTEX_INTERN` | vitaslop-runtime/src/host.rs:2829 | A cheap, allocation-free fingerprint of a vertex stream, for [`TextureSnapshots:: |
-| `VITASLOP_VPK` | vitaslop-runtime/src/ingest/stream.rs:991 | A homebrew VPK (`VITASLOP_VPK=<file>`): probed as `vpk`, imported as files + a |
+| `VITASLOP_VPK` | vitaslop-runtime/src/ingest/stream.rs:1057 | A homebrew VPK (`VITASLOP_VPK=<file>`): probed as `vpk`, imported as files + a |
 | `VITASLOP_WASM_INDICES` | vitaslop-native/src/threaded.rs:2378 | Rewrite `<wasm function N>` in a trap backtrace to name the GUEST function it is. |
 | `VITASLOP_WASM_NAMES` | vitaslop-transpiler/src/emit.rs:1081 | When `VITASLOP_WASM_NAMES` is set, emit a wasm `name` custom section labelling |
 | `VITASLOP_WATCH_` | vitaslop-transpiler/src/emit.rs:1414 | Number of matching store-watchpoint hits to skip before trapping (`VITASLOP_WATCH_ |
@@ -302,6 +303,6 @@ during boot.
 | `VITASLOP_WATCH_STORE_MODE` | vitaslop-transpiler/src/emit.rs:1606 | Store-watchpoint mode, from `VITASLOP_WATCH_STORE_MODE` (default `any`): |
 | `VITASLOP_WATCH_STORE_NZ` | vitaslop-transpiler/src/emit.rs:1629 | `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing |
 | `VITASLOP_WATCH_STORE_SKIP` | vitaslop-transpiler/src/emit.rs:597 | Linear-memory byte offset of the store-watchpoint MATCH COUNTER, or 0 when this |
-| `VITASLOP_X` | vitaslop-frontend/src/settings.rs:224 | Parse a `NAME=VALUE` per line knobs box into a map. |
+| `VITASLOP_X` | vitaslop-frontend/src/settings.rs:243 | Parse a `NAME=VALUE` per line knobs box into a map. |
 | `VITASLOP_XML_DUMP` | vitaslop-runtime/src/vita/sce_xml.rs:580 | `VITASLOP_XML_DUMP=<dir>`: write every document handed to `parse` into `<dir>` as |
-| `VITASLOP_Y` | vitaslop-frontend/src/settings.rs:225 | Parse a `NAME=VALUE` per line knobs box into a map. |
+| `VITASLOP_Y` | vitaslop-frontend/src/settings.rs:244 | Parse a `NAME=VALUE` per line knobs box into a map. |

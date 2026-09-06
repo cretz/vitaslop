@@ -6,7 +6,7 @@
 // emulator wrote. All of these are "some files", so the picker accepts files OR a
 // folder, and the Rust side sniffs what it was given.
 
-import { requestPersistence, storageRoom } from "./opfs.js";
+import { requestPersistence } from "./opfs.js";
 
 /// Relative paths from a picker's FileList or a drop's items. Folder picks carry
 /// `webkitRelativePath` (with the picked folder as the first segment, which is kept -
@@ -52,13 +52,17 @@ function spawn() {
   return new Worker("./import-worker.js", { type: "module" });
 }
 
-/// What these files are. Resolves to the worker's probe object.
-export function probe(entries) {
+/// What these files are, without importing them. Resolves to the worker's probe
+/// object; `onProgress({ stage, file, done, total })` reports the bytes it reads on
+/// the way, which on a phone is the difference between a slow read and a hang.
+export function probe(entries, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     const w = spawn();
     w.onmessage = (e) => {
       const d = e.data;
       if (d.type === "panic") return reject(new Error("import panicked: " + d.message));
+      // The identify job reports its reads. Anything but a report ends the job.
+      if (d.type === "progress") return onProgress(d);
       w.terminate();
       d.type === "probe" ? resolve(d.probe) : reject(new Error(d.message || "probe failed"));
     };
@@ -70,26 +74,54 @@ export function probe(entries) {
   });
 }
 
-/// Import into `games/<titleId>/`. `onProgress({ stage, file, done, total, rate })`.
-export async function run(entries, titleId, needBytes, onProgress = () => {}) {
-  const room = await storageRoom();
-  if (room && room.free < needBytes * 1.05) {
-    throw new Error(
-      `this title needs about ${(needBytes / 1e6) | 0} MB but this browser will only give this site ` +
-        `${(room.free / 1e6) | 0} MB more (quota ${(room.quota / 1e6) | 0} MB, ${(room.usage / 1e6) | 0} MB used). ` +
-        `Free up space on the device, or remove a title.`
-    );
-  }
+/// Identify AND import in one job: the picked files go straight in, and the worker
+/// says what they were (`onProbe`) as soon as it knows, part way through.
+///
+/// There is no confirmation step. Identifying a package means reading it, on a phone
+/// that is slow enough to look like a hang, and doing it twice - once to ask "import
+/// this?" and once inside the import - paid that twice for nothing.
+/// `onProgress({ stage, file, done, total, rate })`; `stage` is `reading` (identifying,
+/// `total` 0), `preparing`, then the import's own stages.
+export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
   await requestPersistence();
-  const t0 = performance.now();
   return new Promise((resolve, reject) => {
     const w = spawn();
     let panic = null;
+    let probe = null;
+    // The rate is measured over a TRAILING WINDOW, not since the start. A container is
+    // a few big files and thousands of small ones, and they do not read at the same
+    // speed: an average taken from the first byte spends the whole import catching up
+    // to the current speed, which is what made the estimate fall by minutes at a time.
+    // Nothing is reported until the window is wide enough to mean something.
+    const WINDOW_MS = 8000;
+    const samples = [];
+    let smooth = 0;
     w.onmessage = (e) => {
       const d = e.data;
       if (d.type === "progress") {
-        const secs = (performance.now() - t0) / 1000;
-        onProgress({ ...d, rate: secs > 0.5 ? d.done / secs : 0 });
+        let rate = 0;
+        if (d.total) {
+          const now = performance.now();
+          if (samples.length && samples[0].total !== d.total) samples.length = 0;
+          samples.push({ t: now, done: d.done, total: d.total });
+          while (samples.length > 2 && now - samples[0].t > WINDOW_MS) samples.shift();
+          const secs = (now - samples[0].t) / 1000;
+          const bytes = d.done - samples[0].done;
+          if (secs >= 2 && bytes > 0) {
+            const inst = bytes / secs;
+            smooth = smooth ? smooth * 0.7 + inst * 0.3 : inst;
+            rate = smooth;
+          }
+        } else {
+          samples.length = 0;
+          smooth = 0;
+        }
+        onProgress({ ...d, rate });
+        return;
+      }
+      if (d.type === "probe") {
+        probe = d.probe;
+        onProbe(d.probe);
         return;
       }
       if (d.type === "panic") {
@@ -97,13 +129,13 @@ export async function run(entries, titleId, needBytes, onProgress = () => {}) {
         return;
       }
       w.terminate();
-      if (d.type === "done") resolve(d);
+      if (d.type === "done") resolve({ ...d, probe });
       else reject(new Error(d.message || panic || "import failed"));
     };
     w.onerror = (e) => {
       w.terminate();
       reject(new Error(panic || e.message || "the import worker died"));
     };
-    w.postMessage({ type: "import", files: entries, titleId });
+    w.postMessage({ type: "import", files: entries });
   });
 }

@@ -136,8 +136,12 @@ export function createPlayer({ onExit }) {
       if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
       else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
     } catch {}
+    // The lock is a setting: a phone held in portrait is a legitimate way to play with
+    // the pad below the screen, and the lock takes that away.
     try {
-      if (coarse && screen.orientation && screen.orientation.lock) await screen.orientation.lock("landscape");
+      if (coarse && settings && settings.lockLandscape !== false && screen.orientation && screen.orientation.lock) {
+        await screen.orientation.lock("landscape");
+      }
     } catch {}
   };
   const exitFullscreen = async () => {
