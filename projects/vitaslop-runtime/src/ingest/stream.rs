@@ -326,27 +326,54 @@ impl PkgSource {
         let mut me = PkgSource { inner, path: path.to_string(), header, session_key, items: HashMap::new(), work_bin };
         let table_len = me.header.item_count as usize * 0x20;
         let table = me.decrypt_at(me.header.data_offset, table_len)?;
-        let mut items = HashMap::new();
+        let be32 = |at: usize| -> Result<u32, Error> {
+            let s = table.get(at..at + 4).ok_or(Error::OutOfBounds("pkg u32"))?;
+            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        let be64 = |at: usize| -> Result<u64, Error> {
+            let s = table.get(at..at + 8).ok_or(Error::OutOfBounds("pkg u64"))?;
+            Ok(u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+        };
+        // Parse every entry first, then fetch all the NAMES IN ONE READ. The names sit
+        // in one contiguous run right after the table, and a read here is a round trip
+        // to the picked `File` - on a phone that is milliseconds each, so one read per
+        // item is a visible stall on the screen before anything is written.
+        let mut entries = Vec::with_capacity(me.header.item_count as usize);
+        let (mut name_lo, mut name_hi) = (u64::MAX, 0u64);
         for i in 0..me.header.item_count as usize {
             let e = i * 0x20;
-            let be32 = |at: usize| -> Result<u32, Error> {
-                let s = table.get(at..at + 4).ok_or(Error::OutOfBounds("pkg u32"))?;
-                Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-            };
-            let be64 = |at: usize| -> Result<u64, Error> {
-                let s = table.get(at..at + 8).ok_or(Error::OutOfBounds("pkg u64"))?;
-                Ok(u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
-            };
             let name_offset = be32(e)? as u64;
             let name_size = be32(e + 4)? as usize;
             let data_offset = be64(e + 8)?;
             let data_size = be64(e + 0x10)?;
             let flags = be32(e + 0x18)?;
-            let name_bytes = me.decrypt_at(me.header.data_offset + name_offset, name_size)?;
-            let name = String::from_utf8_lossy(&name_bytes).into_owned();
+            if !is_directory(flags) {
+                name_lo = name_lo.min(name_offset);
+                name_hi = name_hi.max(name_offset + name_size as u64);
+            }
+            entries.push((name_offset, name_size, data_offset, data_size, flags));
+        }
+        // One read, unless the names are scattered over an implausible span (then the
+        // per-item read is still correct, just slower).
+        const NAME_SPAN_MAX: u64 = 8 << 20;
+        let names = if name_lo <= name_hi && name_hi - name_lo <= NAME_SPAN_MAX {
+            Some((name_lo, me.decrypt_at(me.header.data_offset + name_lo, (name_hi - name_lo) as usize)?))
+        } else {
+            None
+        };
+        let mut items = HashMap::new();
+        for (name_offset, name_size, data_offset, data_size, flags) in entries {
             if is_directory(flags) {
                 continue;
             }
+            let name_bytes = match &names {
+                Some((lo, blob)) => {
+                    let at = (name_offset - lo) as usize;
+                    blob.get(at..at + name_size).ok_or(Error::OutOfBounds("pkg item name"))?.to_vec()
+                }
+                None => me.decrypt_at(me.header.data_offset + name_offset, name_size)?,
+            };
+            let name = String::from_utf8_lossy(&name_bytes).into_owned();
             items.insert(
                 name.clone(),
                 PkgItem { name, data_offset: me.header.data_offset + data_offset, data_size, flags },
@@ -970,6 +997,45 @@ mod tests {
             assert_eq!(gp, ep);
             assert!(gb == eb, "{gp}: bytes differ ({} vs {})", gb.len(), eb.len());
         }
+    }
+
+    /// A pkg's item table, read over a source that only ever hands out RANGES
+    /// (`VITASLOP_PKG=<file>`): every item name resolves, and the names come out of the
+    /// one batched read the same as they do one at a time. The batched read is what
+    /// keeps a phone from paying a file-provider round trip per item before the import
+    /// has written anything.
+    #[test]
+    fn a_pkgs_item_names_read_in_one_go() {
+        let Some(path) = std::env::var_os("VITASLOP_PKG") else { return };
+        struct FileSource(std::path::PathBuf);
+        impl ByteSource for FileSource {
+            fn list(&self) -> Vec<String> {
+                vec!["game.pkg".to_string()]
+            }
+            fn size(&self, _p: &str) -> Option<u64> {
+                std::fs::metadata(&self.0).ok().map(|m| m.len())
+            }
+            fn read_at(&self, _p: &str, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&self.0).map_err(|e| Error::Io(e.to_string()))?;
+                f.seek(SeekFrom::Start(off)).map_err(|e| Error::Io(e.to_string()))?;
+                let mut got = 0;
+                while got < buf.len() {
+                    match f.read(&mut buf[got..]).map_err(|e| Error::Io(e.to_string()))? {
+                        0 => break,
+                        n => got += n,
+                    }
+                }
+                Ok(got)
+            }
+        }
+        let src: Rc<dyn ByteSource> = Rc::new(FileSource(std::path::PathBuf::from(&path)));
+        let pkg = PkgSource::open(src, "game.pkg", None).expect("open pkg");
+        let names = pkg.list();
+        assert!(names.iter().any(|n| n == "sce_sys/param.sfo"), "no param.sfo among {} items", names.len());
+        assert!(names.iter().any(|n| n == "sce_pfs/files.db"), "no sce_pfs/files.db");
+        assert!(names.iter().all(|n| !n.is_empty() && n.is_ascii()), "an item name did not decrypt");
+        assert!(names.iter().all(|n| pkg.size(n).is_some()));
     }
 
     #[test]

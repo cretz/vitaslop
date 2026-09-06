@@ -45,6 +45,18 @@ impl Default for PadSettings {
     }
 }
 
+/// Whether a run takes over the screen when it starts. Browser only: the desktop
+/// shell has F11 and no notion of a start-up gesture.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FullscreenStart {
+    /// Fullscreen on a touch screen, a window on a desktop. The default: a phone has
+    /// no room to spare, and a desktop browser has other tabs.
+    Auto,
+    Always,
+    Never,
+}
+
 /// How the 960x544 panel is fitted to the screen.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +81,11 @@ pub struct Settings {
     /// Desktop only: the frame rate in the window's title bar.
     pub fps_in_title: bool,
     pub scaling: Scaling,
+    /// Browser: whether pressing Play takes over the screen.
+    pub fullscreen_on_start: FullscreenStart,
+    /// Browser, touch devices: hold the screen in landscape while fullscreen. Off, a
+    /// phone rotates the game with the device.
+    pub lock_landscape: bool,
     pub pad: PadSettings,
     /// Button name -> `KeyboardEvent.code`.
     pub keyboard: BTreeMap<String, String>,
@@ -97,6 +114,8 @@ impl Default for Settings {
             show_fps: false,
             fps_in_title: false,
             scaling: Scaling::Fit,
+            fullscreen_on_start: FullscreenStart::Auto,
+            lock_landscape: true,
             pad: PadSettings::default(),
             keyboard: crate::input::default_keyboard(),
             gamepad: crate::input::default_gamepad(),

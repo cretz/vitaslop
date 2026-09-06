@@ -58,14 +58,15 @@ try {
     if (!src) throw new Error("GAME_SRC is required unless SKIP_IMPORT=1");
     await page.goto(url + "#/import");
     await page.waitForSelector("#f-dir", { state: "attached" });
-    await page.setInputFiles("#f-dir", src);
-    await page.waitForSelector("#do-import, .card.error", { timeout: 120000 });
-    if (await page.$(".card.error")) await fail("probe: " + (await page.$eval(".card.error", (e) => e.innerText)));
-    await page.screenshot({ path: join(shotDir, "02-confirm.png") });
-    const confirm = await page.$eval(".confirm", (e) => e.innerText);
-    console.log("probe:", confirm.split("\n").slice(0, 2).join(" | "));
+    // Picking IS the import: there is no confirmation button. The card names the title
+    // part way through, as soon as the worker has identified it.
     const t0 = Date.now();
-    await page.click("#do-import");
+    await page.setInputFiles("#f-dir", src);
+    await page.waitForSelector(".confirm, .card.error", { timeout: 120000 });
+    if (await page.$(".card.error")) await fail("import: " + (await page.$eval(".card.error", (e) => e.innerText)));
+    await page.waitForFunction(() => !/^Reading /.test(document.querySelector("#imp-title")?.textContent || "Reading "), null, { timeout: 10 * 60 * 1000 }).catch(() => {});
+    await page.screenshot({ path: join(shotDir, "02-importing.png") });
+    console.log("identified:", await page.$eval(".confirm", (e) => e.innerText.split("\n").slice(0, 2).join(" | ")));
     await page.waitForFunction(() => location.hash.startsWith("#/title/") || document.querySelector(".card.error"), null, { timeout: 15 * 60 * 1000 });
     if (await page.$(".card.error")) await fail("import: " + (await page.$eval(".card.error", (e) => e.innerText)));
     console.log(`imported in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
