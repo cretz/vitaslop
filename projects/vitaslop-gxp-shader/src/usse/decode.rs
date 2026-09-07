@@ -3685,8 +3685,17 @@ fn decode_grp_mem_load(word: u64) -> Instr {
     //   header), so blocking it here refused the one form the rest of the pipeline is built to
     //   serve. Three vertex programs of a retail title load through it.
     //
-    // TEMP and OUTPUT stay out: neither is observed, and a pointer read out of a register the
-    // program computed for something else is not a thing to guess at.
+    // * TEMP - the SAME skinning idiom as the PA case, landing in a different bank. A
+    //   retail title's skinned vertex program computes `bone_index * 48 + sa[34]` four
+    //   times over (48 bytes being a 4x3 bone matrix) and the compiler puts one of those
+    //   addresses in a PA register and the other three in TEMPs - so the census accepted
+    //   one load of a group and refused its three siblings, on a distinction the program
+    //   does not make. The address arithmetic is the guest's own either way, and the
+    //   emitter addresses a temp (`r[n]`) exactly as it addresses a PA register.
+    //
+    // OUTPUT stays out: it is not observed, and an output register is where a program puts
+    // results, not addresses - a pointer read out of one would be a guess about what the
+    // program meant.
     let src0 = {
         let (ext, sel) = (bits(word, 50, 50), bits(word, 34, 34));
         let bank = match (ext, sel) {
@@ -3695,8 +3704,8 @@ fn decode_grp_mem_load(word: u64) -> Instr {
             (_, 0) => Bank::Output,
             (_, _) => Bank::SecondaryAttr,
         };
-        if !matches!(bank, Bank::PrimaryAttr | Bank::SecondaryAttr) {
-            set(&mut blocked, "0xE8 memory-load src0 outside the PA/SA banks not in the census");
+        if !matches!(bank, Bank::PrimaryAttr | Bank::SecondaryAttr | Bank::Temp) {
+            set(&mut blocked, "0xE8 memory-load src0 outside the PA/SA/TEMP banks not in the census");
         }
         Operand::plain(bank, r7_reg_index(bits(word, 20, 14)), sel as u8)
     };
@@ -5534,9 +5543,16 @@ mod tests {
         let sa_i = decode(sa_ptr);
         assert_eq!(sa_i.blocked, None, "{sa_ptr:#018x}");
         assert_eq!(sa_i.srcs[0].bank, Bank::SecondaryAttr);
-        // A TEMP pointer is in neither, and still blocks by name.
+        // A TEMP pointer is the third census shape: the skinning idiom puts the computed
+        // address of a bone matrix in whichever bank the compiler chose, and one retail
+        // program uses a PA register for one load of a group and TEMPs for its siblings.
         let temp_ptr = base & !(1 << 34); // ext=0, sel=0 -> TEMP pointer
-        assert!(decode(temp_ptr).blocked.is_some_and(|b| b.contains("PA/SA banks")));
+        let temp_i = decode(temp_ptr);
+        assert_eq!(temp_i.blocked, None, "{temp_ptr:#018x}");
+        assert_eq!(temp_i.srcs[0].bank, Bank::Temp);
+        // OUTPUT is still out: a program puts RESULTS there, not addresses.
+        let out_ptr = (base | (1 << 50)) & !(1 << 34); // ext=1, sel=0 -> OUTPUT pointer
+        assert!(decode(out_ptr).blocked.is_some_and(|b| b.contains("PA/SA/TEMP banks")));
         let reg_off = base & !(1 << 49); // src1 ext cleared -> register offset row
         assert!(decode(reg_off).blocked.is_some_and(|b| b.contains("register-supplied")));
     }

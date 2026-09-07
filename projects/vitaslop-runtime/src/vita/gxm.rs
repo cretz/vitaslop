@@ -1283,6 +1283,8 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // to build one from is the two lists of programs it created - see
     // `VitaState::note_vertex_program_created`.
     st.note_vertex_program_created(ctx, program_header);
+    // One reference, for `sceGxmShaderPatcherGetVertexProgramRefCount`.
+    st.note_program_created(handle);
     ctx.write_u32(out, handle);
     ctx.ret(0);
 }
@@ -1430,8 +1432,46 @@ pub(super) fn create_fragment_program(ctx: &mut GuestCtx, st: &mut VitaState) {
     // pipelines built ACROSS the race, with single frames spending 50-100 ms building 2-6 of
     // them. That is not just slow, it is a different SHAPE from the hardware.
     st.queue_shader_precompile(ctx, vertex_program, program_header);
+    // One reference, for `sceGxmShaderPatcherGetFragmentProgramRefCount`.
+    st.note_program_created(handle);
     ctx.write_u32(out, handle);
     ctx.ret(0);
+}
+
+/// `SCE_GXM_ERROR_INVALID_VALUE` (`psp2/gxm.h`): an argument that is not a thing this
+/// context knows about.
+const SCE_GXM_ERROR_INVALID_VALUE: i32 = 0x805B_0003u32 as i32;
+
+/// int sceGxmShaderPatcherGetVertexProgramRefCount(patcher, vertexProgram, uint *count)
+/// int sceGxmShaderPatcherGetFragmentProgramRefCount(patcher, fragmentProgram, uint *count)
+///
+/// The count is real: it is maintained by create and release (see
+/// `VitaState::note_program_created`). Because this patcher never shares a program, a
+/// live one always reads 1 - which is the truth about this model, not a placeholder.
+///
+/// A program the patcher does not know is `SCE_GXM_ERROR_INVALID_VALUE` rather than a
+/// count of zero. A title asking about a pointer we never returned has lost track of its
+/// own programs, and answering "zero references" would tell it the program is already
+/// gone, which is a different and more dangerous statement than "that is not a program".
+pub(super) fn shader_patcher_get_program_ref_count(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program = ctx.arg(1);
+    let out = ctx.arg(2);
+    match st.program_ref_count(program) {
+        Some(n) => {
+            if out != 0 {
+                ctx.write_u32(out, n);
+            }
+            ctx.ret(0);
+        }
+        None => {
+            tracing::warn!(
+                target: "vitaslop::warning",
+                program = format_args!("{program:#010x}").to_string(),
+                "shader patcher: ref count asked for a program this patcher never created"
+            );
+            ctx.ret(SCE_GXM_ERROR_INVALID_VALUE as u32);
+        }
+    }
 }
 
 /// int sceGxmBeginScene(context, flags, renderTarget, validRegion,

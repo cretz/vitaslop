@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>vitaslop - where the import's time goes</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #14161a;
+        color: #e6e8ec;
+        font: 15px/1.5 system-ui, sans-serif;
+      }
+      h1 {
+        font-size: 17px;
+        margin: 0 0 4px;
+      }
+      p {
+        margin: 0 0 12px;
+        color: #a9b0bd;
+      }
+      button,
+      input[type="file"] {
+        font: inherit;
+      }
+      button {
+        background: #2b6cb0;
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin: 4px 6px 12px 0;
+      }
+      .dim {
+        color: #8b93a1;
+        font-size: 13px;
+      }
+      button:disabled {
+        background: #3a404a;
+        color: #8b93a1;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #0d0f12;
+        border: 1px solid #262b33;
+        border-radius: 8px;
+        padding: 12px;
+        font: 12px/1.45 ui-monospace, monospace;
+        min-height: 40vh;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Where the import's time goes</h1>
+    <p>
+      Pick what you would import: a .pkg AND its work.bin, or a dumped folder. Nothing is kept and nothing
+      leaves the device except the result text, and only when this page is served by the dev server.
+      "Measure the parts" times reading, crypto and storage on their own, about a minute. "Run the real
+      import" runs the actual import twice, old read path against new, stopping after 128 MB each, about
+      a minute and a half.
+    </p>
+    <div class="pick">
+      <button id="pick-pkg">Choose the .pkg</button>
+      <button id="pick-work">Choose work.bin</button>
+      <button id="pick-dir">or choose a folder</button>
+    </div>
+    <p id="picked" class="dim">nothing picked</p>
+    <input id="f-pkg" type="file" hidden />
+    <input id="f-work" type="file" hidden />
+    <input id="f-dir" type="file" webkitdirectory hidden />
+    <div>
+      <button id="run" disabled>Measure the parts</button>
+      <button id="bench" disabled>Run the real import (bounded)</button>
+      <button id="copy" disabled>Copy result</button>
+    </div>
+    <pre id="out">pick a file</pre>
+
+    <script type="module">
+      // The page half. Every measurement runs in the worker, because FileReaderSync and
+      // OPFS sync access handles exist only there - which is where the import runs too,
+      // so this times the same calls rather than their main-thread cousins.
+      const $ = (id) => document.getElementById(id);
+      const out = $("out");
+      let text = "";
+
+      // The pickers are SEPARATE, the way the product's own import screen has them.
+      // One multi-select input looks tidier and does not work: an Android file picker
+      // will happily hand back a single file from it, which is how the first run of
+      // this page came back with a pkg and no licence and died complaining about a
+      // missing work.bin inside the container.
+      let entries = [];
+      const describe = () =>
+        ($("picked").textContent = entries.length
+          ? entries.map((e) => `${e.path} (${(e.file.size / 1048576).toFixed(1)} MB)`).join(", ")
+          : "nothing picked");
+
+      const setEntry = (path, file) => {
+        entries = entries.filter((e) => e.path !== path);
+        if (file) entries.push({ path, file });
+        const ready = entries.length > 0;
+        $("run").disabled = !ready;
+        $("bench").disabled = !ready;
+        describe();
+      };
+
+      $("pick-pkg").onclick = () => $("f-pkg").click();
+      $("pick-work").onclick = () => $("f-work").click();
+      $("pick-dir").onclick = () => $("f-dir").click();
+      $("f-pkg").onchange = (e) => e.target.files[0] && setEntry(e.target.files[0].name, e.target.files[0]);
+      $("f-work").onchange = (e) => e.target.files[0] && setEntry("work.bin", e.target.files[0]);
+      // A folder pick REPLACES everything: it is a whole dump, paths and all, and the
+      // ingest reads it the same way the product does (`entriesFromFiles`).
+      $("f-dir").onchange = (e) => {
+        entries = [...e.target.files].map((f) => ({
+          // Backslashes to forward, the way `entriesFromFiles` does it.
+          path: (f.webkitRelativePath && f.webkitRelativePath.length ? f.webkitRelativePath : f.name).split("\\").join("/"),
+          file: f,
+        }));
+        $("run").disabled = $("bench").disabled = entries.length === 0;
+        $("picked").textContent = `${entries.length} files in a folder`;
+      };
+
+      // The container is the BIGGEST picked file: a work.bin is half a kilobyte, and
+      // the part timings want the file the import actually spends its time on.
+      const biggest = () => entries.reduce((a, b) => (a && a.file.size > b.file.size ? a : b), null);
+
+      /// Both buttons do the same thing with a different worker: hand it the files,
+      /// stream its lines into the box, then post the transcript to the dev server.
+      const start = (workerUrl, run) => {
+        const top = biggest();
+        if (!top) return;
+        const file = top.file;
+        $("run").disabled = true;
+        $("bench").disabled = true;
+        out.textContent = "";
+        const w = new Worker(workerUrl, { type: "module" });
+        w.onmessage = async (e) => {
+          if (e.data.type === "log") {
+            out.textContent += (out.textContent ? "\n" : "") + e.data.line;
+            window.scrollTo(0, document.body.scrollHeight);
+            return;
+          }
+          text = e.data.text;
+          w.terminate();
+          $("run").disabled = false;
+          $("bench").disabled = false;
+          $("copy").disabled = false;
+          // The dev server stamps this in; static hosting does not, so the product build
+          // of this page never phones anywhere. Same contract as the diagnostics panel.
+          if (window.__vitaslopDiagSink) {
+            try {
+              await fetch(`/diag?run=${run}&tag=${encodeURIComponent(file.name.slice(0, 24))}`, {
+                method: "POST",
+                body: text,
+              });
+              out.textContent += "\n\n(sent to the dev server)";
+            } catch {}
+          }
+        };
+        w.onerror = (e) => {
+          out.textContent += `
+worker failed: ${e.message}`;
+          $("run").disabled = false;
+          $("bench").disabled = false;
+        };
+        w.postMessage({ file, entries });
+      };
+
+      $("run").onclick = () => start("./import-speed-worker.js", "import-speed");
+      $("bench").onclick = () => start("./import-bench-worker.js", "import-bench");
+
+      $("copy").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          $("copy").textContent = "Copied";
+          setTimeout(() => ($("copy").textContent = "Copy result"), 1500);
+        } catch {
+          // Clipboard access can be refused; the text is on screen either way.
+          $("copy").textContent = "Select the text above";
+        }
+      };
+    </script>
+  </body>
+</html>

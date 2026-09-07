@@ -466,6 +466,135 @@ pub(super) fn delete_object(_st: &mut VitaState, _id: i32) -> i32 {
     0
 }
 
+/// Timer errors, from `psp2/kernel/error.h`:
+///   `SCE_KERNEL_ERROR_TIMER_COUNTING` - start on a timer already counting
+///   `SCE_KERNEL_ERROR_TIMER_STOPPED`  - stop on a timer that is not counting
+///   `SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID` - a uid that is not a timer
+const SCE_KERNEL_ERROR_TIMER_COUNTING: u32 = 0x8002_7303;
+const SCE_KERNEL_ERROR_TIMER_STOPPED: u32 = 0x8002_7304;
+const SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID: u32 = 0x8002_8241;
+
+// --- virtual timers ---
+//
+// A Vita timer is a stopwatch, not an alarm: create it, start it, read it back. The
+// titles seen so far use it exactly that way (the one that brought this family in
+// creates one called "System Debug Timer" and reads it for its own profiling), so the
+// counting half is implemented and the EVENT half - `sceKernelSetTimerEvent`, which
+// wakes a thread on a schedule - deliberately is not. Nothing imports it, and a stub
+// that accepted one would be a timer that silently never fires.
+//
+// The count is DERIVED from `st.now_us()` rather than ticked, so it is exact under a
+// scheduler that does not run in real time. See `VitaState::timer_time_us`.
+//
+// vitasdk publishes these NIDs with no header; prototypes are from the henkaku wiki.
+
+/// SceUID sceKernelCreateTimer(const char *name, SceUInt32 attr,
+///     const SceKernelTimerOptParam *opt)
+///
+/// Created STOPPED with a count of zero: `sceKernelStartTimer` is a separate call.
+#[hostcall]
+pub(super) fn create_timer(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    name: Ptr,
+    attr: u32,
+    _opt: Ptr,
+) -> i32 {
+    let name =
+        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    let id = st.create_timer(&name, attr);
+    tracing::trace!(
+        target: "vitaslop::sema",
+        id, attr, name, thread = st.current_thread(),
+        "timer create"
+    );
+    id
+}
+
+/// SceUID sceKernelOpenTimer(const char *name)
+///
+/// Resolves an EXISTING timer by name, the way `sceKernelOpenSema` does. A name that
+/// was never created is the guest asking for something that is not there, so it gets
+/// the not-found error rather than a fresh timer it would then read as zero forever.
+#[hostcall]
+pub(super) fn open_timer(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr) -> i32 {
+    let name =
+        if name.addr() == 0 { String::new() } else { super::iofilemgr::read_cstr(ctx, name.addr()) };
+    match st.timer_by_name(&name) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                target: "vitaslop::warning",
+                name, thread = st.current_thread(),
+                "sceKernelOpenTimer: no timer with this name exists"
+            );
+            SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID as i32
+        }
+    }
+}
+
+/// int sceKernelStartTimer(SceUID timerId)
+///
+/// Zero if it started, and the "already counting" error if it was running - which is
+/// REPORTED rather than treated as a restart, because a silent restart would throw away
+/// however long the timer had already counted.
+#[hostcall]
+pub(super) fn start_timer(_ctx: &mut GuestCtx, st: &mut VitaState, id: i32) -> i32 {
+    match st.timer_start(id) {
+        Some(false) => 0,
+        Some(true) => SCE_KERNEL_ERROR_TIMER_COUNTING as i32,
+        None => uid_not_found(st, id, "sceKernelStartTimer"),
+    }
+}
+
+/// int sceKernelStopTimer(SceUID timerId)
+#[hostcall]
+pub(super) fn stop_timer(_ctx: &mut GuestCtx, st: &mut VitaState, id: i32) -> i32 {
+    match st.timer_stop(id) {
+        Some(true) => 0,
+        Some(false) => SCE_KERNEL_ERROR_TIMER_STOPPED as i32,
+        None => uid_not_found(st, id, "sceKernelStopTimer"),
+    }
+}
+
+/// int sceKernelGetTimerTime(SceUID timerId, SceUInt64 *time)
+///
+/// The count in microseconds. The pointer is optional in the sense that a title may
+/// pass null and take the value from the return, which is why the write is guarded.
+#[hostcall]
+pub(super) fn get_timer_time(ctx: &mut GuestCtx, st: &mut VitaState, id: i32, out: Ptr) -> i32 {
+    // One expression, no early return: a `#[hostcall]` body cannot return early - the
+    // macro wraps it and the `return` would leave through the wrapper's `()`.
+    match st.timer_time_us(id) {
+        Some(us) => {
+            if out.addr() != 0 {
+                ctx.write_u32(out.addr(), us as u32);
+                ctx.write_u32(out.addr() + 4, (us >> 32) as u32);
+            }
+            0
+        }
+        None => uid_not_found(st, id, "sceKernelGetTimerTime"),
+    }
+}
+
+/// int sceKernelDeleteTimer(SceUID timerId)
+#[hostcall]
+pub(super) fn delete_timer(_ctx: &mut GuestCtx, st: &mut VitaState, id: i32) -> i32 {
+    if st.timer_delete(id) { 0 } else { uid_not_found(st, id, "sceKernelDeleteTimer") }
+}
+
+/// The one report for a timer call naming a uid that does not exist. It is a WARNING:
+/// either the title opened a timer we failed to create, or it is using a uid from a
+/// family we have not implemented, and both are ours to fix.
+fn uid_not_found(st: &VitaState, id: i32, what: &str) -> i32 {
+    tracing::warn!(
+        target: "vitaslop::warning",
+        id = format_args!("{id:#x}").to_string(), thread = st.current_thread(),
+        "{what}: no timer with this uid"
+    );
+    SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID as i32
+}
+
 // --- time ---
 
 /// SceUInt64 sceKernelGetSystemTimeWide(void)

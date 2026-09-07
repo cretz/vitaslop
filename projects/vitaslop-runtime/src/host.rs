@@ -782,6 +782,23 @@ struct SemaRec {
     count: i32,
 }
 
+/// A live virtual timer. It is a stopwatch, so what is stored is `accrued_us` (banked
+/// by every stop) plus the clock reading it was last started at; the current count is
+/// derived, never ticked. That is what keeps it exact under a scheduler that does not
+/// run in real time - a timer that were incremented per frame would measure frames.
+struct TimerRec {
+    uid: i32,
+    /// The name passed to `sceKernelCreateTimer`, which is the key `sceKernelOpenTimer`
+    /// resolves - a lookup key, not just a label.
+    name: String,
+    attr: u32,
+    running: bool,
+    /// Microseconds banked by previous stops.
+    accrued_us: u64,
+    /// The clock reading at the last start; meaningless unless `running`.
+    started_us: u64,
+}
+
 struct ThreadRec {
     uid: i32,
     /// The name the guest passed to `sceKernelCreateThread`, if any. A worker's own
@@ -6083,6 +6100,14 @@ pub struct VitaState {
     // count and an event flag's bit pattern are still tracked so their observable
     // state is faithful for single-thread use (guarding data, wait-then-read).
     semaphores: Vec<SemaRec>,
+    /// Virtual timers (`sceKernelCreateTimer` and friends). A timer is a stopwatch over
+    /// the same virtual clock every other guest-visible time call reads
+    /// ([`now_us`](Self::now_us)), NOT a scheduled event source: the titles seen so far
+    /// create one, start it and read it back for their own profiling. Timer EVENTS
+    /// (`sceKernelSetTimerEvent`, which wakes a thread on a schedule) are deliberately
+    /// not here - nothing has imported them, and a stub that accepted one silently would
+    /// be a timer that never fires.
+    timers: Vec<TimerRec>,
     event_flags: Vec<(i32, u32)>,
     /// The guest's own name for each event flag, for REPORTS only (see
     /// [`create_event_flag`](Self::create_event_flag)). Kept beside `event_flags` rather
@@ -6218,6 +6243,14 @@ pub struct VitaState {
     pub audio_dec: Box<dyn vitaslop_platform::audio_dec::AudioDecodeFactory>,
     /// Opened NGS/audio port and handle bookkeeping (see `vita::ngs` / `vita::audio`).
     pub(crate) audio_state: crate::vita::audio::AudioState,
+    /// SceVoice's ports. A console with no microphone and no session: see
+    /// [`crate::vita::voice`].
+    pub(crate) voice: crate::vita::voice::VoiceState,
+    /// Live shader-patcher programs and how many references each holds, for
+    /// `sceGxmShaderPatcherGet{Vertex,Fragment}ProgramRefCount`. See
+    /// [`program_ref_count`](Self::program_ref_count) for why a count is tracked at all
+    /// when this patcher never shares a program.
+    program_refs: std::collections::BTreeMap<u32, u32>,
     /// `SceAudiodec` decoders the title created for a movie's sound - see
     /// [`crate::vita::audiodec`].
     pub(crate) audiodec: crate::vita::audiodec::AudiodecState,
@@ -6595,6 +6628,7 @@ impl VitaState {
             mspace_exhausted: std::collections::HashSet::new(),
             pending_reentry: None,
             semaphores: Vec::new(),
+            timers: Vec::new(),
             event_flags: Vec::new(),
             event_flag_names: std::collections::BTreeMap::new(),
             open_dialogs: 0,
@@ -6641,6 +6675,8 @@ impl VitaState {
             video: Box::new(vitaslop_platform::video::NoVideo),
             audio_dec: Box::new(vitaslop_platform::audio_dec::NoAudioDecode),
             audio_state: crate::vita::audio::AudioState::default(),
+            voice: crate::vita::voice::VoiceState::default(),
+            program_refs: std::collections::BTreeMap::new(),
             audiodec: crate::vita::audiodec::AudiodecState::default(),
             location: crate::vita::location::LocationState::default(),
             halt_on_terminate: false,
@@ -9568,6 +9604,122 @@ impl VitaState {
         if let Some(s) = self.semaphores.iter_mut().find(|s| s.uid == uid) {
             s.count += n;
         }
+    }
+
+    /// Create a timer, returning its SceUID. Timers are created STOPPED with a count of
+    /// zero, which is what `sceKernelCreateTimer` does: `sceKernelStartTimer` is a
+    /// separate call and a title that reads the time without starting must see nothing.
+    pub fn create_timer(&mut self, name: &str, attr: u32) -> i32 {
+        let uid = self.new_uid();
+        self.timers.push(TimerRec { uid, name: name.to_string(), attr, running: false, accrued_us: 0, started_us: 0 });
+        uid
+    }
+
+    /// The SceUID of an existing timer with this name, for `sceKernelOpenTimer`.
+    pub fn timer_by_name(&self, name: &str) -> Option<i32> {
+        self.timers.iter().find(|t| t.name == name).map(|t| t.uid)
+    }
+
+    /// Start a timer counting. Returns whether it was found, and whether it had ALREADY
+    /// been started - the caller reports that rather than silently restarting, since a
+    /// double start would otherwise lose however long the timer had already run.
+    pub fn timer_start(&mut self, uid: i32) -> Option<bool> {
+        let now = self.virtual_us;
+        let t = self.timers.iter_mut().find(|t| t.uid == uid)?;
+        let already = t.running;
+        if !already {
+            t.running = true;
+            t.started_us = now;
+        }
+        Some(already)
+    }
+
+    /// Stop a timer, banking what it has counted so far.
+    pub fn timer_stop(&mut self, uid: i32) -> Option<bool> {
+        let now = self.virtual_us;
+        let t = self.timers.iter_mut().find(|t| t.uid == uid)?;
+        let was_running = t.running;
+        if was_running {
+            t.accrued_us += now.saturating_sub(t.started_us);
+            t.running = false;
+        }
+        Some(was_running)
+    }
+
+    /// A timer's current count in microseconds: what it banked before it was last
+    /// stopped, plus the time since it was last started if it is running.
+    pub fn timer_time_us(&self, uid: i32) -> Option<u64> {
+        let t = self.timers.iter().find(|t| t.uid == uid)?;
+        Some(if t.running { t.accrued_us + self.virtual_us.saturating_sub(t.started_us) } else { t.accrued_us })
+    }
+
+    /// Set a timer's count, keeping it running if it was.
+    pub fn timer_set_time_us(&mut self, uid: i32, us: u64) -> Option<u64> {
+        let now = self.virtual_us;
+        let t = self.timers.iter_mut().find(|t| t.uid == uid)?;
+        let before = if t.running { t.accrued_us + now.saturating_sub(t.started_us) } else { t.accrued_us };
+        t.accrued_us = us;
+        t.started_us = now;
+        Some(before)
+    }
+
+    /// Forget a timer (`sceKernelDeleteTimer`). Returns whether it existed.
+    pub fn timer_delete(&mut self, uid: i32) -> bool {
+        let n = self.timers.len();
+        self.timers.retain(|t| t.uid != uid);
+        self.timers.len() != n
+    }
+
+    /// The guest's name for a timer, for reports.
+    pub fn timer_name(&self, uid: i32) -> &str {
+        self.timers.iter().find(|t| t.uid == uid).map(|t| t.name.as_str()).unwrap_or("")
+    }
+
+    /// A timer's attribute word, as it was created with.
+    pub fn timer_attr(&self, uid: i32) -> u32 {
+        self.timers.iter().find(|t| t.uid == uid).map(|t| t.attr).unwrap_or(0)
+    }
+
+    /// Whether a timer is currently counting.
+    pub fn timer_running(&self, uid: i32) -> bool {
+        self.timers.iter().any(|t| t.uid == uid && t.running)
+    }
+
+    /// A shader-patcher program was created: it now holds one reference.
+    ///
+    /// >>> WHY A COUNT AND NOT A SET. On the console the patcher SHARES programs: two
+    /// >>> `CreateVertexProgram` calls with identical parameters hand back the same
+    /// >>> program with its reference count at two, and a title that releases once still
+    /// >>> has a live program. This patcher does not share - `new_program_handle`
+    /// >>> allocates a fresh block every time - so every live program here holds exactly
+    /// >>> one reference, and that IS the truthful answer for this model rather than a
+    /// >>> stand-in for one. Keeping it as a count rather than a set means the day the
+    /// >>> patcher does start sharing, the getter is already right.
+    pub fn note_program_created(&mut self, handle: u32) {
+        if handle != 0 {
+            *self.program_refs.entry(handle).or_insert(0) += 1;
+        }
+    }
+
+    /// A program was released: drop one reference, forgetting it at zero. Returns
+    /// whether the handle was known, so a release of something never created can be
+    /// told apart from an ordinary one.
+    pub fn note_program_released(&mut self, handle: u32) -> bool {
+        match self.program_refs.get_mut(&handle) {
+            None => false,
+            Some(n) => {
+                *n -= 1;
+                if *n == 0 {
+                    self.program_refs.remove(&handle);
+                }
+                true
+            }
+        }
+    }
+
+    /// How many references a live program holds, or `None` if it is not one of ours.
+    pub fn program_ref_count(&self, handle: u32) -> Option<u32> {
+        self.program_refs.get(&handle).copied()
     }
 
     /// Create an event flag with an initial bit pattern, returning its SceUID.
@@ -16787,6 +16939,62 @@ mod preemptive_tests {
         assert!(st.release_earliest_io());
         assert_eq!(st.take_wakes(), vec![1]);
         assert!(!st.release_earliest_io(), "nothing outstanding");
+    }
+
+    /// The half a guest-visible conformance case cannot reach: what a timer does when
+    /// the clock MOVES. `vita_timer` runs a real velf through the loader, but that corpus
+    /// has no scheduler and nothing charges the clock, so it can only assert that a
+    /// running timer never goes backward. Here the clock is driven directly.
+    #[test]
+    fn timer_counts_only_while_running() {
+        let mut st = state();
+        let t = st.create_timer("System Debug Timer", 0);
+
+        // Created stopped: the clock may run, the timer does not.
+        st.charge_cpu_quantum(1_000);
+        assert_eq!(st.timer_time_us(t), Some(0), "a timer counts nothing before it is started");
+
+        assert_eq!(st.timer_start(t), Some(false), "not already running");
+        st.charge_cpu_quantum(3_000);
+        assert_eq!(st.timer_time_us(t), Some(3_000));
+
+        // A second start must NOT restart it: the caller is told, and the count stands.
+        assert_eq!(st.timer_start(t), Some(true), "already running");
+        assert_eq!(st.timer_time_us(t), Some(3_000), "a double start must not lose the count");
+
+        // Stopped: what it counted is banked, and further clock does not reach it.
+        assert_eq!(st.timer_stop(t), Some(true));
+        st.charge_cpu_quantum(5_000);
+        assert_eq!(st.timer_time_us(t), Some(3_000), "a stopped timer does not keep counting");
+        assert_eq!(st.timer_stop(t), Some(false), "already stopped");
+
+        // Restarting resumes from the banked count rather than from zero.
+        assert_eq!(st.timer_start(t), Some(false));
+        st.charge_cpu_quantum(2_000);
+        assert_eq!(st.timer_time_us(t), Some(5_000), "a restart resumes, it does not reset");
+
+        // Set replaces the count and keeps it running from there.
+        assert_eq!(st.timer_set_time_us(t, 100), Some(5_000), "returns what it was");
+        st.charge_cpu_quantum(1_000);
+        assert_eq!(st.timer_time_us(t), Some(1_100));
+
+        // Name lookup is what `sceKernelOpenTimer` resolves.
+        assert_eq!(st.timer_by_name("System Debug Timer"), Some(t));
+        assert_eq!(st.timer_by_name("no such timer"), None);
+        assert_eq!(st.timer_name(t), "System Debug Timer");
+        assert!(st.timer_running(t));
+
+        // A second timer is independent of the first.
+        let other = st.create_timer("other", 0);
+        assert_eq!(st.timer_start(other), Some(false));
+        st.charge_cpu_quantum(500);
+        assert_eq!(st.timer_time_us(other), Some(500));
+        assert_eq!(st.timer_time_us(t), Some(1_600));
+
+        assert!(st.timer_delete(t));
+        assert_eq!(st.timer_time_us(t), None, "a deleted uid is gone");
+        assert!(!st.timer_delete(t), "deleting twice is not a delete");
+        assert_eq!(st.timer_time_us(other), Some(500), "an unrelated timer is untouched");
     }
 
     #[test]

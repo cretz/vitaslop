@@ -41,6 +41,7 @@ pub mod touch;
 pub mod audiodec;
 pub mod avcdec;
 pub mod video;
+pub mod voice;
 
 use crate::host::{GuestCtx, VitaState};
 use crate::nid::{
@@ -50,7 +51,7 @@ use crate::nid::{
     livearea as livearea_nid, lwsync as lw_nid, pgf as pgf_nid, xml as xml_nid,
     net as net_nid, ngs as ngs_nid,
     processmgr as pm_nid, pvf as pvf_nid, services as sv_nid, sync as sync_nid,
-    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid,
+    sysmem as sm_nid, threadmgr as tm_nid, videodec as vd_nid, voice as voice_nid,
 };
 use crate::{nid, SvcOutcome};
 
@@ -930,6 +931,28 @@ pub fn dispatch(
         sync_nid::CLEAR_EVENT_FLAG => cont!(sync::clear_event_flag(ctx, st)),
         sync_nid::DELETE_EVENT_FLAG => cont!(sync::delete_object(ctx, st)),
         sync_nid::GET_SYSTEM_TIME_WIDE => cont!(sync::get_system_time_wide(ctx, st)),
+        // Virtual timers: a stopwatch the guest starts and reads. `Open`/`Start`/`Stop`
+        // are SceThreadmgr spellings, `Create`/`GetTime` SceLibKernel ones - one family,
+        // two exporting libraries, which is why the arms sit together.
+        sync_nid::CREATE_TIMER => cont!(sync::create_timer(ctx, st)),
+        tm_nid::OPEN_TIMER => cont!(sync::open_timer(ctx, st)),
+        tm_nid::START_TIMER => cont!(sync::start_timer(ctx, st)),
+        tm_nid::STOP_TIMER => cont!(sync::stop_timer(ctx, st)),
+        tm_nid::DELETE_TIMER => cont!(sync::delete_timer(ctx, st)),
+        sync_nid::GET_TIMER_TIME => cont!(sync::get_timer_time(ctx, st)),
+
+        // --- SceVoice: no microphone, no session (see `vita::voice`) -----------
+        voice_nid::INIT => cont!(voice::init(ctx, st)),
+        voice_nid::END => cont!(voice::end(ctx, st)),
+        voice_nid::START => cont!(voice::start(ctx, st)),
+        voice_nid::STOP => cont!(voice::stop(ctx, st)),
+        voice_nid::CREATE_PORT => cont!(voice::create_port(ctx, st)),
+        voice_nid::DELETE_PORT => cont!(voice::delete_port(ctx, st)),
+        voice_nid::CONNECT_IPORT_TO_OPORT => cont!(voice::connect(ctx, st)),
+        voice_nid::DISCONNECT_IPORT_FROM_OPORT => cont!(voice::disconnect(ctx, st)),
+        voice_nid::WRITE_TO_IPORT => cont!(voice::write_to_iport(ctx, st)),
+        voice_nid::READ_FROM_OPORT => cont!(voice::read_from_oport(ctx, st)),
+        voice_nid::GET_PORT_INFO => cont!(voice::get_port_info(ctx, st)),
 
         // --- libkernel: clib string/mem, threads, process ----------------------
         lk_nid::CLIB_PRINTF => cont!(libkernel::clib_printf(ctx, st)),
@@ -1173,12 +1196,22 @@ pub fn dispatch(
         // Nothing to tear down for these, but the guest is now free to reuse the
         // program's memory, so the reflected constants cached against its header
         // address must not outlive it.
-        gxm_nid::SHADER_PATCHER_DESTROY
-        | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM
-        | gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
+        gxm_nid::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM
         | gxm_nid::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => {
+            // Drop the reference before the reflection cache goes: the handle is the
+            // program the guest is giving back, and after this it must stop reading as
+            // a live program to `...GetProgramRefCount`.
+            st.note_program_released(ctx.arg(1));
             st.invalidate_program_reflection();
             cont!(gxm::ok(ctx))
+        }
+        gxm_nid::SHADER_PATCHER_DESTROY | gxm_nid::SHADER_PATCHER_UNREGISTER_PROGRAM => {
+            st.invalidate_program_reflection();
+            cont!(gxm::ok(ctx))
+        }
+        gxm_nid::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT
+        | gxm_nid::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => {
+            cont!(gxm::shader_patcher_get_program_ref_count(ctx, st))
         }
         // Record the bound fragment program so a draw can reflect its samplers (albedo
         // selection). The direct-draw path binds it here rather than via a precomputed
@@ -1816,6 +1849,7 @@ pub fn dispatch(
             cont!(audiodec::audiodec_create_decoder_external(ctx, st))
         }
         ad_nid::DECODE => cont!(audiodec::audiodec_decode(ctx, st)),
+        ad_nid::DECODE_N_FRAMES => cont!(audiodec::audiodec_decode_n_frames(ctx, st)),
         // The AT9 family: the title's own stream, decoded synchronously in the call.
         ad_nid::INIT_LIBRARY => cont!(audiodec::audiodec_init_library(ctx, st)),
         ad_nid::TERM_LIBRARY => cont!(audiodec::audiodec_term_library(ctx, st)),
@@ -2003,6 +2037,10 @@ pub fn dispatch(
         // here, so the claim is granted. `sceAudioOut` opening a BGM-type port is what
         // actually produces sound (see `vita::audio`), and that is independent of this.
         | sv_nid::APPMGR_ACQUIRE_BGM_PORT
+        // ... and releasing it again. Nothing was taken from anyone, so nothing has to be
+        // handed back; what matters is that the pair is symmetric, since a title that is
+        // told the acquire worked will release it later.
+        | sv_nid::APPMGR_RELEASE_BGM_PORT
         // ScePerf/Razor: a marker packet for the CPU profiler's timeline. No profiler is
         // attached and there is no capture buffer to append to, so the packet has nowhere
         // to go - which is exactly the retail case the call is written to survive.

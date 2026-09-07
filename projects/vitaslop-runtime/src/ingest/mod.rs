@@ -24,6 +24,10 @@
 //! The SELF layer ([`self2elf`]) ports the MIT-licensed `sceutils` (attribution
 //! retained per its license). Embedded keys are bare constants (see [`keys`]).
 
+// Timing the per-byte crypto on the device running it. wasm only: elsewhere the `aes`
+// crate uses the CPU's AES instructions and the question does not arise.
+#[cfg(target_arch = "wasm32")]
+pub mod bench;
 pub mod filesdb;
 pub mod keys;
 pub mod pfs;

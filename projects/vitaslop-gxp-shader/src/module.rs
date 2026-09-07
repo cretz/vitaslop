@@ -268,11 +268,51 @@ fn color_precision(shader: &Shader, color: ColorOutput) -> ColorPrecision {
         ColorOutput::NativeO0 => (Bank::Output, 0),
         ColorOutput::NonNativePa(base) => (Bank::PrimaryAttr, base),
     };
-    let last = shader.instrs.iter().rev().find(|i| {
-        i.dest
-            .as_ref()
-            .is_some_and(|d| d.bank == bank && d.index as u32 == base && i.write_mask.iter().any(|&m| m))
-    });
+    let writer_of = |bank: Bank, index: u32, before: usize| -> Option<(usize, &crate::ir::Instr)> {
+        shader.instrs[..before].iter().enumerate().rev().find(|(_, i)| {
+            i.dest.as_ref().is_some_and(|d| {
+                d.bank == bank && d.index as u32 == index && i.write_mask.iter().any(|&m| m)
+            })
+        })
+    };
+    let mut found = writer_of(bank, base, shader.instrs.len());
+    // >>> A COPY DOES NOT CHANGE THE PRECISION OF WHAT IT COPIES, and taking it at face
+    // >>> value is a black frame that reports success - the same failure
+    // >>> [[vitaslop-f16-colour-output]] records for the F16 reading itself.
+    //
+    // The precision of the colour is the precision of the arithmetic that BUILT it. A
+    // fragment program often assembles its colour in a working register and then moves it
+    // to the colour register in one full-width copy: that copy carries `half_precision ==
+    // false` because it moves 32 bits, and reading it as the colour's precision calls a
+    // register holding two packed halves an F32 component. Bitcasting a packed pair to f32
+    // gives a denormal, so every channel comes out ~0 and the frame is black.
+    //
+    // Found on a retail title whose final gamma pass ends `o[0] = pa[0]; o[1] = pa[1];`
+    // over registers built with `pack2x16float` - the whole picture was black while every
+    // draw, pipeline and texture reported success.
+    //
+    // So a full-width move is followed back to what it copied, and that register's own
+    // writer is asked instead. Bounded, because a chain of copies is still a chain and a
+    // cycle must not hang the compiler.
+    for _ in 0..8 {
+        let Some((at, i)) = found else { break };
+        if !matches!(i.op, Op::Mov) || i.half_precision {
+            break;
+        }
+        // Only a plain register-to-register copy forwards: an immediate or a constant has
+        // no earlier writer to ask, and a swizzle that reorders halves is not a copy of
+        // one register's layout.
+        let Some(src) = i.srcs.first().filter(|s| {
+            matches!(s.bank, Bank::PrimaryAttr | Bank::Temp | Bank::Internal | Bank::Output)
+        }) else {
+            break;
+        };
+        match writer_of(src.bank, u32::from(src.index), at) {
+            Some(next) => found = Some(next),
+            None => break,
+        }
+    }
+    let last = found.map(|(_, i)| i);
     match last {
         // An 8-BIT write leaves four bytes in the one register, whatever `half_precision`
         // says - that flag describes a float view and neither of these ops has one. This has
@@ -815,7 +855,19 @@ pub fn resolve_mem_windows(
     program: &Program,
     shader: &Shader,
 ) -> Result<Vec<MemWindow>, &'static str> {
-    if !shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
+    // >>> THE LOAD CAN BE IN EITHER STREAM, and looking only at the primary refused a
+    // >>> whole retail title. A program that reads a bound uniform buffer by chasing its
+    // >>> pointer can issue that load from the SECONDARY (prologue) program instead - which
+    // >>> is the natural place for it, since the prologue runs once and leaves the fetched
+    // >>> registers in the SA file for the primary to read with no load at all. One title's
+    // >>> world-transform vertex program does exactly that: `MemLoad` in the secondary,
+    // >>> destination sa[20], address sa[18] from the DATA container. Scanning only the
+    // >>> primary found no load, resolved no window, and the linker then rejected the
+    // >>> address register as an SA read with nothing behind it - a message about uniform
+    // >>> buffer extents that named neither the load nor the stream it was in.
+    let secondary = crate::usse::decode_secondary_shader(program);
+    let has_mem_load = |sh: &Shader| sh.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. }));
+    if !has_mem_load(shader) && !has_mem_load(&secondary) {
         return Ok(Vec::new());
     }
     let Some(data) = program.containers.iter().find(|c| c.index == 19) else {
@@ -828,8 +880,9 @@ pub fn resolve_mem_windows(
     // all (see `Program::sa_uniform_buffers`), so it is not a window even when it also has a
     // +0x78 entry - the copy is what the program reads.
     let sa_resident = program.sa_uniform_buffers();
+    // Both streams again: the address register is read by whichever one issues the load.
     let reads_sa = |reg: u32| {
-        shader.instrs.iter().flat_map(|i| i.srcs.iter()).any(|s| {
+        shader.instrs.iter().chain(secondary.instrs.iter()).flat_map(|i| i.srcs.iter()).any(|s| {
             s.bank == crate::ir::Bank::SecondaryAttr && u32::from(s.index) == reg
         })
     };
@@ -912,11 +965,34 @@ pub fn resolve_mem_windows(
     // The other direction: a DATA-container register the program READS that is neither a
     // literal, nor a texture-control word, nor one of the windows above is a POINTER nothing
     // feeds - which would read zero and load fabricated bytes with nothing to say so.
+    // A DATA register the SECONDARY program writes is a computed value, not a pointer: the
+    // prologue puts something there for the primary to read. One title's world program packs
+    // a loaded matrix row into the first DATA register and reads it from the primary, which
+    // is indistinguishable here from an unfed pointer unless the writes are counted - and
+    // calling that "a pointer nothing feeds" refused a program whose prologue feeds it.
+    let written_by_secondary = |reg: u32| {
+        secondary.instrs.iter().any(|i| {
+            i.dest.as_ref().is_some_and(|d| {
+                if d.bank != crate::ir::Bank::SecondaryAttr {
+                    return false;
+                }
+                // A memory load fills `elements` consecutive registers; everything else
+                // writes at most the four lanes of its destination.
+                let base = u32::from(d.index);
+                let span = match i.op {
+                    crate::ir::Op::MemLoad { elements, .. } => u32::from(elements),
+                    _ => 4,
+                };
+                (base..base + span).contains(&reg)
+            })
+        })
+    };
     for reg in u32::from(data.base_sa)..u32::from(data.base_sa) + u32::from(data.size_regs) {
         if !reads_sa(reg)
             || program.literals.iter().any(|&(r, _)| r == reg)
             || program.texture_control.iter().any(|&(r, _)| r == reg)
             || windows.iter().any(|w| w.base_sa == reg)
+            || written_by_secondary(reg)
         {
             continue;
         }

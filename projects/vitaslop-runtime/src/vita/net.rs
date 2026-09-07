@@ -345,6 +345,141 @@ pub(super) fn resolver_create(st: &mut VitaState, _name: Ptr, _param: Ptr, _flag
     st.net_resolver_create()
 }
 
+/// int sceNetResolverAbort(int rid, int flags)
+///
+/// Cancels an in-flight resolve. Nothing here is ever in flight - `resolver_start`
+/// fails synchronously with no record - so there is never anything to cancel, and
+/// saying so is the truthful answer for a live handle. A handle that does not exist is
+/// still `EBADF`, which is the distinction a title's teardown path cares about.
+#[hostcall]
+pub(super) fn resolver_abort(st: &mut VitaState, rid: i32, _flags: i32) -> i32 {
+    if st.net_resolver_error(rid).is_some() { 0 } else { fail(st, SCE_NET_EBADF) }
+}
+
+/// int sceNetGetMacAddress(SceNetEtherAddr *addr, int flags)
+///
+/// The interface is down, not absent: a Vita has a MAC address whether or not it is
+/// associated, and a title uses it as a stable per-console identity (a seed, a save
+/// tag, a peer name). So this succeeds with a FIXED, locally-administered address -
+/// the `0x02` bit in the first octet is what "not globally unique, assigned locally"
+/// means in IEEE 802, which is exactly what this is. It is the same every run, because
+/// a title that stores it must find it again.
+///
+/// It is deliberately not a random or host-derived address: a real one would leak the
+/// player's machine identity into a save file, and a random one would make a title that
+/// remembers it think it moved to a different console on every launch.
+#[hostcall]
+pub(super) fn get_mac_address(ctx: &mut GuestCtx, st: &mut VitaState, addr: Ptr, _flags: i32) -> i32 {
+    if addr.is_null() {
+        fail(st, SCE_NET_EINVAL)
+    } else {
+        ctx.write_bytes(addr.addr(), &[0x02, 0x00, 0x00, 0x76, 0x69, 0x74]);
+        0
+    }
+}
+
+/// int sceNetShowIfconfig(void *p, int b)
+///
+/// A DIAGNOSTIC dump of the interface configuration, which the real one prints to the
+/// system log. There is no interface to describe and nothing that reads our stdout as
+/// an ifconfig table, so it does its work by reporting the state once and succeeding.
+#[hostcall]
+pub(super) fn show_ifconfig(st: &mut VitaState, _p: Ptr, _b: i32) -> i32 {
+    tracing::info!(
+        target: "vitaslop::status",
+        thread = st.current_thread(),
+        "sceNetShowIfconfig: no interface is up (see `vita::net` - the network is modelled down)"
+    );
+    0
+}
+
+/// int sceNetDumpCreate(const char *name, int len, int flags)
+///
+/// A packet-capture handle over an interface. There is no interface, so there is
+/// nothing to capture from and no handle to give: `ENETDOWN` is the same answer every
+/// other call that needs the link returns, and a title is told one consistent story.
+#[hostcall]
+pub(super) fn dump_create(st: &mut VitaState, _name: Ptr, _len: i32, _flags: i32) -> i32 {
+    fail(st, SCE_NET_ENETDOWN)
+}
+
+/// int sceNetDumpDestroy(int id)
+///
+/// No dump handle was ever created, so any id is a bad one.
+#[hostcall]
+pub(super) fn dump_destroy(st: &mut VitaState, _id: i32) -> i32 {
+    fail(st, SCE_NET_EBADF)
+}
+
+/// int sceNetDumpRead(int id, void *buf, int len, int *pflags)
+#[hostcall]
+pub(super) fn dump_read(st: &mut VitaState, _id: i32, _buf: Ptr, _len: i32, _pflags: Ptr) -> i32 {
+    fail(st, SCE_NET_EBADF)
+}
+
+// ============================ SceNetAdhocMatching ============================
+//
+// Ad-hoc matchmaking over the local wireless link: it finds nearby consoles running the
+// same title and negotiates a session. There is no wireless link here and there are no
+// nearby consoles, which is the ordinary case for a player sitting alone - every title
+// with an ad-hoc mode ships the "nobody found" path, and this is that state, not a
+// failure. `Term` and the per-context calls below therefore behave as they would with
+// the library up and NO peers: teardown succeeds, the member list is empty, and
+// anything naming a peer reports that it is not there.
+
+/// int sceNetAdhocMatchingTerm(void)
+///
+/// Teardown succeeds. A title that calls Term in its shutdown path (or after a failed
+/// Init) must not be left thinking the library is still up.
+#[hostcall]
+pub(super) fn adhoc_matching_term(st: &mut VitaState) -> i32 {
+    tracing::info!(
+        target: "vitaslop::status",
+        thread = st.current_thread(),
+        "SceNetAdhocMatching: no wireless link and no nearby consoles - matchmaking finds no peers"
+    );
+    0
+}
+
+/// int sceNetAdhocMatchingGetMembers(int id, unsigned int *members_count,
+///     struct SceNetAdhocMatchingMember *members)
+///
+/// ZERO members, and the count is written even when the buffer is null - that is the
+/// two-call idiom this API is used with (ask the count, allocate, ask again), and a
+/// title that skips the write would allocate from a stale number.
+#[hostcall]
+pub(super) fn adhoc_matching_get_members(
+    ctx: &mut GuestCtx,
+    _st: &mut VitaState,
+    _id: i32,
+    count: Ptr,
+    _members: Ptr,
+) -> i32 {
+    if !count.is_null() {
+        ctx.write_u32(count.addr(), 0);
+    }
+    0
+}
+
+/// int sceNetAdhocMatchingSetHelloOpt(int id, int opt_len, void *opt)
+///
+/// The "hello" payload advertised to peers. There are no peers to advertise to, so the
+/// payload is accepted and goes nowhere - the same shape as writing to a voice input
+/// port with no session.
+#[hostcall]
+pub(super) fn adhoc_matching_set_hello_opt(_st: &mut VitaState, _id: i32, _len: i32, _opt: Ptr) -> i32 {
+    0
+}
+
+/// int sceNetAdhocMatchingCancelTarget(int id, SceNetInAddr *target)
+///
+/// Cancels a pending request to one peer. No peer was ever a target, so there is
+/// nothing outstanding to cancel and the call has already achieved its purpose.
+#[hostcall]
+pub(super) fn adhoc_matching_cancel_target(_st: &mut VitaState, _id: i32, _target: Ptr) -> i32 {
+    0
+}
+
 /// int sceNetResolverDestroy(int rid)
 #[hostcall]
 pub(super) fn resolver_destroy(st: &mut VitaState, rid: i32) -> i32 {

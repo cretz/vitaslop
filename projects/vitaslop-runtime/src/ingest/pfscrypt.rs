@@ -22,13 +22,15 @@
 use super::keys;
 use super::pfs::{FileCtx, PfsCrypto};
 use super::Error;
+use aes::cipher::block_padding::NoPadding;
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, BlockDecryptMut, BlockEncrypt, KeyInit, KeyIvInit};
 use aes::Aes128;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 /// HMAC-SHA1 with `key`.
 pub(crate) fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
@@ -43,24 +45,31 @@ pub(crate) fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
 /// AES-128-CBC-CTS decrypt in place semantics: full 16-byte blocks are CBC-
 /// decrypted; a 1..15-byte tail is recovered CFB-style from the trailing chaining
 /// value. `iv` is the sector IV.
+///
+/// THE FULL BLOCKS GO THROUGH `cbc::Decryptor` IN ONE CALL, not a block at a time.
+/// On wasm32 the `aes` crate has no AES instruction to use and compiles to the
+/// fixslice software backend, whose entire trick is decrypting several blocks
+/// SIMULTANEOUSLY; feeding it one 16-byte block per call throws that away. Measured
+/// on this desktop's browser, the per-block loop this replaced ran at 63 MB/s against
+/// 149 MB/s for the CTR pass over the same bytes with the same cipher, and it is the
+/// slowest stage of the whole import. (`crypto_bench`, via
+/// `web/debug/import-speed.html`.)
 fn cbc_cts_decrypt(key: &[u8; 16], iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
     let full = ct.len() & !0xF;
     let tail = ct.len() & 0xF;
     let mut out = vec![0u8; ct.len()];
-    let mut prev = *iv;
-    let mut i = 0;
-    while i < full {
-        let mut block = GenericArray::clone_from_slice(&ct[i..i + 16]);
-        cipher.decrypt_block(&mut block);
-        for j in 0..16 {
-            out[i + j] = block[j] ^ prev[j];
-        }
-        prev.copy_from_slice(&ct[i..i + 16]);
-        i += 16;
+    out[..full].copy_from_slice(&ct[..full]);
+    if full != 0 {
+        Aes128CbcDec::new(key.into(), iv.into())
+            .decrypt_padded_mut::<NoPadding>(&mut out[..full])
+            .expect("a whole number of blocks never fails to unpad with NoPadding");
     }
     if tail != 0 {
-        let mut ks = GenericArray::clone_from_slice(&prev);
+        // The chaining value the tail is masked with: the last full ciphertext block,
+        // or the IV when the sector is shorter than one block.
+        let prev: &[u8] = if full != 0 { &ct[full - 16..full] } else { &iv[..] };
+        let cipher = Aes128::new(GenericArray::from_slice(key));
+        let mut ks = GenericArray::clone_from_slice(prev);
         cipher.encrypt_block(&mut ks);
         for j in 0..tail {
             out[full + j] = ct[full + j] ^ ks[j];
@@ -259,6 +268,54 @@ mod tests {
     use crate::ingest::rif::Rif;
     use crate::ingest::testfix;
     use crate::ingest::unicv::UnicvDb;
+
+    /// The per-block CBC-CTS decrypt this module used to do, kept as the ORACLE for
+    /// the batched one that replaced it. The rewrite was for speed alone, so the only
+    /// thing that matters is that it did not change a single byte - including at the
+    /// awkward lengths: a bare tail with no full block, an exact block count, and the
+    /// 0x8000 page the real thing works in.
+    fn cbc_cts_decrypt_blockwise(key: &[u8; 16], iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
+        let cipher = Aes128::new(GenericArray::from_slice(key));
+        let full = ct.len() & !0xF;
+        let tail = ct.len() & 0xF;
+        let mut out = vec![0u8; ct.len()];
+        let mut prev = *iv;
+        let mut i = 0;
+        while i < full {
+            let mut block = GenericArray::clone_from_slice(&ct[i..i + 16]);
+            cipher.decrypt_block(&mut block);
+            for j in 0..16 {
+                out[i + j] = block[j] ^ prev[j];
+            }
+            prev.copy_from_slice(&ct[i..i + 16]);
+            i += 16;
+        }
+        if tail != 0 {
+            let mut ks = GenericArray::clone_from_slice(&prev);
+            cipher.encrypt_block(&mut ks);
+            for j in 0..tail {
+                out[full + j] = ct[full + j] ^ ks[j];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn batched_cbc_cts_decrypt_matches_the_blockwise_one() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let mut ct = vec![0u8; 0x8000 + 32];
+        for (i, b) in ct.iter_mut().enumerate() {
+            *b = (i * 7 + (i >> 5)) as u8;
+        }
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 4095, 4096, 0x8000, 0x8000 + 5] {
+            assert_eq!(
+                cbc_cts_decrypt(&key, &iv, &ct[..len]),
+                cbc_cts_decrypt_blockwise(&key, &iv, &ct[..len]),
+                "length {len}"
+            );
+        }
+    }
 
     fn aes_ecb(key: &[u8; 16], block: &[u8; 16], decrypt: bool) -> [u8; 16] {
         let cipher = Aes128::new(GenericArray::from_slice(key));

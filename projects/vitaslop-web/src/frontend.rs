@@ -141,6 +141,25 @@ pub fn ingest_import(source: JsValue, sink: JsValue, progress: Function) -> Resu
     stream::import(src, &mut sink, &mut report).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Time the ingest's per-byte crypto on THIS device: pkg CTR, PFS HMAC-SHA1, PFS CBC,
+/// and all three chained, each for `budget_ms`, in MB/s.
+///
+/// The page compares these against what `crypto.subtle` does with the same primitives.
+/// WebCrypto would replace the ciphers and nothing else, so the gap between `chain`
+/// here and the import's real rate is the part a rewrite could NOT buy back. See
+/// `vitaslop_runtime::ingest::bench`.
+#[wasm_bindgen]
+pub fn crypto_bench(budget_ms: f64) -> JsValue {
+    let now = || js_sys::Date::now();
+    let r = vitaslop_runtime::ingest::bench::crypto_rates(budget_ms, &now);
+    let out = js_sys::Object::new();
+    set(&out, "pkgCtr", JsValue::from_f64(r.pkg_ctr));
+    set(&out, "pfsHmac", JsValue::from_f64(r.pfs_hmac));
+    set(&out, "pfsCbc", JsValue::from_f64(r.pfs_cbc));
+    set(&out, "chain", JsValue::from_f64(r.chain));
+    out.into()
+}
+
 /// The default settings record, as JSON.
 #[wasm_bindgen]
 pub fn settings_defaults() -> String {

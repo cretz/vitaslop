@@ -1704,6 +1704,16 @@ fn secondary_attr_init(
         if d.bank != Bank::SecondaryAttr {
             return out;
         }
+        // A memory load is not a four-lane write: it fills `elements` CONSECUTIVE registers
+        // from `dest.index`, which is how the emitter writes it (`emit_mem_load` stores
+        // `dest.index + k` for k in 0..elements). Counting it as four left the rest of the
+        // span looking unwritten, so a program that loads a 16-register matrix and then reads
+        // its second row was refused for reading an SA register "outside its uniform buffer" -
+        // a register its own prologue had just filled.
+        if let crate::ir::Op::MemLoad { elements, .. } = instr.op {
+            out.extend((0..u32::from(elements)).map(|k| d.index as u32 + k));
+            return out;
+        }
         for c in 0..4u32 {
             if instr.write_mask[c as usize] {
                 out.push(d.index as u32 + if instr.half_precision { c >> 1 } else { c });

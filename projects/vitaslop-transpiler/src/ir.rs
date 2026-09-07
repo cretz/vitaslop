@@ -251,6 +251,16 @@ pub enum NeonStmt {
     /// to `2*esize` bits (sign- or zero-extending per `signed`) and shift it left by
     /// `shift`. `vmovl` is the `shift == 0` case and has its own node.
     WidenShift { esize: u8, dst: NeonReg, src: NeonReg, shift: u8, signed: bool },
+    /// Vector half-precision widen (`vcvt.f32.f16 Qd, Dm`): the four IEEE binary16
+    /// values in the low 64 bits of `src` become four f32 lanes in `dst`.
+    ///
+    /// The narrowing direction (`vcvt.f16.f32`) is deliberately absent - see the note
+    /// in `lower.rs`, and the matching one on the scalar `VfpOp::CvtF32FromHalf`.
+    CvtHalfToFloat { dst: NeonReg, src: NeonReg },
+    /// Vector half-precision narrow (`vcvt.f16.f32 Dd, Qm`): the four f32 lanes of
+    /// `src` become four IEEE binary16 values in the low 64 bits of `dst`, rounded to
+    /// nearest with ties to even.
+    CvtFloatToHalf { dst: NeonReg, src: NeonReg },
     /// Narrowing move (`vmovn`): truncate each `2*esize`-bit element of the `Qm`
     /// source `src` to its low `esize` bits and write the `Dd` result `dst`.
     Narrow { esize: u8, dst: NeonReg, src: NeonReg },

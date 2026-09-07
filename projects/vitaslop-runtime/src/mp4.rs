@@ -421,22 +421,46 @@ fn parse_hdlr(d: &[u8]) -> TrackKind {
 /// `esds`, ...) is a child box after a fixed-size prefix of the ENTRY PAYLOAD: 78 bytes
 /// for a visual entry (8 + 70 of `VisualSampleEntry`), 28 for an audio one (8 + 20 of
 /// `AudioSampleEntry`). Anything else yields no setup bytes rather than a guess.
+///
+/// >>> THE SETUP BOX IS FOUND BY TYPE, NOT BY POSITION, and that is the whole point of
+/// >>> this function. It used to take whatever box came first after the prefix. That is
+/// >>> true of plenty of files and false of plenty of others: `avc1` may carry `pasp`
+/// >>> (pixel aspect ratio), `colr`, `clap` or `btrt` before its `avcC`, and a retail
+/// >>> title was found whose every movie is laid out `pasp`, `avcC`, `btrt`. Reading the
+/// >>> first child there handed 8 bytes of aspect-ratio to the avcC parser, which
+/// >>> reported a record with "0 SPS and 0 PPS" - a configuration failure that names the
+/// >>> codec data and not the box walk, so it reads as a broken FILE rather than a bug
+/// >>> here. The file was fine.
 fn parse_stsd(d: &[u8], kind: TrackKind) -> Result<([u8; 4], Vec<u8>), Mp4Error> {
     // version/flags (4) + entry count (4), then the entries as boxes.
     let entries = d.get(8..).ok_or(Mp4Error::Truncated("stsd"))?;
     let (codec, body, _) = read_box(entries, 0)?;
-    let prefix = match kind {
-        TrackKind::Video => 78,
-        TrackKind::Audio => 28,
+    // The setup box each handler is looking for. A video entry may also be `avc3`
+    // (parameter sets in-band) or `hvc1`/`hev1`; only the ones this decoder can act on
+    // are named, and anything else falls through to "no setup bytes" rather than to a
+    // box that happens to sit in the right place.
+    let (prefix, wanted): (usize, &[&[u8; 4]]) = match kind {
+        TrackKind::Video => (78, &[b"avcC"]),
+        TrackKind::Audio => (28, &[b"esds"]),
         TrackKind::Other => return Ok((codec, Vec::new())),
     };
-    let config = match body.get(prefix..) {
-        Some(rest) => match read_box(rest, 0) {
-            Ok((_, setup, _)) => setup.to_vec(),
-            Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
-    };
+    let mut config = Vec::new();
+    if let Some(rest) = body.get(prefix..) {
+        let mut off = 0usize;
+        // Walk the children rather than reading one. A malformed size would otherwise
+        // spin, so the loop advances by the box size and stops the moment it cannot.
+        while off + 8 <= rest.len() {
+            let Ok((kind4, payload, next)) = read_box(rest, off) else { break };
+            if wanted.iter().any(|w| **w == kind4) {
+                config = payload.to_vec();
+                break;
+            }
+            if next <= off {
+                break;
+            }
+            off = next;
+        }
+    }
     Ok((codec, config))
 }
 

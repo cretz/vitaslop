@@ -54,6 +54,10 @@ pub mod gxm {
     pub const SHADER_PATCHER_CREATE_VERTEX_PROGRAM: u32 = 0xB7BB_A6D5;
     pub const SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM: u32 = 0x4ED2_E49D;
     pub const SHADER_PATCHER_RELEASE_VERTEX_PROGRAM: u32 = 0xAC1F_F2DA;
+    /// The patcher's own reference counts, which a title reads to decide whether a
+    /// program is still shared before releasing it. `psp2/gxm.h` publishes both.
+    pub const SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT: u32 = 0xA1A1_6FF6;
+    pub const SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT: u32 = 0x2C55_50F0;
     pub const SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM: u32 = 0xBE27_43D1;
     pub const PROGRAM_FIND_PARAMETER_BY_NAME: u32 = 0x2777_94C4;
     pub const SHADER_PATCHER_GET_PROGRAM_FROM_ID: u32 = 0xA949_A803;
@@ -644,6 +648,10 @@ pub mod services {
     pub const RTC_FORMAT_RFC3339_LOCAL_TIME: u32 = 0x7422_50A9;
     /// `sceAppMgrAcquireBgmPort`: claim the shared background-music port.
     pub const APPMGR_ACQUIRE_BGM_PORT: u32 = 0xAFCE_AB96;
+    /// `sceAppMgrReleaseBgmPort`: give it back. The pair has to exist together - a title
+    /// that acquires on one screen and releases on the next would hard-fail at the
+    /// release having been told the acquire worked.
+    pub const APPMGR_RELEASE_BGM_PORT: u32 = 0xF371_7E37;
     /// `_sceRazorCpuWriteFiberUltPkt`: a marker packet for the CPU profiler.
     pub const RAZOR_CPU_WRITE_FIBER_ULT_PKT: u32 = 0x409D_966A;
     /// SceUlobjDbg, the ULT object debugger. Unnamed on the henkaku wiki's NID list; the
@@ -1043,11 +1051,44 @@ pub mod threadmgr {
     /// kernel also delivers the calling thread's pending callbacks.
     pub const DELAY_THREAD_CB: u32 = 0x9C01_80E1;
     pub const SEND_SIGNAL: u32 = 0xD4C3_67B2;
+    /// `SceUID sceKernelOpenTimer(const char *name)`: resolve an EXISTING timer by the
+    /// name it was created with. Not a create, the same way `OPEN_SEMA` is not.
+    pub const OPEN_TIMER: u32 = 0xB6E2_86E7;
+    /// `int sceKernelStartTimer(SceUID timerId)`: begin counting. A timer is created
+    /// stopped, so a title that never calls this must read a count of zero.
+    pub const START_TIMER: u32 = 0x4809_1E0C;
+    /// `int sceKernelStopTimer(SceUID timerId)`: stop counting, banking what it counted.
+    /// `int sceKernelDeleteTimer(SceUID timerId)`: release the uid.
+    ///
+    /// Both NIDs are the ones the SDK's own stubs emit, taken from
+    /// `db/360/SceKernelThreadMgr.yml`. The henkaku wiki lists a DIFFERENT pair for the
+    /// user-side spellings (`0x075B1329`, `0x746F3290`); linking a C conformance case
+    /// against the real stubs is what caught it, and the wiki's are not what a title
+    /// built with the SDK imports.
+    pub const STOP_TIMER: u32 = 0x869E_9F20;
+    pub const DELETE_TIMER: u32 = 0xAB1E_42C4;
 }
 
 /// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
 /// skew, and opens fonts. Handles are opaque; the surface is satisfied without a
 /// glyph rasterizer (text is drawn through the captured GXM stream).
+/// SceVoice: voice chat. NIDs from `db/360/SceVoice.yml`; there is no published header
+/// or wiki prototype for the library, so the shapes are read from the callsite - see
+/// `vita::voice`, which models a console with no microphone and no session.
+pub mod voice {
+    pub const INIT: u32 = 0x805C_C20F;
+    pub const END: u32 = 0xAC98_853E;
+    pub const START: u32 = 0xB2ED_725B;
+    pub const STOP: u32 = 0xC386_8DF6;
+    pub const CREATE_PORT: u32 = 0xFA4E_57B1;
+    pub const DELETE_PORT: u32 = 0xAE46_564D;
+    pub const CONNECT_IPORT_TO_OPORT: u32 = 0x698B_DAAE;
+    pub const DISCONNECT_IPORT_FROM_OPORT: u32 = 0x5F02_60F4;
+    pub const WRITE_TO_IPORT: u32 = 0x0A22_EC0E;
+    pub const READ_FROM_OPORT: u32 = 0x09E4_D18C;
+    pub const GET_PORT_INFO: u32 = 0x5933_CCFB;
+}
+
 pub mod pvf {
     pub const NEW_LIB: u32 = 0x72E5_8672;
     pub const DONE_LIB: u32 = 0xE177_17EC;
@@ -1123,6 +1164,16 @@ pub mod sync {
     pub const WAIT_SEMA: u32 = 0x0C7B_834B;
     pub const SIGNAL_SEMA: u32 = 0xE6B7_61D1;
     pub const DELETE_SEMA: u32 = 0xDB32_948A;
+    /// The virtual timer family. A timer is a stopwatch the guest starts, stops and
+    /// reads; the two spellings below are the SceLibKernel ones, and `SceThreadmgr`
+    /// exports its own NIDs for `Open` and `Start` (see [`super::threadmgr`]).
+    ///
+    /// vitasdk publishes the NIDs but no header for these, so the prototypes come from
+    /// the henkaku wiki's SceLibKernel/SceKernelThreadMgr pages:
+    ///   `SceUID sceKernelCreateTimer(const char *name, SceUInt32 attr, const SceKernelTimerOptParam *opt)`
+    ///   `int    sceKernelGetTimerTime(SceUID timerId, SceUInt64 *time)`
+    pub const CREATE_TIMER: u32 = 0x2255_B2A5;
+    pub const GET_TIMER_TIME: u32 = 0x381D_C300;
     pub const CREATE_EVENT_FLAG: u32 = 0x8516_D040;
     pub const SET_EVENT_FLAG: u32 = 0xEC94_DFF7;
     pub const WAIT_EVENT_FLAG: u32 = 0x83C0_E2AF;
@@ -1277,6 +1328,9 @@ pub mod audiodec {
     pub const CREATE_DECODER_EXTERNAL: u32 = 0x5608_5DFB;
     pub const DELETE_DECODER_EXTERNAL: u32 = 0xE4EA_05BB;
     pub const DECODE: u32 = 0xCCDA_BA04;
+    /// `sceAudiodecDecodeNFrames`: several frames in one call, which is how a movie's
+    /// audio track is fed. The same decoder, run once per frame - see `vita::audiodec`.
+    pub const DECODE_N_FRAMES: u32 = 0x8018_AA9B;
 }
 
 /// What [`name`] returns for a NID it does not know. A NID gets its name in the same
@@ -1291,7 +1345,7 @@ pub fn name(func_nid: u32) -> &'static str {
         audio as au, audiodec as ad, audioin, ctrl as c, display as d, fiber as fb, gxm as g, http,
         iofilemgr as io, livearea, pgf, xml,
         libkernel as lk, lwsync as lw, net as nt, ngs as ng, processmgr as pm, pvf as pv, services as sv,
-        sync as sy, sysmem as s, threadmgr as tm, videodec as vd,
+        sync as sy, sysmem as s, threadmgr as tm, videodec as vd, voice as vo,
     };
     match func_nid {
         // SceVideodec / SceAvcdec, and the codec engine's memory.
@@ -1317,6 +1371,7 @@ pub fn name(func_nid: u32) -> &'static str {
         ad::CREATE_DECODER_EXTERNAL => "sceAudiodecCreateDecoderExternal",
         ad::DELETE_DECODER_EXTERNAL => "sceAudiodecDeleteDecoderExternal",
         ad::DECODE => "sceAudiodecDecode",
+        ad::DECODE_N_FRAMES => "sceAudiodecDecodeNFrames",
         ad::INIT_LIBRARY => "sceAudiodecInitLibrary",
         ad::TERM_LIBRARY => "sceAudiodecTermLibrary",
         ad::CREATE_DECODER => "sceAudiodecCreateDecoder",
@@ -1430,6 +1485,8 @@ pub fn name(func_nid: u32) -> &'static str {
         g::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => "sceGxmShaderPatcherCreateVertexProgram",
         g::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherCreateFragmentProgram",
         g::SHADER_PATCHER_RELEASE_VERTEX_PROGRAM => "sceGxmShaderPatcherReleaseVertexProgram",
+        g::SHADER_PATCHER_GET_VERTEX_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetVertexProgramRefCount",
+        g::SHADER_PATCHER_GET_FRAGMENT_PROGRAM_REF_COUNT => "sceGxmShaderPatcherGetFragmentProgramRefCount",
         g::SHADER_PATCHER_RELEASE_FRAGMENT_PROGRAM => "sceGxmShaderPatcherReleaseFragmentProgram",
         g::PROGRAM_FIND_PARAMETER_BY_NAME => "sceGxmProgramFindParameterByName",
         g::SHADER_PATCHER_GET_PROGRAM_FROM_ID => "sceGxmShaderPatcherGetProgramFromId",
@@ -1627,6 +1684,7 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::RTC_GET_DAY_OF_WEEK => "sceRtcGetDayOfWeek",
         sv::RTC_FORMAT_RFC3339_LOCAL_TIME => "sceRtcFormatRFC3339LocalTime",
         sv::APPMGR_ACQUIRE_BGM_PORT => "sceAppMgrAcquireBgmPort",
+        sv::APPMGR_RELEASE_BGM_PORT => "sceAppMgrReleaseBgmPort",
         sv::RAZOR_CPU_WRITE_FIBER_ULT_PKT => "_sceRazorCpuWriteFiberUltPkt",
         sv::ULOBJ_DBG_REGISTER => "SceUlobjDbg_D7F0F610",
         sv::ULOBJ_DBG_UNREGISTER => "SceUlobjDbg_F9C0F5DA",
@@ -1795,6 +1853,21 @@ pub fn name(func_nid: u32) -> &'static str {
         io::IO_DOPEN => "sceIoDopen",
         io::IO_DREAD => "sceIoDread",
         io::IO_DCLOSE => "sceIoDclose",
+        vo::INIT => "sceVoiceInit",
+        vo::END => "sceVoiceEnd",
+        vo::START => "sceVoiceStart",
+        vo::STOP => "sceVoiceStop",
+        vo::CREATE_PORT => "sceVoiceCreatePort",
+        vo::DELETE_PORT => "sceVoiceDeletePort",
+        vo::CONNECT_IPORT_TO_OPORT => "sceVoiceConnectIPortToOPort",
+        vo::DISCONNECT_IPORT_FROM_OPORT => "sceVoiceDisconnectIPortFromOPort",
+        vo::WRITE_TO_IPORT => "sceVoiceWriteToIPort",
+        vo::READ_FROM_OPORT => "sceVoiceReadFromOPort",
+        vo::GET_PORT_INFO => "sceVoiceGetPortInfo",
+        tm::OPEN_TIMER => "sceKernelOpenTimer",
+        tm::DELETE_TIMER => "sceKernelDeleteTimer",
+        tm::START_TIMER => "sceKernelStartTimer",
+        tm::STOP_TIMER => "sceKernelStopTimer",
         tm::DELAY_THREAD => "sceKernelDelayThread",
         tm::DELETE_MSG_PIPE => "sceKernelDeleteMsgPipe",
         tm::EXIT_DELETE_THREAD => "sceKernelExitDeleteThread",
@@ -1811,6 +1884,8 @@ pub fn name(func_nid: u32) -> &'static str {
         sy::WAIT_SEMA => "sceKernelWaitSema",
         sy::SIGNAL_SEMA => "sceKernelSignalSema",
         sy::DELETE_SEMA => "sceKernelDeleteSema",
+        sy::CREATE_TIMER => "sceKernelCreateTimer",
+        sy::GET_TIMER_TIME => "sceKernelGetTimerTime",
         sy::CREATE_EVENT_FLAG => "sceKernelCreateEventFlag",
         sy::SET_EVENT_FLAG => "sceKernelSetEventFlag",
         sy::WAIT_EVENT_FLAG => "sceKernelWaitEventFlag",

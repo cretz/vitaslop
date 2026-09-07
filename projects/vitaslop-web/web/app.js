@@ -650,6 +650,11 @@ async function startImport(entries) {
           text.textContent = `identifying, read ${store.fmtBytes(p.done)}${p.file ? ` - ${p.file}` : ""}`;
           return;
         }
+        if (p.unit === "files") {
+          fill.style.width = `${Math.min(100, (100 * p.done) / p.total)}%`;
+          text.textContent = `preparing storage, ${p.done} of ${p.total} files`;
+          return;
+        }
         if (!p.total) {
           text.textContent = p.stage === "preparing" ? "preparing storage" : stageWord(p.stage);
           return;

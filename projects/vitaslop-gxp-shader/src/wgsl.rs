@@ -1575,23 +1575,34 @@ fn emit_mem_load(
     let src0 = instr.srcs.first()?;
     let ptr_bank = bank_prefix(src0.bank)?;
     let dest_bank = bank_prefix(dest.bank)?;
-    // The GUEST address of the first element. Named per instruction so two loads in one
-    // (unbraced) function body cannot collide.
+    // The GUEST address of the first element, in its OWN BLOCK.
+    //
+    // The name carries the instruction index, which is unique within a stream and NOT
+    // across streams: the secondary and primary programs are emitted separately, each
+    // numbered from zero, and concatenated into one function (see `block`). A program that
+    // loads from BOTH - which is what a title doing skinning on top of a pointer-chased
+    // uniform buffer does - then declares `gxp_a8` twice in one body, the module fails to
+    // parse with "redefinition of gxp_a8", wgpu refuses the pipeline, and every draw using
+    // it is dropped. So the defect surfaces as missing geometry and says nothing about
+    // names. The `let` is read only by the stores right below it, so a block scopes it
+    // with nothing else to change.
+    writeln!(body, "  {{").ok()?;
     writeln!(
         body,
-        "  let gxp_a{index}: u32 = {ptr_bank}[{}] + {offset_bytes}u;",
+        "    let gxp_a{index}: u32 = {ptr_bank}[{}] + {offset_bytes}u;",
         src0.index as u32
     )
     .ok()?;
     for k in 0..elements as u32 {
         writeln!(
             body,
-            "  {dest_bank}[{}] = gxp_mem_word(gxp_a{index} + {}u);",
+            "    {dest_bank}[{}] = gxp_mem_word(gxp_a{index} + {}u);",
             dest.index as u32 + k,
             k * 4
         )
         .ok()?;
     }
+    writeln!(body, "  }}").ok()?;
     Some(())
 }
 

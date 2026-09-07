@@ -100,7 +100,9 @@ export async function run(entries, onProbe = () => {}, onProgress = () => {}) {
       const d = e.data;
       if (d.type === "progress") {
         let rate = 0;
-        if (d.total) {
+        // A stage counting FILES (the storage pre-open) has a total, but it is not
+        // bytes, so it must not feed the byte-rate window.
+        if (d.total && d.unit !== "files") {
           const now = performance.now();
           if (samples.length && samples[0].total !== d.total) samples.length = 0;
           samples.push({ t: now, done: d.done, total: d.total });

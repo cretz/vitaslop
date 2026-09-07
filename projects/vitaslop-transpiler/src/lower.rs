@@ -3879,6 +3879,16 @@ fn lower_neon(op: NeonOp, dt: SIMDDataType, ops: &[Operand]) -> Option<NeonStmt>
             let byte_off = (elem * (ty.bits as u32) / 8) as u8;
             NeonStmt::Ext { dst: r(0)?, a: r(1)?, b: r(2)?, byte_off }
         }
+        // `vcvt.f32.f16 Qd, Dm`: widen four halves into four singles. Half-float is how a
+        // 3D title stores vertex and animation data compactly, so this appears in real
+        // code even though the A9 has no half-precision arithmetic.
+        VCVTF32F16 => NeonStmt::CvtHalfToFloat { dst: r(0)?, src: r(1)? },
+        // `vcvt.f16.f32 Dd, Qm`: narrow four singles to four halves, round-to-nearest
+        // with ties to even. This is the direction a retail title actually executes (it
+        // stores animation data as half-float), and it is a real conversion rather than
+        // the inverse of the widen: overflow becomes infinity, NaN must stay NaN, and
+        // the subnormal range needs its own path.
+        VCVTF16F32 => NeonStmt::CvtFloatToHalf { dst: r(0)?, src: r(1)? },
         VCVTFtoI => NeonStmt::CvtFloatInt { to_int: true, signed: ty.signed, dst: r(0)?, src: r(1)? },
         VCVTItoF => NeonStmt::CvtFloatInt { to_int: false, signed: ty.signed, dst: r(0)?, src: r(1)? },
         // VCEQ/VCGT/VCGE take either a register second operand (`a <rel> b`) or a `#0`

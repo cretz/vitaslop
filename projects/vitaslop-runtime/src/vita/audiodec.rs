@@ -587,6 +587,58 @@ fn decode_at9(ctx: &mut GuestCtx, st: &mut VitaState, ctrl_addr: u32, handle: u3
     0
 }
 
+/// SceInt32 sceAudiodecDecodeNFrames(SceAudiodecCtrl *pCtrl, SceUInt32 nFrames)
+///
+/// `nFrames` consecutive frames in one call, which is what a movie`s audio track is fed
+/// through: MEASURED at the call site, a retail title asks for FOUR at a time with a
+/// 1 KB elementary-stream window and a 1 KB PCM window.
+///
+/// It is the real decoder run `nFrames` times, not a separate path. Each pass reads the
+/// control block the same way `sceAudiodecDecode` does, so between passes the ES and PCM
+/// POINTERS are advanced by what the previous one actually consumed and produced - the
+/// control block is the only place those pointers live, so they are written there and
+/// restored afterwards. The guest gets back its own pointers plus the TOTALS, which is
+/// what the single-frame call reports for one frame.
+///
+/// A failing pass stops the loop and returns its error, with whatever earlier passes
+/// produced left in place and counted: a title that decodes three frames and fails the
+/// fourth has three frames of real audio, and reporting zero would throw them away.
+#[hostcall]
+pub(super) fn audiodec_decode_n_frames(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    p_ctrl: Ptr,
+    n_frames: u32,
+) -> i32 {
+    // No early return: a `#[hostcall]` body is wrapped, so the whole thing is one
+    // expression (the same reason `vita::sync`'s timer getters are written this way).
+    let ctrl_addr = p_ctrl.addr();
+    if ctrl_addr == 0 {
+        ERROR_INVALID_PTR
+    } else {
+    let es0 = ctx.read_u32(ctrl_addr + ctrl::P_ES);
+    let pcm0 = ctx.read_u32(ctrl_addr + ctrl::P_PCM);
+    let (mut es_total, mut pcm_total, mut result) = (0u32, 0u32, 0i32);
+    for _ in 0..n_frames {
+        ctx.write_u32(ctrl_addr + ctrl::P_ES, es0.wrapping_add(es_total));
+        ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0.wrapping_add(pcm_total));
+        let r = do_decode(ctx, st, p_ctrl);
+        if r < 0 {
+            result = r;
+            break;
+        }
+        es_total = es_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::INPUT_ES_SIZE));
+        pcm_total = pcm_total.wrapping_add(ctx.read_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE));
+    }
+    // The guest`s own pointers back, and the totals over every pass that ran.
+    ctx.write_u32(ctrl_addr + ctrl::P_ES, es0);
+    ctx.write_u32(ctrl_addr + ctrl::P_PCM, pcm0);
+    ctx.write_u32(ctrl_addr + ctrl::INPUT_ES_SIZE, es_total);
+    ctx.write_u32(ctrl_addr + ctrl::OUTPUT_PCM_SIZE, pcm_total);
+    result
+    }
+}
+
 /// SceInt32 sceAudiodecDecode(SceAudiodecCtrl *pCtrl)
 ///
 /// Fill `pPcm` with one frame of PCM. MEASURED at the call site: the caller sets `pEs` from
