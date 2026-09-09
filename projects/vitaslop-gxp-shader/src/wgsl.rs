@@ -430,6 +430,33 @@ fn src_channel(op: &Operand, c: usize, prec: Prec) -> Option<String> {
         }
         return Some(e);
     }
+    // A register-INDIRECT operand: its base is only known at run time, so a lane selector
+    // spells out `bank[idx + offset + sel]` rather than a constant index. That is the same
+    // arithmetic `read_lane` does for a plain F32 operand - one register per lane - with the
+    // index register in front of it, which is what makes a vector read through `i0` (a matrix
+    // row a program looked up) come out as the four consecutive registers it is.
+    //
+    // F32 only: the corpus has no F16 or 8-bit instruction reading this row, and the two narrow
+    // views pack several lanes into ONE register, so their lane-to-register map is a different
+    // question this has no evidence for. It returns None and the caller hard-fails.
+    if matches!(op.bank, Bank::Indexed) {
+        let sel = op.swizzle[c];
+        let mut e = match (bank_prec(op.bank, prec), sel) {
+            (Prec::F32, 0..=3) => format!("bitcast<f32>({})", indexed_element(op, sel as u32)?),
+            (_, 4) => "0.0".to_string(),
+            (_, 5) => "1.0".to_string(),
+            (_, 6) => "2.0".to_string(),
+            (_, 7) => "0.5".to_string(),
+            _ => return None,
+        };
+        if op.abs {
+            e = format!("abs({e})");
+        }
+        if op.neg {
+            e = format!("(-{e})");
+        }
+        return Some(e);
+    }
     let prefix = bank_prefix(op.bank)?;
     let sel = op.swizzle[c];
     let prec = bank_prec(op.bank, prec);
@@ -570,6 +597,33 @@ impl Dest<'_> {
         let tmp = format!("g{c}");
         let _ = writeln!(self.body, "  let {tmp} = {expr};");
         self.deferred.push(format!("  {prefix}[{}] = {tmp};\n", op.index as u32 + c as u32));
+        Some(())
+    }
+
+    /// [`Self::store_raw`] for a lane that is HALF a register: lane `c` is half `c & 1` of
+    /// register `index + (c >> 1)`, the same packing [`Prec::F16`] uses, but read-modify-writing
+    /// a raw 16-bit pattern rather than packing a float. The paired half keeps its value, which
+    /// is the whole point - the two halves are two different values the shader will read back
+    /// separately.
+    fn store_raw_half(&mut self, op: &Operand, c: usize, expr: &str) -> Option<()> {
+        let prefix = bank_prefix(op.bank)?;
+        let reg = op.index as u32 + (c as u32 >> 1);
+        let stmt = |v: &str| {
+            if c & 1 == 0 {
+                format!("  {prefix}[{reg}] = ({prefix}[{reg}] & 0xffff0000u) | ({v} & 0x0000ffffu);
+")
+            } else {
+                format!("  {prefix}[{reg}] = ({prefix}[{reg}] & 0x0000ffffu) | (({v} & 0x0000ffffu) << 16u);
+")
+            }
+        };
+        if !self.stage {
+            self.body.push_str(&stmt(expr));
+            return Some(());
+        }
+        let tmp = format!("g{c}");
+        let _ = writeln!(self.body, "  let {tmp} = {expr};");
+        self.deferred.push(stmt(&tmp));
         Some(())
     }
 
@@ -1380,7 +1434,9 @@ fn emit_instr(
         Op::PackToInt { bits, signed, .. } => {
             emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
-        Op::IntMad { signed, bits } => emit_int_mad(s, instr, dest, signed, bits).ok_or_else(unmapped),
+        Op::IntMad { signed, bits, src0_high } => {
+            emit_int_mad(s, instr, dest, signed, bits, src0_high).ok_or_else(unmapped)
+        }
         Op::IntMadStep { signed, high_half } => {
             emit_int_mad_step(s, instr, dest, signed, high_half).ok_or_else(unmapped)
         }
@@ -1392,16 +1448,7 @@ fn emit_instr(
         // binding - no fragment program in the census loads memory - so a fragment body
         // carrying one hard-fails here instead of referencing an undeclared name.
         Op::MemLoad { elements, offset_bytes } => {
-            if !matches!(kind, ProgramKind::Vertex) {
-                return Err(EmitError::Blocked {
-                    index,
-                    byte_offset,
-                    reason: "0xE8 memory load in a FRAGMENT program - the memory window \
-                             binding is only established for the vertex stage",
-                    raw: instr.raw,
-                });
-            }
-            emit_mem_load(s, instr, dest, elements, offset_bytes, index).ok_or_else(unmapped)
+            emit_mem_load(s, instr, dest, elements, offset_bytes, index, kind).ok_or_else(unmapped)
         }
         Op::LoadIndex { addend } => emit_load_index(s, instr, dest, addend).ok_or_else(unmapped),
         Op::Sop2 { color, alpha, f1, f1_complement, f2, f2_complement } => {
@@ -1529,7 +1576,17 @@ fn emit_pack_to_int(
             format!("u32(clamp(trunc({f}), 0.0, 4294967000.0))")
         };
         let e = if lane_mask == u32::MAX { conv } else { format!("({conv} & {lane_mask:#x}u)") };
-        body.store_raw(dest, c, &e)?;
+        // >>> A 16-BIT RESULT IS HALF A REGISTER, NOT A WHOLE ONE. Two lanes share one
+        // register, exactly as an F16 pair does, and the group-0x15 IMAD32s that read these
+        // values back address them by (register, half) through their own `src0_high` bit. A
+        // whole-register store put a skinned mesh's four blend indices in four registers where
+        // its four bone fetches look in two, so half the fetches read a register nothing had
+        // written and the other half were taken twice.
+        if bits == 16 {
+            body.store_raw_half(dest, c, &e)?;
+        } else {
+            body.store_raw(dest, c, &e)?;
+        }
     }
     Some(())
 }
@@ -1542,10 +1599,26 @@ fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) 
     let s1 = instr.srcs.first()?;
     let reg = dest.index.min(1) as u32;
     let bank = bank_prefix(s1.bank)?;
+    // >>> THE INDEX REGISTER COUNTS PAIRS OF REGISTERS, NOT REGISTERS.
+    //
+    // `idx = (src + addend) * 2`. Read as single registers, one title's particle-streak
+    // program indexes its corner table at `src*2 + 21 + 14` = SA 35..45 - which is the TAIL of
+    // the default uniform container, then the DATA container's uniform-buffer POINTERS. A
+    // pointer used as a texcoord weight is a texture coordinate in the millions, and the draw
+    // came out as a full-screen neon moiré (`1a8667f6685d5f47`, capsule 177 of
+    // `caps869b`) [[vitaslop-a-region-clip-outlives-its-scene]].
+    //
+    // The scale is not fitted, it is the only one that closes. That program's literal block
+    // holds EIGHT one-hot `vec4`s at SA 56..88 - the corner selection table for a quad. Under
+    // `*2` the two indexed dots read SA `56 + 4c` and `72 + 4c` for corner `c`, which is
+    // (umin,vmin) (umin,vmax) (umax,vmax) (umax,vmin): a quad's winding, using the table
+    // exactly once end to end with no overrun. A search over every corner step and every base
+    // in the bank returns that solution and NO other.
     writeln!(
         body,
-        "  idx[{reg}] = i32({bank}[{}] & 0xffffu) + {addend}i;",
-        s1.index as u32
+        "  idx[{reg}] = (i32({bank}[{}] & 0xffffu) + {addend}i) * {}i;",
+        s1.index as u32,
+        crate::module::index_register_scale()
     )
     .ok();
     Some(())
@@ -1564,6 +1637,16 @@ fn emit_load_index(body: &mut Dest, instr: &Instr, dest: &Operand, addend: i32) 
 /// A byte address that is not 4-aligned truncates to its containing word; the host refuses a
 /// window (dropping the draw, reported) if its BASE is misaligned, and every in-shader offset
 /// is a multiple of the 4-byte element size.
+/// The name of the guest-memory-window binding a given STAGE reads through. One WGSL module
+/// carries both when a pair loads memory in both stages, and they are different buffers -
+/// bound from different GXM uniform-buffer tables - so they cannot share a name.
+pub fn mem_binding_name(kind: ProgramKind) -> &'static str {
+    match kind {
+        ProgramKind::Vertex => "gxp_mem",
+        _ => "gxp_fmem",
+    }
+}
+
 fn emit_mem_load(
     body: &mut Dest,
     instr: &Instr,
@@ -1571,6 +1654,7 @@ fn emit_mem_load(
     elements: u8,
     offset_bytes: u32,
     index: usize,
+    kind: ProgramKind,
 ) -> Option<()> {
     let src0 = instr.srcs.first()?;
     let ptr_bank = bank_prefix(src0.bank)?;
@@ -1586,18 +1670,64 @@ fn emit_mem_load(
     // it is dropped. So the defect surfaces as missing geometry and says nothing about
     // names. The `let` is read only by the stores right below it, so a block scopes it
     // with nothing else to change.
+    // Any REGISTER-supplied byte offsets the instruction carries, added to the pointer. The
+    // decoder puts them in `srcs` after the pointer; they hold an integer BYTE displacement
+    // the guest's own integer pipeline computed (`index * stride + base`), so they are read
+    // raw, exactly as the pointer is, with no float view.
+    // >>> A REGISTER OFFSET IS 16 BITS WIDE. This is the whole of one title's particle
+    // >>> corruption, and the population it is decided against is ONE program shape.
+    //
+    // THE FINDING. A SubUV particle program computes `pa[8] = int16(SubUVIndices.x) * 16 +
+    // sa[88]` and loads `mem[sa[38] + pa[8]]`, where `sa[88]` is a CONTAINER LITERAL holding
+    // `0x00010000`. Its window is `SubUVExtents`, declared 32 float4s = 512 bytes, indexed
+    // 0..32 - so every displacement the buffer can want is `0..496` and the literal's
+    // `0x10000` is one bit ABOVE that range. Read full-width, a run reported **192 of 208
+    // guest-memory reads landing in NO bound window and reading ZERO**, every one missing by
+    // exactly `0x10000`, and the particle quads it feeds painted the saturated masses and the
+    // screen-length streaks that stood as this title's open picture defect for sessions.
+    //
+    // >>> THE GUEST'S OWN MEMORY SETTLES IT, and it was asked rather than reasoned about.
+    // `VITASLOP_GXP_MEM_PEEK=10000` prints the words at a window's base and at base+0x10000:
+    // at the BASE they are `SubUVExtents` exactly (0.2930, 0.6680, 0.3047, 0.8789 - UV extents
+    // in 0..1); at +0x10000 every word is ZERO, on every particle program in the title. The
+    // data is where this renderer puts the window, so the addend cannot be a byte displacement.
+    //
+    // >>> AND THE OPERAND IS NOT SHARED WITH ANYTHING ELSE. `mem_load_register_offsets_and_
+    // what_computes_them` (tests/corpus.rs) enumerates every 0xE8 load carrying a register
+    // offset across every captured corpus: **there is exactly ONE**, this one. The golf title's
+    // programs - the ones that do 32-bit address arithmetic in an IMAD32 - put the whole
+    // ADDRESS in `src0` (`mem[pa[7]]`, base and all), not in an offset, so their arithmetic
+    // never passes through here and cannot be narrowed by this. A 2026-09-07 note recorded the
+    // narrowing as REFUTED because "some other program's offset legitimately exceeds 65535";
+    // no such program exists in any corpus, and that reading is retired.
+    //
+    // Kept as an arm (`VITASLOP_GXP_MEM_OFFSET16=0` restores the full-width read) because the
+    // rule rests on one program shape plus the guest's memory rather than on a published field
+    // width, and an A/B that needs a rebuild is one nobody takes.
+    let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+    let mut reg_offsets = String::new();
+    for o in instr.srcs.iter().skip(1) {
+        let bank = bank_prefix(o.bank)?;
+        let idx = o.index as u32;
+        if narrow {
+            write!(reg_offsets, " + ({bank}[{idx}] & 0xffffu)").ok()?;
+        } else {
+            write!(reg_offsets, " + {bank}[{idx}]").ok()?;
+        }
+    }
     writeln!(body, "  {{").ok()?;
     writeln!(
         body,
-        "    let gxp_a{index}: u32 = {ptr_bank}[{}] + {offset_bytes}u;",
+        "    let gxp_a{index}: u32 = {ptr_bank}[{}] + {offset_bytes}u{reg_offsets};",
         src0.index as u32
     )
     .ok()?;
     for k in 0..elements as u32 {
         writeln!(
             body,
-            "    {dest_bank}[{}] = gxp_mem_word(gxp_a{index} + {}u);",
+            "    {dest_bank}[{}] = {}_word(gxp_a{index} + {}u);",
             dest.index as u32 + k,
+            mem_binding_name(kind),
             k * 4
         )
         .ok()?;
@@ -2167,6 +2297,7 @@ fn emit_int_mad(
     dest: &Operand,
     signed: bool,
     bits: u8,
+    src0_high: bool,
 ) -> Option<()> {
     // The decoder only produces 32 today and blocks the narrower widths by name; this keeps the
     // emitter honest if that ever changes without the emitter being taught the masking.
@@ -2184,7 +2315,21 @@ fn emit_int_mad(
         }
         Some(format!("{}[{}]", bank_prefix(o.bank)?, o.index as u32))
     };
-    let a = raw(instr.srcs.first()?)?;
+    // >>> src0 IS ONE HALF OF A PACKED PAIR - see `Op::IntMad`. `src0_high` picks which, and
+    // the half is widened to 32 bits before the multiply. The widening follows the
+    // instruction's own `signed` flag; every value any corpus program puts through here is a
+    // small non-negative array index, so the two widenings agree on all of them and this
+    // corpus cannot separate them - the flag is the only statement available and it is used
+    // rather than assumed away.
+    let a0 = raw(instr.srcs.first()?)?;
+    let a = match (signed, src0_high) {
+        // A shift into the sign bit and an ARITHMETIC shift back is the sign extension; the
+        // masks are the zero extension.
+        (true, true) => format!("bitcast<u32>(bitcast<i32>({a0}) >> 16u)"),
+        (true, false) => format!("bitcast<u32>((bitcast<i32>({a0}) << 16u) >> 16u)"),
+        (false, true) => format!("({a0} >> 16u)"),
+        (false, false) => format!("({a0} & 0xffffu)"),
+    };
     let b = raw(instr.srcs.get(1)?)?;
     let c = raw(instr.srcs.get(2)?)?;
     let expr = if signed {

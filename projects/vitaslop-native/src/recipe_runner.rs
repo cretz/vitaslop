@@ -190,6 +190,10 @@ pub fn boot_retail(
         .iter()
         .map(|m| loader::load(&m.elf).map_err(|e| format!("load module: {e:?}")))
         .collect::<Result<_, _>>()?;
+    // This run stands up the THREADED scheduler, so the host mirror block exists and is
+    // refreshed at its resume point - which is what lets the RTC tick be read inline.
+    // See `vitaslop_runtime::vita::set_preemptive_linking`.
+    vitaslop_runtime::vita::set_preemptive_linking(true);
     let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
     let mut env = VitaEnv::new(linked.imports.clone(), linked.base, linked.mem_bytes, world);
     // >>> EVERY NATIVE TOOL DECODES VIDEO, because the one that did not could not SEE the

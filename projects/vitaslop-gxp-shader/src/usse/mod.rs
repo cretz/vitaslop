@@ -3,8 +3,8 @@
 pub mod decode;
 
 pub use decode::{
-    decode, decode_smlsi, field, is_smlsi, opcode1, repeat_extra_iterations, GroupTable, SmlsiSlot,
-    GROUP_TABLES,
+    bits, decode, decode_smlsi, field, is_smlsi, opcode1, repeat_extra_iterations, GroupTable,
+    SmlsiSlot, GROUP_TABLES,
 };
 
 use crate::container::Program;

@@ -35,3 +35,13 @@ region = "NTSC"
 id = "PCSE00120"
 name = "Persona 4 Golden"
 region = "NTSC"
+
+[[game]]
+id = "PCSE00023"
+name = "Mortal Kombat"
+region = "NTSC"
+
+[[game]]
+id = "PCSA00002"
+name = "MLB 12 The Show"
+region = "NTSC"

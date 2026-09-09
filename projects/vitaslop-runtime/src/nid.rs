@@ -224,6 +224,27 @@ pub mod gxm {
     pub const PRECOMPUTED_FRAGMENT_STATE_SET_UNIFORM_BUFFER: u32 = 0xB452_F1FB;
     pub const PRECOMPUTED_VERTEX_STATE_SET_ALL_UNIFORM_BUFFERS: u32 = 0x0389_861D;
     pub const PRECOMPUTED_VERTEX_STATE_SET_UNIFORM_BUFFER: u32 = 0xDBF9_7ED6;
+    /// The shader patcher's USER DATA slot: one opaque word GXM keeps beside the patcher
+    /// on the title's behalf (typically its allocator's `this`). Published in `psp2/gxm.h`
+    /// as a `(patcher, void *userData)` pair with the getter below.
+    pub const SHADER_PATCHER_SET_USER_DATA: u32 = 0xF9B8_FCFD;
+    pub const SHADER_PATCHER_GET_USER_DATA: u32 = 0x96A7_E6DD;
+    /// `sceGxmWaitEvent`: block until the GPU has finished the work submitted before it.
+    /// No published prototype - see `vita::gxm::wait_event` for what is and is not known.
+    pub const WAIT_EVENT: u32 = 0x8BD9_4593;
+    /// The two-sided counterpart of [`SET_FRONT_STENCIL_REF`], applied when
+    /// `sceGxmSetTwoSidedEnable` is on.
+    pub const SET_BACK_STENCIL_REF: u32 = 0x866A_0517;
+    /// `sceGxmProgramIsFragColorUsed`: whether a fragment program READS the frame buffer
+    /// it is writing (programmable blending). Answered from the program itself - see
+    /// `vita::gxm::program_is_frag_color_used`.
+    pub const PROGRAM_IS_FRAG_COLOR_USED: u32 = 0x104F_23F4;
+    /// The texture's minimum mip LEVEL, which unlike every other sampler field is split
+    /// across control words 2 and 3 (`psp2/gxm.h`'s `lod_min0`/`lod_min1`).
+    pub const TEXTURE_SET_LOD_MIN: u32 = 0xB79E_43DD;
+    pub const TEXTURE_GET_LOD_MIN: u32 = 0xBE52_4A2C;
+    /// The setter half of [`TEXTURE_GET_MIPMAP_COUNT`]'s field.
+    pub const TEXTURE_SET_MIPMAP_COUNT: u32 = 0xD2DC_4643;
 }
 
 /// SceDisplayUser / SceDisplay function NIDs. `SET_FRAME_BUF` is SceDisplayUser
@@ -245,6 +266,9 @@ pub mod display {
     pub const WAIT_VBLANK_START_CB: u32 = 0x78B4_1B92;
     pub const WAIT_VBLANK_START_MULTI_CB: u32 = 0x05F2_7764;
     pub const GET_VCOUNT: u32 = 0xB6FD_E0BA;
+    /// `sceDisplayGetFrameBuf`: read back the framebuffer parameters the last
+    /// [`SET_FRAME_BUF`] declared (SceDisplayUser, lib 0x4FAACD11).
+    pub const GET_FRAME_BUF: u32 = 0x42AE_6BBC;
 }
 
 /// SceCtrl function NIDs.
@@ -423,6 +447,13 @@ pub mod net {
     pub const EPOLL_DESTROY: u32 = 0x7915_CAF3;
     pub const EPOLL_CONTROL: u32 = 0x4C87_64AC;
     pub const EPOLL_WAIT: u32 = 0x45CE_337D;
+    /// `sceNetEpollWaitCB`: the same wait, at which the kernel also delivers the calling
+    /// thread's pending callbacks. A separate NID, so a title linking only this one must
+    /// not hard-fail; it shares [`EPOLL_WAIT`]'s handler (see `vita::net`).
+    pub const EPOLL_WAIT_CB: u32 = 0x92D3_E767;
+    /// `sceNetSocketAbort`: unblock whatever is waiting on a socket, so a worker parked
+    /// in a receive can be torn down.
+    pub const SOCKET_ABORT: u32 = 0x891C_1B9B;
 }
 
 /// SceHttp: the HTTP client surface, modelled OFFLINE (see [`crate::vita::http`]).
@@ -447,6 +478,16 @@ pub mod http {
     pub const SSL_LOAD_CERT: u32 = 0xAE8D_7C33;
     pub const SSL_SET_SSL_CALLBACK: u32 = 0xA092_6037;
     pub const SSL_GET_SSL_ERROR: u32 = 0x2B79_BDE0;
+    // The cookie jar. Enabling cookies and registering the receive callback are LOCAL
+    // settings on the template/connection/request; reading a cookie back asks the jar,
+    // which is empty because no response was ever received. See `vita::http`.
+    pub const SET_COOKIE_ENABLED: u32 = 0xAEE5_73A3;
+    /// The getter half of [`SET_COOKIE_ENABLED`]. Registered with it so the setting can
+    /// be read back the way the library reads it back, rather than being written into a
+    /// field nothing ever asks for.
+    pub const GET_COOKIE_ENABLED: u32 = 0x1B6E_F66E;
+    pub const SET_COOKIE_RECV_CALLBACK: u32 = 0xD4F3_2A23;
+    pub const GET_COOKIE: u32 = 0x7022_0BFA;
 }
 
 /// SceLiveAreaUtil: the title's own LiveArea gate (see [`crate::vita::livearea`]).
@@ -808,6 +849,16 @@ pub mod services {
     // SceJpeg: MJPEG decoder lifecycle only - see `vita::jpeg`.
     pub const JPEG_INIT_MJPEG: u32 = 0xB030_773B;
     pub const JPEG_FINISH_MJPEG: u32 = 0x6284_2598;
+    /// `sceJpegGetOutputInfo(jpegData, jpegSize, format, mode, out)`. The DECODE half of
+    /// SceJpegUser: prototypes from vitasdk `psp2/jpeg.h`, NIDs from the henkaku wiki's
+    /// `SceAvcodecUser` export list. See `vita::jpeg`.
+    pub const JPEG_GET_OUTPUT_INFO: u32 = 0x353B_A9B0;
+    /// `sceJpegDecodeMJpegYCbCr(jpegData, jpegSize, mode, out, outSize, work, workSize)`.
+    pub const JPEG_DECODE_MJPEG_YCBCR: u32 = 0x2A76_9BD8;
+    /// `sceJpegMJpegCsc(rgba, yuv, yuvSize, imageWidth, format, sampling)`.
+    pub const JPEG_MJPEG_CSC: u32 = 0xC238_0E3A;
+    /// `sceJpegCsc(...)`: the non-MJpeg twin, with no published prototype - see `vita::jpeg`.
+    pub const JPEG_CSC: u32 = 0x6263_AEC2;
     // SceSystemGesture: gesture recognition layered on top of the touch panels. The NID
     // db names these; NO prototype or struct layout for the library is published
     // anywhere (vitasdk ships no `systemgesture.h`), so the argument shapes here are
@@ -1001,6 +1052,75 @@ pub mod services {
     /// An unnamed SceNearUtil export the title imports ("near" is the offline-social
     /// app; present in no vita-headers revision). Serviced as an offline success.
     pub const NEAR_UTIL_UNKNOWN_A412E9CA: u32 = 0xA412_E9CA;
+    /// `sceRtcParseRFC3339(SceRtcTick *utc, const char *pszDateTime)`: the inverse of
+    /// [`RTC_FORMAT_RFC3339_LOCAL_TIME`]. A real parse - see `vita::services::rtc_parse_rfc3339`.
+    pub const RTC_PARSE_RFC3339: u32 = 0x2D18_AEEC;
+    /// The by-EVENT-ID sibling of [`SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX`].
+    pub const SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID: u32 = 0x5570_B83E;
+    /// `sceNetCtlGetNatInfo(SceNetCtlNatInfo *)`: the STUN-discovered NAT type. There is
+    /// no link to run STUN over, so it reports NOT_CONNECTED like the rest of SceNetCtl.
+    pub const NET_CTL_GET_NAT_INFO: u32 = 0x4DDD_6149;
+    /// The rest of SceNetAdhocMatching's surface: teardown, and the two calls that name a
+    /// PEER. See the dispatch group and `vita::net` - the radio works and nobody is there.
+    pub const ADHOC_MATCHING_TERM: u32 = 0x6E19_5CD1;
+    pub const ADHOC_MATCHING_CANCEL_TARGET: u32 = 0x04FF_010C;
+    pub const ADHOC_MATCHING_SEND_DATA: u32 = 0x83C0_E435;
+    /// The member list and the advertised "hello" payload. Registered with the rest of the
+    /// family rather than left to hard-fail: their handlers exist for the same model
+    /// (`vita::net`), and a family half-registered is a family whose behaviour depends on
+    /// which call a title happens to reach first.
+    pub const ADHOC_MATCHING_GET_MEMBERS: u32 = 0x85B2_3CEB;
+    pub const ADHOC_MATCHING_SET_HELLO_OPT: u32 = 0x659D_4B04;
+    /// `sceAppUtilStoreBrowse`: leave the game and open the PS Store app at a product.
+    /// There is no store and no shell to switch to off-console.
+    pub const APPUTIL_STORE_BROWSE: u32 = 0x85FA_94EE;
+    /// SceNpBasic: send a title-defined message to another player. Needs a PSN session.
+    pub const NP_BASIC_SEND_IN_GAME_DATA_MESSAGE: u32 = 0x7A50_20A5;
+    /// SceNpManager: the cached sign-in parameters of the local account. No account
+    /// off-console, so this reports signed out like the rest of the identity surface.
+    pub const NP_MANAGER_GET_CACHED_PARAM: u32 = 0x43DC_48A1;
+    /// SceNpUtility: resolve an online id to an NP id, against the lookup service.
+    pub const NP_LOOKUP_NP_ID_ASYNC: u32 = 0x5387_BABB;
+    /// SceNpMessage: the paramless init (the `WithParam` spelling is
+    /// [`NP_MESSAGE_INIT_WITH_PARAM`]), and the two calls that read a message's
+    /// ATTACHMENT - of which there are none, there being no messages off-console.
+    pub const NP_MESSAGE_INIT: u32 = 0x258D_A4AC;
+    pub const NP_MESSAGE_GET_ATTACHED_DATA: u32 = 0x7E69_7F98;
+    pub const NP_MESSAGE_SET_ATTACHED_DATA_USED_FLAG: u32 = 0xF533_A73A;
+    /// `sceSaveDataDialogAbort`: dismiss a running save-data dialog from the title's side.
+    pub const SAVEDATA_DIALOG_ABORT: u32 = 0x013E_7F74;
+    /// The friend-list picker: a dialog family of its own (`DialogFamily::NpFriendList`).
+    /// It lists PSN friends, of which there are none off-console, so it opens and closes
+    /// with nothing chosen - the same shape as the NP profile card.
+    pub const NP_FRIEND_LIST_DIALOG_INIT: u32 = 0x93FC_FEC6;
+    pub const NP_FRIEND_LIST_DIALOG_GET_STATUS: u32 = 0x1FD5_D373;
+    pub const NP_FRIEND_LIST_DIALOG_GET_RESULT: u32 = 0xD29F_E607;
+    pub const NP_FRIEND_LIST_DIALOG_TERM: u32 = 0x4A88_0C6A;
+    /// `sceNetCheckDialogGetPS3ConnectInfo`: the PS3 pairing details the net-check dialog
+    /// collects. Nothing was paired, so it reports the dialog's own "no result" error.
+    pub const NET_CHECK_DIALOG_GET_PS3_CONNECT_INFO: u32 = 0x3946_7634;
+    // The rest of SceNpCommerce2 - the PS Store product surface. `NP_COMMERCE2_INIT` and
+    // the context/session-request creations are already above; these are the teardown
+    // calls (which genuinely succeed - nothing was created against a server), and the
+    // product-info fetch and its accessors, every one of which needs the store.
+    pub const NP_COMMERCE2_TERM: u32 = 0xB999_58AE;
+    pub const NP_COMMERCE2_DESTROY_CTX: u32 = 0x6CD2_7BD0;
+    pub const NP_COMMERCE2_DESTROY_REQ: u32 = 0xA446_4754;
+    pub const NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_RESULT: u32 = 0xADF3_BD5B;
+    pub const NP_COMMERCE2_INIT_GET_PRODUCT_INFO_RESULT: u32 = 0x118E_1C5E;
+    pub const NP_COMMERCE2_INIT_GET_PRODUCT_INFO_LIST_RESULT: u32 = 0x2918_6E27;
+    pub const NP_COMMERCE2_GET_SESSION_INFO: u32 = 0xF6F2_3623;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_CREATE_REQ: u32 = 0xB0AF_F6C9;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_START: u32 = 0xC594_ADC2;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_GET_RESULT: u32 = 0x3639_22BA;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_LIST_CREATE_REQ: u32 = 0xE81B_8BAD;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_LIST_START: u32 = 0x18BD_C4BD;
+    pub const NP_COMMERCE2_GET_PRODUCT_INFO_LIST_GET_RESULT: u32 = 0x4DFB_CDD6;
+    pub const NP_COMMERCE2_GET_GAME_PRODUCT_INFO: u32 = 0xA308_B496;
+    pub const NP_COMMERCE2_GET_GAME_PRODUCT_INFO_FROM_GET_PRODUCT_INFO_LIST_RESULT: u32 =
+        0x0550_C016;
+    pub const NP_COMMERCE2_GET_GAME_SKU_INFO_FROM_GAME_PRODUCT_INFO: u32 = 0x3B7C_81A5;
+    pub const NP_COMMERCE2_GET_PRICE: u32 = 0x88D2_36DF;
 }
 
 /// Lightweight synchronization (SceLibKernel LwMutex/LwCond): mutexes and condition
@@ -1067,6 +1187,10 @@ pub mod threadmgr {
     /// built with the SDK imports.
     pub const STOP_TIMER: u32 = 0x869E_9F20;
     pub const DELETE_TIMER: u32 = 0xAB1E_42C4;
+    /// `int sceKernelCheckCallback(void)`: run the calling thread's pending callbacks.
+    /// See `vita::threadmgr::check_callback` for why the honest answer here is "none
+    /// were pending" rather than a stub.
+    pub const CHECK_CALLBACK: u32 = 0xE53E_41F6;
 }
 
 /// ScePvf: the Vita font library. A title creates a lib, configures em/resolution/
@@ -1799,6 +1923,10 @@ pub fn name(func_nid: u32) -> &'static str {
         sv::JPEGENC_SET_VALID_REGION => "sceJpegEncoderSetValidRegion",
         sv::JPEG_INIT_MJPEG => "sceJpegInitMJpeg",
         sv::JPEG_FINISH_MJPEG => "sceJpegFinishMJpeg",
+        sv::JPEG_GET_OUTPUT_INFO => "sceJpegGetOutputInfo",
+        sv::JPEG_DECODE_MJPEG_YCBCR => "sceJpegDecodeMJpegYCbCr",
+        sv::JPEG_MJPEG_CSC => "sceJpegMJpegCsc",
+        sv::JPEG_CSC => "sceJpegCsc",
         sv::SYSTEM_GESTURE_INIT_PRIMITIVE_TOUCH_RECOGNIZER => {
             "sceSystemGestureInitializePrimitiveTouchRecognizer"
         }
@@ -2267,6 +2395,77 @@ pub fn name(func_nid: u32) -> &'static str {
         fios2::DH_CHSTAT_SYNC => "_sceFiosKernelOverlayDHChstatSync",
         fios2::DH_SYNC_SYNC => "_sceFiosKernelOverlayDHSyncSync",
         fios2::DH_CLOSE_SYNC => "_sceFiosKernelOverlayDHCloseSync",
+
+        // --- the imports a baseball title brought in --------------------------
+        // One title's link-time inventory named fifty NIDs with no handler; these are
+        // them, grouped as they arrived. Nothing here is title-specific - each is a
+        // published entry point of a library this engine already models.
+        g::SHADER_PATCHER_SET_USER_DATA => "sceGxmShaderPatcherSetUserData",
+        g::SHADER_PATCHER_GET_USER_DATA => "sceGxmShaderPatcherGetUserData",
+        g::WAIT_EVENT => "sceGxmWaitEvent",
+        g::SET_BACK_STENCIL_REF => "sceGxmSetBackStencilRef",
+        g::PROGRAM_IS_FRAG_COLOR_USED => "sceGxmProgramIsFragColorUsed",
+        g::TEXTURE_SET_LOD_MIN => "sceGxmTextureSetLodMin",
+        g::TEXTURE_GET_LOD_MIN => "sceGxmTextureGetLodMin",
+        g::TEXTURE_SET_MIPMAP_COUNT => "sceGxmTextureSetMipmapCount",
+        d::GET_FRAME_BUF => "sceDisplayGetFrameBuf",
+        tm::CHECK_CALLBACK => "sceKernelCheckCallback",
+        nt::SOCKET_ABORT => "sceNetSocketAbort",
+        nt::EPOLL_WAIT_CB => "sceNetEpollWaitCB",
+        http::SET_COOKIE_ENABLED => "sceHttpSetCookieEnabled",
+        http::GET_COOKIE_ENABLED => "sceHttpGetCookieEnabled",
+        http::SET_COOKIE_RECV_CALLBACK => "sceHttpSetCookieRecvCallback",
+        http::GET_COOKIE => "sceHttpGetCookie",
+        sv::RTC_PARSE_RFC3339 => "sceRtcParseRFC3339",
+        sv::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID => "sceSystemGestureGetTouchEventByEventID",
+        sv::NET_CTL_GET_NAT_INFO => "sceNetCtlGetNatInfo",
+        sv::ADHOC_MATCHING_TERM => "sceNetAdhocMatchingTerm",
+        sv::ADHOC_MATCHING_CANCEL_TARGET => "sceNetAdhocMatchingCancelTarget",
+        sv::ADHOC_MATCHING_SEND_DATA => "sceNetAdhocMatchingSendData",
+        sv::ADHOC_MATCHING_GET_MEMBERS => "sceNetAdhocMatchingGetMembers",
+        sv::ADHOC_MATCHING_SET_HELLO_OPT => "sceNetAdhocMatchingSetHelloOpt",
+        sv::APPUTIL_STORE_BROWSE => "sceAppUtilStoreBrowse",
+        sv::NP_BASIC_SEND_IN_GAME_DATA_MESSAGE => "sceNpBasicSendInGameDataMessage",
+        sv::NP_MANAGER_GET_CACHED_PARAM => "sceNpManagerGetCachedParam",
+        sv::NP_LOOKUP_NP_ID_ASYNC => "sceNpLookupNpIdAsync",
+        sv::NP_MESSAGE_INIT => "sceNpMessageInit",
+        sv::NP_MESSAGE_GET_ATTACHED_DATA => "sceNpMessageGetAttachedData",
+        sv::NP_MESSAGE_SET_ATTACHED_DATA_USED_FLAG => "sceNpMessageSetAttachedDataUsedFlag",
+        sv::SAVEDATA_DIALOG_ABORT => "sceSaveDataDialogAbort",
+        sv::NP_FRIEND_LIST_DIALOG_INIT => "sceNpFriendListDialogInit",
+        sv::NP_FRIEND_LIST_DIALOG_GET_STATUS => "sceNpFriendListDialogGetStatus",
+        sv::NP_FRIEND_LIST_DIALOG_GET_RESULT => "sceNpFriendListDialogGetResult",
+        sv::NP_FRIEND_LIST_DIALOG_TERM => "sceNpFriendListDialogTerm",
+        sv::NET_CHECK_DIALOG_GET_PS3_CONNECT_INFO => "sceNetCheckDialogGetPS3ConnectInfo",
+        sv::NP_COMMERCE2_TERM => "sceNpCommerce2Term",
+        sv::NP_COMMERCE2_DESTROY_CTX => "sceNpCommerce2DestroyCtx",
+        sv::NP_COMMERCE2_DESTROY_REQ => "sceNpCommerce2DestroyReq",
+        sv::NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_RESULT => {
+            "sceNpCommerce2DestroyGetProductInfoResult"
+        }
+        sv::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_RESULT => "sceNpCommerce2InitGetProductInfoResult",
+        sv::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_LIST_RESULT => {
+            "sceNpCommerce2InitGetProductInfoListResult"
+        }
+        sv::NP_COMMERCE2_GET_SESSION_INFO => "sceNpCommerce2GetSessionInfo",
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_CREATE_REQ => "sceNpCommerce2GetProductInfoCreateReq",
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_START => "sceNpCommerce2GetProductInfoStart",
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_GET_RESULT => "sceNpCommerce2GetProductInfoGetResult",
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_CREATE_REQ => {
+            "sceNpCommerce2GetProductInfoListCreateReq"
+        }
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_START => "sceNpCommerce2GetProductInfoListStart",
+        sv::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_GET_RESULT => {
+            "sceNpCommerce2GetProductInfoListGetResult"
+        }
+        sv::NP_COMMERCE2_GET_GAME_PRODUCT_INFO => "sceNpCommerce2GetGameProductInfo",
+        sv::NP_COMMERCE2_GET_GAME_PRODUCT_INFO_FROM_GET_PRODUCT_INFO_LIST_RESULT => {
+            "sceNpCommerce2GetGameProductInfoFromGetProductInfoListResult"
+        }
+        sv::NP_COMMERCE2_GET_GAME_SKU_INFO_FROM_GAME_PRODUCT_INFO => {
+            "sceNpCommerce2GetGameSkuInfoFromGameProductInfo"
+        }
+        sv::NP_COMMERCE2_GET_PRICE => "sceNpCommerce2GetPrice",
 
         _ => UNKNOWN_NAME,
     }

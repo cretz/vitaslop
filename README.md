@@ -147,6 +147,8 @@ neutral references:
   Thumb-2, NEON, and VFP decode and semantics reference.
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) (MIT) as an ATRAC9
   reference.
+- [vgmstream](https://github.com/vgmstream/vgmstream) (ISC) for HE-VAG, the Vita's
+  own 4-bit ADPCM: its 128-entry predictor table and decode arithmetic.
 - [psdevwiki](https://www.psdevwiki.com/vita/) and
   [henkaku wiki](https://wiki.henkaku.xyz/) for hardware documentation.
 - The ARM Architecture Reference Manual.

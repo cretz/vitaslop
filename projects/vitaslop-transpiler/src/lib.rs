@@ -710,6 +710,46 @@ pub enum InlineOp {
     /// thread), so a stale owner is unobservable while a sentinel would be a second encoding
     /// of the same fact.
     LwMutexUnlock { layout: LwMutexLayout, thread_slot: u32 },
+    /// The HEAVYWEIGHT twin of [`InlineOp::LwMutexLock`]: take kernel mutex `r0` when it is
+    /// uncontended. Everything else runs the real host call.
+    ///
+    /// ```text
+    /// e    = table_slot * 4 + (r0 & (entries - 1)) * 16   ; the entry, in linear memory
+    /// take = r1 == 1
+    ///      & u32_at(e + layout.id) == r0
+    ///      & u32_at(e + layout.waiters) == 0
+    ///      & (u32_at(e + layout.count) == 0 | u32_at(e + layout.owner) == mirror[thread_slot])
+    /// if take { owner = mirror[thread_slot]; count += 1; r0 = 0 } else { host call }
+    /// ```
+    ///
+    /// # Why a kernel mutex can be inlined at all, when its handle is host-owned
+    /// It cannot, while its ownership lives on the host - which is the whole reason
+    /// `vitaslop_runtime::vita::kmutex` moves that ownership into a table BOTH sides address.
+    /// Once it is there the uncontended take is the same four-word state machine the
+    /// lightweight form already runs, over the same [`LwMutexLayout`], and this emits the same
+    /// code with one difference: a lightweight mutex is named by a POINTER the guest supplies
+    /// (which needs a bounds guard), and a kernel mutex by an `SceUID` (which needs an index).
+    ///
+    /// The `id == r0` term is what makes the indexing safe rather than merely fast: two uids
+    /// can map to one entry, and an entry that does not name the uid being locked belongs to
+    /// the other mutex, so the operation goes to the handler - which is where that mutex's
+    /// state is.
+    ///
+    /// # What it is worth
+    /// MEASURED on a fighting title's opening MOVIE, where it is the largest remaining item
+    /// once the RTC tick is mirrored: two poll loops, `lock/signalCond/unlock` and
+    /// `lock/unlock/delayThread(30 us)`, at ~158,000 iterations each per 800 frames. Three
+    /// crossings an iteration at ~20 us on the user's phone is most of that phase's 45.8 ms
+    /// frame; this takes each loop to one.
+    ///
+    /// # No yield point
+    /// Loads, a compare and two stores, with no loop and no call on the path that writes -
+    /// see [`InlineOp::LwMutexLock`], which states the whole argument and is pinned by
+    /// `a_lock_form_has_no_suspension_point`.
+    KernelMutexLock { layout: LwMutexLayout, thread_slot: u32, table_slot: u32, entries: u32 },
+    /// Release a lock taken by [`InlineOp::KernelMutexLock`], when nothing is parked on it.
+    /// The heavyweight twin of [`InlineOp::LwMutexUnlock`], over the same entry.
+    KernelMutexUnlock { layout: LwMutexLayout, thread_slot: u32, table_slot: u32, entries: u32 },
     /// `memmove(r0, r1, r2); r0 unchanged` - copy the r2 bytes at the pointer in r1 to the
     /// pointer in r0, and leave the destination in r0 as the return value.
     ///
@@ -795,6 +835,13 @@ pub struct LwMutexLayout {
     /// operation to the host, which is the only side that can wake one.
     pub waiters: u32,
 }
+
+/// Bytes one KERNEL MUTEX TABLE entry occupies - the four words of [`LwMutexLayout`].
+///
+/// The transpiler needs it to turn a uid into an entry offset, and the runtime lays the table
+/// out with it (`vitaslop_runtime::vita::kmutex::ENTRY_BYTES`); the two are held together by
+/// the emitted form reading exactly the words the handler writes.
+pub const MUTEX_ENTRY_BYTES: u32 = 16;
 
 /// Where an [`InlineOp::ReserveUniformBuffer`] finds every word it reads and writes.
 ///
@@ -1020,6 +1067,8 @@ impl InlineOp {
             // `vitaslop_runtime::vita::lwwork::fast_lock`, which the emitted code is held
             // against directly.
             InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 0,
+            // Same state machine over the same four words, one table entry further out.
+            InlineOp::KernelMutexLock { .. } | InlineOp::KernelMutexUnlock { .. } => 0,
             // A successful reserve returns 0, and a refused one never gets here (the host
             // call answers instead). Its real meaning is a bump over two structures, which
             // `eval`'s one-word signature cannot express - the execution test in
@@ -1099,7 +1148,10 @@ impl InlineOp {
             // Take no pointer and read nothing.
             InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
             // Reads four words and writes two, so no single offset describes it.
-            InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => None,
+            InlineOp::LwMutexLock { .. }
+            | InlineOp::LwMutexUnlock { .. }
+            | InlineOp::KernelMutexLock { .. }
+            | InlineOp::KernelMutexUnlock { .. } => None,
             // Reaches from the pointer itself for a length the guest supplies; there is no
             // fixed offset to name.
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
@@ -1156,6 +1208,10 @@ impl InlineOp {
             // mutex on behalf of thread zero.
             InlineOp::LwMutexLock { thread_slot, .. }
             | InlineOp::LwMutexUnlock { thread_slot, .. } => Some(thread_slot),
+            // The kernel forms read the same thread slot AND live in the block themselves;
+            // `top_mirror_slot` is what sizes it for their table.
+            InlineOp::KernelMutexLock { thread_slot, .. }
+            | InlineOp::KernelMutexUnlock { thread_slot, .. } => Some(thread_slot),
             InlineOp::MemCopy | InlineOp::MemFill | InlineOp::MemCompare => None,
             // Read nothing at all, mirror included.
             InlineOp::RetConst { .. } | InlineOp::Nop | InlineOp::Fast => None,
@@ -1180,6 +1236,12 @@ impl InlineOp {
             // BOTH its slots have to be inside the block: the budget is written by the same
             // snapshot and decremented by the emitted code.
             InlineOp::LoadMirrorParking { slot, budget } => Some(slot.max(budget)),
+            // The TABLE is part of the block: its last word has to be inside the page, or the
+            // highest-numbered mutex would read and write past the end of it.
+            InlineOp::KernelMutexLock { thread_slot, table_slot, entries, .. }
+            | InlineOp::KernelMutexUnlock { thread_slot, table_slot, entries, .. } => {
+                Some(thread_slot.max(table_slot + entries * 4 - 1))
+            }
             other => other.mirror_slot(),
         }
     }
@@ -2231,6 +2293,11 @@ mod tests {
         for op in [
             InlineOp::LwMutexLock { layout, thread_slot: 3 },
             InlineOp::LwMutexUnlock { layout, thread_slot: 3 },
+            // The KERNEL forms share this body and add an index computation in front of it,
+            // so they are held to the same rule - and they have to be listed, because a form
+            // that shares code today is a form somebody can stop sharing tomorrow.
+            InlineOp::KernelMutexLock { layout, thread_slot: 3, table_slot: 9, entries: 16 },
+            InlineOp::KernelMutexUnlock { layout, thread_slot: 3, table_slot: 9, entries: 16 },
         ] {
             let artifact = transpile(&Program {
                 code: &code,
@@ -2266,11 +2333,17 @@ mod tests {
                 .expect("operators");
             let loops = ops.iter().filter(|o| matches!(o, Operator::Loop { .. })).count();
             assert_eq!(loops, 0, "{op:?} must emit no loop - a loop header is a yield point");
-            // Two calls, and both are the FALLBACK: one from the pointer guard and one from
-            // the predicate. Any third call would be on the served path, where a yield is
-            // exactly the race this test exists to rule out.
+            // Every call is a FALLBACK arm, and there is one per GUARD: the lightweight form
+            // has two (the pointer guard and the predicate), the kernel form one (only the
+            // predicate - its entry is an index into a block the module reserved, so there is
+            // no pointer to bound). Any call BEYOND those would be on the served path, where a
+            // yield is exactly the race this test exists to rule out.
+            let want = match op {
+                InlineOp::LwMutexLock { .. } | InlineOp::LwMutexUnlock { .. } => 2,
+                _ => 1,
+            };
             let calls = ops.iter().filter(|o| matches!(o, Operator::Call { .. })).count();
-            assert_eq!(calls, 2, "{op:?} must call the host on its two refusal arms and nowhere else");
+            assert_eq!(calls, want, "{op:?} must call the host on its refusal arms and nowhere else");
         }
     }
 
@@ -2309,16 +2382,18 @@ mod tests {
         };
 
         let plain = program(&[]);
-        assert_eq!(plain.mirror_off, None, "no mirror op means no block and no layout change");
+        // The block is reserved in EVERY build now: the ARM exclusive monitor lives in it
+        // (`EXCL_MIRROR_SLOT`), and `LDREX`/`STREX` are lowered whether or not a host call was
+        // inlined. What a mirror op adds is the SLOT, not the block.
+        assert!(plain.mirror_off.is_some(), "the block is reserved for the exclusive monitor");
 
         let mirrored =
             program(&[InlineImport { import: 0, op: InlineOp::LoadMirror { slot: SLOT } }]);
         wasmparser::validate(&mirrored.wasm).expect("valid wasm");
         let off = mirrored.mirror_off.expect("a mirror op reserves the block");
         assert_eq!(
-            mirrored.mem_pages,
-            plain.mem_pages + 1,
-            "the block is one more declared page"
+            mirrored.mem_pages, plain.mem_pages,
+            "the block is one page whether or not a mirror op reads it"
         );
         assert!(
             off >= u64::from(0x20000u32),
@@ -2614,3 +2689,7 @@ mod tests {
         assert_eq!(plain, plain_again, "an unpromoted build must be deterministic");
     }
 }
+
+/// The host-mirror slot the exclusive monitor lives in, re-exported so the runtime can pin
+/// the agreement in a test (see `emit::EXCL_SLOT`).
+pub const EXCL_MIRROR_SLOT: u32 = 9;

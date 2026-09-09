@@ -25,7 +25,20 @@ pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr,
     };
     // CDRAM aligns to 256 KiB, other blocks to 4 KiB. The guest already rounds
     // size; align the base to match hardware granularity.
-    match st.alloc_memblock(size, 256 * 1024, ty) {
+    // Every block, with the arena cursor it landed on. A title's own memory probe and its
+    // pool setup are indistinguishable in a total, and the cursor beside the size is what
+    // says whether a free was actually reclaimed - see `vitaslop::mem`.
+    let uid_or_zero = st.alloc_memblock(size, 256 * 1024, ty);
+    tracing::debug!(
+        target: "vitaslop::mem",
+        size, ty = format_args!("{ty:#010x}"), name = %named(), uid = uid_or_zero,
+        base = format_args!("{:#010x}", st.memblock_base(uid_or_zero).unwrap_or(0)),
+        cursor = format_args!("{:#010x}", st.alloc_cursor_addr()),
+        free_holes = st.freed_memblock_count(),
+        free_bytes = st.freed_memblock_bytes(),
+        "allocMemBlock"
+    );
+    match uid_or_zero {
         0 => {
             // An exhausted arena must be an error the guest can act on. Reporting a live
             // SceUID whose base is 0 is a hollow success: the caller's null check passes,
@@ -49,6 +62,46 @@ pub(super) fn alloc_mem_block(ctx: &mut GuestCtx, st: &mut VitaState, name: Ptr,
 
 /// `SCE_KERNEL_ERROR_NO_MEMORY`: the allocation could not be satisfied.
 const SCE_KERNEL_ERROR_NO_MEMORY: i32 = 0x8002_0003u32 as i32;
+
+/// Which physical partition a `SceKernelMemBlockType` names.
+///
+/// >>> A VITA HAS THREE, AND LUMPING THEM INTO ONE ARENA IS NOT A SIMPLIFICATION - IT IS A
+/// >>> WRONG ANSWER TO A QUESTION TITLES ASK OUT LOUD. A title sizes its pools by ALLOCATING
+/// until it fails: MEASURED here, one probes CDRAM by asking for 128 MB, freeing it, then
+/// 192, 224, 240... Told (by a single flat arena) that 256 MB of CDRAM exists, it took a
+/// 255 MB video block, and the 56 MB MAIN-RAM pool it asked for next - which on hardware
+/// comes out of a different partition entirely - got NO_MEMORY. The console's own figures
+/// are already stated in `sceAppMgrGetBudgetInfo`; these are the same numbers, so the two
+/// answers cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Partition {
+    /// `USER_CDRAM_RW` - the GPU's 128 MB, of which the shell keeps 16.
+    Cdram,
+    /// `USER_MAIN_PHYCONT_*` - physically contiguous main RAM, for hardware that cannot
+    /// scatter-gather (the video decoder, mostly).
+    Phycont,
+    /// Everything else: ordinary user main RAM, cached or not.
+    Main,
+}
+
+/// The partition a memblock type word names. The discriminator is the type's high byte,
+/// which is what separates the families: `0x09...` CDRAM, `0x0C80.../0x0D80...` phycont,
+/// `0x0C20...` ordinary user RW.
+pub(crate) fn partition_of(ty: u32) -> Partition {
+    match ty {
+        0x0940_8060 | 0x0940_D060 => Partition::Cdram,
+        0x0C80_D060 | 0x0C80_8060 | 0x0D80_8060 | 0x0D80_D060 => Partition::Phycont,
+        _ => Partition::Main,
+    }
+}
+
+/// CDRAM available to a GAME: 112 of the 128 MB, the other 16 being the shell's. The
+/// figure `sceAppMgrGetBudgetInfo` reports, and the ceiling `sceKernelAllocMemBlock`
+/// enforces - a budget a title is told about but can exceed is not a budget.
+pub(crate) const CDRAM_BUDGET_BYTES: u32 = 112 * 1024 * 1024;
+
+/// Physically contiguous main RAM available to a game.
+pub(crate) const PHYCONT_BUDGET_BYTES: u32 = 32 * 1024 * 1024;
 
 /// int sceKernelGetMemBlockBase(SceUID uid, void **base)
 #[hostcall]
@@ -93,6 +146,10 @@ pub(super) fn set_gpo(ctx: &mut GuestCtx, st: &mut VitaState, gpo: u32) {
 /// guest. Rejecting an unknown id matches the kernel contract.
 #[hostcall]
 pub(super) fn free_mem_block(st: &mut VitaState, uid: i32) -> i32 {
+    let base = st.memblock_base(uid).unwrap_or(0);
+    tracing::debug!(
+        target: "vitaslop::mem", uid, base = format_args!("{base:#010x}"), "freeMemBlock"
+    );
     if st.free_memblock(uid) {
         0
     } else {

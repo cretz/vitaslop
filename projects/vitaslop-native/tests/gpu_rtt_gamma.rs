@@ -105,6 +105,7 @@ fn quad_inset(color: [u8; 4], tex: Option<BoundTexture>, inset: f32) -> Draw {
         frag_sa: std::sync::Arc::from(&[][..]),
         frag_sa_addr: 0,
         mem_windows: Vec::new(),
+        frag_mem_windows: Vec::new(),
         shader_expanded: false,
     }
 }

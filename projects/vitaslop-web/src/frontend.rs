@@ -160,6 +160,44 @@ pub fn crypto_bench(budget_ms: f64) -> JsValue {
     out.into()
 }
 
+/// Decode a JPEG with THIS build's decoder, `n` times, and return the milliseconds per decode
+/// beside the image's dimensions.
+///
+/// >>> IT EXISTS TO BE COMPARED WITH `createImageBitmap` ON THE SAME BYTES.
+///
+/// `SceJpeg` is a SYNCHRONOUS guest call, and the browser's own JPEG decoders are all
+/// asynchronous - but a host call CAN wait on a promise here, because that is what every
+/// blocking kernel primitive already does through JSPI. So "the browser's decoder is
+/// unreachable" is false, and the question is the ordinary one: which is faster, end to end,
+/// on the device the user is holding. A native decode that costs a round trip through the
+/// event loop and a pixel readback can lose to a scalar wasm decode of a small image, and
+/// guessing which way it goes is exactly what this replaces.
+///
+/// The number this reports is OUR decode only. The page times the browser's own on the same
+/// bytes and prints both.
+#[wasm_bindgen]
+pub fn jpeg_bench(bytes: &[u8], n: u32) -> JsValue {
+    let now = || js_sys::Date::now();
+    let out = js_sys::Object::new();
+    let Some((w, h)) = vitaslop_runtime::vita::jpeg::bench_dimensions(bytes) else {
+        set(&out, "error", JsValue::from_str("not a JPEG this decoder can read"));
+        return out.into();
+    };
+    // One warm decode first: the first touches cold code paths and would be the whole answer
+    // at small `n`.
+    vitaslop_runtime::vita::jpeg::bench_decode(bytes);
+    let t0 = now();
+    for _ in 0..n.max(1) {
+        vitaslop_runtime::vita::jpeg::bench_decode(bytes);
+    }
+    let per = (now() - t0) / f64::from(n.max(1));
+    set(&out, "width", JsValue::from_f64(f64::from(w)));
+    set(&out, "height", JsValue::from_f64(f64::from(h)));
+    set(&out, "msPerDecode", JsValue::from_f64(per));
+    set(&out, "megapixelsPerSecond", JsValue::from_f64(f64::from(w * h) / (per / 1000.0) / 1.0e6));
+    out.into()
+}
+
 /// The default settings record, as JSON.
 #[wasm_bindgen]
 pub fn settings_defaults() -> String {

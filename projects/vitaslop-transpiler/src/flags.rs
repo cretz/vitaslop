@@ -124,7 +124,9 @@ pub fn cond_reads(cond: ConditionCode) -> FlagMask {
 fn value_reads(v: &Value) -> FlagMask {
     match v {
         Value::Flag(f) => FlagMask::of(*f),
-        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::CarryAddResult => FlagMask::NONE,
+        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::ExclAddr | Value::CarryAddResult => {
+            FlagMask::NONE
+        }
         Value::Not(a) | Value::Clz(a) | Value::Load { addr: a, .. } => value_reads(a),
         Value::Bin(_, a, b) => value_reads(a).union(value_reads(b)),
     }
@@ -142,9 +144,8 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
     const Z: FlagMask = FlagMask::of(Flag::Z);
     const C: FlagMask = FlagMask::of(Flag::C);
     match s {
-        Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. } => {
-            (value_reads(v), FlagMask::NONE)
-        }
+        Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. }
+        | Stmt::ExclSet(v) => (value_reads(v), FlagMask::NONE),
         Stmt::Store { addr, data, .. } => {
             (value_reads(addr).union(value_reads(data)), FlagMask::NONE)
         }
@@ -220,7 +221,8 @@ fn stmt_effect(s: &Stmt) -> (FlagMask, FlagMask) {
 /// miscompile.
 fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
     match s {
-        Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. } => f(v),
+        Stmt::SetReg(_, v) | Stmt::SetThreadPtr(v) | Stmt::Rbit { rm: v, .. }
+        | Stmt::ExclSet(v) => f(v),
         Stmt::Store { addr, data, .. } => {
             f(addr);
             f(data);
@@ -268,7 +270,7 @@ fn for_each_value(s: &Stmt, f: &mut impl FnMut(&Value)) {
 fn value_reads_carry_sum(v: &Value) -> bool {
     match v {
         Value::CarryAddResult => true,
-        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::Flag(_) => false,
+        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::ExclAddr | Value::Flag(_) => false,
         Value::Not(a) | Value::Clz(a) | Value::Load { addr: a, .. } => value_reads_carry_sum(a),
         Value::Bin(_, a, b) => value_reads_carry_sum(a) || value_reads_carry_sum(b),
     }
@@ -278,7 +280,9 @@ fn value_reads_carry_sum(v: &Value) -> bool {
 fn value_has_load(v: &Value) -> bool {
     match v {
         Value::Load { .. } => true,
-        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::Flag(_)
+        // The monitor word is not GUEST memory - it is a host slot outside the guest
+        // region - so it is not a load in the sense this asks about.
+        Value::Imm(_) | Value::Reg(_) | Value::ThreadPtr | Value::ExclAddr | Value::Flag(_)
         | Value::CarryAddResult => false,
         Value::Not(a) | Value::Clz(a) => value_has_load(a),
         Value::Bin(_, a, b) => value_has_load(a) || value_has_load(b),

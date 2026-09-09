@@ -46,6 +46,14 @@ sha2 = "0.10"
 miniz_oxide = "0.8"
 skrifa = "0.45.0"
 zeno = "0.3.3"
+# Pure-Rust JPEG decode for SceJpeg (MIT/Apache/Zlib, decoder only, wasm-clean). Its `x86`
+# and `neon` features are ON - they are the crate's own defaults and they are gated by
+# `target_arch` inside it, so they cost the wasm build nothing and buy the native one an
+# AVX2/NEON IDCT and colour convert instead of the scalar one. wasm SIMD would need the
+# crate's `portable_simd` feature, which needs a nightly toolchain, so the browser runs the
+# scalar path [[vitaslop-wasm-simd-must-be-asked-for]].
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
 
 [features]
 # >>> A DIAGNOSTIC BUILD, NOT A SHIPPING ONE. Marks a handful of audio-path functions

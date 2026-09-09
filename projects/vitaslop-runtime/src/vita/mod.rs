@@ -18,6 +18,7 @@ pub mod gxm;
 pub mod gxmctx;
 pub mod gxmstate;
 pub mod gxmprog;
+pub mod hevag;
 pub mod http;
 pub mod iofilemgr;
 pub mod jpeg;
@@ -26,6 +27,7 @@ pub mod libkernel;
 pub mod livearea;
 pub mod location;
 pub mod lwsync;
+pub mod kmutex;
 pub mod lwwork;
 pub mod mirror;
 pub mod ngs;
@@ -74,6 +76,24 @@ use std::sync::{LazyLock, Mutex};
 /// - a BULK move or compare over guest memory and nothing else (the `sceClibMem*` trio in
 ///   [`libkernel`]), which is the first shape whose reach the guest chooses rather than the
 ///   emitter, and so the first whose guard is arithmetic rather than a constant.
+/// Whether the module about to be linked will run under the PREEMPTIVE scheduler.
+///
+/// The HOST MIRROR block only exists under that scheduler - it is refreshed at its single
+/// resume point - and one mirrored value, the RTC wall tick, is a pure function of the virtual
+/// clock only there ([`crate::vita::mirror::SLOT_RTC_LO`] states the contract). The linker runs
+/// BEFORE any `VitaState` exists, so the answer cannot be read off one; a frontend that stands
+/// up the threaded scheduler says so here first.
+///
+/// Defaults to FALSE, which is the safe direction: an entry point that forgets to set it loses
+/// an optimisation, where the other default would serve a clock the contract does not cover.
+static PREEMPTIVE_LINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that the next [`link`](crate::link::link) is for a preemptive run. See
+/// [`PREEMPTIVE_LINK`].
+pub fn set_preemptive_linking(on: bool) {
+    PREEMPTIVE_LINK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     if no_inline_imports() {
         return None;
@@ -93,6 +113,11 @@ pub fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> {
     gxm::inline_op(func_nid)
         .or_else(|| display::inline_op(func_nid))
         .or_else(|| libkernel::inline_op(func_nid))
+        .or_else(|| {
+            let preemptive = PREEMPTIVE_LINK.load(std::sync::atomic::Ordering::Relaxed);
+            services::inline_op(func_nid, preemptive)
+                .or_else(|| (!no_inline_mutex()).then(|| sync::inline_op(func_nid, preemptive)).flatten())
+        })
         .or_else(|| (!no_inline_lwmutex()).then(|| lwsync::inline_op(func_nid)).flatten())
         .or_else(|| (!no_inline_stubs()).then(|| stub_inline_op(func_nid)).flatten())
 }
@@ -361,6 +386,20 @@ fn uniform_watch() -> bool {
 fn no_inline_lwmutex() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_LWMUTEX"))
+}
+
+/// `VITASLOP_NO_INLINE_MUTEX`: route `sceKernelLockMutex`/`sceKernelUnlockMutex` through the
+/// host, leaving every other inline form on.
+///
+/// The scoped A/B arm for the heavyweight lock pair, and the falsifier for the one change it
+/// rests on - the mutex's ownership moving out of `VitaState` and into guest memory
+/// ([`crate::vita::kmutex`]). With the knob set the emitted form is gone but the TABLE is still
+/// where the state lives, so a run that differs between the arms is the emitted code, and one
+/// that differs from a build before the table is the move. Two questions, and only this
+/// separates them.
+fn no_inline_mutex() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::flag("VITASLOP_NO_INLINE_MUTEX"))
 }
 
 /// `VITASLOP_NO_INLINE_TEXTURE`: route `sceGxmSetFragmentTexture` through the host,
@@ -957,6 +996,8 @@ pub fn dispatch(
         // --- libkernel: clib string/mem, threads, process ----------------------
         lk_nid::CLIB_PRINTF => cont!(libkernel::clib_printf(ctx, st)),
         lk_nid::CLIB_SNPRINTF => cont!(libkernel::clib_snprintf(ctx, st)),
+        lk_nid::CLIB_VSNPRINTF => cont!(libkernel::clib_vsnprintf(ctx, st)),
+        lk_nid::CLIB_VPRINTF => cont!(libkernel::clib_vprintf(ctx, st)),
         // memmove shares memcpy's read-then-write impl (tolerates overlap).
         lk_nid::CLIB_MEMCPY | lk_nid::CLIB_MEMMOVE => cont!(libkernel::clib_memcpy(ctx, st)),
         lk_nid::CLIB_MEMSET => cont!(libkernel::clib_memset(ctx, st)),
@@ -1022,6 +1063,7 @@ pub fn dispatch(
         // Closing a semaphore invalidates its id, same as deleting it in this model.
         tm_nid::CLOSE_SEMA => cont!(sync::delete_object(ctx, st)),
         tm_nid::CHANGE_THREAD_VFP_EXCEPTION => cont!(threadmgr::change_thread_vfp_exception(ctx, st)),
+        tm_nid::CHECK_CALLBACK => cont!(threadmgr::check_callback(ctx, st)),
 
         // --- net: BSD sockets, modelled OFFLINE (see `vita::net`) ---------------
         // --- SceMotion: a device AT REST, flat. The two sampling switches are real
@@ -1135,6 +1177,10 @@ pub fn dispatch(
         http_nid::SSL_LOAD_CERT => cont!(http::ssl_load_cert(ctx, st)),
         http_nid::SSL_SET_SSL_CALLBACK => cont!(http::ssl_set_ssl_callback(ctx, st)),
         http_nid::SSL_GET_SSL_ERROR => cont!(http::ssl_get_ssl_error(ctx, st)),
+        http_nid::SET_COOKIE_ENABLED => cont!(http::set_cookie_enabled(ctx, st)),
+        http_nid::GET_COOKIE_ENABLED => cont!(http::get_cookie_enabled(ctx, st)),
+        http_nid::SET_COOKIE_RECV_CALLBACK => cont!(http::set_cookie_recv_callback(ctx, st)),
+        http_nid::GET_COOKIE => cont!(http::get_cookie(ctx, st)),
 
         net_nid::SOCKET => cont!(net::socket(ctx, st)),
         net_nid::SOCKET_CLOSE => cont!(net::socket_close(ctx, st)),
@@ -1165,7 +1211,11 @@ pub fn dispatch(
         net_nid::EPOLL_CREATE => cont!(net::epoll_create(ctx, st)),
         net_nid::EPOLL_DESTROY => cont!(net::epoll_destroy(ctx, st)),
         net_nid::EPOLL_CONTROL => cont!(net::epoll_control(ctx, st)),
-        net_nid::EPOLL_WAIT => cont!(net::epoll_wait(ctx, st)),
+        // The `CB` spelling shares the handler: a `CB` wait additionally delivers the
+        // calling thread's pending callbacks, and this engine delivers those at host-call
+        // boundaries anyway - the same reason the display waits fold their pairs.
+        net_nid::EPOLL_WAIT | net_nid::EPOLL_WAIT_CB => cont!(net::epoll_wait(ctx, st)),
+        net_nid::SOCKET_ABORT => cont!(net::socket_abort(ctx, st)),
 
         // --- fiber: cooperative user-level threads -------------------------------
         // Run/Switch/ReturnToThread hand the baton over and PARK the caller, so these
@@ -1237,6 +1287,12 @@ pub fn dispatch(
         gxm_nid::SYNC_OBJECT_CREATE => cont!(gxm::out_handle(ctx, st, 0)),
         gxm_nid::SHADER_PATCHER_REGISTER_PROGRAM => cont!(gxm::register_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_GET_PROGRAM_FROM_ID => cont!(gxm::get_program_from_id(ctx, st)),
+        gxm_nid::SHADER_PATCHER_SET_USER_DATA => cont!(gxm::shader_patcher_set_user_data(ctx, st)),
+        gxm_nid::SHADER_PATCHER_GET_USER_DATA => cont!(gxm::shader_patcher_get_user_data(ctx, st)),
+        gxm_nid::PROGRAM_IS_FRAG_COLOR_USED => cont!(gxm::program_is_frag_color_used(ctx, st)),
+        // The one GXM wait with no published prototype - see `gxm::wait_event`. It gives up
+        // the CPU rather than returning inline, so it is not in the `ok` group above.
+        gxm_nid::WAIT_EVENT => gxm::wait_event(ctx, st),
         gxm_nid::PROGRAM_PARAMETER_GET_RESOURCE_INDEX => cont!(gxm::param_get_resource_index(ctx)),
         gxm_nid::PROGRAM_FIND_PARAMETER_BY_NAME => cont!(gxm::find_parameter(ctx, st)),
         gxm_nid::PROGRAM_GET_PARAMETER_COUNT => cont!(gxm::program_get_parameter_count(ctx)),
@@ -1418,6 +1474,7 @@ pub fn dispatch(
         gxm_nid::SET_FRONT_POINT_LINE_WIDTH => cont!(gxm::set_front_point_line_width(ctx, st)),
         gxm_nid::SET_FRONT_POLYGON_MODE => cont!(gxm::set_front_polygon_mode(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_REF => cont!(gxm::set_front_stencil_ref(ctx, st)),
+        gxm_nid::SET_BACK_STENCIL_REF => cont!(gxm::set_back_stencil_ref(ctx, st)),
         gxm_nid::SET_FRONT_STENCIL_FUNC => cont!(gxm::set_front_stencil_func(ctx, st)),
         gxm_nid::SET_BACK_STENCIL_FUNC => cont!(gxm::set_back_stencil_func(ctx, st)),
         gxm_nid::SET_VIEWPORT => cont!(gxm::set_viewport(ctx, st)),
@@ -1440,6 +1497,9 @@ pub fn dispatch(
             cont!(gxm::texture_set_v_addr_mode(ctx))
         }
         gxm_nid::TEXTURE_SET_LOD_BIAS => cont!(gxm::texture_set_lod_bias(ctx)),
+        gxm_nid::TEXTURE_SET_MIPMAP_COUNT => cont!(gxm::texture_set_mipmap_count(ctx)),
+        gxm_nid::TEXTURE_SET_LOD_MIN => cont!(gxm::texture_set_lod_min(ctx)),
+        gxm_nid::TEXTURE_GET_LOD_MIN => cont!(gxm::texture_get_lod_min(ctx)),
         gxm_nid::DRAW => cont!(gxm::draw(ctx, st)),
         gxm_nid::DRAW_INSTANCED => cont!(gxm::draw_instanced(ctx, st)),
         gxm_nid::DISPLAY_QUEUE_ADD_ENTRY => {
@@ -1541,6 +1601,7 @@ pub fn dispatch(
 
         // --- display ------------------------------------------------------------
         display_nid::SET_FRAME_BUF => cont!(display::set_frame_buf(ctx, st)),
+        display_nid::GET_FRAME_BUF => cont!(display::get_frame_buf(ctx, st)),
         // A real timed vblank wait (parks under the preemptive scheduler).
         //
         // The `CB` spellings share each handler. A `CB` wait additionally runs the
@@ -1771,6 +1832,7 @@ pub fn dispatch(
         sv_nid::RTC_FORMAT_RFC3339_LOCAL_TIME => {
             cont!(services::rtc_format_rfc3339_local_time(ctx, st))
         }
+        sv_nid::RTC_PARSE_RFC3339 => cont!(services::rtc_parse_rfc3339(ctx, st)),
         sv_nid::APPUTIL_SYSTEM_PARAM_GET_INT => cont!(services::apputil_system_param_get_int(ctx, st)),
         sv_nid::APPUTIL_APP_PARAM_GET_INT => cont!(services::apputil_app_param_get_int(ctx, st)),
         sv_nid::LIVE_AREA_GET_STATUS => cont!(services::live_area_get_status(ctx, st)),
@@ -1813,6 +1875,18 @@ pub fn dispatch(
         sv_nid::ADHOC_MATCHING_STOP => cont!(net::adhoc_matching_set_started(ctx, st, false)),
         sv_nid::ADHOC_MATCHING_DELETE => cont!(net::adhoc_matching_delete(ctx, st)),
         sv_nid::ADHOC_MATCHING_SELECT_TARGET => cont!(net::adhoc_matching_select_target(ctx, st)),
+        sv_nid::ADHOC_MATCHING_TERM => cont!(net::adhoc_matching_term(ctx, st)),
+        // Both name a PEER on a context no peer has ever appeared on - see the handlers for
+        // why the send REFUSES and the cancel succeeds.
+        sv_nid::ADHOC_MATCHING_SEND_DATA => cont!(net::adhoc_matching_send_data(ctx, st)),
+        sv_nid::ADHOC_MATCHING_CANCEL_TARGET => cont!(net::adhoc_matching_cancel_target(ctx, st)),
+        sv_nid::ADHOC_MATCHING_GET_MEMBERS => cont!(net::adhoc_matching_get_members(ctx, st)),
+        sv_nid::ADHOC_MATCHING_SET_HELLO_OPT => cont!(net::adhoc_matching_set_hello_opt(ctx, st)),
+        sv_nid::NET_CTL_GET_NAT_INFO => cont!(services::netctl_get_nat_info(ctx, st)),
+        sv_nid::APPUTIL_STORE_BROWSE => cont!(services::apputil_store_browse(ctx, st)),
+        sv_nid::NET_CHECK_DIALOG_GET_PS3_CONNECT_INFO => {
+            cont!(services::net_check_dialog_get_ps3_connect_info(ctx, st))
+        }
         sv_nid::MP4_OPEN_FILE => cont!(video::mp4_open_file(ctx, st)),
         sv_nid::MP4_START_FILE_STREAMING => cont!(video::mp4_start_file_streaming(ctx, st)),
         sv_nid::MP4_CLOSE_FILE => cont!(video::mp4_close_file(ctx, st)),
@@ -1907,6 +1981,9 @@ pub fn dispatch(
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_INDEX => {
             cont!(gesture::get_touch_event_by_index(ctx, st))
         }
+        sv_nid::SYSTEM_GESTURE_GET_TOUCH_EVENT_BY_EVENT_ID => {
+            cont!(gesture::get_touch_event_by_event_id(ctx, st))
+        }
         sv_nid::SYSTEM_GESTURE_GET_TOUCH_RECOGNIZER_INFORMATION => {
             cont!(gesture::get_touch_recognizer_information(ctx, st))
         }
@@ -1922,6 +1999,10 @@ pub fn dispatch(
         // because there is no honest way to hand back a JPEG that was never encoded.
         sv_nid::JPEG_INIT_MJPEG => cont!(jpeg::init_mjpeg(ctx, st)),
         sv_nid::JPEG_FINISH_MJPEG => cont!(jpeg::finish_mjpeg(ctx, st)),
+        sv_nid::JPEG_GET_OUTPUT_INFO => cont!(jpeg::get_output_info(ctx, st)),
+        sv_nid::JPEG_DECODE_MJPEG_YCBCR => cont!(jpeg::decode_mjpeg_ycbcr(ctx, st)),
+        sv_nid::JPEG_MJPEG_CSC => cont!(jpeg::mjpeg_csc(ctx, st)),
+        sv_nid::JPEG_CSC => cont!(jpeg::plain_csc(ctx, st)),
         sv_nid::JPEGENC_GET_CONTEXT_SIZE => cont!(jpegenc::get_context_size(ctx, st)),
         sv_nid::JPEGENC_INIT => cont!(jpegenc::init(ctx, st)),
         sv_nid::JPEGENC_END => cont!(jpegenc::end(ctx, st)),
@@ -2006,7 +2087,45 @@ pub fn dispatch(
         | sv_nid::NP_SCORE_GET_RANKING_BY_RANGE_ASYNC
         // The async poll: no request was ever accepted, so there is no operation whose
         // completion this could report.
-        | sv_nid::NP_SCORE_POLL_ASYNC => {
+        | sv_nid::NP_SCORE_POLL_ASYNC
+        // The identity, messaging and lookup calls this title adds to the same surface.
+        // `GetCachedParam` reads the signed-in account's cached parameters, of which there
+        // are none; `SendInGameDataMessage` needs a session to send over; `LookupNpIdAsync`
+        // needs the lookup service; and a message's ATTACHMENT can only exist on a message,
+        // of which there are none off-console.
+        | sv_nid::NP_MANAGER_GET_CACHED_PARAM
+        | sv_nid::NP_BASIC_SEND_IN_GAME_DATA_MESSAGE
+        | sv_nid::NP_LOOKUP_NP_ID_ASYNC
+        | sv_nid::NP_MESSAGE_GET_ATTACHED_DATA
+        | sv_nid::NP_MESSAGE_SET_ATTACHED_DATA_USED_FLAG
+        // The rest of SceNpCommerce2's product surface. Every one of these needs the STORE:
+        // a session against it, a request over that session, or a result that only a reply
+        // can fill. `NP_COMMERCE2_CREATE_SESSION_GET_RESULT` above already reports the
+        // signed-out failure of the session those requests would hang off, so reporting the
+        // same cause here is what tells a title the store is unreachable rather than that
+        // its own bookkeeping is wrong.
+        //
+        // The two `Init*Result` calls belong here and not with the successes: they take a
+        // REQUEST id (they initialise the caller's result object against the request that
+        // produced it), and no request here was ever accepted.
+        | sv_nid::NP_COMMERCE2_GET_SESSION_INFO
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_CREATE_REQ
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_START
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_GET_RESULT
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_CREATE_REQ
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_START
+        | sv_nid::NP_COMMERCE2_GET_PRODUCT_INFO_LIST_GET_RESULT
+        | sv_nid::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_RESULT
+        | sv_nid::NP_COMMERCE2_INIT_GET_PRODUCT_INFO_LIST_RESULT
+        // ...and the four accessors that READ a fetched product. They are handed a result
+        // object no fetch ever filled, and each hands back a POINTER into it on hardware.
+        // Reporting signed out is the one answer that cannot mislead: a fabricated product
+        // record would be a price and a name for something nobody offered, and a title
+        // showing it would be showing an invented store listing.
+        | sv_nid::NP_COMMERCE2_GET_GAME_PRODUCT_INFO
+        | sv_nid::NP_COMMERCE2_GET_GAME_PRODUCT_INFO_FROM_GET_PRODUCT_INFO_LIST_RESULT
+        | sv_nid::NP_COMMERCE2_GET_GAME_SKU_INFO_FROM_GAME_PRODUCT_INFO
+        | sv_nid::NP_COMMERCE2_GET_PRICE => {
             cont!(ctx.ret(services::SCE_NP_ERROR_SIGNED_OUT as u32))
         }
         // Everything else here is an init/register that simply succeeds offline.
@@ -2074,7 +2193,18 @@ pub fn dispatch(
         | sv_nid::NP_LOOKUP_INIT
         | sv_nid::NP_TUS_INIT
         | sv_nid::NP_MESSAGE_INIT_WITH_PARAM
+        // The paramless spelling of the same init, a separate NID a title may link instead.
+        | sv_nid::NP_MESSAGE_INIT
         | sv_nid::NP_MESSAGE_TERM
+        // SceNpCommerce2 TEARDOWN, for the reason the rest of the online stack's teardown
+        // succeeds: destroying a context, a request or a result that was never filled
+        // against a server still releases the local object, and a title unwinding after
+        // being told the store is unreachable must not be handed a second error on the way
+        // out.
+        | sv_nid::NP_COMMERCE2_TERM
+        | sv_nid::NP_COMMERCE2_DESTROY_CTX
+        | sv_nid::NP_COMMERCE2_DESTROY_REQ
+        | sv_nid::NP_COMMERCE2_DESTROY_GET_PRODUCT_INFO_RESULT
         | sv_nid::NP_MATCHING2_INIT
         // Matching2 / NpScore TEARDOWN, for the same reason the rest of the online stack's
         // teardown succeeds: nothing was created, so there is nothing that can fail to be
@@ -2151,6 +2281,17 @@ pub fn dispatch(
         sv_nid::NP_PROFILE_DIALOG_TERM => {
             cont!(services::dialog_term(ctx, st, services::DialogFamily::NpProfile))
         }
+        // The PSN friend picker, in the same shape and for the same reasons: no account and
+        // no friend list, so it completes with nobody chosen rather than refusing to open.
+        sv_nid::NP_FRIEND_LIST_DIALOG_INIT => {
+            cont!(services::dialog_init(ctx, st, services::DialogFamily::NpFriendList))
+        }
+        sv_nid::NP_FRIEND_LIST_DIALOG_GET_STATUS => {
+            cont!(services::dialog_get_status(ctx, st, services::DialogFamily::NpFriendList))
+        }
+        sv_nid::NP_FRIEND_LIST_DIALOG_TERM => {
+            cont!(services::dialog_term(ctx, st, services::DialogFamily::NpFriendList))
+        }
         sv_nid::PHOTO_IMPORT_DIALOG_INIT => {
             cont!(services::dialog_init(ctx, st, services::DialogFamily::PhotoImport))
         }
@@ -2162,12 +2303,16 @@ pub fn dispatch(
         }
         // Their result reads, and the trophy-setup one, all write a zeroed result -
         // which for each of these families is "completed, nothing selected".
-        sv_nid::NP_PROFILE_DIALOG_GET_RESULT | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT => {
+        sv_nid::NP_PROFILE_DIALOG_GET_RESULT
+        | sv_nid::PHOTO_IMPORT_DIALOG_GET_RESULT
+        | sv_nid::NP_FRIEND_LIST_DIALOG_GET_RESULT => {
             cont!(services::dialog_ok(ctx, st))
         }
         // Aborting a dialog that has already completed, and closing one the title put
         // up itself, both genuinely succeed: there is nothing left running to stop.
-        sv_nid::NP_PROFILE_DIALOG_ABORT | sv_nid::MSG_DIALOG_CLOSE => cont!(ctx.ret(0)),
+        sv_nid::NP_PROFILE_DIALOG_ABORT
+        | sv_nid::MSG_DIALOG_CLOSE
+        | sv_nid::SAVEDATA_DIALOG_ABORT => cont!(ctx.ret(0)),
         sv_nid::MSG_DIALOG_INIT => cont!(services::dialog_init(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_GET_STATUS => cont!(services::dialog_get_status(ctx, st, services::DialogFamily::Msg)),
         sv_nid::MSG_DIALOG_TERM => cont!(services::dialog_term(ctx, st, services::DialogFamily::Msg)),

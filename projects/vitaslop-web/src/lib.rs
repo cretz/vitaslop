@@ -593,6 +593,93 @@ struct LivePlayback {
     gpu_done_us: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Whether a work-done promise is already outstanding, so presents do not stack them.
     gpu_done_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// >>> SUBMITS THIS THREAD HAS MADE THAT THE GPU HAS NOT YET REPORTED FINISHED.
+    ///
+    /// # THE QUEUE WAS UNBOUNDED, AND AN UNBOUNDED QUEUE IS A BROWSER HANG
+    /// Nothing here ever asked whether the GPU had kept up before encoding the next frame, so
+    /// on a device that cannot the work simply piled into the queue. MEASURED on the user's
+    /// phone: `GPU WORK-DONE LATENCY 765.5 ms` against a `period` of 43.7 ms - seventeen
+    /// frames of backlog - while the frame's own draws cost 1.11 ms of GPU time.
+    ///
+    /// The backlog does not stay in the queue. `queue.write_buffer` copies through a STAGING
+    /// RING, and a ring whose chunks are all still referenced by unfinished submits cannot
+    /// hand out another one until a fence retires - so the call BLOCKS, synchronously, on the
+    /// worker thread. Same run: `arena write 19.1 ms` of a 21.8 ms frame, one write of
+    /// **330 KB blocking 212 ms** and a worst-of-run of **1397 ms for 339 KB**. No copy of
+    /// 330 KB costs that; the thread is waiting on the GPU.
+    ///
+    /// And a worker thread parked inside `write_buffer` is a worker that is not turning its
+    /// event loop: no decoder callback, no timer, no input, no pacing, for a fifth of a second
+    /// at a time. That is the user's report exactly - *"it's like it's hanging my phone, the
+    /// browser stops responding... even when you show 60fps, it's like 10fps but you can't see
+    /// it because it's machine/browser hang not emulator hang"*. The FPS meter is not lying;
+    /// it is averaging over a window whose time went into a blocking call.
+    /// [[vitaslop-a-host-call-that-never-yields-starves-the-browser]]
+    ///
+    /// So the depth is bounded HERE, where it can be bounded for free: a present that would
+    /// make the queue deeper than [`Self::queue_depth_limit`] does nothing at all - it does
+    /// not build the scenes, does not encode, does not submit - and returns
+    /// [`PresentOutcome::Skipped`]. The run loop awaits its tick either way, so the thread
+    /// yields, the callbacks land, the ring retires, and the NEXT present writes into a free
+    /// chunk at memcpy speed.
+    ///
+    /// What this trades: on a device that cannot keep up, presented frames go down. That is
+    /// the honest outcome and it is the one already happening - those frames were being
+    /// encoded and queued behind a backlog, arriving hundreds of milliseconds late while
+    /// freezing the page. A frame not drawn costs nothing; a frame drawn late costs the
+    /// browser's responsiveness. On a device that CAN keep up the counter never reaches the
+    /// limit and not one instruction of this changes what happens.
+    gpu_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// How many submits may be in flight before a present declines to make another. `0`
+    /// disables the bound entirely (`VITASLOP_GPU_QUEUE_DEPTH=0`), which is the arm that
+    /// restores the old unbounded behaviour for an A/B.
+    ///
+    /// Two, not one: at one the CPU and GPU cannot overlap at all - every frame waits for the
+    /// previous to finish before it starts encoding, which halves throughput on a device that
+    /// was keeping up fine. Two lets one frame be encoded while one is executing, which is the
+    /// pipelining a renderer wants, and stops there.
+    queue_depth_limit: u32,
+    /// >>> WHETHER THE BOUND IS ARMED AT ALL: presents remaining in which it may decline.
+    ///
+    /// # THE BOUND WAS ARMED ALWAYS, AND IT THROTTLED A HEALTHY RUN TO A THIRD OF ITS RATE
+    /// MEASURED on the user's phone, one gameplay window, with the bound at its default of 2:
+    /// GPU execution **3.9 ms** a frame against a 19.4 ms period (a timestamp query, so it is
+    /// the GPU's own clock), `arena write 0.2 ms`, worst `write_buffer` of the entire run
+    /// **0.6 ms for 288 KB** - and **908 presents DECLINED**, `0.35 presents/tick`, the page's
+    /// own overlay reading *"95% of the frames the emulator computed were DISCARDED
+    /// unpresented"*. There was no backlog. The bound invented one.
+    ///
+    /// It was reading `on_submitted_work_done`, which on that same window says **897 ms**.
+    /// Against 3.9 ms of measured GPU work that number cannot be the GPU being behind - it is
+    /// how long the promise takes to be DISPATCHED on a worker thread busy running the guest.
+    /// The panel has always warned that the latency "CANNOT separate GPU time from callback
+    /// latency"; the depth counter is built on the same promise and inherits the same defect.
+    ///
+    /// So the bound now arms on the PATHOLOGY, not on a proxy for it: a `queue.write_buffer`
+    /// that BLOCKS. No copy of a few hundred KB costs milliseconds, so a write above
+    /// [`STALL_WRITE_US`] means the thread is waiting for the staging ring to retire, which is
+    /// the failure that froze the page. One such write arms the bound for [`STALL_ARM_PRESENTS`]
+    /// presents; a run that never blocks never declines a frame, which is what the measurement
+    /// above says a healthy run looks like.
+    stall_armed_for: u32,
+    /// Consecutive presents declined for queue depth. Two jobs, and the second is the reason
+    /// it is a count and not a flag.
+    ///
+    /// >>> A CALLBACK THAT NEVER ARRIVES MUST NOT BE A BLACK SCREEN FOREVER. `on_submitted_work_done`
+    /// is a promise, and a promise that is dropped, or a device that stops retiring work,
+    /// leaves the counter high with nothing to bring it down - and every present after that
+    /// declines, forever, silently. So a long enough run of declines OVERRIDES the bound and
+    /// says so. It is a safety valve, not a policy: on a healthy device it never fires,
+    /// because a decline is followed by a tick in which the callback lands.
+    backpressure_skips: u32,
+    /// Declines this run, for the panel. Cumulative: the question a reader asks is "is this
+    /// device being throttled at all", which a windowed count answers only by accident.
+    backpressure_skips_total: u64,
+    /// How many times a blocking write ARMED the bound this run. Reported beside the declines
+    /// because the two answer different questions: this says the pathology occurred at all, the
+    /// declines say what the bound did about it. Zero arms with a healthy rate is the shape of a
+    /// device that never needed the bound.
+    stall_arms_total: u64,
     /// Presents since the run started. NOT `split.presents`, which `take_split` resets every
     /// diagnostics window - a probe cadence driven off that one restarts at zero each window,
     /// so it fires on the same relative frame forever and every report is labelled "frame 0".
@@ -611,6 +698,49 @@ struct LivePlayback {
     occluded: bool,
 }
 
+/// Consecutive queue-depth declines after which the bound overrides itself - see
+/// [`LivePlayback::backpressure_skips`].
+///
+/// Sixty is about a second of ticks. Long enough that no real burst of GPU work reaches it (a
+/// backlog that deep would have to survive a second of the thread doing nothing but yielding,
+/// which is exactly when a queue drains), short enough that a dropped promise costs a second
+/// of picture rather than the rest of the run.
+const BACKPRESSURE_SKIP_CAP: u32 = 60;
+
+/// A `queue.write_buffer` at or above this many MICROSECONDS is taken as a BLOCKING call and
+/// arms the queue-depth bound. See [`LivePlayback::stall_armed_for`].
+///
+/// Four milliseconds. The two populations measured on the user's phone are not close together:
+/// a healthy run's worst write over an ENTIRE RUN was 0.6 ms for 288 KB, and a stalled one's
+/// were 212 ms for 330 KB and 1397 ms for 339 KB. Anything in between is not a copy - the same
+/// bytes move in well under a millisecond - so the threshold only has to sit above the noise,
+/// and putting it at 4 ms leaves the healthy population a factor of six of headroom.
+const STALL_WRITE_US: u64 = 4_000;
+
+/// How many presents one blocking write may decline.
+///
+/// # ONE. A FIXED SENTENCE COSTS FRAMES THE PATHOLOGY NEVER ASKED FOR.
+/// This was 180 presents - a burst-riding window - and MEASURED on the user's phone, one
+/// gameplay run: a SINGLE `queue.write_buffer` blocked 117.8 ms (`ARMED 1 time(s) this run`),
+/// and the sentence that followed it `DECLINED 215 present(s)`. The run's whole shortfall was
+/// that decline list - 2831 guest frames, 2615 presented - and the page's own overlay read
+/// *"38% of the frames the emulator computed were DISCARDED unpresented"* while the GPU's OWN
+/// timestamp query read **4.1 ms a frame against a 17.2 ms period** and no second write ever
+/// blocked. The GPU was never behind. The sentence was.
+///
+/// The reason a fixed sentence cannot be right is in `gpu_in_flight`: the depth counter comes
+/// down on `on_submitted_work_done`, whose DISPATCH on a worker busy running the guest is late
+/// by far more than the GPU's execution. Armed, the depth therefore reads at the limit most
+/// ticks whatever the GPU is doing, so the length of the sentence IS the number of frames lost.
+///
+/// So a stall now buys exactly what a stall needs and nothing more: ONE declined present. That
+/// present's tick is a whole turn of the event loop with no encode and no submit, which is the
+/// thing that lets the staging ring retire. If the ring is still not retiring, the NEXT frame's
+/// write blocks again and arms again - measured, not assumed - and the run settles at whatever
+/// rate the device can actually hold, one observation at a time. An isolated burst costs one
+/// frame. [[vitaslop-a-throttle-must-arm-on-its-own-pathology]]
+const STALL_ARM_PRESENTS: u32 = 1;
+
 /// How far a call to [`LivePlayback::present`] got.
 ///
 /// >>> IT IS A RETURN VALUE BECAUSE SKIPPING A FRAME AND LOSING THE DEVICE USED TO BE THE
@@ -628,6 +758,87 @@ enum PresentOutcome {
     Skipped,
     /// The renderer cannot draw again. The run must stop and say this.
     Fatal(String),
+}
+
+/// >>> THE WORST FLAT-SATURATED FRAME THIS RUN HAS PRESENTED, kept for the panel.
+///
+/// # A FLICKER CANNOT BE REPORTED BY A SNAPSHOT
+/// The user's stray flat shapes are a ONE-FRAME event on a device that cannot be sampled: the
+/// browser harness manages six screenshots in a 3,600-frame window, and a dump is taken minutes
+/// after the thing was seen. A panel line describing the CURRENT frame therefore has almost no
+/// chance of describing the defect, for the same reason a windowed maximum could not survive a
+/// hang [[vitaslop-a-count-needs-its-window]].
+///
+/// So this never resets: whatever the run's worst frame was, by the share of it covered by a
+/// single vivid colour, is still named when the user takes a dump afterwards. That is what
+/// turns "I see flickering" into a frame number and a colour.
+///
+/// The three worst are kept rather than one, because a single outlier could be a legitimate
+/// full-screen effect (a flash, a fade through a hue) and three separated frames at the same
+/// colour is a different claim entirely.
+type VividWhere = [[u8; 8]; 6];
+static WORST_VIVID: std::sync::Mutex<Vec<(u64, f64, (usize, usize, usize), VividWhere)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The previous probed frame's vivid histogram, so the current one can be DIFFERENCED against
+/// it. See the call site: the measure is a colour that appeared, not the frame's biggest.
+static PREV_VIVID: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Offer one probed frame to [`WORST_VIVID`].
+fn note_vivid_frame(frame: u64, share: f64, rgb: (usize, usize, usize), map: VividWhere) {
+    // >>> A CHANGE THAT COVERS THE WHOLE FRAME IS A CUT, AND A CUT IS NOT THIS DEFECT.
+    //
+    // The stray shape is a SHAPE: a run of adjacent cells with the rest of the frame untouched.
+    // A cut, a fade or a full-screen flash moves every cell, and because it moves the most
+    // pixels it wins every ranking that does not exclude it - which is what a browser run
+    // demonstrated, three times over. So a frame whose map is nearly full is dropped here
+    // rather than being allowed to crowd out the frames this exists to find.
+    let filled = map.iter().flatten().filter(|n| **n > 0).count();
+    if filled * 10 >= map.len() * map[0].len() * 8 {
+        return;
+    }
+    let mut w = WORST_VIVID.lock().unwrap_or_else(|e| e.into_inner());
+    w.push((frame, share, rgb, map));
+    w.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    w.truncate(3);
+}
+
+/// The panel line, or `None` if no frame has been probed.
+fn vivid_report() -> Option<String> {
+    let w = WORST_VIVID.lock().unwrap_or_else(|e| e.into_inner());
+    if w.is_empty() {
+        return None;
+    }
+    // Each cell of the 8x6 map is how much of that eighth-by-sixth of the screen the colour
+    // covered, as a single character: a stray shape draws a solid block of `#`, an effect
+    // spread over the frame draws a wash of `.`, and a cut fills every cell.
+    let cell = |n: u8| match n {
+        0 => '.',
+        1..=60 => '-',
+        61..=140 => '+',
+        _ => '#',
+    };
+    let worst: Vec<String> = w
+        .iter()
+        .map(|(f, s, (r, g, b), map)| {
+            // Each cell counts pixels out of (960/8)x(544/6) = 120x90 = 10,800, so scale to
+            // 0..255 before bucketing it into a character.
+            let rows: Vec<String> = map
+                .iter()
+                .map(|row| {
+                    row.iter().map(|n| cell(*n)).collect::<String>()
+                })
+                .collect();
+            format!("frame {f}: {s:.1}% of it is rgb({r},{g},{b})
+      {}", rows.join("
+      "))
+        })
+        .collect();
+    Some(format!(
+        "the THREE biggest SUDDEN APPEARANCES of a vivid colour this run has presented - for          each frame, the colour that gained the most screen against the PREVIOUS probed frame:          {}. >>> WHAT TO READ: this is a measure of CHANGE, so a title's own art contributes          nothing however saturated it is - the stage was already there. Ordinary motion, a          camera cut or a fade moves a few per cent. A single frame where one vivid colour          appears over a tenth or more of the screen, especially a saturated primary, is the          stray flat shape, and its FRAME NUMBER is what a repro needs. It never resets, so it          survives a defect seen minutes before the dump was taken. It only sees frames the          PRESENT PROBE sampled - `VITASLOP_PRESENT_PROBE=1` samples every present and must be          set BEFORE the title starts, because it changes the surface usage at configuration          time.",
+        worst.join("
+    ")
+    ))
 }
 
 /// Sample every OFFSCREEN TARGET of a frame and describe how bright each one is.
@@ -684,7 +895,28 @@ impl TargetProbe {
         }
     }
 
-    /// Copy a corner of every target. Call before the submit that carries `encoder`.
+    /// Whether a new cycle may start: the previous one's buffers must have been read AND
+    /// UNMAPPED by [`Self::take_report`] first.
+    ///
+    /// # This guard was missing and it broke the instrument outright
+    /// [`PresentProbe`] has always had its `in_flight` flag; this one re-used the same
+    /// per-target buffers with nothing stopping a second copy being encoded into a buffer whose
+    /// first map was still outstanding. WebGPU refuses that, and it refuses the WHOLE SUBMIT:
+    /// `[Buffer "target-probe"] used in submit while mapped`, once per present, and the run
+    /// never renders a live frame at all.
+    ///
+    /// It needs a guard of its own rather than riding on the present probe's because the two
+    /// cycles do not drain together: this one holds ONE BUFFER PER RENDER TARGET and
+    /// `take_report` waits for all of them, so at `VITASLOP_PRESENT_PROBE=1` the present probe
+    /// is idle again long before these are. MEASURED on the fighting title in desktop Chrome -
+    /// the flat-colour detector the notes prescribe for its flicker could not take a single
+    /// frame. An instrument that kills the run it is watching is worse than no instrument.
+    fn wants(&self) -> bool {
+        self.pending.is_empty() && !self.awaiting_submit
+    }
+
+    /// Copy a corner of every target. Call before the submit that carries `encoder`, and only
+    /// when [`Self::wants`] says the previous cycle has been drained.
     fn capture(
         &mut self,
         device: &wgpu::Device,
@@ -692,7 +924,9 @@ impl TargetProbe {
         targets: &[(u32, &wgpu::Texture, u32, u32)],
         frame: u64,
     ) {
-        self.pending.clear();
+        if !self.wants() {
+            return;
+        }
         self.frame = frame;
         let row = TARGET_PROBE_EDGE * 4;
         let tile_bytes = (row as u64) * (TARGET_PROBE_EDGE as u64);
@@ -978,6 +1212,8 @@ impl PresentProbe {
     /// presented a blank surface, and a varied one means we presented a picture and the
     /// screen is not showing it.
     fn describe(bytes: &[u8], bytes_per_row: u32, frame: u64, swizzle_bgra: bool) -> String {
+        // See `note_vivid_frame` and the histogram below for what this frame contributes to the
+        // run's flicker record, which is the reason this function does more than describe.
         const GRID_W: usize = 8;
         const GRID_H: usize = 6;
         let (mut white, mut black, mut total) = (0u64, 0u64, 0u64);
@@ -985,6 +1221,10 @@ impl PresentProbe {
         let (mut min_l, mut max_l) = (255u8, 0u8);
         let mut cells = [[0u64; GRID_W]; GRID_H];
         let mut cell_n = [[0u64; GRID_W]; GRID_H];
+        // 32 levels a channel, satscan's quantisation. 32^3 u32 is 128 KB - too big for a
+        // stack array on this target, so it is heap-allocated once per described frame, which
+        // is a frame that has already had its whole surface copied off the GPU.
+        let mut vivid_hist = vec![0u32; 32 * 32 * 32];
         for y in 0..HEIGHT as usize {
             let row = &bytes[y * bytes_per_row as usize..][..WIDTH as usize * 4];
             for x in 0..WIDTH as usize {
@@ -1002,6 +1242,40 @@ impl PresentProbe {
                 if r < 5 && g < 5 && b < 5 {
                     black += 1;
                 }
+                // >>> THE FLICKER DETECTOR, RUN ON THE DEVICE THAT HAS THE FLICKER.
+                //
+                // The user sees stray flat SATURATED shapes with hard polygon edges, on two
+                // titles, only in the browser. `working-area/satscan.py` finds those offline by
+                // ranking shots on exactly this measure - and offline is the one place the
+                // defect does not occur. Every attempt to sample it through the browser harness
+                // failed for a mechanical reason: `page.locator().screenshot()` takes a large
+                // fraction of a second and the harness refuses to overlap them, so a 3,600-frame
+                // live window yielded SIX shots. No sampling schedule fixes that.
+                //
+                // So the measure moves in here, where the surface has already been read back for
+                // this panel and costs nothing more: `mx >= 110 && mx - mn >= 90` is satscan's
+                // own definition of "vivid" (bright, and far from grey), and the histogram below
+                // is its quantisation to 32 levels a channel. A normal frame is mostly
+                // desaturated and dark; a stray full-screen triangle is a wide run of one hue.
+                // >>> STRICTLY SATURATED, because the loose threshold finds SCENE CUTS.
+                //
+                // satscan's offline threshold is `mx >= 110 && mx - mn >= 90`, which is right
+                // for ranking whole frames but wrong for ranking CHANGES: a cut to a pale tan
+                // loading screen puts `rgb(224,192,128)` - spread 96, just over the line -
+                // across 57% of the frame in one frame, and it swamps everything. MEASURED on a
+                // browser attract run: the three "biggest appearances" were all cuts, at
+                // spreads of 96 and 160, and their where-maps filled nearly every cell.
+                //
+                // The defect is not a pale anything. The user's own frames are saturated
+                // GREEN, CYAN and YELLOW - channels pinned at their extremes, spread near 200 -
+                // so requiring 140 keeps every one of those and drops the tans. It cannot hide
+                // a real shape: a stray flat triangle that is only slightly coloured is not
+                // what any report of this defect describes.
+                let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+                if mx >= 110 && mx - mn >= 140 {
+                    vivid_hist
+                        [((r as usize >> 5) << 10) | ((g as usize >> 5) << 5) | (b as usize >> 5)] += 1;
+                }
                 let l = ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8) as u8;
                 min_l = min_l.min(l);
                 max_l = max_l.max(l);
@@ -1012,6 +1286,71 @@ impl PresentProbe {
             }
         }
         let pct = |n: u64| n as f64 * 100.0 / total.max(1) as f64;
+        // The single most common vivid colour and how much of the frame it covers. ONE bucket,
+        // not the vivid total: a stage of orange fire is a large vivid AREA spread over many
+        // hues, while the defect is one flat colour, so the total cannot separate them and the
+        // top bucket can. Measured on this title's own shots, an ordinary fire-lit fight frame
+        // puts about 6% in its biggest bucket.
+        // >>> THE MEASURE IS A COLOUR THAT SUDDENLY APPEARED, NOT THE FRAME'S BIGGEST ONE.
+        //
+        // The first version of this ranked frames by their DOMINANT vivid colour, and the user
+        // named the flaw before it had produced anything: *"it won't be the dominant color
+        // maybe"*. They are right, and a browser run confirmed it - the three "worst" frames of
+        // a whole attract fight were 8.2% of `rgb(56,48,32)`, which is the stage's own dark
+        // brown. A stray cyan shape covering a tenth of a frame is invisible to that measure on
+        // any title whose art already has a big saturated area, which is every title here.
+        //
+        // A FLICKER is a colour that was not there a frame ago and is gone a frame later. So
+        // this differences the histogram against the previous probed frame and takes the
+        // largest INCREASE: a bucket going from nothing to a tenth of the screen in one frame is
+        // the event, whatever else the frame contains and however much of it the shape covers.
+        // The stage's brown contributes nothing, because it was there before.
+        let (jump_i, jump_n) = {
+            let mut prev = PREV_VIVID.lock().unwrap_or_else(|e| e.into_inner());
+            let best = if prev.len() == vivid_hist.len() {
+                vivid_hist
+                    .iter()
+                    .zip(prev.iter())
+                    .enumerate()
+                    .map(|(i, (now, was))| (i, now.saturating_sub(*was) as u64))
+                    .max_by_key(|(_, d)| *d)
+                    .unwrap_or((0, 0))
+            } else {
+                // The first probed frame has nothing to difference against. Reporting its whole
+                // content as an "appearance" would put a guaranteed false positive at the top of
+                // the list for every run.
+                (0, 0)
+            };
+            *prev = vivid_hist.clone();
+            best
+        };
+        let top_share = pct(jump_n);
+        // >>> A BUCKET DECODES AT *32, NOT *8. `r >> 5` on a `u8` is THREE bits, so there are
+        // eight levels a channel and each stands for a 32-wide band - satscan's own
+        // quantisation, which prints `k * 32`. Decoding at *8 reported a bucket-7 channel as
+        // 56, so a BRIGHT CYAN read out as a dark teal and a bright yellow as olive: the
+        // detector was right and its report was describing a different colour. The index
+        // packing (`<< 10` / `<< 5`) is wider than three bits and so collides with nothing;
+        // only the human-readable decode was wrong.
+        let top_rgb = (((jump_i >> 10) & 7) * 32, ((jump_i >> 5) & 7) * 32, (jump_i & 7) * 32);
+        // WHERE it appeared, as an 8x6 map of the frame. A stray triangle is a run of adjacent
+        // cells; a bloom or a fade is spread over all of them, and a cut changes every cell.
+        // Without this the report names a colour and a frame and cannot say which of those it
+        // is, and re-running to a present number in a browser is not reproducible.
+        let mut where_map = [[0u8; GRID_W]; GRID_H];
+        for y in 0..HEIGHT as usize {
+            let row = &bytes[y * bytes_per_row as usize..][..WIDTH as usize * 4];
+            for x in 0..WIDTH as usize {
+                let p = &row[x * 4..x * 4 + 4];
+                let (r, g, b) = if swizzle_bgra { (p[2], p[1], p[0]) } else { (p[0], p[1], p[2]) };
+                let i = ((r as usize >> 5) << 10) | ((g as usize >> 5) << 5) | (b as usize >> 5);
+                if i == jump_i && jump_n > 0 {
+                    let (cy, cx) = (y * GRID_H / HEIGHT as usize, x * GRID_W / WIDTH as usize);
+                    where_map[cy][cx] = where_map[cy][cx].saturating_add(1);
+                }
+            }
+        }
+        note_vivid_frame(frame, top_share, top_rgb, where_map);
         let mut out = format!(
             "presented frame {frame}: {:.1}% pure white, {:.1}% pure black, \
              mean rgb ({:.0},{:.0},{:.0}), luminance {min_l}..{max_l}\n",
@@ -1820,6 +2159,15 @@ impl LivePlayback {
             last_probe: None,
             gpu_done_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             gpu_done_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gpu_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            stall_armed_for: 0,
+            queue_depth_limit: vitaslop_platform::knobs::var("VITASLOP_GPU_QUEUE_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(2),
+            backpressure_skips: 0,
+            backpressure_skips_total: 0,
+            stall_arms_total: 0,
             presents_total: 0,
             lost,
             surface_config,
@@ -1880,6 +2228,44 @@ impl LivePlayback {
                  allocation that did it is in the frame before this one.",
                 self.surface_line
             ));
+        }
+        // >>> THE QUEUE-DEPTH BOUND. Before `begin_frame`, before `build`, before the acquire:
+        // >>> a frame we are not going to submit must cost NOTHING, and every one of those
+        // >>> steps is real work whose only product is a command buffer for a queue that is
+        // >>> already too deep. See `gpu_in_flight` for the measurement this exists for.
+        if self.queue_depth_limit > 0 && self.stall_armed_for > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let depth = self.gpu_in_flight.load(Relaxed);
+            if depth >= self.queue_depth_limit {
+                self.backpressure_skips += 1;
+                self.backpressure_skips_total += 1;
+                // >>> A DECLINE SPENDS THE ARM. The arm is decayed after a SUBMIT, and a
+                // declined present makes none - so without this a bound whose depth does not
+                // come down declines every present until the safety valve fires, which is
+                // exactly how one 118 ms write cost 215 frames. See `STALL_ARM_PRESENTS`.
+                self.stall_armed_for = self.stall_armed_for.saturating_sub(1);
+                // The safety valve - see `backpressure_skips`. A run this long means the
+                // callbacks have stopped arriving, and refusing to draw forever because a
+                // promise was dropped is a worse failure than a deep queue.
+                if self.backpressure_skips >= BACKPRESSURE_SKIP_CAP {
+                    tracing::warn!(
+                        target: "vitaslop::gxm",
+                        "GPU BACKPRESSURE: {} presents in a row declined because {depth} \
+                         submit(s) are still in flight, which means `on_submitted_work_done` \
+                         has stopped reporting - the depth counter can no longer come down on \
+                         its own. Overriding the bound and drawing this frame. If this repeats, \
+                         the bound is not measuring anything and `VITASLOP_GPU_QUEUE_DEPTH=0` \
+                         turns it off.",
+                        self.backpressure_skips
+                    );
+                    self.backpressure_skips = 0;
+                    self.gpu_in_flight.store(0, Relaxed);
+                } else {
+                    return PresentOutcome::Skipped;
+                }
+            } else {
+                self.backpressure_skips = 0;
+            }
         }
         let t0 = clock(&self.perf);
         // Tell the builder a new frame starts here. Its texture cache needs the boundary to
@@ -1970,6 +2356,58 @@ impl LivePlayback {
         // Collect the GPU timestamps of whichever earlier frame's readback has completed.
         self.gxm.ts_poll();
         self.gxm.set_presented(presents);
+        // >>> WHAT THIS PRESENT IS ABOUT TO DRAW, ON A FRAME THAT DRAWS ALMOST NOTHING.
+        //
+        // A frame that reaches the canvas as a flat clear with one small tile in a corner is
+        // the hardest kind of render bug to place from a screenshot: the geometry on screen
+        // says nothing about which of the display size, the surface size or the scene's own
+        // target is the one that is wrong. This says all three, on exactly the frames where it
+        // matters (few draws), so the answer arrives with the reproduction instead of after it.
+        // Reported once per DISTINCT geometry, at any draw count: the frame that goes wrong
+        // is not always a sparse one, and a per-frame line on the present path is its own
+        // performance defect. One line per shape means an unusual shape is visible in the log
+        // whether it happened once or a thousand times.
+        let report_geometry = {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+            let key = format!(
+                "{}x{}|{}x{}|{}",
+                display.0,
+                display.1,
+                frame.texture.width(),
+                frame.texture.height(),
+                scenes
+                    .iter()
+                    .map(|s| match &s.color {
+                        Some(c) => format!("{}x{}", c.width, c.height),
+                        None => "no-colour".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            SEEN.lock().map(|mut g| g.get_or_insert_with(HashSet::new).insert(key)).unwrap_or(false)
+        };
+        if report_geometry {
+            // `display` is also `tracing::field::display` inside the macro, so the tuple is
+            // unpacked out here rather than indexed in there.
+            let (dw, dh) = display;
+            let (sw, sh) = (frame.texture.width(), frame.texture.height());
+            let targets: Vec<String> = scenes
+                .iter()
+                .map(|s| match &s.color {
+                    Some(c) => format!("{}x{}", c.width, c.height),
+                    None => "no-colour".to_string(),
+                })
+                .collect();
+            // STATUS, not a warning: an unusual geometry is worth seeing but is not by itself
+            // a defect, and a warning means we owe a fix [[vitaslop-a-warning-means-we-owe-a-fix]].
+            tracing::info!(
+                target: "vitaslop::status",
+                "present with {draws} draw(s): display {dw}x{dh}, surface texture {sw}x{sh},                  scene colour target(s) [{}]",
+                targets.join(", "),
+            );
+        }
         self.gxm.encode_chain(
             &self.device,
             &self.queue,
@@ -1982,6 +2420,9 @@ impl LivePlayback {
             frame.texture.width(),
             frame.texture.height(),
             CLEAR,
+            // The canvas texture, so a draw whose fragment program reads the DESTINATION
+            // colour is served on the arms that render straight into it.
+            Some(&frame.texture),
         );
         let t2 = clock(&self.perf);
         // Sample the surface BEFORE it is presented - once presented it is no longer ours to
@@ -1995,7 +2436,8 @@ impl LivePlayback {
             }
             // The offscreen targets of the SAME frame, so the chain and the surface describe
             // one picture rather than two moments.
-            if let Some(tp) = self.targets.as_mut() {
+            // Its OWN guard, not the present probe's: see `TargetProbe::wants`.
+            if let Some(tp) = self.targets.as_mut().filter(|t| t.wants()) {
                 let list = self.gxm.rtt_targets();
                 tp.capture(&self.device, &mut encoder, &list, n);
             }
@@ -2005,6 +2447,46 @@ impl LivePlayback {
         // cannot give.
         self.gxm.ts_finish_chain(&mut encoder);
         self.queue.submit([encoder.finish()]);
+        // >>> THE DEPTH COUNTER GOES UP HERE AND COMES DOWN IN A CALLBACK, and this promise is
+        // >>> registered on EVERY submit - unlike the latency one below, which deliberately
+        // >>> does not stack. A counter that skipped a submit would under-count the queue and
+        // >>> the bound would let it grow again. See `gpu_in_flight`.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.gpu_in_flight.fetch_add(1, Relaxed);
+            let inflight = self.gpu_in_flight.clone();
+            self.queue.on_submitted_work_done(move || {
+                // `fetch_update` rather than `fetch_sub`: the safety valve above can zero the
+                // counter while promises are still outstanding, and an unsigned wrap there
+                // would put the depth at four billion and decline every present for the rest
+                // of the run - the exact failure the valve exists to prevent.
+                let _ = inflight.fetch_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(1)));
+            });
+        }
+        // >>> ARM OR DECAY THE QUEUE-DEPTH BOUND, from the writes THIS frame actually made.
+        //
+        // After the submit, so every `write_buffer` of the frame is accounted for, and read
+        // through a take-and-clear so a stall is counted once rather than arming forever off a
+        // register nobody resets. See `stall_armed_for` for the measurement that made the
+        // unconditional bound a regression.
+        {
+            let worst_us = vitaslop_platform::gpu::take_worst_write_us();
+            if worst_us >= STALL_WRITE_US {
+                if self.stall_armed_for == 0 {
+                    tracing::warn!(
+                        target: "vitaslop::gxm",
+                        "GPU BACKPRESSURE ARMED: a single `queue.write_buffer` blocked for                          {:.1} ms. A copy of this size costs microseconds, so the thread was                          waiting on the staging ring to retire - which means the GPU queue is                          deep enough that the worker stops turning its event loop. Presents                          beyond {} in flight will be declined for the next {} presents.",
+                        worst_us as f64 / 1000.0,
+                        self.queue_depth_limit,
+                        STALL_ARM_PRESENTS,
+                    );
+                }
+                self.stall_armed_for = STALL_ARM_PRESENTS;
+                self.stall_arms_total += 1;
+            } else {
+                self.stall_armed_for = self.stall_armed_for.saturating_sub(1);
+            }
+        }
         self.gxm.ts_map_after_submit();
         // >>> HOW FAR BEHIND THE GPU IS, WHICH NOTHING ELSE IN THIS PANEL CAN SAY.
         //
@@ -2185,6 +2667,19 @@ impl LivePlayback {
 
     /// The latest presented-surface description, if the probe produced one since the last
     /// window.
+    /// `(declines, limit, arms, armed_now)` for the panel. See [`Self::stall_armed_for`] - the
+    /// ARM count is the one that says whether the bound touched this run at all, and without it
+    /// a reader cannot tell "the bound never engaged" from "the bound engaged and declined
+    /// nothing". Cumulative, not windowed - see [`Self::backpressure_skips_total`].
+    fn backpressure_report(&self) -> (u64, u32, u64, bool) {
+        (
+            self.backpressure_skips_total,
+            self.queue_depth_limit,
+            self.stall_arms_total,
+            self.stall_armed_for > 0,
+        )
+    }
+
     fn take_probe_report(&mut self) -> Option<String> {
         self.last_probe.take()
     }
@@ -2981,6 +3476,10 @@ async fn mount_and_link(source: JsValue) -> Result<Mounted, JsValue> {
     // The module images are linked into one program from here on; the SELF bytes they
     // came from are dead weight during transpile, which is the peak.
     drop(modules_elf);
+    // This run stands up the THREADED scheduler, so the host mirror block exists and is
+    // refreshed at its resume point - which is what lets the RTC tick be read inline.
+    // See `vitaslop_runtime::vita::set_preemptive_linking`.
+    vitaslop_runtime::vita::set_preemptive_linking(true);
     let linked = link(modules).map_err(|e| JsValue::from_str(&format!("link: {e:?}")))?;
     let decrypt_ms = perf.now() - t_dec;
     // The heap high-water mark is PERMANENT: wasm linear memory grows and never shrinks,
@@ -4419,7 +4918,8 @@ async fn live_loop(
             // NOT `presents` - that name is already a running counter in this scope, and
             // shadowing it here silently retyped it.
             let (scene, flips) = scene;
-            if let PresentOutcome::Fatal(why) = playback.present(&scene, display, &flips) {
+            let outcome = playback.present(&scene, display, &flips);
+            if let PresentOutcome::Fatal(why) = outcome {
                 crate::logging::report_fatal(&format!(
                     "RENDERER FAULT at frame {} - the run is over.\n{why}",
                     sched.core.frames()
@@ -4434,13 +4934,26 @@ async fn live_loop(
                 break 'run;
             }
             let r1 = now();
-            // Counted from the first present, warmup included, for the same reason the frame
-            // total is: what this is read against is `frames_total`, and a ratio whose two
-            // halves start counting at different frames is not a ratio.
-            presents_total += 1;
-            if sched.core.frames() > WARMUP_FRAMES {
-                render_ms += r1 - r0;
-                presents += 1;
+            // >>> A PRESENT THAT DID NOT PRESENT IS NOT COUNTED AS ONE.
+            //
+            // Every arm that returns `Skipped` - an occluded tab, an acquire that failed, and
+            // now the QUEUE-DEPTH BOUND - leaves the screen unchanged, and the depth bound
+            // returns before it builds a single scene, so it costs microseconds. Counting
+            // those would corrupt the two numbers this window exists to publish in opposite
+            // directions at once: `presents` would say the run is presenting at full rate
+            // while it is deliberately not, and `render_ms / presents` would be divided by a
+            // pile of near-zero frames and report a render time nothing ever took. The bound
+            // would then be invisible in exactly the panel a reader uses to judge it, and it
+            // would look like a speed-up. `GPU BACKPRESSURE` carries the declines instead.
+            if outcome == PresentOutcome::Presented {
+                // Counted from the first present, warmup included, for the same reason the
+                // frame total is: what this is read against is `frames_total`, and a ratio
+                // whose two halves start counting at different frames is not a ratio.
+                presents_total += 1;
+                if sched.core.frames() > WARMUP_FRAMES {
+                    render_ms += r1 - r0;
+                    presents += 1;
+                }
             }
             if presents >= PERF_WINDOW {
                 let cpu_avg = if cpu_frames > 0 { cpu_ms / cpu_frames as f64 } else { 0.0 };
@@ -4651,6 +5164,11 @@ async fn live_loop(
                 if let Some(probe) = playback.take_probe_report() {
                     line(&mut diag, "PRESENTED SURFACE", &probe);
                 }
+                // >>> AND THE RUN'S WORST FLAT-SATURATED FRAME, which the line above cannot
+                // carry: it describes ONE frame and the defect this exists for is a flicker.
+                if let Some(v) = vivid_report() {
+                    line(&mut diag, "FLAT-COLOUR FRAMES", &v);
+                }
                 line(&mut diag, "RENDER SPLIT", &perf_line);
                 // >>> AND WHETHER THE GPU IS THE ONE HOLDING THINGS UP. See the
                 // `on_submitted_work_done` call in `present` for why this exists: `arena write`
@@ -4681,6 +5199,28 @@ async fn live_loop(
                                  from callback latency; for that a timestamp query is needed. \
                                  One promise per present, off the critical path; this is the \
                                  PREVIOUS window's value.",
+                            ),
+                        );
+                    }
+                }
+                // >>> AND WHETHER THE QUEUE-DEPTH BOUND IS THE REASON THE RATE IS WHAT IT IS.
+                //
+                // Without this line the bound is invisible and indistinguishable from the
+                // emulator simply being slow: presents go down, `render` goes down with them
+                // (the declined frames cost nothing), and every counter in the panel looks
+                // HEALTHIER than it did while the page was freezing. A throttle nobody can see
+                // in the panel is a throttle that gets diagnosed as something else.
+                {
+                    let (n, limit, arms, armed) = playback.backpressure_report();
+                    if limit > 0 {
+                        line(
+                            &mut diag,
+                            "GPU BACKPRESSURE",
+                            &format!(
+                                "the queue-depth bound is {} right now; it was ARMED {arms}                                  time(s) this run and DECLINED {n} present(s) while armed.                                  >>> READ THE ARM COUNT FIRST: at zero the bound has never                                  engaged, the declines are zero with it, and NOTHING here                                  touched the run - so a low frame rate beside `ARMED 0 time(s)`                                  is not this. The bound arms only when a single                                  `queue.write_buffer` BLOCKS for {:.1} ms or more, which no copy                                  of a few hundred KB does (a healthy run's worst over the whole                                  run was 0.6 ms for 288 KB); a blocking write means the thread                                  is waiting on the staging ring to retire, and a worker parked                                  there turns no event loop at all - no decoder callback, no                                  input, no pacing. Each arming declines AT MOST {} present(s) - and only                                  one whose queue already holds {limit} submit(s) - because a                                  declined present is a whole event-loop turn with no encode                                  and no submit, which is what lets the staging ring retire.                                  If the ring is still stuck the next frame's write blocks                                  again and arms again, so the rate settles on measurement                                  rather than on a fixed sentence: this WAS 180 presents, and                                  one 117.8 ms write then cost 215 frames on a GPU whose own                                  timestamp query read 4.1 ms. It is deliberately NOT gated on                                  `on_submitted_work_done`: that promise read 897 ms on a window                                  whose timestamp query measured 3.9 ms of GPU work, so it is                                  callback dispatch latency, and arming on it throttled a healthy                                  run to a third of its rate. `VITASLOP_GPU_QUEUE_DEPTH=0`                                  disables the bound entirely; the default is 2.",
+                                if armed { "ARMED" } else { "idle" },
+                                STALL_WRITE_US as f64 / 1000.0,
+                                STALL_ARM_PRESENTS,
                             ),
                         );
                     }

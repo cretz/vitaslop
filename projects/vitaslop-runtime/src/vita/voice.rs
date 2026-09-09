@@ -39,7 +39,7 @@
 //! and closes one gets coherent answers about the others, and one that uses a stale id
 //! after deleting it is told so rather than silently working.
 
-use crate::host::{GuestCtx, Ptr, VitaState};
+use crate::host::VitaState;
 use crate::hostcall;
 
 /// SceVoice error codes are in the `0x8010_4???` facility range. Only the two that

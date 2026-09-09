@@ -129,10 +129,12 @@ pub enum StmtKind {
     Uadd8,
     Sel,
     ShiftRegFlags,
+    /// Arming or clearing the exclusive monitor (`LDREX`/`STREX`).
+    ExclSet,
 }
 
 impl StmtKind {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
 
     pub const ALL: [StmtKind; Self::COUNT] = [
         StmtKind::SetReg,
@@ -154,6 +156,7 @@ impl StmtKind {
         StmtKind::Uadd8,
         StmtKind::Sel,
         StmtKind::ShiftRegFlags,
+        StmtKind::ExclSet,
     ];
 
     /// Exhaustive over [`Stmt`] on purpose - a new variant must be given a category here
@@ -164,6 +167,7 @@ impl StmtKind {
             Stmt::Store { .. } => StmtKind::Store,
             Stmt::FlagsAdd { .. } => StmtKind::FlagsAdd,
             Stmt::FlagsLogic { .. } => StmtKind::FlagsLogic,
+            Stmt::ExclSet(..) => StmtKind::ExclSet,
             Stmt::Svc(..) => StmtKind::Svc,
             Stmt::Import(..) => StmtKind::Import,
             Stmt::Rbit { .. } => StmtKind::Rbit,
@@ -206,6 +210,7 @@ impl StmtKind {
             StmtKind::Uadd8 => "uadd8",
             StmtKind::Sel => "sel",
             StmtKind::ShiftRegFlags => "shift-reg-flags",
+            StmtKind::ExclSet => "excl-set",
         }
     }
 }
@@ -1856,6 +1861,21 @@ impl Expansion {
 /// abandoned rather than that the block wants growing.
 const MIRROR_SLOTS_PER_PAGE: u32 = abi::PAGE_SIZE / 4;
 
+/// The host-mirror slot holding the EXCLUSIVE MONITOR's recorded address.
+///
+/// Must equal `vitaslop_runtime::vita::mirror::SLOT_EXCL`: the host clears that slot before
+/// every resume and the emitted `LDREX`/`STREX` read and write it. The two crates do not
+/// share a header, so the agreement is asserted by
+/// `the_exclusive_monitor_slot_matches_the_host` in the runtime's mirror tests.
+const EXCL_SLOT: u32 = 9;
+
+// Linear-memory byte offset of the exclusive-monitor word, set by the layout pass. Zero only
+// in a build with no mirror block, which cannot happen - the block is now unconditional
+// precisely so `LDREX` always has somewhere to record.
+thread_local! {
+    static EXCL_OFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Assemble the full wasm module for `funcs`. `func_index` maps a guest function
 /// address to its wasm function index. `mem_bytes` sizes the guest linear memory;
 /// `base` is the guest image base for the address rebase.
@@ -1921,7 +1941,17 @@ pub fn emit_module(
     // allocation can reach it and no guest store can corrupt it.
     // Sized from the TOP slot each op touches, not its base: a pair form reads two words,
     // and sizing from the base would leave its high word past the end of the page.
-    let mirror_slots = inline_imports.iter().filter_map(|i| i.op.top_mirror_slot()).max();
+    // The EXCLUSIVE MONITOR lives in this block too, and unlike every inline import it is
+    // not optional: any title may execute `LDREX`, so the block is reserved whether or not a
+    // single host call was inlined. `Some` unconditionally, therefore, sized to whichever
+    // slot is higher.
+    let mirror_slots = Some(
+        inline_imports
+            .iter()
+            .filter_map(|i| i.op.top_mirror_slot())
+            .max()
+            .map_or(EXCL_SLOT, |top| top.max(EXCL_SLOT)),
+    );
     if let Some(top) = mirror_slots {
         assert!(
             top < MIRROR_SLOTS_PER_PAGE,
@@ -1941,6 +1971,8 @@ pub fn emit_module(
     });
     let arm_word_off = arm_at_frame().and(diag_off);
     ARM_WORD_OFF.with(|c| c.set(arm_word_off.unwrap_or(0)));
+    // Where the exclusive monitor's word landed, for the `LDREX`/`STREX` emission below.
+    EXCL_OFF.with(|c| c.set(mirror_off.map_or(0, |base| base + EXCL_SLOT as u64 * 4)));
     WATCH_COUNT_OFF.with(|c| {
         c.set(if watch_store_addr().is_some() { diag_off.map_or(0, |o| o + 4) } else { 0 })
     });
@@ -3182,6 +3214,11 @@ fn emit_stmt_inner(
                     poison_flag(f, abi::Flag::C);
                 }
             }
+        }
+        Stmt::ExclSet(value) => {
+            f.instruction(&W::I32Const(0));
+            emit_value(f, value, base);
+            f.instruction(&W::I32Store(MemArg { offset: EXCL_OFF.with(|c| c.get()), align: 2, memory_index: 0 }));
         }
         Stmt::Svc(imm) => {
             f.instruction(&W::I32Const(*imm as i32));
@@ -6196,6 +6233,13 @@ fn emit_value(f: &mut Body, v: &Value, base: u32) {
         Value::ThreadPtr => {
             f.instruction(&W::GlobalGet(abi::TP_GLOBAL));
         }
+        // The monitor word, read straight out of the mirror block. A LINEAR-memory address,
+        // not a guest one, so it is not rebased: the block sits outside the guest region
+        // exactly so no guest pointer can reach it.
+        Value::ExclAddr => {
+            f.instruction(&W::I32Const(0));
+            f.instruction(&W::I32Load(MemArg { offset: EXCL_OFF.with(|c| c.get()), align: 2, memory_index: 0 }));
+        }
         Value::Bin(op, a, b) => {
             emit_value(f, a, base);
             emit_value(f, b, base);
@@ -6511,6 +6555,18 @@ enum InlineLowering {
     /// pointer form, and on its own predicate besides - see
     /// [`crate::InlineOp::LwMutexLock`].
     LwMutex { layout: crate::LwMutexLayout, thread_off: u64, limit: u32, lock: bool },
+    /// The same take/release over a KERNEL mutex, whose state is the four words at `layout`
+    /// from entry `r0 & mask` of a table at `table_off` in the host-mirror block. No pointer
+    /// guard: the address is a constant inside a page this module reserved and the mask keeps
+    /// every index inside the table - what makes the form EXACT is the entry's own id term,
+    /// exactly as it is for the lightweight one. See [`crate::InlineOp::KernelMutexLock`].
+    KMutex {
+        layout: crate::LwMutexLayout,
+        thread_off: u64,
+        table_off: u64,
+        mask: u32,
+        lock: bool,
+    },
     /// Bump the default-uniform ring in the context block r0 points at and hand the block
     /// back through r1 - see [`crate::InlineOp::ReserveUniformBuffer`]. Three pointers are
     /// guarded (the context, the bound program handle read out of it, and the out-parameter)
@@ -6688,6 +6744,21 @@ impl InlineImports {
                     lock,
                 })
             }
+            crate::InlineOp::KernelMutexLock { layout, thread_slot, table_slot, entries }
+            | crate::InlineOp::KernelMutexUnlock { layout, thread_slot, table_slot, entries } => {
+                let base = self.mirror_off.expect("mirror op emitted with no mirror block");
+                let lock =
+                    matches!(*self.ops.get(&index)?, crate::InlineOp::KernelMutexLock { .. });
+                Some(InlineLowering::KMutex {
+                    layout,
+                    thread_off: base + thread_slot as u64 * 4,
+                    table_off: base + table_slot as u64 * 4,
+                    // A power of two by construction (`vitaslop_runtime::vita::kmutex::ENTRIES`),
+                    // so the index is a mask rather than a division.
+                    mask: entries - 1,
+                    lock,
+                })
+            }
             crate::InlineOp::ReserveUniformBuffer { layout } => {
                 // Three pointers, three bounds, each computed against the LAST word that
                 // pointer reaches: the context block (its ring and this stage's record),
@@ -6758,6 +6829,106 @@ impl InlineImports {
 /// a pointer below the image base (the subtraction wraps to a huge value, which is the
 /// null-pointer case) and one too near the end of guest memory; either way the real host
 /// call runs, so the handler keeps defining those cases.
+/// The take-or-release a lock form performs once its ENTRY is in `L_T0` as a linear-memory
+/// offset - the predicate, the two stores and the fallback call. Shared by the lightweight
+/// form (whose entry is the guest's work area, bounds-guarded) and the kernel one (whose
+/// entry is a table slot indexed by uid), because the state machine is the same four words
+/// and one of them being wrong in only one of two copies is exactly the drift a shared
+/// `LwMutexLayout` exists to prevent.
+///
+/// Leaves the emitter INSIDE the predicate's `if`; the caller emits the closing `End`s, since
+/// only it knows whether a pointer guard is open around this.
+fn emit_lock_take(
+    f: &mut Body,
+    layout: crate::LwMutexLayout,
+    thread_off: u64,
+    lock: bool,
+    base: u32,
+    index: u32,
+) {
+    // The entry is in `L_T0`, however the caller got it there. Two values are read
+    // once and used twice, so they go in locals: the current thread id from the
+    // mirror, and the recursion count (tested in the predicate, then incremented or
+    // decremented).
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::I32Load(MemArg { offset: thread_off, align: 0, memory_index: 0 }));
+    f.instruction(&W::LocalSet(L_T2));
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.count)));
+    f.instruction(&W::LocalSet(L_T1));
+
+    // The predicate, built on the stack. Every term is a comparison, so each
+    // leaves exactly 0 or 1 and the combining `and`/`or` are bitwise-safe; a raw
+    // word used as a truth value here would AND its BITS with the terms either
+    // side and admit takes that should have fallen back.
+    //
+    // r1 == 1: the lock/unlock COUNT argument. Anything else is the handler's.
+    f.instruction(&W::GlobalGet(abi::reg_global(1)));
+    f.instruction(&W::I32Const(1));
+    f.instruction(&W::I32Eq);
+    // ...and the work area names ITSELF, so this pointer is the canonical mutex
+    // rather than a byte copy of one (which carries the original's id).
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.id)));
+    f.instruction(&W::GlobalGet(abi::reg_global(0)));
+    f.instruction(&W::I32Eq);
+    f.instruction(&W::I32And);
+    // ...and nothing is parked on it. Only the host can wake a parked thread, so
+    // a mutex with waiters stays entirely on the host.
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::I32Load(word_at(layout.waiters)));
+    f.instruction(&W::I32Eqz);
+    f.instruction(&W::I32And);
+    if lock {
+        // ...and it is free OR already mine (a recursive take).
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32Or);
+        f.instruction(&W::I32And);
+    } else {
+        // ...and it is held, AND held by me. Both, not either: releasing a mutex
+        // this thread does not own is an error only the handler defines, and
+        // decrementing a zero count inline would wrap it to four billion.
+        f.instruction(&W::LocalGet(L_T1));
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32Eqz);
+        f.instruction(&W::I32And);
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::I32Load(word_at(layout.owner)));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Eq);
+        f.instruction(&W::I32And);
+    }
+
+    f.instruction(&W::If(BlockType::Empty));
+    emit_watch_store_inline(f, base, L_T0, layout.count, 4, index);
+    if lock {
+        emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
+        // owner = cur. A no-op on the recursive arm, which is what lets one
+        // branch serve both cases.
+        f.instruction(&W::LocalGet(L_T0));
+        f.instruction(&W::LocalGet(L_T2));
+        f.instruction(&W::I32Store(word_at(layout.owner)));
+    }
+    // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
+    // alone: every reader tests `count` first, and thid 0 is a real thread, so
+    // there is no owner value that could mean "nobody".
+    f.instruction(&W::LocalGet(L_T0));
+    f.instruction(&W::LocalGet(L_T1));
+    f.instruction(&W::I32Const(1));
+    f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
+    f.instruction(&W::I32Store(word_at(layout.count)));
+    f.instruction(&W::I32Const(0));
+    f.instruction(&W::GlobalSet(abi::reg_global(0)));
+    f.instruction(&W::Else);
+    f.instruction(&W::I32Const(index as i32));
+    f.instruction(&W::Call(IMPORT_FUNC));
+}
+
 fn emit_pointer_guard(f: &mut Body, base: u32, limit: u32, index: u32) {
     emit_pointer_guard_reg(f, 0, base, limit, index);
 }
@@ -7148,88 +7319,27 @@ fn emit_import(f: &mut Body, index: u32, base: u32, inline: &InlineImports) {
             f.instruction(&W::End); // the destination pointer guard
             return;
         }
+        Some(InlineLowering::KMutex { layout, thread_off, table_off, mask, lock }) => {
+            // The ENTRY, as a linear-memory offset: `table_off + (r0 & mask) * 16`. There is
+            // no pointer guard because there is no guest pointer - the table sits inside a
+            // page this module reserved, and the mask keeps every index inside it. What makes
+            // the form exact is the entry's own `id == r0` term, which sends a uid that
+            // collided with another mutex's entry to the handler, where that mutex's state is.
+            f.instruction(&W::GlobalGet(abi::reg_global(0)));
+            f.instruction(&W::I32Const(mask as i32));
+            f.instruction(&W::I32And);
+            f.instruction(&W::I32Const(crate::MUTEX_ENTRY_BYTES as i32));
+            f.instruction(&W::I32Mul);
+            f.instruction(&W::I32Const(table_off as i32));
+            f.instruction(&W::I32Add);
+            f.instruction(&W::LocalSet(L_T0));
+            emit_lock_take(f, layout, thread_off, lock, base, index);
+            f.instruction(&W::End); // the predicate's `if`
+            return;
+        }
         Some(InlineLowering::LwMutex { layout, thread_off, limit, lock }) => {
             emit_pointer_guard(f, base, limit, index);
-            // In range. Two values are read once and used twice, so they go in locals:
-            // the current thread id from the mirror, and the recursion count (tested in
-            // the predicate, then incremented or decremented).
-            f.instruction(&W::I32Const(0));
-            f.instruction(&W::I32Load(MemArg { offset: thread_off, align: 0, memory_index: 0 }));
-            f.instruction(&W::LocalSet(L_T2));
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.count)));
-            f.instruction(&W::LocalSet(L_T1));
-
-            // The predicate, built on the stack. Every term is a comparison, so each
-            // leaves exactly 0 or 1 and the combining `and`/`or` are bitwise-safe; a raw
-            // word used as a truth value here would AND its BITS with the terms either
-            // side and admit takes that should have fallen back.
-            //
-            // r1 == 1: the lock/unlock COUNT argument. Anything else is the handler's.
-            f.instruction(&W::GlobalGet(abi::reg_global(1)));
-            f.instruction(&W::I32Const(1));
-            f.instruction(&W::I32Eq);
-            // ...and the work area names ITSELF, so this pointer is the canonical mutex
-            // rather than a byte copy of one (which carries the original's id).
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.id)));
-            f.instruction(&W::GlobalGet(abi::reg_global(0)));
-            f.instruction(&W::I32Eq);
-            f.instruction(&W::I32And);
-            // ...and nothing is parked on it. Only the host can wake a parked thread, so
-            // a mutex with waiters stays entirely on the host.
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::I32Load(word_at(layout.waiters)));
-            f.instruction(&W::I32Eqz);
-            f.instruction(&W::I32And);
-            if lock {
-                // ...and it is free OR already mine (a recursive take).
-                f.instruction(&W::LocalGet(L_T1));
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::I32Load(word_at(layout.owner)));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Eq);
-                f.instruction(&W::I32Or);
-                f.instruction(&W::I32And);
-            } else {
-                // ...and it is held, AND held by me. Both, not either: releasing a mutex
-                // this thread does not own is an error only the handler defines, and
-                // decrementing a zero count inline would wrap it to four billion.
-                f.instruction(&W::LocalGet(L_T1));
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::I32Eqz);
-                f.instruction(&W::I32And);
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::I32Load(word_at(layout.owner)));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Eq);
-                f.instruction(&W::I32And);
-            }
-
-            f.instruction(&W::If(BlockType::Empty));
-            emit_watch_store_inline(f, base, L_T0, layout.count, 4, index);
-            if lock {
-                emit_watch_store_inline(f, base, L_T0, layout.owner, 4, index);
-                // owner = cur. A no-op on the recursive arm, which is what lets one
-                // branch serve both cases.
-                f.instruction(&W::LocalGet(L_T0));
-                f.instruction(&W::LocalGet(L_T2));
-                f.instruction(&W::I32Store(word_at(layout.owner)));
-            }
-            // count += 1 (take) or -= 1 (release). The release deliberately leaves `owner`
-            // alone: every reader tests `count` first, and thid 0 is a real thread, so
-            // there is no owner value that could mean "nobody".
-            f.instruction(&W::LocalGet(L_T0));
-            f.instruction(&W::LocalGet(L_T1));
-            f.instruction(&W::I32Const(1));
-            f.instruction(if lock { &W::I32Add } else { &W::I32Sub });
-            f.instruction(&W::I32Store(word_at(layout.count)));
-            f.instruction(&W::I32Const(0));
-            f.instruction(&W::GlobalSet(abi::reg_global(0)));
-            f.instruction(&W::Else);
-            f.instruction(&W::I32Const(index as i32));
-            f.instruction(&W::Call(IMPORT_FUNC));
+            emit_lock_take(f, layout, thread_off, lock, base, index);
             f.instruction(&W::End); // the predicate's `if`
             f.instruction(&W::End); // the pointer guard's `if`
             return;

@@ -2553,9 +2553,50 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
                 deliver(&sig_ok, &Ev::Returned(rt.read_reg(0)));
             }) as Box<dyn FnOnce(JsValue)>);
             let sig_err = t.signal.clone();
+            // >>> THE REGISTER FILE, AT THE TRAP, IN THE MESSAGE.
+            //
+            // A guest trap reaches the panel as `RuntimeError: memory access out of bounds` and
+            // two wasm function indices. Those name the guest FUNCTION - which is already worth
+            // having - but not the POINTER, and for an out-of-bounds access the pointer is the
+            // whole finding: a wild address is a corrupted object, a small one is a NULL
+            // dereference (guest 0 maps far outside linear memory, so a null deref traps here
+            // exactly like a wild one), and nothing in the report could tell those apart.
+            //
+            // MEASURED on the user's phone: a fault in `0x816d6d58` on the movie player's demux
+            // thread, whose first four instructions are `r6 = this; r0 = [r6+0xc];
+            // r1 = [r0]; ip = [r1+0xc]` - a C++ virtual call. Which of `r6`, `[r6+0xc]` or the
+            // vtable was bad decides whether the object was destroyed, never built, or fine and
+            // the field wrong, and the three have different causes. One register dump answers
+            // it; without one it is a disassembly session and a guess.
+            //
+            // The registers are read in the REJECTION handler, which is a microtask delivered
+            // while this thread's step is still awaited - no other guest thread has run, so the
+            // file still holds the faulting thread's values.
+            let rt_err = t.rt.clone();
             let on_err = Closure::once(Box::new(move |e: JsValue| {
                 let msg = e.as_string().unwrap_or_else(|| format!("{e:?}"));
-                deliver(&sig_err, &Ev::Error(msg));
+                let mut regs = String::from("
+  guest registers AT THE TRAP:");
+                for i in 0..vitaslop_transpiler::abi::REG_COUNT {
+                    // r13/r14/r15 are sp/lr/pc by ARM convention; naming them saves the reader
+                    // counting along a row of sixteen hex words.
+                    let name = match i {
+                        13 => "sp".to_string(),
+                        14 => "lr".to_string(),
+                        15 => "pc".to_string(),
+                        n => format!("r{n}"),
+                    };
+                    if i % 4 == 0 {
+                        regs.push_str("
+   ");
+                    }
+                    regs.push_str(&format!(" {name}={:#010x}", rt_err.read_reg(i)));
+                }
+                regs.push_str(
+                    "
+  A small value (under a megabyte) in a register the faulting                      instruction dereferences is a NULL or near-null pointer, not a wild one -                      guest address 0 is far outside linear memory, so both trap the same way                      here and only the value separates them.",
+                );
+                deliver(&sig_err, &Ev::Error(format!("{msg}{regs}")));
             }) as Box<dyn FnOnce(JsValue)>);
             let _ = done.then2(&on_ok, &on_err);
             on_ok.forget();
@@ -2856,7 +2897,7 @@ impl BrowserSched {
         let (engine, host) =
             build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
         let main = engine.make_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             &[entry & !1],
             0,
             0,
@@ -2887,7 +2928,7 @@ impl BrowserSched {
         let (engine, host) =
             build_engine(module, image, base, mem_pages, mirror_off, dirty_off, env)?;
         let main = engine.make_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             entries,
             0,
             0,

@@ -1,0 +1,196 @@
+@title  PCSE00023 - keep pressing on, to walk through several fights and stages
+@game   PCSE00023
+@shot-every 40
+
+# WHAT THIS RECIPE IS FOR
+# ----------------------
+# The RENDER rig for this title. It presses cross every 150 frames, which is enough to
+# walk the front end, pick fighters and play through several fights on several stages -
+# so one run visits a broad flat ground (the rooftop), a lit interior and a bumpy
+# outdoor stage without any of them being scripted by name.
+#
+# FRAME 3000 IS THE ROOFTOP: flat, light, low camera. It is the clearest reproduction
+# there is of anything that goes wrong between a character and the ground it stands on,
+# because a shallow floor plane amplifies a small depth error into whole screen pixels.
+# That frame is what found the clip-fixup defect that ate ~22 pixels off every boot.
+#
+# There is no NAVIGATION here and there is not meant to be: a fixed cadence of one
+# button walks further into this title than a hand-authored menu path does, and it does
+# not go stale when a screen's timing moves.
+#
+0: @todo no @assert yet - this recipe is judged by its shots, so conformance has nothing
+0: @todo to check. A watched round timer or health value would give it one.
+
+0: @section boot
+200: cross
+212:
+350: cross
+362:
+500: cross
+512:
+650: cross
+662:
+800: cross
+812:
+950: cross
+962:
+1100: cross
+1112:
+1250: cross
+1262:
+1400: cross
+1412:
+1550: cross
+1562:
+1700: cross
+1712:
+1850: cross
+1862:
+2000: cross
+2012:
+2150: cross
+2162:
+2300: cross
+2312:
+2450: cross
+2462:
+2600: cross
+2612:
+2750: cross
+2762:
+2900: cross
+2912:
+3050: cross
+3062:
+3200: cross
+3212:
+3350: cross
+3362:
+3500: cross
+3512:
+3650: cross
+3662:
+3800: cross
+3812:
+3950: cross
+3962:
+4100: cross
+4112:
+4250: cross
+4262:
+4400: cross
+4412:
+4550: cross
+4562:
+4700: cross
+4712:
+4850: cross
+4862:
+5000: cross
+5012:
+5150: cross
+5162:
+5300: cross
+5312:
+5450: cross
+5462:
+5600: cross
+5612:
+5750: cross
+5762:
+5900: cross
+5912:
+6050: cross
+6062:
+6200: cross
+6212:
+6350: cross
+6362:
+6500: cross
+6512:
+6650: cross
+6662:
+6800: cross
+6812:
+6950: cross
+6962:
+7100: cross
+7112:
+7250: cross
+7262:
+7400: cross
+7412:
+7550: cross
+7562:
+7700: cross
+7712:
+7850: cross
+7862:
+8000: cross
+8012:
+8150: cross
+8162:
+8300: cross
+8312:
+8450: cross
+8462:
+8600: cross
+8612:
+8750: cross
+8762:
+8900: cross
+8912:
+9050: cross
+9062:
+9200: cross
+9212:
+9350: cross
+9362:
+9500: cross
+9512:
+9650: cross
+9662:
+9800: cross
+9812:
+9950: cross
+9962:
+10100: cross
+10112:
+10250: cross
+10262:
+10400: cross
+10412:
+10550: cross
+10562:
+10700: cross
+10712:
+10850: cross
+10862:
+11000: cross
+11012:
+11150: cross
+11162:
+11300: cross
+11312:
+11450: cross
+11462:
+11600: cross
+11612:
+11750: cross
+11762:
+11900: cross
+11912:
+12050: cross
+12062:
+12200: cross
+12212:
+12350: cross
+12362:
+12500: cross
+12512:
+12650: cross
+12662:
+12800: cross
+12812:
+12950: cross
+12962:

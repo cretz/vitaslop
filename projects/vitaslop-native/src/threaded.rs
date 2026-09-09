@@ -525,10 +525,11 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         };
 
         // The main thread: sp near the top of the region (with startup headroom), no
-        // entry args, its thid is whatever the host reports for the main thread (0 by
-        // convention here; the host maps it as it likes).
+        // entry args, and the host's own id for the initial thread - which is NOT zero,
+        // because the guest is told this id and no SceUID on hardware is ever zero
+        // (see `MAIN_THID`).
         let main = engine.instantiate_thread(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             entry & !1,
             0,
             0,
@@ -800,8 +801,29 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // title can hang in. Costs nothing when no watchdog is armed.
         {
             let h = host.clone();
+            // The dump reads GUEST memory too, so a lightweight mutex a stalled thread is
+            // parked on names its HOLDER (`vita::lwwork` keeps owner and count in the work
+            // area, not on the host). Reading it from here is sound for the same reason
+            // `read_mem` is: the watchdog fires when nothing has advanced, so no fiber is
+            // mid-write, and a word read that raced one would still only misreport a
+            // diagnostic - it can never disturb the run.
+            let mem = shared_mem.clone();
+            let mem_base = linked.base;
+            let read_word = move |addr: u32| -> u32 {
+                let off = addr.wrapping_sub(mem_base) as usize;
+                let data = mem.data();
+                if off.checked_add(4).is_none_or(|end| end > data.len()) {
+                    return 0;
+                }
+                // SAFETY: as `read_mem` above - a stalled run has no fiber running.
+                let mut b = [0u8; 4];
+                for (i, out) in b.iter_mut().enumerate() {
+                    *out = unsafe { *data[off + i].get() };
+                }
+                u32::from_le_bytes(b)
+            };
             crate::watchdog::register_sync_dump(Box::new(move || match h.try_lock() {
-                Ok(g) => Ok(g.sync_dump()),
+                Ok(g) => Ok(g.sync_dump_with(&read_word)),
                 Err(std::sync::TryLockError::WouldBlock) => {
                     Err("the host lock was held by a thread inside a host call")
                 }
@@ -825,7 +847,7 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // entry) the eboot's - which is where a render loop lives.
         let sp = main_stack_top(linked.base, linked.mem_bytes);
         let main = engine.instantiate_thread_seq(
-            0,
+            vitaslop_runtime::host::MAIN_THID,
             linked.module_inits.clone(),
             arg_len,
             arg_ptr,

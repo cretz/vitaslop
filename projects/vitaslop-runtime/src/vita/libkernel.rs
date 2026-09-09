@@ -649,6 +649,49 @@ pub(super) fn clib_snprintf(ctx: &mut GuestCtx, _st: &mut VitaState) {
     ctx.ret(full_len as u32);
 }
 
+/// int sceClibVsnprintf(char *dst, SceSize dst_max, const char *fmt, va_list ap)
+///
+/// The `va_list` spelling of [`clib_snprintf`], and the one a title's OWN logging wrapper
+/// calls: the wrapper takes `(...)`, and hands the list on. Same C99 semantics - at most
+/// `dst_max - 1` bytes plus a NUL, and the return is the length that WOULD have been written
+/// - and the same formatter, so a message cannot format differently depending on which of
+/// the two a title happened to route it through.
+///
+/// On ARM EABI a `va_list` is a pointer into the caller's argument area, which is what `ap`
+/// is here; [`cfmt::format_into_va`] walks it.
+pub(super) fn clib_vsnprintf(ctx: &mut GuestCtx, _st: &mut VitaState) {
+    let dst = ctx.arg(0);
+    let dst_max = ctx.arg(1);
+    let fmt_addr = ctx.arg(2);
+    let ap = ctx.arg(3);
+    let mut out = Vec::new();
+    cfmt::format_into_va(&mut out, ctx, fmt_addr, ap);
+    let full_len = out.len();
+    if dst_max > 0 {
+        let n = (dst_max as usize - 1).min(full_len);
+        let mut written = out[..n].to_vec();
+        written.push(0); // NUL terminator
+        ctx.write_bytes(dst, &written);
+    }
+    ctx.ret(full_len as u32);
+}
+
+/// int sceClibVprintf(const char *fmt, va_list ap)
+///
+/// [`clib_printf`] over a caller-built list, in the same relationship [`clib_vsnprintf`] has
+/// to [`clib_snprintf`]. Registered alongside it because a title with one logging wrapper
+/// usually has both, and discovering the second one boot later is the cost this whole
+/// exercise exists to avoid.
+pub(super) fn clib_vprintf(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let fmt_addr = ctx.arg(0);
+    let ap = ctx.arg(1);
+    let mut out = Vec::new();
+    cfmt::format_into_va(&mut out, ctx, fmt_addr, ap);
+    let n = out.len() as u32;
+    st.write_stdout(&out);
+    ctx.ret(n);
+}
+
 /// void *sceClibMemcpy(void *dst, const void *src, SceSize len)
 #[hostcall]
 pub(super) fn clib_memcpy(ctx: &mut GuestCtx, dst: Ptr, src: Ptr, len: u32) -> Ptr {

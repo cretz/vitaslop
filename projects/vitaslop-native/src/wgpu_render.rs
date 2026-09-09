@@ -92,9 +92,17 @@ impl WgpuRenderer {
         self.cube
             .encode(&self.device, &self.queue, &mut encoder, &color_view, &depth_view, &batches, clear);
 
-        // Copy the color texture into a readback buffer. width*4 is 256-aligned
-        // for 960 (3840 = 15*256), so no per-row padding is needed here.
-        let bytes_per_row = width * 4;
+        // >>> THE ROW PITCH IS PADDED TO 256, AND ASSUMING IT NEED NOT BE COST A BLACK RUN.
+        //
+        // `width * 4` is 256-aligned for the 960-wide panel (3840 = 15*256), which is what the
+        // comment here used to rest on. A title is free to declare a display buffer SMALLER
+        // than the panel and let the display controller stretch it - MEASURED on a baseball
+        // title, which switches to 720x408 the moment a game starts, and 720*4 = 2880 is not a
+        // multiple of 256. The copy is then a validation error, the submit fails, and the
+        // readback holds nothing: 9,101 errors in one run and every shot from the moment the
+        // game loaded came back BLACK, with the guest submitting 540 draws a frame behind it.
+        let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (bytes_per_row * height) as u64,
@@ -127,7 +135,7 @@ impl WgpuRenderer {
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
-        let rgba = slice.get_mapped_range().unwrap().to_vec();
+        let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
 
         Framebuffer { width, height, rgba }
@@ -368,11 +376,17 @@ impl GeneralRenderer {
             width,
             height,
             clear,
+            // The offline path renders straight into this texture, so a draw whose fragment
+            // program reads the DESTINATION colour is served here too - without it a capsule
+            // of such a draw is dropped and replays to an empty frame.
+            Some(&color_tex),
         );
         let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
         let t_submit = std::time::Instant::now();
 
-        let bytes_per_row = width * 4;
+        // Padded to 256, for the reason the other readback in this file spells out.
+        let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (bytes_per_row * height) as u64,
@@ -405,7 +419,7 @@ impl GeneralRenderer {
         });
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
-        let rgba = slice.get_mapped_range().unwrap().to_vec();
+        let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
         self.last_split = RenderSplit {
             build_ms,
@@ -607,6 +621,22 @@ impl GeneralRenderer {
 /// Written out rather than pulled from a crate because it is the ONLY place this crate needs
 /// it and a wrong `f16` decode would misreport exactly the values this diagnostic exists to
 /// report - a silently wrong number is worse than no number.
+/// Strip a readback's row PADDING: `bytes_per_row` is rounded up to
+/// `COPY_BYTES_PER_ROW_ALIGNMENT` for the copy, and a `Framebuffer` is tightly packed.
+/// A no-op copy when the two already agree, which is every panel-width frame.
+fn unpad_rows(padded: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
+    let tight = (width * 4) as usize;
+    if bytes_per_row as usize == tight {
+        return padded.to_vec();
+    }
+    let mut rgba = Vec::with_capacity(tight * height as usize);
+    for row in 0..height as usize {
+        let start = row * bytes_per_row as usize;
+        rgba.extend_from_slice(&padded[start..start + tight]);
+    }
+    rgba
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;

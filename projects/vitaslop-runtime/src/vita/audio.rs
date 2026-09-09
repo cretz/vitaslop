@@ -76,6 +76,18 @@ pub struct AudioState {
     /// `sceNgsPatchCreateRouting`. A routing volume names a PATCH; the mixer works in
     /// voices, and this is the only link between the two.
     pub(crate) ngs_patch_voice: Vec<(u32, u32)>,
+    /// The ONE port the host-side NGS mix is written into - see the election in
+    /// [`out_output`]. `None` until a port has been elected.
+    ///
+    /// >>> THE NGS MASTER BUSS HAS ONE DESTINATION, AND WRITING IT TO EVERY PORT MULTIPLIES IT.
+    /// A title holds SEVERAL output ports open at once (one measured title opens six, some at
+    /// full scale and some muted) and the sink SUMS them
+    /// [[vitaslop-audio-ports-are-mixed-not-appended]]. Substituting our mix on every port
+    /// therefore submits N copies of the same audio: MEASURED at ~3.3 ports submitting per
+    /// frame on that title, which is a mix roughly three times too hot - 5.8% of all samples
+    /// squared off at full scale, heard on the device as static with the real sound
+    /// underneath it.
+    ngs_port: Option<i32>,
     /// Optional raw-s16le capture of the mixed output stream (env
     /// `VITASLOP_AUDIO_RAW`), for headless verification. `None` = disabled.
     capture: Option<std::fs::File>,
@@ -350,7 +362,35 @@ pub(super) fn out_output(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         // it just wrote.
         let mut pcm = std::mem::take(&mut st.audio_state.scratch_pcm);
         pcm.clear();
-        let mixed = st.audio_state.at9.any_playing() && !no_ngs_mix();
+        // >>> THE NGS MIX GOES TO ONE PORT, AND ONLY WHERE THE GUEST LEFT SILENCE.
+        //
+        // Two rules, and each fixes a different way this used to destroy sound:
+        //
+        // * A grain the guest FILLED ITSELF is submitted as it is. On hardware the DSP writes
+        //   the master buss into the buffer of the port the title copies it from; every other
+        //   port carries audio the title mixed on the CPU - a movie's sound track is one - and
+        //   overwriting that with our mix threw the title's own audio away.
+        // * Of the ports that submit SILENCE, exactly one is the NGS destination. Writing the
+        //   mix into all of them submits N copies of the same audio into a sink that sums
+        //   them; see [`AudioState::ngs_port`] for the measurement. The first silent port seen
+        //   while a voice is playing is elected and kept.
+        //
+        // A port that is elected wrongly is audible as the mix arriving at another port's
+        // volume, so the election says which port it took, once.
+        let guest_silent = ctx.read_bytes(buf, (grain * channels * 2).min(4096)).iter().all(|&b| b == 0);
+        let playing = st.audio_state.at9.any_playing() && !no_ngs_mix();
+        if playing && guest_silent && st.audio_state.ngs_port.is_none() {
+            st.audio_state.ngs_port = Some(port);
+            tracing::info!(
+                target: "vitaslop::status",
+                port,
+                "NGS output port: this port submitted a silent grain while voices were playing, \
+                 so it is the one the guest expects the NGS master buss in. The host-side mix \
+                 goes here and nowhere else - every other port keeps the bytes the title wrote, \
+                 because those ports carry audio the title mixed itself and the sink SUMS them."
+            );
+        }
+        let mixed = playing && st.audio_state.ngs_port == Some(port);
         if mixed {
             let mut mix = std::mem::take(&mut st.audio_state.scratch_mix);
             mix.clear();

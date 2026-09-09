@@ -245,7 +245,7 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // not 48. The emitter materialises the same literal as `48u`, so reading it any other
         // way here would make this reference disagree with the code that ships, which is the one
         // thing an oracle may never do.
-        Op::IntMad { signed, bits } => {
+        Op::IntMad { signed, bits, src0_high } => {
             if bits != 32 {
                 return Err("imad (only the 32-bit width is established)");
             }
@@ -256,7 +256,15 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 }
                 Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
             };
-            let (a, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            let (a0, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            // src0 is one HALF of a packed pair - the same widening the emitter does, so this
+            // oracle and the code that ships agree about which value the multiply sees.
+            let a = match (signed, src0_high) {
+                (true, true) => ((a0 as i32) >> 16) as u32,
+                (true, false) => (((a0 as i32) << 16) >> 16) as u32,
+                (false, true) => a0 >> 16,
+                (false, false) => a0 & 0xffff,
+            };
             let r = if signed {
                 ((a as i32).wrapping_mul(b as i32).wrapping_add(d as i32)) as u32
             } else {
@@ -567,7 +575,12 @@ pub fn run_watching_for_nan_with_env(
             let s1 = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
             let bank = regs.bank(s1.bank).ok_or(InterpError::OutOfRange { index })?;
             let raw = bank.get(s1.index as usize).ok_or(InterpError::OutOfRange { index })?.to_bits();
-            regs.idx[(dest.index & 1) as usize] = (raw & 0xffff) as i32 + addend;
+            // The same PAIR scale the emitter applies - see `wgsl::emit_load_index`. An
+            // interpreter that indexes in single registers is measuring a different program
+            // than the one the GPU runs, which is the whole failure mode this file exists to
+            // avoid.
+            regs.idx[(dest.index & 1) as usize] =
+                ((raw & 0xffff) as i32 + addend) * crate::module::index_register_scale();
             index += 1;
             continue;
         }
@@ -587,7 +600,20 @@ pub fn run_watching_for_nan_with_env(
             };
             let src = instr.srcs.first().ok_or(InterpError::OutOfRange { index })?;
             let ptr = read_channel(regs, src, 0).ok_or(InterpError::OutOfRange { index })?;
-            let addr = ptr.to_bits().wrapping_add(offset_bytes);
+            // The instruction's REGISTER-supplied byte offsets, which the decoder puts in
+            // `srcs` after the pointer, added exactly as the emitted `gxp_a<n>` expression adds
+            // them. Leaving them out is not a small inaccuracy: an indexed read of a bone
+            // matrix or a uniform array would land on element ZERO every time, so a mesh whose
+            // vertices are nowhere would interpret as a mesh that is fine.
+            // The register offset is 16 bits wide - see `wgsl::emit_mem_load`, which is the
+            // code that ships and which this reference may never disagree with.
+            let narrow = crate::link::arm_on(crate::link::MEM_OFFSET16_ARM);
+            let mut addr = ptr.to_bits().wrapping_add(offset_bytes);
+            for o in instr.srcs.iter().skip(1) {
+                let v = read_channel(regs, o, 0).ok_or(InterpError::OutOfRange { index })?;
+                let v = if narrow { v.to_bits() & 0xffff } else { v.to_bits() };
+                addr = addr.wrapping_add(v);
+            }
             let base = dest.index as usize;
             let bank = regs.bank_mut(dest.bank).ok_or(InterpError::OutOfRange { index })?;
             for k in 0..elements as u32 {
@@ -837,7 +863,7 @@ mod tests {
         let a = Operand::plain(Bank::PrimaryAttr, 2, 2);
         let b = Operand::plain(Bank::Immediate, 48, 2);
         let cc = Operand::plain(Bank::SecondaryAttr, 24, 3);
-        let mut i = instr(Op::IntMad { signed: true, bits: 32 }, d, vec![a, b, cc]);
+        let mut i = instr(Op::IntMad { signed: true, bits: 32, src0_high: false }, d, vec![a, b, cc]);
         // The group is scalar and carries no write mask.
         i.write_mask = [true, false, false, false];
         run(&shader(vec![i]), &mut regs).unwrap();
@@ -853,7 +879,7 @@ mod tests {
         let a = Operand::plain(Bank::Temp, 1, 0);
         let b = Operand::plain(Bank::Temp, 2, 0);
         let cc = Operand::plain(Bank::Temp, 3, 0);
-        let i = instr(Op::IntMad { signed: false, bits: 16 }, d, vec![a, b, cc]);
+        let i = instr(Op::IntMad { signed: false, bits: 16, src0_high: false }, d, vec![a, b, cc]);
         assert!(run(&shader(vec![i]), &mut regs).is_err(), "a 16-bit imad must hard-fail");
     }
 

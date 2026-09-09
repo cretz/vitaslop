@@ -7160,6 +7160,7 @@ impl RenderSceneBuilder {
                     frag_sa: d.frag_sa.clone(),
                     frag_sa_addr: d.frag_sa_addr,
                     mem_windows: d.mem_windows.clone(),
+                    frag_mem_windows: d.frag_mem_windows.clone(),
                     vertices: d.vertices.clone(),
                     vertex_stride: d.vertex_stride,
                     attributes,
@@ -7364,6 +7365,7 @@ mod geometry_tests {
             frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
+            frag_mem_windows: Vec::new(),
             shader_expanded: false,
         }
     }
@@ -8361,7 +8363,7 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), shader_expanded: false,
+            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
         let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
@@ -8421,7 +8423,7 @@ mod supersample_tests {
             blend: crate::capture::BlendState::default(),
             exposure: 1.0, material: Default::default(), world: [0.0; 16],
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
-            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), shader_expanded: false,
+            vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
         let s = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).

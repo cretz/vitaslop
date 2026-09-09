@@ -203,6 +203,10 @@ export function createPlayer({ onExit }) {
   $("m-download").addEventListener("click", () => download(`vitaslop-${meta.titleId}-diag.txt`, diagText(), "text/plain"));
   $("m-shot").addEventListener("click", () => screenshot());
   $("fatal-copy").addEventListener("click", () => copyText(diagText(), $("fatal-copy")));
+  // The same file the menu's Download writes, from the panel that is shown INSTEAD of the menu
+  // once the run is over - see the markup for why the clipboard alone was not enough here.
+  $("fatal-download").addEventListener("click", () =>
+    download(`vitaslop-${meta ? meta.titleId : "unknown"}-fatal.txt`, diagText(), "text/plain"));
   $("fatal-quit").addEventListener("click", () => stop());
   document.addEventListener("keydown", (e) => {
     if (running && e.code === "Escape") openMenu(!menuOpen);

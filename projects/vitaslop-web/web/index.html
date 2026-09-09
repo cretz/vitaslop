@@ -96,6 +96,12 @@
           <pre id="fatal-text"></pre>
           <div class="menu-row">
             <button id="fatal-copy" class="btn primary" type="button">Copy diagnostics</button>
+            <!-- The FATAL panel is the one place a dump is certainly wanted and, until now, the
+                 one place it could only leave through the CLIPBOARD. That pipe is narrower than
+                 the dump and truncates without saying so: a phone paste was cut mid-line, part
+                 way through the STATUS panel, which is where the dropped draws and refused
+                 pipelines are. A file has no such limit. -->
+            <button id="fatal-download" class="btn" type="button">Download diagnostics</button>
             <button id="fatal-quit" class="btn" type="button">Back to library</button>
           </div>
         </div>

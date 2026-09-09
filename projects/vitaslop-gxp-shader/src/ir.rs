@@ -370,15 +370,22 @@ pub enum Op {
     /// `decode_grp_sop2`, which explains what the corpus establishes about it and what it
     /// pins rather than reads.
     CopyFx8,
-    /// Integer multiply-add (group 0x15, IMAD32): `dest = src0 * src1 + src2`, scalar, on the
-    /// 32-bit lane read as an integer of the given signedness. `bits` is the operand width;
-    /// only 32 is decoded, because the narrower selector values are encoded but not
+    /// Integer multiply-add (group 0x15, IMAD32): `dest = half(src0) * src1 + src2`, scalar,
+    /// on the 32-bit lane read as an integer of the given signedness. `bits` is the operand
+    /// width; only 32 is decoded, because the narrower selector values are encoded but not
     /// established (the decoder blocks them by name rather than guessing).
+    ///
+    /// `src0_high` is the group's own bit 56, and it selects which 16-bit HALF of `src0` feeds
+    /// the multiplier - the same shape the sibling group 0x1a spells as
+    /// [`Op::IntMadStep`]. It is not a refinement: `src0` in this group is ALWAYS half a packed
+    /// pair. Over five titles' corpora every one of the 122 IMAD32s reads a register a 16-bit
+    /// PACK wrote, and 42 of them set this bit, so reading the whole 32-bit register makes the
+    /// pairs collapse - a four-bone skinned mesh fetches two matrices, each twice.
     ///
     /// This shares no encoding with [`Op::LoadIndex`]'s group 0x14 despite the neighbouring
     /// opcode: the two groups carry different field layouts, and reading one through the
     /// other's table is how a "similar" group silently addresses the wrong registers.
-    IntMad { signed: bool, bits: u8 },
+    IntMad { signed: bool, bits: u8, src0_high: bool },
     /// One STEP of a 32-bit integer multiply-add (group 0x1a, the second 32-bit form):
     /// `dest = half(src0) * src1 + src2`, where `high_half` selects which 16-bit half of
     /// `src0` feeds the multiplier and whether its product is shifted back up:

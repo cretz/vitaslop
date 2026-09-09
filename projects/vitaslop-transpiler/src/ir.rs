@@ -52,6 +52,13 @@ pub enum Value {
     /// base of this thread's thread-local-storage block. Reads the per-instance `tp`
     /// global (see [`crate::abi::TP_GLOBAL`]).
     ThreadPtr,
+    /// The address the EXCLUSIVE MONITOR currently holds, or 0 for "no record".
+    ///
+    /// One word in the host-mirror block, cleared before every resume, which is what makes
+    /// it a per-thread monitor and what makes it the `CLREX` hardware performs on a context
+    /// switch. Read by `STREX` to decide whether its store may proceed; see
+    /// `vita::mirror::SLOT_EXCL`.
+    ExclAddr,
 }
 
 /// Binary operators over 32-bit values. Shifts are the logical/arithmetic wasm
@@ -490,6 +497,9 @@ pub enum Stmt {
     /// present (the shifter carry-out); leave V unchanged. `live` as for
     /// [`Stmt::FlagsAdd`].
     FlagsLogic { value: Value, carry: Option<Value>, live: FlagMask },
+    /// Record (or clear, with `Imm(0)`) the EXCLUSIVE MONITOR's address - see
+    /// [`Value::ExclAddr`]. Emitted by `LDREX` to arm it and by `STREX` to spend it.
+    ExclSet(Value),
     /// Service an ARM `svc #imm` through the host `svc` import.
     Svc(u32),
     /// Service a Vita NID call through the host `import` import, by dense index.

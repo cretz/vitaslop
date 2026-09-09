@@ -27,10 +27,19 @@ const SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID: u32 = 0x8002_8101;
 /// SceUID sceKernelCreateMutex(const char *name, SceUInt attr, int initCount,
 ///     SceKernelMutexOptParam *option)
 #[hostcall]
-pub(super) fn create_mutex(st: &mut VitaState, _name: Ptr, attr: u32, _init: i32, _opt: Ptr) -> i32 {
+pub(super) fn create_mutex(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    _name: Ptr,
+    attr: u32,
+    _init: i32,
+    _opt: Ptr,
+) -> i32 {
     // Recording ownership state is harmless single-thread (lock/unlock take the
     // immediate path there) and necessary for preemptive blocking.
-    let id = st.create_mutex();
+    // `ctx` is here for the KERNEL MUTEX TABLE, not for an argument: the mutex claims its
+    // entry in guest memory at create ([`crate::vita::kmutex`]).
+    let id = st.create_mutex(ctx);
     // `attr` carries the waiter discipline (TH_FIFO 0x0000 vs TH_PRIO 0x2000) and the
     // recursion/ceiling bits. It is traced rather than dropped because "which discipline did
     // the guest ask for" is the first question any thread-ordering investigation asks, and a
@@ -60,7 +69,7 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
     // other blocking primitive EXCEPT the mutexes - so a run asking what serialises two threads
     // saw everything but the answer.
     let lr = format_args!("{:#010x}", ctx.regs[14]).to_string();
-    if try_lock && st.mutex_contended(id) {
+    if try_lock && st.mutex_contended(ctx, id) {
         tracing::trace!(
             target: "vitaslop::sema",
             id, thread = st.current_thread(), lr, "mutex TRYLOCK refused"
@@ -70,7 +79,7 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
     }
     // The return value on success is 0, whether acquired now or after a wake.
     ctx.ret(0);
-    if st.mutex_lock(id) {
+    if st.mutex_lock(ctx, id) {
         tracing::trace!(
             target: "vitaslop::sema",
             id, thread = st.current_thread(), lr, try_lock, "mutex lock acquired"
@@ -87,12 +96,57 @@ pub(super) fn lock_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool)
 
 /// int sceKernelUnlockMutex(SceUID mutexid, int unlockCount)
 #[hostcall]
-pub(super) fn unlock_mutex(st: &mut VitaState, id: i32, _count: i32) -> i32 {
+pub(super) fn unlock_mutex(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    _count: i32,
+) -> i32 {
     if st.is_preemptive() {
         tracing::trace!(target: "vitaslop::sema", id, thread = st.current_thread(), "mutex unlock");
-        st.mutex_unlock(id);
+        st.mutex_unlock(ctx, id);
     }
     0
+}
+
+/// Which of this module's NIDs the transpiler may emit INLINE.
+///
+/// Only the uncontended take and release of a KERNEL MUTEX, and only under the preemptive
+/// scheduler, because that is the only run with a host-mirror block to hold the table and the
+/// only one where a mutex has more than one thread to contend with. See
+/// [`vitaslop_transpiler::InlineOp::KernelMutexLock`] for the state machine and
+/// [`crate::vita::kmutex`] for where the state lives.
+///
+/// `sceKernelTryLockMutex` is deliberately NOT here: its refusal is a return value the handler
+/// defines, and the count argument it does not take makes it a different call, not the same one
+/// with a different name.
+pub(crate) fn inline_op(
+    func_nid: u32,
+    preemptive: bool,
+) -> Option<vitaslop_transpiler::InlineOp> {
+    use crate::nid::sync as sy;
+    use crate::vita::kmutex;
+    use crate::vita::mirror::{SLOT_CURRENT_THREAD, SLOT_MUTEX_TABLE};
+    if !preemptive {
+        return None;
+    }
+    let (layout, thread_slot, table_slot, entries) =
+        (kmutex::layout(), SLOT_CURRENT_THREAD, SLOT_MUTEX_TABLE, kmutex::ENTRIES);
+    match func_nid {
+        sy::LOCK_MUTEX => Some(vitaslop_transpiler::InlineOp::KernelMutexLock {
+            layout,
+            thread_slot,
+            table_slot,
+            entries,
+        }),
+        sy::UNLOCK_MUTEX => Some(vitaslop_transpiler::InlineOp::KernelMutexUnlock {
+            layout,
+            thread_slot,
+            table_slot,
+            entries,
+        }),
+        _ => None,
+    }
 }
 
 // --- semaphore ---
@@ -251,7 +305,7 @@ pub(super) fn wait_cond(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome {
         return SvcOutcome::Continue;
     }
     tracing::trace!(target: "vitaslop::sema", cond = id, timeout_us, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]), "cond WAIT");
-    st.cond_wait(id, timeout_us);
+    st.cond_wait(ctx, id, timeout_us);
     SvcOutcome::Block
 }
 
@@ -260,7 +314,7 @@ pub(super) fn signal_cond(ctx: &mut GuestCtx, st: &mut VitaState, all: bool) {
     let id = ctx.arg(0) as i32;
     tracing::trace!(target: "vitaslop::sema", cond = id, all, thread = st.current_thread(), lr = format_args!("{:#010x}", ctx.regs[14]), "cond SIGNAL");
     if st.is_preemptive() {
-        st.cond_signal(id, all);
+        st.cond_signal(ctx, id, all);
     }
     ctx.ret(0);
 }

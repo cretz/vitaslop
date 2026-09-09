@@ -403,14 +403,18 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         // cause: an unfilled mirror means every inlined read returns a word that never
         // changes, and for the clock that is a vblank spin that can never be satisfied -
         // a livelock thousands of frames away with nothing pointing back here.
-        if core.engine.mirror_base().is_some() {
-            let written = core.refresh_mirror();
-            assert!(
-                written > 0,
-                "this build inlines host-mirror reads, but the host writes no mirror slots \
-                 (ImportDispatch::refresh_mirror); the guest would read a word that never \
-                 changes",
-            );
+        if let Some(base) = core.engine.mirror_base() {
+            // Where the block IS, told to the host once: everything behind the mirrored slots
+            // is shared state the host reads and writes directly - today the kernel mutex
+            // table - and it needs the address, not the slot writer.
+            core.host.lock().unwrap().set_mirror_base(base as u32);
+            // >>> THE BLOCK EXISTING IS NO LONGER EVIDENCE THAT A READ WAS INLINED. It is
+            // reserved UNCONDITIONALLY now, because the ARM exclusive monitor lives in it
+            // (`EXCL_MIRROR_SLOT`) and every build lowers `LDREX`/`STREX` whether or not any
+            // host call was inlined. A host with no mirror writer is therefore an ordinary
+            // build - a mock in a scheduler test - and not the defect this used to guard, so
+            // the assertion that every such build fills a slot is simply false now.
+            let _written = core.refresh_mirror();
         }
         core
     }

@@ -66,6 +66,15 @@ pub const OVERRIDABLE: &[&str] = &[
     // is where outgrowing it costs the most: a wholesale clear there re-decodes hundreds of
     // textures inside one frame's `build`.
     "VITASLOP_DECODE_CACHE_MB",
+    // Every `sceKernelDelayThread` tallied by (call site, requested microseconds). Browser-
+    // reachable for the same reason the call-site profiler is: a polling thread's cost is
+    // iterations times crossings, and a crossing costs twenty times more on the phone than
+    // here - so the phase where the count matters is the one only that engine can be asked.
+    // Read a draw's vertices and indices at `sceGxmEndScene` rather than at the draw call -
+    // ON by default. Browser-reachable because it is a DEFAULT-BEARING arm over what the
+    // engine reads, not a diagnostic, and the browser is where the picture is judged.
+    "VITASLOP_DEFER_GEOMETRY",
+    "VITASLOP_DELAY_CENSUS",
     // The dispatch ABLATION: route even a fallthrough through the function's `br_table`.
     // Browser-reachable because the question it answers is a V8 branch-prediction question -
     // the module carries one indirect branch per 10.5 guest instructions and nothing this
@@ -85,6 +94,12 @@ pub const OVERRIDABLE: &[&str] = &[
     // a PASS instead of on a whole frame.
     "VITASLOP_FRAME_DIGEST",
     "VITASLOP_FRAME_TOPUP",
+    // How many GPU submits may be in flight before a present declines to make another.
+    // Default 2, `0` disables the bound. Browser-reachable because the browser is the only
+    // engine where an unbounded queue is a HANG rather than latency: `queue.write_buffer`
+    // blocks the worker thread when the staging ring cannot retire, and a blocked worker turns
+    // no event loop at all. See `LivePlayback::gpu_in_flight`.
+    "VITASLOP_GPU_QUEUE_DEPTH",
     // The clock's core model, so a browser run can be A/B'd against native without an
     // environment to set it in.
     "VITASLOP_GUEST_CORES",
@@ -99,6 +114,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // silent omission: `set_override` PANICS on an unregistered name, so a phone run that
     // typed it into the knobs box died on boot with a black canvas and no output.
     "VITASLOP_GXM_NO_MULTISAMPLE",
+    "VITASLOP_GXM_STALE_UNIFORMS",
     // Poisons a freshly reserved default uniform buffer, so a lane the guest never wrote is
     // distinguishable from one it wrote as zero. NOTE it only covers the RESERVE path, never a
     // precomputed state's guest-owned buffer - so its silence is not evidence until the pattern
@@ -117,6 +133,8 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_CAPSULE_MIN_INDICES",
     "VITASLOP_GXP_CAPSULE_SKIP",
     "VITASLOP_GXP_CULL",
+    "VITASLOP_GXP_DEST",
+    "VITASLOP_GXP_DEST_BLEND",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
     "VITASLOP_GXP_FORCE",
@@ -132,6 +150,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // The per-VERTEX half of `..._INPUTS`, on its own name because it is unbounded in the one
     // place that cannot afford it: the browser panel keeps 96 distinct lines, and a 288-vertex
     // composite grid evicts every other finding - including the uniforms the run was taken for.
+    // How many DISTINCT INPUT SETS one pair may print under `VITASLOP_GXP_INPUTS` (default 8).
+    // The report dedupes per (pair, inputs), which on a pair resubmitted with new uniforms every
+    // draw is no dedupe at all: unaimed, it wrote 914 MB in eight minutes. Browser-reachable
+    // like the report it bounds.
+    "VITASLOP_GXP_INPUTS_SETS",
     "VITASLOP_GXP_INPUTS_VERTS",
     "VITASLOP_GXP_KEYS",
     "VITASLOP_GXP_LIVE",
@@ -141,6 +164,15 @@ pub const OVERRIDABLE: &[&str] = &[
     // does: the chain is a third of every uploaded RGBA8 texture's bytes, so on the device that
     // runs out of GPU memory it is both a memory lever and the A/B for whether the chain is what
     // prevents speckle.
+    // Whether a 0xE8 memory load's REGISTER offset is read as 16 bits (the default) or
+    // full-width. Browser-reachable because it decides a picture - one title's particle quads
+    // read 64 KB past their window under the full-width reading - and a wrong picture is
+    // reported from the phone.
+    "VITASLOP_GXP_MEM_OFFSET16",
+    // Print the guest words at a memory window's base and at base + this many bytes (hex),
+    // once per (vertex program, buffer). What settled whether a load's addend is a byte
+    // displacement at all - see `wgsl::emit_mem_load`.
+    "VITASLOP_GXP_MEM_PEEK",
     "VITASLOP_GXP_MIPS",
     "VITASLOP_GXP_NEGW",
     "VITASLOP_GXP_NOBLEND",
@@ -155,6 +187,7 @@ pub const OVERRIDABLE: &[&str] = &[
     // The shader PAIRS a run linked, one line each. Browser-reachable because a pair that links
     // on the desktop and not on the device is exactly the failure this names.
     "VITASLOP_GXP_PAIRS",
+    "VITASLOP_GXP_PASS_SPLIT_EVERY",
     // Compile a title's shader pairs AHEAD of the draw that needs them. Browser-reachable
     // because an in-frame shader compile costs the most there - it is the hitch itself.
     "VITASLOP_GXP_PRECOMPILE",
@@ -177,6 +210,11 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_SA_DIRECT",
     "VITASLOP_GXP_SIZE_BANKS",
     "VITASLOP_GXP_SOLID",
+    // The strict stop, so a browser run can be made to fail at the first pair the recompiler
+    // cannot translate instead of dropping that pair's draws - see `gpu::report_fallback` for
+    // the three choices and why dropping is the default.
+    "VITASLOP_GXP_STRICT",
+    "VITASLOP_GXP_VP_TRACE",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
     "VITASLOP_LOG",
@@ -207,7 +245,9 @@ pub const OVERRIDABLE: &[&str] = &[
     // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
     // voice allocates a fresh handle again, which is what left 8,138 voices in the bank and
     // 318 of them playing every grain. It is here so a device can price the difference.
+    "VITASLOP_NGS_NEG_LOOP",
     "VITASLOP_NGS_VOICE_HANDLE_MEMO",
+    "VITASLOP_NGS_ZERO_LEVEL",
     "VITASLOP_NO_BC",
     "VITASLOP_NO_FAST_IMPORT",
     "VITASLOP_NO_INLINE_CLIB",
@@ -223,6 +263,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // family worth ~1,000 calls cannot be priced against that baseline. This one changes
     // nothing else. Read at LINK time; set it before the run, not during it.
     "VITASLOP_NO_INLINE_LWMUTEX",
+    // Route the HEAVYWEIGHT mutex lock/unlock pair through the host instead of emitting it
+    // inline. Browser-reachable because that is where the pair costs what it costs: the pair
+    // is two of the three crossings in each of a title's two movie-phase poll loops, and a
+    // crossing there is twenty times a desktop one.
+    "VITASLOP_NO_INLINE_MUTEX",
     // Routes every host call back through the SUSPENDING trap (`env.import`) instead of
     // sending the never-blocking NIDs through `env.import_fast`. Reachable from the browser
     // because the browser is the only engine where the two traps differ: the JSPI stack

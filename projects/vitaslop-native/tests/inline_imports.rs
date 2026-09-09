@@ -982,6 +982,132 @@ fn check_lw(lock: bool, before: State, ptr: u32, count_arg: u32, thid: i32) {
     }
 }
 
+/// A kernel mutex's SceUID for these cases, and one that maps to the SAME table entry.
+///
+/// `KM_OTHER_UID` is `KM_UID + kmutex::ENTRIES`, so the mask sends both to one entry - which
+/// is the collision case the `id == r0` term exists for, and the one thing about the kernel
+/// form that the lightweight one cannot be asked.
+const KM_UID: i32 = 0x0000_2A11;
+const KM_OTHER_UID: i32 = KM_UID + vitaslop_runtime::vita::kmutex::ENTRIES as i32;
+
+/// The mutex-table entry `uid` indexes, as a guest address inside the mirror block.
+fn km_entry(vm: &Vm, uid: i32) -> u32 {
+    use vitaslop_runtime::vita::{kmutex, mirror};
+    let base = BASE + vm.mirror_off().expect("a mirror op reserves the block") as u32;
+    kmutex::entry_addr(base + mirror::SLOT_MUTEX_TABLE * 4, uid)
+}
+
+/// Run one kernel lock-or-unlock case through the emitted code and hold it to the SAME
+/// definition the lightweight form is held to.
+///
+/// The two emitted forms share their body (`emit_lock_take`), so what is under test here is
+/// what differs: the entry a uid indexes, and the `id == r0` term that decides whether that
+/// entry is this mutex's at all. `uid_arg` is what the guest passes in r0; `entry_id` is the
+/// uid the ENTRY names, which is the same one on the ordinary path and a different one on the
+/// collision path.
+fn check_km(lock: bool, before: State, uid_arg: i32, entry_id: i32, count_arg: u32, thid: i32) {
+    use vitaslop_runtime::vita::{kmutex, mirror};
+    let op = if lock {
+        InlineOp::KernelMutexLock {
+            layout: kmutex::layout(),
+            thread_slot: 3,
+            table_slot: mirror::SLOT_MUTEX_TABLE,
+            entries: kmutex::ENTRIES,
+        }
+    } else {
+        InlineOp::KernelMutexUnlock {
+            layout: kmutex::layout(),
+            thread_slot: 3,
+            table_slot: mirror::SLOT_MUTEX_TABLE,
+            entries: kmutex::ENTRIES,
+        }
+    };
+    let mut vm = vm_with(op);
+    let entry = km_entry(&vm, uid_arg);
+    // The entry's own id is the state's `id` field, so the collision case is expressed by
+    // seeding it with the OTHER uid.
+    let before = State { id: entry_id as u32, ..before };
+
+    // What the definition says should happen, replayed on a plain word map at that entry.
+    let mut expect = Words::default();
+    before.write(&mut expect, entry);
+    let taken = if lock {
+        kmutex::fast_lock(&mut expect, entry, uid_arg, thid, count_arg)
+    } else {
+        kmutex::fast_unlock(&mut expect, entry, uid_arg, thid, count_arg)
+    };
+
+    before.write_vm(&mut vm, entry);
+    write_mirror(&mut vm, &[0, 0, 0, thid as u32]);
+    vm.set_reg(0, uid_arg as u32);
+    vm.set_reg(1, count_arg);
+    let crossed = run(&mut vm);
+
+    let what = format!(
+        "{} {before:?} uid={uid_arg:#x} entry_id={entry_id:#x} n={count_arg} thid={thid}",
+        if lock { "lock" } else { "unlock" }
+    );
+    assert_eq!(crossed, !taken, "crossing disagrees with the definition: {what}");
+    let after = State::read_vm(&mut vm, entry);
+    if taken {
+        assert_eq!(vm.get_reg(0), 0, "a served call returns success: {what}");
+        let want = State::read(&expect, entry);
+        assert_eq!(after.owner, want.owner, "owner: {what}");
+        assert_eq!(after.count, want.count, "count: {what}");
+        assert_eq!(after.waiters, want.waiters, "waiters: {what}");
+    } else {
+        assert_eq!(vm.get_reg(0), HANDLER_SENTINEL, "the handler answers: {what}");
+        assert_eq!(after.owner, before.owner, "owner: {what}");
+        assert_eq!(after.count, before.count, "count: {what}");
+        assert_eq!(after.waiters, before.waiters, "waiters: {what}");
+    }
+    assert_eq!(after.id, before.id, "no arm may rewrite the entry's id: {what}");
+}
+
+/// The kernel take, over every shape of entry, against the same definition.
+#[test]
+fn kernel_mutex_lock_matches_the_lock_definition_on_every_arm() {
+    for &before in &[
+        State::free(),
+        State { owner: OTHER, ..State::free() },
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 5),
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::free() },
+    ] {
+        check_km(true, before, KM_UID, KM_UID, 1, CUR);
+    }
+    // A count other than one is the handler's, exactly as it is for the lightweight form.
+    check_km(true, State::free(), KM_UID, KM_UID, 2, CUR);
+}
+
+#[test]
+fn kernel_mutex_unlock_matches_the_unlock_definition_on_every_arm() {
+    for &before in &[
+        State::held_by(CUR, 1),
+        State::held_by(CUR, 3),
+        State::free(),
+        State::held_by(OTHER, 1),
+        State { waiters: 1, ..State::held_by(CUR, 1) },
+    ] {
+        check_km(false, before, KM_UID, KM_UID, 1, CUR);
+    }
+}
+
+/// >>> A UID THAT COLLIDES WITH ANOTHER MUTEX'S ENTRY MUST REACH THE HANDLER.
+///
+/// The table is indexed by `uid & (ENTRIES - 1)`, so two live mutexes can name one entry. The
+/// newcomer is refused an entry at create and keeps its state on the host - and this is the
+/// emitted half of that contract: an entry whose id is not the uid in r0 is somebody else's,
+/// and touching it would let one mutex take and release another's lock with nothing to say so.
+#[test]
+fn a_kernel_mutex_whose_entry_belongs_to_another_uid_reaches_the_handler() {
+    check_km(true, State::free(), KM_UID, KM_OTHER_UID, 1, CUR);
+    check_km(false, State::held_by(CUR, 1), KM_UID, KM_OTHER_UID, 1, CUR);
+    // ...and an entry that was never claimed (id zero) is nobody's.
+    check_km(true, State::free(), KM_UID, 0, 1, CUR);
+}
+
 /// The take, over every shape of work area, against the definition.
 #[test]
 fn lw_mutex_lock_matches_lwwork_on_every_arm() {

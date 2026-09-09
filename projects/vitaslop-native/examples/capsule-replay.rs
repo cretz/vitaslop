@@ -135,6 +135,160 @@ fn main() {
         cap.draw.frag_sa.len(),
         cap.draw.mem_windows.len(),
     );
+    // The guest's REGION CLIP for this draw. A scissor that excludes the draw's pixels makes
+    // it vanish with every other piece of state looking perfect, and it is per-draw - so a
+    // capsule that renders and a live frame that does not can differ by exactly this.
+    eprintln!(
+        "  region clip: mode {:#010x} rect {:?} viewport {:?} (enable {})",
+        cap.draw.render_state.region_clip_mode,
+        cap.draw.render_state.region_clip,
+        cap.draw.render_state.viewport,
+        cap.draw.render_state.viewport_enable
+    );
+
+    // >>> THE TEXTURES, BECAUSE A BLACK DRAW IS AS OFTEN A BLACK TEXEL AS A BLACK SHADER.
+    //
+    // A draw whose geometry is on screen and whose pixels are still black has exactly two
+    // suspects, and the tool could name neither: what the shader computes, and what it
+    // samples. The MEAN of a texture's snapshotted bytes separates them in one line - a
+    // texture that decodes to nothing shades to nothing whatever the shader does, and
+    // `--tex <unit>=255,255,255,255` then confirms it by substituting a white one.
+    for t in cap.draw.textures.iter() {
+        let n = t.pixels.len().max(1);
+        let mean = t.pixels.iter().map(|b| u64::from(*b)).sum::<u64>() as f64 / n as f64;
+        let nonzero = t.pixels.iter().filter(|b| **b != 0).count();
+        // The DECODED texels beside the raw ones. A source buffer full of content that decodes
+        // to nothing is a decoder bug; one that decodes to something the shader then multiplies
+        // away is not, and only the second mean separates them. `--dump-tex <dir>` writes the
+        // decoded image so it can be looked at.
+        let (dw, dh, rgba) = vitaslop_runtime::render::decode_texture_rgba8(t);
+        let dmean = if rgba.is_empty() {
+            0.0
+        } else {
+            rgba.iter().map(|b| u64::from(*b)).sum::<u64>() as f64 / rgba.len() as f64
+        };
+        if let Some(dir) = std::env::var_os("VITASLOP_CAPSULE_TEX_DIR") {
+            let path = std::path::Path::new(&dir).join(format!("tex{}-{:08x}.png", t.unit, t.data_addr));
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::write(&path, vitaslop_runtime::render::rgba_to_png(dw, dh, &rgba)) {
+                eprintln!("  cannot write {}: {e}", path.display());
+            } else {
+                eprintln!("  wrote {}", path.display());
+            }
+        }
+        eprintln!(
+            "  texture unit {} format {:#06x} swizzle {:#x} type {} {}x{} stride {} mips {}              faces {} at {:#010x}: {} bytes, mean {:.1}/255, {:.1}% non-zero; DECODED {}x{}              mean {dmean:.1}/255",
+            t.unit,
+            t.base_format,
+            t.swizzle,
+            t.tex_type,
+            t.width,
+            t.height,
+            t.stride,
+            t.levels,
+            t.faces,
+            t.data_addr,
+            t.pixels.len(),
+            mean,
+            100.0 * nonzero as f64 / n as f64,
+            dw,
+            dh
+        );
+    }
+
+    // >>> THE GEOMETRY, BECAUSE AN EMPTY DRAW'S FIRST QUESTION IS WHERE ITS VERTICES ARE.
+    //
+    // Every other line here describes state; none of them says what the mesh IS. A draw that
+    // covers no pixel is either transformed off screen or was never a mesh in the first place,
+    // and those need different fixes - so the attribute list and the first few vertices'
+    // lowest-offset float attribute are printed, which is the position on every layout this
+    // engine has seen. Formats other than F32/F16 print as raw bytes rather than a guess.
+    {
+        let stride = cap.draw.vertex_stride as usize;
+        let n = if stride > 0 { cap.draw.vertices.len() / stride } else { 0 };
+        eprintln!("  vertex stride {stride}, so {n} vertices; attributes:");
+        for a in cap.draw.attributes.iter() {
+            eprintln!(
+                "    stream {} offset {:>3} format {:#04x} comps {} -> pa{}",
+                a.stream_index, a.offset, a.format, a.component_count, a.reg_index
+            );
+        }
+        // The lowest-offset attribute with at least three float components: the position on
+        // every layout this engine has seen (`render::layout_of` picks it the same way).
+        let pos = cap
+            .draw
+            .attributes
+            .iter()
+            .filter(|a| (a.format == 9 || a.format == 8) && a.component_count >= 3)
+            .min_by_key(|a| a.offset);
+        if let Some(a) = pos {
+            let comps = a.component_count.min(4) as usize;
+            let width = if a.format == 9 { 4 } else { 2 };
+            // The whole mesh's extent, not just a sample: where a draw SITS is what decides
+            // whether an empty frame is a transform bug or a draw that is legitimately out of
+            // view, and four vertices cannot tell those apart.
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            let mut shown = 0;
+            for v in 0..n {
+                let base = v * stride + a.offset as usize;
+                let mut vals = Vec::new();
+                for c in 0..comps {
+                    let at = base + c * width;
+                    let Some(b) = cap.draw.vertices.get(at..at + width) else { break };
+                    vals.push(if width == 4 {
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    } else {
+                        // F16, unpacked the same way the emitted shader unpacks it.
+                        f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]])))
+                    });
+                }
+                if vals.len() == comps {
+                    if shown < 4 {
+                        eprintln!("    vertex {v}: position {vals:?}");
+                    }
+                    for (k, val) in vals.iter().take(3).enumerate() {
+                        lo[k] = lo[k].min(*val);
+                        hi[k] = hi[k].max(*val);
+                    }
+                    shown += 1;
+                }
+            }
+            if shown > 0 {
+                eprintln!(
+                    "    model-space extent over {shown} vertices: x[{:.1},{:.1}] y[{:.1},{:.1}] z[{:.1},{:.1}]",
+                    lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+                );
+            }
+        } else {
+            eprintln!("    (no float attribute with three or more components - no position)");
+        }
+        // >>> THE WHOLE ROW, WHEN THE DECLARED ATTRIBUTE READS AS NONSENSE.
+        //
+        // `VITASLOP_CAPSULE_DUMP_VERTS=<n>` prints the first `n` vertex rows as f32 lanes AND
+        // as raw bytes. The attribute print above answers "what does the layout say this
+        // vertex's position is"; when that answer is a denormal, the next question is "where in
+        // the row IS the position", and only the whole row can answer it. Reading a row by hand
+        // out of a hex dump of 22 KB was the alternative, and it is how a shifted attribute
+        // offset goes unnoticed for a session.
+        if let Ok(n_dump) = std::env::var("VITASLOP_CAPSULE_DUMP_VERTS").unwrap_or_default().parse::<usize>() {
+            for v in 0..n_dump.min(n) {
+                let row = &cap.draw.vertices[v * stride..(v + 1) * stride];
+                let f32s: Vec<String> = row
+                    .chunks_exact(4)
+                    .map(|b| format!("{:.4}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                    .collect();
+                let f16s: Vec<String> = row
+                    .chunks_exact(2)
+                    .map(|b| format!("{:.3}", f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]])))))
+                    .collect();
+                eprintln!("    row {v}: f32 [{}]", f32s.join(", "));
+                eprintln!("           f16 [{}]", f16s.join(", "));
+                eprintln!("           hex {}", row.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""));
+            }
+        }
+    }
+
     // The state that decides whether a BLACK draw is a bug at all. An additive or alpha-blended
     // draw contributes to what is already there, so black is a legitimate "adds nothing"; only
     // a REPLACE draw owns its pixels outright. A capsule renders against a bare clear, so this
@@ -297,4 +451,24 @@ fn main() {
         "    (the clear is rgb({}, {}, {}) - pixels the draw did not cover)",
         cap.clear[0], cap.clear[1], cap.clear[2]
     );
+}
+
+/// IEEE half -> f32, for printing an F16 position attribute. Small and local: the tool prints
+/// numbers, it does not decode geometry for anything else.
+fn half_from_bits(h: u16) -> f32 {
+    let sign = f32::from_bits(u32::from(h & 0x8000) << 16);
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let v = match exp {
+        0 => f32::from(mant) * 2.0f32.powi(-24),
+        0x1f => {
+            if mant == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + f32::from(mant) / 1024.0) * 2.0f32.powi(i32::from(exp) - 15),
+    };
+    if sign.is_sign_negative() { -v } else { v }
 }

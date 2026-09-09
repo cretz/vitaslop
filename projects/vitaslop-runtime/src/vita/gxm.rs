@@ -252,6 +252,47 @@ pub(super) fn get_program_from_id(ctx: &mut GuestCtx, st: &mut VitaState) {
     ctx.ret(program);
 }
 
+/// int sceGxmShaderPatcherSetUserData(SceGxmShaderPatcher *shaderPatcher, void *userData)
+///
+/// One opaque word GXM keeps beside the patcher. It exists for the host-callback
+/// allocator a title can give `sceGxmShaderPatcherCreate`: those callbacks are handed the
+/// patcher and nothing else, so this is where they find their own context. Stored against
+/// the patcher HANDLE, which is the identity the guest was given.
+pub(super) fn shader_patcher_set_user_data(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let patcher = ctx.arg(0);
+    let user_data = ctx.arg(1);
+    st.set_shader_patcher_user_data(patcher, user_data);
+    ctx.ret(0);
+}
+
+/// void *sceGxmShaderPatcherGetUserData(SceGxmShaderPatcher *shaderPatcher)
+///
+/// NULL for a patcher that was never given one, which is what GXM returns for a patcher
+/// created with a null `userData` - not an error, and not a value to invent.
+pub(super) fn shader_patcher_get_user_data(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let patcher = ctx.arg(0);
+    let data = st.shader_patcher_user_data(patcher);
+    ctx.ret(data);
+}
+
+/// SceBool sceGxmProgramIsFragColorUsed(const SceGxmProgram *program)
+///
+/// Whether the fragment program reads the FRAME BUFFER as an input. Answered from the
+/// program's own instructions (`vitaslop_gxp_shader::fragment_uses_frag_color`) - the same
+/// bytes the hardware library would reflect over - rather than from anything this engine
+/// decided about the program afterwards. See that function for why it is deliberately not
+/// the renderer's `fragment_reads_dest_color`.
+///
+/// A title asks this to decide whether a fragment program may be used with a colour
+/// surface whose format it must first check, so a wrong answer here is a wrong pipeline,
+/// not a cosmetic one.
+pub(super) fn program_is_frag_color_used(ctx: &mut GuestCtx, st: &mut VitaState) {
+    let program = ctx.arg(0);
+    let blob = st.program_blob(ctx, program);
+    let used = vitaslop_gxp_shader::fragment_uses_frag_color(&blob);
+    ctx.ret(used as u32);
+}
+
 /// int sceGxmInitialize(const SceGxmInitializeParams *params)
 pub(super) fn initialize(ctx: &mut GuestCtx, st: &mut VitaState) {
     let params = ctx.arg(0);
@@ -478,6 +519,7 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         g::SET_BACK_POLYGON_MODE => store(ctxoff::BACK_POLYGON_MODE),
         g::SET_FRONT_POINT_LINE_WIDTH => store(ctxoff::FRONT_POINT_LINE_WIDTH),
         g::SET_FRONT_STENCIL_REF => store(ctxoff::FRONT_STENCIL_REF),
+        g::SET_BACK_STENCIL_REF => store(ctxoff::BACK_STENCIL_REF),
         g::SET_VIEWPORT_ENABLE => store(ctxoff::VIEWPORT_ENABLE),
         // `sceGxmSetViewport(context, 6 floats)`: the handler stores the six argument
         // floats' raw bits into six consecutive context words and returns 0, which is the
@@ -1253,6 +1295,21 @@ pub(super) fn create_vertex_program(ctx: &mut GuestCtx, st: &mut VitaState) {
         attribute_count, stream_count, stride, attrs = attributes.len(),
         attrs_addr = format_args!("{attributes_addr:#x}"),
         streams_addr = format_args!("{streams_addr:#x}"),
+        program = format_args!("{:#x}", st.shader_program(program_id)),
+        // EVERY stream's stride, not just stream 0's. One title creates FIVE vertex programs
+        // over the same `SceGxmProgram*` with seven attributes and two streams each, and what
+        // separates them is the SECOND stream - so a line that prints only the first cannot
+        // tell them apart, and a draw fetching through the wrong one of the five reads its
+        // geometry at another factory's stride.
+        strides = format_args!("{:?}", streams.iter().map(|s| s.0).collect::<Vec<_>>()),
+        // The RAW words of the stream array, so the element SIZE is a reading and not an
+        // assumption: `SceGxmVertexStream` is `{u16 stride; u16 indexSource;}` = 4 bytes, and
+        // a wrong element size reads stream N's stride out of stream N-1's padding.
+        stream_words = format_args!(
+            "{:08x?}",
+            (0..8).map(|k| ctx.read_u32(streams_addr + k * 4)).collect::<Vec<_>>()
+        ),
+        offsets = format_args!("{:?}", attributes.iter().map(|a| (a.stream_index, a.offset, a.format, a.component_count, a.reg_index)).collect::<Vec<_>>()),
         "createVertexProgram"
     );
     // A vertex program with NO attributes over a stream that has a real stride cannot
@@ -1702,6 +1759,11 @@ fn report_scene_depth(
 /// in the guest's visibility buffer. All of that is synchronous here, which is why
 /// `sceGxmNotificationWait` never actually has to wait.
 pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
+    // Before the scene is folded: did the guest write any watched vertex window between its
+    // draw call and here? See `STREAM_WATCH` - a no-op without `VITASLOP_DUMP_STREAM_BYTES`.
+    st.report_stream_rewrites(ctx);
+    // The draws' geometry is read HERE, which is when the GPU reads it - see `defer_geometry`.
+    st.resolve_deferred_geometry(ctx);
     st.end_scene();
     st.flush_visibility(ctx);
     let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
@@ -1721,6 +1783,33 @@ fn signal_notification(ctx: &mut GuestCtx, notification: u32) {
     let value = ctx.read_u32(notification + 4);
     if address != 0 {
         ctx.write_u32(address, value);
+    }
+}
+
+/// `int sceGxmWaitEvent(void)`
+///
+/// **NO PROTOTYPE FOR THIS CALL IS PUBLISHED.** The vitasdk NID database names it and stops
+/// there; `psp2/gxm.h` does not declare it and neither wiki has a page. What IS established
+/// is the shape of the family it belongs to: GXM's other waits (`sceGxmFinish`,
+/// `sceGxmNotificationWait`, `sceGxmDisplayQueueFinish`) all block the caller until GPU work
+/// already submitted has completed, and return `0`.
+///
+/// Here every scene completes SYNCHRONOUSLY at `sceGxmEndScene` - which is the same fact
+/// [`notification_wait`] rests on - so by the time a title can call this, there is no
+/// outstanding GPU work for an event to be raised about, and the wait is over before it
+/// starts.
+///
+/// It still gives up the CPU. A wait that has nothing to wait for is a kernel entry on
+/// hardware, and a title polling this in a loop with the immediate return would spin against
+/// whichever of its own threads it is really waiting for - the failure `sceDisplayWaitSetFrameBuf`
+/// already hit here (34.3 million thread resumes to reach frame 3). Rescheduling costs
+/// nothing when the caller is alone and is the difference when it is not.
+pub(super) fn wait_event(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
+    ctx.ret(0);
+    if st.is_preemptive() {
+        crate::SvcOutcome::Reschedule
+    } else {
+        crate::SvcOutcome::Continue
     }
 }
 
@@ -2269,6 +2358,17 @@ pub(super) fn set_front_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, con
     0
 }
 
+/// void sceGxmSetBackStencilRef(SceGxmContext *context, unsigned int sref)
+///
+/// The two-sided counterpart of [`set_front_stencil_ref`], recorded unconditionally for the
+/// reason the back stencil FUNC block is: a title sets it once and enables two-sided later,
+/// and state dropped when it was set is not there when it starts mattering.
+#[hostcall]
+pub(super) fn set_back_stencil_ref(ctx: &mut GuestCtx, _st: &mut VitaState, context: u32, sref: u32) -> i32 {
+    gxmctx::set(ctx, context, gxmctx::off::BACK_STENCIL_REF, sref);
+    0
+}
+
 /// void sceGxmSetFrontStencilFunc(SceGxmContext *context, SceGxmStencilFunc func,
 ///     SceGxmStencilOp stencilFail, SceGxmStencilOp depthFail, SceGxmStencilOp
 ///     depthPass, unsigned char compareMask, unsigned char writeMask)
@@ -2393,10 +2493,12 @@ pub(super) fn color_surface_get_format(ctx: &mut GuestCtx, st: &mut VitaState, s
 /// (so a COPY of an initialised surface still answers), else from the address table.
 fn resolve_color_surface(ctx: &mut GuestCtx, st: &VitaState, addr: u32) -> Option<ColorSurface> {
     let mut s = read_color_surface(ctx, addr).or_else(|| st.color_surface(addr))?;
-    // The gamma mode is sticky host-side state keyed by the SURFACE address, because the
-    // 32-byte guest struct has nowhere to hold it. Merge it back in here so every consumer -
-    // the getter, and the scene's render target - sees a complete surface.
-    s.gamma = st.color_surface_gamma_mode(addr);
+    // The gamma mode is sticky host-side state, because the 32-byte guest struct has nowhere
+    // to hold it. Merge it back in here so every consumer - the getter, and the scene's render
+    // target - sees a complete surface. The surface POINTER is the first key and the surface's
+    // own DATA address is the fallback; see `VitaState::color_surface_gamma` for why a title
+    // that sets the mode through one pointer can describe the same surface through another.
+    s.gamma = st.color_surface_gamma_mode(addr, s.data_addr);
     Some(s)
 }
 
@@ -2598,6 +2700,66 @@ pub(super) fn texture_set_lod_bias(ctx: &mut GuestCtx) {
     ctx.ret(0);
 }
 
+/// int sceGxmTextureSetMipmapCount(SceGxmTexture *texture, unsigned int mipCount)
+///
+/// The setter half of the field [`texture_get_mipmap_count`] reads. A title calls it after
+/// `sceGxmTextureInitLinear` when it uploads a chain whose length differs from the one the
+/// init declared, and the count is what says how many levels the sampler may walk.
+pub(super) fn texture_set_mipmap_count(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let count = ctx.arg(1);
+    set_tex_field(ctx, texture, texword0::MIP_COUNT, count);
+    ctx.ret(0);
+}
+
+/// The minimum mip LEVEL the sampler may use, which is FOUR BITS SPLIT ACROSS TWO CONTROL
+/// WORDS - the one sampler field that is not a run of bits in word 0.
+///
+/// `psp2/gxm.h`'s `SceGxmTexture` names them: `lod_min0` is control word 2 bits 1:0 (the
+/// header calls it "Level of Details higher bits") and `lod_min1` is control word 3 bits
+/// 27:26 ("lower bits"). So the value is `(word2 & 3) << 2 | (word3 >> 26) & 3`, and the
+/// halves must be written together or the level is silently quartered.
+///
+/// Word 2's low two bits are free for this because the other 30 hold the texture DATA
+/// address, which is 4-byte aligned; the same trick puts word 3's palette address in its
+/// top 26. Writing either half therefore has to preserve the rest of its word.
+/// Byte offsets of those two control words within a `SceGxmTexture`, and the shift of
+/// each half within its word.
+const TEX_WORD2: u32 = 8;
+const TEX_WORD3: u32 = 12;
+const TEX_W2_LOD_MIN_HI_SHIFT: u32 = 0;
+const TEX_W3_LOD_MIN_LO_SHIFT: u32 = 26;
+
+/// int sceGxmTextureSetLodMin(SceGxmTexture *texture, unsigned int lodMin)
+pub(super) fn texture_set_lod_min(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    // Masked, not asserted, for the reason `set_tex_field` gives: the field is this wide,
+    // so a wider value gets what the hardware would keep.
+    let lod_min = ctx.arg(1) & 0xf;
+    let w2 = ctx.read_u32(texture + TEX_WORD2);
+    let w3 = ctx.read_u32(texture + TEX_WORD3);
+    ctx.write_u32(
+        texture + TEX_WORD2,
+        (w2 & !(0x3 << TEX_W2_LOD_MIN_HI_SHIFT)) | ((lod_min >> 2) << TEX_W2_LOD_MIN_HI_SHIFT),
+    );
+    ctx.write_u32(
+        texture + TEX_WORD3,
+        (w3 & !(0x3 << TEX_W3_LOD_MIN_LO_SHIFT)) | ((lod_min & 0x3) << TEX_W3_LOD_MIN_LO_SHIFT),
+    );
+    ctx.ret(0);
+}
+
+/// unsigned int sceGxmTextureGetLodMin(const SceGxmTexture *texture)
+///
+/// Registered alongside the setter rather than left to hard-fail: they are one field, and a
+/// getter that disagreed with the setter would be worse than either alone.
+pub(super) fn texture_get_lod_min(ctx: &mut GuestCtx) {
+    let texture = ctx.arg(0);
+    let hi = (ctx.read_u32(texture + TEX_WORD2) >> TEX_W2_LOD_MIN_HI_SHIFT) & 0x3;
+    let lo = (ctx.read_u32(texture + TEX_WORD3) >> TEX_W3_LOD_MIN_LO_SHIFT) & 0x3;
+    ctx.ret((hi << 2) | lo);
+}
+
 /// int sceGxmTextureSetMinFilter(SceGxmTexture *texture, SceGxmTextureFilter minFilter)
 pub(super) fn texture_set_min_filter(ctx: &mut GuestCtx) {
     let texture = ctx.arg(0);
@@ -2779,7 +2941,16 @@ pub(super) fn color_surface_get_stride_in_pixels(ctx: &mut GuestCtx, st: &mut Vi
 /// int sceGxmColorSurfaceSetGammaMode(SceGxmColorSurface *surface, SceGxmColorSurfaceGammaMode gammaMode)
 #[hostcall]
 pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaState, surface: u32, gamma: u32) -> i32 {
-    st.set_color_surface_gamma(surface, gamma);
+    // The buffer this surface writes, recorded beside the pointer so the mode survives the
+    // guest describing the same surface through a different struct - see
+    // `VitaState::color_surface_gamma`. Read from the struct's own contents first, exactly as
+    // `resolve_color_surface` does, so a surface the guest initialised but this table has
+    // never seen still contributes its data address.
+    let data_addr = read_color_surface(ctx, surface)
+        .or_else(|| st.color_surface(surface))
+        .map(|s| s.data_addr)
+        .unwrap_or(0);
+    st.set_color_surface_gamma(surface, data_addr, gamma);
     // Write it into the guest-visible surface struct too, so a scene that resolves its target
     // through `read_color_surface` carries the mode with it. Keeping the mode only in a side
     // table keyed by the SURFACE address loses it the moment the scene is described by its
@@ -3982,6 +4153,7 @@ pub(crate) mod inline_op_tests {
         (g::SET_BACK_POLYGON_MODE, "sceGxmSetBackPolygonMode"),
         (g::SET_FRONT_POINT_LINE_WIDTH, "sceGxmSetFrontPointLineWidth"),
         (g::SET_FRONT_STENCIL_REF, "sceGxmSetFrontStencilRef"),
+        (g::SET_BACK_STENCIL_REF, "sceGxmSetBackStencilRef"),
         (g::SET_VIEWPORT_ENABLE, "sceGxmSetViewportEnable"),
         (g::SET_FRONT_VISIBILITY_TEST_ENABLE, "sceGxmSetFrontVisibilityTestEnable"),
         (g::SET_FRONT_VISIBILITY_TEST_INDEX, "sceGxmSetFrontVisibilityTestIndex"),

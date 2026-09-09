@@ -1,0 +1,45 @@
+@title  PCSE00023 - skip the logos and see what is live
+@game   PCSE00023
+@shot-every 40
+
+0: @todo no @assert yet - an exploration recipe, judged by its shots.
+
+# Exploration only. The logos and studio movies run to roughly f2000 with no input;
+# a title of this kind normally lets a button skip each one, so this presses cross
+# every 60 frames through that stretch and then STOPS, so whatever screen the title
+# settles on is the one the shots show rather than one this recipe walked into.
+
+0: @section boot
+
+200: cross
+212:
+260: cross
+272:
+320: cross
+332:
+380: cross
+392:
+440: cross
+452:
+500: cross
+512:
+560: cross
+572:
+620: cross
+632:
+680: cross
+692:
+740: cross
+752:
+800: cross
+812:
+860: cross
+872:
+920: cross
+932:
+980: cross
+992:
+
+1000: @section settle
+# No input from here: the shots say where the title stopped.
+1600: @note exploration recipe - no navigation past this point

@@ -23,21 +23,49 @@ use crate::host::GuestCtx;
 /// memory, so a missing NUL cannot make us scan the whole address space.
 const MAX_STR: usize = 4096;
 
-/// A cursor over the variadic argument area, in 4-byte words. Word `n` is r`n`
-/// for `n < 4`, else the stack slot at `sp + (n-4)*4` (see [`GuestCtx::arg`]).
+/// Where a cursor reads its variadic arguments from.
+///
+/// The `v` spellings (`sceClibVsnprintf`, `sceClibVprintf`) take a `va_list` the CALLER
+/// already built, which on ARM EABI is a plain pointer walking a contiguous argument area in
+/// guest memory. Everything about reading a conversion is otherwise identical, so the two
+/// differ only here - one call site cannot format differently from the other.
+#[derive(Clone, Copy)]
+enum ArgArea {
+    /// This call's own arguments: word `n` is r`n` for `n < 4`, else the stack slot at
+    /// `sp + (n-4)*4` (see [`GuestCtx::arg`]).
+    Call,
+    /// A `va_list`: word `n` is the guest word at `base + n*4`.
+    VaList { base: u32 },
+}
+
+/// A cursor over the variadic argument area, in 4-byte words.
 struct ArgCursor<'a, 'b> {
     ctx: &'a GuestCtx<'b>,
+    area: ArgArea,
     word: usize,
 }
 
 impl<'a, 'b> ArgCursor<'a, 'b> {
     fn new(ctx: &'a GuestCtx<'b>, first_word: usize) -> Self {
-        ArgCursor { ctx, word: first_word }
+        ArgCursor { ctx, area: ArgArea::Call, word: first_word }
+    }
+
+    /// A cursor over the argument area a `va_list` points at.
+    fn over_va_list(ctx: &'a GuestCtx<'b>, base: u32) -> Self {
+        ArgCursor { ctx, area: ArgArea::VaList { base }, word: 0 }
+    }
+
+    /// The word at index `n` of whichever area this cursor reads.
+    fn word_at(&self, n: usize) -> u32 {
+        match self.area {
+            ArgArea::Call => self.ctx.arg(n),
+            ArgArea::VaList { base } => self.ctx.read_u32(base.wrapping_add(n as u32 * 4)),
+        }
     }
 
     /// Read a 4-byte argument (int, unsigned, pointer, promoted char).
     fn next_word(&mut self) -> u32 {
-        let v = self.ctx.arg(self.word);
+        let v = self.word_at(self.word);
         self.word += 1;
         v
     }
@@ -46,10 +74,22 @@ impl<'a, 'b> ArgCursor<'a, 'b> {
     /// word cursor rounds up to an even index, which - because sp is 8-byte
     /// aligned at a public call - is always an 8-byte boundary across both the
     /// core registers and the stack.
+    ///
+    /// For a `va_list` the alignment is of the ADDRESS, not of the index: the list may start
+    /// at any word the caller's frame put it at, and rounding the index alone would align to
+    /// the wrong parity for an odd-word base - reading a double from one word too early,
+    /// which is a number, not a crash.
     fn next_dword(&mut self) -> u64 {
-        self.word = (self.word + 1) & !1;
-        let lo = self.ctx.arg(self.word) as u64;
-        let hi = self.ctx.arg(self.word + 1) as u64;
+        match self.area {
+            ArgArea::Call => self.word = (self.word + 1) & !1,
+            ArgArea::VaList { base } => {
+                if base.wrapping_add(self.word as u32 * 4) % 8 != 0 {
+                    self.word += 1;
+                }
+            }
+        }
+        let lo = self.word_at(self.word) as u64;
+        let hi = self.word_at(self.word + 1) as u64;
         self.word += 2;
         lo | (hi << 32)
     }
@@ -86,8 +126,18 @@ struct Spec {
 /// `first_word` (1 for `printf`: word 0 is the format-string pointer itself).
 /// Appends the formatted bytes to `out`.
 pub fn format_into(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, first_word: usize) {
+    format_with(out, ctx, fmt_addr, ArgCursor::new(ctx, first_word));
+}
+
+/// The `v` spelling: the same format, with the arguments taken from the `va_list` at
+/// `va_list_addr` instead of from this call's own argument area.
+pub fn format_into_va(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, va_list_addr: u32) {
+    format_with(out, ctx, fmt_addr, ArgCursor::over_va_list(ctx, va_list_addr));
+}
+
+fn format_with(out: &mut Vec<u8>, ctx: &GuestCtx, fmt_addr: u32, args: ArgCursor) {
     let fmt = read_cstr_bytes(ctx, fmt_addr);
-    let mut args = ArgCursor::new(ctx, first_word);
+    let mut args = args;
     let mut i = 0;
     while i < fmt.len() {
         let c = fmt[i];

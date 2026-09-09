@@ -131,6 +131,12 @@ pub struct AvcdecSession {
     /// about how much of the movie actually decoded.
     pub submitted: u64,
     pub delivered: u64,
+    /// >>> THE LAST PICTURE THIS SESSION ACTUALLY WROTE, so a call that decodes nothing can
+    /// >>> still leave the title a picture instead of a buffer nobody has ever written.
+    ///
+    /// `(destination, bytes)` of the most recent [`write_picture`] that authored a whole
+    /// surface. See `repeat_last_picture` for why it is kept and what it costs.
+    pub last_written: Option<(u32, std::sync::Arc<[u8]>)>,
 }
 
 /// One block of guest memory the codec engine is lending out.
@@ -156,6 +162,8 @@ pub struct AvcdecState {
     /// One-shot reports.
     pub reported_sizes: bool,
     pub reported_pixel_format: bool,
+    /// Whether the repeated-picture warning has been said - see [`report_repeated_picture`].
+    pub reported_repeat: bool,
     pub reported_decoder: bool,
     /// Pictures handed to the guest so far, which is what `VITASLOP_MOVIE_PICTURE_HASH`
     /// keys its per-picture line on. See [`report_picture_hash`].
@@ -459,6 +467,7 @@ fn do_avcdec_create_decoder(
         ready: std::collections::VecDeque::new(),
         submitted: 0,
         delivered: 0,
+        last_written: None,
     });
     ctx.write_u32(decoder.addr() + ctrl::HANDLE, handle);
     // The frame buffer the caller put in the control block is memory of its own; it is
@@ -616,6 +625,15 @@ fn do_avcdec_decode_stop(
 /// that never appears and nothing downstream would say so.
 fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: u32) -> i32 {
     let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
+    // >>> WAIT FOR THE DECODER TO ANSWER WHAT IT WAS GIVEN, BEFORE READING WHAT IT HAS.
+    //
+    // Without this the loop below drains whatever a HOST DECODER THREAD happened to have
+    // finished at that instant, so `numOfOutput` - which titles branch on - was a function of
+    // wall-clock progress rather than of the input. MEASURED: two identical headless replays of
+    // one recipe, same binary, disagreed on the delivery digest on the FIRST pair and ran 4.2%
+    // different guest work. See `VideoDecode::drain_owed`; the wait ends on RETIREMENT, never
+    // on a clock, and the decoder's own pipeline still decides which pictures come out when.
+    session.decoder.drain_owed();
     loop {
         match session.decoder.poll() {
             Ok(Some(p)) => session.ready.push_back(p),
@@ -683,8 +701,18 @@ fn deliver_pictures(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, array: 
         written += 1;
     }
     ctx.write_u32(array + array_picture::NUM_OF_OUTPUT, written);
+    // Fold this call's answer into the delivery digest BEFORE any substitution: the digest is
+    // about what the DECODER produced, and `repeat_last_picture` below is a host-side repair
+    // that would otherwise hide an empty call from the one instrument that can see it.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut d = DELIVERY_DIGEST.load(Relaxed) ^ u64::from(written);
+        d = d.wrapping_mul(0x0000_0100_0000_01b3);
+        DELIVERY_DIGEST.store(d, Relaxed);
+    }
     if written == 0 {
         EMPTY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        repeat_last_picture(ctx, st, handle, list, capacity);
     }
     let session = st.avcdec.session_mut(handle).expect("caller checked the handle");
     if session.delivered <= 4 || session.submitted.is_multiple_of(200) {
@@ -748,6 +776,21 @@ static PICTURES_OWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// how many of those calls handed back nothing at all. `EMPTY_CALLS / DECODE_CALLS` is the
 /// share of the movie's own frames that had no new picture to show, which is the flicker
 /// stated as a fraction rather than inferred from a rate.
+/// A fold over the SEQUENCE of picture counts this path has handed the guest, in call order.
+///
+/// # Why a digest and not another total
+/// The totals above are rates; this is an IDENTITY. `numOfOutput` is the one value the movie
+/// path returns that the guest branches on, and it is produced by draining whatever a HOST
+/// DECODER THREAD happened to have finished at that instant ([`deliver_pictures`]) - so if two
+/// runs of the same recipe ever hand out a different SEQUENCE of counts, the guest has been
+/// told two different stories and everything downstream of it is a different run.
+///
+/// Comparing end-of-run determinism signatures cannot find that: the sequences can differ on
+/// hundreds of calls and still converge, so a signature agrees most of the time and the
+/// divergence reads as rare and unattributable. This fold disagrees the FIRST time the race
+/// resolves differently, which is what makes it a test instead of a lottery.
+static DELIVERY_DIGEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0xcbf2_9ce4_8422_2325);
 static DECODE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SLOTS_OFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EMPTY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -833,6 +876,11 @@ pub fn pictures_owed() -> u64 {
     PICTURES_OWED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The delivery digest ([`DELIVERY_DIGEST`]): two runs of one recipe must agree on it.
+pub fn delivery_digest() -> u64 {
+    DELIVERY_DIGEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn movie_counters() -> (u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
@@ -907,6 +955,77 @@ fn picture_frame_timing(st: &VitaState) -> Option<(u32, u32)> {
 /// The caller also chose the pixel format and the pitch; both are honoured rather than
 /// overwritten, because the buffer was sized for them and whatever samples that buffer
 /// next was configured for them too.
+/// >>> A CALL THAT DECODES NOTHING STILL LEAVES THE TITLE A PICTURE.
+///
+/// # What was on screen instead, and why `numOfOutput = 0` was not enough
+/// `numOfOutput = 0` is the honest answer to "how many pictures did you decode", and this
+/// function does not change it. What it changes is the BUFFER. This title rotates FOUR
+/// destination buffers and advances its own rotation whether or not a picture came back, so an
+/// empty call puts on screen a block of guest memory that this engine has never written -
+/// whatever the allocator left there. MEASURED on the user's phone, the intro logos:
+/// `112 access units submitted, 102 pictures delivered, 10 still owed`, `10 of 112 calls
+/// (8.9%) handed back NOTHING`, and the screen is a flat mid-grey with one small corner of
+/// real picture. The engine's own cadence report has named this mechanism for a while - "more
+/// than one and an empty call shows a buffer this engine may never have written, which is the
+/// black half of a flicker" - and nothing acted on it.
+///
+/// # Why repeating the last picture is the honest answer and not an invention
+/// A decoder that misses its deadline drops a frame, and a dropped frame shows the previous
+/// one: that is what a title's own buffer already holds on hardware, where the decoder keeps
+/// up and the rotation is always full. What this repeats is a REAL picture this movie
+/// produced, byte for byte, into the buffer the title is about to show. The alternative on
+/// offer is not a better picture, it is uninitialised memory. Nothing is synthesised, no field
+/// of the picture structure is touched, and the count the title reads still says zero.
+///
+/// It copies only when the offered buffer is NOT the one that already holds the picture - the
+/// one-buffer case the report calls out needs nothing done and must not pay a copy per call.
+fn repeat_last_picture(ctx: &mut GuestCtx, st: &mut VitaState, handle: u32, list: u32, capacity: u32) {
+    if list == 0 || capacity == 0 {
+        return;
+    }
+    let Some((last_dest, bytes)) =
+        st.avcdec.session_mut(handle).and_then(|s| s.last_written.clone())
+    else {
+        // Nothing has ever decoded on this session, so there is no picture to repeat and the
+        // buffer keeps whatever it held. This is the FIRST call of a movie, where the title has
+        // not shown anything yet either.
+        return;
+    };
+    let slot = ctx.read_u32(list);
+    if slot == 0 {
+        return;
+    }
+    let dest = ctx.read_u32(slot + picture::FRAME + frame::P_PICTURE_0);
+    if dest == 0 || dest == last_dest {
+        return;
+    }
+    ctx.write_bytes(dest, &bytes);
+    // The renderer reads a movie surface out of its texture cache, not out of guest memory, so
+    // the copy has to be announced there too or the draw binds the stale entry for this
+    // address - the same authoring path the real write above uses.
+    st.author_texture_bytes(ctx, dest, bytes.clone());
+    if let Some(session) = st.avcdec.session_mut(handle) {
+        session.last_written = Some((dest, bytes));
+    }
+    report_repeated_picture(st, dest, last_dest);
+}
+
+/// Say - once - that a picture was repeated into a buffer the decoder could not fill.
+///
+/// A repeat is a DROPPED FRAME of the movie, which is a real shortfall against the console
+/// even though it looks far better than the alternative, so it is a warning and not status.
+fn report_repeated_picture(st: &mut VitaState, dest: u32, from: u32) {
+    if st.avcdec.reported_repeat {
+        return;
+    }
+    st.avcdec.reported_repeat = true;
+    tracing::warn!(
+        target: "vitaslop::movie",
+        dest = format_args!("{dest:#010x}"), from = format_args!("{from:#010x}"),
+        "sceAvcdecDecode: the decoder had NO picture ready, so the last one was copied into the          destination the title offered. That is a DROPPED FRAME of the movie - the console's          decoder would have had one - but the title advances its own buffer rotation whether or          not a picture comes back, so without this it shows a buffer nothing ever wrote. Judge          the shortfall by `pictures delivered` against `access units submitted` in the MOVIE          panel, not by the picture, which now looks continuous either way."
+    );
+}
+
 fn write_picture(
     ctx: &mut GuestCtx,
     st: &mut VitaState,
@@ -945,6 +1064,11 @@ fn write_picture(
         };
         if let Some(bytes) = authored {
             report_picture_hash(st, &bytes, pitch, height);
+            // Kept BEFORE the move into the cache, so an empty call can lay the same surface
+            // down again somewhere else. See `AvcdecSession::last_written`.
+            if let Some(session) = st.avcdec.session_mut(handle) {
+                session.last_written = Some((dest, bytes.clone()));
+            }
             st.author_texture_bytes(ctx, dest, bytes);
         }
     }

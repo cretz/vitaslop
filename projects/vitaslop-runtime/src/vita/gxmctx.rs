@@ -179,6 +179,11 @@ pub mod off {
     /// their fog and material block is container 0 at sa[0] - and its bind was previously only
     /// warned about and dropped. Appended last so every pre-existing offset keeps its value.
     pub const FRAGMENT_UNIFORM_BUFFERS: u32 = FRONT_DEPTH_BIAS_UNITS + 4;
+    /// `sceGxmSetBackStencilRef(context, sref)` - the two-sided counterpart of
+    /// [`FRONT_STENCIL_REF`]. Appended last, like every field added after the original
+    /// layout, so no offset a running title already holds moves.
+    pub const BACK_STENCIL_REF: u32 =
+        FRAGMENT_UNIFORM_BUFFERS + (super::MAX_UNIFORM_BUFFERS as u32) * 4;
 }
 
 /// Word offsets WITHIN a `VERTEX_UNIFORM` / `FRAGMENT_UNIFORM` record. Both stages have
@@ -225,7 +230,7 @@ pub const MAX_UNIFORM_BUFFERS: usize = 14;
 
 /// Total bytes the block occupies. Every guest context must have at least this much host
 /// memory behind it.
-pub const BYTES: u32 = off::FRAGMENT_UNIFORM_BUFFERS + (MAX_UNIFORM_BUFFERS as u32) * 4;
+pub const BYTES: u32 = off::BACK_STENCIL_REF + 4;
 
 /// `SCE_GXM_MINIMUM_CONTEXT_HOST_MEM_SIZE` (vitasdk `gxm.h`): the smallest `hostMem` GXM
 /// accepts, and therefore the smallest a conforming title can pass.
@@ -602,6 +607,7 @@ pub fn store(ctx: &mut GuestCtx, context: u32, rs: &crate::capture::RenderState)
     w(off::BACK_STENCIL_OP_DEPTH_PASS, rs.back_stencil_op_depth_pass);
     w(off::BACK_STENCIL_COMPARE_MASK, rs.back_stencil_compare_mask);
     w(off::BACK_STENCIL_WRITE_MASK, rs.back_stencil_write_mask);
+    w(off::BACK_STENCIL_REF, rs.back_stencil_ref);
     w(off::VIEWPORT_ENABLE, rs.viewport_enable);
     for (i, v) in rs.viewport.iter().enumerate() {
         w(off::VIEWPORT + i as u32 * 4, v.to_bits());
@@ -807,6 +813,7 @@ impl<'a> Block<'a> {
         back_stencil_op_depth_pass: r(off::BACK_STENCIL_OP_DEPTH_PASS),
         back_stencil_compare_mask: r(off::BACK_STENCIL_COMPARE_MASK) & 0xff,
         back_stencil_write_mask: r(off::BACK_STENCIL_WRITE_MASK) & 0xff,
+        back_stencil_ref: r(off::BACK_STENCIL_REF),
         viewport_enable: r(off::VIEWPORT_ENABLE),
         viewport,
         region_clip_mode: r(off::REGION_CLIP_MODE),
@@ -849,6 +856,7 @@ pub(crate) const SCALARS: &[(u32, &str)] = &[
     (off::BACK_STENCIL_OP_DEPTH_PASS, "back_stencil_op_depth_pass"),
     (off::BACK_STENCIL_COMPARE_MASK, "back_stencil_compare_mask"),
     (off::BACK_STENCIL_WRITE_MASK, "back_stencil_write_mask"),
+    (off::BACK_STENCIL_REF, "back_stencil_ref"),
     (off::VIEWPORT_ENABLE, "viewport_enable"),
     (off::REGION_CLIP_MODE, "region_clip_mode"),
     (off::FRONT_VISIBILITY_TEST_ENABLE, "front_visibility_test_enable"),

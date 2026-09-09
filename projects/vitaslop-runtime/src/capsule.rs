@@ -42,7 +42,13 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 /// Magic + format version. Bump the version on ANY field-order change.
-const MAGIC: &[u8; 8] = b"VSCAPS\x00\x01";
+///
+/// Version 2 added the BACK-face stencil REFERENCE (`sceGxmSetBackStencilRef`) to the render
+/// state block. A version-1 capsule cannot be read as one of these - the block grew by a word
+/// - and a capsule is a scratch artifact recaptured in seconds, so the version is bumped
+/// rather than the reader taught two layouts. Version 3 added the FRAGMENT stage's
+/// guest-memory windows beside the vertex stage's.
+const MAGIC: &[u8; 8] = b"VSCAPS\x00\x03";
 
 /// What a capsule cannot answer. Printed by the replay tool every time - a limitation nobody
 /// reads is a limitation nobody applies.
@@ -225,6 +231,7 @@ fn w_state(o: &mut impl Write, s: &RenderState) -> io::Result<()> {
         s.back_stencil_op_depth_pass,
         s.back_stencil_compare_mask,
         s.back_stencil_write_mask,
+        s.back_stencil_ref,
         s.viewport_enable,
     ] {
         w_u32(o, v)?;
@@ -267,6 +274,7 @@ fn r_state(i: &mut impl Read) -> io::Result<RenderState> {
     s.back_stencil_op_depth_pass = r_u32(i)?;
     s.back_stencil_compare_mask = r_u32(i)?;
     s.back_stencil_write_mask = r_u32(i)?;
+    s.back_stencil_ref = r_u32(i)?;
     s.viewport_enable = r_u32(i)?;
     s.viewport = r_f32s::<6>(i)?;
     s.region_clip_mode = r_u32(i)?;
@@ -345,6 +353,11 @@ impl Capsule {
         w_u32(o, d.frag_sa_addr)?;
         w_u32(o, d.mem_windows.len() as u32)?;
         for (addr, bytes) in &d.mem_windows {
+            w_u32(o, *addr)?;
+            w_bytes(o, bytes)?;
+        }
+        w_u32(o, d.frag_mem_windows.len() as u32)?;
+        for (addr, bytes) in &d.frag_mem_windows {
             w_u32(o, *addr)?;
             w_bytes(o, bytes)?;
         }
@@ -433,6 +446,12 @@ impl Capsule {
             let addr = r_u32(i)?;
             mem_windows.push((addr, r_bytes(i)?));
         }
+        let n = r_u32(i)? as usize;
+        let mut frag_mem_windows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let addr = r_u32(i)?;
+            frag_mem_windows.push((addr, r_bytes(i)?));
+        }
         let shader_expanded = r_u8(i)? != 0;
 
         Ok(Capsule {
@@ -459,6 +478,7 @@ impl Capsule {
                 frag_sa,
                 frag_sa_addr,
                 mem_windows,
+                frag_mem_windows,
                 shader_expanded,
             },
             width,
@@ -567,6 +587,7 @@ mod tests {
             frag_sa: Arc::from(vec![0xDDu8; 8]),
             frag_sa_addr: 0x882c_aa80,
             mem_windows: vec![(0x882c_9780, vec![1, 2, 3, 4]), (0x8e1d_2fb0, vec![5, 6])],
+            frag_mem_windows: vec![(0x8b40_0000, vec![9, 8, 7, 6])],
             shader_expanded: true,
         };
         let c = Capsule {
@@ -754,6 +775,7 @@ pub fn maybe_capture(d: &Draw) {
     d.vert_sa.hash(&mut h);
     d.frag_sa.hash(&mut h);
     d.mem_windows.hash(&mut h);
+    d.frag_mem_windows.hash(&mut h);
     d.vertices.hash(&mut h);
     let inputs = h.finish();
 

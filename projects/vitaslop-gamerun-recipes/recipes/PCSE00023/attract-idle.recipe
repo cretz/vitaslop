@@ -1,0 +1,18 @@
+@title  PCSE00023 - NO INPUT: sit on the title screen and let the demo fight run
+@game   PCSE00023
+@shot-every 100000
+
+# The NEGATIVE CONTROL for every input-driven recipe on this title: whatever reaches the
+# screen here is what the title chose to show, with nothing this project pressed.
+#
+0: @todo no @assert yet - judged by its shots.
+
+# The user's own repro for the stray flat shapes, in their words: "when you stay at main
+# screen and don't press anything" and watch the demo fight. So this recipe presses NOTHING -
+# the logos play out, the title screen sits, and the attract-mode demo fight starts on its own.
+# `mk-explore1.recipe` cannot serve this: it taps cross fifteen times through the logo stretch
+# and so walks into a different screen entirely.
+
+0: @section boot
+2400: @section attract
+6000: @note no input at any point - whatever is on screen is what the title chose to show

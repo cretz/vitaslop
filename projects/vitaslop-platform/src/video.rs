@@ -198,6 +198,30 @@ pub trait VideoDecode: Send {
     /// arrive", never a promise - see [`VideoDecoder::owes_frames`].
     fn owes_frames(&self) -> bool;
 
+    /// Block until every access unit already submitted has been ANSWERED by the decoder, so
+    /// that a following [`poll`](Self::poll) sees a queue whose contents depend only on the
+    /// input given and not on how far a host thread happened to get.
+    ///
+    /// # This is what makes the movie path deterministic, and it is not optional
+    /// `poll` drains whatever a decoder thread has finished at that instant, and the count of
+    /// pictures it yields becomes the guest's `numOfOutput` - a value titles BRANCH ON. So the
+    /// guest's control flow was a function of host thread progress. MEASURED: two identical
+    /// headless replays of one recipe, same binary, disagreed on the delivery digest on the
+    /// FIRST pair and executed **4.2% different guest work** (fuel 96.5 G against 92.5 G).
+    /// That is the whole of the "replay is not deterministic in gameplay" story - it read as
+    /// rare only because an end-of-run signature comparison notices a divergence solely when it
+    /// survives to the end.
+    ///
+    /// Waiting on RETIREMENT rather than on a clock is what keeps this deterministic: every
+    /// submit is retired exactly once, so the wait's end condition is a function of the input.
+    /// A wall-clock timeout here would put the nondeterminism straight back.
+    ///
+    /// The decoder's own PIPELINE is untouched - it still holds pictures back and emits them
+    /// when its reordering says to - because that is a property of the decoder and the
+    /// bitstream, not of thread timing. The default is a no-op, which is correct for a
+    /// synchronous decoder that has already answered by the time `submit` returns.
+    fn drain_owed(&mut self) {}
+
     /// Discard everything for a seek.
     fn reset(&mut self) -> Result<(), VideoError>;
 
@@ -282,6 +306,9 @@ impl VideoDecode for VideoDecoder {
 pub struct ThreadedDecode {
     work: Option<std::sync::mpsc::Sender<Job>>,
     shared: std::sync::Arc<std::sync::Mutex<Answers>>,
+    /// Signalled by the worker every time it retires a job, so [`ThreadedDecode::drain_owed`]
+    /// can wait for an ANSWER rather than for a length of time.
+    answered: std::sync::Arc<std::sync::Condvar>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// Access units handed over and not yet answered. The whole of `owes_frames` - and it is
     /// deliberately maintained HERE rather than asked of the worker: a question asked across a
@@ -331,7 +358,9 @@ impl ThreadedDecode {
             detail: decoder.describe(),
             ..Answers::default()
         }));
+        let answered = std::sync::Arc::new(std::sync::Condvar::new());
         let worker_shared = shared.clone();
+        let worker_answered = answered.clone();
         let worker = std::thread::Builder::new()
             .name("vitaslop-video".to_string())
             .spawn(move || {
@@ -354,6 +383,15 @@ impl ThreadedDecode {
                     };
                     if let Err(e) = result {
                         answers.failed.get_or_insert(e.to_string());
+                        // A failed job still ANSWERS the submit that is waiting on it - retire
+                        // it, or `drain_owed` waits for a picture that is never coming.
+                        if owed {
+                            match answers.retired.iter_mut().find(|(e, _)| *e == epoch) {
+                                Some((_, n)) => *n += 1,
+                                None => answers.retired.push((epoch, 1)),
+                            }
+                        }
+                        worker_answered.notify_all();
                         continue;
                     }
                     drop(answers);
@@ -384,12 +422,17 @@ impl ThreadedDecode {
                             None => a.retired.push((epoch, 1)),
                         }
                     }
+                    // The answer is complete: wake anyone waiting for this submit to be
+                    // retired. Notified while the lock is HELD, which is what makes the
+                    // wait-loop's condition and this update indivisible.
+                    worker_answered.notify_all();
                 }
             })
             .expect("a decoder thread");
         ThreadedDecode {
             work: Some(work_tx),
             shared,
+            answered,
             worker: Some(worker),
             outstanding: 0,
             epoch: 0,
@@ -450,6 +493,34 @@ impl VideoDecode for ThreadedDecode {
 
     fn owes_frames(&self) -> bool {
         self.outstanding > 0
+    }
+
+    /// Wait until the worker has retired every submit this decoder is still owed an answer
+    /// for. See the trait method for why the movie path is wrong without it.
+    fn drain_owed(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        let Ok(mut a) = self.shared.lock() else { return };
+        loop {
+            // Apply everything retired under the CURRENT epoch. A reset bumps the epoch and
+            // zeroes `outstanding`, so a pre-reset answer can never satisfy this wait.
+            if let Some(i) = a.retired.iter().position(|(e, _)| *e == self.epoch) {
+                let (_, n) = a.retired.remove(i);
+                self.outstanding = self.outstanding.saturating_sub(n);
+            }
+            a.retired.retain(|(e, _)| *e >= self.epoch);
+            // A failed decoder answers nothing further; `poll` reports the failure.
+            if self.outstanding == 0 || a.failed.is_some() {
+                return;
+            }
+            a = match self.answered.wait(a) {
+                Ok(a) => a,
+                // The worker panicked. `poll` turns that into a stream error; hanging here
+                // instead would be the one outcome worse than a wrong picture.
+                Err(_) => return,
+            };
+        }
     }
 
     fn reset(&mut self) -> Result<(), VideoError> {

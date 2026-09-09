@@ -86,6 +86,28 @@ pub(super) fn change_thread_vfp_exception(_clear_mask: i32, _set_mask: i32) -> i
     0
 }
 
+/// int sceKernelCheckCallback(void)
+///
+/// Run the CALLING thread's pending kernel callbacks and report how many ran. A title puts
+/// it in its main loop so that callbacks it registered with `sceKernelCreateCallback` -
+/// power/exit notifications, its own `sceKernelNotifyCallback` posts - are delivered at a
+/// point of its choosing rather than inside an arbitrary wait.
+///
+/// **ZERO here is the complete answer, not a stub.** A callback can only exist if it was
+/// created, and `sceKernelCreateCallback` has no handler in this engine at all: a title that
+/// makes one gets the unimplemented-NID hard-fail naming it, by the same rule as every other
+/// unhandled call. So a title that reaches HERE has no callback object, nothing can be
+/// pending for it, and "none ran" is what the kernel would report. There is no silent gap
+/// behind this: the moment a title actually uses the callback surface, the run stops and
+/// says so.
+///
+/// The service-state pumps (`sceNpCheckCallback`, `sceNetCtlCheckCallback`) are a different
+/// mechanism with their own registration and their own deliveries - see `vita::services`.
+#[hostcall]
+pub(super) fn check_callback(_st: &mut VitaState) -> i32 {
+    0
+}
+
 /// int sceKernelChangeThreadPriority(SceUID thid, int priority)
 ///
 /// Retarget a thread's scheduler priority; `thid` 0 is the calling thread. Returns
@@ -125,6 +147,39 @@ pub(super) fn delay_thread(ctx: &mut GuestCtx, st: &mut VitaState) -> SvcOutcome
     if delay_us <= 1 {
         return SvcOutcome::Reschedule;
     }
+    delay_census(delay_us, ctx.regs[14]);
     st.sleep_park(delay_us as u64);
     SvcOutcome::Block
+}
+
+/// Diagnostic (`VITASLOP_DELAY_CENSUS=1`): every `sceKernelDelayThread` tallied by (call site,
+/// requested microseconds), printed by [`dump_delay_census`] at the end of a run.
+///
+/// A polling thread's cost is `iterations x crossings`, and the iteration count is decided by
+/// how long it asked to sleep - which is the ONE number the call-site profiler cannot show.
+/// Without it, "this loop runs 8,000 times a second" reads the same whether the title asked for
+/// a 125 us sleep or asked for a millisecond and this scheduler woke it eight times too often.
+/// Those are opposite defects with opposite fixes.
+static DELAY_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<(u32, u32), u64>>> =
+    std::sync::Mutex::new(None);
+
+fn delay_census(delay_us: u32, lr: u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::knobs::flag("VITASLOP_DELAY_CENSUS")) {
+        return;
+    }
+    let mut g = DELAY_HIST.lock().unwrap_or_else(|e| e.into_inner());
+    *g.get_or_insert_with(Default::default).entry((lr, delay_us)).or_insert(0) += 1;
+}
+
+/// Print what [`delay_census`] gathered, most-called first. A no-op unless the knob is set.
+pub fn dump_delay_census(top: usize) {
+    let g = DELAY_HIST.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(hist) = g.as_ref() else { return };
+    let mut rows: Vec<_> = hist.iter().map(|(&(lr, us), &n)| (lr, us, n)).collect();
+    rows.sort_by_key(|&(_, _, n)| std::cmp::Reverse(n));
+    eprintln!("--- sceKernelDelayThread by (call site, requested us): count ---");
+    for (lr, us, n) in rows.into_iter().take(top) {
+        eprintln!("  {n:>10}  {us:>8} us @ lr={lr:#010x}");
+    }
 }

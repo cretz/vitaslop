@@ -360,12 +360,32 @@ pub fn link(mut modules: Vec<Module>) -> Result<LinkedProgram, vitaslop_loader::
             if let Some(&target) = exports.get(&(imp.library_nid, imp.func_nid)) {
                 // The export address carries the Thumb bit (any ARM function
                 // pointer does); the transpiler decodes at the even address.
+                tracing::debug!(
+                    target: "vitaslop::imports",
+                    stub = format_args!("{:#010x}", imp.stub_addr),
+                    target = format_args!("{:#010x}", target & !1),
+                    nid = format_args!("{:#010x}", imp.func_nid),
+                    name = crate::nid::name(imp.func_nid),
+                    "intermodule stub"
+                );
                 redirects.push(Redirect {
                     addr: imp.stub_addr,
                     target: target & !1,
                     thumb: target & 1 == 1,
                 });
             } else {
+                // The STUB ADDRESS beside the NID, because that is the direction a
+                // disassembly asks in: guest code calls `blx 0x817cd35c` and the only
+                // question is which kernel function that is. Without it, naming one stub
+                // costs a run per guess [[vitaslop-an-inventory-beats-a-serial-hunt]].
+                tracing::debug!(
+                    target: "vitaslop::imports",
+                    stub = format_args!("{:#010x}", imp.stub_addr),
+                    library = format_args!("{:#010x}", imp.library_nid),
+                    nid = format_args!("{:#010x}", imp.func_nid),
+                    name = crate::nid::name(imp.func_nid),
+                    "import stub"
+                );
                 externs.push(Extern { addr: imp.stub_addr, import: imports.len() as u32 });
                 imports.push((imp.library_nid, imp.func_nid));
             }

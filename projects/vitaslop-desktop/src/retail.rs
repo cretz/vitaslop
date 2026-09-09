@@ -236,7 +236,11 @@ impl RetailGuest {
             .map(|m| loader::load(&m.elf))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("load module: {e:?}"))?;
-        let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
+        // This run stands up the THREADED scheduler, so the host mirror block exists and is
+    // refreshed at its resume point - which is what lets the RTC tick be read inline.
+    // See `vitaslop_runtime::vita::set_preemptive_linking`.
+    vitaslop_runtime::vita::set_preemptive_linking(true);
+    let linked = link(modules).map_err(|e| format!("link: {e:?}"))?;
 
         let world: Box<dyn World + Send> = match recipe {
             Some(text) => {
@@ -828,7 +832,7 @@ impl RetailGfx {
             Some((scenes, (dw, dh), presents)) => {
                 let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
                 self.gxm.set_presented(presents);
-                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR);
+                self.gxm.encode_chain(&self.device, &self.queue, &mut encoder, &view, &self.depth, &built, dw, dh, fw, fh, CLEAR, Some(&frame.texture));
             }
             None => {
                 let c = wgpu::Color { r: 11.0 / 255.0, g: 11.0 / 255.0, b: 18.0 / 255.0, a: 1.0 };
@@ -1608,6 +1612,22 @@ pub fn headless_check(
             vitaslop_runtime::host::QUANTUM_FUEL,
         );
     }
+    // >>> THE HOST-DECODER DELIVERY DIGEST, next to the fuel it can move.
+    //
+    // `numOfOutput` is drained from a HOST DECODER THREAD, so the count the guest is handed on
+    // any one call depends on how far that thread got in wall time - and the guest branches on
+    // it. Two runs of one recipe that disagree here have been told two different stories, and
+    // the fuel total above is then expected to differ for that reason and not for a change
+    // under test. It is the cheap first check on any two-run comparison of this title, because
+    // it disagrees the FIRST time the race resolves differently rather than only when the
+    // difference happens to survive to the end.
+    let (au, pics, calls, _) = vitaslop_runtime::vita::avcdec::movie_counters();
+    if calls > 0 {
+        println!(
+            "headless: movie delivery digest {:#018x} over {calls} calls ({au} access units,              {pics} pictures). TWO RUNS OF ONE RECIPE MUST AGREE ON THIS.",
+            vitaslop_runtime::vita::avcdec::delivery_digest(),
+        );
+    }
     // The emitted work counter against wasmtime's own metering, over the same intervals.
     // Both engines preempt on that counter and the game clock is billed from it, and
     // nothing in a BROWSER run can say whether it agrees with a real engine - this is
@@ -1619,6 +1639,20 @@ pub fn headless_check(
             sw as f64 / wt.max(1) as f64,
         );
     }
+    // >>> WHICH GUEST INSTRUCTION MAKES THE HOST CALLS, when the profiler is armed.
+    //
+    // A phase that spends its frame in host calls says so in the per-NID tally, and the tally
+    // then says nothing about WHERE - a title's lock traffic is thousands of calls to one NID
+    // from a handful of call sites, and only the site names the loop to fix
+    // [[vitaslop-rank-the-loop-not-the-nid]]. `VITASLOP_DBG_CALLSITES=1` keys the count by
+    // (NID, guest return address); this is what prints it at the end of a headless run, which
+    // is the only place a recipe-pinned window can be read off.
+    if vitaslop_runtime::vita::callsite_profiling_on() {
+        vitaslop_runtime::vita::dump_call_sites(400);
+    }
+    // ...and how long each of those sleeps ASKED for, which is what decides how many of them
+    // a polling thread makes. See `vitaslop_runtime::vita::threadmgr::delay_census`.
+    vitaslop_runtime::vita::threadmgr::dump_delay_census(30);
     // Zero unless the engine suspended a fiber without running any of our code, which on
     // a build with the emitted work check should be impossible.
     let stray = vitaslop_native::threaded::unattributed_suspends();

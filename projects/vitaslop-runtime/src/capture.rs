@@ -88,6 +88,10 @@ pub struct RenderState {
     pub back_stencil_op_depth_pass: u32,
     pub back_stencil_compare_mask: u32,
     pub back_stencil_write_mask: u32,
+    /// The BACK face's stencil REFERENCE value (`sceGxmSetBackStencilRef`). Separate from
+    /// the func block because GXM sets it with its own call, exactly as it does for the
+    /// front face - a title changes the reference per draw while the comparison stays put.
+    pub back_stencil_ref: u32,
     pub viewport_enable: u32,
     /// `xOffset, xScale, yOffset, yScale, zOffset, zScale` from sceGxmSetViewport.
     pub viewport: [f32; 6],
@@ -134,6 +138,7 @@ impl Default for RenderState {
             back_stencil_op_depth_pass: 0,        // SCE_GXM_STENCIL_OP_KEEP
             back_stencil_compare_mask: 0xff,
             back_stencil_write_mask: 0xff,
+            back_stencil_ref: 0,
             viewport_enable: 0x0000_0000,         // SCE_GXM_VIEWPORT_ENABLED
             viewport: [0.0; 6],
             region_clip_mode: 0x0000_0000,        // SCE_GXM_REGION_CLIP_NONE
@@ -531,6 +536,10 @@ pub struct Draw {
     /// rather than feed fabricated bytes. See `vitaslop_gxp_shader::module::MemWindow` and
     /// `VitaState::capture_mem_windows`.
     pub mem_windows: Vec<(u32, Vec<u8>)>,
+    /// The FRAGMENT program's own memory windows, laid out for its `gxp_fmem` binding and
+    /// snapshotted from the FRAGMENT uniform-buffer table. Empty for almost every program;
+    /// one baseball title's whole menu is drawn by a pair that needs it.
+    pub frag_mem_windows: Vec<(u32, Vec<u8>)>,
     /// The vertex program SYNTHESIZES this draw's primitive rather than reading it: the
     /// stream holds one record per sprite (a centre plus an expansion basis - a
     /// scale/rotation, or an explicit right/up billboard axis pair) and the shader builds
@@ -1491,6 +1500,7 @@ mod extent_tests {
             frag_sa: std::sync::Arc::from(&[][..]),
             frag_sa_addr: 0,
             mem_windows: Vec::new(),
+            frag_mem_windows: Vec::new(),
             shader_expanded: false,
         };
         Scene {

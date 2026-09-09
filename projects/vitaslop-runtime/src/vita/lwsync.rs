@@ -265,19 +265,35 @@ const NOT_INLINABLE: &[(u32, &str)] = &[
 /// than one - and every one of those is a case only the host can settle. That split is the
 /// device's own: on hardware this call is userspace until it contends.
 ///
-/// The `lockCount`/`pTimeout` arguments follow the heavyweight mutex's handling: a single
-/// acquisition, and the timeout is not yet modeled for either mutex kind. The inline form
-/// refuses any count but one for exactly that reason, so the two paths agree wherever both
-/// can run.
+/// `lockCount` follows the heavyweight mutex's handling: a single acquisition. The inline
+/// form refuses any count but one for exactly that reason, so the two paths agree wherever
+/// both can run.
+///
+/// # The TIMEOUT is real, and ignoring it was a hang
+/// `pTimeout` points at a microsecond timeout, or is null for "wait forever". A title that
+/// passes one has a path for the lock FAILING, and parking such a caller forever turns a
+/// wait it meant to abandon into a deadlock. MEASURED on a retail title: its display thread
+/// takes this mutex and then idles inside its own work loop, so the timed lock its MAIN
+/// thread uses to post work into that loop is the only way either of them ever moves - with
+/// the timeout dropped, the title froze on its title screen at the same frame every run,
+/// main parked on a mutex the display thread would not release until main posted work.
+///
+/// A timeout of ZERO means do not wait at all, which is `sceKernelTryLockLwMutex`'s answer
+/// (`ERR_LW_MUTEX_FAILED_TO_OWN`), not an infinite wait - reading it as one is the same
+/// mistake as ignoring the pointer, one value narrower.
 pub(super) fn lock_lw_mutex(ctx: &mut GuestCtx, st: &mut VitaState, try_lock: bool) -> SvcOutcome {
     let work = resolve_mutex(ctx, st, ctx.arg(0));
-    if try_lock && st.lwmutex_contended(ctx, work) {
+    let timeout_ptr = ctx.arg(2);
+    let timeout_us = (!try_lock && timeout_ptr != 0).then(|| ctx.read_u32(timeout_ptr));
+    if (try_lock || timeout_us == Some(0)) && st.lwmutex_contended(ctx, work) {
         ctx.ret(ERR_LW_MUTEX_FAILED_TO_OWN);
         return SvcOutcome::Continue;
     }
-    // Success returns 0 whether acquired now or after a wake by the releasing thread.
+    // Success returns 0 whether acquired now or after a wake by the releasing thread. A
+    // caller that ends up parked with a deadline has this overwritten with WAIT_TIMEOUT
+    // when the deadline passes (`VitaState::advance_time_to`).
     ctx.ret(0);
-    let acquired = st.lwmutex_lock(ctx, work);
+    let acquired = st.lwmutex_lock(ctx, work, timeout_us.filter(|&us| us != 0));
     // >>> WHAT THIS TRACE CAN AND CANNOT SEE. Only the SLOW half arrives here, so an
     // uncontended take - the common case, emitted as `InlineOp::LwMutexLock` straight into guest
     // code - produces NO trace line at all. An empty lwmutex log therefore means "never

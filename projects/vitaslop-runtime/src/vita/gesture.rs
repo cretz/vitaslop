@@ -660,19 +660,62 @@ pub(super) fn get_touch_event_by_index(
             SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT
         }
         Some(&(id, x, y)) => {
-            note_position_only_event();
-            // Zero only as far as the established fields reach - see EVENT_WRITE_BYTES.
-            ctx.write_bytes(event.addr(), &[0u8; EVENT_WRITE_BYTES as usize]);
-            let state = event_state_bits();
-            if state != 0 {
-                ctx.write_bytes(event.addr() + EVENT_STATE_OFF, &state.to_le_bytes());
-            }
-            ctx.write_bytes(event.addr() + EVENT_PRIMITIVE_ID_OFF, &(id as u16).to_le_bytes());
-            if let Some(k) = event_kind() {
-                ctx.write_bytes(event.addr() + EVENT_KIND_OFF, &[k]);
-            }
-            ctx.write_bytes(event.addr() + EVENT_X_OFF, &x.to_le_bytes());
-            ctx.write_bytes(event.addr() + EVENT_Y_OFF, &y.to_le_bytes());
+            write_touch_event(ctx, event.addr(), id, x, y);
+            0
+        }
+    }
+}
+
+/// Fill a `SceSystemGestureTouchEvent` for one reported point. The single spelling both
+/// `GetTouchEventBy*` calls use, so the by-index and by-id readings of one event cannot
+/// drift apart.
+fn write_touch_event(ctx: &mut GuestCtx, event: u32, id: u8, x: i16, y: i16) {
+    note_position_only_event();
+    // Zero only as far as the established fields reach - see EVENT_WRITE_BYTES.
+    ctx.write_bytes(event, &[0u8; EVENT_WRITE_BYTES as usize]);
+    let state = event_state_bits();
+    if state != 0 {
+        ctx.write_bytes(event + EVENT_STATE_OFF, &state.to_le_bytes());
+    }
+    ctx.write_bytes(event + EVENT_PRIMITIVE_ID_OFF, &(id as u16).to_le_bytes());
+    if let Some(k) = event_kind() {
+        ctx.write_bytes(event + EVENT_KIND_OFF, &[k]);
+    }
+    ctx.write_bytes(event + EVENT_X_OFF, &x.to_le_bytes());
+    ctx.write_bytes(event + EVENT_Y_OFF, &y.to_le_bytes());
+}
+
+/// `int sceSystemGestureGetTouchEventByEventID(const SceSystemGestureTouchRecognizer *r,
+///                                            SceUInt32 eventID, SceSystemGestureTouchEvent *ev)`
+///
+/// The by-ID sibling of [`get_touch_event_by_index`]: the same event, addressed by the id it
+/// carries rather than by its position in this frame's list. A title uses it to follow ONE
+/// gesture across frames, where the index would move as other gestures start and end.
+///
+/// **NO CALL SITE FOR THIS ONE HAS BEEN OBSERVED YET** - a title imports it, which is why it
+/// is implemented, but nothing has yet run through it. The argument shape is therefore taken
+/// from its sibling (the recognizer, the selector, the out-buffer), which is the shape every
+/// other `GetTouchEventBy*` in this library has, and it fills the buffer through the SAME
+/// path, so the two cannot report an event differently.
+///
+/// The id matched is the one [`get_touch_event_by_index`] writes at
+/// [`EVENT_PRIMITIVE_ID_OFF`] - the touch point's own id, which is what makes it stable
+/// across frames. An id no live point owns is an error rather than a silently empty event:
+/// the caller is asking about a gesture that has ended, and it needs to be told so.
+#[hostcall]
+pub(super) fn get_touch_event_by_event_id(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    recognizer: Ptr,
+    event_id: u32,
+    event: Ptr,
+) -> i32 {
+    let events = recognizer_events(ctx, st, recognizer.addr());
+    match events.iter().find(|&&(id, _, _)| id as u32 == event_id) {
+        None => SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT,
+        Some(_) if event.is_null() => SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT,
+        Some(&(id, x, y)) => {
+            write_touch_event(ctx, event.addr(), id, x, y);
             0
         }
     }

@@ -153,6 +153,26 @@ pub(super) fn shutdown(st: &mut VitaState, s: i32, _how: i32) -> i32 {
     }
 }
 
+/// int sceNetSocketAbort(int s, int flags)
+///
+/// Unblock everything waiting on a socket, so a worker parked in a receive can be torn
+/// down. Nothing here ever blocks on a socket - every call that would need a peer fails at
+/// once with the link down - so there is never a wait for this to break, and the abort has
+/// genuinely done all there is to do. The descriptor is still CHECKED, because aborting one
+/// that does not exist is a caller error the console reports and this engine's socket table
+/// can see.
+///
+/// `flags` selects which directions to abort (send, receive, or both). With no blocked
+/// operation in either direction the selection changes nothing, which is why it is not read.
+#[hostcall]
+pub(super) fn socket_abort(st: &mut VitaState, s: i32, _flags: i32) -> i32 {
+    if st.net_socket_exists(s) {
+        0
+    } else {
+        fail(st, SCE_NET_EBADF)
+    }
+}
+
 /// int sceNetGetsockname(int s, SceNetSockaddr *name, unsigned int *namelen)
 ///
 /// Reads back what `sceNetBind` recorded. An unbound socket reports the wildcard
@@ -417,69 +437,6 @@ pub(super) fn dump_read(st: &mut VitaState, _id: i32, _buf: Ptr, _len: i32, _pfl
     fail(st, SCE_NET_EBADF)
 }
 
-// ============================ SceNetAdhocMatching ============================
-//
-// Ad-hoc matchmaking over the local wireless link: it finds nearby consoles running the
-// same title and negotiates a session. There is no wireless link here and there are no
-// nearby consoles, which is the ordinary case for a player sitting alone - every title
-// with an ad-hoc mode ships the "nobody found" path, and this is that state, not a
-// failure. `Term` and the per-context calls below therefore behave as they would with
-// the library up and NO peers: teardown succeeds, the member list is empty, and
-// anything naming a peer reports that it is not there.
-
-/// int sceNetAdhocMatchingTerm(void)
-///
-/// Teardown succeeds. A title that calls Term in its shutdown path (or after a failed
-/// Init) must not be left thinking the library is still up.
-#[hostcall]
-pub(super) fn adhoc_matching_term(st: &mut VitaState) -> i32 {
-    tracing::info!(
-        target: "vitaslop::status",
-        thread = st.current_thread(),
-        "SceNetAdhocMatching: no wireless link and no nearby consoles - matchmaking finds no peers"
-    );
-    0
-}
-
-/// int sceNetAdhocMatchingGetMembers(int id, unsigned int *members_count,
-///     struct SceNetAdhocMatchingMember *members)
-///
-/// ZERO members, and the count is written even when the buffer is null - that is the
-/// two-call idiom this API is used with (ask the count, allocate, ask again), and a
-/// title that skips the write would allocate from a stale number.
-#[hostcall]
-pub(super) fn adhoc_matching_get_members(
-    ctx: &mut GuestCtx,
-    _st: &mut VitaState,
-    _id: i32,
-    count: Ptr,
-    _members: Ptr,
-) -> i32 {
-    if !count.is_null() {
-        ctx.write_u32(count.addr(), 0);
-    }
-    0
-}
-
-/// int sceNetAdhocMatchingSetHelloOpt(int id, int opt_len, void *opt)
-///
-/// The "hello" payload advertised to peers. There are no peers to advertise to, so the
-/// payload is accepted and goes nowhere - the same shape as writing to a voice input
-/// port with no session.
-#[hostcall]
-pub(super) fn adhoc_matching_set_hello_opt(_st: &mut VitaState, _id: i32, _len: i32, _opt: Ptr) -> i32 {
-    0
-}
-
-/// int sceNetAdhocMatchingCancelTarget(int id, SceNetInAddr *target)
-///
-/// Cancels a pending request to one peer. No peer was ever a target, so there is
-/// nothing outstanding to cancel and the call has already achieved its purpose.
-#[hostcall]
-pub(super) fn adhoc_matching_cancel_target(_st: &mut VitaState, _id: i32, _target: Ptr) -> i32 {
-    0
-}
-
 /// int sceNetResolverDestroy(int rid)
 #[hostcall]
 pub(super) fn resolver_destroy(st: &mut VitaState, rid: i32) -> i32 {
@@ -658,6 +615,99 @@ pub(super) fn adhoc_matching_set_started(ctx: &mut GuestCtx, st: &mut VitaState,
 #[hostcall]
 pub(super) fn adhoc_matching_delete(st: &mut VitaState, id: i32) -> i32 {
     if st.adhoc_matching_delete(id) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingTerm(void)
+///
+/// Hand the pool back and drop every context with it (see
+/// [`VitaState::adhoc_matching_term`] for why the contexts go too). A term before an init is
+/// the one way this can fail, and it is a caller error the console reports.
+#[hostcall]
+pub(super) fn adhoc_matching_term(st: &mut VitaState) -> i32 {
+    if st.adhoc_matching_term() {
+        tracing::info!(
+            target: "vitaslop::status",
+            thread = st.current_thread(),
+            "SceNetAdhocMatching: no wireless link and no nearby consoles - matchmaking found no peers"
+        );
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_NOT_INITIALIZED
+    }
+}
+
+/// int sceNetAdhocMatchingSendData(int id, SceNetInAddr *addr, int data_len, void *data)
+///
+/// Send a payload to one paired peer. It gets the same answer
+/// [`adhoc_matching_select_target`] gives, for the same reason: no handler has ever fired on
+/// this context, so no address the title can pass is one it has heard from, and
+/// UNKNOWN_TARGET is what the console says about an address that is not in its member list.
+///
+/// Reporting success would be a claim that bytes went out to somebody - the one answer that
+/// cannot be true here, and one a title acts on by waiting for a reply that cannot come.
+#[hostcall]
+pub(super) fn adhoc_matching_send_data(st: &mut VitaState, id: i32, _addr: Ptr, _data_len: i32, _data: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
+        SCE_NET_ADHOC_MATCHING_ERROR_UNKNOWN_TARGET
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingCancelTarget(int id, SceNetInAddr *target)
+///
+/// Withdraw a pairing request. Unlike [`adhoc_matching_send_data`] this SUCCEEDS on a live
+/// context: it is a cancel, no request to that address is outstanding (none could be), and
+/// so the state it asks for is the state already in force. A title reaches this from its own
+/// cleanup path, and the codebase's rule for cancels holds here - there is nothing left
+/// running to stop, so nothing can fail to stop. The context id is still checked, because a
+/// cancel on a context that does not exist is a caller error the console reports.
+#[hostcall]
+pub(super) fn adhoc_matching_cancel_target(st: &mut VitaState, id: i32, _target: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
+        0
+    } else {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    }
+}
+
+/// int sceNetAdhocMatchingGetMembers(int id, unsigned int *members_count,
+///     struct SceNetAdhocMatchingMember *members)
+///
+/// ZERO members, and the count is written even when the buffer is null - that is the
+/// two-call idiom this API is used with (ask the count, allocate, ask again), and a title
+/// that skipped the write would allocate from a stale number. An empty member list is a real
+/// state, not a failure: it is what the first console into a room sees.
+#[hostcall]
+pub(super) fn adhoc_matching_get_members(
+    ctx: &mut GuestCtx,
+    st: &mut VitaState,
+    id: i32,
+    count: Ptr,
+    _members: Ptr,
+) -> i32 {
+    if !st.adhoc_matching_live(id) {
+        SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID
+    } else {
+        if !count.is_null() {
+            ctx.write_u32(count.addr(), 0);
+        }
+        0
+    }
+}
+
+/// int sceNetAdhocMatchingSetHelloOpt(int id, int opt_len, void *opt)
+///
+/// The "hello" payload advertised to peers. There is nobody to advertise to, so the payload
+/// is accepted and goes nowhere - which is what happens on a console in an empty room too:
+/// the hello really is broadcast, and nothing answers.
+#[hostcall]
+pub(super) fn adhoc_matching_set_hello_opt(st: &mut VitaState, id: i32, _opt_len: i32, _opt: Ptr) -> i32 {
+    if st.adhoc_matching_live(id) {
         0
     } else {
         SCE_NET_ADHOC_MATCHING_ERROR_INVALID_ID

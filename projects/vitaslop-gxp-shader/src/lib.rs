@@ -19,6 +19,7 @@
 //! definitions: permissive, fact-only sources, with no copyleft or proprietary code read,
 //! linked, or derived from.
 
+pub mod attrflow;
 pub mod container;
 pub mod interp;
 pub mod ir;
@@ -105,6 +106,12 @@ pub struct RecompiledFragment {
     pub wgsl_body: String,
     /// Stable content hash of the source blob, for pipeline caching.
     pub hash: u64,
+    /// The blend this program performed ITSELF over the destination colour, when
+    /// [`module::lower_dest_blend`] recognised one and rewrote the program to emit only the
+    /// source term. The renderer must apply it as PIPELINE blend state; a `None` here on a
+    /// program that reads its output bank means the equation is not a blend any hardware can
+    /// express and the draw needs the destination texture instead.
+    pub dest_blend: Option<module::DestBlend>,
 }
 
 /// Decode + coverage of a program without requiring full translation. Useful for the
@@ -196,10 +203,14 @@ pub fn recompile_fragment(bytes: &[u8]) -> Result<RecompiledFragment, RecompileE
     if program.kind != ProgramKind::Fragment {
         return Err(RecompileError::WrongKind);
     }
-    let shader = usse::decode_shader(&program);
+    let mut shader = usse::decode_shader(&program);
+    // BEFORE the body is emitted: a program that blends itself over the destination colour is
+    // rewritten here to emit only its source term, and the equation comes back as pipeline
+    // state. See `module::lower_dest_blend` for the shapes and for what it refuses.
+    let dest_blend = module::lower_dest_blend(&mut shader);
     let wgsl_body = wgsl::emit_fragment(&shader)?;
     let hash = program.hash;
-    Ok(RecompiledFragment { program, shader, wgsl_body, hash })
+    Ok(RecompiledFragment { program, shader, wgsl_body, hash, dest_blend })
 }
 
 /// Recompile a fragment shader blob all the way to a complete, bindable [`FragmentModule`]
@@ -255,12 +266,43 @@ pub fn recompile_vertex(bytes: &[u8]) -> Result<RecompiledVertex, RecompileError
 ///
 /// The opcode scan short-circuits before parsing operands: memory loads are a handful of
 /// programs in the whole captured corpus, and this runs once per registered program.
+///
+/// >>> IT SCANS BOTH STREAMS, AND SCANNING ONLY THE PRIMARY BLACKED OUT A WHOLE TITLE'S WORLD.
+///
+/// A program that reads a bound uniform buffer by chasing its pointer normally issues that load
+/// from the SECONDARY (prologue) stream - the prologue runs once and leaves the fetched
+/// registers in the SA file, which is the whole point of having one. [`resolve_mem_windows`]
+/// already looks in both, so the LINK resolved a window and the pipeline was built expecting
+/// its bytes; this pre-filter looked only in `code`, found no 0x1d, and told the capture to
+/// snapshot nothing. The two then disagreed at every draw, and a draw whose pipeline wants a
+/// window it did not get is DROPPED rather than fed zeroes - correctly, and silently as far as
+/// the picture is concerned. MEASURED on a retail fighting title: its stage, its crowd and both
+/// fighters were dropped that way while the HUD, whose programs load no memory, rendered
+/// perfectly on top of the black.
+///
+/// [`resolve_mem_windows`]: module::resolve_mem_windows
 pub fn mem_windows_for_vertex_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    mem_windows_for_blob(bytes, ProgramKind::Vertex)
+}
+
+/// The same, for a FRAGMENT blob. A fragment program reaches its window through
+/// `sceGxmSetFragmentUniformBuffer`, so the capture reads a different table - which is the
+/// only thing that differs. MEASURED on a baseball title: EVERY draw of its menus (72-79 a
+/// frame) uses one pair whose FRAGMENT program opens with a 0xE8 load, and with the stage
+/// refused outright the whole screen was black while the frame kept flipping.
+pub fn mem_windows_for_fragment_blob(bytes: &[u8]) -> Vec<module::MemWindow> {
+    mem_windows_for_blob(bytes, ProgramKind::Fragment)
+}
+
+/// The stage-agnostic body of the two above: the window resolution is a property of the
+/// program's own containers and parameter table, not of which stage runs it.
+fn mem_windows_for_blob(bytes: &[u8], kind: ProgramKind) -> Vec<module::MemWindow> {
     let Ok(program) = Program::parse(bytes) else { return Vec::new() };
-    if program.kind != ProgramKind::Vertex {
+    if program.kind != kind {
         return Vec::new();
     }
-    if !program.code.iter().any(|&w| usse::opcode1(w) == 0x1d) {
+    let loads_memory = |code: &[u64]| code.iter().any(|&w| usse::opcode1(w) == 0x1d);
+    if !loads_memory(&program.code) && !loads_memory(&program.secondary_code) {
         return Vec::new();
     }
     let shader = usse::decode_shader(&program);
@@ -356,6 +398,55 @@ pub struct RopBlend {
 /// corpus here, that word takes this path and blends the wrong way round. It would show as a
 /// surface that is too bright where it should be dark. The guard below pins every field that
 /// this evidence does not read, so such a word returns `None` instead.
+/// Whether a FRAGMENT blob reads the destination colour out of its output bank, and so must be
+/// given a copy of the colour attachment to blend against - see
+/// [`module::BindingPlan::reads_dest_color`].
+///
+/// Standalone (rather than only a field of the link result) because the renderer has to know
+/// BEFORE it starts encoding a pass: the copy is a pass split, and a split cannot be decided
+/// halfway through a render pass that has already begun.
+///
+/// A blob that does not parse or is not a fragment program answers `false`: it has no
+/// destination read this can be sure of, and the link will refuse it anyway.
+pub fn fragment_reads_dest_color(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    // The same question the recompiler asks, in the same order: a program whose ALU blend
+    // LOWERS to a pipeline blend does not read the destination at all after the rewrite, and
+    // asking before the rewrite would split a pass for every one of them.
+    let mut shader = usse::decode_shader(&program);
+    let _ = module::lower_dest_blend(&mut shader);
+    module::declares_dest_color(&shader)
+}
+
+/// Whether a FRAGMENT blob uses the frame-buffer colour as an INPUT - the question
+/// `sceGxmProgramIsFragColorUsed` asks of a program, answered from the program itself.
+///
+/// # Why this is not [`fragment_reads_dest_color`], which looks like the same question
+/// That one answers what the RENDERER needs to do: it runs the ALU-blend lowering first,
+/// because a program whose blend is rewritten into pipeline state no longer reads the
+/// attachment and must not cost a pass split. This one answers what the PROGRAM is, and a
+/// rewrite this engine performs for its own convenience cannot change that - a title asking
+/// whether its shader consumes FragColor would otherwise be told "no" about a shader that
+/// plainly does, and the answer would move whenever the lowering table grew.
+///
+/// The SOP2 exclusion inside [`module::reads_output_bank`] is kept, and it is right for this
+/// question too: an 8-bit SOP2 epilogue over the output register is the FIXED-FUNCTION blend
+/// the compiler emits for a `SceGxmBlendInfo`, present in ordinary programs that declare no
+/// frag-colour input at all.
+///
+/// A blob that does not parse, or is not a fragment program, answers `false` - a vertex
+/// program has no frame buffer to read, which is the API's own answer for one.
+pub fn fragment_uses_frag_color(bytes: &[u8]) -> bool {
+    let Ok(program) = Program::parse(bytes) else { return false };
+    if program.kind != ProgramKind::Fragment {
+        return false;
+    }
+    module::reads_output_bank(&usse::decode_shader(&program))
+}
+
 pub fn rop_blend(bytes: &[u8]) -> Option<RopBlend> {
 
     let program = Program::parse(bytes).ok()?;

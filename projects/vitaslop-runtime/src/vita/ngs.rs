@@ -427,12 +427,48 @@ pub(super) fn rack_get_voice_handle(ctx: &mut GuestCtx, st: &mut VitaState, rack
 
 /// SceInt32 sceNgsVoiceGetStateData(SceNgsHVoice voice, SceUInt32 moduleId,
 ///                                  void *data, SceUInt32 dataSize)
-/// Report an all-zero state: voice available / not playing. A title polling for a
-/// sound to finish sees "done" and proceeds rather than waiting forever.
+///
+/// Zero for every field except the PLAYER's read position, which is the one field a title
+/// has been seen to read - and returning zero for THAT is a streaming title that never
+/// streams.
+///
+/// >>> THE EVIDENCE, off the calling code (one title's audio middleware, `lr=0x816e458b`).
+/// It calls this with `moduleId = 0` (the player) and `dataSize = 0x18`, tests the return
+/// code, and then reads the state buffer EXACTLY ONCE, at offset 0:
+///
+/// ```text
+///   ldr.w r0, [r5, 0x268]   ; the voice handle
+///   movs  r1, 0             ; module 0 - the source player
+///   add   r2, sp, 0         ; the 24-byte state buffer
+///   movs  r3, 0x18
+///   blx.w sceNgsVoiceGetStateData
+///   ...
+///   ldr   r0, [sp]          ; state word 0, and nothing else
+///   ...                     ; zero-extend to 64 bits, multiply by 8,
+///   bl    <64-bit divide>   ; divide by the format's bits per sample
+/// ```
+///
+/// `bytes * 8 / bits_per_sample` is a SAMPLE position, so word 0 is a BYTE position - and
+/// the caller polls it about ten times a displayed frame to decide how much of its ring it
+/// may refill. Held at zero, it concludes nothing has been consumed, never writes, and the
+/// ring it handed NGS stays the silence it was allocated as. That is what made one title
+/// silent from its splash movie onwards, with a voice that was playing correctly the whole
+/// time. [[vitaslop-a-fallback-must-report]] does not apply to a value: there is nothing to
+/// warn about here, only a number to get right.
+///
+/// The OTHER fields stay zero because nothing has been observed reading them, and a
+/// plausible-looking number in a field this engine cannot check is worse than a zero: it
+/// cannot be told from a measurement later.
 #[hostcall]
-pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, _st: &mut VitaState, _voice: u32, _module: u32, data: Ptr, size: u32) -> i32 {
+pub(super) fn voice_get_state_data(ctx: &mut GuestCtx, st: &mut VitaState, voice: u32, module: u32, data: Ptr, size: u32) -> i32 {
     if data.addr() != 0 && size != 0 {
         ctx.write_bytes(data.addr(), &vec![0u8; size as usize]);
+        if module == NGS_PLAYER_MODULE
+            && size >= 4
+            && let Some(pos) = st.audio_state.at9.position_bytes(voice)
+        {
+            ctx.write_u32(data.addr(), pos);
+        }
     }
     0
 }

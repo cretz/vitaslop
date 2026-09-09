@@ -76,6 +76,17 @@ pub struct LinkedProgram {
     pub vertex_hash: u64,
     /// Content hash of the fragment blob (pipeline-cache key half).
     pub fragment_hash: u64,
+    /// Whether the fragment stage reads the DESTINATION colour (it blends for itself). The
+    /// renderer owes such a draw a copy of the colour attachment as it stands immediately
+    /// before it, bound at `@group(3) @binding(1)`. See [`crate::module::BindingPlan::
+    /// reads_dest_color`].
+    pub reads_dest_color: bool,
+    /// The blend the fragment program performed itself and that
+    /// [`crate::module::lower_dest_blend`] recovered as pipeline state. When this is `Some` the
+    /// emitted shader writes only the SOURCE term and the renderer MUST apply this equation, or
+    /// the draw composites wrongly. It and `reads_dest_color` are mutually exclusive by
+    /// construction: the lowering runs first, and what it rewrites no longer reads the output.
+    pub dest_blend: Option<crate::module::DestBlend>,
 }
 
 /// Why a vertex+fragment pair could not be linked into a faithful WGSL module. Every variant
@@ -149,9 +160,11 @@ pub enum LinkError {
     /// window ([`crate::module::resolve_mem_window`] names the specific gap). Emitting anyway
     /// would hand the loads fabricated bytes. Fall back.
     MemWindowUnresolved { why: &'static str },
-    /// The FRAGMENT program carries a 0xE8 memory load; the memory-window binding is only
-    /// established for the vertex stage (no fragment in the census loads memory). Fall back.
-    FragmentMemLoad,
+    /// The FRAGMENT program's 0xE8 memory loads cannot be tied to a bindable guest-memory
+    /// window. Separate from the vertex variant because the two stages bind from DIFFERENT
+    /// GXM uniform-buffer tables, so a message naming the wrong one sends a reader to the
+    /// wrong `sceGxmSet*UniformBuffer` call site.
+    FragmentMemWindowUnresolved { why: &'static str },
 }
 
 impl core::fmt::Display for LinkError {
@@ -231,12 +244,10 @@ impl core::fmt::Display for LinkError {
                 f,
                 "the vertex program's memory loads have no bindable guest-memory window: {why}"
             ),
-            LinkError::FragmentMemLoad => write!(
+            LinkError::FragmentMemWindowUnresolved { why } => write!(
                 f,
-                "the fragment program carries a 0xE8 memory load; the memory-window binding \
-                 is only established for the vertex stage"
-            ),
-        }
+                "the fragment program's memory loads have no bindable guest-memory window: {why}"
+            ),        }
     }
 }
 
@@ -271,18 +282,18 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     let vrc = recompile_vertex(vbytes).map_err(LinkError::VertexRecompile)?;
     let frc = recompile_fragment(fbytes).map_err(LinkError::FragmentRecompile)?;
 
-    // Memory loads: a fragment one has no established binding at all; a vertex one must
-    // resolve to a window or the pair falls back NAMING the gap (the plan's own resolver
-    // call swallows the reason, because a plan has no error channel).
-    if frc.shader.instrs.iter().any(|i| matches!(i.op, crate::ir::Op::MemLoad { .. })) {
-        return Err(LinkError::FragmentMemLoad);
-    }
+    // Memory loads, in EITHER stage: each must resolve to a bindable window or the pair falls
+    // back NAMING the gap (the plan's own resolver call swallows the reason, because a plan has
+    // no error channel).
     crate::module::resolve_mem_windows(&vprog, &vrc.shader)
         .map_err(|why| LinkError::MemWindowUnresolved { why })?;
+    let fmem_windows = crate::module::resolve_mem_windows(&fprog, &frc.shader)
+        .map_err(|why| LinkError::FragmentMemWindowUnresolved { why })?;
 
-    let vplan = plan_vertex_bindings(&vprog, &vrc.shader);
+    let mut vplan = plan_vertex_bindings(&vprog, &vrc.shader);
     let mut fplan =
         plan_bindings(&frc.shader, fprog.sa_carried_extent(), |u| fprog.sampler_is_cube(u as u32));
+    fplan.mem_windows = fmem_windows;
 
     // The vertex must place clip POSITION in o0..o3 (what the rasteriser consumes) and its
     // varyings block must have VALIDATED - otherwise its varying placement is unknown.
@@ -305,6 +316,32 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
     // Match the two stages' own statements of the interface, by usage.
     let iface = plan_interface(&vprog, &fprog, &frc.shader)?;
     let varyings = &iface.components;
+
+    // What each attribute lane is fed when the guest binds fewer components than the program
+    // declares. It is answered HERE and not in the plan because the deciding use is often in the
+    // FRAGMENT stage - a surplus lane forwarded into a varying that a modulate reads - so the
+    // question needs both shaders and the interface between them. See [`crate::attrflow`].
+    let lands: Vec<(u32, crate::attrflow::FragLand)> = varyings
+        .iter()
+        .map(|c| {
+            (
+                c.vertex_lane,
+                match c.dest {
+                    ComponentDest::Register(r) => crate::attrflow::FragLand::Register(r),
+                    ComponentDest::Half { register, slot } => {
+                        crate::attrflow::FragLand::Half { register, slot }
+                    }
+                    ComponentDest::SampleCoord { .. } => crate::attrflow::FragLand::SampleCoord,
+                },
+            )
+        })
+        .collect();
+    for a in &mut vplan.attributes {
+        for c in 0..4u32 {
+            a.surplus_fill[c as usize] =
+                crate::attrflow::lane_fill(&vrc.shader, &frc.shader, a.base_lane, c, &lands);
+        }
+    }
 
     // A PASSTHROUGH fragment program emits the PDS-loaded primary attributes verbatim (see
     // `plan_interface`), so its colour is the primary-attribute bank at register 0 - never the
@@ -390,6 +427,8 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
         frc.shader.instrs.iter().any(|i| i.op == Op::DepthF),
     );
 
+    let reads_dest_color = fplan.reads_dest_color;
+    let dest_blend = frc.dest_blend;
     Ok(LinkedProgram {
         wgsl,
         vertex_bindings: vplan,
@@ -398,6 +437,8 @@ pub fn link_programs(vbytes: &[u8], fbytes: &[u8]) -> Result<LinkedProgram, Link
         fragment_varyings,
         vertex_hash: vprog.hash,
         fragment_hash: fprog.hash,
+        reads_dest_color,
+        dest_blend,
     })
 }
 
@@ -427,7 +468,7 @@ fn output_written_lanes(shader: &Shader) -> Vec<bool> {
 /// ([`crate::wgsl`]): a dot reads a fixed component prefix, a texture sample reads its
 /// coordinate prefix, and every other op reads a source channel only where it writes the
 /// destination channel.
-fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
+pub(crate) fn read_channels(instr: &crate::ir::Instr) -> [bool; 4] {
     match instr.op {
         Op::Dot { components } => {
             let n = (components as usize).clamp(1, 4);
@@ -1088,6 +1129,114 @@ fn forwarding_contradicts(vout: &[OutputVarying], claims: &[(VaryingUsage, Vec<u
     None
 }
 
+/// The lanes each declared varying is filled from, when the vertex program forwards EVERY one of
+/// them straight from an attribute - a COMPLETE reading of the code rather than one claim plus a
+/// convention. Returns `None` the moment anything is missing or inconsistent.
+///
+/// # Why this is a separate, much stricter reading than [`forwarding_claims`]
+/// A single `mov Output[n] <- PrimaryAttr[m]` is weak evidence and MEASURED to be wrong on real
+/// programs: a golf title's course family forwards a COLOR-semantic attribute into the four
+/// lanes the convention calls `TexCoord(0)`, because passing a colour down a spare texcoord
+/// channel is a thing shaders do. Acting on that one claim re-orders twelve varyings and takes
+/// the sky, the course and the whole UI with it (MEASURED: `hole-one.recipe` f001880, 89% of
+/// pixels, world black and sky flat green).
+///
+/// What is not weak is a claim set that accounts for the WHOLE layout: every declared varying
+/// named, each from one attribute, each run exactly its declared width, and the runs tiling the
+/// lane budget with no gap and no overlap. There is nothing left for a convention to decide, and
+/// nothing a channel-reuse can hide in - a program that packs a colour into a texcoord and
+/// computes the rest never produces a complete cover at all, so it is refused rather than
+/// mis-read.
+///
+/// PACKs count as forwards where `forwarding_claims` takes only moves: a float-to-float VPCK
+/// changes a value's STORAGE width and not the value, which is how the fighting title's UI
+/// program writes its vertex colour (`pack o[4].xy <- pa[8].zy`, `pack o[6].xy <- pa[8].xw` -
+/// swizzled, but every lane from the one attribute).
+fn forwarding_cover(vprog: &Program, vshader: &Shader) -> Option<Vec<OutputVarying>> {
+    use crate::container::{ParamCategory, SEMANTIC_COLOR, SEMANTIC_FOGCOORD, SEMANTIC_TEXCOORD};
+    let usage_of = |p: &crate::container::Parameter| match p.semantic {
+        SEMANTIC_FOGCOORD => Some(VaryingUsage::Fog),
+        SEMANTIC_COLOR => match p.semantic_index {
+            0 => Some(VaryingUsage::Color0),
+            1 => Some(VaryingUsage::Color1),
+            _ => None,
+        },
+        SEMANTIC_TEXCOORD => Some(VaryingUsage::TexCoord(p.semantic_index)),
+        _ => None,
+    };
+    let declared = &vprog.output_varyings;
+    if declared.len() < 2 {
+        return None; // one varying cannot be mis-ordered
+    }
+    // Lane -> the usage the code puts there. A lane written twice, or written from two different
+    // attributes, is not a cover.
+    let mut at: Vec<Option<VaryingUsage>> = vec![None; BANK_REGS];
+    for instr in &vshader.instrs {
+        if !matches!(instr.op, Op::Mov | Op::Pack { .. }) || instr.pred != Predicate::Always {
+            continue;
+        }
+        let (Some(d), Some(src)) = (instr.dest.as_ref(), instr.srcs.first()) else { continue };
+        if d.bank != Bank::Output || src.bank != Bank::PrimaryAttr {
+            continue;
+        }
+        // A half-precision destination packs two components per register, so its lanes are not
+        // one per channel and this reading does not model it. Refuse rather than guess.
+        if instr.half_precision {
+            return None;
+        }
+        for c in 0..4 {
+            if !instr.write_mask[c] {
+                continue;
+            }
+            let sel = src.swizzle[c] as u32;
+            if sel > 3 {
+                continue;
+            }
+            let src_reg = src.index as u32 + sel;
+            let Some(a) = vprog.parameters.iter().find(|a| {
+                a.category == ParamCategory::Attribute
+                    && a.resource_index >= 0
+                    && src_reg >= a.resource_index as u32
+                    && src_reg < a.resource_index as u32 + a.component_count as u32
+            }) else {
+                continue;
+            };
+            let Some(u) = usage_of(a) else { continue };
+            let lane = d.index as usize + c;
+            match at.get(lane) {
+                // Written twice with different meanings: not a cover.
+                Some(Some(prev)) if *prev != u => return None,
+                Some(_) => at[lane] = Some(u),
+                None => return None,
+            }
+        }
+    }
+
+    // Every declared varying must be covered by exactly its own contiguous run of its own width.
+    let origin = declared.iter().map(|v| v.base_lane).min()?;
+    let mut out: Vec<OutputVarying> = Vec::with_capacity(declared.len());
+    for v in declared {
+        let first = (0..at.len()).find(|&l| at[l] == Some(v.usage))?;
+        let count = at[first..].iter().take_while(|u| **u == Some(v.usage)).count() as u32;
+        if count != v.components || at[first..].iter().filter(|u| **u == Some(v.usage)).count() as u32 != count {
+            return None;
+        }
+        out.push(OutputVarying { usage: v.usage, base_lane: first as u32, components: v.components });
+    }
+    out.sort_by_key(|v| v.base_lane);
+    // The runs must TILE the budget: start at the same origin the container placed them at, and
+    // abut with no gap. A gap is a lane the code never wrote, which is a varying this reading
+    // did not see and therefore did not cover.
+    let mut lane = origin;
+    for v in &out {
+        if v.base_lane != lane {
+            return None;
+        }
+        lane += v.components;
+    }
+    (out != *declared).then_some(out)
+}
+
 /// Re-order a convention-placed layout so that every forwarded attribute's usage STARTS at the
 /// lane that attribute actually fills. Returns `None` when no permutation does.
 ///
@@ -1117,6 +1266,9 @@ fn forwarding_contradicts(vout: &[OutputVarying], claims: &[(VaryingUsage, Vec<u
 fn layout_from_forwarding_claims(
     vout: &[OutputVarying],
     claims: &[(VaryingUsage, Vec<u32>)],
+    // Whether the layout being refuted is the ATTRIBUTE reading (`VaryingOrder::Known`). Only
+    // then may the ordering SEARCH below run - see `exhaustive_layout_from_claims`.
+    passthrough_reading: bool,
 ) -> Option<Vec<OutputVarying>> {
     // Which usage each claimed START lane demands. A lane claimed by two attributes is not a
     // statement about either, so it is dropped rather than resolved.
@@ -1174,6 +1326,7 @@ fn layout_from_forwarding_claims(
         }
     }
     let origin = vout.iter().map(|v| v.base_lane).min().unwrap_or(0);
+
     let mut placed = vec![false; vout.len()];
     let mut out: Vec<OutputVarying> = Vec::with_capacity(vout.len());
     let mut lane = origin;
@@ -1199,7 +1352,129 @@ fn layout_from_forwarding_claims(
     // has likewise resolved nothing. (The claims are only consulted at all when
     // `forwarding_contradicts` has already fired, so both are the case where the contradiction
     // is real but the evidence cannot reach the lane that would fix it.)
-    (satisfied && out != vout).then_some(out)
+    if satisfied && out != vout {
+        return Some(out);
+    }
+    // >>> THE GREEDY WALK CANNOT REACH A CLAIM THAT LIES PAST ITS OWN FIRST STEP, and that is
+    // >>> not a claim that decides nothing - it is one that decides the order of what comes
+    // >>> BEFORE it. Search the orderings.
+    //
+    // The walk above consults a claim only when it ARRIVES at the claimed lane, so it can never
+    // discover that placing a different varying first is what makes that lane reachable.
+    // MEASURED on a baseball title's menu pair (`27ef71ac110cd816`): the convention places
+    // `TexCoord(0)@4x2 Color0@6x4`, and the vertex's own `mov o[8..10] <- PrimaryAttr(UV)`
+    // claims `TexCoord(0)` at lane 8 - a lane the walk steps straight over (4, 6, 10). The one
+    // ordering that satisfies the claim is `Color0@4x4 TexCoord(0)@8x2`, and under the
+    // convention's layout the fragment read the UV where the colour belongs and sampled its
+    // texture at the SQUARED VERTEX COLOUR: every menu came out a saturated green-to-cyan ramp
+    // with the dialog text unreadable. With it, the menu is the real one.
+    //
+    // >>> AND ONLY WHERE THE ATTRIBUTE READING'S OWN PREMISE IS REFUTED. `VaryingOrder::Known`
+    // means the layout was read off the ATTRIBUTES, which is a reading of a PASSTHROUGH - the
+    // program's outputs are its inputs, in `resource_index` order. A forwarding move that
+    // contradicts it refutes exactly that premise, and the same moves are then the best evidence
+    // for the real order, so searching the orderings that satisfy them reads the witness that
+    // did the refuting. An `Ambiguous` layout has no such premise (the convention placed a
+    // `Color1` no attribute confirms) and has its own reading downstream
+    // (`convention_agrees_with_the_code`, then `resolve_ambiguous_order`); preempting it is a
+    // MEASURED regression - on a racer's two `Ambiguous` world programs the search swaps
+    // `Color0` and `Color1` and the grass comes back washed out in pale streaks with the
+    // foliage unshaded, one shot of twelve.
+    //
+    // >>> UNIQUE OR NOTHING, AND BOUNDED. Several orderings usually satisfy one claim (anything
+    // after the last claimed lane is free), and picking one of them would be inventing a layout,
+    // not reading one. So this acts only when EXACTLY ONE ordering satisfies EVERY claim - which
+    // is what makes it a reading of the vertex - and only for a program with few enough varyings
+    // to enumerate. A bigger program keeps exactly the behaviour it has today.
+    if !passthrough_reading {
+        return None;
+    }
+    exhaustive_layout_from_claims(vout, &stride, &want)
+}
+
+/// Every varying count this will enumerate orderings of. `6! = 720` layouts is nothing per
+/// LINKED PAIR (which happens once per pair, not per draw), and above it the search is both
+/// slow and useless: a program with ten varyings and one claim has hundreds of orderings that
+/// satisfy it, so the uniqueness test refuses anyway.
+const EXHAUSTIVE_LAYOUT_MAX_VARYINGS: usize = 6;
+
+/// The ONE ordering of `vout` that puts every claimed usage at the lane it is claimed at, or
+/// `None` when there is no such ordering or more than one. `stride` is each ORIGINAL varying's
+/// slot width (see the caller - a slot is not the component count).
+fn exhaustive_layout_from_claims(
+    vout: &[OutputVarying],
+    stride: &[u32],
+    want: &[(u32, VaryingUsage)],
+) -> Option<Vec<OutputVarying>> {
+    // The ARM BACK, so the search can be A/B'd against the greedy walk alone on one build.
+    // `VITASLOP_GXP_VARYING_RESOLVE=0` is the wider arm (it turns off the forwarding readings
+    // entirely); this one keeps them and removes only the ordering search.
+    if vout.len() > EXHAUSTIVE_LAYOUT_MAX_VARYINGS
+        || want.is_empty()
+        || std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() == Ok("greedy")
+    {
+        return None;
+    }
+    let origin = vout.iter().map(|v| v.base_lane).min().unwrap_or(0);
+    let mut found: Option<Vec<OutputVarying>> = None;
+    let mut order: Vec<usize> = Vec::with_capacity(vout.len());
+    let mut used = vec![false; vout.len()];
+    // Depth-first over orderings, laying each one out as it goes so a partial layout that
+    // already contradicts a claim is abandoned rather than completed.
+    fn walk(
+        vout: &[OutputVarying],
+        stride: &[u32],
+        want: &[(u32, VaryingUsage)],
+        origin: u32,
+        order: &mut Vec<usize>,
+        used: &mut [bool],
+        found: &mut Option<Vec<OutputVarying>>,
+        second: &mut bool,
+    ) {
+        if *second {
+            return;
+        }
+        if order.len() == vout.len() {
+            // Lay it out and check every claim.
+            let mut lane = origin;
+            let mut out = Vec::with_capacity(vout.len());
+            for &i in order.iter() {
+                out.push(OutputVarying {
+                    usage: vout[i].usage,
+                    base_lane: lane,
+                    components: vout[i].components,
+                });
+                lane += stride[i];
+            }
+            let ok = want.iter().all(|(l, u)| {
+                out.iter().any(|v| v.base_lane == *l && v.usage == *u)
+            });
+            if ok {
+                match found {
+                    None => *found = Some(out),
+                    Some(prev) if *prev != out => *second = true,
+                    Some(_) => {}
+                }
+            }
+            return;
+        }
+        for i in 0..vout.len() {
+            if used[i] {
+                continue;
+            }
+            used[i] = true;
+            order.push(i);
+            walk(vout, stride, want, origin, order, used, found, second);
+            order.pop();
+            used[i] = false;
+        }
+    }
+    let mut second = false;
+    walk(vout, stride, want, origin, &mut order, &mut used, &mut found, &mut second);
+    if second {
+        return None;
+    }
+    found.filter(|out| out != vout)
 }
 
 /// Say, once per distinct contradiction, that a vertex program's own forwarding moves refuse the
@@ -1280,6 +1555,13 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     if let Some(order) = hand_typed_layout(vprog) {
         return plan_interface_with(fprog, fshader, &order);
     }
+    // A DIAGNOSTIC ARM, not the default: order the vertex's lanes the way the paired FRAGMENT
+    // declares them. See `fragment_declared_order` for the two witnesses and for why the
+    // default may not be this - a rule that gives one vertex program two lane orders depending
+    // on its pairing is not a reading of anything. MEASURED as a default: it fixes a baseball
+    // title's menus and BREAKS a racer's world (blocky foliage, striped road, banded terrain),
+    // which is what a convention-vs-convention flip does. The vertex's own forwarding claims
+    // settle both, and that is where the fix went - see `exhaustive_layout_from_claims`.
     if std::env::var("VITASLOP_GXP_VARYING_ORDER").as_deref() == Ok("fragment")
         && let Some(order) = fragment_declared_order(vprog, fprog) {
             return plan_interface_with(fprog, fshader, &order);
@@ -1307,11 +1589,32 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
     // resolver is its own gate - it acts only where a claim names a usage the layout does not
     // put at that lane - which is why the contradiction report below is no longer what admits it.
     let vshader = crate::usse::decode_shader(vprog);
+    // >>> A COMPLETE READING FIRST. When the code forwards every declared varying and the runs
+    // tile the budget exactly, that IS the layout - see [`forwarding_cover`], and see the golf
+    // regression recorded there for why the weaker one-claim reading below must not be
+    // strengthened into this.
+    if std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0")
+        && let Some(order) = forwarding_cover(vprog, &vshader) {
+            let shown: Vec<String> = order
+                .iter()
+                .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
+                .collect();
+            report_forwarding_contradiction(
+                vprog.hash,
+                "the code forwards EVERY declared varying and the runs tile the budget",
+                &format!("COVERED by the vertex alone -> {}", shown.join(" ")),
+            );
+            return plan_interface_with(fprog, fshader, &order);
+        }
     let claims = forwarding_claims(vprog, &vshader);
     // Value-sensitive, because a knob used as an A/B ARM has to be: a presence-only reader
     // turns `=0` into an ON arm and both arms then measure the same build.
     if std::env::var("VITASLOP_GXP_VARYING_RESOLVE").as_deref() != Ok("0")
-        && let Some(order) = layout_from_forwarding_claims(&vprog.output_varyings, &claims) {
+        && let Some(order) = layout_from_forwarding_claims(
+            &vprog.output_varyings,
+            &claims,
+            vprog.output_order == VaryingOrder::Known,
+        ) {
             let shown: Vec<String> = order
                 .iter()
                 .map(|v| format!("{:?}@{}..{}", v.usage, v.base_lane, v.base_lane + v.components))
@@ -1326,6 +1629,24 @@ fn plan_interface(vprog: &Program, fprog: &Program, fshader: &Shader) -> Result<
             );
             return plan_interface_with(fprog, fshader, &order);
         }
+    // >>> WHAT EACH READING SAYS, for every pair that gets this far. A layout question is
+    // settled by comparing the readings, and until now that comparison needed a rebuild with a
+    // hand-typed layout: nothing printed the candidates.
+    if let Some(order) = fragment_declared_order(vprog, fprog) {
+        let show = |vs: &[OutputVarying]| {
+            vs.iter()
+                .map(|v| format!("{:?}@{}x{}", v.usage, v.base_lane, v.components))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if order != vprog.output_varyings {
+            report_forwarding_contradiction(
+                vprog.hash,
+                &format!("layout by {:?}: {}", vprog.output_order, show(&vprog.output_varyings)),
+                &format!("the paired FRAGMENT declares: {}", show(&order)),
+            );
+        }
+    }
     // A `Known` order was read off the attributes and the moves did not refute it.
     if vprog.output_order == VaryingOrder::Known {
         return plan_interface_with(fprog, fshader, &vprog.output_varyings);
@@ -1769,6 +2090,37 @@ fn secondary_attr_init(
             None => return Err(LinkError::SecondaryAttrOutOfRange { register: reg, uniform_regs }),
         }
     }
+    // >>> AN INDEXED READ NAMES NO REGISTER, so the walk above cannot see the literals it
+    // >>> reaches - and dropping one leaves a compile-time CONSTANT reading zero.
+    //
+    // `sa[idx[0] + 14]` is a register the shader picks at runtime; `sa_sources` only ever
+    // reports the ones an operand spells out, so every literal only an indexed read can reach
+    // fell out of this list. MEASURED on a particle vertex program: its four float2 corner
+    // offsets are container literals at `sa[50..57]` - `(0,0) (0,1) (1,1) (1,0)`, the corners
+    // of a unit quad - reached as `sa[cornerIndex*2 + 36 + 14]`. Only `sa[35..49]` were
+    // emitted, so all four corners read (0,0), every particle quad collapsed to a point, and
+    // the title's sparks, smoke and fire drew nothing at all. Nothing reported it: the draw is
+    // prepared, the pipeline builds, the pass encodes it and it covers no pixels.
+    //
+    // The register cannot be narrowed - that is what "indexed" means - so every literal the
+    // container carries goes in. They are constants out of the blob, so emitting one the
+    // shader never reads costs a `let` the compiler drops; omitting one is a wrong picture.
+    // The two exclusions above still apply: a literal inside the uniform buffer's own extent
+    // would overwrite what the guest bound, and one naming a memory-window base would
+    // overwrite the pointer the module puts there.
+    let reads_indexed_sa = shader
+        .instrs
+        .iter()
+        .chain(secondary.instrs.iter())
+        .flat_map(|i| i.srcs.iter())
+        .any(|s| s.bank == Bank::Indexed && crate::ir::indexed_sub_bank(s.index) == Bank::SecondaryAttr);
+    if reads_indexed_sa {
+        for &(r, v) in program.literals.iter() {
+            if r >= uniform_regs && !mem_base_sa.contains(&r) {
+                literals.push((r, v));
+            }
+        }
+    }
     literals.sort_unstable();
     literals.dedup();
     Ok(literals)
@@ -1872,6 +2224,10 @@ fn build_linked_module(
     //   z = the clip-`w` sign correction that same fixup applied (1 none, -1 negate, 2 flip w)
     //   w = which value the guest's own depth buffer holds (see `gxp_guest_depth`)
     m.push_str(GXP_DEPTH_DECL);
+    // The destination-colour texture rides in the same group - see `module::GXP_DEST_DECL`.
+    if fplan.reads_dest_color {
+        m.push_str(crate::module::GXP_DEST_DECL);
+    }
 
     // ---- Vertex default-uniform buffer (SA bank) at group 0 ----
     // The buffer is the guest's raw default-uniform-buffer bytes: a run of 32-bit registers,
@@ -1902,6 +2258,18 @@ fn build_linked_module(
     if fsa_vec4 > 0 {
         let _ = writeln!(m, "struct FsSa {{ data: array<vec4<u32>, {fsa_vec4}> }};");
         let _ = writeln!(m, "@group(1) @binding(0) var<uniform> fs_sa: FsSa;");
+    }
+
+    // ---- The fragment stage's guest-memory window, beside its uniform in group 1 ----
+    // The exact mirror of the vertex one in group 0, with its own name because WGSL has a
+    // single global namespace and the two are different buffers.
+    if !fplan.mem_windows.is_empty() {
+        let _ = writeln!(
+            m,
+            "@group(1) @binding(1) var<uniform> gxp_fmem: array<vec4<u32>, {}>;",
+            crate::module::mem_window_vec4_count(&fplan.mem_windows)
+        );
+        m.push_str(&crate::module::mem_window_helper_named(&fplan.mem_windows, "gxp_fmem"));
     }
 
     // ---- Fragment sampled textures + samplers at group 2 ----
@@ -2013,6 +2381,12 @@ fn build_linked_module(
     let _ = writeln!(m, "\n@fragment\nfn fs_main(in: FsIn) -> {ret_ty} {{");
     m.push_str(crate::wgsl::FRONT_FACING_DECL);
     emit_register_banks(&mut m);
+    // A program that blends for ITSELF starts with the destination colour in the output bank,
+    // because that is what the hardware seeds those registers with - see
+    // `BindingPlan::reads_dest_color`. Before the body, and before anything else writes `o`.
+    if fplan.reads_dest_color {
+        m.push_str(&crate::module::dest_color_init(fplan.color_precision));
+    }
     if writes_depth {
         let _ = writeln!(m, "  let gxp_interp_depth = in.frag_coord.z;");
         let _ = writeln!(m, "  var gxp_frag_depth: f32 = gxp_interp_depth;");
@@ -2128,6 +2502,12 @@ fn build_linked_module(
         }
     }
     emit_secondary_attrs(&mut m, "fs_sa", fsa_regs, fliterals);
+    // The driver-placed pointer register, exactly as the vertex entry does it: the bound
+    // buffer's guest address in the SA register the DATA container names, so the body's own
+    // address arithmetic runs bit-exact. After the literals, for the same reason.
+    for (i, w) in fplan.mem_windows.iter().enumerate() {
+        let _ = writeln!(m, "  sa[{}] = gxp_fmem[{i}u].x;", w.base_sa);
+    }
     m.push_str(fbody);
     let (ret, base) = match fplan.color {
         ColorOutput::NativeO0 => ("o", 0),
@@ -2135,6 +2515,41 @@ fn build_linked_module(
     };
     let color =
         crate::module::color_return_expr(ret, base, fplan.color_precision, varying_locations);
+    if let Some(spec) = depth_probe() {
+        // `=<min>:<scale>` spreads the window `[min, min + 1/scale]` over the whole grey ramp.
+        // A projection crams its whole scene into the far end of the depth buffer - one title's
+        // sits above 0.99 - so the plain ramp saturates and answers nothing; this is what makes
+        // the difference between two surfaces readable.
+        let (lo, k) = match spec.split_once(':') {
+            Some((a, b)) => (a.trim().parse::<f32>().unwrap_or(0.0), b.trim().parse::<f32>().unwrap_or(1.0)),
+            None => (0.0, 1.0),
+        };
+        let d = format!("clamp((in.frag_coord.z - {lo:?}) * {k:?}, 0.0, 1.0)");
+        let color = format!("vec4<f32>(vec3<f32>({d}), 1.0)");
+        if writes_depth {
+            let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);
+}}");
+        } else {
+            let _ = writeln!(m, "  return {color};
+}}");
+        }
+        return size_register_banks(&resolve_sa_init(&m));
+    }
+    let color = match dest_probe() {
+        // `opaque` forces alpha to 1: a draw whose pipeline blend is `SrcAlpha` and whose
+        // destination alpha is zero composites to NOTHING, so the plain probe cannot tell
+        // "the copy is black" from "the copy is transparent and the blend discarded it".
+        Some("opaque") if fplan.reads_dest_color => {
+            "vec4<f32>(gxp_dstc.rgb, 1.0)".to_string()
+        }
+        // `mark` paints a flat MAGENTA. It answers the question that has to come first and
+        // that the other two arms cannot: is this pixel painted by a destination reader at
+        // all? A black rectangle where a blend should be looks the same whether the copy read
+        // black or the draw that made it never read a destination.
+        Some("mark") if fplan.reads_dest_color => "vec4<f32>(1.0, 0.0, 1.0, 1.0)".to_string(),
+        Some(_) if fplan.reads_dest_color => "gxp_dstc".to_string(),
+        _ => color,
+    };
     if writes_depth {
         let _ = writeln!(m, "  return FsOut({color}, gxp_frag_depth);\n}}");
     } else {
@@ -2392,6 +2807,50 @@ fn sa_uses(body: &str) -> Option<Vec<SaUse>> {
     }
     Some(uses)
 }
+/// Diagnostic (`VITASLOP_GXP_DEPTH_PROBE=<lo>:<scale>`): EVERY fragment returns its own window
+/// depth as a grey value, over the window `[lo, lo + 1/scale]`.
+///
+/// The question "why is this surface in front of that one" has no other instrument here: the
+/// depth buffer is not readable, the CPU interpreter cannot run a skinned or texture-sampling
+/// vertex program, and a picture only ever says WHICH draw won, never by how much. Render two
+/// draw ranges with this and the two depths can be compared at the same pixel.
+///
+/// # It is a COMPARISON, not a number
+/// The value goes through the display pass, which gamma-encodes and upscales it, so it is not a
+/// depth to read off. That transform is MONOTONIC and identical for both renders, so the
+/// comparison survives it - and the comparison is the whole question.
+///
+/// # Why it takes a window
+/// A projection crams its whole scene into the far end of the depth buffer: one title's sits
+/// above 0.98, where a plain 0..1 ramp saturates and answers nothing. `0.9:10` is what made a
+/// character's depth and its floor's separable.
+fn depth_probe() -> Option<&'static str> {
+    arm("VITASLOP_GXP_DEPTH_PROBE").filter(|v| *v != "0")
+}
+
+/// Diagnostic (`VITASLOP_GXP_DEST_PROBE=1|opaque|mark`): a fragment program that reads the
+/// DESTINATION colour returns what it READ instead of what it computed.
+///
+/// The destination path has two halves that fail the same way on screen - the renderer's copy
+/// of the attachment (wrong texture, wrong moment, wrong extent) and the shader's own
+/// arithmetic over it - and a black rectangle where a blend should be is the symptom of either.
+///
+/// * `1` returns the seeded colour, so a draw that paints the scene behind it was fed a real
+///   destination and the fault is downstream.
+/// * `opaque` returns it with alpha forced to 1, because a draw whose pipeline blend is
+///   `SrcAlpha` and whose destination alpha is zero composites to NOTHING - which reads exactly
+///   like a black copy.
+/// * `mark` returns flat MAGENTA. It answers the question that has to come FIRST and that
+///   neither of the others can: is this pixel painted by a destination reader at all? A black
+///   rectangle looks the same whether the copy read black or the draw that made it never read a
+///   destination, and an hour went into that difference before this arm existed.
+///
+/// Opt-IN: an unset variable leaves the shader alone. [`arm_on`] defaults to ON, which is right
+/// for a default this crate ships and wrong for a diagnostic.
+fn dest_probe() -> Option<&'static str> {
+    arm("VITASLOP_GXP_DEST_PROBE").filter(|v| *v != "0")
+}
+
 
 /// `VITASLOP_GXP_SIZE_BANKS=0` restores the pre-2026-08-20b emission - every register bank
 /// declared at the full [`BANK_REGS`] - and is the A/B arm for [`size_register_banks`].
@@ -2444,7 +2903,7 @@ fn arms() -> &'static std::sync::Mutex<Arms> {
 /// The names are [`SIZE_BANKS_ARM`] and [`SA_DIRECT_ARM`]; anything else is ignored on purpose,
 /// because this is called from a generic knob table and a typo there must not become an arm.
 pub fn set_arm(name: &str, value: &str) {
-    if name != SIZE_BANKS_ARM && name != SA_DIRECT_ARM {
+    if name != SIZE_BANKS_ARM && name != SA_DIRECT_ARM && name != MEM_OFFSET16_ARM {
         return;
     }
     let v: &'static str = Box::leak(value.trim().to_string().into_boxed_str());
@@ -2455,6 +2914,9 @@ pub fn set_arm(name: &str, value: &str) {
 pub const SIZE_BANKS_ARM: &str = "VITASLOP_GXP_SIZE_BANKS";
 /// `0` restores the SA copy loop, `unroll` the constant-subscript copy - see [`resolve_sa_init`].
 pub const SA_DIRECT_ARM: &str = "VITASLOP_GXP_SA_DIRECT";
+/// `0` reads a memory load's REGISTER offset full-width instead of as 16 bits - see
+/// `wgsl::emit_mem_load`, which carries the measurement.
+pub const MEM_OFFSET16_ARM: &str = "VITASLOP_GXP_MEM_OFFSET16";
 
 /// The marker a stage's register-bank declarations are emitted as, resolved to real sizes by
 /// [`size_register_banks`] once the whole module is built and every subscript is known.
@@ -2753,7 +3215,8 @@ mod tests {
             (VaryingUsage::TexCoord(0), vec![8, 9, 10, 11]),
             (VaryingUsage::Color0, vec![12, 13]),
         ];
-        let got = layout_from_forwarding_claims(&vout, &claims).expect("the TexCoord claim is reachable");
+        let got = layout_from_forwarding_claims(&vout, &claims, false)
+            .expect("the TexCoord claim is reachable");
         assert_eq!(
             got,
             vec![
@@ -2769,7 +3232,10 @@ mod tests {
 
         // A claim the convention already satisfies changes nothing, and "nothing" is reported as
         // no resolution rather than as a layout.
-        assert!(layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])]).is_none());
+        assert!(
+            layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])], false)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2791,7 +3257,8 @@ mod tests {
             OutputVarying { usage: VaryingUsage::TexCoord(0), base_lane: 4, components: 2 },
             OutputVarying { usage: VaryingUsage::Color0, base_lane: 6, components: 4 },
         ];
-        let got = layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])])
+        let got =
+            layout_from_forwarding_claims(&vout, &[(VaryingUsage::Color0, vec![4, 5, 6, 7])], false)
             .expect("the colour attribute fills the lane the layout gives TexCoord(0)");
         assert_eq!(
             got,

@@ -1873,6 +1873,33 @@ fn dataproc(inst: &Instruction, pc: u32) -> Option<(u8, Value, Value)> {
     }
 }
 
+/// The EXCLUSIVE-MONITOR test, as two values: the STATUS a `STREX` reports (0 success, 1
+/// failure - ARM's own convention) and the MASK a conditional store selects with (all ones on
+/// success, zero on failure).
+///
+/// Branch-free on purpose: the IR has no conditional inside a block, and a `STREX` that
+/// branched would split every one of them into three. `(x | -x) >> 31` is 1 for any non-zero
+/// x and 0 for zero, so the exclusive-or of the recorded address with this one yields the
+/// status directly, and `status - 1` is the mask.
+fn excl_test(out: &mut Vec<Stmt>, addr: &Value) -> (Value, Value) {
+    let _ = &out;
+    let diff = bin(BinOp::Xor, Value::ExclAddr, addr.clone());
+    let neg = bin(BinOp::Sub, Value::Imm(0), diff.clone());
+    let fail = bin(BinOp::Lsr, bin(BinOp::Or, diff, neg), Value::Imm(31));
+    let mask = bin(BinOp::Sub, fail.clone(), Value::Imm(1));
+    (fail, mask)
+}
+
+/// Store `data` at `addr` only where `mask` is all-ones, by writing back the bytes already
+/// there when it is zero. A refused `STREX` must leave the word exactly as it was, and this
+/// is that with no branch: the store still happens, but of the value already in memory.
+fn store_if(out: &mut Vec<Stmt>, addr: Value, data: Value, size: MemSize, mask: &Value) {
+    let old = Value::Load { addr: Box::new(addr.clone()), size, signed: false };
+    let kept = bin(BinOp::And, old, Value::Not(Box::new(mask.clone())));
+    let fresh = bin(BinOp::And, data, mask.clone());
+    out.push(Stmt::Store { addr, data: bin(BinOp::Or, fresh, kept), size });
+}
+
 fn bin(op: BinOp, a: Value, b: Value) -> Value {
     Value::Bin(op, Box::new(a), Box::new(b))
 }
@@ -2801,10 +2828,14 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
             out.extend(a.post);
         }
 
-        // Load-exclusive: with one guest CPU worker there is no contending core,
-        // so an exclusive load is a plain load. (When preemptive multi-threading
-        // lands, these need a real exclusive monitor; single-thread bring-up is
-        // faithful as an ordinary load.)
+        // Load-exclusive: the load, plus ARMING THE MONITOR with the address it read.
+        //
+        // The monitor is one word the host clears before every resume, which is exactly the
+        // `CLREX` hardware performs on a context switch (`vita::mirror::SLOT_EXCL`). Without
+        // it `STREX` always succeeded and the guest's retry branch was dead code, so two
+        // threads preempted between their load and their store could both claim a lock word
+        // that only one of them read as free - which is how a title's own compare-and-swap
+        // spinlock loses an owner.
         LDREX | LDREXB | LDREXH => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
             let a = lower_addr(&ops[1], addr, inst.thumb).ok_or_else(err)?;
@@ -2814,36 +2845,43 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 _ => MemSize::Word,
             };
             out.extend(a.pre);
+            out.push(Stmt::ExclSet(a.addr.clone()));
             out.push(Stmt::SetReg(rt, Value::Load { addr: Box::new(a.addr), size, signed: false }));
             out.extend(a.post);
         }
-        // Load-exclusive doubleword: two plain 32-bit loads (single guest core).
+        // Load-exclusive doubleword: two loads, arming the monitor on the pair's base.
         LDREXD => {
             let rt = regnum(&ops[0]).ok_or_else(err)?;
             let rt2 = regnum(&ops[1]).ok_or_else(err)?;
             let a = lower_addr(&ops[2], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
+            out.push(Stmt::ExclSet(a.addr.clone()));
             emit_load_pair(&mut out, rt, rt2, a.addr);
             out.extend(a.post);
         }
-        // Store-exclusive doubleword: store both words, report success (0).
+        // Store-exclusive doubleword: both words, under the same monitor test.
         STREXD => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rt = regnum(&ops[1]).ok_or_else(err)?;
             let rt2 = regnum(&ops[2]).ok_or_else(err)?;
             let a = lower_addr(&ops[3], addr, inst.thumb).ok_or_else(err)?;
             out.extend(a.pre);
-            out.push(Stmt::Store { addr: a.addr.clone(), data: Value::Reg(rt), size: MemSize::Word });
-            out.push(Stmt::Store {
-                addr: bin(BinOp::Add, a.addr, Value::Imm(4)),
-                data: Value::Reg(rt2),
-                size: MemSize::Word,
-            });
-            out.push(Stmt::SetReg(rd, Value::Imm(0)));
+            let (fail, mask) = excl_test(&mut out, &a.addr);
+            store_if(&mut out, a.addr.clone(), Value::Reg(rt), MemSize::Word, &mask);
+            store_if(
+                &mut out,
+                bin(BinOp::Add, a.addr, Value::Imm(4)),
+                Value::Reg(rt2),
+                MemSize::Word,
+                &mask,
+            );
+            out.push(Stmt::SetReg(rd, fail));
+            out.push(Stmt::ExclSet(Value::Imm(0)));
             out.extend(a.post);
         }
-        // Store-exclusive: the store always succeeds (no contention), so it writes
-        // the value and reports success (0) in the status register.
+        // Store-exclusive: the store proceeds only while the monitor still holds THIS
+        // address; otherwise the word is left alone and the status register reports 1, which
+        // is what sends the guest back round its own retry loop.
         STREX | STREXB | STREXH => {
             let rd = regnum(&ops[0]).ok_or_else(err)?;
             let rt = regnum(&ops[1]).ok_or_else(err)?;
@@ -2854,8 +2892,10 @@ fn lower_effects(inst: &Instruction, addr: u32, in_it: bool) -> Result<Vec<Stmt>
                 _ => MemSize::Word,
             };
             out.extend(a.pre);
-            out.push(Stmt::Store { addr: a.addr, data: Value::Reg(rt), size });
-            out.push(Stmt::SetReg(rd, Value::Imm(0)));
+            let (fail, mask) = excl_test(&mut out, &a.addr);
+            store_if(&mut out, a.addr, Value::Reg(rt), size, &mask);
+            out.push(Stmt::SetReg(rd, fail));
+            out.push(Stmt::ExclSet(Value::Imm(0)));
             out.extend(a.post);
         }
 
@@ -3421,7 +3461,8 @@ fn lower_ldm(inst: &Instruction, _addr: u32) -> Result<Vec<Stmt>, Error> {
 fn value_uses_reg(v: &Value, r: u8) -> bool {
     match v {
         Value::Reg(x) => *x == r,
-        Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult | Value::ThreadPtr => false,
+        Value::Imm(_) | Value::Flag(_) | Value::CarryAddResult | Value::ThreadPtr
+        | Value::ExclAddr => false,
         Value::Not(a) | Value::Clz(a) => value_uses_reg(a, r),
         Value::Bin(_, a, b) => value_uses_reg(a, r) || value_uses_reg(b, r),
         Value::Load { addr, .. } => value_uses_reg(addr, r),
