@@ -56,12 +56,7 @@ impl Gfx {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-desktop"),
             required_features: wgpu::Features::empty(),
-            // Keep the conservative downlevel baseline (so this path matches the
-            // headless oracle's capability floor) but raise the resolution-derived
-            // limits to what the adapter really supports: a high-DPI desktop window
-            // is physically larger than the 2048 downlevel max texture dimension.
-            required_limits: wgpu::Limits::downlevel_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,

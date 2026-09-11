@@ -39,6 +39,133 @@ fn dump_sa_requested() -> bool {
     std::env::var_os("VITASLOP_CAPSULE_DUMP_SA").is_some()
 }
 
+/// Print a program's declared uniform parameters with the VALUES this draw fed them.
+///
+/// `VITASLOP_CAPSULE_DUMP_SA=1` printed the banks as anonymous f32 registers, which answers
+/// "is anything obviously zero" and nothing else. Naming them answers the question a wrong
+/// PICTURE actually raises - WHICH uniform is wrong - and it is the parameter table, not a
+/// guess, that says where each one starts, how many components it has, how long its array is
+/// and whether its components are F32 or F16 PAIRS packed two to a register.
+///
+/// A uniform reaches the shader by one of two routes and both are printed here: the SA bank
+/// (the driver copies the default buffer's registers into the register file) and a MEMORY
+/// WINDOW (the driver plants the bound buffer's address and the program chases it). A dump
+/// that showed only one of them would be silent about half of every lit material.
+fn dump_named_uniforms(stage: &str, prog_bytes: &[u8], sa: &[u8], windows: &[(u32, Vec<u8>)]) {
+    use vitaslop_gxp_shader::container::{ParamCategory, ParamType, Program};
+    let Ok(prog) = Program::parse(prog_bytes) else {
+        eprintln!("  {stage} uniforms: program does not parse");
+        return;
+    };
+    let shader = vitaslop_gxp_shader::usse::decode_shader(&prog);
+    let mem = vitaslop_gxp_shader::module::resolve_mem_windows(&prog, &shader).unwrap_or_default();
+    // The window a uniform is read through is decided by its CONTAINER, and a container's
+    // index is the buffer index. Container 14 is the default buffer, which is the SA bank.
+    let source_for = |container_index: u8| -> Option<(&str, &[u8])> {
+        if container_index == 14 {
+            return Some(("sa", sa));
+        }
+        let w = mem.iter().position(|w| w.buffer_index == u32::from(container_index))?;
+        Some(("mem", windows.get(w)?.1.as_slice()))
+    };
+    let mut any = false;
+    let mut params: Vec<_> = prog
+        .parameters
+        .iter()
+        .filter(|p| p.category == ParamCategory::Uniform)
+        .collect();
+    params.sort_by_key(|p| (p.container_index, p.resource_index));
+    for p in params {
+        any = true;
+        let comps = usize::from(p.component_count).max(1);
+        let arr = p.array_size.max(1) as usize;
+        // F16 packs TWO components per 4-byte register; every other type here is one per
+        // register. Reading an F16 block as f32 gives numbers that look like garbage and,
+        // worse, occasionally look plausible.
+        let f16 = p.ptype == ParamType::F16;
+        let (src_name, bytes) = match source_for(p.container_index) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "    {stage} {:<32} reg {:<4} {:?}x{comps}[{arr}] container {} NOT FED",
+                    p.name, p.resource_index, p.ptype, p.container_index
+                );
+                continue;
+            }
+        };
+        let read = |scalar: usize| -> Option<f32> {
+            if f16 {
+                let reg = scalar / 2;
+                let off = reg * 4 + (scalar % 2) * 2;
+                let b = bytes.get(off..off + 2)?;
+                Some(f32::from(half_from_bits(u16::from_le_bytes([b[0], b[1]]))))
+            } else {
+                let off = scalar * 4;
+                let b = bytes.get(off..off + 4)?;
+                Some(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            }
+        };
+        // `resource_index` is a REGISTER offset; for F16 the scalar index is twice that.
+        let base_scalar = (p.resource_index.max(0) as usize) * if f16 { 2 } else { 1 };
+        let mut elems = Vec::new();
+        for e in 0..arr.min(8) {
+            let v: Vec<String> = (0..comps)
+                .map(|c| match read(base_scalar + e * comps + c) {
+                    Some(f) => format!("{f:.5}"),
+                    None => "..".to_string(),
+                })
+                .collect();
+            elems.push(format!("({})", v.join(", ")));
+        }
+        if arr > 8 {
+            elems.push(format!("... {} more", arr - 8));
+        }
+        eprintln!(
+            "    {stage} {:<32} reg {:<4} {:?}x{comps}[{arr}] via {src_name} = {}",
+            p.name,
+            p.resource_index,
+            p.ptype,
+            elems.join(" ")
+        );
+    }
+    if !any {
+        eprintln!("  {stage} uniforms: none declared");
+    }
+}
+
+/// f32 -> IEEE-754 binary16 bits, round-to-nearest-even, for `--fmem`.
+///
+/// Written out rather than pulled in: the substitution has to land in the window as the exact
+/// bits the shader's `unpack2x16float` will read back, and a value that quietly became a
+/// different one would make every reading taken through it wrong in a way nothing reports.
+fn f32_to_half_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let mut mant = (x & 0x007f_ffff) as i32;
+    let exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
+    if exp >= 0x1f {
+        // Overflow (and inf/NaN) saturate to the half's infinity rather than wrapping.
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        // Subnormal or zero: shift the implicit 1 back in and round.
+        if exp < -10 {
+            return sign;
+        }
+        mant |= 0x0080_0000;
+        let shift = 14 - exp;
+        let half = (mant >> shift) as u16;
+        let rem = mant & ((1 << shift) - 1);
+        let tie = 1 << (shift - 1);
+        let round = u16::from(rem > tie || (rem == tie && half & 1 == 1));
+        return sign | (half + round);
+    }
+    let half = ((exp as u16) << 10) | ((mant >> 13) as u16);
+    let rem = mant & 0x1fff;
+    let round = u16::from(rem > 0x1000 || (rem == 0x1000 && (mant >> 13) & 1 == 1));
+    sign | (half + round)
+}
+
 fn main() {
     // A subscriber, or every report the renderer makes about THIS draw is silent - including
     // the substitution warning ("this frame is NOT what the guest asked for") and any pair that
@@ -69,9 +196,33 @@ fn main() {
     // on a captured draw, and a knob that rewrites texels in a live run is a foot-gun with no
     // matching question.
     let mut tex_fill: Vec<(u32, [u8; 4])> = Vec::new();
+    // `--fmem <window>:<f16 lane>=<value>` - rewrite one HALF of the fragment memory window
+    // before the draw runs. This is the `--tex` idea aimed at the other input a lit material
+    // reads: the uniform block. A material whose output is over by a factor is answered by
+    // asking WHICH uniform carries the factor, and the only way to ask that is to change one
+    // and re-render. The lane is counted in F16 components from the window's base, which is
+    // exactly `resource_index * 2 + component` for a declared F16 parameter - the numbering
+    // `VITASLOP_CAPSULE_DUMP_SA=1` prints beside each name.
+    let mut fmem_set: Vec<(usize, usize, f32)> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
+        if a == "--fmem" {
+            let spec = it.next().unwrap_or_default();
+            let bad = || {
+                eprintln!("--fmem wants <window>:<f16 lane>=<value>, e.g. 0:44=0.97");
+                std::process::exit(2);
+            };
+            let Some((w, rest)) = spec.split_once(':') else { bad() };
+            let Some((lane, val)) = rest.split_once('=') else { bad() };
+            let (Ok(w), Ok(lane), Ok(val)) =
+                (w.trim().parse::<usize>(), lane.trim().parse::<usize>(), val.trim().parse::<f32>())
+            else {
+                bad()
+            };
+            fmem_set.push((w, lane, val));
+            continue;
+        }
         if a == "--tex" {
             let spec = it.next().unwrap_or_default();
             let Some((u, rgba)) = spec.split_once('=') else {
@@ -115,13 +266,30 @@ fn main() {
         }
     };
 
-    let cap = match Capsule::load(std::path::Path::new(&path)) {
+    let mut cap = match Capsule::load(std::path::Path::new(&path)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("capsule-replay: cannot read {path}: {e}");
             std::process::exit(1);
         }
     };
+
+    // Apply `--fmem` BEFORE anything reads the draw, and say so on every line: a picture from a
+    // substituted uniform must never be mistaken for a picture of the real thing, which is the
+    // same guarantee the probe and `--tex` carry.
+    for &(w, lane, val) in &fmem_set {
+        let Some((_, bytes)) = cap.draw.frag_mem_windows.get_mut(w) else {
+            eprintln!("  --fmem: this draw has no fragment memory window {w}");
+            std::process::exit(2);
+        };
+        let off = lane * 2;
+        let Some(dst) = bytes.get_mut(off..off + 2) else {
+            eprintln!("  --fmem: lane {lane} is past this window's {} bytes", bytes.len());
+            std::process::exit(2);
+        };
+        dst.copy_from_slice(&f32_to_half_bits(val).to_le_bytes());
+        eprintln!("  --fmem SUBSTITUTED window {w} F16 lane {lane} (byte {off}) = {val}");
+    }
 
     eprintln!(
         "capsule {path}\n  {}\n  {} vertices bytes, {} indices, {} textures, {} vertex textures\n  \
@@ -341,6 +509,34 @@ fn main() {
         for (i, (addr, bytes)) in cap.draw.mem_windows.iter().enumerate() {
             dump_bank(&format!("mem_window[{i}]"), *addr, bytes);
         }
+        // THE FRAGMENT STAGE HAS ITS OWN WINDOWS (`gxp_fmem`), and on this title's world
+        // materials that is where the ENTIRE material lives - the exposure, the ambient and the
+        // tone matrices. A dump that printed only the vertex windows showed nothing about the
+        // half of the pipeline whose output is wrong.
+        for (i, (addr, bytes)) in cap.draw.frag_mem_windows.iter().enumerate() {
+            dump_bank(&format!("frag_mem_window[{i}]"), *addr, bytes);
+        }
+        // AND THE SAME BYTES WITH THE PROGRAM'S OWN NAMES ON THEM. A window of bare floats
+        // cannot say which uniform is wrong; the parameter table can, and it also decides
+        // whether a register is one F32 or a PAIR OF F16s - which is the difference between
+        // reading a tone matrix and reading nonsense.
+        dump_named_uniforms("fragment", &cap.draw.fprog, &cap.draw.frag_sa, &cap.draw.frag_mem_windows);
+        // And the blobs themselves, so the USSE disassembler can be pointed at exactly the two
+        // programs THIS capsule ran - matching a capsule to a corpus blob by eye is a step that
+        // can silently pick the wrong one.
+        if let Some(dir) = std::env::var_os("VITASLOP_CAPSULE_DUMP_PROGS") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            for (kind, bytes) in [("vert", &cap.draw.vprog[..]), ("frag", &cap.draw.fprog[..])] {
+                let hash = vitaslop_gxp_shader::container::Program::parse(bytes)
+                    .map(|p| p.hash)
+                    .unwrap_or(0);
+                let path = dir.join(format!("{kind}_{hash:016x}.gxp"));
+                let _ = std::fs::write(&path, bytes);
+                eprintln!("  wrote {}", path.display());
+            }
+        }
+        dump_named_uniforms("vertex", &cap.draw.vprog, &cap.draw.vert_sa, &cap.draw.mem_windows);
     }
 
     // Name any GXP knob that is in force, so a picture from a probed or substituted run is
@@ -407,11 +603,14 @@ fn main() {
         draw.textures = std::sync::Arc::from(texs);
     }
 
-    let scene = Scene {
+    let scene = Scene { completed_early: false,
         precompile: std::sync::Arc::new(Vec::new()),
         color: None,
         depth: None,
         multisample: 0,
+        // A capsule replays ONE draw into a target of its own; it has no colour-less pass and
+        // therefore no depth-only extent to state. See `capture::Scene::target_extent`.
+        target_extent: None,
         draws: vec![draw],
     };
 

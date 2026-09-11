@@ -14,7 +14,10 @@ const browser = await launchChrome();
 const page = await browser.newPage();
 page.on("pageerror", (e) => console.log("pageerror:", e.message));
 
-await page.goto(`http://127.0.0.1:${port}/jspi-cost.html`);
+// The page lives under `web/debug/`, like every other harness page. Without the prefix this
+// asked the server for a file that has not been at the root for some time and then waited out
+// its 30 s locator timeout on a 404 - a stale path reads exactly like a broken page.
+await page.goto(`http://127.0.0.1:${port}/debug/jspi-cost.html`);
 console.log(await page.textContent("#env"));
 
 await page.click("#go");

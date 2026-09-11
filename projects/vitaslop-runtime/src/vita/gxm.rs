@@ -437,6 +437,20 @@ pub(crate) fn inline_op(func_nid: u32) -> Option<vitaslop_transpiler::InlineOp> 
         g::TEXTURE_GET_TYPE => LoadShiftMask { offset: 4, shift: 0, mask: 0x7 << 29, plus: 0 },
         g::TEXTURE_GET_WIDTH => tex_dim(12),
         g::TEXTURE_GET_HEIGHT => tex_dim(0),
+        // >>> THE DATA POINTER, AND ON ONE TITLE IT IS THE SECOND-BUSIEST HOST CALL THERE IS.
+        //
+        // `texture_get_data` is `read_u32(texture + 8) & 0xffff_fffc` and nothing else - the
+        // first shape this table admits, a pure read through a guest pointer, with the low two
+        // bits masked off because they carry the palette/normalise flags rather than address.
+        //
+        // MEASURED on a retail sports title's gameplay frame, from the device's own panel:
+        // **53,835 calls in a ~30-frame window - about 1,800 A FRAME, ~1.1 ms of a phone's
+        // frame** - second only to `sceGxmDraw`, and every one of them a crossing out of wasm
+        // to run two instructions [[vitaslop-count-calls-not-bytes-across-the-guest-boundary]].
+        // The title calls it around three times per draw, which is what a renderer that walks
+        // its own texture list does; the call is not the title being wasteful, it is an
+        // accessor being charged like a system call.
+        g::TEXTURE_GET_DATA => LoadShiftMask { offset: 8, shift: 0, mask: 0xffff_fffc, plus: 0 },
         // The control-word-0 SETTERS whose handler is `set_tex_field` and nothing else. Each
         // is a read-modify-write of ONE field, which is why they need their own form: a whole
         // word store would clear the seven settings packed beside the one being set, and the
@@ -1598,7 +1612,41 @@ pub(super) fn begin_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
         depth_stencil,
         depth,
     );
-    st.begin_scene(ctx, color, depth, multisample_mode_of(render_target));
+    // The render target's extent travels with the scene. It is the only statement of size a
+    // COLOUR-LESS pass has - see `capture::Scene::target_extent`.
+    let target_extent = st.render_target_extent(render_target).filter(|(w, h)| *w != 0 && *h != 0);
+    // >>> A REGION CLIP BELONGS TO THE TARGET IT WAS STATED FOR. RESET IT HERE.
+    //
+    // `sceGxmSetRegionClip`'s rectangle is in the CURRENT render target's pixels, so a
+    // rectangle set while one target was bound is not a statement about the next one. This
+    // engine keeps the clip in the GXM context struct, where it survives the scene change, and
+    // that has now produced the same user-visible defect on one title TWICE:
+    //
+    //   * the title paginates a 1024x512 atlas through 128x128 region clips, then draws its
+    //     FIGHT into a 640x368 display surface. Inheriting `0,0 .. 1023,127` scissored the frame
+    //     to its top 128 rows - a hard horizontal line two thirds up.
+    //   * the same title, returning to its main screen after an interrupted attract fight,
+    //     inherits `384,384 .. 511,511`. On a 960x544 surface that rectangle FITS, so the
+    //     "a rectangle that does not fit was not written for this target" guard in
+    //     `gpu::RegionClip::rect_in` cannot see it, and the whole main screen comes back as a
+    //     128x128 window of picture in a flat field of clear colour. MEASURED at f003040 and
+    //     every frame for 450 after it; the user's report was "mostly grey coming back from a
+    //     fight".
+    //
+    // The fit test was the approximation of this rule; this is the rule. It is applied here
+    // rather than beside the clip's own setter because `SET_REGION_CLIP` has an INLINE form
+    // that writes the context words without ever entering a handler - `beginScene` does not,
+    // so it is the one place that sees every scene change.
+    //
+    // `VITASLOP_REGION_CLIP_SCENE=0` is the arm back.
+    if crate::knobs::var("VITASLOP_REGION_CLIP_SCENE").ok().as_deref() != Some("0") {
+        let context = ctx.arg(0);
+        gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP_MODE, 0); // SCE_GXM_REGION_CLIP_NONE
+        for i in 0..4 {
+            gxmctx::set(ctx, context, gxmctx::off::REGION_CLIP + i * 4, 0);
+        }
+    }
+    st.begin_scene(ctx, color, depth, multisample_mode_of(render_target), target_extent);
     ctx.ret(0);
 }
 
@@ -1758,18 +1806,22 @@ fn report_scene_depth(
 /// two optional notifications are signalled and where an occlusion query's counts land
 /// in the guest's visibility buffer. All of that is synchronous here, which is why
 /// `sceGxmNotificationWait` never actually has to wait.
-pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) {
+pub(super) fn end_scene(ctx: &mut GuestCtx, st: &mut VitaState) -> crate::SvcOutcome {
     // Before the scene is folded: did the guest write any watched vertex window between its
     // draw call and here? See `STREAM_WATCH` - a no-op without `VITASLOP_DUMP_STREAM_BYTES`.
     st.report_stream_rewrites(ctx);
     // The draws' geometry is read HERE, which is when the GPU reads it - see `defer_geometry`.
     st.resolve_deferred_geometry(ctx);
     st.end_scene();
+    let blocked = complete_small_target_now(ctx, st);
     st.flush_visibility(ctx);
     let (vertex_notification, fragment_notification) = (ctx.arg(1), ctx.arg(2));
     signal_notification(ctx, vertex_notification);
     signal_notification(ctx, fragment_notification);
     ctx.ret(0);
+    // The asynchronous completion parks the thread here; the frontend wakes it once the
+    // scene's pixels are in guest memory. See `VitaState::complete_scene_async`.
+    if blocked { crate::SvcOutcome::Block } else { crate::SvcOutcome::Continue }
 }
 
 /// Write a `SceGxmNotification`'s `value` through its `address`, which is what the GPU
@@ -2972,6 +3024,8 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
         // most common reading of this diagnostic (`mode 0x0` beside the word GAMMA-CORRECT)
         // asserted the opposite of what had happened, on the exact question - does this
         // surface hold encoded bytes - that decides how everything sampling it must decode.
+        // Once per (surface data, mode) for the run - see `set_color_surface_gamma`.
+        if crate::rtt_writeback::report_once(0x6c00_0000_0000_0000 ^ ((s.data_addr as u64) << 16) ^ gamma as u64) {
         tracing::info!(
             target: "vitaslop::status",
             "gxm surface: {} on the surface at data {:#x} ({}x{}), mode {gamma:#x}",
@@ -2980,6 +3034,7 @@ pub(super) fn color_surface_set_gamma_mode(ctx: &mut GuestCtx, st: &mut VitaStat
             s.width,
             s.height
         );
+        }
         st.set_color_surface(surface, s);
     }
     0
@@ -4829,7 +4884,8 @@ mod texture_inline_tests {
 
     /// The texture getters this module checks. Written out rather than derived from
     /// `inline_op`, so a NID added there without a line here is not silently uncovered.
-    const COVERED_GETTERS: [u32; 11] = [
+    const COVERED_GETTERS: [u32; 12] = [
+        g::TEXTURE_GET_DATA,
         g::TEXTURE_GET_LOD_BIAS,
         g::TEXTURE_GET_U_ADDR_MODE_SAFE,
         g::TEXTURE_GET_V_ADDR_MODE_SAFE,
@@ -5048,5 +5104,127 @@ mod texture_control_word_field_tests {
         let w = 2 << texword3::SWIZZLE_SHIFT;
         assert_eq!(read(w), 2);
         assert_eq!((w >> 29) & 0x7, 1, "the old reader halved every selector");
+    }
+}
+
+
+/// Render the scene that just ended and put its pixels back into guest memory, when the
+/// frontend can and the target is small enough to be one a title reads on the CPU. See
+/// `VitaState::complete_scene_now` for the failure this closes.
+fn complete_small_target_now(ctx: &mut GuestCtx, st: &mut VitaState) -> bool {
+    let cap = crate::rtt_writeback::rtt_writeback_texels();
+    if cap == 0 {
+        return false;
+    }
+    let small = |scene: &crate::capture::Scene| {
+        scene.color.is_some_and(|c| c.width.max(1) * c.height.max(1) <= cap)
+    };
+    let Some(last) = st.capture.scenes.last() else { return false };
+    if !small(last) {
+        return false;
+    }
+    // >>> ON A TARGET'S FIRST SIGHT ONLY. That is the read that matters - a title that reads
+    // a probe once at load caches what it read - and every later render reaches memory
+    // through the frame-end write-back, at most a frame or two behind, which a periodic
+    // re-reader tolerates and poison is not. Completing EVERY small scene early was
+    // measured on the browser at 8 GPU round trips a frame: 26 -> 17 fps.
+    if !first_sight_of_small_target(last.color.map_or(0, |c| c.data_addr)) {
+        return false;
+    }
+    if st.complete_scene_now.is_none() && !st.complete_scene_async {
+        if crate::rtt_writeback::report_once(0x6e00_0000_0000_0000) {
+            tracing::warn!(target: "vitaslop::gxm", "gxm rtt: a small target ended its scene with NO completion hook installed - a CPU read of it this frame sees the allocator's fill");
+        }
+        return false;
+    }
+    // >>> IN SUBMISSION ORDER, WITH EVERYTHING THIS FRAME OWES IT. The hardware completes
+    // scenes in the order they were ended, so a probe that samples a cube whose faces ended
+    // earlier in the same frame samples the RENDERED faces. Completing the probe alone
+    // painted it from a cube nobody had drawn yet - the poison colour, the same wrong ambient
+    // by a different route. Every not-yet-completed small scene of the frame comes with it.
+    let n = st.capture.scenes.len();
+    let start = st.capture.scenes[..n]
+        .iter()
+        .rposition(|s| s.completed_early)
+        .map_or(0, |i| i + 1)
+        .max(n.saturating_sub(st.capture.frame_scene_count_so_far()));
+    if st.complete_scene_now.is_none() {
+        // Asynchronous frontend: park the thread on the batch; the run loop finishes it.
+        st.pending_early = Some((st.current_thread(), start, n));
+        return true;
+    }
+    // >>> EVERY preceding scene of the frame comes along, not only the small ones: a small
+    // target that SAMPLES a big pass rendered earlier in the same frame has to see THIS
+    // frame's pass, as the hardware would have completed it first. MEASURED: completing
+    // the small scenes alone changed two frames of a racer and of a hover title - their
+    // blur targets sampled the previous frame's world. Only the DISPLAY buffer's own passes
+    // stay out (they compose the frame at its end; rendered here they would be lost).
+    let display: Vec<u32> = st.capture.presents.iter().rev().take(4).copied().collect();
+    let in_batch = |s: &crate::capture::Scene| {
+        s.color.is_none_or(|c| !display.contains(&c.data_addr))
+    };
+    let batch: Vec<crate::capture::Scene> =
+        st.capture.scenes[start..n].iter().filter(|s| in_batch(s)).cloned().collect();
+    let readbacks = {
+        let hook = st.complete_scene_now.as_mut().expect("checked above");
+        hook(&batch)
+    };
+    let mut written = 0usize;
+    for scene in &batch {
+        let Some(c) = scene.color else { continue };
+        for (addr, w, h, rgba) in &readbacks {
+            if *addr != c.data_addr {
+                continue;
+            }
+            let mut probe = ctx.read_bytes(*addr, 4096);
+            let ok = crate::rtt_writeback::apply_one(
+                *addr,
+                *w,
+                *h,
+                rgba,
+                &c,
+                &mut |_, n| { probe.truncate(n.min(probe.len())); probe.clone() },
+                &mut |a, b| ctx.write_bytes(a, b),
+            );
+            if ok {
+                written += 1;
+                if crate::rtt_writeback::report_once(0x7000_0000_0000_0000 ^ *addr as u64) {
+                    let (w, h) = (*w as usize, *h as usize);
+                    let t = if w > 24 && h > 1 { rgba[(w + 24) * 4..(w + 24) * 4 + 4].to_vec() } else { Vec::new() };
+                    tracing::info!(target: "vitaslop::status", "gxm rtt: first completion of {addr:#010x} ({w}x{h}) in a batch of {}: texel(24,1)={t:?}", batch.len());
+                }
+            }
+        }
+    }
+    for s in st.capture.scenes[start..n].iter_mut() {
+        if in_batch(s) {
+            s.completed_early = true;
+        }
+    }
+    if written > 0 {
+        let c = st.capture.scenes[n - 1].color.expect("small target");
+        report_completed_early(c.data_addr, c.width, c.height);
+    }
+    false
+}
+
+/// Whether this is the first scene ever ended into `addr` - see `complete_small_target_now`.
+fn first_sight_of_small_target(addr: u32) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(addr)
+}
+
+/// Once per address: this target is completed at its own `sceGxmEndScene`.
+pub fn report_completed_early(addr: u32, w: u32, h: u32) {
+    if crate::rtt_writeback::report_once(0x6d00_0000_0000_0000 ^ addr as u64) {
+        tracing::info!(
+            target: "vitaslop::status",
+            "gxm rtt: target {addr:#010x} ({w}x{h}) is now rendered and written back AT ITS OWN \
+             sceGxmEndScene - a CPU read of it in the same frame sees the picture, not the \
+             allocator's fill"
+        );
     }
 }

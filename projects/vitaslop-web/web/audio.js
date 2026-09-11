@@ -53,7 +53,18 @@ const VITA_SAMPLE_RATE = 48000;
 export async function startAudio(note = () => {}) {
   const channels = 2;
   const context = new AudioContext({ sampleRate: VITA_SAMPLE_RATE, latencyHint: "playback" });
-  await context.audioWorklet.addModule("./audio-worklet.js");
+  // >>> RESOLVED AGAINST THIS MODULE, NOT AGAINST THE DOCUMENT.
+  //
+  // `audioWorklet.addModule` is the one loader here that resolves a relative URL against the
+  // DOCUMENT's base URL rather than the importing module's, so a plain "./audio-worklet.js"
+  // works from `/index.html` and 404s from any page in a subdirectory - which is every debug
+  // and e2e page under `web/debug/`. MEASURED: every browser run in this project reported
+  // `AbortError: Unable to load a worklet's module` and then `no ring supplied - this run is
+  // SILENT`, and the engine's own SOUND line read 1.00x throughout - it was producing audio
+  // into a NullSink. That was carried in the notes as "browser audio is silent" and chased as
+  // an NGS gap. `import.meta.url` is this file's own address, so the worklet is found from any
+  // page that can import this one.
+  await context.audioWorklet.addModule(new URL("./audio-worklet.js", import.meta.url));
 
   const capacity = Math.floor(context.sampleRate * RING_SECONDS);
   const ring = new SharedArrayBuffer(CTL_HEADER_BYTES + capacity * channels * 4);

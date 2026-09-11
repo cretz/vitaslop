@@ -141,13 +141,38 @@ const SAMPLER_CUBE_BIT: u32 = 0x1000_0000;
 /// alone rather than given a meaning it has not earned.
 const _SIZE_BIT6_NOT_A_PREFETCH_FLAG: u32 = 0x40;
 
-/// `component_info` bit a fragment varying descriptor carries exactly when it declares a
-/// prefetched sample - the redundant statement of [`INFO_PREFETCH`]. The two are cross-checked
-/// on parse; a program where they disagree is not decoded at all.
-const COMPONENT_INFO_PREFETCH: u32 = 0x20;
+/// `component_info` FIELD (bits 7:4) that is non-zero exactly when a fragment varying descriptor
+/// declares a prefetched sample - the redundant statement of [`INFO_PREFETCH`]. The two are
+/// cross-checked on parse; a program where they disagree is not decoded at all.
+///
+/// # It is a field, not a bit, and reading it as a bit refused a title's whole world
+/// This was `0x20` - bit 1 of the nibble - because every descriptor in four corpora carries
+/// either 0x0 or 0x20 here, and a two-valued field is indistinguishable from a flag. A fifth
+/// title uses the rest of it. Censused over its 269 blobs (`tabulate_prefetch_field_values`),
+/// the nibble takes exactly {0x0, 0x2, 0x3, 0x4}, and the value tracks the prefetched sample's
+/// WIDTH rather than its presence: 0x2 always beside `size` bits 7:6 = 1 (a one-register
+/// prefetch) and 0x3/0x4 always beside `size` bits 7:6 = 3 (the four-register one). Non-zero is
+/// therefore what "a prefetch rides along" means, and it agrees with [`INFO_PREFETCH`] and with
+/// `size` on every descriptor of every corpus - which the single-bit reading did not: it called
+/// three descriptors carrying 0x40 a CONTRADICTION and threw away their programs' whole
+/// interpolant lists.
+const COMPONENT_INFO_PREFETCH: u32 = 0x0000_00f0;
 
-/// `attribute_info` bit marking a descriptor that declares a prefetched sample.
-const INFO_PREFETCH: u32 = 0x0000_0100;
+/// `attribute_info` FIELD (bits 10:8) that is non-zero exactly when a descriptor declares a
+/// prefetched sample.
+///
+/// # Also a field, and the same measurement settles it
+/// This was the single bit `0x100`. Across the five captured corpora the field takes {0, 1, 2,
+/// 3, 5}; the four corpora that agreed with the old reading only ever use 1 and 3, so bit 0
+/// looked like the flag. The fifth title has eight descriptors carrying 2 and one carrying 5,
+/// and on every one of them [`COMPONENT_INFO_PREFETCH`] and the `size` prefetch bits BOTH say a
+/// prefetch is present - so the disagreement was ours, not the program's. What the value itself
+/// counts (a PDS fetch slot, a sample count) is not established and nothing here needs it: the
+/// layout question is only whether a sample rides along, and zero-versus-non-zero answers it
+/// with no contradiction anywhere in 300+ descriptors.
+///
+/// Bit 11 ([`INFO_PREFETCH_LAST`]) sits above this field and is deliberately outside the mask.
+const INFO_PREFETCH: u32 = 0x0000_0700;
 
 /// `attribute_info` bit marking the LAST prefetched sample in the program's descriptor array
 /// (the end of the PDS fetch sequence). Set on exactly one descriptor per program that has any

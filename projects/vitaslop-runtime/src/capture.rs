@@ -589,6 +589,11 @@ impl Draw {
 /// draws issued into it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
+    /// This scene was already rendered - and its target's pixels put back into guest memory
+    /// - at its own `sceGxmEndScene`, because the target is one a title reads on the CPU
+    /// (see `VitaState::complete_scene_now`). The frame render skips it: the target texture
+    /// already holds the image, and rendering an accumulating target twice would double it.
+    pub completed_early: bool,
     /// Shader PAIRS the guest's patcher named since the previous scene, as
     /// `(vertex container bytes, fragment container bytes)` - see
     /// `VitaState::queue_shader_precompile`. The renderer prepares these before it encodes,
@@ -624,6 +629,24 @@ pub struct Scene {
     /// know the sample count - and reading either alone has already produced a wrong
     /// conclusion here (see `report_scene_target`).
     pub multisample: u32,
+    /// The extent of the RENDER TARGET this scene rasterises through
+    /// (`SceGxmRenderTargetParams::width/height`), when the guest's create call was seen.
+    ///
+    /// # It is the only statement of extent a COLOUR-LESS pass has
+    /// A pass with a colour surface takes its extent from the surface (corrected by this same
+    /// render target - see `beginScene: taking the scene extent from the render target`). A
+    /// DEPTH-ONLY pass has no colour surface at all, and a `SceGxmDepthStencilSurface` carries
+    /// no extent, so the size of the target we place it in had to be inferred from the draws'
+    /// own viewports. That inference is off by exactly the border a title insets: MEASURED on
+    /// one title's 2048x1024 shadow map, every draw agrees on a viewport of 2046x1022 (a
+    /// one-texel border, which is what a shadow map does to keep its clamp from bleeding), so
+    /// the target came out two texels short in each axis and every later pass sampling it read
+    /// the map through normalised coordinates scaled by 2048/2046.
+    ///
+    /// The render target's extent is the guest's own number and needs no inference, so where it
+    /// is known it decides. The viewport agreement stays as the fallback for a pass whose
+    /// render target was created before capture began.
+    pub target_extent: Option<(u32, u32)>,
     pub draws: Vec<Draw>,
 }
 
@@ -1298,6 +1321,11 @@ impl Capture {
     /// Between flips (a partially built frame) this reports the previous frame's tail
     /// rather than a mixture, because an observer asking about "this frame" during
     /// construction has no complete frame to be given.
+    /// How many scenes the frame BEING BUILT has ended so far.
+    pub fn frame_scene_count_so_far(&self) -> usize {
+        self.frame_scenes
+    }
+
     pub fn frame_scenes(&self) -> &[Scene] {
         let n = self.prev_frame_scenes.max(1).min(self.scenes.len());
         &self.scenes[self.scenes.len() - n..]
@@ -1503,7 +1531,7 @@ mod extent_tests {
             frag_mem_windows: Vec::new(),
             shader_expanded: false,
         };
-        Scene {
+        Scene { completed_early: false,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: 0,
@@ -1517,6 +1545,7 @@ mod extent_tests {
             }),
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![draw],
         }
     }
@@ -1558,7 +1587,7 @@ mod retention_tests {
 
     /// A scene distinguishable by `tag` through the part of it the signature folds.
     fn scene(tag: u8) -> Scene {
-        Scene {
+        Scene { completed_early: false,
             precompile: Default::default(),
             color: Some(ColorSurface {
                 format: tag as u32,
@@ -1572,6 +1601,7 @@ mod retention_tests {
             }),
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: Vec::new(),
         }
     }

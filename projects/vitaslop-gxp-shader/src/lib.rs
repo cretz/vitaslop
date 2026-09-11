@@ -30,7 +30,7 @@ pub mod wgsl;
 
 pub use container::{Parameter, ParamCategory, ParamType, Program, ProgramKind};
 pub use ir::{Instr, Op, Shader};
-pub use link::{link_programs, LinkError, LinkedProgram, MAX_VARYINGS};
+pub use link::{LinkOptions, link_programs_with, link_programs, LinkError, LinkedProgram, MAX_VARYINGS};
 pub use module::{
     BindingPlan, ColorOutput, ColorPrecision, FragmentModule, MemWindow, VertexAttribute,
     VertexBindingPlan, VertexModule,
@@ -420,6 +420,43 @@ pub fn fragment_reads_dest_color(bytes: &[u8]) -> bool {
     let _ = module::lower_dest_blend(&mut shader);
     module::declares_dest_color(&shader)
 }
+
+/// The DUAL-SOURCE plan of a FRAGMENT blob: `Err` (naming why) if its destination read cannot
+/// be lowered that way at all, else the gates a draw has to satisfy - `(source, byte offset,
+/// byte length)`, every one of which must be zero in the draw's own data. `source` is an index
+/// into the draw's captured fragment memory windows, or [`DUAL_GATE_UNIFORM`] for the fragment
+/// default uniform buffer (`frag_sa`). Empty means every draw qualifies. See
+/// [`module::dual_source_plan`].
+pub fn fragment_dual_source_plan(bytes: &[u8]) -> Result<Vec<(u32, u32, u8)>, String> {
+    let program = Program::parse(bytes).map_err(|e| format!("does not parse: {e:?}"))?;
+    if program.kind != ProgramKind::Fragment {
+        return Err("not a fragment program".into());
+    }
+    // The SAME shader the linker emits from - `recompile_fragment` runs the decode's expansion
+    // passes (a memory load, say, exists only after them) and the ALU-blend lowering.
+    let shader = recompile_fragment(bytes).map_err(|e| format!("does not recompile: {e:?}"))?.shader;
+    let literals = link::secondary_attr_init(&shader, &program).map_err(|e| format!("literals: {e}"))?;
+    let coefs = module::dual_source_plan_or_why(&module::with_secondary(&program, &shader), program.sa_carried_extent(), &literals)?;
+    let windows = module::resolve_mem_windows(&program, &shader).map_err(|e| format!("windows: {e}"))?;
+    coefs
+        .iter()
+        .map(|c| match *c {
+            module::DualCoef::Uniform { byte, len } => Ok((DUAL_GATE_UNIFORM, byte, len)),
+            module::DualCoef::Zero => Err("a zero literal is not a gate".to_string()),
+            module::DualCoef::Window { base_sa, byte, len } => {
+                let w = windows
+                    .iter()
+                    .position(|w| w.base_sa == base_sa)
+                    .ok_or_else(|| format!("gate at pointer sa{base_sa} names no window"))?;
+                Ok((w as u32, byte, len))
+            }
+        })
+        .collect()
+}
+
+/// The `source` of a [`fragment_dual_source_plan`] gate that lives in the fragment default
+/// uniform buffer rather than in a memory window.
+pub const DUAL_GATE_UNIFORM: u32 = u32::MAX;
 
 /// Whether a FRAGMENT blob uses the frame-buffer colour as an INPUT - the question
 /// `sceGxmProgramIsFragColorUsed` asks of a program, answered from the program itself.

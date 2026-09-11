@@ -72,6 +72,15 @@ fn smlsi_state_is_linear(code: &[u64], instrs: &[crate::ir::Instr]) -> bool {
 /// stream length, so a branch target of "one past the end" maps too. Unrolling renumbers the
 /// stream, and a branch offset is a count of code WORDS, so every branch has to be rewritten
 /// through this map or it would silently point at the wrong instruction.
+/// What one repeat iteration does to one operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatStep {
+    /// Advance the operand's register index by this much per iteration.
+    Index(i32),
+    /// Hold the register and take iteration `i`'s component from `(byte >> 2i) & 3`.
+    Component(u8),
+}
+
 fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir::Instr>, Vec<usize>) {
     let linear = smlsi_state_is_linear(code, &instrs);
     let mut state = decode::DEFAULT_REPEAT_STATE;
@@ -139,15 +148,34 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
             });
             continue;
         };
-        let steps: Result<Vec<i32>, &'static str> = operands
+        // What one iteration does to each operand: step its register INDEX, or - when the MOE
+        // slot is in swizzle mode - hold the register and take the iteration's COMPONENT from
+        // the slot's byte.
+        //
+        // >>> SWIZZLE MODE IS A COMPONENT WALK, and it is the second half of how a repeat
+        // addresses its operands. The byte is four 2-bit component selectors, one per
+        // iteration (`(byte >> 2i) & 3`), and the operand's register does not move. In this
+        // IR a source operand reads `index + swizzle[channel]`, so replacing the swizzle with
+        // the iteration's selector expresses exactly that, in the same addressing every other
+        // consumer of these operands already uses.
+        //
+        // The DESTINATION's swizzle mode stays REFUSED: a destination is addressed by its
+        // write MASK here, not by a source swizzle, so the same substitution does not express
+        // it, and no program in any corpus needs it (the one corpus word that programs slot 0
+        // in swizzle mode has no repeat that consults it).
+        let steps: Result<Vec<RepeatStep>, &'static str> = operands
             .iter()
-            .map(|o| match (o.moe, state[o.slot]) {
+            .enumerate()
+            .map(|(i, o)| match (o.moe, state[o.slot]) {
                 // An intrinsic advance - the DP's channel walk - is not the MOE's to program.
-                (false, _) => Ok(o.stride as i32),
-                (true, decode::SmlsiSlot::Increment(n)) => Ok(i32::from(n) * o.stride as i32),
-                (true, decode::SmlsiSlot::Swizzle(_)) => {
-                    Err("0xF8 SMLSI per-iteration SWIZZLE stepping not modeled")
+                (false, _) => Ok(RepeatStep::Index(o.stride as i32)),
+                (true, decode::SmlsiSlot::Increment(n)) => {
+                    Ok(RepeatStep::Index(i32::from(n) * o.stride as i32))
                 }
+                (true, decode::SmlsiSlot::Swizzle(_)) if i == 0 => {
+                    Err("0xF8 SMLSI per-iteration SWIZZLE stepping on a DESTINATION not modeled")
+                }
+                (true, decode::SmlsiSlot::Swizzle(b)) => Ok(RepeatStep::Component(b)),
             })
             .collect();
         let steps = match steps {
@@ -175,12 +203,24 @@ fn unroll_repeats(code: &[u64], instrs: Vec<crate::ir::Instr>) -> (Vec<crate::ir
         for i in 0..=extra {
             let mut it = instr.clone();
             if let Some(d) = it.dest.as_mut() {
-                match advance(d.index, steps[0], i) {
+                let RepeatStep::Index(step) = steps[0] else {
+                    unreachable!("a destination in swizzle mode is refused above")
+                };
+                match advance(d.index, step, i) {
                     Some(index) => d.index = index,
                     None => escaped = true,
                 }
             }
             for (s, &step) in it.srcs.iter_mut().zip(&steps[1..]) {
+                let step = match step {
+                    RepeatStep::Index(n) => n,
+                    // The register holds still; the iteration picks the component.
+                    RepeatStep::Component(b) => {
+                        let sel = (b >> (2 * i.min(3))) & 3;
+                        s.swizzle = [sel; 4];
+                        continue;
+                    }
+                };
                 match advance(s.index, step, i) {
                     // A register-INDIRECT operand's number is not a register index: its top two
                     // bits select the sub-bank and only the low five are the offset. Stepping it

@@ -20,7 +20,7 @@ pub mod threaded;
 pub use threaded::{dump_block_hist, RunReport, ThreadSpawn, ThreadedScheduler};
 
 pub mod wgpu_render;
-pub use wgpu_render::{GeneralRenderer, RenderSplit, WgpuRenderer};
+pub use wgpu_render::{apply_rtt_writebacks, GeneralRenderer, RenderSplit, WgpuRenderer};
 
 pub mod observe;
 

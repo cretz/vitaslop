@@ -4061,6 +4061,7 @@ dependencies = [
  "pollster 1.0.1",
  "tracing",
  "tracing-subscriber",
+ "vitaslop-gxp-shader",
  "vitaslop-loader",
  "vitaslop-platform",
  "vitaslop-runtime",

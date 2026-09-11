@@ -245,7 +245,7 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
         // not 48. The emitter materialises the same literal as `48u`, so reading it any other
         // way here would make this reference disagree with the code that ships, which is the one
         // thing an oracle may never do.
-        Op::IntMad { signed, bits, src0_high } => {
+        Op::IntMad { signed, bits, src0_high, src1_high } => {
             if bits != 32 {
                 return Err("imad (only the 32-bit width is established)");
             }
@@ -256,7 +256,14 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 }
                 Ok(read_channel(regs, o, 0).ok_or("operand")?.to_bits())
             };
-            let (a0, b, d) = (raw(0)?, raw(1)?, raw(2)?);
+            let (a0, b0, d) = (raw(0)?, raw(1)?, raw(2)?);
+            // `src1_high` picks a half of src1 the same way - see the decoder's note. A clear
+            // bit reads the whole register, matching the emitter exactly.
+            let b = match (signed, src1_high) {
+                (_, false) => b0,
+                (true, true) => ((b0 as i32) >> 16) as u32,
+                (false, true) => b0 >> 16,
+            };
             // src0 is one HALF of a packed pair - the same widening the emitter does, so this
             // oracle and the code that ships agree about which value the multiply sees.
             let a = match (signed, src0_high) {
@@ -310,6 +317,15 @@ fn eval_channel(regs: &RegFile, instr: &Instr, c: usize) -> Result<f32, &'static
                 f.trunc().clamp(0.0, 4_294_967_000.0) as u32
             };
             f32::from_bits(raw & lane_mask)
+        }
+        // The INTEGER->float convert refuses for the same reason the two below do: its source
+        // is HALF a register, and this file holds one f32 per lane with nowhere to put the
+        // other half. Widening the whole lane instead would make the oracle agree with an
+        // emitter that had the half selection wrong, which is the one thing an oracle must not
+        // do - and it is the same trap `Op::PackToInt`'s 16-bit destination already documents
+        // on the writing side.
+        Op::PackFromInt { .. } => {
+            return Err("unpack.int (this register file cannot hold a packed 16-bit half pair)")
         }
         // The 8-bit combiner is EMITTABLE but not interpretable here, and that is a property
         // of this register file rather than of the instruction: it holds one f32 per lane,
@@ -863,7 +879,7 @@ mod tests {
         let a = Operand::plain(Bank::PrimaryAttr, 2, 2);
         let b = Operand::plain(Bank::Immediate, 48, 2);
         let cc = Operand::plain(Bank::SecondaryAttr, 24, 3);
-        let mut i = instr(Op::IntMad { signed: true, bits: 32, src0_high: false }, d, vec![a, b, cc]);
+        let mut i = instr(Op::IntMad { signed: true, bits: 32, src0_high: false, src1_high: false }, d, vec![a, b, cc]);
         // The group is scalar and carries no write mask.
         i.write_mask = [true, false, false, false];
         run(&shader(vec![i]), &mut regs).unwrap();
@@ -879,7 +895,7 @@ mod tests {
         let a = Operand::plain(Bank::Temp, 1, 0);
         let b = Operand::plain(Bank::Temp, 2, 0);
         let cc = Operand::plain(Bank::Temp, 3, 0);
-        let i = instr(Op::IntMad { signed: false, bits: 16, src0_high: false }, d, vec![a, b, cc]);
+        let i = instr(Op::IntMad { signed: false, bits: 16, src0_high: false, src1_high: false }, d, vec![a, b, cc]);
         assert!(run(&shader(vec![i]), &mut regs).is_err(), "a 16-bit imad must hard-fail");
     }
 

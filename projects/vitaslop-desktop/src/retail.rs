@@ -224,18 +224,61 @@ impl RetailGuest {
     /// replays in the window.
     pub fn new(dir: &Path, input: SharedInput, recipe: Option<&str>) -> Result<RetailGuest, String> {
         let t0 = Instant::now();
-        let files = read_dir_files(dir)?;
-        let mut vfs = MemVfs::new();
-        for (path, bytes) in files {
-            vfs.insert(path, bytes);
-        }
-        let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
-        let modules = game
-            .modules
+        // >>> THE DATA FILES STAY ON DISK. See `crate::diskvfs`.
+        //
+        // A decrypted-dump tree - which is what every extracted title here is - mounts LAZILY:
+        // the manifest and the loadable modules are read (link and transpile want the whole
+        // image, and they are a few megabytes), and the data files are served a read at a time
+        // from handles opened once. Reading them all instead held 2,822 MB at frame 0 on one
+        // title and peaked at 4,940 MB during the load, for bytes the title had not asked for.
+        // The browser has mounted this way since it had to; the desktop merely could afford not
+        // to, and paid for it on every measurement run.
+        //
+        // Anything that is NOT a dump (a picked .pkg, a PFS tree) still goes through the eager
+        // container decrypt below - that path has to hold its output anyway, and it is not what
+        // a measurement or a play session uses.
+        //
+        // `VITASLOP_EAGER_FILES=1` is the arm back, and it exists so the change can be A/B'd
+        // bit-for-bit from ONE build: a lazy read serves the same bytes or it does not, and a
+        // picture is the only thing that says so.
+        let disk = crate::diskvfs::DiskVfs::open(dir)?;
+        let eager = std::env::var_os("VITASLOP_EAGER_FILES").is_some();
+        let lazy = (!eager)
+            .then(|| vitaslop_runtime::ingest::pipeline::dump_root(&disk))
+            .flatten()
+            .map(|root| vitaslop_runtime::ingest::pipeline::mount_dump_lazy(&disk, &root))
+            .transpose()
+            .map_err(|e| format!("mount dump: {e:?}"))?;
+        let (game_modules, mut resident, backing) = match lazy {
+            Some(dump) => {
+                let backing =
+                    crate::diskvfs::DiskBacking::new(disk.under(&dump.files_prefix));
+                println!(
+                    "loaded: {} data file(s), {:.0} MB, served FROM DISK (not resident)",
+                    backing.file_count(),
+                    backing.total_bytes() as f64 / 1e6,
+                );
+                (dump.modules, None, Some(backing))
+            }
+            None => {
+                let files = read_dir_files(dir)?;
+                let mut vfs = MemVfs::new();
+                for (path, bytes) in files {
+                    vfs.insert(path, bytes);
+                }
+                let game = decrypt_container(&mut vfs).map_err(|e| format!("decrypt: {e:?}"))?;
+                (game.modules, Some(game.files), None)
+            }
+        };
+        let modules = game_modules
             .iter()
             .map(|m| loader::load(&m.elf))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("load module: {e:?}"))?;
+        // The module images are only needed by `load` above; the linked program owns what it
+        // took from them. Dropped here rather than at the end of the function because link and
+        // transpile are the allocation peak of the whole system.
+        drop(game_modules);
         // This run stands up the THREADED scheduler, so the host mirror block exists and is
     // refreshed at its resume point - which is what lets the RTC tick be read inline.
     // See `vitaslop_runtime::vita::set_preemptive_linking`.
@@ -261,14 +304,36 @@ impl RetailGuest {
         env.state.set_modules(linked.loaded_modules.clone());
         env.state.set_tls_template(linked.tls_template);
         env.state.set_preemptive(true);
-        // Move (not clone) the decrypted assets into the guest filesystem - for a
-        // large 3D title this is hundreds of megabytes.
-        for (path, bytes) in game.files.into_files() {
-            env.state.add_file(&path, bytes);
+        // Either the disk serves the assets on demand, or - for a container that had to be
+        // decrypted whole - they are MOVED (not cloned) into the guest filesystem.
+        match (backing, resident.take()) {
+            (Some(b), _) => env.state.set_file_backing(Box::new(b)),
+            (None, Some(files)) => {
+                for (path, bytes) in files.into_files() {
+                    env.state.add_file(&path, bytes);
+                }
+            }
+            (None, None) => {}
         }
 
+        // >>> THE BOOT'S OWN RESIDENCY, BRACKETED. See `vitaslop_platform::heap`.
+        //
+        // Transpile is the allocation peak of the whole system and nothing said where in the
+        // boot it was paid. These two lines bracket it: whatever the peak rises to between them
+        // is the transpiler's, and the LIVE figure after it is what the run then carries. The
+        // browser's ceiling is 4,096 MB and its transpile happens in a worker of its own, so the
+        // peak here is the number that decides whether a title can be brought up at all.
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            println!("loaded: RUST HEAP before transpile - live {live} MB, peak {peak} MB");
+        }
+        vitaslop_platform::heap::reset_peak();
         let (sched, _stubs) = ThreadedScheduler::from_linked(&linked, env, QUANTUM_FUEL)
             .map_err(|e| format!("scheduler: {e:?}"))?;
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            println!("loaded: RUST HEAP after transpile+instantiate - live {live} MB, TRANSPILE PEAK {peak} MB");
+        }
         // >>> NO DETERMINISM SIGNATURE unless something will read it. The fold hashes every
         // retired scene's vertices, indices and uniforms - 3.5 MB a frame on a race, MEASURED
         // at 8.0% of a desktop frame - and this path never prints or compares one. The
@@ -517,6 +582,29 @@ impl RetailGuest {
     /// Who got the CPU, and how much of the device's parallelism the run used. The two
     /// belong together: a lopsided share is only a problem if the starved threads were
     /// READY, and the second report is what says so.
+    /// Overwrite guest memory - the path a RENDER TARGET's pixels take back to the guest.
+    ///
+    /// A title that reads texels out of a target it drew (this one's ambient probe is a 128x128
+    /// grid it indexes on the CPU) reads its allocator's poison unless the rendered pixels are
+    /// put back. See `vitaslop_native::apply_rtt_writebacks`.
+    /// Install the `sceGxmEndScene` completion hook - see `VitaState::complete_scene_now`.
+    pub fn install_complete_scene_hook(
+        &self,
+        hook: Box<dyn FnMut(&[Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send>,
+    ) {
+        self.sched.host().state.complete_scene_now = Some(hook);
+    }
+
+    pub fn write_guest(&self, addr: u32, bytes: &[u8]) {
+        self.sched.write_guest(addr, bytes);
+    }
+
+    /// Read guest memory - the writeback's own gate reads a target's bytes to decide whether
+    /// anything has ever been written there.
+    pub fn read_guest(&self, addr: u32, len: usize) -> Vec<u8> {
+        self.sched.read_guest(addr, len)
+    }
+
     pub fn scheduler_report(&self) -> String {
         format!("{}{}", self.sched.cpu_share_report(), self.sched.runnable_report())
     }
@@ -688,7 +776,7 @@ impl RetailGfx {
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
             // Raise resolution-derived limits to the adapter's: a real title binds
             // textures past the 2048 downlevel floor (some titles have a ~2480px atlas).
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -1283,10 +1371,21 @@ pub fn headless_check(
     // The idle attribution at the call-site window's open, so its close can print the
     // window's own figure - see `idle_attribution_since`.
     let mut idle_at_window_open: Vec<(vitaslop_runtime::host::IdleOwner, u64, u64)> = Vec::new();
-    let mut periodic: Option<vitaslop_native::GeneralRenderer> = None;
+    // Shared with the guest's `sceGxmEndScene` hook (below): a small render target a title
+    // reads on the CPU is completed there, on THIS renderer, so the probe sees the same cube
+    // and targets the frame render built. See `VitaState::complete_scene_now`.
+    let periodic_shared: std::sync::Arc<std::sync::Mutex<Option<vitaslop_native::GeneralRenderer>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     if shot_every > 0 {
         std::fs::create_dir_all(&shot_dir).map_err(|e| format!("mkdir: {e}"))?;
-        periodic = Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
+        *periodic_shared.lock().unwrap() =
+            Some(vitaslop_native::GeneralRenderer::new().ok_or("no GPU adapter")?);
+        let hook_renderer = periodic_shared.clone();
+        guest.install_complete_scene_hook(Box::new(move |scenes| {
+            let mut g = hook_renderer.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(r) = g.as_mut() else { return Vec::new() };
+            r.complete_scenes(scenes)
+        }));
     }
     let mut frame_ms: Vec<f64> = Vec::new();
     // >>> THE HICCUP LOG: per-frame `(frame, guest ms, render ms, scenes, draws)` for every
@@ -1304,6 +1403,12 @@ pub fn headless_check(
     // Outside the shot window nothing is rendered, so a row there would report a render cost of
     // zero and read as a guest-only frame. Only the window is logged.
     let mut hiccups: Vec<Hiccup> = Vec::new();
+    // The last reported heap figure and the frame it was taken on, so a jump can name the
+    // interval it happened in rather than only the frame it was noticed on.
+    let mut last_heap_mb = vitaslop_platform::heap::live_peak_mb().0;
+    let mut last_heap_frame = 0u64;
+    // The run peak already reported, so only a frame that RAISES it says so.
+    let mut last_peak_mb = vitaslop_platform::heap::live_peak_mb().1;
     // Encode counters folded up across the window's per-frame takes, so the run-total report
     // below still sees every one of them. `take_encode_work` RESETS, and the hiccup rows need
     // per-frame deltas, so the two readers have to cooperate rather than race.
@@ -1317,6 +1422,54 @@ pub fn headless_check(
     let mut prep_frames = 0u64;
     while guest.frames() < target && !guest.finished() {
         let f = guest.frames();
+        // >>> WHAT THE RUST HEAP HOLDS, EVERY 250 FRAMES, ALWAYS.
+        //
+        // The browser's own panel prints `memory_size(0)`, a page count that never falls, and on
+        // one title it read 68 MB for nine thousand frames and 3,412 MB thirty frames later -
+        // against wasm32's 4,096 MB ceiling. A page count cannot say what happened in those
+        // thirty frames. LIVE bytes can, because they come back down: a rise that falls is a
+        // working set and a rise that stays is a leak, and the PEAK beside it is what a wasm
+        // heap took pages for and can never return. This is the desktop reader of the same
+        // counters the panel now carries, so a residency A/B can be run here in a minute
+        // instead of on a phone. See `vitaslop_platform::heap`.
+        //
+        // Printed on a schedule AND on a JUMP: a 250-frame interval put two samples inside a
+        // 100-frame render window and read 270 MB then 2,481 MB, which says a step happened
+        // and nothing about where. A 64 MB move since the last line is the pathology this is
+        // looking for, so it reports itself.
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            // >>> AND WHICH FRAME RAISED THE RUN'S PEAK. A peak that stands 2 GB above the
+            // largest LIVE figure ever printed is a WITHIN-FRAME transient, and a per-frame
+            // live sample cannot see one at all: it is allocated and freed between two prints.
+            // On wasm32 a transient costs the device its address space permanently, so it is
+            // worth exactly as much as a leak.
+            if peak > last_peak_mb {
+                println!(
+                    "headless: frame {f} | RUST HEAP PEAK raised to {peak} MB (live here is {live} MB - the difference is a transient INSIDE this frame)"
+                );
+                last_peak_mb = peak;
+            }
+            let jumped = live.abs_diff(last_heap_mb) >= 64;
+            if f % 250 == 0 || jumped {
+                println!(
+                    "headless: frame {f} | RUST HEAP live {live} MB, peak {peak} MB{}",
+                    if jumped { format!(" | JUMPED {} MB since frame {last_heap_frame}", live as i64 - last_heap_mb as i64) } else { String::new() },
+                );
+                // ...and WHAT is holding it, whenever the figure moved. The renderer's cache
+                // line is the browser panel's `RENDERER CACHES`, which the desktop never
+                // printed - so an unbounded cache could be found only from a device dump, on
+                // the one engine where a run costs a minute and the OS reports the process's
+                // working set.
+                if jumped {
+                    if let Some(r) = periodic_shared.lock().unwrap().as_ref() {
+                        println!("headless: frame {f} | {}", r.cache_sizes());
+                    }
+                }
+                last_heap_mb = live;
+                last_heap_frame = f;
+            }
+        }
         if let Some((from, to)) = callsite_window {
             if f == from {
                 vitaslop_runtime::vita::reset_call_sites();
@@ -1364,6 +1517,10 @@ pub fn headless_check(
         // cost of being faithful. Outside the window nothing is rendered, exactly as before.
         let mut render_ms = 0.0f64;
         let mut frame_shape = (0usize, 0usize);
+        // Rendered pixels that have to reach GUEST memory, collected while the scenes are
+        // still borrowed and applied below once they are not.
+        let mut writeback: Vec<(u32, u32, u32, Vec<u8>)> = Vec::new();
+        let mut periodic = periodic_shared.lock().unwrap_or_else(|e| e.into_inner());
         if let (Some(r), true) = (periodic.as_mut(), shot_every > 1 && in_shot_window && f % shot_every != 0) {
             let scenes = guest.current();
             if !scenes.is_empty() {
@@ -1371,6 +1528,7 @@ pub fn headless_check(
                 let t = std::time::Instant::now();
                 let _ = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
+                writeback = r.rtt_writebacks();
             }
         }
         if let (Some(r), true) = (periodic.as_mut(), shot_every > 0 && in_shot_window && f % shot_every == 0) {
@@ -1402,6 +1560,7 @@ pub fn headless_check(
                 let t = std::time::Instant::now();
                 let fb = r.render_frame(scenes, display.0, display.1, CLEAR);
                 render_ms = t.elapsed().as_secs_f64() * 1000.0;
+                writeback = r.rtt_writebacks();
                 let path = shot_dir.join(format!("f{f:06}.png"));
                 // Written at PANEL size whatever the guest declared, so a shot sequence is
                 // comparable frame to frame and against the browser. `scaled_to` is a copy
@@ -1434,6 +1593,21 @@ pub fn headless_check(
                     .join(" "),
             );
         }
+        // The rendered pixels of any small render target go back to GUEST memory now, with the
+        // scenes no longer borrowed. A title that reads texels out of a target it drew - this
+        // one's ambient probe is a 128x128 grid it indexes on the CPU - otherwise reads its own
+        // allocator poison. See `vitaslop_native::apply_rtt_writebacks`.
+        // Released BEFORE the guest advances: the `sceGxmEndScene` hook takes this lock.
+        drop(periodic);
+        if !writeback.is_empty() {
+            let scenes = guest.current().to_vec();
+            vitaslop_native::apply_rtt_writebacks(
+                &writeback,
+                &scenes,
+                |a, n| guest.read_guest(a, n),
+                |a, b| guest.write_guest(a, b),
+            );
+        }
         if use_builtin_taps {
             let touch = taps
                 .iter()
@@ -1446,7 +1620,7 @@ pub fn headless_check(
             guest.advance();
             let guest_ms = t.elapsed().as_secs_f64() * 1000.0;
             frame_ms.push(guest_ms);
-            if in_shot_window && periodic.is_some() {
+            if in_shot_window && periodic_shared.lock().unwrap().is_some() {
                 // The encode counters THIS frame moved. A hitch with a pipeline build in it and
                 // a hitch with a megabyte of texture in it look identical in milliseconds and
                 // need different fixes, and neither is visible in a run total.

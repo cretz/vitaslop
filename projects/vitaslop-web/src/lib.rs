@@ -19,6 +19,16 @@
 //! workspace build does not drag the browser stack onto the desktop toolchain.
 #![cfg(target_arch = "wasm32")]
 
+/// >>> EVERY ALLOCATION IS COUNTED. See [`vitaslop_platform::heap`].
+///
+/// `memory_size(0)` - what the `MEMORY` panel line has always printed - is a page count that
+/// never falls, so by the time it is large the allocation that made it large is gone. This
+/// counts LIVE bytes, which fall when a cache is evicted, and the high-water mark, which is what
+/// the wasm heap actually took pages for and can never give back.
+#[global_allocator]
+static ALLOC: vitaslop_platform::heap::Counting<std::alloc::System> =
+    vitaslop_platform::heap::Counting(std::alloc::System);
+
 mod audio;
 mod browser_sched;
 mod conformance;
@@ -140,7 +150,7 @@ async fn run_cube_scheduled() -> Result<CpuRun, JsValue> {
 
     let t1 = perf.now();
     let report =
-        browser_sched::run_frames(&mut sched.core, FRAMES as u64, 50_000_000, &mut |_| {}).await;
+        browser_sched::run_frames(&mut sched.core, FRAMES as u64, 50_000_000, &mut |_| {}, None).await;
     let run_ms = perf.now() - t1;
 
     let scenes = sched.host.lock().unwrap().state.capture.scenes.clone();
@@ -419,11 +429,7 @@ impl Playback {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("vitaslop-web"),
                 required_features: vitaslop_platform::gpu::wanted_features(&adapter),
-                // The same limits the native pixel oracle asks for - see the note on
-                // the retail device below. NOT the WebGL2 downlevel set: this is a
-                // WebGPU device.
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits: vitaslop_platform::gpu::device_limits(&adapter),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
@@ -556,6 +562,165 @@ fn main_stack_top(base: u32, mem_bytes: u32) -> u32 {
     (base.wrapping_add(mem_bytes).wrapping_sub(MAIN_STACK_HEADROOM)) & !0xF
 }
 
+/// The browser half of the render-target WRITEBACK - see `vitaslop_runtime::rtt_writeback`
+/// for why a title needs its rendered pixels back in guest memory (a baseball title reads its
+/// ambient light out of a 128x128 target on the CPU, and without this it reads its allocator's
+/// poison and the whole frame washes out).
+///
+/// Native blocks on the map and writes the same frame. The browser cannot block: the copy
+/// rides the present's own encoder, the map is requested after the submit, and the bytes are
+/// handed to the guest on the first LATER present whose callback has landed - one or two
+/// frames behind, which for a light probe the guest re-reads every frame is invisible.
+///
+/// One buffer PER TARGET, reused, and a target whose previous map is still outstanding is
+/// skipped this frame rather than re-encoded into a mapped buffer - WebGPU refuses the WHOLE
+/// SUBMIT for that (`used in submit while mapped`), which is how the target probe once killed
+/// the run it was watching.
+struct RttWriteback {
+    /// Per guest address: the readback buffer, its byte size, and whether the map has landed.
+    bufs: std::collections::HashMap<u32, (wgpu::Buffer, u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// Copies encoded this present, awaiting their map: `(addr, w, h, padded row, surface)`.
+    pending: Vec<(u32, u32, u32, u32, vitaslop_runtime::capture::ColorSurface)>,
+    /// Copies whose map is outstanding from an earlier present.
+    in_flight: Vec<(u32, u32, u32, u32, vitaslop_runtime::capture::ColorSurface)>,
+    /// Whether the surface the targets are held in is BGRA, so the bytes are swapped to the
+    /// memory-order RGBA the guest expects.
+    bgra: bool,
+}
+
+impl RttWriteback {
+    fn new(bgra: bool) -> Self {
+        RttWriteback { bufs: Default::default(), pending: Vec::new(), in_flight: Vec::new(), bgra }
+    }
+
+    /// Encode the copies. Call before the submit that carries `encoder`.
+    fn capture(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &[(u32, &wgpu::Texture, u32, u32)],
+        scenes: &[Scene],
+    ) {
+        let cap = vitaslop_runtime::rtt_writeback::rtt_writeback_texels();
+        if cap == 0 {
+            return;
+        }
+        const ALIGN: u32 = 256;
+        for &(addr, tex, w, h) in targets {
+            let (w, h) = (w.max(1), h.max(1));
+            if w * h > cap {
+                continue;
+            }
+            // Only a target this frame's scenes render into - the same bound as native's.
+            let Some(surface) = vitaslop_runtime::rtt_writeback::surface_for(scenes, addr) else {
+                continue;
+            };
+            if self.in_flight.iter().chain(self.pending.iter()).any(|p| p.0 == addr) {
+                continue;
+            }
+            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            let size = (padded * h) as u64;
+            let entry = self.bufs.entry(addr).or_insert_with(|| {
+                (
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("gxm-rtt-writeback"),
+                        size,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    }),
+                    size,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+            });
+            if entry.1 < size {
+                entry.0 = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("gxm-rtt-writeback"),
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                entry.1 = size;
+            }
+            entry.2.store(false, std::sync::atomic::Ordering::Relaxed);
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &entry.0,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.pending.push((addr, w, h, padded, surface));
+        }
+    }
+
+    /// Request the maps, AFTER the submit - before it they would resolve against an unwritten
+    /// buffer.
+    fn begin_map(&mut self) {
+        for p in self.pending.drain(..) {
+            if let Some((buf, size, ready)) = self.bufs.get(&p.0) {
+                let ready = ready.clone();
+                let want = (p.3 * p.2) as u64;
+                buf.slice(..want.min(*size)).map_async(wgpu::MapMode::Read, move |r| {
+                    // A failed map still has to release the slot, or the target is never
+                    // written again; the flag means "the cycle is over", not "the bytes are
+                    // good" - `take` checks the range itself.
+                    let _ = r;
+                    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                self.in_flight.push(p);
+            }
+        }
+    }
+
+    /// Every target whose copy has landed, as `(addr, w, h, tight RGBA8, surface)`, unmapped
+    /// and free for the next cycle.
+    fn take(&mut self) -> Vec<(u32, u32, u32, Vec<u8>, vitaslop_runtime::capture::ColorSurface)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.in_flight.len() {
+            let (addr, w, h, padded, _) = self.in_flight[i];
+            let landed = self
+                .bufs
+                .get(&addr)
+                .is_some_and(|(_, _, r)| r.load(std::sync::atomic::Ordering::Relaxed));
+            if !landed {
+                i += 1;
+                continue;
+            }
+            let (_, _, _, _, surface) = self.in_flight.swap_remove(i);
+            let Some((buf, size, _)) = self.bufs.get(&addr) else { continue };
+            let want = (padded * h) as u64;
+            if let Ok(view) = buf.slice(..want.min(*size)).get_mapped_range() {
+                let tight = (w * 4) as usize;
+                let mut rgba = Vec::with_capacity(tight * h as usize);
+                for row in 0..h as usize {
+                    let start = row * padded as usize;
+                    rgba.extend_from_slice(&view[start..start + tight]);
+                }
+                if self.bgra {
+                    for px in rgba.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                }
+                drop(view);
+                out.push((addr, w, h, rgba, surface));
+            }
+            buf.unmap();
+        }
+        out
+    }
+}
+
 /// Live WebGPU playback of a real title through the general GXM renderer
 /// ([`GxmRenderer`]) - the browser's production render path, the GPU twin of the
 /// native software oracle. Unlike the cube [`Playback`], this holds the general
@@ -584,6 +749,12 @@ struct LivePlayback {
     probe: Option<PresentProbe>,
     /// ...and how bright each offscreen target of the chain is, on the same cadence.
     targets: Option<TargetProbe>,
+    /// The rendered pixels of the small offscreen targets, on their way back to guest
+    /// memory. Always on; `VITASLOP_GXM_RTT_WRITEBACK=0` is the arm back.
+    writeback: RttWriteback,
+    /// A throwaway colour attachment for an early completion's chain (whose display pass is
+    /// suppressed) - see `EarlyCompleter for LivePlayback`.
+    scratch: Option<wgpu::TextureView>,
     /// The most recent probe description, waiting for the next diagnostics window.
     last_probe: Option<String>,
     /// Milliseconds from a `queue.submit` to the GPU reporting that everything submitted is
@@ -1925,8 +2096,7 @@ impl LivePlayback {
                 // working, a demanding one goes black, and the fallback count stays zero.
                 // The native path can only be the browser's pixel oracle if both devices
                 // are built to the same floor.
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits: vitaslop_platform::gpu::device_limits(&adapter),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
@@ -2155,6 +2325,11 @@ impl LivePlayback {
             perf: split_clock,
             split: RenderSplit::default(),
             targets: probe.is_some().then(TargetProbe::new),
+            scratch: None,
+            writeback: RttWriteback::new(matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            )),
             probe,
             last_probe: None,
             gpu_done_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
@@ -2209,12 +2384,29 @@ impl LivePlayback {
     /// panel would put the whole picture in the top-left corner. The canvas is a fixed size
     /// and the surface stretches whatever is rendered into it, so passing the declared size
     /// here IS the hardware's upscale.
+    /// The render-target readbacks that have landed since the last call. See `RttWriteback`.
+    fn take_writebacks(&mut self) -> Vec<(u32, u32, u32, Vec<u8>, vitaslop_runtime::capture::ColorSurface)> {
+        self.writeback.take()
+    }
+
     fn present(
         &mut self,
         scenes: &[Scene],
         display: (u32, u32),
         presents: &[u32],
     ) -> PresentOutcome {
+        // Scenes completed at their own `sceGxmEndScene` are not rendered again - their
+        // target already holds the image (see `Scene::completed_early`). The write-back
+        // capture below still sees ALL of them: a target completed early is still one the
+        // frame rendered into, and its later renders reach guest memory only this way.
+        let all_scenes: &[Scene] = scenes;
+        let owned: Vec<Scene>;
+        let scenes: &[Scene] = if scenes.iter().any(|s| s.completed_early) {
+            owned = scenes.iter().filter(|s| !s.completed_early).cloned().collect();
+            &owned
+        } else {
+            scenes
+        };
         let clock = |p: &Option<web_sys::Performance>| p.as_ref().map(|p| p.now()).unwrap_or(0.0);
         // Asked BEFORE any work: once the device is lost, building scenes and encoding a
         // command buffer is pure cost against a picture that cannot be drawn.
@@ -2445,6 +2637,11 @@ impl LivePlayback {
         // This frame's GPU timestamps ride the same submit; the map is asked for after it.
         // See `GpuTimestamps` - the GPU TIME panel line is the number the latency below
         // cannot give.
+        // The small offscreen targets go back to the guest. Same encoder, no extra submit.
+        {
+            let list = self.gxm.rtt_targets();
+            self.writeback.capture(&self.device, &mut encoder, &list, all_scenes);
+        }
         self.gxm.ts_finish_chain(&mut encoder);
         self.queue.submit([encoder.finish()]);
         // >>> THE DEPTH COUNTER GOES UP HERE AND COMES DOWN IN A CALLBACK, and this promise is
@@ -2535,6 +2732,7 @@ impl LivePlayback {
         if let Some(tp) = self.targets.as_mut() {
             tp.begin_map();
         }
+        self.writeback.begin_map();
         // Deliver any map callback that is ready.
         //
         // On the device the probe announced itself and then produced NOTHING, on two runs -
@@ -3293,6 +3491,28 @@ fn transpile_here(
     // the inside of a frame without taxing what it measures, and without this section every
     // guest function in it is a bare `wasm-function[N]`.
     vitaslop_transpiler::set_wasm_names(vitaslop_runtime::knobs::flag("VITASLOP_WASM_NAMES"));
+    // And the per-block execution tracer's ranges. Emitted at transpile time, so this worker
+    // is the only place it can be asked for - and a browser-only divergence from a desktop
+    // that works is exactly the question it answers.
+    // The emit-time diagnostic family, forwarded verbatim so a knob is spelled the same way
+    // here as in a desktop run script.
+    for name in vitaslop_transpiler::EMIT_KNOBS_OVERRIDABLE {
+        if let Ok(v) = vitaslop_runtime::knobs::var(name) {
+            tracing::warn!("{name}={v:?} - emit-time diagnostic armed for this transpile");
+            vitaslop_transpiler::set_emit_knob(name, &v);
+        }
+    }
+    if vitaslop_runtime::knobs::flag("VITASLOP_TRACK_PC") {
+        vitaslop_transpiler::set_track_pc(true);
+    }
+    if let Ok(spec) = vitaslop_runtime::knobs::var("VITASLOP_TRACE_BLOCKS") {
+        let ranges = vitaslop_transpiler::parse_trace_blocks(&spec);
+        tracing::warn!(
+            "VITASLOP_TRACE_BLOCKS: tracing {} guest block range(s) - every block entry in              them calls the svc hook",
+            ranges.len()
+        );
+        vitaslop_transpiler::set_trace_blocks(ranges);
+    }
     let t = perf.now();
     let built = vitaslop_transpiler::transpile_lenient(&linked.shared_program());
     let ms = perf.now() - t;
@@ -3977,6 +4197,10 @@ async fn live_loop(
     recipe: Option<vitaslop_runtime::recipe::Recipe>,
     persist: Option<Persist>,
 ) {
+    // A small render target a title reads on the CPU is completed at its own
+    // `sceGxmEndScene` - asynchronously here, the thread parked meanwhile. See
+    // `VitaState::complete_scene_async` and `browser_sched::EarlyCompleter`.
+    sched.core.host().lock().unwrap().state.complete_scene_async = true;
     let mut eval = recipe.as_ref().map(|r| vitaslop_runtime::recipe_eval::RecipeEval::new(r, None));
     // >>> ONLY FOLD THE DETERMINISM SIGNATURE WHEN SOMETHING WILL READ IT.
     //
@@ -4408,6 +4632,7 @@ async fn live_loop(
                 target,
                 PER_FRAME_ROUNDS,
                 &mut { report_progress },
+                Some(&mut playback),
             )
             .await;
             // >>> A SLOW DEVICE, ON THIS MACHINE (`VITASLOP_SLOW_FRAME_US`).
@@ -4919,6 +5144,27 @@ async fn live_loop(
             // shadowing it here silently retyped it.
             let (scene, flips) = scene;
             let outcome = playback.present(&scene, display, &flips);
+            // A render target the title reads on the CPU gets its pixels back here - the
+            // copies that landed since the last present, one or two frames behind the picture.
+            // See `RttWriteback`.
+            for (addr, w, h, rgba, surface) in playback.take_writebacks() {
+                // The "is this memory ours" probe is read up front, so the two closures
+                // borrow different things (the probe, and the core for the write).
+                let mut probe = vec![0u8; 4096];
+                if !sched.core.read_guest(addr, &mut probe) {
+                    probe.clear();
+                }
+                let core = &mut sched.core;
+                vitaslop_runtime::rtt_writeback::apply_one(
+                    addr,
+                    w,
+                    h,
+                    &rgba,
+                    &surface,
+                    &mut |_, n| probe[..n.min(probe.len())].to_vec(),
+                    &mut |a, b| core.write_guest(a, b),
+                );
+            }
             if let PresentOutcome::Fatal(why) = outcome {
                 crate::logging::report_fatal(&format!(
                     "RENDERER FAULT at frame {} - the run is over.\n{why}",
@@ -5656,8 +5902,10 @@ async fn live_loop(
                     &mut diag,
                     "MEMORY",
                     &format!(
-                        "emulator wasm heap {} MB (shared with the guest, never returned to the                          OS - this one only goes UP) | GPU texture working set {} MB of a {} MB                          texture cache budget | device reports {} | cache budgets scaled x{:.2}{}",
+                        "emulator wasm heap {} MB (shared with the guest, never returned to the                          OS - this one only goes UP), of which the RUST HEAP holds {} MB LIVE                          and has held {} MB at its peak - the peak is what took the pages, the                          live figure is what is still held, and a gap between them is a                          TRANSIENT that cost the device its address space anyway | GPU texture                          working set {} MB of a {} MB texture cache budget | device reports {} |                          cache budgets scaled x{:.2}{}",
                         wasm_heap_mb(),
+                        vitaslop_platform::heap::live_peak_mb().0,
+                        vitaslop_platform::heap::live_peak_mb().1,
                         vitaslop_platform::gpu::texture_working_set_bytes() / (1024 * 1024),
                         vitaslop_platform::gpu::tex_cache_budget_now() / (1024 * 1024),
                         match vitaslop_platform::knobs::device_memory_gb() {
@@ -6180,4 +6428,84 @@ pub async fn run(canvas: JsValue) -> Result<String, JsValue> {
     let status = format!("{status}; rendering on {}", playback.describe);
     start_raf_loop(playback);
     Ok(status)
+}
+
+impl browser_sched::EarlyCompleter for LivePlayback {
+    fn complete<'a>(
+        &'a mut self,
+        scenes: Vec<Scene>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u32, u32, u32, Vec<u8>)>> + 'a>> {
+        Box::pin(async move {
+            if self.lost.lock().ok().and_then(|s| s.clone()).is_some() {
+                return Vec::new();
+            }
+            let want: std::collections::HashSet<u32> =
+                scenes.iter().filter_map(|s| s.color.map(|c| c.data_addr)).collect();
+            let (w, h) = (960u32, 544u32);
+            if self.scratch.is_none() {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("early-completion-scratch"),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.render_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                self.scratch = Some(tex.create_view(&Default::default()));
+            }
+            let view = self.scratch.clone().expect("created above");
+            let built: Vec<_> = scenes.iter().map(|s| self.builder.build(s)).collect();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("early-completion") });
+            self.gxm.set_offscreen_only(true);
+            self.gxm.encode_chain(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                &self.depth,
+                &built,
+                w,
+                h,
+                w,
+                h,
+                [0, 0, 0, 0],
+                None,
+            );
+            self.gxm.set_offscreen_only(false);
+            // A readback of one of these targets may still be in flight from a present; the
+            // capture would skip it, and the guest would be woken with nothing. Let it land.
+            for _ in 0..2000 {
+                let busy = self.writeback.in_flight.iter().chain(self.writeback.pending.iter()).any(|p| want.contains(&p.0));
+                if !busy {
+                    break;
+                }
+                let _ = self.writeback.take();
+                browser_sched::event_loop_turn().await;
+            }
+            {
+                let list = self.gxm.rtt_targets();
+                self.writeback.capture(&self.device, &mut encoder, &list, &scenes);
+            }
+            self.queue.submit([encoder.finish()]);
+            self.writeback.begin_map();
+            // Wait for the batch's targets to land. Bounded: a map that never resolves (a
+            // lost device) must not park the guest forever.
+            let mut out = Vec::new();
+            for _ in 0..2000 {
+                for (addr, tw, th, rgba, _) in self.writeback.take() {
+                    out.push((addr, tw, th, rgba));
+                }
+                let outstanding = self.writeback.in_flight.iter().any(|p| want.contains(&p.0));
+                if !outstanding {
+                    break;
+                }
+                browser_sched::event_loop_turn().await;
+            }
+            out
+        })
+    }
 }

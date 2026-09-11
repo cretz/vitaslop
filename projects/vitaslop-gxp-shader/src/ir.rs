@@ -349,6 +349,20 @@ pub enum Op {
     /// (VBW, the integer MADs) read and write. The normalized (`scale` set) and C10/O8 forms
     /// stay blocked - they change the value by a factor this does not model.
     PackToInt { bits: u8, signed: bool, src_half: bool },
+    /// VPCK converting a 16-BIT INTEGER source to a FLOAT destination with `scale` clear - the
+    /// exact mirror of [`Op::PackToInt`], and the same truncating-cast reading: a widening
+    /// integer-to-float convert changes no value, so there is nothing here to guess once the
+    /// direction is decoded.
+    ///
+    /// The source is HALF a register, addressed exactly as [`Op::PackToInt`]'s 16-bit
+    /// destination writes it (`crate::wgsl::Dest::store_raw_half`) and exactly as the
+    /// group-0x15 IMAD32s read it back through their own `src0_high` bit - so this reads the
+    /// pairs those two already agree on rather than introducing a third packing.
+    ///
+    /// ONLY the 16-bit widths, for the same reason [`Op::PackUnorm8`] covers only U8: those are
+    /// the ones a packing already exists for. An 8-bit integer source would be a quarter of a
+    /// register and no part of this model carries that, so it stays blocked and named.
+    PackFromInt { bits: u8, signed: bool },
     /// VPCK converting between a FLOAT and a U8 with `scale` SET - the NORMALIZED
     /// conversion, where the byte range 0..255 maps onto 0.0..1.0. This is how a fragment
     /// program that computes in F16 writes an 8-bit-per-channel surface, and how it reads
@@ -385,7 +399,11 @@ pub enum Op {
     /// This shares no encoding with [`Op::LoadIndex`]'s group 0x14 despite the neighbouring
     /// opcode: the two groups carry different field layouts, and reading one through the
     /// other's table is how a "similar" group silently addresses the wrong registers.
-    IntMad { signed: bool, bits: u8, src0_high: bool },
+    /// `src1_high` is the sibling selector at bit 53, and it picks the 16-bit half of `src1`
+    /// the multiplier sees, exactly as `src0_high` does for `src0`. It was zero on every word
+    /// of five titles' corpora and so was refused by name; a sixth title's SKINNED vertex
+    /// programs set it, and refusing it dropped every one of them.
+    IntMad { signed: bool, bits: u8, src0_high: bool, src1_high: bool },
     /// One STEP of a 32-bit integer multiply-add (group 0x1a, the second 32-bit form):
     /// `dest = half(src0) * src1 + src2`, where `high_half` selects which 16-bit half of
     /// `src0` feeds the multiplier and whether its product is shifted back up:
@@ -513,7 +531,8 @@ impl Op {
                 | Op::Dot { .. }
                 | Op::Rcp | Op::Rsq | Op::Log | Op::Exp | Op::Mov | Op::Cmov { .. }
                 | Op::Nop | Op::Tex { .. } | Op::TexGather { .. }
-                | Op::Pack { .. } | Op::PackToInt { .. } | Op::PackUnorm8 { .. } | Op::CopyFx8
+                | Op::Pack { .. } | Op::PackToInt { .. } | Op::PackFromInt { .. }
+                | Op::PackUnorm8 { .. } | Op::CopyFx8
                 | Op::Bitwise { .. }
                 | Op::Sop2 { .. }
                 | Op::IntMad { .. }
@@ -557,6 +576,7 @@ impl Op {
             Op::TexGather { .. } => "tex.gather4",
             Op::Pack { .. } => "pack",
             Op::PackToInt { .. } => "pack.int",
+            Op::PackFromInt { .. } => "unpack.int",
             Op::PackUnorm8 { to_unorm8, .. } => {
                 if to_unorm8 {
                     "pack.unorm8"
@@ -635,6 +655,11 @@ impl Instr {
             // exactly like the float->float form - the instruction's own `half_precision`
             // describes the destination, which here is not a float at all.
             Op::PackToInt { src_half, .. } => src_half,
+            // The INTEGER->float convert reads a 16-bit half pair, which spans registers the
+            // same way an F16 operand does - so the read maps that size a varying or a uniform
+            // from this flag get the right span by reporting the packed width, not the
+            // destination float's.
+            Op::PackFromInt { .. } => true,
             // The normalized U8 convert reads its source at the FLOAT precision only when the
             // float is the source; in the other direction the source is the packed byte
             // register, whose four channels live in one word and are read through

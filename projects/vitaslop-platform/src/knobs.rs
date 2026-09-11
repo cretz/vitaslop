@@ -36,6 +36,7 @@ use std::sync::{Mutex, OnceLock};
 ///   to come from by construction.
 pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_ALLOW_SOFTWARE_GPU",
+    "VITASLOP_ARM_AT_FRAME",
     "VITASLOP_BROWSER_FASTFORWARD",
     "VITASLOP_BROWSER_FUEL",
     "VITASLOP_BROWSER_HEARTBEAT_MS",
@@ -89,6 +90,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // PICTURE, and the pictures that need it are the ones only a device or a browser produces.
     // `VITASLOP_CHAIN_LIMIT` bisects by PASS and cannot touch a title whose frame is one pass.
     "VITASLOP_DRAW_RANGE",
+    // The per-draw dump of one display frame, readable from the browser's knob box.
+    "VITASLOP_DUMP_DRAW_GXP",
     "VITASLOP_FLAGS_WIDE_C",
     // The one frame whose per-SCENE digests are printed, so a cross-engine difference lands on
     // a PASS instead of on a whole frame.
@@ -113,13 +116,25 @@ pub const OVERRIDABLE: &[&str] = &[
     // happened here (the call-site profiler, then the inline-imports switch). It is not a
     // silent omission: `set_override` PANICS on an unregistered name, so a phone run that
     // typed it into the knobs box died on boot with a black canvas and no output.
+    // Per-draw occlusion counts: how many samples each draw of the frame actually wrote. See
+    // `gpu::DrawCoverage`. Registered here so a browser run that sets it does not panic on
+    // boot, though the READBACK is native-only and the run says so.
+    // The destination-colour SPLIT stopwatch: alternate the pass cut on and off every <n> frames
+    // within one run and report the GPU time each arm measured. Browser-reachable because the
+    // question it answers - what a tile store/reload costs - only a TILING GPU can answer.
+    "VITASLOP_GXM_DEST_SPLIT_AB",
+    "VITASLOP_GXM_DRAW_COVERAGE",
     "VITASLOP_GXM_NO_MULTISAMPLE",
+    // The render-target writeback cap in texels; `0` is the arm back. See
+    // `vitaslop_runtime::rtt_writeback`.
+    "VITASLOP_GXM_RTT_WRITEBACK",
     "VITASLOP_GXM_STALE_UNIFORMS",
     // Poisons a freshly reserved default uniform buffer, so a lane the guest never wrote is
     // distinguishable from one it wrote as zero. NOTE it only covers the RESERVE path, never a
     // precomputed state's guest-owned buffer - so its silence is not evidence until the pattern
     // is seen SOMEWHERE. Browser-reachable because the value it has to decide about
     // (`screenTintColour`) only ever appears there.
+    "VITASLOP_GXM_TEX_UNWRITTEN",
     "VITASLOP_GXM_UNIFORM_POISON",
     "VITASLOP_GXP_ALLOW_FIXED_FUNCTION",
     // What an attribute lane the vertex stream does not supply is FILLED with. Browser-reachable
@@ -132,11 +147,18 @@ pub const OVERRIDABLE: &[&str] = &[
     "VITASLOP_GXP_CAPSULE",
     "VITASLOP_GXP_CAPSULE_MIN_INDICES",
     "VITASLOP_GXP_CAPSULE_SKIP",
+    // The interpreter's SA file after the clip sampler has run the prologue - see
+    // `gpu::count_clip_w_signs`. Overridable so a browser run can ask it too.
+    "VITASLOP_GXP_CLIP_DUMP_SA",
     "VITASLOP_GXP_CULL",
     "VITASLOP_GXP_DEST",
     "VITASLOP_GXP_DEST_BLEND",
+    // Whether a destination-reading fragment program linear in the destination is lowered
+    // to a dual-source blend instead of a pass split; `0` is the arm back.
+    "VITASLOP_GXP_DUAL_SOURCE",
     "VITASLOP_GXP_DUMP",
     "VITASLOP_GXP_EXCLUDE",
+    "VITASLOP_GXP_FMEM",
     "VITASLOP_GXP_FORCE",
     // What a draw was FED - its default uniform bank decoded per parameter, its attribute
     // ranges and its bound textures. Reachable from the browser because the defect it is
@@ -214,6 +236,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // cannot translate instead of dropping that pair's draws - see `gpu::report_fallback` for
     // the three choices and why dropping is the default.
     "VITASLOP_GXP_STRICT",
+    // The arm back for binding the guest's own vertex row instead of repacking it to f32.
+    // Browser-reachable because the browser is where its cost lives: the repack it removes was
+    // most of a `prepare` stage that reached 82% of a 265 ms render frame there, so the A/B has
+    // to be runnable on the engine that pays for it.
+    "VITASLOP_GXP_VERTEX_PASSTHROUGH",
     "VITASLOP_GXP_VP_TRACE",
     "VITASLOP_GXP_YFLIP",
     "VITASLOP_GXP_ZFIX",
@@ -232,6 +259,8 @@ pub const OVERRIDABLE: &[&str] = &[
     // `..._PICTURE_HASH` says which picture reached guest memory and what its mean luma was;
     // `..._DUMP_DIR` writes the picture out, which separates "the decoder produced black"
     // from "the conversion is wrong" from "the draw never sampled it".
+    "VITASLOP_MEM_DUMP",
+    "VITASLOP_MEM_DUMP_AT",
     "VITASLOP_MOVIE_DUMP_DIR",
     "VITASLOP_MOVIE_DUMP_EVERY",
     "VITASLOP_MOVIE_PICTURE_HASH",
@@ -242,12 +271,16 @@ pub const OVERRIDABLE: &[&str] = &[
     // audio track while the ones that do are behind thousands of frames of menus.
     "VITASLOP_MOVIE_SUBSTITUTE",
     "VITASLOP_MP4_AUDIO",
-    // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
-    // voice allocates a fresh handle again, which is what left 8,138 voices in the bank and
-    // 318 of them playing every grain. It is here so a device can price the difference.
     "VITASLOP_NGS_NEG_LOOP",
     "VITASLOP_NGS_VOICE_HANDLE_MEMO",
     "VITASLOP_NGS_ZERO_LEVEL",
+    // The falsifier for the voice-handle LOOKUP: with it off, every query for a rack's
+    // voice allocates a fresh handle again, which is what left 8,138 voices in the bank and
+    // 318 of them playing every grain. It is here so a device can price the difference.
+    // The CROSS-ENGINE host-call digest. Browser-reachable by construction: the whole point
+    // is to line a browser run's frames up against a desktop run's and find the first one
+    // that differs, and half of that comparison has no environment to read a knob from.
+    "VITASLOP_NID_DIGEST",
     "VITASLOP_NO_BC",
     "VITASLOP_NO_FAST_IMPORT",
     "VITASLOP_NO_INLINE_CLIB",
@@ -304,6 +337,11 @@ pub const OVERRIDABLE: &[&str] = &[
     // where the audio path had to be priced - it decodes and mixes up to ~100 voices a grain,
     // which is guest-CPU work on the machine that has the least of it.
     "VITASLOP_NO_NGS_MIX",
+    // The repacked-geometry cache's bound in MEGABYTES, and `0` is the arm back to the entry
+    // cap alone. Browser-reachable because the browser is where the bound is load-bearing: an
+    // entry cap of 4,096 meshes let this heap grow 40-80 MB per rendered frame on one title,
+    // 252 MB to 3,751 MB in a hundred frames, and wasm32's ceiling is 4,096 MB.
+    "VITASLOP_PACKED_CACHE_MB",
     "VITASLOP_PAUSE_ON_BLUR",
     "VITASLOP_PERF",
     // Whether the per-window performance report is ALSO written to the browser console. The
@@ -341,6 +379,10 @@ pub const OVERRIDABLE: &[&str] = &[
     // instead of copying it into a per-frame arena and uploading it again. `0` sends every draw
     // back through the arenas, which is the A/B arm. Reachable from the browser because that is
     // where a per-frame upload costs the most.
+    // A/B arm for making the region clip SCENE state: `0` restores the old behaviour, in which
+    // a rectangle set for one render target stays in the GXM context and scissors the next
+    // scene. Browser-reachable because the picture defect it fixes was reported from a phone.
+    "VITASLOP_REGION_CLIP_SCENE",
     "VITASLOP_RESIDENT_GEOM",
     // The byte budget for each of the two resident geometry heaps, in MB (default 48). A heap
     // that fills at its budget is RESET and says so; a reset every few frames means the working
@@ -415,6 +457,18 @@ pub const OVERRIDABLE: &[&str] = &[
     // the browser because `screenTintColour` - the white-out - is written there and never on
     // the desktop.
     "VITASLOP_TEX_PAGE_READ",
+    // The per-basic-block execution tracer's address ranges. Browser-reachable because the
+    // trace is emitted at TRANSPILE time and the browser transpiles in a throwaway worker
+    // with no environment: without this the one instrument that says "which path did this
+    // function actually take" could not be pointed at the engine whose behaviour DIVERGES
+    // from the desktop's, which is the only reason anyone asks.
+    "VITASLOP_TRACE_BLOCKS",
+    // Per-block guest-PC tracking, so a TRAP's register dump names the faulting guest
+    // instruction instead of reporting `pc=0`. Browser-reachable for the same reason the
+    // tracer above is - it is emitted at transpile time - and because a browser fault the
+    // desktop does not reproduce is the case where a wasm stack alone leaves you
+    // disassembling by hand.
+    "VITASLOP_TRACK_PC",
     "VITASLOP_UNIFORM_WATCH",
     // The A/B arm for the vblank SPIN GUARD (`=0` restores the bare mirror read). Here
     // because the browser is where the spin costs the most - 26% of all translated guest
@@ -429,6 +483,17 @@ pub const OVERRIDABLE: &[&str] = &[
     // the engine runs at wasm speed.
     "VITASLOP_VERTEX_INTERN",
     "VITASLOP_WASM_NAMES",
+    "VITASLOP_WATCH_READ",
+    "VITASLOP_WATCH_READ_SKIP",
+    // The emit-time diagnostic family: the store and read watchpoints and the frame gate that
+    // arms them. Browser-reachable for the reason the two above are - they are woven into the
+    // guest's code at TRANSPILE time - and because "who wrote this word, and when" is the
+    // question a browser-only divergence from a working desktop always comes down to.
+    "VITASLOP_WATCH_STORE",
+    "VITASLOP_WATCH_STORE_ARM",
+    "VITASLOP_WATCH_STORE_LOG",
+    "VITASLOP_WATCH_STORE_NZ",
+    "VITASLOP_WATCH_STORE_SKIP",
 ];
 
 /// The override map, consulted by every reader in this module BEFORE the environment.

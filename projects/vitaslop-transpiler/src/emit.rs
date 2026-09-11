@@ -582,7 +582,7 @@ pub fn arm_at_frame() -> Option<u64> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<u64>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_ARM_AT_FRAME").ok().and_then(|s| s.trim().parse().ok())
+        emit_var("VITASLOP_ARM_AT_FRAME").ok().and_then(|s| s.trim().parse().ok())
     })
 }
 
@@ -858,6 +858,59 @@ fn emit_dirty_range(f: &mut Body, addr_local: u32, len_local: u32) {
     f.charge_unbilled_dirty(mark);
 }
 
+
+// --- emit-time diagnostic knobs on a platform with no environment -----------------
+//
+// >>> WHY THIS SEAM EXISTS AT ALL.
+// Every knob below is read at TRANSPILE time, and in the browser the transpile happens in a
+// throwaway worker with no environment: `std::env::var` there always returns `NotPresent`. So
+// the whole emit-time diagnostic family - the store and read watchpoints, the block tracer,
+// guest-PC tracking - could only ever be pointed at the DESKTOP. That is exactly backwards
+// for the questions they answer: a fault the desktop does not reproduce is the case where
+// they are the only instruments there are, and it is the case they could not be used on.
+//
+// The override is a thread-local map because emission is single-threaded per module while a
+// test binary may emit several modules at once, and a process-wide latch would let whichever
+// one ran first decide for all of them. `ANY_OVERRIDE` keeps an unset build's reads to one
+// relaxed atomic load, so an ordinary transpile pays nothing measurable and stays byte-identical.
+thread_local! {
+    static EMIT_KNOBS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+static ANY_EMIT_KNOB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set one emit-time diagnostic knob for this thread, as if the environment carried it.
+/// The value is the same string the environment would hold, so a browser run and a desktop
+/// run spell every knob identically and a recipe copied between them cannot mean two things.
+pub fn set_emit_knob(name: &str, value: &str) {
+    ANY_EMIT_KNOB.store(true, std::sync::atomic::Ordering::Relaxed);
+    EMIT_KNOBS.with(|m| m.borrow_mut().insert(name.to_string(), value.to_string()));
+}
+
+/// Read an emit-time knob: this thread's override if one is set, else the environment.
+fn emit_var(name: &str) -> Result<String, std::env::VarError> {
+    if ANY_EMIT_KNOB.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(v) = EMIT_KNOBS.with(|m| m.borrow().get(name).cloned())
+    {
+        return Ok(v);
+    }
+    std::env::var(name)
+}
+
+/// The emit-time knobs [`set_emit_knob`] accepts, so a caller that forwards a whole table
+/// can ask for exactly the ones that mean something here - and so a typo in a run script
+/// becomes a refusal instead of a silently-off instrument.
+pub const EMIT_KNOBS_OVERRIDABLE: &[&str] = &[
+    "VITASLOP_WATCH_STORE",
+    "VITASLOP_WATCH_STORE_LOG",
+    "VITASLOP_WATCH_STORE_NZ",
+    "VITASLOP_WATCH_STORE_SKIP",
+    "VITASLOP_WATCH_STORE_ARM",
+    "VITASLOP_WATCH_READ",
+    "VITASLOP_WATCH_READ_SKIP",
+    "VITASLOP_ARM_AT_FRAME",
+];
+
 /// Diagnostic store watchpoint. When `VITASLOP_WATCH_STORE=<hex guest addr>` is set
 /// at transpile time, every word store to that exact guest address is preceded by an
 /// `unreachable`, so the first writer traps with a full wasm backtrace (and the
@@ -887,7 +940,7 @@ fn watch_store_addr() -> Option<u32> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<u32>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        let parsed = std::env::var("VITASLOP_WATCH_STORE").ok().and_then(|s| {
+        let parsed = emit_var("VITASLOP_WATCH_STORE").ok().and_then(|s| {
             u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
         });
         // SAY THAT IT PARSED. A run that prints nothing is the watchpoint's ONLY output when the
@@ -895,7 +948,7 @@ fn watch_store_addr() -> Option<u32> {
         // transpiler, or was spelled in a form this parser drops. Those two readings send an
         // investigation in opposite directions, and the second one silently confirms whatever
         // the first was hoping for. [[vitaslop-instrument-failure-imitating-its-subject]]
-        match (std::env::var("VITASLOP_WATCH_STORE"), parsed) {
+        match (emit_var("VITASLOP_WATCH_STORE"), parsed) {
             (Ok(_), Some(a)) => eprintln!(
                 "watch store: ARMED at {a:#010x} - a run with no further `watch store` line means \
                  no instrumented write covered that address"
@@ -1052,7 +1105,7 @@ fn emit_watch_store_extent(f: &mut Body, base: u32, len: WatchExtent, func_addr:
 fn watch_store_nonzero() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_NZ").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_NZ").is_ok())
 }
 
 /// Diagnostic read watchpoint. When `VITASLOP_WATCH_READ=<hex guest addr>` is set at
@@ -1068,7 +1121,7 @@ fn watch_read_addr() -> Option<u32> {
     use std::sync::OnceLock;
     static CELL: OnceLock<Option<u32>> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_READ").ok().and_then(|s| {
+        emit_var("VITASLOP_WATCH_READ").ok().and_then(|s| {
             u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
         })
     })
@@ -1120,7 +1173,20 @@ pub fn set_wasm_names(on: bool) {
 fn track_pc() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_TRACK_PC").is_ok())
+    TRACK_PC.with(|c| c.get()).unwrap_or_else(|| {
+        *CELL.get_or_init(|| std::env::var("VITASLOP_TRACK_PC").is_ok())
+    })
+}
+
+/// Turn guest-PC tracking on for this thread, overriding the knob above.
+///
+/// >>> IT IS BROWSER-REACHABLE, AND A BROWSER TRAP IS WHY. The browser reports a fault as a
+/// > > > wasm stack plus a register dump, and without this the dump's `pc` reads 0 - so the
+/// > > > one thing that would end the disassembly guessing ("WHICH instruction dereferenced
+/// > > > the null") is exactly what a browser-only fault cannot say. Emitted at transpile
+/// > > > time, in a worker with no environment to read.
+pub fn set_track_pc(on: bool) {
+    TRACK_PC.with(|c| c.set(Some(on)));
 }
 
 /// Function indices of the host imports (imports occupy the low function-index
@@ -1422,7 +1488,7 @@ fn watch_store_skip() -> u32 {
     use std::sync::OnceLock;
     static CELL: OnceLock<u32> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_STORE_SKIP")
+        emit_var("VITASLOP_WATCH_STORE_SKIP")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0)
@@ -1435,7 +1501,7 @@ fn watch_read_skip() -> u32 {
     use std::sync::OnceLock;
     static CELL: OnceLock<u32> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("VITASLOP_WATCH_READ_SKIP")
+        emit_var("VITASLOP_WATCH_READ_SKIP")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0)
@@ -1544,13 +1610,26 @@ fn trace_indirect_range() -> Option<(u32, u32)> {
 /// A malformed range is a hard error rather than a silently dropped one: a typo that
 /// quietly traces nothing is indistinguishable from "the code never ran", which is
 /// exactly the reading this instrument exists to settle.
-fn trace_blocks_ranges() -> &'static [(u32, u32)] {
+fn trace_blocks_ranges() -> Vec<(u32, u32)> {
     use std::sync::OnceLock;
+    if let Some(r) = TRACE_BLOCKS.with(|c| c.borrow().clone()) {
+        return r;
+    }
     static CELL: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
     CELL.get_or_init(|| {
         let Ok(s) = std::env::var("VITASLOP_TRACE_BLOCKS") else {
             return Vec::new();
         };
+        parse_trace_blocks(&s)
+    })
+    .clone()
+}
+
+/// Parse the `<lo>-<hi>[,<lo>-<hi>]` range list the block tracer takes, shared by the
+/// environment reader above and [`set_trace_blocks`] so the browser cannot be handed a
+/// spelling the desktop would reject.
+pub fn parse_trace_blocks(s: &str) -> Vec<(u32, u32)> {
+    {
         s.split(',')
             .filter(|t| !t.trim().is_empty())
             .map(|t| {
@@ -1564,7 +1643,18 @@ fn trace_blocks_ranges() -> &'static [(u32, u32)] {
                 }
             })
             .collect()
-    })
+    }
+}
+
+/// Select the block-trace ranges for this thread, overriding the knob above.
+///
+/// >>> IT IS BROWSER-REACHABLE, AND THAT IS THE POINT. The trace is emitted at TRANSPILE
+/// > > > time, and in the browser the transpile happens in a throwaway worker with no
+/// > > > environment to read. Without this seam the one instrument that answers "which path
+/// > > > did this function actually take" existed only on the desktop - and the divergences
+/// > > > worth chasing are precisely the ones where the desktop is the arm that WORKS.
+pub fn set_trace_blocks(ranges: Vec<(u32, u32)>) {
+    TRACE_BLOCKS.with(|c| *c.borrow_mut() = Some(ranges));
 }
 
 /// Diagnostic forced return. `VITASLOP_FORCE_RET=<hex addr>:<dec value>[,...]` makes each
@@ -1615,7 +1705,7 @@ const L_GUARD: u32 = L_NQ0 + NQ_COUNT;
 fn watch_store_arm_mode() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_ARM").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_ARM").is_ok())
 }
 
 /// `VITASLOP_WATCH_STORE_LOG` - LOG each store to the watched address (the storing
@@ -1635,7 +1725,7 @@ fn watch_store_arm_mode() -> bool {
 fn watch_store_log() -> bool {
     use std::sync::OnceLock;
     static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("VITASLOP_WATCH_STORE_LOG").is_ok())
+    *CELL.get_or_init(|| emit_var("VITASLOP_WATCH_STORE_LOG").is_ok())
 }
 
 // Scratch locals used by flag computation. Local 0 is `$bb`.
@@ -2553,6 +2643,11 @@ thread_local! {
     static WASM_NAMES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Per-thread override of the low-bank NEON cache - see [`set_neon_cache`].
     static NEON_CACHE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of guest-PC tracking - see [`set_track_pc`].
+    static TRACK_PC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Per-thread override of the block-trace ranges - see [`set_trace_blocks`].
+    static TRACE_BLOCKS: std::cell::RefCell<Option<Vec<(u32, u32)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether emitted modules hold the low NEON bank in locals across a run of vector

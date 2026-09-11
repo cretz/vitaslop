@@ -42,7 +42,7 @@ impl WgpuRenderer {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gpu"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -237,10 +237,7 @@ impl GeneralRenderer {
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("vitaslop-gxm"),
             required_features: vitaslop_platform::gpu::wanted_features(&adapter),
-            // Raise the resolution-derived limits (max texture dimension, buffer/binding
-            // sizes) to what the adapter really supports: a real title binds textures
-            // larger than the 2048 downlevel floor (some titles have a ~2480px atlas).
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            required_limits: vitaslop_platform::gpu::device_limits(&adapter),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -332,6 +329,15 @@ impl GeneralRenderer {
         // when the composite comes out black the question is WHICH pass is empty - a
         // question the finished frame cannot answer, because every failure mode looks like
         // black. This shows any single pass on its own.
+        // Scenes completed at their own `sceGxmEndScene` are not rendered again: their target
+        // already holds the image (see `Scene::completed_early`).
+        let owned: Vec<Scene>;
+        let scenes: &[Scene] = if scenes.iter().any(|s| s.completed_early) {
+            owned = scenes.iter().filter(|s| !s.completed_early).cloned().collect();
+            &owned
+        } else {
+            scenes
+        };
         let limit = std::env::var("VITASLOP_CHAIN_LIMIT").ok().and_then(|s| s.trim().parse::<usize>().ok());
         let scenes = match limit {
             Some(n) if n > 0 && n < scenes.len() => &scenes[..n],
@@ -381,6 +387,9 @@ impl GeneralRenderer {
             // of such a draw is dropped and replays to an empty frame.
             Some(&color_tex),
         );
+        // `VITASLOP_GXM_DRAW_COVERAGE`: resolve the per-draw occlusion queries onto this same
+        // encoder, so the counts describe the frame the readback below is about.
+        self.gxm.ts_finish_chain(&mut encoder);
         let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
         let t_submit = std::time::Instant::now();
 
@@ -421,6 +430,9 @@ impl GeneralRenderer {
         rx.recv().unwrap().unwrap();
         let rgba = unpad_rows(&slice.get_mapped_range().unwrap(), width, height, bytes_per_row);
         readback.unmap();
+        // ...and now that the submit has completed, say what every draw of that frame covered.
+        // Inert unless `VITASLOP_GXM_DRAW_COVERAGE` is set.
+        self.gxm.coverage_report_blocking(&self.device);
         self.last_split = RenderSplit {
             build_ms,
             encode_ms,
@@ -433,6 +445,114 @@ impl GeneralRenderer {
             self.dump_chain_depth_targets(std::path::Path::new(&dir));
         }
         Framebuffer { width, height, rgba }
+    }
+
+    /// The rendered pixels of every offscreen target small enough to hand back to the GUEST,
+    /// as `(guest colour address, width, height, straight RGBA8)`.
+    ///
+    /// # Why a render target has to reach guest memory at all
+    /// A title does not only SAMPLE its render targets - it also reads texels out of them on
+    /// the CPU. MEASURED on a baseball title: its ambient light is a 128x128 target the GPU
+    /// paints once a frame and the guest then indexes with `row*512 + col*4` to pull one texel
+    /// out. Because nothing ever put the rendered pixels back in guest memory, the read
+    /// returned the game's OWN allocator poison - `0xBAADCAFE`, every word of the buffer - and
+    /// the three poison bytes (254, 202, 173) went through the title's base-10 log decode into
+    /// an ambient of (97.2, 23.7, 10.7). That is a hundred times an ambient, and it is the
+    /// whole of that title's washed-out frame.
+    ///
+    /// # Why SMALL only
+    /// The copy is a GPU->CPU readback, and one per frame for every target would be tens of
+    /// megabytes. The split is not arbitrary: a target a title reads on the CPU is small BY
+    /// CONSTRUCTION - a probe grid, a luminance reduction, an occlusion or exposure result -
+    /// because the CPU has to walk it. A full-size colour buffer is consumed by the GPU and
+    /// never crosses back. `VITASLOP_GXM_RTT_WRITEBACK` is the cap in TEXELS (default 65536,
+    /// i.e. 256x256); `0` disables the writeback entirely and is the arm back.
+    /// What the renderer's caches are holding, in the same line the browser panel prints.
+    ///
+    /// The desktop had no reader for it at all, which is why an unbounded cache could be found
+    /// only from a device dump or a browser panel - on the one engine where a run costs a minute
+    /// and the OS will tell you the process's working set. A residency question should be
+    /// answerable here first.
+    pub fn cache_sizes(&self) -> String {
+        self.gxm.cache_sizes()
+    }
+
+    /// Complete ONE scene now - render it as an offscreen target and return the small
+    /// targets' pixels - for the guest's `sceGxmEndScene` (see `VitaState::complete_scene_now`).
+    /// The scene must not be taken for the display: alone in a frame it would be.
+    pub fn complete_scenes(&mut self, scenes: &[Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        if scenes.is_empty() {
+            return Vec::new();
+        }
+        self.gxm.set_offscreen_only(true);
+        let _ = self.render_frame(scenes, 960, 544, [0, 0, 0, 0]);
+        self.gxm.set_offscreen_only(false);
+        self.rtt_writebacks()
+    }
+
+    pub fn rtt_writebacks(&self) -> Vec<(u32, u32, u32, Vec<u8>)> {
+        let cap = rtt_writeback_texels();
+        if cap == 0 {
+            return Vec::new();
+        }
+        // Row pitch for a texture->buffer copy must be a multiple of 256 bytes, so the
+        // readback is padded and the padding stripped per row on the way out.
+        const ALIGN: u32 = 256;
+        // ONE encoder, ONE submit and ONE poll for every target. A copy-submit-poll per target
+        // is a GPU stall per target: this title has seven small ones and paid seven stalls a
+        // frame for a job whose whole point is that it is cheap
+        // [[vitaslop-a-stall-must-not-buy-a-sentence]].
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gxm-rtt-writeback") });
+        let mut staged: Vec<(u32, u32, u32, u32, wgpu::Buffer)> = Vec::new();
+        for (addr, tex, w, h) in self.gxm.rtt_targets() {
+            let (w, h) = (w.max(1), h.max(1));
+            if w * h > cap {
+                continue;
+            }
+            let padded = (w * 4).div_ceil(ALIGN) * ALIGN;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gxm-rtt-writeback"),
+                size: (padded * h) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            staged.push((addr, w, h, padded, readback));
+        }
+        if staged.is_empty() {
+            return Vec::new();
+        }
+        self.queue.submit([enc.finish()]);
+        for (_, _, _, _, buf) in &staged {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let mut out = Vec::with_capacity(staged.len());
+        for (addr, w, h, padded, buf) in &staged {
+            let Ok(view) = buf.slice(..).get_mapped_range() else { continue };
+            out.push((*addr, *w, *h, unpad_rows(&view, *w, *h, *padded)));
+            drop(view);
+            buf.unmap();
+        }
+        out
     }
 
     /// `VITASLOP_GPU_CHAIN_DIR=<dir>`: write every offscreen target of the frame just
@@ -624,6 +744,9 @@ impl GeneralRenderer {
 /// Strip a readback's row PADDING: `bytes_per_row` is rounded up to
 /// `COPY_BYTES_PER_ROW_ALIGNMENT` for the copy, and a `Framebuffer` is tightly packed.
 /// A no-op copy when the two already agree, which is every panel-width frame.
+pub use vitaslop_runtime::rtt_writeback::apply_rtt_writebacks;
+use vitaslop_runtime::rtt_writeback::rtt_writeback_texels;
+
 fn unpad_rows(padded: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
     let tight = (width * 4) as usize;
     if bytes_per_row as usize == tight {
@@ -691,5 +814,29 @@ mod f16_tests {
         assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
         assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
         assert!(f16_to_f32(0x7e00).is_nan());
+    }
+}
+
+#[cfg(test)]
+mod writeback_tests {
+    use vitaslop_runtime::rtt_writeback::nothing_written_here;
+
+    /// The gate that keeps the render-target writeback off memory a title composed itself.
+    #[test]
+    fn a_uniform_fill_is_unwritten_and_an_image_is_not() {
+        // Zeros - a freshly mapped page.
+        assert!(nothing_written_here(&[0u8; 64]));
+        // 0xBAADCAFE - MLB 12's allocator poison, the case that found this.
+        let poison: Vec<u8> = [0xFEu8, 0xCA, 0xAD, 0xBA].repeat(16);
+        assert!(nothing_written_here(&poison));
+        // One texel written into the poison is enough to make it the guest's.
+        let mut touched = poison.clone();
+        touched[8] = 0x01;
+        assert!(!nothing_written_here(&touched));
+        // Too short to carry a word answers "not empty" rather than guessing.
+        assert!(!nothing_written_here(&[0u8; 3]));
+        // A gradient is an image.
+        let ramp: Vec<u8> = (0..64u8).collect();
+        assert!(!nothing_written_here(&ramp));
     }
 }

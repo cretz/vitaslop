@@ -5967,6 +5967,35 @@ impl IdleKind {
 }
 
 pub struct VitaState {
+    /// >>> A SMALL RENDER TARGET IS COMPLETED AT ITS OWN `sceGxmEndScene`, not at frame end.
+    ///
+    /// Every scene completes synchronously at `sceGxmEndScene` as far as the guest can tell
+    /// (notifications signal there, `sceGxmFinish` has nothing to wait for), but its PIXELS
+    /// only reached guest memory at the end of the display frame - so a title that ends a
+    /// probe scene and reads a texel of it on the CPU in the same frame read what its
+    /// allocator left there. MEASURED on a baseball title: its ambient light is read ONCE, at
+    /// load, right after the probe's scene ends; the read returned `0xBAADCAFE` decoded
+    /// through the title's log curve (97, 24, 11), it cached that for the run, and every
+    /// later write-back landed on a value nobody re-read. The frame stayed washed out with
+    /// the write-back in place and the probe painted correctly.
+    ///
+    /// The frontend installs this: given the scene just ended, render it NOW and return the
+    /// small targets' pixels (`(guest address, width, height, RGBA8)`), which are written back
+    /// here before `sceGxmEndScene` returns. Only scenes whose colour target fits the
+    /// write-back cap take this path; the frame render then skips them
+    /// (`Scene::completed_early`). `None` on a frontend without a renderer.
+    pub complete_scene_now: Option<Box<dyn FnMut(&[crate::capture::Scene]) -> Vec<(u32, u32, u32, Vec<u8>)> + Send>>,
+    /// The ASYNC form of the same completion, for a frontend whose readback cannot block (the
+    /// browser: a GPU map resolves on a later event-loop turn). When set, a small target's
+    /// `sceGxmEndScene` records the batch in `pending_early` and BLOCKS the calling thread;
+    /// the frontend's run loop renders the batch, awaits the pixels, writes them back, marks
+    /// the scenes completed and wakes the thread (`wake_thread`). `sceGxmFinish` semantics
+    /// by another route: the guest cannot run past the end of the scene until its pixels are
+    /// in memory.
+    pub complete_scene_async: bool,
+    /// `(thread id, first scene index, one past the last)` of the batch a blocked
+    /// `sceGxmEndScene` is waiting on - see `complete_scene_async`.
+    pub pending_early: Option<(i32, usize, usize)>,
     pub base: u32,
     pub mem_bytes: u32,
     alloc_cursor: u32,
@@ -6707,6 +6736,9 @@ impl VitaState {
     /// starts at the top of the region.
     pub fn new(base: u32, mem_bytes: u32, world: Box<dyn World + Send>) -> Self {
         VitaState {
+            complete_scene_now: None,
+            complete_scene_async: false,
+            pending_early: None,
             base,
             mem_bytes,
             alloc_cursor: base + 0x0010_0000,
@@ -7255,7 +7287,27 @@ impl VitaState {
 
     /// sceIoPread: positioned read at `offset` that leaves the cursor untouched.
     pub fn io_pread(&mut self, fd: i32, offset: u64, len: usize) -> Option<Vec<u8>> {
-        self.fs.pread(fd, offset, len)
+        let r = self.fs.pread(fd, offset, len);
+        // Traced like `read`, and with the first bytes, because THIS is the call a title's
+        // own archive layer uses and it was the one read the log could not see. Two engines
+        // making the identical pread and then taking different branches is a difference in
+        // the BYTES, and nothing else in the engine could show that: the arguments match, the
+        // call count matches, and the divergence appears several thousand calls later.
+        if tracing::enabled!(target: "vitaslop::io", tracing::Level::TRACE) {
+            let path = self.fs.open.get(&fd).map(|o| o.path.clone()).unwrap_or_default();
+            let head: Vec<String> = r
+                .as_ref()
+                .map(|d| d.iter().take(16).map(|b| format!("{b:02x}")).collect())
+                .unwrap_or_default();
+            tracing::trace!(
+                target: "vitaslop::io",
+                fd, offset, len, path,
+                got = r.as_ref().map(|d| d.len()).unwrap_or(0),
+                head = head.join(""),
+                "pread"
+            );
+        }
+        r
     }
 
     /// sceIoPwrite: positioned write at `offset` that leaves the cursor untouched.
@@ -7689,6 +7741,12 @@ impl VitaState {
     /// Take the threads a host call asked to start (scheduler hook).
     pub fn take_spawns(&mut self) -> Vec<Reentry> {
         std::mem::take(&mut self.pending_spawns)
+    }
+
+    /// Make a parked thread runnable from OUTSIDE a host call - the frontend's async
+    /// completion of a scene (`complete_scene_async`) releases the thread that ended it.
+    pub fn wake_thread(&mut self, thid: i32) {
+        self.pending_wakes.push(thid);
     }
 
     /// Take the parked threads a host call just made runnable (scheduler hook).
@@ -10961,6 +11019,9 @@ impl VitaState {
         depth: Option<crate::capture::DepthSurface>,
         // The render target's `SceGxmMultisampleMode` - see `capture::Scene::multisample`.
         multisample: u32,
+        // The render target's own extent - see `capture::Scene::target_extent`. `None` when the
+        // target was created before capture began.
+        target_extent: Option<(u32, u32)>,
     ) {
         // Texture snapshots deliberately SURVIVE the scene - see `TextureSnapshots`
         // for what invalidates them instead. Only the verifier is re-armed here.
@@ -10977,7 +11038,7 @@ impl VitaState {
             crate::vita::gxmctx::rewind_uniform_ring(ctx, self.gxm_context);
         }
         self.scene =
-            Some(crate::capture::Scene { color, depth, multisample, draws: Vec::new(), precompile: Default::default() });
+            Some(crate::capture::Scene { completed_early: false, color, depth, multisample, target_extent, draws: Vec::new(), precompile: Default::default() });
         self.clear_sa_bank(ctx);
     }
 
@@ -11480,7 +11541,9 @@ impl VitaState {
     /// renders such a surface through an sRGB VIEW of the same texture - the encode then
     /// happens after blending, exactly where the hardware does it.
     pub fn set_color_surface_gamma(&mut self, surface_addr: u32, data_addr: u32, gamma: u32) {
-        if gamma != 0 && self.color_surface_gamma.iter().all(|(a, _, _)| *a != surface_addr) {
+        // Once per (surface, mode) for the whole run: a title sets this every frame, and
+        // 20,000 copies of one fact bury every other line in the log.
+        if gamma != 0 && crate::rtt_writeback::report_once(0x6a00_0000_0000_0000 ^ ((surface_addr as u64) << 16) ^ gamma as u64) {
             {
                 tracing::info!(
                     target: "vitaslop::status",
@@ -13647,6 +13710,15 @@ impl VitaState {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Under `VITASLOP_DUMP_DRAW_GXP=<frame>`, the FRAGMENT windows' bytes ride with the
+        // draw dump: a uniform that lives in a window (container 7 here) has no other
+        // steady-state readout - the once-per-pair inputs dump shows its FIRST sight only.
+        if vitaslop_platform::knobs::var("VITASLOP_DUMP_DRAW_GXP").ok().and_then(|s| s.parse::<u64>().ok()) == Some(self.cur_frame) {
+            for (i, (a, b)) in frag_mem_windows.iter().enumerate() {
+                // At STATUS (not stderr): the browser has no stderr worth reading.
+                tracing::info!(target: "vitaslop::status", "fwindow{i} at {a:#010x} ({} B): {:02x?}", b.len(), &b[..b.len().min(128)]);
+            }
+        }
         drop(gxp_phase);
         let render_state = {
             let _r = crate::perf::scope(crate::perf::Phase::DrawRenderState);
@@ -13863,28 +13935,36 @@ impl VitaState {
             .iter()
             .map(|b| b.base_sa + b.size_regs)
             .fold(layout.default_base + layout.default_regs, u32::max);
-        let mut image = vec![0u8; extent_regs as usize * 4];
-        let put = |image: &mut Vec<u8>, base_reg: u32, bytes: &[u8]| {
-            let at = base_reg as usize * 4;
-            let n = bytes.len().min(image.len().saturating_sub(at));
-            image[at..at + n].copy_from_slice(&bytes[..n]);
+        // ONE allocation, the Arc itself, and each bound buffer is read STRAIGHT INTO it.
+        // This runs twice per draw (one stage each): the previous shape - a Vec, a Vec per
+        // buffer from `read_bytes`, then `Vec -> Arc` - was four allocations and two extra
+        // copies per stage, inside `sceGxmDraw`, on a title that draws 600 times a frame.
+        let mut image: Arc<[u8]> = unsafe {
+            // SAFETY: a zeroed byte is an initialised byte.
+            Arc::<[std::mem::MaybeUninit<u8>]>::assume_init(Arc::new_zeroed_slice(extent_regs as usize * 4))
         };
-        put(&mut image, layout.default_base, &default_bytes);
-        for b in layout.buffers.iter() {
-            let addr = match stage {
-                UniformStage::Vertex => blk.vertex_uniform_buffer(b.buffer_index),
-                UniformStage::Fragment => blk.fragment_uniform_buffer(b.buffer_index),
-            };
-            if addr == 0 {
-                report_unbound_sa_uniform_buffer(header, stage, b.buffer_index);
-                continue;
+        {
+            let img = Arc::get_mut(&mut image).expect("freshly created, uniquely owned");
+            let at = layout.default_base as usize * 4;
+            let n = default_bytes.len().min(img.len().saturating_sub(at));
+            img[at..at + n].copy_from_slice(&default_bytes[..n]);
+            for b in layout.buffers.iter() {
+                let addr = match stage {
+                    UniformStage::Vertex => blk.vertex_uniform_buffer(b.buffer_index),
+                    UniformStage::Fragment => blk.fragment_uniform_buffer(b.buffer_index),
+                };
+                if addr == 0 {
+                    report_unbound_sa_uniform_buffer(header, stage, b.buffer_index);
+                    continue;
+                }
+                let at = b.base_sa as usize * 4;
+                let n = (b.size_regs as usize * 4).min(img.len().saturating_sub(at));
+                ctx.read_into(addr, &mut img[at..at + n]);
             }
-            let bytes = ctx.read_bytes(addr, b.size_regs as usize * 4);
-            put(&mut image, b.base_sa, &bytes);
         }
         // The SA-resident path assembles a fresh image, so this one conversion is unavoidable
         // - and it is the rare arm, taken only by a program that declares SA-resident buffers.
-        image.into()
+        image
     }
 
     /// The buffer index a +0x78 entry gives the DEFAULT uniform buffer. Its address does not
@@ -13959,7 +14039,9 @@ impl VitaState {
                 len = bytes.len(),
                 "a program's guest-memory WINDOW is bound but every byte behind it is ZERO. A                  transform loaded from it is a zero matrix, which collapses every vertex onto                  the origin, and a BLEND coefficient loaded from it multiplies the draw away -                  either way a frame that looks identical to one where the draw was never                  issued."
             );
-        } else {
+        } else if crate::rtt_writeback::report_once(0x6b00_0000_0000_0000 ^ ((vheader as u64) << 8) ^ buffer_index as u64) {
+            // Once per (program, slot): the window is re-bound every frame and the first
+            // sighting is the one that says what it carries.
             tracing::info!(
                 target: "vitaslop::status",
                 vertex_program = format_args!("{vheader:#x}"),
@@ -13969,6 +14051,77 @@ impl VitaState {
                 first = format_args!("{:02x?}", &bytes[..bytes.len().min(96)]),
                 "a program's guest-memory window is bound and carries data"
             );
+        }
+    }
+
+    /// `VITASLOP_MEM_DUMP=<hex addr>:<bytes>[,...]`: write those guest byte ranges to
+    /// `mem-<addr>.bin` in the working directory, once, at the first draw of the display frame
+    /// named by `VITASLOP_MEM_DUMP_AT` (or immediately if that is unset).
+    ///
+    /// # Why a whole-range dump rather than another targeted print
+    /// A wrong UNIFORM has two possible owners - the guest computed the value, or we stored it
+    /// wrongly - and the only thing that separates them is the guest's own F32 source next to
+    /// the F16 the shader reads. `VITASLOP_GXP_MEM_PEEK` prints eight words at two fixed
+    /// offsets, which answers "is the window placed right"; it cannot answer "is the value
+    /// this block was built FROM anywhere nearby". A range on disk can be searched for any
+    /// bit pattern, which is what turns a value question into a grep.
+    fn dump_guest_ranges(ctx: &GuestCtx, frame: u64) {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
+        static AT: OnceLock<Option<u64>> = OnceLock::new();
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "MEM-DUMP: reached at frame {frame}; VITASLOP_MEM_DUMP={:?}",
+                crate::knobs::var("VITASLOP_MEM_DUMP").ok()
+            );
+        }
+        let spec = SPEC.get_or_init(|| {
+            let Ok(v) = crate::knobs::var("VITASLOP_MEM_DUMP") else { return Vec::new() };
+            v.split(',')
+                .filter_map(|one| {
+                    let (a, n) = one.trim().split_once(':')?;
+                    // BOTH halves accept a `0x` prefix. A length silently parsed as decimal
+                    // when it was written as hex drops the whole entry and leaves the spec
+                    // empty, which reads as "the knob did nothing".
+                    let num = |t: &str| {
+                        let t = t.trim();
+                        match t.strip_prefix("0x") {
+                            Some(h) => u32::from_str_radix(h, 16).ok(),
+                            None => t.parse().ok(),
+                        }
+                    };
+                    Some((u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, num(n)?))
+                })
+                .collect()
+        });
+        if spec.is_empty() || DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        let at = *AT.get_or_init(|| {
+            crate::knobs::var("VITASLOP_MEM_DUMP_AT").ok().and_then(|s| s.trim().parse().ok())
+        });
+        if at.is_some_and(|w| frame < w) {
+            // Not there yet on THIS counter. Re-dump periodically anyway, overwriting, so the
+            // file on disk always holds the LATEST state - a gate on a frame counter the caller
+            // cannot see is otherwise a dump that silently never happens, which is the failure
+            // this instrument exists to avoid.
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 65536 != 0 {
+                return;
+            }
+        } else {
+            DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        for &(addr, len) in spec {
+            let bytes: Vec<u8> = ctx.read_bytes(addr, len as usize);
+            let path = format!("mem-{addr:08x}.bin");
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => eprintln!("MEM-DUMP frame {frame}: {len} bytes of {addr:#010x} -> {path}"),
+                Err(e) => eprintln!("MEM-DUMP {addr:#010x}: {e}"),
+            }
         }
     }
 
@@ -14028,6 +14181,10 @@ impl VitaState {
         if spec.is_empty() {
             return Vec::new();
         }
+        // Cheapest place to hang `VITASLOP_MEM_DUMP` off: it fires once, and this is a point
+        // where a uniform block is DEMONSTRABLY live (its window is about to be snapshotted),
+        // so the bytes on disk are the bytes the shader is about to read.
+        Self::dump_guest_ranges(ctx, self.cur_frame);
         let _g = crate::perf::scope(crate::perf::Phase::DrawGxpCapture);
         let mut out = Vec::with_capacity(spec.len());
         for w in spec.iter() {
@@ -14818,7 +14975,7 @@ impl VitaState {
         // Cached: this runs per draw, and reading an unset environment variable on
         // Windows is not free (see `dump_vprog`).
         static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        let want = match WANT.get_or_init(|| std::env::var("VITASLOP_DUMP_DRAW_GXP").ok()) {
+        let want = match WANT.get_or_init(|| vitaslop_platform::knobs::var("VITASLOP_DUMP_DRAW_GXP").ok()) {
             Some(s) => s.clone(),
             None => return,
         };
@@ -15052,9 +15209,9 @@ impl VitaState {
             // the guest genuinely left empty is WHICH address it is, and that is the join to
             // `VITASLOP_PEEK`, the `refs` tool and the scene-target list.
             eprintln!(
-                "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} addr={:#010x} stride={} nonzero={nonzero:.3} sampler={:?}",
+                "  tex unit={} {}x{} base_fmt={:#x} swizzle={:#x} type={} addr={:#010x} stride={} levels={} mip_filter={} lod_bias={} nonzero={nonzero:.3} sampler={:?}",
                 t.unit, t.width, t.height, t.base_format, t.swizzle, t.tex_type, t.data_addr,
-                t.stride, sampler_name(t.unit)
+                t.stride, t.levels, t.mip_filter, t.lod_bias, sampler_name(t.unit)
             );
         }
         if std::env::var("VITASLOP_DUMP_DRAW_GXP_FULL").is_ok() {
@@ -16596,6 +16753,9 @@ pub struct VitaEnv {
     /// (library_nid, func_nid) per dense import index, in loader order.
     imports: Vec<(u32, u32)>,
     pub state: VitaState,
+    /// The cross-engine host-call digest for the frame in progress - see [`NidDigest`].
+    /// Inert (and untouched) unless `VITASLOP_NID_DIGEST` asked for it.
+    nid_digest: NidDigest,
 }
 
 impl VitaEnv {
@@ -16607,7 +16767,11 @@ impl VitaEnv {
         mem_bytes: u32,
         world: Box<dyn World + Send>,
     ) -> Self {
-        VitaEnv { imports, state: VitaState::new(base, mem_bytes, world) }
+        VitaEnv {
+            imports,
+            state: VitaState::new(base, mem_bytes, world),
+            nid_digest: NidDigest::default(),
+        }
     }
 
     /// Convenience constructor with the default deterministic world.
@@ -16649,6 +16813,127 @@ impl<T: SvcDispatch> SvcDispatch for std::rc::Rc<std::cell::RefCell<T>> {
         base: u32,
     ) -> SvcOutcome {
         self.borrow_mut().svc(imm, regs, mem, base)
+    }
+}
+
+
+// --- the CROSS-ENGINE host-call digest -------------------------------------------
+//
+// >>> WHY: "the browser diverges from the desktop" is the hardest question this project asks,
+// > > > and until now nothing could answer it directly. Both engines run the SAME translated
+// > > > module against the SAME host crate, so if they disagree the disagreement entered
+// > > > through a host call - a file read that returned different bytes, a clock that advanced
+// > > > differently, a thread that was scheduled in another order. A picture cannot say which,
+// > > > a block trace covers one function, and a whole-run signature says only "different".
+//
+// `VITASLOP_NID_DIGEST=1` folds every host call the guest makes - its NID, the calling thread
+// and its four argument registers - into a per-frame digest, printed at each frame boundary.
+// Two runs' digest columns line up frame by frame, so the FIRST frame that differs is the
+// frame the divergence entered, and it is one `diff` away on any pair of engines.
+//
+// `VITASLOP_NID_DIGEST=<from>-<to>` additionally lists every call in that frame window, with
+// its arguments, which names the single call once the window is one frame wide.
+//
+// The digest is FNV-1a over little-endian words: no dependency, no allocation, and the same
+// arithmetic on every target, which a hasher chosen by the platform's RandomState would not be.
+static NID_DIGEST_SPEC: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+/// Is the digest on, and over which frame window should each call be LISTED?
+/// `None` = off. `Some((0, 0))` = digest only (the `=1` spelling).
+fn nid_digest_spec() -> Option<(u64, u64)> {
+    *NID_DIGEST_SPEC.get_or_init(|| {
+        let raw = crate::knobs::var("VITASLOP_NID_DIGEST").ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0" {
+            return None;
+        }
+        if raw == "1" {
+            return Some((0, 0));
+        }
+        let (a, b) = raw.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+/// The running host-call digest, per thread and for the run as a whole.
+///
+/// # Why PER THREAD and not one stream
+/// The obvious digest - fold every call in the order it happens - is useless across engines,
+/// and would have been worse than useless: two engines preempt at different points, so the
+/// INTERLEAVING of calls from different threads legitimately differs on the first busy frame.
+/// A digest that folds the interleaving in reports a divergence in every run, including two
+/// correct ones, and an instrument that always fires cannot be used to find anything.
+///
+/// Each thread's own call sequence is the invariant part: given the same host answers, a
+/// guest thread makes the same calls with the same arguments in the same order whatever else
+/// is running. So the digest is per thread and CUMULATIVE, and the frame line is a snapshot
+/// of every thread's running value. The first frame at which a given thread's column differs
+/// is the frame that thread's behaviour diverged, and the `nid call` listing for that one
+/// frame names the call.
+#[derive(Default)]
+pub(crate) struct NidDigest {
+    /// `thid -> (cumulative FNV-1a hash, cumulative call count)`, ordered so two runs'
+    /// lines are directly comparable as text.
+    threads: std::collections::BTreeMap<i32, (u64, u64)>,
+    /// Calls folded this frame, for the frame line's own count.
+    frame_calls: u64,
+}
+
+impl NidDigest {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn fold(hash: &mut u64, word: u32) {
+        for b in word.to_le_bytes() {
+            *hash ^= u64::from(b);
+            *hash = hash.wrapping_mul(Self::FNV_PRIME);
+        }
+    }
+
+    /// Fold one host call into its thread's digest, and list it when the frame is inside the
+    /// requested window.
+    fn record(&mut self, frame: u64, func_nid: u32, thid: i32, regs: &[u32; REG_COUNT]) {
+        let entry = self.threads.entry(thid).or_insert((Self::FNV_OFFSET, 0));
+        entry.1 += 1;
+        Self::fold(&mut entry.0, func_nid);
+        for r in &regs[..4] {
+            Self::fold(&mut entry.0, *r);
+        }
+        self.frame_calls += 1;
+        let n = entry.1;
+        if let Some((from, to)) = nid_digest_spec()
+            && (from, to) != (0, 0)
+            && frame >= from
+            && frame <= to
+        {
+            tracing::info!(
+                target: "vitaslop::status",
+                "nid call: frame={frame} thid={thid:#x} #{n} nid={func_nid:#010x} {}                  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                crate::nid::name(func_nid),
+                regs[0], regs[1], regs[2], regs[3],
+            );
+        }
+    }
+
+    /// Print the per-thread snapshot at a frame boundary. A frame in which no thread called
+    /// anything prints nothing, so an idle stretch adds no lines for two runs to disagree
+    /// about for no reason.
+    fn end_frame(&mut self, frame: u64) {
+        if self.frame_calls == 0 {
+            return;
+        }
+        let cols: Vec<String> = self
+            .threads
+            .iter()
+            .map(|(thid, (hash, calls))| format!("t{thid:#x}={hash:016x}/{calls}"))
+            .collect();
+        tracing::info!(
+            target: "vitaslop::status",
+            "nid digest: frame={frame} calls={} {}",
+            self.frame_calls,
+            cols.join(" "),
+        );
+        self.frame_calls = 0;
     }
 }
 
@@ -16926,6 +17211,13 @@ impl ImportDispatch for VitaEnv {
             .copied()
             .unwrap_or((0, 0));
         self.state.capture.record_call(func_nid, self.state.current);
+        // The cross-engine divergence instrument, off unless asked for. Placed HERE - after
+        // the selector resolves to a NID and before the handler runs - because that is the
+        // one point both engines share and the arguments are still the guest's own.
+        if nid_digest_spec().is_some() {
+            let frame = self.state.cur_frame();
+            self.nid_digest.record(frame, func_nid, self.state.current, regs);
+        }
         // Diagnostic (`RUST_LOG=vitaslop::display=trace`): EVERY host call the guest's
         // display-queue callback makes, in order. GXM runs that callback once per queued
         // entry and the queue is bounded by `displayQueueMaxPendingCount`, so whatever the
@@ -17095,6 +17387,9 @@ impl ImportDispatch for VitaEnv {
     }
 
     fn on_frame_boundary(&mut self, frame: u64) {
+        if nid_digest_spec().is_some() {
+            self.nid_digest.end_frame(frame);
+        }
         // Re-arm the per-frame texture comparison cadence - see `TextureSnapshots`.
         self.state.texture_snapshots.begin_frame();
         self.state.world.set_frame(frame);

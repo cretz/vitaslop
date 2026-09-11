@@ -149,7 +149,8 @@ pub fn fast_nid(func_nid: u32) -> bool {
         gxm_nid::DRAW
             | gxm_nid::DRAW_PRECOMPUTED
             | gxm_nid::BEGIN_SCENE
-            | gxm_nid::END_SCENE
+            // NOT `END_SCENE`: a small target's completion PARKS the thread there in the
+            // browser (`VitaState::complete_scene_async`), and the fast trap cannot suspend.
             | gxm_nid::SET_VISIBILITY_BUFFER
             | gxm_nid::COLOR_SURFACE_GET_DATA
             | gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS
@@ -1308,7 +1309,7 @@ pub fn dispatch(
         gxm_nid::SHADER_PATCHER_CREATE_VERTEX_PROGRAM => cont!(gxm::create_vertex_program(ctx, st)),
         gxm_nid::SHADER_PATCHER_CREATE_FRAGMENT_PROGRAM => cont!(gxm::create_fragment_program(ctx, st)),
         gxm_nid::BEGIN_SCENE => cont!(gxm::begin_scene(ctx, st)),
-        gxm_nid::END_SCENE => cont!(gxm::end_scene(ctx, st)),
+        gxm_nid::END_SCENE => gxm::end_scene(ctx, st),
         gxm_nid::SET_VERTEX_PROGRAM => cont!(gxm::set_vertex_program(ctx, st)),
         gxm_nid::RESERVE_VERTEX_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_vertex_uniforms(ctx, st)),
         gxm_nid::RESERVE_FRAGMENT_DEFAULT_UNIFORM_BUFFER => cont!(gxm::reserve_fragment_uniforms(ctx, st)),
@@ -2459,7 +2460,6 @@ mod frame_boundary_tests {
             gxm_nid::DRAW,
             gxm_nid::DRAW_PRECOMPUTED,
             gxm_nid::BEGIN_SCENE,
-            gxm_nid::END_SCENE,
             gxm_nid::SET_VISIBILITY_BUFFER,
             gxm_nid::COLOR_SURFACE_GET_DATA,
             gxm_nid::COLOR_SURFACE_GET_STRIDE_IN_PIXELS,
@@ -2609,3 +2609,5 @@ mod frame_boundary_tests {
         );
     }
 }
+
+pub use gxm::report_completed_early;

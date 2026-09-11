@@ -24,6 +24,14 @@ pub use emit::{neon_cache, set_neon_cache};
 /// The A/B arm for the flag carry/overflow forms - see [`emit::flags_wide_c`]. The browser
 /// has no environment, so it selects the arm through the setter.
 pub use emit::{flags_wide_c, set_flags_wide_c};
+/// The per-block execution tracer's ranges, settable where there is no environment to
+/// read them from - see [`emit::set_trace_blocks`].
+pub use emit::{parse_trace_blocks, set_trace_blocks};
+/// Guest-PC tracking, settable where there is no environment - see [`emit::set_track_pc`].
+pub use emit::set_track_pc;
+/// The emit-time diagnostic knobs (watchpoints, frame arming) on a platform with no
+/// environment - see [`emit::set_emit_knob`].
+pub use emit::{set_emit_knob, EMIT_KNOBS_OVERRIDABLE};
 /// The ablation that prices a DISPATCH RE-ENTRY - see [`emit::dispatch_all`]. Selected
 /// through the setter for the same reason: the browser has no environment, and the browser
 /// is the engine whose indirect-branch cost is the question.

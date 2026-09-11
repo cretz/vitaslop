@@ -300,6 +300,19 @@ pub enum IdleStep {
 /// the synchronous [`Scheduler`] (native) and the browser's asynchronous loop compose
 /// it - each owns only the tiny resume step, and defers priority, frame counting,
 /// spawn/wake draining, deadlock/timed-wait, and the verdict to these methods.
+/// The display frame the run has reached, stamped by [`SchedCore`] at every flip.
+///
+/// It exists BESIDE the scheduler's own `frames` field because the readers are diagnostics in
+/// other crates - the browser's block tracer among them - that have no `&SchedCore` to ask and
+/// run on the guest's own stack, under a host import, where nothing is borrowable.
+static CURRENT_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The display frame the run has reached (0 before the first flip), for a diagnostic with no
+/// scheduler in hand. See [`CURRENT_FRAME`].
+pub fn current_frame() -> u64 {
+    CURRENT_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct SchedCore<E: GuestEngine, H: ImportDispatch> {
     engine: E,
     host: Arc<Mutex<H>>,
@@ -598,6 +611,12 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
         self.engine.read_mem(addr, out)
     }
 
+    /// Write shared guest memory at guest address `addr`. The seam a render target's
+    /// pixels are put back through on either engine (`rtt_writeback`).
+    pub fn write_guest(&mut self, addr: u32, bytes: &[u8]) {
+        self.engine.write_mem(addr, bytes)
+    }
+
     /// Mutable access to thread `idx`, for an engine whose resume is driven externally
     /// (the browser async loop resumes `thread_mut(idx)` itself, then folds the result
     /// back with [`on_suspended`](Self::on_suspended)/[`on_finished`](Self::on_finished)).
@@ -845,6 +864,13 @@ impl<E: GuestEngine, H: ImportDispatch> SchedCore<E, H> {
                 // Count the frame and advance any frame-keyed input (a scripted TAS
                 // recipe) in lockstep with the render loop.
                 self.frames += 1;
+                // Stamp the ENGINE-AGNOSTIC frame counter beside the scheduler's own, so a
+                // diagnostic that lives outside this crate can put a frame number on its
+                // lines. Native's block tracer has always been able to; the browser's could
+                // not, and a control-flow trace with no frame number cannot be lined up with
+                // a crash frame, a recipe cue, or another instrument's output - which is most
+                // of what such a trace is for.
+                CURRENT_FRAME.store(self.frames, std::sync::atomic::Ordering::Relaxed);
                 // Diagnostic (`RUST_LOG=vitaslop::display=trace`): the frame boundary itself,
                 // so the flip and scene traces either side of it can be attributed to a frame.
                 // Without it those lines are an undivided stream and "which frame flipped what"

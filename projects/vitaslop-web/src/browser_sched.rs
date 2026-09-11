@@ -1435,6 +1435,11 @@ struct ThreadRt {
     /// [`NARROW_REGS`] as a `Uint32Array`, built once per thread so the per-call read does
     /// not allocate one.
     narrow: js_sys::Uint32Array,
+    /// The diagnostic guest-PC global (`VITASLOP_TRACK_PC`), when the module carries one.
+    /// `None` on an ordinary build, which does not export it - and that is the ONLY reason
+    /// a browser trap could ever say `pc=0`: the ARM `pc` register a translated module keeps
+    /// is never live, so the address of the faulting block has to come from here.
+    guest_pc: Option<WebAssembly::Global>,
     /// The whole shared memory as one typed array, built once. See [`SharedView`] for
     /// why caching it is both sound and load-bearing.
     view: SharedView,
@@ -1525,9 +1530,34 @@ impl ThreadRt {
     fn read_reg(&self, i: usize) -> u32 {
         self.regs[i].value().as_f64().unwrap_or(0.0) as i64 as u32
     }
+    /// The block address the guest was executing, or `None` on a build without
+    /// `VITASLOP_TRACK_PC`. See [`ThreadRt::guest_pc`].
+    fn tracked_pc(&self) -> Option<u32> {
+        let g = self.guest_pc.as_ref()?;
+        Some(g.value().as_f64().unwrap_or(0.0) as i64 as u32)
+    }
     fn view(&self) -> SharedView {
         self.view.clone()
     }
+}
+
+/// Whether this run asked for the per-block execution trace. Read once: the transpile that
+/// emits the announcements has already happened by the time an instance is built, so a knob
+/// changed in between could only produce a trace with no listener or a listener with no
+/// trace.
+fn trace_blocks_on() -> bool {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<bool> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        // The STORE WATCHPOINT's logging form announces each write through this same import,
+        // so it needs the hook installed just as much as the block tracer does. Missing that
+        // would make `VITASLOP_WATCH_STORE_LOG` silent in the browser - and a silent
+        // watchpoint reads as "nothing ever wrote this address", which is precisely the
+        // conclusion it is usually deployed to test.
+        ["VITASLOP_TRACE_BLOCKS", "VITASLOP_WATCH_STORE"]
+            .iter()
+            .any(|k| vitaslop_platform::knobs::var(k).is_ok_and(|s| !s.trim().is_empty()))
+    })
 }
 
 /// One guest thread on the browser engine: its own instance (its register file), the
@@ -1614,6 +1644,10 @@ struct ThreadEngine {
     /// The non-suspending trap's closure - see `abi::IMPORT_FAST_NAME`. Kept for the same
     /// reason as `_import`: the instance calls it for as long as it lives.
     _import_fast: Closure<dyn FnMut(i32)>,
+    /// The per-instance block tracer bound to `env.svc`, when `VITASLOP_TRACE_BLOCKS`
+    /// asked for one. `None` on an ordinary run, which then uses the engine's shared
+    /// no-op stub and pays nothing.
+    _trace: Option<Closure<dyn FnMut(i32)>>,
     /// This instance's SOFTWARE FUEL counter (`abi::FUEL_EXPORT`), or `None` in a build
     /// with fuel switched off. Read to price this thread's guest work - see
     /// [`BrowserThread::fuel_used`].
@@ -2254,6 +2288,51 @@ impl BrowserEngine {
             }) as Box<dyn FnMut(i32)>)
         };
 
+        // >>> THE BLOCK TRACER'S `env.svc`, when `VITASLOP_TRACE_BLOCKS` asked for one.
+        //
+        // The shared stub below is a no-op because the Vita path never traps a real `svc`.
+        // But the transpiler's per-block tracer announces every block entry through exactly
+        // this import, and a no-op there means the one instrument that says WHICH PATH A
+        // FUNCTION TOOK exists only on the desktop - while the divergences worth chasing are
+        // the ones where the desktop is the arm that works. It is built PER INSTANCE (unlike
+        // the stub) because the register file is per instance, and a control-flow trace with
+        // no register values cannot say which state decided the branch.
+        let trace_closure = if trace_blocks_on() {
+            let rt_cell = rt_cell.clone();
+            let thid_cell = thid_cell.clone();
+            Some(Closure::wrap(Box::new(move |selector: i32| {
+                let sel = selector as u32;
+                // Guest addresses are >= 0x81000000; a real (small) syscall immediate is not
+                // a block announcement and stays a no-op, as it is on native.
+                if sel & 0x8000_0000 == 0 {
+                    return;
+                }
+                let Some(rt) = rt_cell.borrow().as_ref().cloned() else { return };
+                // Every register, one global at a time - NOT `read_file`, which fills only
+                // `NARROW_REGS` and leaves the rest ZERO. A control-flow trace whose r4..r11
+                // read as a plausible all-zeros is worse than one with no registers at all:
+                // it says the callee-saved file was clobbered, which is a bug that is not there.
+                let regs: [u32; 16] = std::array::from_fn(|i| rt.read_reg(i));
+                // >>> STRAIGHT TO THE CONSOLE, NOT THROUGH `tracing`.
+                //
+                // A WARN is COLLECTED by the panel and REPLAYED in full at every heartbeat, so
+                // a per-block trace line comes back once per report and a trace of ONE guest
+                // call reads as eleven. That is not noise - it is a false FINDING: this exact
+                // artifact was read as "the browser runs the module entry eleven times", and
+                // cost an afternoon before the replay was noticed. A raw console log is
+                // emitted once, in order, and the e2e harness captures it the same way.
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "[trace] frame={} t{:#x} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}                      r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} r8={:#010x} r9={:#010x}                      r10={:#010x} r11={:#010x} r12={:#010x} sp={:#010x} lr={:#010x}",
+                    vitaslop_runtime::sched::current_frame(),
+                    thid_cell.get(),
+                    regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
+                    regs[7], regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14],
+                )));
+            }) as Box<dyn FnMut(i32)>))
+        } else {
+            None
+        };
+
         // env.import wrapped as Suspending; env.import_fast plain; env.memory the shared
         // memory; env.svc / env.dispatch_miss the shared non-suspending stubs.
         let suspending_import = Reflect::construct(
@@ -2268,7 +2347,12 @@ impl BrowserEngine {
             &JsValue::from_str(abi::IMPORT_FAST_NAME),
             fast_closure.as_ref().unchecked_ref(),
         )?;
-        Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?;
+        match trace_closure.as_ref() {
+            Some(c) => {
+                Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), c.as_ref().unchecked_ref())?
+            }
+            None => Reflect::set(&env, &JsValue::from_str(abi::SVC_NAME), &self.svc_fn)?,
+        };
         Reflect::set(&env, &JsValue::from_str(abi::DISPATCH_MISS_NAME), &self.dispatch_miss_fn)?;
         let imports = Object::new();
         Reflect::set(&imports, &JsValue::from_str(abi::IMPORT_MODULE), &env)?;
@@ -2290,10 +2374,16 @@ impl BrowserEngine {
         let globals: Vec<WebAssembly::Global> = regs.into_iter().chain(vfp).collect();
         let narrow = js_sys::Uint32Array::new_with_length(NARROW_REGS.len() as u32);
         narrow.copy_from(&NARROW_REGS);
+        // Absent on an ordinary build - `VITASLOP_TRACK_PC` is what exports it - so a lookup
+        // failure is the normal case and must not fail the instantiation.
+        let guest_pc = Reflect::get(&exports, &JsValue::from_str(abi::GUEST_PC_EXPORT))
+            .ok()
+            .and_then(|v| v.dyn_into::<WebAssembly::Global>().ok());
         let rt = Rc::new(ThreadRt {
             regs: globals,
             file,
             narrow,
+            guest_pc,
             view: self.view.clone(),
             base: self.base,
         });
@@ -2317,6 +2407,7 @@ impl BrowserEngine {
             cont,
             _import: import_closure,
             _import_fast: fast_closure,
+            _trace: trace_closure,
             // Absent in a build with `VITASLOP_BROWSER_FUEL=0`, which is exactly the
             // build that has no fuel to report; the clock then falls back to advancing
             // on flips and idles alone, as it did before fuel existed.
@@ -2409,7 +2500,7 @@ fn suspend(
 ///
 /// A `MessageChannel` message is the cheapest real task there is - unlike `setTimeout(0)`,
 /// which a worker clamps to 4 ms ([[vitaslop-worker-settimeout-is-clamped]]).
-async fn event_loop_turn() {
+pub(crate) async fn event_loop_turn() {
     EVENT_LOOP_TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     thread_local! {
         static CHANNEL: Option<web_sys::MessageChannel> = web_sys::MessageChannel::new().ok();
@@ -2592,6 +2683,12 @@ async fn resume(t: &mut BrowserThread) -> ThreadStep {
                     }
                     regs.push_str(&format!(" {name}={:#010x}", rt_err.read_reg(i)));
                 }
+                if let Some(pc) = rt_err.tracked_pc() {
+                    regs.push_str(&format!(
+                        "
+  the guest block executing at the trap: {pc:#010x} (VITASLOP_TRACK_PC)"
+                    ));
+                }
                 regs.push_str(
                     "
   A small value (under a megabyte) in a register the faulting                      instruction dereferences is a NULL or near-null pointer, not a wild one -                      guest address 0 is far outside linear memory, so both trap the same way                      here and only the value separates them.",
@@ -2683,11 +2780,25 @@ const LONG_FRAME_ROUNDS: u64 = 2_000;
 /// hung one printed the identical line for minutes. The round count is what tells them
 /// apart, and its rate is the only direct read on how fast the browser executes guest
 /// code at all.
+/// The frontend's half of `VitaState::complete_scene_async`: render these scenes as
+/// offscreen targets NOW and hand back the small targets' pixels (`(guest address, width,
+/// height, RGBA8)`), asynchronously, because a WebGPU readback resolves on a later
+/// event-loop turn.
+pub trait EarlyCompleter {
+    fn complete<'a>(
+        &'a mut self,
+        scenes: Vec<vitaslop_runtime::capture::Scene>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u32, u32, u32, Vec<u8>)>> + 'a>>;
+}
+
 pub async fn run_frames(
     core: &mut SchedCore<BrowserEngine, VitaEnv>,
     max_frames: u64,
     max_rounds: u64,
     progress: &mut dyn FnMut(u64),
+    // `+ 'static` on the object so the `&mut` can be REBORROWED per round: a `&'a mut (dyn
+    // Trait + 'a)` cannot be, the object lifetime being invariant.
+    mut completer: Option<&mut (dyn EarlyCompleter + 'static)>,
 ) -> RunReport {
     let mut rounds = 0u64;
     // What the rounds ARE: idle-path turns (nothing runnable), and resumes split by why
@@ -2858,7 +2969,14 @@ pub async fn run_frames(
         if let Some(report) = done {
             return report;
         }
-        // A host call in this resume may have started threads or woken parked ones.
+        // A thread parked by a small target's `sceGxmEndScene` (see
+        // `VitaState::complete_scene_async`): render the batch, wait for the pixels, put them
+        // in guest memory, mark the scenes completed, and wake it - before the drain that
+        // makes it runnable again.
+        let pending = core.host().lock().unwrap().state.pending_early.take();
+        if let Some((thid, start, n)) = pending {
+            complete_early_batch(core, completer.as_mut().map(|c| &mut **c), thid, start, n).await;
+        }
         core.drain();
         drop(book);
     }
@@ -3073,4 +3191,101 @@ pub fn name_guest_frames(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// See `run_frames`: finish a small-target batch the guest is parked on.
+async fn complete_early_batch(
+    core: &mut SchedCore<BrowserEngine, VitaEnv>,
+    completer: Option<&mut (dyn EarlyCompleter + 'static)>,
+    thid: i32,
+    start: usize,
+    n: usize,
+) {
+    use vitaslop_runtime::capture::Scene;
+    let cap = vitaslop_runtime::rtt_writeback::rtt_writeback_texels();
+    let _ = cap;
+    // Every preceding scene of the frame but the display buffer's own - see
+    // `complete_small_target_now` in the runtime for why the order matters.
+    let display: Vec<u32> = {
+        let h = core.host().lock().unwrap();
+        h.state.capture.presents.iter().rev().take(4).copied().collect()
+    };
+    let in_batch = |s: &Scene| s.color.is_none_or(|c| !display.contains(&c.data_addr));
+    let batch: Vec<Scene> = {
+        let h = core.host().lock().unwrap();
+        let scenes = &h.state.capture.scenes;
+        let n = n.min(scenes.len());
+        let start = start.min(n);
+        scenes[start..n].iter().filter(|s| in_batch(s)).cloned().collect()
+    };
+    let readbacks = match completer {
+        Some(c) if !batch.is_empty() => c.complete(batch.clone()).await,
+        _ => Vec::new(),
+    };
+    for scene in &batch {
+        let Some(c) = scene.color else { continue };
+        for (addr, w, h, rgba) in &readbacks {
+            if *addr != c.data_addr {
+                continue;
+            }
+            let mut probe = vec![0u8; 4096];
+            if !core.read_guest(*addr, &mut probe) {
+                probe.clear();
+            }
+            let ok = vitaslop_runtime::rtt_writeback::apply_one(
+                *addr,
+                *w,
+                *h,
+                rgba,
+                &c,
+                &mut |_, k| probe[..k.min(probe.len())].to_vec(),
+                &mut |a, b| core.write_guest(a, b),
+            );
+            if ok {
+                vitaslop_runtime::vita::report_completed_early(c.data_addr, c.width, c.height);
+                let (w, h) = (*w as usize, *h as usize);
+                let t = if w > 24 && h > 1 { rgba[(w + 24) * 4..(w + 24) * 4 + 4].to_vec() } else { Vec::new() };
+                tracing::info!(target: "vitaslop::status", "gxm rtt: early completion of {addr:#010x} ({w}x{h}): texel(24,1)={t:?}");
+            }
+        }
+    }
+    // Readbacks that landed meanwhile for OTHER targets (the present path's own) are
+    // write-backs too; dropping them lost a probe's first real pixels at load.
+    let batch_addrs: std::collections::HashSet<u32> =
+        batch.iter().filter_map(|s| s.color.map(|c| c.data_addr)).collect();
+    let others: Vec<(u32, u32, u32, Vec<u8>, vitaslop_runtime::capture::ColorSurface)> = {
+        let h = core.host().lock().unwrap();
+        readbacks
+            .iter()
+            .filter(|r| !batch_addrs.contains(&r.0))
+            .filter_map(|r| {
+                vitaslop_runtime::rtt_writeback::surface_for(&h.state.capture.scenes, r.0)
+                    .map(|c| (r.0, r.1, r.2, r.3.clone(), c))
+            })
+            .collect()
+    };
+    for (addr, w, h, rgba, c) in &others {
+        let mut probe = vec![0u8; 4096];
+        if !core.read_guest(*addr, &mut probe) {
+            probe.clear();
+        }
+        let _ = vitaslop_runtime::rtt_writeback::apply_one(
+            *addr,
+            *w,
+            *h,
+            rgba,
+            c,
+            &mut |_, k| probe[..k.min(probe.len())].to_vec(),
+            &mut |a, b| core.write_guest(a, b),
+        );
+    }
+    let mut h = core.host().lock().unwrap();
+    let scenes = &mut h.state.capture.scenes;
+    let n = n.min(scenes.len());
+    for s in scenes[start.min(n)..n].iter_mut() {
+        if in_batch(s) {
+            s.completed_early = true;
+        }
+    }
+    h.state.wake_thread(thid);
 }

@@ -6304,6 +6304,13 @@ fn report_depth_range_reader(di: usize, d: &Draw) {
     });
 }
 
+/// `VITASLOP_GXM_TEX_UNWRITTEN=0` - the arm back for reading ANY uniform 4-byte fill as
+/// "nothing has been written here", not only zeros. See `guest_bytes_unwritten` for what it buys.
+fn tex_unwritten_is_any_uniform_fill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::knobs::var("VITASLOP_GXM_TEX_UNWRITTEN").as_deref() != Ok("0"))
+}
+
 /// Budget for the decode cache, in BYTES of decoded RGBA8, before it is cleared wholesale.
 ///
 /// # In bytes, because a count of entries bounded nothing
@@ -6319,6 +6326,71 @@ fn report_depth_range_reader(di: usize, d: &Draw) {
 /// An entry is bounded by what it costs to REBUILD (a decode) and by what it holds (the
 /// decoded pixels), and only the second is measurable here, so that is the budget.
 /// `VITASLOP_DECODE_CACHE_MB` overrides. 256 MB matches the view cache it feeds.
+/// Report - once per (address, format) - the GUEST PIXEL FORMAT of a scene's colour surface,
+/// and say plainly when it is one this renderer cannot reproduce.
+///
+/// # A wide surface rendered into an 8-bit one clamps, and nothing else says so
+/// Every render target here is created in the swapchain's own format, which is 8-bit UNORM.
+/// A title that renders its world into an `F16F16F16F16` (or `F11F11F10`, or `U2F10F10F10`)
+/// surface is writing HDR values a tone-map pass reads back afterwards - values well above
+/// 1.0 are the POINT of such a surface, not an error - and storing them 8-bit clamps every
+/// one of them to white. The picture that comes out is not "a bit bright": it is a frame with
+/// a large saturated area whose brightness carries no information at all, and every attempt to
+/// attribute that to a shader's arithmetic is chasing a clamp that happened after the shader
+/// was right.
+///
+/// `RttTarget` carries no format field, so the renderer has never had this fact available;
+/// naming it here is what turns "the frame is washed out" into a measurement.
+fn report_color_surface_format(c: &crate::capture::ColorSurface) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.get_or_insert_with(HashSet::new).insert((c.data_addr, c.format)) {
+        return;
+    }
+    // The `SceGxmColorFormat` base, which is what decides the channel WIDTHS; the low bits are
+    // the swizzle and say nothing about range.
+    let base = c.format & 0xF180_0000;
+    let (name, wide) = match base {
+        0x0000_0000 => ("U8U8U8U8", false),
+        0x1000_0000 => ("U8U8U8", false),
+        0x3000_0000 => ("U5U6U5", false),
+        0x4000_0000 => ("U1U5U5U5", false),
+        0x5000_0000 => ("U4U4U4U4", false),
+        0x6000_0000 => ("U8U3U3U2", false),
+        0xF000_0000 => ("F16", true),
+        0x0080_0000 => ("F16F16", true),
+        0x1080_0000 => ("F32", true),
+        0x0100_0000 => ("F16F16F16F16", true),
+        0x1100_0000 => ("F32F32", true),
+        0x2100_0000 => ("F11F11F10", true),
+        0x3100_0000 => ("SE5M9M9M9", true),
+        0x4100_0000 => ("U2F10F10F10", true),
+        0x6080_0000 => ("U2U10U10U10", false),
+        _ => ("(unnamed)", false),
+    };
+    if wide {
+        tracing::warn!(
+            target: "vitaslop::render",
+            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}, a FLOATING-POINT              target - values above 1.0 are what it exists to hold. We render every target in              the swapchain's 8-bit UNORM format, so every such value is CLAMPED to white here              and whatever pass tone-maps this surface reads a clamped image.",
+            c.data_addr,
+            c.width,
+            c.height,
+            c.format
+        );
+    } else {
+        tracing::info!(
+            target: "vitaslop::render",
+            "gxm surface: {:#x} ({}x{}) is colour format {:#010x} = {name}",
+            c.data_addr,
+            c.width,
+            c.height,
+            c.format
+        );
+    }
+}
+
 fn decode_cache_budget_bytes() -> usize {
     static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let base = *CELL.get_or_init(|| {
@@ -6681,11 +6753,28 @@ impl RenderSceneBuilder {
             //
             // 4 KB is as good a witness as 4 MB for the question actually being asked: a live
             // render target's guest memory is empty EVERYWHERE, not just past some offset (see
-            // `GxmTexture::guest_bytes_all_zero`). The one case the bound gets wrong is a real
+            // `GxmTexture::guest_bytes_unwritten`). The one case the bound gets wrong is a real
             // texture whose first 4 KB are zero AND whose address is also held as a render
             // target AND whose bound extent disagrees with it - and that texture was being
             // handed the stale target's pixels before any of this existed.
-            guest_bytes_all_zero: t.pixels.iter().take(4096).all(|b| *b == 0),
+            // >>> A BUFFER NOTHING HAS WRITTEN IS NOT ONLY A BUFFER OF ZEROS. A retail title
+            // fills a fresh allocation with its OWN poison - MLB 12 uses `0xBAADCAFE` - and
+            // such a buffer is exactly as empty as one of zeros. A test for zero alone calls
+            // it real data, REFUSES the render-target alias, and the draw then samples the
+            // poison: MEASURED as the three flat salmon video boards in that title's stadium,
+            // which are `0xBAADCAFE` with the scene's lighting on it.
+            //
+            // The test is ONE REPEATED 4-BYTE WORD over the same bounded prefix, which is what
+            // an allocator fill and a zero fill both are, and which no real texture's first
+            // 4 KB is.
+            guest_bytes_unwritten: {
+                let p = &t.pixels[..t.pixels.len().min(4096)];
+                if tex_unwritten_is_any_uniform_fill() {
+                    p.len() >= 4 && p.chunks_exact(4).all(|w| w == &p[..4])
+                } else {
+                    p.iter().all(|b| *b == 0)
+                }
+            },
             filter_linear,
             addr_mode_u: t.u_addr_mode,
             addr_mode_v: t.v_addr_mode,
@@ -7258,6 +7347,9 @@ impl RenderSceneBuilder {
         tally.report_if_total(&mut self.last_empty);
         // Carry where this scene draws to, so a renderer can keep the result addressable
         // for a later pass that samples it (see `RttTarget`).
+        if let Some(c) = scene.color.as_ref() {
+            report_color_surface_format(c);
+        }
         let target = scene.color.map(|c| vitaslop_platform::gpu::RttTarget {
             data_addr: c.data_addr,
             width: c.width,
@@ -7290,7 +7382,21 @@ impl RenderSceneBuilder {
         // guest's statement of the region, and there is nothing left to warn about. If they
         // disagree there is a real ambiguity, and THAT is worth saying out loud - so the caller
         // is told which of the two it got instead of being told the size is derived either way.
-        let depth_extent = if target.is_none() && depth_addr != 0 {
+        // >>> THE RENDER TARGET'S OWN EXTENT DECIDES WHERE IT IS KNOWN.
+        //
+        // The viewport agreement below is an inference, and it is off by exactly the border a
+        // title insets: one title's 2048x1024 shadow map has every draw agreeing on a viewport
+        // of 2046x1022 - a one-texel border, which is what a shadow map does to stop its clamp
+        // bleeding - so the depth-only target came out two texels short in each axis and every
+        // later pass sampling it read the map through coordinates scaled by 2048/2046. The
+        // render target's extent is the guest's own number, so where it is known there is
+        // nothing to infer. See `Scene::target_extent`.
+        let depth_extent = if target.is_none()
+            && depth_addr != 0
+            && let Some((w, h)) = scene.target_extent
+        {
+            Some((w, h, true))
+        } else if target.is_none() && depth_addr != 0 {
             let mut seen: Option<(u32, u32)> = None;
             let mut agreed = true;
             for d in scene.draws.iter().filter(|d| d.render_state.viewport_enable == 0) {
@@ -7417,11 +7523,12 @@ mod geometry_tests {
         mvp[10] = 1.0;
         mvp[11] = 1.0; // w = z
         let tri = [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
-        let scene = Scene {
+        let scene = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![
                 located_draw([10.0, 0.0, 5.0], &tri, mvp),
                 // Same placement as the first: one object drawn in two passes.
@@ -7455,7 +7562,7 @@ mod geometry_tests {
         // convention as the `lang=` stick directive, so a commanded bearing and a
         // measured heading are directly comparable numbers.
         let d = located_draw([0.0, 0.0, 0.0], &tri, mvp);
-        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![d.clone()] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![d.clone()] }, 100, 100);
         let h = found[0].heading.expect("an identity rotation has a heading");
         assert!((h[0] - 0.0).abs() < 1e-3, "local +X is bearing 0, got {}", h[0]);
         assert!((h[1] + 90.0).abs() < 1e-3, "local +Z is bearing -90, got {}", h[1]);
@@ -7466,7 +7573,7 @@ mod geometry_tests {
         turned.world[2] = -1.0;
         turned.world[8] = 1.0;
         turned.world[10] = 0.0;
-        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![turned] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![turned] }, 100, 100);
         let h = found[0].heading.unwrap();
         assert!((h[0] - 90.0).abs() < 1e-3, "expected bearing 90, got {}", h[0]);
 
@@ -7475,7 +7582,7 @@ mod geometry_tests {
         let mut flat = d;
         flat.world[0] = 0.0;
         flat.world[2] = 0.0;
-        let found = locate_scene(&Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![flat] }, 100, 100);
+        let found = locate_scene(&Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![flat] }, 100, 100);
         assert_eq!(found[0].heading, None);
     }
 
@@ -7492,13 +7599,14 @@ mod geometry_tests {
         let car = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let other = [[0.0, 0.0, 2.0], [5.0, 0.0, 2.0], [0.0, 5.0, 2.0]];
 
-        let before = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
+        let before = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![located_draw([0.0, 0.0, 0.0], &car, mvp)] };
         // Next frame: something new is submitted first, and the car has moved.
-        let after = Scene {
+        let after = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![
                 located_draw([99.0, 0.0, 0.0], &other, mvp),
                 located_draw([1.0, 0.0, 0.0], &car, mvp),
@@ -7878,11 +7986,12 @@ mod geometry_tests {
     #[test]
     fn map_keeps_the_higher_surface_and_measures_its_height() {
         // A wide floor with a small block standing on it.
-        let scene = Scene {
+        let scene = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(8.0, 0.0, 0.0, 20.0, 20.0, true),
@@ -7916,7 +8025,7 @@ mod geometry_tests {
     #[test]
     fn map_excludes_geometry_that_does_not_write_depth() {
         let sky = ground_quad(5000.0, -50.0, -50.0, 50.0, 50.0, false);
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true), sky] };
         let map = render_map(&scene, square_view([-50.0, -50.0, 50.0, 50.0], 40), [0, 0, 0, 255], 1, None, [0.0; 3]);
         assert_eq!(map.height_at(0.0, 0.0), Some(0.0), "the floor, not the sky");
         assert_eq!(map.ground_level(0.25), Some(0.0));
@@ -7926,11 +8035,12 @@ mod geometry_tests {
     fn map_ceiling_drops_geometry_above_it_and_reveals_the_floor_below() {
         // A depth-WRITING roof over half the floor: the ceiling option is the only way to
         // see what is under it.
-        let scene = Scene {
+        let scene = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![
                 ground_quad(0.0, -50.0, -50.0, 50.0, 50.0, true),
                 ground_quad(30.0, -50.0, -50.0, 0.0, 50.0, true),
@@ -7946,7 +8056,7 @@ mod geometry_tests {
 
     #[test]
     fn map_origin_shifts_every_coordinate_into_the_anchored_frame() {
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(4.0, -10.0, -10.0, 10.0, 10.0, true)] };
         let origin = [100.0, 4.0, -200.0];
         // The same geometry, asked for in a frame measured from `origin`: the quad now
         // lives at x -110..-90, z 190..210, and its height is 0 rather than 4.
@@ -8017,11 +8127,12 @@ mod geometry_tests {
 
     #[test]
     fn sprites_are_located_on_screen_and_keep_their_identity_when_they_move() {
-        let scene = Scene {
+        let scene = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.0, 0.0, 7)],
         };
         let found = locate_sprites(&scene, 960, 544);
@@ -8033,21 +8144,23 @@ mod geometry_tests {
 
         // The SAME sprite 300 pixels along keeps its id - which a 3D geometry hash could
         // not do, because a 2D sprite's position IS its vertex data.
-        let moved = Scene {
+        let moved = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![sprite_quad(400.0, 200.0, 480.0, 280.0, 0.0, 0.0, 7)],
         };
         let after = locate_sprites(&moved, 960, 544);
         assert_eq!(after[0].id, s.id, "identity must survive motion");
         // A different region of the same sheet is a DIFFERENT sprite.
-        let other = Scene {
+        let other = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![sprite_quad(100.0, 200.0, 180.0, 280.0, 0.5, 0.5, 7)],
         };
         assert_ne!(locate_sprites(&other, 960, 544)[0].id, s.id, "another atlas region");
@@ -8056,11 +8169,12 @@ mod geometry_tests {
     #[test]
     fn sprite_motion_removes_the_scene_scroll() {
         // A backdrop of many sprites panning left by 6px, and one that moves against it.
-        let build = |shift: f32, hero_extra: f32| Scene {
+        let build = |shift: f32, hero_extra: f32| Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: (0..12)
                 .map(|i| {
                     let x = 40.0 * i as f32 + shift;
@@ -8098,11 +8212,12 @@ mod geometry_tests {
     fn sprites_ignore_3d_draws_and_locate_ignores_2d_ones() {
         // The two locators must partition the scene, or an object gets counted twice - or,
         // worse, a title gets an empty report from the one that does not apply to it.
-        let scene = Scene {
+        let scene = Scene { completed_early: false,
             precompile: Default::default(),
             color: None,
             depth: None,
             multisample: 0,
+            target_extent: None,
             draws: vec![
                 sprite_quad(10.0, 10.0, 50.0, 50.0, 0.0, 0.0, 1),
                 ground_quad(0.0, -10.0, -10.0, 10.0, 10.0, true),
@@ -8129,7 +8244,7 @@ mod geometry_tests {
                 draws.push(ground_quad(20.0, g1, -4.0, 100.0, 4.0, true));
             }
         }
-        Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws }
+        Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws }
     }
 
     fn walled_map(gap: Option<(f32, f32)>) -> WorldMap {
@@ -8174,7 +8289,7 @@ mod geometry_tests {
             draws.push(ground_quad(i as f32 * 0.1, x, -50.0, x + 1.0, -20.0, true));
         }
         draws.push(ground_quad(6.0, 20.0, -50.0, 60.0, -20.0, true));
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -8233,7 +8348,7 @@ mod geometry_tests {
 
     #[test]
     fn plan_route_simplifies_open_ground_to_two_points() {
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![ground_quad(0.0, -100.0, -100.0, 100.0, 100.0, true)] };
         let map = render_map(
             &scene,
             MapView { extent: [-100.0, -100.0, 100.0, 100.0], width: 200, height: 200 },
@@ -8285,7 +8400,7 @@ mod geometry_tests {
             let x = -30.0 + i as f32;
             draws.push(ground_quad(0.0, x, -30.0, x + 1.0, 30.0, true));
         }
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws };
         let strict = world_extent(&scene, 1.0).unwrap();
         assert!(strict[0] < -8000.0, "at keep=1.0 the backdrop sets the extent");
         let dense = world_extent(&scene, 0.90).unwrap();
@@ -8365,7 +8480,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
-        let scene = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
+        let scene = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
         let a = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 1);
         let b = render_scene_supersampled(&scene, w, h, [0, 0, 0, 255], 2);
         assert_eq!((b.width, b.height), (w, h));
@@ -8425,7 +8540,7 @@ mod supersample_tests {
             vprog: crate::capture::no_program(), fprog: crate::capture::no_program(),
             vert_sa: std::sync::Arc::from(&[][..]), frag_sa: std::sync::Arc::from(&[][..]), frag_sa_addr: 0, mem_windows: Vec::new(), frag_mem_windows: Vec::new(), shader_expanded: false,
         };
-        let s = Scene { precompile: Default::default(), color: None, depth: None, multisample: 0, draws:vec![draw] };
+        let s = Scene { completed_early: false, precompile: Default::default(), color: None, depth: None, multisample: 0, target_extent: None, draws:vec![draw] };
         // Mean absolute difference between horizontally-adjacent pixels (a speckle proxy).
         fn h_variance(fb: &Framebuffer) -> f64 {
             let mut acc = 0f64;

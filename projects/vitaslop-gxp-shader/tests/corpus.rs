@@ -79,6 +79,50 @@ fn tabulate_blob_hashes() {
     }
 }
 
+/// One line per blob: its name and a hash of the WGSL the recompiler emits for it.
+///
+/// # What this is for, and why a hash rather than the text
+/// A DECODER change's reach is "which programs does it change the emitted code of", and until
+/// now the only answers available were "does the recompile still succeed" (which a wrong
+/// operand does not disturb at all) and a picture from a fifteen-minute replay. Running this
+/// under both arms of a change and diffing names EVERY program it touches, across every corpus
+/// on disk, in seconds - which is what turns "this looks safe" into a list.
+///
+/// The hash is FNV-1a over the emitted string, so a blob whose output is byte-identical hashes
+/// identically and a blob whose output moved by one register does not.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn hash_every_blob_wgsl() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    assert!(!all.is_empty(), "no .gxp blobs under {}", dir.display());
+    let fnv = |s: &str| {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    };
+    for (name, bytes) in &all {
+        let Ok(p) = Program::parse(bytes) else {
+            println!("{name} PARSE-FAIL");
+            continue;
+        };
+        let out = match p.kind {
+            ProgramKind::Vertex => recompile_vertex(bytes).map(|m| m.wgsl_body),
+            ProgramKind::Fragment => recompile_fragment(bytes).map(|m| m.wgsl_body),
+        };
+        match out {
+            Ok(w) => println!("{name} {:016x}", fnv(&w)),
+            Err(e) => println!("{name} FAIL {e}"),
+        }
+    }
+}
+
 /// Recompile every blob on its own and rank the failures by cause.
 ///
 /// A single-stage failure is a decoder or emitter gap and is independent of pairing, so it is
@@ -685,6 +729,12 @@ fn print_one_blob() {
         }
         for &(reg, v) in &p.literals {
             println!("  LITERAL sa[{reg}] = {v:#010x}");
+        }
+        // The +0x78 table, beside the containers: it is what says WHICH SA register holds each
+        // bound buffer's guest pointer, and a read of a DATA-container register that no entry
+        // covers is indistinguishable from a decode gap without it.
+        for b in &p.uniform_buffer_bindings {
+            println!("  UBBIND buffer {} -> DATA slot {}", b.buffer_index, b.data_slot);
         }
         for &(base, unit) in &p.texture_control {
             println!("  TEXCTRL sa[{base}..{}] = texture unit {unit}", base + 4);
@@ -2419,10 +2469,17 @@ fn usse_memory_group_field_census() {
     let mut moe: BTreeMap<(u32, u32, u32, bool), (usize, String)> = BTreeMap::new();
     for (name, bytes) in blobs(&dir) {
         let Ok(p) = Program::parse(&bytes) else { continue };
+        // >>> BOTH STREAMS. This census walked the PRIMARY only, and every memory load of a
+        // shipped baseball title's world materials is in the SECONDARY - the driver-run
+        // program that fills the SA file from the bound uniform buffers. So the reading it
+        // established for `moe_expand` ("set only ever with a single element, and only in
+        // programs where no SMLSI has run") was measured on a domain that excluded the
+        // instructions the question is actually about.
         let shader = vitaslop_gxp_shader::usse::decode_shader(&p);
+        let secondary = vitaslop_gxp_shader::usse::decode_secondary_shader(&p);
         let mut hit = false;
         let mut smlsi_seen = false;
-        for instr in &shader.instrs {
+        for instr in secondary.instrs.iter().chain(shader.instrs.iter()) {
             if vitaslop_gxp_shader::usse::decode::is_smlsi(instr.raw) {
                 smlsi_seen = true;
             }
@@ -2469,6 +2526,84 @@ fn usse_memory_group_field_census() {
         println!(
             "  {dirn}  {mode}    {addr_mode}    {ty}    {bank:<9}       {elems:<5}  {n:<5}  {example}"
         );
+    }
+    // >>> EVERY `moe_expand` LOAD'S IMMEDIATE OFFSET, against the program's own declared
+    // parameters. The bit is allowed through on the argument that a SINGLE element has no
+    // second iteration to step to; if that is right the offset it reads must land where a
+    // parameter does, and if it is wrong the offsets will sit systematically beside one.
+    {
+        let mut off_rows: BTreeMap<(u32, bool), (usize, String)> = BTreeMap::new();
+        for (name, bytes) in blobs(&dir) {
+            let Ok(p) = Program::parse(&bytes) else { continue };
+            // Every register a declared uniform STARTS at, in this program's own terms.
+            let starts: std::collections::BTreeSet<i32> =
+                p.parameters.iter().map(|q| q.resource_index).collect();
+            let sec = vitaslop_gxp_shader::usse::decode_secondary_shader(&p);
+            let pri = vitaslop_gxp_shader::usse::decode_shader(&p);
+            for instr in sec.instrs.iter().chain(pri.instrs.iter()) {
+                let w = instr.raw;
+                if (instr.group != 0x1d && instr.group != 0x1e) || f(w, 53, 53) == 0 {
+                    continue;
+                }
+                let off = f(w, 13, 7) + f(w, 6, 0);
+                let on_start = starts.contains(&(off as i32));
+                let prev_start = starts.contains(&(off as i32 - 1));
+                let e = off_rows.entry((off, on_start || prev_start)).or_insert((0, name.clone()));
+                e.0 += 1;
+                let _ = prev_start;
+            }
+        }
+    // >>> DOES A `moe_expand` LOAD CLOBBER A LITERAL THE PROGRAM STILL NEEDS?
+    //
+    // The destination of one of these is an SA register, and this title's DATA container also
+    // places LITERALS in SA registers. If the load's destination lands on a literal that a LATER
+    // instruction reads, then either the guest is deliberately reusing the register (legitimate
+    // - the literal's last use is before the load) or the DESTINATION is mis-decoded the way the
+    // offset was. The two are told apart by WHERE the literal is last read: after the load, the
+    // program would be reading data it did not put there.
+    {
+        let mut rows: BTreeMap<(bool, bool), (usize, String)> = BTreeMap::new();
+        for (name, bytes) in blobs(&dir) {
+            let Ok(p) = Program::parse(&bytes) else { continue };
+            let lits: std::collections::BTreeSet<u32> =
+                p.literals.iter().map(|l| l.0).collect();
+            if lits.is_empty() {
+                continue;
+            }
+            let sec = vitaslop_gxp_shader::usse::decode_secondary_shader(&p);
+            let pri = vitaslop_gxp_shader::usse::decode_shader(&p);
+            for instr in sec.instrs.iter() {
+                let w = instr.raw;
+                if (instr.group != 0x1d && instr.group != 0x1e) || f(w, 53, 53) == 0 {
+                    continue;
+                }
+                let Some(d) = instr.dest.as_ref() else { continue };
+                let dst = d.index as u32;
+                let on_literal = lits.contains(&dst);
+                // Is that register read by the PRIMARY, i.e. after every secondary load?
+                let read_later = pri.instrs.iter().any(|i| {
+                    i.srcs.iter().any(|o| {
+                        matches!(o.bank, vitaslop_gxp_shader::ir::Bank::SecondaryAttr)
+                            && o.index as u32 == dst
+                    })
+                });
+                let e = rows.entry((on_literal, read_later)).or_insert((0, name.clone()));
+                e.0 += 1;
+            }
+        }
+        println!("
+-- moe_expand LOAD destinations: does the dest hold a LITERAL, and is it read by the PRIMARY? --");
+        println!("  dest_is_a_literal  read_by_primary  count  example");
+        for ((lit, later), (n, example)) in &rows {
+            println!("  {lit:<18} {later:<16} {n:<6} {example}");
+        }
+    }
+        println!("
+-- moe_expand LOAD offsets (in registers): odd? on a declared parameter start? --");
+        println!("  offset  odd    lands_on_or_after_a_param_start  count  example");
+        for ((off, near), (n, example)) in &off_rows {
+            println!("  {off:<7} {:<6} {near:<31} {n:<6} {example}", off % 2 == 1);
+        }
     }
     println!("
 -- moe_expand (bit 53) x elements x SMLSI-earlier-in-program --");
@@ -3587,6 +3722,19 @@ fn print_one_blob_disassembly() {
             println!("  {c:?}");
         }
         println!("  sa_base_from_container = {}", p.sa_base_from_container);
+        // The SA tables, printed BY REGISTER. A register the secondary neither writes nor
+        // finds a literal for reads zero in the emitted WGSL, and nothing else in this listing
+        // says whether that zero is a table the blob does carry or a genuine gap - which is
+        // exactly the question a shader multiplying its colour by an uninitialised lane raises.
+        println!("-- literals (sa register = value) --");
+        for (r, v) in &p.literals {
+            let (lo, hi) = (f16_to_f32(*v as u16), f16_to_f32((*v >> 16) as u16));
+            println!("  sa[{r:<3}] = {v:#010x}   f32 {:<14}  f16 pair ({lo}, {hi})", f32::from_bits(*v));
+        }
+        println!("-- texture control (base sa register, unit) --");
+        for (base, unit) in &p.texture_control {
+            println!("  sa[{base:<3}] unit {unit}");
+        }
         println!("-- parameters --");
         for prm in &p.parameters {
             println!(
@@ -4426,6 +4574,26 @@ fn print_linked_pair_wgsl() {
     println!("===== {vn} + {fnm} =====");
     if let Ok(vp) = Program::parse(&vb) {
         println!("// vertex output order {:?}", vp.output_order);
+        // WHICH OUTPUT LANES THE CODE ACTUALLY WRITES. The declared layout says where each
+        // varying SITS; only this says which of those lanes carry a value at all, and a
+        // fragment read that lands on a lane outside this set shades from whatever the
+        // previous draw left. Printing them side by side is what makes a layout question
+        // decidable by looking rather than by reasoning.
+        let vsh = vitaslop_gxp_shader::usse::decode_shader(&vp);
+        let mut w = vec![false; 64];
+        for i in &vsh.instrs {
+            let Some(d) = i.dest.as_ref() else { continue };
+            if format!("{:?}", d.bank) != "Output" {
+                continue;
+            }
+            for c in 0..4 {
+                if i.write_mask[c] && (d.index as usize + c) < w.len() {
+                    w[d.index as usize + c] = true;
+                }
+            }
+        }
+        let written: Vec<String> = (0..40).map(|l| if w[l] { "#".into() } else { ".".to_string() }).collect();
+        println!("//   vertex WRITES lanes 0..40: {}", written.join(""));
         for v in &vp.output_varyings {
             println!("//   vertex output {:?} lanes {}..{}", v.usage, v.base_lane, v.base_lane + v.components);
         }
@@ -4802,5 +4970,543 @@ fn indexed_source_swizzles() {
     ranked.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
     for (k, n) in ranked {
         println!("  {n:>4}  {k}");
+    }
+}
+
+/// Link every `<key>.vert.gxp` / `<key>.frag.gxp` PAIR in a directory and rank what stops them.
+///
+/// A blob that recompiles alone can still fail to LINK: the interface between the two stages is
+/// where the varying layout, the uniform banks and the memory windows are decided, and none of
+/// them is visible to a single-stage test. `recompile_every_blob_and_rank_the_failures` reports
+/// the decoder's frontier; this reports the RENDERER's, which is the one a black frame is about.
+///
+/// `working-area/tools/extract_pairs.py <run log> <dir>` builds the directory straight out of a
+/// run's dropped-pair reports, so the corpus is exactly the pairs a frame lost.
+#[test]
+#[ignore = "needs a captured pair corpus (game bytes); set VITASLOP_GXP_PAIR_CORPUS"]
+fn link_every_pair_and_rank_the_failures() {
+    let Some(dir) = std::env::var_os("VITASLOP_GXP_PAIR_CORPUS").map(PathBuf::from) else {
+        eprintln!("VITASLOP_GXP_PAIR_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let mut keys: Vec<String> = std::fs::read_dir(&dir)
+        .expect("pair corpus dir")
+        .filter_map(|e| {
+            let n = e.ok()?.file_name().to_string_lossy().into_owned();
+            n.strip_suffix(".vert.gxp").map(str::to_string)
+        })
+        .collect();
+    keys.sort();
+
+    let mut ok = 0usize;
+    let mut by_reason: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // One VERBATIM example per class, kept beside the collapsed shape: the digits are what say
+    // WHICH register and which extent, and a ranking that hides them cannot be acted on.
+    let mut verbatim: BTreeMap<String, String> = BTreeMap::new();
+    for key in &keys {
+        let v = std::fs::read(dir.join(format!("{key}.vert.gxp"))).expect("vert");
+        let f = std::fs::read(dir.join(format!("{key}.frag.gxp"))).expect("frag");
+        match link_programs(&v, &f) {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                // Rank by the SHAPE of the failure, not the instance: the numbers in a message
+                // are one pair's registers, and grouping on them hides that ten pairs are one
+                // gap. Digits collapse to `N`.
+                let msg = e.to_string();
+                let msg: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+                let shape_of = |m: &str| -> String {
+                    let mut sh = String::new();
+                    let mut pd = false;
+                    for c in m.chars() {
+                        if c.is_ascii_digit() {
+                            if !pd { sh.push('N'); }
+                            pd = true;
+                        } else { sh.push(c); pd = false; }
+                    }
+                    sh
+                };
+                let mut shape = String::new();
+                let mut prev_digit = false;
+                for c in msg.chars() {
+                    if c.is_ascii_digit() {
+                        if !prev_digit {
+                            shape.push('N');
+                        }
+                        prev_digit = true;
+                    } else {
+                        shape.push(c);
+                        prev_digit = false;
+                    }
+                }
+                by_reason.entry(shape).or_default().push(key.clone());
+                verbatim.entry(shape_of(&msg)).or_insert_with(|| format!("{key}: {msg}"));
+            }
+        }
+    }
+
+    println!("\n{} of {} pairs LINK", ok, keys.len());
+    let mut ranked: Vec<_> = by_reason.into_iter().collect();
+    ranked.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (reason, pairs) in &ranked {
+        println!("\n{:3} pairs: {}", pairs.len(), reason);
+        println!("        e.g. {}", pairs.iter().take(4).cloned().collect::<Vec<_>>().join(" "));
+        if let Some(v) = verbatim.get(reason) {
+            println!("        ONE: {v}");
+        }
+    }
+}
+
+/// Census the RAW prefetch-bearing words of every fragment descriptor, unreduced to flags.
+///
+/// [`tabulate_varying_descriptor_flags`] asks whether three named BITS agree. When they do not,
+/// the next question is not which bit is right but whether the field is one bit at all: a
+/// two-bit field whose corpus has only ever shown its low value looks exactly like a flag until
+/// a program uses the high one. This prints `attribute_info`'s bits 8..11 and `component_info`'s
+/// bits 4..7 as VALUES, against the size word, so the shape of the field is read off the
+/// population instead of assumed.
+///
+/// Point `VITASLOP_GXP_CORPUS` at each corpus in turn; the interesting rows are the ones that
+/// appear in only one title, which is what says a reading was never measured rather than agreed.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn tabulate_prefetch_field_values() {
+    let Some(dir) = corpus_dir() else { return };
+    // key: (semantic nibble, info bits 11:8, component_info bits 7:4, size bits 7:6)
+    let mut table: BTreeMap<(u32, u32, u32, u32), (usize, String)> = BTreeMap::new();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Fragment {
+            continue;
+        }
+        for d in vitaslop_gxp_shader::container::raw_varying_descriptors(&bytes) {
+            let [info, res, size, comp] = d;
+            let key = ((info >> 12) & 0xf, (info >> 8) & 0xf, (comp >> 4) & 0xf, (size >> 6) & 0x3);
+            let e = table.entry(key).or_insert_with(|| {
+                (0, format!("{name} info={info:#010x} res={res} size={size:#x} comp={comp:#x}"))
+            });
+            e.0 += 1;
+        }
+    }
+    println!("sem info[11:8] comp[7:4] size[7:6]  count  example");
+    for ((sem, i, c, s), (n, ex)) in &table {
+        println!("  {sem:#x}   {i:#03x}      {c:#03x}      {s}          {n:<5}  {ex}");
+    }
+}
+
+/// For every blob, the SA registers its code READS that no declared home covers, classified by
+/// where they fall: inside the DATA container, inside the default uniform buffer's span, or
+/// past everything.
+///
+/// `secondary_attr_init` refuses these one at a time, naming a register. That is the right
+/// behaviour and the wrong diagnostic for asking WHAT the register is: a single number cannot
+/// say whether one title has one unexplained slot or every title has scattered ones, and those
+/// are different defects - the first is a layout slot nobody has identified, the second is the
+/// register-addressing model. Run it over each corpus in turn and compare.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn sa_reads_no_declared_home_covers() {
+    let Some(dir) = corpus_dir() else { return };
+    let mut total = 0usize;
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        // Every home a read can legitimately have, as the linker counts them.
+        let lits: std::collections::BTreeSet<u32> = p.literals.iter().map(|&(r, _)| r).collect();
+        let texc: std::collections::BTreeSet<u32> =
+            p.texture_control.iter().flat_map(|&(b, _)| b..b + 4).collect();
+        let ptrs: std::collections::BTreeSet<u32> = p
+            .containers
+            .iter()
+            .find(|c| c.index == 19)
+            .map(|c| {
+                p.uniform_buffer_bindings
+                    .iter()
+                    .map(|b| u32::from(c.base_sa) + u32::from(b.data_slot))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let carried = p.sa_carried_extent();
+        let data = p.containers.iter().find(|c| c.index == 19).map(|c| {
+            (u32::from(c.base_sa), u32::from(c.base_sa) + u32::from(c.size_regs))
+        });
+
+        // Registers the code reads, and registers it writes, by the linker's own addressing.
+        let (mut reads, mut writes) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        for stream in [
+            vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
+            vitaslop_gxp_shader::usse::decode_shader(&p),
+        ] {
+            for i in &stream.instrs {
+                for s in &i.srcs {
+                    if s.bank == Bank::SecondaryAttr {
+                        for c in 0..4 {
+                            let sel = s.swizzle[c] as u32;
+                            if sel < 4 {
+                                reads.insert(s.index as u32 + sel);
+                            }
+                        }
+                    }
+                }
+                if let Some(d) = i.dest.as_ref()
+                    && d.bank == Bank::SecondaryAttr {
+                        let n = match i.op {
+                            Op::MemLoad { elements, .. } => u32::from(elements),
+                            _ => 4,
+                        };
+                        writes.extend((0..n).map(|k| d.index as u32 + k));
+                    }
+            }
+        }
+        let orphans: Vec<u32> = reads
+            .iter()
+            .copied()
+            .filter(|r| {
+                *r >= carried
+                    && !lits.contains(r)
+                    && !texc.contains(r)
+                    && !ptrs.contains(r)
+                    && !writes.contains(r)
+            })
+            .collect();
+        if orphans.is_empty() {
+            continue;
+        }
+        total += orphans.len();
+        let where_ = |r: u32| match data {
+            Some((lo, hi)) if r >= lo && r < hi => format!("DATA+{}", r - lo),
+            _ => "past-everything".to_string(),
+        };
+        println!(
+            "{name}: {}",
+            orphans.iter().map(|&r| format!("sa[{r}]({})", where_(r))).collect::<Vec<_>>().join(" ")
+        );
+    }
+    println!("\n{total} orphan SA reads in this corpus");
+}
+
+/// Print a digest of every blob's recompiled WGSL, so two builds can be compared exactly.
+///
+/// A count of what recompiles cannot see a change that alters a REGISTER an instruction reads:
+/// the blob still recompiles, and the picture is wrong. This turns "is this decoder change inert
+/// on the titles that already work" into a diff of two text files, which is the only form of
+/// that question that can actually be answered before a ten-minute replay.
+/// [[vitaslop-identical-output-is-evidence]]
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn digest_every_blobs_wgsl() {
+    let Some(dir) = corpus_dir() else { return };
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        let body = match p.kind {
+            ProgramKind::Vertex => recompile_vertex(&bytes).map(|r| r.wgsl_body),
+            ProgramKind::Fragment => recompile_fragment(&bytes).map(|r| r.wgsl_body),
+        };
+        match body {
+            // FNV-1a over the emitted text: any changed register, swizzle or statement moves it.
+            Ok(w) => {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in w.as_bytes() {
+                    h ^= u64::from(*b);
+                    h = h.wrapping_mul(0x1000_0000_01b3);
+                }
+                println!("{name} {h:016x} {}", w.len());
+            }
+            Err(e) => println!("{name} FAILED {e}"),
+        }
+    }
+}
+
+/// For every fragment descriptor that declares a PREFETCH, print the texcoord it names beside
+/// the TexCoord semantics the same program declares - the two candidate readings of the field
+/// side by side.
+///
+/// `source_texcoord` is read as an ABSOLUTE `TexCoord(n)` semantic. The alternative is that it
+/// INDEXES the program's own declared texcoords, and the two agree on every program whose
+/// texcoords start at 0 - which is most of them. This prints the disagreements.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn prefetch_source_against_the_texcoords_the_program_declares() {
+    let Some(dir) = corpus_dir() else { return };
+    let (mut agree, mut differ) = (0usize, 0usize);
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        if p.kind != ProgramKind::Fragment {
+            continue;
+        }
+        // The TexCoord semantics this program declares, in descriptor order.
+        let declared: Vec<u32> = p
+            .interpolants
+            .iter()
+            .filter_map(|i| match i.usage {
+                vitaslop_gxp_shader::container::VaryingUsage::TexCoord(n) => Some(u32::from(n)),
+                _ => None,
+            })
+            .collect();
+        for it in &p.interpolants {
+            let Some(pf) = it.prefetch else { continue };
+            let src = u32::from(pf.source_texcoord);
+            let absolute_ok = declared.contains(&src);
+            let indexed = declared.get(src as usize).copied();
+            if absolute_ok {
+                agree += 1;
+            } else {
+                differ += 1;
+                println!(
+                    "{name}: prefetch source {src} - declared TexCoords {declared:?}; \
+                     as an ABSOLUTE semantic it is NOT declared, as an INDEX it is {indexed:?}"
+                );
+            }
+        }
+    }
+    println!("\n{agree} prefetches whose source is a declared TexCoord semantic, {differ} not");
+}
+
+/// IEEE half -> f32, so a literal table can be read in the width the program reads it in.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exp = u32::from((bits >> 10) & 0x1f);
+    let man = u32::from(bits & 0x3ff);
+    let out = match exp {
+        0 if man == 0 => sign,
+        0 => {
+            // Subnormal: normalise it into an f32 exponent.
+            let shift = man.leading_zeros() - 21;
+            sign | ((127 - 15 - shift) << 23) | ((man << (shift + 1)) & 0x7f_ffff)
+        }
+        0x1f => sign | 0x7f80_0000 | (man << 13),
+        _ => sign | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(out)
+}
+
+/// One line per blob: the SA-register INITIALISER list the linker would build for it.
+///
+/// The counterpart of [`hash_every_blob_wgsl`] for the LINK stage. A change to which container
+/// literals survive into a program's prologue moves nothing in a blob's own WGSL body - that is
+/// built before linking - so the WGSL hash census reads IDENTICAL across both arms of such a
+/// change and says nothing at all. Run this under both arms and diff, and it names every blob
+/// on disk whose uniform prologue moves, in seconds.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn hash_every_blob_sa_literals() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    assert!(!all.is_empty(), "no .gxp blobs under {}", dir.display());
+    for (name, bytes) in &all {
+        let Ok(p) = Program::parse(bytes) else {
+            println!("{name} PARSE-FAIL");
+            continue;
+        };
+        match vitaslop_gxp_shader::link::sa_literal_init(&p) {
+            Ok(mut l) => {
+                l.sort_unstable();
+                let regs: Vec<String> =
+                    l.iter().map(|(r, v)| format!("sa[{r}]={v:#010x}")).collect();
+                println!("{name} {}", regs.join(" "));
+            }
+            Err(e) => println!("{name} FAIL {e:?}"),
+        }
+    }
+}
+
+/// Every instruction whose destination write mask decodes to NOTHING, by group and by the
+/// mask-control bits that produced it.
+///
+/// **A shipped compiler does not emit an instruction that writes nothing.** So every row this
+/// prints is either a decode gap or a form worth naming, and the emitter is SILENT about them -
+/// it emits no statement and reports nothing, which is exactly how a lost lane in the middle of
+/// a skinning chain leaves the rest of the chain reading a stale accumulator.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn instructions_whose_write_mask_is_empty() {
+    use vitaslop_gxp_shader::usse::decode::{field, GROUP_TABLES};
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let g00 = GROUP_TABLES.iter().find(|(n, _, _)| *n == "grp00_mad").expect("grp00_mad");
+    // group -> count, and for group 0x00 the (data_format, swz_mask16, swz_mask32, swz_en) tally.
+    let mut by_group: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut g00_bits: BTreeMap<(u32, u32, u32, u32), usize> = BTreeMap::new();
+    let mut total = 0usize;
+    let mut blobs_hit: std::collections::BTreeSet<String> = Default::default();
+    for (name, bytes) in blobs(&dir) {
+        let Ok(p) = Program::parse(&bytes) else { continue };
+        for shader in [
+            vitaslop_gxp_shader::usse::decode_shader(&p),
+            vitaslop_gxp_shader::usse::decode_secondary_shader(&p),
+        ] {
+            for ins in &shader.instrs {
+                total += 1;
+                if ins.dest.is_none() || ins.write_mask.iter().any(|w| *w) || ins.blocked.is_some() {
+                    continue;
+                }
+                *by_group.entry(ins.group).or_default() += 1;
+                blobs_hit.insert(name.clone());
+                if ins.group == 0x00 {
+                    let (hi, lo) = ((ins.raw >> 32) as u32, ins.raw as u32);
+                    let f = |n: &str| field(hi, g00.1, n);
+                    *g00_bits
+                        .entry((f("data_format"), f("swz_mask16"), f("swz_mask32"), f("swz_en")))
+                        .or_default() += 1;
+                    let _ = lo;
+                }
+            }
+        }
+    }
+    println!("{total} instructions decoded; {} blobs carry an empty-mask write", blobs_hit.len());
+    for (g, n) in &by_group {
+        println!("  group {g:#04x}: {n}");
+    }
+    println!("group 0x00 by (data_format, swz_mask16, swz_mask32, swz_en):");
+    for ((df, m16, m32, en), n) in &g00_bits {
+        println!("  df={df} m16={m16} m32={m32} en={en}: {n}");
+    }
+}
+
+/// Hash the LINKED WGSL of every vert x frag pairing in a corpus, so a LINK-STAGE change can be
+/// censused the way `hash_every_blob_wgsl` censuses a DECODER change.
+///
+/// A per-blob hash is blind to anything the linker decides - the varying layout, the prefetch
+/// coordinates, the SA literal initialiser - because none of it exists until two programs are
+/// put together [[vitaslop-a-blob-recompiling-is-not-a-pair-linking]]. This links every
+/// combination that links at all and prints one line per successful pairing, which turns
+/// "what does this link change touch" into a diff of two text files.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn hash_every_pair_link() {
+    let Some(dir) = corpus_dir() else { return };
+    let all = blobs(&dir);
+    let verts: Vec<_> = all
+        .iter()
+        .filter(|(_, b)| Program::parse(b).map(|p| p.kind == ProgramKind::Vertex).unwrap_or(false))
+        .collect();
+    let frags: Vec<_> = all
+        .iter()
+        .filter(|(_, b)| Program::parse(b).map(|p| p.kind == ProgramKind::Fragment).unwrap_or(false))
+        .collect();
+    let mut n = 0usize;
+    for (vn, vb) in &verts {
+        for (fnm, fb) in &frags {
+            let Ok(l) = link_programs(vb, fb) else { continue };
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in l.wgsl.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+            println!("{vn}+{fnm} {h:016x} {}", l.wgsl.len());
+            n += 1;
+        }
+    }
+    println!("{n} linked pairings");
+}
+
+/// >>> WHICH OF A TITLE'S DESTINATION-READING FRAGMENT PROGRAMS STILL COST A PASS SPLIT, AND
+/// WHAT SHAPE THE ONES THAT DO NOT LOWER ACTUALLY ARE.
+///
+/// A sports title measured **~230 destination-colour splits in one frame** on a phone, against
+/// 9 for the title `lower_dest_blend` was built on. Each split is a full store and reload of
+/// every tile on a tiling GPU, and that title is GPU-BOUND BY 2x - so the splits are the first
+/// thing to price. The live renderer's `gxp dest colour` report says how many splits a pass took
+/// and by which pair, but it FIRES ONCE and it can only name pairs it actually drew, so it
+/// cannot say what the unlowered programs have in common.
+///
+/// This is the INVENTORY instead ([[an-inventory-beats-a-serial-hunt]]): every fragment blob in
+/// the corpus, asked the same two questions the renderer asks, in the same order -
+///   1. does it source the output bank at all (is it a destination reader), and
+///   2. does `lower_dest_blend` turn it into pipeline state?
+/// A program that answers yes then no is one split per draw, every frame, forever. The tail
+/// instructions of each such program are printed because the ANSWER to "why did it not lower"
+/// is a shape, and a shape has to be read to be added to `match_dest_blend`.
+#[test]
+#[ignore = "needs a captured corpus (game bytes); set VITASLOP_GXP_CORPUS"]
+fn rank_the_destination_readers_that_do_not_lower() {
+    let Some(dir) = corpus_dir() else {
+        eprintln!("VITASLOP_GXP_CORPUS not set - nothing to analyse");
+        return;
+    };
+    let all = blobs(&dir);
+    assert!(!all.is_empty(), "no .gxp blobs under {}", dir.display());
+
+    let mut frags = 0usize;
+    let mut readers = 0usize;
+    let mut lowered: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stuck: Vec<(String, vitaslop_gxp_shader::Shader)> = Vec::new();
+
+    for (name, bytes) in &all {
+        let Ok(program) = Program::parse(bytes) else { continue };
+        if program.kind != ProgramKind::Fragment {
+            continue;
+        }
+        frags += 1;
+        let mut shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        // BEFORE the rewrite: is this a destination reader at all? Asking after would count a
+        // lowered program as never having been one, which is the number we are trying to split.
+        if !vitaslop_gxp_shader::module::declares_dest_color(&shader) {
+            continue;
+        }
+        readers += 1;
+        match vitaslop_gxp_shader::module::lower_dest_blend(&mut shader) {
+            Some(b) => *lowered.entry(format!("{:?}/{:?}", b.color, b.alpha)).or_default() += 1,
+            None => stuck.push((name.clone(), shader)),
+        }
+    }
+
+    println!("\n{frags} fragment programs, {readers} read the DESTINATION colour");
+    println!("  LOWERED to pipeline state: {}", readers - stuck.len());
+    for (shape, n) in &lowered {
+        println!("    x{n:<3} {shape}");
+    }
+    println!("  >>> STILL SPLIT THE PASS: {}", stuck.len());
+
+    // The tail is where the blend is: `match_dest_blend` matches the last instructions of the
+    // program. Twelve is enough to hold every shape the matcher knows and the context around it.
+    for (name, shader) in &stuck {
+        // >>> AND IS IT LINEAR IN THE DESTINATION? That is what decides whether a DUAL-SOURCE
+        // lowering (`out = dst*F + G`, with F emitted as src1) can take the program, or
+        // whether it keeps its render-pass split.
+        let linear = vitaslop_gxp_shader::module::dest_is_linear(shader);
+        println!(
+            "
+  --- {name}: {} instructions, LINEAR IN DEST: {}{}",
+            shader.instrs.len(),
+            linear,
+            if linear { "  <- a dual-source lowering can take this" } else { "" }
+        );
+        println!("      tail:");
+        let from = shader.instrs.len().saturating_sub(12);
+        for (i, instr) in shader.instrs.iter().enumerate().skip(from) {
+            println!(
+                "    [{i:3}] {:?} dest={:?} srcs={:?} mask={:?} pred={:?} half={}",
+                instr.op, instr.dest, instr.srcs, instr.write_mask, instr.pred, instr.half_precision
+            );
+        }
+    }
+}
+
+/// Print the DUAL-SOURCE plan (or the reason there is none) for every destination reader in
+/// the corpus, with `VITASLOP_GXP_DUAL_TRACE=1` walking the analysis instruction by
+/// instruction. A diagnostic, not an assertion.
+#[test]
+#[ignore]
+fn print_dual_source_plans() {
+    let Some(dir) = corpus_dir() else { return };
+    vitaslop_gxp_shader::module::set_dual_source_blend(true);
+    for (name, bytes) in &blobs(&dir) {
+        let Ok(program) = Program::parse(bytes) else { continue };
+        if program.kind != ProgramKind::Fragment {
+            continue;
+        }
+        let mut shader = vitaslop_gxp_shader::usse::decode_shader(&program);
+        if !vitaslop_gxp_shader::module::declares_dest_color(&shader) {
+            continue;
+        }
+        if vitaslop_gxp_shader::module::lower_dest_blend(&mut shader).is_some() {
+            continue;
+        }
+        eprintln!("== {name}");
+        eprintln!("   {:?}", vitaslop_gxp_shader::fragment_dual_source_plan(bytes));
     }
 }

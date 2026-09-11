@@ -62,6 +62,23 @@
             r[name] = "threw: " + e;
           }
         }
+        // >>> WHAT THE ADAPTER CAN DO, not just whether there is one.
+        //
+        // A fragment program that blends against the destination in ALU costs a RENDER-PASS
+        // SPLIT per draw, and a tiler stores and reloads every tile at each one. A sports title
+        // takes ~230 of them a frame. The ones that do not lower to a fixed-function blend are
+        // all of the shape `dst * F + G`, where F and G are computed per pixel - which is
+        // exactly what DUAL-SOURCE BLENDING expresses and nothing else in WebGPU's blend state
+        // can. It is an OPTIONAL feature, so whether that fix is available at all is a property
+        // of this device, and guessing it wrong is a day's work aimed at nothing.
+        try {
+          const a = await navigator.gpu.requestAdapter({});
+          r.features = a ? [...a.features].sort().join(" ") || "(none)" : "no adapter";
+          r.dualSource = a ? a.features.has("dual-source-blending") : false;
+          r.maxTexture = a ? a.limits?.maxTextureDimension2D : "-";
+        } catch (e) {
+          r.features = "threw: " + e;
+        }
         return r;
       }
 
@@ -85,6 +102,15 @@
                 r[name] = a ? ("ADAPTER " + ((a.info && a.info.vendor) || "?") + " / " + ((a.info && a.info.architecture) || "?")) : "null";
               } catch (e) { r[name] = "threw: " + e; }
             }
+            // The same feature question, asked where the emulator actually runs. A worker is a
+            // different context and is free to answer differently - which is the whole premise
+            // of this page.
+            try {
+              const a = await self.navigator.gpu.requestAdapter({});
+              r.features = a ? [...a.features].sort().join(" ") || "(none)" : "no adapter";
+              r.dualSource = a ? a.features.has("dual-source-blending") : false;
+              r.maxTexture = a ? (a.limits && a.limits.maxTextureDimension2D) : "-";
+            } catch (e) { r.features = "threw: " + e; }
           }
           self.postMessage(r);
         };`;
@@ -117,6 +143,14 @@
           const t = there[k] ?? there.error ?? "-";
           add(`requestAdapter(${k})`, `PAGE:   ${p}\nWORKER: ${t}`, String(p).startsWith("ADAPTER"));
         }
+        add(
+          "DUAL-SOURCE BLENDING",
+          `page ${here.dualSource} / worker ${there.dualSource}`,
+          !!there.dualSource
+        );
+        add("adapter features (page)", here.features ?? "-");
+        add("adapter features (worker)", there.features ?? "-");
+        add("maxTextureDimension2D", `page ${here.maxTexture} / worker ${there.maxTexture}`);
         if (there.error) add("worker", there.error, false);
         document.getElementById("copy").onclick = () => {
           navigator.clipboard.writeText(lines.join("\n")).then(

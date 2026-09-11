@@ -692,6 +692,13 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         return Err(EmitError::Empty);
     }
     let mut body = String::new();
+    // >>> THE DERIVATIVE PRELUDE, and why the function needs one.
+    //
+    // `dpdx`/`dpdy` may only be called from UNIFORM control flow, and a program is entitled to
+    // put one inside a branch. The call therefore has to leave the branch, and there is nowhere
+    // to put it but the top of the function - so it is emitted here and the branch body reads
+    // the temporary. See the hoist in `emit_instr` for the guard that makes that exact.
+    let mut prelude = String::new();
     // Track which internal-register lanes (i0..i3 x 4) an earlier instruction has written, so a
     // read of an unwritten internal lane in a FRAGMENT program hard-fails instead of translating
     // garbage: fragment internal registers can be pre-loaded by the texture-coordinate iterators
@@ -712,8 +719,10 @@ pub fn emit_body(shader: &Shader) -> Result<String, EmitError> {
         &mut internal_written,
         None,
         1,
+        &mut prelude,
+        None,
     )?;
-    Ok(body)
+    Ok(format!("{prelude}{body}"))
 }
 
 /// Emit instructions `[start, end)`, turning USSE branches into structured WGSL.
@@ -763,6 +772,11 @@ fn emit_range(
     internal_written: &mut [bool; INTERNAL_LANES],
     open_loop: Option<usize>,
     depth: usize,
+    prelude: &mut String,
+    // `cond_start`: the instruction at which the OUTERMOST enclosing conditional region begins,
+    // or `None` at the top level. A derivative hoisted out of a block is placed immediately
+    // above that region, so this is where the "was the source written in between" check starts.
+    cond_start: Option<usize>,
 ) -> Result<(), EmitError> {
     let mut index = start;
     while index < end {
@@ -790,6 +804,8 @@ fn emit_range(
                     guard_internal_reads,
                     internal_written,
                     depth,
+                    prelude,
+                    cond_start,
                 )?;
                 index = tail + 1;
                 continue;
@@ -805,7 +821,7 @@ fn emit_range(
             if guard_internal_reads {
                 check_internal_reads(instr, index, byte_offset, internal_written)?;
             }
-            emit_instr(body, instr, index, byte_offset, shader.kind)?;
+            emit_instr(body, instr, index, byte_offset, shader.kind, shader, prelude, cond_start)?;
             emit_probe_snapshot(body, index, depth);
             record_internal_writes(instr, internal_written);
             index += 1;
@@ -927,38 +943,56 @@ fn emit_range(
                 // early exit, this whole range's own exit.
                 let then_exit =
                     else_arm.unwrap_or(if early_exit { exit } else { target });
-                let _ = writeln!(body, "{pad}if ({c}) {{");
-                emit_range(
-                    body,
-                    shader,
-                    index + 1,
-                    then_end,
-                    then_exit,
-                    guard_internal_reads,
-                    internal_written,
-                    open_loop,
-                    depth + 1,
-                )?;
-                match else_arm {
-                    None => {
-                        let _ = writeln!(body, "{pad}}}");
-                    }
-                    Some(e) => {
-                        let _ = writeln!(body, "{pad}}} else {{");
-                        emit_range(
-                            body,
-                            shader,
-                            target,
-                            else_end.unwrap_or(e),
-                            e,
-                            guard_internal_reads,
-                            internal_written,
-                            open_loop,
-                            depth + 1,
-                        )?;
-                        let _ = writeln!(body, "{pad}}}");
+                // >>> THE ARMS ARE BUFFERED so anything they HOIST can be written ABOVE the
+                // `if`. A derivative may only be called from uniform control flow, and the
+                // first uniform point outside this block is the line before it - see the
+                // hoist in `emit_instr`. A block nested inside another one hoists all the way
+                // out to the outermost, which is where `cond_start` points.
+                let mut arms = String::new();
+                let mut block_prelude = String::new();
+                let inner_start = cond_start.or(Some(index + 1));
+                {
+                    let inner: &mut String =
+                        if cond_start.is_some() { &mut *prelude } else { &mut block_prelude };
+                    let _ = writeln!(arms, "{pad}if ({c}) {{");
+                    emit_range(
+                        &mut arms,
+                        shader,
+                        index + 1,
+                        then_end,
+                        then_exit,
+                        guard_internal_reads,
+                        internal_written,
+                        open_loop,
+                        depth + 1,
+                        inner,
+                        inner_start,
+                    )?;
+                    match else_arm {
+                        None => {
+                            let _ = writeln!(arms, "{pad}}}");
+                        }
+                        Some(e) => {
+                            let _ = writeln!(arms, "{pad}}} else {{");
+                            emit_range(
+                                &mut arms,
+                                shader,
+                                target,
+                                else_end.unwrap_or(e),
+                                e,
+                                guard_internal_reads,
+                                internal_written,
+                                open_loop,
+                                depth + 1,
+                                inner,
+                                inner_start,
+                            )?;
+                            let _ = writeln!(arms, "{pad}}}");
+                        }
                     }
                 }
+                body.push_str(&block_prelude);
+                body.push_str(&arms);
             }
         }
         // An unconditional branch consumes only its own skip; a conditional one that recovered
@@ -1028,6 +1062,7 @@ fn back_edge_to(shader: &Shader, head: usize) -> Option<usize> {
 ///
 /// Every failure hard-fails naming itself rather than emitting the body straight-line - running
 /// a loop once is the plausible-looking wrong picture this recompiler exists to refuse.
+#[allow(clippy::too_many_arguments)]
 fn emit_loop(
     body: &mut String,
     shader: &Shader,
@@ -1036,6 +1071,8 @@ fn emit_loop(
     guard_internal_reads: bool,
     internal_written: &mut [bool; INTERNAL_LANES],
     depth: usize,
+    prelude: &mut String,
+    cond_start: Option<usize>,
 ) -> Result<(), EmitError> {
     let back = &shader.instrs[tail];
     let blocked = |reason| {
@@ -1068,18 +1105,31 @@ fn emit_loop(
         Predicate::Raw(_) => return blocked("0xF8 BR carries an unresolved predicate encoding"),
     };
     let pad = "  ".repeat(depth);
-    let _ = writeln!(body, "{pad}loop {{");
-    emit_range(
-        body,
-        shader,
-        head,
-        tail,
-        tail,
-        guard_internal_reads,
-        internal_written,
-        Some(tail),
-        depth + 1,
-    )?;
+    // Buffered for the reason the branch arms are: a derivative hoisted out of the body has to
+    // land ABOVE the loop, where control flow is still uniform.
+    let mut arms = String::new();
+    let mut block_prelude = String::new();
+    let inner_start = cond_start.or(Some(head));
+    {
+        let inner: &mut String =
+            if cond_start.is_some() { &mut *prelude } else { &mut block_prelude };
+        let _ = writeln!(arms, "{pad}loop {{");
+        emit_range(
+            &mut arms,
+            shader,
+            head,
+            tail,
+            tail,
+            guard_internal_reads,
+            internal_written,
+            Some(tail),
+            depth + 1,
+            inner,
+            inner_start,
+        )?;
+    }
+    body.push_str(&block_prelude);
+    body.push_str(&arms);
     if let Some(c) = repeat {
         let _ = writeln!(body, "{pad}  if ({c}) {{ break; }}");
     }
@@ -1280,12 +1330,16 @@ pub fn wrap_vertex_module(body: &str, varying_vec4s: u32) -> String {
     m
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_instr(
     body: &mut String,
     instr: &Instr,
     index: usize,
     byte_offset: usize,
     kind: ProgramKind,
+    shader: &Shader,
+    prelude: &mut String,
+    cond_start: Option<usize>,
 ) -> Result<(), EmitError> {
     // Reject an op the emitter has not wired before touching operands, so the error names
     // the op (what to implement next) rather than a missing-operand symptom.
@@ -1393,14 +1447,79 @@ fn emit_instr(
         return finish_predicated(body, instr, &stmt, index);
     }
     let dest = instr.dest.as_ref().ok_or_else(unmapped)?;
+    // >>> A DERIVATIVE MAY NOT SIT INSIDE A PREDICATE'S `if`, AND ON HARDWARE IT DOES NOT.
+    //
+    // `dpdx`/`dpdy` difference a value across the rasteriser's 2x2 QUAD, so they need every
+    // lane of the quad to have executed them - which is why WGSL requires them in UNIFORM
+    // control flow, and why Tint REJECTS one inside an `if` on a per-pixel predicate:
+    // `error: 'dpdy' must only be called from uniform control flow`. naga accepts it, so the
+    // desktop ran this program for months and the browser could not compile it at all - the
+    // pipeline was invalid, its command buffer with it, and the run eventually trapped
+    // [[vitaslop-tint-rejects-what-naga-accepts]].
+    //
+    // The USSE does not predicate the DIFFERENCING either: a predicated `dsx`/`dsy` computes
+    // the quad derivative regardless and only the WRITE-BACK is conditional. So hoisting the
+    // call above the `if` and predicating only the store is both what the hardware does and
+    // what WGSL requires - it is a correctness fix that happens to also be a portability one.
+    //
+    // TWO PLACES to put the hoisted call, because there are two shapes of conditional here:
+    //
+    //  * the instruction's OWN predicate, whose `if` this function emits a line later. Lifting
+    //    the call just above that `if` is enough, and keeps it reading the register values it
+    //    would have read.
+    //  * an enclosing BRANCH the structuring turned into an `if`/`loop`. Nothing inside that
+    //    block is in uniform control flow, so the call has to leave the block entirely - and
+    //    the only place guaranteed to be uniform is the top of the function. That is exact ONLY
+    //    if nothing before this instruction has written the registers it reads, so that is
+    //    CHECKED, and a program that fails the check is refused by name rather than hoisted to
+    //    a different value.
+    let hoisted = if matches!(instr.op, Op::Dsx | Op::Dsy)
+        && (cond_start.is_some() || !matches!(instr.pred, Predicate::Always))
+    {
+        let func = if matches!(instr.op, Op::Dsx) { "dpdx" } else { "dpdy" };
+        let s1 = instr.srcs.first().ok_or_else(unmapped)?;
+        if let Some(from) = cond_start
+            && writes_between(shader, from, index, s1)
+        {
+            return Err(EmitError::Blocked {
+                index,
+                byte_offset,
+                reason: "a derivative inside a BRANCH whose source register an earlier                          instruction writes - the call cannot leave the branch (WGSL requires                          uniform control flow) without reading a different value",
+                raw: instr.raw,
+            });
+        }
+        let p = Prec::of(instr);
+        let mut names: [Option<String>; 4] = [None, None, None, None];
+        for (c, name) in names.iter_mut().enumerate() {
+            if !mask[c] {
+                continue;
+            }
+            let e = src_channel(s1, c, p).ok_or_else(unmapped)?;
+            let n = format!("gxp_deriv{index}_{c}");
+            let out = if cond_start.is_some() { &mut *prelude } else { &mut *body };
+            let _ = writeln!(out, "  let {n} = {func}({e});");
+            *name = Some(n);
+        }
+        Some(names)
+    } else {
+        None
+    };
     let r = match instr.op {
         Op::Mul => emit_binop(s, instr, dest, mask, "*", index).ok_or_else(unmapped),
         Op::Add => emit_binop(s, instr, dest, mask, "+", index).ok_or_else(unmapped),
         Op::Min => emit_func2(s, instr, dest, mask, "min", index).ok_or_else(unmapped),
         Op::Max => emit_func2(s, instr, dest, mask, "max", index).ok_or_else(unmapped),
         Op::Frc => emit_func1(s, instr, dest, mask, "fract", index).ok_or_else(unmapped),
-        Op::Dsx => emit_func1(s, instr, dest, mask, "dpdx", index).ok_or_else(unmapped),
-        Op::Dsy => emit_func1(s, instr, dest, mask, "dpdy", index).ok_or_else(unmapped),
+        // The call itself may already be hoisted above this instruction's predicate `if` -
+        // see `hoisted` above. When it is, the store reads the temporary rather than
+        // calling the builtin again (calling it twice would put one back inside the `if`).
+        Op::Dsx | Op::Dsy => {
+            let func = if matches!(instr.op, Op::Dsx) { "dpdx" } else { "dpdy" };
+            match &hoisted {
+                Some(names) => emit_stored(s, instr, dest, mask, names).ok_or_else(unmapped),
+                None => emit_func1(s, instr, dest, mask, func, index).ok_or_else(unmapped),
+            }
+        }
         Op::Mad => emit_mad(s, instr, dest, mask).ok_or_else(unmapped),
         Op::Dot { components } => emit_dot(s, instr, dest, mask, components).ok_or_else(unmapped),
         // Unary transcendentals (group 0x30) - the source broadcasts its single selected
@@ -1434,8 +1553,11 @@ fn emit_instr(
         Op::PackToInt { bits, signed, .. } => {
             emit_pack_to_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
         }
-        Op::IntMad { signed, bits, src0_high } => {
-            emit_int_mad(s, instr, dest, signed, bits, src0_high).ok_or_else(unmapped)
+        Op::PackFromInt { bits, signed } => {
+            emit_pack_from_int(s, instr, dest, mask, bits, signed).ok_or_else(unmapped)
+        }
+        Op::IntMad { signed, bits, src0_high, src1_high } => {
+            emit_int_mad(s, instr, dest, signed, bits, src0_high, src1_high).ok_or_else(unmapped)
         }
         Op::IntMadStep { signed, high_half } => {
             emit_int_mad_step(s, instr, dest, signed, high_half).ok_or_else(unmapped)
@@ -1521,6 +1643,46 @@ fn emit_func1(body: &mut Dest, instr: &Instr, dest: &Operand, mask: [bool; 4], f
     Some(())
 }
 
+/// Does any instruction in `[from, index)` write a register `src` reads?
+///
+/// The question a hoist has to answer. The temporary is computed immediately ABOVE the
+/// outermost enclosing block, so the hoist is exact exactly when nothing between that point
+/// and the instruction changes the register it reads. Deliberately coarse - any write to the
+/// same bank and register number counts, whatever the channel, and an INDEXED write counts
+/// wherever it might land. A coarse "no" is safe; a coarse "yes" only costs a refusal that
+/// names itself.
+fn writes_between(shader: &Shader, from: usize, index: usize, src: &Operand) -> bool {
+    let hi = index.min(shader.instrs.len());
+    shader.instrs[from.min(hi)..hi].iter().any(|i| {
+        i.dest.as_ref().is_some_and(|d| {
+            if matches!(d.bank, Bank::Indexed) {
+                return true;
+            }
+            d.bank == src.bank && d.index == src.index
+        })
+    })
+}
+
+/// `dest.c = <precomputed name for c>` for each written channel: the store half of an
+/// instruction whose VALUE was computed before this statement. Used by the derivative ops,
+/// whose builtin must be called outside any predicate `if` - see `hoisted` in `emit_instr`.
+fn emit_stored(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    names: &[Option<String>; 4],
+) -> Option<()> {
+    let p = Prec::of(instr);
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        body.store(dest, c, names[c].as_ref()?, p)?;
+    }
+    Some(())
+}
+
 /// `dest.c = WRAP(src1.c)` for each written channel, where `wrap` builds the WGSL rvalue
 /// from the source channel expression. Covers the transcendentals (rcp/rsq/log2/exp2) and a
 /// plain move (`wrap` = identity), which do not fit the fixed `FN(x)` shape of `emit_func1`.
@@ -1587,6 +1749,49 @@ fn emit_pack_to_int(
         } else {
             body.store_raw(dest, c, &e)?;
         }
+    }
+    Some(())
+}
+
+/// The mirror of [`emit_pack_to_int`]: widen a 16-bit integer half to the destination float.
+///
+/// The SOURCE half is addressed exactly as `Dest::store_raw_half` writes one - half `sel & 1` of
+/// register `index + (sel >> 1)`, where `sel` is the operand's own component selector - so a
+/// value this recompiler stored through that path reads back as itself. The sign extension is
+/// the same shift pair `emit_int_mad` uses on its packed operand, for the same reason: those two
+/// already agree on how a 16-bit half is widened, and a third rule here would be a third answer.
+fn emit_pack_from_int(
+    body: &mut Dest,
+    instr: &Instr,
+    dest: &Operand,
+    mask: [bool; 4],
+    bits: u8,
+    signed: bool,
+) -> Option<()> {
+    debug_assert_eq!(bits, 16, "only the 16-bit widths decode to this op");
+    let s1 = instr.srcs.first()?;
+    let dp = Prec::of(instr);
+    for c in 0..4 {
+        if !mask[c] {
+            continue;
+        }
+        let sel = s1.swizzle[c] as u32;
+        let reg = format!("{}[{}]", bank_prefix(s1.bank)?, s1.index as u32 + (sel >> 1));
+        let half = if signed {
+            if sel & 1 == 1 {
+                format!("(bitcast<i32>({reg}) >> 16u)")
+            } else {
+                format!("((bitcast<i32>({reg}) << 16u) >> 16u)")
+            }
+        } else if sel & 1 == 1 {
+            format!("({reg} >> 16u)")
+        } else {
+            format!("({reg} & 0xffffu)")
+        };
+        let e = if signed { format!("f32({half})") } else { format!("f32({half})") };
+        let e = if s1.neg { format!("(-{e})") } else { e };
+        let e = if s1.abs { format!("abs({e})") } else { e };
+        body.store(dest, c, &e, dp)?;
     }
     Some(())
 }
@@ -2298,6 +2503,7 @@ fn emit_int_mad(
     signed: bool,
     bits: u8,
     src0_high: bool,
+    src1_high: bool,
 ) -> Option<()> {
     // The decoder only produces 32 today and blocks the narrower widths by name; this keeps the
     // emitter honest if that ever changes without the emitter being taught the masking.
@@ -2330,7 +2536,16 @@ fn emit_int_mad(
         (false, true) => format!("({a0} >> 16u)"),
         (false, false) => format!("({a0} & 0xffffu)"),
     };
-    let b = raw(instr.srcs.get(1)?)?;
+    // `src1_high` selects a 16-bit half of src1 the same way, and for the same reason: the
+    // packed pair the multiplier reads a half of is wherever the compiler put it. A CLEAR bit
+    // reads the whole register, which is what every program that recompiled before this bit
+    // was decoded did - see the decoder's note.
+    let b0 = raw(instr.srcs.get(1)?)?;
+    let b = match (signed, src1_high) {
+        (_, false) => b0,
+        (true, true) => format!("bitcast<u32>(bitcast<i32>({b0}) >> 16u)"),
+        (false, true) => format!("({b0} >> 16u)"),
+    };
     let c = raw(instr.srcs.get(2)?)?;
     let expr = if signed {
         format!("bitcast<u32>(bitcast<i32>({a}) * bitcast<i32>({b}) + bitcast<i32>({c}))")

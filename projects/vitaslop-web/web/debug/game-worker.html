@@ -41,6 +41,24 @@
       // reach a VITASLOP_* knob - and one retail racer needs VITASLOP_FRAME_TOPUP=0 to
       // finish loading at all.
       window.__boot = async (recipe, maxFrames, maxRounds, knobs, titleId = "default") => {
+      // Fetch one container file, refusing anything that is not a complete, successful
+      // response.
+      //
+      // >>> A NON-OK RESPONSE HAS A BODY, AND THAT BODY IS NOT THE FILE. Without this check
+      // > > > a 404's nine-byte `not found` was imported AS a 2.9 GB game archive, the marker
+      // > > > called the title complete, and every later boot reused it. The run then failed
+      // > > > three hundred frames later inside the guest, with nothing anywhere saying a file
+      // > > > was wrong. `content-length` is passed on so the import can hold the transfer to
+      // > > > the length the server promised.
+      const gameFile = async (p) => {
+        const res = await fetch("/game/" + p);
+        if (!res.ok) {
+          throw new Error(`GET /game/${p} -> HTTP ${res.status} ${res.statusText}; the body of a
+ failed response is not the file`);
+        }
+        const len = res.headers.get("content-length");
+        return { body: res.body, bytes: len === null ? null : Number(len) };
+      };
         status.textContent = "fetching manifest...";
         const manifest = await (await fetch("/game-manifest.json")).json();
 
@@ -61,10 +79,7 @@
           // was re-importing, for 29 runs and 49 GB.
           console.log(`[opfs] REUSED an existing import of ${titleId} (${manifest.length} files)`);
         } else {
-          const entries = manifest.map((p) => ({
-            path: p,
-            source: async () => (await fetch("/game/" + p)).body,
-          }));
+          const entries = manifest.map((p) => ({ path: p, source: () => gameFile(p) }));
           await importTitle(titleId, entries, (done, total, bytes) => {
             if (done % 20 === 0 || done === total) {
               status.textContent = `importing to OPFS ${done}/${total} (${(bytes / 1e6) | 0} MB)`;

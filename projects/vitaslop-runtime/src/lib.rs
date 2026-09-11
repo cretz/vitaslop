@@ -41,6 +41,7 @@ pub mod recipe;
 pub mod recipe_eval;
 pub mod sched;
 pub mod render;
+pub mod rtt_writeback;
 pub mod trophy;
 pub mod vita;
 pub mod world;

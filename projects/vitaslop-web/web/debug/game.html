@@ -41,7 +41,19 @@
         const files = {};
         let bytes = 0;
         for (let i = 0; i < manifest.length; i++) {
-          const buf = await (await fetch("/game/" + manifest[i])).arrayBuffer();
+          // A failed response still has a body, and it is not the file - see the same check
+          // in game-worker.html for the run that made this necessary.
+          const res = await fetch("/game/" + manifest[i]);
+          if (!res.ok) {
+            throw new Error(`GET /game/${manifest[i]} -> HTTP ${res.status} ${res.statusText}`);
+          }
+          const buf = await res.arrayBuffer();
+          const promised = res.headers.get("content-length");
+          if (promised !== null && buf.byteLength !== Number(promised)) {
+            throw new Error(
+              `GET /game/${manifest[i]} delivered ${buf.byteLength} bytes, promised ${promised}`
+            );
+          }
           files[manifest[i]] = new Uint8Array(buf);
           bytes += buf.byteLength;
           if (i % 40 === 0) status.textContent = `fetched ${i}/${manifest.length} (${(bytes/1e6)|0} MB)`;

@@ -42,6 +42,22 @@ export function decodeName(name) {
 /// count too means a partial directory that somehow kept its marker is still caught.
 const MANIFEST = "vitaslop-opfs-manifest.json";
 
+/// Marker format version. An import made by an older build is REJECTED and redone.
+///
+/// >>> WHY A VERSION AND NOT JUST A NEW FIELD. Version 1 verified nothing about the bytes
+/// > > > it stored: a source that answered a file request with an ERROR PAGE was imported as
+/// > > > that file, and the marker then said the title was complete. One measured title's
+/// > > > 2.9 GB archive came back as the nine bytes `not found` - the harness could not read a
+/// > > > file over 2 GiB and returned its 404 body - and every later boot REUSED that import,
+/// > > > because the only check was the file COUNT. The guest read nine ASCII bytes where its
+/// > > > archive header belonged, took the failure branch of its loader, and ran on for three
+/// > > > hundred frames with nothing loaded before dereferencing a registry that was never
+/// > > > filled. Nothing in the run said "a file is wrong".
+/// > > >
+/// > > > A stored import that predates the size check cannot be distinguished from a correct
+/// > > > one by inspecting it, so the version is what forces it to be redone once.
+const MANIFEST_VERSION = 2;
+
 /// Whether `id` has a complete import, whatever its size. The marker is written last.
 export async function isComplete(id) {
   try {
@@ -64,12 +80,15 @@ export async function removeTitle(id) {
 }
 
 /// Whether `id` is already imported and complete. Cheap: one read of the marker.
+///
+/// An import whose marker predates [`MANIFEST_VERSION`] is treated as ABSENT, so it is redone
+/// under the size checks - see the note on that constant for what a stored import could be.
 export async function isImported(id, expectedCount) {
   try {
     const dir = await titleDir(id, { create: false });
     const fh = await dir.getFileHandle(MANIFEST);
     const m = JSON.parse(await (await fh.getFile()).text());
-    return m.count === expectedCount && m.complete === true;
+    return m.count === expectedCount && m.complete === true && m.v === MANIFEST_VERSION;
   } catch {
     return false;
   }
@@ -127,8 +146,10 @@ export async function requestPersistence() {
   }
 }
 
-/// Import a whole container into OPFS from a list of `{ path, source }`, where `source`
-/// is a `Blob`/`File` (the web form) or a `ReadableStream` (a fetch body). Calls
+/// Import a whole container into OPFS from a list of `{ path, source }`, where `source()`
+/// yields a `Blob`/`File` (the web form), a `ReadableStream` (a fetch body), or
+/// `{ body, bytes }` - a stream together with the length its source PROMISED, which the
+/// import then holds it to. Calls
 /// `onProgress(done, total, bytes)` as it goes. Idempotent: an already-complete title
 /// is left alone.
 export async function importTitle(id, entries, onProgress = () => {}) {
@@ -143,20 +164,40 @@ export async function importTitle(id, entries, onProgress = () => {}) {
     // file still moves the counter without flooding the caller. See `storeOne`.
     let inFlight = 0;
     let reported = 0;
-    const written = await storeOne(dir, entries[i].path, await entries[i].source(), (n) => {
+    // A source may name the length it PROMISED (a fetch's `content-length`). See below.
+    const src = await entries[i].source();
+    const promised = src && typeof src === "object" && "bytes" in src ? src.bytes : null;
+    const body = src && typeof src === "object" && "body" in src ? src.body : src;
+    const written = await storeOne(dir, entries[i].path, body, (n) => {
       inFlight += n;
       if (inFlight - reported >= 4 << 20) {
         reported = inFlight;
         onProgress(i, entries.length, bytes + inFlight, false);
       }
     });
+    // >>> A FILE THAT DID NOT ARRIVE WHOLE IS NOT A FILE, AND MUST NOT BE STORED AS ONE.
+    //
+    // A source that promises a length and delivers another has failed, whatever the transport
+    // said: a truncated download, a proxy that cut the body, a server that answered the
+    // request with an error page. Importing it anyway produces a title that BOOTS and is
+    // wrong - the guest reads its own asset, gets something else, and takes a branch nobody
+    // can trace back here. That is the failure this whole check exists to prevent; see
+    // `MANIFEST_VERSION` for the run that made it necessary.
+    if (promised !== null && written !== promised) {
+      throw new Error(
+        `import of ${entries[i].path} stored ${written} bytes but the source promised ` +
+          `${promised} - the file did not arrive whole, and a partial asset is not importable`
+      );
+    }
     bytes += written;
     onProgress(i + 1, entries.length, bytes, false);
   }
   // The marker goes last, so "present" always means "everything before it is there".
   const fh = await dir.getFileHandle(MANIFEST, { create: true });
   const w = await fh.createWritable();
-  await w.write(JSON.stringify({ complete: true, count: entries.length, bytes }));
+  await w.write(
+    JSON.stringify({ complete: true, count: entries.length, bytes, v: MANIFEST_VERSION })
+  );
   await w.close();
   return { reused: false, bytes };
 }

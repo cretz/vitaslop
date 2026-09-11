@@ -62,18 +62,38 @@ use crate::wgsl::BANK_REGS;
 /// The constant a surplus attribute lane is fed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fill {
-    /// 1.0 - the lane only ever scales something (or is never read at all).
+    /// 1.0 - the lane scales something, so the identity of a multiply is what makes it vanish.
     Identity,
     /// 0.0 - the lane reaches an additive, positional or otherwise non-scaling use.
     Zero,
+    /// **NOTHING READS THIS LANE**, so no value it is given can be observed.
+    ///
+    /// Its `value()` is 1.0, exactly what [`Fill::Identity`] gave before this variant existed,
+    /// so nothing that writes a fill changes - and that is the point: this splits a claim that
+    /// was already being made, it does not make a new one. What it adds is a caller that can
+    /// ask "does this lane need MY constant?" and be told no.
+    ///
+    /// The distinction pays for itself in the renderer's vertex path. Feeding a surplus lane a
+    /// chosen constant means WRITING it, which means repacking the guest's vertex row into a
+    /// buffer this code owns; a lane nobody reads can be left to whatever the hardware's own
+    /// vertex fetch supplies, and the row can then be bound as it stands. MEASURED on a golf
+    /// title, where this is the difference: 102 of its pipelines were held off that path by a
+    /// lane that turned out to be unread.
+    Unobserved,
 }
 
 impl Fill {
     pub fn value(self) -> f32 {
         match self {
-            Fill::Identity => 1.0,
+            Fill::Identity | Fill::Unobserved => 1.0,
             Fill::Zero => 0.0,
         }
+    }
+
+    /// Whether this lane's value is READ at all - i.e. whether `value()` is a decision or an
+    /// arbitrary choice among equals.
+    pub fn observed(self) -> bool {
+        !matches!(self, Fill::Unobserved)
     }
 }
 
@@ -304,22 +324,35 @@ pub fn lane_fill(
     // recipe. The rule the walk implements is about lanes that carry DATA; `w` carries the
     // homogeneous coordinate, and its identity is 1 for exactly the reason a position is not
     // data.
-    if component == 3 {
-        return Fill::Identity;
-    }
+    //
+    // >>> THE PIN IS ON THE VALUE, NOT ON THE QUESTION. The walk still runs for `w`, and its
+    // answer is narrowed to the two that carry 1.0 - `Identity` when anything reads the lane,
+    // `Unobserved` when nothing does. Zero, the answer that destroyed the title above, remains
+    // unreachable for `w`. The distinction matters to a caller that is not choosing a constant
+    // at all: a `w` nobody reads is a lane the hardware may fill with whatever falls under it,
+    // which is what lets a three-component F16 attribute be fetched by a four-component format.
+    let pinned = component == 3;
+    // Every answer below leaves through here, so the pin is applied ONCE and cannot be missed by
+    // a path added later - which is the failure this shape exists to prevent, given what the one
+    // wrong answer for `w` cost.
+    let pin = |f: Fill| match (pinned, f) {
+        (true, Fill::Unobserved) => Fill::Unobserved,
+        (true, _) => Fill::Identity,
+        (false, f) => f,
+    };
     let lane = base_lane + component;
     let mut taint = Taint::new();
     taint.set(PA_BANK, lane as usize, 0, true);
     taint.set(PA_BANK, lane as usize, 1, true);
     if walk(vsh, &mut taint) {
-        return Fill::Zero;
+        return pin(Fill::Zero);
     }
 
     // Clip POSITION. A surplus lane that survives to a position lane is positional by
     // definition, whatever it passed through on the way.
     for l in 0..4 {
         if taint.get(OUT_BANK, l, 0) || taint.get(OUT_BANK, l, 1) {
-            return Fill::Zero;
+            return pin(Fill::Zero);
         }
     }
 
@@ -342,16 +375,21 @@ pub fn lane_fill(
                 ftaint.set(PA_BANK, register as usize, (slot & 1) as usize, true);
             }
             // A texture coordinate is positional.
-            FragLand::SampleCoord => return Fill::Zero,
+            FragLand::SampleCoord => return pin(Fill::Zero),
         }
     }
     if !crossed {
-        return Fill::Identity;
+        // NOTHING DOWNSTREAM CAN SEE THIS LANE. Either the vertex program never moved it to an
+        // output at all, or the output lane it reached is one the fragment stage does not read -
+        // and the position lanes, the one output that is read without being a varying, were
+        // excluded just above. The value is unobservable, which is a stronger and more useful
+        // statement than the 1.0 this used to return: see [`Fill::Unobserved`].
+        return pin(Fill::Unobserved);
     }
     if walk(fsh, &mut ftaint) {
-        return Fill::Zero;
+        return pin(Fill::Zero);
     }
-    Fill::Identity
+    pin(Fill::Identity)
 }
 
 #[cfg(test)]
@@ -420,12 +458,70 @@ mod tests {
         assert_eq!(lane_fill(&vsh, &fsh, 0, 2, &[]), Fill::Zero);
     }
 
-    /// A lane nothing reads cannot be observed, so it keeps the renderer's standing fill.
+    /// The FOURTH lane is 1.0 whatever the walk would have said - the convention every graphics
+    /// API shares, and the one this module's two readings agree on. See [`lane_fill`] for the
+    /// title that went black when the walk was allowed to answer it.
     #[test]
-    fn an_unread_lane_is_identity() {
+    fn the_fourth_lane_is_identity_without_asking() {
         let vsh = shader(vec![instr(Op::Mov, Some(out(0)), vec![pa(0)])]);
         let fsh = Shader { kind: ProgramKind::Fragment, instrs: vec![] };
         assert_eq!(lane_fill(&vsh, &fsh, 0, 3, &[]), Fill::Identity);
+    }
+
+    /// `w` REACHING A POSITION is still 1.0 - the exact case that blacked out a title's front
+    /// end when the walk was allowed to answer ZERO for it. The pin narrows the answer; it does
+    /// not stop the walk running.
+    #[test]
+    fn a_fourth_lane_that_multiplies_a_matrix_column_stays_identity() {
+        // The shape the walk calls ZERO for any other lane: a multiplicand of a mad. The SAME
+        // shape is written for lane 2 and for lane 3, so the only difference between the two
+        // answers is the pin.
+        let fsh = Shader { kind: ProgramKind::Fragment, instrs: vec![] };
+        let lane2 = shader(vec![instr(Op::Mad, Some(out(0)), vec![pa(2), sa(0), sa(4)])]);
+        let lane3 = shader(vec![instr(Op::Mad, Some(out(0)), vec![pa(3), sa(0), sa(4)])]);
+        assert_eq!(lane_fill(&lane2, &fsh, 0, 2, &[]), Fill::Zero, "the rule for an ordinary lane");
+        assert_eq!(lane_fill(&lane3, &fsh, 0, 3, &[]), Fill::Identity, "and the pin for `w`");
+    }
+
+    /// A `w` NOTHING reads reports itself unobserved, while still valuing 1.0.
+    ///
+    /// This is the distinction that lets a three-component F16 attribute be fetched by a
+    /// four-component vertex format: the fourth lane picks up whatever guest bytes follow, and
+    /// that is only admissible when nothing can look at it.
+    #[test]
+    fn an_unread_fourth_lane_is_unobserved() {
+        let vsh = shader(vec![instr(Op::Mov, Some(out(4)), vec![pa(0)])]);
+        let fsh = Shader { kind: ProgramKind::Fragment, instrs: vec![] };
+        let f = lane_fill(&vsh, &fsh, 0, 3, &[(4, FragLand::Register(0))]);
+        assert_eq!(f, Fill::Unobserved);
+        assert_eq!(f.value(), 1.0);
+    }
+
+    /// A lane NOTHING reads is `Unobserved`, not `Identity`.
+    ///
+    /// The two carry the same 1.0 and are still different answers: `Identity` says a constant
+    /// was CHOSEN and any other would show, `Unobserved` says no choice is being made at all -
+    /// which is what lets the renderer bind the guest's vertex row as it stands instead of
+    /// rewriting it to place a value nobody will look at.
+    #[test]
+    fn a_lane_nothing_reads_is_unobserved() {
+        // The vertex program moves a DIFFERENT lane; lane 2's taint reaches no output.
+        let vsh = shader(vec![instr(Op::Mov, Some(out(4)), vec![pa(0)])]);
+        let fsh = Shader { kind: ProgramKind::Fragment, instrs: vec![] };
+        assert_eq!(lane_fill(&vsh, &fsh, 0, 2, &[(4, FragLand::Register(0))]), Fill::Unobserved);
+        assert!(!lane_fill(&vsh, &fsh, 0, 2, &[(4, FragLand::Register(0))]).observed());
+        // And it is still the same 1.0 to anyone that writes a fill, so the repack is unchanged.
+        assert_eq!(Fill::Unobserved.value(), Fill::Identity.value());
+    }
+
+    /// A lane the vertex DOES forward, into a varying the fragment does not read, is unobserved
+    /// too - the interface is where the observation is lost, not the vertex stage.
+    #[test]
+    fn a_varying_the_fragment_never_reads_is_unobserved() {
+        let vsh = shader(vec![instr(Op::Mov, Some(out(6)), vec![pa(2)])]);
+        let fsh = Shader { kind: ProgramKind::Fragment, instrs: vec![] };
+        // o[6] carries the lane, and the varying map does not mention o[6] at all.
+        assert_eq!(lane_fill(&vsh, &fsh, 0, 2, &[(4, FragLand::Register(0))]), Fill::Unobserved);
     }
 
     /// A write to the lane's own register before it is read does NOT make the attribute's value

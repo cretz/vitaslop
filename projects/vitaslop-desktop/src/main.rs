@@ -9,6 +9,18 @@
 //! wgpu surface through the shared cube pipeline the browser and headless oracle
 //! also use.
 
+/// >>> EVERY ALLOCATION IS COUNTED, on the desktop as in the browser.
+///
+/// The number that decides whether a title runs in a browser at all is the size of the
+/// emulator's linear memory, and the desktop is where it is cheap to watch: same Rust, same
+/// caches, same transpiler, an RSS the OS will report. Wrapping the system allocator here means
+/// `heap::live_bytes` reads the same subject on both sides, so a desktop A/B on a cache's
+/// residency transfers to the phone instead of having to be re-measured there.
+#[global_allocator]
+static ALLOC: vitaslop_platform::heap::Counting<std::alloc::System> =
+    vitaslop_platform::heap::Counting(std::alloc::System);
+
+mod diskvfs;
 mod gfx;
 mod input;
 mod library;

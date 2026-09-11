@@ -562,7 +562,27 @@ impl<H: ImportDispatch + Send + 'static> ThreadedScheduler<H> {
         // so the preemption GRANULARITY is unchanged; what changes is that every
         // preemption is now a call through our own import, where the counter can be read.
         transpiler::set_fuel_interval(u32::try_from(quantum_fuel).unwrap_or(u32::MAX));
+        // >>> THE TRANSPILE'S OWN PEAK, SPLIT FROM THE ENGINE COMPILE THAT FOLLOWS IT.
+        //
+        // Transpile is the allocation peak of the whole system and the browser does it in a
+        // worker under a 4,096 MB ceiling, so "which half of the boot took 2 GB" is the
+        // question that decides whether a title can be brought up at all. The transpiler crate
+        // is deliberately dependency-light and cannot read these counters itself; this is the
+        // nearest caller that can. See `vitaslop_platform::heap`.
+        vitaslop_platform::heap::reset_peak();
         let built = transpiler::transpile_lenient(&linked.shared_program());
+        {
+            let (live, peak) = vitaslop_platform::heap::live_peak_mb();
+            // `vitaslop::status`, not `vitaslop::perf`: every documented repro command in this
+            // project runs at `warn,vitaslop::status=info`, so a boot fact on the perf target is
+            // a boot fact nobody ever sees
+            // [[vitaslop-a-diagnostic-at-debug-is-a-diagnostic-that-does-not-exist]].
+            tracing::info!(
+                target: "vitaslop::status",
+                "transpile: RUST HEAP peaked at {peak} MB and holds {live} MB after it                  (the module's bytes plus whatever the lift did not give back)",
+            );
+        }
+        vitaslop_platform::heap::reset_peak();
         // Leave the thread as we found it: the emitted module carries its own interval
         // and every runtime reader takes it from `ThreadData`, so nothing after this
         // point should depend on a thread-local that another transpile could inherit.
@@ -1294,9 +1314,16 @@ fn bind_svc<H: ImportDispatch + Send + 'static>(
                             eprintln!(
                                 "[trace] frame={frame} t{thid} f_{sel:x}  r0={:#010x} r1={:#010x} r2={:#010x} \
                                  r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x} \
-                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x} lr={:#010x}{watched}",
+                                 r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x}                                  sp={:#010x} lr={:#010x}{watched}",
                                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
-                                r[8], r[9], r[10], r[11], r[12], get_reg(&mut caller, 14),
+                                r[8], r[9], r[10], r[11], r[12],
+                                // SP, which the browser's copy of this line already carries. A
+                                // watched store names the FUNCTION and its registers, but the
+                                // value a caller is about to copy out of its own frame lives at
+                                // an address only SP gives - which is how a table pointer held in
+                                // a callee's frame is reached at all.
+                                get_reg(&mut caller, 13),
+                                get_reg(&mut caller, 14),
                             );
                         }
                         // qemu-diff capture (opt-in; see the qdiff_* helpers below). The
